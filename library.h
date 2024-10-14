@@ -266,6 +266,7 @@ namespace TidesDB {
 		std::vector<uint8_t> minKey; // Minimum key
 		std::vector<uint8_t> maxKey; // Maximum key
 		std::shared_mutex lock; // Mutex for SSTable
+		std::string GetFilePath() const;
 	}; // SSTable class
 
 	// SSTableIterator class

@@ -7,7 +7,7 @@ int main() {
     std::string directory = "./tidesdb_data"; // The directory for storing data
     std::filesystem::perms directoryPerm = std::filesystem::perms::owner_all | std::filesystem::perms::group_read; // Permissions
     int memtableFlushSize = 10 * 1024; // Example flush size (10 KB)
-    int compactionInterval = 5; // Example compaction interval (in seconds)
+    int compactionInterval = 4; // Example compaction interval (amounr of ss tables before compaction)
     int minimumSSTables = 2; // Minimum SSTables required
 
     try {
@@ -26,6 +26,9 @@ int main() {
 
 
         lsmTree->Close();
+
+        return 0;
+
 
     } catch (const std::exception& e) {
         std::cerr << "Error initializing LSMT: " << e.what() << std::endl;

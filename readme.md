@@ -18,12 +18,14 @@ This process merges multiple SSTables into fewer ones, reducing file count and m
 - [x] AVL tree memtable
 - [x] Transaction control (`BeginTransaction`, `CommitTransaction`, `RollbackTransaction`)
 - [x] Concurrent safe
-- [] Compression (todo)
+- [ ] Compression (todo)
 - [x] Tombstone deletion
-- [] Range functionality (NGet, Range, NRange, GreaterThan, LessThan, GreaterThanEq, LessThanEq)
+- [ ] Range functionality (`NGet`, `Range`, `NRange`, `GreaterThan`, `LessThan`, `GreaterThanEq`, `LessThanEq`)
 
 ## Requirements
-## Protobuf
+Whats required to build TidesDB..
+
+### Protobuf
 ```bash
 sudo apt-get install libprotobuf-dev protobuf-compiler
 ```

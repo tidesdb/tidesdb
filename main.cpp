@@ -1,6 +1,9 @@
 #include <iostream>
 #include "library.h"
 
+/* just used for testing, not part of the library */
+/* IZ TEMP */
+
 std::vector<uint8_t> convertToUint8Vector(const std::vector<char>& input) {
     return std::vector<uint8_t>(input.begin(), input.end());
 }

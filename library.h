@@ -139,7 +139,7 @@ namespace TidesDB {
 		AVLNode* minValueNode(AVLNode* node);
 
 		// height gets the height of a node
-		int height(AVLNode* node);
+		static int height(AVLNode* node);
 
 		// inOrderTraversal traverses the AVL tree in in-order traversal and calls a function on each node
 		void inOrderTraversal(AVLNode* node, std::function<void(const std::vector<uint8_t>&, const std::vector<uint8_t>&)> func);
@@ -198,7 +198,7 @@ namespace TidesDB {
           // Writes to an existing page in the file
           // takes a vector of characters as input
           // returns page number
-		  int64_t WriteTo(int64_t page_number, const std::vector<uint8_t> &data);
+		  static int64_t WriteTo(int64_t page_number, const std::vector<uint8_t> &data);
 
           // Read
 		  // Reads a page from the file
@@ -227,7 +227,7 @@ namespace TidesDB {
 		std::shared_mutex lock; // Mutex for write-ahead log
 
 		// WriteOperation writes an operation to the write-ahead log
-		bool WriteOperation(const Operation& operation);
+		static bool WriteOperation(const Operation& operation);
 
 		// ReadOperations reads operations from the write-ahead log
 		std::vector<Operation> ReadOperations();

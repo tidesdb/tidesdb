@@ -244,14 +244,19 @@ namespace TidesDB {
 		// WriteOperation writes an operation to the write-ahead log
 		bool WriteOperation(const Operation& op) const;
 
+		// Recover recovers operations from the write-ahead log
+		std::vector<Operation> Recover() const;
+
 		// ReadOperations reads operations from the write-ahead log
 		std::vector<Operation> ReadOperations();
+
 
 		// Close closes the write-ahead log
 		void Close() const;
 
 	private:
 		Pager* pager; // Pager instance
+		mutable std::shared_mutex walLock; // Mutex for write-ahead log
 	}; // Wal class
 
 	// SSTable class
@@ -339,6 +344,9 @@ namespace TidesDB {
 
 		// RollbackTransaction rolls back a transaction
 		void RollbackTransaction(Transaction *tx);
+
+		// RunRecoveredOperations runs recovered operations from the write-ahead log
+		bool RunRecoveredOperations(const std::vector<Operation>& operations);
 
 		// SplitSSTable splits an SSTable into n SSTables
 		std::vector<std::shared_ptr<SSTable>> SplitSSTable(SSTable* sstable, int n) const;

@@ -280,7 +280,7 @@ inline ::OperationType Operation::type() const {
   return _internal_type();
 }
 inline void Operation::_internal_set_type(::OperationType value) {
-  
+
   _impl_.type_ = value;
 }
 inline void Operation::set_type(::OperationType value) {
@@ -299,7 +299,7 @@ inline const std::string& Operation::key() const {
 template <typename ArgT0, typename... ArgT>
 inline PROTOBUF_ALWAYS_INLINE
 void Operation::set_key(ArgT0&& arg0, ArgT... args) {
- 
+
  _impl_.key_.SetBytes(static_cast<ArgT0 &&>(arg0), args..., GetArenaForAllocation());
   // @@protoc_insertion_point(field_set:Operation.key)
 }
@@ -312,11 +312,11 @@ inline const std::string& Operation::_internal_key() const {
   return _impl_.key_.Get();
 }
 inline void Operation::_internal_set_key(const std::string& value) {
-  
+
   _impl_.key_.Set(value, GetArenaForAllocation());
 }
 inline std::string* Operation::_internal_mutable_key() {
-  
+
   return _impl_.key_.Mutable(GetArenaForAllocation());
 }
 inline std::string* Operation::release_key() {
@@ -325,9 +325,9 @@ inline std::string* Operation::release_key() {
 }
 inline void Operation::set_allocated_key(std::string* key) {
   if (key != nullptr) {
-    
+
   } else {
-    
+
   }
   _impl_.key_.SetAllocated(key, GetArenaForAllocation());
 #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
@@ -349,7 +349,7 @@ inline const std::string& Operation::value() const {
 template <typename ArgT0, typename... ArgT>
 inline PROTOBUF_ALWAYS_INLINE
 void Operation::set_value(ArgT0&& arg0, ArgT... args) {
- 
+
  _impl_.value_.SetBytes(static_cast<ArgT0 &&>(arg0), args..., GetArenaForAllocation());
   // @@protoc_insertion_point(field_set:Operation.value)
 }
@@ -362,11 +362,11 @@ inline const std::string& Operation::_internal_value() const {
   return _impl_.value_.Get();
 }
 inline void Operation::_internal_set_value(const std::string& value) {
-  
+
   _impl_.value_.Set(value, GetArenaForAllocation());
 }
 inline std::string* Operation::_internal_mutable_value() {
-  
+
   return _impl_.value_.Mutable(GetArenaForAllocation());
 }
 inline std::string* Operation::release_value() {
@@ -375,9 +375,9 @@ inline std::string* Operation::release_value() {
 }
 inline void Operation::set_allocated_value(std::string* value) {
   if (value != nullptr) {
-    
+
   } else {
-    
+
   }
   _impl_.value_.SetAllocated(value, GetArenaForAllocation());
 #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING

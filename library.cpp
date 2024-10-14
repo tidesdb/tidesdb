@@ -446,6 +446,31 @@ namespace TidesDB {
         return {}; // Key not found, return an empty vector
     }
 
+    // Recover recovers the write-ahead log
+    std::vector<Operation> Wal::Recover() const {
+        std::vector<Operation> operations;
+
+        // Lock the WAL for reading
+        std::unique_lock<std::shared_mutex> lock(walLock);
+
+        // Get the number of pages in the WAL
+        int64_t pageCount = pager->PagesCount();
+
+        // Iterate through each page in the WAL
+        for (int64_t i = 0; i < pageCount; ++i) {
+            // Read the data from the current page
+            std::vector<uint8_t> data = pager->Read(i);
+
+            // Deserialize the data into an Operation object
+            Operation op = deserializeOperation(data);
+
+            // Add the operation to the list of operations
+            operations.push_back(op);
+        }
+
+        return operations;
+    }
+
     // WriteOperation writes an operation to the write-ahead log
     bool Wal::WriteOperation(const Operation& op) const {
         // Serialize the operation
@@ -466,6 +491,33 @@ namespace TidesDB {
         }
 
         return true; // Return true if successful
+    }
+
+    // RunRecoveredOperations runs the recovered operations
+    bool LSMT::RunRecoveredOperations(const std::vector<Operation>& operations) {
+        for (const auto& op : operations) {
+            switch (static_cast<int>(op.type())) {
+                case static_cast<int>(OperationType::OpPut): {
+                    std::vector<uint8_t> key(op.key().begin(), op.key().end());
+                    std::vector<uint8_t> value(op.value().begin(), op.value().end());
+                    if (!Put(key, value)) {
+                        return false;
+                    }
+                    break;
+                }
+                case static_cast<int>(OperationType::OpDelete): {
+                    std::vector<uint8_t> key(op.key().begin(), op.key().end());
+                    if (!Delete(key)) {
+                        return false;
+                    }
+                    break;
+                }
+                default:
+                    std::cerr << "Unknown operation type\n";
+                return false;
+            }
+        }
+        return true;
     }
 
     // flushMemtable flushes the memtable to disk

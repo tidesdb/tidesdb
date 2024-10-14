@@ -454,7 +454,6 @@ namespace TidesDB {
 
     // flushMemtable flushes the memtable to disk
     bool LSMT::flushMemtable() {
-        std::cout << "flushMemtable called\n";
 
         // Iterate through the memtable and write the key-value pairs to the SSTable
         std::vector<KeyValue> kvPairs;
@@ -491,10 +490,7 @@ namespace TidesDB {
         // Serialize the key-value pairs
         for (const auto& kv : kvPairs) {
             std::vector<uint8_t> serialized = serialize(kv);
-            // Print serialized data
-            for (auto byte : serialized) {
-                std::cout << std::hex << static_cast<int>(byte) << " ";
-            }
+
             std::cout << std::dec << std::endl;
 
             sstable->pager->Write(serialized);
@@ -543,31 +539,19 @@ namespace TidesDB {
 
     // Put puts a key-value pair in the LSMT
     bool LSMT::Put(const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) {
-        std::cout << "Put called\n";
 
         // Check if we are flushing or compacting
         std::unique_lock<std::mutex> lock(condMutex);
         cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
 
-        std::cout << "Put called after wait\n";
-
-        std::cout << "lock memtable\n";
 
 
         std::unique_lock<std::shared_mutex> walLock(wal->lock);
 
-        std::cout << "wal locked\n";
 
         // Lock memtable for writing
         std::unique_lock<std::shared_mutex> memtableLock(memtableMutex);
 
-        std::cout << "memtable locked\n";
-
-        std::cout << "lock wal\n";
-
-
-        // Append the operation to the write-ahead log
-        std::cout << "append operation\n";
 
         // Append the operation to the write-ahead log
         Operation op;
@@ -578,8 +562,6 @@ namespace TidesDB {
         if (!wal->WriteOperation(op)) {
             return false;
         }
-
-        std::cout << "operation appended\n";
 
         // Check if value is tombstone
         if (value == std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
@@ -595,8 +577,6 @@ namespace TidesDB {
         // Increase the memtable size
         memtableSize.fetch_add(key.size() + value.size());
 
-        std::cout << "memtable size: " << memtableSize.load() << std::endl;
-        std::cout << "key value inserted\n";
 
         // If the memtable size exceeds the flush size, flush the memtable to disk
         if (memtableSize.load() > memtableFlushSize) {
@@ -738,7 +718,6 @@ namespace TidesDB {
 
     // Compact compacts the SSTables
 bool LSMT::Compact() {
-    std::cout << "compacting\n";
     isCompacting.store(1);
 
 

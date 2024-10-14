@@ -400,6 +400,14 @@ bool Wal::WriteOperation(const Operation& op) {
     // Create a new SSTable
     auto sstable = std::make_shared<SSTable>(new Pager(sstablePath, std::ios::in | std::ios::out | std::ios::trunc));
 
+    // We must set minKey and maxKey
+    if (!kvPairs.empty()) {
+        if (!kvPairs.empty()) {
+            sstable->minKey.assign(kvPairs.front().key().begin(), kvPairs.front().key().end());
+            sstable->maxKey.assign(kvPairs.back().key().begin(), kvPairs.back().key().end());
+        }
+    }
+
     // Serialize the key-value pairs
     for (const auto& kv : kvPairs) {
         std::vector<uint8_t> serialized = serialize(kv);

@@ -50,13 +50,6 @@ namespace TidesDB {
 		OpPut,
 		OpDelete
 	};
-	//
-	// // Operation struct
-	// struct Operation {
-	// 	OperationType type; // Operation type
-	// 	std::vector<uint8_t> key; // Key as a vector of bytes
-	// 	std::vector<uint8_t> value; // Only used for OpPut
-	// };
 
 	// Transaction struct
 	struct Transaction {
@@ -75,12 +68,6 @@ namespace TidesDB {
 	    }
 	};
 
-
-	// Key-value struct
-	// struct KeyValue {
-	// 	std::vector<uint8_t> key;    // Key as a vector of bytes
-	// 	std::vector<uint8_t> value;  // Value as a vector of bytes
-	// };
 
 	// Serialize serializes the KeyValue struct to a byte vector
 	std::vector<uint8_t> serialize(const KeyValue& kv);

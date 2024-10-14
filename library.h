@@ -132,6 +132,10 @@ namespace TidesDB {
 
 		void clear();
 
+		// Get
+		// Returns the value for a given key
+		std::vector<uint8_t> Get(const std::vector<uint8_t>& key);
+
 		int GetSize(AVLNode * root);
 
 		int GetSize();

@@ -19,3 +19,8 @@
 *.app
 cmake-build-debug
 .idea
+tests/lsmt/cmake-build-debug
+tests/avl/cmake-build-debug
+tests/pager/cmake-build-debug
+tests/txn/cmake-build-debug
+tests/wal/cmake-build-debug

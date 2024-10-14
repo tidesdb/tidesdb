@@ -218,7 +218,6 @@ int AVLTree::GetSize() {
 
 
 
-
 AVLNode* AVLTree::rightRotate(AVLNode* y) {
     AVLNode* x = y->left;
     AVLNode* T2 = x->right;
@@ -395,6 +394,24 @@ void AVLTree::inOrderTraversal(std::function<void(const std::vector<uint8_t>&, c
 void AVLTree::deleteKey(const std::vector<uint8_t>& key) {
     std::unique_lock<std::shared_mutex> lock(rwlock);
     root = deleteNode(root, key);
+}
+
+// Get returns the value for a given key
+std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t>& key) {
+    std::shared_lock<std::shared_mutex> lock(rwlock);
+    AVLNode* current = root;
+
+    while (current != nullptr) {
+        if (key < current->key) {
+            current = current->left;
+        } else if (key > current->key) {
+            current = current->right;
+        } else {
+            return current->value; // Key found, return the value
+        }
+    }
+
+    return {}; // Key not found, return an empty vector
 }
 
 bool Wal::WriteOperation(const Operation& op) {
@@ -750,5 +767,7 @@ bool LSMT::Compact() {
 
     return true;
 }
+
+
 
 } // namespace TidesDB

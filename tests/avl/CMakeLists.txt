@@ -12,10 +12,10 @@ include_directories(${Protobuf_INCLUDE_DIRS})
 # Add the generated protobuf source files
 # protoc --cpp_out=. operation.proto
 # protoc --cpp_out=. kv.proto
-set(PROTO_SRC kv.pb.cc operation.pb.cc)
-set(PROTO_HDR kv.pb.h operation.pb.h)
+set(PROTO_SRC ../../kv.pb.cc ../../operation.pb.cc)
+set(PROTO_HDR ../../kv.pb.h ../../operation.pb.h)
 
-add_executable(tidesdb main.cpp library.cpp ${PROTO_SRC})
+add_executable(tidesdb main.cpp ../../library.cpp ${PROTO_SRC})
 
 # Link the protobuf library
 target_link_libraries(tidesdb ${Protobuf_LIBRARIES})

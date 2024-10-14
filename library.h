@@ -35,7 +35,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <functional>
-
+#include <optional>
 
 
 // The TidesDB namespace
@@ -44,6 +44,10 @@ namespace TidesDB {
 	constexpr std::string SSTABLE_EXTENSION = ".sst"; // SSTable file extension
 	constexpr std::string TOMBSTONE_VALUE = "$tombstone"; // Tombstone value
 	constexpr std::string WAL_EXTENSION = ".wal"; // Write-ahead log file extension
+
+	std::vector<uint8_t> ConvertToUint8Vector(const std::vector<char>& input);
+	std::vector<char> ConvertToCharVector(const std::vector<uint8_t>& input);
+
 
 	// // Operation types (for transactions)
 	enum class OperationType {
@@ -127,13 +131,17 @@ namespace TidesDB {
 		void inOrderTraversal(std::function<void(const std::vector<uint8_t>&, const std::vector<uint8_t>&)> func);
 
 		void clear();
+
+		int GetSize(AVLNode * root);
+
+		int GetSize();
 	};
 
     // Pager class
     // Manages reading and writing pages to a file
 	class Pager {
 	private:
-
+		std::string fileName;
 		std::fstream file;
 	public:
           // Constructor
@@ -148,7 +156,7 @@ namespace TidesDB {
           // If the page is full, it writes to a new page and updates the overflow page number in the header
           // returns page number
 		  int64_t Write(const std::vector<uint8_t> &data);
-
+		  std::string GetFileName() const;
           // Write to page
           // Writes to an existing page in the file
           // takes a vector of characters as input
@@ -165,6 +173,11 @@ namespace TidesDB {
 		 // GetFile
 		 // Returns the file stream
 		 std::fstream& GetFile();
+
+		// PagesCount
+		// Returns the number of pages in the file
+		int64_t PagesCount();
+
 
 
 	}; // Pager class
@@ -192,6 +205,29 @@ namespace TidesDB {
 		std::shared_mutex lock;
 	};
 
+	class SSTableIterator {
+	public:
+		SSTableIterator(Pager* pager) : pager(pager), maxPages(pager->PagesCount()), currentPage(0) {}
+
+		bool Ok() const {
+			return currentPage < maxPages;
+		}
+
+		std::optional<KeyValue> Next() {
+			if (!Ok()) {
+				return std::nullopt;
+			}
+
+			auto data = pager->Read(currentPage++);
+			return deserialize(data);
+		}
+
+	private:
+		Pager* pager;
+		int64_t maxPages;
+		int64_t currentPage;
+	};
+
 	class LSMT {
 
 	public:
@@ -217,7 +253,8 @@ namespace TidesDB {
 
 		bool Put(const std::vector<uint8_t>& key, const std::vector<uint8_t>& value);
 		bool Delete(const std::vector<uint8_t>& key);
-
+		bool Compact();
+		std::vector<std::shared_ptr<SSTable>> SplitSSTable(SSTable* sstable, int n) const;
 		
 
 		void Close() {

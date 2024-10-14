@@ -5,6 +5,15 @@
 
 namespace TidesDB {
 
+
+std::vector<uint8_t> ConvertToUint8Vector(const std::vector<char>& input) {
+    return std::vector<uint8_t>(input.begin(), input.end());
+}
+
+std::vector<char> ConvertToCharVector(const std::vector<uint8_t>& input) {
+    return std::vector<char>(input.begin(), input.end());
+}
+
 // Serialize serializes the KeyValue struct to a byte vector
 std::vector<uint8_t> serialize(const KeyValue& kv) {
     std::vector<uint8_t> buffer(kv.ByteSizeLong());
@@ -45,7 +54,8 @@ std::string getPathSeparator() {
 }
 
 // Constructor
-Pager::Pager(const std::string &filename, std::ios::openmode mode) {
+Pager::Pager(const std::string &filename, std::ios::openmode mode) : fileName(filename) {
+
     // Check if the file exists
     if (!std::filesystem::exists(filename)) {
         // Create the file
@@ -62,6 +72,10 @@ Pager::Pager(const std::string &filename, std::ios::openmode mode) {
     if (!file.is_open()) {
         throw TidesDBException("Failed to open file: " + filename);
     }
+}
+
+std::string Pager::GetFileName() const {
+    return fileName;
 }
 
 // Destructor
@@ -188,6 +202,22 @@ int AVLTree::height(AVLNode* node) {
         return 0;
     return node->height;
 }
+
+// GetSize returns the size of the AVL tree
+int AVLTree::GetSize(AVLNode* node) {
+    if (node == nullptr) {
+        return 0;
+    }
+    return 1 + GetSize(node->left) + GetSize(node->right);
+}
+
+int AVLTree::GetSize() {
+    std::shared_lock<std::shared_mutex> lock(rwlock);
+    return GetSize(root);
+}
+
+
+
 
 AVLNode* AVLTree::rightRotate(AVLNode* y) {
     AVLNode* x = y->left;
@@ -426,6 +456,11 @@ bool Wal::WriteOperation(const Operation& op) {
         sstables.push_back(sstable.get());
     }
 
+    if (sstableCounter >= minimumSSTables) {
+        // Compact the SSTables
+        Compact();
+    }
+
     return true;
 }
 
@@ -553,7 +588,18 @@ void Wal::Close() const {
     }
 }
 
+// PagesCount returns the number of pages in the SSTable
+int64_t Pager::PagesCount() {
+    if (!file.is_open()) {
+        throw TidesDBException("File is not open");
+    }
 
+    file.seekg(0, std::ios::end);
+    int64_t fileSize = file.tellg();
+    return fileSize / PAGE_SIZE;
+
+
+}
 
 // clear memtable
 void AVLTree::clear() {
@@ -561,6 +607,148 @@ void AVLTree::clear() {
 
     // initialze new AVL tree
     root = nullptr;
+}
+
+std::vector<std::shared_ptr<SSTable>> LSMT::SplitSSTable(SSTable* sstable, int n) const {
+    std::vector<std::unique_ptr<AVLTree>> memTables(n);
+    for (int i = 0; i < n; ++i) {
+        memTables[i] = std::make_unique<AVLTree>();
+    }
+
+    int memtSeq = 0;
+
+    if (sstable == nullptr) {
+        return {};
+    }
+
+    // Get an iterator for the SSTable file.
+    // use SSTableIterator to iterate over the SSTable
+    auto it = std::make_unique<SSTableIterator>(sstable->pager);
+
+    // Iterate over the SSTable.
+    while (it->Ok()) {
+        auto kv = it->Next();
+        if (!kv) {
+            break;
+        }
+
+        // If the value is a tombstone, skip this key-value pair.
+        if (ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end())) == std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+            continue;
+        }
+
+        // If the value is not a tombstone, add it to the memtable.
+        if (memtSeq < memTables.size()) {
+
+
+            // If we have reached the size of the memtable, flush it to disk.
+            if (memTables[memtSeq]->GetSize() >= memtableFlushSize) {
+                memtSeq++;
+            }
+        }
+    }
+
+    // Close the SSTable pager.
+    sstable->pager->GetFile().close();
+
+    // Delete the SSTable file.
+    std::filesystem::remove(sstable->pager->GetFileName());
+
+    std::vector<std::shared_ptr<SSTable>> sstables(n);
+    for (int i = 0; i < n; ++i) {
+        // Create a new SSTable file.
+        std::string sstablePath = directory + getPathSeparator() + "sstable_" + std::to_string(i) + SSTABLE_EXTENSION;
+
+        // Create a new SSTable.
+        auto newSSTable = std::make_shared<SSTable>(new Pager(sstablePath, std::ios::in | std::ios::out | std::ios::trunc));
+
+        // Write the key-value pairs to the SSTable.
+        memTables[i]->inOrderTraversal([&newSSTable](const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) {
+            KeyValue kv;
+            kv.set_key(key.data(), key.size());
+            kv.set_value(value.data(), value.size());
+            std::vector<uint8_t> serialized = serialize(kv);
+            newSSTable->pager->Write(serialized);
+        });
+
+        // Add the new SSTable to the list of SSTables.
+        sstables[i] = newSSTable;
+    }
+
+    return sstables;
+}
+
+bool LSMT::Compact() {
+    isCompacting.store(1);
+
+    // Create a new empty memtable.
+    auto newMemtable = std::make_unique<AVLTree>();
+
+    // Iterate over all existing SSTables.
+    for (auto& sstable : sstables) {
+        // Get an iterator for the SSTable file.
+        auto it = std::make_unique<SSTableIterator>(sstable->pager);
+
+        // Iterate over the SSTable.
+        while (it->Ok()) {
+            auto kv = it->Next();
+            if (!kv) {
+                break;
+            }
+
+            if (ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end())) == std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+                continue;
+            }
+
+            // If the value is not a tombstone, add it to the new memtable.
+            newMemtable->insert(ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())), ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end())));
+        }
+
+        sstable->pager->GetFile().close(); // Close the SSTable pager.
+    }
+
+    // Remove all the SSTables in the directory.
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.is_regular_file() && entry.path().extension() == SSTABLE_EXTENSION) {
+            std::filesystem::remove(entry.path());
+            std::filesystem::remove(entry.path().string() + ".del");
+        }
+    }
+
+    // Clear the SSTables.
+    sstables.clear();
+
+    // Flush the new memtable to disk, creating a new SSTable.
+    auto newSSTable = std::make_shared<SSTable>(new Pager(directory + getPathSeparator() + "sstable_0" + SSTABLE_EXTENSION, std::ios::in | std::ios::out | std::ios::trunc));
+    newMemtable->inOrderTraversal([&newSSTable](const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) {
+        KeyValue kv;
+        kv.set_key(key.data(), key.size());
+        kv.set_value(value.data(), value.size());
+        std::vector<uint8_t> serialized = serialize(kv);
+        newSSTable->pager->Write(serialized);
+    });
+
+    // Replace the list of old SSTables with the new SSTable.
+    sstables.push_back(newSSTable.get());
+
+    // Replace the list of old SSTables with the new SSTable.
+    sstables.push_back(newSSTable.get());
+
+    // Split the SSTable into smaller SSTables.
+    auto splitSSTables = SplitSSTable(newSSTable.get(), minimumSSTables);
+
+    // Convert std::vector<std::shared_ptr<SSTable>> to std::vector<SSTable*>
+    sstables.clear();
+    for (const auto& sstable : splitSSTables) {
+        sstables.push_back(sstable.get());
+    }
+
+    isCompacting.store(0);
+
+    // Signal the condition variable.
+    cond.notify_all();
+
+    return true;
 }
 
 } // namespace TidesDB

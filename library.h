@@ -69,22 +69,10 @@ namespace TidesDB {
 	struct Transaction {
 		std::vector<TransactionOperation> operations; // List of operations
 		bool aborted = false; // Whether the transaction was aborted
+		void AddPut(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
 	};
 
-	// BeginTransaction starts a new transaction.
-	Transaction* BeginTransaction();
 
-	// AddPut adds a put operation to a transaction.
-	void AddPut(Transaction* tx, const std::vector<uint8_t>& key, const std::vector<uint8_t>& value);
-
-	// AddDelete adds a delete operation to a transaction.
-	void AddDelete(Transaction* tx, const std::vector<uint8_t>& key);
-
-	// CommitTransaction commits a transaction.
-	bool CommitTransaction(Transaction* tx);
-
-	// RollbackTransaction aborts a transaction.
-	void RollbackTransaction(Transaction* tx);
 
 	// Exception class
 	class TidesDBException : public std::exception {
@@ -341,6 +329,15 @@ namespace TidesDB {
 
 		// Compact compacts the SSTables
 		bool Compact();
+
+		// BeginTransaction begins a new transaction
+		Transaction *BeginTransaction();
+
+		// CommitTransaction commits a transaction
+		bool CommitTransaction(Transaction *tx);
+
+		// RollbackTransaction rolls back a transaction
+		void RollbackTransaction(Transaction *tx);
 
 		// SplitSSTable splits an SSTable into n SSTables
 		std::vector<std::shared_ptr<SSTable>> SplitSSTable(SSTable* sstable, int n) const;

@@ -804,4 +804,99 @@ namespace TidesDB {
 
         return true;
     }
+
+    // BeginTransaction starts a new transaction.
+    Transaction* LSMT::BeginTransaction() {
+        auto tx = new Transaction();
+        activeTransactions.push_back(tx);
+        return tx;
+    }
+
+    // AddPut adds a put operation to the transaction.
+    void AddPut(Transaction* tx, const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) {
+        Rollback* rollback = new Rollback{OperationType::OpDelete, key, {}};
+
+        // op
+        Operation op;
+        op.set_type(static_cast<::OperationType>(OperationType::OpPut));
+        op.set_key(key.data(), key.size());
+        op.set_value(value.data(), value.size());
+
+        tx->operations.push_back(TransactionOperation{op, rollback});
+    }
+
+    // AddDelete adds a delete operation to the transaction.
+    void AddDelete(Transaction* tx, const std::vector<uint8_t>& key) {
+        // Would be good to get the value of the key before deleting it so we can rollback
+
+        Rollback* rollback = new Rollback{OperationType::OpPut, key, {}};
+
+        // op
+        Operation op;
+        op.set_type(static_cast<::OperationType>(OperationType::OpDelete));
+        op.set_key(key.data(), key.size());
+
+        tx->operations.push_back(TransactionOperation{op, rollback});
+    }
+
+
+    // CommitTransaction commits a transaction.
+    // On error we rollback the transaction
+    bool LSMT::CommitTransaction(Transaction* tx) {
+        if (tx->aborted) {
+            throw std::runtime_error("transaction has been aborted");
+        }
+
+        for (const auto& txOp : tx->operations) {
+            const auto& op = txOp.op;
+            switch (op.type()) {
+                case static_cast<int>(OperationType::OpPut):
+                    if (!Put(ConvertToUint8Vector(std::vector<char>(op.key().begin(), op.key().end())),
+                             ConvertToUint8Vector(std::vector<char>(op.value().begin(), op.value().end())))) {
+                        RollbackTransaction(tx);
+                        return false;
+                             }
+                break;
+                case static_cast<int>(OperationType::OpDelete):
+                    if (!Delete(ConvertToUint8Vector(std::vector<char>(op.key().begin(), op.key().end())))) {
+                        RollbackTransaction(tx);
+                        return false;
+                    }
+                break;
+            }
+        }
+
+        // Remove the transaction from the active list.
+        auto it = std::find(activeTransactions.begin(), activeTransactions.end(), tx);
+        if (it != activeTransactions.end()) {
+            activeTransactions.erase(it);
+        }
+
+        return true;
+    }
+
+    // RollbackTransaction rolls back a transaction.
+    void LSMT::RollbackTransaction(Transaction* tx) {
+        tx->aborted = true;
+        for (auto it = tx->operations.rbegin(); it != tx->operations.rend(); ++it) {
+            const auto& rollback = it->rollback;
+            switch (rollback->type) {
+                case OperationType::OpPut:
+                    Put(rollback->key, rollback->value);
+                break;
+                case OperationType::OpDelete:
+                    Delete(rollback->key);
+                break;
+            }
+        }
+
+        // Remove the transaction from the active list.
+        auto it = std::find(activeTransactions.begin(), activeTransactions.end(), tx);
+        if (it != activeTransactions.end()) {
+            activeTransactions.erase(it);
+        }
+    }
+
+
+
 } // namespace TidesDB

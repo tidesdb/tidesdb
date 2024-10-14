@@ -10,10 +10,11 @@ find_package(Protobuf REQUIRED)
 include_directories(${Protobuf_INCLUDE_DIRS})
 
 # Add the generated protobuf source files
+# protoc --cpp_out=. operation.proto
+# protoc --cpp_out=. kv.proto
 set(PROTO_SRC kv.pb.cc operation.pb.cc)
 set(PROTO_HDR kv.pb.h operation.pb.h)
 
-# Add your executable
 add_executable(tidesdb main.cpp library.cpp ${PROTO_SRC})
 
 # Link the protobuf library

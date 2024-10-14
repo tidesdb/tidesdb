@@ -676,6 +676,59 @@ namespace TidesDB {
         return true;
     }
 
+    // Get gets a value for a given key
+    std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t>& key) {
+        // Check if we are flushing or compacting
+        std::unique_lock<std::mutex> lock(condMutex);
+        cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
+        lock.unlock();
+
+        // Lock memtable for reading
+        std::shared_lock<std::shared_mutex> memtableLock(memtableMutex);
+
+        // Check the memtable for the key
+        std::vector<uint8_t> value = memtable->Get(key);
+        memtableLock.unlock();
+
+        if (!value.empty() && value != std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+            return value;
+        }
+
+        // Search the SSTables for the key, starting from the latest
+        for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+            auto sstable = *it;
+            std::shared_lock<std::shared_mutex> sstableLock(sstable->lock);
+
+            // If the key is not within the range of this SSTable, skip it
+            if (key < sstable->minKey || key > sstable->maxKey) {
+                continue;
+            }
+
+            // Get an iterator for the SSTable file
+            auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
+
+            // Iterate over the SSTable.
+            while (sstableIt->Ok()) {
+                auto kv = sstableIt->Next();
+                if (!kv) {
+                    break;
+                }
+
+                // If the value is a tombstone, skip this key-value pair.
+                if (ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end())) == std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+                    continue;
+                }
+
+                if (key == ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))) {
+                    return ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()));
+                }
+            }
+
+        }
+
+        throw std::runtime_error("key not found");
+    }
+
     // GetFile gets pager file
     std::fstream& Pager::GetFile() {
         return file;

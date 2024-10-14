@@ -348,6 +348,9 @@ namespace TidesDB {
 		// RunRecoveredOperations runs recovered operations from the write-ahead log
 		bool RunRecoveredOperations(const std::vector<Operation>& operations);
 
+		// Get returns the value for a given key
+		std::vector<uint8_t> Get(const std::vector<uint8_t>& key);
+
 		// SplitSSTable splits an SSTable into n SSTables
 		std::vector<std::shared_ptr<SSTable>> SplitSSTable(SSTable* sstable, int n) const;
 

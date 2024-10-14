@@ -140,7 +140,7 @@ namespace TidesDB {
 		AVLNode* insert(AVLNode* node, const std::vector<uint8_t>& key, const std::vector<uint8_t>& value);
 
 		// printHex prints a vector of unsigned 8-bit integers in hexadecimal format
-		void printHex(const std::vector<uint8_t>& data);
+		static void printHex(const std::vector<uint8_t>& data);
 
 		// deleteNode deletes a node from the AVL tree
 		AVLNode* deleteNode(AVLNode* root, const std::vector<uint8_t>& key);
@@ -239,11 +239,10 @@ namespace TidesDB {
 	class Wal {
 	public:
 		Wal(Pager* pager) : pager(pager) {}
-		Pager* pager; // Pager instance
 		std::shared_mutex lock; // Mutex for write-ahead log
 
 		// WriteOperation writes an operation to the write-ahead log
-		static bool WriteOperation(const Operation& operation);
+		bool WriteOperation(const Operation& op) const;
 
 		// ReadOperations reads operations from the write-ahead log
 		std::vector<Operation> ReadOperations();
@@ -252,6 +251,7 @@ namespace TidesDB {
 		void Close() const;
 
 	private:
+		Pager* pager; // Pager instance
 	}; // Wal class
 
 	// SSTable class

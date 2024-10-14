@@ -447,9 +447,25 @@ namespace TidesDB {
     }
 
     // WriteOperation writes an operation to the write-ahead log
-    bool Wal::WriteOperation(const Operation& op) {
-            // Implementation of writing operation to WAL
-            return true; // Return true if successful, false otherwise
+    bool Wal::WriteOperation(const Operation& op) const {
+        // Serialize the operation
+        std::vector<uint8_t> serializedOp = serializeOperation(op);
+
+        // Check if the WAL file is open
+        if (!pager->GetFile().is_open()) {
+            std::cerr << "Error: WAL file is not open\n";
+            return false;
+        }
+
+        // Write the serialized operation to the WAL
+        try {
+            pager->Write(serializedOp);
+        } catch (const TidesDBException& e) {
+            std::cerr << "Error writing to WAL: " << e.what() << std::endl;
+            return false;
+        }
+
+        return true; // Return true if successful
     }
 
     // flushMemtable flushes the memtable to disk

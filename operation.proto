@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+enum OperationType {
+    OpPut = 0;
+    OpDelete = 1;
+}
+
+message Operation {
+    OperationType type = 1;
+    bytes key = 2;
+    bytes value = 3; // Only used for OpPut
+}

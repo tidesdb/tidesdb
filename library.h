@@ -178,7 +178,7 @@ namespace TidesDB {
 		bool WriteOperation(const Operation& operation);
 		std::vector<Operation> ReadOperations();
 
-		void Close();
+		void Close() const;
 
 	private:
 	};
@@ -216,6 +216,9 @@ namespace TidesDB {
 		}
 
 		bool Put(const std::vector<uint8_t>& key, const std::vector<uint8_t>& value);
+		bool Delete(const std::vector<uint8_t>& key);
+
+		
 
 		void Close() {
 			std::cout << "Close called\n";
@@ -242,6 +245,7 @@ namespace TidesDB {
 
 			std::cout << "Close completed\n";
 		}
+		
 
 		// Function to create a new LSMT instance
 		static std::unique_ptr<LSMT> New(const std::string &directory, std::filesystem::perms directoryPerm, int memtableFlushSize, int compactionInterval, int minimumSSTables) {

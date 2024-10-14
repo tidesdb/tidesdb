@@ -429,6 +429,32 @@ bool Wal::WriteOperation(const Operation& op) {
     return true;
 }
 
+
+bool LSMT::Delete(const std::vector<uint8_t>& key) {
+    // Check if we are flushing or compacting
+    std::unique_lock<std::mutex> lock(condMutex);
+    cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
+    lock.unlock();
+
+    // Append the operation to the write-ahead log
+    Operation op;
+    op.set_type(static_cast<::OperationType>(OperationType::OpDelete)); // Corrected the operation type to OpDelete
+    op.set_key(key.data(), key.size());
+
+    if (!wal->WriteOperation(op)) {
+        return false;
+    }
+
+    // Lock memtable for writing
+    std::unique_lock<std::shared_mutex> memtableLock(memtableMutex);
+
+    // Write a tombstone value to the memtable for the key
+    memtable->insert(key, std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end()));
+
+    return true;
+}
+
+
 bool LSMT::Put(const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) {
     std::cout << "Put called\n";
 
@@ -521,11 +547,13 @@ std::fstream& Pager::GetFile() {
 }
 
 // wal close
-void Wal::Close() {
+void Wal::Close() const {
     if (pager->GetFile().is_open()) {
         pager->GetFile().close();
     }
 }
+
+
 
 // clear memtable
 void AVLTree::clear() {

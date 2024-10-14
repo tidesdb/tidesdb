@@ -52,11 +52,39 @@ namespace TidesDB {
 		OpDelete // Delete operation
 	};
 
+	// Transaction operation
+	struct TransactionOperation {
+		Operation op; // the operation
+		struct Rollback* rollback; // Rollback information
+	};
+
+	// Rollback information for a transaction operation
+	struct Rollback {
+		OperationType type; // Type of the operation (OpPut or OpDelete)
+		std::vector<uint8_t> key; // Key of the operation
+		std::vector<uint8_t> value; // Value of the operation (for OpPut)
+	};
+
 	// Transaction struct
 	struct Transaction {
-		std::vector<Operation> operations; // Operations in the transaction
+		std::vector<TransactionOperation> operations; // List of operations
 		bool aborted = false; // Whether the transaction was aborted
 	};
+
+	// BeginTransaction starts a new transaction.
+	Transaction* BeginTransaction();
+
+	// AddPut adds a put operation to a transaction.
+	void AddPut(Transaction* tx, const std::vector<uint8_t>& key, const std::vector<uint8_t>& value);
+
+	// AddDelete adds a delete operation to a transaction.
+	void AddDelete(Transaction* tx, const std::vector<uint8_t>& key);
+
+	// CommitTransaction commits a transaction.
+	bool CommitTransaction(Transaction* tx);
+
+	// RollbackTransaction aborts a transaction.
+	void RollbackTransaction(Transaction* tx);
 
 	// Exception class
 	class TidesDBException : public std::exception {
@@ -364,6 +392,7 @@ namespace TidesDB {
 			return std::unique_ptr<LSMT>(new LSMT(directory, memtableFlushSize, compactionInterval, minimumSSTables, walPager, sstables));
 		}
 	private:
+		std::vector<Transaction*> activeTransactions; // List of active transactions
 		std::vector<SSTable*> sstables; // List of SSTables
 		std::shared_mutex sstablesLock; // Mutex for SSTables
 		std::shared_mutex memtableLock; // Mutex for memtable

@@ -1,7 +1,4 @@
-#include <iostream>
 #include "../../library.h"
+#include <iostream>
 
-int main() {
-
-
-}
+int main() {}

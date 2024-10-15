@@ -11,20 +11,19 @@ TidesDB utilizes an in-memory AVL tree, known as a memtable, for temporarily sto
 This process merges multiple SSTables into fewer ones, reducing file count and minimizing disk I/O for read operations. Additionally, the system maintains a minimum number of SSTables to further optimize read perfor
 
 ## Features
-- [x] Key-Value storage engine
+- [x] Embeddable storage engine
 - [x] Variable-length byte array keys and values
 - [x] Simple API (`Put`, `Get`, `Delete`)
-- [x] Paged SSTable with overflow management
-- [x] LSM-Tree data structure implementation
+- [x] Range functionality (`NGet`, `Range`, `NRange`, `GreaterThan`, `LessThan`, `GreaterThanEq`, `LessThanEq`)
+- [x] Custom pager for SSTables and WAL
+- [x] LSM-Tree data structure implementation (log structured merge tree)
 - [x] Write-ahead logging
 - [x] Recovery/Replay WAL (`RunRecoveredOperations`)
-- [x] AVL tree memtable
+- [x] In-memory AVL tree (memtable)
 - [x] Transaction control (`BeginTransaction`, `CommitTransaction`, `RollbackTransaction`)
 - [x] Concurrent safe
-- [ ] Compression (todo)
 - [x] Tombstone deletion
-- [x] Range functionality (`NGet`, `Range`, `NRange`, `GreaterThan`, `LessThan`, `GreaterThanEq`, `LessThanEq`)
-
+- [ ] Compression (todo)
 ## Design
 Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.
 <div>

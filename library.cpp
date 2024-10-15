@@ -61,11 +61,7 @@ namespace TidesDB {
 
     // Gets os specific path separator
     std::string getPathSeparator() {
-        #ifdef _WIN32
-                return "\\";
-        #else
-                return "/";
-        #endif
+        return std::string(1, std::filesystem::path::preferred_separator);
     }
 
     // Pager Constructor

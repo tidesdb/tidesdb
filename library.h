@@ -103,7 +103,7 @@ namespace TidesDB {
 	std::string getPathSeparator();
 
 	// Constants
-	constexpr int PAGE_SIZE = 1024; // Page size
+	constexpr int PAGE_SIZE = (1024*4); // Page size, as discussed on Reddit 1024*4 is a better page size.
 	constexpr int PAGE_HEADER_SIZE = sizeof(int64_t); // 8 bytes for overflow page pointer
 	constexpr int PAGE_BODY_SIZE = PAGE_SIZE - PAGE_HEADER_SIZE; // Page body size
 

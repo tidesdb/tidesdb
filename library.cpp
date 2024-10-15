@@ -522,7 +522,6 @@ namespace TidesDB {
 
     // flushMemtable flushes the memtable to disk
     bool LSMT::flushMemtable() {
-
         // Iterate through the memtable and write the key-value pairs to the SSTable
         std::vector<KeyValue> kvPairs;
 
@@ -544,23 +543,18 @@ namespace TidesDB {
         // Write the key-value pairs to the SSTable
         std::string sstablePath = directory + getPathSeparator() + "sstable_" + std::to_string(sstableCounter++) + SSTABLE_EXTENSION;
 
-        // Create a new SSTable
+        // Create a new SSTable with a new Pager
         auto sstable = std::make_shared<SSTable>(new Pager(sstablePath, std::ios::in | std::ios::out | std::ios::trunc));
 
         // We must set minKey and maxKey
         if (!kvPairs.empty()) {
-            if (!kvPairs.empty()) {
-                sstable->minKey.assign(kvPairs.front().key().begin(), kvPairs.front().key().end());
-                sstable->maxKey.assign(kvPairs.back().key().begin(), kvPairs.back().key().end());
-            }
+            sstable->minKey.assign(kvPairs.front().key().begin(), kvPairs.front().key().end());
+            sstable->maxKey.assign(kvPairs.back().key().begin(), kvPairs.back().key().end());
         }
 
         // Serialize the key-value pairs
         for (const auto& kv : kvPairs) {
             std::vector<uint8_t> serialized = serialize(kv);
-
-            std::cout << std::dec << std::endl;
-
             sstable->pager->Write(serialized);
         }
 
@@ -838,91 +832,94 @@ namespace TidesDB {
     }
 
     // Compact compacts the SSTables
-bool LSMT::Compact() {
-    isCompacting.store(1);
+    bool LSMT::Compact() {
+        isCompacting.store(1);
 
+        // Create a new empty memtable.
+        auto newMemtable = std::make_unique<AVLTree>();
 
+        // Iterate over all existing SSTables.
+        for (auto& sstable : sstables) {
+            // Use SSTableIterator to iterate over the SSTable
+            auto it = std::make_unique<SSTableIterator>(sstable->pager);
 
-    // Create a new empty memtable.
-    auto newMemtable = std::make_unique<AVLTree>();
+            // Iterate over the SSTable.
+            while (it->Ok()) {
+                // Add key-value pairs to the new memtable
 
-    // Iterate over all existing SSTables.
-    for (auto& sstable : sstables) {
-        // Get an iterator for the SSTable file.
-        auto it = std::make_unique<SSTableIterator>(sstable->pager);
+                auto kv = it->Next();
 
-        // Check if the pager file is open
-        if (!sstable->pager->GetFile().is_open()) {
-            std::cerr << "Error: SSTable file is not open\n";
-            isCompacting.store(0);
-            return false;
-        }
+                if (!kv) {
+                    break;
+                }
 
-        // Iterate over the SSTable.
-        while (it->Ok()) {
-            auto kv = it->Next();
-            if (!kv) {
-                break;
+                // If the value is a tombstone, delete the key from the memtable.
+                if (ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end())) == std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+                    newMemtable->deleteKV(ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())));
+                } else {
+                    newMemtable->insert(ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())), ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end())));
+                }
+
             }
 
-            if (ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end())) == std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
-                continue;
+            // Close the SSTable pager.
+            sstable->pager->GetFile().close();
+
+            // Delete the SSTable file.
+            std::filesystem::remove(sstable->pager->GetFileName());
+        }
+
+        // Clear the SSTables.
+        sstables.clear();
+
+        // Flush the new memtable to disk, creating a new SSTable.
+        auto newSSTable = std::make_shared<SSTable>(new Pager(directory + getPathSeparator() + "sstable_0" + SSTABLE_EXTENSION, std::ios::in | std::ios::out | std::ios::trunc));
+        if (!newSSTable->pager->GetFile().is_open()) {
+            throw TidesDBException("Failed to open new SSTable file");
+        }
+
+        newMemtable->inOrderTraversal([&newSSTable](const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) {
+            KeyValue kv;
+
+            // Check if key and value are empty
+            if (key.empty()) {
+                return;
             }
 
-            // If the value is not a tombstone, add it to the new memtable.
-            newMemtable->insert(ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())), ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end())));
+            if (value.empty()) {
+                return;
+            }
+
+           kv.set_key(key.data(), key.size());
+           kv.set_value(value.data(), value.size());
+
+
+
+           std::vector<uint8_t> serialized = serialize(kv);
+
+            newSSTable->pager->Write(serialized);
+        });
+
+        // Replace the list of old SSTables with the new SSTable.
+        sstables.push_back(newSSTable.get());
+
+
+        // Split the SSTable into smaller SSTables.
+        auto splitSSTables = SplitSSTable(newSSTable.get(), minimumSSTables);
+
+        // Convert std::vector<std::shared_ptr<SSTable>> to std::vector<SSTable*>
+        sstables.clear();
+        for (const auto& sstable : splitSSTables) {
+            sstables.push_back(sstable.get());
         }
 
-        // Close the SSTable pager.
-        sstable->pager->GetFile().close();
-    }
-
-    // Remove all the SSTables in the directory.
-    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-        if (entry.is_regular_file() && entry.path().extension() == SSTABLE_EXTENSION) {
-            std::filesystem::remove(entry.path());
-            std::filesystem::remove(entry.path().string() + ".del");
-        }
-    }
-
-    // Clear the SSTables.
-    sstables.clear();
-
-    // Flush the new memtable to disk, creating a new SSTable.
-    auto newSSTable = std::make_shared<SSTable>(new Pager(directory + getPathSeparator() + "sstable_0" + SSTABLE_EXTENSION, std::ios::in | std::ios::out | std::ios::trunc));
-    if (!newSSTable->pager->GetFile().is_open()) {
-        std::cerr << "Error: Failed to open new SSTable file\n";
         isCompacting.store(0);
-        return false;
+
+        // Signal the condition variable.
+        cond.notify_all();
+
+        return true;
     }
-
-    newMemtable->inOrderTraversal([&newSSTable](const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) {
-        KeyValue kv;
-        kv.set_key(key.data(), key.size());
-        kv.set_value(value.data(), value.size());
-        std::vector<uint8_t> serialized = serialize(kv);
-        newSSTable->pager->Write(serialized);
-    });
-
-    // Replace the list of old SSTables with the new SSTable.
-    sstables.push_back(newSSTable.get());
-
-    // Split the SSTable into smaller SSTables.
-    auto splitSSTables = SplitSSTable(newSSTable.get(), minimumSSTables);
-
-    // Convert std::vector<std::shared_ptr<SSTable>> to std::vector<SSTable*>
-    sstables.clear();
-    for (const auto& sstable : splitSSTables) {
-        sstables.push_back(sstable.get());
-    }
-
-    isCompacting.store(0);
-
-    // Signal the condition variable.
-    cond.notify_all();
-
-    return true;
-}
 
     // BeginTransaction starts a new transaction.
     Transaction* LSMT::BeginTransaction() {

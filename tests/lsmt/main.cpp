@@ -24,6 +24,19 @@ int main() {
             lsmTree->Put(key, value);
         }
 
+        // Get key 5555
+        std::vector<uint8_t> key(4, 5);
+
+        std::vector<uint8_t> dat = lsmTree->Get(key);
+
+        if (dat.size() == 0) {
+            std::cerr << "Key not found" << std::endl;
+        } else {
+            std::cout << "Key found" << std::endl;
+        }
+
+
+
 
         lsmTree->Close();
 

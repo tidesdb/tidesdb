@@ -646,60 +646,51 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
 }
 
 // Put puts a key-value pair in the LSMT
-bool LSMT::Put(const std::vector<uint8_t> &key,
-               const std::vector<uint8_t> &value) {
+bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+    // Check if we are flushing or compacting
+    std::unique_lock lock(sstablesLock);
+    cond.wait(lock, [this] {
+        return isFlushing.load() == 0 && isCompacting.load() == 0;
+    });
+    lock.unlock(); // Unlock the mutex
 
-  // Check if we are flushing or compacting
-  std::unique_lock lock(sstablesLock);
-  cond.wait(lock, [this] {
-    return isFlushing.load() == 0 && isCompacting.load() == 0;
-  });
+    walLock.lock();
+    // Append the operation to the write-ahead log
+    Operation op;
+    op.set_key(key.data(), key.size());
+    op.set_value(value.data(), value.size());
+    op.set_type(static_cast<::OperationType>(OperationType::OpPut));
 
-  lock.unlock(); // Unlock the mutex
-
-  // Lock memtable for writing
-  memtableLock.lock();
-
-  walLock.lock();
-  // Append the operation to the write-ahead log
-  Operation op;
-  op.set_key(key.data(), key.size());
-  op.set_value(value.data(), value.size());
-  op.set_type(static_cast<::OperationType>(OperationType::OpPut));
-
-  if (!wal->WriteOperation(op)) {
+    if (!wal->WriteOperation(op)) {
+        walLock.unlock();
+        return false;
+    }
     walLock.unlock();
-    return false;
-  }
-  walLock.unlock();
 
-  // Check if value is tombstone
-  if (value ==
-      std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
-    throw std::invalid_argument("value cannot be a tombstone");
-  }
+    // Check if value is tombstone
+    if (value == std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+        throw std::invalid_argument("value cannot be a tombstone");
+    }
 
-
-  // Put the key-value pair in the memtable
-  memtable->insert(key, value);
+    // Lock the memtable for writing
+    std::unique_lock<std::shared_mutex> memtableLockGuard(memtableLock);
+    memtable->insert(key, value);
+    memtableLockGuard.unlock();
 
     // Increase the memtable size
     memtableSize.fetch_add(key.size() + value.size());
 
-    memtableLock.unlock();
-
-  // If the memtable size exceeds the flush size, flush the memtable to disk
-  if (memtableSize.load() > memtableFlushSize) {
-    if (!flushMemtable()) {
-
-      return false;
+    // If the memtable size exceeds the flush size, flush the memtable to disk
+    if (memtableSize.load() > memtableFlushSize) {
+        if (!flushMemtable()) {
+            return false;
+        }
     }
-  }
 
-  // Notify the compaction thread
-  cond.notify_one();
+    // Notify the compaction thread
+    cond.notify_one();
 
-  return true;
+    return true;
 }
 
 // Get gets a value for a given key

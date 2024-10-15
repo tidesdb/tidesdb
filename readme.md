@@ -8,7 +8,8 @@ TidesDB has a robust feature-set, and was designed to be a high-performance, low
 
 TidesDB is built on the principles of the Log-Structured Merge-Tree (LSM-Tree) data structure.
 TidesDB utilizes an in-memory AVL tree, known as a memtable, for temporarily storing key-value pairs. These pairs are then flushed to Sorted String Tables (SSTables) on disk. When the number of SSTables reaches a specified threshold, the compaction process is triggered.
-This process merges multiple SSTables into fewer ones, reducing file count and minimizing disk I/O for read operations. Additionally, the system maintains a minimum number of SSTables to further optimize read perfor
+
+This process merges pairs of SSTables into a new SSTable, and deletes any redundant data. The compaction process ensures that the number of SSTables remains low, and that read performance is optimized.
 
 ## Features
 - [x] Embeddable storage engine
@@ -26,9 +27,6 @@ This process merges multiple SSTables into fewer ones, reducing file count and m
 - [ ] Compression (todo)
 ## Design
 Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.
-<div>
-    <h1 align="center"><img width="384" src="artwork/drawing.png"></h1>
-</div>
 
 ## Requirements
 Whats required to build TidesDB..

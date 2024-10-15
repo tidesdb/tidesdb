@@ -1,5 +1,6 @@
-#include "../../library.h"
 #include <iostream>
+
+#include "../../libtidesdb.h"
 
 int main() {
   // Define parameters
@@ -11,13 +12,12 @@ int main() {
 
     // compaction interval is
   int compactionInterval = 8;
-  int minimumSSTables = 2; // Minimum SSTables required
 
   try {
     // Initialize the LSMT
     auto lsmTree =
         TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize,
-                           compactionInterval, minimumSSTables);
+                           compactionInterval);
 
     // Insert 20kb of data
     for (int i = 0; i < 20; i++) {

@@ -307,12 +307,11 @@ class LSMT {
    public:
     // Constructor
     LSMT(const std::string &string, int memtable_flush_size, int compaction_interval,
-         int minimum_ss_tables, const std::shared_ptr<Pager> &pager,
+         const std::shared_ptr<Pager> &pager,
          const std::vector<std::shared_ptr<SSTable>> &vector)
         : directory(string),
           memtableFlushSize(memtable_flush_size),
-          compactionInterval(compaction_interval),
-          minimumSSTables(minimum_ss_tables) {
+          compactionInterval(compaction_interval) {
         wal = new Wal(new Pager(directory + getPathSeparator() + WAL_EXTENSION,
                                 std::ios::in | std::ios::out | std::ios::trunc));
         memtableSize.store(0);
@@ -320,7 +319,7 @@ class LSMT {
         isCompacting.store(0);
 
         for (const auto &sstable : vector) {
-            sstables.push_back(sstable.get());
+                sstables.push_back(sstable);
         }
 
         // Create a new memtable
@@ -411,7 +410,7 @@ class LSMT {
     // New creates a new LSMT instance
     static std::unique_ptr<LSMT> New(const std::string &directory,
                                      std::filesystem::perms directoryPerm, int memtableFlushSize,
-                                     int compactionInterval, int minimumSSTables) {
+                                     int compactionInterval) {
         if (directory.empty()) {
             throw std::invalid_argument("directory cannot be empty");
         }
@@ -425,17 +424,17 @@ class LSMT {
             std::make_shared<Pager>(directory + getPathSeparator() + WAL_EXTENSION,
                                     std::ios::in | std::ios::out | std::ios::trunc);
 
-        std::vector<std::shared_ptr<SSTable>> sstables;
+
         for (const auto &entry : std::filesystem::directory_iterator(directory)) {
             if (entry.is_regular_file() && entry.path().extension() == SSTABLE_EXTENSION) {
                 std::shared_ptr<Pager> sstablePager =
                     std::make_shared<Pager>(entry.path().string(), std::ios::in | std::ios::out);
-                sstables.push_back(std::make_shared<SSTable>(sstablePager.get()));
+                    std::shared_ptr<SSTable> sstable = std::make_shared<SSTable>(sstablePager.get());
             }
         }
 
-        return std::unique_ptr<LSMT>(new LSMT(directory, memtableFlushSize, compactionInterval,
-                                              minimumSSTables, walPager, sstables));
+        return std::make_unique<LSMT>(directory, memtableFlushSize, compactionInterval,
+                                       walPager, std::vector<std::shared_ptr<SSTable>>());
     }
 
    private:
@@ -444,8 +443,11 @@ class LSMT {
     std::vector<Transaction *> activeTransactions;  // List of active transactions
     std::shared_mutex activeTransactionsLock;       // Mutex for active transactions
 
-    std::vector<SSTable *> sstables;  // List of SSTables
-    std::shared_mutex sstablesLock;   // Mutex for SSTables
+    std::vector<std::shared_ptr<SSTable>> sstables; // List of SSTables
+
+    // sstablesLock
+
+    std::shared_mutex sstablesLock;  // Mutex for SSTables
 
     // We lock memtable when writing to it
     std::shared_mutex memtableLock;  // Mutex for memtable

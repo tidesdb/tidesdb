@@ -13,7 +13,7 @@
  * either express or implied. See the License for the specific language
  * governing permissions and limitations under the License.
  */
-#include "library.h"
+#include "libtidesdb.h"
 
 #include <iostream>
 
@@ -543,63 +543,67 @@ bool LSMT::RunRecoveredOperations(const std::vector<Operation> &operations) {
 
 // flushMemtable flushes the memtable to disk
 bool LSMT::flushMemtable() {
-  // Iterate through the memtable and write the key-value pairs to the SSTable
-  std::vector<KeyValue> kvPairs;
+    std::vector<KeyValue> kvPairs; // Key-value pairs to be written to the SSTable
 
-  // Lock the memtable for reading
-  std::shared_lock<std::shared_mutex> lock(memtableLock);
+    // Lock the memtable for reading
+    std::shared_lock<std::shared_mutex> lock(memtableLock);
 
-  // Populate kvPairs with key-value pairs from the memtable
-  memtable->inOrderTraversal([&kvPairs](const std::vector<uint8_t> &key,
-                                        const std::vector<uint8_t> &value) {
-    KeyValue kv;
-    kv.set_key(key.data(), key.size());
-    kv.set_value(value.data(), value.size());
-    kvPairs.push_back(kv);
-  });
+    // Populate kvPairs with key-value pairs from the memtable
+    memtable->inOrderTraversal([&kvPairs](const std::vector<uint8_t> &key,
+                                          const std::vector<uint8_t> &value) {
+        KeyValue kv;
+        kv.set_key(key.data(), key.size());
+        kv.set_value(value.data(), value.size());
+        kvPairs.push_back(kv);
+    });
 
-  lock.unlock();
+    lock.unlock(); // Unlock the memtable
 
-  int sstableCounter = sstables.size();
-
-
-  // Write the key-value pairs to the SSTable
-  std::string sstablePath = directory + getPathSeparator() + "sstable_" +
-                            std::to_string(sstableCounter++) +
-                            SSTABLE_EXTENSION;
-
-  // Create a new SSTable with a new Pager
-  auto sstable = std::make_shared<SSTable>(
-      new Pager(sstablePath, std::ios::in | std::ios::out | std::ios::trunc));
-
-  // We must set minKey and maxKey
-  if (!kvPairs.empty()) {
-    sstable->minKey.assign(kvPairs.front().key().begin(),
-                           kvPairs.front().key().end());
-    sstable->maxKey.assign(kvPairs.back().key().begin(),
-                           kvPairs.back().key().end());
-  }
-
-  // Serialize the key-value pairs
-  for (const auto &kv : kvPairs) {
-    std::vector<uint8_t> serialized = serialize(kv);
-    sstable->pager->Write(serialized);
-  }
-
-  // Add the new SSTable to the list of SSTables
-  {
-    std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
-    sstables.push_back(sstable.get());
-  }
-
-  if (sstableCounter >= compactionInterval) {
-    // Compact the SSTables
-    if (!Compact()) {
-      return false;
+    // Increment the counter before using it
+    int sstableCounter;
+    {
+        std::shared_lock<std::shared_mutex> lock(sstablesLock);
+        sstableCounter = sstables.size() + 1;
+        lock.unlock();
     }
-  }
 
-  return true;
+    std::cout << "Flushing memtable to SSTable " << sstableCounter << std::endl;
+
+    // Write the key-value pairs to the SSTable
+    std::string sstablePath = directory + getPathSeparator() + "sstable_" +
+                              std::to_string(sstableCounter) +
+                              SSTABLE_EXTENSION;
+
+    // Create a new SSTable with a new Pager
+    auto sstable = std::make_shared<SSTable>(
+        new Pager(sstablePath, std::ios::in | std::ios::out | std::ios::trunc));
+
+    // We must set minKey and maxKey
+    if (!kvPairs.empty()) {
+        sstable->minKey.assign(kvPairs.front().key().begin(),
+                               kvPairs.front().key().end());
+        sstable->maxKey.assign(kvPairs.back().key().begin(),
+                               kvPairs.back().key().end());
+    }
+
+    // Serialize the key-value pairs
+    for (const auto &kv : kvPairs) {
+        std::vector<uint8_t> serialized = serialize(kv);
+        sstable->pager->Write(serialized);
+    }
+
+    // Add the new SSTable to the list of SSTables
+    {
+        std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
+        sstables.push_back(sstable);
+    }
+
+    if (sstableCounter >= compactionInterval) {
+        // Compact the SSTables
+      Compact();
+    }
+
+    return true;
 }
 
 // Delete deletes a key from the LSMT
@@ -675,14 +679,12 @@ bool LSMT::Put(const std::vector<uint8_t> &key,
     throw std::invalid_argument("value cannot be a tombstone");
   }
 
-  // Increase the memtable size
-  memtableSize.fetch_add(key.size() + value.size());
 
   // Put the key-value pair in the memtable
   memtable->insert(key, value);
 
-  // Increase the memtable size
-  memtableSize.fetch_add(key.size() + value.size());
+    // Increase the memtable size
+    memtableSize.fetch_add(key.size() + value.size());
 
     memtableLock.unlock();
 
@@ -791,151 +793,115 @@ void AVLTree::clear() {
   root = nullptr;
 }
 
-// SplitSSTable splits an SSTable into smaller SSTables up to a certain number
-// of SSTables
-std::vector<std::shared_ptr<SSTable>> LSMT::SplitSSTable(SSTable *sstable,
-                                                         int n) const {
-  std::vector<std::unique_ptr<AVLTree>> memTables(n);
-  for (int i = 0; i < n; ++i) {
-    memTables[i] = std::make_unique<AVLTree>();
-  }
-
-  int memtSeq = 0;
-
-  if (sstable == nullptr) {
-    return {};
-  }
-
-  // Get an iterator for the SSTable file.
-  // use SSTableIterator to iterate over the SSTable
-  auto it = std::make_unique<SSTableIterator>(sstable->pager);
-
-  // Iterate over the SSTable.
-  while (it->Ok()) {
-    auto kv = it->Next();
-    if (!kv) {
-      break;
-    }
-
-    // If the value is a tombstone, skip this key-value pair.
-    if (ConvertToUint8Vector(
-            std::vector<char>(kv->value().begin(), kv->value().end())) ==
-        std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
-      continue;
-    }
-
-    // If the value is not a tombstone, add it to the memtable.
-    if (memtSeq < memTables.size()) {
-
-      // If we have reached the size of the memtable, flush it to disk.
-      if (memTables[memtSeq]->GetSize() >= memtableFlushSize) {
-        memtSeq++;
-      }
-    }
-  }
-
-  // Close the SSTable pager.
-  sstable->pager->GetFile().close();
-
-  // Delete the SSTable file.
-  std::filesystem::remove(sstable->pager->GetFileName());
-
-  std::vector<std::shared_ptr<SSTable>> sstables(n);
-  for (int i = 0; i < n; ++i) {
-    // Create a new SSTable file.
-    std::string sstablePath = directory + getPathSeparator() + "sstable_" +
-                              std::to_string(i) + SSTABLE_EXTENSION;
-
-    // Create a new SSTable.
-    auto newSSTable = std::make_shared<SSTable>(
-        new Pager(sstablePath, std::ios::in | std::ios::out | std::ios::trunc));
-
-    // Write the key-value pairs to the SSTable.
-    memTables[i]->inOrderTraversal(
-        [&newSSTable](const std::vector<uint8_t> &key,
-                      const std::vector<uint8_t> &value) {
-          KeyValue kv;
-          kv.set_key(key.data(), key.size());
-          kv.set_value(value.data(), value.size());
-          std::vector<uint8_t> serialized = serialize(kv);
-          newSSTable->pager->Write(serialized);
-        });
-
-    // Add the new SSTable to the list of SSTables.
-    sstables[i] = newSSTable;
-  }
-
-  return sstables;
-}
-
 // GetFilePath gets the file path of the SSTable
 std::string SSTable::GetFilePath() const { return pager->GetFileName(); }
 
 // Compact compacts the SSTables into a single
 bool LSMT::Compact() {
     std::cout << "Compacting SSTables\n";
-    isCompacting.store(1);
+    isCompacting.store(1); // Set the compaction flag
 
-    // Create a thread pool
     std::vector<std::future<void>> futures;
 
-    // Determine pairs of SSTables for concurrent processing
     std::vector<std::pair<SSTable*, SSTable*>> sstablePairs;
-    for (size_t i = 0; i < sstables.size(); i += 2) {
-        if (i + 1 < sstables.size()) {
-            sstablePairs.emplace_back(sstables[i], sstables[i + 1]);
+    {
+        std::shared_lock<std::shared_mutex> lock(sstablesLock);
+        for (size_t i = 0; i < sstables.size(); i += 2) {
+            if (i + 1 < sstables.size()) {
+                sstablePairs.push_back({sstables[i].get(), sstables[i + 1].get()});
+            }
         }
     }
 
-    // Process pairs of SSTables concurrently
+    std::cout << "Amount of pairs: " << sstablePairs.size() << std::endl;
+
     for (const auto& pair : sstablePairs) {
         futures.push_back(std::async(std::launch::async, [this, pair] {
             auto sstable1 = pair.first;
             auto sstable2 = pair.second;
 
-            // Use SSTableIterator to iterate over the SSTables
             auto it1 = std::make_unique<SSTableIterator>(sstable1->pager);
             auto it2 = std::make_unique<SSTableIterator>(sstable2->pager);
-
-            // Create a new empty memtable for the merged result
             auto newMemtable = std::make_unique<AVLTree>();
 
-            // Merge the key-value pairs from both SSTables into the new memtable
-            while (it1->Ok() || it2->Ok()) {
+            std::optional<std::vector<uint8_t>> currentKey1, currentValue1;
+            std::optional<std::vector<uint8_t>> currentKey2, currentValue2;
+
+            // Initialize keys and values
+            try {
                 if (it1->Ok()) {
                     auto kv1 = it1->Next();
-                    if (kv1) {
-                        newMemtable->insert(ConvertToUint8Vector(std::vector<char>(kv1->key().begin(), kv1->key().end())),
-                                            ConvertToUint8Vector(std::vector<char>(kv1->value().begin(), kv1->value().end())));
-                    }
+                    currentKey1 = ConvertToUint8Vector(std::vector<char>(kv1->key().begin(), kv1->key().end()));
+                    currentValue1 = ConvertToUint8Vector(std::vector<char>(kv1->value().begin(), kv1->value().end()));
                 }
+            } catch (const std::exception& e) {
+                // Skip to next valid key
+            }
 
+            try {
                 if (it2->Ok()) {
                     auto kv2 = it2->Next();
-                    if (kv2) {
-                        newMemtable->insert(ConvertToUint8Vector(std::vector<char>(kv2->key().begin(), kv2->key().end())),
-                                            ConvertToUint8Vector(std::vector<char>(kv2->value().begin(), kv2->value().end())));
+                    currentKey2 = ConvertToUint8Vector(std::vector<char>(kv2->key().begin(), kv2->key().end()));
+                    currentValue2 = ConvertToUint8Vector(std::vector<char>(kv2->value().begin(), kv2->value().end()));
+                }
+            } catch (const std::exception& e) {
+                // Skip to next valid key
+            }
+
+            while (currentKey1.has_value() || currentKey2.has_value()) {
+                try {
+                    if (currentKey1.has_value() && (!currentKey2.has_value() || *currentKey1 <= *currentKey2)) {
+                        newMemtable->insert(*currentKey1, *currentValue1);
+                        // Advance iterator for key1
+                        if (it1->Ok()) {
+                            auto kv1 = it1->Next();
+                            currentKey1 = ConvertToUint8Vector(std::vector<char>(kv1->key().begin(), kv1->key().end()));
+                            currentValue1 = ConvertToUint8Vector(std::vector<char>(kv1->value().begin(), kv1->value().end()));
+                        } else {
+                            currentKey1.reset();
+                            currentValue1.reset();
+                        }
+                    } else {
+                        newMemtable->insert(*currentKey2, *currentValue2);
+                        // Advance iterator for key2
+                        if (it2->Ok()) {
+                            auto kv2 = it2->Next();
+                            currentKey2 = ConvertToUint8Vector(std::vector<char>(kv2->key().begin(), kv2->key().end()));
+                            currentValue2 = ConvertToUint8Vector(std::vector<char>(kv2->value().begin(), kv2->value().end()));
+                        } else {
+                            currentKey2.reset();
+                            currentValue2.reset();
+                        }
                     }
+                } catch (const std::exception& e) {
+                    // Skip to next valid entry
+                    if (currentKey1.has_value()) currentKey1.reset();
+                    if (currentValue1.has_value()) currentValue1.reset();
+                    if (currentKey2.has_value()) currentKey2.reset();
+                    if (currentValue2.has_value()) currentValue2.reset();
                 }
             }
 
-            // Create a new SSTable file for the merged result
-            std::string sstablePath = directory + getPathSeparator() + "sstable_merged_" + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) + SSTABLE_EXTENSION;
-            auto newSSTable = std::make_shared<SSTable>(new Pager(sstablePath, std::ios::in | std::ios::out | std::ios::trunc));
+            // Check if the new memtable has entries before writing
+            if (newMemtable->GetSize() > 0) {
+                std::cout << "Merging SSTables with memtable size: " << newMemtable->GetSize() << std::endl;
+                std::string sstablePath = directory + getPathSeparator() + "sstable_merged_" + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) + SSTABLE_EXTENSION;
+                auto newSSTable = std::make_shared<SSTable>(new Pager(sstablePath, std::ios::in | std::ios::out | std::ios::trunc));
 
-            // Write the key-value pairs to the new SSTable
-            newMemtable->inOrderTraversal([&newSSTable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
-                KeyValue kv;
-                kv.set_key(key.data(), key.size());
-                kv.set_value(value.data(), value.size());
-                std::vector<uint8_t> serialized = serialize(kv);
-                newSSTable->pager->Write(serialized);
-            });
+                newMemtable->inOrderTraversal([&newSSTable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+                    KeyValue kv;
+                    kv.set_key(key.data(), key.size());
+                    kv.set_value(value.data(), value.size());
+                    std::vector<uint8_t> serialized = serialize(kv);
+                    newSSTable->pager->Write(serialized);
+                });
 
-            // Add the new SSTable to the list of SSTables
-            {
-                std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
-                sstables.push_back(newSSTable.get());
+                {
+                    std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
+                    sstables.push_back(newSSTable);
+                }
+            } else {
+                std::cout << "No entries in memtable; skipping SSTable write." << std::endl;
             }
 
             // Delete the old SSTables
@@ -944,14 +910,15 @@ bool LSMT::Compact() {
         }));
     }
 
-    // Wait for all futures to complete
     for (auto &future : futures) {
         future.get();
     }
 
     isCompacting.store(0);
+    std::cout << "Done compacting SSTables\n";
     return true;
 }
+
 
 
 // BeginTransaction starts a new transaction.

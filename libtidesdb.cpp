@@ -460,6 +460,11 @@ std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
     } else if (key > current->key) {
       current = current->right;
     } else {
+        // check if tombstone
+        if (current->value == std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+            return {};
+        }
+
       return current->value; // Key found, return the value
     }
   }
@@ -609,40 +614,42 @@ bool LSMT::flushMemtable() {
 // Delete deletes a key from the LSMT
 bool LSMT::Delete(const std::vector<uint8_t> &key) {
     // Check if we are flushing or compacting
-    std::unique_lock lock(sstablesLock);
-    cond.wait(lock, [this] {
-      return isFlushing.load() == 0 && isCompacting.load() == 0;
-    });
+    {
+        std::unique_lock lock(sstablesLock);
+        cond.wait(lock, [this] {
+            return isFlushing.load() == 0 && isCompacting.load() == 0;
+        });
+    } // Automatically unlocks when leaving the scope
 
-    lock.unlock(); // Unlock the mutex
+    // Lock and write to the write-ahead log
+    {
+        std::unique_lock lock(walLock);
+        Operation op;
+        op.set_type(static_cast<::OperationType>(OperationType::OpDelete));
+        op.set_key(key.data(), key.size());
 
+        if (!wal->WriteOperation(op)) {
+            return false; // Handle failure appropriately
+        }
+    } // Automatically unlocks when leaving the scope
 
-  walLock.lock();
-  // Append the operation to the write-ahead log
-  Operation op;
-  op.set_type(static_cast<::OperationType>(
-      OperationType::OpDelete));
-  op.set_key(key.data(), key.size());
+    // Lock memtable for writing
+    {
+        std::unique_lock lock(memtableLock);
+        memtable->insert(key, std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end()));
+    } // Automatically unlocks when leaving the scope
 
-  if (!wal->WriteOperation(op)) {
-    walLock.unlock();
-    return false;
-  }
+    // Increase the memtable size
+    memtableSize.fetch_add(key.size() + TOMBSTONE_VALUE.size());
 
-  walLock.unlock();
+    // If the memtable size exceeds the flush size, flush the memtable to disk
+    if (memtableSize.load() > memtableFlushSize) {
+        if (!flushMemtable()) {
+            return false;
+        }
+    }
 
-  // Lock memtable for writing
-  memtableLock.lock();
-
-  // Write a tombstone value to the memtable for the key
-  memtable->insert(key, std::vector<uint8_t>(TOMBSTONE_VALUE.begin(),
-                                             TOMBSTONE_VALUE.end()));
-
-  memtableLock.unlock(); // Unlock the memtable
-
-
-
-  return true;
+    return true;
 }
 
 // Put puts a key-value pair in the LSMT
@@ -695,64 +702,60 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
 
 // Get gets a value for a given key
 std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
-  // Check if we are flushing or compacting
-  // The condMutex is used in conjunction with the condition variable cond to
-  // synchronize access to shared resources and ensure that certain conditions
-  // are met before proceeding with operations.
-  std::unique_lock<std::shared_mutex> lock(sstablesLock);
-  cond.wait(lock, [this] {
-    return isFlushing.load() == 0 && isCompacting.load() == 0;
-  });
+    // Check if we are flushing or compacting
+    {
+        std::unique_lock lock(sstablesLock);
+        cond.wait(lock, [this] {
+            return isFlushing.load() == 0 && isCompacting.load() == 0;
+        });
+    } // Automatically unlocks when leaving the scope
 
-  lock.unlock(); // Unlock the mutex
+    // Check the memtable for the key
+    std::vector<uint8_t> value;
+    {
+        std::unique_lock lock(memtableLock);
+        value = memtable->Get(key);
+    } // Automatically unlocks when leaving the scope
 
-  // Check the memtable for the key
-    memtableLock.lock();
-    std::vector<uint8_t> value = memtable->Get(key);
-  memtableLock.unlock();
-
-  if (!value.empty() && value != std::vector<uint8_t>(TOMBSTONE_VALUE.begin(),
-                                                      TOMBSTONE_VALUE.end())) {
-    return value;
-  }
-
-  // Search the SSTables for the key, starting from the latest
-  for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
-    auto sstable = *it;
-    std::shared_lock<std::shared_mutex> sstableLock(sstable->lock);
-
-    // If the key is not within the range of this SSTable, skip it
-    if (key < sstable->minKey || key > sstable->maxKey) {
-      continue;
+    // If value is found and it's not a tombstone, return it
+    if (!value.empty() && value != std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+        return value;
     }
 
-    // Get an iterator for the SSTable file
-    auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
+    // Search the SSTables for the key, starting from the latest
+    for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+        auto sstable = *it;
+        std::shared_lock<std::shared_mutex> sstableLock(sstable->lock);
 
-    // Iterate over the SSTable.
-    while (sstableIt->Ok()) {
-      auto kv = sstableIt->Next();
-      if (!kv) {
-        break;
-      }
+        // If the key is not within the range of this SSTable, skip it
+        if (key < sstable->minKey || key > sstable->maxKey) {
+            continue;
+        }
 
-      // If the value is a tombstone, skip this key-value pair.
-      if (ConvertToUint8Vector(
-              std::vector<char>(kv->value().begin(), kv->value().end())) ==
-          std::vector<uint8_t>(TOMBSTONE_VALUE.begin(),
-                               TOMBSTONE_VALUE.end())) {
-        continue;
-      }
+        // Get an iterator for the SSTable file
+        auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
 
-      if (key == ConvertToUint8Vector(
-                     std::vector<char>(kv->key().begin(), kv->key().end()))) {
-        return ConvertToUint8Vector(
-            std::vector<char>(kv->value().begin(), kv->value().end()));
-      }
+        // Iterate over the SSTable
+        while (sstableIt->Ok()) {
+            auto kv = sstableIt->Next();
+            if (!kv) {
+                break;
+            }
+
+            // Check for tombstones
+            if (ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end())) ==
+                std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+                continue;
+            }
+
+            // Check for the key
+            if (key == ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))) {
+                return ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()));
+            }
+        }
     }
-  }
 
-  return {}; // Key not found, return an empty vector
+    return {}; // Key not found, return an empty vector
 }
 
 // GetFile gets pager file
@@ -842,7 +845,9 @@ bool LSMT::Compact() {
             while (currentKey1.has_value() || currentKey2.has_value()) {
                 try {
                     if (currentKey1.has_value() && (!currentKey2.has_value() || *currentKey1 <= *currentKey2)) {
-                        newMemtable->insert(*currentKey1, *currentValue1);
+                        if (currentValue1 != std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+                            newMemtable->insert(*currentKey1, *currentValue1);
+                        }
                         // Advance iterator for key1
                         if (it1->Ok()) {
                             auto kv1 = it1->Next();
@@ -853,7 +858,9 @@ bool LSMT::Compact() {
                             currentValue1.reset();
                         }
                     } else {
-                        newMemtable->insert(*currentKey2, *currentValue2);
+                        if (currentValue2 != std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+                            newMemtable->insert(*currentKey2, *currentValue2);
+                        }
                         // Advance iterator for key2
                         if (it2->Ok()) {
                             auto kv2 = it2->Next();

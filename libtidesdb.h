@@ -442,30 +442,19 @@ class LSMT {
     // Transactions that are actively being written to and awaiting commit
     std::vector<Transaction *> activeTransactions;  // List of active transactions
     std::shared_mutex activeTransactionsLock;       // Mutex for active transactions
-
     std::vector<std::shared_ptr<SSTable>> sstables; // List of SSTables
-
-    // sstablesLock
-
-    std::shared_mutex sstablesLock;  // Mutex for SSTables
-
+    std::shared_mutex sstablesLock;                 // Mutex for SSTables
     // We lock memtable when writing to it
     std::shared_mutex memtableLock;  // Mutex for memtable
-
     // We lock wal when writing to it
     std::shared_mutex walLock;  // Mutex for write-ahead log
     Wal *wal;                   // Write-ahead log
-
     std::string directory;  // Directory for storing data
-
     int compactionInterval;  // Compaction interval (amount of SSTables to wait before compacting)
-
-    int minimumSSTables;               // Minimum number of SSTables required, after compaction
                                        // we should have at least this many SSTables, if there
                                        // are less after compaction, we will not further compact
     std::condition_variable_any cond;  // Condition variable for flushing and compacting
     AVLTree *memtable;                 // AVL tree for the memtable
-
     std::atomic<int32_t> isFlushing;         // Whether the memtable is being flushed
     std::atomic<int32_t> isCompacting;       // Whether the SSTables are being compacted
     std::atomic<int64_t> memtableSize;       // Size of the memtable

@@ -34,6 +34,9 @@ int main() {
         std::cout << "Pager tests failed" << std::endl;
     }
 
+    // Remove the test.db file
+    std::filesystem::remove("test.db");
+
 
 
 }

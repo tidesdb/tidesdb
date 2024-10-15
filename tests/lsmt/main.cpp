@@ -30,15 +30,37 @@ int main() {
         std::vector<uint8_t> dat = lsmTree->Get(key);
 
         if (dat.size() == 0) {
-            std::cerr << "Key not found" << std::endl;
+            std::cerr << "Key not found Get test failed" << std::endl;
         } else {
-            std::cout << "Key found" << std::endl;
+            std::cout << "Key found Get test past" << std::endl;
+        }
+
+
+        // Delete key 5555
+        if (lsmTree->Delete(key)) {
+            std::cout << "Key deleted Delete test past" << std::endl;
+        } else {
+            std::cerr << "Key not found Delete test failed" << std::endl;
+        }
+
+        // Check if key 5555 is deleted
+        dat = lsmTree->Get(key);
+
+        if (dat.size() == 0) {
+            std::cout << "Key not found delete then get test past" << std::endl;
+        } else {
+            std::cerr << "Key found delete get then test failed" << std::endl;
         }
 
 
 
 
+
         lsmTree->Close();
+
+        // Remove the directory
+        std::filesystem::remove_all(directory);
+
 
         return 0;
 

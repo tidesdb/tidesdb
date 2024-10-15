@@ -720,7 +720,7 @@ namespace TidesDB {
 
         }
 
-        throw std::runtime_error("key not found");
+        return {}; // Key not found, return an empty vector
     }
 
     // GetFile gets pager file

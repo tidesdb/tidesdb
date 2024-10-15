@@ -28,7 +28,7 @@ This process merges multiple SSTables into fewer ones, reducing file count and m
 ## Design
 Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.
 <div>
-    <h1 align="center"><img width="384" src="drawing.png"></h1>
+    <h1 align="center"><img width="384" src="artwork/drawing.png"></h1>
 </div>
 
 ## Requirements

@@ -1,4 +1,7 @@
-# TidesDB
+<div>
+    <h1 align="center"><img width="328" src="artwork/tidesdb-logo.png"></h1>
+</div>
+
 TidesDB is a library that provides an embeddable, persistent key-value store for fast flash and ram storage.
 
 TidesDB has a robust feature-set, and was designed to be a high-performance, low-latency storage engine. It is optimized for write and read-heavy workloads.

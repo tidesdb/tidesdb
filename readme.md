@@ -23,7 +23,7 @@ This process merges multiple SSTables into fewer ones, reducing file count and m
 - [x] Concurrent safe
 - [ ] Compression (todo)
 - [x] Tombstone deletion
-- [ ] Range functionality (`NGet`, `Range`, `NRange`, `GreaterThan`, `LessThan`, `GreaterThanEq`, `LessThanEq`)
+- [x] Range functionality (`NGet`, `Range`, `NRange`, `GreaterThan`, `LessThan`, `GreaterThanEq`, `LessThanEq`)
 
 ## Design
 Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.

@@ -336,6 +336,32 @@ namespace TidesDB {
 		// Compact compacts the SSTables
 		bool Compact();
 
+		// NGet returns all key-value pairs not equal to a given key
+		std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NGet(const std::vector<uint8_t>& key) const;
+
+		// LessThan returns all key-value pairs less than a given key
+		std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LessThan(
+			const std::vector<uint8_t> &key) const;
+
+		// GreaterThan returns all key-value pairs greater than a given key
+		std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> GreaterThan(
+			const std::vector<uint8_t> &key) const;
+
+		// Range returns all key-value pairs between a start and end key
+		std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> Range(
+			const std::vector<uint8_t> &start, const std::vector<uint8_t> &end) const;
+
+		// NRange returns all key-value pairs not between a start and end key
+		std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> NRange(
+			const std::vector<uint8_t> &start, const std::vector<uint8_t> &end) const;
+
+		// LessThanEq returns all key-value pairs less than or equal to a given key
+		std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessThanEq(const std::vector<uint8_t>& key);
+
+		// GreaterThanEq returns all key-value pairs greater than or equal to a given key
+		std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> GreaterThanEq(
+			const std::vector<uint8_t> &key) const;
+
 		// BeginTransaction begins a new transaction
 		Transaction *BeginTransaction();
 

@@ -1014,5 +1014,176 @@ namespace TidesDB {
     }
 
 
+    // NGet gets all key-value pairs except the key
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NGet(const std::vector<uint8_t>& key) const {
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+        memtable->inOrderTraversal([&](const std::vector<uint8_t>& k, const std::vector<uint8_t>& v) {
+            if (k != key) {
+                result.emplace_back(k, v);
+            }
+        });
+
+        for (const auto& sstable : sstables) {
+            SSTableIterator it(sstable->pager);
+            while (it.Ok()) {
+                auto kv = it.Next();
+                if (kv && ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())) != key) {
+                    result.emplace_back(
+                        ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())),
+                        ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()))
+                    );
+                }
+            }
+        }
+        return result;
+    }
+
+    // LessThanEq gets all key-value pairs less than or equal to the key
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessThanEq(const std::vector<uint8_t>& key) {
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+        memtable->inOrderTraversal([&](const std::vector<uint8_t>& k, const std::vector<uint8_t>& v) {
+            if (k <= key) {
+                result.emplace_back(k, v);
+            }
+        });
+
+        for (const auto& sstable : sstables) {
+            SSTableIterator it(sstable->pager);
+            while (it.Ok()) {
+                auto kv = it.Next();
+                if (kv && std::string(key.begin(), key.end()) <= kv->key()) {
+                    result.emplace_back(
+                        key,
+                        ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()))
+                    );
+                }
+            }
+        }
+        return result;
+    }
+
+    // GreaterThanEq gets all key-value pairs greater than or equal to the key
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::GreaterThanEq(const std::vector<uint8_t>& key) const {
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+        memtable->inOrderTraversal([&](const std::vector<uint8_t>& k, const std::vector<uint8_t>& v) {
+            if (k >= key) {
+                result.emplace_back(k, v);
+            }
+        });
+
+        for (const auto& sstable : sstables) {
+            SSTableIterator it(sstable->pager);
+            while (it.Ok()) {
+                auto kv = it.Next();
+                if (kv && std::string(key.begin(), key.end()) >= kv->key()) {
+                    result.emplace_back(
+                        key,
+                        ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()))
+                    );
+                }
+            }
+        }
+        return result;
+    }
+
+    // LessThan gets all key-value pairs less than the key
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessThan(const std::vector<uint8_t>& key) const {
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+        memtable->inOrderTraversal([&](const std::vector<uint8_t>& k, const std::vector<uint8_t>& v) {
+            if (k < key) {
+                result.emplace_back(k, v);
+            }
+        });
+
+        for (const auto& sstable : sstables) {
+            SSTableIterator it(sstable->pager);
+            while (it.Ok()) {
+                auto kv = it.Next();
+                if (kv && std::string(key.begin(), key.end()) < kv->key()) {
+                    result.emplace_back(
+                        key,
+                        ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()))
+                    );
+                }
+            }
+        }
+        return result;
+    }
+
+    // GreaterThan gets all key-value pairs greater than the key
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::GreaterThan(const std::vector<uint8_t>& key) const {
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+        memtable->inOrderTraversal([&](const std::vector<uint8_t>& k, const std::vector<uint8_t>& v) {
+            if (k > key) {
+                result.emplace_back(k, v);
+            }
+        });
+
+        for (const auto& sstable : sstables) {
+            SSTableIterator it(sstable->pager);
+            while (it.Ok()) {
+                auto kv = it.Next();
+                if (kv && std::string(key.begin(), key.end()) > kv->key()) {
+                    result.emplace_back(
+                        key,
+                        ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()))
+                    );
+                }
+            }
+        }
+        return result;
+    }
+
+    // Range gets all key-value pairs in the range of start and end
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Range(const std::vector<uint8_t>& start, const std::vector<uint8_t>& end) const {
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+        memtable->inOrderTraversal([&](const std::vector<uint8_t>& k, const std::vector<uint8_t>& v) {
+            if (k >= start && k <= end) {
+                result.emplace_back(k, v);
+            }
+        });
+
+        for (const auto& sstable : sstables) {
+            SSTableIterator it(sstable->pager);
+            while (it.Ok()) {
+                auto kv = it.Next();
+                if (kv && (std::string(start.begin(), start.end()) <= kv->key() && std::string(end.begin(), end.end()) >= kv->key())) {
+                    result.emplace_back(
+                        ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())),
+                        ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()))
+                    );
+                }
+            }
+        }
+        return result;
+    }
+
+
+    // NRange gets all key-value pairs not in the range of start and end
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NRange(const std::vector<uint8_t>& start, const std::vector<uint8_t>& end) const {
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+        memtable->inOrderTraversal([&](const std::vector<uint8_t>& k, const std::vector<uint8_t>& v) {
+            if (k < start || k > end) {
+                result.emplace_back(k, v);
+            }
+        });
+
+        for (const auto& sstable : sstables) {
+            SSTableIterator it(sstable->pager);
+            while (it.Ok()) {
+                auto kv = it.Next();
+                if (kv && (std::string(start.begin(), start.end()) > kv->key() || std::string(end.begin(), end.end()) < kv->key())) {
+                    result.emplace_back(
+                        ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())),
+                        ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()))
+                    );
+                }
+            }
+        }
+        return result;
+    }
+
+
+
 
 } // namespace TidesDB

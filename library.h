@@ -16,8 +16,8 @@
 #ifndef TIDESDB_LIBRARY_H
 #define TIDESDB_LIBRARY_H
 
-#include "kv.pb.h"
-#include "operation.pb.h"
+#include "proto/kv.pb.h"
+#include "proto/operation.pb.h"
 #include <iostream>
 #include <fstream>
 #include <string>

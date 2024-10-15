@@ -11,6 +11,9 @@ TidesDB utilizes an in-memory AVL tree, known as a memtable, for temporarily sto
 
 This process merges pairs of SSTables into a new SSTable, and deletes any redundant data. The compaction process ensures that the number of SSTables remains low, and that read performance is optimized.
 
+> [!WARNING]
+> Still in beta stages, use at your own risk and check back often for updates.
+
 ## Features
 - [x] Embeddable storage engine
 - [x] Variable-length byte array keys and values
@@ -24,6 +27,7 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] Transaction control (`BeginTransaction`, `CommitTransaction`, `RollbackTransaction`)
 - [x] Concurrent safe
 - [x] Tombstone deletion
+- [x] Multi-threaded paired compaction
 - [ ] Compression (todo)
 ## Design
 Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.

@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+
 #include "../../libtidesdb.h"
 
 int main() {
@@ -15,9 +16,9 @@ int main() {
         skipList.get({4, 5, 6}) == std::vector<uint8_t>({40, 50, 60}) &&
         skipList.get({2, 3, 4}) == std::vector<uint8_t>({20, 30, 40})) {
         std::cout << "Insert test passed" << std::endl;
-        } else {
-            std::cout << "Insert test failed" << std::endl;
-        }
+    } else {
+        std::cout << "Insert test failed" << std::endl;
+    }
 
     // Delete a key
     skipList.deleteKV({1, 2, 3});
@@ -27,9 +28,9 @@ int main() {
         skipList.get({4, 5, 6}) == std::vector<uint8_t>({40, 50, 60}) &&
         skipList.get({2, 3, 4}) == std::vector<uint8_t>({20, 30, 40})) {
         std::cout << "Delete test passed" << std::endl;
-        } else {
-            std::cout << "Delete test failed" << std::endl;
-        }
+    } else {
+        std::cout << "Delete test failed" << std::endl;
+    }
 
     // Test retrieval
     std::vector<uint8_t> value = skipList.get({4, 5, 6});

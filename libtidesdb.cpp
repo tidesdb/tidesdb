@@ -225,14 +225,14 @@ int SkipList::randomLevel() const {
 
 // insert inserts a key-value pair into the SkipList
 void SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
-    std::vector<SkipListNode*> update(maxLevel, nullptr);
+    std::vector<SkipListNode *> update(maxLevel, nullptr);
     auto x = head.get();
 
     for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
         while (x->forward[i].load(std::memory_order_acquire) != nullptr &&
                x->forward[i].load(std::memory_order_acquire)->key < key) {
             x = x->forward[i].load(std::memory_order_acquire);
-               }
+        }
         update[i] = x;
     }
 
@@ -253,24 +253,24 @@ void SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t
 
         x = new SkipListNode(key, value, newLevel);
         for (int i = 0; i < newLevel; i++) {
-            x->forward[i].store(update[i]->forward[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            x->forward[i].store(update[i]->forward[i].load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
             update[i]->forward[i].store(x, std::memory_order_release);
         }
         cachedSize.fetch_add(1, std::memory_order_relaxed);  // Increment cachedSize
     }
 }
 
-
 // deleteKV deletes a key-value pair from the SkipList
 void SkipList::deleteKV(const std::vector<uint8_t> &key) {
-    std::vector<SkipListNode*> update(maxLevel, nullptr);
+    std::vector<SkipListNode *> update(maxLevel, nullptr);
     auto x = head.get();
 
     for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
         while (x->forward[i].load(std::memory_order_acquire) != nullptr &&
                x->forward[i].load(std::memory_order_acquire)->key < key) {
             x = x->forward[i].load(std::memory_order_acquire);
-               }
+        }
         update[i] = x;
     }
 
@@ -281,21 +281,24 @@ void SkipList::deleteKV(const std::vector<uint8_t> &key) {
             if (update[i]->forward[i].load(std::memory_order_acquire) != x) {
                 break;
             }
-            update[i]->forward[i].store(x->forward[i].load(std::memory_order_relaxed), std::memory_order_release);
+            update[i]->forward[i].store(x->forward[i].load(std::memory_order_relaxed),
+                                        std::memory_order_release);
         }
 
         while (level.load(std::memory_order_relaxed) > 0 &&
-               head->forward[level.load(std::memory_order_relaxed)].load(std::memory_order_acquire) == nullptr) {
+               head->forward[level.load(std::memory_order_relaxed)].load(
+                   std::memory_order_acquire) == nullptr) {
             level.fetch_sub(1, std::memory_order_relaxed);
-               }
+        }
 
         cachedSize.fetch_sub(1, std::memory_order_relaxed);  // Decrement cachedSize
-        delete x;  // Free the memory of the deleted node
+        delete x;                                            // Free the memory of the deleted node
     }
 }
 
 // inOrderTraversal traverses the SkipList in order and calls the function on each node
-void SkipList::inOrderTraversal(std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const {
+void SkipList::inOrderTraversal(
+    std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const {
     auto x = head.get();
     while (x->forward[0].load(std::memory_order_acquire) != nullptr) {
         x = x->forward[0].load(std::memory_order_acquire);
@@ -725,8 +728,6 @@ bool LSMT::flushMemtable() {
     return true;
 }
 
-
-
 // Delete deletes a key from the LSMT
 bool LSMT::Delete(const std::vector<uint8_t> &key) {
     // Check if we are flushing or compacting
@@ -751,7 +752,6 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
         memtable->insert(
             key, std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)));
     }  // Automatically unlocks when leaving the scope
-
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
     if (memtable->getSize() > memtableFlushSize) {
@@ -786,7 +786,6 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
         throw std::invalid_argument("value cannot be a tombstone");
     }
 
-
     memtable->insert(key, value);
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
@@ -812,9 +811,7 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
 
     // Check the memtable for the key
     std::vector<uint8_t> value;
-    {
-        value = memtable->get(key);
-    }  // Automatically unlocks when leaving the scope
+    { value = memtable->get(key); }  // Automatically unlocks when leaving the scope
 
     // If value is found and it's not a tombstone, return it
     if (!value.empty() &&
@@ -883,8 +880,6 @@ void TidesDB::Wal::backgroundThreadFunc() {
     }
 }
 
-
-
 // PagesCount returns the number of pages in the SSTable
 int64_t Pager::PagesCount() {
     if (!file.is_open()) {
@@ -946,12 +941,14 @@ bool LSMT::Compact() {
                     if (it1->Ok()) {
                         auto kv = it1->Next();
                         currentKey1 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                        currentValue1 = std::vector<uint8_t>(kv->value().begin(), kv->value().end());
+                        currentValue1 =
+                            std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                     }
                     if (it2->Ok()) {
                         auto kv = it2->Next();
                         currentKey2 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                        currentValue2 = std::vector<uint8_t>(kv->value().begin(), kv->value().end());
+                        currentValue2 =
+                            std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                     }
                 } catch (const std::exception &e) {
                     std::cerr << "Error initializing keys and values: " << e.what() << std::endl;
@@ -959,12 +956,14 @@ bool LSMT::Compact() {
                 }
 
                 while (currentKey1.has_value() || currentKey2.has_value()) {
-                    if (!currentKey2.has_value() || (currentKey1.has_value() && currentKey1 < currentKey2)) {
+                    if (!currentKey2.has_value() ||
+                        (currentKey1.has_value() && currentKey1 < currentKey2)) {
                         newMemtable->insert(currentKey1.value(), currentValue1.value());
                         if (it1->Ok()) {
                             auto kv = it1->Next();
                             currentKey1 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                            currentValue1 = std::vector<uint8_t>(kv->value().begin(), kv->value().end());
+                            currentValue1 =
+                                std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                         } else {
                             currentKey1.reset();
                             currentValue1.reset();
@@ -974,7 +973,8 @@ bool LSMT::Compact() {
                         if (it2->Ok()) {
                             auto kv = it2->Next();
                             currentKey2 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                            currentValue2 = std::vector<uint8_t>(kv->value().begin(), kv->value().end());
+                            currentValue2 =
+                                std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                         } else {
                             currentKey2.reset();
                             currentValue2.reset();
@@ -985,12 +985,16 @@ bool LSMT::Compact() {
                 // Check if the new memtable has entries before writing
                 if (newMemtable->GetSize() > 0) {
                     // Write the new memtable to a new SSTable
-                    std::string newSSTablePath = directory + getPathSeparator() + "sstable_compacted_" +
-                        std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + SSTABLE_EXTENSION;
+                    std::string newSSTablePath =
+                        directory + getPathSeparator() + "sstable_compacted_" +
+                        std::to_string(
+                            std::chrono::system_clock::now().time_since_epoch().count()) +
+                        SSTABLE_EXTENSION;
                     auto newSSTable = std::make_shared<SSTable>(
                         new Pager(newSSTablePath, std::ios::in | std::ios::out | std::ios::trunc));
 
-                    newMemtable->inOrderTraversal([&newSSTable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+                    newMemtable->inOrderTraversal([&newSSTable](const std::vector<uint8_t> &key,
+                                                                const std::vector<uint8_t> &value) {
                         KeyValue kv;
                         kv.set_key(key.data(), key.size());
                         kv.set_value(value.data(), value.size());
@@ -1012,8 +1016,10 @@ bool LSMT::Compact() {
                 // Remove the old SSTables from the list of SSTables
                 {
                     std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
-                    sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable1), sstables.end());
-                    sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable2), sstables.end());
+                    sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable1),
+                                   sstables.end());
+                    sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable2),
+                                   sstables.end());
                 }
             }));
         }

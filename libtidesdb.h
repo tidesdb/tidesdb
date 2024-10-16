@@ -106,17 +106,16 @@ constexpr int PAGE_SIZE =
 constexpr int PAGE_HEADER_SIZE = sizeof(int64_t);             // 8 bytes for overflow page pointer
 constexpr int PAGE_BODY_SIZE = PAGE_SIZE - PAGE_HEADER_SIZE;  // Page body size
 
-
 // SkipListNode is a node in a skip list
 class SkipListNode {
-public:
-    std::vector<uint8_t> key;    // Key
-    std::vector<uint8_t> value;  // Value
+   public:
+    std::vector<uint8_t> key;                          // Key
+    std::vector<uint8_t> value;                        // Value
     std::vector<std::atomic<SkipListNode *>> forward;  // Forward pointers
 
     // Constructor
     SkipListNode(const std::vector<uint8_t> &k, const std::vector<uint8_t> &v, int level)
-      : key(k), value(v), forward(level) {
+        : key(k), value(v), forward(level) {
         for (int i = 0; i < level; ++i) {
             forward[i].store(nullptr, std::memory_order_relaxed);
         }
@@ -125,19 +124,22 @@ public:
 
 // SkipList is a lock-free skip list class
 class SkipList {
-private:
-    int maxLevel;  // Maximum level of the skip list
+   private:
+    int maxLevel;       // Maximum level of the skip list
     float probability;  // Probability of a node having a higher level
     std::shared_ptr<SkipListNode> head;
-    std::atomic<int> level;  // Current level of the skip list
-    std::atomic<int> cachedSize;  // should be atomic because it is accessed by multiple threads, this helps us avoid traversing the list to get the size
+    std::atomic<int> level;       // Current level of the skip list
+    std::atomic<int> cachedSize;  // should be atomic because it is accessed by multiple threads,
+                                  // this helps us avoid traversing the list to get the size
     // randomLevel generates a random level for a new node
     int randomLevel() const;
-public:
+
+   public:
     // Constructor
     SkipList(int maxLevel, float probability)
-           : maxLevel(maxLevel), probability(probability), level(0) {
-        head = std::make_shared<SkipListNode>(std::vector<uint8_t>(), std::vector<uint8_t>(), maxLevel);
+        : maxLevel(maxLevel), probability(probability), level(0) {
+        head = std::make_shared<SkipListNode>(std::vector<uint8_t>(), std::vector<uint8_t>(),
+                                              maxLevel);
     }
 
     // insert inserts a key-value pair into the skip list
@@ -149,19 +151,17 @@ public:
     // get gets the value for a given key
     std::vector<uint8_t> get(const std::vector<uint8_t> &key);
 
-    // inOrderTraversal traverses the skip list in in-order traversal and calls a function on each node
-    void inOrderTraversal(std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const;
+    // inOrderTraversal traverses the skip list in in-order traversal and calls a function on each
+    // node
+    void inOrderTraversal(
+        std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const;
 
     // getSize returns the number of nodes in the skip list
     int getSize() const;
 
     // clear clears the skip list
     void clear();
-
-
-
 };
-
 
 // AVL Node class
 // @deprecated
@@ -312,14 +312,15 @@ class Wal {
     // ReadOperations reads operations from the write-ahead log
     std::vector<Operation> ReadOperations();
 
-    mutable std::mutex queueMutex; // Mutex for operation queue
-    std::condition_variable queueCondVar; // Condition variable for operation queue
-    std::queue<Operation> operationQueue; // Operation queue
-    bool stopBackgroundThread = false; // Stop background thread
-    std::thread backgroundThread; // Background thread
+    mutable std::mutex queueMutex;         // Mutex for operation queue
+    std::condition_variable queueCondVar;  // Condition variable for operation queue
+    std::queue<Operation> operationQueue;  // Operation queue
+    bool stopBackgroundThread = false;     // Stop background thread
+    std::thread backgroundThread;          // Background thread
 
     // backgroundThreadFunc is the function that runs in the background thread
-    // instead of appending on every write, we append to a queue and write in the background to not block the main thread
+    // instead of appending on every write, we append to a queue and write in the background to not
+    // block the main thread
     void backgroundThreadFunc();
 
     // Close closes the write-ahead log
@@ -389,14 +390,11 @@ class LSMT {
         }
 
         // Create a new memtable
-        memtable = new SkipList(12, 0.25); // 12 is the max level, 0.25 is the probability
+        memtable = new SkipList(12, 0.25);  // 12 is the max level, 0.25 is the probability
     }
 
     // Destructor
-    ~LSMT() {
-
-
-    }
+    ~LSMT() {}
 
     // Put inserts a key-value pair into the LSMT
     bool Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
@@ -473,7 +471,6 @@ class LSMT {
             flushThread.join();
         }
 
-
         // Close the write-ahead log
         wal->Close();
 
@@ -528,7 +525,7 @@ class LSMT {
                              // we should have at least this many SSTables, if there
                              // are less after compaction, we will not further compact
     std::condition_variable_any cond;        // Condition variable for flushing and compacting
-    SkipList *memtable;                       // Skip list memtable
+    SkipList *memtable;                      // Skip list memtable
     std::atomic<int32_t> isFlushing;         // Whether the memtable is being flushed
     std::atomic<int32_t> isCompacting;       // Whether the SSTables are being compacted
     int memtableFlushSize;                   // Memtable flush size

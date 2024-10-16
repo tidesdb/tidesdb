@@ -16,6 +16,7 @@
 #include "libtidesdb.h"
 
 #include <iostream>
+#include <random>
 
 // The TidesDB namespace
 namespace TidesDB {
@@ -58,14 +59,17 @@ std::vector<uint8_t> serializeOperation(const Operation &op) {
     return buffer;
 }
 
+// getPathSeparator
 // Gets os specific path separator
 std::string getPathSeparator() {
     return std::string(1, std::filesystem::path::preferred_separator);
 }
 
-// GetFilePath gets the file path of the SSTable
+// SSTable::GetFilePath
+// gets the file path of the SSTable
 std::string SSTable::GetFilePath() const { return pager->GetFileName(); }
 
+// Pager::Pager
 // Pager Constructor
 Pager::Pager(const std::string &filename, std::ios::openmode mode) : fileName(filename) {
     // Check if the file exists
@@ -86,9 +90,11 @@ Pager::Pager(const std::string &filename, std::ios::openmode mode) : fileName(fi
     }
 }
 
-// GetFileName returns the filename of the pager
+// Pager::GetFileName
+// returns the filename of the pager
 std::string Pager::GetFileName() const { return fileName; }
 
+// Pager::~Pager
 // Pager Destructor
 Pager::~Pager() {
     if (file.is_open()) {
@@ -96,12 +102,14 @@ Pager::~Pager() {
     }
 }
 
-// Write writes the data to the pager
+// Pager::Write writes data to the paged file, creating overflow pages if necessary
 int64_t Pager::Write(const std::vector<uint8_t> &data) {
+    // Check if the file is open
     if (!file.is_open()) {
         throw TidesDBException("File is not open");
     }
 
+    // Check if the data is empty
     if (data.empty()) {
         throw TidesDBException("Data is empty");
     }
@@ -145,6 +153,7 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
     return page_number;
 }
 
+// Pager::WriteTo
 // @TODO: Implement the method, probably wont be used
 int64_t Pager::WriteTo(int64_t page_number, const std::vector<uint8_t> &data) {
     // Implement the method similarly to Write, but start at the specified
@@ -152,22 +161,30 @@ int64_t Pager::WriteTo(int64_t page_number, const std::vector<uint8_t> &data) {
     return 0;
 }
 
-// Read reads the data from the pager
+// Pager::Read
+// reads data from a file starting at a specified page number and handles overflow pages if the data
+// spans multiple pages
 std::vector<uint8_t> Pager::Read(int64_t page_number) {
+    // We check if the file is open
     if (!file.is_open()) {
         throw TidesDBException("File is not open");
     }
 
+    // If the page number is less than 0, we throw an exception
     if (page_number < 0) {
         throw TidesDBException("Invalid page number");
     }
 
+    // Seek to the page specified by page_number
     file.seekg(page_number * PAGE_SIZE);
     if (file.fail()) {
+        // If we fail to seek to the page, we throw an exception
         throw TidesDBException("Failed to seek to page: " + std::to_string(page_number));
     }
 
-    int64_t overflow_page;
+    int64_t overflow_page;  // The overflow page
+
+    // Read the overflow page header
     file.read(reinterpret_cast<char *>(&overflow_page), sizeof(overflow_page));
     if (file.fail()) {
         throw TidesDBException("Failed to read page header for page: " +
@@ -217,29 +234,34 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
     return data;
 }
 
-// randomLevel returns a random level for the SkipList
+// SkipList::randomLevel
+// generates a random level for a new node in the skip list. This level determines the height of the
+// node in the skip list, which affects the efficiency of search, insertion, and deletion operations
 int SkipList::randomLevel() const {
+    static thread_local std::mt19937 generator(std::random_device{}());
+    static thread_local std::uniform_real_distribution<double> distribution(0.0, 1.0);
     int lvl = 1;
-    while ((static_cast<float>(rand()) / RAND_MAX) < probability && lvl < maxLevel) {
+    while (distribution(generator) < probability && lvl < maxLevel) {
         lvl++;
     }
-    return lvl;
+    return std::min(lvl, maxLevel);  // Ensure it doesn't exceed maxLevel
 }
 
-// insert inserts a key-value pair into the SkipList
+// SkipList::insert
+// inserts a key-value pair into the SkipList
 void SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
     std::vector<SkipListNode *> update(maxLevel, nullptr);
     auto x = head.get();
 
-    // Ensure head is not null
     if (!x) {
         throw std::runtime_error("Head node is null");
     }
 
     for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
-        while (x->forward[i].load(std::memory_order_acquire) != nullptr &&
-               x->forward[i].load(std::memory_order_acquire)->key < key) {
-            x = x->forward[i].load(std::memory_order_acquire);
+        auto next = x->forward[i].load(std::memory_order_acquire);
+        while (next != nullptr && next->key < key) {
+            x = next;
+            next = x->forward[i].load(std::memory_order_acquire);
         }
         update[i] = x;
     }
@@ -247,10 +269,8 @@ void SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t
     x = x->forward[0].load(std::memory_order_acquire);
 
     if (x != nullptr && x->key == key) {
-        // Key exists, update the value
         x->value = value;
     } else {
-        // Key does not exist, insert a new node
         int newLevel = randomLevel();
         if (newLevel > level.load(std::memory_order_relaxed)) {
             for (int i = level.load(std::memory_order_relaxed) + 1; i < newLevel; i++) {
@@ -259,22 +279,26 @@ void SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t
             level.store(newLevel, std::memory_order_release);
         }
 
-        x = new SkipListNode(key, value, newLevel);
-        for (int i = 0; i < newLevel; i++) {
-            x->forward[i].store(update[i]->forward[i].load(std::memory_order_relaxed),
-                                std::memory_order_relaxed);
-            update[i]->forward[i].store(x, std::memory_order_release);
+        auto newNode = new SkipListNode(key, value, newLevel);
+        if (!newNode) {
+            throw std::runtime_error("Memory allocation failed for new node");
         }
-        cachedSize.fetch_add(1, std::memory_order_relaxed);  // Increment cachedSize
+
+        for (int i = 0; i < newLevel; i++) {
+            newNode->forward[i].store(update[i]->forward[i].load(std::memory_order_relaxed),
+                                      std::memory_order_relaxed);
+            update[i]->forward[i].store(newNode, std::memory_order_release);
+        }
+        cachedSize.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-// deleteKV deletes a key-value pair from the SkipList
+// SkipList::deleteKV
+// deletes a key-value pair from the SkipList
 void SkipList::deleteKV(const std::vector<uint8_t> &key) {
     std::vector<SkipListNode *> update(maxLevel, nullptr);
     auto x = head.get();
 
-    // Traverse the list to find the position to delete
     for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
         while (x->forward[i].load(std::memory_order_acquire) != nullptr &&
                x->forward[i].load(std::memory_order_acquire)->key < key) {
@@ -285,7 +309,6 @@ void SkipList::deleteKV(const std::vector<uint8_t> &key) {
 
     x = x->forward[0].load(std::memory_order_acquire);
 
-    // If the key is found, delete the node
     if (x != nullptr && x->key == key) {
         for (int i = 0; i <= level.load(std::memory_order_relaxed); i++) {
             if (update[i]->forward[i].load(std::memory_order_acquire) != x) {
@@ -295,24 +318,24 @@ void SkipList::deleteKV(const std::vector<uint8_t> &key) {
                                         std::memory_order_release);
         }
 
-        // Adjust the level of the skip list if necessary
         while (level.load(std::memory_order_relaxed) > 0 &&
                head->forward[level.load(std::memory_order_relaxed)].load(
                    std::memory_order_acquire) == nullptr) {
             level.fetch_sub(1, std::memory_order_relaxed);
         }
 
-        cachedSize.fetch_sub(1, std::memory_order_relaxed);  // Decrement cachedSize
-        delete x;                                            // Free the memory of the deleted node
+        cachedSize.fetch_sub(1, std::memory_order_relaxed);
+        delete x;
     }
 }
 
-// inOrderTraversal traverses the SkipList in order and calls the function on each node
+// SkipList::inOrderTraversal
+// traverses the skip list in order and applies the provided function func to each key-value pair
 void SkipList::inOrderTraversal(
     std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const {
     auto x = head.get();
     if (!x) {
-        return;  // Return if head is null
+        return;
     }
 
     while (x->forward[0].load(std::memory_order_acquire) != nullptr) {
@@ -323,11 +346,12 @@ void SkipList::inOrderTraversal(
     }
 }
 
+// SkipList::get
 // get returns the value for a given key in the SkipList
-std::vector<uint8_t> SkipList::get(const std::vector<uint8_t> &key) {
+std::vector<uint8_t> SkipList::get(const std::vector<uint8_t> &key) const {
     auto x = head.get();
     if (!x) {
-        return {};  // Return empty if head is null
+        return {};
     }
 
     for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
@@ -345,9 +369,11 @@ std::vector<uint8_t> SkipList::get(const std::vector<uint8_t> &key) {
     return {};
 }
 
+// SkipList::getSize
 // GetSize returns the size of the SkipList
 int SkipList::getSize() const { return cachedSize.load(std::memory_order_relaxed); }
 
+// SkipList::clear
 // clear clears the SkipList
 void SkipList::clear() {
     auto x = head->forward[0].load(std::memory_order_acquire);
@@ -357,20 +383,22 @@ void SkipList::clear() {
         x = next;
     }
     for (int i = 0; i < maxLevel; ++i) {
-        head->forward[i].store(nullptr, std::memory_order_relaxed);
+        head->forward[i].store(nullptr, std::memory_order_release);
     }
-    level.store(0, std::memory_order_relaxed);
-    cachedSize.store(0, std::memory_order_relaxed);
+    level.store(0, std::memory_order_release);
+    cachedSize.store(0, std::memory_order_release);
 }
 
-// height returns the height of the AVL tree node
+// AVLTree::height
+// returns the height of the AVL tree node
 // @deprecated
 int AVLTree::height(AVLNode *node) {
     if (node == nullptr) return 0;
     return node->height;
 }
 
-// GetSize returns the size of the AVL tree
+// AVLTree::GetSize
+// returns the size of the AVL tree
 // @deprecated
 int AVLTree::GetSize(AVLNode *node) {
     if (node == nullptr) {
@@ -379,14 +407,16 @@ int AVLTree::GetSize(AVLNode *node) {
     return 1 + GetSize(node->left) + GetSize(node->right);
 }
 
-// GetSize returns the size of the AVL tree
+// AVLTree::GetSize
+// returns the size of the AVL tree
 // @deprecated
 int AVLTree::GetSize() {
     std::shared_lock<std::shared_mutex> lock(rwlock);
     return GetSize(root);
 }
 
-// rightRotate performs a right rotation on the AVL tree node
+// AVLTree::rightRotate
+// performs a right rotation on the AVL tree node
 // @deprecated
 AVLNode *AVLTree::rightRotate(AVLNode *y) {
     AVLNode *x = y->left;
@@ -401,7 +431,8 @@ AVLNode *AVLTree::rightRotate(AVLNode *y) {
     return x;
 }
 
-// leftRotate performs a left rotation on the AVL tree node
+// AVLTree::leftRotate
+// performs a left rotation on the AVL tree node
 // @deprecated
 AVLNode *AVLTree::leftRotate(AVLNode *x) {
     AVLNode *y = x->right;
@@ -416,14 +447,16 @@ AVLNode *AVLTree::leftRotate(AVLNode *x) {
     return y;
 }
 
-// getBalance returns the balance factor of the AVL tree node
+// AVLTree::getBalance
+// returns the balance factor of the AVL tree node
 // @deprecated
 int AVLTree::getBalance(AVLNode *node) {
     if (node == nullptr) return 0;
     return height(node->left) - height(node->right);
 }
 
-// insert inserts a key-value pair into the AVL tree
+// AVLTree::insert
+// inserts a key-value pair into the AVL tree
 // @deprecated
 AVLNode *AVLTree::insert(AVLNode *node, const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) {
@@ -460,7 +493,8 @@ AVLNode *AVLTree::insert(AVLNode *node, const std::vector<uint8_t> &key,
     return node;
 }
 
-// printHex prints the hex representation of the data
+// AVLTree::printHex
+// prints the hex representation of the data
 // @deprecated
 void AVLTree::printHex(const std::vector<uint8_t> &data) {
     for (auto byte : data) {
@@ -469,7 +503,8 @@ void AVLTree::printHex(const std::vector<uint8_t> &data) {
     std::cout << std::dec << std::endl;
 }
 
-// deleteNode deletes a key-value pair from the AVL tree
+// AVLTree::deleteNode
+// deletes a key-value pair from the AVL tree
 // @deprecated
 AVLNode *AVLTree::deleteNode(AVLNode *root, const std::vector<uint8_t> &key) {
     if (root == nullptr) return root;
@@ -522,7 +557,8 @@ AVLNode *AVLTree::deleteNode(AVLNode *root, const std::vector<uint8_t> &key) {
     return root;
 }
 
-// minValueNode returns the node with the minimum value in the AVL tree
+// AVLTree::minValueNode
+// returns the node with the minimum value in the AVL tree
 // @deprecated
 AVLNode *AVLTree::minValueNode(AVLNode *node) {
     AVLNode *current = node;
@@ -530,7 +566,8 @@ AVLNode *AVLTree::minValueNode(AVLNode *node) {
     return current;
 }
 
-// insert inserts a key-value pair into the AVL tree
+// AVLTree::insert
+// inserts a key-value pair into the AVL tree
 // will update the value if the key already exists
 // @deprecated
 void AVLTree::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
@@ -538,11 +575,13 @@ void AVLTree::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t>
     root = insert(root, key, value);
 }
 
-// deleteKV deletes a key-value pair from the AVL tree
+// AVLTree::deleteKV
+// deletes a key-value pair from the AVL tree
 // @deprecated
 void AVLTree::deleteKV(const std::vector<uint8_t> &key) { deleteKey(key); }
 
-// inOrder prints the key-value pairs in the AVL tree in order
+// AVLTree::inOrder
+// prints the key-value pairs in the AVL tree in order
 // @deprecated
 void AVLTree::inOrder(AVLNode *node) {
     if (node != nullptr) {
@@ -552,14 +591,16 @@ void AVLTree::inOrder(AVLNode *node) {
     }
 }
 
-// inOrder prints the key-value pairs in the AVL tree in order
+// AVLTree::inOrder
+// prints the key-value pairs in the AVL tree in order
 // @deprecated
 void AVLTree::inOrder() {
     std::shared_lock<std::shared_mutex> lock(rwlock);
     inOrder(root);
 }
 
-// inOrderTraversal traverses the AVL tree in order and calls the function on
+// AVLTree::inOrderTraversal
+// traverses the AVL tree in order and calls the function on
 // each node
 // @deprecated
 void AVLTree::inOrderTraversal(
@@ -572,7 +613,8 @@ void AVLTree::inOrderTraversal(
     }
 }
 
-// inOrderTraversal traverses the AVL tree in order and calls the function on
+// AVLTree::inOrderTraversal
+// traverses the AVL tree in order and calls the function on
 // each node
 // @deprecated
 void AVLTree::inOrderTraversal(
@@ -581,14 +623,16 @@ void AVLTree::inOrderTraversal(
     inOrderTraversal(root, func);
 }
 
-// deleteKey deletes a key from the AVL tree
+// AVLTree::deleteKey
+// deletes a key from the AVL tree
 // @deprecated
 void AVLTree::deleteKey(const std::vector<uint8_t> &key) {
     std::unique_lock<std::shared_mutex> lock(rwlock);
     root = deleteNode(root, key);
 }
 
-// Get returns the value for a given key
+// AVLTree::Get
+// returns the value for a given key
 // @deprecated
 std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
     std::shared_lock<std::shared_mutex> lock(rwlock);
@@ -613,7 +657,10 @@ std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
     return {};  // Key not found, return an empty vector
 }
 
-// Close closes the Write-Ahead Log
+// Wal::Close
+// responsible for safely stopping the background thread that processes the write-ahead log (WAL).
+// It sets a flag to stop the thread, notifies the condition variable to wake up the thread
+// if it is waiting, and then joins the thread to ensure it has finished executing.
 void Wal::Close() {
     {
         std::lock_guard<std::mutex> lock(queueMutex);
@@ -625,7 +672,11 @@ void Wal::Close() {
     }
 }
 
-// WriteOperation writes an operation to the write-ahead log
+// Wal::WriteOperation
+// tesponsible for writing an operation to the write-ahead log (WAL).
+// It ensures thread safety by using a mutex to lock the operation queue,
+// pushes the operation onto the queue, and then notifies a condition variable to
+// signal that a new operation is available
 bool Wal::WriteOperation(const Operation &op) {
     {
         std::lock_guard<std::mutex> lock(queueMutex);
@@ -635,10 +686,12 @@ bool Wal::WriteOperation(const Operation &op) {
     return true;
 }
 
-// Recover recovers the write-ahead log
-std::vector<Operation> Wal::Recover() const {
-    std::vector<Operation> operations;
-
+// Wal::Recover
+// reads and processes operations from the Write-Ahead Log (WAL) pages one by one. It locks the WAL
+// for reading, iterates through each page, deserializes the data into an Operation object, and
+// immediately processes the operation by inserting or deleting key-value pairs in the LSMT's
+// memtable. This approach avoids storing all operations in memory at once, optimizing memory usage.
+bool TidesDB::Wal::Recover(LSMT &lsmt) const {
     // Lock the WAL for reading
     std::unique_lock<std::shared_mutex> lock(walLock);
 
@@ -653,26 +706,17 @@ std::vector<Operation> Wal::Recover() const {
         // Deserialize the data into an Operation object
         Operation op = deserializeOperation(data);
 
-        // Add the operation to the list of operations
-        operations.push_back(op);
-    }
-
-    return operations;
-}
-
-// RunRecoveredOperations runs the recovered operations
-bool LSMT::RunRecoveredOperations(const std::vector<Operation> &operations) const {
-    for (const auto &op : operations) {
+        // Process the operation immediately
         switch (static_cast<int>(op.type())) {
             case static_cast<int>(TidesDB::OperationType::OpPut): {
                 std::vector<uint8_t> key(op.key().begin(), op.key().end());
                 std::vector<uint8_t> value(op.value().begin(), op.value().end());
-                memtable->insert(key, value);
+                lsmt.InsertIntoMemtable(key, value);
                 break;
             }
             case static_cast<int>(TidesDB::OperationType::OpDelete): {
                 std::vector<uint8_t> key(op.key().begin(), op.key().end());
-                memtable->deleteKV(key);
+                lsmt.DeleteFromMemtable(key);
                 break;
             }
             default:
@@ -680,10 +724,14 @@ bool LSMT::RunRecoveredOperations(const std::vector<Operation> &operations) cons
                 return false;
         }
     }
+
     return true;
 }
 
-// flushMemtable flushes the memtable to disk
+// LSMT::flushMemtable
+// responsible for flushing the current memtable to disk. It creates a new memtable,
+// transfers the data from the current memtable to the new one, and then adds the new memtable
+// to the flush queue. Finally, it notifies the flush thread to process the queue
 bool LSMT::flushMemtable() {
     // Create a new memtable
     auto newMemtable = std::make_unique<SkipList>(12, 0.25);
@@ -706,7 +754,10 @@ bool LSMT::flushMemtable() {
     return true;
 }
 
-// flushThreadFunc is the function that runs in the flush thread
+// LSMT::flushThreadFunc
+// responsible for flushing the memtable to disk. It continuously waits for new memtables
+// to be added to the flush queue, processes them, and writes their key-value pairs to SSTables.
+// If the number of SSTables exceeds the compaction interval, it triggers a background compaction
 void LSMT::flushThreadFunc() {
     while (true) {
         std::unique_ptr<SkipList> newMemtable;
@@ -777,7 +828,11 @@ void LSMT::flushThreadFunc() {
     }
 }
 
-// Delete deletes a key from the LSMT
+// LSMT::Delete
+// responsible for deleting a key from the LSMT structure.
+// It ensures thread safety by using locks and condition variables, writes the delete operation to
+// the Write-Ahead Log (WAL), and inserts a tombstone value into the memtable. If the memtable
+// exceeds a certain size, it triggers a background flush to disk
 bool LSMT::Delete(const std::vector<uint8_t> &key) {
     // Check if we are flushing or compacting
     {
@@ -810,7 +865,11 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
     return true;
 }
 
-// Put puts a key-value pair in the LSMT
+// LSMT::Put
+//  inserts a key-value pair into the LSMT structure.
+//  function ensures thread safety by using locks and condition variables, writes the operation to
+//  the Write-Ahead Log (WAL), and inserts the key-value pair into the memtable. If the memtable
+//  exceeds a certain size, it triggers a background flush to disk.
 bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
     // Check if we are flushing or compacting
     {
@@ -857,7 +916,10 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
     return true;
 }
 
-// Get gets a value for a given key
+// LSMT::Get
+// retrieve a value for a given key from the LSMT.
+// It first checks the memtable and then searches the SSTables if the key is not found in the
+// memtable.
 std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
     // Check if we are flushing or compacting
     {
@@ -914,10 +976,13 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
     return {};  // Key not found, return an empty vector
 }
 
-// GetFile gets pager file
+// Pager::GetFile
+// gets pager file
 std::fstream &Pager::GetFile() { return file; }
 
-// backgroundThreadFunc is the background thread function for the WAL
+// TidesDB::Wal::backgroundThreadFunc
+// is a background thread function for the Write-Ahead Log (WAL).
+// It continuously processes operations from a queue and writes them to the WAL file
 void TidesDB::Wal::backgroundThreadFunc() {
     while (true) {
         std::unique_lock<std::mutex> lock(queueMutex);
@@ -937,7 +1002,8 @@ void TidesDB::Wal::backgroundThreadFunc() {
     }
 }
 
-// PagesCount returns the number of pages in the SSTable
+// Pager::PagesCount
+// returns the number of pages in the SSTable
 int64_t Pager::PagesCount() {
     if (!file.is_open()) {
         return 0;
@@ -948,7 +1014,8 @@ int64_t Pager::PagesCount() {
     return fileSize / PAGE_SIZE;
 }
 
-// clear memtable
+// AVLTree::clear
+// clears the AVL tree
 void AVLTree::clear() {
     std::unique_lock<std::shared_mutex> lock(rwlock);
 
@@ -956,11 +1023,13 @@ void AVLTree::clear() {
     root = nullptr;
 }
 
-// Compact
-// Compact merges pairs of SSTables in a trivial non-blocking multithreaded manner
+// LSMT::Compact
+// starts a background thread to perform compaction of SSTables in a non-blocking manner. It pairs
+// SSTables, merges them, and writes the merged data to new SSTables. The old SSTables are then
+// deleted.
 bool LSMT::Compact() {
     // Start a background thread for compaction
-    std::thread compactionThread([this]() {
+    compactionThread = std::thread([this]() {
         std::vector<std::future<void>> futures;
         std::vector<std::pair<std::shared_ptr<SSTable>, std::shared_ptr<SSTable>>> sstablePairs;
 
@@ -1088,7 +1157,8 @@ bool LSMT::Compact() {
     return true;
 }
 
-// BeginTransaction starts a new transaction.
+// LSMT::BeginTransaction
+// begins a new transaction
 Transaction *LSMT::BeginTransaction() {
     auto tx = new Transaction();
     {
@@ -1098,7 +1168,8 @@ Transaction *LSMT::BeginTransaction() {
     return tx;
 }
 
-// AddPut adds a put operation to the transaction.
+// LSMT::AddPut
+// adds a put operation to the transaction.
 void LSMT::AddPut(Transaction *tx, const std::vector<uint8_t> &key,
                   const std::vector<uint8_t> &value) {
     auto rollback =
@@ -1115,7 +1186,8 @@ void LSMT::AddPut(Transaction *tx, const std::vector<uint8_t> &key,
     }
 }
 
-// AddDelete adds a delete operation to the transaction.
+// LSMT::AddDelete
+// adds a delete operation to the transaction.
 void LSMT::AddDelete(Transaction *tx, const std::vector<uint8_t> &key,
                      const std::vector<uint8_t> &value) {
     auto rollback = std::make_unique<Rollback>(OperationType::OpPut, key, value);
@@ -1130,13 +1202,25 @@ void LSMT::AddDelete(Transaction *tx, const std::vector<uint8_t> &key,
     }
 }
 
-// CommitTransaction commits a transaction.
+// LSMT::CommitTransaction
+// commits a transaction.
 // On error we rollback the transaction
 bool LSMT::CommitTransaction(Transaction *tx) {
+    // Check if the transaction has already been aborted
     if (tx->aborted) {
         throw std::runtime_error("transaction has been aborted");
     }
 
+    // Check if the transaction is already committed
+    {
+        std::shared_lock<std::shared_mutex> lock(activeTransactionsLock);
+        if (std::find(activeTransactions.begin(), activeTransactions.end(), tx) ==
+            activeTransactions.end()) {
+            throw std::runtime_error("transaction has already been committed or does not exist");
+        }
+    }
+
+    // Process each operation in the transaction
     for (const auto &txOp : tx->operations) {
         const auto &op = txOp.op;
         switch (op.type()) {
@@ -1158,17 +1242,28 @@ bool LSMT::CommitTransaction(Transaction *tx) {
         }
     }
 
-    // Remove the transaction from the active list.
-    auto it = std::find(activeTransactions.begin(), activeTransactions.end(), tx);
-    if (it != activeTransactions.end()) {
-        activeTransactions.erase(it);
+    // Remove the transaction from the active list
+    {
+        std::lock_guard<std::shared_mutex> lock(activeTransactionsLock);
+        auto it = std::find(activeTransactions.begin(), activeTransactions.end(), tx);
+        if (it != activeTransactions.end()) {
+            activeTransactions.erase(it);
+        }
     }
 
     return true;
 }
 
-// RollbackTransaction rolls back a transaction.
+// LSMT::RollbackTransaction
+// rolls back a transaction, checks if the transaction has already been committed
 void LSMT::RollbackTransaction(Transaction *tx) {
+    // Check if the transaction has already been committed
+    if (std::find(activeTransactions.begin(), activeTransactions.end(), tx) ==
+        activeTransactions.end()) {
+        std::cerr << "Transaction has already been committed or does not exist" << std::endl;
+        return;
+    }
+
     tx->aborted = true;
     for (auto it = tx->operations.rbegin(); it != tx->operations.rend(); ++it) {
         const auto &rollback = it->rollback;
@@ -1189,7 +1284,8 @@ void LSMT::RollbackTransaction(Transaction *tx) {
     }
 }
 
-// NGet gets all key-value pairs except the key
+// LSMT::NGet
+// gets all key-value pairs except the key
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NGet(
     const std::vector<uint8_t> &key) const {
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
@@ -1227,9 +1323,10 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NGet(
     return result;
 }
 
-// LessThanEq gets all key-value pairs less than or equal to the key
+// LSMT::LessThanEq
+// gets all key-value pairs less than or equal to the key
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessThanEq(
-    const std::vector<uint8_t> &key) {
+    const std::vector<uint8_t> &key) const {
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
 
     // Traverse the memtable and collect key-value pairs less than or equal to the key
@@ -1262,7 +1359,8 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
     return result;
 }
 
-// GreaterThanEq gets all key-value pairs greater than or equal to the key
+// LSMT::GreaterThanEq
+// gets all key-value pairs greater than or equal to the key
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::GreaterThanEq(
     const std::vector<uint8_t> &key) const {
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
@@ -1295,7 +1393,8 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Greater
     return result;
 }
 
-// LessThan gets all key-value pairs less than the key
+// LSMT::LessThan
+// gets all key-value pairs less than the key
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessThan(
     const std::vector<uint8_t> &key) const {
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
@@ -1328,7 +1427,8 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
     return result;
 }
 
-// GreaterThan gets all key-value pairs greater than the key
+// LSMT::GreaterThan
+// gets all key-value pairs greater than the key
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::GreaterThan(
     const std::vector<uint8_t> &key) const {
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
@@ -1364,7 +1464,8 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Greater
     return result;
 }
 
-// Range gets all key-value pairs in the range of start and end
+// LSMT::Range
+// gets all key-value pairs in the range of start and end
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Range(
     const std::vector<uint8_t> &start, const std::vector<uint8_t> &end) const {
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
@@ -1405,7 +1506,8 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Range(
     return result;
 }
 
-// NRange gets all key-value pairs not in the range of start and end
+// LSMT::NRange
+// gets all key-value pairs not in the range of start and end
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NRange(
     const std::vector<uint8_t> &start, const std::vector<uint8_t> &end) const {
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;

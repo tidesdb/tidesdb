@@ -15,14 +15,14 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 > Still in beta stages, use at your own risk and check back often for updates.
 
 ## Features
-- [x] Embeddable storage engine
+- [x] Lightweight embeddable storage engine
 - [x] Variable-length byte array keys and values
-- [x] Simple API (`Put`, `Get`, `Delete`)
+- [x] Simple yet effective API (`Put`, `Get`, `Delete`)
 - [x] Range functionality (`NGet`, `Range`, `NRange`, `GreaterThan`, `LessThan`, `GreaterThanEq`, `LessThanEq`)
 - [x] Custom pager for SSTables and WAL
 - [x] LSM-Tree data structure implementation (log structured merge tree)
 - [x] Write-ahead logging (WAL queue for faster writes)
-- [x] Recovery/Replay WAL (`RunRecoveredOperations`)
+- [x] Crash Recovery/Replay WAL (`Recover`)
 - [x] In-memory lockfree skip list (memtable)
 - [x] Transaction control (`BeginTransaction`, `CommitTransaction`, `RollbackTransaction`) on failed commit the transaction is automatically rolled back
 - [x] Concurrent safe
@@ -31,17 +31,33 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] Background memtable flushing
 - [x] Background paired multithreaded compaction
 - [x] Configurable options
-- [ ] Compression (todo)
+- [x] Support for large amounts of data
+- [x] Threadsafe
+- [ ] Compression (todo, LZ4, Snappy)
+
 ## Design
 Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.
 
 ## Requirements
-Whats required to build TidesDB..
+Whats required to build TidesDB.
 
 ### Protobuf
 ```bash
 sudo apt-get install libprotobuf-dev protobuf-compiler
 ```
 
-### Gtest
-.. maybe coming soon
+### Bindings
+- C (coming soon)
+
+### FFI (Foreign Function Interfaces)
+- Go (coming soon)
+- Python (coming soon)
+- Rust (coming soon)
+- NodeJS (coming soon)
+- Java (coming soon)
+- Haskell (coming soon)
+- Lua (coming soon)
+- Ruby (coming soon)
+
+### Interested in joining the project?
+Email us at [hello@tides.com](mailto:hello@tides.com)

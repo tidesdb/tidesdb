@@ -38,6 +38,8 @@
 // The TidesDB namespace
 namespace TidesDB {
 
+class LSMT;  // Forward declaration
+
 const std::string SSTABLE_EXTENSION = ".sst";          // SSTable file extension
 constexpr const char *TOMBSTONE_VALUE = "$tombstone";  // Tombstone value
 const std::string WAL_EXTENSION = ".wal";              // Write-ahead log file extension
@@ -160,7 +162,7 @@ class SkipList {
     void deleteKV(const std::vector<uint8_t> &key);
 
     // get gets the value for a given key
-    std::vector<uint8_t> get(const std::vector<uint8_t> &key);
+    std::vector<uint8_t> get(const std::vector<uint8_t> &key) const;
 
     // inOrderTraversal traverses the skip list in in-order traversal and calls a function on each
     // node
@@ -342,10 +344,7 @@ class Wal {
     bool WriteOperation(const Operation &op);
 
     // Recover recovers operations from the write-ahead log
-    std::vector<Operation> Recover() const;
-
-    // ReadOperations reads operations from the write-ahead log
-    std::vector<Operation> ReadOperations();
+    bool Recover(LSMT &lsmt) const;
 
     mutable std::mutex queueMutex;         // Mutex for operation queue
     std::condition_variable queueCondVar;  // Condition variable for operation queue
@@ -426,7 +425,11 @@ class LSMT {
         }
 
         // Create a new memtable
+        // 10, 0.25)
         memtable = new SkipList(12, 0.25);  // 12 is the max level, 0.25 is the probability
+
+        // Start background thread for flushing
+        flushThread = std::thread(&LSMT::flushThreadFunc, this);
     }
 
     // Destructor
@@ -463,7 +466,7 @@ class LSMT {
 
     // LessThanEq returns all key-value pairs less than or equal to a given key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LessThanEq(
-        const std::vector<uint8_t> &key);
+        const std::vector<uint8_t> &key) const;
 
     // GreaterThanEq returns all key-value pairs greater than or equal to a given
     // key
@@ -479,9 +482,6 @@ class LSMT {
     // RollbackTransaction rolls back a transaction
     void RollbackTransaction(Transaction *tx);
 
-    // RunRecoveredOperations runs recovered operations from the write-ahead log
-    bool RunRecoveredOperations(const std::vector<Operation> &operations) const;
-
     // AddDelete adds a delete operation to a transaction
     static void AddDelete(Transaction *tx, const std::vector<uint8_t> &key,
                           const std::vector<uint8_t> &value);
@@ -493,8 +493,14 @@ class LSMT {
     // Get returns the value for a given key
     std::vector<uint8_t> Get(const std::vector<uint8_t> &key);
 
-    // SplitSSTable splits an SSTable into n SSTables
-    std::vector<std::shared_ptr<SSTable>> SplitSSTable(SSTable *sstable, int n) const;
+    // Public method to insert a key-value pair into the memtable
+    void InsertIntoMemtable(const std::vector<uint8_t> &key,
+                            const std::vector<uint8_t> &value) const {
+        memtable->insert(key, value);
+    }
+
+    // Public method to delete a key from the memtable
+    void DeleteFromMemtable(const std::vector<uint8_t> &key) const { memtable->deleteKV(key); }
 
     // Close closes the LSMT
     void Close() {
@@ -511,6 +517,11 @@ class LSMT {
         // Wait for the flush thread to finish
         if (flushThread.joinable()) {
             flushThread.join();
+        }
+
+        // Wait for the compaction thread to finish
+        if (compactionThread.joinable()) {
+            compactionThread.join();
         }
 
         // Close the write-ahead log
@@ -576,17 +587,11 @@ class LSMT {
     std::queue<std::unique_ptr<SkipList>> flushQueue;  // Queue for flushing
     std::mutex flushQueueMutex;                        // Mutex for flush queue
     std::condition_variable flushQueueCondVar;         // Condition variable for flush queue
-
-    // Create a thread pool, could be configurable in the future
-    const size_t compactionThreads = std::thread::hardware_concurrency();  // Number of threads used
-                                                                           // for compaction
-    // We try to get through the SSTables as fast as possible, so we use a thread
-    // pool for compaction Each thread batch processes SSTables, so we can have
-    // multiple threads processing SSTables at the same time to speed up
-    // compaction
-
+    std::thread compactionThread;                      // Thread for compaction
     // flushMemtable flushes the memtable to disk
     bool flushMemtable();
+
+    // flushThreadFunc is the function that runs in the flush thread
     void flushThreadFunc();
 };
 

@@ -107,14 +107,13 @@ int main() {
 
         // Recover from WAL
         auto wal = std::make_unique<TidesDB::Wal>(directory + "/wal.log");
-        std::vector<Operation> recoveredOperations = wal->Recover();
 
         // Initialize a new LSMT instance
         auto recoveredLsmTree =
             TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
 
-        // Run recovered operations
-        if (!recoveredLsmTree->RunRecoveredOperations(recoveredOperations)) {
+        // Run recovered operations directly from WAL
+        if (!wal->Recover(*recoveredLsmTree)) {
             std::cerr << "Failed to run recovered operations" << std::endl;
             return 1;
         }

@@ -5,7 +5,7 @@
 #include "../../libtidesdb.h"
 
 int main() {
-    TidesDB::SkipList skipList(10, 0.5);
+    TidesDB::SkipList skipList(8, 0.5);
 
     // Insert key-value pairs
     skipList.insert({1, 2, 3}, {10, 20, 30});

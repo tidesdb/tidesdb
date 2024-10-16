@@ -73,7 +73,7 @@ struct Rollback {
 struct Transaction {
     std::vector<TransactionOperation> operations;  // List of operations
     bool aborted = false;                          // Whether the transaction was aborted
-    void AddPut(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
+    std::mutex operationsMutex;                    // Mutex for operations
 };
 
 // Exception class
@@ -447,6 +447,12 @@ class LSMT {
 
     // RunRecoveredOperations runs recovered operations from the write-ahead log
     bool RunRecoveredOperations(const std::vector<Operation> &operations);
+
+    // AddDelete adds a delete operation to a transaction
+    static void AddDelete(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
+
+    // AddPut adds a put operation to a transaction
+    static void AddPut(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
 
     // Get returns the value for a given key
     std::vector<uint8_t> Get(const std::vector<uint8_t> &key);

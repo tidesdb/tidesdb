@@ -63,45 +63,54 @@ int main() {
 
     try {
         // Initialize the LSMT
-        auto lsmTree =
-            TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
+        auto lsmTree = TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
 
         // Begin a transaction
         auto transaction1 = lsmTree->BeginTransaction();
 
-        // Insert data within the transaction
+        // Add a key-value pair within the transaction
         std::vector<uint8_t> key1 = {1, 1, 1, 1};
         std::vector<uint8_t> value1 = {1};
-        lsmTree->Put(key1, value1);
-
-        std::vector<uint8_t> key2 = {2, 2, 2, 2};
-        std::vector<uint8_t> value2 = {2};
-        lsmTree->Put(key2, value2);
+        lsmTree->AddPut(transaction1, key1, value1);
 
         // Commit the transaction
-        lsmTree->CommitTransaction(transaction1);
+        if (!lsmTree->CommitTransaction(transaction1)) {
+            std::cerr << "Transaction commit failed" << std::endl;
+            return 1;
+        }
 
-        // Verify the data was inserted
+        // Verify the key-value pair was added
         auto result1 = lsmTree->Get(key1);
         assert(result1 == value1 && "Transaction test failed for key1");
-
-        auto result2 = lsmTree->Get(key2);
-        assert(result2 == value2 && "Transaction test failed for key2");
 
         // Begin another transaction
         auto transaction2 = lsmTree->BeginTransaction();
 
-        // Insert more data within the transaction
-        std::vector<uint8_t> key3 = {3, 3, 3, 3};
-        std::vector<uint8_t> value3 = {3};
-        lsmTree->Put(key3, value3);
+        // Delete the key within the transaction
+        lsmTree->AddDelete(transaction2, key1, value1);
+
+        // Commit the transaction
+        if (!lsmTree->CommitTransaction(transaction2)) {
+            std::cerr << "Transaction commit failed" << std::endl;
+            return 1;
+        }
+
+        // Verify the key was deleted
+        auto result2 = lsmTree->Get(key1);
+        assert(result2.empty() && "Delete operation failed");
+
+        // Begin another transaction to test rollback
+        auto transaction3 = lsmTree->BeginTransaction();
+
+        // Delete the key again within the transaction
+        lsmTree->AddDelete(transaction3, key1, value1);
 
         // Rollback the transaction
-        lsmTree->RollbackTransaction(transaction2);
+        lsmTree->RollbackTransaction(transaction3);
 
-        // Verify the data was not inserted
-        auto result3 = lsmTree->Get(key3);
-        assert(result3.empty() && "Rollback test failed for key3");
+        // Verify the key was restored
+        auto result3 = lsmTree->Get(key1);
+        assert(result3 == value1 && "Rollback operation failed");
 
         lsmTree->Close();
 

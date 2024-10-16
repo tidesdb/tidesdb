@@ -63,6 +63,9 @@ std::string getPathSeparator() {
     return std::string(1, std::filesystem::path::preferred_separator);
 }
 
+// GetFilePath gets the file path of the SSTable
+std::string SSTable::GetFilePath() const { return pager->GetFileName(); }
+
 // Pager Constructor
 Pager::Pager(const std::string &filename, std::ios::openmode mode) : fileName(filename) {
     // Check if the file exists
@@ -357,6 +360,7 @@ int AVLTree::GetSize(AVLNode *node) {
 }
 
 // GetSize returns the size of the AVL tree
+// @deprecated
 int AVLTree::GetSize() {
     std::shared_lock<std::shared_mutex> lock(rwlock);
     return GetSize(root);
@@ -899,8 +903,6 @@ void AVLTree::clear() {
     root = nullptr;
 }
 
-// GetFilePath gets the file path of the SSTable
-std::string SSTable::GetFilePath() const { return pager->GetFileName(); }
 
 // Compact
 // Compact merges pairs of SSTables in a trivial non-blocking multithreaded manner
@@ -1037,13 +1039,15 @@ bool LSMT::Compact() {
 // BeginTransaction starts a new transaction.
 Transaction *LSMT::BeginTransaction() {
     auto tx = new Transaction();
-    activeTransactions.push_back(tx);
+    {
+        std::lock_guard<std::shared_mutex> lock(activeTransactionsLock);
+        activeTransactions.push_back(tx);
+    }
     return tx;
 }
 
-
 // AddPut adds a put operation to the transaction.
-void AddPut(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+void LSMT::AddPut(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
     auto rollback = std::make_unique<Rollback>(OperationType::OpDelete, key, std::vector<uint8_t>{});
 
     Operation op;
@@ -1051,22 +1055,26 @@ void AddPut(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<
     op.set_key(key.data(), key.size());
     op.set_value(value.data(), value.size());
 
-    tx->operations.push_back(TransactionOperation{op, rollback.release()});
+    {
+        std::lock_guard<std::mutex> lock(tx->operationsMutex);
+        tx->operations.push_back(TransactionOperation{op, rollback.release()});
+    }
 }
 
 // AddDelete adds a delete operation to the transaction.
-void AddDelete(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+void LSMT::AddDelete(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
     auto rollback = std::make_unique<Rollback>(OperationType::OpPut, key, value);
 
     Operation op;
     op.set_type(static_cast<::OperationType>(OperationType::OpDelete));
     op.set_key(key.data(), key.size());
 
-    tx->operations.push_back(TransactionOperation{op, rollback.release()});
+    {
+        std::lock_guard<std::mutex> lock(tx->operationsMutex);
+        tx->operations.push_back(TransactionOperation{op, rollback.release()});
+    }
 }
 
-// CommitTransaction commits a transaction.
-// On error we rollback the transaction
 // CommitTransaction commits a transaction.
 // On error we rollback the transaction
 bool LSMT::CommitTransaction(Transaction *tx) {

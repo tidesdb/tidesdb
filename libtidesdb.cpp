@@ -1192,170 +1192,261 @@ void LSMT::RollbackTransaction(Transaction *tx) {
 // NGet gets all key-value pairs except the key
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NGet(
     const std::vector<uint8_t> &key) const {
-    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
+
+    // Traverse the memtable and collect key-value pairs not equal to the key
     memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k != key) {
-            result.emplace_back(k, v);
+            kvMap.insert({k, v});  // Use insert to avoid overwriting
         }
     });
 
+    // Traverse the SSTables and collect key-value pairs not equal to the key
     for (const auto &sstable : sstables) {
         SSTableIterator it(sstable->pager);
         while (it.Ok()) {
             auto kv = it.Next();
-            if (kv && ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())) !=
-                          key) {
-                result.emplace_back(
-                    ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())),
-                    ConvertToUint8Vector(
-                        std::vector<char>(kv->value().begin(), kv->value().end())));
+            if (kv) {
+                auto kvKey =
+                    ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()));
+                if (kvKey != key) {
+                    kvMap.insert(
+                        {kvKey, ConvertToUint8Vector(std::vector<char>(
+                                    kv->value().begin(), kv->value().end()))});  // Use insert
+                }
             }
         }
     }
+
+    // Convert the map to a vector of pairs
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    for (const auto &kv : kvMap) {
+        result.emplace_back(kv);
+    }
+
     return result;
 }
 
 // LessThanEq gets all key-value pairs less than or equal to the key
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessThanEq(
     const std::vector<uint8_t> &key) {
-    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
+
+    // Traverse the memtable and collect key-value pairs less than or equal to the key
     memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
-        if (k <= key) {
-            result.emplace_back(k, v);
+        if (k <= key && kvMap.find(k) == kvMap.end()) {
+            kvMap[k] = v;
         }
     });
 
+    // Traverse the SSTables and collect key-value pairs less than or equal to the key
     for (const auto &sstable : sstables) {
         SSTableIterator it(sstable->pager);
         while (it.Ok()) {
             auto kv = it.Next();
-            if (kv && std::string(key.begin(), key.end()) <= kv->key()) {
-                result.emplace_back(key, ConvertToUint8Vector(std::vector<char>(
-                                             kv->value().begin(), kv->value().end())));
+            if (kv && std::string(key.begin(), key.end()) >= kv->key() &&
+                kvMap.find(ConvertToUint8Vector(
+                    std::vector<char>(kv->key().begin(), kv->key().end()))) == kvMap.end()) {
+                kvMap[ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))] =
+                    ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()));
             }
         }
     }
+
+    // Convert the map to a vector of pairs
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    for (const auto &kv : kvMap) {
+        result.emplace_back(kv);
+    }
+
     return result;
 }
 
 // GreaterThanEq gets all key-value pairs greater than or equal to the key
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::GreaterThanEq(
     const std::vector<uint8_t> &key) const {
-    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
+
+    // Traverse the memtable and collect key-value pairs greater than or equal to the key
     memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k >= key) {
-            result.emplace_back(k, v);
+            kvMap[k] = v;
         }
     });
 
+    // Traverse the SSTables and collect key-value pairs greater than or equal to the key
     for (const auto &sstable : sstables) {
         SSTableIterator it(sstable->pager);
         while (it.Ok()) {
             auto kv = it.Next();
-            if (kv && std::string(key.begin(), key.end()) >= kv->key()) {
-                result.emplace_back(key, ConvertToUint8Vector(std::vector<char>(
-                                             kv->value().begin(), kv->value().end())));
+            if (kv && std::string(key.begin(), key.end()) <= kv->key()) {
+                kvMap[ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))] =
+                    ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()));
             }
         }
     }
+
+    // Convert the map to a vector of pairs
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    for (const auto &kv : kvMap) {
+        result.emplace_back(kv);
+    }
+
     return result;
 }
 
 // LessThan gets all key-value pairs less than the key
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessThan(
     const std::vector<uint8_t> &key) const {
-    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
+
+    // Traverse the memtable and collect key-value pairs less than the key
     memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k < key) {
-            result.emplace_back(k, v);
+            kvMap[k] = v;
         }
     });
 
+    // Traverse the SSTables and collect key-value pairs less than the key
     for (const auto &sstable : sstables) {
         SSTableIterator it(sstable->pager);
         while (it.Ok()) {
             auto kv = it.Next();
             if (kv && std::string(key.begin(), key.end()) < kv->key()) {
-                result.emplace_back(key, ConvertToUint8Vector(std::vector<char>(
-                                             kv->value().begin(), kv->value().end())));
+                kvMap[ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))] =
+                    ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()));
             }
         }
     }
+
+    // Convert the map to a vector of pairs
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    for (const auto &kv : kvMap) {
+        result.emplace_back(kv);
+    }
+
     return result;
 }
 
 // GreaterThan gets all key-value pairs greater than the key
+#include <map>
+#include <utility>
+#include <vector>
+
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::GreaterThan(
     const std::vector<uint8_t> &key) const {
-    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
+
+    // Traverse the memtable and collect key-value pairs greater than the key
     memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k > key) {
-            result.emplace_back(k, v);
+            kvMap.insert({k, v});  // Use insert to avoid overwriting
         }
     });
 
-    for (const auto &sstable : sstables) {
-        SSTableIterator it(sstable->pager);
-        while (it.Ok()) {
-            auto kv = it.Next();
-            if (kv && std::string(key.begin(), key.end()) > kv->key()) {
-                result.emplace_back(key, ConvertToUint8Vector(std::vector<char>(
-                                             kv->value().begin(), kv->value().end())));
+    // Traverse the SSTables and collect key-value pairs greater than the key
+    for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+        SSTableIterator sstableIt((*it)->pager);
+        while (sstableIt.Ok()) {
+            auto kv = sstableIt.Next();
+            if (kv) {
+                std::vector<uint8_t> kv_key(kv->key().begin(), kv->key().end());
+                std::vector<uint8_t> kv_value(kv->value().begin(), kv->value().end());
+                if (kv_key > key) {
+                    kvMap.insert({kv_key, kv_value});  // Use insert to avoid overwriting
+                }
             }
         }
     }
+
+    // Convert the map to a vector of pairs
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    for (const auto &kv : kvMap) {
+        result.emplace_back(kv);
+    }
+
     return result;
 }
 
 // Range gets all key-value pairs in the range of start and end
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Range(
     const std::vector<uint8_t> &start, const std::vector<uint8_t> &end) const {
-    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
+
+    // Traverse the memtable and collect key-value pairs in the range
     memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k >= start && k <= end) {
-            result.emplace_back(k, v);
+            kvMap.insert({k, v});  // Use insert to avoid overwriting
         }
     });
 
-    for (const auto &sstable : sstables) {
-        SSTableIterator it(sstable->pager);
-        while (it.Ok()) {
-            auto kv = it.Next();
-            if (kv && (std::string(start.begin(), start.end()) <= kv->key() &&
-                       std::string(end.begin(), end.end()) >= kv->key())) {
-                result.emplace_back(
-                    ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())),
-                    ConvertToUint8Vector(
-                        std::vector<char>(kv->value().begin(), kv->value().end())));
+    // Traverse the SSTables and collect key-value pairs in the range
+    for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+        SSTableIterator sstableIt((*it)->pager);
+        while (sstableIt.Ok()) {
+            auto kv = sstableIt.Next();
+            if (kv) {
+                std::string kv_key_str = kv->key();
+                std::vector<char> kv_key_chars(kv_key_str.begin(), kv_key_str.end());
+                std::vector<uint8_t> kv_key = ConvertToUint8Vector(
+                    std::vector<char>(kv_key_chars.begin(), kv_key_chars.end()));
+
+                if (kv_key >= start && kv_key <= end) {
+                    kvMap.insert(
+                        {kv_key, ConvertToUint8Vector(std::vector<char>(
+                                     kv->value().begin(), kv->value().end()))});  // Use insert
+                }
             }
         }
     }
+
+    // Convert the map to a vector of pairs
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    for (const auto &kv : kvMap) {
+        result.emplace_back(kv);
+    }
+
     return result;
 }
 
 // NRange gets all key-value pairs not in the range of start and end
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NRange(
     const std::vector<uint8_t> &start, const std::vector<uint8_t> &end) const {
-    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
+
+    // Traverse the memtable and collect key-value pairs not in the range
     memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k < start || k > end) {
-            result.emplace_back(k, v);
+            kvMap.insert({k, v});  // Use insert to avoid overwriting
         }
     });
 
-    for (const auto &sstable : sstables) {
-        SSTableIterator it(sstable->pager);
-        while (it.Ok()) {
-            auto kv = it.Next();
-            if (kv && (std::string(start.begin(), start.end()) > kv->key() ||
-                       std::string(end.begin(), end.end()) < kv->key())) {
-                result.emplace_back(
-                    ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end())),
-                    ConvertToUint8Vector(
-                        std::vector<char>(kv->value().begin(), kv->value().end())));
+    // Traverse the SSTables and collect key-value pairs not in the range
+    for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+        SSTableIterator sstableIt((*it)->pager);
+        while (sstableIt.Ok()) {
+            auto kv = sstableIt.Next();
+            if (kv) {
+                std::string kv_key_str = kv->key();
+                std::vector<char> kv_key_chars(kv_key_str.begin(), kv_key_str.end());
+                std::vector<uint8_t> kv_key = ConvertToUint8Vector(
+                    std::vector<char>(kv_key_chars.begin(), kv_key_chars.end()));
+
+                if (kv_key < start || kv_key > end) {
+                    kvMap.insert(
+                        {kv_key, ConvertToUint8Vector(std::vector<char>(
+                                     kv->value().begin(), kv->value().end()))});  // Use insert
+                }
             }
         }
     }
+
+    // Convert the map to a vector of pairs
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    for (const auto &kv : kvMap) {
+        result.emplace_back(kv);
+    }
+
     return result;
 }
 

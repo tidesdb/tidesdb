@@ -50,6 +50,17 @@ std::vector<uint8_t> ConvertToUint8Vector(const std::vector<char> &input);
 // of characters
 std::vector<char> ConvertToCharVector(const std::vector<uint8_t> &input);
 
+// Custom hash function for std::vector<uint8_t>
+struct VectorHash {
+    std::size_t operator()(const std::vector<uint8_t> &v) const {
+        std::size_t hash = 0;
+        for (auto &i : v) {
+            hash ^= std::hash<uint8_t>()(i) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        }
+        return hash;
+    }
+};
+
 // Operation types (for transactions)
 enum class OperationType {
     OpPut,    // Put operation

@@ -320,6 +320,12 @@ class Pager {
 class Wal {
    public:
     Wal(Pager *pager) : pager(pager) {}
+    Wal(const std::string &path) : walPath(path) {
+        // Open the write-ahead log
+        pager = new Pager(path, std::ios::in | std::ios::out);
+
+    }
+
     std::shared_mutex lock;  // Mutex for write-ahead log
 
     // WriteOperation writes an operation to the write-ahead log
@@ -348,6 +354,7 @@ class Wal {
    private:
     Pager *pager;                       // Pager instance
     mutable std::shared_mutex walLock;  // Mutex for write-ahead log
+    std::string walPath;                // Path to the write-ahead log, for when recovering
 };                                      // Wal class
 
 // SSTable class

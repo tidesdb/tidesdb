@@ -1,3 +1,4 @@
+#include <chrono>
 #include <iostream>
 #include <vector>
 
@@ -39,6 +40,17 @@ int main() {
     } else {
         std::cout << "Get test failed" << std::endl;
     }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < 1000000; ++i) {
+        std::vector<uint8_t> key = {static_cast<uint8_t>(i)};
+        std::vector<uint8_t> value = {static_cast<uint8_t>(i)};
+        skipList.insert(key, value);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    std::cout << "Time taken to insert 1,000,000 key-value pairs: " << duration.count()
+              << " seconds" << std::endl;
 
     return 0;
 }

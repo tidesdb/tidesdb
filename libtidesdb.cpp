@@ -231,6 +231,11 @@ void SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t
     std::vector<SkipListNode *> update(maxLevel, nullptr);
     auto x = head.get();
 
+    // Ensure head is not null
+    if (!x) {
+        throw std::runtime_error("Head node is null");
+    }
+
     for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
         while (x->forward[i].load(std::memory_order_acquire) != nullptr &&
                x->forward[i].load(std::memory_order_acquire)->key < key) {
@@ -269,6 +274,7 @@ void SkipList::deleteKV(const std::vector<uint8_t> &key) {
     std::vector<SkipListNode *> update(maxLevel, nullptr);
     auto x = head.get();
 
+    // Traverse the list to find the position to delete
     for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
         while (x->forward[i].load(std::memory_order_acquire) != nullptr &&
                x->forward[i].load(std::memory_order_acquire)->key < key) {
@@ -279,6 +285,7 @@ void SkipList::deleteKV(const std::vector<uint8_t> &key) {
 
     x = x->forward[0].load(std::memory_order_acquire);
 
+    // If the key is found, delete the node
     if (x != nullptr && x->key == key) {
         for (int i = 0; i <= level.load(std::memory_order_relaxed); i++) {
             if (update[i]->forward[i].load(std::memory_order_acquire) != x) {
@@ -288,6 +295,7 @@ void SkipList::deleteKV(const std::vector<uint8_t> &key) {
                                         std::memory_order_release);
         }
 
+        // Adjust the level of the skip list if necessary
         while (level.load(std::memory_order_relaxed) > 0 &&
                head->forward[level.load(std::memory_order_relaxed)].load(
                    std::memory_order_acquire) == nullptr) {
@@ -303,15 +311,25 @@ void SkipList::deleteKV(const std::vector<uint8_t> &key) {
 void SkipList::inOrderTraversal(
     std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const {
     auto x = head.get();
+    if (!x) {
+        return;  // Return if head is null
+    }
+
     while (x->forward[0].load(std::memory_order_acquire) != nullptr) {
         x = x->forward[0].load(std::memory_order_acquire);
-        func(x->key, x->value);
+        if (x) {
+            func(x->key, x->value);
+        }
     }
 }
 
 // get returns the value for a given key in the SkipList
 std::vector<uint8_t> SkipList::get(const std::vector<uint8_t> &key) {
     auto x = head.get();
+    if (!x) {
+        return {};  // Return empty if head is null
+    }
+
     for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
         while (x->forward[i].load(std::memory_order_acquire) != nullptr &&
                x->forward[i].load(std::memory_order_acquire)->key < key) {
@@ -332,13 +350,15 @@ int SkipList::getSize() const { return cachedSize.load(std::memory_order_relaxed
 
 // clear clears the SkipList
 void SkipList::clear() {
-    auto x = head.get();
-    while (x->forward[0].load(std::memory_order_acquire) != nullptr) {
+    auto x = head->forward[0].load(std::memory_order_acquire);
+    while (x != nullptr) {
         auto next = x->forward[0].load(std::memory_order_acquire);
         delete x;
         x = next;
     }
-    delete x;
+    for (int i = 0; i < maxLevel; ++i) {
+        head->forward[i].store(nullptr, std::memory_order_relaxed);
+    }
     level.store(0, std::memory_order_relaxed);
     cachedSize.store(0, std::memory_order_relaxed);
 }

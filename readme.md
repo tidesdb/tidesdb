@@ -21,7 +21,7 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] Range functionality (`NGet`, `Range`, `NRange`, `GreaterThan`, `LessThan`, `GreaterThanEq`, `LessThanEq`)
 - [x] Custom pager for SSTables and WAL
 - [x] LSM-Tree data structure implementation (log structured merge tree)
-- [x] Write-ahead logging
+- [x] Write-ahead logging (WAL queue for faster writes)
 - [x] Recovery/Replay WAL (`RunRecoveredOperations`)
 - [x] In-memory lockless skip list (memtable)
 - [x] Transaction control (`BeginTransaction`, `CommitTransaction`, `RollbackTransaction`)

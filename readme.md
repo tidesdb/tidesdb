@@ -28,6 +28,10 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] Concurrent safe
 - [x] Tombstone deletion
 - [x] Multi-threaded paired compaction
+- [x] Minimal blocking on flushing, and compaction operations
+- [x] Background memtable flushing
+- [x] Background paired multithreaded compaction
+- [x] Configurable options
 - [ ] Compression (todo)
 ## Design
 Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.

@@ -706,7 +706,7 @@ bool LSMT::flushMemtable() {
     return true;
 }
 
-// Flush thread function
+// flushThreadFunc is the function that runs in the flush thread
 void LSMT::flushThreadFunc() {
     while (true) {
         std::unique_ptr<SkipList> newMemtable;
@@ -1329,10 +1329,6 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
 }
 
 // GreaterThan gets all key-value pairs greater than the key
-#include <map>
-#include <utility>
-#include <vector>
-
 std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::GreaterThan(
     const std::vector<uint8_t> &key) const {
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;

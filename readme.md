@@ -23,7 +23,7 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] LSM-Tree data structure implementation (log structured merge tree)
 - [x] Write-ahead logging (WAL queue for faster writes)
 - [x] Recovery/Replay WAL (`RunRecoveredOperations`)
-- [x] In-memory lockless skip list (memtable)
+- [x] In-memory lockfree skip list (memtable)
 - [x] Transaction control (`BeginTransaction`, `CommitTransaction`, `RollbackTransaction`) on failed commit the transaction is automatically rolled back
 - [x] Concurrent safe
 - [x] Tombstone deletion

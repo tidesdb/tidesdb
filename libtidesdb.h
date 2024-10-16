@@ -556,6 +556,9 @@ class LSMT {
     int memtableFlushSize;                   // Memtable flush size
     std::vector<std::future<void>> futures;  // List of futures, used for flushing and compacting
     std::thread flushThread;                 // Thread for flushing
+    std::queue<std::unique_ptr<SkipList>> flushQueue; // Queue for flushing
+    std::mutex flushQueueMutex;  // Mutex for flush queue
+    std::condition_variable flushQueueCondVar; // Condition variable for flush queue
 
     // Create a thread pool, could be configurable in the future
     const size_t compactionThreads = std::thread::hardware_concurrency();  // Number of threads used
@@ -567,6 +570,7 @@ class LSMT {
 
     // flushMemtable flushes the memtable to disk
     bool flushMemtable();
+    void flushThreadFunc();
 };
 
 }  // namespace TidesDB

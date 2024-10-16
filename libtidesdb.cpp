@@ -670,16 +670,44 @@ bool LSMT::RunRecoveredOperations(const std::vector<Operation> &operations) {
 // flushMemtable flushes the memtable to disk
 bool LSMT::flushMemtable() {
     // Create a new memtable
-    auto newMemtable = std::make_unique<AVLTree>();
-
+    auto newMemtable = std::make_unique<SkipList>(12, 0.25);
     // Iterate over the current memtable and insert its elements into the new memtable
     memtable->inOrderTraversal(
         [&newMemtable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
             newMemtable->insert(key, value);
         });
 
-    // Start a background thread for flushing
-    flushThread = std::thread([this, newMemtable = std::move(newMemtable)]() mutable {
+    // Add the new memtable to the flush queue
+    {
+        std::lock_guard<std::mutex> lock(flushQueueMutex);
+        flushQueue.push(std::move(newMemtable));
+    }
+    flushQueueCondVar.notify_one();  // Notify the flush thread
+
+    return true;
+}
+
+// Flush thread function
+void LSMT::flushThreadFunc() {
+    while (true) {
+        std::unique_ptr<SkipList> newMemtable;
+
+        // Wait for a new memtable to be added to the queue
+        {
+            std::unique_lock<std::mutex> lock(flushQueueMutex);
+            flushQueueCondVar.wait(lock, [this] {
+                return !flushQueue.empty();
+            });
+
+            newMemtable = std::move(flushQueue.front());
+            flushQueue.pop();
+
+            // Check for the sentinel value
+            if (newMemtable == nullptr) {
+                break; // Exit the loop if the sentinel value is encountered
+            }
+        }
+
         std::vector<KeyValue> kvPairs;  // Key-value pairs to be written to the SSTable
 
         // Populate kvPairs with key-value pairs from the new memtable
@@ -726,10 +754,7 @@ bool LSMT::flushMemtable() {
         if (sstableCounter >= compactionInterval) {
             Compact();
         }
-    });
-
-    flushThread.detach();  // Detach the thread to run in the background
-    return true;
+    }
 }
 
 // Delete deletes a key from the LSMT

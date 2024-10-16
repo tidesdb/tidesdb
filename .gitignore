@@ -27,3 +27,4 @@ tests/wal/cmake-build-debug
 tests/range/cmake-build-debug
 tests/skiplist/cmake-build-debug
 tests/skiplist-concurrent/cmake-build-debug
+tests/bench/cmake-build-debug

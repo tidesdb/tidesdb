@@ -214,6 +214,15 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
     return data;
 }
 
+// randomLevel returns a random level for the SkipList
+int SkipList::randomLevel() const {
+    int lvl = 1;
+    while (((float) rand() / RAND_MAX) < probability && lvl < maxLevel) {
+        lvl++;
+    }
+    return lvl;
+}
+
 // height returns the height of the AVL tree node
 int AVLTree::height(AVLNode *node) {
     if (node == nullptr) return 0;

@@ -7,7 +7,7 @@ TidesDB is a library that provides an embeddable, persistent key-value store for
 TidesDB has a robust feature-set, and was designed to be a high-performance, low-latency storage engine. It is optimized for write and read-heavy workloads.
 
 TidesDB is built on the principles of the Log-Structured Merge-Tree (LSM-Tree) data structure.
-TidesDB utilizes an in-memory AVL tree, known as a memtable, for temporarily storing key-value pairs. These pairs are then flushed to Sorted String Tables (SSTables) on disk. When the number of SSTables reaches a specified threshold, the compaction process is triggered.
+TidesDB utilizes an in-memory lockless skip list, known as a memtable, for temporarily storing key-value pairs. These pairs are then flushed to Sorted String Tables (SSTables) on disk. When the number of SSTables reaches a specified threshold, the compaction process is triggered.
 
 This process merges pairs of SSTables into a new SSTable, and deletes any redundant data. The compaction process ensures that the number of SSTables remains low, and that read performance is optimized.
 
@@ -23,7 +23,7 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] LSM-Tree data structure implementation (log structured merge tree)
 - [x] Write-ahead logging
 - [x] Recovery/Replay WAL (`RunRecoveredOperations`)
-- [x] In-memory AVL tree (memtable)
+- [x] In-memory lockless skip list (memtable)
 - [x] Transaction control (`BeginTransaction`, `CommitTransaction`, `RollbackTransaction`)
 - [x] Concurrent safe
 - [x] Tombstone deletion

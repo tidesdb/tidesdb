@@ -152,7 +152,7 @@ public:
     void inOrderTraversal(std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const;
 
     // getSize returns the number of nodes in the skip list
-    int getSize();
+    int getSize() const;
 
     // clear clears the skip list
     void clear();
@@ -163,6 +163,7 @@ public:
 
 
 // AVL Node class
+// @deprecated
 class AVLNode {
    public:
     std::vector<uint8_t> key;    // Key
@@ -177,6 +178,7 @@ class AVLNode {
 };
 
 // AVL Tree class
+// @deprecated
 class AVLTree {
    private:
     AVLNode *root;             // Root node
@@ -368,7 +370,6 @@ class LSMT {
           compactionInterval(compaction_interval) {
         wal = new Wal(new Pager(directory + getPathSeparator() + WAL_EXTENSION,
                                 std::ios::in | std::ios::out | std::ios::trunc));
-        memtableSize.store(0);
         isFlushing.store(0);
         isCompacting.store(0);
 
@@ -377,7 +378,7 @@ class LSMT {
         }
 
         // Create a new memtable
-        memtable = new AVLTree();
+        memtable = new SkipList(12, 0.25); // 12 is the max level, 0.25 is the probability
     }
 
     // Destructor
@@ -497,8 +498,6 @@ class LSMT {
     std::shared_mutex activeTransactionsLock;        // Mutex for active transactions
     std::vector<std::shared_ptr<SSTable>> sstables;  // List of SSTables
     std::shared_mutex sstablesLock;                  // Mutex for SSTables
-    // We lock memtable when writing to it
-    std::shared_mutex memtableLock;  // Mutex for memtable
     // We lock wal when writing to it
     std::shared_mutex walLock;  // Mutex for write-ahead log
     Wal *wal;                   // Write-ahead log
@@ -507,10 +506,9 @@ class LSMT {
                              // we should have at least this many SSTables, if there
                              // are less after compaction, we will not further compact
     std::condition_variable_any cond;        // Condition variable for flushing and compacting
-    AVLTree *memtable;                       // AVL tree for the memtable
+    SkipList *memtable;                       // Skip list memtable
     std::atomic<int32_t> isFlushing;         // Whether the memtable is being flushed
     std::atomic<int32_t> isCompacting;       // Whether the SSTables are being compacted
-    std::atomic<int64_t> memtableSize;       // Size of the memtable
     int memtableFlushSize;                   // Memtable flush size
     std::vector<std::future<void>> futures;  // List of futures, used for flushing and compacting
 

@@ -321,6 +321,22 @@ std::vector<uint8_t> SkipList::get(const std::vector<uint8_t> &key) {
     return {};
 }
 
+// GetSize returns the size of the SkipList
+int SkipList::getSize() const { return cachedSize.load(std::memory_order_relaxed); }
+
+// clear clears the SkipList
+void SkipList::clear() {
+    auto x = head.get();
+    while (x->forward[0].load(std::memory_order_acquire) != nullptr) {
+        auto next = x->forward[0].load(std::memory_order_acquire);
+        delete x;
+        x = next;
+    }
+    delete x;
+    level.store(0, std::memory_order_relaxed);
+    cachedSize.store(0, std::memory_order_relaxed);
+}
+
 // height returns the height of the AVL tree node
 int AVLTree::height(AVLNode *node) {
     if (node == nullptr) return 0;
@@ -634,7 +650,6 @@ bool LSMT::flushMemtable() {
 
     // Iterate over the current memtable and insert its elements into the new memtable
     {
-        std::unique_lock<std::shared_mutex> lock(memtableLock);
         memtable->inOrderTraversal(
             [&newMemtable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
                 newMemtable->insert(key, value);
@@ -716,18 +731,14 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
         }
     }  // Automatically unlocks when leaving the scope
 
-    // Lock memtable for writing
     {
-        std::unique_lock lock(memtableLock);
         memtable->insert(
             key, std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)));
     }  // Automatically unlocks when leaving the scope
 
-    // Increase the memtable size
-    memtableSize.fetch_add(key.size() + strlen(TOMBSTONE_VALUE));
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
-    if (memtableSize.load() > memtableFlushSize) {
+    if (memtable->getSize() > memtableFlushSize) {
         flushMemtable();
     }
 
@@ -759,16 +770,11 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
         throw std::invalid_argument("value cannot be a tombstone");
     }
 
-    // Lock the memtable for writing
-    std::unique_lock<std::shared_mutex> memtableLockGuard(memtableLock);
-    memtable->insert(key, value);
-    memtableLockGuard.unlock();
 
-    // Increase the memtable size
-    memtableSize.fetch_add(key.size() + value.size());
+    memtable->insert(key, value);
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
-    if (memtableSize.load() > memtableFlushSize) {
+    if (memtable->getSize() > memtableFlushSize) {
         if (!flushMemtable()) {
             return false;
         }
@@ -791,8 +797,7 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
     // Check the memtable for the key
     std::vector<uint8_t> value;
     {
-        std::unique_lock lock(memtableLock);
-        value = memtable->Get(key);
+        value = memtable->get(key);
     }  // Automatically unlocks when leaving the scope
 
     // If value is found and it's not a tombstone, return it

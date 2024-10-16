@@ -570,7 +570,6 @@ class LSMT {
     std::shared_mutex activeTransactionsLock;        // Mutex for active transactions
     std::vector<std::shared_ptr<SSTable>> sstables;  // List of SSTables
     std::shared_mutex sstablesLock;                  // Mutex for SSTables
-    // We lock wal when writing to it
     std::shared_mutex walLock;  // Mutex for write-ahead log
     Wal *wal;                   // Write-ahead log
     std::string directory;      // Directory for storing data

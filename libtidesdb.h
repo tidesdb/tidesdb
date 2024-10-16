@@ -14,7 +14,6 @@
  * governing permissions and limitations under the License.
  */
 
-
 #ifndef TIDESDB_LIBRARY_H
 #define TIDESDB_LIBRARY_H
 
@@ -31,16 +30,15 @@
 #include <shared_mutex>
 #include <string>
 #include <vector>
+
 #include "proto/kv.pb.h"
 #include "proto/operation.pb.h"
-
-
 
 // The TidesDB namespace
 namespace TidesDB {
 
 constexpr std::string SSTABLE_EXTENSION = ".sst";      // SSTable file extension
-constexpr const char* TOMBSTONE_VALUE = "$tombstone";  // Tombstone value
+constexpr const char *TOMBSTONE_VALUE = "$tombstone";  // Tombstone value
 constexpr std::string WAL_EXTENSION = ".wal";          // Write-ahead log file extension
 
 // ConvertToUint8Vector converts a vector of characters to a vector of unsigned
@@ -272,7 +270,7 @@ class SSTable {
     std::vector<uint8_t> minKey;  // Minimum key
     std::vector<uint8_t> maxKey;  // Maximum key
     std::shared_mutex lock;       // Mutex for SSTable
-    std::string GetFilePath() const;
+    std::string GetFilePath() const; // Get file path of SSTable
 };  // SSTable class
 
 // SSTableIterator class
@@ -307,8 +305,7 @@ class LSMT {
    public:
     // Constructor
     LSMT(const std::string &string, int memtable_flush_size, int compaction_interval,
-         const std::shared_ptr<Pager> &pager,
-         const std::vector<std::shared_ptr<SSTable>> &vector)
+         const std::shared_ptr<Pager> &pager, const std::vector<std::shared_ptr<SSTable>> &vector)
         : directory(string),
           memtableFlushSize(memtable_flush_size),
           compactionInterval(compaction_interval) {
@@ -319,7 +316,7 @@ class LSMT {
         isCompacting.store(0);
 
         for (const auto &sstable : vector) {
-                sstables.push_back(sstable);
+            sstables.push_back(sstable);
         }
 
         // Create a new memtable
@@ -424,37 +421,36 @@ class LSMT {
             std::make_shared<Pager>(directory + getPathSeparator() + WAL_EXTENSION,
                                     std::ios::in | std::ios::out | std::ios::trunc);
 
-
         for (const auto &entry : std::filesystem::directory_iterator(directory)) {
             if (entry.is_regular_file() && entry.path().extension() == SSTABLE_EXTENSION) {
                 std::shared_ptr<Pager> sstablePager =
                     std::make_shared<Pager>(entry.path().string(), std::ios::in | std::ios::out);
-                    std::shared_ptr<SSTable> sstable = std::make_shared<SSTable>(sstablePager.get());
+                std::shared_ptr<SSTable> sstable = std::make_shared<SSTable>(sstablePager.get());
             }
         }
 
-        return std::make_unique<LSMT>(directory, memtableFlushSize, compactionInterval,
-                                       walPager, std::vector<std::shared_ptr<SSTable>>());
+        return std::make_unique<LSMT>(directory, memtableFlushSize, compactionInterval, walPager,
+                                      std::vector<std::shared_ptr<SSTable>>());
     }
 
    private:
     // Active transactions
     // Transactions that are actively being written to and awaiting commit
-    std::vector<Transaction *> activeTransactions;  // List of active transactions
-    std::shared_mutex activeTransactionsLock;       // Mutex for active transactions
-    std::vector<std::shared_ptr<SSTable>> sstables; // List of SSTables
-    std::shared_mutex sstablesLock;                 // Mutex for SSTables
+    std::vector<Transaction *> activeTransactions;   // List of active transactions
+    std::shared_mutex activeTransactionsLock;        // Mutex for active transactions
+    std::vector<std::shared_ptr<SSTable>> sstables;  // List of SSTables
+    std::shared_mutex sstablesLock;                  // Mutex for SSTables
     // We lock memtable when writing to it
     std::shared_mutex memtableLock;  // Mutex for memtable
     // We lock wal when writing to it
     std::shared_mutex walLock;  // Mutex for write-ahead log
     Wal *wal;                   // Write-ahead log
-    std::string directory;  // Directory for storing data
+    std::string directory;      // Directory for storing data
     int compactionInterval;  // Compaction interval (amount of SSTables to wait before compacting)
-                                       // we should have at least this many SSTables, if there
-                                       // are less after compaction, we will not further compact
-    std::condition_variable_any cond;  // Condition variable for flushing and compacting
-    AVLTree *memtable;                 // AVL tree for the memtable
+                             // we should have at least this many SSTables, if there
+                             // are less after compaction, we will not further compact
+    std::condition_variable_any cond;        // Condition variable for flushing and compacting
+    AVLTree *memtable;                       // AVL tree for the memtable
     std::atomic<int32_t> isFlushing;         // Whether the memtable is being flushed
     std::atomic<int32_t> isCompacting;       // Whether the SSTables are being compacted
     std::atomic<int64_t> memtableSize;       // Size of the memtable

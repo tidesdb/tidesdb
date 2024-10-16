@@ -39,3 +39,6 @@ Whats required to build TidesDB..
 ```bash
 sudo apt-get install libprotobuf-dev protobuf-compiler
 ```
+
+### Gtest
+.. maybe coming soon

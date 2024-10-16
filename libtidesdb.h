@@ -37,9 +37,9 @@
 // The TidesDB namespace
 namespace TidesDB {
 
-constexpr std::string SSTABLE_EXTENSION = ".sst";      // SSTable file extension
+const std::string SSTABLE_EXTENSION = ".sst";          // SSTable file extension
 constexpr const char *TOMBSTONE_VALUE = "$tombstone";  // Tombstone value
-constexpr std::string WAL_EXTENSION = ".wal";          // Write-ahead log file extension
+const std::string WAL_EXTENSION = ".wal";              // Write-ahead log file extension
 
 // ConvertToUint8Vector converts a vector of characters to a vector of unsigned
 // 8-bit integers
@@ -266,12 +266,12 @@ class SSTable {
     // Constructor
     SSTable(Pager *pager) : pager(pager) {}
 
-    Pager *pager;                 // Pager instance
-    std::vector<uint8_t> minKey;  // Minimum key
-    std::vector<uint8_t> maxKey;  // Maximum key
-    std::shared_mutex lock;       // Mutex for SSTable
-    std::string GetFilePath() const; // Get file path of SSTable
-};  // SSTable class
+    Pager *pager;                     // Pager instance
+    std::vector<uint8_t> minKey;      // Minimum key
+    std::vector<uint8_t> maxKey;      // Maximum key
+    std::shared_mutex lock;           // Mutex for SSTable
+    std::string GetFilePath() const;  // Get file path of SSTable
+};                                    // SSTable class
 
 // SSTableIterator class
 // Used to iterate over the key-value pairs in an SSTable

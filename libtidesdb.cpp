@@ -1041,34 +1041,32 @@ Transaction *LSMT::BeginTransaction() {
     return tx;
 }
 
+
 // AddPut adds a put operation to the transaction.
 void AddPut(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
-    Rollback *rollback = new Rollback{OperationType::OpDelete, key, {}};
+    auto rollback = std::make_unique<Rollback>(OperationType::OpDelete, key, std::vector<uint8_t>{});
 
-    // op
     Operation op;
     op.set_type(static_cast<::OperationType>(OperationType::OpPut));
     op.set_key(key.data(), key.size());
     op.set_value(value.data(), value.size());
 
-    tx->operations.push_back(TransactionOperation{op, rollback});
+    tx->operations.push_back(TransactionOperation{op, rollback.release()});
 }
 
 // AddDelete adds a delete operation to the transaction.
-void AddDelete(Transaction *tx, const std::vector<uint8_t> &key) {
-    // Would be good to get the value of the key before deleting it so we can
-    // rollback
+void AddDelete(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+    auto rollback = std::make_unique<Rollback>(OperationType::OpPut, key, value);
 
-    Rollback *rollback = new Rollback{OperationType::OpPut, key, {}};
-
-    // op
     Operation op;
     op.set_type(static_cast<::OperationType>(OperationType::OpDelete));
     op.set_key(key.data(), key.size());
 
-    tx->operations.push_back(TransactionOperation{op, rollback});
+    tx->operations.push_back(TransactionOperation{op, rollback.release()});
 }
 
+// CommitTransaction commits a transaction.
+// On error we rollback the transaction
 // CommitTransaction commits a transaction.
 // On error we rollback the transaction
 bool LSMT::CommitTransaction(Transaction *tx) {
@@ -1085,15 +1083,15 @@ bool LSMT::CommitTransaction(Transaction *tx) {
                              std::vector<char>(op.value().begin(), op.value().end())))) {
                     RollbackTransaction(tx);
                     return false;
-                }
-                break;
+                             }
+            break;
             case static_cast<int>(OperationType::OpDelete):
                 if (!Delete(ConvertToUint8Vector(
                         std::vector<char>(op.key().begin(), op.key().end())))) {
                     RollbackTransaction(tx);
                     return false;
-                }
-                break;
+                        }
+            break;
         }
     }
 

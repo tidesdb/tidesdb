@@ -186,68 +186,87 @@ class AVLTree {
     std::shared_mutex rwlock;  // Read-write lock
 
     // rightRotate rotates the AVL tree to the right
+    // @deprecated
     AVLNode *rightRotate(AVLNode *y);
 
     // leftRotate rotates the AVL tree to the left
+    // @deprecated
     AVLNode *leftRotate(AVLNode *x);
 
     // getBalance gets the balance factor of a node
+    // @deprecated
     int getBalance(AVLNode *node);
 
     // insert inserts a key-value pair into the AVL tree
+    // @deprecated
     AVLNode *insert(AVLNode *node, const std::vector<uint8_t> &key,
                     const std::vector<uint8_t> &value);
 
     // printHex prints a vector of unsigned 8-bit integers in hexadecimal format
+    // @deprecated
     static void printHex(const std::vector<uint8_t> &data);
 
     // deleteNode deletes a node from the AVL tree
+    // @deprecated
     AVLNode *deleteNode(AVLNode *root, const std::vector<uint8_t> &key);
 
     // deleteKey deletes a key from the AVL tree
+    // @deprecated
     void deleteKey(const std::vector<uint8_t> &key);
 
     // inOrder prints the key-value pairs in the AVL tree in in-order traversal
+    // @deprecated
     void inOrder(AVLNode *node);
 
     // minValueNode finds the node with the minimum value in the AVL tree
+    // @deprecated
     AVLNode *minValueNode(AVLNode *node);
 
     // height gets the height of a node
+    // @deprecated
     static int height(AVLNode *node);
 
     // inOrderTraversal traverses the AVL tree in in-order traversal and calls a
     // function on each node
+    // @deprecated
     void inOrderTraversal(
         AVLNode *node,
         std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func);
 
    public:
     // insert inserts a key-value pair into the AVL tree
+    // @deprecated
     void insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
 
     // deleteKV deletes a key from the AVL tree
+    // @deprecated
     void deleteKV(const std::vector<uint8_t> &key);
 
     // inOrder prints the key-value pairs in the AVL tree in in-order traversal
+    // @deprecated
     void inOrder();
 
     // inOrderTraversal traverses the AVL tree in in-order traversal and calls a
     // function on each node
+    // @deprecated
     void inOrderTraversal(
         std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func);
 
     // clear clears the AVL tree
+    // @deprecated
     void clear();
 
     // Get
     // Returns the value for a given key
+    // @deprecated
     std::vector<uint8_t> Get(const std::vector<uint8_t> &key);
 
     // GetSize returns the number of nodes in the AVL tree
+    // @deprecated
     int GetSize(AVLNode *root);
 
     // GetRoot returns the root node of the AVL tree
+    // @deprecated
     int GetSize();
 };
 
@@ -360,8 +379,8 @@ class SSTableIterator {
             return std::nullopt;
         }
 
-        auto data = pager->Read(currentPage++);
-        return deserialize(data);
+        auto data = pager->Read(currentPage++); // Read the page
+        return deserialize(data); // Deserialize the data
     }
 
    private:
@@ -404,8 +423,6 @@ class LSMT {
 
     // Compact compacts the SSTables
     bool Compact();
-
-    void processSSTable(SSTable *sstable, std::unique_ptr<AVLTree> &memtable);
 
     // NGet returns all key-value pairs not equal to a given key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> NGet(

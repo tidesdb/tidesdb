@@ -60,4 +60,4 @@ sudo apt-get install libprotobuf-dev protobuf-compiler
 - Ruby (coming soon)
 
 ### Interested in joining the project?
-Email us at [hello@tides.com](mailto:hello@tides.com)
+Email us at [hello@tidesdb.com](mailto:hello@tidesdb.com)

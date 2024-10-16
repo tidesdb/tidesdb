@@ -99,10 +99,10 @@ int main() {
 
         // Remove all SSTables to simulate a crash
         for (const auto &entry : std::filesystem::directory_iterator(directory)) {
-               // check if ending in .sst
-                if (entry.path().extension() == ".sst") {
-                        std::filesystem::remove(entry.path());
-                }
+            // check if ending in .sst
+            if (entry.path().extension() == ".sst") {
+                std::filesystem::remove(entry.path());
+            }
         }
 
         // Recover from WAL

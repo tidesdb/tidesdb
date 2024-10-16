@@ -323,7 +323,6 @@ class Wal {
     Wal(const std::string &path) : walPath(path) {
         // Open the write-ahead log
         pager = new Pager(path, std::ios::in | std::ios::out);
-
     }
 
     std::shared_mutex lock;  // Mutex for write-ahead log
@@ -470,7 +469,7 @@ class LSMT {
     void RollbackTransaction(Transaction *tx);
 
     // RunRecoveredOperations runs recovered operations from the write-ahead log
-    bool RunRecoveredOperations(const std::vector<Operation> &operations);
+    bool RunRecoveredOperations(const std::vector<Operation> &operations) const;
 
     // AddDelete adds a delete operation to a transaction
     static void AddDelete(Transaction *tx, const std::vector<uint8_t> &key,
@@ -563,9 +562,9 @@ class LSMT {
     int memtableFlushSize;                   // Memtable flush size
     std::vector<std::future<void>> futures;  // List of futures, used for flushing and compacting
     std::thread flushThread;                 // Thread for flushing
-    std::queue<std::unique_ptr<SkipList>> flushQueue; // Queue for flushing
-    std::mutex flushQueueMutex;  // Mutex for flush queue
-    std::condition_variable flushQueueCondVar; // Condition variable for flush queue
+    std::queue<std::unique_ptr<SkipList>> flushQueue;  // Queue for flushing
+    std::mutex flushQueueMutex;                        // Mutex for flush queue
+    std::condition_variable flushQueueCondVar;         // Condition variable for flush queue
 
     // Create a thread pool, could be configurable in the future
     const size_t compactionThreads = std::thread::hardware_concurrency();  // Number of threads used

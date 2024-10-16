@@ -2,6 +2,7 @@
 #include <iostream>
 #include <random>
 #include <vector>
+
 #include "../libtidesdb.h"
 
 // Function to generate random data
@@ -19,7 +20,7 @@ void benchmarkLSMT(TidesDB::LSMT &lsmt, size_t numOperations, size_t dataSize) {
     std::vector<std::vector<uint8_t>> keys(numOperations);
     std::vector<std::vector<uint8_t>> values(numOperations);
     for (size_t i = 0; i < numOperations; ++i) {
-        keys[i] = generateRandomData(dataSize);  // Generate random key
+        keys[i] = generateRandomData(dataSize);    // Generate random key
         values[i] = generateRandomData(dataSize);  // Generate random value
     }
 
@@ -28,25 +29,25 @@ void benchmarkLSMT(TidesDB::LSMT &lsmt, size_t numOperations, size_t dataSize) {
     for (size_t i = 0; i < numOperations; ++i) {
         lsmt.Put(keys[i], values[i]);  // Perform Put operation
     }
-    auto end = high_resolution_clock::now();  // End timer
+    auto end = high_resolution_clock::now();                              // End timer
     auto putDuration = duration_cast<milliseconds>(end - start).count();  // Calculate duration
-    std::cout << numOperations <<  " Put operations took " << putDuration << " ms\n";
+    std::cout << numOperations << " Put operations took " << putDuration << " ms\n";
 
     // Benchmark Get operations
     start = high_resolution_clock::now();  // Start timer
     for (size_t i = 0; i < numOperations; ++i) {
         lsmt.Get(keys[i]);  // Perform Get operation
     }
-    end = high_resolution_clock::now();  // End timer
+    end = high_resolution_clock::now();                                   // End timer
     auto getDuration = duration_cast<milliseconds>(end - start).count();  // Calculate duration
-    std::cout << numOperations <<  " Get operations took " << getDuration << " ms\n";
+    std::cout << numOperations << " Get operations took " << getDuration << " ms\n";
 
     // Benchmark Delete operations
     start = high_resolution_clock::now();  // Start timer
     for (size_t i = 0; i < numOperations; ++i) {
         lsmt.Delete(keys[i]);  // Perform Delete operation
     }
-    end = high_resolution_clock::now();  // End timer
+    end = high_resolution_clock::now();                                      // End timer
     auto deleteDuration = duration_cast<milliseconds>(end - start).count();  // Calculate duration
     std::cout << numOperations << " Delete operations took " << deleteDuration << " ms\n";
 }
@@ -60,7 +61,7 @@ int main() {
     benchmarkLSMT(*lsmt, 1000, 5);
 
     // Remove benchmark directory
-        std::filesystem::remove_all("benchmark_directory");
+    std::filesystem::remove_all("benchmark_directory");
 
     return 0;
 }

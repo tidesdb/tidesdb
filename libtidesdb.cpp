@@ -641,26 +641,22 @@ std::vector<Operation> Wal::Recover() const {
 }
 
 // RunRecoveredOperations runs the recovered operations
-bool LSMT::RunRecoveredOperations(const std::vector<Operation> &operations) {
+bool LSMT::RunRecoveredOperations(const std::vector<Operation> &operations) const {
     for (const auto &op : operations) {
         switch (static_cast<int>(op.type())) {
-            case static_cast<int>(OperationType::OpPut): {
+            case static_cast<int>(TidesDB::OperationType::OpPut): {
                 std::vector<uint8_t> key(op.key().begin(), op.key().end());
                 std::vector<uint8_t> value(op.value().begin(), op.value().end());
-                if (!Put(key, value)) {
-                    return false;
-                }
+                memtable->insert(key, value);
                 break;
             }
-            case static_cast<int>(OperationType::OpDelete): {
+            case static_cast<int>(TidesDB::OperationType::OpDelete): {
                 std::vector<uint8_t> key(op.key().begin(), op.key().end());
-                if (!Delete(key)) {
-                    return false;
-                }
+                memtable->deleteKV(key);
                 break;
             }
             default:
-                std::cerr << "Unknown operation type\n";
+                std::cerr << "Unknown operation type: " << static_cast<int>(op.type()) << std::endl;
                 return false;
         }
     }
@@ -671,6 +667,7 @@ bool LSMT::RunRecoveredOperations(const std::vector<Operation> &operations) {
 bool LSMT::flushMemtable() {
     // Create a new memtable
     auto newMemtable = std::make_unique<SkipList>(12, 0.25);
+
     // Iterate over the current memtable and insert its elements into the new memtable
     memtable->inOrderTraversal(
         [&newMemtable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
@@ -682,7 +679,9 @@ bool LSMT::flushMemtable() {
         std::lock_guard<std::mutex> lock(flushQueueMutex);
         flushQueue.push(std::move(newMemtable));
     }
-    flushQueueCondVar.notify_one();  // Notify the flush thread
+
+    // Notify the flush thread
+    flushQueueCondVar.notify_one();
 
     return true;
 }
@@ -695,16 +694,14 @@ void LSMT::flushThreadFunc() {
         // Wait for a new memtable to be added to the queue
         {
             std::unique_lock<std::mutex> lock(flushQueueMutex);
-            flushQueueCondVar.wait(lock, [this] {
-                return !flushQueue.empty();
-            });
+            flushQueueCondVar.wait(lock, [this] { return !flushQueue.empty(); });
 
             newMemtable = std::move(flushQueue.front());
             flushQueue.pop();
 
             // Check for the sentinel value
             if (newMemtable == nullptr) {
-                break; // Exit the loop if the sentinel value is encountered
+                break;  // Exit the loop if the sentinel value is encountered
             }
         }
 
@@ -736,7 +733,10 @@ void LSMT::flushThreadFunc() {
 
         // We must set minKey and maxKey
         if (!kvPairs.empty()) {
-            // Set minKey and maxKey here
+            sstable->minKey =
+                std::vector<uint8_t>(kvPairs.front().key().begin(), kvPairs.front().key().end());
+            sstable->maxKey =
+                std::vector<uint8_t>(kvPairs.back().key().begin(), kvPairs.back().key().end());
         }
 
         // Serialize the key-value pairs
@@ -793,28 +793,35 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
 // Put puts a key-value pair in the LSMT
 bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
     // Check if we are flushing or compacting
-    std::unique_lock lock(sstablesLock);
-    cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
-    lock.unlock();  // Unlock the mutex
+    {
+        std::unique_lock lock(sstablesLock);
+        cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
+    }  // Automatically unlocks when leaving the scope
 
-    walLock.lock();
-    // Append the operation to the write-ahead log
-    Operation op;
-    op.set_key(key.data(), key.size());
-    op.set_value(value.data(), value.size());
-    op.set_type(static_cast<::OperationType>(OperationType::OpPut));
-
-    if (!wal->WriteOperation(op)) {
-        walLock.unlock();
-        return false;
+    // Check for null pointers
+    if (!wal || !memtable) {
+        throw std::runtime_error("WAL or memtable is not initialized");
     }
-    walLock.unlock();
+
+    // Lock and write to the write-ahead log
+    {
+        std::unique_lock lock(walLock);
+        Operation op;
+        op.set_key(key.data(), key.size());
+        op.set_value(value.data(), value.size());
+        op.set_type(static_cast<::OperationType>(OperationType::OpPut));
+
+        if (!wal->WriteOperation(op)) {
+            return false;  // Return false if writing to the WAL fails
+        }
+    }  // Automatically unlocks when leaving the scope
 
     // Check if value is tombstone
     if (value == std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
         throw std::invalid_argument("value cannot be a tombstone");
     }
 
+    // Insert the key-value pair into the memtable
     memtable->insert(key, value);
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
@@ -840,12 +847,13 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
 
     // Check the memtable for the key
     std::vector<uint8_t> value;
-    { value = memtable->get(key); }  // Automatically unlocks when leaving the scope
+    if (memtable) {
+        value = memtable->get(key);  // Automatically unlocks when leaving the scope
+    }
 
     // If value is found and it's not a tombstone, return it
     if (!value.empty() &&
-        value != std::vector<uint8_t>(std::vector<uint8_t>(
-                     TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)))) {
+        value != std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
         return value;
     }
 

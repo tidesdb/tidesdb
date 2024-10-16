@@ -45,10 +45,10 @@ Whats required to build TidesDB.
 sudo apt-get install libprotobuf-dev protobuf-compiler
 ```
 
-### Bindings
+## Bindings
 - C (coming soon)
 
-### FFI (Foreign Function Interfaces)
+## FFI (Foreign Function Interfaces)
 - Go (coming soon)
 - Python (coming soon)
 - Rust (coming soon)
@@ -58,5 +58,5 @@ sudo apt-get install libprotobuf-dev protobuf-compiler
 - Lua (coming soon)
 - Ruby (coming soon)
 
-### Interested in joining the project?
+## Interested in joining the project?
 Email us at [hello@tidesdb.com](mailto:hello@tidesdb.com)

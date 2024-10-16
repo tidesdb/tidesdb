@@ -41,9 +41,36 @@ Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.
 Whats required to build TidesDB.
 
 ### Protobuf
+#### Installing Protocol Buffers
+
+This document provides instructions for installing Protocol Buffers (protobuf) on Unix-like systems, Windows, and macOS.
+
+##### Unix/Linux
 ```bash
-sudo apt-get install libprotobuf-dev protobuf-compiler
+   sudo apt-get update
+   sudo apt-get install -y protobuf-compiler libprotobuf-dev
+   protoc --version
 ```
+
+##### MacOS
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install protobuf
+protoc --version
+```
+
+##### Windows
+```bash
+vcpkg install protobuf
+```
+
+
+
+
+
+
+
+
 
 ## Bindings
 - C (coming soon)

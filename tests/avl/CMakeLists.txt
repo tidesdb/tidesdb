@@ -15,7 +15,7 @@ include_directories(${Protobuf_INCLUDE_DIRS})
 set(PROTO_SRC ../../proto/kv.pb.cc ../../proto/operation.pb.cc)
 set(PROTO_HDR ../../proto/kv.pb.h ../../proto/operation.pb.h)
 
-add_executable(tidesdb main.cpp ../../libtidesdb.cpp ${PROTO_SRC})
+add_executable(tidesdb avl_tests.cpp ../../libtidesdb.cpp ${PROTO_SRC})
 
 # Link the protobuf library
 target_link_libraries(tidesdb ${Protobuf_LIBRARIES})

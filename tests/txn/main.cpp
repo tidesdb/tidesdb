@@ -1,5 +1,5 @@
 #include <iostream>
 
-#include "../../library.h"
+#include "../../libtidesdb.h"
 
 int main() {}

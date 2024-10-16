@@ -24,7 +24,7 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] Write-ahead logging (WAL queue for faster writes)
 - [x] Recovery/Replay WAL (`RunRecoveredOperations`)
 - [x] In-memory lockless skip list (memtable)
-- [x] Transaction control (`BeginTransaction`, `CommitTransaction`, `RollbackTransaction`)
+- [x] Transaction control (`BeginTransaction`, `CommitTransaction`, `RollbackTransaction`) on failed commit the transaction is automatically rolled back
 - [x] Concurrent safe
 - [x] Tombstone deletion
 - [x] Minimal blocking on flushing, and compaction operations

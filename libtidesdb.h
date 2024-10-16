@@ -27,6 +27,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -303,7 +304,7 @@ class Wal {
     std::shared_mutex lock;  // Mutex for write-ahead log
 
     // WriteOperation writes an operation to the write-ahead log
-    bool WriteOperation(const Operation &op) const;
+    bool WriteOperation(const Operation &op);
 
     // Recover recovers operations from the write-ahead log
     std::vector<Operation> Recover() const;
@@ -311,8 +312,18 @@ class Wal {
     // ReadOperations reads operations from the write-ahead log
     std::vector<Operation> ReadOperations();
 
+    mutable std::mutex queueMutex; // Mutex for operation queue
+    std::condition_variable queueCondVar; // Condition variable for operation queue
+    std::queue<Operation> operationQueue; // Operation queue
+    bool stopBackgroundThread = false; // Stop background thread
+    std::thread backgroundThread; // Background thread
+
+    // backgroundThreadFunc is the function that runs in the background thread
+    // instead of appending on every write, we append to a queue and write in the background to not block the main thread
+    void backgroundThreadFunc();
+
     // Close closes the write-ahead log
-    void Close() const;
+    void Close();
 
    private:
     Pager *pager;                       // Pager instance

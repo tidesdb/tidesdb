@@ -569,6 +569,28 @@ std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
     return {};  // Key not found, return an empty vector
 }
 
+// Close closes the Write-Ahead Log
+void Wal::Close() {
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        stopBackgroundThread = true;
+    }
+    queueCondVar.notify_one();
+    if (backgroundThread.joinable()) {
+        backgroundThread.join();
+    }
+}
+
+// WriteOperation writes an operation to the write-ahead log
+bool Wal::WriteOperation(const Operation &op) {
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        operationQueue.push(op);
+    }
+    queueCondVar.notify_one();
+    return true;
+}
+
 // Recover recovers the write-ahead log
 std::vector<Operation> Wal::Recover() const {
     std::vector<Operation> operations;
@@ -592,28 +614,6 @@ std::vector<Operation> Wal::Recover() const {
     }
 
     return operations;
-}
-
-// WriteOperation writes an operation to the write-ahead log
-bool Wal::WriteOperation(const Operation &op) const {
-    // Serialize the operation
-    std::vector<uint8_t> serializedOp = serializeOperation(op);
-
-    // Check if the WAL file is open
-    if (!pager->GetFile().is_open()) {
-        std::cerr << "Error: WAL file is not open\n";
-        return false;
-    }
-
-    // Write the serialized operation to the WAL
-    try {
-        pager->Write(serializedOp);
-    } catch (const TidesDBException &e) {
-        std::cerr << "Error writing to WAL: " << e.what() << std::endl;
-        return false;
-    }
-
-    return true;  // Return true if successful
 }
 
 // RunRecoveredOperations runs the recovered operations
@@ -710,6 +710,8 @@ bool LSMT::flushMemtable() {
     flushThread.detach();  // Detach the thread to run in the background
     return true;
 }
+
+
 
 // Delete deletes a key from the LSMT
 bool LSMT::Delete(const std::vector<uint8_t> &key) {
@@ -849,12 +851,27 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
 // GetFile gets pager file
 std::fstream &Pager::GetFile() { return file; }
 
-// Close wal
-void Wal::Close() const {
-    if (pager->GetFile().is_open()) {
-        pager->GetFile().close();
+// backgroundThreadFunc is the background thread function for the WAL
+void TidesDB::Wal::backgroundThreadFunc() {
+    while (true) {
+        std::unique_lock<std::mutex> lock(queueMutex);
+        queueCondVar.wait(lock, [this] { return !operationQueue.empty() || stopBackgroundThread; });
+
+        if (stopBackgroundThread && operationQueue.empty()) {
+            break;
+        }
+
+        Operation op = operationQueue.front();
+        operationQueue.pop();
+        lock.unlock();
+
+        // Serialize and write the operation to the WAL
+        std::vector<uint8_t> serializedOp = serializeOperation(op);
+        pager->Write(serializedOp);
     }
 }
+
+
 
 // PagesCount returns the number of pages in the SSTable
 int64_t Pager::PagesCount() {

@@ -903,7 +903,6 @@ void AVLTree::clear() {
     root = nullptr;
 }
 
-
 // Compact
 // Compact merges pairs of SSTables in a trivial non-blocking multithreaded manner
 bool LSMT::Compact() {
@@ -1047,8 +1046,10 @@ Transaction *LSMT::BeginTransaction() {
 }
 
 // AddPut adds a put operation to the transaction.
-void LSMT::AddPut(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
-    auto rollback = std::make_unique<Rollback>(OperationType::OpDelete, key, std::vector<uint8_t>{});
+void LSMT::AddPut(Transaction *tx, const std::vector<uint8_t> &key,
+                  const std::vector<uint8_t> &value) {
+    auto rollback =
+        std::make_unique<Rollback>(OperationType::OpDelete, key, std::vector<uint8_t>{});
 
     Operation op;
     op.set_type(static_cast<::OperationType>(OperationType::OpPut));
@@ -1062,7 +1063,8 @@ void LSMT::AddPut(Transaction *tx, const std::vector<uint8_t> &key, const std::v
 }
 
 // AddDelete adds a delete operation to the transaction.
-void LSMT::AddDelete(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+void LSMT::AddDelete(Transaction *tx, const std::vector<uint8_t> &key,
+                     const std::vector<uint8_t> &value) {
     auto rollback = std::make_unique<Rollback>(OperationType::OpPut, key, value);
 
     Operation op;
@@ -1091,15 +1093,15 @@ bool LSMT::CommitTransaction(Transaction *tx) {
                              std::vector<char>(op.value().begin(), op.value().end())))) {
                     RollbackTransaction(tx);
                     return false;
-                             }
-            break;
+                }
+                break;
             case static_cast<int>(OperationType::OpDelete):
                 if (!Delete(ConvertToUint8Vector(
                         std::vector<char>(op.key().begin(), op.key().end())))) {
                     RollbackTransaction(tx);
                     return false;
-                        }
-            break;
+                }
+                break;
         }
     }
 

@@ -1,7 +1,8 @@
-#include <iostream>
-#include <vector>
 #include <cassert>
 #include <filesystem>
+#include <iostream>
+#include <vector>
+
 #include "../../libtidesdb.h"
 
 void printResult(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &result) {
@@ -21,7 +22,8 @@ void printResult(const std::vector<std::pair<std::vector<uint8_t>, std::vector<u
 bool expect(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &result,
             const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &expected) {
     if (result.size() != expected.size()) {
-        std::cerr << "Size mismatch: expected " << expected.size() << " but got " << result.size() << std::endl;
+        std::cerr << "Size mismatch: expected " << expected.size() << " but got " << result.size()
+                  << std::endl;
         return false;
     }
     for (size_t i = 0; i < result.size(); ++i) {
@@ -63,7 +65,8 @@ int main() {
 
     try {
         // Initialize the LSMT
-        auto lsmTree = TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
+        auto lsmTree =
+            TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
 
         // Begin a transaction
         auto transaction1 = lsmTree->BeginTransaction();

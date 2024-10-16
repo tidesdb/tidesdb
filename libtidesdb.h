@@ -379,8 +379,8 @@ class SSTableIterator {
             return std::nullopt;
         }
 
-        auto data = pager->Read(currentPage++); // Read the page
-        return deserialize(data); // Deserialize the data
+        auto data = pager->Read(currentPage++);  // Read the page
+        return deserialize(data);                // Deserialize the data
     }
 
    private:
@@ -466,10 +466,12 @@ class LSMT {
     bool RunRecoveredOperations(const std::vector<Operation> &operations);
 
     // AddDelete adds a delete operation to a transaction
-    static void AddDelete(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
+    static void AddDelete(Transaction *tx, const std::vector<uint8_t> &key,
+                          const std::vector<uint8_t> &value);
 
     // AddPut adds a put operation to a transaction
-    static void AddPut(Transaction *tx, const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
+    static void AddPut(Transaction *tx, const std::vector<uint8_t> &key,
+                       const std::vector<uint8_t> &value);
 
     // Get returns the value for a given key
     std::vector<uint8_t> Get(const std::vector<uint8_t> &key);

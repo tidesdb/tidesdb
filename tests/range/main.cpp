@@ -1,6 +1,7 @@
+#include <cassert>
 #include <iostream>
 #include <vector>
-#include <cassert>
+
 #include "../../libtidesdb.h"
 
 void printResult(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &result) {
@@ -20,7 +21,8 @@ void printResult(const std::vector<std::pair<std::vector<uint8_t>, std::vector<u
 bool expect(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &result,
             const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &expected) {
     if (result.size() != expected.size()) {
-        std::cerr << "Size mismatch: expected " << expected.size() << " but got " << result.size() << std::endl;
+        std::cerr << "Size mismatch: expected " << expected.size() << " but got " << result.size()
+                  << std::endl;
         return false;
     }
     for (size_t i = 0; i < result.size(); ++i) {
@@ -78,11 +80,9 @@ int main() {
         auto rangeResult = lsmTree->Range({0, 0, 0, 0}, {10, 10, 10, 10});
         printResult(rangeResult);
         std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> expectedRange = {
-            {{0, 0, 0, 0}, {0}}, {{1, 1, 1, 1}, {1}}, {{2, 2, 2, 2}, {2}},
-            {{3, 3, 3, 3}, {3}}, {{4, 4, 4, 4}, {4}}, {{5, 5, 5, 5}, {5}},
-            {{6, 6, 6, 6}, {6}}, {{7, 7, 7, 7}, {7}}, {{8, 8, 8, 8}, {8}},
-            {{9, 9, 9, 9}, {9}}, {{10, 10, 10, 10}, {10}}
-        };
+            {{0, 0, 0, 0}, {0}}, {{1, 1, 1, 1}, {1}}, {{2, 2, 2, 2}, {2}},     {{3, 3, 3, 3}, {3}},
+            {{4, 4, 4, 4}, {4}}, {{5, 5, 5, 5}, {5}}, {{6, 6, 6, 6}, {6}},     {{7, 7, 7, 7}, {7}},
+            {{8, 8, 8, 8}, {8}}, {{9, 9, 9, 9}, {9}}, {{10, 10, 10, 10}, {10}}};
         assert(expect(rangeResult, expectedRange) && "Range test failed");
 
         // Test the LessThan function
@@ -90,11 +90,9 @@ int main() {
         auto lessThanResult = lsmTree->LessThan({10, 10, 10, 10});
         printResult(lessThanResult);
         std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> expectedLessThan = {
-            {{0, 0, 0, 0}, {0}}, {{1, 1, 1, 1}, {1}}, {{2, 2, 2, 2}, {2}},
-            {{3, 3, 3, 3}, {3}}, {{4, 4, 4, 4}, {4}}, {{5, 5, 5, 5}, {5}},
-            {{6, 6, 6, 6}, {6}}, {{7, 7, 7, 7}, {7}}, {{8, 8, 8, 8}, {8}},
-            {{9, 9, 9, 9}, {9}}
-        };
+            {{0, 0, 0, 0}, {0}}, {{1, 1, 1, 1}, {1}}, {{2, 2, 2, 2}, {2}}, {{3, 3, 3, 3}, {3}},
+            {{4, 4, 4, 4}, {4}}, {{5, 5, 5, 5}, {5}}, {{6, 6, 6, 6}, {6}}, {{7, 7, 7, 7}, {7}},
+            {{8, 8, 8, 8}, {8}}, {{9, 9, 9, 9}, {9}}};
         assert(expect(lessThanResult, expectedLessThan) && "LessThan test failed");
 
         // Test the GreaterThan function
@@ -102,12 +100,9 @@ int main() {
         auto greaterThanResult = lsmTree->GreaterThan({10, 10, 10, 10});
         printResult(greaterThanResult);
         std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> expectedGreaterThan = {
-            {{11, 11, 11, 11}, {11}}, {{12, 12, 12, 12}, {12}},
-            {{13, 13, 13, 13}, {13}}, {{14, 14, 14, 14}, {14}},
-            {{15, 15, 15, 15}, {15}}, {{16, 16, 16, 16}, {16}},
-            {{17, 17, 17, 17}, {17}}, {{18, 18, 18, 18}, {18}},
-            {{19, 19, 19, 19}, {19}}
-        };
+            {{11, 11, 11, 11}, {11}}, {{12, 12, 12, 12}, {12}}, {{13, 13, 13, 13}, {13}},
+            {{14, 14, 14, 14}, {14}}, {{15, 15, 15, 15}, {15}}, {{16, 16, 16, 16}, {16}},
+            {{17, 17, 17, 17}, {17}}, {{18, 18, 18, 18}, {18}}, {{19, 19, 19, 19}, {19}}};
         assert(expect(greaterThanResult, expectedGreaterThan) && "GreaterThan test failed");
 
         // Test the NRange function
@@ -115,36 +110,32 @@ int main() {
         auto nrangeResult = lsmTree->NRange({0, 0, 0, 0}, {10, 10, 10, 10});
         printResult(nrangeResult);
         std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> expectedNRange = {
-            {{11, 11, 11, 11}, {11}}, {{12, 12, 12, 12}, {12}},
-            {{13, 13, 13, 13}, {13}}, {{14, 14, 14, 14}, {14}},
-            {{15, 15, 15, 15}, {15}}, {{16, 16, 16, 16}, {16}},
-            {{17, 17, 17, 17}, {17}}, {{18, 18, 18, 18}, {18}},
-            {{19, 19, 19, 19}, {19}}
-        };
+            {{11, 11, 11, 11}, {11}}, {{12, 12, 12, 12}, {12}}, {{13, 13, 13, 13}, {13}},
+            {{14, 14, 14, 14}, {14}}, {{15, 15, 15, 15}, {15}}, {{16, 16, 16, 16}, {16}},
+            {{17, 17, 17, 17}, {17}}, {{18, 18, 18, 18}, {18}}, {{19, 19, 19, 19}, {19}}};
         assert(expect(nrangeResult, expectedNRange) && "NRange test failed");
 
         // Test the GreaterThanEqual function
         std::cout << "GreaterThanEqual [10,10,10,10]:" << std::endl;
         auto greaterThanEqualResult = lsmTree->GreaterThanEq({10, 10, 10, 10});
         printResult(greaterThanEqualResult);
-        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> expectedGreaterThanEqual = {
-            {{10, 10, 10, 10}, {10}}, {{11, 11, 11, 11}, {11}}, {{12, 12, 12, 12}, {12}},
-            {{13, 13, 13, 13}, {13}}, {{14, 14, 14, 14}, {14}}, {{15, 15, 15, 15}, {15}},
-            {{16, 16, 16, 16}, {16}}, {{17, 17, 17, 17}, {17}}, {{18, 18, 18, 18}, {18}},
-            {{19, 19, 19, 19}, {19}}
-        };
-        assert(expect(greaterThanEqualResult, expectedGreaterThanEqual) && "GreaterThanEqual test failed");
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
+            expectedGreaterThanEqual = {{{10, 10, 10, 10}, {10}}, {{11, 11, 11, 11}, {11}},
+                                        {{12, 12, 12, 12}, {12}}, {{13, 13, 13, 13}, {13}},
+                                        {{14, 14, 14, 14}, {14}}, {{15, 15, 15, 15}, {15}},
+                                        {{16, 16, 16, 16}, {16}}, {{17, 17, 17, 17}, {17}},
+                                        {{18, 18, 18, 18}, {18}}, {{19, 19, 19, 19}, {19}}};
+        assert(expect(greaterThanEqualResult, expectedGreaterThanEqual) &&
+               "GreaterThanEqual test failed");
 
         // Test the LessThanEqual function
         std::cout << "LessThanEqual [10,10,10,10]:" << std::endl;
         auto lessThanEqualResult = lsmTree->LessThanEq({10, 10, 10, 10});
         printResult(lessThanEqualResult);
         std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> expectedLessThanEqual = {
-            {{0, 0, 0, 0}, {0}}, {{1, 1, 1, 1}, {1}}, {{2, 2, 2, 2}, {2}},
-            {{3, 3, 3, 3}, {3}}, {{4, 4, 4, 4}, {4}}, {{5, 5, 5, 5}, {5}},
-            {{6, 6, 6, 6}, {6}}, {{7, 7, 7, 7}, {7}}, {{8, 8, 8, 8}, {8}},
-            {{9, 9, 9, 9}, {9}}, {{10, 10, 10, 10}, {10}}
-        };
+            {{0, 0, 0, 0}, {0}}, {{1, 1, 1, 1}, {1}}, {{2, 2, 2, 2}, {2}},     {{3, 3, 3, 3}, {3}},
+            {{4, 4, 4, 4}, {4}}, {{5, 5, 5, 5}, {5}}, {{6, 6, 6, 6}, {6}},     {{7, 7, 7, 7}, {7}},
+            {{8, 8, 8, 8}, {8}}, {{9, 9, 9, 9}, {9}}, {{10, 10, 10, 10}, {10}}};
         assert(expect(lessThanEqualResult, expectedLessThanEqual) && "LessThanEqual test failed");
 
         lsmTree->Close();

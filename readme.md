@@ -38,12 +38,10 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.
 
 ## Requirements
-Whats required to build TidesDB.
+Whats required to build TidesDB?
 
 ### Protobuf
 #### Installing Protocol Buffers
-
-This document provides instructions for installing Protocol Buffers (protobuf) on Unix-like systems, Windows, and macOS.
 
 ##### Unix/Linux
 ```bash

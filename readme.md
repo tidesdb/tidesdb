@@ -54,7 +54,6 @@ This document provides instructions for installing Protocol Buffers (protobuf) o
 
 ##### MacOS
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 brew install protobuf
 protoc --version
 ```

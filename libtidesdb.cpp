@@ -461,8 +461,8 @@ std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
       current = current->right;
     } else {
         // check if tombstone
-        if (current->value == std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
-            return {};
+        if (current->value == std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
+            // Handle tombstone
         }
 
       return current->value; // Key found, return the value
@@ -572,8 +572,6 @@ bool LSMT::flushMemtable() {
         lock.unlock();
     }
 
-    std::cout << "Flushing memtable to SSTable " << sstableCounter << std::endl;
-
     // Write the key-value pairs to the SSTable
     std::string sstablePath = directory + getPathSeparator() + "sstable_" +
                               std::to_string(sstableCounter) +
@@ -629,18 +627,18 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
         op.set_key(key.data(), key.size());
 
         if (!wal->WriteOperation(op)) {
-            return false; // Handle failure appropriately
+            return false; // Return false if writing to the WAL fails
         }
     } // Automatically unlocks when leaving the scope
 
     // Lock memtable for writing
     {
         std::unique_lock lock(memtableLock);
-        memtable->insert(key, std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end()));
+        memtable->insert(key, std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)));
     } // Automatically unlocks when leaving the scope
 
     // Increase the memtable size
-    memtableSize.fetch_add(key.size() + TOMBSTONE_VALUE.size());
+    memtableSize.fetch_add(key.size() + strlen(TOMBSTONE_VALUE));
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
     if (memtableSize.load() > memtableFlushSize) {
@@ -675,7 +673,7 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
     walLock.unlock();
 
     // Check if value is tombstone
-    if (value == std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+    if (value == std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
         throw std::invalid_argument("value cannot be a tombstone");
     }
 
@@ -718,7 +716,8 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
     } // Automatically unlocks when leaving the scope
 
     // If value is found and it's not a tombstone, return it
-    if (!value.empty() && value != std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+    if (!value.empty() && value != std::vector<uint8_t>(std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)))) {
+        std::cout << "Key found in Memtable\n";
         return value;
     }
 
@@ -743,13 +742,13 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
             }
 
             // Check for tombstones
-            if (ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end())) ==
-                std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
-                continue;
+            if (std::string(kv->value().begin(), kv->value().end()) == TOMBSTONE_VALUE) {
+                return {};
             }
 
             // Check for the key
             if (key == ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))) {
+                std::cout << "Key found in SSTable\n";
                 return ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()));
             }
         }
@@ -792,7 +791,6 @@ std::string SSTable::GetFilePath() const { return pager->GetFileName(); }
 
 // Compact compacts the SSTables into a single
 bool LSMT::Compact() {
-    std::cout << "Compacting SSTables\n";
     isCompacting.store(1); // Set the compaction flag
 
     std::vector<std::future<void>> futures;
@@ -807,7 +805,6 @@ bool LSMT::Compact() {
         }
     }
 
-    std::cout << "Amount of pairs: " << sstablePairs.size() << std::endl;
 
     for (const auto& pair : sstablePairs) {
         futures.push_back(std::async(std::launch::async, [this, pair] {
@@ -845,7 +842,7 @@ bool LSMT::Compact() {
             while (currentKey1.has_value() || currentKey2.has_value()) {
                 try {
                     if (currentKey1.has_value() && (!currentKey2.has_value() || *currentKey1 <= *currentKey2)) {
-                        if (currentValue1 != std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+                        if (currentValue1 != std::vector<uint8_t>(std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)))) {
                             newMemtable->insert(*currentKey1, *currentValue1);
                         }
                         // Advance iterator for key1
@@ -858,7 +855,7 @@ bool LSMT::Compact() {
                             currentValue1.reset();
                         }
                     } else {
-                        if (currentValue2 != std::vector<uint8_t>(TOMBSTONE_VALUE.begin(), TOMBSTONE_VALUE.end())) {
+                        if (currentValue2 != std::vector<uint8_t>(std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)))) {
                             newMemtable->insert(*currentKey2, *currentValue2);
                         }
                         // Advance iterator for key2
@@ -882,7 +879,6 @@ bool LSMT::Compact() {
 
             // Check if the new memtable has entries before writing
             if (newMemtable->GetSize() > 0) {
-                std::cout << "Merging SSTables with memtable size: " << newMemtable->GetSize() << std::endl;
                 std::string sstablePath = directory + getPathSeparator() + "sstable_merged_" + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) + SSTABLE_EXTENSION;
                 auto newSSTable = std::make_shared<SSTable>(new Pager(sstablePath, std::ios::in | std::ios::out | std::ios::trunc));
 
@@ -898,8 +894,6 @@ bool LSMT::Compact() {
                     std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
                     sstables.push_back(newSSTable);
                 }
-            } else {
-                std::cout << "No entries in memtable; skipping SSTable write." << std::endl;
             }
 
             // Delete the old SSTables
@@ -913,7 +907,6 @@ bool LSMT::Compact() {
     }
 
     isCompacting.store(0);
-    std::cout << "Done compacting SSTables\n";
     return true;
 }
 

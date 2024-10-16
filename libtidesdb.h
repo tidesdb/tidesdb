@@ -40,7 +40,7 @@
 namespace TidesDB {
 
 constexpr std::string SSTABLE_EXTENSION = ".sst";      // SSTable file extension
-constexpr std::string TOMBSTONE_VALUE = "$tombstone";  // Tombstone value
+constexpr const char* TOMBSTONE_VALUE = "$tombstone";  // Tombstone value
 constexpr std::string WAL_EXTENSION = ".wal";          // Write-ahead log file extension
 
 // ConvertToUint8Vector converts a vector of characters to a vector of unsigned

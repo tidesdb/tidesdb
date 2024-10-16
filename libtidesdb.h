@@ -129,7 +129,7 @@ private:
     float probability;  // Probability of a node having a higher level
     std::shared_ptr<SkipListNode> head;
     std::atomic<int> level;  // Current level of the skip list
-    int cachedSize;  // Cached size of the skip list
+    std::atomic<int> cachedSize;  // should be atomic because it is accessed by multiple threads, this helps us avoid traversing the list to get the size
     // randomLevel generates a random level for a new node
     int randomLevel() const;
 public:
@@ -143,19 +143,20 @@ public:
     void insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
 
     // deleteKV deletes a key from the skip list
-        void deleteKV(const std::vector<uint8_t> &key);
+    void deleteKV(const std::vector<uint8_t> &key);
 
     // get gets the value for a given key
     std::vector<uint8_t> get(const std::vector<uint8_t> &key);
 
     // inOrderTraversal traverses the skip list in in-order traversal and calls a function on each node
-    void inOrderTraversal(std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func);
+    void inOrderTraversal(std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const;
 
     // getSize returns the number of nodes in the skip list
     int getSize();
 
     // clear clears the skip list
     void clear();
+
 
 
 };

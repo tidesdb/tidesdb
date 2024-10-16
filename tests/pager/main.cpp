@@ -1,6 +1,6 @@
 #include <iostream>
 
-#include "../../library.h"
+#include "../../libtidesdb.h"
 
 std::vector<uint8_t> convertToUint8Vector(const std::vector<char> &input) {
     return std::vector<uint8_t>(input.begin(), input.end());

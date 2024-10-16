@@ -338,12 +338,14 @@ void SkipList::clear() {
 }
 
 // height returns the height of the AVL tree node
+// @deprecated
 int AVLTree::height(AVLNode *node) {
     if (node == nullptr) return 0;
     return node->height;
 }
 
 // GetSize returns the size of the AVL tree
+// @deprecated
 int AVLTree::GetSize(AVLNode *node) {
     if (node == nullptr) {
         return 0;
@@ -358,6 +360,7 @@ int AVLTree::GetSize() {
 }
 
 // rightRotate performs a right rotation on the AVL tree node
+// @deprecated
 AVLNode *AVLTree::rightRotate(AVLNode *y) {
     AVLNode *x = y->left;
     AVLNode *T2 = x->right;
@@ -372,6 +375,7 @@ AVLNode *AVLTree::rightRotate(AVLNode *y) {
 }
 
 // leftRotate performs a left rotation on the AVL tree node
+// @deprecated
 AVLNode *AVLTree::leftRotate(AVLNode *x) {
     AVLNode *y = x->right;
     AVLNode *T2 = y->left;
@@ -386,12 +390,14 @@ AVLNode *AVLTree::leftRotate(AVLNode *x) {
 }
 
 // getBalance returns the balance factor of the AVL tree node
+// @deprecated
 int AVLTree::getBalance(AVLNode *node) {
     if (node == nullptr) return 0;
     return height(node->left) - height(node->right);
 }
 
 // insert inserts a key-value pair into the AVL tree
+// @deprecated
 AVLNode *AVLTree::insert(AVLNode *node, const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) {
     if (node == nullptr) return new AVLNode(key, value);
@@ -428,6 +434,7 @@ AVLNode *AVLTree::insert(AVLNode *node, const std::vector<uint8_t> &key,
 }
 
 // printHex prints the hex representation of the data
+// @deprecated
 void AVLTree::printHex(const std::vector<uint8_t> &data) {
     for (auto byte : data) {
         std::cout << std::hex << static_cast<int>(byte) << " ";
@@ -436,6 +443,7 @@ void AVLTree::printHex(const std::vector<uint8_t> &data) {
 }
 
 // deleteNode deletes a key-value pair from the AVL tree
+// @deprecated
 AVLNode *AVLTree::deleteNode(AVLNode *root, const std::vector<uint8_t> &key) {
     if (root == nullptr) return root;
 
@@ -488,6 +496,7 @@ AVLNode *AVLTree::deleteNode(AVLNode *root, const std::vector<uint8_t> &key) {
 }
 
 // minValueNode returns the node with the minimum value in the AVL tree
+// @deprecated
 AVLNode *AVLTree::minValueNode(AVLNode *node) {
     AVLNode *current = node;
     while (current->left != nullptr) current = current->left;
@@ -496,15 +505,18 @@ AVLNode *AVLTree::minValueNode(AVLNode *node) {
 
 // insert inserts a key-value pair into the AVL tree
 // will update the value if the key already exists
+// @deprecated
 void AVLTree::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
     std::unique_lock<std::shared_mutex> lock(rwlock);
     root = insert(root, key, value);
 }
 
 // deleteKV deletes a key-value pair from the AVL tree
+// @deprecated
 void AVLTree::deleteKV(const std::vector<uint8_t> &key) { deleteKey(key); }
 
 // inOrder prints the key-value pairs in the AVL tree in order
+// @deprecated
 void AVLTree::inOrder(AVLNode *node) {
     if (node != nullptr) {
         inOrder(node->left);
@@ -514,6 +526,7 @@ void AVLTree::inOrder(AVLNode *node) {
 }
 
 // inOrder prints the key-value pairs in the AVL tree in order
+// @deprecated
 void AVLTree::inOrder() {
     std::shared_lock<std::shared_mutex> lock(rwlock);
     inOrder(root);
@@ -521,6 +534,7 @@ void AVLTree::inOrder() {
 
 // inOrderTraversal traverses the AVL tree in order and calls the function on
 // each node
+// @deprecated
 void AVLTree::inOrderTraversal(
     AVLNode *node,
     std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) {
@@ -533,6 +547,7 @@ void AVLTree::inOrderTraversal(
 
 // inOrderTraversal traverses the AVL tree in order and calls the function on
 // each node
+// @deprecated
 void AVLTree::inOrderTraversal(
     std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) {
     std::shared_lock<std::shared_mutex> lock(rwlock);
@@ -540,12 +555,14 @@ void AVLTree::inOrderTraversal(
 }
 
 // deleteKey deletes a key from the AVL tree
+// @deprecated
 void AVLTree::deleteKey(const std::vector<uint8_t> &key) {
     std::unique_lock<std::shared_mutex> lock(rwlock);
     root = deleteNode(root, key);
 }
 
 // Get returns the value for a given key
+// @deprecated
 std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
     std::shared_lock<std::shared_mutex> lock(rwlock);
     AVLNode *current = root;
@@ -649,16 +666,13 @@ bool LSMT::flushMemtable() {
     auto newMemtable = std::make_unique<AVLTree>();
 
     // Iterate over the current memtable and insert its elements into the new memtable
-    {
-        memtable->inOrderTraversal(
-            [&newMemtable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
-                newMemtable->insert(key, value);
-            });
-        memtable->clear();
-    }
+    memtable->inOrderTraversal(
+        [&newMemtable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+            newMemtable->insert(key, value);
+        });
 
     // Start a background thread for flushing
-    std::thread flushThread([this, newMemtable = std::move(newMemtable)]() mutable {
+    flushThread = std::thread([this, newMemtable = std::move(newMemtable)]() mutable {
         std::vector<KeyValue> kvPairs;  // Key-value pairs to be written to the SSTable
 
         // Populate kvPairs with key-value pairs from the new memtable
@@ -806,7 +820,6 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
     if (!value.empty() &&
         value != std::vector<uint8_t>(std::vector<uint8_t>(
                      TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)))) {
-        std::cout << "Key found in Memtable\n";
         return value;
     }
 
@@ -838,7 +851,6 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
             // Check for the key
             if (key ==
                 ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))) {
-                std::cout << "Key found in SSTable\n";
                 return ConvertToUint8Vector(
                     std::vector<char>(kv->value().begin(), kv->value().end()));
             }

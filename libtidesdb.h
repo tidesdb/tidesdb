@@ -393,7 +393,10 @@ class LSMT {
     }
 
     // Destructor
-    ~LSMT() {}
+    ~LSMT() {
+
+
+    }
 
     // Put inserts a key-value pair into the LSMT
     bool Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
@@ -455,22 +458,30 @@ class LSMT {
 
     // Close closes the LSMT
     void Close() {
+        // Commits any active transactions
+        for (auto tx : activeTransactions) {
+            CommitTransaction(tx);
+        }
+
         // Flush the memtable to disk
         if (!flushMemtable()) {
             std::cerr << "Failed to flush memtable during close\n";
         }
 
-        // Clear the memtable
-        memtable->clear();
+        // Wait for the flush thread to finish
+        if (flushThread.joinable()) {
+            flushThread.join();
+        }
+
+
+        // Close the write-ahead log
+        wal->Close();
 
         // Clear the list of SSTables
         {
             std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
             sstables.clear();
         }
-
-        // Close the write-ahead log
-        wal->Close();
     }
 
     // New creates a new LSMT instance
@@ -522,6 +533,7 @@ class LSMT {
     std::atomic<int32_t> isCompacting;       // Whether the SSTables are being compacted
     int memtableFlushSize;                   // Memtable flush size
     std::vector<std::future<void>> futures;  // List of futures, used for flushing and compacting
+    std::thread flushThread;                 // Thread for flushing
 
     // Create a thread pool, could be configurable in the future
     const size_t compactionThreads = std::thread::hardware_concurrency();  // Number of threads used

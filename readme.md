@@ -47,9 +47,9 @@ This document provides instructions for installing Protocol Buffers (protobuf) o
 
 ##### Unix/Linux
 ```bash
-   sudo apt-get update
-   sudo apt-get install -y protobuf-compiler libprotobuf-dev
-   protoc --version
+sudo apt-get update
+sudo apt-get install -y protobuf-compiler libprotobuf-dev
+protoc --version
 ```
 
 ##### MacOS

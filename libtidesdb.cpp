@@ -107,6 +107,9 @@ Pager::~Pager() {}
 
 // Pager::Write writes data to the paged file, creating overflow pages if necessary
 int64_t Pager::Write(const std::vector<uint8_t> &data) {
+    std::unique_lock<std::shared_mutex> fileLock(fileMutex);
+
+
     if (!file.is_open()) {
         throw TidesDBException("File is not open");
     }
@@ -115,11 +118,16 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
         throw TidesDBException("Data is empty");
     }
 
+
+
     file.seekg(0, std::ios::end);
     int64_t page_number = file.tellg() / PAGE_SIZE;
 
     int64_t data_written = 0;
     int64_t current_page = page_number;
+
+    // Create new page lock
+    pageLocks.push_back(std::make_shared<std::shared_mutex>());
 
     while (data_written < data.size()) {
         file.seekp(current_page * PAGE_SIZE);
@@ -149,6 +157,9 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
         }
 
         current_page++;
+
+        // Create a new page lock
+        pageLocks.push_back(std::make_shared<std::shared_mutex>());
     }
 
     return page_number;
@@ -196,7 +207,12 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
     }
 
     int64_t current_page = overflow_page;
+
+
+
     while (current_page != -1) {
+        std::shared_lock overflow_lock(*pageLocks[current_page]);
+
         file.seekg(current_page * PAGE_SIZE);
         if (file.fail()) {
             throw TidesDBException("Failed to seek to overflow page: " +

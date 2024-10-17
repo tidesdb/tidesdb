@@ -1,8 +1,9 @@
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <random>
 #include <vector>
-#include <filesystem>
+
 #include "../libtidesdb.h"
 
 // Function to generate random data

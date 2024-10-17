@@ -36,4 +36,18 @@ int main() {
     } else {
         std::cout << "Get after delete test failed" << std::endl;
     }
+
+    // Time and insert 1,000,000 key-value pairs
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < 1000000; ++i) {
+        std::vector<uint8_t> key = {static_cast<uint8_t>(i)};
+        std::vector<uint8_t> value = {static_cast<uint8_t>(i)};
+        tree.insert(key, value);
+    }
+
+    std::cout
+        << "Time taken to insert 1,000,000 key-value pairs: "
+        << std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count()
+        << " seconds" << std::endl;
 }

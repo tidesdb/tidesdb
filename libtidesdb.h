@@ -28,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <random>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -111,14 +112,13 @@ constexpr int PAGE_BODY_SIZE = PAGE_SIZE - PAGE_HEADER_SIZE;  // Page body size
 // SkipListNode is a node in a skip list
 class SkipListNode {
    public:
-    std::vector<uint8_t> key;                          // Key
-    std::vector<uint8_t> value;                        // Value
-    std::vector<std::atomic<SkipListNode *>> forward;  // Forward pointers
+    std::vector<uint8_t> key;
+    std::vector<uint8_t> value;
+    std::vector<std::atomic<SkipListNode *>> forward;
 
-    // Constructor
     SkipListNode(const std::vector<uint8_t> &k, const std::vector<uint8_t> &v, int level)
-        : key(k), value(v), forward(level) {
-        for (int i = 0; i < level; ++i) {
+        : key(k), value(v), forward(level + 1) {
+        for (int i = 0; i <= level; ++i) {
             forward[i].store(nullptr, std::memory_order_relaxed);
         }
     }
@@ -129,23 +129,30 @@ class SkipList {
    private:
     int maxLevel;       // Maximum level of the skip list
     float probability;  // Probability of a node having a higher level
+    std::atomic<int> level;
     std::shared_ptr<SkipListNode> head;
-    std::atomic<int> level;       // Current level of the skip list
-    std::atomic<int> cachedSize;  // should be atomic because it is accessed by multiple threads,
-                                  // this helps us avoid traversing the list to get the size
+    std::mt19937 gen;                      // Random number generator
+    std::uniform_real_distribution<> dis;  // Uniform distribution
+    std::atomic<int> cachedSize;           // Size of the skip list
+
     // randomLevel generates a random level for a new node
-    int randomLevel() const;
+    int randomLevel();
 
    public:
     // Constructor
     SkipList(int maxLevel, float probability)
-        : maxLevel(maxLevel), probability(probability), level(0) {
-        head = std::make_shared<SkipListNode>(std::vector<uint8_t>(), std::vector<uint8_t>(),
+        : maxLevel(maxLevel),
+          probability(probability),
+          level(0),
+          gen(std::random_device{}()),
+          dis(0, RAND_MAX),
+          cachedSize(0) {
+        head = std::make_unique<SkipListNode>(std::vector<uint8_t>(), std::vector<uint8_t>(),
                                               maxLevel);
     }
 
     // insert inserts a key-value pair into the skip list
-    void insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
+    bool insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
 
     // deleteKV deletes a key from the skip list
     void deleteKV(const std::vector<uint8_t> &key);

@@ -10,7 +10,7 @@ int main() {
     std::string directory = "./tidesdb_data";  // The directory for storing data
     std::filesystem::perms directoryPerm =
         std::filesystem::perms::owner_all | std::filesystem::perms::group_read;  // Permissions
-    int memtableFlushSize = 10 * 1024;  // Example flush size (10 KB)
+    int memtableFlushSize = 6 * 4;  // Flush size to trigger after 6 key-value pairs (24 bytes)
     int compactionInterval = 8;
 
     try {
@@ -18,8 +18,8 @@ int main() {
         auto lsmTree =
             TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
 
-        // Insert enough data to trigger a flush
-        for (int i = 0; i < 1000; i++) {
+        // Insert 12 key-value pairs to trigger two flushes
+        for (int i = 0; i < 12; i++) {
             std::vector<uint8_t> key = {
                 static_cast<uint8_t>((i >> 16) & 0xFF),  // First byte
                 static_cast<uint8_t>((i >> 8) & 0xFF),   // Second byte
@@ -30,9 +30,13 @@ int main() {
             lsmTree->Put(key, value);
         }
 
-        // Check for all 1000 keys
-        for (int i = 0; i < 1000; i++) {
-            std::vector<uint8_t> key(4, i);
+        // Check for all 12 keys
+        for (int i = 0; i < 12; i++) {
+            std::vector<uint8_t> key = {
+                static_cast<uint8_t>((i >> 16) & 0xFF),  // First byte
+                static_cast<uint8_t>((i >> 8) & 0xFF),   // Second byte
+                static_cast<uint8_t>(i & 0xFF)           // Third byte
+            };
             std::vector<uint8_t> dat = lsmTree->Get(key);
 
             if (dat.size() == 0) {

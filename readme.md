@@ -29,7 +29,7 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] Minimal blocking on flushing, and compaction operations
 - [x] Background memtable flushing
 - [x] Background paired multithreaded compaction
-- [x] Configurable options
+- [x] Configurable memtable and compaction options
 - [x] Support for large amounts of data
 - [x] Threadsafe
 - [x] Granular page locking mechanisms on reads

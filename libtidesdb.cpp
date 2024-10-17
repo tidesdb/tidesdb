@@ -115,6 +115,9 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
         throw TidesDBException("Data is empty");
     }
 
+    // Lock the file mutex
+    std::unique_lock<std::shared_mutex> lock(fileMutex);
+
     file.seekg(0, std::ios::end);
     int64_t page_number = file.tellg() / PAGE_SIZE;
 
@@ -122,6 +125,11 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
     int64_t current_page = page_number;
 
     while (data_written < data.size()) {
+        // A little check if we need to add a new lock for the current page, just in case
+        if (current_page >= pageLocks.size()) {
+            pageLocks.push_back(std::make_shared<std::shared_mutex>());
+        }
+
         file.seekp(current_page * PAGE_SIZE);
         if (file.fail()) {
             throw TidesDBException("Failed to seek to page: " + std::to_string(current_page));
@@ -145,6 +153,7 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
         // Pad the body if necessary
         if (chunk_size < PAGE_BODY_SIZE) {
             std::vector<uint8_t> body_padding(PAGE_BODY_SIZE - chunk_size, '\0');
+
             file.write(reinterpret_cast<const char *>(body_padding.data()), body_padding.size());
         }
 
@@ -174,6 +183,10 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
         throw TidesDBException("Invalid page number");
     }
 
+    // We will calculate the page index and acquire the page lock
+    int64_t pageIndex = page_number % pageLocks.size();
+    std::shared_lock<std::shared_mutex> pageLock(*pageLocks[pageIndex]);
+
     file.seekg(page_number * PAGE_SIZE);
     if (file.fail()) {
         throw TidesDBException("Failed to seek to page: " + std::to_string(page_number));
@@ -197,6 +210,11 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
 
     int64_t current_page = overflow_page;
     while (current_page != -1) {
+        // We will calculate the page index and acquire the overflow page lock
+        pageIndex = current_page % pageLocks.size();
+        std::shared_lock<std::shared_mutex> overflowPageLock(
+            *pageLocks[pageIndex]);  // Will unlock when out of scope
+
         file.seekg(current_page * PAGE_SIZE);
         if (file.fail()) {
             throw TidesDBException("Failed to seek to overflow page: " +

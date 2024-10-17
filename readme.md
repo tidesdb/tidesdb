@@ -84,4 +84,7 @@ vcpkg install protobuf
 - Ruby (coming soon)
 
 ## Interested in joining the project?
-Email us at [hello@tidesdb.com](mailto:hello@tidesdb.com)
+Hey you, yeah you!  Are you interested in joining the TidesDB project?
+We are always looking for talented individuals to join our open-source project.
+
+Email us at [hello@tidesdb.com](mailto:hello@tidesdb.com) with some information about yourself and how you can contribute to the project.

@@ -276,10 +276,10 @@ class AVLTree {
 // Manages reading and writing pages to a file
 class Pager {
    private:
-    std::string fileName;  // File name
-    std::fstream file;     // File stream
-    std::vector<std::shared_ptr<std::shared_mutex>> pageLocks; // Lock for each page
-    std::shared_mutex fileMutex; // Mutex for writing to the file
+    std::string fileName;                                       // File name
+    std::fstream file;                                          // File stream
+    std::vector<std::shared_ptr<std::shared_mutex>> pageLocks;  // Lock for each page
+    std::shared_mutex fileMutex;                                // Mutex for writing to the file
    public:
     // Constructor
     Pager(const std::string &filename, std::ios::openmode mode);
@@ -546,14 +546,13 @@ class LSMT {
             // Close the write-ahead log
             wal->Close();
 
-
-
             {
-                std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock); // Lock the SSTables
+                std::unique_lock<std::shared_mutex> sstablesLockGuard(
+                    sstablesLock);  // Lock the SSTables
 
                 // Iterate over the SSTables and close them
                 for (const auto &sstable : sstables) {
-                   sstable->pager->Close();
+                    sstable->pager->Close();
                 }
 
                 // Clear the list of SSTables
@@ -604,9 +603,9 @@ class LSMT {
     std::shared_mutex activeTransactionsLock;        // Mutex for active transactions
     std::vector<std::shared_ptr<SSTable>> sstables;  // List of SSTables
     std::shared_mutex sstablesLock;                  // Mutex for SSTables
-    std::shared_mutex walLock;  // Mutex for write-ahead log
-    Wal *wal;                   // Write-ahead log
-    std::string directory;      // Directory for storing data
+    std::shared_mutex walLock;                       // Mutex for write-ahead log
+    Wal *wal;                                        // Write-ahead log
+    std::string directory;                           // Directory for storing data
     int compactionInterval;  // Compaction interval (amount of SSTables to wait before compacting)
                              // we should have at least this many SSTables, if there
                              // are less after compaction, we will not further compact
@@ -619,7 +618,7 @@ class LSMT {
     std::thread flushThread;                 // Thread for flushing
     std::queue<std::unique_ptr<SkipList>> flushQueue;  // Queue for flushing
     std::mutex flushQueueMutex;                        // Mutex for flush queue
-    std::atomic_bool stopBackgroundThreads = false;                      // Stop background thread
+    std::atomic_bool stopBackgroundThreads = false;    // Stop background thread
     std::condition_variable flushQueueCondVar;         // Condition variable for flush queue
     std::thread compactionThread;                      // Thread for compaction
     // flushMemtable flushes the memtable to disk

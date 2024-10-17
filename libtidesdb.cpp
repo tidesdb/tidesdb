@@ -95,7 +95,6 @@ Pager::Pager(const std::string &filename, std::ios::openmode mode) : fileName(fi
     for (auto &lock : pageLocks) {
         lock = std::make_shared<std::shared_mutex>();
     }
-
 }
 
 // Pager::GetFileName
@@ -104,9 +103,7 @@ std::string Pager::GetFileName() const { return fileName; }
 
 // Pager::~Pager
 // Pager Destructor
-Pager::~Pager() {
-
-}
+Pager::~Pager() {}
 
 // Pager::Write writes data to the paged file, creating overflow pages if necessary
 int64_t Pager::Write(const std::vector<uint8_t> &data) {
@@ -686,7 +683,6 @@ void Wal::Close() {
 
     // Close the pager
     pager->Close();
-
 }
 
 // Wal::WriteOperation

@@ -38,14 +38,14 @@ std::vector<uint8_t> serialize(const KeyValue &kv) {
     return buffer;
 }
 
-// deserialize deserializes a byte vector to a KeyValue struct
+// deserialize deserializes a byte vector to a KeyValue
 KeyValue deserialize(const std::vector<uint8_t> &buffer) {
     KeyValue kv;
     kv.ParseFromArray(buffer.data(), buffer.size());
     return kv;
 }
 
-// deserializeOperation deserializes a byte vector to an Operation struct
+// deserializeOperation deserializes a byte vector to an Operation
 Operation deserializeOperation(const std::vector<uint8_t> &buffer) {
     Operation op;
     op.ParseFromArray(buffer.data(), buffer.size());
@@ -88,6 +88,14 @@ Pager::Pager(const std::string &filename, std::ios::openmode mode) : fileName(fi
     if (!file.is_open()) {
         throw TidesDBException("Failed to open file: " + filename);
     }
+
+    // Initialize pageLocks based on the number of pages
+    int64_t pageCount = PagesCount();
+    pageLocks.resize(pageCount);
+    for (auto &lock : pageLocks) {
+        lock = std::make_shared<std::shared_mutex>();
+    }
+
 }
 
 // Pager::GetFileName
@@ -97,9 +105,13 @@ std::string Pager::GetFileName() const { return fileName; }
 // Pager::~Pager
 // Pager Destructor
 Pager::~Pager() {
+    // Close the file if it is open
     if (file.is_open()) {
         file.close();
     }
+
+    // Clear the pageLocks vector to release all locks
+    pageLocks.clear();
 }
 
 // Pager::Write writes data to the paged file, creating overflow pages if necessary
@@ -120,7 +132,15 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
     int64_t data_written = 0;
     int64_t current_page = page_number;
 
+    // Resize pageLocks if necessary
+    if (current_page >= pageLocks.size()) {
+        pageLocks.resize(current_page + 1);
+    }
+
+
     while (data_written < data.size()) {
+        std::unique_lock lock(*pageLocks[current_page]);
+
         file.seekp(current_page * PAGE_SIZE);
         if (file.fail()) {
             throw TidesDBException("Failed to seek to page: " + std::to_string(current_page));
@@ -148,6 +168,7 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
         }
 
         current_page++;
+
     }
 
     return page_number;
@@ -174,6 +195,9 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
     if (page_number < 0) {
         throw TidesDBException("Invalid page number");
     }
+
+    // Lock the page for reading
+    std::shared_lock lock(*pageLocks[page_number]);
 
     // Seek to the page specified by page_number
     file.seekg(page_number * PAGE_SIZE);
@@ -202,6 +226,8 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
 
     int64_t current_page = overflow_page;
     while (current_page != -1) {
+        std::shared_lock overflow_lock(*pageLocks[current_page]);
+
         file.seekg(current_page * PAGE_SIZE);
         if (file.fail()) {
             throw TidesDBException("Failed to seek to overflow page: " +

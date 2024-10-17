@@ -278,6 +278,7 @@ class Pager {
    private:
     std::string fileName;  // File name
     std::fstream file;     // File stream
+    std::vector<std::shared_ptr<std::shared_mutex>> pageLocks; // Lock for each page
    public:
     // Constructor
     Pager(const std::string &filename, std::ios::openmode mode);

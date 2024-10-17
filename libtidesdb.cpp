@@ -658,11 +658,11 @@ std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
 // if it is waiting, and then joins the thread to ensure it has finished executing.
 void Wal::Close() {
     {
-        std::lock_guard<std::mutex> lock(queueMutex); // Lock the queue mutex
-        stopBackgroundThread = true; // Set the flag to stop the background thread
+        std::lock_guard<std::mutex> lock(queueMutex);  // Lock the queue mutex
+        stopBackgroundThread = true;                   // Set the flag to stop the background thread
     }
-    queueCondVar.notify_one(); // Notify the condition variable to wake up the thread
-    if (backgroundThread.joinable()) { // Join the thread to ensure it has finished executing
+    queueCondVar.notify_one();          // Notify the condition variable to wake up the thread
+    if (backgroundThread.joinable()) {  // Join the thread to ensure it has finished executing
         backgroundThread.join();
     }
 
@@ -677,10 +677,11 @@ void Wal::Close() {
 // signal that a new operation is available
 bool Wal::WriteOperation(const Operation &op) {
     {
-        std::lock_guard<std::mutex> lock(queueMutex); // Lock the queue mutex
-        operationQueue.push(op); // Push the operation onto the queue
+        std::lock_guard<std::mutex> lock(queueMutex);  // Lock the queue mutex
+        operationQueue.push(op);                       // Push the operation onto the queue
     }
-    queueCondVar.notify_one(); // Notify the condition variable to signal that a new operation is available
+    queueCondVar
+        .notify_one();  // Notify the condition variable to signal that a new operation is available
     return true;
 }
 
@@ -732,8 +733,11 @@ bool TidesDB::Wal::Recover(LSMT &lsmt) const {
 // to the flush queue. Finally, it notifies the flush thread to process the queue
 bool LSMT::flushMemtable() {
     try {
+        isFlushing.store(1);  // Set the flag to indicate that we are flushing
         // Create a new memtable
-        auto newMemtable = std::make_unique<SkipList>(12, 0.25); // @todo would be good if on LSMT creation a user can set a maxLevel and probability
+        auto newMemtable =
+            std::make_unique<SkipList>(12, 0.25);  // @todo would be good if on LSMT creation a user
+                                                   // can set a maxLevel and probability
 
         // Iterate over the current memtable and insert its elements into the new memtable
         memtable->inOrderTraversal(
@@ -749,10 +753,9 @@ bool LSMT::flushMemtable() {
             std::lock_guard<std::mutex> lock(flushQueueMutex);
             flushQueue.push(std::move(newMemtable));
 
-            // Log the flush queue event
-            std::cout << "Memtable flush queued." << std::endl;
-
             flushQueueCondVar.notify_one();  // Notify the flush thread
+
+            isFlushing.store(0);  // Reset the flag
         }
 
         return true;
@@ -833,7 +836,6 @@ void LSMT::flushThreadFunc() {
         if (sstableCounter >= compactionInterval) {
             Compact();
         }
-
     }
 }
 
@@ -913,10 +915,7 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
     memtable->insert(key, value);
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
-    std::cout << "Memtable size: " << memtable->getSize() << " flush size: " << memtableFlushSize
-              << std::endl;
     if (memtable->getSize() >= memtableFlushSize) {
-        std::cout << "FLUSH\n";
         if (!flushMemtable()) {
             return false;
         }

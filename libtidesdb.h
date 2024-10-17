@@ -436,7 +436,7 @@ class LSMT {
         }
 
         // Create a new memtable
-        // 10, 0.25)
+        // We could make this configurable in the future
         memtable = new SkipList(12, 0.25);  // 12 is the max level, 0.25 is the probability
 
         // Start background thread for flushing

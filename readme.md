@@ -32,6 +32,7 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] Configurable options
 - [x] Support for large amounts of data
 - [x] Threadsafe
+- [x] Granular page locking mechanisms on reads
 - [ ] Compression (todo, LZ4, Snappy)
 
 ## Design

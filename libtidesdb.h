@@ -286,6 +286,8 @@ class Pager {
     // Destructor
     ~Pager();
 
+    // Close
+    // Close gracefully closes the pager
     bool Close() {
         // Check if we require to release any locks
         if (!pageLocks.empty()) { pageLocks.clear(); }

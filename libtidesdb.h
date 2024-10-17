@@ -196,15 +196,15 @@ class AVLTree {
 
     // rightRotate rotates the AVL tree to the right
     // @deprecated
-    AVLNode *rightRotate(AVLNode *y);
+    static AVLNode *rightRotate(AVLNode *y);
 
     // leftRotate rotates the AVL tree to the left
     // @deprecated
-    AVLNode *leftRotate(AVLNode *x);
+    static AVLNode *leftRotate(AVLNode *x);
 
     // getBalance gets the balance factor of a node
     // @deprecated
-    int getBalance(AVLNode *node);
+    static int getBalance(AVLNode *node);
 
     // insert inserts a key-value pair into the AVL tree
     // @deprecated
@@ -229,7 +229,7 @@ class AVLTree {
 
     // minValueNode finds the node with the minimum value in the AVL tree
     // @deprecated
-    AVLNode *minValueNode(AVLNode *node);
+    static AVLNode *minValueNode(AVLNode *node);
 
     // height gets the height of a node
     // @deprecated
@@ -465,6 +465,8 @@ class LSMT {
         flushThread = std::thread(&LSMT::flushThreadFunc, this);
 
         stopBackgroundThreads.store(false);
+
+
     }
 
     // Destructor
@@ -630,8 +632,6 @@ class LSMT {
     std::shared_mutex walLock;                       // Mutex for write-ahead log
     Wal *wal;                                        // Write-ahead log
     std::string directory;                           // Directory for storing data
-    std::atomic<int> flushCounter{0};
-    std::mutex flushCounterMutex;
     int compactionInterval;  // Compaction interval (amount of SSTables to wait before compacting)
                              // we should have at least this many SSTables, if there
                              // are less after compaction, we will not further compact

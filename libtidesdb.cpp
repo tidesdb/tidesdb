@@ -658,11 +658,11 @@ std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
 // if it is waiting, and then joins the thread to ensure it has finished executing.
 void Wal::Close() {
     {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        stopBackgroundThread = true;
+        std::lock_guard<std::mutex> lock(queueMutex); // Lock the queue mutex
+        stopBackgroundThread = true; // Set the flag to stop the background thread
     }
-    queueCondVar.notify_one();
-    if (backgroundThread.joinable()) {
+    queueCondVar.notify_one(); // Notify the condition variable to wake up the thread
+    if (backgroundThread.joinable()) { // Join the thread to ensure it has finished executing
         backgroundThread.join();
     }
 
@@ -677,10 +677,10 @@ void Wal::Close() {
 // signal that a new operation is available
 bool Wal::WriteOperation(const Operation &op) {
     {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        operationQueue.push(op);
+        std::lock_guard<std::mutex> lock(queueMutex); // Lock the queue mutex
+        operationQueue.push(op); // Push the operation onto the queue
     }
-    queueCondVar.notify_one();
+    queueCondVar.notify_one(); // Notify the condition variable to signal that a new operation is available
     return true;
 }
 
@@ -733,7 +733,7 @@ bool TidesDB::Wal::Recover(LSMT &lsmt) const {
 bool LSMT::flushMemtable() {
     try {
         // Create a new memtable
-        auto newMemtable = std::make_unique<SkipList>(12, 0.25);
+        auto newMemtable = std::make_unique<SkipList>(12, 0.25); // @todo would be good if on LSMT creation a user can set a maxLevel and probability
 
         // Iterate over the current memtable and insert its elements into the new memtable
         memtable->inOrderTraversal(
@@ -782,13 +782,6 @@ void LSMT::flushThreadFunc() {
             if (newMemtable == nullptr) {
                 break;  // Exit the loop if the sentinel value is encountered
             }
-        }
-
-        // Increment the flush counter and log the start of a flush
-        {
-            std::unique_lock<std::mutex> lock(flushCounterMutex);
-            flushCounter++;
-            std::cout << "Flush started. Total flushes: " << flushCounter << std::endl;
         }
 
         std::vector<KeyValue> kvPairs;  // Key-value pairs to be written to the SSTable
@@ -841,8 +834,6 @@ void LSMT::flushThreadFunc() {
             Compact();
         }
 
-        // Log the completion of a flush
-        std::cout << "Flush completed. Total flushes: " << flushCounter << std::endl;
     }
 }
 

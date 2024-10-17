@@ -465,8 +465,6 @@ class LSMT {
         flushThread = std::thread(&LSMT::flushThreadFunc, this);
 
         stopBackgroundThreads.store(false);
-
-
     }
 
     // Destructor

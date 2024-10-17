@@ -1,6 +1,8 @@
+#include <chrono>  // Include for std::chrono::seconds
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <thread>  // Include for std::this_thread::sleep_for
 #include <vector>
 
 #include "../../libtidesdb.h"
@@ -30,6 +32,9 @@ int main() {
             lsmTree->Put(key, value);
         }
 
+        // Sleep for a while to let the background thread complete the flush
+        std::this_thread::sleep_for(std::chrono::milliseconds(755));
+
         // Check for all 12 keys
         for (int i = 0; i < 12; i++) {
             std::vector<uint8_t> key = {
@@ -49,7 +54,7 @@ int main() {
         lsmTree->Close();
 
         // Remove the directory
-        std::filesystem::remove_all(directory);
+        // std::filesystem::remove_all(directory);
 
         return 0;
 

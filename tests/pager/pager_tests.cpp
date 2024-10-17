@@ -1,4 +1,6 @@
+#include <filesystem>
 #include <iostream>
+#include <vector>
 
 #include "../../libtidesdb.h"
 
@@ -13,44 +15,34 @@ std::vector<char> convertToCharVector(const std::vector<uint8_t> &input) {
 int main() {
     // Open the file in both read and write mode
     TidesDB::Pager pager("test.db", std::ios::in | std::ios::out | std::ios::binary);
-    std::vector<char> data(1024, 'a');
+    std::vector<char> data(1024 * 8, 'a');  // Write 8192 bytes of 'a' characters
 
-    // Write hello world to end of data vector
+    // Write "Hello, world!" to the end of the data vector
     data.insert(data.end(), "Hello, world!", "Hello, world!" + 13);
 
-    // Convert data to std::vector<uint8_t> before writing
-    int64_t page_number = pager.Write(convertToUint8Vector(data));
-    // std::cout << "Page number: " << page_number << std::endl;
+    // Write multiple pages
+    std::vector<int64_t> page_numbers;
+    for (int i = 0; i < 5; ++i) {
+        int64_t page_number = pager.Write(convertToUint8Vector(data));
+        page_numbers.push_back(page_number);
+        std::cout << "Page number " << i << ": " << page_number << std::endl;
+    }
 
-    // Convert read data from std::vector<uint8_t> to std::vector<char>
-    std::vector<char> read_data = convertToCharVector(pager.Read(page_number));
-    // std::cout << "Read data size: " << read_data.size() << std::endl;
-    // std::cout << "Read data: " << std::string(read_data.begin(),
-    // read_data.end()) << std::endl;
+    // Verify the data for each page
+    bool all_tests_passed = true;
+    for (int i = 0; i < 5; ++i) {
+        std::vector<char> read_data = convertToCharVector(pager.Read(page_numbers[i]));
+        if (std::string(read_data.begin(), read_data.end()) !=
+            std::string(1024 * 8, 'a') + "Hello, world!") {
+            std::cout << "Pager test failed for page " << i << std::endl;
+            all_tests_passed = false;
+        }
+    }
 
-    // expected
-    // aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaHello,
-    // world!
-
-    if (std::string(read_data.begin(), read_data.end()) ==
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaHello, world!") {
-        std::cout << "Pager tests passed" << std::endl;
+    if (all_tests_passed) {
+        std::cout << "All pager tests passed" << std::endl;
     } else {
-        std::cout << "Pager tests failed" << std::endl;
+        std::cout << "Some pager tests failed" << std::endl;
     }
 
     // Remove the test.db file

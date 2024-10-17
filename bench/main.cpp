@@ -18,8 +18,10 @@ void benchmarkLSMT(TidesDB::LSMT &lsmt, size_t numOperations, size_t dataSize) {
     using namespace std::chrono;
 
     // Generate random keys and values
-    std::vector<std::vector<uint8_t>> keys(numOperations);
-    std::vector<std::vector<uint8_t>> values(numOperations);
+    std::vector<std::vector<uint8_t>> keys;
+    ;
+    std::vector<std::vector<uint8_t>> values;
+    ;
     for (size_t i = 0; i < numOperations; ++i) {
         keys[i] = generateRandomData(dataSize);    // Generate random key
         values[i] = generateRandomData(dataSize);  // Generate random value
@@ -38,12 +40,12 @@ void benchmarkLSMT(TidesDB::LSMT &lsmt, size_t numOperations, size_t dataSize) {
     std::cout << numOperations << " Put operations took " << putDuration << " ms\n";
 
     // sleep for 1 second
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+    // std::this_thread::sleep_for(std::chrono::seconds(5));
 
     // Benchmark Get operations
     start = high_resolution_clock::now();  // Start timer
     for (size_t i = 0; i < numOperations; ++i) {
-        auto result = lsmt.Get(keys[i]);
+        auto result = lsmt.GreaterThan(keys[i]);
         if (result.empty()) {  // Perform Get operation with error handling
             std::cerr << "Get operation failed for key " << i << "\n";
             return;
@@ -71,7 +73,7 @@ int main() {
     srand(static_cast<unsigned>(time(0)));
 
     // Initialize LSMT
-    auto lsmt = TidesDB::LSMT::New("benchmark_directory", std::filesystem::perms::all, 2000000, 100);
+    auto lsmt = TidesDB::LSMT::New("benchmark_directory", std::filesystem::perms::all, 100, 22);
     if (!lsmt) {
         std::cerr << "Failed to initialize LSMT\n";
         return 1;
@@ -79,12 +81,12 @@ int main() {
 
     // Run benchmark
     // Note: The benchmark will run for 1000 operations with 5 bytes of data per operation
-    benchmarkLSMT(*lsmt, 1000000, 5);
+    benchmarkLSMT(*lsmt, 1000, 5);
 
     lsmt->Close();
 
     // Remove benchmark directory
-    //std::filesystem::remove_all("benchmark_directory");
+    // std::filesystem::remove_all("benchmark_directory");
 
     return 0;
 }

@@ -402,25 +402,23 @@ class SSTable {
 class SSTableIterator {
    public:
     // Constructor
-    SSTableIterator(Pager *pager) : pager(pager), maxPages(pager->PagesCount()), currentPage(0) {}
+    SSTableIterator(Pager *pager)
+        : pager(pager), maxPages(pager ? pager->PagesCount() : 0), currentPage(0) {
+        if (!pager) {
+            throw std::invalid_argument("Pager cannot be null");
+        }
+    }
 
     // Ok checks if the iterator is valid
     bool Ok() const { return currentPage < maxPages; }
 
     // Next returns the next key-value pair in the SSTable
     std::optional<KeyValue> Next() {
-        if (!Ok() || currentPage >= maxPages) {
+        if (!Ok()) {
             return std::nullopt;
         }
 
-        std::vector<uint8_t> data;
-        try {
-            data = pager->Read(currentPage++);  // Read the page
-        } catch (const TidesDBException &e) {
-            std::cerr << "Error: " << e.what() << "\n";
-            return std::nullopt;
-        }
-
+        std::vector<uint8_t> data = pager->Read(currentPage++);
         if (data.empty()) {
             std::cerr << "Error: Failed to read data from pager.\n";
             return std::nullopt;
@@ -465,6 +463,8 @@ class LSMT {
 
         // Start background thread for flushing
         flushThread = std::thread(&LSMT::flushThreadFunc, this);
+
+        stopBackgroundThreads.store(false);
     }
 
     // Destructor
@@ -551,7 +551,7 @@ class LSMT {
             }
 
             // Signal the background threads to stop
-            stopBackgroundThreads = true;
+            stopBackgroundThreads.store(true);
 
             // Notify the condition variables to wake up the threads
             flushQueueCondVar.notify_all();
@@ -630,6 +630,8 @@ class LSMT {
     std::shared_mutex walLock;                       // Mutex for write-ahead log
     Wal *wal;                                        // Write-ahead log
     std::string directory;                           // Directory for storing data
+    std::atomic<int> flushCounter{0};
+    std::mutex flushCounterMutex;
     int compactionInterval;  // Compaction interval (amount of SSTables to wait before compacting)
                              // we should have at least this many SSTables, if there
                              // are less after compaction, we will not further compact

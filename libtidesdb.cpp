@@ -286,9 +286,11 @@ bool SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t
 
     x = new SkipListNode(key, value, newLevel);
     for (int i = 0; i <= newLevel; i++) {
-        x->forward[i].store(update[i]->forward[i].load(std::memory_order_relaxed),
-                            std::memory_order_relaxed);
-        update[i]->forward[i].store(x, std::memory_order_release);
+        SkipListNode *next;
+        do {
+            next = update[i]->forward[i].load(std::memory_order_relaxed);
+            x->forward[i].store(next, std::memory_order_relaxed);
+        } while (!update[i]->forward[i].compare_exchange_weak(next, x, std::memory_order_release, std::memory_order_relaxed));
     }
 
     cachedSize.fetch_add(1, std::memory_order_relaxed);  // Increment size

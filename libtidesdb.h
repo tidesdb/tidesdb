@@ -608,16 +608,45 @@ class LSMT {
             std::make_shared<Pager>(directory + getPathSeparator() + WAL_EXTENSION,
                                     std::ios::in | std::ios::out | std::ios::trunc);
 
+        // Load SSTables from the directory into memory
+        std::vector<std::shared_ptr<SSTable>> sstables;
         for (const auto &entry : std::filesystem::directory_iterator(directory)) {
             if (entry.is_regular_file() && entry.path().extension() == SSTABLE_EXTENSION) {
                 std::shared_ptr<Pager> sstablePager =
                     std::make_shared<Pager>(entry.path().string(), std::ios::in | std::ios::out);
                 std::shared_ptr<SSTable> sstable = std::make_shared<SSTable>(sstablePager.get());
+
+                // Initialize minKey and maxKey
+                SSTableIterator sstableIt(sstablePager.get());
+                if (sstableIt.Ok()) {
+                    auto kv = sstableIt.Next();
+                    if (kv) {
+                        sstable->minKey = ConvertToUint8Vector(
+                            std::vector<char>(kv->key().begin(), kv->key().end()));
+                        sstable->maxKey = sstable->minKey;  // Initialize maxKey to minKey
+                    }
+                }
+
+                while (sstableIt.Ok()) {
+                    auto kv = sstableIt.Next();
+                    if (kv) {
+                        std::vector<uint8_t> currentKey = ConvertToUint8Vector(
+                            std::vector<char>(kv->key().begin(), kv->key().end()));
+                        if (currentKey < sstable->minKey) {
+                            sstable->minKey = currentKey;
+                        }
+                        if (currentKey > sstable->maxKey) {
+                            sstable->maxKey = currentKey;
+                        }
+                    }
+                }
+
+                sstables.push_back(sstable);
             }
         }
 
         return std::make_unique<LSMT>(directory, memtableFlushSize, compactionInterval, walPager,
-                                      std::vector<std::shared_ptr<SSTable>>());
+                                      sstables);
     }
 
    private:

@@ -760,6 +760,8 @@ bool LSMT::flushMemtable() {
 
         return true;
     } catch (const std::exception &e) {
+        isFlushing.store(0);  // Reset the flag
+
         std::cerr << "Error in flushMemtable: " << e.what() << std::endl;
         return false;
     }
@@ -1059,6 +1061,9 @@ bool LSMT::Compact() {
             }
         }
 
+        // set isCompacting flag
+        isCompacting.store(1);
+
         for (const auto &pair : sstablePairs) {
             futures.push_back(std::async(std::launch::async, [this, pair] {
                 try {
@@ -1077,6 +1082,7 @@ bool LSMT::Compact() {
                     std::unique_lock<std::shared_mutex> sstableLock2(sstable2->lock);
 
                     if (!it1 || !it2) {
+                        isCompacting.store(0);
                         std::cerr << "Error: Failed to create SSTableIterator.\n";
                         return;
                     }
@@ -1084,6 +1090,7 @@ bool LSMT::Compact() {
                     if (it1->Ok()) {
                         auto kv = it1->Next();
                         if (!kv) {
+                            isCompacting.store(0);
                             std::cerr
                                 << "Error: Failed to get next key-value from SSTableIterator 1.\n";
                             return;
@@ -1096,6 +1103,7 @@ bool LSMT::Compact() {
                     if (it2->Ok()) {
                         auto kv = it2->Next();
                         if (!kv) {
+                            isCompacting.store(0);
                             std::cerr
                                 << "Error: Failed to get next key-value from SSTableIterator 2.\n";
                             return;
@@ -1161,6 +1169,12 @@ bool LSMT::Compact() {
                                 kv.set_key(key.data(), key.size());
                                 kv.set_value(value.data(), value.size());
                                 std::vector<uint8_t> serialized = serialize(kv);
+
+                                // check if data is empty
+                                if (serialized.empty()) {
+                                    return;
+                                }
+
                                 newSSTable->pager->Write(serialized);
                             });
 
@@ -1180,6 +1194,8 @@ bool LSMT::Compact() {
                         sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable2),
                                        sstables.end());
                     }
+                    isCompacting.store(0);
+
                 } catch (const std::exception &e) {
                     std::cerr << "Error during compaction: " << e.what() << std::endl;
                 }

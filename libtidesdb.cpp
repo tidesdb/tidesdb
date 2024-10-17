@@ -105,17 +105,13 @@ std::string Pager::GetFileName() const { return fileName; }
 // Pager::~Pager
 // Pager Destructor
 Pager::~Pager() {
-    // Close the file if it is open
-    if (file.is_open()) {
-        file.close();
-    }
 
-    // Check if we require to release any locks
-    if (!pageLocks.empty()) { pageLocks.clear(); }
 }
 
 // Pager::Write writes data to the paged file, creating overflow pages if necessary
 int64_t Pager::Write(const std::vector<uint8_t> &data) {
+    std::unique_lock<std::shared_mutex> fileLock(fileMutex);
+
     // Check if the file is open
     if (!file.is_open()) {
         throw TidesDBException("File is not open");
@@ -132,15 +128,7 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
     int64_t data_written = 0;
     int64_t current_page = page_number;
 
-    // Resize pageLocks if necessary
-    if (current_page >= pageLocks.size()) {
-        pageLocks.resize(current_page + 1);
-    }
-
-
     while (data_written < data.size()) {
-        std::unique_lock lock(*pageLocks[current_page]);
-
         file.seekp(current_page * PAGE_SIZE);
         if (file.fail()) {
             throw TidesDBException("Failed to seek to page: " + std::to_string(current_page));
@@ -168,7 +156,6 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
         }
 
         current_page++;
-
     }
 
     return page_number;
@@ -699,6 +686,7 @@ void Wal::Close() {
 
     // Close the pager
     pager->Close();
+
 }
 
 // Wal::WriteOperation
@@ -788,7 +776,7 @@ bool LSMT::flushMemtable() {
 // to be added to the flush queue, processes them, and writes their key-value pairs to SSTables.
 // If the number of SSTables exceeds the compaction interval, it triggers a background compaction
 void LSMT::flushThreadFunc() {
-    while (true) {
+    while (stopBackgroundThreads.load() == 0) {
         std::unique_ptr<SkipList> newMemtable;
 
         // Wait for a new memtable to be added to the queue

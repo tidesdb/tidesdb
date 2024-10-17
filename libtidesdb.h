@@ -279,6 +279,7 @@ class Pager {
     std::string fileName;  // File name
     std::fstream file;     // File stream
     std::vector<std::shared_ptr<std::shared_mutex>> pageLocks; // Lock for each page
+    std::shared_mutex fileMutex; // Mutex for writing to the file
    public:
     // Constructor
     Pager(const std::string &filename, std::ios::openmode mode);
@@ -289,13 +290,21 @@ class Pager {
     // Close
     // Close gracefully closes the pager
     bool Close() {
-        // Check if we require to release any locks
-        if (!pageLocks.empty()) { pageLocks.clear(); }
-        // Close the file
-        if (file.is_open()) {
-            file.close();
-            return true;
+        try {
+            // Check if we require to release any locks
+            if (!pageLocks.empty()) {
+                pageLocks.clear();
+            }
+            // Close the file
+            if (file.is_open()) {
+                file.close();
+                return true;
+            }
+        } catch (const std::system_error &e) {
+            std::cerr << "System error during close: " << e.what() << std::endl;
+            return false;
         }
+        return false;
     }
 
     // Write
@@ -517,6 +526,13 @@ class LSMT {
                 std::cerr << "Failed to flush memtable during close\n";
             }
 
+            // Signal the background threads to stop
+            stopBackgroundThreads = true;
+
+            // Notify the condition variables to wake up the threads
+            flushQueueCondVar.notify_all();
+            cond.notify_all();
+
             // Wait for the flush thread to finish
             if (flushThread.joinable()) {
                 flushThread.join();
@@ -530,12 +546,14 @@ class LSMT {
             // Close the write-ahead log
             wal->Close();
 
+
+
             {
-                std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
+                std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock); // Lock the SSTables
 
                 // Iterate over the SSTables and close them
                 for (const auto &sstable : sstables) {
-                    sstable->pager->Close();
+                   sstable->pager->Close();
                 }
 
                 // Clear the list of SSTables
@@ -601,6 +619,7 @@ class LSMT {
     std::thread flushThread;                 // Thread for flushing
     std::queue<std::unique_ptr<SkipList>> flushQueue;  // Queue for flushing
     std::mutex flushQueueMutex;                        // Mutex for flush queue
+    std::atomic_bool stopBackgroundThreads = false;                      // Stop background thread
     std::condition_variable flushQueueCondVar;         // Condition variable for flush queue
     std::thread compactionThread;                      // Thread for compaction
     // flushMemtable flushes the memtable to disk

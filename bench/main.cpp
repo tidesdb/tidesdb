@@ -2,7 +2,7 @@
 #include <iostream>
 #include <random>
 #include <vector>
-
+#include <filesystem>
 #include "../libtidesdb.h"
 
 // Function to generate random data
@@ -27,7 +27,10 @@ void benchmarkLSMT(TidesDB::LSMT &lsmt, size_t numOperations, size_t dataSize) {
     // Benchmark Put operations
     auto start = high_resolution_clock::now();  // Start timer
     for (size_t i = 0; i < numOperations; ++i) {
-        lsmt.Put(keys[i], values[i]);  // Perform Put operation
+        if (!lsmt.Put(keys[i], values[i])) {  // Perform Put operation with error handling
+            std::cerr << "Put operation failed for key " << i << "\n";
+            return;
+        }
     }
     auto end = high_resolution_clock::now();                              // End timer
     auto putDuration = duration_cast<milliseconds>(end - start).count();  // Calculate duration
@@ -36,7 +39,11 @@ void benchmarkLSMT(TidesDB::LSMT &lsmt, size_t numOperations, size_t dataSize) {
     // Benchmark Get operations
     start = high_resolution_clock::now();  // Start timer
     for (size_t i = 0; i < numOperations; ++i) {
-        lsmt.Get(keys[i]);  // Perform Get operation
+        auto result = lsmt.Get(keys[i]);
+        if (result.empty()) {  // Perform Get operation with error handling
+            std::cerr << "Get operation failed for key " << i << "\n";
+            return;
+        }
     }
     end = high_resolution_clock::now();                                   // End timer
     auto getDuration = duration_cast<milliseconds>(end - start).count();  // Calculate duration
@@ -45,7 +52,10 @@ void benchmarkLSMT(TidesDB::LSMT &lsmt, size_t numOperations, size_t dataSize) {
     // Benchmark Delete operations
     start = high_resolution_clock::now();  // Start timer
     for (size_t i = 0; i < numOperations; ++i) {
-        lsmt.Delete(keys[i]);  // Perform Delete operation
+        if (!lsmt.Delete(keys[i])) {  // Perform Delete operation with error handling
+            std::cerr << "Delete operation failed for key " << i << "\n";
+            return;
+        }
     }
     end = high_resolution_clock::now();                                      // End timer
     auto deleteDuration = duration_cast<milliseconds>(end - start).count();  // Calculate duration
@@ -53,6 +63,9 @@ void benchmarkLSMT(TidesDB::LSMT &lsmt, size_t numOperations, size_t dataSize) {
 }
 
 int main() {
+    // Seed the random number generator
+    srand(static_cast<unsigned>(time(0)));
+
     // Initialize LSMT
     auto lsmt = TidesDB::LSMT::New("benchmark_directory", std::filesystem::perms::all, 250, 2);
 

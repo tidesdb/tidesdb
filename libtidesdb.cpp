@@ -107,14 +107,10 @@ Pager::~Pager() {}
 
 // Pager::Write writes data to the paged file, creating overflow pages if necessary
 int64_t Pager::Write(const std::vector<uint8_t> &data) {
-    std::unique_lock<std::shared_mutex> fileLock(fileMutex);
-
-    // Check if the file is open
     if (!file.is_open()) {
         throw TidesDBException("File is not open");
     }
 
-    // Check if the data is empty
     if (data.empty()) {
         throw TidesDBException("Data is empty");
     }
@@ -170,29 +166,20 @@ int64_t Pager::WriteTo(int64_t page_number, const std::vector<uint8_t> &data) {
 // reads data from a file starting at a specified page number and handles overflow pages if the data
 // spans multiple pages
 std::vector<uint8_t> Pager::Read(int64_t page_number) {
-    // We check if the file is open
     if (!file.is_open()) {
         throw TidesDBException("File is not open");
     }
 
-    // If the page number is less than 0, we throw an exception
     if (page_number < 0) {
         throw TidesDBException("Invalid page number");
     }
 
-    // Lock the page for reading
-    std::shared_lock lock(*pageLocks[page_number]);
-
-    // Seek to the page specified by page_number
     file.seekg(page_number * PAGE_SIZE);
     if (file.fail()) {
-        // If we fail to seek to the page, we throw an exception
         throw TidesDBException("Failed to seek to page: " + std::to_string(page_number));
     }
 
-    int64_t overflow_page;  // The overflow page
-
-    // Read the overflow page header
+    int64_t overflow_page;
     file.read(reinterpret_cast<char *>(&overflow_page), sizeof(overflow_page));
     if (file.fail()) {
         throw TidesDBException("Failed to read page header for page: " +
@@ -210,8 +197,6 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
 
     int64_t current_page = overflow_page;
     while (current_page != -1) {
-        std::shared_lock overflow_lock(*pageLocks[current_page]);
-
         file.seekg(current_page * PAGE_SIZE);
         if (file.fail()) {
             throw TidesDBException("Failed to seek to overflow page: " +
@@ -243,6 +228,7 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
 
     return data;
 }
+
 
 // SkipList::randomLevel
 // generates a random level for a new node in the skip list. This level determines the height of the
@@ -732,25 +718,31 @@ bool TidesDB::Wal::Recover(LSMT &lsmt) const {
 // transfers the data from the current memtable to the new one, and then adds the new memtable
 // to the flush queue. Finally, it notifies the flush thread to process the queue
 bool LSMT::flushMemtable() {
-    // Create a new memtable
-    auto newMemtable = std::make_unique<SkipList>(12, 0.25);
+    try {
+        // Create a new memtable
+        auto newMemtable = std::make_unique<SkipList>(12, 0.25);
 
-    // Iterate over the current memtable and insert its elements into the new memtable
-    memtable->inOrderTraversal(
-        [&newMemtable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
-            newMemtable->insert(key, value);
-        });
+        // Iterate over the current memtable and insert its elements into the new memtable
+        memtable->inOrderTraversal(
+            [&newMemtable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+                newMemtable->insert(key, value);
+            });
 
-    // Add the new memtable to the flush queue
-    {
-        std::lock_guard<std::mutex> lock(flushQueueMutex);
-        flushQueue.push(std::move(newMemtable));
+        // Clear the current memtable
+        memtable->clear();
+
+        // Add the new memtable to the flush queue
+        {
+            std::lock_guard<std::mutex> lock(flushQueueMutex);
+            flushQueue.push(std::move(newMemtable));
+            flushQueueCondVar.notify_one();  // Notify the flush thread
+        }
+
+        return true;
+    } catch (const std::exception &e) {
+        std::cerr << "Error in flushMemtable: " << e.what() << std::endl;
+        return false;
     }
-
-    // Notify the flush thread
-    flushQueueCondVar.notify_one();
-
-    return true;
 }
 
 // LSMT::flushThreadFunc
@@ -928,15 +920,14 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
 
     // Check the memtable for the key
     std::vector<uint8_t> value;
-    if (memtable) {
-        value = memtable->get(key);  // Automatically unlocks when leaving the scope
-    }
+    { value = memtable->get(key); }  // Automatically unlocks when leaving the scope
 
     // If value is found and it's not a tombstone, return it
     if (!value.empty() &&
-        value != std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
+        value != std::vector<uint8_t>(std::vector<uint8_t>(
+                     TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)))) {
         return value;
-    }
+                     }
 
     // Search the SSTables for the key, starting from the latest
     for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
@@ -968,7 +959,7 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
                 ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))) {
                 return ConvertToUint8Vector(
                     std::vector<char>(kv->value().begin(), kv->value().end()));
-            }
+                }
         }
     }
 
@@ -1027,8 +1018,7 @@ void AVLTree::clear() {
 // SSTables, merges them, and writes the merged data to new SSTables. The old SSTables are then
 // deleted.
 bool LSMT::Compact() {
-    // Start a background thread for compaction
-    compactionThread = std::thread([this]() {
+    try {
         std::vector<std::future<void>> futures;
         std::vector<std::pair<std::shared_ptr<SSTable>, std::shared_ptr<SSTable>>> sstablePairs;
 
@@ -1036,7 +1026,6 @@ bool LSMT::Compact() {
             std::shared_lock<std::shared_mutex> lock(sstablesLock);
             for (size_t i = 0; i < sstables.size(); i += 2) {
                 if (i + 1 < sstables.size()) {
-                    // Lock the SSTables temporarily
                     sstablePairs.emplace_back(sstables[i], sstables[i + 1]);
                 }
             }
@@ -1044,104 +1033,101 @@ bool LSMT::Compact() {
 
         for (const auto &pair : sstablePairs) {
             futures.push_back(std::async(std::launch::async, [this, pair] {
-                auto sstable1 = pair.first;
-                auto sstable2 = pair.second;
-
-                auto it1 = std::make_unique<SSTableIterator>(sstable1->pager);
-                auto it2 = std::make_unique<SSTableIterator>(sstable2->pager);
-                auto newMemtable = std::make_unique<AVLTree>();
-
-                std::optional<std::vector<uint8_t>> currentKey1, currentValue1;
-                std::optional<std::vector<uint8_t>> currentKey2, currentValue2;
-
-                // Lock sstable1 and sstable2
-                std::unique_lock<std::shared_mutex> sstableLock1(sstable1->lock);
-                std::unique_lock<std::shared_mutex> sstableLock2(sstable2->lock);
-
-                // Initialize keys and values
                 try {
+                    auto sstable1 = pair.first;
+                    auto sstable2 = pair.second;
+
+                    auto it1 = std::make_unique<SSTableIterator>(sstable1->pager);
+                    auto it2 = std::make_unique<SSTableIterator>(sstable2->pager);
+                    auto newMemtable = std::make_unique<AVLTree>();
+
+                    std::optional<std::vector<uint8_t>> currentKey1, currentValue1;
+                    std::optional<std::vector<uint8_t>> currentKey2, currentValue2;
+
+                    std::unique_lock<std::shared_mutex> sstableLock1(sstable1->lock);
+                    std::unique_lock<std::shared_mutex> sstableLock2(sstable2->lock);
+
+
+                    if (!it1 || !it2) {
+                        return;
+                    }
+
                     if (it1->Ok()) {
                         auto kv = it1->Next();
+                        if (!kv) {
+                            return;
+                        }
+
                         currentKey1 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                        currentValue1 =
-                            std::vector<uint8_t>(kv->value().begin(), kv->value().end());
+                        currentValue1 = std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                     }
                     if (it2->Ok()) {
                         auto kv = it2->Next();
+                        if (!kv) {
+                                                return;
+                                            }
+
+
                         currentKey2 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                        currentValue2 =
-                            std::vector<uint8_t>(kv->value().begin(), kv->value().end());
+                        currentValue2 = std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                     }
-                } catch (const std::exception &e) {
-                    std::cerr << "Error initializing keys and values: " << e.what() << std::endl;
-                    return;
-                }
 
-                while (currentKey1.has_value() || currentKey2.has_value()) {
-                    if (!currentKey2.has_value() ||
-                        (currentKey1.has_value() && currentKey1 < currentKey2)) {
-                        newMemtable->insert(currentKey1.value(), currentValue1.value());
-                        if (it1->Ok()) {
-                            auto kv = it1->Next();
-                            currentKey1 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                            currentValue1 =
-                                std::vector<uint8_t>(kv->value().begin(), kv->value().end());
+                    while (currentKey1.has_value() || currentKey2.has_value()) {
+                        if (!currentKey2.has_value() || (currentKey1.has_value() && currentKey1 < currentKey2)) {
+                            newMemtable->insert(currentKey1.value(), currentValue1.value());
+                            if (it1->Ok()) {
+                                auto kv = it1->Next();
+                                currentKey1 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
+                                currentValue1 = std::vector<uint8_t>(kv->value().begin(), kv->value().end());
+                            } else {
+                                currentKey1.reset();
+                                currentValue1.reset();
+                            }
                         } else {
-                            currentKey1.reset();
-                            currentValue1.reset();
-                        }
-                    } else {
-                        newMemtable->insert(currentKey2.value(), currentValue2.value());
-                        if (it2->Ok()) {
-                            auto kv = it2->Next();
-                            currentKey2 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                            currentValue2 =
-                                std::vector<uint8_t>(kv->value().begin(), kv->value().end());
-                        } else {
-                            currentKey2.reset();
-                            currentValue2.reset();
+                            newMemtable->insert(currentKey2.value(), currentValue2.value());
+                            if (it2->Ok()) {
+                                auto kv = it2->Next();
+                                currentKey2 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
+                                currentValue2 = std::vector<uint8_t>(kv->value().begin(), kv->value().end());
+                            } else {
+                                currentKey2.reset();
+                                currentValue2.reset();
+                            }
                         }
                     }
-                }
 
-                // Check if the new memtable has entries before writing
-                if (newMemtable->GetSize() > 0) {
-                    // Write the new memtable to a new SSTable
-                    std::string newSSTablePath =
-                        directory + getPathSeparator() + "sstable_compacted_" +
-                        std::to_string(
-                            std::chrono::system_clock::now().time_since_epoch().count()) +
-                        SSTABLE_EXTENSION;
-                    auto newSSTable = std::make_shared<SSTable>(
-                        new Pager(newSSTablePath, std::ios::in | std::ios::out | std::ios::trunc));
+                    if (newMemtable->GetSize() > 0) {
+                        std::string newSSTablePath = directory + getPathSeparator() + "sstable_compacted_" +
+                                                     std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) +
+                                                     SSTABLE_EXTENSION;
+                        auto newSSTable = std::make_shared<SSTable>(
+                            new Pager(newSSTablePath, std::ios::in | std::ios::out | std::ios::trunc));
 
-                    newMemtable->inOrderTraversal([&newSSTable](const std::vector<uint8_t> &key,
-                                                                const std::vector<uint8_t> &value) {
-                        KeyValue kv;
-                        kv.set_key(key.data(), key.size());
-                        kv.set_value(value.data(), value.size());
-                        std::vector<uint8_t> serialized = serialize(kv);
-                        newSSTable->pager->Write(serialized);
-                    });
+                        newMemtable->inOrderTraversal([&newSSTable](const std::vector<uint8_t> &key,
+                                                                    const std::vector<uint8_t> &value) {
+                            KeyValue kv;
+                            kv.set_key(key.data(), key.size());
+                            kv.set_value(value.data(), value.size());
+                            std::vector<uint8_t> serialized = serialize(kv);
+                            newSSTable->pager->Write(serialized);
+                        });
 
-                    // Add the new SSTable to the list of SSTables
+                        {
+                            std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
+                            sstables.push_back(newSSTable);
+                        }
+                    }
+
+                    std::filesystem::remove(sstable1->pager->GetFileName());
+                    std::filesystem::remove(sstable2->pager->GetFileName());
+
                     {
                         std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
-                        sstables.push_back(newSSTable);
+                        sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable1), sstables.end());
+                        sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable2), sstables.end());
                     }
-                }
-
-                // Delete the old SSTables
-                std::filesystem::remove(sstable1->pager->GetFileName());
-                std::filesystem::remove(sstable2->pager->GetFileName());
-
-                // Remove the old SSTables from the list of SSTables
-                {
-                    std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
-                    sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable1),
-                                   sstables.end());
-                    sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable2),
-                                   sstables.end());
+                } catch (const std::exception &e) {
+                    std::cerr << "Error during compaction: " << e.what() << std::endl;
                 }
             }));
         }
@@ -1149,9 +1135,10 @@ bool LSMT::Compact() {
         for (auto &future : futures) {
             future.get();
         }
-    });
-
-    compactionThread.detach();  // Detach the thread to run in the background
+    } catch (const std::exception &e) {
+        std::cerr << "Error in Compact function: " << e.what() << std::endl;
+        return false;
+    }
 
     return true;
 }

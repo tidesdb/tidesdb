@@ -10,7 +10,7 @@ int main() {
     std::string directory = "./tidesdb_data";  // The directory for storing data
     std::filesystem::perms directoryPerm =
         std::filesystem::perms::owner_all | std::filesystem::perms::group_read;  // Permissions
-    int memtableFlushSize = 6 * 4;  // Flush size to trigger after 6 key-value pairs (24 bytes)
+    int memtableFlushSize = 6 * 2;  // Flush size to trigger after 6 key-value pairs (24 bytes)
     int compactionInterval = 2;     // Compaction interval to trigger after 2 flushes
 
     try {
@@ -29,6 +29,9 @@ int main() {
 
             lsmTree->Put(key, value);
         }
+
+        // sleep main thread let background thread finish compaction
+        std::this_thread::sleep_for(std::chrono::milliseconds(5000));
 
         // Check for all 24 keys
         for (int i = 0; i < 24; i++) {
@@ -49,7 +52,7 @@ int main() {
         lsmTree->Close();
 
         // Remove the directory
-        std::filesystem::remove_all(directory);
+        // std::filesystem::remove_all(directory);
 
         return 0;
 

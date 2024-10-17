@@ -13,7 +13,7 @@ int main() {
     std::filesystem::perms directoryPerm =
         std::filesystem::perms::owner_all | std::filesystem::perms::group_read;  // Permissions
     int memtableFlushSize = 6 * 4;  // Flush size to trigger after 6 key-value pairs (24 bytes)
-    int compactionInterval = 8;
+    int compactionInterval = 22;
 
     try {
         // Initialize the LSMT

@@ -110,8 +110,8 @@ Pager::~Pager() {
         file.close();
     }
 
-    // Clear the pageLocks vector to release all locks
-    pageLocks.clear();
+    // Check if we require to release any locks
+    if (!pageLocks.empty()) { pageLocks.clear(); }
 }
 
 // Pager::Write writes data to the paged file, creating overflow pages if necessary
@@ -696,6 +696,9 @@ void Wal::Close() {
     if (backgroundThread.joinable()) {
         backgroundThread.join();
     }
+
+    // Close the pager
+    pager->Close();
 }
 
 // Wal::WriteOperation

@@ -286,6 +286,16 @@ class Pager {
     // Destructor
     ~Pager();
 
+    bool Close() {
+        // Check if we require to release any locks
+        if (!pageLocks.empty()) { pageLocks.clear(); }
+        // Close the file
+        if (file.is_open()) {
+            file.close();
+            return true;
+        }
+    }
+
     // Write
     // Writes a new page to the file
     // takes a vector of characters as input
@@ -523,9 +533,7 @@ class LSMT {
 
                 // Iterate over the SSTables and close them
                 for (const auto &sstable : sstables) {
-                    if (sstable->pager->GetFile().is_open()) {
-                        sstable->pager->GetFile().close();
-                    }
+                    sstable->pager->Close();
                 }
 
                 // Clear the list of SSTables

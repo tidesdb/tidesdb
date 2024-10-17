@@ -494,33 +494,49 @@ class LSMT {
 
     // Close closes the LSMT
     void Close() {
-        // Commits any active transactions
-        for (auto tx : activeTransactions) {
-            CommitTransaction(tx);
-        }
+        try {
+            // Commits any active transactions
+            for (auto tx : activeTransactions) {
+                CommitTransaction(tx);
+            }
 
-        // Flush the memtable to disk
-        if (!flushMemtable()) {
-            std::cerr << "Failed to flush memtable during close\n";
-        }
+            // Flush the memtable to disk
+            if (!flushMemtable()) {
+                std::cerr << "Failed to flush memtable during close\n";
+            }
 
-        // Wait for the flush thread to finish
-        if (flushThread.joinable()) {
-            flushThread.join();
-        }
+            // Wait for the flush thread to finish
+            if (flushThread.joinable()) {
+                flushThread.join();
+            }
 
-        // Wait for the compaction thread to finish
-        if (compactionThread.joinable()) {
-            compactionThread.join();
-        }
+            // Wait for the compaction thread to finish
+            if (compactionThread.joinable()) {
+                compactionThread.join();
+            }
 
-        // Close the write-ahead log
-        wal->Close();
+            // Close the write-ahead log
+            wal->Close();
 
-        // Clear the list of SSTables
-        {
-            std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
-            sstables.clear();
+            {
+                std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
+
+                // Iterate over the SSTables and close them
+                for (const auto &sstable : sstables) {
+                    if (sstable->pager->GetFile().is_open()) {
+                        sstable->pager->GetFile().close();
+                    }
+                }
+
+                // Clear the list of SSTables
+                sstables.clear();
+            }
+        } catch (const std::system_error &e) {
+            std::cerr << "System error during close: " << e.what() << std::endl;
+            throw;
+        } catch (const std::exception &e) {
+            std::cerr << "Exception during close: " << e.what() << std::endl;
+            throw;
         }
     }
 

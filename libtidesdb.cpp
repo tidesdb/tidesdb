@@ -670,19 +670,18 @@ void Wal::Close() {
     pager->Close();
 }
 
-// Wal::WriteOperation
-// tesponsible for writing an operation to the write-ahead log (WAL).
+// Wal::AppendOperation
+// responsible for appending an operation to the write-ahead log (WAL).
 // It ensures thread safety by using a mutex to lock the operation queue,
 // pushes the operation onto the queue, and then notifies a condition variable to
 // signal that a new operation is available
-bool Wal::WriteOperation(const Operation &op) {
+void Wal::AppendOperation(const Operation &op) {
     {
         std::lock_guard<std::mutex> lock(queueMutex);  // Lock the queue mutex
         operationQueue.push(op);                       // Push the operation onto the queue
     }
     queueCondVar
         .notify_one();  // Notify the condition variable to signal that a new operation is available
-    return true;
 }
 
 // Wal::Recover
@@ -748,14 +747,14 @@ bool LSMT::flushMemtable() {
         // Clear the current memtable
         memtable->clear();
 
+        isFlushing.store(0);  // Reset the flag
+
         // Add the new memtable to the flush queue
         {
             std::lock_guard<std::mutex> lock(flushQueueMutex);
             flushQueue.push(std::move(newMemtable));
 
             flushQueueCondVar.notify_one();  // Notify the flush thread
-
-            isFlushing.store(0);  // Reset the flag
         }
 
         return true;
@@ -823,6 +822,10 @@ void LSMT::flushThreadFunc() {
                 std::vector<uint8_t>(kvPairs.back().key().begin(), kvPairs.back().key().end());
         }
 
+        if (kvPairs.empty()) {
+            continue;  // Skip if there are no key-value pairs
+        }
+
         // Serialize the key-value pairs
         for (const auto &kv : kvPairs) {
             sstable->pager->Write(serialize(kv));
@@ -836,7 +839,9 @@ void LSMT::flushThreadFunc() {
 
         // Check if we need to compact
         if (sstableCounter >= compactionInterval) {
+            isCompacting.store(1);
             Compact();
+            isCompacting.store(0);
         }
     }
 }
@@ -853,17 +858,12 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
         cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
     }  // Automatically unlocks when leaving the scope
 
-    // Lock and write to the write-ahead log
     {
-        std::unique_lock lock(walLock);
         Operation op;
         op.set_type(static_cast<::OperationType>(OperationType::OpDelete));
         op.set_key(key.data(), key.size());
-
-        if (!wal->WriteOperation(op)) {
-            return false;  // Return false if writing to the WAL fails
-        }
-    }  // Automatically unlocks when leaving the scope
+        wal->AppendOperation(op);
+    }
 
     {
         memtable->insert(
@@ -871,7 +871,7 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
     }  // Automatically unlocks when leaving the scope
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
-    if (memtable->getSize() > memtableFlushSize) {
+    if (memtable->getSize() >= memtableFlushSize) {
         flushMemtable();
     }
 
@@ -892,25 +892,20 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
 
     // Check for null pointers
     if (!wal || !memtable) {
-        throw std::runtime_error("WAL or memtable is not initialized");
+        throw TidesDBException("WAL or memtable is null");
     }
 
-    // Lock and write to the write-ahead log
     {
-        std::unique_lock lock(walLock);
         Operation op;
         op.set_key(key.data(), key.size());
         op.set_value(value.data(), value.size());
         op.set_type(static_cast<::OperationType>(OperationType::OpPut));
-
-        if (!wal->WriteOperation(op)) {
-            return false;  // Return false if writing to the WAL fails
-        }
-    }  // Automatically unlocks when leaving the scope
+        wal->AppendOperation(op);
+    }
 
     // Check if value is tombstone
     if (value == std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
-        throw std::invalid_argument("value cannot be a tombstone");
+        throw TidesDBException("Value cannot be a tombstone value");
     }
 
     // Insert the key-value pair into the memtable
@@ -950,15 +945,10 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
         return {};  // Early exit if there are no SSTables
     }
 
-    for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
-        // Check if iterator is valid
-        if (it == sstables.rend() || !*it) {
-            continue;  // Skip null iterators
-        }
-
-        auto sstable = *it;
+    for (const auto &sstable :
+         std::vector<std::shared_ptr<SSTable>>(sstables.rbegin(), sstables.rend())) {
         if (!sstable) {
-            continue;  // Skip if sstable is null
+            continue;  // Skip null SSTables
         }
 
         // If the key is not within the range of this SSTable, skip it
@@ -1061,9 +1051,6 @@ bool LSMT::Compact() {
             }
         }
 
-        // set isCompacting flag
-        isCompacting.store(1);
-
         for (const auto &pair : sstablePairs) {
             futures.push_back(std::async(std::launch::async, [this, pair] {
                 try {
@@ -1082,52 +1069,49 @@ bool LSMT::Compact() {
                     std::unique_lock<std::shared_mutex> sstableLock2(sstable2->lock);
 
                     if (!it1 || !it2) {
-                        isCompacting.store(0);
                         std::cerr << "Error: Failed to create SSTableIterator.\n";
                         return;
                     }
 
                     if (it1->Ok()) {
                         auto kv = it1->Next();
-                        if (!kv) {
-                            isCompacting.store(0);
-                            std::cerr
-                                << "Error: Failed to get next key-value from SSTableIterator 1.\n";
-                            return;
+                        if (kv) {
+                            currentKey1 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
+                            currentValue1 =
+                                std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                         }
-
-                        currentKey1 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                        currentValue1 =
-                            std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                     }
                     if (it2->Ok()) {
                         auto kv = it2->Next();
-                        if (!kv) {
-                            isCompacting.store(0);
-                            std::cerr
-                                << "Error: Failed to get next key-value from SSTableIterator 2.\n";
-                            return;
+                        if (kv) {
+                            currentKey2 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
+                            currentValue2 =
+                                std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                         }
-
-                        currentKey2 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                        currentValue2 =
-                            std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                     }
+
+                    std::optional<std::vector<uint8_t>> minKey, maxKey;
 
                     while (currentKey1.has_value() || currentKey2.has_value()) {
                         if (!currentKey2.has_value() ||
                             (currentKey1.has_value() && currentKey1 < currentKey2)) {
                             newMemtable->insert(currentKey1.value(), currentValue1.value());
+                            if (!minKey.has_value() || currentKey1 < minKey) {
+                                minKey = currentKey1;
+                            }
+                            if (!maxKey.has_value() || currentKey1 > maxKey) {
+                                maxKey = currentKey1;
+                            }
                             if (it1->Ok()) {
                                 auto kv = it1->Next();
-                                if (!kv) {
-                                    currentKey1.reset();
-                                    currentValue1.reset();
-                                } else {
+                                if (kv) {
                                     currentKey1 =
                                         std::vector<uint8_t>(kv->key().begin(), kv->key().end());
                                     currentValue1 = std::vector<uint8_t>(kv->value().begin(),
                                                                          kv->value().end());
+                                } else {
+                                    currentKey1.reset();
+                                    currentValue1.reset();
                                 }
                             } else {
                                 currentKey1.reset();
@@ -1135,16 +1119,22 @@ bool LSMT::Compact() {
                             }
                         } else {
                             newMemtable->insert(currentKey2.value(), currentValue2.value());
+                            if (!minKey.has_value() || currentKey2 < minKey) {
+                                minKey = currentKey2;
+                            }
+                            if (!maxKey.has_value() || currentKey2 > maxKey) {
+                                maxKey = currentKey2;
+                            }
                             if (it2->Ok()) {
                                 auto kv = it2->Next();
-                                if (!kv) {
-                                    currentKey2.reset();
-                                    currentValue2.reset();
-                                } else {
+                                if (kv) {
                                     currentKey2 =
                                         std::vector<uint8_t>(kv->key().begin(), kv->key().end());
                                     currentValue2 = std::vector<uint8_t>(kv->value().begin(),
                                                                          kv->value().end());
+                                } else {
+                                    currentKey2.reset();
+                                    currentValue2.reset();
                                 }
                             } else {
                                 currentKey2.reset();
@@ -1170,31 +1160,30 @@ bool LSMT::Compact() {
                                 kv.set_value(value.data(), value.size());
                                 std::vector<uint8_t> serialized = serialize(kv);
 
-                                // check if data is empty
-                                if (serialized.empty()) {
-                                    return;
+                                if (!serialized.empty()) {
+                                    newSSTable->pager->Write(serialized);
                                 }
-
-                                newSSTable->pager->Write(serialized);
                             });
+
+                        if (minKey.has_value()) {
+                            newSSTable->minKey = minKey.value();
+                        }
+                        if (maxKey.has_value()) {
+                            newSSTable->maxKey = maxKey.value();
+                        }
 
                         {
                             std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
+                            sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable1),
+                                           sstables.end());
+                            sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable2),
+                                           sstables.end());
                             sstables.push_back(newSSTable);
                         }
                     }
 
                     std::filesystem::remove(sstable1->pager->GetFileName());
                     std::filesystem::remove(sstable2->pager->GetFileName());
-
-                    {
-                        std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
-                        sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable1),
-                                       sstables.end());
-                        sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable2),
-                                       sstables.end());
-                    }
-                    isCompacting.store(0);
 
                 } catch (const std::exception &e) {
                     std::cerr << "Error during compaction: " << e.what() << std::endl;

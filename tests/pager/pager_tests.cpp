@@ -32,7 +32,7 @@ int main() {
     bool all_tests_passed = true;
     for (int i = 0; i < 5; ++i) {
         std::vector<char> read_data = convertToCharVector(pager.Read(page_numbers[i]));
-        if (std::string(read_data.begin(), read_data.end()) !=
+        if (std::string(read_data.begin(), read_data.end()) !=  // not equal
             std::string(1024 * 8, 'a') + "Hello, world!") {
             std::cout << "Pager test failed for page " << i << std::endl;
             all_tests_passed = false;

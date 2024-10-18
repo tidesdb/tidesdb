@@ -79,7 +79,7 @@ struct Transaction {
     std::mutex operationsMutex;                    // Mutex for operations
 };
 
-// Exception class
+// TidesDBException is an exception class for TidesDB
 class TidesDBException : public std::exception {
    private:
     std::string message;  // Exception message
@@ -88,19 +88,19 @@ class TidesDBException : public std::exception {
     virtual const char *what() const noexcept override { return message.c_str(); }
 };
 
-// Serialize serializes the KeyValue struct to a byte vector
+// deserialize serializes the KeyValue struct to a byte vector
 std::vector<uint8_t> serialize(const KeyValue &kv);
 
-// Deserialize deserializes a byte vector to a KeyValue struct
+// deserialize deserializes a byte vector to a KeyValue struct
 KeyValue deserialize(const std::vector<uint8_t> &buffer);
 
-// SerializeOperation serializes the Operation struct to a byte vector
+// serializeOperation serializes the Operation struct to a byte vector
 std::vector<uint8_t> serializeOperation(const Operation &op);
 
-// DeserializeOperation deserializes a byte vector to an Operation struct
+// deserializeOperation deserializes a byte vector to an Operation struct
 Operation deserializeOperation(const std::vector<uint8_t> &buffer);
 
-// Gets os specific path separator
+// getPathSeparator Gets os specific path separator
 std::string getPathSeparator();
 
 // Constants
@@ -112,13 +112,15 @@ constexpr int PAGE_BODY_SIZE = PAGE_SIZE - PAGE_HEADER_SIZE;  // Page body size
 // SkipListNode is a node in a skip list
 class SkipListNode {
    public:
-    std::vector<uint8_t> key;
-    std::vector<uint8_t> value;
+    // Each node contains a key, value, and an array of forward pointers
+    std::vector<uint8_t> key;    // Node key
+    std::vector<uint8_t> value;  // Node value
     std::vector<std::atomic<SkipListNode *>> forward;
 
+    // SkipListNode Constructor
     SkipListNode(const std::vector<uint8_t> &k, const std::vector<uint8_t> &v, int level)
         : key(k), value(v), forward(level + 1) {
-        for (int i = 0; i <= level; ++i) {
+        for (int i = 0; i <= level; ++i) {  // Initialize forward pointers
             forward[i].store(nullptr, std::memory_order_relaxed);
         }
     }
@@ -127,10 +129,10 @@ class SkipListNode {
 // SkipList is a lock-free skip list class
 class SkipList {
    private:
-    int maxLevel;       // Maximum level of the skip list
-    float probability;  // Probability of a node having a higher level
-    std::atomic<int> level;
-    std::shared_ptr<SkipListNode> head;
+    int maxLevel;                          // Maximum level of the skip list
+    float probability;                     // Probability of a node having a higher level
+    std::atomic<int> level;                // Current level of the skip list
+    std::shared_ptr<SkipListNode> head;    // Head node of the skip list
     std::mt19937 gen;                      // Random number generator
     std::uniform_real_distribution<> dis;  // Uniform distribution
     std::atomic<int> cachedSize;           // Size of the skip list
@@ -358,8 +360,8 @@ class Wal {
 
     std::shared_mutex lock;  // Mutex for write-ahead log
 
-    // WriteOperation writes an operation to the write-ahead log
-    bool WriteOperation(const Operation &op);
+    void AppendOperation(
+        const Operation &op);  // AppendOperation writes an operation to the write-ahead log
 
     // Recover recovers operations from the write-ahead log
     bool Recover(LSMT &lsmt) const;
@@ -407,6 +409,13 @@ class SSTableIterator {
         if (!pager) {
             throw std::invalid_argument("Pager cannot be null");
         }
+
+        if (maxPages == 0) {
+            std::cout << "Pager has no pages\n";
+            throw std::invalid_argument("Pager has no pages");
+        }
+
+        std::cout << "Pager has " << maxPages << " pages\n";
     }
 
     // Ok checks if the iterator is valid
@@ -479,6 +488,22 @@ class LSMT {
     // Compact compacts the SSTables
     bool Compact();
 
+    // IsFlushing returns whether the memtable is being flushed
+    bool IsFlushing() const { return isFlushing.load(); }
+
+    // IsCompacting returns whether the SSTables are being compacted
+    bool IsCompacting() const { return isCompacting.load(); }
+
+    // GetMemtable returns the memtable
+    SkipList *GetMemtable() const { return memtable; }
+
+    // GetSSTableCount returns the number of SSTables
+    int GetSSTableCount() {
+        // lock the SSTables
+        std::shared_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
+        return sstables.size();
+    }
+
     // NGet returns all key-value pairs not equal to a given key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> NGet(
         const std::vector<uint8_t> &key) const;
@@ -543,6 +568,11 @@ class LSMT {
             // Commits any active transactions
             for (auto tx : activeTransactions) {
                 CommitTransaction(tx);
+            }
+
+            // Wait for the memtable to flush and or compaction to finish
+            while (IsFlushing() || IsCompacting()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
             // Flush the memtable to disk
@@ -674,10 +704,13 @@ class LSMT {
     std::atomic_bool stopBackgroundThreads = false;    // Stop background thread
     std::condition_variable flushQueueCondVar;         // Condition variable for flush queue
     std::thread compactionThread;                      // Thread for compaction
+
     // flushMemtable flushes the memtable to disk
     bool flushMemtable();
 
     // flushThreadFunc is the function that runs in the flush thread
+    // This function waits notification and pops latest memtable from the queue and flushes it to
+    // disk
     void flushThreadFunc();
 };
 

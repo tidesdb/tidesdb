@@ -112,6 +112,9 @@ int main() {
 
         newLSMT->Close();
 
+        // remove the directory
+        std::filesystem::remove_all(directory);
+
         return 0;
 
     } catch (const std::exception &e) {

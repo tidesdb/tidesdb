@@ -13,15 +13,15 @@ int main() {
     std::string directory = "./tidesdb_data";  // The directory for storing data
     std::filesystem::perms directoryPerm =
         std::filesystem::perms::owner_all | std::filesystem::perms::group_read;  // Permissions
-    int memtableFlushSize = 2;
-    int compactionInterval = 3;
+    int memtableFlushSize = 6;
+    int compactionInterval = 100;
 
     try {
         // Initialize the LSMT
         auto lsmTree =
             TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
 
-        for (int i = 1; i <= 6; i++) {  // Insert fewer key-value pairs
+        for (int i = 1; i <= 200; i++) {
             std::string keyStr = std::to_string(i);
             std::vector<uint8_t> key(keyStr.begin(), keyStr.end());
             std::vector<uint8_t> value(keyStr.begin(), keyStr.end());
@@ -31,7 +31,7 @@ int main() {
 
         // Set of missing keys
         std::set<std::vector<uint8_t>> missingKeys;
-        for (int i = 1; i <= 6; i++) {  // Adjust the range accordingly
+        for (int i = 1; i <= 200; i++) {
             std::string keyStr = std::to_string(i);
             std::vector<uint8_t> key(keyStr.begin(), keyStr.end());
             missingKeys.insert(key);
@@ -54,8 +54,29 @@ int main() {
         }
 
         lsmTree->Close();
+        std::cout << "LSMT closed" << std::endl;
 
-        std::cout << "Test passed" << std::endl;
+        // Reopen the LSMT
+        auto reopenedLSMT =
+            TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
+        std::cout << "LSMT reopened" << std::endl;
+
+        // Verify recovered data
+        for (int i = 1; i <= 200; i++) {
+            std::string keyStr = std::to_string(i);
+            std::vector<uint8_t> key(keyStr.begin(), keyStr.end());
+            std::vector<uint8_t> expectedValue(keyStr.begin(), keyStr.end());
+            std::vector<uint8_t> recoveredValue = reopenedLSMT->Get(key);
+
+            if (recoveredValue != expectedValue) {
+                std::cerr << "Recovered data does not match for key " << keyStr << std::endl;
+                return 1;
+            }
+        }
+
+        std::cout << "Recovered data matches original data" << std::endl;
+
+        reopenedLSMT->Close();
 
         // Remove the directory
         std::filesystem::remove_all(directory);
@@ -64,5 +85,6 @@ int main() {
 
     } catch (const std::exception &e) {
         std::cerr << "Error initializing LSMT: " << e.what() << std::endl;
+        return 1;
     }
 }

@@ -73,6 +73,8 @@ int main() {
         // Remove the directory
         std::filesystem::remove_all(directory);
 
+        std::cout << "All tests passed" << std::endl;
+
         return 0;
 
     } catch (const std::exception& e) {

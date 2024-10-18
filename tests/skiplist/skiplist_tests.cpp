@@ -7,6 +7,13 @@
 int main() {
     TidesDB::SkipList skipList(12, 0.5);
 
+    // Try to get on an empty skip list
+    if (skipList.get({1, 2, 3}).empty()) {
+        std::cout << "Get on empty skip list passed" << std::endl;
+    } else {
+        std::cout << "Get on empty skip list failed" << std::endl;
+    }
+
     // Insert key-value pairs
     skipList.insert({1, 2, 3}, {10, 20, 30});
     skipList.insert({4, 5, 6}, {40, 50, 60});

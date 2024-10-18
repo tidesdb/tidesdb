@@ -73,7 +73,7 @@ int main() {
     srand(static_cast<unsigned>(time(0)));
 
     // Initialize LSMT
-    auto lsmt = TidesDB::LSMT::New("benchmark_directory", std::filesystem::perms::all, 100, 22);
+    auto lsmt = TidesDB::LSMT::New("benchmark_directory", std::filesystem::perms::all, 100, 10);
     if (!lsmt) {
         std::cerr << "Failed to initialize LSMT\n";
         return 1;
@@ -86,7 +86,7 @@ int main() {
     lsmt->Close();
 
     // Remove benchmark directory
-    // std::filesystem::remove_all("benchmark_directory");
+    std::filesystem::remove_all("benchmark_directory");
 
     return 0;
 }

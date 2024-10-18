@@ -15,8 +15,7 @@
  */
 #include "libtidesdb.h"
 
-#include <iostream>
-#include <random>
+#include <semaphore.h>
 
 // The TidesDB namespace
 namespace TidesDB {
@@ -153,7 +152,6 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
         // Pad the body if necessary
         if (chunk_size < PAGE_BODY_SIZE) {
             std::vector<uint8_t> body_padding(PAGE_BODY_SIZE - chunk_size, '\0');
-
             file.write(reinterpret_cast<const char *>(body_padding.data()), body_padding.size());
         }
 
@@ -350,6 +348,12 @@ void SkipList::inOrderTraversal(
 // get returns the value for a given key in the SkipList
 std::vector<uint8_t> SkipList::get(const std::vector<uint8_t> &key) const {
     SkipListNode *x = head.get();
+
+    // Check if the SkipList is empty
+    if (x == nullptr || x->forward[0].load(std::memory_order_acquire) == nullptr) {
+        return {};  // SkipList is empty, return right away
+    }
+
     for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
         while (x->forward[i].load(std::memory_order_acquire) != nullptr &&
                x->forward[i].load(std::memory_order_acquire)->key < key) {
@@ -689,7 +693,7 @@ void Wal::AppendOperation(const Operation &op) {
 // for reading, iterates through each page, deserializes the data into an Operation object, and
 // immediately processes the operation by inserting or deleting key-value pairs in the LSMT's
 // memtable. This approach avoids storing all operations in memory at once, optimizing memory usage.
-bool TidesDB::Wal::Recover(LSMT &lsmt) const {
+bool Wal::Recover(LSMT &lsmt) const {
     // Lock the WAL for reading
     std::unique_lock<std::shared_mutex> lock(walLock);
 
@@ -699,10 +703,28 @@ bool TidesDB::Wal::Recover(LSMT &lsmt) const {
     // Iterate through each page in the WAL
     for (int64_t i = 0; i < pageCount; ++i) {
         // Read the data from the current page
-        std::vector<uint8_t> data = pager->Read(i);
+        std::vector<uint8_t> data;
+        try {
+            data = pager->Read(i);
+        } catch (const std::exception &e) {
+            std::cerr << "Error reading page " << i << ": " << e.what() << std::endl;
+            return false;
+        }
+
+        if (data.empty()) {
+            std::cerr << "Page " << i << " is empty" << std::endl;
+            continue;
+        }
 
         // Deserialize the data into an Operation object
-        Operation op = deserializeOperation(data);
+        Operation op;
+        try {
+            op = deserializeOperation(data);
+        } catch (const std::exception &e) {
+            std::cerr << "Error deserializing operation from page " << i << ": " << e.what()
+                      << std::endl;
+            return false;
+        }
 
         // Process the operation immediately
         switch (static_cast<int>(op.type())) {
@@ -718,7 +740,8 @@ bool TidesDB::Wal::Recover(LSMT &lsmt) const {
                 break;
             }
             default:
-                std::cerr << "Unknown operation type: " << static_cast<int>(op.type()) << std::endl;
+                std::cerr << "Unknown operation type: " << static_cast<int>(op.type())
+                          << " on page " << i << std::endl;
                 return false;
         }
     }
@@ -932,13 +955,18 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
         cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
     }  // Automatically unlocks when leaving the scope
 
-    // Check the memtable for the key
-    std::vector<uint8_t> value = memtable->get(key);
+    std::vector<uint8_t> value;
 
-    // If value is found and it's not a tombstone, return it
-    if (!value.empty() &&
-        value != std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
-        return value;
+    if (memtable->getSize() > 0) {
+        // Check the memtable for the key
+        value = memtable->get(key);
+
+        // If value is found and it's not a tombstone, return it
+        if (!value.empty() &&
+            value !=
+                std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
+            return value;
+        }
     }
 
     if (sstables.empty()) {
@@ -993,22 +1021,34 @@ std::fstream &Pager::GetFile() { return file; }
 // TidesDB::Wal::backgroundThreadFunc
 // is a background thread function for the Write-Ahead Log (WAL).
 // It continuously processes operations from a queue and writes them to the WAL file
-void TidesDB::Wal::backgroundThreadFunc() {
-    while (true) {
-        std::unique_lock<std::mutex> lock(queueMutex);
-        queueCondVar.wait(lock, [this] { return !operationQueue.empty() || stopBackgroundThread; });
+void Wal::backgroundThreadFunc() {
+    try {
+        while (true) {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            queueCondVar.wait(lock,
+                              [this] { return stopBackgroundThread || !operationQueue.empty(); });
 
-        if (stopBackgroundThread && operationQueue.empty()) {
-            break;
+            if (stopBackgroundThread && operationQueue.empty()) {
+                break;
+            }
+
+            if (!operationQueue.empty()) {
+                Operation op = operationQueue.front();
+                operationQueue.pop();
+                lock.unlock();
+
+                // Serialize and write the operation to the WAL
+                std::vector<uint8_t> serializedOp = serializeOperation(op);
+                int64_t pageNumber = pager->Write(serializedOp);
+                if (pageNumber < 0) {
+                    std::cerr << "Failed to write operation to WAL" << std::endl;
+                }
+            }
         }
-
-        Operation op = operationQueue.front();
-        operationQueue.pop();
-        lock.unlock();
-
-        // Serialize and write the operation to the WAL
-        std::vector<uint8_t> serializedOp = serializeOperation(op);
-        pager->Write(serializedOp);
+    } catch (const std::exception &e) {
+        std::cerr << "Exception in backgroundThreadFunc: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "Unknown exception in backgroundThreadFunc." << std::endl;
     }
 }
 
@@ -1038,168 +1078,192 @@ void AVLTree::clear() {
 // SSTables, merges them, and writes the merged data to new SSTables. The old SSTables are then
 // deleted.
 bool LSMT::Compact() {
-    try {
-        std::vector<std::future<void>> futures;
-        std::vector<std::pair<std::shared_ptr<SSTable>, std::shared_ptr<SSTable>>> sstablePairs;
+    // Start a background thread to perform compaction
+    compactionThread = std::thread([this] {
+        try {
+            const int maxConcurrentThreads = std::max(1, maxCompactionThreads);
+            std::vector<std::unique_ptr<std::counting_semaphore<1>>> semaphores;
+            for (int i = 0; i < maxConcurrentThreads; ++i) {
+                semaphores.emplace_back(std::make_unique<std::counting_semaphore<1>>(1));
+            }
 
-        {
-            std::shared_lock<std::shared_mutex> lock(sstablesLock);
-            for (size_t i = 0; i < sstables.size(); i += 2) {
-                if (i + 1 < sstables.size()) {
-                    sstablePairs.emplace_back(sstables[i], sstables[i + 1]);
+            std::vector<std::future<void>> futures;
+            std::vector<std::pair<std::shared_ptr<SSTable>, std::shared_ptr<SSTable>>> sstablePairs;
+
+            {
+                std::shared_lock<std::shared_mutex> lock(sstablesLock);
+                for (size_t i = 0; i < sstables.size(); i += 2) {
+                    if (i + 1 < sstables.size()) {
+                        sstablePairs.emplace_back(sstables[i], sstables[i + 1]);
+                    }
                 }
             }
-        }
 
-        for (const auto &pair : sstablePairs) {
-            futures.push_back(std::async(std::launch::async, [this, pair] {
-                try {
-                    auto sstable1 = pair.first;
-                    auto sstable2 = pair.second;
+            for (const auto &pair : sstablePairs) {
+                for (auto &semaphore : semaphores) {
+                    semaphore->acquire();
+                }
+                futures.push_back(std::async(std::launch::async, [this, pair, &semaphores] {
+                    try {
+                        auto sstable1 = pair.first;
+                        auto sstable2 = pair.second;
 
-                    auto it1 = std::make_unique<SSTableIterator>(sstable1->pager);
-                    auto it2 = std::make_unique<SSTableIterator>(sstable2->pager);
-                    auto newMemtable =
-                        std::make_unique<SkipList>(/* maxLevel */ 16, /* probability */ 0.5f);
+                        auto it1 = std::make_unique<SSTableIterator>(sstable1->pager);
+                        auto it2 = std::make_unique<SSTableIterator>(sstable2->pager);
+                        auto newMemtable = std::make_unique<SkipList>(maxLevel, probability);
 
-                    std::optional<std::vector<uint8_t>> currentKey1, currentValue1;
-                    std::optional<std::vector<uint8_t>> currentKey2, currentValue2;
+                        std::optional<std::vector<uint8_t>> currentKey1, currentValue1;
+                        std::optional<std::vector<uint8_t>> currentKey2, currentValue2;
 
-                    std::unique_lock<std::shared_mutex> sstableLock1(sstable1->lock);
-                    std::unique_lock<std::shared_mutex> sstableLock2(sstable2->lock);
+                        std::unique_lock<std::shared_mutex> sstableLock1(sstable1->lock);
+                        std::unique_lock<std::shared_mutex> sstableLock2(sstable2->lock);
 
-                    if (!it1 || !it2) {
-                        std::cerr << "Error: Failed to create SSTableIterator.\n";
-                        return;
-                    }
-
-                    if (it1->Ok()) {
-                        auto kv = it1->Next();
-                        if (kv) {
-                            currentKey1 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                            currentValue1 =
-                                std::vector<uint8_t>(kv->value().begin(), kv->value().end());
-                        }
-                    }
-                    if (it2->Ok()) {
-                        auto kv = it2->Next();
-                        if (kv) {
-                            currentKey2 = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                            currentValue2 =
-                                std::vector<uint8_t>(kv->value().begin(), kv->value().end());
-                        }
-                    }
-
-                    std::optional<std::vector<uint8_t>> minKey, maxKey;
-
-                    while (currentKey1.has_value() || currentKey2.has_value()) {
-                        if (!currentKey2.has_value() ||
-                            (currentKey1.has_value() && currentKey1 < currentKey2)) {
-                            newMemtable->insert(currentKey1.value(), currentValue1.value());
-                            if (!minKey.has_value() || currentKey1 < minKey) {
-                                minKey = currentKey1;
+                        if (!it1 || !it2) {
+                            std::cerr << "Error: Failed to create SSTableIterator.\n";
+                            for (auto &semaphore : semaphores) {
+                                semaphore.release();
                             }
-                            if (!maxKey.has_value() || currentKey1 > maxKey) {
-                                maxKey = currentKey1;
+                            return;
+                        }
+
+                        it1 = std::make_unique<SSTableIterator>(sstable1->pager);
+                        it2 = std::make_unique<SSTableIterator>(sstable2->pager);
+
+                        if (it1->Ok()) {
+                            auto kv = it1->Next();
+                            if (kv) {
+                                currentKey1 =
+                                    std::vector<uint8_t>(kv->key().begin(), kv->key().end());
+                                currentValue1 =
+                                    std::vector<uint8_t>(kv->value().begin(), kv->value().end());
                             }
-                            if (it1->Ok()) {
-                                auto kv = it1->Next();
-                                if (kv) {
-                                    currentKey1 =
-                                        std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                                    currentValue1 = std::vector<uint8_t>(kv->value().begin(),
-                                                                         kv->value().end());
+                        }
+                        if (it2->Ok()) {
+                            auto kv = it2->Next();
+                            if (kv) {
+                                currentKey2 =
+                                    std::vector<uint8_t>(kv->key().begin(), kv->key().end());
+                                currentValue2 =
+                                    std::vector<uint8_t>(kv->value().begin(), kv->value().end());
+                            }
+                        }
+
+                        std::optional<std::vector<uint8_t>> minKey, maxKey;
+
+                        while (currentKey1.has_value() || currentKey2.has_value()) {
+                            if (!currentKey2.has_value() ||
+                                (currentKey1.has_value() && *currentKey1 < *currentKey2)) {
+                                newMemtable->insert(*currentKey1, *currentValue1);
+                                if (!minKey.has_value() || *currentKey1 < *minKey) {
+                                    minKey = currentKey1;
+                                }
+                                if (!maxKey.has_value() || *currentKey1 > *maxKey) {
+                                    maxKey = currentKey1;
+                                }
+                                if (it1->Ok()) {
+                                    auto kv = it1->Next();
+                                    if (kv) {
+                                        currentKey1 = std::vector<uint8_t>(kv->key().begin(),
+                                                                           kv->key().end());
+                                        currentValue1 = std::vector<uint8_t>(kv->value().begin(),
+                                                                             kv->value().end());
+                                    } else {
+                                        currentKey1.reset();
+                                        currentValue1.reset();
+                                    }
                                 } else {
                                     currentKey1.reset();
                                     currentValue1.reset();
                                 }
                             } else {
-                                currentKey1.reset();
-                                currentValue1.reset();
-                            }
-                        } else {
-                            newMemtable->insert(currentKey2.value(), currentValue2.value());
-                            if (!minKey.has_value() || currentKey2 < minKey) {
-                                minKey = currentKey2;
-                            }
-                            if (!maxKey.has_value() || currentKey2 > maxKey) {
-                                maxKey = currentKey2;
-                            }
-                            if (it2->Ok()) {
-                                auto kv = it2->Next();
-                                if (kv) {
-                                    currentKey2 =
-                                        std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                                    currentValue2 = std::vector<uint8_t>(kv->value().begin(),
-                                                                         kv->value().end());
+                                newMemtable->insert(*currentKey2, *currentValue2);
+                                if (!minKey.has_value() || *currentKey2 < *minKey) {
+                                    minKey = currentKey2;
+                                }
+                                if (!maxKey.has_value() || *currentKey2 > *maxKey) {
+                                    maxKey = currentKey2;
+                                }
+                                if (it2->Ok()) {
+                                    auto kv = it2->Next();
+                                    if (kv) {
+                                        currentKey2 = std::vector<uint8_t>(kv->key().begin(),
+                                                                           kv->key().end());
+                                        currentValue2 = std::vector<uint8_t>(kv->value().begin(),
+                                                                             kv->value().end());
+                                    } else {
+                                        currentKey2.reset();
+                                        currentValue2.reset();
+                                    }
                                 } else {
                                     currentKey2.reset();
                                     currentValue2.reset();
                                 }
-                            } else {
-                                currentKey2.reset();
-                                currentValue2.reset();
                             }
                         }
+
+                        if (newMemtable->getSize() > 0) {
+                            std::string newSSTablePath =
+                                directory + getPathSeparator() + "sstable_compacted_" +
+                                std::to_string(
+                                    std::chrono::system_clock::now().time_since_epoch().count()) +
+                                SSTABLE_EXTENSION;
+                            auto newSSTable = std::make_shared<SSTable>(new Pager(
+                                newSSTablePath, std::ios::in | std::ios::out | std::ios::trunc));
+
+                            newMemtable->inOrderTraversal(
+                                [&newSSTable, this](const std::vector<uint8_t> &key,
+                                                    const std::vector<uint8_t> &value) {
+                                    KeyValue kv;
+                                    kv.set_key(key.data(), key.size());
+                                    kv.set_value(value.data(), value.size());
+                                    std::vector<uint8_t> serialized = serialize(kv);
+
+                                    if (!serialized.empty()) {
+                                        newSSTable->pager->Write(serialized);
+                                    }
+                                });
+
+                            if (minKey.has_value()) {
+                                newSSTable->minKey = *minKey;
+                            }
+                            if (maxKey.has_value()) {
+                                newSSTable->maxKey = *maxKey;
+                            }
+
+                            {
+                                std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
+                                sstables.erase(
+                                    std::remove(sstables.begin(), sstables.end(), sstable1),
+                                    sstables.end());
+                                sstables.erase(
+                                    std::remove(sstables.begin(), sstables.end(), sstable2),
+                                    sstables.end());
+                                sstables.push_back(newSSTable);
+                            }
+                        }
+
+                        std::filesystem::remove(sstable1->pager->GetFileName());
+                        std::filesystem::remove(sstable2->pager->GetFileName());
+
+                    } catch (const std::exception &e) {
+                        std::cerr << "Error during compaction: " << e.what() << std::endl;
                     }
-
-                    if (newMemtable->getSize() > 0) {
-                        std::string newSSTablePath =
-                            directory + getPathSeparator() + "sstable_compacted_" +
-                            std::to_string(
-                                std::chrono::system_clock::now().time_since_epoch().count()) +
-                            SSTABLE_EXTENSION;
-                        auto newSSTable = std::make_shared<SSTable>(new Pager(
-                            newSSTablePath, std::ios::in | std::ios::out | std::ios::trunc));
-
-                        newMemtable->inOrderTraversal(
-                            [&newSSTable](const std::vector<uint8_t> &key,
-                                          const std::vector<uint8_t> &value) {
-                                KeyValue kv;
-                                kv.set_key(key.data(), key.size());
-                                kv.set_value(value.data(), value.size());
-                                std::vector<uint8_t> serialized = serialize(kv);
-
-                                if (!serialized.empty()) {
-                                    newSSTable->pager->Write(serialized);
-                                }
-                            });
-
-                        if (minKey.has_value()) {
-                            newSSTable->minKey = minKey.value();
-                        }
-                        if (maxKey.has_value()) {
-                            newSSTable->maxKey = maxKey.value();
-                        }
-
-                        {
-                            std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
-                            sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable1),
-                                           sstables.end());
-                            sstables.erase(std::remove(sstables.begin(), sstables.end(), sstable2),
-                                           sstables.end());
-                            sstables.push_back(newSSTable);
-                        }
+                    for (auto &semaphore : semaphores) {
+                        semaphore.release();
                     }
+                }));
+            }
 
-                    std::filesystem::remove(sstable1->pager->GetFileName());
-                    std::filesystem::remove(sstable2->pager->GetFileName());
-
-                } catch (const std::exception &e) {
-                    std::cerr << "Error during compaction: " << e.what() << std::endl;
-                }
-            }));
+            for (auto &future : futures) {
+                future.get();
+            }
+        } catch (const std::exception &e) {
+            std::cerr << "Error in Compact function: " << e.what() << std::endl;
+            return false;
         }
 
-        for (auto &future : futures) {
-            future.get();
-        }
-    } catch (const std::exception &e) {
-        std::cerr << "Error in Compact function: " << e.what() << std::endl;
-        return false;
-    }
-
-    return true;
+        return true;
+    });
 }
 
 // LSMT::BeginTransaction

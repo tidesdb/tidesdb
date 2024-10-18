@@ -1,59 +1,9 @@
-#include <cassert>
 #include <filesystem>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #include "../../libtidesdb.h"
-
-void printResult(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &result) {
-    for (const auto &kv : result) {
-        std::cout << "Key: ";
-        for (auto byte : kv.first) {
-            std::cout << static_cast<int>(byte) << " ";
-        }
-        std::cout << "Value: ";
-        for (auto byte : kv.second) {
-            std::cout << static_cast<int>(byte) << " ";
-        }
-        std::cout << std::endl;
-    }
-}
-
-bool expect(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &result,
-            const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &expected) {
-    if (result.size() != expected.size()) {
-        std::cerr << "Size mismatch: expected " << expected.size() << " but got " << result.size()
-                  << std::endl;
-        return false;
-    }
-    for (size_t i = 0; i < result.size(); ++i) {
-        if (result[i].first != expected[i].first) {
-            std::cerr << "Key mismatch at index " << i << ": expected ";
-            for (auto byte : expected[i].first) {
-                std::cerr << static_cast<int>(byte) << " ";
-            }
-            std::cerr << "but got ";
-            for (auto byte : result[i].first) {
-                std::cerr << static_cast<int>(byte) << " ";
-            }
-            std::cerr << std::endl;
-            return false;
-        }
-        if (result[i].second != expected[i].second) {
-            std::cerr << "Value mismatch at index " << i << ": expected ";
-            for (auto byte : expected[i].second) {
-                std::cerr << static_cast<int>(byte) << " ";
-            }
-            std::cerr << "but got ";
-            for (auto byte : result[i].second) {
-                std::cerr << static_cast<int>(byte) << " ";
-            }
-            std::cerr << std::endl;
-            return false;
-        }
-    }
-    return true;
-}
 
 int main() {
     // Define parameters
@@ -61,77 +11,111 @@ int main() {
     std::filesystem::perms directoryPerm =
         std::filesystem::perms::owner_all | std::filesystem::perms::group_read;  // Permissions
     int memtableFlushSize = 10 * 1024;  // Example flush size (10 KB)
-    int compactionInterval = 8;
+    int compactionInterval = 8;         // Compaction interval
 
     try {
         // Initialize the LSMT
         auto lsmTree =
             TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
 
-        // Begin a transaction
-        auto transaction1 = lsmTree->BeginTransaction();
-
-        // Add a key-value pair within the transaction
-        std::vector<uint8_t> key1 = {1, 1, 1, 1};
-        std::vector<uint8_t> value1 = {1};
-        lsmTree->AddPut(transaction1, key1, value1);
-
-        // Commit the transaction
-        if (!lsmTree->CommitTransaction(transaction1)) {
-            std::cerr << "Transaction commit failed" << std::endl;
-            return 1;
+        // Insert 20kb of data
+        for (int i = 0; i < 20; i++) {
+            std::string keyStr = "key" + std::to_string(i);
+            std::string valueStr(1024, 'a' + i);
+            std::vector<uint8_t> key(keyStr.begin(), keyStr.end());
+            std::vector<uint8_t> value(valueStr.begin(), valueStr.end());
+            lsmTree->Put(key, value);
         }
 
-        // Begin another transaction
-        auto transaction2 = lsmTree->BeginTransaction();
+        // Get key "key5"
+        std::string keyStr = "key5";
+        std::vector<uint8_t> key(keyStr.begin(), keyStr.end());
+        std::vector<uint8_t> dat = lsmTree->Get(key);
 
-        // Delete the key within the transaction
-        lsmTree->AddDelete(transaction2, key1, value1);
-
-        // Commit the transaction
-        if (!lsmTree->CommitTransaction(transaction2)) {
-            std::cerr << "Transaction commit failed" << std::endl;
-            return 1;
+        if (dat.empty()) {
+            std::cerr << "Key not found Get test failed" << std::endl;
+        } else {
+            std::cout << "Key found Get test passed" << std::endl;
         }
 
-        // Close the LSMT instance
+        // Delete key "key5"
+        if (lsmTree->Delete(key)) {
+            std::cout << "Key deleted Delete test passed" << std::endl;
+        } else {
+            std::cerr << "Key not found Delete test failed" << std::endl;
+        }
+
+        // Check if key "key5" is deleted
+        dat = lsmTree->Get(key);
+
+        if (dat.empty()) {
+            std::cout << "Key not found delete then get test passed" << std::endl;
+        } else {
+            std::cerr << "Key found delete then get test failed" << std::endl;
+        }
+
         lsmTree->Close();
 
-        // Remove all SSTables to simulate a crash
+        // Read the directory and delete all .sst files
         for (const auto &entry : std::filesystem::directory_iterator(directory)) {
-            // check if ending in .sst
             if (entry.path().extension() == ".sst") {
                 std::filesystem::remove(entry.path());
             }
         }
 
-        // Recover from WAL
-        auto wal = std::make_unique<TidesDB::Wal>(directory + "/wal.log");
+        // Find the .wal file and rename to test.wal
+        std::filesystem::path walFile;
+        for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+            if (entry.path().filename() == ".wal") {
+                walFile = entry.path();
+                break;
+            }
+        }
 
-        // Initialize a new LSMT instance
-        auto recoveredLsmTree =
-            TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
-
-        // Run recovered operations directly from WAL
-        if (!wal->Recover(*recoveredLsmTree)) {
-            std::cerr << "Failed to run recovered operations" << std::endl;
+        if (walFile.empty()) {
+            std::cerr << "No .wal file found" << std::endl;
             return 1;
         }
 
-        // Verify the key was deleted
-        auto result = recoveredLsmTree->Get(key1);
-        assert(result.empty() && "Recovery test failed");
+        std::filesystem::rename(walFile, directory + "/test.wal");
 
-        recoveredLsmTree->Close();
+        TidesDB::Wal wal(directory + "/test.wal");
 
-        // Clean up
-        std::filesystem::remove_all(directory);
+        auto newLSMT =
+            TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
 
-        std::cout << "WAL recovery test passed!" << std::endl;
+        wal.Recover(*newLSMT);
+
+        // Verify recovered data
+        for (int i = 0; i < 20; i++) {
+            std::string keyStr = "key" + std::to_string(i);
+            std::vector<uint8_t> key(keyStr.begin(), keyStr.end());
+            std::string expectedValueStr(1024, 'a' + i);
+            std::vector<uint8_t> expectedValue(expectedValueStr.begin(), expectedValueStr.end());
+            std::vector<uint8_t> recoveredValue = newLSMT->Get(key);
+
+            if (keyStr == "key5") {
+                if (!recoveredValue.empty()) {
+                    std::cerr << "Recovered data should be empty for deleted key " << keyStr
+                              << std::endl;
+                    return 1;
+                }
+            } else {
+                if (recoveredValue != expectedValue) {
+                    std::cerr << "Recovered data does not match for key " << keyStr << std::endl;
+                    return 1;
+                }
+            }
+        }
+
+        std::cout << "Recovered data matches original data" << std::endl;
+
+        newLSMT->Close();
+
         return 0;
 
     } catch (const std::exception &e) {
-        std::cerr << "Error during WAL recovery test: " << e.what() << std::endl;
+        std::cerr << "Error initializing LSMT: " << e.what() << std::endl;
         return 1;
     }
 }

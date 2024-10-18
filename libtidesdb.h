@@ -33,13 +33,15 @@
 #include <string>
 #include <vector>
 
+// We include the protobuf headers here because we need to use the
+// generated files for our KeyValue and Operation structs
 #include "proto/kv.pb.h"
 #include "proto/operation.pb.h"
 
 // The TidesDB namespace
 namespace TidesDB {
 
-class LSMT;  // Forward declaration
+class LSMT;  // Forward declaration of the LSMT class
 
 const std::string SSTABLE_EXTENSION = ".sst";          // SSTable file extension
 constexpr const char *TOMBSTONE_VALUE = "$tombstone";  // Tombstone value
@@ -352,8 +354,11 @@ class Pager {
 // Wal class
 class Wal {
    public:
-    Wal(Pager *pager) : pager(pager) {}
-    Wal(const std::string &path) : walPath(path) {
+    explicit Wal(Pager *pager) : pager(pager) {
+        // Start the background thread
+        backgroundThread = std::thread(&Wal::backgroundThreadFunc, this);
+    }
+    explicit Wal(const std::string &path) : walPath(path) {
         // Open the write-ahead log
         pager = new Pager(path, std::ios::in | std::ios::out);
     }
@@ -411,11 +416,8 @@ class SSTableIterator {
         }
 
         if (maxPages == 0) {
-            std::cout << "Pager has no pages\n";
             throw std::invalid_argument("Pager has no pages");
         }
-
-        std::cout << "Pager has " << maxPages << " pages\n";
     }
 
     // Ok checks if the iterator is valid
@@ -424,6 +426,10 @@ class SSTableIterator {
     // Next returns the next key-value pair in the SSTable
     std::optional<KeyValue> Next() {
         if (!Ok()) {
+            return std::nullopt;
+        }
+
+        if (currentPage >= maxPages) {
             return std::nullopt;
         }
 
@@ -452,28 +458,113 @@ class SSTableIterator {
 class LSMT {
    public:
     // Constructor
-    LSMT(const std::string &string, int memtable_flush_size, int compaction_interval,
-         const std::shared_ptr<Pager> &pager, const std::vector<std::shared_ptr<SSTable>> &vector)
-        : directory(string),
+    LSMT(const std::string &directory, int memtable_flush_size, int compaction_interval,
+         const std::shared_ptr<Pager> &pager, const std::vector<std::shared_ptr<SSTable>> &sstables,
+         int max_compaction_threads, int maxLevel = 12, float probability = 0.25)
+        : directory(directory),
           memtableFlushSize(memtable_flush_size),
-          compactionInterval(compaction_interval) {
+          compactionInterval(compaction_interval),
+          maxCompactionThreads(max_compaction_threads),
+          maxLevel(maxLevel),
+          probability(probability) {
         wal = new Wal(new Pager(directory + getPathSeparator() + WAL_EXTENSION,
-                                std::ios::in | std::ios::out | std::ios::trunc));
+                                std::ios::in | std::ios::out));
         isFlushing.store(0);
         isCompacting.store(0);
 
-        for (const auto &sstable : vector) {
-            sstables.push_back(sstable);
+        stopBackgroundThreads.store(false);
+
+        for (const auto &sstable : sstables) {
+            this->sstables.push_back(sstable);
         }
 
         // Create a new memtable
-        // We could make this configurable in the future
-        memtable = new SkipList(12, 0.25);  // 12 is the max level, 0.25 is the probability
+        memtable = new SkipList(maxLevel, probability);
 
         // Start background thread for flushing
         flushThread = std::thread(&LSMT::flushThreadFunc, this);
+    }
 
-        stopBackgroundThreads.store(false);
+    // New creates a new LSMT instance
+    static std::unique_ptr<LSMT> New(const std::string &directory,
+                                     std::filesystem::perms directoryPerm, int memtableFlushSize,
+                                     int compactionInterval,
+                                     std::optional<int> maxCompactionThreads = std::nullopt) {
+        if (directory.empty()) {
+            throw TidesDBException("directory cannot be empty");
+        }
+
+        if (!std::filesystem::exists(directory)) {
+            std::filesystem::create_directory(directory);
+            std::filesystem::permissions(directory, directoryPerm);
+        }
+
+        std::shared_ptr<Pager> walPager =
+            std::make_shared<Pager>(directory + getPathSeparator() + WAL_EXTENSION,
+                                    std::ios::in | std::ios::out | std::ios::trunc);
+
+        // Load SSTables from the directory into memory
+        std::vector<std::shared_ptr<SSTable>> sstables;
+        for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+            if (entry.is_regular_file() && entry.path().extension() == SSTABLE_EXTENSION) {
+                std::shared_ptr<Pager> sstablePager =
+                    std::make_shared<Pager>(entry.path().string(), std::ios::in | std::ios::out);
+                std::shared_ptr<SSTable> sstable = std::make_shared<SSTable>(sstablePager.get());
+
+                // Initialize minKey and maxKey
+                SSTableIterator sstableIt(sstablePager.get());
+                if (sstableIt.Ok()) {
+                    auto kv = sstableIt.Next();
+                    if (kv) {
+                        sstable->minKey = ConvertToUint8Vector(
+                            std::vector<char>(kv->key().begin(), kv->key().end()));
+                        sstable->maxKey = sstable->minKey;  // Initialize maxKey to minKey
+                    }
+                }
+
+                while (sstableIt.Ok()) {
+                    auto kv = sstableIt.Next();
+                    if (kv) {
+                        std::vector<uint8_t> currentKey = ConvertToUint8Vector(
+                            std::vector<char>(kv->key().begin(), kv->key().end()));
+                        if (currentKey < sstable->minKey) {
+                            sstable->minKey = currentKey;
+                        }
+                        if (currentKey > sstable->maxKey) {
+                            sstable->maxKey = currentKey;
+                        }
+                    }
+                }
+
+                sstables.push_back(sstable);
+            }
+        }
+
+        // Determine the maximum number of compaction threads
+        int availableThreads = std::thread::hardware_concurrency();
+        if (availableThreads == 0) {
+            throw TidesDBException("could not determine number of available threads");
+        }
+        // Default to 3 threads less than the number of available threads
+        int maxThreads = maxCompactionThreads.value_or(std::max(1, availableThreads - 3));
+
+        // Make sure maxThreads isnt greater than availableThreads
+        if (maxThreads > availableThreads) {
+            throw TidesDBException(
+                "max compaction threads cannot be greater than available threads");
+        }
+
+        return std::make_unique<LSMT>(directory, memtableFlushSize, compactionInterval, walPager,
+                                      sstables, maxThreads);
+    }
+
+    // ConvertToHexString converts a vector of unsigned 8-bit integers to a hexadecimal string
+    static std::string ConvertToHexString(const std::vector<uint8_t> &data) {
+        std::ostringstream oss;
+        for (auto byte : data) {
+            oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+        }
+        return oss.str();
     }
 
     // Destructor
@@ -577,7 +668,7 @@ class LSMT {
 
             // Flush the memtable to disk
             if (!flushMemtable()) {
-                std::cerr << "Failed to flush memtable during close\n";
+                throw TidesDBException("failed to flush memtable to disk");
             }
 
             // Signal the background threads to stop
@@ -600,6 +691,9 @@ class LSMT {
             // Close the write-ahead log
             wal->Close();
 
+            // Clear the memtable
+            memtable->clear();
+
             {
                 std::unique_lock<std::shared_mutex> sstablesLockGuard(
                     sstablesLock);  // Lock the SSTables
@@ -613,70 +707,10 @@ class LSMT {
                 sstables.clear();
             }
         } catch (const std::system_error &e) {
-            std::cerr << "System error during close: " << e.what() << std::endl;
-            throw;
+            throw TidesDBException("system error during close: " + std::string(e.what()));
         } catch (const std::exception &e) {
-            std::cerr << "Exception during close: " << e.what() << std::endl;
-            throw;
+            throw TidesDBException("error during close: " + std::string(e.what()));
         }
-    }
-
-    // New creates a new LSMT instance
-    static std::unique_ptr<LSMT> New(const std::string &directory,
-                                     std::filesystem::perms directoryPerm, int memtableFlushSize,
-                                     int compactionInterval) {
-        if (directory.empty()) {
-            throw std::invalid_argument("directory cannot be empty");
-        }
-
-        if (!std::filesystem::exists(directory)) {
-            std::filesystem::create_directory(directory);
-            std::filesystem::permissions(directory, directoryPerm);
-        }
-
-        std::shared_ptr<Pager> walPager =
-            std::make_shared<Pager>(directory + getPathSeparator() + WAL_EXTENSION,
-                                    std::ios::in | std::ios::out | std::ios::trunc);
-
-        // Load SSTables from the directory into memory
-        std::vector<std::shared_ptr<SSTable>> sstables;
-        for (const auto &entry : std::filesystem::directory_iterator(directory)) {
-            if (entry.is_regular_file() && entry.path().extension() == SSTABLE_EXTENSION) {
-                std::shared_ptr<Pager> sstablePager =
-                    std::make_shared<Pager>(entry.path().string(), std::ios::in | std::ios::out);
-                std::shared_ptr<SSTable> sstable = std::make_shared<SSTable>(sstablePager.get());
-
-                // Initialize minKey and maxKey
-                SSTableIterator sstableIt(sstablePager.get());
-                if (sstableIt.Ok()) {
-                    auto kv = sstableIt.Next();
-                    if (kv) {
-                        sstable->minKey = ConvertToUint8Vector(
-                            std::vector<char>(kv->key().begin(), kv->key().end()));
-                        sstable->maxKey = sstable->minKey;  // Initialize maxKey to minKey
-                    }
-                }
-
-                while (sstableIt.Ok()) {
-                    auto kv = sstableIt.Next();
-                    if (kv) {
-                        std::vector<uint8_t> currentKey = ConvertToUint8Vector(
-                            std::vector<char>(kv->key().begin(), kv->key().end()));
-                        if (currentKey < sstable->minKey) {
-                            sstable->minKey = currentKey;
-                        }
-                        if (currentKey > sstable->maxKey) {
-                            sstable->maxKey = currentKey;
-                        }
-                    }
-                }
-
-                sstables.push_back(sstable);
-            }
-        }
-
-        return std::make_unique<LSMT>(directory, memtableFlushSize, compactionInterval, walPager,
-                                      sstables);
     }
 
    private:
@@ -704,8 +738,11 @@ class LSMT {
     std::atomic_bool stopBackgroundThreads = false;    // Stop background thread
     std::condition_variable flushQueueCondVar;         // Condition variable for flush queue
     std::thread compactionThread;                      // Thread for compaction
+    int maxCompactionThreads;                          // Maximum number of threads for compaction
+    int maxLevel;                                      // Maximum level of the skip list
+    float probability;  // Probability of a node having a higher level
 
-    // flushMemtable flushes the memtable to disk
+    // flushMemtable flushes a memtable to disk
     bool flushMemtable();
 
     // flushThreadFunc is the function that runs in the flush thread

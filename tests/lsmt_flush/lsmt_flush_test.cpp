@@ -1,9 +1,7 @@
-#include <chrono>  // Include for std::chrono::seconds
 #include <filesystem>
 #include <iostream>
 #include <set>
 #include <string>
-#include <thread>  // Include for std::this_thread::sleep_for
 #include <vector>
 
 #include "../../libtidesdb.h"
@@ -57,6 +55,8 @@ int main() {
 
         // Remove the directory
         std::filesystem::remove_all(directory);
+
+        std::cout << "Test passed" << std::endl;
 
         return 0;
 

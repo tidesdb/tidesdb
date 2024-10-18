@@ -161,6 +161,9 @@ class SkipList {
     // deleteKV deletes a key from the skip list
     void deleteKV(const std::vector<uint8_t> &key);
 
+    // clearCache clears the cached size of the skip list
+    void clearCache();
+
     // get gets the value for a given key
     std::vector<uint8_t> get(const std::vector<uint8_t> &key) const;
 
@@ -469,13 +472,13 @@ class LSMT {
           probability(probability) {
         wal = new Wal(new Pager(directory + getPathSeparator() + WAL_EXTENSION,
                                 std::ios::in | std::ios::out));
-        isFlushing.store(0);
-        isCompacting.store(0);
+        isFlushing.store(0);    // Initialize isFlushing to 0 whcih means not flushing
+        isCompacting.store(0);  // Initialize isCompacting to 0 which means not compacting
 
         stopBackgroundThreads.store(false);
 
         for (const auto &sstable : sstables) {
-            this->sstables.push_back(sstable);
+            this->sstables.push_back(sstable);  // Copy the SSTables
         }
 
         // Create a new memtable
@@ -486,6 +489,7 @@ class LSMT {
     }
 
     // New creates a new LSMT instance
+    // Opens all SSTables in the directory and loads them into memory (just the pager, min and max)
     static std::unique_ptr<LSMT> New(const std::string &directory,
                                      std::filesystem::perms directoryPerm, int memtableFlushSize,
                                      int compactionInterval,
@@ -505,6 +509,9 @@ class LSMT {
 
         // Load SSTables from the directory into memory
         std::vector<std::shared_ptr<SSTable>> sstables;
+        std::vector<std::pair<std::shared_ptr<SSTable>, std::filesystem::file_time_type>>
+            sstableWithTime;
+
         for (const auto &entry : std::filesystem::directory_iterator(directory)) {
             if (entry.is_regular_file() && entry.path().extension() == SSTABLE_EXTENSION) {
                 std::shared_ptr<Pager> sstablePager =
@@ -536,8 +543,20 @@ class LSMT {
                     }
                 }
 
-                sstables.push_back(sstable);
+                // Get the last write time and store it with the SSTable
+                auto lastWriteTime = std::filesystem::last_write_time(entry);
+                sstableWithTime.emplace_back(sstable, lastWriteTime);
             }
+        }
+
+        // Sort the SSTables by their last write time in descending order
+        std::sort(sstableWithTime.begin(), sstableWithTime.end(),
+                  [](const auto &a, const auto &b) { return a.second > b.second; });
+
+        // Extract the sorted SSTables
+        sstables.clear();
+        for (const auto &pair : sstableWithTime) {
+            sstables.push_back(pair.first);
         }
 
         // Determine the maximum number of compaction threads
@@ -656,16 +675,6 @@ class LSMT {
     // Close closes the LSMT
     void Close() {
         try {
-            // Commits any active transactions
-            for (auto tx : activeTransactions) {
-                CommitTransaction(tx);
-            }
-
-            // Wait for the memtable to flush and or compaction to finish
-            while (IsFlushing() || IsCompacting()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-
             // Flush the memtable to disk
             if (!flushMemtable()) {
                 throw TidesDBException("failed to flush memtable to disk");

@@ -15,8 +15,6 @@
  */
 #include "libtidesdb.h"
 
-#include <semaphore.h>
-
 // The TidesDB namespace
 namespace TidesDB {
 
@@ -256,6 +254,10 @@ int SkipList::randomLevel() {
     return lvl;
 }
 
+// SkipList::clearCache
+// clears cached size of skiplist
+void SkipList::clearCache() { cachedSize.store(0, std::memory_order_relaxed); }
+
 // SkipList::insert
 // inserts a key-value pair into the SkipList
 bool SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
@@ -290,7 +292,10 @@ bool SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t
         update[i]->forward[i].store(x);
     }
 
-    cachedSize.fetch_add(1, std::memory_order_relaxed);  // Increment size
+    // add up size of key and value
+    int sizeToAdd = key.size() + value.size();
+
+    cachedSize.fetch_add(sizeToAdd, std::memory_order_relaxed);
     return true;
 }
 
@@ -756,10 +761,15 @@ bool Wal::Recover(LSMT &lsmt) const {
 bool LSMT::flushMemtable() {
     try {
         isFlushing.store(1);  // Set the flag to indicate that we are flushing
+
+        // Check if memtable is empty (in case on close)
+        if (memtable->getSize() == 0) {
+            isFlushing.store(0);  // Reset the flag
+            return true;
+        }
+
         // Create a new memtable
-        auto newMemtable =
-            std::make_unique<SkipList>(12, 0.25);  // @todo would be good if on LSMT creation a user
-                                                   // can set a maxLevel and probability
+        auto newMemtable = std::make_unique<SkipList>(maxLevel, probability);
 
         // Iterate over the current memtable and insert its elements into the new memtable
         memtable->inOrderTraversal(
@@ -769,6 +779,7 @@ bool LSMT::flushMemtable() {
 
         // Clear the current memtable
         memtable->clear();
+        memtable->clearCache();
 
         isFlushing.store(0);  // Reset the flag
 
@@ -783,7 +794,6 @@ bool LSMT::flushMemtable() {
         return true;
     } catch (const std::exception &e) {
         isFlushing.store(0);  // Reset the flag
-
         std::cerr << "Error in flushMemtable: " << e.what() << std::endl;
         return false;
     }

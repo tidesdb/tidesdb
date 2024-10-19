@@ -54,7 +54,7 @@ int main() {
         lsmTree->Close();
 
         // reopen the LSMT
-        lsmTree =
+        auto lsmTreeReopen =
             TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
 
         // Set of missing keys
@@ -69,7 +69,7 @@ int main() {
         // Retry until all key-value pairs are found
         while (!missingKeys.empty()) {
             for (auto it = missingKeys.begin(); it != missingKeys.end();) {
-                std::vector<uint8_t> result = lsmTree->Get(*it);
+                std::vector<uint8_t> result = lsmTreeReopen->Get(*it);
                 if (!result.empty() && result == *it) {  // Assuming value is the same as the key
                     it = missingKeys.erase(it);          // Remove found key from the set
                 } else {
@@ -81,6 +81,8 @@ int main() {
                 std::this_thread::sleep_for(std::chrono::seconds(1));  // Wait before retrying
             }
         }
+
+        lsmTreeReopen->Close();
 
         // Remove the directory
         std::filesystem::remove_all(directory);

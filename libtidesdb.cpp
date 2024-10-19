@@ -785,11 +785,10 @@ bool LSMT::flushMemtable() {
 
         // Add the new memtable to the flush queue
         {
-            std::lock_guard<std::mutex> lock(flushQueueMutex);
+            std::unique_lock<std::mutex> lock(flushQueueMutex);
             flushQueue.push(std::move(newMemtable));
-
-            flushQueueCondVar.notify_one();  // Notify the flush thread
         }
+        flushQueueCondVar.notify_one();
 
         return true;
     } catch (const std::exception &e) {
@@ -810,7 +809,11 @@ void LSMT::flushThreadFunc() {
         // Wait for a new memtable to be added to the queue
         {
             std::unique_lock<std::mutex> lock(flushQueueMutex);
-            flushQueueCondVar.wait(lock, [this] { return !flushQueue.empty(); });
+            flushQueueCondVar.wait(
+                lock, [this] { return stopBackgroundThreads.load() || !flushQueue.empty(); });
+            if (stopBackgroundThreads.load()) {
+                break;
+            }
 
             newMemtable = std::move(flushQueue.front());
             flushQueue.pop();
@@ -844,8 +847,8 @@ void LSMT::flushThreadFunc() {
                                   std::to_string(sstableCounter) + SSTABLE_EXTENSION;
 
         // Create a new SSTable with a new Pager
-        auto sstable = std::make_shared<SSTable>(
-            new Pager(sstablePath, std::ios::in | std::ios::out | std::ios::trunc));
+        auto sstable = std::make_shared<SSTable>(new Pager(
+            sstablePath, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc));
 
         // We must set minKey and maxKey
         if (!kvPairs.empty()) {
@@ -876,6 +879,10 @@ void LSMT::flushThreadFunc() {
             Compact();
             isCompacting.store(0);
         }
+
+        // Reset the isFlushing flag
+        isFlushing.store(0);
+        flushQueueCondVar.notify_all();
     }
 }
 
@@ -1083,6 +1090,14 @@ void AVLTree::clear() {
     root = nullptr;
 }
 
+std::string toHexString(const std::vector<uint8_t> &vec) {
+    std::ostringstream oss;
+    for (auto byte : vec) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    }
+    return oss.str();
+}
+
 // LSMT::Compact
 // starts a background thread to perform compaction of SSTables in a non-blocking manner. It pairs
 // SSTables, merges them, and writes the merged data to new SSTables. The old SSTables are then
@@ -1131,13 +1146,10 @@ bool LSMT::Compact() {
                         if (!it1 || !it2) {
                             std::cerr << "Error: Failed to create SSTableIterator.\n";
                             for (auto &semaphore : semaphores) {
-                                semaphore.release();
+                                semaphore->release();
                             }
                             return;
                         }
-
-                        it1 = std::make_unique<SSTableIterator>(sstable1->pager);
-                        it2 = std::make_unique<SSTableIterator>(sstable2->pager);
 
                         if (it1->Ok()) {
                             auto kv = it1->Next();
@@ -1218,7 +1230,8 @@ bool LSMT::Compact() {
                                     std::chrono::system_clock::now().time_since_epoch().count()) +
                                 SSTABLE_EXTENSION;
                             auto newSSTable = std::make_shared<SSTable>(new Pager(
-                                newSSTablePath, std::ios::in | std::ios::out | std::ios::trunc));
+                                newSSTablePath,
+                                std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc));
 
                             newMemtable->inOrderTraversal(
                                 [&newSSTable, this](const std::vector<uint8_t> &key,
@@ -1252,6 +1265,8 @@ bool LSMT::Compact() {
                             }
                         }
 
+                        sstable1->pager->Close();
+                        sstable2->pager->Close();
                         std::filesystem::remove(sstable1->pager->GetFileName());
                         std::filesystem::remove(sstable2->pager->GetFileName());
 
@@ -1259,7 +1274,7 @@ bool LSMT::Compact() {
                         std::cerr << "Error during compaction: " << e.what() << std::endl;
                     }
                     for (auto &semaphore : semaphores) {
-                        semaphore.release();
+                        semaphore->release();
                     }
                 }));
             }
@@ -1274,6 +1289,12 @@ bool LSMT::Compact() {
 
         return true;
     });
+
+    if (compactionThread.joinable()) {
+        compactionThread.join();
+    }
+
+    return true;
 }
 
 // LSMT::BeginTransaction

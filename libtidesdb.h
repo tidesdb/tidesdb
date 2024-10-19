@@ -363,7 +363,7 @@ class Wal {
     }
     explicit Wal(const std::string &path) : walPath(path) {
         // Open the write-ahead log
-        pager = new Pager(path, std::ios::in | std::ios::out);
+        pager = new Pager(path, std::ios::in | std::ios::out | std::ios::binary);
     }
 
     std::shared_mutex lock;  // Mutex for write-ahead log
@@ -471,7 +471,7 @@ class LSMT {
           maxLevel(maxLevel),
           probability(probability) {
         wal = new Wal(new Pager(directory + getPathSeparator() + WAL_EXTENSION,
-                                std::ios::in | std::ios::out));
+                                std::ios::in | std::ios::out | std::ios::binary));
         isFlushing.store(0);    // Initialize isFlushing to 0 whcih means not flushing
         isCompacting.store(0);  // Initialize isCompacting to 0 which means not compacting
 
@@ -514,8 +514,8 @@ class LSMT {
 
         for (const auto &entry : std::filesystem::directory_iterator(directory)) {
             if (entry.is_regular_file() && entry.path().extension() == SSTABLE_EXTENSION) {
-                std::shared_ptr<Pager> sstablePager =
-                    std::make_shared<Pager>(entry.path().string(), std::ios::in | std::ios::out);
+                std::shared_ptr<Pager> sstablePager = std::make_shared<Pager>(
+                    entry.path().string(), std::ios::in | std::ios::out | std::ios::binary);
                 std::shared_ptr<SSTable> sstable = std::make_shared<SSTable>(sstablePager.get());
 
                 // Initialize minKey and maxKey
@@ -680,7 +680,6 @@ class LSMT {
                 throw TidesDBException("failed to flush memtable to disk");
             }
 
-            // Signal the background threads to stop
             stopBackgroundThreads.store(true);
 
             // Notify the condition variables to wake up the threads
@@ -715,6 +714,7 @@ class LSMT {
                 // Clear the list of SSTables
                 sstables.clear();
             }
+
         } catch (const std::system_error &e) {
             throw TidesDBException("system error during close: " + std::string(e.what()));
         } catch (const std::exception &e) {
@@ -747,11 +747,14 @@ class LSMT {
     std::atomic_bool stopBackgroundThreads = false;    // Stop background thread
     std::condition_variable flushQueueCondVar;         // Condition variable for flush queue
     std::thread compactionThread;                      // Thread for compaction
-    int maxCompactionThreads;                          // Maximum number of threads for compaction
-    int maxLevel;                                      // Maximum level of the skip list
-    float probability;  // Probability of a node having a higher level
+    int maxCompactionThreads;  // Maximum number of threads for paired compaction
+    int maxLevel;              // Maximum level of the skip list
+    float probability;         // Probability for skiplist
 
-    // flushMemtable flushes a memtable to disk
+    // flushMemtable
+    // responsible for flushing the current memtable to disk. It creates a new memtable,
+    // transfers the data from the current memtable to the new one, and then adds the new memtable
+    // to the flush queue. Finally, it notifies the flush thread to process the queue
     bool flushMemtable();
 
     // flushThreadFunc is the function that runs in the flush thread

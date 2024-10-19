@@ -12,6 +12,7 @@ std::vector<char> convertToCharVector(const std::vector<uint8_t> &input) {
     return std::vector<char>(input.begin(), input.end());
 }
 
+// Test the pager by writing data to the file and reading it back
 int main() {
     // Open the file in both read and write mode
     TidesDB::Pager pager("test.db", std::ios::in | std::ios::out | std::ios::binary);
@@ -46,6 +47,28 @@ int main() {
     }
 
     pager.Close();
+
+    // Reopen the file in read and write mode
+    TidesDB::Pager pagerReopen("test.db", std::ios::in | std::ios::out | std::ios::binary);
+
+    // Verify the data for each page
+    all_tests_passed = true;
+    for (int i = 0; i < 5; ++i) {
+        std::vector<char> read_data = convertToCharVector(pagerReopen.Read(page_numbers[i]));
+        if (std::string(read_data.begin(), read_data.end()) !=  // not equal
+            std::string(1024 * 8, 'a') + "Hello, world!") {
+            std::cout << "Pager test failed for page " << i << std::endl;
+            all_tests_passed = false;
+        }
+    }
+
+    if (all_tests_passed) {
+        std::cout << "All pager tests passed" << std::endl;
+    } else {
+        std::cout << "Some pager tests failed" << std::endl;
+    }
+
+    pagerReopen.Close();
 
     // Remove the test.db file
     std::filesystem::remove("test.db");

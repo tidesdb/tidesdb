@@ -5,7 +5,7 @@
 #include "../../libtidesdb.h"
 
 int main() {
-    TidesDB::SkipList skipList(12, 0.5);
+    TidesDB::SkipList skipList(12, 0.25);
 
     // Try to get on an empty skip list
     if (skipList.get({1, 2, 3}).empty()) {

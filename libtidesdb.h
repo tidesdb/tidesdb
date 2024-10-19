@@ -433,26 +433,21 @@ class SSTableIterator {
     // Next
     // returns the next key-value pair in the SSTable
     std::optional<KeyValue> Next() {
-        if (!Ok()) {
-            return std::nullopt;
-        }
+        while (Ok()) {
+            std::vector<uint8_t> data = pager->Read(currentPage++);
+            if (data.empty()) {
+                std::cerr << "Error: Failed to read data from pager.\n";
+                continue;  // Skip empty data
+            }
 
-        if (currentPage >= maxPages) {
-            return std::nullopt;
+            try {
+                return deserialize(data);  // Deserialize the data
+            } catch (const std::exception &e) {
+                std::cerr << "Warning: Failed to deserialize data: " << e.what() << "\n";
+                continue;  // Skip invalid data
+            }
         }
-
-        std::vector<uint8_t> data = pager->Read(currentPage++);
-        if (data.empty()) {
-            std::cerr << "Error: Failed to read data from pager.\n";
-            return std::nullopt;
-        }
-
-        try {
-            return deserialize(data);  // Deserialize the data
-        } catch (const std::exception &e) {
-            std::cerr << "Error: Failed to deserialize data: " << e.what() << "\n";
-            return std::nullopt;
-        }
+        return std::nullopt;  // No more valid data
     }
 
    private:

@@ -1,92 +1,44 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
-#include <random>
+#include <string>
 #include <vector>
 
 #include "../libtidesdb.h"
 
-// Function to generate random data
-std::vector<uint8_t> generateRandomData(size_t size) {
-    std::vector<uint8_t> data(size);
-    std::generate(data.begin(), data.end(), []() { return rand() % 256; });
-    return data;
-}
-
-// Benchmarking function
-void benchmarkLSMT(TidesDB::LSMT &lsmt, size_t numOperations, size_t dataSize) {
-    using namespace std::chrono;
-
-    // Generate random keys and values
-    std::vector<std::vector<uint8_t>> keys;
-    ;
-    std::vector<std::vector<uint8_t>> values;
-    ;
-    for (size_t i = 0; i < numOperations; ++i) {
-        keys[i] = generateRandomData(dataSize);    // Generate random key
-        values[i] = generateRandomData(dataSize);  // Generate random value
-    }
-
-    // Benchmark Put operations
-    auto start = high_resolution_clock::now();  // Start timer
-    for (size_t i = 0; i < numOperations; ++i) {
-        if (!lsmt.Put(keys[i], values[i])) {  // Perform Put operation with error handling
-            std::cerr << "Put operation failed for key " << i << "\n";
-            return;
-        }
-    }
-    auto end = high_resolution_clock::now();                              // End timer
-    auto putDuration = duration_cast<milliseconds>(end - start).count();  // Calculate duration
-    std::cout << numOperations << " Put operations took " << putDuration << " ms\n";
-
-    // sleep for 1 second
-    // std::this_thread::sleep_for(std::chrono::seconds(5));
-
-    // Benchmark Get operations
-    start = high_resolution_clock::now();  // Start timer
-    for (size_t i = 0; i < numOperations; ++i) {
-        auto result = lsmt.GreaterThan(keys[i]);
-        if (result.empty()) {  // Perform Get operation with error handling
-            std::cerr << "Get operation failed for key " << i << "\n";
-            return;
-        }
-    }
-    end = high_resolution_clock::now();                                   // End timer
-    auto getDuration = duration_cast<milliseconds>(end - start).count();  // Calculate duration
-    std::cout << numOperations << " Get operations took " << getDuration << " ms\n";
-
-    // Benchmark Delete operations
-    start = high_resolution_clock::now();  // Start timer
-    for (size_t i = 0; i < numOperations; ++i) {
-        if (!lsmt.Delete(keys[i])) {  // Perform Delete operation with error handling
-            std::cerr << "Delete operation failed for key " << i << "\n";
-            return;
-        }
-    }
-    end = high_resolution_clock::now();                                      // End timer
-    auto deleteDuration = duration_cast<milliseconds>(end - start).count();  // Calculate duration
-    std::cout << numOperations << " Delete operations took " << deleteDuration << " ms\n";
-}
-
 int main() {
-    // Seed the random number generator
-    srand(static_cast<unsigned>(time(0)));
+    // Define parameters
+    std::string directory = "./tidesdb_benchmark_data";
+    std::filesystem::perms directoryPerm =
+        std::filesystem::perms::owner_all | std::filesystem::perms::group_read;
+    int memtableFlushSize = (1024 * 1024) * 500;  // 128MB in bytes
+    int compactionInterval = 100;
 
-    // Initialize LSMT
-    auto lsmt = TidesDB::LSMT::New("benchmark_directory", std::filesystem::perms::all, 100, 10);
-    if (!lsmt) {
-        std::cerr << "Failed to initialize LSMT\n";
-        return 1;
+    try {
+        // Initialize the LSMT
+        auto lsmTree =
+            TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
+
+        // Benchmark Put operation
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < 1000000; i++) {
+            std::string keyStr = std::to_string(i);
+            std::vector<uint8_t> key(keyStr.begin(), keyStr.end());
+            std::vector<uint8_t> value(keyStr.begin(), keyStr.end());
+            lsmTree->Put(key, value);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> putDuration = end - start;
+        std::cout << "Put operation took: " << putDuration.count() << " seconds" << std::endl;
+
+        lsmTree->Close();
+
+        // Remove the directory
+        std::filesystem::remove_all(directory);
+
+    } catch (const std::exception &e) {
+        std::cerr << "Error initializing LSMT: " << e.what() << std::endl;
     }
-
-    // Run benchmark
-    // Note: The benchmark will run for 1000 operations with 5 bytes of data per operation
-    benchmarkLSMT(*lsmt, 1000, 5);
-
-    lsmt->Close();
-
-    // Remove benchmark directory
-    std::filesystem::remove_all("benchmark_directory");
 
     return 0;
 }

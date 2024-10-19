@@ -793,6 +793,9 @@ bool LSMT::flushMemtable() {
     }
 }
 
+// flushThreadFunc
+// the background thread function that processes the flush queue. It waits for a new memtable to be
+// added to the queue then pops and flushes the memtable to disk
 void LSMT::flushThreadFunc() {
     while (true) {
         std::unique_ptr<SkipList> newMemtable;
@@ -864,9 +867,9 @@ void LSMT::flushThreadFunc() {
 
             // Check if we need to compact
             if (sstableCounter >= compactionInterval) {
-                isCompacting.store(1); // Set the flag to indicate that we are compacting
-                Compact(); // Compact the SSTables
-                isCompacting.store(0); // Reset the flag
+                isCompacting.store(1);  // Set the flag to indicate that we are compacting
+                Compact();              // Compact the SSTables
+                isCompacting.store(0);  // Reset the flag
             }
         }
 
@@ -980,8 +983,9 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
         return {};  // Early exit if there are no SSTables
     }
 
-    for (const auto &sstable :
-         std::vector<std::shared_ptr<SSTable>>(sstables.rbegin(), sstables.rend())) {
+    // Iterate over the SSTables from latest to oldest
+    for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+        const auto &sstable = *it;
         if (!sstable) {
             continue;  // Skip null SSTables
         }
@@ -1096,9 +1100,11 @@ bool LSMT::Compact() {
     // Start a background thread to perform compaction
     compactionThread = std::thread([this] {
         try {
-            const int maxConcurrentThreads = std::max(1, maxCompactionThreads); // Max concurrent threads
-            std::vector<std::unique_ptr<std::counting_semaphore<1>>> semaphores; // Semaphores for concurrency
-            for (int i = 0; i < maxConcurrentThreads; ++i) { // Create semaphores
+            const int maxConcurrentThreads =
+                std::max(1, maxCompactionThreads);  // Max concurrent threads
+            std::vector<std::unique_ptr<std::counting_semaphore<1>>>
+                semaphores;                                   // Semaphores for concurrency
+            for (int i = 0; i < maxConcurrentThreads; ++i) {  // Create semaphores
                 semaphores.emplace_back(std::make_unique<std::counting_semaphore<1>>(1));
             }
 
@@ -1428,19 +1434,36 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NGet(
         }
     });
 
-    // Traverse the SSTables and collect key-value pairs not equal to the key
-    for (const auto &sstable : sstables) {
-        SSTableIterator it(sstable->pager);
-        while (it.Ok()) {
-            auto kv = it.Next();
-            if (kv) {
-                auto kvKey =
-                    ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()));
-                if (kvKey != key) {
-                    kvMap.insert(
-                        {kvKey, ConvertToUint8Vector(std::vector<char>(
-                                    kv->value().begin(), kv->value().end()))});  // Use insert
-                }
+    // Traverse the SSTables from latest to oldest and collect key-value pairs not equal to the key
+    for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+        const auto &sstable = *it;
+        if (!sstable) {
+            continue;  // Skip null SSTables
+        }
+
+        // If the key is not within the range of this SSTable, skip it
+        if (key < sstable->minKey || key > sstable->maxKey) {
+            continue;
+        }
+
+        // Get an iterator for the SSTable file
+        auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
+        if (!sstableIt) {
+            continue;  // Skip if iterator creation failed
+        }
+
+        // Iterate over the SSTable
+        while (sstableIt->Ok()) {
+            auto kv = sstableIt->Next();
+            if (!kv) {
+                break;  // Break if no more key-value pairs
+            }
+
+            auto kvKey =
+                ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()));
+            if (kvKey != key) {
+                kvMap.insert({kvKey, ConvertToUint8Vector(std::vector<char>(
+                                         kv->value().begin(), kv->value().end()))});  // Use insert
             }
         }
     }
@@ -1467,15 +1490,36 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
         }
     });
 
-    // Traverse the SSTables and collect key-value pairs less than or equal to the key
-    for (const auto &sstable : sstables) {
-        SSTableIterator it(sstable->pager);
-        while (it.Ok()) {
-            auto kv = it.Next();
-            if (kv && std::string(key.begin(), key.end()) >= kv->key() &&
-                kvMap.find(ConvertToUint8Vector(
-                    std::vector<char>(kv->key().begin(), kv->key().end()))) == kvMap.end()) {
-                kvMap[ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))] =
+    // Traverse the SSTables from latest to oldest and collect key-value pairs less than or equal to
+    // the key
+    for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+        const auto &sstable = *it;
+        if (!sstable) {
+            continue;  // Skip null SSTables
+        }
+
+        // If the key is not within the range of this SSTable, skip it
+        if (key < sstable->minKey || key > sstable->maxKey) {
+            continue;
+        }
+
+        // Get an iterator for the SSTable file
+        auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
+        if (!sstableIt) {
+            continue;  // Skip if iterator creation failed
+        }
+
+        // Iterate over the SSTable
+        while (sstableIt->Ok()) {
+            auto kv = sstableIt->Next();
+            if (!kv) {
+                continue;  // Skip if kv is null
+            }
+
+            auto kvKey =
+                ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()));
+            if (kvKey <= key && kvMap.find(kvKey) == kvMap.end()) {
+                kvMap[kvKey] =
                     ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()));
             }
         }
@@ -1503,13 +1547,36 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Greater
         }
     });
 
-    // Traverse the SSTables and collect key-value pairs greater than or equal to the key
-    for (const auto &sstable : sstables) {
-        SSTableIterator it(sstable->pager);
-        while (it.Ok()) {
-            auto kv = it.Next();
-            if (kv && std::string(key.begin(), key.end()) <= kv->key()) {
-                kvMap[ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))] =
+    // Traverse the SSTables from latest to oldest and collect key-value pairs greater than or equal
+    // to the key
+    for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+        const auto &sstable = *it;
+        if (!sstable) {
+            continue;  // Skip null SSTables
+        }
+
+        // If the key is not within the range of this SSTable, skip it
+        if (key < sstable->minKey || key > sstable->maxKey) {
+            continue;
+        }
+
+        // Get an iterator for the SSTable file
+        auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
+        if (!sstableIt) {
+            continue;  // Skip if iterator creation failed
+        }
+
+        // Iterate over the SSTable
+        while (sstableIt->Ok()) {
+            auto kv = sstableIt->Next();
+            if (!kv) {
+                break;  // Break if no more key-value pairs
+            }
+
+            auto kvKey =
+                ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()));
+            if (kvKey >= key && kvMap.find(kvKey) == kvMap.end()) {
+                kvMap[kvKey] =
                     ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()));
             }
         }
@@ -1537,13 +1604,35 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
         }
     });
 
-    // Traverse the SSTables and collect key-value pairs less than the key
-    for (const auto &sstable : sstables) {
-        SSTableIterator it(sstable->pager);
-        while (it.Ok()) {
-            auto kv = it.Next();
-            if (kv && std::string(key.begin(), key.end()) < kv->key()) {
-                kvMap[ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()))] =
+    // Traverse the SSTables from latest to oldest and collect key-value pairs less than the key
+    for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+        const auto &sstable = *it;
+        if (!sstable) {
+            continue;  // Skip null SSTables
+        }
+
+        // If the key is not within the range of this SSTable, skip it
+        if (key <= sstable->minKey) {
+            continue;
+        }
+
+        // Get an iterator for the SSTable file
+        auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
+        if (!sstableIt) {
+            continue;  // Skip if iterator creation failed
+        }
+
+        // Iterate over the SSTable
+        while (sstableIt->Ok()) {
+            auto kv = sstableIt->Next();
+            if (!kv) {
+                continue;
+            }
+
+            auto kvKey =
+                ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()));
+            if (kvKey < key && kvMap.find(kvKey) == kvMap.end()) {
+                kvMap[kvKey] =
                     ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()));
             }
         }
@@ -1571,17 +1660,36 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Greater
         }
     });
 
-    // Traverse the SSTables and collect key-value pairs greater than the key
+    // Traverse the SSTables from latest to oldest and collect key-value pairs greater than the key
     for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
-        SSTableIterator sstableIt((*it)->pager);
-        while (sstableIt.Ok()) {
-            auto kv = sstableIt.Next();
-            if (kv) {
-                std::vector<uint8_t> kv_key(kv->key().begin(), kv->key().end());
-                std::vector<uint8_t> kv_value(kv->value().begin(), kv->value().end());
-                if (kv_key > key) {
-                    kvMap.insert({kv_key, kv_value});  // Use insert to avoid overwriting
-                }
+        const auto &sstable = *it;
+        if (!sstable) {
+            continue;  // Skip null SSTables
+        }
+
+        // If the key is not within the range of this SSTable, skip it
+        if (key >= sstable->maxKey) {
+            continue;
+        }
+
+        // Get an iterator for the SSTable file
+        auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
+        if (!sstableIt) {
+            continue;  // Skip if iterator creation failed
+        }
+
+        // Iterate over the SSTable
+        while (sstableIt->Ok()) {
+            auto kv = sstableIt->Next();
+            if (!kv) {
+                continue;
+            }
+
+            auto kvKey =
+                ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()));
+            if (kvKey > key && kvMap.find(kvKey) == kvMap.end()) {
+                kvMap[kvKey] =
+                    ConvertToUint8Vector(std::vector<char>(kv->value().begin(), kv->value().end()));
             }
         }
     }
@@ -1608,22 +1716,36 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Range(
         }
     });
 
-    // Traverse the SSTables and collect key-value pairs in the range
+    // Traverse the SSTables from latest to oldest and collect key-value pairs in the range
     for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
-        SSTableIterator sstableIt((*it)->pager);
-        while (sstableIt.Ok()) {
-            auto kv = sstableIt.Next();
-            if (kv) {
-                std::string kv_key_str = kv->key();
-                std::vector<char> kv_key_chars(kv_key_str.begin(), kv_key_str.end());
-                std::vector<uint8_t> kv_key = ConvertToUint8Vector(
-                    std::vector<char>(kv_key_chars.begin(), kv_key_chars.end()));
+        const auto &sstable = *it;
+        if (!sstable) {
+            continue;  // Skip null SSTables
+        }
 
-                if (kv_key >= start && kv_key <= end) {
-                    kvMap.insert(
-                        {kv_key, ConvertToUint8Vector(std::vector<char>(
-                                     kv->value().begin(), kv->value().end()))});  // Use insert
-                }
+        // If the key range does not overlap with this SSTable, skip it
+        if (end < sstable->minKey || start > sstable->maxKey) {
+            continue;
+        }
+
+        // Get an iterator for the SSTable file
+        auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
+        if (!sstableIt) {
+            continue;  // Skip if iterator creation failed
+        }
+
+        // Iterate over the SSTable
+        while (sstableIt->Ok()) {
+            auto kv = sstableIt->Next();
+            if (!kv) {
+                continue;  // Skip if kv is null
+            }
+
+            auto kvKey =
+                ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()));
+            if (kvKey >= start && kvKey <= end && kvMap.find(kvKey) == kvMap.end()) {
+                kvMap.insert({kvKey, ConvertToUint8Vector(std::vector<char>(kv->value().begin(),
+                                                                            kv->value().end()))});
             }
         }
     }
@@ -1650,22 +1772,36 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NRange(
         }
     });
 
-    // Traverse the SSTables and collect key-value pairs not in the range
+    // Traverse the SSTables from latest to oldest and collect key-value pairs not in the range
     for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
-        SSTableIterator sstableIt((*it)->pager);
-        while (sstableIt.Ok()) {
-            auto kv = sstableIt.Next();
-            if (kv) {
-                std::string kv_key_str = kv->key();
-                std::vector<char> kv_key_chars(kv_key_str.begin(), kv_key_str.end());
-                std::vector<uint8_t> kv_key = ConvertToUint8Vector(
-                    std::vector<char>(kv_key_chars.begin(), kv_key_chars.end()));
+        const auto &sstable = *it;
+        if (!sstable) {
+            continue;  // Skip null SSTables
+        }
 
-                if (kv_key < start || kv_key > end) {
-                    kvMap.insert(
-                        {kv_key, ConvertToUint8Vector(std::vector<char>(
-                                     kv->value().begin(), kv->value().end()))});  // Use insert
-                }
+        // If the key range does not overlap with this SSTable, skip it
+        if (end < sstable->minKey || start > sstable->maxKey) {
+            continue;
+        }
+
+        // Get an iterator for the SSTable file
+        auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
+        if (!sstableIt) {
+            continue;  // Skip if iterator creation failed
+        }
+
+        // Iterate over the SSTable
+        while (sstableIt->Ok()) {
+            auto kv = sstableIt->Next();
+            if (!kv) {
+                continue;  // Skip null key-value pairs
+            }
+
+            auto kvKey =
+                ConvertToUint8Vector(std::vector<char>(kv->key().begin(), kv->key().end()));
+            if ((kvKey < start || kvKey > end) && kvMap.find(kvKey) == kvMap.end()) {
+                kvMap.insert({kvKey, ConvertToUint8Vector(std::vector<char>(kv->value().begin(),
+                                                                            kv->value().end()))});
             }
         }
     }

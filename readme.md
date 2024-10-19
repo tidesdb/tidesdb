@@ -62,26 +62,20 @@ protoc --version
 vcpkg install protobuf
 ```
 
-
-
-
-
-
-
-
-
 ## Bindings
-- C (coming soon)
+- C
 
 ## FFI (Foreign Function Interfaces)
-- Go (coming soon)
-- Python (coming soon)
-- Rust (coming soon)
-- NodeJS (coming soon)
-- Java (coming soon)
-- Haskell (coming soon)
-- Lua (coming soon)
-- Ruby (coming soon)
+- Go
+- Python
+- Rust
+- NodeJS
+- Java
+- Haskell
+- Lua
+- Ruby
+
+The FFIs are still in their early stages.
 
 ## Interested in joining the project?
 Hey you, yeah you!  Are you interested in joining the TidesDB project?

@@ -80,6 +80,9 @@ Pager::Pager(const std::string &filename, std::ios::openmode mode) : fileName(fi
         createFile.close();
     }
 
+    // set filename and mode
+    this->fileName = filename;
+
     // Open the file with the given filename and mode
     file.open(filename, mode);
     if (!file.is_open()) {
@@ -157,14 +160,6 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
     }
 
     return page_number;
-}
-
-// Pager::WriteTo
-// @TODO: Implement the method, probably wont be used
-int64_t Pager::WriteTo(int64_t page_number, const std::vector<uint8_t> &data) {
-    // Implement the method similarly to Write, but start at the specified
-    // page_number
-    return 0;
 }
 
 // Pager::Read
@@ -736,12 +731,12 @@ bool Wal::Recover(LSMT &lsmt) const {
             case static_cast<int>(TidesDB::OperationType::OpPut): {
                 std::vector<uint8_t> key(op.key().begin(), op.key().end());
                 std::vector<uint8_t> value(op.value().begin(), op.value().end());
-                lsmt.InsertIntoMemtable(key, value);
+                lsmt.Put(key, value);
                 break;
             }
             case static_cast<int>(TidesDB::OperationType::OpDelete): {
                 std::vector<uint8_t> key(op.key().begin(), op.key().end());
-                lsmt.DeleteFromMemtable(key);
+                lsmt.Delete(key);
                 break;
             }
             default:
@@ -798,12 +793,8 @@ bool LSMT::flushMemtable() {
     }
 }
 
-// LSMT::flushThreadFunc
-// responsible for flushing the memtable to disk. It continuously waits for new memtables
-// to be added to the flush queue, processes them, and writes their key-value pairs to SSTables.
-// If the number of SSTables exceeds the compaction interval, it triggers a background compaction
 void LSMT::flushThreadFunc() {
-    while (stopBackgroundThreads.load() == 0) {
+    while (true) {
         std::unique_ptr<SkipList> newMemtable;
 
         // Wait for a new memtable to be added to the queue
@@ -811,73 +802,72 @@ void LSMT::flushThreadFunc() {
             std::unique_lock<std::mutex> lock(flushQueueMutex);
             flushQueueCondVar.wait(
                 lock, [this] { return stopBackgroundThreads.load() || !flushQueue.empty(); });
-            if (stopBackgroundThreads.load()) {
+            if (stopBackgroundThreads.load() && flushQueue.empty()) {
                 break;
             }
 
-            newMemtable = std::move(flushQueue.front());
-            flushQueue.pop();
-
-            // Check for the sentinel value
-            if (newMemtable == nullptr) {
-                break;  // Exit the loop if the sentinel value is encountered
+            if (!flushQueue.empty()) {
+                newMemtable = std::move(flushQueue.front());
+                flushQueue.pop();
             }
         }
 
-        std::vector<KeyValue> kvPairs;  // Key-value pairs to be written to the SSTable
+        if (newMemtable) {
+            std::vector<KeyValue> kvPairs;  // Key-value pairs to be written to the SSTable
 
-        // Populate kvPairs with key-value pairs from the new memtable
-        newMemtable->inOrderTraversal(
-            [&kvPairs](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
-                KeyValue kv;
-                kv.set_key(key.data(), key.size());
-                kv.set_value(value.data(), value.size());
-                kvPairs.push_back(kv);
-            });
+            // Populate kvPairs with key-value pairs from the new memtable
+            newMemtable->inOrderTraversal(
+                [&kvPairs](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+                    KeyValue kv;
+                    kv.set_key(key.data(), key.size());
+                    kv.set_value(value.data(), value.size());
+                    kvPairs.push_back(kv);
+                });
 
-        // Increment the counter before using it
-        int sstableCounter;
-        {
-            std::shared_lock<std::shared_mutex> lock(sstablesLock);
-            sstableCounter = sstables.size() + 1;
-        }
+            // Increment the counter before using it
+            int sstableCounter;
+            {
+                std::shared_lock<std::shared_mutex> lock(sstablesLock);
+                sstableCounter = sstables.size() + 1;
+            }
 
-        // Write the key-value pairs to the SSTable
-        std::string sstablePath = directory + getPathSeparator() + "sstable_" +
-                                  std::to_string(sstableCounter) + SSTABLE_EXTENSION;
+            // Write the key-value pairs to the SSTable
+            std::string sstablePath = directory + getPathSeparator() + "sstable_" +
+                                      std::to_string(sstableCounter) + SSTABLE_EXTENSION;
 
-        // Create a new SSTable with a new Pager
-        auto sstable = std::make_shared<SSTable>(new Pager(
-            sstablePath, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc));
+            // Create a new SSTable with a new Pager
+            auto sstable = std::make_shared<SSTable>(std::make_shared<Pager>(
+                sstablePath, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc));
 
-        // We must set minKey and maxKey
-        if (!kvPairs.empty()) {
-            sstable->minKey =
-                std::vector<uint8_t>(kvPairs.front().key().begin(), kvPairs.front().key().end());
-            sstable->maxKey =
-                std::vector<uint8_t>(kvPairs.back().key().begin(), kvPairs.back().key().end());
-        }
+            // We must set minKey and maxKey
+            if (!kvPairs.empty()) {
+                sstable->minKey = std::vector<uint8_t>(kvPairs.front().key().begin(),
+                                                       kvPairs.front().key().end());
+                sstable->maxKey =
+                    std::vector<uint8_t>(kvPairs.back().key().begin(), kvPairs.back().key().end());
+            }
 
-        if (kvPairs.empty()) {
-            continue;  // Skip if there are no key-value pairs
-        }
+            if (kvPairs.empty()) {
+                continue;  // Skip if there are no key-value pairs
+            }
 
-        // Serialize the key-value pairs
-        for (const auto &kv : kvPairs) {
-            sstable->pager->Write(serialize(kv));
-        }
+            // Serialize the key-value pairs
+            for (const auto &kv : kvPairs) {
+                sstable->pager->Write(serialize(kv));
+            }
 
-        // Add the new SSTable to the list of SSTables
-        {
-            std::unique_lock<std::shared_mutex> lock(sstablesLock);
-            sstables.push_back(sstable);
-        }
+            // Add the new SSTable to the list of SSTables
+            {
+                std::unique_lock<std::shared_mutex> lock(sstablesLock);
+                sstables.push_back(sstable);
+            }
 
-        // Check if we need to compact
-        if (sstableCounter >= compactionInterval) {
-            isCompacting.store(1);
-            Compact();
-            isCompacting.store(0);
+            // Check if we need to compact
+            if (sstableCounter >= compactionInterval) {
+                isCompacting.store(1); // Set the flag to indicate that we are compacting
+                Compact(); // Compact the SSTables
+                isCompacting.store(0); // Reset the flag
+            }
         }
 
         // Reset the isFlushing flag
@@ -1106,15 +1096,16 @@ bool LSMT::Compact() {
     // Start a background thread to perform compaction
     compactionThread = std::thread([this] {
         try {
-            const int maxConcurrentThreads = std::max(1, maxCompactionThreads);
-            std::vector<std::unique_ptr<std::counting_semaphore<1>>> semaphores;
-            for (int i = 0; i < maxConcurrentThreads; ++i) {
+            const int maxConcurrentThreads = std::max(1, maxCompactionThreads); // Max concurrent threads
+            std::vector<std::unique_ptr<std::counting_semaphore<1>>> semaphores; // Semaphores for concurrency
+            for (int i = 0; i < maxConcurrentThreads; ++i) { // Create semaphores
                 semaphores.emplace_back(std::make_unique<std::counting_semaphore<1>>(1));
             }
 
             std::vector<std::future<void>> futures;
             std::vector<std::pair<std::shared_ptr<SSTable>, std::shared_ptr<SSTable>>> sstablePairs;
 
+            // Pair SSTables
             {
                 std::shared_lock<std::shared_mutex> lock(sstablesLock);
                 for (size_t i = 0; i < sstables.size(); i += 2) {
@@ -1124,6 +1115,7 @@ bool LSMT::Compact() {
                 }
             }
 
+            // Compact SSTables
             for (const auto &pair : sstablePairs) {
                 for (auto &semaphore : semaphores) {
                     semaphore->acquire();
@@ -1229,10 +1221,9 @@ bool LSMT::Compact() {
                                 std::to_string(
                                     std::chrono::system_clock::now().time_since_epoch().count()) +
                                 SSTABLE_EXTENSION;
-                            auto newSSTable = std::make_shared<SSTable>(new Pager(
+                            auto newSSTable = std::make_shared<SSTable>(std::make_shared<Pager>(
                                 newSSTablePath,
                                 std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc));
-
                             newMemtable->inOrderTraversal(
                                 [&newSSTable, this](const std::vector<uint8_t> &key,
                                                     const std::vector<uint8_t> &value) {

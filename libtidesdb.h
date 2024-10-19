@@ -43,9 +43,14 @@ namespace TidesDB {
 
 class LSMT;  // Forward declaration of the LSMT class
 
-const std::string SSTABLE_EXTENSION = ".sst";          // SSTable file extension
-constexpr const char *TOMBSTONE_VALUE = "$tombstone";  // Tombstone value
-const std::string WAL_EXTENSION = ".wal";              // Write-ahead log file extension
+// Constants
+constexpr int PAGE_SIZE =
+    (1024 * 4);  // Page size, as discussed on Reddit 1024*4 is a better page size.
+constexpr int PAGE_HEADER_SIZE = sizeof(int64_t);             // 8 bytes for overflow page pointer
+constexpr int PAGE_BODY_SIZE = PAGE_SIZE - PAGE_HEADER_SIZE;  // Page body size
+const std::string SSTABLE_EXTENSION = ".sst";                 // SSTable file extension
+constexpr const char *TOMBSTONE_VALUE = "$tombstone";         // Tombstone value
+const std::string WAL_EXTENSION = ".wal";                     // Write-ahead log file extension
 
 // ConvertToUint8Vector converts a vector of characters to a vector of unsigned
 // 8-bit integers
@@ -54,6 +59,15 @@ std::vector<uint8_t> ConvertToUint8Vector(const std::vector<char> &input);
 // ConvertToCharVector converts a vector of unsigned 8-bit integers to a vector
 // of characters
 std::vector<char> ConvertToCharVector(const std::vector<uint8_t> &input);
+
+// TidesDBException is an exception class for TidesDB
+class TidesDBException : public std::exception {
+   private:
+    std::string message;  // Exception message
+   public:
+    explicit TidesDBException(const std::string &msg) : message(msg) {}
+    virtual const char *what() const noexcept override { return message.c_str(); }
+};
 
 // Operation types (for transactions)
 enum class OperationType {
@@ -81,15 +95,6 @@ struct Transaction {
     std::mutex operationsMutex;                    // Mutex for operations
 };
 
-// TidesDBException is an exception class for TidesDB
-class TidesDBException : public std::exception {
-   private:
-    std::string message;  // Exception message
-   public:
-    explicit TidesDBException(const std::string &msg) : message(msg) {}
-    virtual const char *what() const noexcept override { return message.c_str(); }
-};
-
 // deserialize serializes the KeyValue struct to a byte vector
 std::vector<uint8_t> serialize(const KeyValue &kv);
 
@@ -105,25 +110,19 @@ Operation deserializeOperation(const std::vector<uint8_t> &buffer);
 // getPathSeparator Gets os specific path separator
 std::string getPathSeparator();
 
-// Constants
-constexpr int PAGE_SIZE =
-    (1024 * 4);  // Page size, as discussed on Reddit 1024*4 is a better page size.
-constexpr int PAGE_HEADER_SIZE = sizeof(int64_t);             // 8 bytes for overflow page pointer
-constexpr int PAGE_BODY_SIZE = PAGE_SIZE - PAGE_HEADER_SIZE;  // Page body size
-
 // SkipListNode is a node in a skip list
 class SkipListNode {
    public:
     // Each node contains a key, value, and an array of forward pointers
-    std::vector<uint8_t> key;    // Node key
-    std::vector<uint8_t> value;  // Node value
-    std::vector<std::atomic<SkipListNode *>> forward;
+    std::vector<uint8_t> key;                          // Node key
+    std::vector<uint8_t> value;                        // Node value
+    std::vector<std::atomic<SkipListNode *>> forward;  // Forward pointers
 
     // SkipListNode Constructor
     SkipListNode(const std::vector<uint8_t> &k, const std::vector<uint8_t> &v, int level)
         : key(k), value(v), forward(level + 1) {
-        for (int i = 0; i <= level; ++i) {  // Initialize forward pointers
-            forward[i].store(nullptr, std::memory_order_relaxed);
+        for (int i = 0; i <= level; ++i) {                         // Initialize forward pointers
+            forward[i].store(nullptr, std::memory_order_relaxed);  // Initialize to nullptr
         }
     }
 };
@@ -299,10 +298,11 @@ class Pager {
     Pager(const std::string &filename, std::ios::openmode mode);
 
     // Destructor
+    // ** Use Close() to close the pager
     ~Pager();
 
     // Close
-    // Close gracefully closes the pager
+    // gracefully closes the pager
     bool Close() {
         try {
             // Check if we require to release any locks
@@ -331,12 +331,6 @@ class Pager {
     // GetFileName
     std::string GetFileName() const;
 
-    // WriteTp
-    // Writes to an existing page in the file
-    // takes a vector of characters as input
-    // returns page number
-    static int64_t WriteTo(int64_t page_number, const std::vector<uint8_t> &data);
-
     // Read
     // Reads a page from the file
     // takes a page number as input
@@ -354,13 +348,18 @@ class Pager {
 
 };  // Pager class
 
-// Wal class
+// Wal (write ahead log) class
 class Wal {
    public:
+    // Constructor
+    // This constructor takes a pager and is used for normal pager operations
     explicit Wal(Pager *pager) : pager(pager) {
         // Start the background thread
         backgroundThread = std::thread(&Wal::backgroundThreadFunc, this);
     }
+
+    // Constructor
+    // This constructor takes a path for the write-ahead log and is used for recovery
     explicit Wal(const std::string &path) : walPath(path) {
         // Open the write-ahead log
         pager = new Pager(path, std::ios::in | std::ios::out | std::ios::binary);
@@ -368,6 +367,7 @@ class Wal {
 
     std::shared_mutex lock;  // Mutex for write-ahead log
 
+    // AppendOperation appends an operation to the write-ahead log queue
     void AppendOperation(
         const Operation &op);  // AppendOperation writes an operation to the write-ahead log
 
@@ -398,12 +398,14 @@ class Wal {
 class SSTable {
    public:
     // Constructor
-    SSTable(Pager *pager) : pager(pager) {}
+    // Accepts a shared pointer to a Pager instance
+    SSTable(std::shared_ptr<Pager> pager) : pager(pager) {}
 
-    Pager *pager;                     // Pager instance
-    std::vector<uint8_t> minKey;      // Minimum key
-    std::vector<uint8_t> maxKey;      // Maximum key
-    std::shared_mutex lock;           // Mutex for SSTable
+    std::shared_ptr<Pager> pager;  // Pager instance
+    std::vector<uint8_t> minKey;   // Minimum key
+    std::vector<uint8_t> maxKey;   // Maximum key
+    std::shared_mutex
+        lock;  // Mutex for SSTable (used mainly for compaction, otherwise page locks are used)
     std::string GetFilePath() const;  // Get file path of SSTable
 };                                    // SSTable class
 
@@ -412,7 +414,8 @@ class SSTable {
 class SSTableIterator {
    public:
     // Constructor
-    SSTableIterator(Pager *pager)
+    // Accepts a shared pointer to a Pager instance
+    SSTableIterator(std::shared_ptr<Pager> pager)
         : pager(pager), maxPages(pager ? pager->PagesCount() : 0), currentPage(0) {
         if (!pager) {
             throw std::invalid_argument("Pager cannot be null");
@@ -423,10 +426,12 @@ class SSTableIterator {
         }
     }
 
-    // Ok checks if the iterator is valid
+    // Ok
+    // checks if the iterator is valid
     bool Ok() const { return currentPage < maxPages; }
 
-    // Next returns the next key-value pair in the SSTable
+    // Next
+    // returns the next key-value pair in the SSTable
     std::optional<KeyValue> Next() {
         if (!Ok()) {
             return std::nullopt;
@@ -451,19 +456,22 @@ class SSTableIterator {
     }
 
    private:
-    Pager *pager;         // Pager instance
-    int64_t maxPages;     // Maximum number of pages
-    int64_t currentPage;  // Current page
+    std::shared_ptr<Pager> pager;  // Use shared_ptr to manage Pager instance
+    int64_t maxPages;              // Maximum number of pages
+    int64_t currentPage;           // Current page
 };
 
 // LSMT class
 // Log-structured merge-tree
+// This class is the main data storage class for TidesDB
 class LSMT {
    public:
     // Constructor
+    // Accepts a directory, memtable flush size, compaction interval, pager, and maximum number of
+    // compaction threads, you can also specify the maximum level and probability for the memtable
     LSMT(const std::string &directory, int memtable_flush_size, int compaction_interval,
-         const std::shared_ptr<Pager> &pager, const std::vector<std::shared_ptr<SSTable>> &sstables,
-         int max_compaction_threads, int maxLevel = 12, float probability = 0.25)
+         const std::shared_ptr<Pager> &pager, int max_compaction_threads, int maxLevel = 12,
+         float probability = 0.25)
         : directory(directory),
           memtableFlushSize(memtable_flush_size),
           compactionInterval(compaction_interval),
@@ -472,14 +480,49 @@ class LSMT {
           probability(probability) {
         wal = new Wal(new Pager(directory + getPathSeparator() + WAL_EXTENSION,
                                 std::ios::in | std::ios::out | std::ios::binary));
-        isFlushing.store(0);    // Initialize isFlushing to 0 whcih means not flushing
+        isFlushing.store(0);    // Initialize isFlushing to 0 which means not flushing
         isCompacting.store(0);  // Initialize isCompacting to 0 which means not compacting
 
+        // Set the stop background threads flag to false
         stopBackgroundThreads.store(false);
 
-        for (const auto &sstable : sstables) {
-            this->sstables.push_back(sstable);  // Copy the SSTables
+        // Initialize the sstables vector
+        this->sstables = std::vector<std::shared_ptr<SSTable>>();
+
+        // Load SSTables
+        for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+            if (entry.path().extension() == SSTABLE_EXTENSION) {
+                auto pager = std::make_shared<Pager>(
+                    entry.path().string(), std::ios::in | std::ios::out | std::ios::binary);
+                auto sstable = std::make_shared<SSTable>(pager);  // Pass shared_ptr
+
+                // Populate minKey and maxKey
+                SSTableIterator it(pager);
+                if (it.Ok()) {
+                    auto kv = it.Next();
+                    if (kv) {
+                        sstable->minKey = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
+                    }
+                }
+
+                while (it.Ok()) {
+                    auto kv = it.Next();
+                    if (kv) {
+                        sstable->maxKey = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
+                    }
+                }
+
+                this->sstables.push_back(sstable);
+            }
         }
+
+        // Sort SSTables by last modified time
+        std::sort(this->sstables.begin(), this->sstables.end(),
+                  [](const std::shared_ptr<SSTable> &a, const std::shared_ptr<SSTable> &b) {
+                      auto a_time = std::filesystem::last_write_time(a->pager->GetFileName());
+                      auto b_time = std::filesystem::last_write_time(b->pager->GetFileName());
+                      return a_time < b_time;
+                  });
 
         // Create a new memtable
         memtable = new SkipList(maxLevel, probability);
@@ -503,87 +546,25 @@ class LSMT {
             std::filesystem::permissions(directory, directoryPerm);
         }
 
-        std::shared_ptr<Pager> walPager =
-            std::make_shared<Pager>(directory + getPathSeparator() + WAL_EXTENSION,
-                                    std::ios::in | std::ios::out | std::ios::trunc);
+        auto walPager = std::make_shared<Pager>(
+            directory + getPathSeparator() + WAL_EXTENSION,
+            std::ios::in | std::ios::out | std::ios::binary);  // Open the write-ahead log
 
-        // Load SSTables from the directory into memory
-        std::vector<std::shared_ptr<SSTable>> sstables;
-        std::vector<std::pair<std::shared_ptr<SSTable>, std::filesystem::file_time_type>>
-            sstableWithTime;
+        int availableThreads =
+            std::thread::hardware_concurrency();  // Get the number of available threads
 
-        for (const auto &entry : std::filesystem::directory_iterator(directory)) {
-            if (entry.is_regular_file() && entry.path().extension() == SSTABLE_EXTENSION) {
-                std::shared_ptr<Pager> sstablePager = std::make_shared<Pager>(
-                    entry.path().string(), std::ios::in | std::ios::out | std::ios::binary);
-                std::shared_ptr<SSTable> sstable = std::make_shared<SSTable>(sstablePager.get());
-
-                // Initialize minKey and maxKey
-                SSTableIterator sstableIt(sstablePager.get());
-                if (sstableIt.Ok()) {
-                    auto kv = sstableIt.Next();
-                    if (kv) {
-                        sstable->minKey = ConvertToUint8Vector(
-                            std::vector<char>(kv->key().begin(), kv->key().end()));
-                        sstable->maxKey = sstable->minKey;  // Initialize maxKey to minKey
-                    }
-                }
-
-                while (sstableIt.Ok()) {
-                    auto kv = sstableIt.Next();
-                    if (kv) {
-                        std::vector<uint8_t> currentKey = ConvertToUint8Vector(
-                            std::vector<char>(kv->key().begin(), kv->key().end()));
-                        if (currentKey < sstable->minKey) {
-                            sstable->minKey = currentKey;
-                        }
-                        if (currentKey > sstable->maxKey) {
-                            sstable->maxKey = currentKey;
-                        }
-                    }
-                }
-
-                // Get the last write time and store it with the SSTable
-                auto lastWriteTime = std::filesystem::last_write_time(entry);
-                sstableWithTime.emplace_back(sstable, lastWriteTime);
-            }
-        }
-
-        // Sort the SSTables by their last write time in descending order
-        std::sort(sstableWithTime.begin(), sstableWithTime.end(),
-                  [](const auto &a, const auto &b) { return a.second > b.second; });
-
-        // Extract the sorted SSTables
-        sstables.clear();
-        for (const auto &pair : sstableWithTime) {
-            sstables.push_back(pair.first);
-        }
-
-        // Determine the maximum number of compaction threads
-        int availableThreads = std::thread::hardware_concurrency();
         if (availableThreads == 0) {
             throw TidesDBException("could not determine number of available threads");
         }
-        // Default to 3 threads less than the number of available threads
         int maxThreads = maxCompactionThreads.value_or(std::max(1, availableThreads - 3));
 
-        // Make sure maxThreads isnt greater than availableThreads
         if (maxThreads > availableThreads) {
             throw TidesDBException(
                 "max compaction threads cannot be greater than available threads");
         }
 
         return std::make_unique<LSMT>(directory, memtableFlushSize, compactionInterval, walPager,
-                                      sstables, maxThreads);
-    }
-
-    // ConvertToHexString converts a vector of unsigned 8-bit integers to a hexadecimal string
-    static std::string ConvertToHexString(const std::vector<uint8_t> &data) {
-        std::ostringstream oss;
-        for (auto byte : data) {
-            oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
-        }
-        return oss.str();
+                                      maxThreads);
     }
 
     // Destructor
@@ -663,16 +644,7 @@ class LSMT {
     // Get returns the value for a given key
     std::vector<uint8_t> Get(const std::vector<uint8_t> &key);
 
-    // Public method to insert a key-value pair into the memtable
-    void InsertIntoMemtable(const std::vector<uint8_t> &key,
-                            const std::vector<uint8_t> &value) const {
-        memtable->insert(key, value);
-    }
-
-    // Public method to delete a key from the memtable
-    void DeleteFromMemtable(const std::vector<uint8_t> &key) const { memtable->deleteKV(key); }
-
-    // Close closes the LSMT
+    // Close closes the LSMT gracefully
     void Close() {
         try {
             // Flush the memtable to disk
@@ -680,11 +652,16 @@ class LSMT {
                 throw TidesDBException("failed to flush memtable to disk");
             }
 
-            stopBackgroundThreads.store(true);
-
             // Notify the condition variables to wake up the threads
+            stopBackgroundThreads.store(true);
             flushQueueCondVar.notify_all();
             cond.notify_all();
+
+            // Wait for the flush queue to be empty
+            {
+                std::unique_lock<std::mutex> lock(flushQueueMutex);
+                flushQueueCondVar.wait(lock, [this] { return flushQueue.empty(); });
+            }
 
             // Wait for the flush thread to finish
             if (flushThread.joinable()) {

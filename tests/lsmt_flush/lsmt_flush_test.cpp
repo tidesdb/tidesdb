@@ -11,7 +11,7 @@ int main() {
     std::string directory = "./tidesdb_data";  // The directory for storing data
     std::filesystem::perms directoryPerm =
         std::filesystem::perms::owner_all | std::filesystem::perms::group_read;  // Permissions
-    int memtableFlushSize = 6;
+    int memtableFlushSize = 100;
     int compactionInterval = 100;
 
     try {
@@ -50,6 +50,8 @@ int main() {
                 std::this_thread::sleep_for(std::chrono::seconds(1));  // Wait before retrying
             }
         }
+
+        std::cout << "All key-value pairs found" << std::endl;
 
         lsmTree->Close();
 

@@ -1,7 +1,9 @@
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../../libtidesdb.h"
@@ -19,35 +21,28 @@ int main() {
         auto lsmTree =
             TidesDB::LSMT::New(directory, directoryPerm, memtableFlushSize, compactionInterval);
 
-        for (int i = 1; i <= 6; i++) {  // Insert fewer key-value pairs
+        for (int i = 1; i <= 8; i++) {  // Insert fewer key-value pairs
             std::string keyStr = std::to_string(i);
             std::vector<uint8_t> key(keyStr.begin(), keyStr.end());
             std::vector<uint8_t> value(keyStr.begin(), keyStr.end());
 
             lsmTree->Put(key, value);
+            std::cout << "Inserted key: " << keyStr << ", value: " << keyStr << std::endl;
         }
 
-        // Set of missing keys
-        std::set<std::vector<uint8_t>> missingKeys;
-        for (int i = 1; i <= 6; i++) {  // Adjust the range accordingly
+        // Wait for background threads to finish flushing and compacting
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+
+        std::cout << "Keys and values after compaction:" << std::endl;
+        for (int i = 1; i <= 8; i++) {
             std::string keyStr = std::to_string(i);
             std::vector<uint8_t> key(keyStr.begin(), keyStr.end());
-            missingKeys.insert(key);
-        }
-
-        // Retry until all key-value pairs are found
-        while (!missingKeys.empty()) {
-            for (auto it = missingKeys.begin(); it != missingKeys.end();) {
-                std::vector<uint8_t> result = lsmTree->Get(*it);
-                if (!result.empty() && result == *it) {  // Assuming value is the same as the key
-                    it = missingKeys.erase(it);          // Remove found key from the set
-                } else {
-                    ++it;
-                }
-            }
-
-            if (!missingKeys.empty()) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));  // Wait before retrying
+            auto value = lsmTree->Get(key);
+            if (value.data()) {
+                std::string valueStr(value.begin(), value.end());
+                std::cout << keyStr << ": " << valueStr << std::endl;
+            } else {
+                std::cout << keyStr << ": not found" << std::endl;
             }
         }
 

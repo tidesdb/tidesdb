@@ -145,10 +145,26 @@ uint8_t** LSMT_LessThanEq(LSMT* lsmTree, const uint8_t* key, size_t key_len, siz
     return convertToCArray(result, result_len);
 }
 
+struct Wal {
+    std::unique_ptr<TidesDB::Wal> instance;
+};
+
 uint8_t** LSMT_GreaterThanEq(LSMT* lsmTree, const uint8_t* key, size_t key_len,
                              size_t* result_len) {
     std::vector<uint8_t> keyVec(key, key + key_len);
     auto result = lsmTree->instance->GreaterThanEq(keyVec);
     return convertToCArray(result, result_len);
+}
+
+Wal* Wal_NewWithPath(const char* path) {
+    std::string pathStr(path);
+    return new Wal{std::make_unique<TidesDB::Wal>(pathStr)};
+}
+
+int Wal_Recover(Wal* wal, LSMT* lsmTree) { return wal->instance->Recover(*lsmTree->instance); }
+
+void Wal_Close(Wal* wal) {
+    wal->instance->Close();
+    delete wal;
 }
 }

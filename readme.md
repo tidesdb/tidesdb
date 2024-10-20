@@ -35,6 +35,7 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] Granular page locking mechanisms on reads
 - [x] ZSTD Compression sstables if enabled
 - [x] Debug logging (optional, degrades performance)
+- [x] TTL (Time to Live) support
 
 ## Design
 Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.

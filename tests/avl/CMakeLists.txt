@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD 20)
 # Find Protobuf package
 find_package(Protobuf REQUIRED)
 
+# Find Zstd package
+find_package(Zstd REQUIRED)
+
 # Include the generated protobuf headers
 include_directories(${Protobuf_INCLUDE_DIRS})
 
@@ -18,4 +21,4 @@ set(PROTO_HDR ../../proto/kv.pb.h ../../proto/operation.pb.h)
 add_executable(tidesdb avl_tests.cpp ../../libtidesdb.cpp ${PROTO_SRC})
 
 # Link the protobuf library
-target_link_libraries(tidesdb ${Protobuf_LIBRARIES})
+target_link_libraries(tidesdb ${Protobuf_LIBRARIES} Zstd::Zstd)

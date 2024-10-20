@@ -17,7 +17,10 @@
 #ifndef TIDESDB_LIBRARY_HPP
 #define TIDESDB_LIBRARY_HPP
 
+#include <zstd.h>
+
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
@@ -51,6 +54,7 @@ constexpr int PAGE_BODY_SIZE = PAGE_SIZE - PAGE_HEADER_SIZE;  // Page body size
 const std::string SSTABLE_EXTENSION = ".sst";                 // SSTable file extension
 constexpr const char *TOMBSTONE_VALUE = "$tombstone";         // Tombstone value
 const std::string WAL_EXTENSION = ".wal";                     // Write-ahead log file extension
+const std::string LOG_EXTENSION = ".log";                     // Log file extension
 
 // ConvertToUint8Vector
 // converts a vector of characters to a vector of unsigned
@@ -61,6 +65,14 @@ std::vector<uint8_t> ConvertToUint8Vector(const std::vector<char> &input);
 // converts a vector of unsigned 8-bit integers to a vector
 // of characters
 std::vector<char> ConvertToCharVector(const std::vector<uint8_t> &input);
+
+// compressZstd
+// compresses a byte vector using Zstandard
+std::vector<uint8_t> compressZstd(const std::vector<uint8_t> &input);
+
+// decompressZstd
+// decompresses a byte vector using Zstandard
+std::vector<uint8_t> decompressZstd(const std::vector<uint8_t> &compressed);
 
 // TidesDBException
 // is an exception class for TidesDB
@@ -268,7 +280,7 @@ class Pager {
     // takes a vector of characters as input
     // If the page is full, it writes to a new page and updates the overflow page
     // number in the header returns page number
-    int64_t Write(const std::vector<uint8_t> &data);
+    int64_t Write(const std::vector<uint8_t> &data, bool compress = false);
 
     // GetFileName
     std::string GetFileName() const;
@@ -278,7 +290,7 @@ class Pager {
     // takes a page number as input
     // returns a vector of characters
     // takes into account overflow pages
-    std::vector<uint8_t> Read(int64_t page_number);
+    std::vector<uint8_t> Read(int64_t page_number, bool decompress = false);
 
     // GetFile
     // Returns the file stream
@@ -411,7 +423,8 @@ class LSMT {
     // Accepts a directory, memtable flush size, compaction interval, pager, and maximum number of
     // compaction threads, you can also specify the maximum level and probability for the memtable
     LSMT(const std::string &directory, int memtable_flush_size, int compaction_interval,
-         const std::shared_ptr<Pager> &pager, int max_compaction_threads)
+         const std::shared_ptr<Pager> &pager, int max_compaction_threads, bool compress = false,
+         bool logging = false)
         : directory(directory),
           memtableFlushSize(memtable_flush_size),
           compactionInterval(compaction_interval),
@@ -423,6 +436,8 @@ class LSMT {
 
         // Set the stop background threads flag to false
         stopBackgroundThreads.store(false);
+
+        // If logging is enabled we create a log file and write specific operations to it
 
         // Initialize the sstables vector
         this->sstables = std::vector<std::shared_ptr<SSTable>>();
@@ -615,6 +630,10 @@ class LSMT {
     // memtable, close all SSTables, and finally close the pager
     void Close() {
         try {
+            if (logging) {
+                writeLineToLog("CLOSING UP");
+            }
+
             // We will rollback all active transactions
             std::shared_lock<std::shared_mutex> activeTransactionsLockGuard(
                 activeTransactionsLock);  // Lock the active transactions
@@ -668,6 +687,10 @@ class LSMT {
                 sstables.clear();
             }
 
+            if (logging) {
+                writeLineToLog("CLOSED SUCCESSFULLY");
+            }
+
         } catch (const std::system_error &e) {
             throw TidesDBException("system error during close: " + std::string(e.what()));
         } catch (const std::exception &e) {
@@ -701,6 +724,11 @@ class LSMT {
     std::condition_variable flushQueueCondVar;        // Condition variable for flush queue
     std::thread compactionThread;                     // Thread for compaction
     int maxCompactionThreads;  // Maximum number of threads for paired compaction
+    bool compress;             // if true keys and the values will be compressed
+    bool logging;  // if true system will log Put, Delete, Flush, Compaction, Close operations (will
+                   // degrade performance significantly as not optimized)
+    std::ofstream logFile;   // the log file
+    std::mutex logFileLock;  // Mutex for log file
 
     // flushMemtable
     // responsible for flushing the current memtable to disk. It creates a new memtable,
@@ -713,6 +741,9 @@ class LSMT {
     // on initialization This function waits notification and pops latest memtable from the queue
     // and flushes it to disk
     void flushThreadFunc();
+
+    // writeLineToLog
+    void writeLineToLog(const std::string &line);
 };
 
 }  // namespace TidesDB

@@ -4,14 +4,14 @@
 #include <string>
 #include <vector>
 
-#include "../libtidesdb.h"
+#include "../libtidesdb.hpp"
 
 int main() {
     // Define parameters
     std::string directory = "./tidesdb_benchmark_data";
     std::filesystem::perms directoryPerm =
         std::filesystem::perms::owner_all | std::filesystem::perms::group_read;
-    int memtableFlushSize = (1024 * 1024) * 128;  // 128MB in bytes
+    int memtableFlushSize = (1024 * 1024) * 500;  // 128MB in bytes
     int compactionInterval = 100;
 
     try {

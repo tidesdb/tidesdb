@@ -2,7 +2,7 @@
 #include <iostream>
 #include <vector>
 
-#include "../../libtidesdb.h"
+#include "../../libtidesdb.hpp"
 
 std::vector<uint8_t> convertToUint8Vector(const std::vector<char> &input) {
     return std::vector<uint8_t>(input.begin(), input.end());

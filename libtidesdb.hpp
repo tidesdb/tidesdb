@@ -14,8 +14,8 @@
  * governing permissions and limitations under the License.
  */
 
-#ifndef TIDESDB_LIBRARY_H
-#define TIDESDB_LIBRARY_H
+#ifndef TIDESDB_LIBRARY_HPP
+#define TIDESDB_LIBRARY_HPP
 
 #include <atomic>
 #include <condition_variable>
@@ -52,15 +52,18 @@ const std::string SSTABLE_EXTENSION = ".sst";                 // SSTable file ex
 constexpr const char *TOMBSTONE_VALUE = "$tombstone";         // Tombstone value
 const std::string WAL_EXTENSION = ".wal";                     // Write-ahead log file extension
 
-// ConvertToUint8Vector converts a vector of characters to a vector of unsigned
+// ConvertToUint8Vector
+// converts a vector of characters to a vector of unsigned
 // 8-bit integers
 std::vector<uint8_t> ConvertToUint8Vector(const std::vector<char> &input);
 
-// ConvertToCharVector converts a vector of unsigned 8-bit integers to a vector
+// ConvertToCharVector
+// converts a vector of unsigned 8-bit integers to a vector
 // of characters
 std::vector<char> ConvertToCharVector(const std::vector<uint8_t> &input);
 
-// TidesDBException is an exception class for TidesDB
+// TidesDBException
+// is an exception class for TidesDB
 class TidesDBException : public std::exception {
    private:
     std::string message;  // Exception message
@@ -76,12 +79,14 @@ enum class OperationType {
 };
 
 // Transaction operation
+// This struct is used to store information about a transaction operation
 struct TransactionOperation {
     Operation op;               // the operation
     struct Rollback *rollback;  // Rollback information
 };
 
-// Rollback information for a transaction operation
+// Rollback
+// information for a transaction operation
 struct Rollback {
     OperationType type;          // Type of the operation (OpPut or OpDelete)
     std::vector<uint8_t> key;    // Key of the operation
@@ -95,19 +100,24 @@ struct Transaction {
     std::mutex operationsMutex;                    // Mutex for operations
 };
 
-// deserialize serializes the KeyValue struct to a byte vector
+// deserialize
+// serializes the KeyValue struct to a byte vector
 std::vector<uint8_t> serialize(const KeyValue &kv);
 
-// deserialize deserializes a byte vector to a KeyValue struct
+// deserialize
+// deserializes a byte vector to a KeyValue struct
 KeyValue deserialize(const std::vector<uint8_t> &buffer);
 
-// serializeOperation serializes the Operation struct to a byte vector
+// serializeOperation
+// serializes the Operation struct to a byte vector
 std::vector<uint8_t> serializeOperation(const Operation &op);
 
-// deserializeOperation deserializes a byte vector to an Operation struct
+// deserializeOperation
+// deserializes a byte vector to an Operation struct
 Operation deserializeOperation(const std::vector<uint8_t> &buffer);
 
-// getPathSeparator Gets os specific path separator
+// getPathSeparator
+// Gets os specific path separator
 std::string getPathSeparator();
 
 // AVL Node class
@@ -133,55 +143,70 @@ class AVLTree {
     // rwlock is a read-write lock for the AVL tree
     mutable std::shared_mutex rwlock;
 
-    // rightRotate rotates the AVL tree to the right
+    // rightRotate
+    // performs a right rotation on an AVL tree node
     AVLNode *rightRotate(AVLNode *y);
 
-    // leftRotate rotates the AVL tree to the left
+    // leftRotate
+    // performs a left rotation on an AVL tree node
     AVLNode *leftRotate(AVLNode *x);
 
-    // getBalance gets the balance factor of a node
+    // getBalance
+    // gets the balance factor of a node
     int getBalance(AVLNode *node);
 
-    // getCachedSize gets the cached size of the AVL tree
+    // getCachedSize
+    // gets the cached size of the AVL tree
     int getCachedSize() const;
 
-    // insert inserts a key-value pair into the AVL tree
+    // insert
+    // inserts a key-value pair into the AVL tree
     AVLNode *insert(AVLNode *node, const std::vector<uint8_t> &key,
                     const std::vector<uint8_t> &value);
 
-    // printHex prints a vector of unsigned 8-bit integers in hexadecimal format
+    // printHex
+    // prints a vector of unsigned 8-bit integers in hexadecimal format
     void printHex(const std::vector<uint8_t> &data);
 
-    // deleteNode deletes a node from the AVL tree
+    // deleteNode
+    // deletes a node from the AVL tree
     AVLNode *deleteNode(AVLNode *root, const std::vector<uint8_t> &key);
 
-    // inOrder prints the key-value pairs in the AVL tree in in-order traversal
+    // inOrder
+    // prints the key-value pairs in the AVL tree in in-order traversal
     void inOrder(AVLNode *node);
 
-    // minValueNode finds the node with the minimum value in the AVL tree
+    // minValueNode
+    // finds the node with the minimum value in the AVL tree
     AVLNode *minValueNode(AVLNode *node);
 
-    // height gets the height of a node
+    // height
+    // gets the height of a node
     int height(AVLNode *node);
 
-    // inOrderTraversal traverses the AVL tree in in-order traversal and calls a
+    // inOrderTraversal
+    // traverses the AVL tree in in-order traversal and calls a
     // function on each node
     void inOrderTraversal(
         AVLNode *node,
         std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func);
 
    public:
-    // insert inserts a key-value pair into the AVL tree
+    // insert
+    // inserts a key-value pair into the AVL tree
     void Insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
     void InsertBatch(const std::vector<KeyValue> &kvPairs);
 
-    // Delete deletes a key from the AVL tree
+    // Delete
+    // deletes a key from the AVL tree
     void Delete(const std::vector<uint8_t> &key);
 
-    // inOrder prints the key-value pairs in the AVL tree in in-order traversal
+    // inOrder
+    // prints the key-value pairs in the AVL tree in in-order traversal
     void inOrder();
 
-    // inOrderTraversal traverses the AVL tree in in-order traversal and calls a
+    // inOrderTraversal
+    // traverses the AVL tree in in-order traversal and calls a
     // function on each node
     void InOrderTraversal(
         std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func);
@@ -193,10 +218,12 @@ class AVLTree {
     // Returns the value for a given key
     std::vector<uint8_t> Get(const std::vector<uint8_t> &key);
 
-    // GetSize returns the number of nodes in the AVL tree
+    // GetSize
+    // returns the number of nodes in the AVL tree
     int GetSize(AVLNode *root);
 
-    // GetRoot returns the root node of the AVL tree
+    // GetRoot
+    // returns the root node of the AVL tree
     int GetSize();
 };
 
@@ -282,11 +309,13 @@ class Wal {
 
     std::shared_mutex lock;  // Mutex for write-ahead log
 
-    // AppendOperation appends an operation to the write-ahead log queue
+    // AppendOperation
+    // appends an operation to the write-ahead log queue
     void AppendOperation(
         const Operation &op);  // AppendOperation writes an operation to the write-ahead log
 
-    // Recover recovers operations from the write-ahead log
+    // Recover
+    // recovers operations from the write-ahead log
     bool Recover(LSMT &lsmt) const;
 
     mutable std::mutex queueMutex;         // Mutex for operation queue
@@ -295,12 +324,14 @@ class Wal {
     bool stopBackgroundThread = false;     // Stop background thread
     std::thread backgroundThread;          // Background thread
 
-    // backgroundThreadFunc is the function that runs in the background thread
+    // backgroundThreadFunc
+    // is the function that runs in the background thread
     // instead of appending on every write, we append to a queue and write in the background to not
     // block the main thread
     void backgroundThreadFunc();
 
-    // Close closes the write-ahead log
+    // Close
+    // closes the write-ahead log
     void Close();
 
    private:
@@ -380,8 +411,7 @@ class LSMT {
     // Accepts a directory, memtable flush size, compaction interval, pager, and maximum number of
     // compaction threads, you can also specify the maximum level and probability for the memtable
     LSMT(const std::string &directory, int memtable_flush_size, int compaction_interval,
-         const std::shared_ptr<Pager> &pager, int max_compaction_threads, int maxLevel = 12,
-         float probability = 0.25)
+         const std::shared_ptr<Pager> &pager, int max_compaction_threads)
         : directory(directory),
           memtableFlushSize(memtable_flush_size),
           compactionInterval(compaction_interval),
@@ -439,7 +469,8 @@ class LSMT {
         flushThread = std::thread(&LSMT::flushThreadFunc, this);
     }
 
-    // New creates a new LSMT instance
+    // New
+    // creates a new LSMT instance
     // Opens all SSTables in the directory and loads them into memory (just the pager, min and max)
     static std::unique_ptr<LSMT> New(const std::string &directory,
                                      std::filesystem::perms directoryPerm, int memtableFlushSize,
@@ -478,87 +509,120 @@ class LSMT {
     // Destructor
     ~LSMT() {}
 
-    // Put inserts a key-value pair into the LSMT
+    // Put
+    // inserts a key-value pair into the LSMT
     bool Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
     bool PutBatch(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &batch);
 
-    // Delete deletes a key from the LSMT
+    // Delete
+    // deletes a key from the LSMT
     bool Delete(const std::vector<uint8_t> &key);
 
-    // DeleteBatch deletes a batch of keys from the LSMT
+    // DeleteBatch
+    // deletes a batch of keys from the LSMT
     bool DeleteBatch(const std::vector<std::vector<uint8_t>> &keys);
 
-    // Compact compacts the SSTables
+    // Compact
+    // compacts the SSTables using background thread.  We do a multi-threaded paired compaction
     bool Compact();
 
-    // IsFlushing returns whether the memtable is being flushed
+    // IsFlushing
+    // returns whether the memtable is being flushed
     bool IsFlushing() const { return isFlushing.load(); }
 
-    // IsCompacting returns whether the SSTables are being compacted
+    // IsCompacting
+    // returns whether the SSTables are being compacted
     bool IsCompacting() const { return isCompacting.load(); }
 
-    // GetMemtable returns the memtable
+    // GetMemtable
+    // returns the memtable
     AVLTree *GetMemtable() const { return memtable; }
 
-    // GetSSTableCount returns the number of SSTables
+    // GetSSTableCount
+    // returns the number of SSTables
     int GetSSTableCount() {
         // lock the SSTables
         std::shared_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
         return sstables.size();
     }
 
-    // NGet returns all key-value pairs not equal to a given key
+    // NGet
+    // returns all key-value pairs not equal to a given key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> NGet(
         const std::vector<uint8_t> &key) const;
 
-    // LessThan returns all key-value pairs less than a given key
+    // LessThan
+    // returns all key-value pairs less than a given key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LessThan(
         const std::vector<uint8_t> &key) const;
 
-    // GreaterThan returns all key-value pairs greater than a given key
+    // GreaterThan
+    // returns all key-value pairs greater than a given key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> GreaterThan(
         const std::vector<uint8_t> &key) const;
 
-    // Range returns all key-value pairs between a start and end key
+    // Range
+    // returns all key-value pairs between a start and end key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> Range(
         const std::vector<uint8_t> &start, const std::vector<uint8_t> &end) const;
 
-    // NRange returns all key-value pairs not between a start and end key
+    // NRange
+    // returns all key-value pairs not between a start and end key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> NRange(
         const std::vector<uint8_t> &start, const std::vector<uint8_t> &end) const;
 
-    // LessThanEq returns all key-value pairs less than or equal to a given key
+    // LessThanEq
+    // returns all key-value pairs less than or equal to a given key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LessThanEq(
         const std::vector<uint8_t> &key) const;
 
-    // GreaterThanEq returns all key-value pairs greater than or equal to a given
-    // key
+    // GreaterThanEq
+    // returns all key-value pairs greater than or equal to a given key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> GreaterThanEq(
         const std::vector<uint8_t> &key) const;
 
-    // BeginTransaction begins a new transaction
+    // BeginTransaction
+    // begins a new transaction
     Transaction *BeginTransaction();
 
-    // CommitTransaction commits a transaction
+    // CommitTransaction
+    // commits a transaction
     bool CommitTransaction(Transaction *tx);
 
-    // RollbackTransaction rolls back a transaction
+    // RollbackTransaction
+    // rolls back a transaction
     void RollbackTransaction(Transaction *tx);
 
-    // AddDelete adds a delete operation to a transaction
+    // AddDelete
+    // adds a delete operation to a transaction
     static void AddDelete(Transaction *tx, const std::vector<uint8_t> &key,
                           const std::vector<uint8_t> &value);
 
-    // AddPut adds a put operation to a transaction
+    // AddPut
+    // adds a put operation to a transaction
     static void AddPut(Transaction *tx, const std::vector<uint8_t> &key,
                        const std::vector<uint8_t> &value);
 
-    // Get returns the value for a given key
+    // Get
+    // returns the value for a given key
     std::vector<uint8_t> Get(const std::vector<uint8_t> &key);
 
-    // Close closes the LSMT gracefully
+    // Close
+    // closes the LSMT gracefully.
+    // We first rollback all active transactions, then flush the memtable to disk,
+    // wait for the flush queue to be empty, wait for the flush thread to finish,
+    // wait for the compaction thread to finish, close the write-ahead log, clear the
+    // memtable, close all SSTables, and finally close the pager
     void Close() {
         try {
+            // We will rollback all active transactions
+            std::shared_lock<std::shared_mutex> activeTransactionsLockGuard(
+                activeTransactionsLock);  // Lock the active transactions
+
+            for (auto tx : activeTransactions) {
+                RollbackTransaction(tx);
+            }
+
             // Flush the memtable to disk
             if (!flushMemtable()) {
                 throw TidesDBException("failed to flush memtable to disk");
@@ -644,12 +708,13 @@ class LSMT {
     // to the flush queue. Finally, it notifies the flush thread to process the queue
     bool flushMemtable();
 
-    // flushThreadFunc is the function that runs in the flush thread
-    // This function waits notification and pops latest memtable from the queue and flushes it to
-    // disk
+    // flushThreadFunc
+    // is the function that runs in the flush memtable thread (background thread) which gets started
+    // on initialization This function waits notification and pops latest memtable from the queue
+    // and flushes it to disk
     void flushThreadFunc();
 };
 
 }  // namespace TidesDB
 
-#endif  // TIDESDB_LIBRARY_H
+#endif  // TIDESDB_LIBRARY_HPP

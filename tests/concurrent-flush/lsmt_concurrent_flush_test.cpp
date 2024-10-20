@@ -6,7 +6,7 @@
 #include <thread>
 #include <vector>
 
-#include "../../libtidesdb.h"
+#include "../../libtidesdb.hpp"
 
 void putValues(TidesDB::LSMT* lsmTree, int start, int end, std::mutex& mtx) {
     for (int i = start; i <= end; i++) {

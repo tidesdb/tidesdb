@@ -6,7 +6,7 @@
 #include <thread>
 #include <vector>
 
-#include "../../libtidesdb.h"
+#include "../../libtidesdb.hpp"
 
 void predefinedInserts(
     TidesDB::AVLTree &tree,

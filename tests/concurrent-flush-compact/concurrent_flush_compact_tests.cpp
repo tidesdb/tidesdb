@@ -3,7 +3,7 @@
 #include <thread>
 #include <vector>
 
-#include "../../libtidesdb.h"
+#include "../../libtidesdb.hpp"
 
 void writeData(TidesDB::LSMT* lsmTree, int start, int end) {
     for (int i = start; i < end; ++i) {

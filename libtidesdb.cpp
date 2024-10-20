@@ -13,43 +13,49 @@
  * either express or implied. See the License for the specific language
  * governing permissions and limitations under the License.
  */
-#include "libtidesdb.h"
+#include "libtidesdb.hpp"
 
 // The TidesDB namespace
 namespace TidesDB {
 
-// ConvertToUint8Vector converts a vector of chars to a vector of uint8_t
+// ConvertToUint8Vector
+// converts a vector of chars to a vector of uint8_t
 std::vector<uint8_t> ConvertToUint8Vector(const std::vector<char> &input) {
     return std::vector<uint8_t>(input.begin(), input.end());
 }
 
-// ConvertToCharVector converts a vector of uint8_t to a vector of chars
+// ConvertToCharVector
+// converts a vector of uint8_t to a vector of chars
 std::vector<char> ConvertToCharVector(const std::vector<uint8_t> &input) {
     return std::vector<char>(input.begin(), input.end());
 }
 
-// serialize serializes the KeyValue struct to a byte vector
+// serialize
+// serializes the KeyValue struct to a byte vector
 std::vector<uint8_t> serialize(const KeyValue &kv) {
     std::vector<uint8_t> buffer(kv.ByteSizeLong());
     kv.SerializeToArray(buffer.data(), buffer.size());
     return buffer;
 }
 
-// deserialize deserializes a byte vector to a KeyValue
+// deserialize
+// deserializes a byte vector to a KeyValue
 KeyValue deserialize(const std::vector<uint8_t> &buffer) {
     KeyValue kv;
     kv.ParseFromArray(buffer.data(), buffer.size());
     return kv;
 }
 
-// deserializeOperation deserializes a byte vector to an Operation
+// deserializeOperation
+// deserializes a byte vector to an Operation
 Operation deserializeOperation(const std::vector<uint8_t> &buffer) {
     Operation op;
     op.ParseFromArray(buffer.data(), buffer.size());
     return op;
 }
 
-// serializeOperation serializes the Operation struct to a byte vector
+// serializeOperation
+// serializes the Operation struct to a byte vector
 std::vector<uint8_t> serializeOperation(const Operation &op) {
     std::vector<uint8_t> buffer(op.ByteSizeLong());
     op.SerializeToArray(buffer.data(), buffer.size());
@@ -1025,14 +1031,6 @@ int64_t Pager::PagesCount() {
     file.seekg(0, std::ios::end);
     int64_t fileSize = file.tellg();
     return fileSize / PAGE_SIZE;
-}
-
-std::string toHexString(const std::vector<uint8_t> &vec) {
-    std::ostringstream oss;
-    for (auto byte : vec) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
-    }
-    return oss.str();
 }
 
 // LSMT::Compact

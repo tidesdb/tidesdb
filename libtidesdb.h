@@ -110,76 +110,7 @@ Operation deserializeOperation(const std::vector<uint8_t> &buffer);
 // getPathSeparator Gets os specific path separator
 std::string getPathSeparator();
 
-// SkipListNode is a node in a skip list
-class SkipListNode {
-   public:
-    // Each node contains a key, value, and an array of forward pointers
-    std::vector<uint8_t> key;                          // Node key
-    std::vector<uint8_t> value;                        // Node value
-    std::vector<std::atomic<SkipListNode *>> forward;  // Forward pointers
-
-    // SkipListNode Constructor
-    SkipListNode(const std::vector<uint8_t> &k, const std::vector<uint8_t> &v, int level)
-        : key(k), value(v), forward(level + 1) {
-        for (int i = 0; i <= level; ++i) {                         // Initialize forward pointers
-            forward[i].store(nullptr, std::memory_order_relaxed);  // Initialize to nullptr
-        }
-    }
-};
-
-// SkipList is a lock-free skip list class
-class SkipList {
-   private:
-    int maxLevel;                          // Maximum level of the skip list
-    float probability;                     // Probability of a node having a higher level
-    std::atomic<int> level;                // Current level of the skip list
-    std::shared_ptr<SkipListNode> head;    // Head node of the skip list
-    std::mt19937 gen;                      // Random number generator
-    std::uniform_real_distribution<> dis;  // Uniform distribution
-    std::atomic<int> cachedSize;           // Size of the skip list
-
-    // randomLevel generates a random level for a new node
-    int randomLevel();
-
-   public:
-    // Constructor
-    SkipList(int maxLevel, float probability)
-        : maxLevel(maxLevel),
-          probability(probability),
-          level(0),
-          gen(std::random_device{}()),
-          dis(0, RAND_MAX),
-          cachedSize(0) {
-        head = std::make_unique<SkipListNode>(std::vector<uint8_t>(), std::vector<uint8_t>(),
-                                              maxLevel);
-    }
-
-    // insert inserts a key-value pair into the skip list
-    bool insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
-
-    // deleteKV deletes a key from the skip list
-    void deleteKV(const std::vector<uint8_t> &key);
-
-    // clearCache clears the cached size of the skip list
-    void clearCache();
-
-    // get gets the value for a given key
-    std::vector<uint8_t> get(const std::vector<uint8_t> &key) const;
-
-    // inOrderTraversal traverses the skip list in in-order traversal and calls a function on each
-    // node
-    void inOrderTraversal(
-        std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const;
-
-    // getSize returns the number of nodes in the skip list
-    int getSize() const;
-
-    // clear clears the skip list
-    void clear();
-};
-
 // AVL Node class
-// @deprecated
 class AVLNode {
    public:
     std::vector<uint8_t> key;    // Key
@@ -194,94 +125,81 @@ class AVLNode {
 };
 
 // AVL Tree class
-// @deprecated
 class AVLTree {
    private:
-    AVLNode *root;             // Root node
-    std::shared_mutex rwlock;  // Read-write lock
+    AVLNode *root;   // Root node
+    int cachedSize;  // Cached size of the AVL tree (size in bytes)
+
+    // rwlock is a read-write lock for the AVL tree
+    mutable std::shared_mutex rwlock;
 
     // rightRotate rotates the AVL tree to the right
-    // @deprecated
-    static AVLNode *rightRotate(AVLNode *y);
+    AVLNode *rightRotate(AVLNode *y);
 
     // leftRotate rotates the AVL tree to the left
-    // @deprecated
-    static AVLNode *leftRotate(AVLNode *x);
+    AVLNode *leftRotate(AVLNode *x);
 
     // getBalance gets the balance factor of a node
-    // @deprecated
-    static int getBalance(AVLNode *node);
+    int getBalance(AVLNode *node);
+
+    // getCachedSize gets the cached size of the AVL tree
+    int getCachedSize() const;
 
     // insert inserts a key-value pair into the AVL tree
-    // @deprecated
     AVLNode *insert(AVLNode *node, const std::vector<uint8_t> &key,
                     const std::vector<uint8_t> &value);
 
     // printHex prints a vector of unsigned 8-bit integers in hexadecimal format
-    // @deprecated
-    static void printHex(const std::vector<uint8_t> &data);
+    void printHex(const std::vector<uint8_t> &data);
 
     // deleteNode deletes a node from the AVL tree
-    // @deprecated
     AVLNode *deleteNode(AVLNode *root, const std::vector<uint8_t> &key);
 
     // deleteKey deletes a key from the AVL tree
-    // @deprecated
     void deleteKey(const std::vector<uint8_t> &key);
 
     // inOrder prints the key-value pairs in the AVL tree in in-order traversal
-    // @deprecated
     void inOrder(AVLNode *node);
 
     // minValueNode finds the node with the minimum value in the AVL tree
-    // @deprecated
-    static AVLNode *minValueNode(AVLNode *node);
+    AVLNode *minValueNode(AVLNode *node);
 
     // height gets the height of a node
-    // @deprecated
-    static int height(AVLNode *node);
+    int height(AVLNode *node);
 
     // inOrderTraversal traverses the AVL tree in in-order traversal and calls a
     // function on each node
-    // @deprecated
     void inOrderTraversal(
         AVLNode *node,
         std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func);
 
    public:
     // insert inserts a key-value pair into the AVL tree
-    // @deprecated
     void insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
+    void insertBatch(const std::vector<KeyValue> &kvPairs);
 
     // deleteKV deletes a key from the AVL tree
-    // @deprecated
     void deleteKV(const std::vector<uint8_t> &key);
 
     // inOrder prints the key-value pairs in the AVL tree in in-order traversal
-    // @deprecated
     void inOrder();
 
     // inOrderTraversal traverses the AVL tree in in-order traversal and calls a
     // function on each node
-    // @deprecated
     void inOrderTraversal(
         std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func);
 
     // clear clears the AVL tree
-    // @deprecated
     void clear();
 
     // Get
     // Returns the value for a given key
-    // @deprecated
     std::vector<uint8_t> Get(const std::vector<uint8_t> &key);
 
     // GetSize returns the number of nodes in the AVL tree
-    // @deprecated
     int GetSize(AVLNode *root);
 
     // GetRoot returns the root node of the AVL tree
-    // @deprecated
     int GetSize();
 };
 
@@ -470,9 +388,7 @@ class LSMT {
         : directory(directory),
           memtableFlushSize(memtable_flush_size),
           compactionInterval(compaction_interval),
-          maxCompactionThreads(max_compaction_threads),
-          maxLevel(maxLevel),
-          probability(probability) {
+          maxCompactionThreads(max_compaction_threads) {
         wal = new Wal(new Pager(directory + getPathSeparator() + WAL_EXTENSION,
                                 std::ios::in | std::ios::out | std::ios::binary));
         isFlushing.store(0);    // Initialize isFlushing to 0 which means not flushing
@@ -520,7 +436,7 @@ class LSMT {
                   });
 
         // Create a new memtable
-        memtable = new SkipList(maxLevel, probability);
+        memtable = new AVLTree();
 
         // Start background thread for flushing
         flushThread = std::thread(&LSMT::flushThreadFunc, this);
@@ -567,9 +483,13 @@ class LSMT {
 
     // Put inserts a key-value pair into the LSMT
     bool Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
+    bool PutBatch(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &batch);
 
     // Delete deletes a key from the LSMT
     bool Delete(const std::vector<uint8_t> &key);
+
+    // DeleteBatch deletes a batch of keys from the LSMT
+    bool DeleteBatch(const std::vector<std::vector<uint8_t>> &keys);
 
     // Compact compacts the SSTables
     bool Compact();
@@ -581,7 +501,7 @@ class LSMT {
     bool IsCompacting() const { return isCompacting.load(); }
 
     // GetMemtable returns the memtable
-    SkipList *GetMemtable() const { return memtable; }
+    AVLTree *GetMemtable() const { return memtable; }
 
     // GetSSTableCount returns the number of SSTables
     int GetSSTableCount() {
@@ -708,20 +628,18 @@ class LSMT {
                              // we should have at least this many SSTables, if there
                              // are less after compaction, we will not further compact
     std::condition_variable_any cond;        // Condition variable for flushing and compacting
-    SkipList *memtable;                      // Skip list memtable
+    AVLTree *memtable;                       // AVL tree memtable
     std::atomic<int32_t> isFlushing;         // Whether the memtable is being flushed
     std::atomic<int32_t> isCompacting;       // Whether the SSTables are being compacted
-    int memtableFlushSize;                   // Memtable flush size
+    int memtableFlushSize;                   // Memtable flush size (in bytes)
     std::vector<std::future<void>> futures;  // List of futures, used for flushing and compacting
     std::thread flushThread;                 // Thread for flushing
-    std::queue<std::unique_ptr<SkipList>> flushQueue;  // Queue for flushing
-    std::mutex flushQueueMutex;                        // Mutex for flush queue
-    std::atomic_bool stopBackgroundThreads = false;    // Stop background thread
-    std::condition_variable flushQueueCondVar;         // Condition variable for flush queue
-    std::thread compactionThread;                      // Thread for compaction
+    std::queue<std::unique_ptr<AVLTree>> flushQueue;  // Queue for flushing
+    std::mutex flushQueueMutex;                       // Mutex for flush queue
+    std::atomic_bool stopBackgroundThreads = false;   // Stop background thread
+    std::condition_variable flushQueueCondVar;        // Condition variable for flush queue
+    std::thread compactionThread;                     // Thread for compaction
     int maxCompactionThreads;  // Maximum number of threads for paired compaction
-    int maxLevel;              // Maximum level of the skip list
-    float probability;         // Probability for skiplist
 
     // flushMemtable
     // responsible for flushing the current memtable to disk. It creates a new memtable,

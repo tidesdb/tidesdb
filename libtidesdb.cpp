@@ -238,168 +238,23 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
     return data;
 }
 
-// SkipList::randomLevel
-// generates a random level for a new node in the skip list. This level determines the height of the
-// node in the skip list, which affects the efficiency of search, insertion, and deletion operations
-int SkipList::randomLevel() {
-    int lvl = 0;
-    while (lvl < maxLevel && dis(gen) < probability * RAND_MAX) {
-        lvl++;
-    }
-    return lvl;
+// AVLTree::clear
+// clears the AVL tree
+void AVLTree::clear() {
+    std::unique_lock<std::shared_mutex> lock(rwlock);
+    root = nullptr;
+    cachedSize = 0;
 }
 
-// SkipList::clearCache
-// clears cached size of skiplist
-void SkipList::clearCache() { cachedSize.store(0, std::memory_order_relaxed); }
-
-// SkipList::insert
-// inserts a key-value pair into the SkipList
-bool SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
-    std::vector<SkipListNode *> update(maxLevel + 1);
-    SkipListNode *x = head.get();
-
-    for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
-        while (x->forward[i].load(std::memory_order_acquire) &&
-               x->forward[i].load(std::memory_order_acquire)->key < key) {
-            x = x->forward[i].load(std::memory_order_acquire);
-        }
-        update[i] = x;
-    }
-
-    x = x->forward[0].load(std::memory_order_acquire);
-
-    if (x && x->key == key) {
-        x->value = value;  // Update the value if the key already exists
-        return true;
-    }
-
-    int newLevel = randomLevel();
-    if (newLevel > level.load(std::memory_order_relaxed)) {
-        for (int i = level.load(std::memory_order_relaxed) + 1; i <= newLevel; i++) {
-            update[i] = head.get();
-        }
-        level.store(newLevel, std::memory_order_relaxed);
-    }
-
-    x = new SkipListNode(key, value, newLevel);
-    for (int i = 0; i <= newLevel; i++) {
-        SkipListNode *next;
-        do {
-            next = update[i]->forward[i].load(std::memory_order_relaxed);
-            x->forward[i].store(next, std::memory_order_relaxed);
-        } while (!update[i]->forward[i].compare_exchange_weak(next, x, std::memory_order_release,
-                                                              std::memory_order_relaxed));
-    }
-
-    int sizeToAdd = key.size() + value.size();
-    cachedSize.fetch_add(sizeToAdd, std::memory_order_relaxed);
-    return true;
-}
-
-// SkipList::deleteKV
-// deletes a key-value pair from the SkipList
-void SkipList::deleteKV(const std::vector<uint8_t> &key) {
-    std::vector<SkipListNode *> update(maxLevel + 1);
-    SkipListNode *x = head.get();
-
-    // Find the node to delete
-    for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
-        while (x->forward[i].load(std::memory_order_acquire) != nullptr &&
-               x->forward[i].load(std::memory_order_acquire)->key < key) {
-            x = x->forward[i].load(std::memory_order_acquire);
-        }
-        update[i] = x;
-    }
-
-    x = x->forward[0].load(std::memory_order_acquire);
-
-    // If the key exists, proceed to delete
-    if (x != nullptr && x->key == key) {
-        for (int i = 0; i <= level.load(std::memory_order_relaxed); i++) {
-            SkipListNode *next;
-            do {
-                next = update[i]->forward[i].load(std::memory_order_relaxed);
-                if (next != x) {
-                    break;
-                }
-            } while (!update[i]->forward[i].compare_exchange_weak(
-                next, x->forward[i].load(std::memory_order_relaxed), std::memory_order_release,
-                std::memory_order_relaxed));
-        }
-
-        // Decrease the level of the skip list if needed
-        while (level.load(std::memory_order_relaxed) > 0 &&
-               head->forward[level.load(std::memory_order_relaxed)].load(
-                   std::memory_order_acquire) == nullptr) {
-            level.fetch_sub(1, std::memory_order_relaxed);
-        }
-
-        cachedSize.fetch_sub(1, std::memory_order_relaxed);
-        delete x;  // Free the memory
-    }
-}
-
-// SkipList::inOrderTraversal
-// traverses the skip list in order and applies the provided function func to each key-value pair
-void SkipList::inOrderTraversal(
-    std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const {
-    if (!head) return;  // Check if head is null
-
-    SkipListNode *x = head->forward[0].load(std::memory_order_acquire);
-    while (x != nullptr) {
-        func(x->key, x->value);
-        x = x->forward[0].load(std::memory_order_acquire);
-    }
-}
-
-// SkipList::get
-// get returns the value for a given key in the SkipList
-std::vector<uint8_t> SkipList::get(const std::vector<uint8_t> &key) const {
-    SkipListNode *x = head.get();
-
-    // Check if the SkipList is empty
-    if (x == nullptr || x->forward[0].load(std::memory_order_acquire) == nullptr) {
-        return {};  // SkipList is empty, return right away
-    }
-
-    for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
-        while (x->forward[i].load(std::memory_order_acquire) != nullptr &&
-               x->forward[i].load(std::memory_order_acquire)->key < key) {
-            x = x->forward[i].load(std::memory_order_acquire);
-        }
-    }
-
-    x = x->forward[0].load(std::memory_order_acquire);
-    if (x != nullptr && x->key == key) {
-        return x->value;
-    }
-    return {};  // Key not found
-}
-
-// SkipList::getSize
-// GetSize returns the size of the SkipList
-int SkipList::getSize() const { return cachedSize.load(std::memory_order_relaxed); }
-
-// SkipList::clear
-// clear clears the SkipList
-void SkipList::clear() {
-    SkipListNode *x = head->forward[0].load(std::memory_order_acquire);
-    while (x != nullptr) {
-        SkipListNode *next = x->forward[0].load(std::memory_order_acquire);
-        delete x;
-        x = next;
-    }
-    for (int i = 0; i < maxLevel; ++i) {
-        head->forward[i].store(nullptr, std::memory_order_release);
-    }
-    level.store(0, std::memory_order_release);
-    cachedSize.store(0, std::memory_order_release);
+// AVLTree::getCachedSize
+// Get the total size of the tree
+int AVLTree::getCachedSize() const {
+    std::shared_lock<std::shared_mutex> lock(rwlock);
+    return cachedSize;
 }
 
 // AVLTree::height
 // returns the height of the AVL tree node
-// @deprecated
 int AVLTree::height(AVLNode *node) {
     if (node == nullptr) return 0;
     return node->height;
@@ -407,8 +262,8 @@ int AVLTree::height(AVLNode *node) {
 
 // AVLTree::GetSize
 // returns the size of the AVL tree
-// @deprecated
 int AVLTree::GetSize(AVLNode *node) {
+    std::shared_lock<std::shared_mutex> lock(rwlock);
     if (node == nullptr) {
         return 0;
     }
@@ -417,15 +272,14 @@ int AVLTree::GetSize(AVLNode *node) {
 
 // AVLTree::GetSize
 // returns the size of the AVL tree
-// @deprecated
 int AVLTree::GetSize() {
-    std::shared_lock<std::shared_mutex> lock(rwlock);
-    return GetSize(root);
+    // std::shared_lock<std::shared_mutex> lock(rwlock);
+    // return GetSize(root);
+    return cachedSize;
 }
 
 // AVLTree::rightRotate
 // performs a right rotation on the AVL tree node
-// @deprecated
 AVLNode *AVLTree::rightRotate(AVLNode *y) {
     AVLNode *x = y->left;
     AVLNode *T2 = x->right;
@@ -441,7 +295,6 @@ AVLNode *AVLTree::rightRotate(AVLNode *y) {
 
 // AVLTree::leftRotate
 // performs a left rotation on the AVL tree node
-// @deprecated
 AVLNode *AVLTree::leftRotate(AVLNode *x) {
     AVLNode *y = x->right;
     AVLNode *T2 = y->left;
@@ -457,7 +310,6 @@ AVLNode *AVLTree::leftRotate(AVLNode *x) {
 
 // AVLTree::getBalance
 // returns the balance factor of the AVL tree node
-// @deprecated
 int AVLTree::getBalance(AVLNode *node) {
     if (node == nullptr) return 0;
     return height(node->left) - height(node->right);
@@ -465,34 +317,32 @@ int AVLTree::getBalance(AVLNode *node) {
 
 // AVLTree::insert
 // inserts a key-value pair into the AVL tree
-// @deprecated
 AVLNode *AVLTree::insert(AVLNode *node, const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) {
-    if (node == nullptr) return new AVLNode(key, value);
+    if (node == nullptr) {
+        return new AVLNode(key, value);
+    }
 
-    if (key < node->key)
+    if (key < node->key) {
         node->left = insert(node->left, key, value);
-    else if (key > node->key)
+    } else if (key > node->key) {
         node->right = insert(node->right, key, value);
-    else {
-        // Key already exists, update the value
-        node->value = value;
+    } else {
+        node->value = value;  // Update value
         return node;
     }
 
+    // Height and balancing logic
     node->height = 1 + std::max(height(node->left), height(node->right));
-
     int balance = getBalance(node);
 
+    // Rotation logic
     if (balance > 1 && key < node->left->key) return rightRotate(node);
-
     if (balance < -1 && key > node->right->key) return leftRotate(node);
-
     if (balance > 1 && key > node->left->key) {
         node->left = leftRotate(node->left);
         return rightRotate(node);
     }
-
     if (balance < -1 && key < node->right->key) {
         node->right = rightRotate(node->right);
         return leftRotate(node);
@@ -503,7 +353,6 @@ AVLNode *AVLTree::insert(AVLNode *node, const std::vector<uint8_t> &key,
 
 // AVLTree::printHex
 // prints the hex representation of the data
-// @deprecated
 void AVLTree::printHex(const std::vector<uint8_t> &data) {
     for (auto byte : data) {
         std::cout << std::hex << static_cast<int>(byte) << " ";
@@ -513,7 +362,6 @@ void AVLTree::printHex(const std::vector<uint8_t> &data) {
 
 // AVLTree::deleteNode
 // deletes a key-value pair from the AVL tree
-// @deprecated
 AVLNode *AVLTree::deleteNode(AVLNode *root, const std::vector<uint8_t> &key) {
     if (root == nullptr) return root;
 
@@ -522,6 +370,7 @@ AVLNode *AVLTree::deleteNode(AVLNode *root, const std::vector<uint8_t> &key) {
     else if (key > root->key)
         root->right = deleteNode(root->right, key);
     else {
+        cachedSize -= root->key.size() + root->value.size();
         if ((root->left == nullptr) || (root->right == nullptr)) {
             AVLNode *temp = root->left ? root->left : root->right;
 
@@ -567,7 +416,6 @@ AVLNode *AVLTree::deleteNode(AVLNode *root, const std::vector<uint8_t> &key) {
 
 // AVLTree::minValueNode
 // returns the node with the minimum value in the AVL tree
-// @deprecated
 AVLNode *AVLTree::minValueNode(AVLNode *node) {
     AVLNode *current = node;
     while (current->left != nullptr) current = current->left;
@@ -577,20 +425,33 @@ AVLNode *AVLTree::minValueNode(AVLNode *node) {
 // AVLTree::insert
 // inserts a key-value pair into the AVL tree
 // will update the value if the key already exists
-// @deprecated
 void AVLTree::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
     std::unique_lock<std::shared_mutex> lock(rwlock);
     root = insert(root, key, value);
+    cachedSize += key.size() + value.size();
+}
+
+// AVLTree::insertBatch
+// inserts a batch of key-value pairs into the AVL tree
+void AVLTree::insertBatch(const std::vector<KeyValue> &kvPairs) {
+    std::unique_lock<std::shared_mutex> lock(rwlock);
+    for (const auto &kv : kvPairs) {
+        root =
+            insert(root, ConvertToUint8Vector(std::vector<char>(kv.key().begin(), kv.key().end())),
+                   ConvertToUint8Vector(std::vector<char>(kv.value().begin(), kv.value().end())));
+        cachedSize += kv.key().size() + kv.value().size();
+    }
 }
 
 // AVLTree::deleteKV
 // deletes a key-value pair from the AVL tree
-// @deprecated
-void AVLTree::deleteKV(const std::vector<uint8_t> &key) { deleteKey(key); }
+void AVLTree::deleteKV(const std::vector<uint8_t> &key) {
+    std::unique_lock<std::shared_mutex> lock(rwlock);
+    deleteKey(key);
+}
 
 // AVLTree::inOrder
 // prints the key-value pairs in the AVL tree in order
-// @deprecated
 void AVLTree::inOrder(AVLNode *node) {
     if (node != nullptr) {
         inOrder(node->left);
@@ -601,19 +462,15 @@ void AVLTree::inOrder(AVLNode *node) {
 
 // AVLTree::inOrder
 // prints the key-value pairs in the AVL tree in order
-// @deprecated
-void AVLTree::inOrder() {
-    std::shared_lock<std::shared_mutex> lock(rwlock);
-    inOrder(root);
-}
+void AVLTree::inOrder() { inOrder(root); }
 
 // AVLTree::inOrderTraversal
 // traverses the AVL tree in order and calls the function on
 // each node
-// @deprecated
 void AVLTree::inOrderTraversal(
     AVLNode *node,
     std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) {
+    std::shared_lock<std::shared_mutex> lock(rwlock);
     if (node != nullptr) {
         inOrderTraversal(node->left, func);
         func(node->key, node->value);
@@ -624,7 +481,6 @@ void AVLTree::inOrderTraversal(
 // AVLTree::inOrderTraversal
 // traverses the AVL tree in order and calls the function on
 // each node
-// @deprecated
 void AVLTree::inOrderTraversal(
     std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) {
     std::shared_lock<std::shared_mutex> lock(rwlock);
@@ -633,15 +489,10 @@ void AVLTree::inOrderTraversal(
 
 // AVLTree::deleteKey
 // deletes a key from the AVL tree
-// @deprecated
-void AVLTree::deleteKey(const std::vector<uint8_t> &key) {
-    std::unique_lock<std::shared_mutex> lock(rwlock);
-    root = deleteNode(root, key);
-}
+void AVLTree::deleteKey(const std::vector<uint8_t> &key) { root = deleteNode(root, key); }
 
 // AVLTree::Get
 // returns the value for a given key
-// @deprecated
 std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
     std::shared_lock<std::shared_mutex> lock(rwlock);
     AVLNode *current = root;
@@ -774,13 +625,13 @@ bool LSMT::flushMemtable() {
         isFlushing.store(1);  // Set the flag to indicate that we are flushing
 
         // Check if memtable is empty (in case on close)
-        if (memtable->getSize() == 0) {
+        if (memtable->GetSize() == 0) {
             isFlushing.store(0);  // Reset the flag
             return true;
         }
 
         // Create a new memtable
-        auto newMemtable = std::make_unique<SkipList>(maxLevel, probability);
+        auto newMemtable = std::make_unique<AVLTree>();
 
         // Iterate over the current memtable and insert its elements into the new memtable
         memtable->inOrderTraversal(
@@ -790,7 +641,6 @@ bool LSMT::flushMemtable() {
 
         // Clear the current memtable
         memtable->clear();
-        memtable->clearCache();
 
         isFlushing.store(0);  // Reset the flag
 
@@ -814,7 +664,7 @@ bool LSMT::flushMemtable() {
 // added to the queue then pops and flushes the memtable to disk
 void LSMT::flushThreadFunc() {
     while (true) {
-        std::unique_ptr<SkipList> newMemtable;
+        std::unique_ptr<AVLTree> newMemtable;
 
         // Wait for a new memtable to be added to the queue
         {
@@ -920,7 +770,50 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
     }  // Automatically unlocks when leaving the scope
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
-    if (memtable->getSize() >= memtableFlushSize) {
+    if (memtable->GetSize() >= memtableFlushSize) {
+        flushMemtable();
+    }
+
+    return true;
+}
+
+// LSMT::DeleteBatch
+// responsible for deleting a batch of keys from the LSMT structure.
+bool LSMT::DeleteBatch(const std::vector<std::vector<uint8_t>> &keys) {
+    // Check if we are flushing or compacting
+    {
+        std::unique_lock lock(sstablesLock);
+        cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
+    }  // Automatically unlocks when leaving the scope
+
+    // Create a batch of operations
+    std::vector<Operation> operations;
+    for (const auto &key : keys) {
+        Operation op;
+        op.set_type(static_cast<::OperationType>(OperationType::OpDelete));
+        op.set_key(key.data(), key.size());
+        operations.push_back(op);
+    }
+
+    // Append the operations to the Write-Ahead Log (WAL)
+    for (const auto &op : operations) {
+        wal->AppendOperation(op);
+    }
+
+    // Create a batch of KeyValue pairs with tombstone values
+    std::vector<KeyValue> kvPairs;
+    for (const auto &key : keys) {
+        KeyValue kv;
+        kv.set_key(key.data(), key.size());
+        kv.set_value(TOMBSTONE_VALUE, strlen(TOMBSTONE_VALUE));
+        kvPairs.push_back(kv);
+    }
+
+    // Insert the batch of KeyValue pairs into the memtable
+    memtable->insertBatch(kvPairs);
+
+    // If the memtable size exceeds the flush size, flush the memtable to disk
+    if (memtable->GetSize() >= memtableFlushSize) {
         flushMemtable();
     }
 
@@ -961,7 +854,67 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
     memtable->insert(key, value);
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
-    if (memtable->getSize() >= memtableFlushSize) {
+    if (memtable->GetSize() >= memtableFlushSize) {
+        if (!flushMemtable()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// LSMT::PutBatch
+// inserts a batch of key-value pairs into the LSMT structure.
+// It ensures thread safety by using locks and condition variables, writes the operations to the
+// Write-Ahead Log (WAL), and inserts the key-value pairs into the memtable. If the memtable exceeds
+// a certain size, it triggers a background flush to disk.
+bool LSMT::PutBatch(
+    const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &batch) {
+    // Check if we are flushing or compacting
+    {
+        std::unique_lock lock(sstablesLock);
+        cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
+    }  // Automatically unlocks when leaving the scope
+
+    // Check for null pointers
+    if (!wal || !memtable) {
+        throw TidesDBException("WAL or memtable is null");
+    }
+
+    // Create a batch of operations
+    std::vector<Operation> operations;
+    for (const auto &[key, value] : batch) {
+        Operation op;
+        op.set_key(key.data(), key.size());
+        op.set_value(value.data(), value.size());
+        op.set_type(static_cast<::OperationType>(OperationType::OpPut));
+        operations.push_back(op);
+    }
+
+    // Append the operations to the Write-Ahead Log (WAL)
+    for (const auto &op : operations) {
+        wal->AppendOperation(op);
+    }
+
+    // Convert batch to KeyValue pairs
+    std::vector<KeyValue> kvPairs;
+    for (const auto &[key, value] : batch) {
+        // Check if value is tombstone
+        if (value ==
+            std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
+            throw TidesDBException("Value cannot be a tombstone value");
+        }
+        KeyValue kv;
+        kv.set_key(key.data(), key.size());
+        kv.set_value(value.data(), value.size());
+        kvPairs.push_back(kv);
+    }
+
+    // Insert the batch of key-value pairs into the memtable
+    memtable->insertBatch(kvPairs);
+
+    // If the memtable size exceeds the flush size, flush the memtable to disk
+    if (memtable->GetSize() >= memtableFlushSize) {
         if (!flushMemtable()) {
             return false;
         }
@@ -983,9 +936,9 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
 
     std::vector<uint8_t> value;
 
-    if (memtable->getSize() > 0) {
+    if (memtable->GetSize() > 0) {
         // Check the memtable for the key
-        value = memtable->get(key);
+        value = memtable->Get(key);
 
         // If value is found and it's not a tombstone, return it
         if (!value.empty() &&
@@ -1096,15 +1049,6 @@ int64_t Pager::PagesCount() {
     return fileSize / PAGE_SIZE;
 }
 
-// AVLTree::clear
-// clears the AVL tree
-void AVLTree::clear() {
-    std::unique_lock<std::shared_mutex> lock(rwlock);
-
-    // initialze new AVL tree
-    root = nullptr;
-}
-
 std::string toHexString(const std::vector<uint8_t> &vec) {
     std::ostringstream oss;
     for (auto byte : vec) {
@@ -1154,7 +1098,7 @@ bool LSMT::Compact() {
 
                         auto it1 = std::make_unique<SSTableIterator>(sstable1->pager);
                         auto it2 = std::make_unique<SSTableIterator>(sstable2->pager);
-                        auto newMemtable = std::make_unique<SkipList>(maxLevel, probability);
+                        auto newMemtable = std::make_unique<AVLTree>();
 
                         std::optional<std::vector<uint8_t>> currentKey1, currentValue1;
                         std::optional<std::vector<uint8_t>> currentKey2, currentValue2;
@@ -1242,7 +1186,7 @@ bool LSMT::Compact() {
                             }
                         }
 
-                        if (newMemtable->getSize() > 0) {
+                        if (newMemtable->GetSize() > 0) {
                             std::string newSSTablePath =
                                 directory + getPathSeparator() + "sstable_compacted_" +
                                 std::to_string(

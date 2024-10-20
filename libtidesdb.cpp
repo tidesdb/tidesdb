@@ -785,6 +785,15 @@ void LSMT::flushThreadFunc() {
             newMemtable->InOrderTraversal(
                 [&kvPairs](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
                     KeyValue kv;
+
+                    // Check if the value is a tombstone
+                    // We should not write tombstones to disk
+                    // We skip them
+                    if (value == std::vector<uint8_t>(TOMBSTONE_VALUE,
+                                                      TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
+                        return;
+                    }
+
                     kv.set_key(key.data(), key.size());
                     kv.set_value(value.data(), value.size());
                     kvPairs.push_back(kv);

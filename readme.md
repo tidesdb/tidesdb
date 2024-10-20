@@ -9,7 +9,7 @@ TidesDB has a robust feature-set, and was designed to be a high-performance, low
 TidesDB is built on the principles of the Log-Structured Merge-Tree (LSM-Tree) data structure.
 TidesDB utilizes an in-memory AVL tree, known as a memtable, for temporarily storing key-value pairs. These pairs are then flushed to Sorted String Tables (SSTables) on disk. When the number of SSTables reaches a specified threshold, the compaction process is triggered.
 
-This process merges pairs of SSTables into a new SSTable, and deletes any redundant data. The compaction process ensures that the number of SSTables remains low, and that read performance is optimized.
+This process merges pairs of SSTables into a new SSTable, and deletes any redundant, tombstoned data. The compaction process ensures that the number of SSTables remains low, and that read performance is optimized.
 
 > [!WARNING]
 > Still in beta stages, use at your own risk and check back often for updates.

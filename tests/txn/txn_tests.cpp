@@ -3,7 +3,7 @@
 #include <iostream>
 #include <vector>
 
-#include "../../libtidesdb.h"
+#include "../../libtidesdb.hpp"
 
 void printResult(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &result) {
     for (const auto &kv : result) {

@@ -17,7 +17,7 @@
 #ifndef TIDESDB_C_H
 #define TIDESDB_C_H
 
-#include "../../libtidesdb.h"
+#include "../../libtidesdb.hpp"
 
 #ifdef __cplusplus
 extern "C" {

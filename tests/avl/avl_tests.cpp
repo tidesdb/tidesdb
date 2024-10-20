@@ -1,6 +1,6 @@
 #include <iostream>
 
-#include "../../libtidesdb.h"
+#include "../../libtidesdb.hpp"
 
 int main() {
     // Test AVL tree

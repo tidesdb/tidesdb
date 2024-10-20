@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-#include "../../libtidesdb.h"
+#include "../../libtidesdb.hpp"
 
 int main() {
     // Define parameters

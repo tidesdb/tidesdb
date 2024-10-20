@@ -259,14 +259,15 @@ bool SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t
     std::vector<SkipListNode *> update(maxLevel + 1);
     SkipListNode *x = head.get();
 
-    for (int i = level; i >= 0; i--) {
-        while (x->forward[i].load() && x->forward[i].load()->key < key) {
-            x = x->forward[i].load();
+    for (int i = level.load(std::memory_order_relaxed); i >= 0; i--) {
+        while (x->forward[i].load(std::memory_order_acquire) &&
+               x->forward[i].load(std::memory_order_acquire)->key < key) {
+            x = x->forward[i].load(std::memory_order_acquire);
         }
         update[i] = x;
     }
 
-    x = x->forward[0].load();
+    x = x->forward[0].load(std::memory_order_acquire);
 
     if (x && x->key == key) {
         x->value = value;  // Update the value if the key already exists
@@ -274,22 +275,24 @@ bool SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t
     }
 
     int newLevel = randomLevel();
-    if (newLevel > level) {
-        for (int i = level + 1; i <= newLevel; i++) {
+    if (newLevel > level.load(std::memory_order_relaxed)) {
+        for (int i = level.load(std::memory_order_relaxed) + 1; i <= newLevel; i++) {
             update[i] = head.get();
         }
-        level = newLevel;
+        level.store(newLevel, std::memory_order_relaxed);
     }
 
     x = new SkipListNode(key, value, newLevel);
     for (int i = 0; i <= newLevel; i++) {
-        x->forward[i].store(update[i]->forward[i].load());
-        update[i]->forward[i].store(x);
+        SkipListNode *next;
+        do {
+            next = update[i]->forward[i].load(std::memory_order_relaxed);
+            x->forward[i].store(next, std::memory_order_relaxed);
+        } while (!update[i]->forward[i].compare_exchange_weak(next, x, std::memory_order_release,
+                                                              std::memory_order_relaxed));
     }
 
-    // add up size of key and value
     int sizeToAdd = key.size() + value.size();
-
     cachedSize.fetch_add(sizeToAdd, std::memory_order_relaxed);
     return true;
 }
@@ -297,7 +300,7 @@ bool SkipList::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t
 // SkipList::deleteKV
 // deletes a key-value pair from the SkipList
 void SkipList::deleteKV(const std::vector<uint8_t> &key) {
-    std::vector<SkipListNode *> update(maxLevel, nullptr);
+    std::vector<SkipListNode *> update(maxLevel + 1);
     SkipListNode *x = head.get();
 
     // Find the node to delete
@@ -314,11 +317,15 @@ void SkipList::deleteKV(const std::vector<uint8_t> &key) {
     // If the key exists, proceed to delete
     if (x != nullptr && x->key == key) {
         for (int i = 0; i <= level.load(std::memory_order_relaxed); i++) {
-            if (update[i]->forward[i].load(std::memory_order_acquire) != x) {
-                break;
-            }
-            update[i]->forward[i].store(x->forward[i].load(std::memory_order_relaxed),
-                                        std::memory_order_release);
+            SkipListNode *next;
+            do {
+                next = update[i]->forward[i].load(std::memory_order_relaxed);
+                if (next != x) {
+                    break;
+                }
+            } while (!update[i]->forward[i].compare_exchange_weak(
+                next, x->forward[i].load(std::memory_order_relaxed), std::memory_order_release,
+                std::memory_order_relaxed));
         }
 
         // Decrease the level of the skip list if needed
@@ -337,6 +344,8 @@ void SkipList::deleteKV(const std::vector<uint8_t> &key) {
 // traverses the skip list in order and applies the provided function func to each key-value pair
 void SkipList::inOrderTraversal(
     std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) const {
+    if (!head) return;  // Check if head is null
+
     SkipListNode *x = head->forward[0].load(std::memory_order_acquire);
     while (x != nullptr) {
         func(x->key, x->value);
@@ -755,6 +764,13 @@ bool Wal::Recover(LSMT &lsmt) const {
 // to the flush queue. Finally, it notifies the flush thread to process the queue
 bool LSMT::flushMemtable() {
     try {
+        // wait until we are done flushing
+        // Check if we are flushing or compacting
+        {
+            std::unique_lock lock(sstablesLock);
+            cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
+        }  // Automatically unlocks when leaving the scope
+
         isFlushing.store(1);  // Set the flag to indicate that we are flushing
 
         // Check if memtable is empty (in case on close)
@@ -990,9 +1006,14 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
             continue;  // Skip null SSTables
         }
 
-        // If the key is not within the range of this SSTable, skip it
-        if (key < sstable->minKey || key > sstable->maxKey) {
-            continue;
+        {
+            // we must lock for the min and max key check
+            std::shared_lock lock(sstable->lock);
+
+            // If the key is not within the range of this SSTable, skip it
+            if (key < sstable->minKey || key > sstable->maxKey) {
+                continue;
+            }
         }
 
         // Get an iterator for the SSTable file
@@ -1442,8 +1463,14 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NGet(
         }
 
         // If the key is not within the range of this SSTable, skip it
-        if (key < sstable->minKey || key > sstable->maxKey) {
-            continue;
+        {
+            // we must lock for the min and max key check
+            std::shared_lock lock(sstable->lock);
+
+            // If the key is not within the range of this SSTable, skip it
+            if (key < sstable->minKey || key > sstable->maxKey) {
+                continue;
+            }
         }
 
         // Get an iterator for the SSTable file
@@ -1499,8 +1526,14 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
         }
 
         // If the key is not within the range of this SSTable, skip it
-        if (key < sstable->minKey || key > sstable->maxKey) {
-            continue;
+        {
+            // we must lock for the min and max key check
+            std::shared_lock lock(sstable->lock);
+
+            // If the key is not within the range of this SSTable, skip it
+            if (key < sstable->minKey || key > sstable->maxKey) {
+                continue;
+            }
         }
 
         // Get an iterator for the SSTable file
@@ -1556,10 +1589,15 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Greater
         }
 
         // If the key is not within the range of this SSTable, skip it
-        if (key < sstable->minKey || key > sstable->maxKey) {
-            continue;
-        }
+        {
+            // we must lock for the min and max key check
+            std::shared_lock lock(sstable->lock);
 
+            // If the key is not within the range of this SSTable, skip it
+            if (key < sstable->minKey || key > sstable->maxKey) {
+                continue;
+            }
+        }
         // Get an iterator for the SSTable file
         auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
         if (!sstableIt) {
@@ -1612,8 +1650,15 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
         }
 
         // If the key is not within the range of this SSTable, skip it
-        if (key <= sstable->minKey) {
-            continue;
+
+        {
+            // we must lock for the min and max key check
+            std::shared_lock lock(sstable->lock);
+
+            // If the key is not within the range of this SSTable, skip it
+            if (key <= sstable->minKey) {
+                continue;
+            }
         }
 
         // Get an iterator for the SSTable file
@@ -1668,8 +1713,14 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Greater
         }
 
         // If the key is not within the range of this SSTable, skip it
-        if (key >= sstable->maxKey) {
-            continue;
+        {
+            // we must lock for the min and max key check
+            std::shared_lock lock(sstable->lock);
+
+            // If the key is not within the range of this SSTable, skip it
+            if (key >= sstable->maxKey) {
+                continue;
+            }
         }
 
         // Get an iterator for the SSTable file
@@ -1723,9 +1774,14 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Range(
             continue;  // Skip null SSTables
         }
 
-        // If the key range does not overlap with this SSTable, skip it
-        if (end < sstable->minKey || start > sstable->maxKey) {
-            continue;
+        {
+            // we must lock for the min and max key check
+            std::shared_lock lock(sstable->lock);
+
+            // If the key is not within the range of this SSTable, skip it
+            if (end < sstable->minKey || start > sstable->maxKey) {
+                continue;
+            }
         }
 
         // Get an iterator for the SSTable file
@@ -1780,8 +1836,14 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NRange(
         }
 
         // If the key range does not overlap with this SSTable, skip it
-        if (end < sstable->minKey || start > sstable->maxKey) {
-            continue;
+        {
+            // we must lock for the min and max key check
+            std::shared_lock lock(sstable->lock);
+
+            // If the key is not within the range of this SSTable, skip it
+            if (end < sstable->minKey || start > sstable->maxKey) {
+                continue;
+            }
         }
 
         // Get an iterator for the SSTable file

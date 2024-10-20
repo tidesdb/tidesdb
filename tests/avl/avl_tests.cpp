@@ -7,22 +7,22 @@ int main() {
     TidesDB::AVLTree tree;
     //
     // // Insert some key-value pairs
-    tree.insert({1, 2, 3}, {10, 20, 30});
-    tree.insert({4, 5, 6}, {40, 50, 60});
-    tree.insert({2, 3, 4}, {20, 30, 40});
+    tree.Insert({1, 2, 3}, {10, 20, 30});
+    tree.Insert({4, 5, 6}, {40, 50, 60});
+    tree.Insert({2, 3, 4}, {20, 30, 40});
 
     // Get keys
-    if (tree.GetSize() == 3) {
+    if (tree.GetSize() == 18) {
         std::cout << "Insert test passed" << std::endl;
     } else {
         std::cout << "Insert test failed" << std::endl;
     }
 
     // Delete a key
-    tree.deleteKV({1, 2, 3});
+    tree.Delete({1, 2, 3});
 
     // Get keys
-    if (tree.GetSize() == 2) {
+    if (tree.GetSize() == 12) {
         std::cout << "Delete test passed" << std::endl;
     } else {
         std::cout << "Delete test failed" << std::endl;
@@ -43,7 +43,7 @@ int main() {
     for (int i = 0; i < 1000000; ++i) {
         std::vector<uint8_t> key = {static_cast<uint8_t>(i)};
         std::vector<uint8_t> value = {static_cast<uint8_t>(i)};
-        tree.insert(key, value);
+        tree.Insert(key, value);
     }
 
     std::cout

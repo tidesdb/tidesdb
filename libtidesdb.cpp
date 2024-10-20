@@ -238,19 +238,12 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
     return data;
 }
 
-// AVLTree::clear
+// AVLTree::Clear
 // clears the AVL tree
-void AVLTree::clear() {
+void AVLTree::Clear() {
     std::unique_lock<std::shared_mutex> lock(rwlock);
     root = nullptr;
     cachedSize = 0;
-}
-
-// AVLTree::getCachedSize
-// Get the total size of the tree
-int AVLTree::getCachedSize() const {
-    std::shared_lock<std::shared_mutex> lock(rwlock);
-    return cachedSize;
 }
 
 // AVLTree::height
@@ -262,19 +255,8 @@ int AVLTree::height(AVLNode *node) {
 
 // AVLTree::GetSize
 // returns the size of the AVL tree
-int AVLTree::GetSize(AVLNode *node) {
-    std::shared_lock<std::shared_mutex> lock(rwlock);
-    if (node == nullptr) {
-        return 0;
-    }
-    return 1 + GetSize(node->left) + GetSize(node->right);
-}
-
-// AVLTree::GetSize
-// returns the size of the AVL tree
 int AVLTree::GetSize() {
-    // std::shared_lock<std::shared_mutex> lock(rwlock);
-    // return GetSize(root);
+    std::shared_lock<std::shared_mutex> lock(rwlock);
     return cachedSize;
 }
 
@@ -422,18 +404,18 @@ AVLNode *AVLTree::minValueNode(AVLNode *node) {
     return current;
 }
 
-// AVLTree::insert
+// AVLTree::Insert
 // inserts a key-value pair into the AVL tree
 // will update the value if the key already exists
-void AVLTree::insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+void AVLTree::Insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
     std::unique_lock<std::shared_mutex> lock(rwlock);
     root = insert(root, key, value);
     cachedSize += key.size() + value.size();
 }
 
-// AVLTree::insertBatch
+// AVLTree::InsertBatch
 // inserts a batch of key-value pairs into the AVL tree
-void AVLTree::insertBatch(const std::vector<KeyValue> &kvPairs) {
+void AVLTree::InsertBatch(const std::vector<KeyValue> &kvPairs) {
     std::unique_lock<std::shared_mutex> lock(rwlock);
     for (const auto &kv : kvPairs) {
         root =
@@ -441,13 +423,6 @@ void AVLTree::insertBatch(const std::vector<KeyValue> &kvPairs) {
                    ConvertToUint8Vector(std::vector<char>(kv.value().begin(), kv.value().end())));
         cachedSize += kv.key().size() + kv.value().size();
     }
-}
-
-// AVLTree::deleteKV
-// deletes a key-value pair from the AVL tree
-void AVLTree::deleteKV(const std::vector<uint8_t> &key) {
-    std::unique_lock<std::shared_mutex> lock(rwlock);
-    deleteKey(key);
 }
 
 // AVLTree::inOrder
@@ -478,18 +453,21 @@ void AVLTree::inOrderTraversal(
     }
 }
 
-// AVLTree::inOrderTraversal
+// AVLTree::InOrderTraversal
 // traverses the AVL tree in order and calls the function on
 // each node
-void AVLTree::inOrderTraversal(
+void AVLTree::InOrderTraversal(
     std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func) {
     std::shared_lock<std::shared_mutex> lock(rwlock);
     inOrderTraversal(root, func);
 }
 
-// AVLTree::deleteKey
+// AVLTree::Delete
 // deletes a key from the AVL tree
-void AVLTree::deleteKey(const std::vector<uint8_t> &key) { root = deleteNode(root, key); }
+void AVLTree::Delete(const std::vector<uint8_t> &key) {
+    std::unique_lock<std::shared_mutex> lock(rwlock);
+    root = deleteNode(root, key);
+}
 
 // AVLTree::Get
 // returns the value for a given key
@@ -634,13 +612,13 @@ bool LSMT::flushMemtable() {
         auto newMemtable = std::make_unique<AVLTree>();
 
         // Iterate over the current memtable and insert its elements into the new memtable
-        memtable->inOrderTraversal(
+        memtable->InOrderTraversal(
             [&newMemtable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
-                newMemtable->insert(key, value);
+                newMemtable->Insert(key, value);
             });
 
         // Clear the current memtable
-        memtable->clear();
+        memtable->Clear();
 
         isFlushing.store(0);  // Reset the flag
 
@@ -685,7 +663,7 @@ void LSMT::flushThreadFunc() {
             std::vector<KeyValue> kvPairs;  // Key-value pairs to be written to the SSTable
 
             // Populate kvPairs with key-value pairs from the new memtable
-            newMemtable->inOrderTraversal(
+            newMemtable->InOrderTraversal(
                 [&kvPairs](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
                     KeyValue kv;
                     kv.set_key(key.data(), key.size());
@@ -765,7 +743,7 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
     }
 
     {
-        memtable->insert(
+        memtable->Insert(
             key, std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)));
     }  // Automatically unlocks when leaving the scope
 
@@ -810,7 +788,7 @@ bool LSMT::DeleteBatch(const std::vector<std::vector<uint8_t>> &keys) {
     }
 
     // Insert the batch of KeyValue pairs into the memtable
-    memtable->insertBatch(kvPairs);
+    memtable->InsertBatch(kvPairs);
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
     if (memtable->GetSize() >= memtableFlushSize) {
@@ -851,7 +829,7 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
     }
 
     // Insert the key-value pair into the memtable
-    memtable->insert(key, value);
+    memtable->Insert(key, value);
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
     if (memtable->GetSize() >= memtableFlushSize) {
@@ -911,7 +889,7 @@ bool LSMT::PutBatch(
     }
 
     // Insert the batch of key-value pairs into the memtable
-    memtable->insertBatch(kvPairs);
+    memtable->InsertBatch(kvPairs);
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
     if (memtable->GetSize() >= memtableFlushSize) {
@@ -1138,7 +1116,7 @@ bool LSMT::Compact() {
                         while (currentKey1.has_value() || currentKey2.has_value()) {
                             if (!currentKey2.has_value() ||
                                 (currentKey1.has_value() && *currentKey1 < *currentKey2)) {
-                                newMemtable->insert(*currentKey1, *currentValue1);
+                                newMemtable->Insert(*currentKey1, *currentValue1);
                                 if (!minKey.has_value() || *currentKey1 < *minKey) {
                                     minKey = currentKey1;
                                 }
@@ -1161,7 +1139,7 @@ bool LSMT::Compact() {
                                     currentValue1.reset();
                                 }
                             } else {
-                                newMemtable->insert(*currentKey2, *currentValue2);
+                                newMemtable->Insert(*currentKey2, *currentValue2);
                                 if (!minKey.has_value() || *currentKey2 < *minKey) {
                                     minKey = currentKey2;
                                 }
@@ -1195,7 +1173,7 @@ bool LSMT::Compact() {
                             auto newSSTable = std::make_shared<SSTable>(std::make_shared<Pager>(
                                 newSSTablePath,
                                 std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc));
-                            newMemtable->inOrderTraversal(
+                            newMemtable->InOrderTraversal(
                                 [&newSSTable, this](const std::vector<uint8_t> &key,
                                                     const std::vector<uint8_t> &value) {
                                     KeyValue kv;
@@ -1393,7 +1371,7 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NGet(
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
 
     // Traverse the memtable and collect key-value pairs not equal to the key
-    memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
+    memtable->InOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k != key) {
             kvMap.insert({k, v});  // Use insert to avoid overwriting
         }
@@ -1455,7 +1433,7 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
 
     // Traverse the memtable and collect key-value pairs less than or equal to the key
-    memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
+    memtable->InOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k <= key && kvMap.find(k) == kvMap.end()) {
             kvMap[k] = v;
         }
@@ -1518,7 +1496,7 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Greater
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
 
     // Traverse the memtable and collect key-value pairs greater than or equal to the key
-    memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
+    memtable->InOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k >= key) {
             kvMap[k] = v;
         }
@@ -1580,7 +1558,7 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
 
     // Traverse the memtable and collect key-value pairs less than the key
-    memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
+    memtable->InOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k < key) {
             kvMap[k] = v;
         }
@@ -1643,7 +1621,7 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Greater
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
 
     // Traverse the memtable and collect key-value pairs greater than the key
-    memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
+    memtable->InOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k > key) {
             kvMap.insert({k, v});  // Use insert to avoid overwriting
         }
@@ -1705,7 +1683,7 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Range(
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
 
     // Traverse the memtable and collect key-value pairs in the range
-    memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
+    memtable->InOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k >= start && k <= end) {
             kvMap.insert({k, v});  // Use insert to avoid overwriting
         }
@@ -1766,7 +1744,7 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NRange(
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> kvMap;
 
     // Traverse the memtable and collect key-value pairs not in the range
-    memtable->inOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
+    memtable->InOrderTraversal([&](const std::vector<uint8_t> &k, const std::vector<uint8_t> &v) {
         if (k < start || k > end) {
             kvMap.insert({k, v});  // Use insert to avoid overwriting
         }

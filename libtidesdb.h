@@ -155,9 +155,6 @@ class AVLTree {
     // deleteNode deletes a node from the AVL tree
     AVLNode *deleteNode(AVLNode *root, const std::vector<uint8_t> &key);
 
-    // deleteKey deletes a key from the AVL tree
-    void deleteKey(const std::vector<uint8_t> &key);
-
     // inOrder prints the key-value pairs in the AVL tree in in-order traversal
     void inOrder(AVLNode *node);
 
@@ -175,22 +172,22 @@ class AVLTree {
 
    public:
     // insert inserts a key-value pair into the AVL tree
-    void insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
-    void insertBatch(const std::vector<KeyValue> &kvPairs);
+    void Insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
+    void InsertBatch(const std::vector<KeyValue> &kvPairs);
 
-    // deleteKV deletes a key from the AVL tree
-    void deleteKV(const std::vector<uint8_t> &key);
+    // Delete deletes a key from the AVL tree
+    void Delete(const std::vector<uint8_t> &key);
 
     // inOrder prints the key-value pairs in the AVL tree in in-order traversal
     void inOrder();
 
     // inOrderTraversal traverses the AVL tree in in-order traversal and calls a
     // function on each node
-    void inOrderTraversal(
+    void InOrderTraversal(
         std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func);
 
     // clear clears the AVL tree
-    void clear();
+    void Clear();
 
     // Get
     // Returns the value for a given key
@@ -592,7 +589,7 @@ class LSMT {
             wal->Close();
 
             // Clear the memtable
-            memtable->clear();
+            memtable->Clear();
 
             {
                 std::unique_lock<std::shared_mutex> sstablesLockGuard(

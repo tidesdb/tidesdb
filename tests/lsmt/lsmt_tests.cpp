@@ -1,5 +1,10 @@
+#include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include "../../libtidesdb.h"
 
@@ -26,37 +31,30 @@ int main() {
                       << std::endl;  // Debug statement
         }
 
-        // Choose a valid key, for example, key 5
-        std::vector<uint8_t> key(4, 5);
-
-        // Get key 5 before deletion
-        std::vector<uint8_t> dat = lsmTree->Get(key);
-        if (dat.empty()) {
-            std::cerr << "Key not found on Get test for key: " << static_cast<int>(key[0])
-                      << std::endl;
-        } else {
-            std::cout << "Key found Get test passed for key: " << static_cast<int>(key[0])
-                      << std::endl;
+        // Set of missing keys
+        std::set<std::vector<uint8_t>> missingKeys;
+        for (int i = 0; i < 20; i++) {
+            std::vector<uint8_t> key(4, i);
+            missingKeys.insert(key);
         }
 
-        // // Delete key 5
-        // if (lsmTree->Delete(key)) {
-        //     std::cout << "Key deleted Delete test passed for key: " << static_cast<int>(key[0])
-        //     << std::endl;
-        // } else {
-        //     std::cerr << "Key not found Delete test failed for key: " << static_cast<int>(key[0])
-        //     << std::endl;
-        // }
-        //
-        // // Check if key 5 is deleted
-        // dat = lsmTree->Get(key);
-        // if (dat.empty()) {
-        //     std::cout << "Key not found delete then get test passed for key: " <<
-        //     static_cast<int>(key[0]) << std::endl;
-        // } else {
-        //     std::cerr << "Key found delete then get test failed for key: " <<
-        //     static_cast<int>(key[0]) << std::endl;
-        // }
+        // Retry until all key-value pairs are found
+        while (!missingKeys.empty()) {
+            for (auto it = missingKeys.begin(); it != missingKeys.end();) {
+                std::vector<uint8_t> result = lsmTree->Get(*it);
+                if (!result.empty() && result == *it) {  // Assuming value is the same as the key
+                    it = missingKeys.erase(it);          // Remove found key from the set
+                } else {
+                    ++it;
+                }
+            }
+
+            if (!missingKeys.empty()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));  // Wait before retrying
+            }
+        }
+
+        std::cout << "closing the LSMT" << std::endl;
 
         lsmTree->Close();
 

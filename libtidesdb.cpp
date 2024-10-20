@@ -30,6 +30,51 @@ std::vector<char> ConvertToCharVector(const std::vector<uint8_t> &input) {
     return std::vector<char>(input.begin(), input.end());
 }
 
+// compressZstd
+// compresses a byte vector using Zstandard
+std::vector<uint8_t> compressZstd(const std::vector<uint8_t> &input) {
+    size_t maxCompressedSize = ZSTD_compressBound(input.size());
+    std::vector<uint8_t> compressed(maxCompressedSize);
+
+    size_t compressedSize =
+        ZSTD_compress(compressed.data(), maxCompressedSize, input.data(), input.size(),
+                      1  // Compression level
+        );
+
+    if (ZSTD_isError(compressedSize)) {
+        throw std::runtime_error("Compression failed: " +
+                                 std::string(ZSTD_getErrorName(compressedSize)));
+    }
+
+    compressed.resize(compressedSize);
+    return compressed;
+}
+
+// decompressZstd
+// decompresses a byte vector using Zstandard
+std::vector<uint8_t> decompressZstd(const std::vector<uint8_t> &compressed) {
+    unsigned long long decompressedSize =
+        ZSTD_getFrameContentSize(compressed.data(), compressed.size());
+    if (decompressedSize == ZSTD_CONTENTSIZE_ERROR) {
+        throw std::runtime_error("Not compressed by zstd");
+    }
+    if (decompressedSize == ZSTD_CONTENTSIZE_UNKNOWN) {
+        throw std::runtime_error("Original size unknown");
+    }
+
+    std::vector<uint8_t> decompressed(decompressedSize);
+
+    size_t result = ZSTD_decompress(decompressed.data(), decompressedSize, compressed.data(),
+                                    compressed.size());
+
+    if (ZSTD_isError(result)) {
+        throw std::runtime_error("Decompression failed: " + std::string(ZSTD_getErrorName(result)));
+    }
+
+    decompressed.resize(result);
+    return decompressed;
+}
+
 // serialize
 // serializes the KeyValue struct to a byte vector
 std::vector<uint8_t> serialize(const KeyValue &kv) {
@@ -112,13 +157,24 @@ std::string Pager::GetFileName() const { return fileName; }
 Pager::~Pager() {}
 
 // Pager::Write writes data to the paged file, creating overflow pages if necessary
-int64_t Pager::Write(const std::vector<uint8_t> &data) {
+int64_t Pager::Write(const std::vector<uint8_t> &data, bool compress) {
     if (!file.is_open()) {
         throw TidesDBException("File is not open");
     }
 
     if (data.empty()) {
         throw TidesDBException("Data is empty");
+    }
+
+    const std::vector<uint8_t> *dataToWrite = &data;
+
+    if (compress) {
+        std::vector<uint8_t> compressedData;
+        // Compress the data
+        compressedData = compressZstd(data);
+        dataToWrite = &compressedData;
+    } else {
+        dataToWrite = &data;
     }
 
     // Lock the file mutex
@@ -130,7 +186,7 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
     int64_t data_written = 0;
     int64_t current_page = page_number;
 
-    while (data_written < data.size()) {
+    while (data_written < dataToWrite->size()) {
         // A little check if we need to add a new lock for the current page, just in case
         if (current_page >= pageLocks.size()) {
             pageLocks.push_back(std::make_shared<std::shared_mutex>());
@@ -143,7 +199,7 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
 
         // Write the header for overflow management
         int64_t overflow_page =
-            (data.size() - data_written > PAGE_BODY_SIZE) ? current_page + 1 : -1;
+            (dataToWrite->size() - data_written > PAGE_BODY_SIZE) ? current_page + 1 : -1;
         file.write(reinterpret_cast<const char *>(&overflow_page), sizeof(overflow_page));
 
         // Pad the header
@@ -151,9 +207,9 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
         file.write(reinterpret_cast<const char *>(header_padding.data()), header_padding.size());
 
         // Write the page body
-        int64_t chunk_size = std::min(static_cast<int64_t>(data.size() - data_written),
+        int64_t chunk_size = std::min(static_cast<int64_t>(dataToWrite->size() - data_written),
                                       static_cast<int64_t>(PAGE_BODY_SIZE));
-        file.write(reinterpret_cast<const char *>(data.data() + data_written), chunk_size);
+        file.write(reinterpret_cast<const char *>(dataToWrite->data() + data_written), chunk_size);
         data_written += chunk_size;
 
         // Pad the body if necessary
@@ -171,7 +227,7 @@ int64_t Pager::Write(const std::vector<uint8_t> &data) {
 // Pager::Read
 // reads data from a file starting at a specified page number and handles overflow pages if the data
 // spans multiple pages
-std::vector<uint8_t> Pager::Read(int64_t page_number) {
+std::vector<uint8_t> Pager::Read(int64_t page_number, bool decompress) {
     if (!file.is_open()) {
         throw TidesDBException("File is not open");
     }
@@ -240,6 +296,11 @@ std::vector<uint8_t> Pager::Read(int64_t page_number) {
     // Remove null bytes from the data
     data.erase(std::remove_if(data.begin(), data.end(), [](uint8_t c) { return c == '\0'; }),
                data.end());
+
+    // Decompress the data if necessary
+    if (decompress) {
+        return decompressZstd(data);
+    }
 
     return data;
 }
@@ -593,6 +654,24 @@ bool Wal::Recover(LSMT &lsmt) const {
     return true;
 }
 
+// LSMT::writeLineToLog
+// writes a line to the log file in format [YYYY-MM-DD HH:MM:SS] line
+void LSMT::writeLineToLog(const std::string &line) {
+    // Lock the log file mutex
+    std::lock_guard<std::mutex> lock(logFileLock);
+
+    // Get the current time
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+
+    // Format the time as [YYYY-MM-DD HH:MM:SS]
+    std::stringstream ss;
+    ss << "[" << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %X") << "] ";
+
+    // Write the formatted time and the line to the log file
+    logFile << ss.str() << line << std::endl;
+}
+
 // LSMT::flushMemtable
 // responsible for flushing the current memtable to disk. It creates a new memtable,
 // transfers the data from the current memtable to the new one, and then adds the new memtable
@@ -607,6 +686,12 @@ bool LSMT::flushMemtable() {
         }  // Automatically unlocks when leaving the scope
 
         isFlushing.store(1);  // Set the flag to indicate that we are flushing
+
+        // If debug logging is enabled, write the operation to the log file
+        if (logging) {
+            writeLineToLog("Flushing memtable to disk at size: " +
+                           std::to_string(memtable->GetSize()));
+        }
 
         // Check if memtable is empty (in case on close)
         if (memtable->GetSize() == 0) {
@@ -748,6 +833,12 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
         wal->AppendOperation(op);
     }
 
+    // If debug logging is enabled, write the operation to the log file
+    if (logging) {
+        std::string line = "DELETE " + std::string(key.begin(), key.end());
+        writeLineToLog(line);
+    }
+
     {
         memtable->Insert(
             key, std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)));
@@ -819,6 +910,13 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
     // Check for null pointers
     if (!wal || !memtable) {
         throw TidesDBException("WAL or memtable is null");
+    }
+
+    // If debug logging is enabled, write the operation to the log file
+    if (logging) {
+        std::string line = "PUT " + std::string(key.begin(), key.end()) + " " +
+                           std::string(value.begin(), value.end());
+        writeLineToLog(line);
     }
 
     {
@@ -1041,6 +1139,11 @@ bool LSMT::Compact() {
     // Start a background thread to perform compaction
     compactionThread = std::thread([this] {
         try {
+            // If debug logging is enabled, write the operation to the log file
+            if (logging) {
+                writeLineToLog("Compacting SSTables");
+            }
+
             const int maxConcurrentThreads =
                 std::max(1, maxCompactionThreads);  // Max concurrent threads
             std::vector<std::unique_ptr<std::counting_semaphore<1>>>

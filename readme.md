@@ -33,7 +33,8 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] Support for large amounts of data
 - [x] Threadsafe
 - [x] Granular page locking mechanisms on reads
-- [ ] Compression (todo, LZ4, Snappy)
+- [x] ZSTD Compression on keys and values if enabled
+- [x] Debug logging (optional, degrades performance)
 
 ## Design
 Single level meaning 1 memtable and multiple sstables.  No hierarchical levels.
@@ -60,6 +61,19 @@ protoc --version
 ##### Windows
 ```bash
 vcpkg install protobuf
+```
+
+### ZSTD
+#### Installing ZSTD
+
+##### Unix/Linux
+```bash
+sudo apt-get install -y libzstd-dev
+```
+
+#### Windows
+```bash
+vcpkg install zstd
 ```
 
 ## Bindings

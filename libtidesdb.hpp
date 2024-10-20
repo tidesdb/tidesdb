@@ -140,10 +140,14 @@ class AVLNode {
     AVLNode *left;               // Left child
     AVLNode *right;              // Right child
     int height;                  // Height of the node
+    std::optional<std::chrono::time_point<std::chrono::steady_clock>>
+        expirationTime;  // Expiration time (TTL)
 
     // Constructor
-    AVLNode(const std::vector<uint8_t> &k, const std::vector<uint8_t> &v)
-        : key(k), value(v), left(nullptr), right(nullptr), height(1) {}
+    AVLNode(
+        const std::vector<uint8_t> &k, const std::vector<uint8_t> &v,
+        std::optional<std::chrono::time_point<std::chrono::steady_clock>> expTime = std::nullopt)
+        : key(k), value(v), left(nullptr), right(nullptr), height(1), expirationTime(expTime) {}
 };
 
 // AVL Tree class
@@ -174,7 +178,8 @@ class AVLTree {
     // insert
     // inserts a key-value pair into the AVL tree
     AVLNode *insert(AVLNode *node, const std::vector<uint8_t> &key,
-                    const std::vector<uint8_t> &value);
+                    const std::vector<uint8_t> &value,
+                    std::optional<std::chrono::time_point<std::chrono::steady_clock>> expTime);
 
     // printHex
     // prints a vector of unsigned 8-bit integers in hexadecimal format
@@ -206,7 +211,9 @@ class AVLTree {
    public:
     // insert
     // inserts a key-value pair into the AVL tree
-    void Insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
+    void Insert(
+        const std::vector<uint8_t> &key, const std::vector<uint8_t> &value,
+        std::optional<std::chrono::time_point<std::chrono::steady_clock>> expTime = std::nullopt);
     void InsertBatch(const std::vector<KeyValue> &kvPairs);
 
     // Delete
@@ -526,7 +533,9 @@ class LSMT {
 
     // Put
     // inserts a key-value pair into the LSMT
-    bool Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value);
+    bool Put(
+        const std::vector<uint8_t> &key, const std::vector<uint8_t> &value,
+        std::optional<std::chrono::time_point<std::chrono::steady_clock>> expTime = std::nullopt);
     bool PutBatch(const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &batch);
 
     // Delete

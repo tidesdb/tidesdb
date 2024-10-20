@@ -42,8 +42,8 @@ std::vector<uint8_t> compressZstd(const std::vector<uint8_t> &input) {
         );
 
     if (ZSTD_isError(compressedSize)) {
-        throw std::runtime_error("Compression failed: " +
-                                 std::string(ZSTD_getErrorName(compressedSize)));
+        throw TidesDBException("Compression failed: " +
+                               std::string(ZSTD_getErrorName(compressedSize)));
     }
 
     compressed.resize(compressedSize);
@@ -56,10 +56,10 @@ std::vector<uint8_t> decompressZstd(const std::vector<uint8_t> &compressed) {
     unsigned long long decompressedSize =
         ZSTD_getFrameContentSize(compressed.data(), compressed.size());
     if (decompressedSize == ZSTD_CONTENTSIZE_ERROR) {
-        throw std::runtime_error("Not compressed by zstd");
+        throw TidesDBException("Error getting decompressed size");
     }
     if (decompressedSize == ZSTD_CONTENTSIZE_UNKNOWN) {
-        throw std::runtime_error("Original size unknown");
+        throw TidesDBException("Unknown decompressed size");
     }
 
     std::vector<uint8_t> decompressed(decompressedSize);
@@ -68,7 +68,7 @@ std::vector<uint8_t> decompressZstd(const std::vector<uint8_t> &compressed) {
                                     compressed.size());
 
     if (ZSTD_isError(result)) {
-        throw std::runtime_error("Decompression failed: " + std::string(ZSTD_getErrorName(result)));
+        throw TidesDBException("Decompression failed: " + std::string(ZSTD_getErrorName(result)));
     }
 
     decompressed.resize(result);
@@ -367,17 +367,33 @@ int AVLTree::getBalance(AVLNode *node) {
 // AVLTree::insert
 // inserts a key-value pair into the AVL tree
 AVLNode *AVLTree::insert(AVLNode *node, const std::vector<uint8_t> &key,
-                         const std::vector<uint8_t> &value) {
+                         const std::vector<uint8_t> &value,
+                         std::optional<std::chrono::steady_clock::time_point> expirationTime) {
     if (node == nullptr) {
-        return new AVLNode(key, value);
+        return new AVLNode(key, value, expirationTime);
+    }
+
+    // Check if the current node is expired
+    if (node->expirationTime.has_value() &&
+        node->expirationTime.value() <= std::chrono::steady_clock::now()) {
+        // Mark as tombstone
+        node->value =
+            std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE));
     }
 
     if (key < node->key) {
-        node->left = insert(node->left, key, value);
+        node->left = insert(node->left, key, value, expirationTime);
     } else if (key > node->key) {
-        node->right = insert(node->right, key, value);
+        node->right = insert(node->right, key, value, expirationTime);
     } else {
         node->value = value;  // Update value
+
+        if (expirationTime.has_value()) {
+            node->expirationTime = expirationTime.value();
+        } else {
+            node->expirationTime.reset();
+        }
+
         return node;
     }
 
@@ -474,9 +490,10 @@ AVLNode *AVLTree::minValueNode(AVLNode *node) {
 // AVLTree::Insert
 // inserts a key-value pair into the AVL tree
 // will update the value if the key already exists
-void AVLTree::Insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+void AVLTree::Insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value,
+                     std::optional<std::chrono::steady_clock::time_point> expirationTime) {
     std::unique_lock<std::shared_mutex> lock(rwlock);
-    root = insert(root, key, value);
+    root = insert(root, key, value, expirationTime);
     cachedSize += key.size() + value.size();
 }
 
@@ -487,7 +504,8 @@ void AVLTree::InsertBatch(const std::vector<KeyValue> &kvPairs) {
     for (const auto &kv : kvPairs) {
         root =
             insert(root, ConvertToUint8Vector(std::vector<char>(kv.key().begin(), kv.key().end())),
-                   ConvertToUint8Vector(std::vector<char>(kv.value().begin(), kv.value().end())));
+                   ConvertToUint8Vector(std::vector<char>(kv.value().begin(), kv.value().end())),
+                   std::nullopt);
         cachedSize += kv.key().size() + kv.value().size();
     }
 }
@@ -551,7 +569,17 @@ std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
             // check if tombstone
             if (current->value ==
                 std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
-                // Handle tombstone
+                // We return an empty vector if it is a tombstone
+                return {};
+            }
+
+            // Check if expired
+            if (current->expirationTime.has_value() &&
+                current->expirationTime.value() <= std::chrono::steady_clock::now()) {
+                // Mark as tombstone
+                current->value = std::vector<uint8_t>(TOMBSTONE_VALUE,
+                                                      TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE));
+                return {};
             }
 
             return current->value;  // Key found, return the value
@@ -900,7 +928,8 @@ bool LSMT::DeleteBatch(const std::vector<std::vector<uint8_t>> &keys) {
 //  function ensures thread safety by using locks and condition variables, writes the operation to
 //  the Write-Ahead Log (WAL), and inserts the key-value pair into the memtable. If the memtable
 //  exceeds a certain size, it triggers a background flush to disk.
-bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value,
+               std::optional<std::chrono::steady_clock::time_point> expirationTime) {
     // Check if we are flushing or compacting
     {
         std::unique_lock lock(sstablesLock);
@@ -933,7 +962,7 @@ bool LSMT::Put(const std::vector<uint8_t> &key, const std::vector<uint8_t> &valu
     }
 
     // Insert the key-value pair into the memtable
-    memtable->Insert(key, value);
+    memtable->Insert(key, value, expirationTime);
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
     if (memtable->GetSize() >= memtableFlushSize) {

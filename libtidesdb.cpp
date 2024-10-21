@@ -666,7 +666,7 @@ bool Wal::Recover(LSMT &lsmt) const {
         // Read the data from the current page
         std::vector<uint8_t> data;
         try {
-            data = pager->Read(i);
+            data = pager->Read(i, compress);
         } catch (const std::exception &e) {
             std::cerr << "Error reading page " << i << ": " << e.what() << std::endl;
             return false;
@@ -1182,7 +1182,7 @@ void Wal::backgroundThreadFunc() {
 
                 // Serialize and write the operation to the WAL
                 std::vector<uint8_t> serializedOp = serializeOperation(op);
-                int64_t pageNumber = pager->Write(serializedOp);
+                int64_t pageNumber = pager->Write(serializedOp, compress);
                 if (pageNumber < 0) {
                     std::cerr << "Failed to write operation to WAL" << std::endl;
                 }

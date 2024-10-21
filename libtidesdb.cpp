@@ -33,6 +33,11 @@ std::vector<char> ConvertToCharVector(const std::vector<uint8_t> &input) {
 // compressZstd
 // compresses a byte vector using Zstandard
 std::vector<uint8_t> compressZstd(const std::vector<uint8_t> &input) {
+    // Check if the input is empty
+    if (input.empty()) {
+        return {};
+    }
+
     size_t maxCompressedSize = ZSTD_compressBound(input.size());
     std::vector<uint8_t> compressed(maxCompressedSize);
 
@@ -53,6 +58,11 @@ std::vector<uint8_t> compressZstd(const std::vector<uint8_t> &input) {
 // decompressZstd
 // decompresses a byte vector using Zstandard
 std::vector<uint8_t> decompressZstd(const std::vector<uint8_t> &compressed) {
+    // Check if the input is empty
+    if (compressed.empty()) {
+        return {};
+    }
+
     unsigned long long decompressedSize =
         ZSTD_getFrameContentSize(compressed.data(), compressed.size());
     if (decompressedSize == ZSTD_CONTENTSIZE_ERROR) {
@@ -78,6 +88,11 @@ std::vector<uint8_t> decompressZstd(const std::vector<uint8_t> &compressed) {
 // serialize
 // serializes the KeyValue struct to a byte vector
 std::vector<uint8_t> serialize(const KeyValue &kv) {
+    // Check if the key or value is empty
+    if (kv.key().empty() || kv.value().empty()) {
+        throw TidesDBException("Key or value is empty");
+    }
+
     std::vector<uint8_t> buffer(kv.ByteSizeLong());
     kv.SerializeToArray(buffer.data(), buffer.size());
     return buffer;
@@ -86,6 +101,10 @@ std::vector<uint8_t> serialize(const KeyValue &kv) {
 // deserialize
 // deserializes a byte vector to a KeyValue
 KeyValue deserialize(const std::vector<uint8_t> &buffer) {
+    if (buffer.empty()) {
+        throw TidesDBException("Buffer is empty");
+    }
+
     KeyValue kv;
     kv.ParseFromArray(buffer.data(), buffer.size());
     return kv;
@@ -94,6 +113,10 @@ KeyValue deserialize(const std::vector<uint8_t> &buffer) {
 // deserializeOperation
 // deserializes a byte vector to an Operation
 Operation deserializeOperation(const std::vector<uint8_t> &buffer) {
+    if (buffer.empty()) {
+        throw TidesDBException("Buffer is empty");
+    }
+
     Operation op;
     op.ParseFromArray(buffer.data(), buffer.size());
     return op;
@@ -102,6 +125,10 @@ Operation deserializeOperation(const std::vector<uint8_t> &buffer) {
 // serializeOperation
 // serializes the Operation struct to a byte vector
 std::vector<uint8_t> serializeOperation(const Operation &op) {
+    if (op.key().empty() || op.value().empty()) {
+        throw TidesDBException("Key or value is empty");
+    }
+
     std::vector<uint8_t> buffer(op.ByteSizeLong());
     op.SerializeToArray(buffer.data(), buffer.size());
     return buffer;

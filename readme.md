@@ -33,7 +33,7 @@ This process merges pairs of SSTables into a new SSTable, and deletes any redund
 - [x] Support for large amounts of data
 - [x] Threadsafe
 - [x] Granular page locking mechanisms on reads
-- [x] ZSTD Compression sstables if enabled
+- [x] ZSTD compression which if enabled will compress the SSTables and WAL page data
 - [x] Debug logging (optional, degrades performance)
 - [x] TTL (Time to Live) support
 

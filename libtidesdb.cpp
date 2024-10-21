@@ -125,7 +125,7 @@ Operation deserializeOperation(const std::vector<uint8_t> &buffer) {
 // serializeOperation
 // serializes the Operation struct to a byte vector
 std::vector<uint8_t> serializeOperation(const Operation &op) {
-    if (op.key().empty() || op.value().empty()) {
+    if (op.key().empty() && op.value().empty()) {
         throw TidesDBException("Key or value is empty");
     }
 
@@ -734,8 +734,7 @@ void LSMT::writeLineToLog(const std::string &line) {
 // to the flush queue. Finally, it notifies the flush thread to process the queue
 bool LSMT::flushMemtable() {
     try {
-        // wait until we are done flushing
-        // Check if we are flushing or compacting
+        // Wait until we are done flushing or compacting
         {
             std::unique_lock lock(sstablesLock);
             cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
@@ -752,6 +751,7 @@ bool LSMT::flushMemtable() {
         // Check if memtable is empty (in case on close)
         if (memtable->GetSize() == 0) {
             isFlushing.store(0);  // Reset the flag
+            cond.notify_all();    // Notify all waiting threads
             return true;
         }
 
@@ -759,15 +759,21 @@ bool LSMT::flushMemtable() {
         auto newMemtable = std::make_unique<AVLTree>();
 
         // Iterate over the current memtable and insert its elements into the new memtable
-        memtable->InOrderTraversal(
-            [&newMemtable](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
-                newMemtable->Insert(key, value);
-            });
+        memtable->InOrderTraversal([&newMemtable](const std::vector<uint8_t> &key,
+                                                  const std::vector<uint8_t> &value) {
+            // Skip tombstones
+            if (value ==
+                std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE))) {
+                return;
+            }
+            newMemtable->Insert(key, value);
+        });
 
         // Clear the current memtable
         memtable->Clear();
 
         isFlushing.store(0);  // Reset the flag
+        cond.notify_all();    // Notify all waiting threads
 
         // Add the new memtable to the flush queue
         {
@@ -779,6 +785,7 @@ bool LSMT::flushMemtable() {
         return true;
     } catch (const std::exception &e) {
         isFlushing.store(0);  // Reset the flag
+        cond.notify_all();    // Notify all waiting threads
         std::cerr << "Error in flushMemtable: " << e.what() << std::endl;
         return false;
     }
@@ -788,7 +795,7 @@ bool LSMT::flushMemtable() {
 // the background thread function that processes the flush queue. It waits for a new memtable to be
 // added to the queue then pops and flushes the memtable to disk
 void LSMT::flushThreadFunc() {
-    while (true) {
+    while (stopBackgroundThreads.load() == 0) {
         std::unique_ptr<AVLTree> newMemtable;
 
         // Wait for a new memtable to be added to the queue
@@ -904,10 +911,8 @@ bool LSMT::Delete(const std::vector<uint8_t> &key) {
         writeLineToLog(line);
     }
 
-    {
-        memtable->Insert(
-            key, std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)));
-    }  // Automatically unlocks when leaving the scope
+    memtable->Insert(
+        key, std::vector<uint8_t>(TOMBSTONE_VALUE, TOMBSTONE_VALUE + strlen(TOMBSTONE_VALUE)));
 
     // If the memtable size exceeds the flush size, flush the memtable to disk
     if (memtable->GetSize() >= memtableFlushSize) {
@@ -1169,6 +1174,11 @@ void Wal::backgroundThreadFunc() {
                 Operation op = operationQueue.front();
                 operationQueue.pop();
                 lock.unlock();
+
+                // if empty skip
+                if (op.key().empty() && op.value().empty()) {
+                    continue;
+                }
 
                 // Serialize and write the operation to the WAL
                 std::vector<uint8_t> serializedOp = serializeOperation(op);

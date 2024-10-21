@@ -1,13 +1,13 @@
 #include <gtest/gtest.h>
 
-#include "../libtidesdb.hpp"  // Include the header where AVLNode is declared
+#include "../libtidesdb.hpp"
 
 TEST(AVLNodeTest, ConstructorInitializesCorrectly) {
     std::vector<uint8_t> key = {'k', 'e', 'y'};
     std::vector<uint8_t> value = {'v', 'a', 'l', 'u', 'e'};
     auto expirationTime = std::chrono::steady_clock::now();
 
-    TidesDB::AVLNode node(key, value, expirationTime);
+    TidesDB::AVLNode node(key, value);
 
     EXPECT_EQ(node.key, key);
     EXPECT_EQ(node.value, value);
@@ -36,7 +36,8 @@ TEST(AVLTreeTest, DeleteDeletesKey) {
     tree.Insert(key, value);
     tree.Delete(key);
 
-    EXPECT_THROW(tree.Get(key), TidesDB::TidesDBException);
+    // we expect empty vector to be returned
+    EXPECT_EQ(tree.Get(key), std::vector<uint8_t>());
 }
 
 TEST(AVLTreeTest, GetRetrievesValue) {
@@ -58,5 +59,5 @@ TEST(AVLTreeTest, ClearClearsTree) {
     tree.Insert(key, value);
     tree.Clear();
 
-    EXPECT_THROW(tree.Get(key), TidesDB::TidesDBException);
+    EXPECT_EQ(tree.Get(key), std::vector<uint8_t>());
 }

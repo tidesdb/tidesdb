@@ -520,6 +520,7 @@ AVLNode *AVLTree::minValueNode(AVLNode *node) {
 void AVLTree::Insert(const std::vector<uint8_t> &key, const std::vector<uint8_t> &value,
                      std::optional<std::chrono::steady_clock::time_point> expirationTime) {
     std::unique_lock<std::shared_mutex> lock(rwlock);
+
     root = insert(root, key, value, expirationTime);
     cachedSize += key.size() + value.size();
 }
@@ -1965,4 +1966,4 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NRange(
     return result;
 }
 
-}  // namespace TidesDB
+}  // end namespace TidesDB

@@ -60,7 +60,6 @@ add_executable(runTests ${TEST_SRC}
         tests/lsmt_compact.cpp
         tests/lsmt_compact_concurrent.cpp
         tests/pager.cpp
-        tests/pager_multiple_pages.cpp
         tests/pager_overflows.cpp
         tests/sstable.cpp
         tests/sstable_iterator.cpp

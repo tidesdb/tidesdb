@@ -209,6 +209,9 @@ class AVLTree {
         std::function<void(const std::vector<uint8_t> &, const std::vector<uint8_t> &)> func);
 
    public:
+    // Constructor
+    AVLTree() : root(nullptr), cachedSize(0) {}
+
     // insert
     // inserts a key-value pair into the AVL tree
     void Insert(
@@ -752,9 +755,10 @@ class LSMT {
     void flushThreadFunc();
 
     // writeLineToLog
+    // writes a line to the log file
     void writeLineToLog(const std::string &line);
 };
 
-}  // namespace TidesDB
+}  // end namespace TidesDB
 
 #endif  // TIDESDB_LIBRARY_HPP

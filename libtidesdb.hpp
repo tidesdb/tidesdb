@@ -317,7 +317,8 @@ class Wal {
    public:
     // Constructor
     // This constructor takes a pager and is used for normal pager operations
-    explicit Wal(Pager *pager) : pager(pager) {
+    explicit Wal(Pager *pager, bool compress = false) : pager(pager) {
+        this->compress = compress;
         // Start the background thread
         backgroundThread = std::thread(&Wal::backgroundThreadFunc, this);
     }
@@ -345,6 +346,7 @@ class Wal {
     std::queue<Operation> operationQueue;  // Operation queue
     bool stopBackgroundThread = false;     // Stop background thread
     std::thread backgroundThread;          // Background thread
+    bool compress = false;                 // Compress the write-ahead log
 
     // backgroundThreadFunc
     // is the function that runs in the background thread
@@ -440,7 +442,8 @@ class LSMT {
           compactionInterval(compaction_interval),
           maxCompactionThreads(max_compaction_threads) {
         wal = new Wal(new Pager(directory + getPathSeparator() + WAL_EXTENSION,
-                                std::ios::in | std::ios::out | std::ios::binary));
+                                std::ios::in | std::ios::out | std::ios::binary),
+                      compress);
         isFlushing.store(0);    // Initialize isFlushing to 0 which means not flushing
         isCompacting.store(0);  // Initialize isCompacting to 0 which means not compacting
 
@@ -500,7 +503,8 @@ class LSMT {
     static std::unique_ptr<LSMT> New(const std::string &directory,
                                      std::filesystem::perms directoryPerm, int memtableFlushSize,
                                      int compactionInterval,
-                                     std::optional<int> maxCompactionThreads = std::nullopt) {
+                                     std::optional<int> maxCompactionThreads = std::nullopt,
+                                     bool compress = false, bool logging = false) {
         if (directory.empty()) {
             throw TidesDBException("directory cannot be empty");
         }
@@ -528,7 +532,7 @@ class LSMT {
         }
 
         return std::make_unique<LSMT>(directory, memtableFlushSize, compactionInterval, walPager,
-                                      maxThreads);
+                                      maxThreads, compress, logging);
     }
 
     // Destructor
@@ -646,12 +650,13 @@ class LSMT {
                 writeLineToLog("CLOSING UP");
             }
 
-            // We will rollback all active transactions
-            std::shared_lock<std::shared_mutex> activeTransactionsLockGuard(
-                activeTransactionsLock);  // Lock the active transactions
-
-            for (auto tx : activeTransactions) {
-                RollbackTransaction(tx);
+            // Rollback all active transactions
+            {
+                std::shared_lock<std::shared_mutex> activeTransactionsLockGuard(
+                    activeTransactionsLock);
+                for (auto tx : activeTransactions) {
+                    RollbackTransaction(tx);
+                }
             }
 
             // Flush the memtable to disk
@@ -683,19 +688,12 @@ class LSMT {
             // Close the write-ahead log
             wal->Close();
 
-            // Clear the memtable
-            memtable->Clear();
-
+            // Lock the SSTables and close them
             {
-                std::unique_lock<std::shared_mutex> sstablesLockGuard(
-                    sstablesLock);  // Lock the SSTables
-
-                // Iterate over the SSTables and close them
+                std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
                 for (const auto &sstable : sstables) {
                     sstable->pager->Close();
                 }
-
-                // Clear the list of SSTables
                 sstables.clear();
             }
 

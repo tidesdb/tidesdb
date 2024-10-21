@@ -50,7 +50,7 @@ TEST_F(LSMTTest, DeleteTest) {
     ASSERT_TRUE(lsmt->Put(key, value));
     ASSERT_TRUE(lsmt->Delete(key));
     auto retrievedValue = lsmt->Get(key);
-    ASSERT_TRUE(retrievedValue.empty());
+    ASSERT_EQ(retrievedValue, std::vector<uint8_t>());
 
     // Close the LSMT
     lsmt->Close();

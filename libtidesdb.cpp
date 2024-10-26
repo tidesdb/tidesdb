@@ -618,16 +618,14 @@ std::vector<uint8_t> AVLTree::Get(const std::vector<uint8_t> &key) {
 }
 
 // Wal::Close
-// responsible for safely stopping the background thread that processes the write-ahead log (WAL).
-// It sets a flag to stop the thread, notifies the condition variable to wake up the thread
-// if it is waiting, and then joins the thread to ensure it has finished executing.
 void Wal::Close() {
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);  // Lock the queue mutex
-        stopBackgroundThread = true;                   // Set the flag to stop the background thread
-    }
-    queueCondVar.notify_one();          // Notify the condition variable to wake up the thread
-    if (backgroundThread.joinable()) {  // Join the thread to ensure it has finished executing
+    stopBackgroundThread = true;
+
+    // Notify the background thread to stop
+    queueCondVar.notify_all();
+
+    // Join the background thread if it is joinable
+    if (backgroundThread.joinable()) {
         backgroundThread.join();
     }
 
@@ -792,8 +790,9 @@ bool LSMT::flushMemtable() {
 }
 
 // flushThreadFunc
-// the background thread function that processes the flush queue. It waits for a new memtable to be
-// added to the queue then pops and flushes the memtable to disk
+// is the function that runs in the flush memtable thread (background thread) which gets started
+// on initialization This function awaits notification and pops latest memtable from the queue
+// and flushes it to disk
 void LSMT::flushThreadFunc() {
     while (stopBackgroundThreads.load() == 0) {
         std::unique_ptr<AVLTree> newMemtable;
@@ -1161,10 +1160,10 @@ std::fstream &Pager::GetFile() { return file; }
 // It continuously processes operations from a queue and writes them to the WAL file
 void Wal::backgroundThreadFunc() {
     try {
-        while (true) {
+        while (stopBackgroundThread) {
             std::unique_lock<std::mutex> lock(queueMutex);
             queueCondVar.wait(lock,
-                              [this] { return stopBackgroundThread || !operationQueue.empty(); });
+                              [this] { return stopBackgroundThread && operationQueue.empty(); });
 
             if (stopBackgroundThread && operationQueue.empty()) {
                 break;

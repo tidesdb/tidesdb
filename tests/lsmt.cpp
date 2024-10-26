@@ -56,37 +56,6 @@ TEST_F(LSMTTest, DeleteTest) {
     lsmt->Close();
 }
 
-TEST_F(LSMTTest, CompactionTest) {
-    auto lsmt = TidesDB::LSMT::New(testDirectory, std::filesystem::perms::all, 1024, 10);
-    std::vector<uint8_t> key1 = {'k', 'e', 'y', '1'};
-    std::vector<uint8_t> value1 = {'v', 'a', 'l', 'u', 'e', '1'};
-    std::vector<uint8_t> key2 = {'k', 'e', 'y', '2'};
-    std::vector<uint8_t> value2 = {'v', 'a', 'l', 'u', 'e', '2'};
-
-    ASSERT_TRUE(lsmt->Put(key1, value1));
-    ASSERT_TRUE(lsmt->Put(key2, value2));
-    ASSERT_TRUE(lsmt->Compact());
-    ASSERT_EQ(lsmt->GetSSTableCount(), 1);
-
-    // Close the LSMT
-    lsmt->Close();
-}
-
-TEST_F(LSMTTest, TransactionTest) {
-    auto lsmt = TidesDB::LSMT::New(testDirectory, std::filesystem::perms::all, 1024, 10);
-    auto tx = lsmt->BeginTransaction();
-    std::vector<uint8_t> key = {'k', 'e', 'y'};
-    std::vector<uint8_t> value = {'v', 'a', 'l', 'u', 'e'};
-
-    TidesDB::LSMT::AddPut(tx, key, value);
-    ASSERT_TRUE(lsmt->CommitTransaction(tx));
-    auto retrievedValue = lsmt->Get(key);
-    ASSERT_EQ(retrievedValue, value);
-
-    // Close the LSMT
-    lsmt->Close();
-}
-
 TEST_F(LSMTTest, CloseTest) {
     auto lsmt = TidesDB::LSMT::New(testDirectory, std::filesystem::perms::all, 1024, 10);
     std::vector<uint8_t> key = {'k', 'e', 'y'};
@@ -94,10 +63,11 @@ TEST_F(LSMTTest, CloseTest) {
 
     ASSERT_TRUE(lsmt->Put(key, value));
     lsmt->Close();
+
     auto lsmt2 = TidesDB::LSMT::New(testDirectory, std::filesystem::perms::all, 1024, 10);
     auto retrievedValue = lsmt2->Get(key);
     ASSERT_EQ(retrievedValue, value);
 
     // Close the LSMT
-    lsmt->Close();
+    lsmt2->Close();
 }

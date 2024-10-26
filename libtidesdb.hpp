@@ -17,8 +17,6 @@
 #ifndef TIDESDB_LIBRARY_HPP
 #define TIDESDB_LIBRARY_HPP
 
-#include <zstd.h>
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -35,6 +33,7 @@
 #include <shared_mutex>
 #include <string>
 #include <vector>
+#include <zstd.h>
 
 // We include the protobuf headers here because we need to use the
 // generated files for our KeyValue and Operation structs
@@ -577,6 +576,10 @@ class LSMT {
         return sstables.size();
     }
 
+    // Get
+    // returns the value for a given key
+    std::vector<uint8_t> Get(const std::vector<uint8_t> &key);
+
     // NGet
     // returns all key-value pairs not equal to a given key
     std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> NGet(
@@ -634,71 +637,69 @@ class LSMT {
     static void AddPut(Transaction *tx, const std::vector<uint8_t> &key,
                        const std::vector<uint8_t> &value);
 
-    // Get
-    // returns the value for a given key
-    std::vector<uint8_t> Get(const std::vector<uint8_t> &key);
 
     // Close
     // closes the LSMT gracefully.
-    // We first rollback all active transactions, then flush the memtable to disk,
-    // wait for the flush queue to be empty, wait for the flush thread to finish,
-    // wait for the compaction thread to finish, close the write-ahead log, clear the
-    // memtable, close all SSTables, and finally close the pager
     void Close() {
         try {
-            if (logging) {
-                writeLineToLog("CLOSING UP");
-            }
+            writeLineToLog("CLOSING");
 
             // Rollback all active transactions
             {
-                std::shared_lock<std::shared_mutex> activeTransactionsLockGuard(
-                    activeTransactionsLock);
+                std::unique_lock<std::shared_mutex> lock(activeTransactionsLock);
                 for (auto tx : activeTransactions) {
                     RollbackTransaction(tx);
                 }
+                activeTransactions.clear();
             }
 
             // Flush the memtable to disk
-            if (!flushMemtable()) {
-                throw TidesDBException("failed to flush memtable to disk");
+            flushMemtable();
+
+            // wait for flush and or compaction to finish
+            {
+                std::unique_lock lock(sstablesLock);
+                cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
             }
 
-            // Notify the condition variables to wake up the threads
+            // Set isFlushing and isCompacting to 0
+            isFlushing.store(0);
+            isCompacting.store(0);
+
+
+            // Stop background threads
             stopBackgroundThreads.store(true);
             flushQueueCondVar.notify_all();
-            cond.notify_all();
-
-            // Wait for the flush queue to be empty
-            {
-                std::unique_lock<std::mutex> lock(flushQueueMutex);
-                flushQueueCondVar.wait(lock, [this] { return flushQueue.empty(); });
-            }
-
-            // Wait for the flush thread to finish
             if (flushThread.joinable()) {
                 flushThread.join();
             }
-
-            // Wait for the compaction thread to finish
             if (compactionThread.joinable()) {
                 compactionThread.join();
             }
 
             // Close the write-ahead log
-            wal->Close();
+            if (wal) {
+                wal->Close();
+                delete wal;
+                wal = nullptr;
+            }
 
-            // Lock the SSTables and close them
+            // Clear the memtable
+            if (memtable) {
+                memtable->Clear();
+                delete memtable;
+                memtable = nullptr;
+            }
+
+            // Clear SSTables
             {
-                std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
-                for (const auto &sstable : sstables) {
-                    sstable->pager->Close();
-                }
+                std::unique_lock<std::shared_mutex> lock(sstablesLock);
                 sstables.clear();
             }
 
-            if (logging) {
-                writeLineToLog("CLOSED SUCCESSFULLY");
+            // Close the log file if logging is enabled
+            if (logging && logFile.is_open()) {
+                logFile.close();
             }
 
         } catch (const std::system_error &e) {
@@ -748,7 +749,7 @@ class LSMT {
 
     // flushThreadFunc
     // is the function that runs in the flush memtable thread (background thread) which gets started
-    // on initialization This function waits notification and pops latest memtable from the queue
+    // on initialization This function awaits notification and pops latest memtable from the queue
     // and flushes it to disk
     void flushThreadFunc();
 

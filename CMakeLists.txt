@@ -71,6 +71,7 @@ add_executable(runTests ${TEST_SRC}
         tests/range_functions.cpp
         tests/put_batch.cpp
         tests/delete_batch.cpp
+        tests/lsmt_log.cpp
 )
 
 # Link the test executable with Google Test and tidesdb

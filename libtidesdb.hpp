@@ -691,10 +691,18 @@ class LSMT {
                 memtable = nullptr;
             }
 
+            // Close SSTables
+            {
+                for (auto &sstable : sstables) {
+                    sstable->pager->Close();
+                }
+            }
+
             // Clear SSTables
             {
                 std::unique_lock<std::shared_mutex> lock(sstablesLock);
                 sstables.clear();
+                
             }
 
             // Close the log file if logging is enabled

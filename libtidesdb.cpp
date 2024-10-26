@@ -1160,7 +1160,7 @@ std::fstream &Pager::GetFile() { return file; }
 // It continuously processes operations from a queue and writes them to the WAL file
 void Wal::backgroundThreadFunc() {
     try {
-        while (stopBackgroundThread) {
+        while (!stopBackgroundThread) {
             std::unique_lock<std::mutex> lock(queueMutex);
             queueCondVar.wait(lock,
                               [this] { return stopBackgroundThread && operationQueue.empty(); });

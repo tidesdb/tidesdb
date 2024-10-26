@@ -1,8 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "../libtidesdb.hpp"  // Include the header where deserialize is declared
+#include "../libtidesdb.hpp"
 
-// Test case for deserialize
 TEST(DeserializeTest, HandlesEmptyBuffer) {
     std::vector<uint8_t> buffer;
     EXPECT_THROW({ KeyValue kv = TidesDB::deserialize(buffer); }, TidesDB::TidesDBException);

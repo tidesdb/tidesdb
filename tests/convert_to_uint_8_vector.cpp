@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "../libtidesdb.hpp"  // Include the header where ConvertToUint8Vector is declared
+#include "../libtidesdb.hpp"
 
 // Test case for ConvertToUint8Vector
 TEST(ConvertToUint8VectorTest, HandlesEmptyInput) {

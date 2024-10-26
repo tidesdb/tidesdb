@@ -1,8 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "../libtidesdb.hpp"  // Include the header where compressZstd is declared
+#include "../libtidesdb.hpp"
 
-// Test case for compressZstd
 TEST(CompressZstdTest, HandlesEmptyInput) {
     std::vector<uint8_t> input;
     std::vector<uint8_t> output = TidesDB::compressZstd(input);

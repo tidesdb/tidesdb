@@ -23,7 +23,7 @@ class PagerTest : public ::testing::Test {
 
 TEST_F(PagerTest, WriteAndReadMultiplePages) {
     TidesDB::Pager pager(testFileName, std::ios::out | std::ios::in | std::ios::binary);
-    std::vector<uint8_t> data(4096, 'a');  // Assuming page size is 4096 bytes
+    std::vector<uint8_t> data(4096, 'a');
     int64_t pageNumber1 = pager.Write(data);
     int64_t pageNumber2 = pager.Write(data);
 
@@ -37,7 +37,7 @@ TEST_F(PagerTest, WriteAndReadMultiplePages) {
 TEST_F(PagerTest, WriteAndReadWithOverflow) {
     TidesDB::Pager pager(testFileName, std::ios::out | std::ios::in | std::ios::binary);
     std::vector<uint8_t> largeData(
-        8192, 'b');  // Assuming page size is 4096 bytes, this will overflow to 2 pages
+        8192, 'b');  // Page size is 4096 bytes, this will overflow to 2 pages
     int64_t pageNumber = pager.Write(largeData);
 
     std::vector<uint8_t> readData = pager.Read(pageNumber);

@@ -1,8 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "../libtidesdb.hpp"  // Include the header where deserializeOperation is declared
+#include "../libtidesdb.hpp"
 
-// Test case for deserializeOperation
 TEST(DeserializeOperationTest, HandlesValidBuffer) {
     Operation op;
     op.set_type(OperationType::OpPut);

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "../libtidesdb.hpp"  // Include the header where ConvertToCharVector is declared
+#include "../libtidesdb.hpp"
 
 // Test case for ConvertToCharVector
 TEST(ConvertToCharVectorTest, HandlesEmptyInput) {

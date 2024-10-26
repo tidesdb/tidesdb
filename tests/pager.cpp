@@ -5,7 +5,6 @@
 
 #include "../libtidesdb.hpp"
 
-// Test fixture for Pager tests
 class PagerTest : public ::testing::Test {
    protected:
     std::string testFileName = "test_pager_file.dat";

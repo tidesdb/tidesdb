@@ -1163,7 +1163,7 @@ void Wal::backgroundThreadFunc() {
         while (!stopBackgroundThread) {
             std::unique_lock<std::mutex> lock(queueMutex);
             queueCondVar.wait(lock,
-                              [this] { return stopBackgroundThread && operationQueue.empty(); });
+                              [this] { return stopBackgroundThread || !operationQueue.empty(); });
 
             if (stopBackgroundThread && operationQueue.empty()) {
                 break;

@@ -1,8 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "../libtidesdb.hpp"  // Include the header where decompressZstd is declared
+#include "../libtidesdb.hpp"
 
-// Test case for decompressZstd
 TEST(DecompressZstdTest, HandlesEmptyInput) {
     std::vector<uint8_t> input;
     std::vector<uint8_t> output = TidesDB::decompressZstd(input);

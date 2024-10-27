@@ -72,6 +72,7 @@ add_executable(runTests ${TEST_SRC}
         tests/put_batch.cpp
         tests/delete_batch.cpp
         tests/lsmt_log.cpp
+        tests/bloomfilter.cpp
 )
 
 # Link the test executable with Google Test and tidesdb

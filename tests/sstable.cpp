@@ -25,8 +25,6 @@ TEST_F(SSTableTest, ConstructorInitializesCorrectly) {
     TidesDB::SSTable sstable(pager);
 
     EXPECT_EQ(sstable.pager, pager);
-    EXPECT_TRUE(sstable.minKey.empty());
-    EXPECT_TRUE(sstable.maxKey.empty());
 }
 
 TEST_F(SSTableTest, GetFilePathReturnsCorrectPath) {

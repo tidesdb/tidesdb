@@ -60,6 +60,25 @@ TEST_F(LSMTTest, CloseTest) {
     auto lsmt = TidesDB::LSMT::New(testDirectory, std::filesystem::perms::all, 1024, 10);
     std::vector<uint8_t> key = {'k', 'e', 'y'};
     std::vector<uint8_t> value = {'v', 'a', 'l', 'u', 'e'};
+    std::vector<uint8_t> key2 = {'k', 'e', 'y', '2'};
+    std::vector<uint8_t> value2 = {'v', 'a', 'l', 'u', 'e', '2'};
+
+    ASSERT_TRUE(lsmt->Put(key, value));
+    ASSERT_TRUE(lsmt->Put(key2, value2));
+    lsmt->Close();
+
+    auto lsmt2 = TidesDB::LSMT::New(testDirectory, std::filesystem::perms::all, 1024, 10);
+    auto retrievedValue = lsmt2->Get(key2);
+    ASSERT_EQ(retrievedValue, value2);
+
+    // Close the LSMT
+    lsmt2->Close();
+}
+
+TEST_F(LSMTTest, CloseTest2) {
+    auto lsmt = TidesDB::LSMT::New(testDirectory, std::filesystem::perms::all, 1024, 10);
+    std::vector<uint8_t> key = {'k', 'e', 'y'};
+    std::vector<uint8_t> value = {'v', 'a', 'l', 'u', 'e'};
 
     ASSERT_TRUE(lsmt->Put(key, value));
     lsmt->Close();

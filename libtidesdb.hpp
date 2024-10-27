@@ -17,6 +17,8 @@
 #ifndef TIDESDB_LIBRARY_HPP
 #define TIDESDB_LIBRARY_HPP
 
+#include <zstd.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -33,7 +35,6 @@
 #include <shared_mutex>
 #include <string>
 #include <vector>
-#include <zstd.h>
 
 // We include the protobuf headers here because we need to use the
 // generated files for our KeyValue and Operation structs
@@ -248,6 +249,119 @@ class AVLTree {
     int GetSize();
 };
 
+// BloomFilter class
+class BloomFilter {
+   public:
+    // Constructor
+    BloomFilter(size_t size, size_t numHashes) : bitArray(size), numHashes(numHashes) {}
+
+    // Copy constructor
+    BloomFilter(const BloomFilter &other) : bitArray(other.bitArray), numHashes(other.numHashes) {}
+
+    // Assignment operator using copy-and-swap idiom
+    BloomFilter &operator=(BloomFilter other) {
+        swap(*this, other);
+        return *this;
+    }
+
+    // Swap function
+    friend void swap(BloomFilter &first, BloomFilter &second) noexcept {
+        using std::swap;
+        swap(first.bitArray, second.bitArray);
+        swap(first.numHashes, second.numHashes);
+    }
+
+    // add
+    // adds a key to the Bloom filter
+    void add(const std::vector<uint8_t> &key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t i = 0; i < numHashes; ++i) {
+            size_t hash = hashFunction(key, i);
+            bitArray[hash % bitArray.size()] = true;
+        }
+    }
+
+    // contains
+    // checks if a key is in the Bloom filter
+    bool contains(const std::vector<uint8_t> &key) const {
+        for (size_t i = 0; i < numHashes; ++i) {
+            size_t hash = hashFunction(key, i);
+            if (!bitArray[hash % bitArray.size()]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // serialize
+    // serializes the Bloom filter to a byte vector
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> data;
+        data.reserve(bitArray.size() / 8 + sizeof(numHashes));
+
+        // Serialize numHashes
+        for (size_t i = 0; i < sizeof(numHashes); ++i) {
+            data.push_back((numHashes >> (i * 8)) & 0xFF);
+        }
+
+        // Serialize bitArray
+        uint8_t byte = 0;
+        for (size_t i = 0; i < bitArray.size(); ++i) {
+            byte |= bitArray[i] << (i % 8);
+            if (i % 8 == 7) {
+                data.push_back(byte);
+                byte = 0;
+            }
+        }
+        if (bitArray.size() % 8 != 0) {
+            data.push_back(byte);
+        }
+
+        return data;
+    }
+
+    // deserialize
+    // deserializes a byte vector to a Bloom filter
+    static BloomFilter deserialize(const std::vector<uint8_t> &data) {
+        size_t numHashes = 0;
+        for (size_t i = 0; i < sizeof(numHashes); ++i) {
+            numHashes |= static_cast<size_t>(data[i]) << (i * 8);
+        }
+
+        size_t bitArraySize = (data.size() - sizeof(numHashes)) * 8;
+        BloomFilter bloomFilter(bitArraySize, numHashes);
+
+        // Deserialize bitArray with bounds checking
+        for (size_t i = 0; i < bitArraySize; ++i) {
+            size_t byteIndex = i / 8 + sizeof(numHashes);
+            size_t bitIndex = i % 8;
+            if (byteIndex < data.size() && i < bloomFilter.bitArray.size()) {
+                bloomFilter.bitArray[i] = (data[byteIndex] >> bitIndex) & 1;
+            } else {
+                break;
+            }
+        }
+
+        return bloomFilter;
+    }
+
+   private:
+    std::vector<bool> bitArray;  // Bit array
+    size_t numHashes;            // Number of hash functions
+    mutable std::mutex mutex;    // Mutex
+
+    // hashFunction
+    // generates a hash for a key
+    static size_t hashFunction(const std::vector<uint8_t> &key, size_t seed) {
+        std::hash<size_t> hasher;
+        size_t hash = seed;
+        for (const auto &byte : key) {
+            hash ^= hasher(byte) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        }
+        return hash;
+    }
+};
+
 // Pager class
 // Manages reading and writing pages to a file
 class Pager {
@@ -371,8 +485,6 @@ class SSTable {
     SSTable(std::shared_ptr<Pager> pager) : pager(pager) {}
 
     std::shared_ptr<Pager> pager;  // Pager instance
-    std::vector<uint8_t> minKey;   // Minimum key
-    std::vector<uint8_t> maxKey;   // Maximum key
     std::shared_mutex
         lock;  // Mutex for SSTable (used mainly for compaction, otherwise page locks are used)
     std::string GetFilePath() const;  // Get file path of SSTable
@@ -450,6 +562,12 @@ class LSMT {
         stopBackgroundThreads.store(false);
 
         // If logging is enabled we create a log file and write specific operations to it
+        if (logging) {
+            logFile.open(directory + getPathSeparator() + LOG_EXTENSION, std::ios::out);
+            if (!logFile.is_open()) {
+                throw TidesDBException("could not open log file");
+            }
+        }
 
         // Initialize the sstables vector
         this->sstables = std::vector<std::shared_ptr<SSTable>>();
@@ -460,22 +578,6 @@ class LSMT {
                 auto pager = std::make_shared<Pager>(
                     entry.path().string(), std::ios::in | std::ios::out | std::ios::binary);
                 auto sstable = std::make_shared<SSTable>(pager);  // Pass shared_ptr
-
-                // Populate minKey and maxKey
-                SSTableIterator it(pager);
-                if (it.Ok()) {
-                    auto kv = it.Next();
-                    if (kv) {
-                        sstable->minKey = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                    }
-                }
-
-                while (it.Ok()) {
-                    auto kv = it.Next();
-                    if (kv) {
-                        sstable->maxKey = std::vector<uint8_t>(kv->key().begin(), kv->key().end());
-                    }
-                }
 
                 this->sstables.push_back(sstable);
             }
@@ -637,7 +739,6 @@ class LSMT {
     static void AddPut(Transaction *tx, const std::vector<uint8_t> &key,
                        const std::vector<uint8_t> &value);
 
-
     // Close
     // closes the LSMT gracefully.
     void Close() {
@@ -653,19 +754,22 @@ class LSMT {
                 activeTransactions.clear();
             }
 
-            // Flush the memtable to disk
-            flushMemtable();
+            // check if memtable has data
+            if (memtable->GetSize() > 0) {
+                // Flush the memtable to disk
+                flushMemtable();
+            }
 
             // wait for flush and or compaction to finish
             {
                 std::unique_lock lock(sstablesLock);
-                cond.wait(lock, [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
+                cond.wait(lock,
+                          [this] { return isFlushing.load() == 0 && isCompacting.load() == 0; });
             }
 
             // Set isFlushing and isCompacting to 0
             isFlushing.store(0);
             isCompacting.store(0);
-
 
             // Stop background threads
             stopBackgroundThreads.store(true);
@@ -702,7 +806,6 @@ class LSMT {
             {
                 std::unique_lock<std::shared_mutex> lock(sstablesLock);
                 sstables.clear();
-                
             }
 
             // Close the log file if logging is enabled

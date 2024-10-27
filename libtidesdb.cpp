@@ -815,9 +815,13 @@ void LSMT::flushThreadFunc() {
         if (newMemtable) {
             std::vector<KeyValue> kvPairs;  // Key-value pairs to be written to the SSTable
 
+            // Create a Bloom filter
+            TidesDB::BloomFilter bloomFilter(1000, 3);
+
             // Populate kvPairs with key-value pairs from the new memtable
             newMemtable->InOrderTraversal(
-                [&kvPairs](const std::vector<uint8_t> &key, const std::vector<uint8_t> &value) {
+                [&kvPairs, &bloomFilter](const std::vector<uint8_t> &key,
+                                         const std::vector<uint8_t> &value) {
                     KeyValue kv;
 
                     // Check if the value is a tombstone
@@ -831,6 +835,9 @@ void LSMT::flushThreadFunc() {
                     kv.set_key(key.data(), key.size());
                     kv.set_value(value.data(), value.size());
                     kvPairs.push_back(kv);
+
+                    // Add key to the Bloom filter
+                    bloomFilter.add(key);
                 });
 
             // Increment the counter before using it
@@ -840,7 +847,7 @@ void LSMT::flushThreadFunc() {
                 sstableCounter = sstables.size() + 1;
             }
 
-            // Write the key-value pairs to the SSTable
+            // create ssTable path
             std::string sstablePath = directory + getPathSeparator() + "sstable_" +
                                       std::to_string(sstableCounter) + SSTABLE_EXTENSION;
 
@@ -848,19 +855,14 @@ void LSMT::flushThreadFunc() {
             auto sstable = std::make_shared<SSTable>(std::make_shared<Pager>(
                 sstablePath, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc));
 
-            // We must set minKey and maxKey
-            if (!kvPairs.empty()) {
-                sstable->minKey = std::vector<uint8_t>(kvPairs.front().key().begin(),
-                                                       kvPairs.front().key().end());
-                sstable->maxKey =
-                    std::vector<uint8_t>(kvPairs.back().key().begin(), kvPairs.back().key().end());
-            }
-
             if (kvPairs.empty()) {
                 continue;  // Skip if there are no key-value pairs
             }
 
-            // Serialize the key-value pairs
+            // Serialize the Bloom filter and write it as the first page
+            sstable->pager->Write(bloomFilter.serialize());
+
+            // Serialize the key-value pairs starting from the second page
             for (const auto &kv : kvPairs) {
                 sstable->pager->Write(serialize(kv));
             }
@@ -1111,20 +1113,24 @@ std::vector<uint8_t> LSMT::Get(const std::vector<uint8_t> &key) {
             continue;  // Skip null SSTables
         }
 
-        {
-            // we must lock for the min and max key check
-            std::shared_lock lock(sstable->lock);
-
-            // If the key is not within the range of this SSTable, skip it
-            if (key < sstable->minKey || key > sstable->maxKey) {
-                continue;
-            }
-        }
-
         // Get an iterator for the SSTable file
         auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
         if (!sstableIt) {
             continue;  // Skip if iterator creation failed
+        }
+
+        // Read first page check if it is a bloom filter
+        auto bloomFilterData = sstable->pager->Read(0, compress);
+        if (bloomFilterData.empty()) {
+            continue;  // Skip if the Bloom filter data is empty
+        }
+
+        // Deserialize the Bloom filter
+        TidesDB::BloomFilter bloomFilter = TidesDB::BloomFilter::deserialize(bloomFilterData);
+
+        // Check if the key exists in the Bloom filter
+        if (!bloomFilter.contains(key)) {
+            continue;  // Skip this SSTable if the key is not in the Bloom filter
         }
 
         // Iterate over the SSTable
@@ -1288,11 +1294,13 @@ bool LSMT::Compact() {
                         }
 
                         std::optional<std::vector<uint8_t>> minKey, maxKey;
+                        BloomFilter bloomFilter(1000, 3);
 
                         while (currentKey1.has_value() || currentKey2.has_value()) {
                             if (!currentKey2.has_value() ||
                                 (currentKey1.has_value() && *currentKey1 < *currentKey2)) {
                                 newMemtable->Insert(*currentKey1, *currentValue1);
+                                bloomFilter.add(*currentKey1);  // Add key to Bloom filter
                                 if (!minKey.has_value() || *currentKey1 < *minKey) {
                                     minKey = currentKey1;
                                 }
@@ -1316,6 +1324,7 @@ bool LSMT::Compact() {
                                 }
                             } else {
                                 newMemtable->Insert(*currentKey2, *currentValue2);
+                                bloomFilter.add(*currentKey2);  // Add key to Bloom filter
                                 if (!minKey.has_value() || *currentKey2 < *minKey) {
                                     minKey = currentKey2;
                                 }
@@ -1349,6 +1358,11 @@ bool LSMT::Compact() {
                             auto newSSTable = std::make_shared<SSTable>(std::make_shared<Pager>(
                                 newSSTablePath,
                                 std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc));
+
+                            // Serialize and write the Bloom filter to the first page
+                            std::vector<uint8_t> bloomFilterData = bloomFilter.serialize();
+                            newSSTable->pager->Write(bloomFilterData);
+
                             newMemtable->InOrderTraversal(
                                 [&newSSTable, this](const std::vector<uint8_t> &key,
                                                     const std::vector<uint8_t> &value) {
@@ -1361,13 +1375,6 @@ bool LSMT::Compact() {
                                         newSSTable->pager->Write(serialized);
                                     }
                                 });
-
-                            if (minKey.has_value()) {
-                                newSSTable->minKey = *minKey;
-                            }
-                            if (maxKey.has_value()) {
-                                newSSTable->maxKey = *maxKey;
-                            }
 
                             {
                                 std::unique_lock<std::shared_mutex> sstablesLockGuard(sstablesLock);
@@ -1560,21 +1567,24 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NGet(
             continue;  // Skip null SSTables
         }
 
-        // If the key is not within the range of this SSTable, skip it
-        {
-            // we must lock for the min and max key check
-            std::shared_lock lock(sstable->lock);
-
-            // If the key is not within the range of this SSTable, skip it
-            if (key < sstable->minKey || key > sstable->maxKey) {
-                continue;
-            }
-        }
-
         // Get an iterator for the SSTable file
         auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
         if (!sstableIt) {
             continue;  // Skip if iterator creation failed
+        }
+
+        // Read first page check if it is a bloom filter
+        auto bloomFilterData = sstable->pager->Read(0, compress);
+        if (bloomFilterData.empty()) {
+            continue;  // Skip if the Bloom filter data is empty
+        }
+
+        // Deserialize the Bloom filter
+        TidesDB::BloomFilter bloomFilter = TidesDB::BloomFilter::deserialize(bloomFilterData);
+
+        // Check if the key exists in the Bloom filter
+        if (!bloomFilter.contains(key)) {
+            continue;  // Skip this SSTable if the key is not in the Bloom filter
         }
 
         // Iterate over the SSTable
@@ -1623,21 +1633,24 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
             continue;  // Skip null SSTables
         }
 
-        // If the key is not within the range of this SSTable, skip it
-        {
-            // we must lock for the min and max key check
-            std::shared_lock lock(sstable->lock);
-
-            // If the key is not within the range of this SSTable, skip it
-            if (key < sstable->minKey || key > sstable->maxKey) {
-                continue;
-            }
-        }
-
         // Get an iterator for the SSTable file
         auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
         if (!sstableIt) {
             continue;  // Skip if iterator creation failed
+        }
+
+        // Read first page check if it is a bloom filter
+        auto bloomFilterData = sstable->pager->Read(0, compress);
+        if (bloomFilterData.empty()) {
+            continue;  // Skip if the Bloom filter data is empty
+        }
+
+        // Deserialize the Bloom filter
+        TidesDB::BloomFilter bloomFilter = TidesDB::BloomFilter::deserialize(bloomFilterData);
+
+        // Check if the key exists in the Bloom filter
+        if (!bloomFilter.contains(key)) {
+            continue;  // Skip this SSTable if the key is not in the Bloom filter
         }
 
         // Iterate over the SSTable
@@ -1686,20 +1699,24 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Greater
             continue;  // Skip null SSTables
         }
 
-        // If the key is not within the range of this SSTable, skip it
-        {
-            // we must lock for the min and max key check
-            std::shared_lock lock(sstable->lock);
-
-            // If the key is not within the range of this SSTable, skip it
-            if (key < sstable->minKey || key > sstable->maxKey) {
-                continue;
-            }
-        }
         // Get an iterator for the SSTable file
         auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
         if (!sstableIt) {
             continue;  // Skip if iterator creation failed
+        }
+
+        // Read first page check if it is a bloom filter
+        auto bloomFilterData = sstable->pager->Read(0, compress);
+        if (bloomFilterData.empty()) {
+            continue;  // Skip if the Bloom filter data is empty
+        }
+
+        // Deserialize the Bloom filter
+        TidesDB::BloomFilter bloomFilter = TidesDB::BloomFilter::deserialize(bloomFilterData);
+
+        // Check if the key exists in the Bloom filter
+        if (!bloomFilter.contains(key)) {
+            continue;  // Skip this SSTable if the key is not in the Bloom filter
         }
 
         // Iterate over the SSTable
@@ -1747,22 +1764,24 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::LessTha
             continue;  // Skip null SSTables
         }
 
-        // If the key is not within the range of this SSTable, skip it
-
-        {
-            // we must lock for the min and max key check
-            std::shared_lock lock(sstable->lock);
-
-            // If the key is not within the range of this SSTable, skip it
-            if (key <= sstable->minKey) {
-                continue;
-            }
-        }
-
         // Get an iterator for the SSTable file
         auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
         if (!sstableIt) {
             continue;  // Skip if iterator creation failed
+        }
+
+        // Read first page check if it is a bloom filter
+        auto bloomFilterData = sstable->pager->Read(0, compress);
+        if (bloomFilterData.empty()) {
+            continue;  // Skip if the Bloom filter data is empty
+        }
+
+        // Deserialize the Bloom filter
+        TidesDB::BloomFilter bloomFilter = TidesDB::BloomFilter::deserialize(bloomFilterData);
+
+        // Check if the key exists in the Bloom filter
+        if (!bloomFilter.contains(key)) {
+            continue;  // Skip this SSTable if the key is not in the Bloom filter
         }
 
         // Iterate over the SSTable
@@ -1810,21 +1829,24 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Greater
             continue;  // Skip null SSTables
         }
 
-        // If the key is not within the range of this SSTable, skip it
-        {
-            // we must lock for the min and max key check
-            std::shared_lock lock(sstable->lock);
-
-            // If the key is not within the range of this SSTable, skip it
-            if (key >= sstable->maxKey) {
-                continue;
-            }
-        }
-
         // Get an iterator for the SSTable file
         auto sstableIt = std::make_unique<SSTableIterator>(sstable->pager);
         if (!sstableIt) {
             continue;  // Skip if iterator creation failed
+        }
+
+        // Read first page check if it is a bloom filter
+        auto bloomFilterData = sstable->pager->Read(0, compress);
+        if (bloomFilterData.empty()) {
+            continue;  // Skip if the Bloom filter data is empty
+        }
+
+        // Deserialize the Bloom filter
+        TidesDB::BloomFilter bloomFilter = TidesDB::BloomFilter::deserialize(bloomFilterData);
+
+        // Check if the key exists in the Bloom filter
+        if (!bloomFilter.contains(key)) {
+            continue;  // Skip this SSTable if the key is not in the Bloom filter
         }
 
         // Iterate over the SSTable
@@ -1870,16 +1892,6 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::Range(
         const auto &sstable = *it;
         if (!sstable) {
             continue;  // Skip null SSTables
-        }
-
-        {
-            // we must lock for the min and max key check
-            std::shared_lock lock(sstable->lock);
-
-            // If the key is not within the range of this SSTable, skip it
-            if (end < sstable->minKey || start > sstable->maxKey) {
-                continue;
-            }
         }
 
         // Get an iterator for the SSTable file
@@ -1931,17 +1943,6 @@ std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> LSMT::NRange(
         const auto &sstable = *it;
         if (!sstable) {
             continue;  // Skip null SSTables
-        }
-
-        // If the key range does not overlap with this SSTable, skip it
-        {
-            // we must lock for the min and max key check
-            std::shared_lock lock(sstable->lock);
-
-            // If the key is not within the range of this SSTable, skip it
-            if (end < sstable->minKey || start > sstable->maxKey) {
-                continue;
-            }
         }
 
         // Get an iterator for the SSTable file

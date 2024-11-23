@@ -1,6 +1,0 @@
-syntax = "proto3";
-
-message KeyValue {
-    bytes key = 1;
-    bytes value = 2;
-}

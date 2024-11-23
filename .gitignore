@@ -19,3 +19,4 @@
 *.app
 cmake-build-debug
 .idea
+build

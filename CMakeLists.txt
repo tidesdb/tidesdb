@@ -1,86 +1,63 @@
-cmake_minimum_required(VERSION 3.29)
-project(tidesdb)
+# cmake -S . -B build
+# cmake --build build
+# cmake --install build
+cmake_minimum_required(VERSION 3.25)
+project(tidesdb C)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_C_STANDARD 23)
+set(PROJECT_VERSION 1.0.0)
 
-# Find Protobuf package
-find_package(Protobuf REQUIRED)
-
-# Find Zstandard package
 find_package(zstd REQUIRED)
 
-# Include the generated protobuf headers
-include_directories(${Protobuf_INCLUDE_DIRS})
+add_library(xxhash STATIC external/xxhash.c)
+add_library(tidesdb SHARED src/tidesdb.c src/tidesdb.h src/err.c src/err.h src/pager.c src/pager.h src/skiplist.c src/skiplist.h src/queue.c src/queue.h src/bloomfilter.c src/bloomfilter.h src/serializable_structures.h src/serialize.c src/serialize.h)
 
-# Specify paths for generated protobuf source and header files
-set(PROTO_SRC
-        proto/kv.pb.cc
-        proto/operation.pb.cc
-)
+install(TARGETS tidesdb
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib)
 
-set(PROTO_HDR
-        proto/kv.pb.h
-        proto/operation.pb.h
-)
-
-# Add the library and link with Protobuf and Zstandard
-add_library(tidesdb STATIC libtidesdb.cpp ${PROTO_SRC})
-
-target_link_libraries(tidesdb PRIVATE
-        ${Protobuf_LIBRARIES}
-        zstd::libzstd
-)
-
-target_include_directories(tidesdb PRIVATE ${Protobuf_INCLUDE_DIRS})
-
-# Add Google Test
+install(FILES src/tidesdb.h src/err.h src/pager.h src/skiplist.h src/queue.h src/bloomfilter.h external/xxhash.h src/serializable_structures.h src/serialize.h DESTINATION include)
 enable_testing()
-find_package(GTest REQUIRED)
-include_directories(${GTest_INCLUDE_DIRS})
 
-# Collect all test source files
-file(GLOB TEST_SRC "tests/*.cpp")
+add_executable(err_tests test/err__tests.c)
+add_executable(pager_tests test/pager__tests.c)
+add_executable(skiplist_tests test/skiplist__tests.c)
+add_executable(queue_tests test/queue__tests.c)
+add_executable(bloomfilter_tests test/bloomfilter__tests.c)
+add_executable(serialize_tests test/serialize__tests.c)
+add_executable(tidesdb_tests test/tidesdb__tests.c)
 
-# Define the test executable
-add_executable(runTests ${TEST_SRC}
-        tests/convert_to_char_vector.cpp
-        tests/run_tests.cpp
-        tests/compress_zstd.cpp
-        tests/decompres_zstd.cpp
-        tests/serialize.cpp
-        tests/deserialize.cpp
-        tests/serialize_operation.cpp
-        tests/deserialize_operation.cpp
-        tests/avl.cpp
-        tests/avl_concurrent.cpp
-        tests/avl_ttl.cpp
-        tests/lsmt.cpp
-        tests/lsmt_flush.cpp
-        tests/lsmt_flush_concurrent.cpp
-        tests/lsmt_compact.cpp
-        tests/lsmt_compact_concurrent.cpp
-        tests/pager.cpp
-        tests/pager_overflows.cpp
-        tests/sstable.cpp
-        tests/sstable_iterator.cpp
-        tests/wal.cpp
-        tests/recovery.cpp
-        tests/transactions.cpp
-        tests/transactions_concurrent.cpp
-        tests/equi_functions.cpp
-        tests/range_functions.cpp
-        tests/put_batch.cpp
-        tests/delete_batch.cpp
-        tests/lsmt_log.cpp
-        tests/bloomfilter.cpp
+target_link_libraries(tidesdb xxhash zstd)
+target_link_libraries(pager_tests tidesdb)
+target_link_libraries(skiplist_tests tidesdb)
+target_link_libraries(queue_tests tidesdb)
+target_link_libraries(bloomfilter_tests tidesdb xxhash)
+target_link_libraries(serialize_tests tidesdb)
+target_link_libraries(tidesdb_tests tidesdb xxhash zstd)
+
+add_test(NAME err_tests COMMAND err_tests)
+add_test(NAME pager_tests COMMAND pager_tests)
+add_test(NAME skiplist_tests COMMAND skiplist_tests)
+add_test(NAME queue_tests COMMAND queue_tests)
+add_test(NAME bloomfilter_tests COMMAND bloomfilter_tests)
+add_test(NAME serialize_tests COMMAND serialize_tests)
+add_test(NAME tidesdb_test COMMAND tidesdb_tests)
+
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/TidesDBConfigVersion.cmake"
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY AnyNewerVersion
 )
 
-# Link the test executable with Google Test and tidesdb
-target_link_libraries(runTests PRIVATE
-        GTest::GTest
-        GTest::Main
-        tidesdb
+configure_package_config_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TidesDBConfig.cmake.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/TidesDBConfig.cmake"
+        INSTALL_DESTINATION lib/cmake/tidesdb
 )
 
-# Add tests
-add_test(NAME runTests COMMAND runTests)
+install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/TidesDBConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/TidesDBConfigVersion.cmake"
+        DESTINATION lib/cmake/tidesdb
+)

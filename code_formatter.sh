@@ -1,6 +1,5 @@
 #!/bin/bash
 
-EXCLUDE_DIRS="proto\|ffi"
+EXCLUDE_DIRS="external\|cmake-build-debug\|.idea|build|cmake"
 
-# Find all files except those in the excluded directories and run clang-format
-find . -type f -name "*.cpp" -o -name "*.hpp" -o -name "*.h" | grep -v "$EXCLUDE_DIRS" | xargs clang-format -i
+find . -type f -name "*.c" -o -name "*.h" | grep -v "$EXCLUDE_DIRS" | xargs clang-format -i

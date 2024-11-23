@@ -1,1 +1,0 @@
-## Haskell TidesDB FFI

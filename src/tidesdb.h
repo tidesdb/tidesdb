@@ -185,9 +185,9 @@ typedef struct {
  * @param end the end index for the sstables
  */
 typedef struct {
-    column_family* cf; // the column family
-    int start;        // the start index for the sstables
-    int end;         // the end index for the sstables
+    column_family* cf;  // the column family
+    int start;          // the start index for the sstables
+    int end;            // the end index for the sstables
 } compact_thread_args;
 
 /* TidesDB function prototypes */
@@ -569,8 +569,7 @@ void* _compact_sstables_thread(void* arg);
  * @param sst2 the second sstable
  * @param cf the column family
  */
-sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family *cf);
-
+sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf);
 
 /*
  * _uchar_arr_to_uint8
@@ -580,7 +579,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family *cf);
  * @param uint8_arr the uint8_t array
  * @return whether the conversion was successful
  */
-bool _uchar_arr_to_uint8(const unsigned char** uchar_arr, size_t length, uint8_t** uint8_arr);
+bool _uchar_arr_to_uint8(const unsigned char** uchar_arr, size_t* length, uint8_t** uint8_arr);
 
 /*
  * _uint8_arr_to_uchar
@@ -590,7 +589,6 @@ bool _uchar_arr_to_uint8(const unsigned char** uchar_arr, size_t length, uint8_t
  * @param uchar_arr the unsigned char array
  * @return whether the conversion was successful
  */
-bool _uint8_arr_to_uchar(const uint8_t** uint8_arr, size_t length, unsigned char** uchar_arr);
-
+bool _uint8_arr_to_uchar(const uint8_t** uint8_arr, size_t* length, unsigned char** uchar_arr);
 
 #endif  // TIDESDB_H

@@ -670,6 +670,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
         return tidesdb_err_new(1032, "Failed to lock flush lock");
     }
 
+
     // we check the sstables starting at the latest
     for (int i = cf->num_sstables - 1; i >= 0; i--) {
         // we read initial pages for bloom filter
@@ -685,21 +686,117 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
         bloomfilter *bf = NULL;
 
         if (!deserialize_bloomfilter(bloom_filter_buffer, bloom_filter_read, &bf, cf->config.compressed)) {
+            free(bloom_filter_buffer);
             pthread_mutex_unlock(&tdb->flush_lock);
             return tidesdb_err_new(1034, "Failed to deserialize bloom filter");
+        }
+
+        if (bf == NULL) {
+            free(bloom_filter_buffer);
+            continue;
         }
 
         // we check if the key is in the bloom filter
         if (bloomfilter_check(bf, key, key_size)) {
 
-            // now we start a scanning for the key
+            // we create a pager cursor
+            pager_cursor* cursor = NULL;
 
+            if (!pager_cursor_init(cf->sstables[i]->pager, &cursor)) {
+                bloomfilter_destroy(bf);
+                free(bloom_filter_buffer);
+                pthread_mutex_unlock(&tdb->flush_lock);
+                return tidesdb_err_new(1035, "Failed to initialize pager cursor");
+            }
+
+            // we iterate over the sstable
+            unsigned char* buffer = NULL;
+            size_t buffer_len = 0;
+
+            // skip the first page as it contains the bloom filter
+            if (!pager_cursor_next(cursor)) {
+                bloomfilter_destroy(bf);
+                free(bloom_filter_buffer);
+                pager_cursor_free(cursor);
+                pthread_mutex_unlock(&tdb->flush_lock);
+                return tidesdb_err_new(1036, "Failed to move to next page");
+            }
+
+            while (pager_cursor_next(cursor)) {
+                if (!pager_read(cf->sstables[i]->pager, cursor->page_number, &buffer, &buffer_len)) {
+                    break;
+                }
+
+                // we deserialize the key-value pair
+                key_value_pair* kv = NULL;
+
+
+                if (!deserialize_key_value_pair(buffer, buffer_len, &kv, cf->config.compressed)) {
+                    // free the buffer
+                    free(buffer);
+                    // go to the next page
+                    continue;
+                }
+
+
+                // we check if the key is the one we are looking for
+                if (kv->key_size == key_size && memcmp(kv->key, key, key_size) == 0) {
+                    // we found the key
+                    // we check if the value is a tombstone
+                    if (_is_tombstone(kv->value, kv->value_size)) {
+                        // we return NULL as the key is a tombstone
+                        free(kv->key);
+                        free(kv->value);
+                        free(kv);
+                        free(buffer);
+                        bloomfilter_destroy(bf);
+                        free(bloom_filter_buffer);
+                        pager_cursor_free(cursor);
+                        pthread_mutex_unlock(&tdb->flush_lock);
+                        return tidesdb_err_new(1031, "Key not found");
+                    }
+
+                    // we return the value
+                    *value = kv->value;
+                    *value_size = kv->value_size;
+
+                    // we free the key and key-value pair
+                    free(kv->key);
+                    free(kv);
+                    free(buffer);
+
+                    // we free the cursor
+                    pager_cursor_free(cursor);
+
+                    // we unlock the flush lock
+                    pthread_mutex_unlock(&tdb->flush_lock);
+
+                    // we free the bloom filter
+                    bloomfilter_destroy(bf);
+                    free(bloom_filter_buffer);
+
+                    return NULL;
+                }
+
+                // we free the key and key-value pair
+                free(kv->key);
+                free(kv->value);
+                free(kv);
+
+            }
+
+
+
+            pager_cursor_free(cursor);
         }
 
+        // we free the bloom filter
+        bloomfilter_destroy(bf);
+        free(bloom_filter_buffer);
     }
 
+    pthread_mutex_unlock(&tdb->flush_lock);
     return tidesdb_err_new(1031, "Key not found");
-
 }
 
 tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const unsigned char* key,

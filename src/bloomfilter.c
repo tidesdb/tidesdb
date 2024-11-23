@@ -51,13 +51,16 @@ void bloomfilter_destroy(bloomfilter *bf) {
 
     if (bf->next != NULL) {
         bloomfilter_destroy(bf->next);
+        bf->next = NULL;
     }
 
     if (bf->set != NULL) {
         free(bf->set);
+        bf->set = NULL;
     }
 
     free(bf);
+    bf = NULL;
 }
 
 bool bloomfilter_check(bloomfilter *bf, const unsigned char *data, unsigned int data_len) {

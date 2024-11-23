@@ -6,6 +6,15 @@ TidesDB is designed to be fast, simple, durable and efficient.  It is not a full
 > [!WARNING]
 > In very active beta development. Not ready for production use.
 
+## Todo list
+- [ ] Finalize and check methods for memory safety
+- [ ] DB cursor
+- [ ] Finalize error codes and their messages
+- [ ] Add more tests fulfilling `@todo` comments
+- [ ] Add more tests for edge cases such as concurrency
+- [ ] Benchmark
+- [ ] Documentation
+
 ## Features
 - [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist is granularly locked.  SSTables are sorted, immutable and can be read concurrently and are protected via page locks.
 - [x] **Column Families** store data in separate key-value stores.

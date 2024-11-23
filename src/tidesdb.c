@@ -471,8 +471,19 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family *cf) {
         return NULL;
     }
 
+   unsigned char *bf_buffer_uchar = malloc(bf_buffer_len);
+
+    if (!_uint8_arr_to_uchar((const uint8_t**)&bf_buffer, bf_buffer_len, &bf_buffer_uchar)) {
+        skiplist_destroy(mergetable);
+        bloomfilter_destroy(bf);
+        pager_close(new_pager);
+        return NULL;
+    }
+
+    unsigned int page_num;
+
     // write the bloom filter to the pager
-    if (!pager_write(new_pager, 0, bf_buffer, bf_buffer_len)) {
+    if (!pager_write(new_pager, bf_buffer_uchar , bf_buffer_len, &page_num)) {
         skiplist_destroy(mergetable);
         bloomfilter_destroy(bf);
         pager_close(new_pager);
@@ -491,7 +502,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family *cf) {
         unsigned char* kv_buffer = NULL;
         size_t kv_buffer_len = 0;
 
-        key_value_pair kvp* = malloc(sizeof(key_value_pair));
+        key_value_pair *kvp = malloc(sizeof(key_value_pair));
 
         kvp->key = sl_cursor->current->key;
         kvp->key_size = sl_cursor->current->key_size;
@@ -576,7 +587,6 @@ tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uns
 
     // we check if the memtable has reached the flush threshold
     if ((int)cf->memtable->total_size >= cf->config.flush_threshold) {
-        printf("Adding to flush queue\n");
         // get flush mutex
         pthread_mutex_lock(&tdb->flush_lock);
 
@@ -1868,9 +1878,6 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
         return false;
     }
 
-
-    printf("flushed memtable to sstable\n");
-
     return true;
 }
 
@@ -2154,4 +2161,28 @@ int _remove_directory(const char* path) {
         }
 
         return 0;
+}
+
+bool _uchar_arr_to_uint8(const unsigned char** uchar_arr, size_t length, uint8_t** uint8_arr) {
+    if (uchar_arr == NULL || uint8_arr == NULL) {
+        return false;
+    }
+    *uint8_arr = (uint8_t*)malloc(length * sizeof(uint8_t));
+    if (*uint8_arr == NULL) {
+        return false;
+    }
+    memcpy(*uint8_arr, *uchar_arr, length);
+    return true;
+}
+
+bool _uint8_arr_to_uchar(const uint8_t** uint8_arr, size_t length, unsigned char** uchar_arr) {
+    if (uint8_arr == NULL || uchar_arr == NULL) {
+        return false;
+    }
+    *uchar_arr = (unsigned char*)malloc(length * sizeof(unsigned char));
+    if (*uchar_arr == NULL) {
+        return false;
+    }
+    memcpy(*uchar_arr, *uint8_arr, length);
+    return true;
 }

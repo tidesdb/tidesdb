@@ -671,8 +671,6 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
         // we check if the value is a tombstone
         if (_is_tombstone(*value, *value_size)) {
             // we return NULL as the key is a tombstone
-            free(*value);
-            *value = NULL;
             return tidesdb_err_new(1031, "Key not found");
         }
 
@@ -839,8 +837,6 @@ tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const 
         return tidesdb_err_new(1030, "Failed to put into memtable");
     }
 
-    free(tombstone);
-
     return NULL;
 }
 
@@ -996,9 +992,6 @@ tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction) {
                 // mark op committed
                 transaction->ops[i].committed = true;
 
-                free(op.kv->value);
-                free(op.kv->key);
-                free(op.kv);
                 break;
             case OP_DELETE:
 
@@ -1013,10 +1006,6 @@ tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction) {
                 // mark op committed
                 transaction->ops[i].committed = true;
 
-                free(tombstone);
-                free(op.kv->value);
-                free(op.kv->key);
-                free(op.kv);
                 break;
             default:
                 break;
@@ -1111,11 +1100,20 @@ tidesdb_err* tidesdb_txn_free(txn* transaction) {
 
     for (int i = 0; i < transaction->num_ops; i++) {
         free(transaction->ops[i].op->column_family);
-        free(transaction->ops[i].op->kv->key);
-        free(transaction->ops[i].op->kv->value);
-        free(transaction->ops[i].rollback_op->column_family);
-        free(transaction->ops[i].rollback_op->kv->key);
-        free(transaction->ops[i].rollback_op->kv->value);
+        if (transaction->ops[i].op->kv != NULL) {
+            free(transaction->ops[i].op->kv->key);
+            free(transaction->ops[i].op->kv->value);
+            free(transaction->ops[i].op->kv);
+        }
+
+        if (transaction->ops[i].rollback_op != NULL) {
+            free(transaction->ops[i].rollback_op->column_family);
+            if (transaction->ops[i].rollback_op->kv != NULL) {
+                free(transaction->ops[i].rollback_op->kv->key);
+                free(transaction->ops[i].rollback_op->kv->value);
+                free(transaction->ops[i].rollback_op->kv);
+            }
+        }
         free(transaction->ops[i].op);
         free(transaction->ops[i].rollback_op);
     }
@@ -1749,10 +1747,6 @@ bool _replay_from_wal(tidesdb* tdb, wal* wal) {
     }
 
     pager_cursor_free(pc);
-
-    if (!_truncate_wal(wal, 0)) {
-        return false;
-    }
 
     return true;
 }

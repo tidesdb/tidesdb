@@ -321,7 +321,10 @@ int skiplist_clear(skiplist *list) {
     while (current != NULL) {
         skiplist_node *next = current->forward[0];
         free(current->key);
-        free(current->value);
+        if (current->value != NULL) {
+            free(current->value);
+        }
+
         free(current);
         current = next;
     }

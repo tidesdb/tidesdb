@@ -41,13 +41,13 @@ void test_pager_write_read() {
     assert(pager_open("test.db", &p) == true);
     assert(p != NULL);
 
-    unsigned char key[] = "key";
+    uint8_t key[] = "key";
     unsigned int key_size = sizeof(key);
     unsigned int page_num = 0;
 
     assert(pager_write(p, key, key_size, &page_num) == true);
 
-    unsigned char* read_key = NULL;
+    uint8_t* read_key = NULL;
     size_t read_key_size = 0;
 
     assert(pager_read(p, page_num, &read_key, &read_key_size) == true);
@@ -67,19 +67,19 @@ void test_pager_write_reopen_read() {
     assert(pager_open("test.db", &p) == true);
     assert(p != NULL);
 
-    unsigned char key[] = "key";
+    uint8_t key[] = "key";
     unsigned int key_size = sizeof(key);
     unsigned int page_num = 0;
 
     assert(pager_write(p, key, key_size, &page_num) == true);
 
-    unsigned char key2[] = "key2";
+    uint8_t key2[] = "key2";
     unsigned int key_size2 = sizeof(key2);
     unsigned int page_num2 = 0;
 
     assert(pager_write(p, key2, key_size2, &page_num2) == true);
 
-    unsigned char* read_key = NULL;
+    uint8_t* read_key = NULL;
     size_t read_key_size = 0;
 
     assert(pager_read(p, page_num2, &read_key, &read_key_size) == true);
@@ -93,7 +93,7 @@ void test_pager_write_reopen_read() {
     // reopen
     assert(pager_open("test.db", &p) == true);
 
-    unsigned char* read_key2 = NULL;
+    uint8_t* read_key2 = NULL;
     size_t read_key_size2 = 0;
 
     assert(pager_read(p, page_num2, &read_key2, &read_key_size2) == true);
@@ -115,7 +115,7 @@ void test_pager_overflowed_write_read() {
     assert(pager_open("test.db", &p) == true);
     assert(p != NULL);
 
-    unsigned char value[] =
+    uint8_t value[] =
         "In the realm of the dark, where silence reigns, A world unseen by eyes, where logic "
         "remains. A whispering hum in the wires and boards, Where every signal is a tale that "
         "accords. It starts with a flicker, a pulse, a shift, In the lowest of levels, a binary "
@@ -151,7 +151,7 @@ void test_pager_overflowed_write_read() {
 
     assert(pager_write(p, value, value_size, &page_num) == true);
 
-    unsigned char* read_value = NULL;
+    uint8_t* read_value = NULL;
     size_t read_value_size = 0;
 
     assert(pager_read(p, page_num, &read_value, &read_value_size) == true);
@@ -173,7 +173,7 @@ void test_pager_cursor() {
     assert(pager_open("test.db", &p) == true);
     assert(p != NULL);
 
-    unsigned char value[] =
+    uint8_t value[] =
         "In the realm of the dark, where silence reigns, A world unseen by eyes, where logic "
         "remains. A whispering hum in the wires and boards, Where every signal is a tale that "
         "accords. It starts with a flicker, a pulse, a shift, In the lowest of levels, a binary "
@@ -209,7 +209,7 @@ void test_pager_cursor() {
 
     assert(pager_write(p, value, value_size, &page_num) == true);
 
-    unsigned char value2[] = "value 2";
+    uint8_t value2[] = "value 2";
     unsigned int value_size2 = sizeof(value2);
     unsigned int page_num2 = 0;
 
@@ -219,7 +219,7 @@ void test_pager_cursor() {
 
     assert(pager_cursor_init(p, &cursor) == true);
 
-    unsigned char* read_value = NULL;
+    uint8_t* read_value = NULL;
     size_t read_value_size = 0;
 
     assert(pager_read(p, page_num, &read_value, &read_value_size) == true);
@@ -255,7 +255,7 @@ void test_pager_pages_count() {
     assert(p != NULL);
 
     for (int i = 0; i < 1000; i++) {
-        unsigned char value[] = "value";
+        uint8_t value[] = "value";
         unsigned int value_size = sizeof(value);
         unsigned int page_num = 0;
 
@@ -284,7 +284,7 @@ void test_pager_pager_size() {
     assert(p != NULL);
 
     for (int i = 0; i < 1000; i++) {
-        unsigned char value[] = "value";
+        uint8_t value[] = "value";
         unsigned int value_size = sizeof(value);
         unsigned int page_num = 0;
 
@@ -313,7 +313,7 @@ void test_pager_truncate() {
     assert(p != NULL);
 
     for (int i = 0; i < 1000; i++) {
-        unsigned char value[] = "value";
+        uint8_t value[] = "value";
         unsigned int value_size = sizeof(value);
         unsigned int page_num = 0;
 

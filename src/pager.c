@@ -195,14 +195,14 @@ bool pager_close(pager* p) {
     return true;
 }
 
-bool pager_write(pager* p, unsigned char* data, size_t data_len, unsigned int* init_page_number) {
+bool pager_write(pager* p, uint8_t* data, size_t data_len, unsigned int* init_page_number) {
     if (!p || !p->file || !p->page_locks || !data || data_len == 0) {
         return false;
     }
 
     size_t pages_needed = (data_len + PAGE_BODY - 1) / PAGE_BODY;
     size_t remaining_data = data_len;
-    unsigned char buffer[PAGE_SIZE];
+    uint8_t buffer[PAGE_SIZE];
     size_t offset = 0;
 
     long page_number = p->num_pages;  // Start from the current number of pages
@@ -281,14 +281,13 @@ bool pager_write(pager* p, unsigned char* data, size_t data_len, unsigned int* i
     return true;
 }
 
-bool pager_read(pager* p, unsigned int start_page_number, unsigned char** buffer,
-                size_t* buffer_len) {
+bool pager_read(pager* p, unsigned int start_page_number, uint8_t** buffer, size_t* buffer_len) {
     if (!p || !p->file || !p->page_locks || !buffer || !buffer_len) {
         return false;
     }
 
     size_t offset = 0;
-    unsigned char page_buffer[PAGE_SIZE];
+    uint8_t page_buffer[PAGE_SIZE];
     long page_number = start_page_number;
     size_t actual_data_len = 0;
 
@@ -310,7 +309,7 @@ bool pager_read(pager* p, unsigned int start_page_number, unsigned char** buffer
 
         size_t chunk_size = PAGE_SIZE - PAGE_HEADER;
         *buffer_len = offset + chunk_size;
-        unsigned char* new_buffer = (unsigned char*)realloc(*buffer, *buffer_len);
+        uint8_t* new_buffer = (uint8_t*)realloc(*buffer, *buffer_len);
         if (new_buffer == NULL) {
             free(*buffer);
             return false;
@@ -362,7 +361,7 @@ bool pager_cursor_next(pager_cursor* cursor) {
 
     while (cursor->page_number < (long)cursor->pager->num_pages - 1) {
         cursor->page_number++;
-        unsigned char page_buffer[PAGE_SIZE];
+        uint8_t page_buffer[PAGE_SIZE];
         pthread_rwlock_rdlock(&cursor->pager->page_locks[cursor->page_number]);
         if (fseek(cursor->pager->file, cursor->page_number * PAGE_SIZE, SEEK_SET) != 0) {
             pthread_rwlock_unlock(&cursor->pager->page_locks[cursor->page_number]);
@@ -391,7 +390,7 @@ bool pager_cursor_prev(pager_cursor* cursor) {
 
     while (cursor->page_number > 0) {
         cursor->page_number--;
-        unsigned char page_buffer[PAGE_SIZE];
+        uint8_t page_buffer[PAGE_SIZE];
         pthread_rwlock_rdlock(&cursor->pager->page_locks[cursor->page_number]);
         if (fseek(cursor->pager->file, cursor->page_number * PAGE_SIZE, SEEK_SET) != 0) {
             pthread_rwlock_unlock(&cursor->pager->page_locks[cursor->page_number]);

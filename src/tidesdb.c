@@ -75,13 +75,13 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb) {
         // loading their sstables and sorting them by last modified being last
         for (int i = 0; i < (*tdb)->num_column_families; i++) {
             // we load the sstables
-            if (!_load_sstables(&(*tdb)->column_families[i])) {
-                return tidesdb_err_new(1007, "Failed to load sstables");
-            }
+            _load_sstables(&(*tdb)->column_families[i]);  // there could be no sstables
 
-            // we sort the sstables
-            if (!_sort_sstables(&(*tdb)->column_families[i])) {
-                return tidesdb_err_new(1008, "Failed to sort sstables");
+            if ((*tdb)->column_families[i].num_sstables > 0) {
+                // we sort the sstables
+                if (!_sort_sstables(&(*tdb)->column_families[i])) {
+                    return tidesdb_err_new(1008, "Failed to sort sstables");
+                }
             }
         }
     }
@@ -493,19 +493,10 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
         return NULL;
     }
 
-    unsigned char* bf_buffer_uchar = malloc(bf_buffer_len);
-
-    if (!_uint8_arr_to_uchar((const uint8_t**)&bf_buffer, &bf_buffer_len, &bf_buffer_uchar)) {
-        skiplist_destroy(mergetable);
-        bloomfilter_destroy(bf);
-        pager_close(new_pager);
-        return NULL;
-    }
-
     unsigned int page_num;
 
     // write the bloom filter to the pager
-    if (!pager_write(new_pager, bf_buffer_uchar, bf_buffer_len, &page_num)) {
+    if (!pager_write(new_pager, bf_buffer, bf_buffer_len, &page_num)) {
         skiplist_destroy(mergetable);
         bloomfilter_destroy(bf);
         pager_close(new_pager);
@@ -1374,13 +1365,15 @@ bool _load_column_families(tidesdb* tdb) {
 
     // we essentially open configured db directory
     // each directory is a column family within the db directory
-    // we open the cf directory and read the config file
+    // we open the column family directories, read the config file and load the column family
     DIR* tdb_dir = opendir(tdb->config.db_path);
     if (tdb_dir == NULL) {
         return false;
     }
 
-    struct dirent* tdb_entry;
+    struct dirent* tdb_entry;  // create a dirent struct for the db directory
+
+    // we iterate over the db directory
     while ((tdb_entry = readdir(tdb_dir)) != NULL) {
         // we skip the . and .. directories
         if (strcmp(tdb_entry->d_name, ".") == 0 || strcmp(tdb_entry->d_name, "..") == 0) {
@@ -1400,14 +1393,18 @@ bool _load_column_families(tidesdb* tdb) {
 
         struct dirent* cf_entry;  // create a dirent struct for the column family directory
 
+        // we iterate over the column family directory
         while ((cf_entry = readdir(cf_dir)) != NULL) {
-            if (strstr(cf_entry->d_name, COLUMN_FAMILY_CONFIG_FILE_EXT) != NULL) {
+            if (strstr(cf_entry->d_name, COLUMN_FAMILY_CONFIG_FILE_EXT) !=
+                NULL) {  // if the file is a config file
                 // if the file is a config file
                 // Construct the full path to the config file
                 char config_file_path[PATH_MAX];
                 if (snprintf(config_file_path, sizeof(config_file_path), "%s%s%s", cf_path,
                              _get_path_seperator(),
                              cf_entry->d_name) >= (long)sizeof(config_file_path)) {
+                    closedir(cf_dir);
+                    closedir(tdb_dir);
                     return false;
                 }
 
@@ -1465,6 +1462,8 @@ bool _load_column_families(tidesdb* tdb) {
                 if (cf->memtable == NULL) {
                     free(cf->config.name);
                     free(cf);
+                    closedir(cf_dir);
+                    closedir(tdb_dir);
                     return false;
                 }
 
@@ -1472,22 +1471,28 @@ bool _load_column_families(tidesdb* tdb) {
                 if (pthread_rwlock_init(&cf->sstables_lock, NULL) != 0) {
                     free(cf->config.name);
                     free(cf);
+                    closedir(cf_dir);
+                    closedir(tdb_dir);
                     return false;
                 }
 
                 // we add the column family
                 if (!_add_column_family(tdb, cf)) {
+                    free(cf->config.name);
+                    free(cf);
+                    closedir(cf_dir);
+                    closedir(tdb_dir);
                     return false;
                 }
-
-                // we free up resources
-                closedir(cf_dir);
             }
-
-            // we free up resources
-            closedir(tdb_dir);
         }
+
+        // we free up resources
+        closedir(cf_dir);
     }
+
+    // we free up resources
+    closedir(tdb_dir);
 
     return true;
 }
@@ -1580,11 +1585,12 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key
     memcpy(op->kv->value, value, value_size);
 
     // we serialize the operation
-    uint8_t* serialized_op = NULL;
+    uint8_t* serialized_op_buffer = NULL;
 
-    size_t serialized_op_size = 0;
+    size_t serialized_op_buffer_size = 0;
 
-    if (!serialize_operation(op, &serialized_op, &serialized_op_size, tdb->config.compressed_wal)) {
+    if (!serialize_operation(op, &serialized_op_buffer, &serialized_op_buffer_size,
+                             tdb->config.compressed_wal)) {
         free(op->column_family);
         free(op->kv->key);
         free(op->kv->value);
@@ -1595,13 +1601,13 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key
 
     // we write the operation to the wal
     unsigned int pg_num = 0;
-    if (!pager_write(wal->pager, serialized_op, serialized_op_size, &pg_num)) {
+    if (!pager_write(wal->pager, serialized_op_buffer, serialized_op_buffer_size, &pg_num)) {
         free(op->column_family);
         free(op->kv->key);
         free(op->kv->value);
         free(op->kv);
         free(op);
-        free(serialized_op);
+        free(serialized_op_buffer);
         return false;
     }
 
@@ -1611,7 +1617,7 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key
     free(op->kv->value);
     free(op->kv);
     free(op);
-    free(serialized_op);
+    free(serialized_op_buffer);
 
     return true;
 }
@@ -1688,76 +1694,80 @@ bool _truncate_wal(wal* wal, int checkpoint) {
 }
 
 bool _replay_from_wal(tidesdb* tdb, wal* wal) {
-    // we check if the wal is NULL
-    if (wal == NULL) {
+    if (wal == NULL || tdb == NULL) {
         return false;
     }
 
-    // we checkif the tdb is NULL
-    if (tdb == NULL) {
-        return false;
-    }
-
-    // we lock the wal
     if (pthread_rwlock_rdlock(&wal->lock) != 0) {
         return false;
     }
 
-    // create a new pager cursor
+    // we check if the wal is empty
+    size_t pages_count = 0;
+    if (!pager_pages_count(wal->pager, &pages_count)) {
+        pthread_rwlock_unlock(&wal->lock);
+        return false;  // failed to get pages count
+    }
+
+    if (pages_count == 0) {
+        pthread_rwlock_unlock(&wal->lock);
+        return true;  // wal is empty
+    }
+
     pager_cursor* pc = NULL;
     if (!pager_cursor_init(wal->pager, &pc)) {
-        // unlock
         pthread_rwlock_unlock(&wal->lock);
         return false;
     }
 
     do {
         unsigned int pg_num;
-
-        if (pager_cursor_get(pc, &pg_num)) {
-            continue;  // we continue to the next operation
-        }
-        uint8_t* op_value = NULL;
-        size_t op_value_size = 0;
-
-        // read the page
-        if (pager_read(wal->pager, pg_num, &op_value, &op_value_size)) {
-            continue;  // we continue to the next operation
+        if (!pager_cursor_get(pc, &pg_num)) {
+            break;
         }
 
-        // deserialize the operation
         operation* op = NULL;
-        if (!deserialize_operation(op_value, op_value_size, &op, tdb->config.compressed_wal)) {
-            continue;  // we continue to the next operation
+
+        unsigned char* op_buffer = NULL;
+        size_t op_buffer_size = 0;
+        if (!pager_read(wal->pager, pg_num, &op_buffer, &op_buffer_size)) {
+            continue;
+        }
+
+        if (!deserialize_operation(op_buffer, op_buffer_size, &op, tdb->config.compressed_wal)) {
+            free(op_buffer);
+            continue;
         }
 
         column_family* cf = NULL;
         if (!_get_column_family(tdb, op->column_family, &cf)) {
-            continue;  // we continue to the next operation
+            free(op_buffer);
+            free(op);
+            continue;
         }
 
         switch (op->op_code) {
             case OP_PUT:
-                if (!tidesdb_put(tdb, op->column_family, op->kv->key, op->kv->key_size,
-                                 op->kv->value, op->kv->value_size, op->kv->ttl)) {
-                    continue;  // we continue to the next operation
-                }
+                tidesdb_put(tdb, op->column_family, op->kv->key, op->kv->key_size, op->kv->value,
+                            op->kv->value_size, op->kv->ttl);
 
             case OP_DELETE:
-                if (!tidesdb_delete(tdb, op->column_family, op->kv->key, op->kv->key_size)) {
-                    continue;  // we continue to the next operation
-                }
+                tidesdb_delete(tdb, op->column_family, op->kv->key, op->kv->key_size);
 
             default:
-                break;
         }
 
-        free(op_value);
+        free(op_buffer);
         free(op);
 
     } while (pager_cursor_next(pc));
 
+    pager_cursor_free(pc);
     pthread_rwlock_unlock(&wal->lock);
+
+    if (!_truncate_wal(wal, 0)) {
+        return false;
+    }
 
     return true;
 }
@@ -1897,23 +1907,10 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
     // we write the bloom filter to the sstable
     unsigned int pg_num = 0;
 
-    // convert bf_buffer_len to unsigned char*
-    unsigned char* uchar_bf_buffer = NULL;
-
-    if (_uint8_arr_to_uchar((const uint8_t**)&bf_buffer, &bf_buffer_len, &uchar_bf_buffer) ==
-        false) {
-        pthread_rwlock_unlock(&cf->sstables_lock);
-        bloomfilter_destroy(bf);
-        free(sst);
-        pager_close(p);
-        return false;
-    }
-
-    if (!pager_write(p, uchar_bf_buffer, bf_buffer_len, &pg_num)) {
+    if (!pager_write(p, bf_buffer, bf_buffer_len, &pg_num)) {
         pthread_rwlock_unlock(&cf->sstables_lock);
         bloomfilter_destroy(bf);
         free(bf_buffer);
-        free(uchar_bf_buffer);
         free(sst);
         pager_close(p);
         return false;
@@ -1922,7 +1919,6 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
     // we free the bloom filter
     bloomfilter_destroy(bf);
     free(bf_buffer);
-    free(uchar_bf_buffer);
 
     cursor = skiplist_cursor_init(memtable);
     if (cursor == NULL) {
@@ -1953,12 +1949,13 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
         key_value_pair kvp = {cursor->current->key, cursor->current->key_size,
                               cursor->current->value, cursor->current->value_size,
                               cursor->current->ttl};
-        uint8_t* serialized = NULL;
-        if (!serialize_key_value_pair(&kvp, &serialized, &encoded_size, cf->config.compressed)) {
+        uint8_t* serialized_buffer = NULL;
+        if (!serialize_key_value_pair(&kvp, &serialized_buffer, &encoded_size,
+                                      cf->config.compressed)) {
             continue;
         }
 
-        if (serialized == NULL) {
+        if (serialized_buffer == NULL) {
             pthread_rwlock_unlock(&cf->sstables_lock);
             skiplist_cursor_free(cursor);
             free(sst);
@@ -1966,27 +1963,14 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
             return false;
         }
 
-        unsigned char* uchar_serialized;
-
-        if (_uint8_arr_to_uchar((const uint8_t**)&serialized, &encoded_size, &uchar_serialized) ==
-            false) {
-            pthread_rwlock_unlock(&cf->sstables_lock);
-            free(serialized);
-            free(sst);
-            pager_close(p);
-            return false;
-        }
-
         // we write the key-value pair to the sstable
-        if (!pager_write(p, uchar_serialized, encoded_size, &pg_num)) {
-            free(serialized);
-            free(uchar_serialized);
+        if (!pager_write(p, serialized_buffer, encoded_size, &pg_num)) {
+            free(serialized_buffer);
             continue;
         }
 
         // we free the serialized key-value pair
-        free(serialized);
-        free(uchar_serialized);
+        free(serialized_buffer);
     } while (skiplist_cursor_next(cursor));
 
     // we free the cursor

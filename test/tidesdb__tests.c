@@ -729,6 +729,96 @@ void test_put_compact() {
     printf(GREEN "test_put_compact passed\n" RESET);
 }
 
+void test_put_compact_get() {
+    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+
+    tdb_config->db_path = "testdb";
+    tdb_config->compressed_wal = false;
+
+    tidesdb* tdb = NULL;
+
+    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    assert(e == NULL);
+
+    assert(tdb != NULL);
+
+    free(e);
+    e = NULL;
+
+    // Create a column family
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+    assert(e == NULL);
+
+    free(e);
+    e = NULL;
+
+    column_family* cf = NULL;
+
+    // we should be able to get the column family
+    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+
+    // put 100k key-value pairs
+    for (int i = 0; i < 100000; i++) {
+        char key[38];
+        char value[38];
+        snprintf(key, sizeof(key), "key%d", i);
+        snprintf(value, sizeof(value), "value%d", i);
+
+        e = tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
+        if (e != NULL) {
+            printf(RED "Error: %s\n" RESET, e->message);
+            break;
+        }
+
+        assert(e == NULL);
+        free(e);
+        e = NULL;
+    }
+
+    // we compact
+    e = tidesdb_compact_sstables(tdb, cf, 2);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+
+    assert(e == NULL);
+
+    // get the key-value pairs
+    for (int i = 0; i < 100000 / 4; i++) {
+        unsigned char key[38];
+        unsigned char value[38];
+        snprintf(key, sizeof(key), "key%d", i);
+        snprintf(value, sizeof(value), "value%d", i);
+
+        size_t value_len = 0;
+        unsigned char* value_out = NULL;
+
+        e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
+        if (e != NULL) {
+            printf(RED "Error: %s\n" RESET, e->message);
+            free(e);
+            e = NULL;
+            continue;
+        }
+
+        assert(e == NULL);
+        assert(value_len == strlen((char*)value));
+        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+
+        free(e);
+        e = NULL;
+    }
+
+    tidesdb_close(tdb);
+
+    remove_directory("testdb");
+
+    printf(GREEN "test_put_compact passed\n" RESET);
+}
+
 int main(void) {
     test_open_close();
     test_create_column_family();
@@ -740,7 +830,7 @@ int main(void) {
     test_put_get_delete();
     test_txn_put_delete_get();
     test_put_compact();
-    // @todo test_put_compact_get();
+    test_put_compact_get();
     // @todo test_put_compact_get_reopen
     // @todo test_cursor
     // @todo test_concurrent_put_get

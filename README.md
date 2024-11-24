@@ -7,11 +7,9 @@ TidesDB is designed to be fast, simple, durable and efficient.  It is not a full
 > In very active beta development. Not ready for production use.
 
 ## Todo list
-- [ ] Finalize and check methods for memory safety
 - [ ] DB cursor
 - [ ] Finalize error codes and their messages
 - [ ] Add more tests fulfilling `@todo` comments
-- [ ] Add more tests for edge cases such as concurrency
 - [ ] Benchmark
 - [ ] Documentation
 

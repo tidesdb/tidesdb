@@ -291,7 +291,8 @@ tidesdb_err* tidesdb_compact_sstables(tidesdb* tdb, column_family* cf, int max_t
     // split the work based on max_threads
     int sstables_per_thread = (num_sstables + max_threads - 1) / max_threads;
     pthread_t threads[max_threads];
-    compact_thread_args* thread_args = malloc(max_threads * sizeof(compact_thread_args));  // allocate memory for thread arguments
+    compact_thread_args* thread_args =
+        malloc(max_threads * sizeof(compact_thread_args));  // allocate memory for thread arguments
 
     if (thread_args == NULL) {
         pthread_rwlock_unlock(&cf->sstables_lock);
@@ -305,7 +306,8 @@ tidesdb_err* tidesdb_compact_sstables(tidesdb* tdb, column_family* cf, int max_t
         if (thread_args[i].end > num_sstables) {
             thread_args[i].end = num_sstables;
         }
-        if (pthread_create(&threads[i], NULL, _compact_sstables_thread, (void*)&thread_args[i]) != 0) {
+        if (pthread_create(&threads[i], NULL, _compact_sstables_thread, (void*)&thread_args[i]) !=
+            0) {
             pthread_rwlock_unlock(&cf->sstables_lock);
             free(thread_args);
             return tidesdb_err_new(1032, "Failed to create compaction thread");
@@ -317,8 +319,16 @@ tidesdb_err* tidesdb_compact_sstables(tidesdb* tdb, column_family* cf, int max_t
         pthread_join(threads[i], NULL);
     }
 
-    // update the sstables list in the column family
-    cf->num_sstables = (num_sstables + 1) / 2;
+    // we remove the null sstables
+    int j = 0;
+    for (int i = 0; i < num_sstables; i++) {
+        if (cf->sstables[i] != NULL) {
+            cf->sstables[j++] = cf->sstables[i];
+        }
+    }
+
+    // update the number of sstables
+    cf->num_sstables = j;
 
     // unlock the sstables lock
     pthread_rwlock_unlock(&cf->sstables_lock);
@@ -343,28 +353,25 @@ void* _compact_sstables_thread(void* arg) {
         // merge sstables[i] and sstables[i+1] into a new sstable
         sstable* new_sstable = _merge_sstables(cf->sstables[i], cf->sstables[i + 1], cf);
 
-
-
         // remove old sstable files
         char sstable_path1[PATH_MAX];
         char sstable_path2[PATH_MAX];
 
         // get the sstable paths
-        snprintf(sstable_path1, PATH_MAX, "%s",  cf->sstables[i]->pager->filename);
+        snprintf(sstable_path1, PATH_MAX, "%s", cf->sstables[i]->pager->filename);
         snprintf(sstable_path2, PATH_MAX, "%s", cf->sstables[i + 1]->pager->filename);
 
         // free the old sstables
         _free_sstable(cf->sstables[i]);
         _free_sstable(cf->sstables[i + 1]);
 
-
         // remove the sstable files
         remove(sstable_path1);
         remove(sstable_path2);
 
-
         // replace the old sstables with the new one
-        cf->sstables[i / 2] = new_sstable;
+        cf->sstables[i] = new_sstable;
+        cf->sstables[i + 1] = NULL;
     }
 
     return NULL;
@@ -398,8 +405,6 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
         return NULL;
     }
 
-
-
     bool has_next1 = true;
     bool has_next2 = true;
 
@@ -411,21 +416,22 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
 
         if (has_next1) {
             has_next1 = pager_cursor_next(cursor1);
-            if (has_next1 && !pager_read(sst1->pager, cursor1->page_number, &buffer1, &buffer_len1)) {
+            if (has_next1 &&
+                !pager_read(sst1->pager, cursor1->page_number, &buffer1, &buffer_len1)) {
                 break;
             }
         }
 
         if (has_next2) {
             has_next2 = pager_cursor_next(cursor2);
-            if (has_next2 && !pager_read(sst2->pager, cursor2->page_number, &buffer2, &buffer_len2)) {
+            if (has_next2 &&
+                !pager_read(sst2->pager, cursor2->page_number, &buffer2, &buffer_len2)) {
                 break;
             }
         }
 
         key_value_pair* kv1 = NULL;
         key_value_pair* kv2 = NULL;
-
 
         if (!deserialize_key_value_pair(buffer1, buffer_len1, &kv1, cf->config.compressed)) {
             free(buffer1);
@@ -446,13 +452,15 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
         }
 
         if (!_is_tombstone(kv1->value, kv1->value_size)) {
-            if (!skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size, kv1->ttl)) {
+            if (!skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size,
+                              kv1->ttl)) {
                 break;
             }
         }
 
         if (!_is_tombstone(kv2->value, kv2->value_size)) {
-            if (!skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size, kv2->ttl)) {
+            if (!skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size,
+                              kv2->ttl)) {
                 break;
             }
         }
@@ -473,11 +481,12 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
 
     char numeric_part1[PATH_MAX];
     char numeric_part2[PATH_MAX];
-    _sst_extract_numeric_part(sst1->pager->filename, numeric_part1);
-    _sst_extract_numeric_part(sst2->pager->filename, numeric_part2);
+    _sst_extract_numeric_parts(sst1->pager->filename, numeric_part1);
+    _sst_extract_numeric_parts(sst2->pager->filename, numeric_part2);
 
     // Format the new SSTable name
-    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%s_%s.sst", cf->path, _get_path_seperator(), numeric_part1, numeric_part2);
+    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%s_%s.sst", cf->path, _get_path_seperator(),
+             numeric_part1, numeric_part2);
 
     if (!pager_open(new_sstable_name, &new_pager)) {
         skiplist_destroy(mergetable);
@@ -505,6 +514,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
     }
 
     free(bf_buffer);
+    bloomfilter_destroy(bf);
 
     skiplist_cursor* sl_cursor = skiplist_cursor_init(mergetable);
 
@@ -539,7 +549,6 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
     } while (skiplist_cursor_next(sl_cursor));
 
     skiplist_destroy(mergetable);
-    bloomfilter_destroy(bf);
 
     sstable* new_sstable = malloc(sizeof(sstable));
     new_sstable->pager = new_pager;
@@ -703,12 +712,14 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
 
         // we check if the key is in the bloom filter
         if (bloomfilter_check(bf, key, key_size)) {
+            // we free the bloom filter
+            bloomfilter_destroy(bf);
+            free(bloom_filter_buffer);
+
             // we create a pager cursor
             pager_cursor* cursor = NULL;
 
             if (!pager_cursor_init(cf->sstables[i]->pager, &cursor)) {
-                bloomfilter_destroy(bf);
-                free(bloom_filter_buffer);
                 pthread_mutex_unlock(&tdb->flush_lock);
                 return tidesdb_err_new(1035, "Failed to initialize pager cursor");
             }
@@ -743,8 +754,6 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
                         free(kv->value);
                         free(kv);
                         free(buffer);
-                        bloomfilter_destroy(bf);
-                        free(bloom_filter_buffer);
                         pager_cursor_free(cursor);
                         pthread_mutex_unlock(&tdb->flush_lock);
                         return tidesdb_err_new(1031, "Key not found");
@@ -765,10 +774,6 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
                     // we unlock the flush lock
                     pthread_mutex_unlock(&tdb->flush_lock);
 
-                    // we free the bloom filter
-                    bloomfilter_destroy(bf);
-                    free(bloom_filter_buffer);
-
                     return NULL;
                 }
 
@@ -779,11 +784,11 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             }
 
             pager_cursor_free(cursor);
+        } else {
+            // we free the bloom filter
+            bloomfilter_destroy(bf);
+            free(bloom_filter_buffer);
         }
-
-        // we free the bloom filter
-        bloomfilter_destroy(bf);
-        free(bloom_filter_buffer);
     }
 
     pthread_mutex_unlock(&tdb->flush_lock);
@@ -2273,7 +2278,7 @@ int _remove_directory(const char* path) {
 void _sst_extract_numeric_parts(const char* filename, char* numeric_parts) {
     const char* start = strrchr(filename, '_');
     if (start != NULL) {
-        start++; // move past the last '_'
+        start++;  // move past the last '_'
         const char* end = strrchr(start, '.');
         if (end != NULL) {
             strncpy(numeric_parts, start, end - start);

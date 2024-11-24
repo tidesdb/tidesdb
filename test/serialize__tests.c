@@ -25,12 +25,12 @@
 #include "test_macros.h"
 
 void test_serialize_key_value_pair_no_compression() {
-    key_value_pair kvp = {.key = (unsigned char *)"key",
+    key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
-                          .value = (unsigned char *)"value",
+                          .value = (uint8_t *)"value",
                           .value_size = 5,
                           .ttl = 12345};
-    unsigned char *buffer;
+    uint8_t *buffer;
     size_t encoded_size;
 
     assert(serialize_key_value_pair(&kvp, &buffer, &encoded_size, false) == true);
@@ -41,19 +41,19 @@ void test_serialize_key_value_pair_no_compression() {
 }
 
 void test_deserialize_key_value_pair_no_compression() {
-    key_value_pair kvp = {.key = (unsigned char *)"key",
+    key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
-                          .value = (unsigned char *)"value",
+                          .value = (uint8_t *)"value",
                           .value_size = 5,
                           .ttl = 12345};
-    unsigned char *buffer;
+    uint8_t *buffer;
     size_t encoded_size;
 
     serialize_key_value_pair(&kvp, &buffer, &encoded_size, false);
 
     key_value_pair *deserialized_kvp = NULL;
-    assert(deserialize_key_value_pair((unsigned char *)buffer, encoded_size, &deserialized_kvp,
-                                      false) == true);
+    assert(deserialize_key_value_pair((uint8_t *)buffer, encoded_size, &deserialized_kvp, false) ==
+           true);
     assert(deserialized_kvp->key_size == kvp.key_size);
     assert(memcmp(deserialized_kvp->key, kvp.key, kvp.key_size) == 0);
     assert(deserialized_kvp->value_size == kvp.value_size);
@@ -68,8 +68,8 @@ void test_deserialize_key_value_pair_no_compression() {
 }
 
 void test_serialize_bloomfilter_no_compression() {
-    bloomfilter bf = {.size = 8, .count = 0, .set = (unsigned char *)calloc(1, 1)};
-    unsigned char *buffer;
+    bloomfilter bf = {.size = 8, .count = 0, .set = (uint8_t *)calloc(1, 1)};
+    uint8_t *buffer;
     size_t encoded_size;
 
     assert(serialize_bloomfilter(&bf, &buffer, &encoded_size, false) == true);
@@ -81,8 +81,8 @@ void test_serialize_bloomfilter_no_compression() {
 }
 
 void test_deserialize_bloomfilter_no_compression() {
-    bloomfilter bf = {.size = 8, .count = 0, .set = (unsigned char *)calloc(1, 1)};
-    unsigned char *buffer;
+    bloomfilter bf = {.size = 8, .count = 0, .set = (uint8_t *)calloc(1, 1)};
+    uint8_t *buffer;
     size_t encoded_size;
 
     serialize_bloomfilter(&bf, &buffer, &encoded_size, false);
@@ -102,11 +102,11 @@ void test_deserialize_bloomfilter_no_compression() {
 
 void test_serialize_deserialize_full_bloomfilter_no_compression() {
     bloomfilter *bf = bloomfilter_create(8);  // Small size for testing
-    const unsigned char data1[] = "test1";
-    const unsigned char data2[] = "test2";
+    const uint8_t data1[] = "test1";
+    const uint8_t data2[] = "test2";
 
     for (int i = 0; i < 256; i++) {
-        unsigned char data[2] = {(unsigned char)i, '\0'};
+        uint8_t data[2] = {(uint8_t)i, '\0'};
         bloomfilter_add(bf, data, 1);
     }
 
@@ -116,12 +116,12 @@ void test_serialize_deserialize_full_bloomfilter_no_compression() {
 
     // Check if all the data is in the bloom filter
     for (int i = 0; i < 256; i++) {
-        unsigned char data[2] = {(unsigned char)i, '\0'};
+        uint8_t data[2] = {(uint8_t)i, '\0'};
         assert(bloomfilter_check(bf, data, 1) == true);
     }
 
     // Serialize the bloom filter
-    unsigned char *buffer;
+    uint8_t *buffer;
     size_t encoded_size;
     assert(serialize_bloomfilter(bf, &buffer, &encoded_size, false) == true);
     assert(encoded_size > 0);
@@ -138,7 +138,7 @@ void test_serialize_deserialize_full_bloomfilter_no_compression() {
     bloomfilter_destroy(bf);
 
     for (int i = 0; i < 256; i++) {
-        unsigned char data[2] = {(unsigned char)i, '\0'};
+        uint8_t data[2] = {(uint8_t)i, '\0'};
         assert(bloomfilter_check(deserialized_bf, data, 1) == true);
     }
     assert(bloomfilter_check(deserialized_bf, data2, strlen((const char *)data2)) == true);
@@ -152,12 +152,12 @@ void test_serialize_deserialize_full_bloomfilter_no_compression() {
 }
 
 void test_serialize_key_value_pair_compression() {
-    key_value_pair kvp = {.key = (unsigned char *)"key",
+    key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
-                          .value = (unsigned char *)"value",
+                          .value = (uint8_t *)"value",
                           .value_size = 5,
                           .ttl = 12345};
-    unsigned char *buffer;
+    uint8_t *buffer;
     size_t encoded_size;
 
     assert(serialize_key_value_pair(&kvp, &buffer, &encoded_size, true) == true);
@@ -168,19 +168,19 @@ void test_serialize_key_value_pair_compression() {
 }
 
 void test_deserialize_key_value_pair_compression() {
-    key_value_pair kvp = {.key = (unsigned char *)"key",
+    key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
-                          .value = (unsigned char *)"value",
+                          .value = (uint8_t *)"value",
                           .value_size = 5,
                           .ttl = 12345};
-    unsigned char *buffer;
+    uint8_t *buffer;
     size_t encoded_size;
 
     serialize_key_value_pair(&kvp, &buffer, &encoded_size, true);
 
     key_value_pair *deserialized_kvp = NULL;
-    assert(deserialize_key_value_pair((unsigned char *)buffer, encoded_size, &deserialized_kvp,
-                                      true) == true);
+    assert(deserialize_key_value_pair((uint8_t *)buffer, encoded_size, &deserialized_kvp, true) ==
+           true);
     assert(deserialized_kvp->key_size == kvp.key_size);
     assert(memcmp(deserialized_kvp->key, kvp.key, kvp.key_size) == 0);
     assert(deserialized_kvp->value_size == kvp.value_size);
@@ -195,8 +195,8 @@ void test_deserialize_key_value_pair_compression() {
 }
 
 void test_serialize_bloomfilter_compression() {
-    bloomfilter bf = {.size = 8, .count = 0, .set = (unsigned char *)calloc(1, 1)};
-    unsigned char *buffer;
+    bloomfilter bf = {.size = 8, .count = 0, .set = (uint8_t *)calloc(1, 1)};
+    uint8_t *buffer;
     size_t encoded_size;
 
     assert(serialize_bloomfilter(&bf, &buffer, &encoded_size, true) == true);
@@ -208,8 +208,8 @@ void test_serialize_bloomfilter_compression() {
 }
 
 void test_deserialize_bloomfilter_compression() {
-    bloomfilter bf = {.size = 8, .count = 0, .set = (unsigned char *)calloc(1, 1)};
-    unsigned char *buffer;
+    bloomfilter bf = {.size = 8, .count = 0, .set = (uint8_t *)calloc(1, 1)};
+    uint8_t *buffer;
     size_t encoded_size;
 
     serialize_bloomfilter(&bf, &buffer, &encoded_size, true);
@@ -229,11 +229,11 @@ void test_deserialize_bloomfilter_compression() {
 
 void test_serialize_deserialize_full_bloomfilter_compression() {
     bloomfilter *bf = bloomfilter_create(8);  // Small size for testing
-    const unsigned char data1[] = "test1";
-    const unsigned char data2[] = "test2";
+    const uint8_t data1[] = "test1";
+    const uint8_t data2[] = "test2";
 
     for (int i = 0; i < 256; i++) {
-        unsigned char data[2] = {(unsigned char)i, '\0'};
+        uint8_t data[2] = {(uint8_t)i, '\0'};
         bloomfilter_add(bf, data, 1);
     }
 
@@ -243,12 +243,12 @@ void test_serialize_deserialize_full_bloomfilter_compression() {
 
     // Check if all the data is in the bloom filter
     for (int i = 0; i < 256; i++) {
-        unsigned char data[2] = {(unsigned char)i, '\0'};
+        uint8_t data[2] = {(uint8_t)i, '\0'};
         assert(bloomfilter_check(bf, data, 1) == true);
     }
 
     // Serialize the bloom filter
-    unsigned char *buffer;
+    uint8_t *buffer;
     size_t encoded_size;
     assert(serialize_bloomfilter(bf, &buffer, &encoded_size, true) == true);
     assert(encoded_size > 0);
@@ -265,7 +265,7 @@ void test_serialize_deserialize_full_bloomfilter_compression() {
     bloomfilter_destroy(bf);
 
     for (int i = 0; i < 256; i++) {
-        unsigned char data[2] = {(unsigned char)i, '\0'};
+        uint8_t data[2] = {(uint8_t)i, '\0'};
         assert(bloomfilter_check(deserialized_bf, data, 1) == true);
     }
     assert(bloomfilter_check(deserialized_bf, data2, strlen((const char *)data2)) == true);
@@ -279,13 +279,13 @@ void test_serialize_deserialize_full_bloomfilter_compression() {
 }
 
 void test_serialize_operation_compression() {
-    key_value_pair kvp = {.key = (unsigned char *)"key",
+    key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
-                          .value = (unsigned char *)"value",
+                          .value = (uint8_t *)"value",
                           .value_size = 5,
                           .ttl = 12345};
     operation op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
-    unsigned char *buffer = NULL;
+    uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
     assert(serialize_operation(&op, &buffer, &encoded_size, true) == true);
@@ -296,13 +296,13 @@ void test_serialize_operation_compression() {
 }
 
 void test_deserialize_operation_compression() {
-    key_value_pair kvp = {.key = (unsigned char *)"key",
+    key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
-                          .value = (unsigned char *)"value",
+                          .value = (uint8_t *)"value",
                           .value_size = 5,
                           .ttl = 12345};
     operation op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
-    unsigned char *buffer = NULL;
+    uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
     assert(serialize_operation(&op, &buffer, &encoded_size, true) == true);
@@ -333,7 +333,7 @@ void test_serialize_column_family_config_no_compression() {
                                    .max_level = 5,
                                    .probability = 0.01f,
                                    .compressed = true};
-    unsigned char *buffer;
+    uint8_t *buffer;
     size_t encoded_size;
 
     assert(serialize_column_family_config(&config, &buffer, &encoded_size) == true);
@@ -349,7 +349,7 @@ void test_deserialize_column_family_config_no_compression() {
                                    .max_level = 5,
                                    .probability = 0.01f,
                                    .compressed = true};
-    unsigned char *buffer = NULL;
+    uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
     serialize_column_family_config(&config, &buffer, &encoded_size);
@@ -369,13 +369,13 @@ void test_deserialize_column_family_config_no_compression() {
 }
 
 void test_serialize_operation_no_compression() {
-    key_value_pair kvp = {.key = (unsigned char *)"key",
+    key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
-                          .value = (unsigned char *)"value",
+                          .value = (uint8_t *)"value",
                           .value_size = 5,
                           .ttl = 12345};
     operation op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
-    unsigned char *buffer = NULL;
+    uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
     assert(serialize_operation(&op, &buffer, &encoded_size, false) == true);
@@ -386,13 +386,13 @@ void test_serialize_operation_no_compression() {
 }
 
 void test_deserialize_operation_no_compression() {
-    key_value_pair kvp = {.key = (unsigned char *)"key",
+    key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
-                          .value = (unsigned char *)"value",
+                          .value = (uint8_t *)"value",
                           .value_size = 5,
                           .ttl = 12345};
     operation op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
-    unsigned char *buffer = NULL;
+    uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
     serialize_operation(&op, &buffer, &encoded_size, false);

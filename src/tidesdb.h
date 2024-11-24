@@ -19,6 +19,7 @@
 #ifndef TIDESDB_H
 #define TIDESDB_H
 #include <dirent.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +27,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <limits.h>
 
 #include "bloomfilter.h"
 #include "err.h"
@@ -578,6 +578,6 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf);
  * @param filename the filename
  * @param numeric_part the numeric part
  */
-void _sst_extract_numeric_part(const char* filename, char* numeric_part);
+void _sst_extract_numeric_parts(const char* filename, char* numeric_part);
 
 #endif  // TIDESDB_H

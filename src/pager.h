@@ -39,6 +39,16 @@
 /*
  * pager
  * the pager struct is used to manage the file and pages
+ * @param file the file the pager is assigned
+ * @param filename the filename of the paged file
+ * @param file_lock lock for the file (only one thread can write to file at a time)
+ * @param page_locks page locks for each page
+ * @param num_pages number of pages in file currently
+ * @param sync_thread background sync thread
+ * @param sync_mutex mutex for sync thread
+ * @param sync_cond condition variable for sync thread
+ * @param write_count number of writes since last sync
+ * @param stop_sync_thread flag to stop the sync thread
  */
 typedef struct {
     FILE* file;                  // the file the pager is assigned
@@ -56,6 +66,8 @@ typedef struct {
 /*
  * pager_cursor
  * the cursor struct is used to navigate the pages of the file
+ * @param pager the pager the cursor is assigned
+ * @param page_number the page number the cursor is currently on
  */
 typedef struct {
     pager* pager;              // the pager the cursor is assigned

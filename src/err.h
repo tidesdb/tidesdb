@@ -25,6 +25,8 @@
  * tidesdb_err
  * the TidesDB error struct
  * used for error handling in TidesDB
+ * @param code the error code
+ * @param message the error message
  */
 typedef struct {
     int code;       // the error code

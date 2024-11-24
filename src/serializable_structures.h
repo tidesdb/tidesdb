@@ -32,6 +32,11 @@ enum OP_CODE { OP_PUT, OP_DELETE };
  * key_value_pair
  * key value pair struct
  * used for key value pairs in TidesDB
+ * @param key the key
+ * @param key_size the size of the key
+ * @param value the value
+ * @param value_size the size of the value
+ * @param ttl the time to live of the key value pair
  */
 typedef struct {
     uint8_t *key;
@@ -45,6 +50,11 @@ typedef struct {
  * column_family_config
  * column family configuration struct
  * used for column family configuration in TidesDB
+ * @param name the name of the column family
+ * @param flush_threshold the flush threshold of the column family
+ * @param max_level the max level of the column family
+ * @param probability the probability of the column family
+ * @param compressed the compressed status of the column family
  */
 typedef struct {
     char *name;
@@ -54,6 +64,14 @@ typedef struct {
     bool compressed;
 } column_family_config;
 
+/*
+ * operation
+ * operation struct
+ * used for operations in TidesDB
+ * @param op_code the operation code
+ * @param kv the key value pair
+ * @param column_family the column family for the operation
+ */
 typedef struct {
     enum OP_CODE op_code;  // the operation code
     key_value_pair *kv;    // the key-value pair

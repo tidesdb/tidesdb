@@ -86,11 +86,6 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb) {
         }
     }
 
-    // now we replay from the wal
-    if (!_replay_from_wal((*tdb), (*tdb)->wal)) {
-        return tidesdb_err_new(1009, "Failed to replay wal");
-    }
-
     // initialize the flush queue
     (*tdb)->flush_queue = queue_new();
     if ((*tdb)->flush_queue == NULL) {
@@ -122,6 +117,11 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb) {
     if (pthread_create(&(*tdb)->flush_thread, NULL, _flush_memtable_thread, *tdb) != 0) {
         free(*tdb);
         return tidesdb_err_new(1014, "Failed to start flush thread");
+    }
+
+    // now we replay from the wal
+    if (!_replay_from_wal((*tdb), (*tdb)->wal)) {
+        return tidesdb_err_new(1009, "Failed to replay wal");
     }
 
     return NULL;
@@ -1508,52 +1508,35 @@ const char* _get_path_seperator() {
 bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key_size,
                     const unsigned char* value, size_t value_size, time_t ttl, enum OP_CODE op_code,
                     const char* cf) {
-    // we check if tdb if null
-    if (tdb == NULL) {
+    if (tdb == NULL || wal == NULL || key == NULL) {
         return false;
     }
 
-    // we check if wal is null
-    if (wal == NULL) {
-        return false;
-    }
-
-    // we check if the key is null
-    if (key == NULL) {
-        return false;
-    }
-
-    // we get column family
     column_family* column_family = NULL;
     if (!_get_column_family(tdb, cf, &column_family)) {
         return false;
     }
 
-    // we create the operation
     operation* op = (operation*)malloc(sizeof(operation));
     if (op == NULL) {
         return false;
     }
 
-    // we set the operation
     op->op_code = op_code;
     op->column_family = strdup(cf);
-    op->op_code = op_code;
+    if (op->column_family == NULL) {
+        free(op);
+        return false;
+    }
 
-    // we allocate memory for the key value pair
     op->kv = (key_value_pair*)malloc(sizeof(key_value_pair));
-
-    // we check if the key value pair was allocated
     if (op->kv == NULL) {
         free(op->column_family);
         free(op);
         return false;
     }
 
-    // we set the key value pair
     op->kv->key = (unsigned char*)malloc(key_size);
-
-    // we check if the key was allocated
     if (op->kv->key == NULL) {
         free(op->column_family);
         free(op->kv);
@@ -1561,18 +1544,10 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key
         return false;
     }
 
-    // we set the key
     memcpy(op->kv->key, key, key_size);
-
-    // we set the key size
     op->kv->key_size = key_size;
 
-    // we set the value
     op->kv->value = (unsigned char*)malloc(value_size);
-    op->kv->value_size = value_size;
-    op->kv->ttl = ttl;
-
-    // we check if the value was allocated
     if (op->kv->value == NULL) {
         free(op->column_family);
         free(op->kv->key);
@@ -1581,12 +1556,11 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key
         return false;
     }
 
-    // we set the value
     memcpy(op->kv->value, value, value_size);
+    op->kv->value_size = value_size;
+    op->kv->ttl = ttl;
 
-    // we serialize the operation
     uint8_t* serialized_op_buffer = NULL;
-
     size_t serialized_op_buffer_size = 0;
 
     if (!serialize_operation(op, &serialized_op_buffer, &serialized_op_buffer_size,
@@ -1599,7 +1573,6 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key
         return false;
     }
 
-    // we write the operation to the wal
     unsigned int pg_num = 0;
     if (!pager_write(wal->pager, serialized_op_buffer, serialized_op_buffer_size, &pg_num)) {
         free(op->column_family);
@@ -1611,7 +1584,6 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key
         return false;
     }
 
-    // we free up resources
     free(op->column_family);
     free(op->kv->key);
     free(op->kv->value);
@@ -1698,72 +1670,85 @@ bool _replay_from_wal(tidesdb* tdb, wal* wal) {
         return false;
     }
 
-    if (pthread_rwlock_rdlock(&wal->lock) != 0) {
-        return false;
-    }
-
     // we check if the wal is empty
     size_t pages_count = 0;
     if (!pager_pages_count(wal->pager, &pages_count)) {
-        pthread_rwlock_unlock(&wal->lock);
         return false;  // failed to get pages count
     }
 
     if (pages_count == 0) {
-        pthread_rwlock_unlock(&wal->lock);
         return true;  // wal is empty
     }
 
     pager_cursor* pc = NULL;
-    if (!pager_cursor_init(wal->pager, &pc)) {
-        pthread_rwlock_unlock(&wal->lock);
-        return false;
+    if (pager_cursor_init(wal->pager, &pc)) {
+        do {
+            unsigned int pg_num;
+            if (!pager_cursor_get(pc, &pg_num)) {
+                break;
+            }
+
+            operation* op = NULL;
+
+            uint8_t* op_buffer = NULL;
+            size_t op_buffer_size = 0;
+
+            if (!pager_read(wal->pager, pg_num, &op_buffer, &op_buffer_size)) {
+                free(op_buffer);
+                break;
+            }
+
+            if (!deserialize_operation(op_buffer, op_buffer_size, &op,
+                                       tdb->config.compressed_wal)) {
+                free(op_buffer);
+                break;
+            }
+
+            column_family* cf = NULL;
+
+            if (!_get_column_family(tdb, op->column_family, &cf)) {
+                free(op_buffer);
+                free(op);
+                break;
+            }
+
+            switch (op->op_code) {
+                case OP_PUT:
+                    skiplist_put(cf->memtable, op->kv->key, op->kv->key_size, op->kv->value,
+                                 op->kv->value_size, op->kv->ttl);
+                    break;
+
+                case OP_DELETE:
+                    unsigned char* tombstone = (unsigned char*)malloc(4);
+                    if (tombstone != NULL) {
+                        uint32_t tombstone_value = TOMBSTONE;
+                        memcpy(tombstone, &tombstone_value, sizeof(uint32_t));
+                    }
+
+                    // add to memtable
+                    if (!skiplist_put(cf->memtable, op->kv->key, op->kv->key_size, tombstone, 4,
+                                      -1)) {
+                        free(tombstone);
+                        break;
+                    }
+
+                    free(tombstone);
+                    break;
+
+                default:
+                    break;
+            }
+
+            free(op->kv->value);
+            free(op->kv->key);
+            free(op->kv);
+            free(op);
+            free(op_buffer);
+
+        } while (pager_cursor_next(pc));
     }
 
-    do {
-        unsigned int pg_num;
-        if (!pager_cursor_get(pc, &pg_num)) {
-            break;
-        }
-
-        operation* op = NULL;
-
-        unsigned char* op_buffer = NULL;
-        size_t op_buffer_size = 0;
-        if (!pager_read(wal->pager, pg_num, &op_buffer, &op_buffer_size)) {
-            continue;
-        }
-
-        if (!deserialize_operation(op_buffer, op_buffer_size, &op, tdb->config.compressed_wal)) {
-            free(op_buffer);
-            continue;
-        }
-
-        column_family* cf = NULL;
-        if (!_get_column_family(tdb, op->column_family, &cf)) {
-            free(op_buffer);
-            free(op);
-            continue;
-        }
-
-        switch (op->op_code) {
-            case OP_PUT:
-                tidesdb_put(tdb, op->column_family, op->kv->key, op->kv->key_size, op->kv->value,
-                            op->kv->value_size, op->kv->ttl);
-
-            case OP_DELETE:
-                tidesdb_delete(tdb, op->column_family, op->kv->key, op->kv->key_size);
-
-            default:
-        }
-
-        free(op_buffer);
-        free(op);
-
-    } while (pager_cursor_next(pc));
-
     pager_cursor_free(pc);
-    pthread_rwlock_unlock(&wal->lock);
 
     if (!_truncate_wal(wal, 0)) {
         return false;

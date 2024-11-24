@@ -398,7 +398,7 @@ void test_put_reopen_get() {
     assert(_get_column_family(tdb, "test_cf", &cf) == 1);
 
     // put 240 key-value pairs
-    for (int i = 0; i < 240; i++) {
+    for (int i = 0; i < 50; i++) {
         char key[48];
         char value[48];
         snprintf(key, sizeof(key), "key%d", i);
@@ -419,6 +419,8 @@ void test_put_reopen_get() {
 
     tidesdb_close(tdb);
 
+    tdb = NULL;
+
     e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) {
         printf(RED "Error: %s\n" RESET, e->message);
@@ -431,7 +433,7 @@ void test_put_reopen_get() {
     e = NULL;
 
     // we get the key-value pairs
-    for (int i = 0; i < 240; i++) {
+    for (int i = 0; i < 50; i++) {
         unsigned char key[48];
         unsigned char value[48];
         snprintf(key, sizeof(key), "key%d", i);

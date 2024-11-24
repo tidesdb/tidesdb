@@ -26,6 +26,8 @@
 /*
  * queue_node
  * node for queue
+ * @param data data in node
+ * @param next next node
  */
 typedef struct queue_node {
     void *data;               // data in node
@@ -35,6 +37,10 @@ typedef struct queue_node {
 /*
  * queue
  * queue struct
+ * @param head head of queue
+ * @param tail tail of queue
+ * @param size size of queue
+ * @param lock rw lock for queue
  */
 typedef struct queue {
     queue_node *head;       // head of queue
@@ -52,30 +58,36 @@ queue *queue_new();
 /*
  * queue_enqueue
  * adds data to end of queue
+ * @param q queue
+ * @param data data to add
  */
 bool queue_enqueue(queue *q, void *data);
 
 /*
  * queue_dequeue
  * removes data from front of queue
+ * @param q queue
  */
 void *queue_dequeue(queue *q);
 
 /*
  * queue_size
  * returns size of queue
+ * @param q queue
  */
 size_t queue_size(queue *q);
 
 /*
  * free_queue_node
  * frees queue node
+ * @param node node to free
  */
 void free_queue_node(queue_node *node);
 
 /*
  * queue_destroy
  * destroys queue
+ * @param q queue
  */
 void queue_destroy(queue *q);
 

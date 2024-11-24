@@ -360,7 +360,7 @@ void test_put_flush_get() {
     printf(GREEN "test_put_flush_get passed\n" RESET);
 }
 
-// this test puts 240 key-value pairs, closes the database, reopens it, and gets the key-value pairs
+// this test puts 50 key-value pairs, closes the database, reopens it, and gets the key-value pairs
 // by doing this we are testing the WAL recovery as we are not hitting the flush threshold, we are
 // replaying the WAL and populate the memtable with the key-value pairs
 void test_put_reopen_get() {
@@ -397,7 +397,7 @@ void test_put_reopen_get() {
     // we should be able to get the column family
     assert(_get_column_family(tdb, "test_cf", &cf) == 1);
 
-    // put 240 key-value pairs
+    // put 50 key-value pairs
     for (int i = 0; i < 50; i++) {
         char key[48];
         char value[48];
@@ -414,8 +414,6 @@ void test_put_reopen_get() {
         free(e);
         e = NULL;
     }
-
-    printf("done putting\n");
 
     tidesdb_close(tdb);
 
@@ -466,6 +464,207 @@ void test_put_reopen_get() {
     printf(GREEN "test_put_get_reopen passed\n" RESET);
 }
 
+void test_put_get_delete() {
+    tidesdb_config* tdb_config = (tidesdb_config*)malloc(sizeof(tidesdb_config));
+    if (tdb_config == NULL) {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
+
+    tdb_config->db_path = "testdb";
+    tdb_config->compressed_wal = false;
+
+    tidesdb* tdb = NULL;
+
+    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    assert(e == NULL);
+    assert(tdb != NULL);
+
+    free(e);
+    e = NULL;
+
+    // Create a column family
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+    assert(e == NULL);
+
+    free(e);
+    e = NULL;
+
+    column_family* cf = NULL;
+
+    // we should be able to get the column family
+    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+
+    // put 240 key-value pairs
+    for (int i = 0; i < 240; i++) {
+        char key[48];
+        char value[48];
+        snprintf(key, sizeof(key), "key%d", i);
+        snprintf(value, sizeof(value), "value%d", i);
+
+        e = tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
+        if (e != NULL) {
+            printf(RED "Error: %s\n" RESET, e->message);
+            break;
+        }
+
+        assert(e == NULL);
+        free(e);
+        e = NULL;
+    }
+
+    // we delete the key-value pairs
+    for (int i = 0; i < 240; i++) {
+        unsigned char key[48];
+        snprintf(key, sizeof(key), "key%d", i);
+
+        e = tidesdb_delete(tdb, cf->config.name, key, strlen(key));
+        if (e != NULL) {
+            printf(RED "Error: %s\n" RESET, e->message);
+            free(e);
+            e = NULL;
+            continue;
+        }
+    }
+
+    // we get the key-value pairs
+    for (int i = 0; i < 240; i++) {
+        unsigned char key[48];
+        unsigned char value[48];
+        snprintf(key, sizeof(key), "key%d", i);
+        snprintf(value, sizeof(value), "value%d", i);
+
+        size_t value_len = 0;
+        unsigned char* value_out = NULL;
+
+        e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
+
+        // we should get an error as the key-value pairs have been deleted
+        assert(e != NULL);
+
+        free(e);
+        e = NULL;
+    }
+
+    tidesdb_close(tdb);
+    free(tdb_config);
+
+    remove_directory("testdb");
+
+    printf(GREEN "test_put_get_delete passed\n" RESET);
+}
+
+void test_txn_put_delete_get() {
+    tidesdb_config* tdb_config = (tidesdb_config*)malloc(sizeof(tidesdb_config));
+    if (tdb_config == NULL) {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
+
+    tdb_config->db_path = "testdb";
+    tdb_config->compressed_wal = false;
+
+    tidesdb* tdb = NULL;
+
+    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    assert(e == NULL);
+    assert(tdb != NULL);
+
+    free(e);
+    e = NULL;
+
+    // Create a column family
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+    assert(e == NULL);
+
+    free(e);
+    e = NULL;
+
+    column_family* cf = NULL;
+
+    // we should be able to get the column family
+    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+
+    txn* txn = NULL;
+    e = tidesdb_txn_begin(&txn, cf->config.name);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+
+    // we add some put operations to the transaction and a final delete operation
+    e = tidesdb_txn_put(txn, "key1", 4, "value1", 6, -1);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+
+    e = tidesdb_txn_put(txn, "key2", 4, "value2", 6, -1);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+
+    e = tidesdb_txn_put(txn, "key3", 4, "value3", 6, -1);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+
+    e = tidesdb_txn_delete(txn, "key1", 4);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+
+    // we expect key2 and key3 to be the result of the transaction
+
+    // commit the transaction
+    e = tidesdb_txn_commit(tdb, txn);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+
+    assert(e == NULL);
+
+    tidesdb_txn_free(txn);
+
+    unsigned char* value2 = NULL;
+    unsigned char* value3 = NULL;
+    size_t value_len2 = 0;
+    size_t value_len3 = 0;
+
+    e = tidesdb_get(tdb, cf->config.name, "key2", 4, &value2, &value_len2);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+
+    assert(e == NULL);
+
+    e = tidesdb_get(tdb, cf->config.name, "key3", 4, &value3, &value_len3);
+    if (e != NULL) {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+
+    assert(e == NULL);
+
+    unsigned char* value1 = NULL;
+    size_t value_len1 = 0;
+
+    // we try to get key1
+    e = tidesdb_get(tdb, cf->config.name, "key1", 4, &value1, &value_len1);
+    // we expect an error as key1 was deleted
+    assert(e != NULL);
+
+    tidesdb_close(tdb);
+    free(tdb_config);
+
+    remove_directory("testdb");
+
+    printf(GREEN "test_txn_put_delete_get passed\n" RESET);
+}
+
 int main(void) {
     test_open_close();
     test_create_column_family();
@@ -474,12 +673,12 @@ int main(void) {
     test_put_get();
     test_put_flush_get();
     test_put_reopen_get();
-    // @todo test_put_get_delete
+    test_put_get_delete();
+    test_txn_put_delete_get();
     // @todo test_put_compact_get
     // @todo test_put_compact_get_reopen
     // @todo test_cursor
     // @todo test_concurrent_put_get
-    // @todo test_txn_put_delete_get
 
     return 0;
 }

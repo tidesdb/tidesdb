@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <limits.h>
 
 #include "bloomfilter.h"
 #include "err.h"
@@ -570,5 +571,13 @@ void* _compact_sstables_thread(void* arg);
  * @param cf the column family
  */
 sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf);
+
+/*
+ * _sst_extract_numeric_part
+ * extract the numeric part of an sstable filename
+ * @param filename the filename
+ * @param numeric_part the numeric part
+ */
+void _sst_extract_numeric_part(const char* filename, char* numeric_part);
 
 #endif  // TIDESDB_H

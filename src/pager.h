@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,7 +91,7 @@ bool pager_close(pager* p);
  * @param init_page_number the page number of the page written
  * @return bool true if the write was successful, false otherwise
  */
-bool pager_write(pager* p, unsigned char* data, size_t data_len, unsigned int* init_page_number);
+bool pager_write(pager* p, uint8_t* data, size_t data_len, unsigned int* init_page_number);
 
 /*
  * pager_read
@@ -101,8 +102,7 @@ bool pager_write(pager* p, unsigned char* data, size_t data_len, unsigned int* i
  * @param buffer_len the length of the buffer
  * @return bool true if the read was successful, false otherwise
  */
-bool pager_read(pager* p, unsigned int start_page_number, unsigned char** buffer,
-                size_t* buffer_len);
+bool pager_read(pager* p, unsigned int start_page_number, uint8_t** buffer, size_t* buffer_len);
 
 /*
  * pager_cursor_init

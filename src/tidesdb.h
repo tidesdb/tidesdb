@@ -571,24 +571,4 @@ void* _compact_sstables_thread(void* arg);
  */
 sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf);
 
-/*
- * _uchar_arr_to_uint8
- * unsigned char array to uint8_t array
- * @param uchar_arr the unsigned char array
- * @param length the length of the array
- * @param uint8_arr the uint8_t array
- * @return whether the conversion was successful
- */
-bool _uchar_arr_to_uint8(const unsigned char** uchar_arr, size_t* length, uint8_t** uint8_arr);
-
-/*
- * _uint8_arr_to_uchar
- * convert uint8_t array to unsigned char array
- * @param uint8_arr the uint8_t array
- * @param length the length of the array
- * @param uchar_arr the unsigned char array
- * @return whether the conversion was successful
- */
-bool _uint8_arr_to_uchar(const uint8_t** uint8_arr, size_t* length, unsigned char** uchar_arr);
-
 #endif  // TIDESDB_H

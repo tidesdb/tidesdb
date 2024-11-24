@@ -291,17 +291,23 @@ tidesdb_err* tidesdb_compact_sstables(tidesdb* tdb, column_family* cf, int max_t
     // split the work based on max_threads
     int sstables_per_thread = (num_sstables + max_threads - 1) / max_threads;
     pthread_t threads[max_threads];
-    int thread_args[max_threads][2];  // start and end indices for each thread
+    compact_thread_args* thread_args = malloc(max_threads * sizeof(compact_thread_args));  // allocate memory for thread arguments
+
+    if (thread_args == NULL) {
+        pthread_rwlock_unlock(&cf->sstables_lock);
+        return tidesdb_err_new(1033, "Failed to allocate memory for thread arguments");
+    }
 
     for (int i = 0; i < max_threads; i++) {
-        thread_args[i][0] = i * sstables_per_thread;
-        thread_args[i][1] = (i + 1) * sstables_per_thread;
-        if (thread_args[i][1] > num_sstables) {
-            thread_args[i][1] = num_sstables;
+        thread_args[i].cf = cf;
+        thread_args[i].start = i * sstables_per_thread;
+        thread_args[i].end = (i + 1) * sstables_per_thread;
+        if (thread_args[i].end > num_sstables) {
+            thread_args[i].end = num_sstables;
         }
-        if (pthread_create(&threads[i], NULL, _compact_sstables_thread, (void*)thread_args[i]) !=
-            0) {
+        if (pthread_create(&threads[i], NULL, _compact_sstables_thread, (void*)&thread_args[i]) != 0) {
             pthread_rwlock_unlock(&cf->sstables_lock);
+            free(thread_args);
             return tidesdb_err_new(1032, "Failed to create compaction thread");
         }
     }
@@ -317,6 +323,8 @@ tidesdb_err* tidesdb_compact_sstables(tidesdb* tdb, column_family* cf, int max_t
     // unlock the sstables lock
     pthread_rwlock_unlock(&cf->sstables_lock);
 
+    free(thread_args);  // free allocated memory for thread arguments
+
     return NULL;
 }
 
@@ -328,31 +336,32 @@ void* _compact_sstables_thread(void* arg) {
 
     // perform the compaction for the given range of sstables
     for (int i = start; i < end - 1; i += 2) {
+        if (i + 1 >= cf->num_sstables) {
+            break;  // Ensure we do not exceed the number of SSTables
+        }
+
         // merge sstables[i] and sstables[i+1] into a new sstable
         sstable* new_sstable = _merge_sstables(cf->sstables[i], cf->sstables[i + 1], cf);
 
-        // close pagers for the old sstables
-        fclose(cf->sstables[i]->pager->file);
-        fclose(cf->sstables[i + 1]->pager->file);
+
 
         // remove old sstable files
         char sstable_path1[PATH_MAX];
         char sstable_path2[PATH_MAX];
 
         // get the sstable paths
-        snprintf(sstable_path1, PATH_MAX, "%s/%s", cf->path, cf->sstables[i]->pager->filename);
-        snprintf(sstable_path2, PATH_MAX, "%s/%s", cf->path, cf->sstables[i + 1]->pager->filename);
+        snprintf(sstable_path1, PATH_MAX, "%s",  cf->sstables[i]->pager->filename);
+        snprintf(sstable_path2, PATH_MAX, "%s", cf->sstables[i + 1]->pager->filename);
+
+        // free the old sstables
+        _free_sstable(cf->sstables[i]);
+        _free_sstable(cf->sstables[i + 1]);
+
 
         // remove the sstable files
         remove(sstable_path1);
         remove(sstable_path2);
 
-        pager_close(cf->sstables[i]->pager);
-        pager_close(cf->sstables[i + 1]->pager);
-
-        // free the old sstables
-        _free_sstable(cf->sstables[i]);
-        _free_sstable(cf->sstables[i + 1]);
 
         // replace the old sstables with the new one
         cf->sstables[i / 2] = new_sstable;
@@ -362,27 +371,17 @@ void* _compact_sstables_thread(void* arg) {
 }
 
 sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
-    // we create a new skiplist
-    // we create a bloom filter
-    // we do a nested loop to insert all the key-value pairs and add them to the bloom filter
-    // we create a new pager for the sstable
-    // we write the bloom filter to the pager
-    // we iterate over the skiplist and write the key-value pairs to the pager
-    // we return the sstable
-
     skiplist* mergetable = new_skiplist(cf->config.max_level, cf->config.probability);
     if (mergetable == NULL) {
         return NULL;
     }
 
-    // create a new bloom filter
     bloomfilter* bf = bloomfilter_create(BLOOMFILTER_SIZE);
     if (bf == NULL) {
         skiplist_destroy(mergetable);
         return NULL;
     }
 
-    // we create a pager cursor for the sstables
     pager_cursor* cursor1 = NULL;
     pager_cursor* cursor2 = NULL;
 
@@ -399,91 +398,94 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
         return NULL;
     }
 
-    unsigned char* buffer1 = NULL;
-    size_t buffer_len1 = 0;
-    unsigned char* buffer2 = NULL;
-    size_t buffer_len2 = 0;
 
-    // we iterate over the sstables
+
     bool has_next1 = true;
     bool has_next2 = true;
 
     while (has_next1 || has_next2) {
+        uint8_t* buffer1 = NULL;
+        size_t buffer_len1 = 0;
+        uint8_t* buffer2 = NULL;
+        size_t buffer_len2 = 0;
+
         if (has_next1) {
             has_next1 = pager_cursor_next(cursor1);
-            if (has_next1 &&
-                !pager_read(sst1->pager, cursor1->page_number, &buffer1, &buffer_len1)) {
+            if (has_next1 && !pager_read(sst1->pager, cursor1->page_number, &buffer1, &buffer_len1)) {
                 break;
             }
         }
 
         if (has_next2) {
             has_next2 = pager_cursor_next(cursor2);
-            if (has_next2 &&
-                !pager_read(sst2->pager, cursor2->page_number, &buffer2, &buffer_len2)) {
+            if (has_next2 && !pager_read(sst2->pager, cursor2->page_number, &buffer2, &buffer_len2)) {
                 break;
             }
         }
 
-        // we deserialize the key-value pairs
         key_value_pair* kv1 = NULL;
         key_value_pair* kv2 = NULL;
 
+
         if (!deserialize_key_value_pair(buffer1, buffer_len1, &kv1, cf->config.compressed)) {
+            free(buffer1);
+            free(buffer2);
             break;
         }
 
         if (!deserialize_key_value_pair(buffer2, buffer_len2, &kv2, cf->config.compressed)) {
+            free(buffer1);
+            free(buffer2);
             break;
         }
 
-        // we add the key-value pairs to the mergetable
+        if (kv1 == NULL || kv2 == NULL) {
+            free(buffer1);
+            free(buffer2);
+            break;
+        }
 
-        // check if value is a tombstone
         if (!_is_tombstone(kv1->value, kv1->value_size)) {
-            if (!skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size,
-                              kv1->ttl)) {
+            if (!skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size, kv1->ttl)) {
                 break;
             }
         }
 
         if (!_is_tombstone(kv2->value, kv2->value_size)) {
-            if (!skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size,
-                              kv2->ttl)) {
+            if (!skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size, kv2->ttl)) {
                 break;
             }
         }
 
-        // add the key to the bloom filter
         bloomfilter_add(bf, kv1->key, kv1->key_size);
         bloomfilter_add(bf, kv2->key, kv2->key_size);
 
-        // free the key-value pairs
-        free(kv1->key);
-        free(kv1->value);
         free(kv1);
-
-        free(kv2->key);
-        free(kv2->value);
         free(kv2);
 
         free(buffer1);
         free(buffer2);
     }
 
-    // now we create a new pager for the sstable
     pager* new_pager = NULL;
 
-    if (!pager_open(cf->path, &new_pager)) {
+    char new_sstable_name[PATH_MAX];
+
+    char numeric_part1[PATH_MAX];
+    char numeric_part2[PATH_MAX];
+    _sst_extract_numeric_part(sst1->pager->filename, numeric_part1);
+    _sst_extract_numeric_part(sst2->pager->filename, numeric_part2);
+
+    // Format the new SSTable name
+    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%s_%s.sst", cf->path, _get_path_seperator(), numeric_part1, numeric_part2);
+
+    if (!pager_open(new_sstable_name, &new_pager)) {
         skiplist_destroy(mergetable);
         bloomfilter_destroy(bf);
         return NULL;
     }
 
-    // we write the bloom filter to the pager
     uint8_t* bf_buffer = NULL;
-
-    // serialize the bloom filter
     size_t bf_buffer_len = 0;
 
     if (!serialize_bloomfilter(bf, &bf_buffer, &bf_buffer_len, cf->config.compressed)) {
@@ -495,7 +497,6 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
 
     unsigned int page_num;
 
-    // write the bloom filter to the pager
     if (!pager_write(new_pager, bf_buffer, bf_buffer_len, &page_num)) {
         skiplist_destroy(mergetable);
         bloomfilter_destroy(bf);
@@ -503,15 +504,11 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
         return NULL;
     }
 
-    // free the bloom filter buffer
     free(bf_buffer);
 
-    // we iterate over the mergetable and write the key-value pairs to the pager
-    // we create new sl cursor
     skiplist_cursor* sl_cursor = skiplist_cursor_init(mergetable);
 
     do {
-        // serialize the key-value pair
         unsigned char* kv_buffer = NULL;
         size_t kv_buffer_len = 0;
 
@@ -531,15 +528,12 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
 
         unsigned int page_number;
 
-        // write the key-value pair to the pager
         if (!pager_write(new_pager, kv_buffer, kv_buffer_len, &page_number)) {
             break;
         }
 
-        // free the key-value pair buffer
         free(kv_buffer);
 
-        // increment the number of pages
         new_pager->num_pages++;
 
     } while (skiplist_cursor_next(sl_cursor));
@@ -547,13 +541,9 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
     skiplist_destroy(mergetable);
     bloomfilter_destroy(bf);
 
-    // now we create the sstable
     sstable* new_sstable = malloc(sizeof(sstable));
-
-    // set the pager
     new_sstable->pager = new_pager;
 
-    // we return the sstable
     return new_sstable;
 }
 
@@ -2278,4 +2268,16 @@ int _remove_directory(const char* path) {
     }
 
     return 0;
+}
+
+void _sst_extract_numeric_parts(const char* filename, char* numeric_parts) {
+    const char* start = strrchr(filename, '_');
+    if (start != NULL) {
+        start++; // move past the last '_'
+        const char* end = strrchr(start, '.');
+        if (end != NULL) {
+            strncpy(numeric_parts, start, end - start);
+            numeric_parts[end - start] = '\0';
+        }
+    }
 }

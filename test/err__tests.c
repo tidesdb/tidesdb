@@ -23,7 +23,8 @@
 #include "../src/err.h"
 #include "test_macros.h"
 
-void test_tidesdb_err_new() {
+void test_tidesdb_err_new()
+{
     tidesdb_err* e = tidesdb_err_new(1, "message");
     assert(e != NULL);
     assert(e->code == 1);
@@ -33,7 +34,8 @@ void test_tidesdb_err_new() {
     printf(GREEN "test_tidesdb_err_new passed\n" RESET);
 }
 
-int main(void) {
+int main(void)
+{
     test_tidesdb_err_new();
     return 0;
 }

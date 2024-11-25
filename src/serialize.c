@@ -19,17 +19,14 @@
 #include "serialize.h"
 
 bool serialize_key_value_pair(const key_value_pair* kvp, uint8_t** buffer, size_t* encoded_size,
-                              bool compress) {
-    if (!kvp || !buffer || !encoded_size) {
-        return false;
-    }
+                              bool compress)
+{
+    if (!kvp || !buffer || !encoded_size) return false;
 
     *encoded_size =
         sizeof(uint32_t) + kvp->key_size + sizeof(uint32_t) + kvp->value_size + sizeof(int64_t);
-    uint8_t* temp_buffer = (uint8_t*)malloc(*encoded_size);
-    if (!temp_buffer) {
-        return false;
-    }
+    uint8_t* temp_buffer = malloc(*encoded_size);
+    if (!temp_buffer) return false;
 
     uint8_t* ptr = temp_buffer;
 
@@ -45,16 +42,19 @@ bool serialize_key_value_pair(const key_value_pair* kvp, uint8_t** buffer, size_
 
     memcpy(ptr, &kvp->ttl, sizeof(int64_t));
 
-    if (compress) {
+    if (compress)
+    {
         size_t compressed_size = ZSTD_compressBound(*encoded_size);
         *buffer = (uint8_t*)malloc(compressed_size);
-        if (!*buffer) {
+        if (!*buffer)
+        {
             free(temp_buffer);
             return false;
         }
 
         compressed_size = ZSTD_compress(*buffer, compressed_size, temp_buffer, *encoded_size, 1);
-        if (ZSTD_isError(compressed_size)) {
+        if (ZSTD_isError(compressed_size))
+        {
             free(temp_buffer);
             free(*buffer);
             return false;
@@ -62,32 +62,31 @@ bool serialize_key_value_pair(const key_value_pair* kvp, uint8_t** buffer, size_
 
         *encoded_size = compressed_size;
         free(temp_buffer);
-    } else {
-        *buffer = temp_buffer;
     }
+    else
+        *buffer = temp_buffer;
 
     return true;
 }
 
 bool deserialize_key_value_pair(const uint8_t* buffer, size_t buffer_size, key_value_pair** kvp,
-                                bool decompress) {
-    if (!buffer || !kvp) {
-        return false;
-    }
+                                bool decompress)
+{
+    uint8_t* temp_buffer = NULL;
 
-    if (decompress) {
+    if (!buffer || !kvp) return false;
+
+    if (decompress)
+    {
         size_t decompressed_size = ZSTD_getFrameContentSize(buffer, buffer_size);
-        if (decompressed_size == ZSTD_CONTENTSIZE_ERROR) {
-            return false;
-        }
+        if (decompressed_size == ZSTD_CONTENTSIZE_ERROR) return false;
 
-        uint8_t* temp_buffer = (uint8_t*)malloc(decompressed_size);
-        if (!temp_buffer) {
-            return false;
-        }
+        temp_buffer = malloc(decompressed_size);
+        if (!temp_buffer) return false;
 
         decompressed_size = ZSTD_decompress(temp_buffer, decompressed_size, buffer, buffer_size);
-        if (ZSTD_isError(decompressed_size)) {
+        if (ZSTD_isError(decompressed_size))
+        {
             free(temp_buffer);
             return false;
         }
@@ -97,7 +96,9 @@ bool deserialize_key_value_pair(const uint8_t* buffer, size_t buffer_size, key_v
     }
 
     *kvp = (key_value_pair*)malloc(sizeof(key_value_pair));
-    if (!*kvp) {
+    if (!*kvp)
+    {
+        if (temp_buffer) free(temp_buffer);
         return false;
     }
 
@@ -106,8 +107,10 @@ bool deserialize_key_value_pair(const uint8_t* buffer, size_t buffer_size, key_v
     memcpy(&(*kvp)->key_size, ptr, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
     (*kvp)->key = (uint8_t*)malloc((*kvp)->key_size);
-    if (!(*kvp)->key) {
+    if (!(*kvp)->key)
+    {
         free(*kvp);
+        if (temp_buffer) free(temp_buffer);
         return false;
     }
     memcpy((*kvp)->key, ptr, (*kvp)->key_size);
@@ -116,9 +119,11 @@ bool deserialize_key_value_pair(const uint8_t* buffer, size_t buffer_size, key_v
     memcpy(&(*kvp)->value_size, ptr, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
     (*kvp)->value = (uint8_t*)malloc((*kvp)->value_size);
-    if (!(*kvp)->value) {
+    if (!(*kvp)->value)
+    {
         free((*kvp)->key);
         free(*kvp);
+        if (temp_buffer) free(temp_buffer);
         return false;
     }
     memcpy((*kvp)->value, ptr, (*kvp)->value_size);
@@ -126,26 +131,25 @@ bool deserialize_key_value_pair(const uint8_t* buffer, size_t buffer_size, key_v
 
     memcpy(&(*kvp)->ttl, ptr, sizeof(int64_t));
 
+    if (temp_buffer) free(temp_buffer);
+
     return true;
 }
 
-bool serialize_operation(const operation* op, uint8_t** buffer, size_t* encoded_size,
-                         bool compress) {
-    if (!op || !buffer || !encoded_size) {
-        return false;
-    }
+bool serialize_operation(const operation* op, uint8_t** buffer, size_t* encoded_size, bool compress)
+{
+    if (!op || !buffer || !encoded_size) return false;
 
     size_t kvp_encoded_size;
     uint8_t* kvp_buffer;
-    if (!serialize_key_value_pair(op->kv, &kvp_buffer, &kvp_encoded_size, false)) {
-        return false;
-    }
+    if (!serialize_key_value_pair(op->kv, &kvp_buffer, &kvp_encoded_size, false)) return false;
 
     size_t column_family_size = strlen(op->column_family) + 1;
     *encoded_size = sizeof(int) + kvp_encoded_size + column_family_size;
 
-    uint8_t* temp_buffer = (uint8_t*)malloc(*encoded_size);
-    if (!temp_buffer) {
+    uint8_t* temp_buffer = malloc(*encoded_size);
+    if (!temp_buffer)
+    {
         free(kvp_buffer);
         return false;
     }
@@ -159,16 +163,19 @@ bool serialize_operation(const operation* op, uint8_t** buffer, size_t* encoded_
 
     free(kvp_buffer);
 
-    if (compress) {
+    if (compress)
+    {
         size_t compressed_size = ZSTD_compressBound(*encoded_size);
         *buffer = (uint8_t*)malloc(compressed_size);
-        if (!*buffer) {
+        if (!*buffer)
+        {
             free(temp_buffer);
             return false;
         }
 
         compressed_size = ZSTD_compress(*buffer, compressed_size, temp_buffer, *encoded_size, 1);
-        if (ZSTD_isError(compressed_size)) {
+        if (ZSTD_isError(compressed_size))
+        {
             free(temp_buffer);
             free(*buffer);
             return false;
@@ -176,34 +183,34 @@ bool serialize_operation(const operation* op, uint8_t** buffer, size_t* encoded_
 
         *encoded_size = compressed_size;
         free(temp_buffer);
-    } else {
-        *buffer = temp_buffer;
     }
+    else
+        *buffer = temp_buffer;
 
     return true;
 }
 
 bool deserialize_operation(const uint8_t* buffer, size_t buffer_size, operation** op,
-                           bool decompress) {
-    if (!buffer || !op) {
-        return false;
-    }
+                           bool decompress)
+{
+    if (!buffer || !op) return false;
 
     uint8_t* temp_buffer = NULL;
-    if (decompress) {
+    if (decompress)
+    {
         size_t decompressed_size = ZSTD_getFrameContentSize(buffer, buffer_size);
         if (decompressed_size == ZSTD_CONTENTSIZE_ERROR ||
-            decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+            decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN)
+        {
             return false;
         }
 
         temp_buffer = (uint8_t*)malloc(decompressed_size);
-        if (!temp_buffer) {
-            return false;
-        }
+        if (!temp_buffer) return false;
 
         decompressed_size = ZSTD_decompress(temp_buffer, decompressed_size, buffer, buffer_size);
-        if (ZSTD_isError(decompressed_size)) {
+        if (ZSTD_isError(decompressed_size))
+        {
             free(temp_buffer);
             return false;
         }
@@ -213,10 +220,9 @@ bool deserialize_operation(const uint8_t* buffer, size_t buffer_size, operation*
     }
 
     *op = (operation*)malloc(sizeof(operation));
-    if (!*op) {
-        if (temp_buffer) {
-            free(temp_buffer);
-        }
+    if (!*op)
+    {
+        if (temp_buffer) free(temp_buffer);
         return false;
     }
 
@@ -224,11 +230,10 @@ bool deserialize_operation(const uint8_t* buffer, size_t buffer_size, operation*
     memcpy(&(*op)->op_code, ptr, sizeof(int));
     ptr += sizeof(int);
 
-    if (!deserialize_key_value_pair(ptr, buffer_size - (ptr - buffer), &(*op)->kv, false)) {
+    if (!deserialize_key_value_pair(ptr, buffer_size - (ptr - buffer), &(*op)->kv, false))
+    {
         free(*op);
-        if (temp_buffer) {
-            free(temp_buffer);
-        }
+        if (temp_buffer) free(temp_buffer);
         return false;
     }
 
@@ -237,38 +242,32 @@ bool deserialize_operation(const uint8_t* buffer, size_t buffer_size, operation*
 
     size_t column_family_size = strlen((char*)ptr) + 1;
     (*op)->column_family = (char*)malloc(column_family_size);
-    if (!(*op)->column_family) {
+    if (!(*op)->column_family)
+    {
         free((*op)->kv->key);
         free((*op)->kv->value);
         free((*op)->kv);
         free(*op);
-        if (temp_buffer) {
-            free(temp_buffer);
-        }
+        if (temp_buffer) free(temp_buffer);
         return false;
     }
     memcpy((*op)->column_family, ptr, column_family_size);
 
-    if (temp_buffer) {
-        free(temp_buffer);
-    }
+    if (temp_buffer) free(temp_buffer);
 
     return true;
 }
 
 bool serialize_column_family_config(const column_family_config* config, uint8_t** buffer,
-                                    size_t* encoded_size) {
-    if (!config || !buffer || !encoded_size) {
-        return false;
-    }
+                                    size_t* encoded_size)
+{
+    if (!config || !buffer || !encoded_size) return false;
 
     size_t name_size = strlen(config->name) + 1;
     *encoded_size = name_size + sizeof(int32_t) * 2 + sizeof(float) + sizeof(bool);
 
-    uint8_t* temp_buffer = (uint8_t*)malloc(*encoded_size);
-    if (!temp_buffer) {
-        return false;
-    }
+    uint8_t* temp_buffer = malloc(*encoded_size);
+    if (!temp_buffer) return false;
 
     uint8_t* ptr = temp_buffer;
     memcpy(ptr, config->name, name_size);
@@ -287,20 +286,18 @@ bool serialize_column_family_config(const column_family_config* config, uint8_t*
 }
 
 bool deserialize_column_family_config(const uint8_t* buffer, size_t buffer_size,
-                                      column_family_config** config) {
-    if (!buffer || !config) {
-        return false;
-    }
+                                      column_family_config** config)
+{
+    if (!buffer || !config) return false;
 
     *config = (column_family_config*)malloc(sizeof(column_family_config));
-    if (!*config) {
-        return false;
-    }
+    if (!*config) return false;
 
     const uint8_t* ptr = buffer;
     size_t name_size = strlen((char*)ptr) + 1;
     (*config)->name = (char*)malloc(name_size);
-    if (!(*config)->name) {
+    if (!(*config)->name)
+    {
         free(*config);
         return false;
     }
@@ -318,16 +315,13 @@ bool deserialize_column_family_config(const uint8_t* buffer, size_t buffer_size,
 }
 
 bool serialize_bloomfilter(const bloomfilter* bf, uint8_t** buffer, size_t* encoded_size,
-                           bool compress) {
-    if (!bf || !buffer || !encoded_size) {
-        return false;
-    }
+                           bool compress)
+{
+    if (!bf || !buffer || !encoded_size) return false;
 
     *encoded_size = sizeof(uint32_t) * 2 + bf->size + sizeof(bool);
-    uint8_t* temp_buffer = (uint8_t*)malloc(*encoded_size);
-    if (!temp_buffer) {
-        return false;
-    }
+    uint8_t* temp_buffer = malloc(*encoded_size);
+    if (!temp_buffer) return false;
 
     uint8_t* ptr = temp_buffer;
     memcpy(ptr, &bf->size, sizeof(uint32_t));
@@ -339,16 +333,19 @@ bool serialize_bloomfilter(const bloomfilter* bf, uint8_t** buffer, size_t* enco
     bool has_next = (bf->next != NULL);
     memcpy(ptr, &has_next, sizeof(bool));
 
-    if (compress) {
+    if (compress)
+    {
         size_t compressed_size = ZSTD_compressBound(*encoded_size);
         *buffer = (uint8_t*)malloc(compressed_size);
-        if (!*buffer) {
+        if (!*buffer)
+        {
             free(temp_buffer);
             return false;
         }
 
         compressed_size = ZSTD_compress(*buffer, compressed_size, temp_buffer, *encoded_size, 1);
-        if (ZSTD_isError(compressed_size)) {
+        if (ZSTD_isError(compressed_size))
+        {
             free(temp_buffer);
             free(*buffer);
             return false;
@@ -356,34 +353,32 @@ bool serialize_bloomfilter(const bloomfilter* bf, uint8_t** buffer, size_t* enco
 
         *encoded_size = compressed_size;
         free(temp_buffer);
-    } else {
-        *buffer = temp_buffer;
     }
+    else
+        *buffer = temp_buffer;
 
     return true;
 }
 
 bool deserialize_bloomfilter(const uint8_t* buffer, size_t buffer_size, bloomfilter** bf,
-                             bool decompress) {
-    if (!buffer || !bf) {
-        return false;
-    }
+                             bool decompress)
+{
+    if (!buffer || !bf) return false;
 
     uint8_t* temp_buffer = NULL;
-    if (decompress) {
+    if (decompress)
+    {
         size_t decompressed_size = ZSTD_getFrameContentSize(buffer, buffer_size);
         if (decompressed_size == ZSTD_CONTENTSIZE_ERROR ||
-            decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+            decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN)
             return false;
-        }
 
         temp_buffer = (uint8_t*)malloc(decompressed_size);
-        if (!temp_buffer) {
-            return false;
-        }
+        if (!temp_buffer) return false;
 
         decompressed_size = ZSTD_decompress(temp_buffer, decompressed_size, buffer, buffer_size);
-        if (ZSTD_isError(decompressed_size)) {
+        if (ZSTD_isError(decompressed_size))
+        {
             free(temp_buffer);
             return false;
         }
@@ -393,10 +388,9 @@ bool deserialize_bloomfilter(const uint8_t* buffer, size_t buffer_size, bloomfil
     }
 
     *bf = (bloomfilter*)malloc(sizeof(bloomfilter));
-    if (!*bf) {
-        if (temp_buffer) {
-            free(temp_buffer);
-        }
+    if (!*bf)
+    {
+        if (temp_buffer) free(temp_buffer);
         return false;
     }
 
@@ -407,11 +401,11 @@ bool deserialize_bloomfilter(const uint8_t* buffer, size_t buffer_size, bloomfil
     ptr += sizeof(uint32_t);
 
     (*bf)->set = (uint8_t*)malloc((*bf)->size);
-    if (!(*bf)->set) {
+    if (!(*bf)->set)
+    {
         free(*bf);
-        if (temp_buffer) {
-            free(temp_buffer);
-        }
+        if (temp_buffer) free(temp_buffer);
+
         return false;
     }
     memcpy((*bf)->set, ptr, (*bf)->size);
@@ -421,9 +415,7 @@ bool deserialize_bloomfilter(const uint8_t* buffer, size_t buffer_size, bloomfil
     memcpy(&has_next, ptr, sizeof(bool));
     (*bf)->next = has_next ? (bloomfilter*)malloc(sizeof(bloomfilter)) : NULL;
 
-    if (temp_buffer) {
-        free(temp_buffer);
-    }
+    if (temp_buffer) free(temp_buffer);
 
     return true;
 }

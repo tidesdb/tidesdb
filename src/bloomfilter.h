@@ -37,12 +37,13 @@ typedef struct bloomfilter bloomfilter;
  * @param set array of integers representing the bloom filter's bitset
  * @param next pointer to the next bloomfilter (for chaining)
  */
-typedef struct bloomfilter {
-    uint32_t size;             // Size of the bloom filter (number of bits or slots)
-    uint32_t count;            // Number of elements in the bloom filter
-    uint8_t *set;              // Array of integers representing the bloom filter's bitset
-    struct bloomfilter *next;  // Pointer to the next bloomfilter (for chaining)
-} bloomfilter;
+struct bloomfilter
+{
+    uint32_t size;     /* Size of the bloom filter (number of bits or slots) */
+    uint32_t count;    /* Number of elements in the bloom filter */
+    uint8_t *set;      /* Array of integers representing the bloom filter's bitset */
+    bloomfilter *next; /* Pointer to the next bloomfilter (for chaining) */
+};
 
 /* Bloom filter function prototypes */
 
@@ -108,4 +109,4 @@ unsigned int hash2(const unsigned char *data, unsigned int data_len);
  */
 unsigned int bloomfilter_get_size(bloomfilter *bf);
 
-#endif  // BLOOMFILTER_H
+#endif /* BLOOMFILTER_H */

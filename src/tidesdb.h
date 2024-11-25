@@ -35,12 +35,13 @@
 #include "serialize.h"
 #include "skiplist.h"
 
-#define BLOOMFILTER_SIZE \
-    1000  // size of each bloom filter.  Bloom filters are linked once they reach this size
-#define WAL_EXT ".wal"                        // extension for the write-ahead log file
-#define SSTABLE_EXT ".sst"                    // extension for the SSTable file
-#define COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"  // configuration file for the column family
-#define TOMBSTONE 0xDEADBEEF                  // tombstone value for deleted keys
+#define BLOOMFILTER_SIZE                                                                      \
+    1000 /* size of each bloom filter.  Bloom filters are linked once they reach this size in \
+            occupied capacity */
+#define WAL_EXT                       ".wal"     /* extension for the write-ahead log file */
+#define SSTABLE_EXT                   ".sst"     /* extension for the SSTable file */
+#define COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"     /* configuration file for the column family */
+#define TOMBSTONE                     0xDEADBEEF /* tombstone value for deleted keys */
 
 /*
  * tidesdb_config_new
@@ -48,9 +49,10 @@
  * @param db_path the path for/to TidesDB
  * @param compressed_wal whether the wal should be compressed
  */
-typedef struct {
-    char* db_path;        // the path for/to TidesDB.  This is where column families are stored
-    bool compressed_wal;  // whether the wal should be compressed
+typedef struct
+{
+    char* db_path;       /* the path for/to TidesDB.  This is where column families are stored */
+    bool compressed_wal; /* whether the wal should be compressed */
 } tidesdb_config;
 
 /*
@@ -58,8 +60,9 @@ typedef struct {
  * struct for the SSTable
  * @param pager the pager for the SSTable
  */
-typedef struct {
-    pager* pager;  // the pager for the SSTable
+typedef struct
+{
+    pager* pager; /* the pager for the SSTable */
 } sstable;
 
 /*
@@ -68,9 +71,10 @@ typedef struct {
  * @param pager the pager for the WAL
  * @param lock the read-write lock for the WAL
  */
-typedef struct {
-    pager* pager;           // the pager for the SSTable
-    pthread_rwlock_t lock;  // Read-write lock for the SSTable
+typedef struct
+{
+    pager* pager;          /* the pager for the WAL */
+    pthread_rwlock_t lock; /* Read-write lock for the SSTable */
 } wal;
 
 /*
@@ -83,14 +87,15 @@ typedef struct {
  * @param sstables_lock Read-write lock for SSTables mainly for when adding a new sstable
  * @param memtable the memtable for the column family
  */
-typedef struct {
-    column_family_config config;  // the configuration for the column family
-    char* path;                   // the path to the column family
-    sstable** sstables;           // the sstables for the column family
-    int num_sstables;             // the number of sstables for the column family
+typedef struct
+{
+    column_family_config config; /* the configuration for the column family */
+    char* path;                  /* the path to the column family */
+    sstable** sstables;          /* the sstables for the column family */
+    int num_sstables;            /* the number of sstables for the column family */
     pthread_rwlock_t
-        sstables_lock;   // Read-write lock for SSTables mainly for when adding a new sstable
-    skiplist* memtable;  // the memtable for the column family
+        sstables_lock;  /* Read-write lock for SSTables mainly for when adding a new sstable */
+    skiplist* memtable; /* the memtable for the column family */
 } column_family;
 
 /*
@@ -100,10 +105,11 @@ typedef struct {
  * @param rollback_op the rollback operation for the operation
  * @param committed whether the transaction op has been committed
  */
-typedef struct {
-    operation* op;           // the operation for the transaction
-    operation* rollback_op;  // the rollback operation for the operation
-    bool committed;          // whether the transaction op has been committed
+typedef struct
+{
+    operation* op;          /* the operation for the transaction */
+    operation* rollback_op; /* the rollback operation for the operation */
+    bool committed;         /* whether the transaction op has been committed */
 } txn_op;
 
 /*
@@ -113,10 +119,11 @@ typedef struct {
  * @param num_ops the number of operations in the transaction
  * @param column_family the column family for the transaction
  */
-typedef struct {
-    txn_op* ops;          // the operations in the transaction
-    int num_ops;          // the number of operations in the transaction
-    char* column_family;  // the column family for the transaction
+typedef struct
+{
+    txn_op* ops;         /* the operations in the transaction */
+    int num_ops;         /* the number of operations in the transaction */
+    char* column_family; /* the column family for the transaction */
 } txn;
 
 /*
@@ -133,17 +140,18 @@ typedef struct {
  * @param flush_cond the condition variable for flush thread
  * @param stop_flush_thread flag to stop the flush thread
  */
-typedef struct {
-    tidesdb_config config;                  // the configuration for tidesdb
-    column_family* column_families;         // the column families currently
-    pthread_rwlock_t column_families_lock;  // Read-write lock for column families
-    int num_column_families;                // the number of column families currently
-    wal* wal;                               // the write-ahead log for tidesdb
-    pthread_t flush_thread;                 // the thread for flushing memtables
-    queue* flush_queue;                     // the queue for flushing memtables
-    pthread_mutex_t flush_lock;             // flush lock
-    pthread_cond_t flush_cond;              // condition variable for flush thread
-    bool stop_flush_thread;                 // flag to stop the flush thread
+typedef struct
+{
+    tidesdb_config config;                 /* the configuration for tidesdb */
+    column_family* column_families;        /* the column families currently */
+    pthread_rwlock_t column_families_lock; /* Read-write lock for column families */
+    int num_column_families;               /* the number of column families currently */
+    wal* wal;                              /* the write-ahead log for tidesdb */
+    pthread_t flush_thread;                /* the thread for flushing memtables */
+    queue* flush_queue;                    /* the queue for flushing memtables */
+    pthread_mutex_t flush_lock;            /* flush lock */
+    pthread_cond_t flush_cond;             /* condition variable for flush thread */
+    bool stop_flush_thread;                /* flag to stop the flush thread */
 } tidesdb;
 
 /*
@@ -156,13 +164,14 @@ typedef struct {
  * @param sstable_cursor the cursor for the sstable
  * @param current the current key-value pair
  */
-typedef struct {
-    tidesdb* tidesdb;                  // tidesdb instance
-    column_family* cf;                 // the column family
-    skiplist_cursor* memtable_cursor;  // the cursor for the memtable
-    size_t sstable_index;              // the index of the sstable
-    pager_cursor* sstable_cursor;      // the cursor for the sstable
-    key_value_pair* current;           // the current key-value pair
+typedef struct
+{
+    tidesdb* tidesdb;                 /* tidesdb instance */
+    column_family* cf;                /* the column family */
+    skiplist_cursor* memtable_cursor; /* the cursor for the memtable */
+    size_t sstable_index;             /* the index of the sstable */
+    pager_cursor* sstable_cursor;     /* the cursor for the sstable */
+    key_value_pair* current;          /* the current key-value pair */
 } tidesdb_cursor;
 
 /*
@@ -172,10 +181,11 @@ typedef struct {
  * @param cf the column family
  * @param wal_checkpoint the point in the wal to truncate after flush
  */
-typedef struct {
-    skiplist* memtable;     // the memtable
-    column_family* cf;      // the column family
-    size_t wal_checkpoint;  // the point in the wal to truncate after flush
+typedef struct
+{
+    skiplist* memtable;    /* the memtable */
+    column_family* cf;     /* the column family */
+    size_t wal_checkpoint; /* the point in the wal to truncate after flush */
 } queue_entry;
 
 /*
@@ -185,10 +195,11 @@ typedef struct {
  * @param start the start index for the sstables
  * @param end the end index for the sstables
  */
-typedef struct {
-    column_family* cf;  // the column family
-    int start;          // the start index for the sstables
-    int end;            // the end index for the sstables
+typedef struct
+{
+    column_family* cf; /* the column family */
+    int start;         /* the start index for the sstables */
+    int end;           /* the end index for the sstables */
 } compact_thread_args;
 
 /* TidesDB function prototypes */
@@ -580,4 +591,4 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf);
  */
 void _sst_extract_numeric_parts(const char* filename, char* numeric_part);
 
-#endif  // TIDESDB_H
+#endif /* TIDESDB_H */

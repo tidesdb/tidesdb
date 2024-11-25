@@ -19,11 +19,11 @@
 #ifndef PAGER_H
 #define PAGER_H
 
-#define PAGE_HEADER 16L  // The page header is used to store an overflow page number
-#define PAGE_BODY 1024   // The page body is used to store the actual data
-#define PAGE_SIZE (PAGE_HEADER + PAGE_BODY)  // The page size is the sum of the header and body
-#define SYNC_INTERVAL 24576                  // Sync every 24576 writes
-#define SYNC_ESCALATION 2  // We sync when we hit sync escalation or when we hit sync interval
+#define PAGE_HEADER     16L  /* The page header is used to store an overflow page number */
+#define PAGE_BODY       1024 /* The page body is used to store the actual data */
+#define PAGE_SIZE       (PAGE_HEADER + PAGE_BODY) /* The page size is the sum of the header and body */
+#define SYNC_INTERVAL   24576                     /* Sync every 24576 writes */
+#define SYNC_ESCALATION 2 /* We sync when we hit sync escalation or when we hit sync interval */
 
 #include <errno.h>
 #include <pthread.h>
@@ -50,17 +50,19 @@
  * @param write_count number of writes since last sync
  * @param stop_sync_thread flag to stop the sync thread
  */
-typedef struct {
-    FILE* file;                  // the file the pager is assigned
-    char* filename;              // the filename of the paged file
-    pthread_rwlock_t file_lock;  // lock for the file (only one thread can write to file at a time)
-    pthread_rwlock_t* page_locks;  // page locks for each page
-    size_t num_pages;              // number of pages in file currently
-    pthread_t sync_thread;         // background sync thread
-    pthread_mutex_t sync_mutex;    // mutex for sync thread
-    pthread_cond_t sync_cond;      // condition variable for sync thread
-    size_t write_count;            // number of writes since last sync
-    bool stop_sync_thread;         // flag to stop the sync thread
+typedef struct
+{
+    FILE* file;     /* the file the pager is assigned */
+    char* filename; /* the filename of the paged file */
+    pthread_rwlock_t
+        file_lock; /* lock for the file (only one thread can write to file at a time) */
+    pthread_rwlock_t* page_locks; /* page locks for each page */
+    size_t num_pages;             /* number of pages in file currently */
+    pthread_t sync_thread;        /* background sync thread */
+    pthread_mutex_t sync_mutex;   /* mutex for sync thread */
+    pthread_cond_t sync_cond;     /* condition variable for sync thread */
+    size_t write_count;           /* number of writes since last sync */
+    bool stop_sync_thread;        /* flag to stop the sync thread */
 } pager;
 
 /*
@@ -69,9 +71,10 @@ typedef struct {
  * @param pager the pager the cursor is assigned
  * @param page_number the page number the cursor is currently on
  */
-typedef struct {
-    pager* pager;              // the pager the cursor is assigned
-    unsigned int page_number;  // the page number the cursor is currently on
+typedef struct
+{
+    pager* pager;             /* the pager the cursor is assigned */
+    unsigned int page_number; /* the page number the cursor is currently on */
 } pager_cursor;
 
 /* Pager function prototypes */
@@ -199,4 +202,4 @@ bool pager_pages_count(pager* p, size_t* num_pages);
  */
 bool pager_size(pager* p, size_t* size);
 
-#endif  // PAGER_H
+#endif /* PAGER_H */

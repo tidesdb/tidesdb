@@ -21,7 +21,8 @@
 #include "../src/pager.h"
 #include "test_macros.h"
 
-void test_pager_open_close() {
+void test_pager_open_close()
+{
     pager* p = NULL;
 
     assert(pager_open("test.db", &p) == true);
@@ -35,7 +36,8 @@ void test_pager_open_close() {
     printf(GREEN "test_pager_open_close passed\n" RESET);
 }
 
-void test_pager_write_read() {
+void test_pager_write_read()
+{
     pager* p = NULL;
 
     assert(pager_open("test.db", &p) == true);
@@ -61,7 +63,8 @@ void test_pager_write_read() {
     printf(GREEN "test_pager_write_read passed\n" RESET);
 }
 
-void test_pager_write_reopen_read() {
+void test_pager_write_reopen_read()
+{
     pager* p = NULL;
 
     assert(pager_open("test.db", &p) == true);
@@ -90,7 +93,7 @@ void test_pager_write_reopen_read() {
 
     p = NULL;
 
-    // reopen
+    /* reopen */
     assert(pager_open("test.db", &p) == true);
 
     uint8_t* read_key2 = NULL;
@@ -100,7 +103,7 @@ void test_pager_write_reopen_read() {
 
     assert(memcmp(key2, read_key2, key_size2) == 0);
 
-    // cleanup
+    /* cleanup */
     free(read_key2);
     assert(pager_close(p) == true);
 
@@ -109,7 +112,8 @@ void test_pager_write_reopen_read() {
     printf(GREEN "test_pager_write_read passed\n" RESET);
 }
 
-void test_pager_overflowed_write_read() {
+void test_pager_overflowed_write_read()
+{
     pager* p = NULL;
 
     assert(pager_open("test.db", &p) == true);
@@ -165,9 +169,10 @@ void test_pager_overflowed_write_read() {
     printf(GREEN "test_pager_overflowed_write_read passed\n" RESET);
 }
 
-void test_pager_cursor() {
-    // we write an overflowed page and a normal page
-    // the cursor skips overflow pages
+void test_pager_cursor()
+{
+    /* we write an overflowed page and a normal page
+     * the cursor skips overflow pages */
     pager* p = NULL;
 
     assert(pager_open("test.db", &p) == true);
@@ -228,7 +233,7 @@ void test_pager_cursor() {
 
     free(read_value);
     read_value = NULL;
-    read_value_size = 0;  // reset
+    read_value_size = 0; /* reset */
 
     assert(pager_cursor_next(cursor) == true);
 
@@ -247,14 +252,16 @@ void test_pager_cursor() {
     printf(GREEN "test_pager_cursor passed\n" RESET);
 }
 
-void test_pager_pages_count() {
-    // we write many small values and count the pages
+void test_pager_pages_count()
+{
+    /* we write many small values and count the pages */
     pager* p = NULL;
 
     assert(pager_open("test.db", &p) == true);
     assert(p != NULL);
 
-    for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < 1000; i++)
+    {
         uint8_t value[] = "value";
         unsigned int value_size = sizeof(value);
         unsigned int page_num = 0;
@@ -262,12 +269,12 @@ void test_pager_pages_count() {
         assert(pager_write(p, value, value_size, &page_num) == true);
     }
 
-    // we should have 999 pages
+    /* we should have 999 pages */
     size_t pages_count;
 
     assert(pager_pages_count(p, &pages_count) == true);
 
-    assert(pages_count == 999);  // we should have 999 pages
+    assert(pages_count == 999); /* we should have 999 pages */
 
     assert(pager_close(p) == true);
 
@@ -276,14 +283,16 @@ void test_pager_pages_count() {
     printf(GREEN "test_pager_pages_count passed\n" RESET);
 }
 
-void test_pager_pager_size() {
-    // we write many small values and count the pages
+void test_pager_pager_size()
+{
+    /* we write many small values and count the pages */
     pager* p = NULL;
 
     assert(pager_open("test.db", &p) == true);
     assert(p != NULL);
 
-    for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < 1000; i++)
+    {
         uint8_t value[] = "value";
         unsigned int value_size = sizeof(value);
         unsigned int page_num = 0;
@@ -291,7 +300,7 @@ void test_pager_pager_size() {
         assert(pager_write(p, value, value_size, &page_num) == true);
     }
 
-    // we should have PAGE_SIZE * 999
+    /* we should have PAGE_SIZE * 999 */
     size_t size;
 
     assert(pager_size(p, &size) == true);
@@ -305,14 +314,16 @@ void test_pager_pager_size() {
     printf(GREEN "test_pager_pager_size passed\n" RESET);
 }
 
-void test_pager_truncate() {
-    // we write many small values and count the pages
+void test_pager_truncate()
+{
+    /* we write many small values and count the pages */
     pager* p = NULL;
 
     assert(pager_open("test.db", &p) == true);
     assert(p != NULL);
 
-    for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < 1000; i++)
+    {
         uint8_t value[] = "value";
         unsigned int value_size = sizeof(value);
         unsigned int page_num = 0;
@@ -320,14 +331,14 @@ void test_pager_truncate() {
         assert(pager_write(p, value, value_size, &page_num) == true);
     }
 
-    // we should have PAGE_SIZE * 999
+    /* we should have PAGE_SIZE * 999 */
     size_t size;
 
     assert(pager_size(p, &size) == true);
 
     assert(size == PAGE_SIZE * 999);
 
-    // truncate to 0
+    /* truncate to 0 */
     assert(pager_truncate(p, 0) == true);
 
     assert(pager_size(p, &size) == true);
@@ -341,7 +352,8 @@ void test_pager_truncate() {
     printf(GREEN "test_pager_truncate passed\n" RESET);
 }
 
-void test_get_last_modified() {
+void test_get_last_modified()
+{
     const char* filename = "test_file.txt";
     FILE* file = fopen(filename, "w");
     assert(file != NULL);
@@ -359,7 +371,8 @@ void test_get_last_modified() {
     printf(GREEN "test_get_last_modified passed\n" RESET);
 }
 
-int main(void) {
+int main(void)
+{
     test_get_last_modified();
     test_pager_open_close();
     test_pager_write_read();

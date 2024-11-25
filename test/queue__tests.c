@@ -23,7 +23,8 @@
 #include "../src/queue.h"
 #include "test_macros.h"
 
-void test_queue_new() {
+void test_queue_new()
+{
     queue *q = queue_new();
     assert(q != NULL);
     assert(q->head == NULL);
@@ -34,7 +35,8 @@ void test_queue_new() {
     printf(GREEN "test_queue_new passed\n" RESET);
 }
 
-void test_queue_enqueue_dequeue() {
+void test_queue_enqueue_dequeue()
+{
     queue *q = queue_new();
     int data1 = 1, data2 = 2, data3 = 3;
 
@@ -61,7 +63,8 @@ void test_queue_enqueue_dequeue() {
     printf(GREEN "test_queue_enqueue_dequeue passed\n" RESET);
 }
 
-void test_queue_size() {
+void test_queue_size()
+{
     queue *q = queue_new();
     int data1 = 1, data2 = 2;
 
@@ -84,7 +87,8 @@ void test_queue_size() {
     printf(GREEN "test_queue_size passed\n" RESET);
 }
 
-void test_queue_destroy() {
+void test_queue_destroy()
+{
     queue *q = queue_new();
     int data1 = 1, data2 = 2;
 
@@ -96,7 +100,8 @@ void test_queue_destroy() {
     printf(GREEN "test_queue_destroy passed\n" RESET);
 }
 
-void test_dequeue_no_entries() {
+void test_dequeue_no_entries()
+{
     queue *q = queue_new();
     assert(queue_dequeue(q) == NULL);
     queue_destroy(q);
@@ -104,7 +109,8 @@ void test_dequeue_no_entries() {
     printf(GREEN "test_dequeue_no_entries passed\n" RESET);
 }
 
-int main(void) {
+int main(void)
+{
     test_queue_new();
     test_queue_enqueue_dequeue();
     test_queue_size();

@@ -26,7 +26,11 @@
  * operation code enum
  * used for operation codes in TidesDB
  */
-enum OP_CODE { OP_PUT, OP_DELETE };
+enum OP_CODE
+{
+    OP_PUT,
+    OP_DELETE
+};
 
 /*
  * key_value_pair
@@ -38,12 +42,13 @@ enum OP_CODE { OP_PUT, OP_DELETE };
  * @param value_size the size of the value
  * @param ttl the time to live of the key value pair
  */
-typedef struct {
-    uint8_t *key;
-    uint32_t key_size;
-    uint8_t *value;
-    uint32_t value_size;
-    int64_t ttl;
+typedef struct
+{
+    uint8_t *key;        /* key */
+    uint32_t key_size;   /* size of the key */
+    uint8_t *value;      /* value */
+    uint32_t value_size; /* size of the value */
+    int64_t ttl;         /* time to live of the key value pair */
 } key_value_pair;
 
 /*
@@ -56,12 +61,14 @@ typedef struct {
  * @param probability the probability of the column family
  * @param compressed the compressed status of the column family
  */
-typedef struct {
-    char *name;
-    int32_t flush_threshold;
-    int32_t max_level;
-    float probability;
-    bool compressed;
+typedef struct
+{
+    char *name;              /* name of the column family */
+    int32_t flush_threshold; /* flush threshold for memtable of the column family */
+    int32_t max_level;       /* max level for the column family memtable*/
+    float probability;       /* probability for the column family memtable */
+    bool compressed; /* compressed flag for the column family; whether sstable data is compressed or
+                        not */
 } column_family_config;
 
 /*
@@ -72,10 +79,11 @@ typedef struct {
  * @param kv the key value pair
  * @param column_family the column family for the operation
  */
-typedef struct {
-    enum OP_CODE op_code;  // the operation code
-    key_value_pair *kv;    // the key-value pair
-    char *column_family;   // the column family for the operation
+typedef struct
+{
+    enum OP_CODE op_code; /* the operation code */
+    key_value_pair *kv;   /* the key-value pair */
+    char *column_family;  /* the column family for the operation */
 } operation;
 
-#endif  // SERIALIZEABLE_STRUCTURES_H
+#endif /* SERIALIZEABLE_STRUCTURES_H */

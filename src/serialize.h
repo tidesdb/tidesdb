@@ -16,6 +16,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifndef SERIALIZE_H
+#define SERIALIZE_H
+
 #include <zstd.h>
 
 #include "bloomfilter.h"
@@ -114,3 +117,5 @@ bool serialize_bloomfilter(const bloomfilter* bf, uint8_t** buffer, size_t* enco
  */
 bool deserialize_bloomfilter(const uint8_t* buffer, size_t buffer_size, bloomfilter** bf,
                              bool decompress);
+
+#endif /* SERIALIZE_H */

@@ -18,25 +18,27 @@
  */
 #include "err.h"
 
-tidesdb_err* tidesdb_err_new(int code, char* message) {
-    // We allocate memory for the error struct
+tidesdb_err* tidesdb_err_new(int code, char* message)
+{
+    /* we allocate memory for the error struct */
     tidesdb_err* e = malloc(sizeof(tidesdb_err));
+    if (e == NULL) return NULL;
 
-    // We set the code and message
+    /* We set the code and message */
     e->code = code;
     e->message = message;
 
-    // We return the error
+    /* We return the error */
     return e;
 }
 
-void tidesdb_err_free(tidesdb_err* e) {
-    // Check if e is NULL
-    if (e == NULL) {
-        return;
-    }
+void tidesdb_err_free(tidesdb_err* e)
+{
+    /* Check if e is NULL */
+    if (e == NULL) return;
 
-    // We don't free the message has it shouldn't be dynamically allocated
-    // We free the error
+    /* we don't free the message has it shouldn't be dynamically allocated */
+    /* we free the error */
     free(e);
+    e = NULL;
 }

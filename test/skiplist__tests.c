@@ -22,10 +22,11 @@
 #include "../src/skiplist.h"
 #include "test_macros.h"
 
-#define CONCURRENT_NUM_THREADS 10
+#define CONCURRENT_NUM_THREADS    10
 #define CONCURRENT_NUM_OPERATIONS 1000
 
-void test_skiplist_create_node() {
+void test_skiplist_create_node()
+{
     unsigned char key[] = "key";
     unsigned char value[] = "value";
     skiplist_node *node = skiplist_create_node(3, key, sizeof(key), value, sizeof(value), -1);
@@ -38,20 +39,22 @@ void test_skiplist_create_node() {
     printf(GREEN "test_skiplist_create_node passed\n" RESET);
 }
 
-void test_new_skiplist() {
-    skiplist *list = new_skiplist(4, 0.5);
+void test_new_skiplist()
+{
+    skiplist *list = new_skiplist(12, 0.24f);
     assert(list != NULL);
     assert(list->level == 1);
-    assert(list->max_level == 4);
-    assert(list->probability == 0.5);
+    assert(list->max_level == 12);
+    assert(list->probability == 0.24f);
     assert(list->header != NULL);
     skiplist_destroy(list);
 
     printf(GREEN "test_new_skiplist passed\n" RESET);
 }
 
-void test_skiplist_put_get() {
-    skiplist *list = new_skiplist(12, 0.5);
+void test_skiplist_put_get()
+{
+    skiplist *list = new_skiplist(12, 0.24f);
     unsigned char key[] = "key";
     unsigned char value[] = "value";
     assert(skiplist_put(list, key, sizeof(key), value, sizeof(value), -1) == true);
@@ -66,8 +69,9 @@ void test_skiplist_put_get() {
     printf(GREEN "test_skiplist_put_get passed\n" RESET);
 }
 
-void test_skiplist_delete() {
-    skiplist *list = new_skiplist(4, 0.5);
+void test_skiplist_delete()
+{
+    skiplist *list = new_skiplist(12, 0.24f);
     unsigned char key[] = "key";
     unsigned char value[] = "value";
     assert(skiplist_put(list, key, sizeof(key), value, sizeof(value), -1) == true);
@@ -82,8 +86,9 @@ void test_skiplist_delete() {
     printf(GREEN "test_skiplist_delete passed\n" RESET);
 }
 
-void test_skiplist_clear() {
-    skiplist *list = new_skiplist(4, 0.5);
+void test_skiplist_clear()
+{
+    skiplist *list = new_skiplist(12, 0.24f);
     unsigned char key[] = "key";
     unsigned char value[] = "value";
     assert(skiplist_put(list, key, sizeof(key), value, sizeof(value), -1) == true);
@@ -98,8 +103,9 @@ void test_skiplist_clear() {
     printf(GREEN "test_skiplist_clear passed\n" RESET);
 }
 
-void test_skiplist_cursor() {
-    skiplist *list = new_skiplist(4, 0.5);
+void test_skiplist_cursor()
+{
+    skiplist *list = new_skiplist(12, 0.24f);
     unsigned char key1[] = "key1";
     unsigned char value1[] = "value1";
     unsigned char key2[] = "key2";
@@ -124,11 +130,12 @@ void test_skiplist_cursor() {
     printf(GREEN "test_skiplist_cursor passed\n" RESET);
 }
 
-void test_skiplist_ttl() {
-    skiplist *list = new_skiplist(4, 0.5);
+void test_skiplist_ttl()
+{
+    skiplist *list = new_skiplist(12, 0.24f);
     unsigned char key[] = "key";
     unsigned char value[] = "value";
-    time_t ttl = 1;  // 1 second TTL
+    time_t ttl = 1; /* 1 second TTL */
 
     assert(skiplist_put(list, key, sizeof(key), value, sizeof(value), time(NULL) + ttl) == true);
 
@@ -137,12 +144,12 @@ void test_skiplist_ttl() {
     assert(skiplist_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size) == true);
     assert(memcmp(retrieved_value, value, sizeof(value)) == 0);
 
-    // Wait for TTL to expire
+    /* wait for TTL to expire */
     sleep(ttl + 2);
 
     assert(skiplist_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size) == true);
 
-    // check if value is TOMBSTONE
+    /* check if value is TOMBSTONE */
     assert(memcmp(retrieved_value, "\xEF\xBE\xAD\xDE", 4) == 0);
 
     skiplist_destroy(list);
@@ -150,17 +157,21 @@ void test_skiplist_ttl() {
     printf(GREEN "test_skiplist_ttl passed\n" RESET);
 }
 
-typedef struct {
+/* thread_data_t struct to pass arguments to the thread function */
+typedef struct
+{
     skiplist *list;
     int thread_id;
 } thread_data_t;
 
-void *thread_func(void *arg) {
-    thread_data_t *data = (thread_data_t *)arg;
+void *thread_func(void *arg)
+{
+    thread_data_t *data = arg;
     skiplist *list = data->list;
     int thread_id = data->thread_id;
 
-    for (int i = 0; i < CONCURRENT_NUM_OPERATIONS; i++) {
+    for (int i = 0; i < CONCURRENT_NUM_OPERATIONS; i++)
+    {
         unsigned char key[16];
         unsigned char value[16];
         snprintf((char *)key, sizeof(key), "key%d_%d", thread_id, i);
@@ -178,28 +189,29 @@ void *thread_func(void *arg) {
     pthread_exit(NULL);
 }
 
-void test_skiplist_concurrency() {
-    skiplist *list = new_skiplist(4, 0.5);
+void test_skiplist_concurrency()
+{
+    skiplist *list = new_skiplist(12, 0.24f);
     pthread_t threads[CONCURRENT_NUM_THREADS];
     thread_data_t thread_data[CONCURRENT_NUM_THREADS];
 
-    for (int i = 0; i < CONCURRENT_NUM_THREADS; i++) {
+    for (int i = 0; i < CONCURRENT_NUM_THREADS; i++)
+    {
         thread_data[i].list = list;
         thread_data[i].thread_id = i;
         pthread_create(&threads[i], NULL, thread_func, (void *)&thread_data[i]);
     }
 
-    for (int i = 0; i < CONCURRENT_NUM_THREADS; i++) {
-        pthread_join(threads[i], NULL);
-    }
+    for (int i = 0; i < CONCURRENT_NUM_THREADS; i++) pthread_join(threads[i], NULL);
 
     skiplist_destroy(list);
 
     printf(GREEN "test_skiplist_concurrency passed\n" RESET);
 }
 
-void test_skiplist_copy() {
-    skiplist *list = new_skiplist(4, 0.5);
+void test_skiplist_copy()
+{
+    skiplist *list = new_skiplist(12, 0.24f);
     unsigned char key1[] = "key1";
     unsigned char value1[] = "value1";
     unsigned char key2[] = "key2";
@@ -225,7 +237,8 @@ void test_skiplist_copy() {
     printf(GREEN "test_skiplist_copy passed\n" RESET);
 }
 
-int main(void) {
+int main(void)
+{
     test_skiplist_create_node();
     test_new_skiplist();
     test_skiplist_put_get();

@@ -23,16 +23,19 @@
 #include <stddef.h>
 #include <stdlib.h>
 
+typedef struct queue_node queue_node;
+
 /*
  * queue_node
  * node for queue
  * @param data data in node
  * @param next next node
  */
-typedef struct queue_node {
-    void *data;               // data in node
-    struct queue_node *next;  // next node
-} queue_node;
+struct queue_node
+{
+    void *data;       /* data in node */
+    queue_node *next; /* next node */
+};
 
 /*
  * queue
@@ -42,11 +45,12 @@ typedef struct queue_node {
  * @param size size of queue
  * @param lock rw lock for queue
  */
-typedef struct queue {
-    queue_node *head;       // head of queue
-    queue_node *tail;       // tail of queue
-    size_t size;            // size of queue
-    pthread_rwlock_t lock;  // rw lock for queue
+typedef struct queue
+{
+    queue_node *head;      /* head of queue */
+    queue_node *tail;      /* tail of queue */
+    size_t size;           /* size of queue */
+    pthread_rwlock_t lock; /* rw lock for queue */
 } queue;
 
 /*
@@ -91,4 +95,4 @@ void free_queue_node(queue_node *node);
  */
 void queue_destroy(queue *q);
 
-#endif  // QUEUE_H
+#endif /* QUEUE_H */

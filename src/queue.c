@@ -18,11 +18,11 @@
  */
 #include "queue.h"
 
-queue *queue_new() {
-    queue *q = (queue *)malloc(sizeof(queue));
-    if (q == NULL) {
-        return NULL;
-    }
+queue *queue_new()
+{
+    queue *q = malloc(sizeof(queue));
+    if (q == NULL) return NULL;
+
     q->head = NULL;
     q->tail = NULL;
     q->size = 0;
@@ -30,19 +30,22 @@ queue *queue_new() {
     return q;
 }
 
-bool queue_enqueue(queue *q, void *data) {
-    queue_node *new_node = (queue_node *)malloc(sizeof(queue_node));
-    if (new_node == NULL) {
-        return false;
-    }
+bool queue_enqueue(queue *q, void *data)
+{
+    queue_node *new_node = malloc(sizeof(queue_node));
+    if (new_node == NULL) return false;
+
     new_node->data = data;
     new_node->next = NULL;
 
     pthread_rwlock_wrlock(&q->lock);
-    if (q->tail == NULL) {
+    if (q->tail == NULL)
+    {
         q->head = new_node;
         q->tail = new_node;
-    } else {
+    }
+    else
+    {
         q->tail->next = new_node;
         q->tail = new_node;
     }
@@ -52,18 +55,21 @@ bool queue_enqueue(queue *q, void *data) {
     return true;
 }
 
-void *queue_dequeue(queue *q) {
+void *queue_dequeue(queue *q)
+{
     pthread_rwlock_wrlock(&q->lock);
-    if (q->head == NULL) {
+    if (q->head == NULL)
+    {
         pthread_rwlock_unlock(&q->lock);
         return NULL;
     }
+
     queue_node *node = q->head;
     void *data = node->data;
     q->head = q->head->next;
-    if (q->head == NULL) {
-        q->tail = NULL;
-    }
+
+    if (q->head == NULL) q->tail = NULL;
+
     q->size--;
     pthread_rwlock_unlock(&q->lock);
 
@@ -71,24 +77,36 @@ void *queue_dequeue(queue *q) {
     return data;
 }
 
-size_t queue_size(queue *q) {
+size_t queue_size(queue *q)
+{
     pthread_rwlock_rdlock(&q->lock);
     size_t size = q->size;
     pthread_rwlock_unlock(&q->lock);
     return size;
 }
 
-void free_queue_node(queue_node *node) { free(node); }
+void free_queue_node(queue_node *node)
+{
+    if (node == NULL) return;
 
-void queue_destroy(queue *q) {
+    free(node);
+    node = NULL;
+}
+
+void queue_destroy(queue *q)
+{
     pthread_rwlock_wrlock(&q->lock);
     queue_node *current = q->head;
-    while (current != NULL) {
+
+    while (current != NULL)
+    {
         queue_node *next = current->next;
         free_queue_node(current);
         current = next;
     }
+
     pthread_rwlock_unlock(&q->lock);
     pthread_rwlock_destroy(&q->lock);
     free(q);
+    q = NULL;
 }

@@ -24,7 +24,8 @@
 #include "../src/serialize.h"
 #include "test_macros.h"
 
-void test_serialize_key_value_pair_no_compression() {
+void test_serialize_key_value_pair_no_compression()
+{
     key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
                           .value = (uint8_t *)"value",
@@ -40,7 +41,8 @@ void test_serialize_key_value_pair_no_compression() {
     printf(GREEN "test_serialize_key_value_pair_no_compression passed\n" RESET);
 }
 
-void test_deserialize_key_value_pair_no_compression() {
+void test_deserialize_key_value_pair_no_compression()
+{
     key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
                           .value = (uint8_t *)"value",
@@ -67,7 +69,8 @@ void test_deserialize_key_value_pair_no_compression() {
     printf(GREEN "test_deserialize_key_value_pair_no_compression passed\n" RESET);
 }
 
-void test_serialize_bloomfilter_no_compression() {
+void test_serialize_bloomfilter_no_compression()
+{
     bloomfilter bf = {.size = 8, .count = 0, .set = (uint8_t *)calloc(1, 1)};
     uint8_t *buffer;
     size_t encoded_size;
@@ -80,7 +83,8 @@ void test_serialize_bloomfilter_no_compression() {
     printf(GREEN "test_serialize_bloomfilter_no_compression passed\n" RESET);
 }
 
-void test_deserialize_bloomfilter_no_compression() {
+void test_deserialize_bloomfilter_no_compression()
+{
     bloomfilter bf = {.size = 8, .count = 0, .set = (uint8_t *)calloc(1, 1)};
     uint8_t *buffer;
     size_t encoded_size;
@@ -100,12 +104,14 @@ void test_deserialize_bloomfilter_no_compression() {
     printf(GREEN "test_deserialize_bloomfilter_no_compression passed\n" RESET);
 }
 
-void test_serialize_deserialize_full_bloomfilter_no_compression() {
-    bloomfilter *bf = bloomfilter_create(8);  // Small size for testing
+void test_serialize_deserialize_full_bloomfilter_no_compression()
+{
+    bloomfilter *bf = bloomfilter_create(8); /* small size for testing */
     const uint8_t data1[] = "test1";
     const uint8_t data2[] = "test2";
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 256; i++)
+    {
         uint8_t data[2] = {(uint8_t)i, '\0'};
         bloomfilter_add(bf, data, 1);
     }
@@ -114,36 +120,38 @@ void test_serialize_deserialize_full_bloomfilter_no_compression() {
     assert(bloomfilter_add(bf, data2, strlen((const char *)data2)) == 0);
     assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == true);
 
-    // Check if all the data is in the bloom filter
-    for (int i = 0; i < 256; i++) {
+    /* check if all the data is in the bloom filter */
+    for (int i = 0; i < 256; i++)
+    {
         uint8_t data[2] = {(uint8_t)i, '\0'};
         assert(bloomfilter_check(bf, data, 1) == true);
     }
 
-    // Serialize the bloom filter
+    /* serialize the bloom filter */
     uint8_t *buffer;
     size_t encoded_size;
     assert(serialize_bloomfilter(bf, &buffer, &encoded_size, false) == true);
     assert(encoded_size > 0);
 
-    // Deserialize the bloom filter
+    /* deserialize the bloom filter */
     bloomfilter *deserialized_bf = NULL;
     assert(deserialize_bloomfilter(buffer, encoded_size, &deserialized_bf, false) == true);
 
-    // Verify the deserialized bloom filter
+    /* verify the deserialized bloom filter */
     assert(deserialized_bf->size == bf->size);
     assert(deserialized_bf->count == bf->count);
     assert(memcmp(deserialized_bf->set, bf->set, (bf->size + 7) / 8) == 0);
 
     bloomfilter_destroy(bf);
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 256; i++)
+    {
         uint8_t data[2] = {(uint8_t)i, '\0'};
         assert(bloomfilter_check(deserialized_bf, data, 1) == true);
     }
     assert(bloomfilter_check(deserialized_bf, data2, strlen((const char *)data2)) == true);
 
-    // Clean up
+    /* clean up */
     free(buffer);
 
     bloomfilter_destroy(deserialized_bf);
@@ -151,7 +159,8 @@ void test_serialize_deserialize_full_bloomfilter_no_compression() {
     printf(GREEN "test_serialize_deserialize_full_bloomfilter_no_compression passed\n" RESET);
 }
 
-void test_serialize_key_value_pair_compression() {
+void test_serialize_key_value_pair_compression()
+{
     key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
                           .value = (uint8_t *)"value",
@@ -167,7 +176,8 @@ void test_serialize_key_value_pair_compression() {
     printf(GREEN "test_serialize_key_value_pair_compression passed\n" RESET);
 }
 
-void test_deserialize_key_value_pair_compression() {
+void test_deserialize_key_value_pair_compression()
+{
     key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
                           .value = (uint8_t *)"value",
@@ -194,7 +204,8 @@ void test_deserialize_key_value_pair_compression() {
     printf(GREEN "test_deserialize_key_value_pair_compression passed\n" RESET);
 }
 
-void test_serialize_bloomfilter_compression() {
+void test_serialize_bloomfilter_compression()
+{
     bloomfilter bf = {.size = 8, .count = 0, .set = (uint8_t *)calloc(1, 1)};
     uint8_t *buffer;
     size_t encoded_size;
@@ -207,7 +218,8 @@ void test_serialize_bloomfilter_compression() {
     printf(GREEN "test_serialize_bloomfilter_compression passed\n" RESET);
 }
 
-void test_deserialize_bloomfilter_compression() {
+void test_deserialize_bloomfilter_compression()
+{
     bloomfilter bf = {.size = 8, .count = 0, .set = (uint8_t *)calloc(1, 1)};
     uint8_t *buffer;
     size_t encoded_size;
@@ -227,12 +239,14 @@ void test_deserialize_bloomfilter_compression() {
     printf(GREEN "test_deserialize_bloomfilter_compression passed\n" RESET);
 }
 
-void test_serialize_deserialize_full_bloomfilter_compression() {
-    bloomfilter *bf = bloomfilter_create(8);  // Small size for testing
+void test_serialize_deserialize_full_bloomfilter_compression()
+{
+    bloomfilter *bf = bloomfilter_create(8); /* small size for testing */
     const uint8_t data1[] = "test1";
     const uint8_t data2[] = "test2";
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 256; i++)
+    {
         uint8_t data[2] = {(uint8_t)i, '\0'};
         bloomfilter_add(bf, data, 1);
     }
@@ -241,36 +255,38 @@ void test_serialize_deserialize_full_bloomfilter_compression() {
     assert(bloomfilter_add(bf, data2, strlen((const char *)data2)) == 0);
     assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == true);
 
-    // Check if all the data is in the bloom filter
-    for (int i = 0; i < 256; i++) {
+    /* check if all the data is in the bloom filter */
+    for (int i = 0; i < 256; i++)
+    {
         uint8_t data[2] = {(uint8_t)i, '\0'};
         assert(bloomfilter_check(bf, data, 1) == true);
     }
 
-    // Serialize the bloom filter
+    /* serialize the bloom filter */
     uint8_t *buffer;
     size_t encoded_size;
     assert(serialize_bloomfilter(bf, &buffer, &encoded_size, true) == true);
     assert(encoded_size > 0);
 
-    // Deserialize the bloom filter
+    /* deserialize the bloom filter */
     bloomfilter *deserialized_bf = NULL;
     assert(deserialize_bloomfilter(buffer, encoded_size, &deserialized_bf, true) == true);
 
-    // Verify the deserialized bloom filter
+    /* verify the deserialized bloom filter */
     assert(deserialized_bf->size == bf->size);
     assert(deserialized_bf->count == bf->count);
     assert(memcmp(deserialized_bf->set, bf->set, (bf->size + 7) / 8) == 0);
 
     bloomfilter_destroy(bf);
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 256; i++)
+    {
         uint8_t data[2] = {(uint8_t)i, '\0'};
         assert(bloomfilter_check(deserialized_bf, data, 1) == true);
     }
     assert(bloomfilter_check(deserialized_bf, data2, strlen((const char *)data2)) == true);
 
-    // Clean up
+    /* clean up */
     free(buffer);
 
     bloomfilter_destroy(deserialized_bf);
@@ -278,7 +294,8 @@ void test_serialize_deserialize_full_bloomfilter_compression() {
     printf(GREEN "test_serialize_deserialize_full_bloomfilter_compression passed\n" RESET);
 }
 
-void test_serialize_operation_compression() {
+void test_serialize_operation_compression()
+{
     key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
                           .value = (uint8_t *)"value",
@@ -295,7 +312,8 @@ void test_serialize_operation_compression() {
     printf(GREEN "test_serialize_operation_compression passed\n" RESET);
 }
 
-void test_deserialize_operation_compression() {
+void test_deserialize_operation_compression()
+{
     key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
                           .value = (uint8_t *)"value",
@@ -327,7 +345,8 @@ void test_deserialize_operation_compression() {
     printf(GREEN "test_deserialize_operation_compression passed\n" RESET);
 }
 
-void test_serialize_column_family_config_no_compression() {
+void test_serialize_column_family_config_no_compression()
+{
     column_family_config config = {.name = "test_cf",
                                    .flush_threshold = 100,
                                    .max_level = 5,
@@ -343,7 +362,8 @@ void test_serialize_column_family_config_no_compression() {
     printf(GREEN "test_serialize_column_family_config_no_compression passed\n" RESET);
 }
 
-void test_deserialize_column_family_config_no_compression() {
+void test_deserialize_column_family_config_no_compression()
+{
     column_family_config config = {.name = "test_cf",
                                    .flush_threshold = 100,
                                    .max_level = 5,
@@ -368,7 +388,8 @@ void test_deserialize_column_family_config_no_compression() {
     printf(GREEN "test_deserialize_column_family_config_no_compression passed\n" RESET);
 }
 
-void test_serialize_operation_no_compression() {
+void test_serialize_operation_no_compression()
+{
     key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
                           .value = (uint8_t *)"value",
@@ -385,7 +406,8 @@ void test_serialize_operation_no_compression() {
     printf(GREEN "test_serialize_operation_no_compression passed\n" RESET);
 }
 
-void test_deserialize_operation_no_compression() {
+void test_deserialize_operation_no_compression()
+{
     key_value_pair kvp = {.key = (uint8_t *)"key",
                           .key_size = 3,
                           .value = (uint8_t *)"value",
@@ -416,7 +438,8 @@ void test_deserialize_operation_no_compression() {
     printf(GREEN "test_deserialize_operation_no_compression passed\n" RESET);
 }
 
-int main(void) {
+int main(void)
+{
     test_serialize_key_value_pair_no_compression();
     test_deserialize_key_value_pair_no_compression();
     test_serialize_key_value_pair_compression();

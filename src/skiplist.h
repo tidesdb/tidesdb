@@ -28,7 +28,7 @@
 #include <time.h>
 
 #define TOMBSTONE \
-    0xDEADBEEF  // On expiration of a node if time to live is set we set the key's value to this
+    0xDEADBEEF /* On expiration of a node if time to live is set we set the key's value to this */
 
 typedef struct skiplist_node skiplist_node;
 
@@ -42,13 +42,14 @@ typedef struct skiplist_node skiplist_node;
  * @param ttl an expiration time for the node (optional)
  * @param forward the forward pointers for the node
  */
-struct skiplist_node {
-    unsigned char *key;        // the key for the node
-    size_t key_size;           // the key size
-    unsigned char *value;      // the value for the node
-    size_t value_size;         // the value size
-    time_t ttl;                // an expiration time for the node (optional)
-    skiplist_node *forward[];  // the forward pointers for the node
+struct skiplist_node
+{
+    unsigned char *key;       /* the key for the node */
+    size_t key_size;          /* the key size */
+    unsigned char *value;     /* the value for the node */
+    size_t value_size;        /* the value size */
+    time_t ttl;               /* an expiration time for the node (optional) */
+    skiplist_node *forward[]; /* the forward pointers for the node */
 };
 
 /*
@@ -61,13 +62,14 @@ struct skiplist_node {
  * @param total_size the total size in bytes
  * @param lock the read-write lock for list-level synchronization
  */
-typedef struct {
-    int level;              // the current level of the skiplist
-    int max_level;          // the maximum level of the skiplist
-    float probability;      // the probability of a node having a certain level
-    skiplist_node *header;  // the header node of the skiplist
-    size_t total_size;      // total size in bytes
-    pthread_rwlock_t lock;  // read-write lock for list-level synchronization
+typedef struct
+{
+    int level;             /* the current level of the skiplist  */
+    int max_level;         /* the maximum level of the skiplist  */
+    float probability;     /* the probability of a node having a certain level  */
+    skiplist_node *header; /* the header node of the skiplist  */
+    size_t total_size;     /* total size in bytes  */
+    pthread_rwlock_t lock; /* read-write lock for list-level synchronization  */
 } skiplist;
 
 /*
@@ -76,9 +78,10 @@ typedef struct {
  * @param list the skiplist
  * @param current the current node
  */
-typedef struct skiplist_cursor {
-    skiplist *list;          // the skiplist
-    skiplist_node *current;  // the current node
+typedef struct skiplist_cursor
+{
+    skiplist *list;         /* the skiplist  */
+    skiplist_node *current; /* the current node  */
 } skiplist_cursor;
 
 /* Skip list function prototypes */
@@ -234,4 +237,4 @@ skiplist *skiplist_copy(skiplist *list);
  */
 bool skiplist_check_and_update_ttl(skiplist_node *node);
 
-#endif  // SKIPLIST_H
+#endif /* SKIPLIST_H */

@@ -23,61 +23,65 @@
 #include "../src/bloomfilter.h"
 #include "test_macros.h"
 
-// we test bloom filter creation and destruction
-void test_bloomfilter_create() {
-    // we create a bloom filter with size 1024
+/* we test bloom filter creation and destruction */
+void test_bloomfilter_create()
+{
+    /* we create a bloom filter with size 1024 */
     bloomfilter *bf = bloomfilter_create(1024);
 
-    // we check if the bloom filter was created correctly
+    /* we check if the bloom filter was created correctly */
 
-    // is not null
+    /* is not null */
     assert(bf != NULL);
 
-    // has the correct size
+    /* has the correct size */
     assert(bf->size == 1024);
 
-    // has the correct count
+    /* has the correct count */
     assert(bf->count == 0);
 
-    // has the correct set
+    /* has the correct set */
     assert(bf->set != NULL);
 
-    // let us destroy the bloom filter
+    /* let us destroy the bloom filter */
     bloomfilter_destroy(bf);
 
     printf(GREEN "test_bloomfilter_create passed\n" RESET);
 }
 
-// we test bloom filter add and check
-// we add 1 data entry and check if it is in the bloom filter
-void test_bloomfilter_add_check() {
-    // we create a bloom filter with size 1024
+/* we test bloom filter add and check
+ * we add 1 data entry and check if it is in the bloom filter */
+void test_bloomfilter_add_check()
+{
+    /* we create a bloom filter with size 1024 */
     bloomfilter *bf = bloomfilter_create(1024);
 
-    const unsigned char data1[] = "test1";  // the entry that will be in bf
-    const unsigned char data2[] = "test2";  // the entry that will not be in bf
+    const unsigned char data1[] = "test1"; /* the entry that will be in bf */
+    const unsigned char data2[] = "test2"; /* the entry that will not be in bf */
 
-    // we add data1 to the bloom filter
+    /* we add data1 to the bloom filter
     assert(bloomfilter_add(bf, data1, strlen((const char *)data1)) == 0);
 
-    // we check if data1 is in the bloom filter, it should be
+    /* we check if data1 is in the bloom filter, it should be */
     assert(bloomfilter_check(bf, data1, strlen((const char *)data1)) == true);
 
-    // we check if data2 is in the bloom filter, it should not be
+    /* we check if data2 is in the bloom filter, it should not be */
     assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == false);
 
-    // we destroy the bloom filter
+    /* we destroy the bloom filter */
     bloomfilter_destroy(bf);
 
     printf(GREEN "test_bloomfilter_add_check passed\n" RESET);
 }
 
-// we test if the bloom filter is full
-// we add 16 data entries to a bloom filter with size 8
-void test_bloomfilter_is_full() {
-    bloomfilter *bf = bloomfilter_create(8);  // Small size for testing
+/* we test if the bloom filter is full
+ * we add 16 data entries to a bloom filter with size 8 */
+void test_bloomfilter_is_full()
+{
+    bloomfilter *bf = bloomfilter_create(8); /* Small size for testing */
 
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 16; i++)
+    {
         unsigned char data[2] = {(unsigned char)i, '\0'};
         bloomfilter_add(bf, data, 1);
     }
@@ -89,12 +93,14 @@ void test_bloomfilter_is_full() {
     printf(GREEN "test_bloomfilter_is_full passed\n" RESET);
 }
 
-void test_bloomfilter_chaining() {
-    bloomfilter *bf = bloomfilter_create(8);  // Small size for testing
+void test_bloomfilter_chaining()
+{
+    bloomfilter *bf = bloomfilter_create(8); /* Small size for testing */
     const unsigned char data1[] = "test1";
     const unsigned char data2[] = "test2";
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 256; i++)
+    {
         unsigned char data[256] = {(unsigned char)i, '\0'};
         bloomfilter_add(bf, data, 1);
     }
@@ -103,8 +109,9 @@ void test_bloomfilter_chaining() {
     assert(bloomfilter_add(bf, data2, strlen((const char *)data2)) == 0);
     assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == true);
 
-    // check if all the data is in the bloom filter
-    for (int i = 0; i < 256; i++) {
+    /* check if all the data is in the bloom filter */
+    for (int i = 0; i < 256; i++)
+    {
         unsigned char data[256] = {(unsigned char)i, '\0'};
         assert(bloomfilter_check(bf, data, 1) == true);
     }
@@ -114,7 +121,8 @@ void test_bloomfilter_chaining() {
     printf(GREEN "test_bloomfilter_chaining passed\n" RESET);
 }
 
-int main(void) {
+int main(void)
+{
     test_bloomfilter_create();
     test_bloomfilter_add_check();
     test_bloomfilter_is_full();

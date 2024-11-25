@@ -19,7 +19,7 @@
 #ifndef TIDESDB_ERR_H
 #define TIDESDB_ERR_H
 
-#include <stdlib.h>  // mainly for malloc
+#include <stdlib.h>
 
 /*
  * tidesdb_err
@@ -28,9 +28,10 @@
  * @param code the error code
  * @param message the error message
  */
-typedef struct {
-    int code;       // the error code
-    char* message;  // the error message
+typedef struct
+{
+    int code;      /* the error code */
+    char* message; /* the error message */
 } tidesdb_err;
 
 /*
@@ -48,4 +49,4 @@ tidesdb_err* tidesdb_err_new(int code, char* message);
  */
 void tidesdb_err_free(tidesdb_err* e);
 
-#endif  // TIDESDB_ERR_H
+#endif  /* TIDESDB_ERR_H */

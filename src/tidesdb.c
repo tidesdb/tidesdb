@@ -383,7 +383,8 @@ void* _compact_sstables_thread(void* arg) {
 }
 
 sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
-    if (cf == NULL || sst1 == NULL || sst2 == NULL || sst1->pager->num_pages == 0 || sst2->pager->num_pages == 0) {
+    if (cf == NULL || sst1 == NULL || sst2 == NULL || sst1->pager->num_pages == 0 ||
+        sst2->pager->num_pages == 0) {
         return NULL;
     }
 
@@ -420,7 +421,8 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
 
         if (has_next1) {
             has_next1 = pager_cursor_next(cursor1);
-            if (has_next1 && !pager_read(sst1->pager, cursor1->page_number, &buffer1, &buffer_len1)) {
+            if (has_next1 &&
+                !pager_read(sst1->pager, cursor1->page_number, &buffer1, &buffer_len1)) {
                 free(buffer1);
                 break;
             }
@@ -428,8 +430,10 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
 
         if (has_next2) {
             has_next2 = pager_cursor_next(cursor2);
-            if (has_next2 && !pager_read(sst2->pager, cursor2->page_number, &buffer2, &buffer_len2)) {
+            if (has_next2 &&
+                !pager_read(sst2->pager, cursor2->page_number, &buffer2, &buffer_len2)) {
                 free(buffer2);
+                free(buffer1);
                 break;
             }
         }
@@ -437,34 +441,38 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
         key_value_pair* kv1 = NULL;
         key_value_pair* kv2 = NULL;
 
-        if (buffer1 && !deserialize_key_value_pair(buffer1, buffer_len1, &kv1, cf->config.compressed)) {
+        if (buffer1 &&
+            !deserialize_key_value_pair(buffer1, buffer_len1, &kv1, cf->config.compressed)) {
             free(buffer1);
             free(buffer2);
             break;
         }
 
-        if (buffer2 && !deserialize_key_value_pair(buffer2, buffer_len2, &kv2, cf->config.compressed)) {
+        if (buffer2 &&
+            !deserialize_key_value_pair(buffer2, buffer_len2, &kv2, cf->config.compressed)) {
             free(buffer1);
             free(buffer2);
             break;
         }
 
-        if (kv1 && !_is_tombstone(kv1->value, kv1->value_size) && !skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size, kv1->ttl)) {
+        if (kv1 && !_is_tombstone(kv1->value, kv1->value_size) &&
+            !skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size,
+                          kv1->ttl)) {
             free(buffer1);
             free(buffer2);
             free(kv1->key);
             free(kv1->value);
             free(kv1);
-            break;
         }
 
-        if (kv2 && !_is_tombstone(kv2->value, kv2->value_size) && !skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size, kv2->ttl)) {
+        if (kv2 && !_is_tombstone(kv2->value, kv2->value_size) &&
+            !skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size,
+                          kv2->ttl)) {
             free(buffer1);
             free(buffer2);
             free(kv2->key);
             free(kv2->value);
             free(kv2);
-            break;
         }
 
         if (kv1) {
@@ -487,12 +495,13 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
 
     pager* new_pager = NULL;
     char new_sstable_name[PATH_MAX];
-    char numeric_part1[PATH_MAX/4];
-    char numeric_part2[PATH_MAX/4];
+    char numeric_part1[PATH_MAX / 4];
+    char numeric_part2[PATH_MAX / 4];
     _sst_extract_numeric_parts(sst1->pager->filename, numeric_part1);
     _sst_extract_numeric_parts(sst2->pager->filename, numeric_part2);
 
-    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%s_%s.sst", cf->path, _get_path_seperator(), numeric_part1, numeric_part2);
+    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%s_%s.sst", cf->path, _get_path_seperator(),
+             numeric_part1, numeric_part2);
 
     if (!pager_open(new_sstable_name, &new_pager)) {
         skiplist_destroy(mergetable);
@@ -566,6 +575,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
         pager_close(new_pager);
         return NULL;
     }
+
     new_sstable->pager = new_pager;
 
     return new_sstable;
@@ -713,7 +723,6 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             return tidesdb_err_new(1055, "Failed to read bloom filter");
         }
 
-
         bloomfilter* bf = NULL;
 
         // we deserialize the bloom filter
@@ -751,153 +760,141 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             continue;
         }
 
+        bool has_next = true;
+        while (has_next) {
+            uint8_t* buffer = NULL;
+            size_t buffer_len = 0;
 
-         bool has_next = true;
-            while (has_next) {
-                uint8_t* buffer = NULL;
-                size_t buffer_len = 0;
-
-                if (!pager_read(cf->sstables[i]->pager, cursor->page_number, &buffer,
-                                &buffer_len)) {
-                    if (buffer != NULL) {
-                        free(buffer);
-                    }
-
-                    if (bf != NULL) {
-                        bloomfilter_destroy(bf);
-                    }
-                    if (bloom_filter_buffer != NULL) {
-                        free(bloom_filter_buffer);
-                    }
-                    if (cursor != NULL) {
-                        pager_cursor_free(cursor);
-                    }
-                    pthread_mutex_unlock(&tdb->flush_lock);
-                    return tidesdb_err_new(1036, "Failed to read sstable");
-                                }
-
-                key_value_pair* kv = NULL;
-
-                if (!deserialize_key_value_pair(buffer, buffer_len, &kv, cf->config.compressed)) {
-                    if (buffer != NULL) {
-                        free(buffer);
-                    }
-
-                    if (bf != NULL) {
-                        bloomfilter_destroy(bf);
-                    }
-                    if (bloom_filter_buffer != NULL) {
-                        free(bloom_filter_buffer);
-                    }
-                    if (cursor != NULL) {
-                        pager_cursor_free(cursor);
-                    }
-                    pthread_mutex_unlock(&tdb->flush_lock);
-                    return tidesdb_err_new(1037, "Failed to deserialize key value pair");
+            if (!pager_read(cf->sstables[i]->pager, cursor->page_number, &buffer, &buffer_len)) {
+                if (buffer != NULL) {
+                    free(buffer);
                 }
 
-                if (kv == NULL) {
-                    if (buffer != NULL) {
-                        free(buffer);
-                    }
+                if (bf != NULL) {
+                    bloomfilter_destroy(bf);
+                }
+                if (bloom_filter_buffer != NULL) {
+                    free(bloom_filter_buffer);
+                }
+                if (cursor != NULL) {
+                    pager_cursor_free(cursor);
+                }
+                pthread_mutex_unlock(&tdb->flush_lock);
+                return tidesdb_err_new(1036, "Failed to read sstable");
+            }
 
-                    if (bf != NULL) {
-                        bloomfilter_destroy(bf);
+            key_value_pair* kv = NULL;
 
-                    }
-                    if (bloom_filter_buffer != NULL) {
-                        free(bloom_filter_buffer);
-                    }
-                    if (cursor != NULL) {
-                        pager_cursor_free(cursor);
-
-                    }
-                    pthread_mutex_unlock(&tdb->flush_lock);
-                    return tidesdb_err_new(1038, "Key value pair is NULL");
+            if (!deserialize_key_value_pair(buffer, buffer_len, &kv, cf->config.compressed)) {
+                if (buffer != NULL) {
+                    free(buffer);
                 }
 
-                if (memcmp(kv->key, key, key_size) == 0) {
-                    if (_is_tombstone(kv->value, kv->value_size)) {
-                        if (buffer != NULL) {
-                            free(buffer);
-                        }
+                if (bf != NULL) {
+                    bloomfilter_destroy(bf);
+                }
+                if (bloom_filter_buffer != NULL) {
+                    free(bloom_filter_buffer);
+                }
+                if (cursor != NULL) {
+                    pager_cursor_free(cursor);
+                }
+                pthread_mutex_unlock(&tdb->flush_lock);
+                return tidesdb_err_new(1037, "Failed to deserialize key value pair");
+            }
 
-                        if (bf != NULL) {
-                            bloomfilter_destroy(bf);
+            if (kv == NULL) {
+                if (buffer != NULL) {
+                    free(buffer);
+                }
 
-                        }
-                        if (bloom_filter_buffer != NULL) {
-                            free(bloom_filter_buffer);
-                        }
-                        if (cursor != NULL) {
-                            pager_cursor_free(cursor);
+                if (bf != NULL) {
+                    bloomfilter_destroy(bf);
+                }
+                if (bloom_filter_buffer != NULL) {
+                    free(bloom_filter_buffer);
+                }
+                if (cursor != NULL) {
+                    pager_cursor_free(cursor);
+                }
+                pthread_mutex_unlock(&tdb->flush_lock);
+                return tidesdb_err_new(1038, "Key value pair is NULL");
+            }
 
-                        }
-                        pthread_mutex_unlock(&tdb->flush_lock);
-                        return tidesdb_err_new(1031, "Key not found");
-                    }
-
-                    // check if ttl is set and has expired
-                    if (kv->ttl != -1 && kv->ttl < time(NULL)) {
-                        if (buffer != NULL) {
-                            free(buffer);
-                        }
-
-                        if (bf != NULL) {
-                            bloomfilter_destroy(bf);
-
-                        }
-                        if (bloom_filter_buffer != NULL) {
-                            free(bloom_filter_buffer);
-                        }
-                        if (cursor != NULL) {
-                            pager_cursor_free(cursor);
-
-                        }
-
-                        if (kv != NULL) {
-                            free(kv);
-                        }
-
-                        pthread_mutex_unlock(&tdb->flush_lock);
-                        return tidesdb_err_new(1039, "Key not found");
-                    }
-
-                    *value = kv->value;
-                    *value_size = kv->value_size;
-
-
+            if (memcmp(kv->key, key, key_size) == 0) {
+                if (_is_tombstone(kv->value, kv->value_size)) {
                     if (buffer != NULL) {
                         free(buffer);
                     }
 
                     if (bf != NULL) {
                         bloomfilter_destroy(bf);
-
                     }
                     if (bloom_filter_buffer != NULL) {
                         free(bloom_filter_buffer);
                     }
                     if (cursor != NULL) {
                         pager_cursor_free(cursor);
-
                     }
+                    pthread_mutex_unlock(&tdb->flush_lock);
+                    return tidesdb_err_new(1031, "Key not found");
+                }
+
+                // check if ttl is set and has expired
+                if (kv->ttl != -1 && kv->ttl < time(NULL)) {
+                    if (buffer != NULL) {
+                        free(buffer);
+                    }
+
+                    if (bf != NULL) {
+                        bloomfilter_destroy(bf);
+                    }
+                    if (bloom_filter_buffer != NULL) {
+                        free(bloom_filter_buffer);
+                    }
+                    if (cursor != NULL) {
+                        pager_cursor_free(cursor);
+                    }
+
                     if (kv != NULL) {
                         free(kv);
                     }
 
                     pthread_mutex_unlock(&tdb->flush_lock);
-
-                    return NULL;
+                    return tidesdb_err_new(1039, "Key not found");
                 }
 
-                if (pager_cursor_next(cursor)) {
-                    has_next = true;
-                } else {
-                    break;
+                *value = kv->value;
+                *value_size = kv->value_size;
+
+                if (buffer != NULL) {
+                    free(buffer);
                 }
+
+                if (bf != NULL) {
+                    bloomfilter_destroy(bf);
+                }
+                if (bloom_filter_buffer != NULL) {
+                    free(bloom_filter_buffer);
+                }
+                if (cursor != NULL) {
+                    pager_cursor_free(cursor);
+                }
+                if (kv != NULL) {
+                    free(kv);
+                }
+
+                pthread_mutex_unlock(&tdb->flush_lock);
+
+                return NULL;
             }
 
+            if (pager_cursor_next(cursor)) {
+                has_next = true;
+            } else {
+                break;
+            }
+        }
 
         if (bloom_filter_buffer != NULL) {
             free(bloom_filter_buffer);
@@ -905,16 +902,12 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
 
         if (bf != NULL) {
             bloomfilter_destroy(bf);
-
         }
 
         if (cursor == NULL) {
             continue;
         }
         pager_cursor_free(cursor);
-
-
-
     }
 
     pthread_mutex_unlock(&tdb->flush_lock);
@@ -1936,14 +1929,14 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
         return false;
     }
 
-    sstable* sst = (sstable*)malloc(sizeof(sstable)); // allocate memory for sstable
+    sstable* sst = (sstable*)malloc(sizeof(sstable));  // allocate memory for sstable
     if (sst == NULL) {
         pthread_rwlock_unlock(&cf->sstables_lock);
         pager_close(p);
         return false;
     }
 
-    sst->pager = p; // set pager for sstable
+    sst->pager = p;  // set pager for sstable
 
     bloomfilter* bf = bloomfilter_create(BLOOMFILTER_SIZE);
     if (bf == NULL) {
@@ -2405,12 +2398,12 @@ int _remove_directory(const char* path) {
 }
 
 void _sst_extract_numeric_parts(const char* filename, char* numeric_parts) {
-    const char* start = strrchr(filename, '_'); // we get last '_'
+    const char* start = strrchr(filename, '_');  // we get last '_'
     if (start != NULL) {
-        start++;  // move past the last '_'
-        const char* end = strrchr(start, '.'); // stop at extension
+        start++;                                // move past the last '_'
+        const char* end = strrchr(start, '.');  // stop at extension
         if (end != NULL) {
-            strncpy(numeric_parts, start, end - start); // copy the numeric part
+            strncpy(numeric_parts, start, end - start);  // copy the numeric part
             numeric_parts[end - start] = '\0';
         }
     }

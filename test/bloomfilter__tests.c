@@ -25,7 +25,6 @@
 
 // we test bloom filter creation and destruction
 void test_bloomfilter_create() {
-
     // we create a bloom filter with size 1024
     bloomfilter *bf = bloomfilter_create(1024);
 
@@ -49,17 +48,14 @@ void test_bloomfilter_create() {
     printf(GREEN "test_bloomfilter_create passed\n" RESET);
 }
 
-
 // we test bloom filter add and check
 // we add 1 data entry and check if it is in the bloom filter
 void test_bloomfilter_add_check() {
-
     // we create a bloom filter with size 1024
     bloomfilter *bf = bloomfilter_create(1024);
 
-
-    const unsigned char data1[] = "test1"; // the entry that will be in bf
-    const unsigned char data2[] = "test2"; // the entry that will not be in bf
+    const unsigned char data1[] = "test1";  // the entry that will be in bf
+    const unsigned char data2[] = "test2";  // the entry that will not be in bf
 
     // we add data1 to the bloom filter
     assert(bloomfilter_add(bf, data1, strlen((const char *)data1)) == 0);

@@ -27,8 +27,8 @@
 #include "../external/xxhash.h"
 #include "endian.h"
 
-// we define the bloomfilter struct here so
-// we can use it in the struct definition for the next member
+/* we define the bloomfilter struct here so
+ * we can use it in the struct definition for the next member */
 typedef struct bloomfilter bloomfilter;
 
 /* bloomfilter struct
@@ -38,10 +38,10 @@ typedef struct bloomfilter bloomfilter;
  * @param next pointer to the next bloomfilter (for chaining)
  */
 typedef struct bloomfilter {
-    uint32_t size;
-    uint32_t count;
-    uint8_t *set;
-    struct bloomfilter *next;
+    uint32_t size;             // Size of the bloom filter (number of bits or slots)
+    uint32_t count;            // Number of elements in the bloom filter
+    uint8_t *set;              // Array of integers representing the bloom filter's bitset
+    struct bloomfilter *next;  // Pointer to the next bloomfilter (for chaining)
 } bloomfilter;
 
 /* Bloom filter function prototypes */

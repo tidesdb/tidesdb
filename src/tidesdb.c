@@ -487,8 +487,8 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf) {
 
     pager* new_pager = NULL;
     char new_sstable_name[PATH_MAX];
-    char numeric_part1[PATH_MAX];
-    char numeric_part2[PATH_MAX];
+    char numeric_part1[PATH_MAX/4];
+    char numeric_part2[PATH_MAX/4];
     _sst_extract_numeric_parts(sst1->pager->filename, numeric_part1);
     _sst_extract_numeric_parts(sst2->pager->filename, numeric_part2);
 

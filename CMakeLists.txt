@@ -28,6 +28,7 @@ add_executable(serialize_tests test/serialize__tests.c)
 add_executable(tidesdb_tests test/tidesdb__tests.c)
 
 target_link_libraries(tidesdb xxhash zstd)
+target_link_libraries(err_tests tidesdb)
 target_link_libraries(pager_tests tidesdb)
 target_link_libraries(skiplist_tests tidesdb)
 target_link_libraries(queue_tests tidesdb)

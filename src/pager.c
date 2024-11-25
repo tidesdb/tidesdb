@@ -192,6 +192,8 @@ bool pager_close(pager* p) {
     // We free the pager
     free(p);
 
+    p = NULL;
+
     return true;
 }
 
@@ -435,6 +437,8 @@ void pager_cursor_free(pager_cursor* cursor) {
     if (cursor) {
         free(cursor);
     }
+
+    cursor = NULL;
 }
 
 bool pager_truncate(pager* p, size_t size) {

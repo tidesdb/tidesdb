@@ -357,6 +357,7 @@ int skiplist_destroy(skiplist *list) {
     free(list->header->value);
     free(list->header);
     free(list);
+    list = NULL;
     return 0;
 }
 

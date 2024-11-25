@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 23)
-set(PROJECT_VERSION 1.0.0)
+set(PROJECT_VERSION 0.1.0) # TidesDB v0.1.0 (working towards)
 
 find_package(zstd REQUIRED)
 

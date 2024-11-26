@@ -14,7 +14,7 @@ TidesDB is designed to be fast, simple, durable and efficient.  It is not a full
 - [ ] Documentation
 
 ## Features
-- [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist is locked on writes.  SSTables are sorted, immutable and can be read concurrently and are protected via page locks.
+- [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist uses an RW lock.  SSTables are sorted, immutable and can be read concurrently and are protected via page locks.
 - [x] **Column Families** store data in separate key-value stores.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically.
 - [ ] **Cursor** iterate over key-value pairs forward and backward.

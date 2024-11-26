@@ -334,7 +334,6 @@ void test_put_flush_get()
             tidesdb_err_free(e);
             break;
         }
-
     }
 
     sleep(3); /* wait for the SST file to be written */

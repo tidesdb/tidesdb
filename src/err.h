@@ -49,4 +49,4 @@ tidesdb_err* tidesdb_err_new(int code, char* message);
  */
 void tidesdb_err_free(tidesdb_err* e);
 
-#endif  /* TIDESDB_ERR_H */
+#endif /* TIDESDB_ERR_H */

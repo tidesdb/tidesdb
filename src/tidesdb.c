@@ -208,6 +208,7 @@ tidesdb_err* tidesdb_drop_column_family(tidesdb* tdb, const char* name)
 
     skiplist_destroy(tdb->column_families[index].memtable);
     pthread_rwlock_destroy(&tdb->column_families[index].sstables_lock);
+    id_gen_destroy(tdb->column_families[index].id_gen);
 
     /* remove all files in the column family directory */
     _remove_directory(tdb->column_families[index].path);
@@ -483,13 +484,9 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
 
     pager* new_pager = NULL;
     char new_sstable_name[PATH_MAX];
-    char numeric_part1[PATH_MAX / 4];
-    char numeric_part2[PATH_MAX / 4];
-    _sst_extract_numeric_parts(sst1->pager->filename, numeric_part1);
-    _sst_extract_numeric_parts(sst2->pager->filename, numeric_part2);
 
-    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%s_%s.sst", cf->path, _get_path_seperator(),
-             numeric_part1, numeric_part2);
+    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%lu.sst", cf->path, _get_path_seperator(),
+             id_gen_new(cf->id_gen));
 
     if (!pager_open(new_sstable_name, &new_pager))
     {
@@ -728,7 +725,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
         if (!key_exists)
         {
             if (i == 0) break; /* we have reached the end of the sstables */
-            continue; /* go to the next sstable */
+            continue;          /* go to the next sstable */
         }
 
         pager_cursor* cursor = NULL;
@@ -744,7 +741,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             pager_cursor_free(cursor);
             pthread_mutex_unlock(&tdb->flush_lock);
             if (i == 0) break; /* we have reached the end of the sstables */
-            continue; /* go to the next sstable */
+            continue;          /* go to the next sstable */
         }
 
         bool has_next = true; /* we have a next page */
@@ -1211,6 +1208,9 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
     /* we set the probability */
     (*cf)->config.probability = probability;
 
+    /* we initialize the id generator */
+    (*cf)->id_gen = id_gen_init((uint64_t)time(NULL));
+
     /* we construct the path to the column family */
     char cf_path[PATH_MAX];
 
@@ -1489,6 +1489,7 @@ bool _load_column_families(tidesdb* tdb)
                 cf->sstables = NULL;
                 cf->num_sstables = 0;
                 cf->memtable = new_skiplist(cf->config.max_level, cf->config.probability);
+                cf->id_gen = id_gen_init((uint64_t)time(NULL));
 
                 /* we check if the memtable was created */
                 if (cf->memtable == NULL)
@@ -1839,11 +1840,11 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
 
     pthread_rwlock_wrlock(&cf->sstables_lock); /* we get sstables lock for hte column family */
 
-    char filename[1024]; /* could be a problem, the size can be bigger */
+    char filename[1024];
 
     /* we create the filename for the sstable */
-    snprintf(filename, sizeof(filename), "%s%ssstable_%u%s", cf->path, _get_path_seperator(),
-             cf->num_sstables, SSTABLE_EXT);
+    snprintf(filename, sizeof(filename), "%s%ssstable_%lu%s", cf->path, _get_path_seperator(),
+             id_gen_new(cf->id_gen), SSTABLE_EXT);
 
     pager* p = NULL;
 
@@ -2096,6 +2097,8 @@ tidesdb_err* tidesdb_close(tidesdb* tdb)
                 skiplist_clear(tdb->column_families[i].memtable);
                 skiplist_destroy(tdb->column_families[i].memtable);
             }
+
+            id_gen_destroy(tdb->column_families[i].id_gen);
 
             pthread_rwlock_destroy(&tdb->column_families[i].sstables_lock);
 

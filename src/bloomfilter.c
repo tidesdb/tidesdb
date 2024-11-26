@@ -48,22 +48,11 @@ bloomfilter *bloomfilter_create(unsigned int size)
 
 void bloomfilter_destroy(bloomfilter *bf)
 {
-    if (bf == NULL) return;
-
-    if (bf->next != NULL)
-    {
-        bloomfilter_destroy(bf->next);
-        bf->next = NULL;
+    while (bf != NULL) {
+        bloomfilter *next = bf->next;
+        free(bf);
+        bf = next;
     }
-
-    if (bf->set != NULL)
-    {
-        free(bf->set);
-        bf->set = NULL;
-    }
-
-    free(bf);
-    bf = NULL;
 }
 
 bool bloomfilter_check(bloomfilter *bf, const unsigned char *data, unsigned int data_len)

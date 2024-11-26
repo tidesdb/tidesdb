@@ -16,8 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef SERIALIZEABLE_STRUCTURES_H
-#define SERIALIZEABLE_STRUCTURES_H
+#ifndef SERIALIZABLE_STRUCTURES_H
+#define SERIALIZABLE_STRUCTURES_H
 #include <stdbool.h>
 #include <time.h>
 
@@ -28,8 +28,8 @@
  */
 enum OP_CODE
 {
-    OP_PUT,
-    OP_DELETE
+    OP_PUT,   /* a put operation into a column family */
+    OP_DELETE /* a delete operation from a column family */
 };
 
 /*
@@ -86,4 +86,4 @@ typedef struct
     char *column_family;  /* the column family for the operation */
 } operation;
 
-#endif /* SERIALIZEABLE_STRUCTURES_H */
+#endif /* SERIALIZABLE_STRUCTURES_H */

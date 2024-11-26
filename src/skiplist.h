@@ -78,7 +78,7 @@ typedef struct
  * @param list the skiplist
  * @param current the current node
  */
-typedef struct skiplist_cursor
+typedef struct
 {
     skiplist *list;         /* the skiplist  */
     skiplist_node *current; /* the current node  */

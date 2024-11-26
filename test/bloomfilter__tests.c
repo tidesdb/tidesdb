@@ -59,7 +59,7 @@ void test_bloomfilter_add_check()
     const unsigned char data1[] = "test1"; /* the entry that will be in bf */
     const unsigned char data2[] = "test2"; /* the entry that will not be in bf */
 
-    /* we add data1 to the bloom filter
+    /* we add data1 to the bloom filter */
     assert(bloomfilter_add(bf, data1, strlen((const char *)data1)) == 0);
 
     /* we check if data1 is in the bloom filter, it should be */

@@ -607,10 +607,10 @@ tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uns
     /* we check if the memtable has reached the flush threshold */
     if ((int)cf->memtable->total_size >= cf->config.flush_threshold)
     {
-        /* get flush mutex */
+        /* get flush mutex and lock it */
         pthread_mutex_lock(&tdb->flush_lock);
 
-        queue_entry* entry = (queue_entry*)malloc(sizeof(queue_entry));
+        queue_entry* entry = malloc(sizeof(queue_entry)); /* we allocate a queue entry */
         if (entry == NULL)
         {
             /* unlock the flush mutex */
@@ -618,7 +618,8 @@ tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uns
             return tidesdb_err_new(1045, "Failed to allocate memory for queue entry");
         }
 
-        /* we make a copy of the memtable */
+        /* we make a copy of the memtable whilst also setting
+         * the entry memtable to be flushed to disk */
         entry->memtable = skiplist_copy(cf->memtable);
         if (entry->memtable == NULL)
         {
@@ -627,8 +628,10 @@ tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uns
             free(entry);
             return tidesdb_err_new(1011, "Failed to copy memtable");
         }
-        entry->cf = cf;
 
+        entry->cf = cf; /* we set the column family for the entry */
+
+        /* we get the wal checkpoint */
         if (!pager_size(tdb->wal->pager, &entry->wal_checkpoint))
         {
             pthread_mutex_unlock(&tdb->flush_lock);
@@ -717,18 +720,20 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             continue;
         }
 
-        if (!bloomfilter_check(bf, key, key_size))
+        bool key_exists = bloomfilter_check(bf, key, key_size);
+
+        bloomfilter_destroy(bf);
+        free(bloom_filter_buffer);
+
+        if (!key_exists)
         {
-            free(bloom_filter_buffer);
-            bloomfilter_destroy(bf);
-            continue;
+            if (i == 0) break; /* we have reached the end of the sstables */
+            continue; /* go to the next sstable */
         }
 
         pager_cursor* cursor = NULL;
         if (!pager_cursor_init(cf->sstables[i]->pager, &cursor))
         {
-            bloomfilter_destroy(bf);
-            free(bloom_filter_buffer);
             pthread_mutex_unlock(&tdb->flush_lock);
             return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
         }
@@ -736,13 +741,13 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
         /* we skip the bloom filter page(s) */
         if (!pager_cursor_next(cursor))
         {
-            bloomfilter_destroy(bf);
-            free(bloom_filter_buffer);
             pager_cursor_free(cursor);
-            continue;
+            pthread_mutex_unlock(&tdb->flush_lock);
+            if (i == 0) break; /* we have reached the end of the sstables */
+            continue; /* go to the next sstable */
         }
 
-        bool has_next = true;
+        bool has_next = true; /* we have a next page */
         while (has_next)
         {
             uint8_t* buffer = NULL;
@@ -751,13 +756,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             if (!pager_read(cf->sstables[i]->pager, cursor->page_number, &buffer, &buffer_len))
             {
                 if (buffer != NULL) free(buffer);
-
-                if (bf != NULL) bloomfilter_destroy(bf);
-
-                if (bloom_filter_buffer != NULL) free(bloom_filter_buffer);
-
-                if (cursor != NULL) pager_cursor_free(cursor);
-
+                pager_cursor_free(cursor);
                 pthread_mutex_unlock(&tdb->flush_lock);
                 return tidesdb_err_new(1036, "Failed to read sstable");
             }
@@ -767,13 +766,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             if (!deserialize_key_value_pair(buffer, buffer_len, &kv, cf->config.compressed))
             {
                 if (buffer != NULL) free(buffer);
-
-                if (bf != NULL) bloomfilter_destroy(bf);
-
-                if (bloom_filter_buffer != NULL) free(bloom_filter_buffer);
-
-                if (cursor != NULL) pager_cursor_free(cursor);
-
+                pager_cursor_free(cursor);
                 pthread_mutex_unlock(&tdb->flush_lock);
                 return tidesdb_err_new(1037, "Failed to deserialize key value pair");
             }
@@ -781,13 +774,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             if (kv == NULL)
             {
                 if (buffer != NULL) free(buffer);
-
-                if (bf != NULL) bloomfilter_destroy(bf);
-
-                if (bloom_filter_buffer != NULL) free(bloom_filter_buffer);
-
-                if (cursor != NULL) pager_cursor_free(cursor);
-
+                pager_cursor_free(cursor);
                 pthread_mutex_unlock(&tdb->flush_lock);
                 return tidesdb_err_new(1038, "Key value pair is NULL");
             }
@@ -796,14 +783,8 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             {
                 if (_is_tombstone(kv->value, kv->value_size))
                 {
-                    if (buffer != NULL) free(buffer);
-
-                    if (bf != NULL) bloomfilter_destroy(bf);
-
-                    if (bloom_filter_buffer != NULL) free(bloom_filter_buffer);
-
-                    if (cursor != NULL) pager_cursor_free(cursor);
-
+                    free(buffer);
+                    pager_cursor_free(cursor);
                     pthread_mutex_unlock(&tdb->flush_lock);
                     return tidesdb_err_new(1031, "Key not found");
                 }
@@ -811,16 +792,9 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
                 /* check if ttl is set and has expired */
                 if (kv->ttl != -1 && kv->ttl < time(NULL))
                 {
-                    if (buffer != NULL) free(buffer);
-
-                    if (bf != NULL) bloomfilter_destroy(bf);
-
-                    if (bloom_filter_buffer != NULL) free(bloom_filter_buffer);
-
-                    if (cursor != NULL) pager_cursor_free(cursor);
-
-                    if (kv != NULL) free(kv);
-
+                    free(buffer);
+                    pager_cursor_free(cursor);
+                    free(kv);
                     pthread_mutex_unlock(&tdb->flush_lock);
                     return tidesdb_err_new(1039, "Key not found");
                 }
@@ -828,16 +802,9 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
                 *value = kv->value;
                 *value_size = kv->value_size;
 
-                if (buffer != NULL) free(buffer);
-
-                if (bf != NULL) bloomfilter_destroy(bf);
-
-                if (bloom_filter_buffer != NULL) free(bloom_filter_buffer);
-
-                if (cursor != NULL) pager_cursor_free(cursor);
-
-                if (kv != NULL) free(kv);
-
+                free(buffer);
+                pager_cursor_free(cursor);
+                free(kv);
                 pthread_mutex_unlock(&tdb->flush_lock);
 
                 return NULL;
@@ -849,17 +816,12 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             }
             else
             {
+                pager_cursor_free(cursor);
+                free(buffer);
+                free(kv);
                 break;
             }
         }
-
-        if (bloom_filter_buffer != NULL) free(bloom_filter_buffer);
-
-        if (bf != NULL) bloomfilter_destroy(bf);
-
-        if (cursor == NULL) continue;
-
-        pager_cursor_free(cursor);
     }
 
     pthread_mutex_unlock(&tdb->flush_lock);
@@ -1875,14 +1837,17 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
     /* we check if the memtable is NULL */
     if (memtable == NULL) return false;
 
-    pthread_rwlock_wrlock(&cf->sstables_lock);
-    char filename[1024];
+    pthread_rwlock_wrlock(&cf->sstables_lock); /* we get sstables lock for hte column family */
 
+    char filename[1024]; /* could be a problem, the size can be bigger */
+
+    /* we create the filename for the sstable */
     snprintf(filename, sizeof(filename), "%s%ssstable_%u%s", cf->path, _get_path_seperator(),
              cf->num_sstables, SSTABLE_EXT);
 
     pager* p = NULL;
 
+    /* we open a new pager for the sstable */
     if (!pager_open(filename, &p))
     {
         pthread_rwlock_unlock(&cf->sstables_lock);
@@ -1899,6 +1864,9 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
 
     sst->pager = p; /* set pager for sstable */
 
+    /* we create a bloom filter.
+     * the bloom filter is used to determine if a key is within an sstable before a scan.
+     * A bloomfilter can span multiple initial pages */
     bloomfilter* bf = bloomfilter_create(BLOOMFILTER_SIZE);
     if (bf == NULL)
     {
@@ -2046,7 +2014,7 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
     skiplist_clear(memtable);
     skiplist_destroy(memtable);
 
-    /* truncate the wal */
+    /* truncate the wal at the entries provided checkpoint */
     if (!_truncate_wal(tdb->wal, wal_checkpoint)) return false;
 
     return true;

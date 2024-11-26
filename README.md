@@ -7,9 +7,9 @@ TidesDB is designed to be fast, simple, durable and efficient.  It is not a full
 > In very active beta development. Not ready for production use.
 
 ## Todo list
-- [ ] DB cursor
-- [ ] Finalize error codes and their messages
-- [ ] Add more tests fulfilling `@todo` comments
+- [ ] DB cursor, the ability to iterate over key-value pairs forward and backward through memtable and sstables for a column family.
+- [ ] Finalize error codes and their messages (in progress)
+- [ ] Add more tests fulfilling `@todo` comments (in progress)
 - [ ] Benchmark
 - [ ] Documentation
 

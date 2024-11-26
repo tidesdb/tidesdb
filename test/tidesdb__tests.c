@@ -331,12 +331,10 @@ void test_put_flush_get()
         if (e != NULL)
         {
             printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
             break;
         }
 
-        assert(e == NULL);
-        free(e);
-        e = NULL;
     }
 
     sleep(3); /* wait for the SST file to be written */

@@ -48,7 +48,8 @@ bloomfilter *bloomfilter_create(unsigned int size)
 
 void bloomfilter_destroy(bloomfilter *bf)
 {
-    while (bf != NULL) {
+    while (bf != NULL)
+    {
         bloomfilter *next = bf->next;
         free(bf);
         bf = next;

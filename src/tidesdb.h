@@ -30,6 +30,7 @@
 
 #include "bloomfilter.h"
 #include "err.h"
+#include "id_gen.h"
 #include "pager.h"
 #include "queue.h"
 #include "serialize.h"
@@ -86,6 +87,7 @@ typedef struct
  * @param num_sstables the number of sstables for the column family
  * @param sstables_lock Read-write lock for SSTables mainly for when adding a new sstable
  * @param memtable the memtable for the column family
+ * @param id_gen id generator for the column family; mainly used for sstable filenames
  */
 typedef struct
 {
@@ -96,6 +98,7 @@ typedef struct
     pthread_rwlock_t
         sstables_lock;  /* Read-write lock for SSTables mainly for when adding a new sstable */
     skiplist* memtable; /* the memtable for the column family */
+    id_gen* id_gen;     /* id generator for the column family; mainly used for sstable filenames */
 } column_family;
 
 /*

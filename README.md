@@ -14,7 +14,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist uses an RW lock which means multiple readers and one true writer.  SSTables are sorted, immutable and can be read concurrently they are protected via page locks.
 - [x] **Column Families** store data in separate key-value stores.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically.
-- [x] **Cursor** iterate over key-value pairs forward and backward. (in progress)
+- [x] **Cursor** iterate over key-value pairs forward and backward.
 - [x] **WAL** write-ahead logging for durability.  As operations are appended they are also truncated at specific points once persisted to an sstable(s).
 - [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
 - [x] **Background flush** memtable flushes are enqueued and then flushed in the background.
@@ -88,8 +88,8 @@ It is not a full-featured database, but rather a library that can be used to bui
 | 1059       | Failed to initialize sstable cursor                                  |
 | 1060       | Failed to get key value pair from cursor                             |
 | 1061       | Cursor is NULL                                                       |
-| 1062       | End of cursor                                                        |
-
+| 1062       | At end of cursor                                                     |
+| 1063       | At start of cursor                                                   |
 ```
 
 ## License

@@ -25,6 +25,11 @@
 void test_open_close()
 {
     tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
 
     tdb_config->db_path = "testdb";
     tdb_config->compressed_wal = false;
@@ -55,6 +60,11 @@ void test_open_close()
 void test_create_column_family()
 {
     tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
 
     tdb_config->db_path = "testdb";
     tdb_config->compressed_wal = false;
@@ -96,6 +106,11 @@ void test_create_column_family()
 void test_drop_column_family()
 {
     tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
 
     tdb_config->db_path = "testdb";
     tdb_config->compressed_wal = false;
@@ -103,6 +118,8 @@ void test_drop_column_family()
     tidesdb* tdb = NULL;
 
     tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
     assert(e == NULL);
 
     assert(tdb != NULL);
@@ -146,6 +163,11 @@ void test_drop_column_family()
 void test_put()
 {
     tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
 
     tdb_config->db_path = "testdb";
     tdb_config->compressed_wal = false;
@@ -153,6 +175,8 @@ void test_put()
     tidesdb* tdb = NULL;
 
     tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
     assert(e == NULL);
 
     assert(tdb != NULL);
@@ -379,7 +403,7 @@ void test_put_flush_get()
  * replaying the WAL and populate the memtable with the key-value pairs */
 void test_put_reopen_get()
 {
-    tidesdb_config* tdb_config = (tidesdb_config*)malloc(sizeof(tidesdb_config));
+    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -392,6 +416,13 @@ void test_put_reopen_get()
     tidesdb* tdb = NULL;
 
     tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    if (e != NULL)
+    {
+        printf(RED "Error: %s\n" RESET, e->message);
+        tidesdb_err_free(e);
+        free(tdb_config);
+        return;
+    }
     assert(e == NULL);
     assert(tdb != NULL);
 
@@ -601,6 +632,8 @@ void test_txn_put_delete_get()
     tidesdb* tdb = NULL;
 
     tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
     assert(e == NULL);
     assert(tdb != NULL);
 
@@ -713,6 +746,11 @@ void test_txn_put_delete_get()
 void test_put_compact()
 {
     tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
 
     tdb_config->db_path = "testdb";
     tdb_config->compressed_wal = false;
@@ -720,6 +758,8 @@ void test_put_compact()
     tidesdb* tdb = NULL;
 
     tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
     assert(e == NULL);
 
     assert(tdb != NULL);
@@ -779,6 +819,11 @@ void test_put_compact()
 void test_put_compact_get()
 {
     tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
 
     tdb_config->db_path = "testdb";
     tdb_config->compressed_wal = false;
@@ -786,6 +831,8 @@ void test_put_compact_get()
     tidesdb* tdb = NULL;
 
     tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
     assert(e == NULL);
 
     assert(tdb != NULL);
@@ -872,6 +919,377 @@ void test_put_compact_get()
     printf(GREEN "test_put_compact passed\n" RESET);
 }
 
+void test_put_compact_get_reopen()
+{
+    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
+
+    tdb_config->db_path = "testdb";
+    tdb_config->compressed_wal = false;
+
+    tidesdb* tdb = NULL;
+
+    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+
+    assert(tdb != NULL);
+
+    tidesdb_err_free(e);
+
+    /* create a column family */
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    column_family* cf = NULL;
+
+    /* we should be able to get the column family */
+    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+
+    /* put 100k key-value pairs */
+    for (int i = 0; i < 100000; i++)
+    {
+        char key[38];
+        char value[38];
+        snprintf(key, sizeof(key), "key%d", i);
+        snprintf(value, sizeof(value), "value%d", i);
+
+        e = tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            break;
+        }
+
+        assert(e == NULL);
+    }
+
+    /* we compact */
+    e = tidesdb_compact_sstables(tdb, cf, 2);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    e = tidesdb_close(tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    tidesdb_err_free(e);
+
+    tdb_config = NULL;
+
+    /* reopen the database */
+    tdb_config = (malloc(sizeof(tidesdb_config)));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
+
+    e = tidesdb_open(tdb_config, &tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    /* get the key-value pairs */
+    for (int i = 0; i < 100000 / 4; i++)
+    {
+        unsigned char key[38];
+        unsigned char value[38];
+        snprintf(key, sizeof(key), "key%d", i);
+        snprintf(value, sizeof(value), "value%d", i);
+
+        size_t value_len = 0;
+        unsigned char* value_out = NULL;
+
+        e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            continue;
+        }
+
+        assert(e == NULL);
+
+        assert(value_len == strlen((char*)value));
+        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+
+        free(value_out); /* free the value_out pointer */
+        value_out = NULL;
+        value_len = 0;
+        tidesdb_err_free(e);
+    }
+
+    e = tidesdb_close(tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    tidesdb_err_free(e);
+
+    remove_directory("testdb");
+
+    printf(GREEN "test_put_compact_get_reopen passed\n" RESET);
+}
+
+void* put_thread(void* arg)
+{
+    tidesdb* tdb = (tidesdb*)arg;
+    column_family* cf = NULL;
+    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+
+    for (int i = 0; i < 12000; i++)
+    {
+        char key[48];
+        char value[48];
+        snprintf(key, sizeof(key), "key_put%03d", i);
+        snprintf(value, sizeof(value), "value_put%03d", i);
+
+        tidesdb_err* e =
+            tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+/* helper for test_concurrent_put_get */
+void* get_thread(void* arg)
+{
+    tidesdb* tdb = (tidesdb*)arg;
+    column_family* cf = NULL;
+    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+
+    for (int i = 0; i < 12000; i++)
+    {
+        unsigned char key[48];
+        unsigned char value[48];
+        snprintf(key, sizeof(key), "key_put%03d", i);
+
+        size_t value_len = 0;
+        unsigned char* value_out = NULL;
+
+        tidesdb_err* e =
+            tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            continue;
+        }
+
+        assert(e == NULL);
+        free(value_out); /* free the value_out pointer */
+    }
+
+    return NULL;
+}
+
+void test_concurrent_put_get()
+{
+    /* rough */
+    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
+
+    tdb_config->db_path = "testdb";
+    tdb_config->compressed_wal = false;
+
+    tidesdb* tdb = NULL;
+
+    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    assert(e == NULL);
+    assert(tdb != NULL);
+
+    tidesdb_err_free(e);
+
+    /* create a column family */
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    column_family* cf = NULL;
+
+    /* we should be able to get the column family */
+    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+
+    pthread_t put_tid, get_tid;
+
+    pthread_create(&put_tid, NULL, put_thread, tdb);
+    pthread_create(&get_tid, NULL, get_thread, tdb);
+
+    pthread_join(put_tid, NULL);
+    pthread_join(get_tid, NULL);
+
+    e = tidesdb_close(tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    tidesdb_err_free(e);
+
+    remove_directory("testdb");
+
+    printf(GREEN "test_concurrent_put_get passed\n" RESET);
+}
+
+void test_cursor()
+{
+    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
+
+    tdb_config->db_path = "testdb";
+    tdb_config->compressed_wal = false;
+
+    tidesdb* tdb = NULL;
+
+    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    assert(e == NULL);
+    assert(tdb != NULL);
+
+    tidesdb_err_free(e);
+
+    /* create a column family */
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    column_family* cf = NULL;
+
+    /* we should be able to get the column family */
+    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+
+    /* put 24000 key-value pairs
+     * this creates 1 SST file and some in-memory data in the column family memtable on most systems
+     */
+    for (int i = 0; i < 24000; i++)
+    {
+        char key[48];
+        char value[48];
+        snprintf(key, sizeof(key), "key%03d", i);
+        snprintf(value, sizeof(value), "value%03d", i);
+
+        e = tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            break;
+        }
+    }
+
+    sleep(3); /* wait for the SST file to be written */
+
+    /* we get the key-value pairs */
+    for (int i = 0; i < 100; i++)
+    {
+        unsigned char key[48];
+        unsigned char value[48];
+        snprintf(key, sizeof(key), "key%03d", i);
+        snprintf(value, sizeof(value), "value%03d", i);
+
+        size_t value_len = 0;
+        unsigned char* value_out = NULL;
+
+        e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            continue;
+        }
+
+        assert(e == NULL);
+        assert(value_len == strlen((char*)value));
+        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+
+        free(value_out); /* free the value_out pointer */
+    }
+
+    tidesdb_cursor* cursor = NULL;
+    e = tidesdb_cursor_init(tdb, "test_cf", &cursor);
+    if (e != NULL)
+    {
+        printf(RED "Error: %s\n" RESET, e->message);
+        tidesdb_err_free(e);
+        tidesdb_close(tdb);
+    }
+
+    assert(e == NULL);
+
+    key_value_pair* kv = malloc(sizeof(key_value_pair));
+    if (kv == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for kv\n" RESET);
+        tidesdb_cursor_free(cursor);
+        tidesdb_close(tdb);
+    }
+
+    assert(kv != NULL);
+
+    /* need to make this test more efficient */
+
+    while (tidesdb_cursor_next(cursor) == NULL)
+    {
+        e = tidesdb_cursor_get(cursor, &kv);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            break;
+        }
+    }
+
+    // go back to the beginning
+    while (tidesdb_cursor_prev(cursor) == NULL)
+    {
+        e = tidesdb_cursor_get(cursor, &kv);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            break;
+        }
+    }
+
+    free(kv);
+    tidesdb_cursor_free(cursor);
+    tidesdb_close(tdb);
+
+    e = tidesdb_close(tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    tidesdb_err_free(e);
+
+    remove_directory("testdb");
+
+    printf(GREEN "test_cursor passed\n" RESET);
+}
+
 int main(void)
 {
     test_open_close();
@@ -885,9 +1303,9 @@ int main(void)
     test_txn_put_delete_get();
     test_put_compact();
     test_put_compact_get();
-    /** @todo test_put_compact_get_reopen */
-    /** @todo test_cursor */
-    /** @todo test_concurrent_put_get */
+    test_put_compact_get_reopen();
+    test_concurrent_put_get();
+    test_cursor();
 
     return 0;
 }

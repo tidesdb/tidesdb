@@ -83,6 +83,13 @@ It is not a full-featured database, but rather a library that can be used to bui
 | 1054       | Transaction is NULL                                                  |
 | 1055       | Failed to read bloom filter                                          |
 | 1056       | Failed to reallocate memory for transaction operations               |
+| 1057       | Failed to allocate memory for cursor                                 |
+| 1058       | Failed to initialize memtable cursor                                 |
+| 1059       | Failed to initialize sstable cursor                                  |
+| 1060       | Failed to get key value pair from cursor                             |
+| 1061       | Cursor is NULL                                                       |
+| 1062       | End of cursor                                                        |
+
 ```
 
 ## License

@@ -1199,11 +1199,46 @@ tidesdb_err* tidesdb_cursor_init(tidesdb* tdb, const char* column_family_name,
 
 tidesdb_err* tidesdb_cursor_next(tidesdb_cursor* cursor)
 {
-    /*** @TODO */
-
     /* we start at the memtable
      * once the memtable is exhausted we move to the sstables
      */
+
+    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
+
+    if (cursor->memtable_cursor->current != NULL)
+    {
+        /* we move to the next key in the memtable */
+        if (skiplist_cursor_next(cursor->memtable_cursor))
+        {
+            return NULL;
+        }
+        else
+        {
+            /* go next to the sstables */
+            if (pager_cursor_next(cursor->sstable_cursor))
+            {
+                return NULL;
+            }
+            else
+            {
+                /* we move to the next sstable */
+                cursor->sstable_index++;
+                if (cursor->sstable_index >= cursor->cf->num_sstables)
+                {
+                    return tidesdb_err_new(1062, "End of cursor");
+                }
+
+                /* we initialize the new sstable cursor */
+                if (!pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
+                                       &cursor->sstable_cursor))
+                {
+                    return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
+                }
+
+                return NULL;
+            }
+        }
+    }
 
     return NULL;
 }
@@ -1224,6 +1259,8 @@ tidesdb_err* tidesdb_cursor_get(tidesdb_cursor* cursor, key_value_pair** kv)
     /* we get the key value pair from the cursor.
      * could be from the memtable or an sstable
      */
+
+    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
 
     if (cursor->memtable_cursor->current != NULL)
     {
@@ -1264,6 +1301,8 @@ tidesdb_err* tidesdb_cursor_get(tidesdb_cursor* cursor, key_value_pair** kv)
 
 tidesdb_err* tidesdb_cursor_free(tidesdb_cursor* cursor)
 {
+    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
+
     /* we try to free the sstable cursor */
     if (cursor->sstable_cursor != NULL) pager_cursor_free(cursor->sstable_cursor);
 

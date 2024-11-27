@@ -2260,9 +2260,11 @@ tidesdb_err* tidesdb_close(tidesdb* tdb)
         /* we iterate over the column families and free them */
         for (int i = 0; i < tdb->num_column_families; i++)
         {
-            /* we free the column family */
-            free(tdb->column_families[i].config.name);
-            free(tdb->column_families[i].path);
+            if (tdb->column_families[i].config.name != NULL)
+                free(tdb->column_families[i].config.name);
+
+            if (tdb->column_families[i].path != NULL) free(tdb->column_families[i].path);
+
             if (tdb->column_families[i].memtable != NULL)
             {
                 skiplist_clear(tdb->column_families[i].memtable);

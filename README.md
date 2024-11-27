@@ -24,7 +24,6 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Configurable** many options are configurable for the engine, and column families.
 - [x] **Error Handling** majority of functions return an error code.
 - [x] **Easy API** simple and easy to use api.
-
 ## Errors
 ```
 | Error Code | Error Message                                                        |

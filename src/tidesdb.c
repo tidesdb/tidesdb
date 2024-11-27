@@ -1225,7 +1225,7 @@ tidesdb_err* tidesdb_cursor_next(tidesdb_cursor* cursor)
                 cursor->sstable_index++;
                 if (cursor->sstable_index >= cursor->cf->num_sstables)
                 {
-                    return tidesdb_err_new(1062, "End of cursor");
+                    return tidesdb_err_new(1062, "At end of cursor");
                 }
 
                 /* we initialize the new sstable cursor */
@@ -1245,13 +1245,47 @@ tidesdb_err* tidesdb_cursor_next(tidesdb_cursor* cursor)
 
 tidesdb_err* tidesdb_cursor_prev(tidesdb_cursor* cursor)
 {
-    /*** @TODO */
+    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
 
-    /* depending on where the cursor is we move to the previous key
-     * if the index for sstable pagers is 0 then we move previous on the memtable if not we move
-     * previous on the sstable
-     */
-    return NULL;
+    if (cursor->sstable_cursor != NULL)
+    {
+        /* we move to the previous key in the sstable */
+        if (pager_cursor_prev(cursor->sstable_cursor))
+        {
+            return NULL;
+        }
+
+        /* we move to the previous sstable */
+        if (cursor->sstable_index == 0)
+        {
+            /* if we are at the first sstable, move to the memtable */
+            if (skiplist_cursor_prev(cursor->memtable_cursor))
+            {
+                return NULL;
+            }
+            return tidesdb_err_new(1063, "At start of cursor");
+        }
+
+        cursor->sstable_index--;
+        if (!pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
+                               &cursor->sstable_cursor))
+        {
+            return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
+        }
+
+        /* move to the last key in the new sstable */
+        pager_cursor_next(cursor->sstable_cursor);
+
+        return NULL;
+    }
+
+    /* if sstable_cursor is NULL, move to the previous key in the memtable */
+    if (skiplist_cursor_prev(cursor->memtable_cursor))
+    {
+        return NULL;
+    }
+
+    return tidesdb_err_new(1063, "At start of cursor");
 }
 
 tidesdb_err* tidesdb_cursor_get(tidesdb_cursor* cursor, key_value_pair** kv)

@@ -535,7 +535,7 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
 /*
  * _flush_memtable_thread
  * thread for flushing memtables
- * @param arg the arguments for the thread
+ * @param arg the arguments for the thread in this case a tidesdb instance
  */
 void* _flush_memtable_thread(void* arg);
 
@@ -574,6 +574,7 @@ int _remove_directory(const char* path);
 /*
  * _compact_sstables_thread
  * a thread for compacting sstable pairs
+ * @param arg the arguments for the thread in this case a compact_thread_args struct
  */
 void* _compact_sstables_thread(void* arg);
 
@@ -585,13 +586,5 @@ void* _compact_sstables_thread(void* arg);
  * @param cf the column family
  */
 sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf);
-
-/*
- * _sst_extract_numeric_part
- * extract the numeric part of an sstable filename
- * @param filename the filename
- * @param numeric_part the numeric part
- */
-void _sst_extract_numeric_parts(const char* filename, char* numeric_part);
 
 #endif /* TIDESDB_H */

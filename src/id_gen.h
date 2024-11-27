@@ -25,6 +25,10 @@
 #include <stdlib.h>
 #include <time.h>
 
+#define M ((uint64_t)9223372036854775808ULL) /* 2^63 */
+#define A ((uint64_t)6364136223846793005ULL)
+#define C ((uint64_t)1)
+
 /* id_gen
  * generates unique ids
  * @param state the state of the id generator

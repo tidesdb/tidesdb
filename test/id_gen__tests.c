@@ -48,7 +48,7 @@ void test_id_gen_new()
 /* helper */
 void* generate_ids(void* arg)
 {
-    id_gen* gen = (id_gen*)arg;
+    id_gen* gen = arg;
     for (int i = 0; i < 10; ++i)
     {
         uint64_t id = id_gen_new(gen);

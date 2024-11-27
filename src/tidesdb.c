@@ -1142,25 +1142,89 @@ tidesdb_err* tidesdb_txn_free(txn* transaction)
 tidesdb_err* tidesdb_cursor_init(tidesdb* tdb, const char* column_family_name,
                                  tidesdb_cursor** cursor)
 {
-    /*** @TODO */
+
+    /* we check if the db is NULL */
+    if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
+
+    /* we check if the column name if null, it should not be */
+    if (column_family_name == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
+
+    /* we get the column family */
+    column_family *cf = NULL;
+
+    if (!_get_column_family(tdb, column_family_name, &cf))
+        return tidesdb_err_new(1028, "Column family not found");
+
+    /* we allocate memory for the new cursor */
+    *cursor = malloc(sizeof(tidesdb_cursor));
+    if (*cursor == NULL) return tidesdb_err_new(1057, "Failed to allocate memory for cursor");
+
+    /* now we set the member variables */
+    (*cursor)->tidesdb = tdb;
+    (*cursor)->cf = cf;
+    (*cursor)->sstable_cursor = NULL;
+    (*cursor)->memtable_cursor = NULL;
+    (*cursor)->sstable_index = 0; /* we start at the first sstable.. we could start at
+    * the most recent but for now I think first is fine */
+
+    /* we lock create a memtable cursor */
+    (*cursor)->memtable_cursor = skiplist_cursor_init(cf->memtable);
+    if ((*cursor)->memtable_cursor == NULL)
+    {
+        free(*cursor);
+        return tidesdb_err_new(1058, "Failed to initialize memtable cursor");
+    }
+
+    /* we get current sstable cursor */
+
+    (*cursor)->sstable_cursor = NULL;
+    /* we initialize the sstable cursor */
+    if (!pager_cursor_init(cf->sstables[(*cursor)->sstable_index]->pager, &(*cursor)->sstable_cursor))
+    {
+        skiplist_cursor_free((*cursor)->memtable_cursor);
+        free(*cursor);
+        return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
+    }
+
+    /* we check if the sstable cursor is NULL */
+    if ((*cursor)->sstable_cursor == NULL)
+    {
+        skiplist_cursor_free((*cursor)->memtable_cursor);
+        free(*cursor);
+        return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
+    }
+
     return NULL;
 }
 
 tidesdb_err* tidesdb_cursor_next(tidesdb_cursor* cursor)
 {
     /*** @TODO */
+
+    /* we start at the memtable
+     * once the memtable is exhausted we move to the sstables
+     */
+
     return NULL;
 }
 
 tidesdb_err* tidesdb_cursor_prev(tidesdb_cursor* cursor)
 {
     /*** @TODO */
+
+    /* depending on where the cursor is we move to the previous key
+     * if the index for sstable pagers is 0 then we move previous on the memtable if not we move previous on the sstable
+     */
     return NULL;
 }
 
 tidesdb_err* tidesdb_cursor_get(tidesdb_cursor* cursor, key_value_pair** kv)
 {
     /*** @TODO */
+
+    /* we get the key value pair from the cursor.
+     * could be from the memtable or an sstable
+     */
     return NULL;
 }
 
@@ -2322,20 +2386,4 @@ int _remove_directory(const char* path)
     }
 
     return 0;
-}
-
-void _sst_extract_numeric_parts(const char* filename, char* numeric_parts)
-{
-    const char* start = strrchr(filename, '_'); /* we get last '_' */
-
-    if (start != NULL)
-    {
-        start++;                               /* move past the last '_' */
-        const char* end = strrchr(start, '.'); /* stop at extension */
-        if (end != NULL)
-        {
-            strncpy(numeric_parts, start, end - start); /* copy the numeric part */
-            numeric_parts[end - start] = '\0';
-        }
-    }
 }

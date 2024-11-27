@@ -38,16 +38,11 @@ uint64_t id_gen_new(id_gen* gen)
 {
     uint64_t id; /* the new id */
 
-    /* Define the constants for the LCG */
-    const uint64_t m = 9223372036854775808ULL; /* 2^63 */
-    const uint64_t a = 6364136223846793005ULL;
-    const uint64_t c = 1;
-
     /* lock the id generator */
     pthread_mutex_lock(&gen->lock);
 
     /* generate a new id using the LCG formula */
-    gen->state = (a * gen->state + c) % m;
+    gen->state = (A * gen->state + C) % M;
     id = gen->state;
 
     /* unlock the id generator */
@@ -62,4 +57,6 @@ void id_gen_destroy(id_gen* gen)
     pthread_mutex_destroy(&gen->lock);
     /* free the memory allocated for the id generator */
     free(gen);
+
+    gen = NULL;
 }

@@ -1142,7 +1142,6 @@ tidesdb_err* tidesdb_txn_free(txn* transaction)
 tidesdb_err* tidesdb_cursor_init(tidesdb* tdb, const char* column_family_name,
                                  tidesdb_cursor** cursor)
 {
-
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
 
@@ -1150,7 +1149,7 @@ tidesdb_err* tidesdb_cursor_init(tidesdb* tdb, const char* column_family_name,
     if (column_family_name == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
 
     /* we get the column family */
-    column_family *cf = NULL;
+    column_family* cf = NULL;
 
     if (!_get_column_family(tdb, column_family_name, &cf))
         return tidesdb_err_new(1028, "Column family not found");
@@ -1165,7 +1164,7 @@ tidesdb_err* tidesdb_cursor_init(tidesdb* tdb, const char* column_family_name,
     (*cursor)->sstable_cursor = NULL;
     (*cursor)->memtable_cursor = NULL;
     (*cursor)->sstable_index = 0; /* we start at the first sstable.. we could start at
-    * the most recent but for now I think first is fine */
+                                   * the most recent but for now I think first is fine */
 
     /* we lock create a memtable cursor */
     (*cursor)->memtable_cursor = skiplist_cursor_init(cf->memtable);
@@ -1179,7 +1178,8 @@ tidesdb_err* tidesdb_cursor_init(tidesdb* tdb, const char* column_family_name,
 
     (*cursor)->sstable_cursor = NULL;
     /* we initialize the sstable cursor */
-    if (!pager_cursor_init(cf->sstables[(*cursor)->sstable_index]->pager, &(*cursor)->sstable_cursor))
+    if (!pager_cursor_init(cf->sstables[(*cursor)->sstable_index]->pager,
+                           &(*cursor)->sstable_cursor))
     {
         skiplist_cursor_free((*cursor)->memtable_cursor);
         free(*cursor);
@@ -1213,19 +1213,53 @@ tidesdb_err* tidesdb_cursor_prev(tidesdb_cursor* cursor)
     /*** @TODO */
 
     /* depending on where the cursor is we move to the previous key
-     * if the index for sstable pagers is 0 then we move previous on the memtable if not we move previous on the sstable
+     * if the index for sstable pagers is 0 then we move previous on the memtable if not we move
+     * previous on the sstable
      */
     return NULL;
 }
 
 tidesdb_err* tidesdb_cursor_get(tidesdb_cursor* cursor, key_value_pair** kv)
 {
-    /*** @TODO */
-
     /* we get the key value pair from the cursor.
      * could be from the memtable or an sstable
      */
-    return NULL;
+
+    if (cursor->memtable_cursor->current != NULL)
+    {
+        (*kv)->key = cursor->memtable_cursor->current->key;
+        (*kv)->key_size = cursor->memtable_cursor->current->key_size;
+        (*kv)->value = cursor->memtable_cursor->current->value;
+        (*kv)->value_size = cursor->memtable_cursor->current->value_size;
+        return NULL;
+    }
+
+    uint8_t* kv_buffer = NULL; /* key value buffer reading from page */
+    size_t kv_buffer_len = 0;  /* key value buffer length */
+
+    /* read current page */
+    if (pager_read(cursor->cf->sstables[cursor->sstable_index]->pager,
+                   cursor->sstable_cursor->page_number, &kv_buffer, &kv_buffer_len))
+    {
+        key_value_pair* dkv = NULL;
+
+        /* deserialize key value pair */
+        if (deserialize_key_value_pair(kv_buffer, kv_buffer_len, &dkv,
+                                       cursor->cf->config.compressed))
+        {
+            if (dkv != NULL)
+            {
+                (*kv)->key = dkv->key;
+                (*kv)->key_size = dkv->key_size;
+                (*kv)->value = dkv->value;
+                (*kv)->value_size = dkv->value_size;
+
+                return NULL;
+            }
+        }
+    }
+
+    return tidesdb_err_new(1060, "Failed to get key value pair from cursor");
 }
 
 tidesdb_err* tidesdb_cursor_free(tidesdb_cursor* cursor)

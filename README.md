@@ -52,6 +52,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 | 1021       | Failed to add column family                                          |
 | 1022       | Failed to lock column families lock                                  |
 | 1024       | Failed to lock sstables lock                                         |
+| 1025       | Failed to unlock sstables lock                                       |
 | 1026       | Key is NULL                                                          |
 | 1027       | Value is NULL                                                        |
 | 1028       | Column family not found                                              |

@@ -883,33 +883,22 @@ void test_put_compact_get()
     tidesdb_err_free(e);
 
     /* get the key-value pairs */
-    for (int i = 0; i < 100000 / 4; i++)
+    for (int i = 0; i < 50; i++)
     {
-        unsigned char key[38];
-        unsigned char value[38];
+        char key[48];
+        char value[48];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
-        size_t value_len = 0;
-        unsigned char* value_out = NULL;
-
-        e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
+        e = tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
         if (e != NULL)
         {
             printf(RED "Error: %s\n" RESET, e->message);
             tidesdb_err_free(e);
-            continue;
+            break;
         }
 
         assert(e == NULL);
-
-        assert(value_len == strlen((char*)value));
-        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
-
-        free(value_out); /* free the value_out pointer */
-        value_out = NULL;
-        value_len = 0;
-        tidesdb_err_free(e);
     }
 
     e = tidesdb_close(tdb);

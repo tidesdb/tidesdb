@@ -368,9 +368,11 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
         sst2->pager->num_pages == 0)
         return NULL;
 
+    /* we used a skiplist to keep things in order */
     skiplist* mergetable = new_skiplist(cf->config.max_level, cf->config.probability);
     if (mergetable == NULL) return NULL;
 
+    /* create a new bloomfilter for the merged sstable */
     bloomfilter* bf = bloomfilter_create(BLOOMFILTER_SIZE);
     if (bf == NULL)
     {
@@ -381,6 +383,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
     pager_cursor* cursor1 = NULL;
     pager_cursor* cursor2 = NULL;
 
+    /* we initialize a new cursor for each sstable */
     if (!pager_cursor_init(sst1->pager, &cursor1) || !pager_cursor_init(sst2->pager, &cursor2))
     {
         skiplist_destroy(mergetable);
@@ -390,6 +393,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
         return NULL;
     }
 
+    /* whether there are more pages to read on either sstable */
     bool has_next1 = true;
     bool has_next2 = true;
 
@@ -402,7 +406,9 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
 
         if (has_next1)
         {
-            has_next1 = pager_cursor_next(cursor1);
+            /* if there is a next page, read it */
+            has_next1 =
+                pager_cursor_next(cursor1); /* we are skipping the initial bloom filter pages */
             if (has_next1 && !pager_read(sst1->pager, cursor1->page_number, &buffer1, &buffer_len1))
             {
                 free(buffer1);
@@ -440,53 +446,75 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
             break;
         }
 
-        if (kv1 && !_is_tombstone(kv1->value, kv1->value_size) &&
-            !skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size,
-                          kv1->ttl))
+        /* check if the key is not a tombstone */
+        if (kv1 && !_is_tombstone(kv1->value, kv1->value_size))
         {
-            free(buffer1);
-            free(buffer2);
+            /* check if ttl is set and if it has not expired */
+            if (kv1 && kv1->ttl > 0 && kv1->ttl > time(NULL))
+            {
+                if (!skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size,
+                                  kv1->ttl))
+                {
+                    free(buffer1);
+                    free(kv1->key);
+                    free(kv1->value);
+                    free(kv1);
+                    kv1 = NULL;
+                }
+                else
+                {
+                    bloomfilter_add(bf, kv1->key, kv1->key_size);
+                }
+            }
+        }
+
+        /* now onto the next key value pair */
+
+        /* check if the key is not a tombstone */
+        if (kv2 && !_is_tombstone(kv2->value, kv2->value_size))
+        {
+            /* check if ttl is set and if it has not expired */
+            if (kv2 && kv2->ttl > 0 && kv2->ttl > time(NULL))
+            {
+                if (!skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size,
+                                  kv2->ttl))
+                {
+                    free(buffer2);
+                    buffer2 = NULL;
+                    free(kv2->key);
+                    free(kv2->value);
+                    free(kv2);
+                    kv2 = NULL;
+                }
+                else
+                {
+                    bloomfilter_add(bf, kv2->key, kv2->key_size);
+                }
+            }
+        }
+
+        /* free the key value pairs */
+        if (buffer1 != NULL) free(buffer1);
+        if (buffer2 != NULL) free(buffer2);
+        if (kv1 != NULL)
+        {
             free(kv1->key);
             free(kv1->value);
             free(kv1);
         }
-
-        if (kv2 && !_is_tombstone(kv2->value, kv2->value_size) &&
-            !skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size,
-                          kv2->ttl))
+        if (kv2 != NULL)
         {
-            free(buffer1);
-            free(buffer2);
             free(kv2->key);
             free(kv2->value);
             free(kv2);
         }
-
-        if (kv1)
-        {
-            bloomfilter_add(bf, kv1->key, kv1->key_size);
-            free(kv1->key);
-            free(kv1->value);
-            free(kv1);
-        }
-
-        if (kv2)
-        {
-            bloomfilter_add(bf, kv2->key, kv2->key_size);
-            free(kv2->key);
-            free(kv2->value);
-            free(kv2);
-        }
-
-        free(buffer1);
-        free(buffer2);
     }
 
     pager* new_pager = NULL;
     char new_sstable_name[PATH_MAX];
 
-    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%lu.sst", cf->path, _get_path_seperator(),
-             id_gen_new(cf->id_gen));
+    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%lu.%s", cf->path, _get_path_seperator(),
+             id_gen_new(cf->id_gen), SSTABLE_EXT);
 
     if (!pager_open(new_sstable_name, &new_pager))
     {
@@ -506,7 +534,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
         return NULL;
     }
 
-    unsigned int page_num;
+    unsigned int page_num; /* bf page number */
 
     if (!pager_write(new_pager, bf_buffer, bf_buffer_len, &page_num))
     {
@@ -517,10 +545,24 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
         return NULL;
     }
 
+    /* clean up bf */
     free(bf_buffer);
     bloomfilter_destroy(bf);
 
     skiplist_cursor* sl_cursor = skiplist_cursor_init(mergetable);
+
+    /* check mergetable size */
+    if (mergetable->total_size == 0)
+    {
+        skiplist_destroy(mergetable);
+        pager_close(new_pager);
+        /* remove the sstable file */
+        remove(new_sstable_name);
+
+        return NULL;
+    }
+
+    bool has_next = true;
 
     do
     {
@@ -555,7 +597,9 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
         free(kv_buffer);
         new_pager->num_pages++;
 
-    } while (skiplist_cursor_next(sl_cursor));
+        has_next = skiplist_cursor_next(sl_cursor);
+
+    } while (has_next);
 
     skiplist_destroy(mergetable);
 
@@ -690,7 +734,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
     if (pthread_mutex_lock(&tdb->flush_lock) != 0)
         return tidesdb_err_new(1032, "Failed to lock flush lock");
 
-    for (int i = cf->num_sstables - 1; i >= 0; i--)
+    for (int i = cf->num_sstables - 1; i >= 0; i--) /* we are iterating from the newest sstable */
     {
         if (cf->sstables[i] == NULL) continue;
 

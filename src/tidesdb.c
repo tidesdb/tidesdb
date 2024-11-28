@@ -664,6 +664,10 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
     /* we check if key is NULL */
     if (key == NULL) return tidesdb_err_new(1026, "Key is NULL");
 
+    /* key value cannot be a tombstone */
+    if (_is_tombstone(*value, *value_size))
+        return tidesdb_err_new(1066, "Key's value cannot be a tombstone");
+
     /* we get column family */
     column_family* cf = NULL;
     if (!_get_column_family(tdb, column_family_name, &cf))
@@ -1328,6 +1332,37 @@ tidesdb_err* tidesdb_cursor_get(tidesdb_cursor* cursor, key_value_pair** kv)
         {
             if (dkv != NULL)
             {
+                /* we check if the key is a tombstoned or has a ttl set and has expired
+                 * if so we report back this information so the user can decide what to do */
+                /* we don't know the direction the user is going thus we leave it up to them */
+                if (_is_tombstone(dkv->value, dkv->value_size))
+                {
+                    free(kv_buffer);
+                    free(dkv->key);
+                    free(dkv->value);
+                    free(dkv);
+                    dkv = NULL;
+                    return tidesdb_err_new(
+                        1064, "Key has a tombstone value.  To be deleted on next compaction");
+                }
+                else if (dkv->ttl != -1 && dkv->ttl < time(NULL))
+                {
+                    free(kv_buffer);
+                    free(dkv->key);
+                    free(dkv->value);
+                    free(dkv);
+                    dkv = NULL;
+                    return tidesdb_err_new(
+                        1065,
+                        "Key has expired.  To be deleted on next compaction"); /* only for sstable
+                                                                                  scans, the
+                                                                                  memtable cursor
+                                                                                  will not report
+                                                                                  back a key that
+                                                                                  has expired or is
+                                                                                  a tombstone */
+                }
+
                 (*kv)->key = dkv->key;
                 (*kv)->key_size = dkv->key_size;
                 (*kv)->value = dkv->value;

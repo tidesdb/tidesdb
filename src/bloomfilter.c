@@ -54,6 +54,8 @@ void bloomfilter_destroy(bloomfilter *bf)
         free(bf);
         bf = next;
     }
+
+    bf = NULL;
 }
 
 bool bloomfilter_check(bloomfilter *bf, const unsigned char *data, unsigned int data_len)

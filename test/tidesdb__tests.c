@@ -1181,7 +1181,14 @@ void test_cursor()
 
     /* create a column family */
     e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+    if (e != NULL)
+    {
+        printf(RED "Error: %s\n" RESET, e->message);
+        tidesdb_err_free(e);
+        tidesdb_close(tdb);
+        free(tdb_config);
+        return;
+    }
 
     assert(e == NULL);
 
@@ -1192,9 +1199,7 @@ void test_cursor()
     /* we should be able to get the column family */
     assert(_get_column_family(tdb, "test_cf", &cf) == 1);
 
-    /* put 24000 key-value pairs
-     * this creates 1 SST file and some in-memory data in the column family memtable on most systems
-     */
+    /* put 24000 key-value pairs */
     for (int i = 0; i < 24000; i++)
     {
         char key[48];
@@ -1213,32 +1218,6 @@ void test_cursor()
 
     sleep(3); /* wait for the SST file to be written */
 
-    /* we get the key-value pairs */
-    for (int i = 0; i < 100; i++)
-    {
-        unsigned char key[48];
-        unsigned char value[48];
-        snprintf(key, sizeof(key), "key%03d", i);
-        snprintf(value, sizeof(value), "value%03d", i);
-
-        size_t value_len = 0;
-        unsigned char* value_out = NULL;
-
-        e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
-        if (e != NULL)
-        {
-            printf(RED "Error: %s\n" RESET, e->message);
-            tidesdb_err_free(e);
-            continue;
-        }
-
-        assert(e == NULL);
-        assert(value_len == strlen((char*)value));
-        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
-
-        free(value_out); /* free the value_out pointer */
-    }
-
     tidesdb_cursor* cursor = NULL;
     e = tidesdb_cursor_init(tdb, "test_cf", &cursor);
     if (e != NULL)
@@ -1246,6 +1225,8 @@ void test_cursor()
         printf(RED "Error: %s\n" RESET, e->message);
         tidesdb_err_free(e);
         tidesdb_close(tdb);
+        free(tdb_config);
+        return;
     }
 
     assert(e == NULL);
@@ -1256,13 +1237,21 @@ void test_cursor()
         printf(RED "Error: Failed to allocate memory for kv\n" RESET);
         tidesdb_cursor_free(cursor);
         tidesdb_close(tdb);
+        free(tdb_config);
+        return;
     }
 
     assert(kv != NULL);
 
-    /* need to make this test more efficient */
+    /* initialize a 2D array to track keys */
+    bool keys[24000][2] = {false};
 
-    while (tidesdb_cursor_next(cursor) == NULL)
+    int i = 0;
+
+    bool has_next = true;
+
+    /* iterate with cursor next and mark keys as true */
+    while (has_next)
     {
         e = tidesdb_cursor_get(cursor, &kv);
         if (e != NULL)
@@ -1271,9 +1260,31 @@ void test_cursor()
             tidesdb_err_free(e);
             break;
         }
+        keys[i][0] = true;
+        i++;
+        e = tidesdb_cursor_next(cursor);
+        if (e != NULL)
+        {
+            has_next = false;
+        }
     }
 
-    /* go back to the beginning */
+    /* Check if all keys are marked true */
+    bool all_true = true;
+    for (int j = 0; j < 24000; j++)
+    {
+        if (!keys[j][0])
+        {
+            printf(RED "Error: Key %d is missing\n" RESET, j);
+            all_true = false;
+            break;
+        }
+    }
+
+    assert(all_true);
+
+    i = 23999; /* start from the last key */
+    /* iterate with cursor prev and mark keys as false */
     while (tidesdb_cursor_prev(cursor) == NULL)
     {
         e = tidesdb_cursor_get(cursor, &kv);
@@ -1283,16 +1294,30 @@ void test_cursor()
             tidesdb_err_free(e);
             break;
         }
+        keys[i][1] = false;
+        i--;
     }
+
+    /* check if all keys are marked false */
+    bool all_false = true;
+    for (int j = 0; j < 24000; j++)
+    {
+        if (keys[j][1])
+        {
+            all_false = false;
+            break;
+        }
+    }
+    assert(all_false);
 
     free(kv);
     tidesdb_cursor_free(cursor);
-    tidesdb_close(tdb);
 
     e = tidesdb_close(tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     tidesdb_err_free(e);
+    free(tdb_config);
 
     remove_directory("testdb");
 

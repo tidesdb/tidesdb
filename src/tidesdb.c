@@ -1175,8 +1175,23 @@ tidesdb_err* tidesdb_cursor_init(tidesdb* tdb, const char* column_family_name,
     (*cursor)->cf = cf;
     (*cursor)->sstable_cursor = NULL;
     (*cursor)->memtable_cursor = NULL;
-    (*cursor)->sstable_index = 0; /* we start at the first sstable.. we could start at
-                                   * the most recent but for now I think first is fine */
+
+    /* lock sstables */
+
+    if (pthread_rwlock_rdlock(&cf->sstables_lock) != 0)
+    {
+        free(*cursor);
+        return tidesdb_err_new(1024, "Failed to lock sstables");
+    }
+
+    (*cursor)->sstable_index = cf->num_sstables - 1; /* we start at the last sstable */
+
+    /* unlock sstables */
+    if (pthread_rwlock_unlock(&cf->sstables_lock) != 0)
+    {
+        free(*cursor);
+        return tidesdb_err_new(1025, "Failed to unlock sstables lock");
+    }
 
     /* we lock create a memtable cursor */
     (*cursor)->memtable_cursor = skiplist_cursor_init(cf->memtable);
@@ -1234,7 +1249,7 @@ tidesdb_err* tidesdb_cursor_next(tidesdb_cursor* cursor)
             else
             {
                 /* we move to the next sstable */
-                cursor->sstable_index++;
+                cursor->sstable_index--;
                 if (cursor->sstable_index >= cursor->cf->num_sstables)
                 {
                     return tidesdb_err_new(1062, "At end of cursor");
@@ -1268,7 +1283,13 @@ tidesdb_err* tidesdb_cursor_prev(tidesdb_cursor* cursor)
         }
 
         /* we move to the previous sstable */
-        if (cursor->sstable_index == 0)
+        /* get sstables lock */
+        if (pthread_rwlock_rdlock(&cursor->cf->sstables_lock) != 0)
+        {
+            return tidesdb_err_new(1024, "Failed to lock sstables");
+        }
+        /* check if we are at the first sstable */
+        if (cursor->sstable_index == cursor->cf->num_sstables - 1)
         {
             /* if we are at the first sstable, move to the memtable */
             if (skiplist_cursor_prev(cursor->memtable_cursor))
@@ -1278,7 +1299,7 @@ tidesdb_err* tidesdb_cursor_prev(tidesdb_cursor* cursor)
             return tidesdb_err_new(1063, "At start of cursor");
         }
 
-        cursor->sstable_index--;
+        cursor->sstable_index++;
         if (!pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
                                &cursor->sstable_cursor))
         {

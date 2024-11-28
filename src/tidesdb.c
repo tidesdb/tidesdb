@@ -713,6 +713,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
 
         if (bf == NULL)
         {
+            bloomfilter_destroy(bf);
             free(bloom_filter_buffer);
             continue;
         }
@@ -1113,8 +1114,10 @@ tidesdb_err* tidesdb_txn_free(txn* transaction)
         free(transaction->ops[i].op->column_family);
         if (transaction->ops[i].op->kv != NULL)
         {
-            free(transaction->ops[i].op->kv->key);
-            free(transaction->ops[i].op->kv->value);
+            if (transaction->ops[i].op->kv->key != NULL) free(transaction->ops[i].op->kv->key);
+
+            if (transaction->ops[i].op->kv->value != NULL) free(transaction->ops[i].op->kv->value);
+
             free(transaction->ops[i].op->kv);
         }
 
@@ -1123,9 +1126,14 @@ tidesdb_err* tidesdb_txn_free(txn* transaction)
             free(transaction->ops[i].rollback_op->column_family);
             if (transaction->ops[i].rollback_op->kv != NULL)
             {
-                free(transaction->ops[i].rollback_op->kv->key);
-                free(transaction->ops[i].rollback_op->kv->value);
-                free(transaction->ops[i].rollback_op->kv);
+                if (transaction->ops[i].rollback_op->kv != NULL)
+                {
+                    free(transaction->ops[i].rollback_op->kv->key);
+                    if (transaction->ops[i].rollback_op->kv->value != NULL)
+                        free(transaction->ops[i].rollback_op->kv->value);
+
+                    free(transaction->ops[i].rollback_op->kv);
+                }
             }
         }
         free(transaction->ops[i].op);
@@ -1536,6 +1544,9 @@ bool _get_column_family(tidesdb* tdb, const char* name, column_family** cf)
 {
     /* we check if tdb or name is NULL */
     if (tdb == NULL || name == NULL) return false;
+
+    /* we check if column name is NULL */
+    if (name == NULL) return false;
 
     /* lock the column families lock */
     if (pthread_rwlock_rdlock(&tdb->column_families_lock) != 0) return false;

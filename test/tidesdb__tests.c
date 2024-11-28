@@ -493,7 +493,7 @@ void test_put_reopen_get()
         size_t value_len = 0;
         unsigned char* value_out = NULL;
 
-        e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
+        e = tidesdb_get(tdb, "test_cf", key, strlen(key), &value_out, &value_len);
         if (e != NULL)
         {
             printf(RED "Error: %s\n" RESET, e->message);
@@ -726,7 +726,6 @@ void test_txn_put_delete_get()
 
     /* we try to get key1 */
     e = tidesdb_get(tdb, cf->config.name, "key1", 4, &value1, &value_len1);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     /* we expect an error as key1 was deleted */
     assert(e != NULL);
@@ -797,6 +796,8 @@ void test_put_compact()
 
         assert(e == NULL);
     }
+
+    sleep(5); /* wait for the SST files to be written */
 
     /* we compact */
     e = tidesdb_compact_sstables(tdb, cf, 2);
@@ -870,6 +871,8 @@ void test_put_compact_get()
 
         assert(e == NULL);
     }
+
+    sleep(5); /* wait for the SST files to be written */
 
     /* we compact */
     e = tidesdb_compact_sstables(tdb, cf, 2);
@@ -1076,19 +1079,25 @@ void* get_thread(void* arg)
     for (int i = 0; i < 12000; i++)
     {
         unsigned char key[48];
-        unsigned char value[48];
         snprintf(key, sizeof(key), "key_put%03d", i);
 
         size_t value_len = 0;
         unsigned char* value_out = NULL;
+        tidesdb_err* e = NULL;
 
-        tidesdb_err* e =
-            tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
-        if (e != NULL)
+        while (true)
         {
-            printf(RED "Error: %s\n" RESET, e->message);
-            tidesdb_err_free(e);
-            continue;
+            e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
+            if (e == NULL)
+            {
+                break;
+            }
+            else
+            {
+                printf(RED "Error: %s\n" RESET, e->message);
+                tidesdb_err_free(e);
+                sleep(1); /* wait for a second before retrying **/
+            }
         }
 
         assert(e == NULL);
@@ -1264,7 +1273,7 @@ void test_cursor()
         }
     }
 
-    // go back to the beginning
+    /* go back to the beginning */
     while (tidesdb_cursor_prev(cursor) == NULL)
     {
         e = tidesdb_cursor_get(cursor, &kv);
@@ -1301,11 +1310,11 @@ int main(void)
     test_put_reopen_get();
     test_put_get_delete();
     test_txn_put_delete_get();
+    test_concurrent_put_get();
+    test_cursor();
     test_put_compact();
     test_put_compact_get();
     test_put_compact_get_reopen();
-    test_concurrent_put_get();
-    test_cursor();
 
     return 0;
 }

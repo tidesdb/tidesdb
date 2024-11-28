@@ -153,6 +153,9 @@ bool pager_close(pager* p)
     /* we close the file */
     if (fclose(p->file) != 0) return false;
 
+    /* free filename */
+    free(p->filename);
+
     /* we destroy the file lock */
     if (pthread_rwlock_destroy(&p->file_lock) != 0) return false;
 

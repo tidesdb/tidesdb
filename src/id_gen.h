@@ -19,11 +19,15 @@
 #ifndef ID_GEN_H
 #define ID_GEN_H
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#elif __linux__ || defined(__unix__) || defined(__APPLE__)
 #include <pthread.h>
+#endif
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 
 #define M ((uint64_t)9223372036854775808ULL) /* 2^63 */
 #define A ((uint64_t)6364136223846793005ULL)
@@ -34,11 +38,19 @@
  * @param state the state of the id generator
  * @param lock the lock for the id generator
  */
+#if defined(_WIN32) || defined(_WIN64)
+typedef struct
+{
+    uint64_t state;
+    CRITICAL_SECTION lock;
+} id_gen;
+#elif __linux__ || defined(__unix__) || defined(__APPLE__)
 typedef struct
 {
     uint64_t state;
     pthread_mutex_t lock;
 } id_gen;
+#endif
 
 /* id_gen_init
  * creates a new id generator

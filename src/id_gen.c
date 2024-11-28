@@ -18,6 +18,23 @@
  */
 #include "id_gen.h"
 
+#if defined(_WIN32) || defined(_WIN64)
+id_gen* id_gen_init(uint64_t seed)
+{
+    id_gen* gen = malloc(sizeof(id_gen)); /* allocate memory for the id generator */
+    /* check if successful */
+    if (gen == NULL)
+    {
+        return NULL;
+    }
+    /* set the state of the id generator */
+    gen->state = seed;
+
+    /* initialize the lock for the id generator */
+    InitializeCriticalSection(&gen->lock);
+    return gen;
+}
+#elif __linux__ || defined(__unix__) || defined(__APPLE__)
 id_gen* id_gen_init(uint64_t seed)
 {
     id_gen* gen = malloc(sizeof(id_gen)); /* allocate memory for the id generator */
@@ -33,7 +50,26 @@ id_gen* id_gen_init(uint64_t seed)
     pthread_mutex_init(&gen->lock, NULL);
     return gen;
 }
+#endif
 
+#if defined(_WIN32) || defined(_WIN64)
+uint64_t id_gen_new(id_gen* gen)
+{
+    uint64_t id; /* the new id */
+
+    /* lock the id generator */
+    EnterCriticalSection(&gen->lock);
+
+    /* generate a new id using the LCG formula */
+    gen->state = (A * gen->state + C) % M;
+    id = gen->state;
+
+    /* unlock the id generator */
+    LeaveCriticalSection(&gen->lock);
+
+    return id;
+}
+#elif __linux__ || defined(__unix__) || defined(__APPLE__)
 uint64_t id_gen_new(id_gen* gen)
 {
     uint64_t id; /* the new id */
@@ -50,7 +86,19 @@ uint64_t id_gen_new(id_gen* gen)
 
     return id;
 }
+#endif
 
+#if defined(_WIN32) || defined(_WIN64)
+void id_gen_destroy(id_gen* gen)
+{
+    /* destroy the lock */
+    DeleteCriticalSection(&gen->lock);
+    /* free the memory allocated for the id generator */
+    free(gen);
+
+    gen = NULL;
+}
+#elif __linux__ || defined(__unix__) || defined(__APPLE__)
 void id_gen_destroy(id_gen* gen)
 {
     /* destroy the lock */
@@ -60,3 +108,4 @@ void id_gen_destroy(id_gen* gen)
 
     gen = NULL;
 }
+#endif

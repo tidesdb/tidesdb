@@ -18,7 +18,12 @@
  */
 #ifndef QUEUE_H
 #define QUEUE_H
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#elif __linux__ || defined(__unix__) || defined(__APPLE__)
 #include <pthread.h>
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -45,6 +50,15 @@ struct queue_node
  * @param size size of queue
  * @param lock rw lock for queue
  */
+#if defined(_WIN32) || defined(_WIN64)
+typedef struct queue
+{
+    queue_node *head;      /* head of queue */
+    queue_node *tail;      /* tail of queue */
+    size_t size;           /* size of queue */
+    CRITICAL_SECTION lock; /* rw lock for queue */
+} queue;
+#elif __linux__ || defined(__unix__) || defined(__APPLE__)
 typedef struct queue
 {
     queue_node *head;      /* head of queue */
@@ -52,6 +66,7 @@ typedef struct queue
     size_t size;           /* size of queue */
     pthread_rwlock_t lock; /* rw lock for queue */
 } queue;
+#endif
 
 /*
  * queue_new

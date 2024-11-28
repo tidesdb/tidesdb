@@ -94,6 +94,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 | 1064       | Key has a tombstone value.  To be deleted on next compaction         |
 | 1065       | Key has expired.  To be deleted on next compaction                   |
 | 1066       | Key's value cannot be a tombstone                                    |
+| 1067       | Failed to allocate memory for wal                                    |
 ```
 
 ## License

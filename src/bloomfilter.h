@@ -25,7 +25,6 @@
 #include <string.h>
 
 #include "../external/xxhash.h"
-#include "endian.h"
 
 /* we define the bloomfilter struct here so
  * we can use it in the struct definition for the next member */

@@ -51,6 +51,13 @@ void bloomfilter_destroy(bloomfilter *bf)
     while (bf != NULL)
     {
         bloomfilter *next = bf->next;
+
+        if (bf->set != NULL)
+        {
+            free(bf->set);
+            bf->set = NULL;
+        }
+
         free(bf);
         bf = next;
     }

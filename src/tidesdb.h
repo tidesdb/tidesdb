@@ -238,7 +238,7 @@ tidesdb_err* tidesdb_close(tidesdb* tdb);
  * @return error or NULL
  */
 tidesdb_err* tidesdb_create_column_family(tidesdb* tdb, const char* name, int flush_threshold,
-                                          int max_level, float probability);
+                                          int max_level, float probability, bool compressed);
 
 /*
  * tidesdb_drop_column_family
@@ -426,7 +426,7 @@ tidesdb_err* tidesdb_cursor_free(tidesdb_cursor* cursor);
  * @return whether the column family was created
  */
 bool _new_column_family(const char* db_path, const char* name, int flush_threshold, int max_level,
-                        float probability, column_family** cf);
+                        float probability, column_family** cf, bool compressed);
 
 /*
  * _add_column_family
@@ -586,5 +586,12 @@ void* _compact_sstables_thread(void* arg);
  * @param cf the column family
  */
 sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf);
+
+/*
+ * _free_column_families
+ * free the memory for the column families
+ * @param tdb the TidesDB instance
+ */
+void _free_column_families(tidesdb* tdb);
 
 #endif /* TIDESDB_H */

@@ -319,7 +319,8 @@ bool serialize_bloomfilter(const bloomfilter* bf, uint8_t** buffer, size_t* enco
 {
     if (!bf || !buffer || !encoded_size) return false;
 
-    *encoded_size = sizeof(uint32_t) * 2 + bf->size + sizeof(bool);
+    // Calculate the size of the encoded data
+    *encoded_size = sizeof(uint32_t) * 2 + (bf->size + 7) / 8 + sizeof(uint8_t);
     uint8_t* temp_buffer = malloc(*encoded_size);
     if (!temp_buffer) return false;
 
@@ -328,10 +329,10 @@ bool serialize_bloomfilter(const bloomfilter* bf, uint8_t** buffer, size_t* enco
     ptr += sizeof(uint32_t);
     memcpy(ptr, &bf->count, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
-    memcpy(ptr, bf->set, bf->size);
-    ptr += bf->size;
-    bool has_next = (bf->next != NULL);
-    memcpy(ptr, &has_next, sizeof(bool));
+    memcpy(ptr, bf->set, (bf->size + 7) / 8);
+    ptr += (bf->size + 7) / 8;
+    uint8_t has_next = (bf->next != NULL) ? 1 : 0;
+    memcpy(ptr, &has_next, sizeof(uint8_t));
 
     if (compress)
     {
@@ -355,7 +356,9 @@ bool serialize_bloomfilter(const bloomfilter* bf, uint8_t** buffer, size_t* enco
         free(temp_buffer);
     }
     else
+    {
         *buffer = temp_buffer;
+    }
 
     return true;
 }
@@ -400,19 +403,18 @@ bool deserialize_bloomfilter(const uint8_t* buffer, size_t buffer_size, bloomfil
     memcpy(&(*bf)->count, ptr, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
 
-    (*bf)->set = (uint8_t*)malloc((*bf)->size);
+    (*bf)->set = (uint8_t*)malloc(((*bf)->size + 7) / 8);
     if (!(*bf)->set)
     {
         free(*bf);
         if (temp_buffer) free(temp_buffer);
-
         return false;
     }
-    memcpy((*bf)->set, ptr, (*bf)->size);
-    ptr += (*bf)->size;
+    memcpy((*bf)->set, ptr, ((*bf)->size + 7) / 8);
+    ptr += ((*bf)->size + 7) / 8;
 
-    bool has_next;
-    memcpy(&has_next, ptr, sizeof(bool));
+    uint8_t has_next;
+    memcpy(&has_next, ptr, sizeof(uint8_t));
     (*bf)->next = has_next ? (bloomfilter*)malloc(sizeof(bloomfilter)) : NULL;
 
     if (temp_buffer) free(temp_buffer);

@@ -23,6 +23,9 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     /* we check if the config is NULL */
     if (config == NULL) return tidesdb_err_new(1001, "Config is NULL");
 
+    /* we check the configured db path */
+    if (config->db_path == NULL) return tidesdb_err_new(1003, "DB path is NULL");
+
     /* we check if the tdb is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
 
@@ -30,7 +33,12 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     *tdb = malloc(sizeof(tidesdb));
 
     /* we check if allocation was successful */
-    if (*tdb == NULL) return tidesdb_err_new(1000, "Failed to allocate memory for new db");
+    if (*tdb == NULL)
+    {
+        if (config != NULL)
+            if (config->db_path != NULL) free(config->db_path);
+        return tidesdb_err_new(1000, "Failed to allocate memory for new db");
+    }
 
     /* we set the config */
     (*tdb)->config = *config;
@@ -39,24 +47,42 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     (*tdb)->column_families = NULL;
     (*tdb)->num_column_families = 0; /* 0 for now until we read db path */
 
-    /* we check the configured db path */
-    if (config->db_path == NULL) return tidesdb_err_new(1003, "DB path is NULL");
-
     /* we check to see if the db path exists
      * if not we create it */
     if (access(config->db_path, F_OK) == -1) /* we create the directory **/
         if (mkdir(config->db_path, 0777) == -1)
+        {
+            free((*tdb)->config.db_path);
+            free(*tdb);
             return tidesdb_err_new(1004, "Failed to create db directory");
-
-    /* now we load the column families */
-    if (!_load_column_families(*tdb))
-        return tidesdb_err_new(1041, "Failed to load column families");
+        }
 
     (*tdb)->wal = malloc(sizeof(wal));
+    if ((*tdb)->wal == NULL) /* could not allocate memory for wal */
+    {
+        free((*tdb)->config.db_path);
+        free(*tdb);
+        return tidesdb_err_new(1005, "Failed to allocate memory for wal");
+    }
 
     /* now we open the wal */
     if (!_open_wal((*tdb)->config.db_path, &(*tdb)->wal))
+    {
+        _close_wal((*tdb)->wal);
+        free((*tdb)->config.db_path);
+        free(*tdb);
         return tidesdb_err_new(1042, "Failed to open wal");
+    }
+
+    /* now we load the column families */
+    if (!_load_column_families(*tdb))
+    {
+        _free_column_families(*tdb);
+        _close_wal((*tdb)->wal);
+        free((*tdb)->config.db_path);
+        free(*tdb);
+        return tidesdb_err_new(1041, "Failed to load column families");
+    }
 
     if ((*tdb)->num_column_families > 0)
     {
@@ -71,7 +97,13 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
             {
                 /* we sort the sstables */
                 if (!_sort_sstables(&(*tdb)->column_families[i]))
+                {
+                    _free_column_families(*tdb);
+                    _close_wal((*tdb)->wal);
+                    free((*tdb)->config.db_path);
+                    free(*tdb);
                     return tidesdb_err_new(1008, "Failed to sort sstables");
+                }
             }
         }
     }
@@ -80,6 +112,9 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     (*tdb)->flush_queue = queue_new();
     if ((*tdb)->flush_queue == NULL)
     {
+        _free_column_families(*tdb);
+        _close_wal((*tdb)->wal);
+        free((*tdb)->config.db_path);
         free(*tdb);
         return tidesdb_err_new(1010, "Failed to initialize flush queue");
     }
@@ -87,6 +122,10 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     /* initialize flush_mutex */
     if (pthread_mutex_init(&(*tdb)->flush_lock, NULL) != 0)
     {
+        _free_column_families(*tdb);
+        queue_destroy((*tdb)->flush_queue);
+        _close_wal((*tdb)->wal);
+        free((*tdb)->config.db_path);
         free(*tdb);
         return tidesdb_err_new(1046, "Failed to initialize flush mutex");
     }
@@ -94,6 +133,11 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     /* initialize flush_cond **/
     if (pthread_cond_init(&(*tdb)->flush_cond, NULL) != 0)
     {
+        pthread_mutex_destroy(&(*tdb)->flush_lock);
+        _free_column_families(*tdb);
+        queue_destroy((*tdb)->flush_queue);
+        _close_wal((*tdb)->wal);
+        free((*tdb)->config.db_path);
         free(*tdb);
         return tidesdb_err_new(1047, "Failed to initialize flush condition variable");
     }
@@ -103,6 +147,12 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     /* initialize column_families_lock */
     if (pthread_rwlock_init(&(*tdb)->column_families_lock, NULL) != 0)
     {
+        pthread_cond_destroy(&(*tdb)->flush_cond);
+        pthread_mutex_destroy(&(*tdb)->flush_lock);
+        _free_column_families(*tdb);
+        queue_destroy((*tdb)->flush_queue);
+        _close_wal((*tdb)->wal);
+        free((*tdb)->config.db_path);
         free(*tdb);
         return tidesdb_err_new(1013, "Failed to initialize column families lock");
     }
@@ -110,19 +160,36 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     /* start the flush thread */
     if (pthread_create(&(*tdb)->flush_thread, NULL, _flush_memtable_thread, *tdb) != 0)
     {
+        pthread_rwlock_destroy(&(*tdb)->column_families_lock);
+        pthread_cond_destroy(&(*tdb)->flush_cond);
+        pthread_mutex_destroy(&(*tdb)->flush_lock);
+        _free_column_families(*tdb);
+        queue_destroy((*tdb)->flush_queue);
+        _close_wal((*tdb)->wal);
+        free((*tdb)->config.db_path);
         free(*tdb);
         return tidesdb_err_new(1014, "Failed to start flush thread");
     }
 
     /* now we replay from the wal */
     if (!_replay_from_wal((*tdb), (*tdb)->wal))
+    {
+        pthread_rwlock_destroy(&(*tdb)->column_families_lock);
+        pthread_cond_destroy(&(*tdb)->flush_cond);
+        pthread_mutex_destroy(&(*tdb)->flush_lock);
+        _free_column_families(*tdb);
+        queue_destroy((*tdb)->flush_queue);
+        _close_wal((*tdb)->wal);
+        free((*tdb)->config.db_path);
+        free(*tdb);
         return tidesdb_err_new(1009, "Failed to replay wal");
+    }
 
     return NULL;
 }
 
 tidesdb_err* tidesdb_create_column_family(tidesdb* tdb, const char* name, int flush_threshold,
-                                          int max_level, float probability)
+                                          int max_level, float probability, bool compressed)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -146,8 +213,8 @@ tidesdb_err* tidesdb_create_column_family(tidesdb* tdb, const char* name, int fl
     if (probability < 0.1) return tidesdb_err_new(1019, "Probability is too low");
 
     column_family* cf = NULL;
-    if (!_new_column_family(tdb->config.db_path, name, flush_threshold, max_level, probability,
-                            &cf))
+    if (!_new_column_family(tdb->config.db_path, name, flush_threshold, max_level, probability, &cf,
+                            compressed))
         return tidesdb_err_new(1020, "Failed to create new column family");
 
     /* now we add the column family */
@@ -1460,7 +1527,7 @@ tidesdb_err* tidesdb_cursor_free(tidesdb_cursor* cursor)
 }
 
 bool _new_column_family(const char* db_path, const char* name, int flush_threshold, int max_level,
-                        float probability, column_family** cf)
+                        float probability, column_family** cf, bool compressed)
 {
     /* we allocate memory for the column family */
     *cf = malloc(sizeof(column_family));
@@ -1489,6 +1556,15 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
 
     /* we initialize the id generator */
     (*cf)->id_gen = id_gen_init((uint64_t)time(NULL));
+    if ((*cf)->id_gen == NULL)
+    {
+        free((*cf)->config.name);
+        free(*cf);
+        return false;
+    }
+
+    /* set compressed to false */
+    (*cf)->config.compressed = compressed;
 
     /* we construct the path to the column family */
     char cf_path[PATH_MAX];
@@ -1637,6 +1713,7 @@ bool _add_column_family(tidesdb* tdb, column_family* cf)
     tdb->column_families[tdb->num_column_families - 1] = *cf;
 
     pthread_rwlock_unlock(&tdb->column_families_lock);
+    free(cf);
     return true;
 }
 
@@ -1929,13 +2006,6 @@ bool _open_wal(const char* db_path, wal** w)
     pager* p = NULL;
     if (!pager_open(wal_path, &p)) return false;
 
-    *w = (wal*)malloc(sizeof(wal));
-    if (*w == NULL)
-    {
-        pager_close(p);
-        return false;
-    }
-
     (*w)->pager = p;
     if (pthread_rwlock_init(&(*w)->lock, NULL) != 0)
     {
@@ -1960,6 +2030,8 @@ void _close_wal(wal* wal)
 
     /* we free the wal */
     free(wal);
+
+    wal = NULL;
 }
 
 bool _truncate_wal(wal* wal, int checkpoint)
@@ -2357,14 +2429,8 @@ bool _is_tombstone(const unsigned char* value, size_t value_size)
     return value_size == 4 && *(uint32_t*)value == TOMBSTONE;
 }
 
-tidesdb_err* tidesdb_close(tidesdb* tdb)
+void _free_column_families(tidesdb* tdb)
 {
-    if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
-
-    /* we lock the column families lock */
-    if (pthread_rwlock_wrlock(&tdb->column_families_lock) != 0)
-        return tidesdb_err_new(1003, "Failed to lock column families lock");
-
     /* we check if we have column families */
     if (tdb->num_column_families > 0)
     {
@@ -2399,6 +2465,17 @@ tidesdb_err* tidesdb_close(tidesdb* tdb)
         /* we free the column families */
         free(tdb->column_families);
     }
+}
+
+tidesdb_err* tidesdb_close(tidesdb* tdb)
+{
+    if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
+
+    /* we lock the column families lock */
+    if (pthread_rwlock_wrlock(&tdb->column_families_lock) != 0)
+        return tidesdb_err_new(1003, "Failed to lock column families lock");
+
+    _free_column_families(tdb);
 
     /* we unlock the column families lock */
     pthread_rwlock_unlock(&tdb->column_families_lock);
@@ -2433,7 +2510,11 @@ tidesdb_err* tidesdb_close(tidesdb* tdb)
     queue_destroy(tdb->flush_queue);
 
     /* we close the wal */
-    if (tdb->wal != NULL) _close_wal(tdb->wal);
+    if (tdb->wal != NULL)
+    {
+        _close_wal(tdb->wal);
+        tdb->wal = NULL;
+    }
 
     /* we destroy the column families lock */
     if (pthread_rwlock_destroy(&tdb->column_families_lock) != 0)

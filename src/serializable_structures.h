@@ -19,7 +19,6 @@
 #ifndef SERIALIZABLE_STRUCTURES_H
 #define SERIALIZABLE_STRUCTURES_H
 #include <stdbool.h>
-#include <time.h>
 
 /*
  * OP_CODE

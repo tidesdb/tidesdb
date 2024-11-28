@@ -37,7 +37,10 @@ void test_open_close()
     tidesdb* tdb = NULL;
 
     tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+    if (e != NULL)
+    {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
 
     assert(e == NULL);
 
@@ -53,6 +56,8 @@ void test_open_close()
     tidesdb_err_free(e);
 
     remove_directory("testdb");
+
+    free(tdb_config);
 
     printf(GREEN "test_open_close passed\n" RESET);
 }
@@ -81,7 +86,7 @@ void test_create_column_family()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -97,6 +102,8 @@ void test_create_column_family()
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     tidesdb_err_free(e);
+
+    free(tdb_config);
 
     remove_directory("testdb");
 
@@ -127,7 +134,7 @@ void test_drop_column_family()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -157,6 +164,8 @@ void test_drop_column_family()
 
     remove_directory("testdb");
 
+    free(tdb_config);
+
     printf(GREEN "test_drop_column_family passed\n" RESET);
 }
 
@@ -184,7 +193,7 @@ void test_put()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -222,6 +231,8 @@ void test_put()
 
     remove_directory("testdb");
 
+    free(tdb_config);
+
     printf(GREEN "test_put passed\n" RESET);
 }
 
@@ -246,7 +257,7 @@ void test_put_get()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -329,7 +340,7 @@ void test_put_flush_get()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -430,7 +441,7 @@ void test_put_reopen_get()
     e = NULL;
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -539,7 +550,7 @@ void test_put_get_delete()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -640,7 +651,7 @@ void test_txn_put_delete_get()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -766,7 +777,7 @@ void test_put_compact()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -841,7 +852,7 @@ void test_put_compact_get()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -935,7 +946,7 @@ void test_put_compact_get_reopen()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -1118,7 +1129,7 @@ void test_concurrent_put_get()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -1169,7 +1180,7 @@ void test_cursor()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f);
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
     if (e != NULL)
     {
         printf(RED "Error: %s\n" RESET, e->message);
@@ -1313,6 +1324,7 @@ void test_cursor()
     printf(GREEN "test_cursor passed\n" RESET);
 }
 
+/** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/tidesdb__tests.c -lzstd **/
 int main(void)
 {
     test_open_close();

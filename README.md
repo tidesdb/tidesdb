@@ -90,6 +90,9 @@ It is not a full-featured database, but rather a library that can be used to bui
 | 1061       | Cursor is NULL                                                       |
 | 1062       | At end of cursor                                                     |
 | 1063       | At start of cursor                                                   |
+| 1064       | Key has a tombstone value.  To be deleted on next compaction         |
+| 1065       | Key has expired.  To be deleted on next compaction                   |
+| 1066       | Key's value cannot be a tombstone                                    |
 ```
 
 ## License

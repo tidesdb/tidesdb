@@ -237,6 +237,7 @@ void test_skiplist_copy()
     printf(GREEN "test_skiplist_copy passed\n" RESET);
 }
 
+/** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/skiplist__tests.c -lzstd **/
 int main(void)
 {
     test_skiplist_create_node();

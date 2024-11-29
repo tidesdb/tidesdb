@@ -371,6 +371,7 @@ void test_get_last_modified()
     printf(GREEN "test_get_last_modified passed\n" RESET);
 }
 
+/** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/pager__tests.c -lzstd **/
 int main(void)
 {
     test_get_last_modified();

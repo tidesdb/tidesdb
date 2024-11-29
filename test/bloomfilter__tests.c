@@ -121,6 +121,7 @@ void test_bloomfilter_chaining()
     printf(GREEN "test_bloomfilter_chaining passed\n" RESET);
 }
 
+/** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/bloomfilter__tests.c -lzstd **/
 int main(void)
 {
     test_bloomfilter_create();

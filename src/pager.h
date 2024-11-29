@@ -19,12 +19,13 @@
 #ifndef PAGER_H
 #define PAGER_H
 
-#define PAGE_HEADER     16L  /* The page header is used to store an overflow page number */
-#define PAGE_BODY       1024 /* The page body is used to store the actual data */
-#define PAGE_SIZE       (PAGE_HEADER + PAGE_BODY) /* The page size is the sum of the header and body */
-#define SYNC_INTERVAL   24576                     /* Sync every 24576 writes */
-#define SYNC_ESCALATION 0.128 /* We sync when we hit sync escalation or when we hit sync interval \
-                               */
+#define PAGE_HEADER   16L  /* The page header is used to store an overflow page number */
+#define PAGE_BODY     1024 /* The page body is used to store the actual data */
+#define PAGE_SIZE     (PAGE_HEADER + PAGE_BODY) /* The page size is the sum of the header and body */
+#define SYNC_INTERVAL 24576                     /* Sync every 24576 writes */
+#define SYNC_ESCALATION                                                       \
+    0.128 /* We sync when we hit sync escalation or when we hit sync interval \
+           */
 
 #include <errno.h>
 #include <pthread.h>

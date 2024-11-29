@@ -282,8 +282,7 @@ tidesdb_err* tidesdb_compact_sstables(tidesdb* tdb, column_family* cf, int max_t
  * @return error or NULL
  */
 tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uint8_t* key,
-                         size_t key_size, const uint8_t* value, size_t value_size,
-                         time_t ttl);
+                         size_t key_size, const uint8_t* value, size_t value_size, time_t ttl);
 
 /*
  * tidesdb_get

@@ -915,12 +915,29 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uin
                     return tidesdb_err_new(1039, "Key not found");
                 }
 
-                *value = kv->value;
+                /* copy the value */
+                *value = malloc(kv->value_size);
+                if (*value == NULL)
+                {
+                    free(buffer);
+                    free(kv->key);
+                    free(kv->value);
+                    free(kv);
+                    pager_cursor_free(cursor);
+                    pthread_mutex_unlock(&tdb->flush_lock);
+                    return tidesdb_err_new(1040, "Failed to allocate memory for value");
+                }
+
+                /* copy the value size */
                 *value_size = kv->value_size;
+
+                /* copy the value */
+                memcpy(*value, kv->value, kv->value_size);
 
                 free(buffer);
                 pager_cursor_free(cursor);
                 free(kv->key);
+                free(kv->value);
                 free(kv);
                 pthread_mutex_unlock(&tdb->flush_lock);
 
@@ -1128,7 +1145,7 @@ tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction)
             case OP_DELETE:
 
                 /* put tombstone value */
-              uint8_t* tombstone = (uint8_t*)malloc(4);
+                uint8_t* tombstone = (uint8_t*)malloc(4);
                 if (tombstone != NULL)
                 {
                     uint32_t tombstone_value = TOMBSTONE;
@@ -2124,7 +2141,7 @@ bool _replay_from_wal(tidesdb* tdb, wal* wal)
                     break;
 
                 case OP_DELETE:
-                   uint8_t* tombstone = (uint8_t*)malloc(4);
+                    uint8_t* tombstone = (uint8_t*)malloc(4);
                     if (tombstone != NULL)
                     {
                         uint32_t tombstone_value = TOMBSTONE;
@@ -2199,7 +2216,6 @@ int _compare_sstables(const void* a, const void* b)
 
 bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wal_checkpoint)
 {
-
     /* we check if the tidesdb is NULL */
     if (tdb == NULL) return false;
 
@@ -2388,7 +2404,6 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
 
     /* truncate the wal at the entries provided checkpoint */
     if (!_truncate_wal(tdb->wal, wal_checkpoint)) return false;
-
 
     return true;
 }
@@ -2709,18 +2724,22 @@ int _remove_directory(const char* path)
     return 0;
 }
 
-int _compare_keys(const uint8_t* key1, size_t key1_size, const uint8_t* key2, size_t key2_size) {
+int _compare_keys(const uint8_t* key1, size_t key1_size, const uint8_t* key2, size_t key2_size)
+{
     if (key1 == NULL || key2 == NULL) return 0;
 
     size_t min_size = key1_size < key2_size ? key1_size : key2_size;
 
-    for (size_t i = 0; i < min_size; i++) {
-        if (key1[i] != key2[i]) {
+    for (size_t i = 0; i < min_size; i++)
+    {
+        if (key1[i] != key2[i])
+        {
             return (key1[i] < key2[i]) ? -1 : 1;
         }
     }
 
-    if (key1_size != key2_size) {
+    if (key1_size != key2_size)
+    {
         return (key1_size < key2_size) ? -1 : 1;
     }
 

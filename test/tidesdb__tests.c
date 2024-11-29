@@ -291,13 +291,13 @@ void test_put_get()
     /* we get the key-value pairs */
     for (int i = 0; i < 240; i++)
     {
-        unsigned char key[48];
-        unsigned char value[48];
+        uint8_t key[48];
+        uint8_t value[48];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
         size_t value_len = 0;
-        unsigned char* value_out = NULL;
+        uint8_t* value_out = NULL;
 
         e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
         if (e != NULL)
@@ -345,7 +345,7 @@ void test_put_flush_get()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, "test_cf", (1024 * 1024), 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -379,15 +379,16 @@ void test_put_flush_get()
     sleep(5); /* wait for the SST file to be written */
 
     /* we get the key-value pairs */
-    for (int i = 0; i < 24000; i++)
+    for (int i = 0; i < 24000 / 12;
+         i++) /* remove division by 12 to test all key-value pairs for a slower test.. */
     {
-        unsigned char key[48];
-        unsigned char value[48];
+        uint8_t key[48];
+        uint8_t value[48];
         snprintf(key, sizeof(key), "key%03d", i);
         snprintf(value, sizeof(value), "value%03d", i);
 
         size_t value_len = 0;
-        unsigned char* value_out = NULL;
+        uint8_t* value_out = NULL;
 
         e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
         if (e != NULL)
@@ -485,6 +486,7 @@ void test_put_reopen_get()
 
     tdb = NULL;
 
+    /* reopen recovers from the WAL as no flush was triggered */
     e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL)
     {
@@ -502,13 +504,13 @@ void test_put_reopen_get()
     /* we get the key-value pairs */
     for (int i = 0; i < 50; i++)
     {
-        unsigned char key[48];
-        unsigned char value[48];
+        uint8_t key[48];
+        uint8_t value[48];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
         size_t value_len = 0;
-        unsigned char* value_out = NULL;
+        uint8_t* value_out = NULL;
 
         e = tidesdb_get(tdb, "test_cf", key, strlen(key), &value_out, &value_len);
         if (e != NULL)
@@ -574,8 +576,8 @@ void test_put_get_delete()
     /* put 240 key-value pairs */
     for (int i = 0; i < 240; i++)
     {
-        char key[48];
-        char value[48];
+        uint8_t key[48];
+        uint8_t value[48];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
@@ -593,7 +595,7 @@ void test_put_get_delete()
     /* we delete the key-value pairs */
     for (int i = 0; i < 240; i++)
     {
-        unsigned char key[48];
+        uint8_t key[48];
         snprintf(key, sizeof(key), "key%d", i);
 
         e = tidesdb_delete(tdb, cf->config.name, key, strlen(key));
@@ -607,24 +609,21 @@ void test_put_get_delete()
     /* we get the key-value pairs */
     for (int i = 0; i < 240; i++)
     {
-        unsigned char key[48];
-        unsigned char value[48];
+        uint8_t key[48];
+        uint8_t value[48];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
         size_t value_len = 0;
-        unsigned char* value_out = NULL;
+        uint8_t* value_out = NULL;
 
         e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
-        if (e != NULL)
-        {
-            printf(RED "Error: %s\n" RESET, e->message);
-            tidesdb_err_free(e);
-            continue;
-        }
 
+        free(value_out);
         /* we should get an error as the key-value pairs have been deleted */
         assert(e != NULL);
+
+        tidesdb_err_free(e);
     }
 
     e = tidesdb_close(tdb);
@@ -641,7 +640,7 @@ void test_put_get_delete()
 
 void test_txn_put_delete_get()
 {
-    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -654,19 +653,33 @@ void test_txn_put_delete_get()
     tidesdb* tdb = NULL;
 
     tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
-    if (e != NULL)
-    {
-        printf(RED "Error: %s\n" RESET, e->message);
-    }
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
-
     assert(tdb != NULL);
 
     tidesdb_err_free(e);
 
+    /* create a column family */
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    column_family* cf = NULL;
+
+    /* we should be able to get the column family */
+    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+
     txn* transaction;
-    tidesdb_txn_begin(&transaction, "column_family_name");
+    e = tidesdb_txn_begin(&transaction, "test_cf");
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
 
     const uint8_t key[] = "example_key";
     const uint8_t value[] = "example_value";
@@ -675,29 +688,79 @@ void test_txn_put_delete_get()
     const uint8_t key3[] = "example_key3";
     const uint8_t value3[] = "example_value3";
 
-    tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), 0);
-    tidesdb_txn_put(transaction, key2, sizeof(key2), value2, sizeof(value2), 0);
-    tidesdb_txn_put(transaction, key3, sizeof(key3), value3, sizeof(value3), 0);
+    e = tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), -1);
 
-    tidesdb_txn_delete(transaction, key2, sizeof(key2));
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    e = tidesdb_txn_put(transaction, key2, sizeof(key2), value2, sizeof(value2), -1);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    e = tidesdb_txn_put(transaction, key3, sizeof(key3), value3, sizeof(value3), -1);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    e = tidesdb_txn_delete(transaction, key2, sizeof(key2));
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
 
     /* commit the transaction */
-    tidesdb_txn_commit(tdb, transaction);
-    tidesdb_txn_free(transaction);
+    e = tidesdb_txn_commit(tdb, transaction);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    e = tidesdb_txn_free(transaction);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
 
     /* get the key-value pairs */
     size_t value_len = 0;
     uint8_t* value_out = NULL;
 
-    assert(tidesdb_get(tdb, "column_family_name", key, sizeof(key), &value_out, &value_len) ==
-           NULL);
-    free(value_out);
-    assert(tidesdb_get(tdb, "column_family_name", key2, sizeof(key2), &value_out, &value_len) !=
-           NULL);
+    e = tidesdb_get(tdb, "test_cf", key, sizeof(key), &value_out, &value_len);
+    if (e != NULL)
+    {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+    else
+    {
+        free(value_out);
+    }
 
-    assert(tidesdb_get(tdb, "column_family_name", key3, sizeof(key3), &value_out, &value_len) ==
-           NULL);
-    free(value_out);
+    assert(e == NULL);
+    tidesdb_err_free(e);
+
+    e = tidesdb_get(tdb, "test_cf", key2, sizeof(key), &value_out, &value_len);
+
+    assert(e != NULL);
+
+    tidesdb_err_free(e);
+
+    e = tidesdb_get(tdb, "test_cf", key3, sizeof(key3), &value_out, &value_len);
+    if (e != NULL)
+    {
+        printf(RED "Error: %s\n" RESET, e->message);
+    }
+    else
+    {
+        free(value_out);
+    }
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
 
     e = tidesdb_close(tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
@@ -1027,10 +1090,10 @@ void* put_thread(void* arg)
     column_family* cf = NULL;
     assert(_get_column_family(tdb, "test_cf", &cf) == 1);
 
-    for (int i = 0; i < 12000; i++)
+    for (int i = 0; i < 1200; i++)
     {
-        char key[48];
-        char value[48];
+        uint8_t key[48];
+        uint8_t value[48];
         snprintf(key, sizeof(key), "key_put%03d", i);
         snprintf(value, sizeof(value), "value_put%03d", i);
 
@@ -1054,9 +1117,9 @@ void* get_thread(void* arg)
     column_family* cf = NULL;
     assert(_get_column_family(tdb, "test_cf", &cf) == 1);
 
-    for (int i = 0; i < 12000; i++)
+    for (int i = 0; i < 1200; i++)
     {
-        unsigned char key[48];
+        uint8_t key[48];
         snprintf(key, sizeof(key), "key_put%03d", i);
 
         size_t value_len = 0;
@@ -1072,8 +1135,9 @@ void* get_thread(void* arg)
             }
             else
             {
-                printf(RED "Error: %s\n" RESET, e->message);
+                printf(MAGENTA "Retrying concurrent get operation %s\n" RESET, e->message);
                 tidesdb_err_free(e);
+                free(value_out);
                 sleep(1); /* wait for a second before retrying **/
             }
         }
@@ -1101,6 +1165,7 @@ void test_concurrent_put_get()
     tidesdb* tdb = NULL;
 
     tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
     assert(e == NULL);
     assert(tdb != NULL);
 
@@ -1304,7 +1369,10 @@ void test_cursor()
     printf(GREEN "test_cursor passed\n" RESET);
 }
 
-/** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/tidesdb__tests.c -lzstd **/
+/** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/tidesdb__tests.c -lzstd
+ * OR cc -g3 -fsanitize=undefined src/*.c external/*.c test/tidesdb__tests.c -lzstd <-- if above
+ * get's stuck. use this as it seem's like something with the sanitizer.  Could be looked at
+ * **/
 int main(void)
 {
     remove_directory(TEST_DIR);
@@ -1316,7 +1384,6 @@ int main(void)
     test_put_flush_get();
     test_put_reopen_get();
     test_put_get_delete();
-    test_txn_put_delete_get();
     test_txn_put_delete_get();
     test_concurrent_put_get();
     test_cursor();

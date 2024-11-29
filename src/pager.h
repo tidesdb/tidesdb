@@ -37,6 +37,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* @TODO windows support */
+
 /*
  * pager
  * the pager struct is used to manage the file and pages

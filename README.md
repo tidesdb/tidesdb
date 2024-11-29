@@ -7,8 +7,8 @@ The underlying data structure is based on a log-structured merge-tree (LSM-tree)
 
 It is not a full-featured database, but rather a library that can be used to build a database atop of.
 
-> [!WARNING]
-> In very active beta development. Not ready for production use.
+> [!CAUTION]
+> In very active beta development. Not ready for production use.  The library is not yet stable.
 
 ## Features
 - [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist uses an RW lock which means multiple readers and one true writer.  SSTables are sorted, immutable and can be read concurrently they are protected via page locks.
@@ -26,6 +26,9 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Easy API** simple and easy to use api.
 
 ## Errors
+> [!CAUTION]
+> Errors are not finalized and may change.
+
 ```
 | Error Code | Error Message                                                        |
 |------------|----------------------------------------------------------------------|

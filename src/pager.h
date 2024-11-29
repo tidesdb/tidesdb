@@ -23,7 +23,8 @@
 #define PAGE_BODY       1024 /* The page body is used to store the actual data */
 #define PAGE_SIZE       (PAGE_HEADER + PAGE_BODY) /* The page size is the sum of the header and body */
 #define SYNC_INTERVAL   24576                     /* Sync every 24576 writes */
-#define SYNC_ESCALATION 2 /* We sync when we hit sync escalation or when we hit sync interval */
+#define SYNC_ESCALATION 0.128 /* We sync when we hit sync escalation or when we hit sync interval \
+                               */
 
 #include <errno.h>
 #include <pthread.h>
@@ -33,7 +34,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
 
 /*
@@ -201,5 +201,12 @@ bool pager_pages_count(pager* p, size_t* num_pages);
  * @return bool true if the size was retrieved successfully, false otherwise
  */
 bool pager_size(pager* p, size_t* size);
+
+/*
+ * sleep_ms
+ * sleeps for the given number of milliseconds
+ * @param milliseconds the number of milliseconds to sleep
+ */
+void sleep_ms(int milliseconds);
 
 #endif /* PAGER_H */

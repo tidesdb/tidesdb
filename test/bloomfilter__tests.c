@@ -56,8 +56,8 @@ void test_bloomfilter_add_check()
     /* we create a bloom filter with size 1024 */
     bloomfilter *bf = bloomfilter_create(1024);
 
-    const unsigned char data1[] = "test1"; /* the entry that will be in bf */
-    const unsigned char data2[] = "test2"; /* the entry that will not be in bf */
+    const uint8_t data1[] = "test1"; /* the entry that will be in bf */
+    const uint8_t data2[] = "test2"; /* the entry that will not be in bf */
 
     /* we add data1 to the bloom filter */
     assert(bloomfilter_add(bf, data1, strlen((const char *)data1)) == 0);
@@ -82,7 +82,7 @@ void test_bloomfilter_is_full()
 
     for (int i = 0; i < 16; i++)
     {
-        unsigned char data[2] = {(unsigned char)i, '\0'};
+        uint8_t data[2] = {(uint8_t)i, '\0'};
         bloomfilter_add(bf, data, 1);
     }
 
@@ -96,12 +96,12 @@ void test_bloomfilter_is_full()
 void test_bloomfilter_chaining()
 {
     bloomfilter *bf = bloomfilter_create(8); /* Small size for testing */
-    const unsigned char data1[] = "test1";
-    const unsigned char data2[] = "test2";
+    const uint8_t data1[] = "test1";
+    const uint8_t data2[] = "test2";
 
     for (int i = 0; i < 256; i++)
     {
-        unsigned char data[256] = {(unsigned char)i, '\0'};
+        uint8_t data[256] = {(uint8_t)i, '\0'};
         bloomfilter_add(bf, data, 1);
     }
 
@@ -112,7 +112,7 @@ void test_bloomfilter_chaining()
     /* check if all the data is in the bloom filter */
     for (int i = 0; i < 256; i++)
     {
-        unsigned char data[256] = {(unsigned char)i, '\0'};
+        uint8_t data[256] = {(uint8_t)i, '\0'};
         assert(bloomfilter_check(bf, data, 1) == true);
     }
 

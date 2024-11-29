@@ -74,7 +74,7 @@ bool bloomfilter_is_full(bloomfilter *bf);
  * @param data the data to add
  * @param data_len the length of the data
  */
-int bloomfilter_add(bloomfilter *bf, const unsigned char *data, unsigned int data_len);
+int bloomfilter_add(bloomfilter *bf, const uint8_t *data, unsigned int data_len);
 
 /*
  * bloomfilter_check
@@ -83,7 +83,7 @@ int bloomfilter_add(bloomfilter *bf, const unsigned char *data, unsigned int dat
  * @param data the data to check
  * @param data_len the length of the data
  */
-bool bloomfilter_check(bloomfilter *bf, const unsigned char *data, unsigned int data_len);
+bool bloomfilter_check(bloomfilter *bf, const uint8_t *data, unsigned int data_len);
 
 /*
  * hash1
@@ -91,7 +91,7 @@ bool bloomfilter_check(bloomfilter *bf, const unsigned char *data, unsigned int 
  * @param data the data to hash
  * @param data_len the length of the data
  */
-unsigned int hash1(const unsigned char *data, unsigned int data_len);
+unsigned int hash1(const uint8_t *data, unsigned int data_len);
 
 /*
  * hash2
@@ -99,7 +99,7 @@ unsigned int hash1(const unsigned char *data, unsigned int data_len);
  * @param data the data to hash
  * @param data_len the length of the data
  */
-unsigned int hash2(const unsigned char *data, unsigned int data_len);
+unsigned int hash2(const uint8_t *data, unsigned int data_len);
 
 /*
  * bloomfilter_get_size

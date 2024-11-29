@@ -17,12 +17,12 @@
  * limitations under the License.
  */
 #include "bloomfilter.h"
-unsigned int hash1(const unsigned char *data, unsigned int data_len)
+unsigned int hash1(const uint8_t *data, unsigned int data_len)
 {
     return XXH32(data, data_len, 0);
 }
 
-unsigned int hash2(const unsigned char *data, unsigned int data_len)
+unsigned int hash2(const uint8_t *data, unsigned int data_len)
 {
     return XXH32(data, data_len, 1);
 }
@@ -62,7 +62,7 @@ void bloomfilter_destroy(bloomfilter *bf)
     }
 }
 
-bool bloomfilter_check(bloomfilter *bf, const unsigned char *data, unsigned int data_len)
+bool bloomfilter_check(bloomfilter *bf, const uint8_t *data, unsigned int data_len)
 {
     unsigned int hash_value1 = hash1(data, data_len);
     unsigned int hash_value2 = hash2(data, data_len);
@@ -87,7 +87,7 @@ bool bloomfilter_is_full(bloomfilter *bf)
     return true;
 }
 
-int bloomfilter_add(bloomfilter *bf, const unsigned char *data, unsigned int data_len)
+int bloomfilter_add(bloomfilter *bf, const uint8_t *data, unsigned int data_len)
 {
     unsigned int hash_value1 = hash1(data, data_len);
     unsigned int hash_value2 = hash2(data, data_len);

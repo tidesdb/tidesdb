@@ -27,8 +27,8 @@
 
 void test_skiplist_create_node()
 {
-    unsigned char key[] = "key";
-    unsigned char value[] = "value";
+    uint8_t key[] = "key";
+    uint8_t value[] = "value";
     skiplist_node *node = skiplist_create_node(3, key, sizeof(key), value, sizeof(value), -1);
     assert(node != NULL);
     assert(memcmp(node->key, key, sizeof(key)) == 0);
@@ -55,11 +55,11 @@ void test_new_skiplist()
 void test_skiplist_put_get()
 {
     skiplist *list = new_skiplist(12, 0.24f);
-    unsigned char key[] = "key";
-    unsigned char value[] = "value";
+    uint8_t key[] = "key";
+    uint8_t value[] = "value";
     assert(skiplist_put(list, key, sizeof(key), value, sizeof(value), -1) == true);
 
-    unsigned char *retrieved_value;
+    uint8_t *retrieved_value;
     size_t retrieved_value_size;
     assert(skiplist_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size) == true);
     assert(memcmp(retrieved_value, value, sizeof(value)) == 0);
@@ -72,12 +72,12 @@ void test_skiplist_put_get()
 void test_skiplist_delete()
 {
     skiplist *list = new_skiplist(12, 0.24f);
-    unsigned char key[] = "key";
-    unsigned char value[] = "value";
+    uint8_t key[] = "key";
+    uint8_t value[] = "value";
     assert(skiplist_put(list, key, sizeof(key), value, sizeof(value), -1) == true);
     assert(skiplist_delete(list, key, sizeof(key)) == true);
 
-    unsigned char *retrieved_value;
+    uint8_t *retrieved_value;
     size_t retrieved_value_size;
     assert(skiplist_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size) == false);
 
@@ -89,12 +89,12 @@ void test_skiplist_delete()
 void test_skiplist_clear()
 {
     skiplist *list = new_skiplist(12, 0.24f);
-    unsigned char key[] = "key";
-    unsigned char value[] = "value";
+    uint8_t key[] = "key";
+    uint8_t value[] = "value";
     assert(skiplist_put(list, key, sizeof(key), value, sizeof(value), -1) == true);
     assert(skiplist_clear(list) == 0);
 
-    unsigned char *retrieved_value;
+    uint8_t *retrieved_value;
     size_t retrieved_value_size;
     assert(skiplist_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size) == false);
 
@@ -106,10 +106,10 @@ void test_skiplist_clear()
 void test_skiplist_cursor()
 {
     skiplist *list = new_skiplist(12, 0.24f);
-    unsigned char key1[] = "key1";
-    unsigned char value1[] = "value1";
-    unsigned char key2[] = "key2";
-    unsigned char value2[] = "value2";
+    uint8_t key1[] = "key1";
+    uint8_t value1[] = "value1";
+    uint8_t key2[] = "key2";
+    uint8_t value2[] = "value2";
     assert(skiplist_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == true);
     assert(skiplist_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == true);
 
@@ -133,13 +133,13 @@ void test_skiplist_cursor()
 void test_skiplist_ttl()
 {
     skiplist *list = new_skiplist(12, 0.24f);
-    unsigned char key[] = "key";
-    unsigned char value[] = "value";
+    uint8_t key[] = "key";
+    uint8_t value[] = "value";
     time_t ttl = 1; /* 1 second TTL */
 
     assert(skiplist_put(list, key, sizeof(key), value, sizeof(value), time(NULL) + ttl) == true);
 
-    unsigned char *retrieved_value;
+    uint8_t *retrieved_value;
     size_t retrieved_value_size;
     assert(skiplist_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size) == true);
     assert(memcmp(retrieved_value, value, sizeof(value)) == 0);
@@ -172,14 +172,14 @@ void *thread_func(void *arg)
 
     for (int i = 0; i < CONCURRENT_NUM_OPERATIONS; i++)
     {
-        unsigned char key[16];
-        unsigned char value[16];
+        uint8_t key[16];
+        uint8_t value[16];
         snprintf((char *)key, sizeof(key), "key%d_%d", thread_id, i);
         snprintf((char *)value, sizeof(value), "value%d_%d", thread_id, i);
 
         skiplist_put(list, key, strlen((char *)key) + 1, value, strlen((char *)value) + 1, -1);
 
-        unsigned char *retrieved_value;
+        uint8_t *retrieved_value;
         size_t retrieved_value_size;
         skiplist_get(list, key, strlen((char *)key) + 1, &retrieved_value, &retrieved_value_size);
 
@@ -212,17 +212,17 @@ void test_skiplist_concurrency()
 void test_skiplist_copy()
 {
     skiplist *list = new_skiplist(12, 0.24f);
-    unsigned char key1[] = "key1";
-    unsigned char value1[] = "value1";
-    unsigned char key2[] = "key2";
-    unsigned char value2[] = "value2";
+    uint8_t key1[] = "key1";
+    uint8_t value1[] = "value1";
+    uint8_t key2[] = "key2";
+    uint8_t value2[] = "value2";
     assert(skiplist_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == true);
     assert(skiplist_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == true);
 
     skiplist *copied_list = skiplist_copy(list);
     assert(copied_list != NULL);
 
-    unsigned char *retrieved_value;
+    uint8_t *retrieved_value;
     size_t retrieved_value_size;
     assert(skiplist_get(copied_list, key1, sizeof(key1), &retrieved_value, &retrieved_value_size) ==
            true);

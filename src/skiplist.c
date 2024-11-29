@@ -18,8 +18,8 @@
  */
 #include "skiplist.h"
 
-skiplist_node *skiplist_create_node(int level, const unsigned char *key, size_t key_size,
-                                    const unsigned char *value, size_t value_size, time_t ttl)
+skiplist_node *skiplist_create_node(int level, const uint8_t *key, size_t key_size,
+                                    const uint8_t *value, size_t value_size, time_t ttl)
 {
     /* validate level to prevent overflow */
     if (level <= 0) return NULL;
@@ -29,7 +29,7 @@ skiplist_node *skiplist_create_node(int level, const unsigned char *key, size_t 
     if (node == NULL) return NULL;
 
     /* allocate memory for the key */
-    node->key = (unsigned char *)malloc(key_size);
+    node->key = (uint8_t *)malloc(key_size);
     if (node->key == NULL)
     {
         free(node);
@@ -40,7 +40,7 @@ skiplist_node *skiplist_create_node(int level, const unsigned char *key, size_t 
     node->key_size = key_size;
 
     /* allocate memory for the value */
-    node->value = (unsigned char *)malloc(value_size);
+    node->value = (uint8_t *)malloc(value_size);
     if (node->value == NULL)
     {
         free(node->key);
@@ -72,7 +72,7 @@ bool skiplist_check_and_update_ttl(skiplist_node *node)
         /*n ode has expired */
         free(node->value);
 
-        node->value = (unsigned char *)malloc(sizeof(TOMBSTONE));
+        node->value = (uint8_t *)malloc(sizeof(TOMBSTONE));
         if (node->value == NULL) return false;
 
         *(uint32_t *)node->value = TOMBSTONE; /* directly assign the value */
@@ -96,8 +96,8 @@ skiplist *new_skiplist(int max_level, float probability)
     list->total_size = 0;
     pthread_rwlock_init(&list->lock, NULL); /* initialize read-write lock */
 
-    unsigned char header_key[1] = {0};
-    unsigned char header_value[1] = {0};
+    uint8_t header_key[1] = {0};
+    uint8_t header_value[1] = {0};
     list->header = skiplist_create_node(max_level, header_key, 1, header_value, 1, -1);
 
     if (list->header == NULL)
@@ -122,7 +122,7 @@ int skiplist_random_level(skiplist *list)
     return level;
 }
 
-int skiplist_compare_keys(const unsigned char *key1, size_t key1_size, const unsigned char *key2,
+int skiplist_compare_keys(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                           size_t key2_size)
 {
     size_t min_size = key1_size < key2_size ? key1_size : key2_size;
@@ -132,8 +132,8 @@ int skiplist_compare_keys(const unsigned char *key1, size_t key1_size, const uns
     return (key1_size < key2_size) ? -1 : (key1_size > key2_size) ? 1 : 0;
 }
 
-bool skiplist_put(skiplist *list, const unsigned char *key, size_t key_size,
-                  const unsigned char *value, size_t value_size, time_t ttl)
+bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size,
+                  const uint8_t *value, size_t value_size, time_t ttl)
 {
     if (list == NULL || key == NULL || value == NULL) return false;
 
@@ -159,7 +159,7 @@ bool skiplist_put(skiplist *list, const unsigned char *key, size_t key_size,
         list->total_size -= x->value_size; /* sub old value size */
         free(x->value);
 
-        x->value = (unsigned char *)malloc(value_size);
+        x->value = (uint8_t *)malloc(value_size);
         if (x->value == NULL)
         {
             pthread_rwlock_unlock(&list->lock); /* unlock sl */
@@ -200,7 +200,7 @@ bool skiplist_put(skiplist *list, const unsigned char *key, size_t key_size,
     return true;
 }
 
-bool skiplist_delete(skiplist *list, const unsigned char *key, size_t key_size)
+bool skiplist_delete(skiplist *list, const uint8_t *key, size_t key_size)
 {
     pthread_rwlock_wrlock(&list->lock);
     skiplist_node *update[list->max_level];
@@ -244,7 +244,7 @@ bool skiplist_delete(skiplist *list, const unsigned char *key, size_t key_size)
     return true;
 }
 
-bool skiplist_get(skiplist *list, const unsigned char *key, size_t key_size, unsigned char **value,
+bool skiplist_get(skiplist *list, const uint8_t *key, size_t key_size, uint8_t **value,
                   size_t *value_size)
 {
     if (list == NULL || key == NULL || value == NULL || value_size == NULL) return false;
@@ -353,8 +353,13 @@ int skiplist_clear(skiplist *list)
     {
         skiplist_node *next = current->forward[0];
         free(current->key);
+        current->key = NULL;
 
-        if (current->value != NULL) free(current->value);
+        if (current->value != NULL)
+        {
+            free(current->value);
+            current->value = NULL;
+        }
 
         free(current);
         current = next;
@@ -393,7 +398,9 @@ bool skiplist_destroy_node(skiplist_node *node)
     if (node == NULL) return false;
 
     free(node->key);
+    node->key = NULL;
     free(node->value);
+    node->value = NULL;
     free(node);
     node = NULL;
     return true;

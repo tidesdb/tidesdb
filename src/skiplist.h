@@ -44,9 +44,9 @@ typedef struct skiplist_node skiplist_node;
  */
 struct skiplist_node
 {
-    unsigned char *key;       /* the key for the node */
+    uint8_t *key;       /* the key for the node */
     size_t key_size;          /* the key size */
-    unsigned char *value;     /* the value for the node */
+    uint8_t *value;     /* the value for the node */
     size_t value_size;        /* the value size */
     time_t ttl;               /* an expiration time for the node (optional) */
     skiplist_node *forward[]; /* the forward pointers for the node */
@@ -97,8 +97,8 @@ typedef struct
  * @param ttl an expiration time for the node (optional)
  * @return the new skiplist node
  */
-skiplist_node *skiplist_create_node(int level, const unsigned char *key, size_t key_size,
-                                    const unsigned char *value, size_t value_size, time_t ttl);
+skiplist_node *skiplist_create_node(int level, const uint8_t *key, size_t key_size,
+                                    const uint8_t *value, size_t value_size, time_t ttl);
 
 /*
  * skiplist_destroy_node
@@ -142,7 +142,7 @@ int skiplist_random_level(skiplist *list);
  * @param key2_size the second key size
  * @return 0 if the keys are equal, -1 if key1 is less than key2, 1 if key1 is greater than key2
  */
-int skiplist_compare_keys(const unsigned char *key1, size_t key1_size, const unsigned char *key2,
+int skiplist_compare_keys(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                           size_t key2_size);
 
 /*
@@ -153,7 +153,7 @@ int skiplist_compare_keys(const unsigned char *key1, size_t key1_size, const uns
  * @param key_size the key size
  * @return true if the key was deleted successfully, false otherwise
  */
-bool skiplist_delete(skiplist *list, const unsigned char *key, size_t key_size);
+bool skiplist_delete(skiplist *list, const uint8_t *key, size_t key_size);
 
 /*
  * skiplist_put
@@ -166,8 +166,8 @@ bool skiplist_delete(skiplist *list, const unsigned char *key, size_t key_size);
  * @param ttl an expiration time for the node (optional)
  * @return true if the key-value pair was put successfully, false otherwise
  */
-bool skiplist_put(skiplist *list, const unsigned char *key, size_t key_size,
-                  const unsigned char *value, size_t value_size, time_t ttl);
+bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size,
+                  const uint8_t *value, size_t value_size, time_t ttl);
 
 /*
  * skiplist_get
@@ -179,7 +179,7 @@ bool skiplist_put(skiplist *list, const unsigned char *key, size_t key_size,
  * @param value_size the value size
  * @return true if the value was retrieved successfully, false otherwise
  */
-bool skiplist_get(skiplist *list, const unsigned char *key, size_t key_size, unsigned char **value,
+bool skiplist_get(skiplist *list, const uint8_t *key, size_t key_size, uint8_t **value,
                   size_t *value_size);
 
 /*

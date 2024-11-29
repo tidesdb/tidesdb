@@ -77,7 +77,6 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     /* now we load the column families */
     if (!_load_column_families(*tdb))
     {
-        _free_column_families(*tdb);
         _close_wal((*tdb)->wal);
         free((*tdb)->config.db_path);
         free(*tdb);
@@ -633,7 +632,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
 
     do
     {
-        unsigned char* kv_buffer = NULL;
+        uint8_t* kv_buffer = NULL;
         size_t kv_buffer_len = 0;
 
         key_value_pair* kvp = malloc(sizeof(key_value_pair));
@@ -682,8 +681,8 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
     return new_sstable;
 }
 
-tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const unsigned char* key,
-                         size_t key_size, const unsigned char* value, size_t value_size, time_t ttl)
+tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uint8_t* key,
+                         size_t key_size, const uint8_t* value, size_t value_size, time_t ttl)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -763,8 +762,8 @@ tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uns
     return NULL;
 }
 
-tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const unsigned char* key,
-                         size_t key_size, unsigned char** value, size_t* value_size)
+tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uint8_t* key,
+                         size_t key_size, uint8_t** value, size_t* value_size)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -855,7 +854,6 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
         if (!pager_cursor_next(cursor))
         {
             pager_cursor_free(cursor);
-            pthread_mutex_unlock(&tdb->flush_lock);
             if (i == 0) break; /* we have reached the end of the sstables */
             continue;          /* go to the next sstable */
         }
@@ -892,11 +890,14 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
                 return tidesdb_err_new(1038, "Key value pair is NULL");
             }
 
-            if (memcmp(kv->key, key, key_size) == 0)
+            if (_compare_keys((const uint8_t*)kv->key, kv->key_size, key, key_size) == 0)
             {
                 if (_is_tombstone(kv->value, kv->value_size))
                 {
                     free(buffer);
+                    free(kv->key);
+                    free(kv->value);
+                    free(kv);
                     pager_cursor_free(cursor);
                     pthread_mutex_unlock(&tdb->flush_lock);
                     return tidesdb_err_new(1031, "Key not found");
@@ -906,8 +907,10 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
                 if (kv->ttl != -1 && kv->ttl < time(NULL))
                 {
                     free(buffer);
-                    pager_cursor_free(cursor);
+                    free(kv->key);
+                    free(kv->value);
                     free(kv);
+                    pager_cursor_free(cursor);
                     pthread_mutex_unlock(&tdb->flush_lock);
                     return tidesdb_err_new(1039, "Key not found");
                 }
@@ -917,6 +920,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
 
                 free(buffer);
                 pager_cursor_free(cursor);
+                free(kv->key);
                 free(kv);
                 pthread_mutex_unlock(&tdb->flush_lock);
 
@@ -929,19 +933,23 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
             }
             else
             {
-                pager_cursor_free(cursor);
-                free(buffer);
-                free(kv);
-                break;
+                has_next = false;
             }
+
+            free(buffer);
+            free(kv->key);
+            free(kv->value);
+            free(kv);
         }
+
+        pager_cursor_free(cursor);
     }
 
     pthread_mutex_unlock(&tdb->flush_lock);
     return tidesdb_err_new(1031, "Key not found");
 }
 
-tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const unsigned char* key,
+tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const uint8_t* key,
                             size_t key_size)
 {
     /* we check if the db is NULL */
@@ -960,7 +968,7 @@ tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const 
     if (!_append_to_wal(tdb, tdb->wal, key, key_size, NULL, 0, 0, OP_DELETE, column_family_name))
         return tidesdb_err_new(1029, "Failed to append to wal");
 
-    unsigned char* tombstone = malloc(4);
+    uint8_t* tombstone = malloc(4);
 
     if (tombstone != NULL)
     {
@@ -991,8 +999,8 @@ tidesdb_err* tidesdb_txn_begin(txn** transaction, const char* column_family)
     return NULL;
 }
 
-tidesdb_err* tidesdb_txn_put(txn* transaction, const unsigned char* key, size_t key_size,
-                             const unsigned char* value, size_t value_size, time_t ttl)
+tidesdb_err* tidesdb_txn_put(txn* transaction, const uint8_t* key, size_t key_size,
+                             const uint8_t* value, size_t value_size, time_t ttl)
 {
     /* we check if the transaction is NULL */
     if (transaction == NULL) return tidesdb_err_new(1054, "Transaction is NULL");
@@ -1015,12 +1023,13 @@ tidesdb_err* tidesdb_txn_put(txn* transaction, const unsigned char* key, size_t 
     transaction->ops[transaction->num_ops].op->column_family = strdup(transaction->column_family);
     transaction->ops[transaction->num_ops].op->kv = (key_value_pair*)malloc(sizeof(key_value_pair));
     transaction->ops[transaction->num_ops].op->kv->key_size = key_size;
-    transaction->ops[transaction->num_ops].op->kv->key = (unsigned char*)malloc(key_size);
+    transaction->ops[transaction->num_ops].op->kv->key = (uint8_t*)malloc(key_size);
     memcpy(transaction->ops[transaction->num_ops].op->kv->key, key, key_size);
     transaction->ops[transaction->num_ops].op->kv->value_size = value_size;
-    transaction->ops[transaction->num_ops].op->kv->value = (unsigned char*)malloc(value_size);
+    transaction->ops[transaction->num_ops].op->kv->value = (uint8_t*)malloc(value_size);
     memcpy(transaction->ops[transaction->num_ops].op->kv->value, value, value_size);
     transaction->ops[transaction->num_ops].op->kv->ttl = ttl;
+    transaction->ops[transaction->num_ops].committed = false;
 
     transaction->ops[transaction->num_ops].rollback_op = (operation*)malloc(sizeof(operation));
 
@@ -1031,7 +1040,7 @@ tidesdb_err* tidesdb_txn_put(txn* transaction, const unsigned char* key, size_t 
     transaction->ops[transaction->num_ops].rollback_op->kv =
         (key_value_pair*)malloc(sizeof(key_value_pair));
     transaction->ops[transaction->num_ops].rollback_op->kv->key_size = key_size;
-    transaction->ops[transaction->num_ops].rollback_op->kv->key = (unsigned char*)malloc(key_size);
+    transaction->ops[transaction->num_ops].rollback_op->kv->key = (uint8_t*)malloc(key_size);
     memcpy(transaction->ops[transaction->num_ops].rollback_op->kv->key, key, key_size);
 
     transaction->num_ops++;
@@ -1039,7 +1048,7 @@ tidesdb_err* tidesdb_txn_put(txn* transaction, const unsigned char* key, size_t 
     return NULL;
 }
 
-tidesdb_err* tidesdb_txn_delete(txn* transaction, const unsigned char* key, size_t key_size)
+tidesdb_err* tidesdb_txn_delete(txn* transaction, const uint8_t* key, size_t key_size)
 {
     /* we check if the transaction is NULL */
     if (transaction == NULL) return tidesdb_err_new(1032, "Transaction is NULL");
@@ -1057,11 +1066,12 @@ tidesdb_err* tidesdb_txn_delete(txn* transaction, const unsigned char* key, size
     transaction->ops[transaction->num_ops].op->column_family = strdup(transaction->column_family);
     transaction->ops[transaction->num_ops].op->kv = (key_value_pair*)malloc(sizeof(key_value_pair));
     transaction->ops[transaction->num_ops].op->kv->key_size = key_size;
-    transaction->ops[transaction->num_ops].op->kv->key = (unsigned char*)malloc(key_size);
+    transaction->ops[transaction->num_ops].op->kv->key = (uint8_t*)malloc(key_size);
     memcpy(transaction->ops[transaction->num_ops].op->kv->key, key, key_size);
     transaction->ops[transaction->num_ops].op->kv->value_size = 0;
     transaction->ops[transaction->num_ops].op->kv->value = NULL;
     transaction->ops[transaction->num_ops].op->kv->ttl = 0;
+    transaction->ops[transaction->num_ops].committed = false;
 
     transaction->ops[transaction->num_ops].rollback_op = (operation*)malloc(sizeof(operation));
 
@@ -1072,7 +1082,7 @@ tidesdb_err* tidesdb_txn_delete(txn* transaction, const unsigned char* key, size
     transaction->ops[transaction->num_ops].rollback_op->kv =
         (key_value_pair*)malloc(sizeof(key_value_pair));
     transaction->ops[transaction->num_ops].rollback_op->kv->key_size = key_size;
-    transaction->ops[transaction->num_ops].rollback_op->kv->key = (unsigned char*)malloc(key_size);
+    transaction->ops[transaction->num_ops].rollback_op->kv->key = (uint8_t*)malloc(key_size);
     memcpy(transaction->ops[transaction->num_ops].rollback_op->kv->key, key, key_size);
 
     transaction->ops[transaction->num_ops].rollback_op->kv->value_size = 0;
@@ -1118,7 +1128,7 @@ tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction)
             case OP_DELETE:
 
                 /* put tombstone value */
-                unsigned char* tombstone = (unsigned char*)malloc(4);
+              uint8_t* tombstone = (uint8_t*)malloc(4);
                 if (tombstone != NULL)
                 {
                     uint32_t tombstone_value = TOMBSTONE;
@@ -1220,39 +1230,45 @@ tidesdb_err* tidesdb_txn_rollback(tidesdb* tdb, txn* transaction)
     return NULL;
 }
 
+void _free_key_value_pair(key_value_pair* kv)
+{
+    if (kv != NULL)
+    {
+        if (kv->key != NULL)
+        {
+            free(kv->key);
+            kv->key = NULL;
+        }
+        if (kv->value != NULL)
+        {
+            free(kv->value);
+            kv->value = NULL;
+        }
+        free(kv);
+    }
+}
+
+void _free_operation(operation* op)
+{
+    if (op != NULL)
+    {
+        free(op->column_family);
+        _free_key_value_pair(op->kv);
+        free(op);
+    }
+}
+
 tidesdb_err* tidesdb_txn_free(txn* transaction)
 {
     if (transaction == NULL) return tidesdb_err_new(1032, "Transaction is NULL");
 
     for (int i = 0; i < transaction->num_ops; i++)
     {
-        free(transaction->ops[i].op->column_family);
-        if (transaction->ops[i].op->kv != NULL)
+        if (!transaction->ops[i].committed)
         {
-            if (transaction->ops[i].op->kv->key != NULL) free(transaction->ops[i].op->kv->key);
-
-            if (transaction->ops[i].op->kv->value != NULL) free(transaction->ops[i].op->kv->value);
-
-            free(transaction->ops[i].op->kv);
+            _free_operation(transaction->ops[i].op);
+            _free_operation(transaction->ops[i].rollback_op);
         }
-
-        if (transaction->ops[i].rollback_op != NULL)
-        {
-            free(transaction->ops[i].rollback_op->column_family);
-            if (transaction->ops[i].rollback_op->kv != NULL)
-            {
-                if (transaction->ops[i].rollback_op->kv != NULL)
-                {
-                    free(transaction->ops[i].rollback_op->kv->key);
-                    if (transaction->ops[i].rollback_op->kv->value != NULL)
-                        free(transaction->ops[i].rollback_op->kv->value);
-
-                    free(transaction->ops[i].rollback_op->kv);
-                }
-            }
-        }
-        free(transaction->ops[i].op);
-        free(transaction->ops[i].rollback_op);
     }
 
     free(transaction->column_family);
@@ -1808,7 +1824,7 @@ bool _load_column_families(tidesdb* tdb)
                 size_t config_size = ftell(config_file); /* get size of file */
                 fseek(config_file, 0, SEEK_SET);         /* seek back to beginning of file */
 
-                unsigned char* buffer = malloc(config_size);
+                uint8_t* buffer = malloc(config_size);
                 if (fread(buffer, 1, config_size, config_file) != config_size)
                 {
                     free(buffer);
@@ -1901,8 +1917,8 @@ const char* _get_path_seperator()
 #endif
 }
 
-bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key_size,
-                    const unsigned char* value, size_t value_size, time_t ttl, enum OP_CODE op_code,
+bool _append_to_wal(tidesdb* tdb, wal* wal, const uint8_t* key, size_t key_size,
+                    const uint8_t* value, size_t value_size, time_t ttl, enum OP_CODE op_code,
                     const char* cf)
 {
     if (tdb == NULL || wal == NULL || key == NULL) return false;
@@ -1930,7 +1946,7 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key
         return false;
     }
 
-    op->kv->key = (unsigned char*)malloc(key_size);
+    op->kv->key = (uint8_t*)malloc(key_size);
     if (op->kv->key == NULL)
     {
         free(op->column_family);
@@ -1942,7 +1958,7 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key
     memcpy(op->kv->key, key, key_size);
     op->kv->key_size = key_size;
 
-    op->kv->value = (unsigned char*)malloc(value_size);
+    op->kv->value = (uint8_t*)malloc(value_size);
     if (op->kv->value == NULL)
     {
         free(op->column_family);
@@ -2108,7 +2124,7 @@ bool _replay_from_wal(tidesdb* tdb, wal* wal)
                     break;
 
                 case OP_DELETE:
-                    unsigned char* tombstone = (unsigned char*)malloc(4);
+                   uint8_t* tombstone = (uint8_t*)malloc(4);
                     if (tombstone != NULL)
                     {
                         uint32_t tombstone_value = TOMBSTONE;
@@ -2183,6 +2199,7 @@ int _compare_sstables(const void* a, const void* b)
 
 bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wal_checkpoint)
 {
+
     /* we check if the tidesdb is NULL */
     if (tdb == NULL) return false;
 
@@ -2372,6 +2389,7 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
     /* truncate the wal at the entries provided checkpoint */
     if (!_truncate_wal(tdb->wal, wal_checkpoint)) return false;
 
+
     return true;
 }
 
@@ -2424,7 +2442,7 @@ void* _flush_memtable_thread(void* arg)
     return NULL;
 }
 
-bool _is_tombstone(const unsigned char* value, size_t value_size)
+bool _is_tombstone(const uint8_t* value, size_t value_size)
 {
     return value_size == 4 && *(uint32_t*)value == TOMBSTONE;
 }
@@ -2444,8 +2462,8 @@ void _free_column_families(tidesdb* tdb)
 
             if (tdb->column_families[i].memtable != NULL)
             {
-                skiplist_clear(tdb->column_families[i].memtable);
                 skiplist_destroy(tdb->column_families[i].memtable);
+                tdb->column_families[i].memtable = NULL;
             }
 
             id_gen_destroy(tdb->column_families[i].id_gen);
@@ -2459,11 +2477,13 @@ void _free_column_families(tidesdb* tdb)
                     _free_sstable(tdb->column_families[i].sstables[j]);
 
                 free(tdb->column_families[i].sstables);
+                tdb->column_families[i].sstables = NULL;
             }
         }
 
         /* we free the column families */
         free(tdb->column_families);
+        tdb->column_families = NULL;
     }
 }
 
@@ -2684,6 +2704,24 @@ int _remove_directory(const char* path)
     {
         perror("rmdir");
         return -1;
+    }
+
+    return 0;
+}
+
+int _compare_keys(const uint8_t* key1, size_t key1_size, const uint8_t* key2, size_t key2_size) {
+    if (key1 == NULL || key2 == NULL) return 0;
+
+    size_t min_size = key1_size < key2_size ? key1_size : key2_size;
+
+    for (size_t i = 0; i < min_size; i++) {
+        if (key1[i] != key2[i]) {
+            return (key1[i] < key2[i]) ? -1 : 1;
+        }
+    }
+
+    if (key1_size != key2_size) {
+        return (key1_size < key2_size) ? -1 : 1;
     }
 
     return 0;

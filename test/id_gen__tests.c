@@ -52,7 +52,7 @@ void* generate_ids(void* arg)
     for (int i = 0; i < 10; ++i)
     {
         uint64_t id = id_gen_new(gen);
-        printf("Generated ID: %llu\n", id);
+        printf("Generated ID: %lu\n", id);
     }
     return NULL;
 }
@@ -77,6 +77,7 @@ void test_id_gen_thread_safety()
     printf(GREEN "test_id_gen_thread_safety passed\n" RESET);
 }
 
+/** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/id_gen__tests.c -lzstd **/
 int main(void)
 {
     test_id_gen_init();

@@ -109,6 +109,7 @@ void test_dequeue_no_entries()
     printf(GREEN "test_dequeue_no_entries passed\n" RESET);
 }
 
+/** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/queue__tests.c -lzstd **/
 int main(void)
 {
     test_queue_new();

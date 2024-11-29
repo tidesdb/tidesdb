@@ -23,6 +23,7 @@
 #include "../src/err.h"
 #include "test_macros.h"
 
+/** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/err__tests.c -lzstd **/
 void test_tidesdb_err_new()
 {
     tidesdb_err* e = tidesdb_err_new(1, "message");

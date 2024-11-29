@@ -17,7 +17,6 @@
  * limitations under the License.
  */
 #include "bloomfilter.h"
-
 unsigned int hash1(const unsigned char *data, unsigned int data_len)
 {
     return XXH32(data, data_len, 0);
@@ -61,8 +60,6 @@ void bloomfilter_destroy(bloomfilter *bf)
         free(bf);
         bf = next;
     }
-
-    bf = NULL;
 }
 
 bool bloomfilter_check(bloomfilter *bf, const unsigned char *data, unsigned int data_len)
@@ -72,8 +69,8 @@ bool bloomfilter_check(bloomfilter *bf, const unsigned char *data, unsigned int 
 
     while (bf != NULL)
     {
-        if ((bf->set[hash_value1 % bf->size / 8] & (1 << (hash_value1 % 8))) &&
-            (bf->set[hash_value2 % bf->size / 8] & (1 << (hash_value2 % 8))))
+        if ((bf->set[(hash_value1 % bf->size) / 8] & (1 << (hash_value1 % 8))) &&
+            (bf->set[(hash_value2 % bf->size) / 8] & (1 << (hash_value2 % 8))))
         {
             return true;
         }
@@ -110,8 +107,8 @@ int bloomfilter_add(bloomfilter *bf, const unsigned char *data, unsigned int dat
         current = new_bf;
     }
 
-    current->set[hash_value1 % current->size / 8] |= (1 << (hash_value1 % 8));
-    current->set[hash_value2 % current->size / 8] |= (1 << (hash_value2 % 8));
+    current->set[(hash_value1 % current->size) / 8] |= (1 << (hash_value1 % 8));
+    current->set[(hash_value2 % current->size) / 8] |= (1 << (hash_value2 % 8));
     current->count++;
 
     return 0;

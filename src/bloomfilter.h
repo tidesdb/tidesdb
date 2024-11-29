@@ -50,6 +50,7 @@ struct bloomfilter
  * bloomfilter_create
  * create a new bloomfilter with an initial size
  * @param size the size of the bloomfilter
+ * @return the new bloomfilter
  */
 bloomfilter *bloomfilter_create(unsigned int size);
 
@@ -64,6 +65,7 @@ void bloomfilter_destroy(bloomfilter *bf);
  * bloomfilter_is_full
  * check if the bloomfilter is full
  * @param bf the bloomfilter to check
+ * @return true if the bloomfilter is full, false otherwise
  */
 bool bloomfilter_is_full(bloomfilter *bf);
 
@@ -73,6 +75,7 @@ bool bloomfilter_is_full(bloomfilter *bf);
  * @param bf the bloomfilter to add to
  * @param data the data to add
  * @param data_len the length of the data
+ * @return whether the data was added to the bloomfilter
  */
 int bloomfilter_add(bloomfilter *bf, const uint8_t *data, unsigned int data_len);
 
@@ -82,6 +85,7 @@ int bloomfilter_add(bloomfilter *bf, const uint8_t *data, unsigned int data_len)
  * @param bf the bloomfilter to check
  * @param data the data to check
  * @param data_len the length of the data
+ * @return true if the data is in the bloomfilter, false otherwise
  */
 bool bloomfilter_check(bloomfilter *bf, const uint8_t *data, unsigned int data_len);
 
@@ -90,6 +94,7 @@ bool bloomfilter_check(bloomfilter *bf, const uint8_t *data, unsigned int data_l
  * hashes the data using xxhash
  * @param data the data to hash
  * @param data_len the length of the data
+ * @return the hash value
  */
 unsigned int hash1(const uint8_t *data, unsigned int data_len);
 
@@ -98,6 +103,7 @@ unsigned int hash1(const uint8_t *data, unsigned int data_len);
  * hashes the data using xxhash
  * @param data the data to hash
  * @param data_len the length of the data
+ * @return the hash value
  */
 unsigned int hash2(const uint8_t *data, unsigned int data_len);
 
@@ -105,6 +111,7 @@ unsigned int hash2(const uint8_t *data, unsigned int data_len);
  * bloomfilter_get_size
  * gets the size of the bloomfilter
  * @param bf the bloomfilter to get the size of
+ * @return the size of the bloomfilter
  */
 unsigned int bloomfilter_get_size(bloomfilter *bf);
 

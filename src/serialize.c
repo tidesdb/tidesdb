@@ -33,10 +33,15 @@ bool serialize_key_value_pair(const key_value_pair* kvp, uint8_t** buffer, size_
     ptr += sizeof(kvp->key_size);
     memcpy(ptr, kvp->key, kvp->key_size);
     ptr += kvp->key_size;
-    memcpy(ptr, &kvp->value_size, sizeof(kvp->value_size));
-    ptr += sizeof(kvp->value_size);
-    memcpy(ptr, kvp->value, kvp->value_size);
-    ptr += kvp->value_size;
+
+    if (kvp->value != NULL)
+    {
+        memcpy(ptr, &kvp->value_size, sizeof(kvp->value_size));
+        ptr += sizeof(kvp->value_size);
+        memcpy(ptr, kvp->value, kvp->value_size);
+        ptr += kvp->value_size;
+    }
+
     memcpy(ptr, &kvp->ttl, sizeof(kvp->ttl));
 
     if (compress)

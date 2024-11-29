@@ -36,6 +36,8 @@
 #include "serialize.h"
 #include "skiplist.h"
 
+/* ** * @TODO windows support */
+
 #define BLOOMFILTER_SIZE                                                                      \
     1000 /* size of each bloom filter.  Bloom filters are linked once they reach this size in \
             occupied capacity */
@@ -567,6 +569,7 @@ bool _sort_sstables(const column_family* cf);
  * remove_directory
  * recursively remove a directory and its contents
  * @param path the path to the directory
+ * @return whether the directory was removed
  */
 int _remove_directory(const char* path);
 
@@ -583,6 +586,7 @@ void* _compact_sstables_thread(void* arg);
  * @param sst1 the first sstable
  * @param sst2 the second sstable
  * @param cf the column family
+ * @return the new sstable
  */
 sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf);
 

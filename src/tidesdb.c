@@ -981,21 +981,27 @@ tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const 
     if (!_get_column_family(tdb, column_family_name, &cf))
         return tidesdb_err_new(1028, "Column family not found");
 
-    /* append to wal */
-    if (!_append_to_wal(tdb, tdb->wal, key, key_size, NULL, 0, 0, OP_DELETE, column_family_name))
-        return tidesdb_err_new(1029, "Failed to append to wal");
-
     uint8_t* tombstone = malloc(4);
 
     if (tombstone != NULL)
     {
         uint32_t tombstone_value = TOMBSTONE;
         memcpy(tombstone, &tombstone_value, sizeof(uint32_t));
+
+        if (tombstone == NULL)
+            return tidesdb_err_new(1030, "Failed to allocate memory for tombstone");
     }
+
+    /* append to wal */
+    if (!_append_to_wal(tdb, tdb->wal, key, key_size, tombstone, 4, 0, OP_DELETE,
+                        column_family_name))
+        return tidesdb_err_new(1029, "Failed to append to wal");
 
     /* add to memtable */
     if (!skiplist_put(cf->memtable, key, key_size, tombstone, 4, -1))
         return tidesdb_err_new(1030, "Failed to put into memtable");
+
+    free(tombstone);
 
     return NULL;
 }
@@ -1005,11 +1011,21 @@ tidesdb_err* tidesdb_txn_begin(txn** transaction, const char* column_family)
     /* we check if column family is NULL */
     if (column_family == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
 
+    /* we check if transaction is NULL */
+    if (transaction == NULL) return tidesdb_err_new(1053, "Transaction pointer is NULL");
+
     *transaction = (txn*)malloc(sizeof(txn));
     if (*transaction == NULL)
         return tidesdb_err_new(1052, "Failed to allocate memory for transaction");
 
     (*transaction)->column_family = strdup(column_family);
+    if ((*transaction)->column_family == NULL)
+    {
+        free(*transaction);
+        *transaction = NULL;
+        return tidesdb_err_new(1054, "Failed to allocate memory for column family name");
+    }
+
     (*transaction)->ops = NULL;
     (*transaction)->num_ops = 0;
 
@@ -1036,30 +1052,52 @@ tidesdb_err* tidesdb_txn_put(txn* transaction, const uint8_t* key, size_t key_si
     transaction->ops = temp_ops;
 
     transaction->ops[transaction->num_ops].op = (operation*)malloc(sizeof(operation));
+    if (transaction->ops[transaction->num_ops].op == NULL)
+    {
+        return tidesdb_err_new(1057, "Failed to allocate memory for operation");
+    }
+
     transaction->ops[transaction->num_ops].op->op_code = OP_PUT;
     transaction->ops[transaction->num_ops].op->column_family = strdup(transaction->column_family);
+    if (transaction->ops[transaction->num_ops].op->column_family == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1058, "Failed to allocate memory for column family name");
+    }
+
     transaction->ops[transaction->num_ops].op->kv = (key_value_pair*)malloc(sizeof(key_value_pair));
+    if (transaction->ops[transaction->num_ops].op->kv == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].op->column_family);
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1059, "Failed to allocate memory for key-value pair");
+    }
+
     transaction->ops[transaction->num_ops].op->kv->key_size = key_size;
     transaction->ops[transaction->num_ops].op->kv->key = (uint8_t*)malloc(key_size);
+    if (transaction->ops[transaction->num_ops].op->kv->key == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].op->kv);
+        free(transaction->ops[transaction->num_ops].op->column_family);
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1060, "Failed to allocate memory for key");
+    }
     memcpy(transaction->ops[transaction->num_ops].op->kv->key, key, key_size);
+
     transaction->ops[transaction->num_ops].op->kv->value_size = value_size;
     transaction->ops[transaction->num_ops].op->kv->value = (uint8_t*)malloc(value_size);
+    if (transaction->ops[transaction->num_ops].op->kv->value == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].op->kv->key);
+        free(transaction->ops[transaction->num_ops].op->kv);
+        free(transaction->ops[transaction->num_ops].op->column_family);
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1061, "Failed to allocate memory for value");
+    }
     memcpy(transaction->ops[transaction->num_ops].op->kv->value, value, value_size);
+
     transaction->ops[transaction->num_ops].op->kv->ttl = ttl;
     transaction->ops[transaction->num_ops].committed = false;
-
-    transaction->ops[transaction->num_ops].rollback_op = (operation*)malloc(sizeof(operation));
-
-    /* a rollback for put is a delete */
-    transaction->ops[transaction->num_ops].rollback_op->op_code = OP_DELETE;
-    transaction->ops[transaction->num_ops].rollback_op->column_family =
-        strdup(transaction->column_family);
-    transaction->ops[transaction->num_ops].rollback_op->kv =
-        (key_value_pair*)malloc(sizeof(key_value_pair));
-    transaction->ops[transaction->num_ops].rollback_op->kv->key_size = key_size;
-    transaction->ops[transaction->num_ops].rollback_op->kv->key = (uint8_t*)malloc(key_size);
-    memcpy(transaction->ops[transaction->num_ops].rollback_op->kv->key, key, key_size);
-
     transaction->num_ops++;
 
     return NULL;
@@ -1075,31 +1113,94 @@ tidesdb_err* tidesdb_txn_delete(txn* transaction, const uint8_t* key, size_t key
 
     txn_op* temp_ops = realloc(transaction->ops, (transaction->num_ops + 1) * sizeof(txn_op));
     if (temp_ops == NULL) return tidesdb_err_new(1031, "Failed to allocate memory for transaction");
-
     transaction->ops = temp_ops;
 
     transaction->ops[transaction->num_ops].op = (operation*)malloc(sizeof(operation));
+    if (transaction->ops[transaction->num_ops].op == NULL)
+        return tidesdb_err_new(1057, "Failed to allocate memory for operation");
+
     transaction->ops[transaction->num_ops].op->op_code = OP_DELETE;
     transaction->ops[transaction->num_ops].op->column_family = strdup(transaction->column_family);
+    if (transaction->ops[transaction->num_ops].op->column_family == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1058, "Failed to allocate memory for column family name");
+    }
+
     transaction->ops[transaction->num_ops].op->kv = (key_value_pair*)malloc(sizeof(key_value_pair));
+    if (transaction->ops[transaction->num_ops].op->kv == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].op->column_family);
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1059, "Failed to allocate memory for key-value pair");
+    }
+
     transaction->ops[transaction->num_ops].op->kv->key_size = key_size;
     transaction->ops[transaction->num_ops].op->kv->key = (uint8_t*)malloc(key_size);
+    if (transaction->ops[transaction->num_ops].op->kv->key == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].op->kv);
+        free(transaction->ops[transaction->num_ops].op->column_family);
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1060, "Failed to allocate memory for key");
+    }
     memcpy(transaction->ops[transaction->num_ops].op->kv->key, key, key_size);
+
     transaction->ops[transaction->num_ops].op->kv->value_size = 0;
     transaction->ops[transaction->num_ops].op->kv->value = NULL;
     transaction->ops[transaction->num_ops].op->kv->ttl = 0;
     transaction->ops[transaction->num_ops].committed = false;
 
     transaction->ops[transaction->num_ops].rollback_op = (operation*)malloc(sizeof(operation));
+    if (transaction->ops[transaction->num_ops].rollback_op == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].op->kv->key);
+        free(transaction->ops[transaction->num_ops].op->kv);
+        free(transaction->ops[transaction->num_ops].op->column_family);
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1062, "Failed to allocate memory for rollback operation");
+    }
 
     /* a rollback for delete is a put */
     transaction->ops[transaction->num_ops].rollback_op->op_code = OP_PUT;
     transaction->ops[transaction->num_ops].rollback_op->column_family =
         strdup(transaction->column_family);
+    if (transaction->ops[transaction->num_ops].rollback_op->column_family == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].rollback_op);
+        free(transaction->ops[transaction->num_ops].op->kv->key);
+        free(transaction->ops[transaction->num_ops].op->kv);
+        free(transaction->ops[transaction->num_ops].op->column_family);
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1058, "Failed to allocate memory for column family name");
+    }
+
     transaction->ops[transaction->num_ops].rollback_op->kv =
         (key_value_pair*)malloc(sizeof(key_value_pair));
+    if (transaction->ops[transaction->num_ops].rollback_op->kv == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].rollback_op->column_family);
+        free(transaction->ops[transaction->num_ops].rollback_op);
+        free(transaction->ops[transaction->num_ops].op->kv->key);
+        free(transaction->ops[transaction->num_ops].op->kv);
+        free(transaction->ops[transaction->num_ops].op->column_family);
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1059, "Failed to allocate memory for key-value pair");
+    }
+
     transaction->ops[transaction->num_ops].rollback_op->kv->key_size = key_size;
     transaction->ops[transaction->num_ops].rollback_op->kv->key = (uint8_t*)malloc(key_size);
+    if (transaction->ops[transaction->num_ops].rollback_op->kv->key == NULL)
+    {
+        free(transaction->ops[transaction->num_ops].rollback_op->kv);
+        free(transaction->ops[transaction->num_ops].rollback_op->column_family);
+        free(transaction->ops[transaction->num_ops].rollback_op);
+        free(transaction->ops[transaction->num_ops].op->kv->key);
+        free(transaction->ops[transaction->num_ops].op->kv);
+        free(transaction->ops[transaction->num_ops].op->column_family);
+        free(transaction->ops[transaction->num_ops].op);
+        return tidesdb_err_new(1060, "Failed to allocate memory for key");
+    }
     memcpy(transaction->ops[transaction->num_ops].rollback_op->kv->key, key, key_size);
 
     transaction->ops[transaction->num_ops].rollback_op->kv->value_size = 0;
@@ -1131,6 +1232,7 @@ tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction)
     for (int i = 0; i < transaction->num_ops; i++)
     {
         operation op = *transaction->ops[i].op;
+        if (transaction->ops[i].committed) continue;
 
         switch (op.op_code)
         {
@@ -1269,9 +1371,16 @@ void _free_operation(operation* op)
 {
     if (op != NULL)
     {
-        free(op->column_family);
-        _free_key_value_pair(op->kv);
+        if (op->column_family != NULL)
+        {
+            free(op->column_family);
+        }
+        if (op->kv != NULL)
+        {
+            _free_key_value_pair(op->kv);
+        }
         free(op);
+        op = NULL;
     }
 }
 
@@ -1365,6 +1474,8 @@ tidesdb_err* tidesdb_cursor_init(tidesdb* tdb, const char* column_family_name,
         return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
     }
 
+    /** pager_cursor_next((*cursor)->sstable_cursor); */
+
     return NULL;
 }
 
@@ -1405,6 +1516,8 @@ tidesdb_err* tidesdb_cursor_next(tidesdb_cursor* cursor)
                 {
                     return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
                 }
+
+                /**pager_cursor_next(cursor->sstable_cursor); */
 
                 return NULL;
             }
@@ -1449,9 +1562,6 @@ tidesdb_err* tidesdb_cursor_prev(tidesdb_cursor* cursor)
         {
             return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
         }
-
-        /* move to the last key in the new sstable */
-        pager_cursor_next(cursor->sstable_cursor);
 
         return NULL;
     }
@@ -1985,8 +2095,13 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const uint8_t* key, size_t key_size,
         return false;
     }
 
-    memcpy(op->kv->value, value, value_size);
-    op->kv->value_size = value_size;
+    /* could be a delete */
+    if (value != NULL)
+    {
+        memcpy(op->kv->value, value, value_size);
+        op->kv->value_size = value_size;
+    }
+
     op->kv->ttl = ttl;
 
     uint8_t* serialized_op_buffer = NULL;
@@ -2284,7 +2399,7 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
         if (_is_tombstone(cursor->current->value, cursor->current->value_size)) continue;
 
         /* check if ttl is set and if so if it has expired */
-        if (cursor->current->ttl > 0 && cursor->current->ttl < time(NULL)) continue;
+        if (cursor->current->ttl != -1 && cursor->current->ttl < time(NULL)) continue;
 
         /* we add the key to the bloom filter */
         bloomfilter_add(bf, cursor->current->key, cursor->current->key_size);
@@ -2349,13 +2464,12 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
         if (_is_tombstone(cursor->current->value, cursor->current->value_size)) continue;
 
         /* check if ttl is set and if so if it has expired */
-        if (cursor->current->ttl > 0 && cursor->current->ttl < time(NULL)) continue;
+        if (cursor->current->ttl != -1 && cursor->current->ttl < time(NULL)) continue;
 
         /* we serialize the key-value pair */
         size_t encoded_size;
         key_value_pair kvp = {cursor->current->key, cursor->current->key_size,
-                              cursor->current->value, cursor->current->value_size,
-                              cursor->current->ttl};
+                              cursor->current->value, cursor->current->value_size, -1};
         uint8_t* serialized_buffer = NULL;
         if (!serialize_key_value_pair(&kvp, &serialized_buffer, &encoded_size,
                                       cf->config.compressed))

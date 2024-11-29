@@ -132,8 +132,8 @@ int skiplist_compare_keys(const uint8_t *key1, size_t key1_size, const uint8_t *
     return (key1_size < key2_size) ? -1 : (key1_size > key2_size) ? 1 : 0;
 }
 
-bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size,
-                  const uint8_t *value, size_t value_size, time_t ttl)
+bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size, const uint8_t *value,
+                  size_t value_size, time_t ttl)
 {
     if (list == NULL || key == NULL || value == NULL) return false;
 
@@ -267,8 +267,22 @@ bool skiplist_get(skiplist *list, const uint8_t *key, size_t key_size, uint8_t *
 
     if (x && skiplist_compare_keys(x->key, x->key_size, key, key_size) == 0)
     {
-        *value = x->value;
+        /* *value = x->value; */
+        /* *value_size = x->value_size; */
+
+        /* copy the value */
+        *value = malloc(x->value_size);
+        if (*value == NULL)
+        {
+            pthread_rwlock_unlock(&list->lock);
+            return false;
+        }
+
+        /* copy the value size */
         *value_size = x->value_size;
+
+        /* copy the value */
+        memcpy(*value, x->value, x->value_size);
 
         pthread_rwlock_unlock(&list->lock);
         return true;

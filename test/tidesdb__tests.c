@@ -309,6 +309,7 @@ void test_put_get()
         assert(e == NULL);
         assert(value_len == strlen((char*)value));
         assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+        free(value_out);
     }
 
     e = tidesdb_close(tdb);
@@ -399,6 +400,7 @@ void test_put_flush_get()
         assert(e == NULL);
         assert(value_len == strlen((char*)value));
         assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+        free(value_out);
     }
 
     e = tidesdb_close(tdb);
@@ -519,6 +521,7 @@ void test_put_reopen_get()
         assert(e == NULL);
         assert(value_len == strlen((char*)value));
         assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+        free(value_out);
     }
 
     e = tidesdb_close(tdb);
@@ -527,6 +530,8 @@ void test_put_reopen_get()
     tidesdb_err_free(e);
 
     remove_directory(TEST_DIR);
+
+    free(tdb_config);
 
     printf(GREEN "test_put_get_reopen passed\n" RESET);
 }
@@ -629,6 +634,8 @@ void test_put_get_delete()
 
     remove_directory(TEST_DIR);
 
+    free(tdb_config);
+
     printf(GREEN "test_put_get_delete passed\n" RESET);
 }
 
@@ -661,12 +668,36 @@ void test_txn_put_delete_get()
     txn* transaction;
     tidesdb_txn_begin(&transaction, "column_family_name");
 
-    const unsigned char key[] = "example_key";
-    const unsigned char value[] = "example_value";
-    tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), 0);
+    const uint8_t key[] = "example_key";
+    const uint8_t value[] = "example_value";
+    const uint8_t key2[] = "example_key2";
+    const uint8_t value2[] = "example_value2";
+    const uint8_t key3[] = "example_key3";
+    const uint8_t value3[] = "example_value3";
 
+    tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), 0);
+    tidesdb_txn_put(transaction, key2, sizeof(key2), value2, sizeof(value2), 0);
+    tidesdb_txn_put(transaction, key3, sizeof(key3), value3, sizeof(value3), 0);
+
+    tidesdb_txn_delete(transaction, key2, sizeof(key2));
+
+    /* commit the transaction */
     tidesdb_txn_commit(tdb, transaction);
     tidesdb_txn_free(transaction);
+
+    /* get the key-value pairs */
+    size_t value_len = 0;
+    uint8_t* value_out = NULL;
+
+    assert(tidesdb_get(tdb, "column_family_name", key, sizeof(key), &value_out, &value_len) ==
+           NULL);
+    free(value_out);
+    assert(tidesdb_get(tdb, "column_family_name", key2, sizeof(key2), &value_out, &value_len) !=
+           NULL);
+
+    assert(tidesdb_get(tdb, "column_family_name", key3, sizeof(key3), &value_out, &value_len) ==
+           NULL);
+    free(value_out);
 
     e = tidesdb_close(tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
@@ -754,6 +785,8 @@ void test_put_compact()
 
     remove_directory(TEST_DIR);
 
+    free(tdb_config);
+
     printf(GREEN "test_put_compact passed\n" RESET);
 }
 
@@ -823,22 +856,32 @@ void test_put_compact_get()
     tidesdb_err_free(e);
 
     /* get the key-value pairs */
-    for (int i = 0; i < 50; i++)
+    for (int i = 0; i < 100000 / 4; i++)
     {
-        char key[48];
-        char value[48];
+        unsigned char key[38];
+        unsigned char value[38];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
-        e = tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
+        size_t value_len = 0;
+        unsigned char* value_out = NULL;
+
+        e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
         if (e != NULL)
         {
             printf(RED "Error: %s\n" RESET, e->message);
             tidesdb_err_free(e);
-            break;
+            continue;
         }
 
         assert(e == NULL);
+
+        assert(value_len == strlen((char*)value));
+        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+
+        free(value_out); /* free the value_out pointer */
+        value_out = NULL;
+        value_len = 0;
     }
 
     e = tidesdb_close(tdb);
@@ -847,6 +890,8 @@ void test_put_compact_get()
     tidesdb_err_free(e);
 
     remove_directory(TEST_DIR);
+
+    free(tdb_config);
 
     printf(GREEN "test_put_compact passed\n" RESET);
 }
@@ -919,6 +964,8 @@ void test_put_compact_get_reopen()
 
     tidesdb_err_free(e);
 
+    free(tdb_config);
+
     tdb_config = NULL;
 
     /* reopen the database */
@@ -968,6 +1015,8 @@ void test_put_compact_get_reopen()
     tidesdb_err_free(e);
 
     remove_directory(TEST_DIR);
+
+    free(tdb_config);
 
     printf(GREEN "test_put_compact_get_reopen passed\n" RESET);
 }
@@ -1084,6 +1133,8 @@ void test_concurrent_put_get()
     tidesdb_err_free(e);
 
     remove_directory(TEST_DIR);
+
+    free(tdb_config);
 
     printf(GREEN "test_concurrent_put_get passed\n" RESET);
 }

@@ -44,9 +44,9 @@ typedef struct skiplist_node skiplist_node;
  */
 struct skiplist_node
 {
-    uint8_t *key;       /* the key for the node */
+    uint8_t *key;             /* the key for the node */
     size_t key_size;          /* the key size */
-    uint8_t *value;     /* the value for the node */
+    uint8_t *value;           /* the value for the node */
     size_t value_size;        /* the value size */
     time_t ttl;               /* an expiration time for the node (optional) */
     skiplist_node *forward[]; /* the forward pointers for the node */
@@ -166,8 +166,8 @@ bool skiplist_delete(skiplist *list, const uint8_t *key, size_t key_size);
  * @param ttl an expiration time for the node (optional)
  * @return true if the key-value pair was put successfully, false otherwise
  */
-bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size,
-                  const uint8_t *value, size_t value_size, time_t ttl);
+bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size, const uint8_t *value,
+                  size_t value_size, time_t ttl);
 
 /*
  * skiplist_get

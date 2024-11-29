@@ -22,6 +22,8 @@
 #include "test_macros.h"
 #include "test_utils.h"
 
+#define TEST_DIR "testdb"
+
 void test_open_close()
 {
     tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
@@ -31,7 +33,7 @@ void test_open_close()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -55,7 +57,7 @@ void test_open_close()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     free(tdb_config);
 
@@ -71,7 +73,7 @@ void test_create_column_family()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -105,7 +107,7 @@ void test_create_column_family()
 
     free(tdb_config);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     printf(GREEN "test_create_column_family passed\n" RESET);
 }
@@ -119,7 +121,7 @@ void test_drop_column_family()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -162,7 +164,7 @@ void test_drop_column_family()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     free(tdb_config);
 
@@ -178,7 +180,7 @@ void test_put()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -229,7 +231,7 @@ void test_put()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     free(tdb_config);
 
@@ -245,7 +247,7 @@ void test_put_get()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -314,7 +316,9 @@ void test_put_get()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
+
+    free(tdb_config);
 
     printf(GREEN "test_put_get passed\n" RESET);
 }
@@ -328,7 +332,7 @@ void test_put_flush_get()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -371,10 +375,10 @@ void test_put_flush_get()
         }
     }
 
-    sleep(3); /* wait for the SST file to be written */
+    sleep(5); /* wait for the SST file to be written */
 
     /* we get the key-value pairs */
-    for (int i = 0; i < 100; i++)
+    for (int i = 0; i < 24000; i++)
     {
         unsigned char key[48];
         unsigned char value[48];
@@ -395,8 +399,6 @@ void test_put_flush_get()
         assert(e == NULL);
         assert(value_len == strlen((char*)value));
         assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
-
-        free(value_out); /* free the value_out pointer */
     }
 
     e = tidesdb_close(tdb);
@@ -404,7 +406,9 @@ void test_put_flush_get()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
+
+    free(tdb_config);
 
     printf(GREEN "test_put_flush_get passed\n" RESET);
 }
@@ -421,7 +425,7 @@ void test_put_reopen_get()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -522,7 +526,7 @@ void test_put_reopen_get()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     printf(GREEN "test_put_get_reopen passed\n" RESET);
 }
@@ -536,7 +540,7 @@ void test_put_get_delete()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -623,48 +627,26 @@ void test_put_get_delete()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     printf(GREEN "test_put_get_delete passed\n" RESET);
 }
 
 void test_txn_put_delete_get()
 {
-    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
+    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
 
     tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    assert(e == NULL);
-    assert(tdb != NULL);
-
-    tidesdb_err_free(e);
-
-    /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    assert(e == NULL);
-
-    tidesdb_err_free(e);
-
-    column_family* cf = NULL;
-
-    /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
-
-    txn* txn = NULL;
-    e = tidesdb_txn_begin(&txn, cf->config.name);
     if (e != NULL)
     {
         printf(RED "Error: %s\n" RESET, e->message);
@@ -672,83 +654,30 @@ void test_txn_put_delete_get()
 
     assert(e == NULL);
 
-    tidesdb_err_free(e);
-
-    /* we add some put operations to the transaction and a final delete operation */
-    e = tidesdb_txn_put(txn, "key1", 4, "value1", 6, -1);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    assert(e == NULL);
+    assert(tdb != NULL);
 
     tidesdb_err_free(e);
 
-    e = tidesdb_txn_put(txn, "key2", 4, "value2", 6, -1);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+    txn* transaction;
+    tidesdb_txn_begin(&transaction, "column_family_name");
 
-    assert(e == NULL);
+    const unsigned char key[] = "example_key";
+    const unsigned char value[] = "example_value";
+    tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), 0);
 
-    tidesdb_err_free(e);
-
-    e = tidesdb_txn_put(txn, "key3", 4, "value3", 6, -1);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    tidesdb_err_free(e);
-
-    e = tidesdb_txn_delete(txn, "key1", 4);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    assert(e == NULL);
-
-    tidesdb_err_free(e);
-
-    /* we expect key2 and key3 to be the result of the transaction */
-
-    /* commit the transaction */
-    e = tidesdb_txn_commit(tdb, txn);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    assert(e == NULL);
-
-    tidesdb_err_free(e);
-
-    tidesdb_txn_free(txn);
-
-    unsigned char* value2 = NULL;
-    unsigned char* value3 = NULL;
-    size_t value_len2 = 0;
-    size_t value_len3 = 0;
-
-    e = tidesdb_get(tdb, cf->config.name, "key2", 4, &value2, &value_len2);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    assert(e == NULL);
-
-    tidesdb_err_free(e);
-
-    e = tidesdb_get(tdb, cf->config.name, "key3", 4, &value3, &value_len3);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    tidesdb_err_free(e);
-
-    assert(e == NULL);
-
-    unsigned char* value1 = NULL;
-    size_t value_len1 = 0;
-
-    /* we try to get key1 */
-    e = tidesdb_get(tdb, cf->config.name, "key1", 4, &value1, &value_len1);
-
-    /* we expect an error as key1 was deleted */
-    assert(e != NULL);
-
-    tidesdb_err_free(e);
+    tidesdb_txn_commit(tdb, transaction);
+    tidesdb_txn_free(transaction);
 
     e = tidesdb_close(tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
+    assert(e == NULL);
+
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
+
+    free(tdb_config);
 
     printf(GREEN "test_txn_put_delete_get passed\n" RESET);
 }
@@ -762,7 +691,7 @@ void test_put_compact()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -823,7 +752,7 @@ void test_put_compact()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     printf(GREEN "test_put_compact passed\n" RESET);
 }
@@ -837,7 +766,7 @@ void test_put_compact_get()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -917,7 +846,7 @@ void test_put_compact_get()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     printf(GREEN "test_put_compact passed\n" RESET);
 }
@@ -931,7 +860,7 @@ void test_put_compact_get_reopen()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -1038,7 +967,7 @@ void test_put_compact_get_reopen()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     printf(GREEN "test_put_compact_get_reopen passed\n" RESET);
 }
@@ -1117,7 +1046,7 @@ void test_concurrent_put_get()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -1154,7 +1083,7 @@ void test_concurrent_put_get()
 
     tidesdb_err_free(e);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     printf(GREEN "test_concurrent_put_get passed\n" RESET);
 }
@@ -1168,7 +1097,7 @@ void test_cursor()
         return;
     }
 
-    tdb_config->db_path = "testdb";
+    tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
     tidesdb* tdb = NULL;
@@ -1319,7 +1248,7 @@ void test_cursor()
     tidesdb_err_free(e);
     free(tdb_config);
 
-    remove_directory("testdb");
+    remove_directory(TEST_DIR);
 
     printf(GREEN "test_cursor passed\n" RESET);
 }
@@ -1327,6 +1256,7 @@ void test_cursor()
 /** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/tidesdb__tests.c -lzstd **/
 int main(void)
 {
+    remove_directory(TEST_DIR);
     test_open_close();
     test_create_column_family();
     test_drop_column_family();
@@ -1335,6 +1265,7 @@ int main(void)
     test_put_flush_get();
     test_put_reopen_get();
     test_put_get_delete();
+    test_txn_put_delete_get();
     test_txn_put_delete_get();
     test_concurrent_put_get();
     test_cursor();

@@ -281,8 +281,8 @@ tidesdb_err* tidesdb_compact_sstables(tidesdb* tdb, column_family* cf, int max_t
  * @param ttl the time-to-live for the key-value pair
  * @return error or NULL
  */
-tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const unsigned char* key,
-                         size_t key_size, const unsigned char* value, size_t value_size,
+tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uint8_t* key,
+                         size_t key_size, const uint8_t* value, size_t value_size,
                          time_t ttl);
 
 /*
@@ -296,8 +296,8 @@ tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uns
  * @param value_size the size of the value
  * @return error or NULL
  */
-tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const unsigned char* key,
-                         size_t key_size, unsigned char** value, size_t* value_size);
+tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uint8_t* key,
+                         size_t key_size, uint8_t** value, size_t* value_size);
 
 /*
  * tidesdb_delete
@@ -308,7 +308,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uns
  * @param key_size the size of the key
  * @return error or NULL
  */
-tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const unsigned char* key,
+tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const uint8_t* key,
                             size_t key_size);
 
 /*
@@ -331,8 +331,8 @@ tidesdb_err* tidesdb_txn_begin(txn** transaction, const char* column_family);
  * @param ttl the time-to-live for the key-value pair
  * @return error or NULL
  */
-tidesdb_err* tidesdb_txn_put(txn* transaction, const unsigned char* key, size_t key_size,
-                             const unsigned char* value, size_t value_size, time_t ttl);
+tidesdb_err* tidesdb_txn_put(txn* transaction, const uint8_t* key, size_t key_size,
+                             const uint8_t* value, size_t value_size, time_t ttl);
 
 /*
  * tidesdb_txn_delete
@@ -342,7 +342,7 @@ tidesdb_err* tidesdb_txn_put(txn* transaction, const unsigned char* key, size_t 
  * @param key_size the size of the key
  * @return error or NULL
  */
-tidesdb_err* tidesdb_txn_delete(txn* transaction, const unsigned char* key, size_t key_size);
+tidesdb_err* tidesdb_txn_delete(txn* transaction, const uint8_t* key, size_t key_size);
 
 /*
  * tidesdb_txn_commit
@@ -466,8 +466,8 @@ const char* _get_path_seperator();
  * @param cf the column family
  * @return whether the operation was appended to the wal
  */
-bool _append_to_wal(tidesdb* tdb, wal* wal, const unsigned char* key, size_t key_size,
-                    const unsigned char* value, size_t value_size, time_t ttl, enum OP_CODE op_code,
+bool _append_to_wal(tidesdb* tdb, wal* wal, const uint8_t* key, size_t key_size,
+                    const uint8_t* value, size_t value_size, time_t ttl, enum OP_CODE op_code,
                     const char* cf);
 
 /*
@@ -546,7 +546,7 @@ void* _flush_memtable_thread(void* arg);
  * @param value_size the size of the value
  * @return whether the value is a tombstone
  */
-bool _is_tombstone(const unsigned char* value, size_t value_size);
+bool _is_tombstone(const uint8_t* value, size_t value_size);
 
 /*
  * _load_sstables
@@ -593,5 +593,30 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf);
  * @param tdb the TidesDB instance
  */
 void _free_column_families(tidesdb* tdb);
+
+/*
+ * _free_key_value_pair
+ * free the memory for a key-value pair
+ * @param kv the key-value pair
+ */
+void _free_key_value_pair(key_value_pair* kv);
+
+/*
+ * _free_operation
+ * free the memory for an operation
+ * @param op the operation
+ */
+void _free_operation(operation* op);
+
+/*
+ * _compare_keys
+ * compare two keys
+ * @param key1 the first key
+ * @param key1_size the size of the first key
+ * @param key2 the second key
+ * @param key2_size the size of the second key
+ * @return the comparison
+ */
+int _compare_keys(const uint8_t* key1, size_t key1_size, const uint8_t* key2, size_t key2_size);
 
 #endif /* TIDESDB_H */

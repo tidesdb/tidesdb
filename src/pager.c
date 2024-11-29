@@ -482,6 +482,18 @@ bool pager_size(pager* p, size_t* size)
     return true;
 }
 
+void sleep_ms(int milliseconds)
+{
+#ifdef _WIN32
+    Sleep(milliseconds);
+#else
+    struct timespec ts;
+    ts.tv_sec = milliseconds / 1000;
+    ts.tv_nsec = (milliseconds % 1000) * 1000000;
+    nanosleep(&ts, NULL);
+#endif
+}
+
 void* pager_sync_thread(void* arg)
 {
     pager* p = arg;

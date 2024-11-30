@@ -22,7 +22,7 @@
 #include "test_macros.h"
 #include "test_utils.h"
 
-#define TEST_DIR "testdb"
+#define TEST_DIR           "testdb"
 #define TEST_COLUMN_FAMILY "cf"
 
 void test_open_close()
@@ -717,7 +717,6 @@ void test_txn_put_delete_get()
     e = tidesdb_txn_free(transaction);
 
     assert(e == NULL);
-
     tidesdb_err_free(e);
 
     /* get the key-value pairs */
@@ -951,7 +950,7 @@ void test_put_compact_get()
 
     free(tdb_config);
 
-    printf(GREEN "test_put_compact passed\n" RESET);
+    printf(GREEN "test_put_compact_get passed\n" RESET);
 }
 
 void test_put_compact_reopen_get()
@@ -1218,11 +1217,11 @@ int main(void)
     test_put_flush_get();
     test_put_reopen_get();
     test_put_get_delete();
-    test_txn_put_delete_get();
     test_concurrent_put_get();
     test_put_compact();
     test_put_compact_get();
     test_put_compact_reopen_get();
+    test_txn_put_delete_get();
 
     return 0;
 }

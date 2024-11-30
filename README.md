@@ -269,12 +269,12 @@ if (e != NULL)
     /* handle error */
     tidesdb_err_free(e);
 }
+```
 
 ## Errors
 > [!CAUTION]
 > Errors are not finalized and may change.
 
-```
 | Error Code | Error Message                                                        |
 |------------|----------------------------------------------------------------------|
 | 1000       | Failed to allocate memory for new db                                 |
@@ -344,7 +344,6 @@ if (e != NULL)
 | 1065       | Key has expired.  To be deleted on next compaction                   |
 | 1066       | Key's value cannot be a tombstone                                    |
 | 1067       | Failed to allocate memory for wal                                    |
-```
 
 ## License
 Multiple

@@ -25,6 +25,222 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Error Handling** majority of functions return an error code.
 - [x] **Easy API** simple and easy to use api.
 
+## Building
+Using cmake to build the shared library.
+```bash
+cmake -S . -B build
+cmake --build build
+cmake --install build
+```
+
+## Usage
+Each database method returns a `tidesdb_err*` which returns an error code and message. If no error, TidesDB returns `NULL`.
+```c
+typedef struct
+{
+    int code;
+    char* message;
+} tidesdb_err;
+```
+
+### Opening a database
+To open a new database you need to create a configuration and then open the database.
+```c
+tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+if (tdb_config == NULL)
+{
+    printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+    return;
+}
+
+tdb_config->db_path = "the_dir_you_want_to_store_the_db"; /* tidesdb will create the directory if not exists */
+tdb_config->compressed_wal = false; /* whether you want WAL(write ahead log) entries to be compressed */
+
+tidesdb tdb = NULL;
+tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+/* close the database */
+e = tidesdb_close(tdb);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+/* free the configuration */
+free(tdb_config);
+```
+
+### Creating a column family
+In order to store data in TidesDB you need a column family.
+You pass
+- the database
+- the name of the column family
+- memtable flush threshold in bytes.  Example below is 128MB.
+- skiplist max level.  Example below is 12.
+- skiplist probability.  Example below is 0.24.
+- whether column family data is compressed
+
+```c
+/* create a column family */
+e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+```
+
+### Dropping a column family
+
+```c
+/* drop a column family */
+e = tidesdb_drop_column_family(tdb, "test_cf");
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+```
+
+### Putting a key-value pair
+You pass
+- the database
+- the column family name
+- the key
+- the key size
+- the value
+- the value size
+- when the key-value pair should expire.  If -1 then it never expires.
+
+```c
+/* put a key-value pair */
+uint8_t key[] = "key";
+uint8_t value[] = "value";
+
+e = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), -1);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+```
+
+### Putting a key-value pair with TTL
+```c
+/* put a key-value pair with TTL */
+uint8_t key[] = "key";
+uint8_t value[] = "value";
+
+time_t ttl = time(NULL) + 10; /* 10 seconds */
+e = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), ttl);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+```
+
+### Getting a key-value pair
+You pass
+- the database
+- the column family name
+- the key
+- the key size
+- a pointer to the value
+- a pointer to the value size
+```c
+size_t value_len = 0;
+uint8_t* value_out = NULL;
+uint8_t key[] = "key";
+
+e = tidesdb_get(tdb, "your_column_family", key, strlen(key), &value_out, &value_len);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+```
+
+### Deleting a key-value pair
+You pass
+- the database
+- the column family name
+- the key
+- the key size
+```c
+uint8_t key[] = "key";
+
+e = tidesdb_delete(tdb, "your_column_family", key, strlen(key));
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+```
+
+### Transactions
+You can perform a series of operations atomically.  This will block other threads from reading or writing to the database until the transaction is committed or rolled back.
+
+You begin a transaction by calling `tidesdb_txn_begin`.
+
+You pass
+- the transaction
+- the column family name
+```c
+txn* transaction;
+e = tidesdb_txn_begin(&transaction, "your_column_family");
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+```
+
+Now we can add operations to the transaction.
+```c
+const uint8_t key[] = "example_key";
+const uint8_t value[] = "example_value";
+e = tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), -1); /* you can pass a ttl, similar to put */
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+/* you can add delete operations as well */
+e = tidesdb_txn_delete(transaction, key, sizeof(key));
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+/* now we commit */
+e = tidesdb_txn_commit(tdb, transaction);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+/* before you free, you can rollback */
+e = tidesdb_txn_rollback(tdb, transaction);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+/* free the transaction */
+tidesdb_txn_free(transaction);
+```
+
 ## Errors
 > [!CAUTION]
 > Errors are not finalized and may change.

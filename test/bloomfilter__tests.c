@@ -27,7 +27,7 @@
 void test_bloomfilter_create()
 {
     /* we create a bloom filter with size 1024 */
-    bloomfilter *bf = bloomfilter_create(1024);
+    bloomfilter_t *bf = bloomfilter_create(1024);
 
     /* we check if the bloom filter was created correctly */
 
@@ -54,7 +54,7 @@ void test_bloomfilter_create()
 void test_bloomfilter_add_check()
 {
     /* we create a bloom filter with size 1024 */
-    bloomfilter *bf = bloomfilter_create(1024);
+    bloomfilter_t *bf = bloomfilter_create(1024);
 
     const uint8_t data1[] = "test1"; /* the entry that will be in bf */
     const uint8_t data2[] = "test2"; /* the entry that will not be in bf */
@@ -63,10 +63,10 @@ void test_bloomfilter_add_check()
     assert(bloomfilter_add(bf, data1, strlen((const char *)data1)) == 0);
 
     /* we check if data1 is in the bloom filter, it should be */
-    assert(bloomfilter_check(bf, data1, strlen((const char *)data1)) == true);
+    assert(bloomfilter_check(bf, data1, strlen((const char *)data1)) == 0);
 
     /* we check if data2 is in the bloom filter, it should not be */
-    assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == false);
+    assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == -1);
 
     /* we destroy the bloom filter */
     bloomfilter_destroy(bf);
@@ -78,7 +78,7 @@ void test_bloomfilter_add_check()
  * we add 16 data entries to a bloom filter with size 8 */
 void test_bloomfilter_is_full()
 {
-    bloomfilter *bf = bloomfilter_create(8); /* Small size for testing */
+    bloomfilter_t *bf = bloomfilter_create(8); /* Small size for testing */
 
     for (int i = 0; i < 16; i++)
     {
@@ -86,7 +86,7 @@ void test_bloomfilter_is_full()
         bloomfilter_add(bf, data, 1);
     }
 
-    assert(bloomfilter_is_full(bf) == true);
+    assert(bloomfilter_is_full(bf) == 0);
 
     bloomfilter_destroy(bf);
 
@@ -95,7 +95,7 @@ void test_bloomfilter_is_full()
 
 void test_bloomfilter_chaining()
 {
-    bloomfilter *bf = bloomfilter_create(8); /* Small size for testing */
+    bloomfilter_t *bf = bloomfilter_create(8); /* Small size for testing */
     const uint8_t data1[] = "test1";
     const uint8_t data2[] = "test2";
 
@@ -107,13 +107,13 @@ void test_bloomfilter_chaining()
 
     assert(bf->next != NULL);
     assert(bloomfilter_add(bf, data2, strlen((const char *)data2)) == 0);
-    assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == true);
+    assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == 0);
 
     /* check if all the data is in the bloom filter */
     for (int i = 0; i < 256; i++)
     {
         uint8_t data[256] = {(uint8_t)i, '\0'};
-        assert(bloomfilter_check(bf, data, 1) == true);
+        assert(bloomfilter_check(bf, data, 1) == 0);
     }
 
     bloomfilter_destroy(bf);

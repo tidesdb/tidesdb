@@ -26,7 +26,7 @@
 /** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/err__tests.c -lzstd **/
 void test_tidesdb_err_new()
 {
-    tidesdb_err* e = tidesdb_err_new(1, "message");
+    tidesdb_err_t* e = tidesdb_err_new(1, "message");
     assert(e != NULL);
     assert(e->code == 1);
     assert(strcmp(e->message, "message") == 0);

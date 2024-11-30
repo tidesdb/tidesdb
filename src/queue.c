@@ -32,10 +32,10 @@ queue *queue_new()
     return q;
 }
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
-queue *queue_new()
+queue_t *queue_new()
 {
     /* allocate memory for the queue */
-    queue *q = malloc(sizeof(queue));
+    queue_t *q = malloc(sizeof(queue_t));
     if (q == NULL) return NULL; /* check if successful */
 
     /* initialize the queue */
@@ -75,10 +75,10 @@ bool queue_enqueue(queue *q, void *data)
     return true;
 }
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
-bool queue_enqueue(queue *q, void *data)
+int queue_enqueue(queue_t *q, void *data)
 {
-    queue_node *new_node = malloc(sizeof(queue_node)); /* allocate memory for the new node */
-    if (new_node == NULL) return false;                /* check if successful */
+    queue_node_t *new_node = malloc(sizeof(queue_node_t)); /* allocate memory for the new node */
+    if (new_node == NULL) return -1;                       /* check if successful */
 
     new_node->data = data; /* set the data */
     new_node->next = NULL; /* set the next node to NULL */
@@ -98,7 +98,7 @@ bool queue_enqueue(queue *q, void *data)
     q->size++;                       /* increment the size */
     pthread_rwlock_unlock(&q->lock); /* unlock the queue */
 
-    return true;
+    return 0;
 }
 #endif
 
@@ -125,7 +125,7 @@ void *queue_dequeue(queue *q)
     return data;
 }
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
-void *queue_dequeue(queue *q)
+void *queue_dequeue(queue_t *q)
 {
     pthread_rwlock_wrlock(&q->lock); /* lock the queue */
     if (q->head == NULL)             /* check if the queue is empty */
@@ -135,7 +135,7 @@ void *queue_dequeue(queue *q)
     }
 
     /* dequeue a node */
-    queue_node *node = q->head;
+    queue_node_t *node = q->head;
     void *data = node->data;
     q->head = q->head->next;
 
@@ -162,7 +162,7 @@ size_t queue_size(queue *q)
     return size;
 }
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
-size_t queue_size(queue *q)
+size_t queue_size(queue_t *q)
 {
     pthread_rwlock_rdlock(&q->lock); /* lock the queue */
     size_t size = q->size;           /* get the size */
@@ -171,7 +171,7 @@ size_t queue_size(queue *q)
 }
 #endif
 
-void free_queue_node(queue_node *node)
+void free_queue_node(queue_node_t *node)
 {
     if (node == NULL) return; /* check if the node is NULL */
 
@@ -200,17 +200,17 @@ void queue_destroy(queue *q)
     q = NULL;                        /* set the queue to NULL */
 }
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
-void queue_destroy(queue *q)
+void queue_destroy(queue_t *q)
 {
     /* lock the queue */
     pthread_rwlock_wrlock(&q->lock);
 
     /* free all the nodes in the queue */
-    queue_node *current = q->head;
+    queue_node_t *current = q->head;
 
     while (current != NULL)
     {
-        queue_node *next = current->next;
+        queue_node_t *next = current->next;
         free_queue_node(current);
         current = next; /* move to the next node */
     }

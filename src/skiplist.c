@@ -18,14 +18,14 @@
  */
 #include "skiplist.h"
 
-skiplist_node *skiplist_create_node(int level, const uint8_t *key, size_t key_size,
-                                    const uint8_t *value, size_t value_size, time_t ttl)
+skiplist_node_t *skiplist_create_node(int level, const uint8_t *key, size_t key_size,
+                                      const uint8_t *value, size_t value_size, time_t ttl)
 {
     /* validate level to prevent overflow */
     if (level <= 0) return NULL;
 
     /* allocate memory for the node, including space for forward pointers */
-    skiplist_node *node = malloc(sizeof(skiplist_node) + level * sizeof(skiplist_node *));
+    skiplist_node_t *node = malloc(sizeof(skiplist_node_t) + level * sizeof(skiplist_node_t *));
     if (node == NULL) return NULL;
 
     /* allocate memory for the key */
@@ -63,9 +63,9 @@ skiplist_node *skiplist_create_node(int level, const uint8_t *key, size_t key_si
     return node;
 }
 
-bool skiplist_check_and_update_ttl(skiplist_node *node)
+int skiplist_check_and_update_ttl(skiplist_node_t *node)
 {
-    if (node == NULL) return false;
+    if (node == NULL) return -1;
 
     if (node->ttl != -1 && node->ttl < time(NULL))
     {
@@ -73,21 +73,21 @@ bool skiplist_check_and_update_ttl(skiplist_node *node)
         free(node->value);
 
         node->value = (uint8_t *)malloc(sizeof(TOMBSTONE));
-        if (node->value == NULL) return false;
+        if (node->value == NULL) return -1;
 
         *(uint32_t *)node->value = TOMBSTONE; /* directly assign the value */
         node->value_size = 4;                 /* size of TOMBSTONE */
-        return true;
+        return 0;
     }
-    return false;
+    return -1;
 }
 
-skiplist *new_skiplist(int max_level, float probability)
+skiplist_t *new_skiplist(int max_level, float probability)
 {
     /* validate max_level and probability */
     if (max_level <= 0 || probability <= 0.0 || probability >= 1.0) return NULL;
 
-    skiplist *list = (skiplist *)malloc(sizeof(skiplist));
+    skiplist_t *list = (skiplist_t *)malloc(sizeof(skiplist_t));
     if (list == NULL) return NULL;
 
     list->level = 1;
@@ -113,7 +113,7 @@ skiplist *new_skiplist(int max_level, float probability)
     return list;
 }
 
-int skiplist_random_level(skiplist *list)
+int skiplist_random_level(skiplist_t *list)
 {
     int level = 1;
     float rand_max_inv = 1.0f / RAND_MAX;
@@ -132,14 +132,14 @@ int skiplist_compare_keys(const uint8_t *key1, size_t key1_size, const uint8_t *
     return (key1_size < key2_size) ? -1 : (key1_size > key2_size) ? 1 : 0;
 }
 
-bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size, const uint8_t *value,
-                  size_t value_size, time_t ttl)
+int skiplist_put(skiplist_t *list, const uint8_t *key, size_t key_size, const uint8_t *value,
+                 size_t value_size, time_t ttl)
 {
-    if (list == NULL || key == NULL || value == NULL) return false;
+    if (list == NULL || key == NULL || value == NULL) return -1;
 
     pthread_rwlock_wrlock(&list->lock); /* lock the list for writing */
-    skiplist_node *update[list->max_level];
-    skiplist_node *x = list->header;
+    skiplist_node_t *update[list->max_level];
+    skiplist_node_t *x = list->header;
     for (int i = list->level - 1; i >= 0; i--)
     {
         while (x->forward[i] && skiplist_compare_keys(x->forward[i]->key, x->forward[i]->key_size,
@@ -163,7 +163,7 @@ bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size, const uin
         if (x->value == NULL)
         {
             pthread_rwlock_unlock(&list->lock); /* unlock sl */
-            return false;
+            return -1;
         }
 
         memcpy(x->value, value, value_size);
@@ -185,7 +185,7 @@ bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size, const uin
         if (x == NULL)
         {
             pthread_rwlock_unlock(&list->lock);
-            return false;
+            return -1;
         }
         for (int i = 0; i < level; i++)
         {
@@ -193,18 +193,20 @@ bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size, const uin
             update[i]->forward[i] = x;
         }
 
-        list->total_size += sizeof(skiplist_node) + level * sizeof(skiplist_node *) + key_size +
+        list->total_size += sizeof(skiplist_node_t) + level * sizeof(skiplist_node_t *) + key_size +
                             value_size; /* add to total size */
     }
     pthread_rwlock_unlock(&list->lock);
-    return true;
+    return 0;
 }
 
-bool skiplist_delete(skiplist *list, const uint8_t *key, size_t key_size)
+int skiplist_delete(skiplist_t *list, const uint8_t *key, size_t key_size)
 {
+    if (list == NULL || key == NULL) return -1;
+
     pthread_rwlock_wrlock(&list->lock);
-    skiplist_node *update[list->max_level];
-    skiplist_node *x = list->header;
+    skiplist_node_t *update[list->max_level];
+    skiplist_node_t *x = list->header;
 
     for (int i = list->level - 1; i >= 0; i--)
     {
@@ -224,7 +226,7 @@ bool skiplist_delete(skiplist *list, const uint8_t *key, size_t key_size)
     if (!x || skiplist_compare_keys(x->key, x->key_size, key, key_size) != 0)
     {
         pthread_rwlock_unlock(&list->lock);
-        return false;
+        return -1;
     }
     for (int i = 0; i < list->level; i++)
     {
@@ -233,24 +235,24 @@ bool skiplist_delete(skiplist *list, const uint8_t *key, size_t key_size)
         update[i]->forward[i] = x->forward[i];
     }
 
-    list->total_size -= sizeof(skiplist_node) + x->key_size + x->value_size +
-                        list->level * sizeof(skiplist_node *); /* sub node size */
+    list->total_size -= sizeof(skiplist_node_t) + x->key_size + x->value_size +
+                        list->level * sizeof(skiplist_node_t *); /* sub node size */
     free(x->key);
     free(x->value);
     free(x);
     while (list->level > 1 && list->header->forward[list->level - 1] == NULL) list->level--;
 
     pthread_rwlock_unlock(&list->lock);
-    return true;
+    return 0;
 }
 
-bool skiplist_get(skiplist *list, const uint8_t *key, size_t key_size, uint8_t **value,
-                  size_t *value_size)
+int skiplist_get(skiplist_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
+                 size_t *value_size)
 {
-    if (list == NULL || key == NULL || value == NULL || value_size == NULL) return false;
+    if (list == NULL || key == NULL || value == NULL || value_size == NULL) return -1;
 
     pthread_rwlock_rdlock(&list->lock);
-    skiplist_node *x = list->header;
+    skiplist_node_t *x = list->header;
 
     for (int i = list->level - 1; i >= 0; i--)
     {
@@ -267,15 +269,12 @@ bool skiplist_get(skiplist *list, const uint8_t *key, size_t key_size, uint8_t *
 
     if (x && skiplist_compare_keys(x->key, x->key_size, key, key_size) == 0)
     {
-        /* *value = x->value; */
-        /* *value_size = x->value_size; */
-
         /* copy the value */
         *value = malloc(x->value_size);
         if (*value == NULL)
         {
             pthread_rwlock_unlock(&list->lock);
-            return false;
+            return -1;
         }
 
         /* copy the value size */
@@ -285,18 +284,18 @@ bool skiplist_get(skiplist *list, const uint8_t *key, size_t key_size, uint8_t *
         memcpy(*value, x->value, x->value_size);
 
         pthread_rwlock_unlock(&list->lock);
-        return true;
+        return 0;
     }
 
     pthread_rwlock_unlock(&list->lock);
-    return false;
+    return -1;
 }
 
-skiplist_cursor *skiplist_cursor_init(skiplist *list)
+skiplist_cursor_t *skiplist_cursor_init(skiplist_t *list)
 {
     if (list == NULL || list->header == NULL) return NULL;
 
-    skiplist_cursor *cursor = malloc(sizeof(skiplist_cursor));
+    skiplist_cursor_t *cursor = malloc(sizeof(skiplist_cursor_t));
     if (cursor == NULL) return NULL;
 
     cursor->list = list;
@@ -304,9 +303,9 @@ skiplist_cursor *skiplist_cursor_init(skiplist *list)
     return cursor;
 }
 
-bool skiplist_cursor_next(skiplist_cursor *cursor)
+int skiplist_cursor_next(skiplist_cursor_t *cursor)
 {
-    if (cursor == NULL || cursor->list == NULL) return false;
+    if (cursor == NULL || cursor->list == NULL) return -1;
 
     pthread_rwlock_rdlock(&cursor->list->lock); /* lock the list for reading */
     if (cursor->current != NULL && cursor->current->forward[0] != NULL)
@@ -314,20 +313,20 @@ bool skiplist_cursor_next(skiplist_cursor *cursor)
         cursor->current = cursor->current->forward[0];
         skiplist_check_and_update_ttl(cursor->current);
         pthread_rwlock_unlock(&cursor->list->lock); /* unlock the list */
-        return true;
+        return 0;
     }
 
     pthread_rwlock_unlock(&cursor->list->lock); /* unlock the list */
-    return false;
+    return -1;
 }
 
-bool skiplist_cursor_prev(skiplist_cursor *cursor)
+int skiplist_cursor_prev(skiplist_cursor_t *cursor)
 {
-    if (cursor == NULL || cursor->list == NULL || cursor->current == NULL) return false;
+    if (cursor == NULL || cursor->list == NULL || cursor->current == NULL) return -1;
 
     pthread_rwlock_rdlock(&cursor->list->lock); /* lock the list for reading */
-    skiplist_node *x = cursor->list->header;
-    skiplist_node *prev = NULL;
+    skiplist_node_t *x = cursor->list->header;
+    skiplist_node_t *prev = NULL;
 
     while (x->forward[0] && x->forward[0] != cursor->current)
     {
@@ -341,31 +340,31 @@ bool skiplist_cursor_prev(skiplist_cursor *cursor)
         cursor->current = prev;
         skiplist_check_and_update_ttl(cursor->current);
         pthread_rwlock_unlock(&cursor->list->lock); /* unlock the sl */
-        return true;
+        return 0;
     }
 
     pthread_rwlock_unlock(&cursor->list->lock); /* unlock the sl */
-    return false;
+    return -1;
 }
 
-void skiplist_cursor_free(skiplist_cursor *cursor)
+void skiplist_cursor_free(skiplist_cursor_t *cursor)
 {
     if (cursor != NULL) free(cursor);
 
     cursor = NULL;
 }
 
-int skiplist_clear(skiplist *list)
+int skiplist_clear(skiplist_t *list)
 {
     if (list == NULL || list->header == NULL) return -1;
 
     if (pthread_rwlock_wrlock(&list->lock) != 0) /* lock the sl for writing */
         return -1;
 
-    skiplist_node *current = list->header->forward[0];
+    skiplist_node_t *current = list->header->forward[0];
     while (current != NULL)
     {
-        skiplist_node *next = current->forward[0];
+        skiplist_node_t *next = current->forward[0];
         free(current->key);
         current->key = NULL;
 
@@ -391,7 +390,7 @@ int skiplist_clear(skiplist *list)
     return 0;
 }
 
-int skiplist_destroy(skiplist *list)
+int skiplist_destroy(skiplist_t *list)
 {
     if (list == NULL) return -1;
 
@@ -407,9 +406,9 @@ int skiplist_destroy(skiplist *list)
     return 0;
 }
 
-bool skiplist_destroy_node(skiplist_node *node)
+int skiplist_destroy_node(skiplist_node_t *node)
 {
-    if (node == NULL) return false;
+    if (node == NULL) return -1;
 
     free(node->key);
     node->key = NULL;
@@ -417,22 +416,22 @@ bool skiplist_destroy_node(skiplist_node *node)
     node->value = NULL;
     free(node);
     node = NULL;
-    return true;
+    return 0;
 }
 
-skiplist *skiplist_copy(skiplist *list)
+skiplist_t *skiplist_copy(skiplist_t *list)
 {
     if (list == NULL) return NULL;
 
     /* create a new skiplist with the same max level and probability */
-    skiplist *new_list = new_skiplist(list->max_level, list->probability);
+    skiplist_t *new_list = new_skiplist(list->max_level, list->probability);
     if (new_list == NULL) return NULL;
 
     /* lock the original skiplist for reading */
     pthread_rwlock_rdlock(&list->lock);
 
     /* iterate through the original skiplist and copy each node */
-    skiplist_node *current = list->header->forward[0];
+    skiplist_node_t *current = list->header->forward[0];
     while (current != NULL)
     {
         skiplist_put(new_list, current->key, current->key_size, current->value, current->value_size,

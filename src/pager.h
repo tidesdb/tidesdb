@@ -23,8 +23,8 @@
 #define PAGE_BODY     1024 /* The page body is used to store the actual data */
 #define PAGE_SIZE     (PAGE_HEADER + PAGE_BODY) /* The page size is the sum of the header and body */
 #define SYNC_INTERVAL 24576                     /* Sync every 24576 writes */
-#define SYNC_ESCALATION                                                       \
-    0.128 /* We sync when we hit sync escalation or when we hit sync interval \
+#define SYNC_ESCALATION                                                               \
+    0.128 /* We sync when we hit sync escalation (128ms) or when we hit sync interval \
            */
 
 #include <errno.h>
@@ -40,7 +40,7 @@
 /* @TODO windows support */
 
 /*
- * pager
+ * pager_t
  * the pager struct is used to manage the file and pages
  * @param file the file the pager is assigned
  * @param filename the filename of the paged file
@@ -66,19 +66,19 @@ typedef struct
     pthread_cond_t sync_cond;     /* condition variable for sync thread */
     size_t write_count;           /* number of writes since last sync */
     bool stop_sync_thread;        /* flag to stop the sync thread */
-} pager;
+} pager_t;
 
 /*
- * pager_cursor
+ * pager_cursor_t
  * the cursor struct is used to navigate the pages of the file
  * @param pager the pager the cursor is assigned
  * @param page_number the page number the cursor is currently on
  */
 typedef struct
 {
-    pager* pager;             /* the pager the cursor is assigned */
+    pager_t* pager;           /* the pager the cursor is assigned */
     unsigned int page_number; /* the page number the cursor is currently on */
-} pager_cursor;
+} pager_cursor_t;
 
 /* Pager function prototypes */
 
@@ -87,17 +87,17 @@ typedef struct
  * opens new pager with the given filename
  * will reopen the file if it already exists
  * @param filename the filename of the file to open
- * @return bool true if the pager was opened successfully, false otherwise
+ * @return 0 if the pager was opened successfully, -1 otherwise
  */
-bool pager_open(const char* filename, pager** p);
+int pager_open(const char* filename, pager_t** p);
 
 /*
  * pager_close
  * closes the pager and frees the memory
  * @param p the pager to close
- * @return bool true if the pager was closed successfully, false otherwise
+ * @return 0 if the pager was closed successfully, -1 otherwise
  */
-bool pager_close(pager* p);
+int pager_close(pager_t* p);
 
 /*
  * pager_write
@@ -107,9 +107,9 @@ bool pager_close(pager* p);
  * @param data the data to write
  * @param data_len the length of the data
  * @param init_page_number the page number of the page written
- * @return bool true if the write was successful, false otherwise
+ * @return 0 if the write was successful, -1 otherwise
  */
-bool pager_write(pager* p, uint8_t* data, size_t data_len, unsigned int* init_page_number);
+int pager_write(pager_t* p, uint8_t* data, size_t data_len, unsigned int* init_page_number);
 
 /*
  * pager_read
@@ -118,43 +118,43 @@ bool pager_write(pager* p, uint8_t* data, size_t data_len, unsigned int* init_pa
  * @param start_page_number the page number to start reading from
  * @param buffer the buffer to read into
  * @param buffer_len the length of the buffer
- * @return bool true if the read was successful, false otherwise
+ * @return 0 if the read was successful, -1 otherwise
  */
-bool pager_read(pager* p, unsigned int start_page_number, uint8_t** buffer, size_t* buffer_len);
+int pager_read(pager_t* p, unsigned int start_page_number, uint8_t** buffer, size_t* buffer_len);
 
 /*
  * pager_cursor_init
  * initializes a new cursor for the pager
  * @param p the pager to create the cursor for
  * @param cursor the cursor to initialize
- * @return bool true if the cursor was initialized successfully, false otherwise
+ * @return 0 if the cursor was initialized successfully, -1 otherwise
  */
-bool pager_cursor_init(pager* p, pager_cursor** cursor);
+int pager_cursor_init(pager_t* p, pager_cursor_t** cursor);
 
 /*
  * pager_cursor_next
  * moves the cursor to the next page
  * @param cursor the cursor to move
- * @return bool true if the cursor was moved successfully, false otherwise
+ * @return 0 if the cursor was moved successfully, -1 otherwise
  */
-bool pager_cursor_next(pager_cursor* cursor);
+int pager_cursor_next(pager_cursor_t* cursor);
 
 /*
  * pager_cursor_prev
  * moves the cursor to the previous page
  * @param cursor the cursor to move
- * @return bool true if the cursor was moved successfully, false otherwise
+ * @return 0 if the cursor was moved successfully, -1 otherwise
  */
-bool pager_cursor_prev(pager_cursor* cursor);
+int pager_cursor_prev(pager_cursor_t* cursor);
 
 /*
  * pager_cursor_get
  * gets the current page number the cursor is on
  * @param cursor the cursor to get the page number from
  * @param page_number the page number the cursor is on
- * @return bool true if the page number was retrieved successfully, false otherwise
+ * @return 0 if the page number was retrieved successfully, -1 otherwise
  */
-bool pager_cursor_get(pager_cursor* cursor, unsigned int* page_number);
+int pager_cursor_get(pager_cursor_t* cursor, unsigned int* page_number);
 
 /*
  * get_last_modified
@@ -169,7 +169,7 @@ time_t get_last_modified(const char* filename);
  * frees the memory for the cursor
  * @param cursor the cursor to free
  */
-void pager_cursor_free(pager_cursor* cursor);
+void pager_cursor_free(pager_cursor_t* cursor);
 
 /*
  * pager_sync_thread
@@ -183,27 +183,27 @@ void* pager_sync_thread(void* arg);
  * truncates the file to the given size
  * @param p the pager to truncate
  * @param size the size to truncate the file to
- * @return bool true if the file was truncated successfully, false otherwise
+ * @return 0 if the file was truncated successfully, -1 otherwise
  */
-bool pager_truncate(pager* p, size_t size);
+int pager_truncate(pager_t* p, size_t size);
 
 /*
  * pager_pages_count
  * returns the number of pages in the file
  * @param p the pager to get the number of pages from
  * @param num_pages the number of pages in the file
- * @return bool true if the number of pages was retrieved successfully, false otherwise
+ * @return 0 if the number of pages was retrieved successfully, -1 otherwise
  */
-bool pager_pages_count(pager* p, size_t* num_pages);
+int pager_pages_count(pager_t* p, size_t* num_pages);
 
 /*
  * pager_size
  * returns the size of the file
  * @param p the pager to get the size from
  * @param size the size of the file
- * @return bool true if the size was retrieved successfully, false otherwise
+ * @return 0 if the size was retrieved successfully, -1 otherwise
  */
-bool pager_size(pager* p, size_t* size);
+int pager_size(pager_t* p, size_t* size);
 
 /*
  * sleep_ms

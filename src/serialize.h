@@ -31,10 +31,10 @@
  * @param buffer the buffer to write the serialized data to
  * @param encoded_size the size of the encoded data
  * @param compress whether to compress the data
- * @return whether the operation was successful
+ * @return 0 if the operation was successful, -1 otherwise
  */
-bool serialize_key_value_pair(const key_value_pair* kvp, uint8_t** buffer, size_t* encoded_size,
-                              bool compress);
+int serialize_key_value_pair(const key_value_pair_t* kvp, uint8_t** buffer, size_t* encoded_size,
+                             bool compress);
 
 /*
  * deserialize_key_value_pair
@@ -43,10 +43,10 @@ bool serialize_key_value_pair(const key_value_pair* kvp, uint8_t** buffer, size_
  * @param buffer_size the size of the buffer
  * @param kvp the key value pair to deserialize
  * @param decompress whether to decompress the data
- * @return whether the operation was successful
+ * @return 0 if the operation was successful, -1 otherwise
  */
-bool deserialize_key_value_pair(const uint8_t* buffer, size_t buffer_size, key_value_pair** kvp,
-                                bool decompress);
+int deserialize_key_value_pair(const uint8_t* buffer, size_t buffer_size, key_value_pair_t** kvp,
+                               bool decompress);
 
 /*
  * serialize_operation
@@ -55,10 +55,10 @@ bool deserialize_key_value_pair(const uint8_t* buffer, size_t buffer_size, key_v
  * @param buffer the buffer to write the serialized data to
  * @param encoded_size the size of the encoded data
  * @param compress whether to compress the data
- * @return whether the operation was successful
+ * @return 0 if the operation was successful, -1 otherwise
  */
-bool serialize_operation(const operation* op, uint8_t** buffer, size_t* encoded_size,
-                         bool compress);
+int serialize_operation(const operation_t* op, uint8_t** buffer, size_t* encoded_size,
+                        bool compress);
 
 /*
  * deserialize_operation
@@ -67,10 +67,10 @@ bool serialize_operation(const operation* op, uint8_t** buffer, size_t* encoded_
  * @param buffer_size the size of the buffer
  * @param op the operation to deserialize
  * @param decompress whether to decompress the data
- * @return whether the operation was successful
+ * @return 0 if the operation was successful, -1 otherwise
  */
-bool deserialize_operation(const uint8_t* buffer, size_t buffer_size, operation** op,
-                           bool decompress);
+int deserialize_operation(const uint8_t* buffer, size_t buffer_size, operation_t** op,
+                          bool decompress);
 
 /*
  * serialize_column_family_config
@@ -78,10 +78,10 @@ bool deserialize_operation(const uint8_t* buffer, size_t buffer_size, operation*
  * @param config the column family config to serialize
  * @param buffer the buffer to write the serialized data to
  * @param encoded_size the size of the encoded data
- * @return whether the operation was successful
+ * @return 0 if the operation was successful, -1 otherwise
  */
-bool serialize_column_family_config(const column_family_config* config, uint8_t** buffer,
-                                    size_t* encoded_size);
+int serialize_column_family_config(const column_family_config_t* config, uint8_t** buffer,
+                                   size_t* encoded_size);
 
 /*
  * deserialize_column_family_config
@@ -89,10 +89,10 @@ bool serialize_column_family_config(const column_family_config* config, uint8_t*
  * @param buffer the buffer to read the serialized data from
  * @param buffer_size the size of the buffer
  * @param config the column family config to deserialize
- * @return whether the operation was successful
+ * @return 0 if the operation was successful, -1 otherwise
  */
-bool deserialize_column_family_config(const uint8_t* buffer, size_t buffer_size,
-                                      column_family_config** config);
+int deserialize_column_family_config(const uint8_t* buffer, size_t buffer_size,
+                                     column_family_config_t** config);
 
 /*
  * serialize_bloomfilter
@@ -101,10 +101,10 @@ bool deserialize_column_family_config(const uint8_t* buffer, size_t buffer_size,
  * @param buffer the buffer to write the serialized data to
  * @param encoded_size the size of the encoded data
  * @param compress whether to compress the data
- * @return whether the operation was successful
+ * @return 0 if the operation was successful, -1 otherwise
  */
-bool serialize_bloomfilter(const bloomfilter* bf, uint8_t** buffer, size_t* encoded_size,
-                           bool compress);
+int serialize_bloomfilter(const bloomfilter_t* bf, uint8_t** buffer, size_t* encoded_size,
+                          bool compress);
 
 /*
  * deserialize_bloomfilter
@@ -113,9 +113,9 @@ bool serialize_bloomfilter(const bloomfilter* bf, uint8_t** buffer, size_t* enco
  * @param buffer_size the size of the buffer
  * @param bf the bloomfilter to deserialize
  * @param decompress whether to decompress the data
- * @return whether the operation was successful
+ * @return 0 if the operation was successful, -1 otherwise
  */
-bool deserialize_bloomfilter(const uint8_t* buffer, size_t buffer_size, bloomfilter** bf,
-                             bool decompress);
+int deserialize_bloomfilter(const uint8_t* buffer, size_t buffer_size, bloomfilter_t** bf,
+                            bool decompress);
 
 #endif /* SERIALIZE_H */

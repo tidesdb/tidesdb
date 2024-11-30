@@ -26,7 +26,7 @@
 
 void test_id_gen_init()
 {
-    id_gen* gen = id_gen_init(12345);
+    id_gen_t* gen = id_gen_init(12345);
     assert(gen != NULL);
     assert(gen->state == 12345);
     id_gen_destroy(gen);
@@ -36,7 +36,7 @@ void test_id_gen_init()
 
 void test_id_gen_new()
 {
-    id_gen* gen = id_gen_init(12345);
+    id_gen_t* gen = id_gen_init(12345);
     uint64_t id1 = id_gen_new(gen);
     uint64_t id2 = id_gen_new(gen);
     assert(id1 != id2);
@@ -48,18 +48,18 @@ void test_id_gen_new()
 /* helper */
 void* generate_ids(void* arg)
 {
-    id_gen* gen = arg;
+    id_gen_t* gen = arg;
     for (int i = 0; i < 10; ++i)
     {
         uint64_t id = id_gen_new(gen);
-        printf("Generated ID: %lu\n", id);
+        printf(BOLDYELLOW "Generated ID: %lu\n" RESET, id);
     }
     return NULL;
 }
 
 void test_id_gen_thread_safety()
 {
-    id_gen* gen = id_gen_init(12345);
+    id_gen_t* gen = id_gen_init(12345);
     pthread_t threads[4];
 
     for (int i = 0; i < 4; ++i)

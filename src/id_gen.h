@@ -31,9 +31,9 @@
 
 #define M ((uint64_t)9223372036854775808ULL) /* 2^63 */
 #define A ((uint64_t)6364136223846793005ULL)
-#define C ((uint64_t)1)
+#define C ((uint64_t)1ULL)
 
-/* id_gen
+/* id_gen_t
  * generates unique ids
  * @param state the state of the id generator
  * @param lock the lock for the id generator
@@ -49,7 +49,7 @@ typedef struct
 {
     uint64_t state;
     pthread_mutex_t lock;
-} id_gen;
+} id_gen_t;
 #endif
 
 /* id_gen_init
@@ -57,19 +57,19 @@ typedef struct
  * @param seed the seed for the id generator
  * @return the new id generator
  */
-id_gen* id_gen_init(uint64_t seed);
+id_gen_t* id_gen_init(uint64_t seed);
 
 /* id_gen_new
  * generates a new id
  * @param gen the id generator
  * @return the new id
  */
-uint64_t id_gen_new(id_gen* gen);
+uint64_t id_gen_new(id_gen_t* gen);
 
 /* id_gen_destroy
  * destroys the id generator
  * @param gen the id generator
  */
-void id_gen_destroy(id_gen* gen);
+void id_gen_destroy(id_gen_t* gen);
 
 #endif /* ID_GEN_H */

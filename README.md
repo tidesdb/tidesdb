@@ -14,7 +14,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist uses an RW lock which means multiple readers and one true writer.  SSTables are sorted, immutable and can be read concurrently they are protected via page locks.
 - [x] **Column Families** store data in separate key-value stores.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically.
-- [x] **Cursor** iterate over key-value pairs forward and backward.
+- [ ] **Cursor** iterate over key-value pairs forward and backward. (in progress)
 - [x] **WAL** write-ahead logging for durability.  As operations are appended they are also truncated at specific points once persisted to an sstable(s).
 - [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
 - [x] **Background flush** memtable flushes are enqueued and then flushed in the background.
@@ -45,13 +45,13 @@ typedef struct
 {
     int code;
     char* message;
-} tidesdb_err;
+} tidesdb_err_t;
 ```
 
 ### Opening a database
 To open a new database you need to create a configuration and then open the database.
 ```c
-tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+tidesdb_config_t* tdb_config = (malloc(sizeof(tidesdb_config_t)));
 if (tdb_config == NULL)
 {
     /* handle error */
@@ -61,8 +61,8 @@ if (tdb_config == NULL)
 tdb_config->db_path = "the_dir_you_want_to_store_the_db"; /* tidesdb will create the directory if not exists */
 tdb_config->compressed_wal = false; /* whether you want WAL(write ahead log) entries to be compressed */
 
-tidesdb tdb = NULL;
-tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+tidesdb_t tdb = NULL;
+tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
 if (e != NULL)
 {
     /* handle error */
@@ -93,7 +93,7 @@ You pass
 
 ```c
 /* create a column family */
-tidesdb_err *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false);
+tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false);
 if (e != NULL)
 {
     /* handle error */
@@ -105,7 +105,7 @@ if (e != NULL)
 
 ```c
 /* drop a column family */
-tidesdb_err *e = tidesdb_drop_column_family(tdb, "test_cf");
+tidesdb_err_t *e = tidesdb_drop_column_family(tdb, "test_cf");
 if (e != NULL)
 {
     /* handle error */
@@ -128,7 +128,7 @@ You pass
 uint8_t key[] = "key";
 uint8_t value[] = "value";
 
-tidesdb_err *e = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), -1);
+tidesdb_err_t *e = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), -1);
 if (e != NULL)
 {
     /* handle error */
@@ -143,7 +143,7 @@ uint8_t key[] = "key";
 uint8_t value[] = "value";
 
 time_t ttl = time(NULL) + 10; /* 10 seconds */
-tidesdb_err *e  = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), ttl);
+tidesdb_err_t *e  = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), ttl);
 if (e != NULL)
 {
     /* handle error */
@@ -164,7 +164,7 @@ size_t value_len = 0;
 uint8_t* value_out = NULL;
 uint8_t key[] = "key";
 
-tidesdb_err *e = tidesdb_get(tdb, "your_column_family", key, strlen(key), &value_out, &value_len);
+tidesdb_err_t *e = tidesdb_get(tdb, "your_column_family", key, strlen(key), &value_out, &value_len);
 if (e != NULL)
 {
     /* handle error */
@@ -181,7 +181,7 @@ You pass
 ```c
 uint8_t key[] = "key";
 
-tidesdb_err *e = tidesdb_delete(tdb, "your_column_family", key, strlen(key));
+tidesdb_err_t *e = tidesdb_delete(tdb, "your_column_family", key, strlen(key));
 if (e != NULL)
 {
     /* handle error */
@@ -198,8 +198,8 @@ You pass
 - the transaction
 - the column family name
 ```c
-txn* transaction;
-tidesdb_err *e = tidesdb_txn_begin(&transaction, "your_column_family");
+tidesdb_txn_t* transaction;
+tidesdb_err_t *e = tidesdb_txn_begin(&transaction, "your_column_family");
 if (e != NULL)
 {
     /* handle error */
@@ -211,7 +211,7 @@ Now we can add operations to the transaction.
 ```c
 const uint8_t key[] = "example_key";
 const uint8_t value[] = "example_value";
-tidesdb_err *e = tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), -1); /* you can pass a ttl, similar to put */
+tidesdb_err_t *e = tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), -1); /* you can pass a ttl, similar to put */
 if (e != NULL)
 {
     /* handle error */
@@ -235,7 +235,7 @@ if (e != NULL)
 }
 
 /* before you free, you can rollback */
-tidesdb_err *e = tidesdb_txn_rollback(tdb, transaction);
+tidesdb_err_t *e = tidesdb_txn_rollback(tdb, transaction);
 if (e != NULL)
 {
     /* handle error */
@@ -249,8 +249,8 @@ tidesdb_txn_free(transaction);
 ### Cursors
 You can iterate over key-value pairs in a column family.
 ```c
-cursor* c;
-tidesdb_err *e = tidesdb_cursor_init(tdb, "your_column_family", &c);
+tidesdb_cursor_t* c;
+tidesdb_err_t *e = tidesdb_cursor_init(tdb, "your_column_family", &c);
 if (e != NULL)
 {
     /* handle error */
@@ -263,7 +263,7 @@ if (e != NULL)
 ### Compaction
 You can manually compact sstables.
 ```c
-tidesdb_err *e = tidesdb_compact_sstables(tdb, "your_column_family", 10); /* use 10 threads */
+tidesdb_err_t *e = tidesdb_compact_sstables(tdb, "your_column_family", 10); /* use 10 threads */
 if (e != NULL)
 {
     /* handle error */

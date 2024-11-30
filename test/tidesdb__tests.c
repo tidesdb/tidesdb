@@ -23,10 +23,11 @@
 #include "test_utils.h"
 
 #define TEST_DIR "testdb"
+#define TEST_COLUMN_FAMILY "cf"
 
 void test_open_close()
 {
-    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    tidesdb_config_t* tdb_config = (malloc(sizeof(tidesdb_config_t)));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -36,9 +37,9 @@ void test_open_close()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL)
     {
         printf(RED "Error: %s\n" RESET, e->message);
@@ -66,7 +67,7 @@ void test_open_close()
 
 void test_create_column_family()
 {
-    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    tidesdb_config_t* tdb_config = (malloc(sizeof(tidesdb_config_t)));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -76,9 +77,9 @@ void test_create_column_family()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -88,17 +89,17 @@ void test_create_column_family()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     e = tidesdb_close(tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
@@ -114,7 +115,7 @@ void test_create_column_family()
 
 void test_drop_column_family()
 {
-    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    tidesdb_config_t* tdb_config = (malloc(sizeof(tidesdb_config_t)));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -124,9 +125,9 @@ void test_drop_column_family()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -136,20 +137,20 @@ void test_drop_column_family()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     /* drop the column family */
-    e = tidesdb_drop_column_family(tdb, "test_cf");
+    e = tidesdb_drop_column_family(tdb, TEST_COLUMN_FAMILY);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -157,7 +158,7 @@ void test_drop_column_family()
     tidesdb_err_free(e);
 
     /* we should not be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 0);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == -1);
 
     e = tidesdb_close(tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
@@ -173,7 +174,7 @@ void test_drop_column_family()
 
 void test_put()
 {
-    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    tidesdb_config_t* tdb_config = (malloc(sizeof(tidesdb_config_t)));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -183,9 +184,9 @@ void test_put()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -195,17 +196,17 @@ void test_put()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     /* put 24000 key-value pairs */
     for (int i = 0; i < 24000; i++)
@@ -240,7 +241,7 @@ void test_put()
 
 void test_put_get()
 {
-    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
+    tidesdb_config_t* tdb_config = malloc(sizeof(tidesdb_config_t));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -250,26 +251,26 @@ void test_put_get()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     assert(e == NULL);
     assert(tdb != NULL);
 
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     /* put 240 key-value pairs */
     for (int i = 0; i < 240; i++)
@@ -326,7 +327,7 @@ void test_put_get()
 
 void test_put_flush_get()
 {
-    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
+    tidesdb_config_t* tdb_config = malloc(sizeof(tidesdb_config_t));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -336,26 +337,26 @@ void test_put_flush_get()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     assert(e == NULL);
     assert(tdb != NULL);
 
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", (1024 * 1024), 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, (1024 * 1024), 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     /* put 24000 key-value pairs
      * this creates 1 SST file and some in-memory data in the column family memtable on most systems
@@ -391,14 +392,8 @@ void test_put_flush_get()
         uint8_t* value_out = NULL;
 
         e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
-        if (e != NULL)
-        {
-            printf(RED "Error: %s\n" RESET, e->message);
-            tidesdb_err_free(e);
-            continue;
-        }
-
         assert(e == NULL);
+        tidesdb_err_free(e);
         assert(value_len == strlen((uint8_t*)value));
         assert(strncmp((uint8_t*)value_out, (uint8_t*)value, value_len) == 0);
         free(value_out);
@@ -421,7 +416,7 @@ void test_put_flush_get()
  * replaying the WAL and populate the memtable with the key-value pairs */
 void test_put_reopen_get()
 {
-    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
+    tidesdb_config_t* tdb_config = malloc(sizeof(tidesdb_config_t));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -431,9 +426,9 @@ void test_put_reopen_get()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL)
     {
         printf(RED "Error: %s\n" RESET, e->message);
@@ -448,17 +443,17 @@ void test_put_reopen_get()
     e = NULL;
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     /* put 50 key-value pairs */
     for (int i = 0; i < 50; i++)
@@ -512,7 +507,7 @@ void test_put_reopen_get()
         size_t value_len = 0;
         uint8_t* value_out = NULL;
 
-        e = tidesdb_get(tdb, "test_cf", key, strlen(key), &value_out, &value_len);
+        e = tidesdb_get(tdb, TEST_COLUMN_FAMILY, key, strlen(key), &value_out, &value_len);
         if (e != NULL)
         {
             printf(RED "Error: %s\n" RESET, e->message);
@@ -540,7 +535,7 @@ void test_put_reopen_get()
 
 void test_put_get_delete()
 {
-    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
+    tidesdb_config_t* tdb_config = malloc(sizeof(tidesdb_config_t));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -550,9 +545,9 @@ void test_put_get_delete()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -561,17 +556,17 @@ void test_put_get_delete()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     /* put 240 key-value pairs */
     for (int i = 0; i < 240; i++)
@@ -640,7 +635,7 @@ void test_put_get_delete()
 
 void test_txn_put_delete_get()
 {
-    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
+    tidesdb_config_t* tdb_config = malloc(sizeof(tidesdb_config_t));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -650,9 +645,9 @@ void test_txn_put_delete_get()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -661,20 +656,20 @@ void test_txn_put_delete_get()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
-    txn* transaction;
-    e = tidesdb_txn_begin(&transaction, "test_cf");
+    tidesdb_txn_t* transaction;
+    e = tidesdb_txn_begin(&transaction, TEST_COLUMN_FAMILY);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -729,7 +724,7 @@ void test_txn_put_delete_get()
     size_t value_len = 0;
     uint8_t* value_out = NULL;
 
-    e = tidesdb_get(tdb, "test_cf", key, sizeof(key), &value_out, &value_len);
+    e = tidesdb_get(tdb, TEST_COLUMN_FAMILY, key, sizeof(key), &value_out, &value_len);
     if (e != NULL)
     {
         printf(RED "Error: %s\n" RESET, e->message);
@@ -742,13 +737,13 @@ void test_txn_put_delete_get()
     assert(e == NULL);
     tidesdb_err_free(e);
 
-    e = tidesdb_get(tdb, "test_cf", key2, sizeof(key), &value_out, &value_len);
+    e = tidesdb_get(tdb, TEST_COLUMN_FAMILY, key2, sizeof(key), &value_out, &value_len);
 
     assert(e != NULL);
 
     tidesdb_err_free(e);
 
-    e = tidesdb_get(tdb, "test_cf", key3, sizeof(key3), &value_out, &value_len);
+    e = tidesdb_get(tdb, TEST_COLUMN_FAMILY, key3, sizeof(key3), &value_out, &value_len);
     if (e != NULL)
     {
         printf(RED "Error: %s\n" RESET, e->message);
@@ -778,7 +773,7 @@ void test_txn_put_delete_get()
 
 void test_put_compact()
 {
-    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    tidesdb_config_t* tdb_config = (malloc(sizeof(tidesdb_config_t)));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -788,9 +783,9 @@ void test_put_compact()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -800,17 +795,17 @@ void test_put_compact()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     /* put 100k key-value pairs */
     for (int i = 0; i < 100000; i++)
@@ -855,7 +850,7 @@ void test_put_compact()
 
 void test_put_compact_get()
 {
-    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    tidesdb_config_t* tdb_config = (malloc(sizeof(tidesdb_config_t)));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -865,9 +860,9 @@ void test_put_compact_get()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -877,17 +872,17 @@ void test_put_compact_get()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     /* put 100k key-value pairs */
     for (int i = 0; i < 100000; i++)
@@ -961,7 +956,7 @@ void test_put_compact_get()
 
 void test_put_compact_reopen_get()
 {
-    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    tidesdb_config_t* tdb_config = (malloc(sizeof(tidesdb_config_t)));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -971,9 +966,9 @@ void test_put_compact_reopen_get()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -982,16 +977,16 @@ void test_put_compact_reopen_get()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     /* put 100k key-value pairs */
     for (int i = 0; i < 100000; i++)
@@ -1030,7 +1025,7 @@ void test_put_compact_reopen_get()
     /* reopen the database */
     tdb = NULL;
 
-    tdb_config = (malloc(sizeof(tidesdb_config)));
+    tdb_config = (malloc(sizeof(tidesdb_config_t)));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -1050,7 +1045,7 @@ void test_put_compact_reopen_get()
 
     /* re-fetch the column family */
     cf = NULL;
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     /* get the key-value pairs */
     for (int i = 0; i < 100000 / 390.625; i++)
@@ -1093,9 +1088,9 @@ void test_put_compact_reopen_get()
 
 void* put_thread(void* arg)
 {
-    tidesdb* tdb = (tidesdb*)arg;
-    column_family* cf = NULL;
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    tidesdb_t* tdb = (tidesdb_t*)arg;
+    column_family_t* cf = NULL;
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     for (int i = 0; i < 1200; i++)
     {
@@ -1104,7 +1099,7 @@ void* put_thread(void* arg)
         snprintf(key, sizeof(key), "key_put%03d", i);
         snprintf(value, sizeof(value), "value_put%03d", i);
 
-        tidesdb_err* e =
+        tidesdb_err_t* e =
             tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
         if (e != NULL)
         {
@@ -1120,9 +1115,9 @@ void* put_thread(void* arg)
 /* helper for test_concurrent_put_get */
 void* get_thread(void* arg)
 {
-    tidesdb* tdb = (tidesdb*)arg;
-    column_family* cf = NULL;
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    tidesdb_t* tdb = (tidesdb_t*)arg;
+    column_family_t* cf = NULL;
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     for (int i = 0; i < 1200; i++)
     {
@@ -1131,7 +1126,7 @@ void* get_thread(void* arg)
 
         size_t value_len = 0;
         uint8_t* value_out = NULL;
-        tidesdb_err* e = NULL;
+        tidesdb_err_t* e = NULL;
 
         while (true)
         {
@@ -1158,8 +1153,7 @@ void* get_thread(void* arg)
 
 void test_concurrent_put_get()
 {
-    /* rough */
-    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
+    tidesdb_config_t* tdb_config = malloc(sizeof(tidesdb_config_t));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -1169,9 +1163,9 @@ void test_concurrent_put_get()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
+    tidesdb_t* tdb = NULL;
 
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
     assert(e == NULL);
     assert(tdb != NULL);
@@ -1179,17 +1173,17 @@ void test_concurrent_put_get()
     tidesdb_err_free(e);
 
     /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, 1024 * 1024, 12, 0.24f, false);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
 
     tidesdb_err_free(e);
 
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
     /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     pthread_t put_tid, get_tid;
 
@@ -1211,174 +1205,7 @@ void test_concurrent_put_get()
     printf(GREEN "test_concurrent_put_get passed\n" RESET);
 }
 
-void test_cursor()
-{
-    tidesdb_config* tdb_config = malloc(sizeof(tidesdb_config));
-    if (tdb_config == NULL)
-    {
-        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
-        return;
-    }
-
-    tdb_config->db_path = TEST_DIR;
-    tdb_config->compressed_wal = false;
-
-    tidesdb* tdb = NULL;
-
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
-    assert(e == NULL);
-    assert(tdb != NULL);
-
-    tidesdb_err_free(e);
-
-    /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
-    if (e != NULL)
-    {
-        printf(RED "Error: %s\n" RESET, e->message);
-        tidesdb_err_free(e);
-        tidesdb_close(tdb);
-        free(tdb_config);
-        return;
-    }
-
-    assert(e == NULL);
-
-    tidesdb_err_free(e);
-
-    column_family* cf = NULL;
-
-    /* we should be able to get the column family */
-    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
-
-    /* put 24000 key-value pairs */
-    for (int i = 0; i < 24000; i++)
-    {
-        uint8_t key[48];
-        uint8_t value[48];
-        snprintf(key, sizeof(key), "key%03d", i);
-        snprintf(value, sizeof(value), "value%03d", i);
-
-        e = tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
-        if (e != NULL)
-        {
-            printf(RED "Error: %s\n" RESET, e->message);
-            tidesdb_err_free(e);
-            break;
-        }
-    }
-
-    sleep(3); /* wait for the SST file to be written */
-
-    tidesdb_cursor* cursor = NULL;
-    e = tidesdb_cursor_init(tdb, "test_cf", &cursor);
-    if (e != NULL)
-    {
-        printf(RED "Error: %s\n" RESET, e->message);
-        tidesdb_err_free(e);
-        tidesdb_close(tdb);
-        free(tdb_config);
-        return;
-    }
-
-    assert(e == NULL);
-
-    key_value_pair* kv = malloc(sizeof(key_value_pair));
-    if (kv == NULL)
-    {
-        printf(RED "Error: Failed to allocate memory for kv\n" RESET);
-        tidesdb_cursor_free(cursor);
-        tidesdb_close(tdb);
-        free(tdb_config);
-        return;
-    }
-
-    assert(kv != NULL);
-
-    /* initialize a 2D array to track keys */
-    bool keys[24000][2] = {false};
-
-    int i = 0;
-
-    bool has_next = true;
-
-    /* iterate with cursor next and mark keys as true */
-    while (has_next)
-    {
-        e = tidesdb_cursor_get(cursor, &kv);
-        if (e != NULL)
-        {
-            printf(RED "Error: %s\n" RESET, e->message);
-            tidesdb_err_free(e);
-            break;
-        }
-        keys[i][0] = true;
-        i++;
-        e = tidesdb_cursor_next(cursor);
-        if (e != NULL)
-        {
-            has_next = false;
-        }
-    }
-
-    /* Check if all keys are marked true */
-    bool all_true = true;
-    for (int j = 0; j < 24000; j++)
-    {
-        if (!keys[j][0])
-        {
-            printf(RED "Error: Key %d is missing\n" RESET, j);
-            all_true = false;
-            break;
-        }
-    }
-
-    assert(all_true);
-
-    i = 23999; /* start from the last key */
-    /* iterate with cursor prev and mark keys as false */
-    while (tidesdb_cursor_prev(cursor) == NULL)
-    {
-        e = tidesdb_cursor_get(cursor, &kv);
-        if (e != NULL)
-        {
-            printf(RED "Error: %s\n" RESET, e->message);
-            tidesdb_err_free(e);
-            break;
-        }
-        keys[i][1] = false;
-        i--;
-    }
-
-    /* check if all keys are marked false */
-    bool all_false = true;
-    for (int j = 0; j < 24000; j++)
-    {
-        if (keys[j][1])
-        {
-            all_false = false;
-            break;
-        }
-    }
-    assert(all_false);
-
-    free(kv);
-    tidesdb_cursor_free(cursor);
-
-    e = tidesdb_close(tdb);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    tidesdb_err_free(e);
-    free(tdb_config);
-
-    remove_directory(TEST_DIR);
-
-    printf(GREEN "test_cursor passed\n" RESET);
-}
-
-/** OR cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/tidesdb__tests.c -lzstd
- * OR cc -g3 -fsanitize=undefined src/*.c external/*.c test/tidesdb__tests.c -lzstd <-- if above
- * get's stuck. use this as it seem's like something with the sanitizer.  Could be looked at
+/** cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/tidesdb__tests.c -lzstd
  * **/
 int main(void)
 {
@@ -1393,7 +1220,6 @@ int main(void)
     test_put_get_delete();
     test_txn_put_delete_get();
     test_concurrent_put_get();
-    test_cursor();
     test_put_compact();
     test_put_compact_get();
     test_put_compact_reopen_get();

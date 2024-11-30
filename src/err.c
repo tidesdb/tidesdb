@@ -18,10 +18,10 @@
  */
 #include "err.h"
 
-tidesdb_err* tidesdb_err_new(int code, char* message)
+tidesdb_err_t* tidesdb_err_new(int code, char* message)
 {
     /* we allocate memory for the error struct */
-    tidesdb_err* e = malloc(sizeof(tidesdb_err));
+    tidesdb_err_t* e = malloc(sizeof(tidesdb_err_t));
     if (e == NULL) return NULL;
 
     /* We set the code and message */
@@ -32,7 +32,7 @@ tidesdb_err* tidesdb_err_new(int code, char* message)
     return e;
 }
 
-void tidesdb_err_free(tidesdb_err* e)
+void tidesdb_err_free(tidesdb_err_t* e)
 {
     /* Check if e is NULL */
     if (e == NULL) return;

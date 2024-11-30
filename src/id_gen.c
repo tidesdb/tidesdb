@@ -35,9 +35,9 @@ id_gen* id_gen_init(uint64_t seed)
     return gen;
 }
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
-id_gen* id_gen_init(uint64_t seed)
+id_gen_t* id_gen_init(uint64_t seed)
 {
-    id_gen* gen = malloc(sizeof(id_gen)); /* allocate memory for the id generator */
+    id_gen_t* gen = malloc(sizeof(id_gen_t)); /* allocate memory for the id generator */
     /* check if successful */
     if (gen == NULL)
     {
@@ -70,7 +70,7 @@ uint64_t id_gen_new(id_gen* gen)
     return id;
 }
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
-uint64_t id_gen_new(id_gen* gen)
+uint64_t id_gen_new(id_gen_t* gen)
 {
     uint64_t id; /* the new id */
 
@@ -99,7 +99,7 @@ void id_gen_destroy(id_gen* gen)
     gen = NULL;
 }
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
-void id_gen_destroy(id_gen* gen)
+void id_gen_destroy(id_gen_t* gen)
 {
     /* destroy the lock */
     pthread_mutex_destroy(&gen->lock);

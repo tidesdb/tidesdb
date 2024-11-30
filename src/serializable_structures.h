@@ -25,14 +25,14 @@
  * operation code enum
  * used for operation codes in TidesDB
  */
-enum OP_CODE
+typedef enum
 {
     OP_PUT,   /* a put operation into a column family */
     OP_DELETE /* a delete operation from a column family */
-};
+} OP_CODE;
 
 /*
- * key_value_pair
+ * key_value_pair_t
  * key value pair struct
  * used for key value pairs in TidesDB
  * @param key the key
@@ -48,10 +48,10 @@ typedef struct
     uint8_t *value;      /* value */
     uint32_t value_size; /* size of the value */
     int64_t ttl;         /* time to live of the key value pair */
-} key_value_pair;
+} key_value_pair_t;
 
 /*
- * column_family_config
+ * column_family_config_t
  * column family configuration struct
  * used for column family configuration in TidesDB
  * @param name the name of the column family
@@ -68,10 +68,10 @@ typedef struct
     float probability;       /* probability for the column family memtable */
     bool compressed; /* compressed flag for the column family; whether sstable data is compressed or
                         not */
-} column_family_config;
+} column_family_config_t;
 
 /*
- * operation
+ * operation_t
  * operation struct
  * used for operations in TidesDB
  * @param op_code the operation code
@@ -80,9 +80,9 @@ typedef struct
  */
 typedef struct
 {
-    enum OP_CODE op_code; /* the operation code */
-    key_value_pair *kv;   /* the key-value pair */
+    OP_CODE op_code;      /* the operation code */
+    key_value_pair_t *kv; /* the key-value pair */
     char *column_family;  /* the column family for the operation */
-} operation;
+} operation_t;
 
 #endif /* SERIALIZABLE_STRUCTURES_H */

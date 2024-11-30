@@ -210,8 +210,8 @@ void test_put()
     /* put 24000 key-value pairs */
     for (int i = 0; i < 24000; i++)
     {
-        char key[38];
-        char value[38];
+        uint8_t key[38];
+        uint8_t value[38];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
@@ -274,8 +274,8 @@ void test_put_get()
     /* put 240 key-value pairs */
     for (int i = 0; i < 240; i++)
     {
-        char key[48];
-        char value[48];
+        uint8_t key[48];
+        uint8_t value[48];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
@@ -307,8 +307,8 @@ void test_put_get()
         }
 
         assert(e == NULL);
-        assert(value_len == strlen((char*)value));
-        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+        assert(value_len == strlen((uint8_t*)value));
+        assert(strncmp((uint8_t*)value_out, (uint8_t*)value, value_len) == 0);
         free(value_out);
     }
 
@@ -362,8 +362,8 @@ void test_put_flush_get()
      */
     for (int i = 0; i < 24000; i++)
     {
-        char key[48];
-        char value[48];
+        uint8_t key[48];
+        uint8_t value[48];
         snprintf(key, sizeof(key), "key%03d", i);
         snprintf(value, sizeof(value), "value%03d", i);
 
@@ -399,8 +399,8 @@ void test_put_flush_get()
         }
 
         assert(e == NULL);
-        assert(value_len == strlen((char*)value));
-        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+        assert(value_len == strlen((uint8_t*)value));
+        assert(strncmp((uint8_t*)value_out, (uint8_t*)value, value_len) == 0);
         free(value_out);
     }
 
@@ -463,8 +463,8 @@ void test_put_reopen_get()
     /* put 50 key-value pairs */
     for (int i = 0; i < 50; i++)
     {
-        char key[48];
-        char value[48];
+        uint8_t key[48];
+        uint8_t value[48];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
@@ -521,8 +521,8 @@ void test_put_reopen_get()
         }
 
         assert(e == NULL);
-        assert(value_len == strlen((char*)value));
-        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+        assert(value_len == strlen((uint8_t*)value));
+        assert(strncmp((uint8_t*)value_out, (uint8_t*)value, value_len) == 0);
         free(value_out);
     }
 
@@ -815,8 +815,8 @@ void test_put_compact()
     /* put 100k key-value pairs */
     for (int i = 0; i < 100000; i++)
     {
-        char key[38];
-        char value[38];
+        uint8_t key[38];
+        uint8_t value[38];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
@@ -892,8 +892,112 @@ void test_put_compact_get()
     /* put 100k key-value pairs */
     for (int i = 0; i < 100000; i++)
     {
-        char key[38];
-        char value[38];
+        uint8_t key[38];
+        uint8_t value[38];
+        snprintf(key, sizeof(key), "key%d", i);
+        snprintf(value, sizeof(value), "value%d", i);
+
+        e = tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            break;
+        }
+
+        assert(e == NULL);
+    }
+
+    sleep(5); /* wait for the SST files to be written */
+
+    /* we compact */
+    e = tidesdb_compact_sstables(tdb, cf, 4);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    /* get the key-value pairs */
+    for (int i = 0; i < 100000 / 390.625; i++)
+    {
+        uint8_t key[38];
+        uint8_t value[38];
+        snprintf(key, sizeof(key), "key%d", i);
+        snprintf(value, sizeof(value), "value%d", i);
+
+        size_t value_len = 0;
+        uint8_t* value_out = NULL;
+
+        e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            continue;
+        }
+
+        assert(e == NULL);
+
+        assert(value_len == strlen((uint8_t*)value));
+        assert(strncmp((uint8_t*)value_out, (uint8_t*)value, value_len) == 0);
+
+        free(value_out); /* free the value_out pointer */
+        value_out = NULL;
+        value_len = 0;
+    }
+
+    e = tidesdb_close(tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    tidesdb_err_free(e);
+
+    remove_directory(TEST_DIR);
+
+    free(tdb_config);
+
+    printf(GREEN "test_put_compact passed\n" RESET);
+}
+
+void test_put_compact_reopen_get()
+{
+    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
+
+    tdb_config->db_path = TEST_DIR;
+    tdb_config->compressed_wal = false;
+
+    tidesdb* tdb = NULL;
+
+    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+    assert(tdb != NULL);
+
+    tidesdb_err_free(e);
+
+    /* create a column family */
+    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+    tidesdb_err_free(e);
+
+    column_family* cf = NULL;
+
+    /* we should be able to get the column family */
+    assert(_get_column_family(tdb, "test_cf", &cf) == 1);
+
+    /* put 100k key-value pairs */
+    for (int i = 0; i < 100000; i++)
+    {
+        uint8_t key[38];
+        uint8_t value[38];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
@@ -915,53 +1019,18 @@ void test_put_compact_get()
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
-
     tidesdb_err_free(e);
-
-    /* get the key-value pairs */
-    for (int i = 0; i < 100000 / 4; i++)
-    {
-        unsigned char key[38];
-        unsigned char value[38];
-        snprintf(key, sizeof(key), "key%d", i);
-        snprintf(value, sizeof(value), "value%d", i);
-
-        size_t value_len = 0;
-        unsigned char* value_out = NULL;
-
-        e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
-        if (e != NULL)
-        {
-            printf(RED "Error: %s\n" RESET, e->message);
-            tidesdb_err_free(e);
-            continue;
-        }
-
-        assert(e == NULL);
-
-        assert(value_len == strlen((char*)value));
-        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
-
-        free(value_out); /* free the value_out pointer */
-        value_out = NULL;
-        value_len = 0;
-    }
 
     e = tidesdb_close(tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     tidesdb_err_free(e);
-
-    remove_directory(TEST_DIR);
-
     free(tdb_config);
 
-    printf(GREEN "test_put_compact passed\n" RESET);
-}
+    /* reopen the database */
+    tdb = NULL;
 
-void test_put_compact_get_reopen()
-{
-    tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
+    tdb_config = (malloc(sizeof(tidesdb_config)));
     if (tdb_config == NULL)
     {
         printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
@@ -971,87 +1040,28 @@ void test_put_compact_get_reopen()
     tdb_config->db_path = TEST_DIR;
     tdb_config->compressed_wal = false;
 
-    tidesdb* tdb = NULL;
-
-    tidesdb_err* e = tidesdb_open(tdb_config, &tdb);
+    e = tidesdb_open(tdb_config, &tdb);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
-
     assert(tdb != NULL);
 
     tidesdb_err_free(e);
 
-    /* create a column family */
-    e = tidesdb_create_column_family(tdb, "test_cf", 1024 * 1024, 12, 0.24f, false);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    assert(e == NULL);
-
-    tidesdb_err_free(e);
-
-    column_family* cf = NULL;
-
-    /* we should be able to get the column family */
+    /* re-fetch the column family */
+    cf = NULL;
     assert(_get_column_family(tdb, "test_cf", &cf) == 1);
 
-    /* put 100k key-value pairs */
-    for (int i = 0; i < 100000; i++)
-    {
-        char key[38];
-        char value[38];
-        snprintf(key, sizeof(key), "key%d", i);
-        snprintf(value, sizeof(value), "value%d", i);
-
-        e = tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
-        if (e != NULL)
-        {
-            printf(RED "Error: %s\n" RESET, e->message);
-            tidesdb_err_free(e);
-            break;
-        }
-
-        assert(e == NULL);
-    }
-
-    /* we compact */
-    e = tidesdb_compact_sstables(tdb, cf, 2);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    assert(e == NULL);
-
-    tidesdb_err_free(e);
-
-    e = tidesdb_close(tdb);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
-    tidesdb_err_free(e);
-
-    free(tdb_config);
-
-    tdb_config = NULL;
-
-    /* reopen the database */
-    tdb_config = (malloc(sizeof(tidesdb_config)));
-    if (tdb_config == NULL)
-    {
-        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
-        return;
-    }
-
-    e = tidesdb_open(tdb_config, &tdb);
-    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
-
     /* get the key-value pairs */
-    for (int i = 0; i < 100000 / 4; i++)
+    for (int i = 0; i < 100000 / 390.625; i++)
     {
-        unsigned char key[38];
-        unsigned char value[38];
+        uint8_t key[38];
+        uint8_t value[38];
         snprintf(key, sizeof(key), "key%d", i);
         snprintf(value, sizeof(value), "value%d", i);
 
         size_t value_len = 0;
-        unsigned char* value_out = NULL;
+        uint8_t* value_out = NULL;
 
         e = tidesdb_get(tdb, cf->config.name, key, strlen(key), &value_out, &value_len);
         if (e != NULL)
@@ -1062,9 +1072,8 @@ void test_put_compact_get_reopen()
         }
 
         assert(e == NULL);
-
-        assert(value_len == strlen((char*)value));
-        assert(strncmp((char*)value_out, (char*)value, value_len) == 0);
+        assert(value_len == strlen((uint8_t*)value));
+        assert(strncmp((uint8_t*)value_out, (uint8_t*)value, value_len) == 0);
 
         free(value_out); /* free the value_out pointer */
         value_out = NULL;
@@ -1076,10 +1085,8 @@ void test_put_compact_get_reopen()
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     tidesdb_err_free(e);
-
-    remove_directory(TEST_DIR);
-
     free(tdb_config);
+    remove_directory(TEST_DIR);
 
     printf(GREEN "test_put_compact_get_reopen passed\n" RESET);
 }
@@ -1123,7 +1130,7 @@ void* get_thread(void* arg)
         snprintf(key, sizeof(key), "key_put%03d", i);
 
         size_t value_len = 0;
-        unsigned char* value_out = NULL;
+        uint8_t* value_out = NULL;
         tidesdb_err* e = NULL;
 
         while (true)
@@ -1247,8 +1254,8 @@ void test_cursor()
     /* put 24000 key-value pairs */
     for (int i = 0; i < 24000; i++)
     {
-        char key[48];
-        char value[48];
+        uint8_t key[48];
+        uint8_t value[48];
         snprintf(key, sizeof(key), "key%03d", i);
         snprintf(value, sizeof(value), "value%03d", i);
 
@@ -1389,7 +1396,7 @@ int main(void)
     test_cursor();
     test_put_compact();
     test_put_compact_get();
-    test_put_compact_get_reopen();
+    test_put_compact_reopen_get();
 
     return 0;
 }

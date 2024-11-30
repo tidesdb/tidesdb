@@ -95,14 +95,8 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
             if ((*tdb)->column_families[i].num_sstables > 0)
             {
                 /* we sort the sstables */
-                if (!_sort_sstables(&(*tdb)->column_families[i]))
-                {
-                    _free_column_families(*tdb);
-                    _close_wal((*tdb)->wal);
-                    free((*tdb)->config.db_path);
-                    free(*tdb);
-                    return tidesdb_err_new(1008, "Failed to sort sstables");
-                }
+                _sort_sstables(
+                    &(*tdb)->column_families[i]); /* we don't need to catch the error here */
             }
         }
     }

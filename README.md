@@ -33,6 +33,11 @@ cmake --build build
 cmake --install build
 ```
 
+## Include
+```c
+#include <tidesdb.h>
+```
+
 ## Usage
 Each database method returns a `tidesdb_err*` which returns an error code and message. If no error, TidesDB returns `NULL`.
 ```c
@@ -49,7 +54,7 @@ To open a new database you need to create a configuration and then open the data
 tidesdb_config* tdb_config = (malloc(sizeof(tidesdb_config)));
 if (tdb_config == NULL)
 {
-    printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+    /* handle error */
     return;
 }
 
@@ -88,7 +93,7 @@ You pass
 
 ```c
 /* create a column family */
-e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false);
+tidesdb_err *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false);
 if (e != NULL)
 {
     /* handle error */
@@ -100,7 +105,7 @@ if (e != NULL)
 
 ```c
 /* drop a column family */
-e = tidesdb_drop_column_family(tdb, "test_cf");
+tidesdb_err *e = tidesdb_drop_column_family(tdb, "test_cf");
 if (e != NULL)
 {
     /* handle error */
@@ -123,7 +128,7 @@ You pass
 uint8_t key[] = "key";
 uint8_t value[] = "value";
 
-e = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), -1);
+tidesdb_err *e = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), -1);
 if (e != NULL)
 {
     /* handle error */
@@ -138,7 +143,7 @@ uint8_t key[] = "key";
 uint8_t value[] = "value";
 
 time_t ttl = time(NULL) + 10; /* 10 seconds */
-e = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), ttl);
+tidesdb_err *e  = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), ttl);
 if (e != NULL)
 {
     /* handle error */
@@ -159,7 +164,7 @@ size_t value_len = 0;
 uint8_t* value_out = NULL;
 uint8_t key[] = "key";
 
-e = tidesdb_get(tdb, "your_column_family", key, strlen(key), &value_out, &value_len);
+tidesdb_err *e = tidesdb_get(tdb, "your_column_family", key, strlen(key), &value_out, &value_len);
 if (e != NULL)
 {
     /* handle error */
@@ -176,7 +181,7 @@ You pass
 ```c
 uint8_t key[] = "key";
 
-e = tidesdb_delete(tdb, "your_column_family", key, strlen(key));
+tidesdb_err *e = tidesdb_delete(tdb, "your_column_family", key, strlen(key));
 if (e != NULL)
 {
     /* handle error */
@@ -194,7 +199,7 @@ You pass
 - the column family name
 ```c
 txn* transaction;
-e = tidesdb_txn_begin(&transaction, "your_column_family");
+tidesdb_err *e = tidesdb_txn_begin(&transaction, "your_column_family");
 if (e != NULL)
 {
     /* handle error */
@@ -206,7 +211,7 @@ Now we can add operations to the transaction.
 ```c
 const uint8_t key[] = "example_key";
 const uint8_t value[] = "example_value";
-e = tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), -1); /* you can pass a ttl, similar to put */
+tidesdb_err *e = tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), -1); /* you can pass a ttl, similar to put */
 if (e != NULL)
 {
     /* handle error */
@@ -230,7 +235,7 @@ if (e != NULL)
 }
 
 /* before you free, you can rollback */
-e = tidesdb_txn_rollback(tdb, transaction);
+tidesdb_err *e = tidesdb_txn_rollback(tdb, transaction);
 if (e != NULL)
 {
     /* handle error */
@@ -240,6 +245,30 @@ if (e != NULL)
 /* free the transaction */
 tidesdb_txn_free(transaction);
 ```
+
+### Cursors
+You can iterate over key-value pairs in a column family.
+```c
+cursor* c;
+tidesdb_err *e = tidesdb_cursor_init(tdb, "your_column_family", &c);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+/* COMING SOON */
+```
+
+### Compaction
+You can manually compact sstables.
+```c
+tidesdb_err *e = tidesdb_compact_sstables(tdb, "your_column_family", 10); /* use 10 threads */
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
 
 ## Errors
 > [!CAUTION]

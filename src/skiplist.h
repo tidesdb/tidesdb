@@ -237,4 +237,18 @@ skiplist_t *skiplist_copy(skiplist_t *list);
  */
 int skiplist_check_and_update_ttl(skiplist_node_t *node);
 
+/*
+ * skiplist_put_no_lock
+ * put a new key-value pair into the skiplist without acquiring the lock
+ * @param list the skiplist
+ * @param key the key to put
+ * @param key_size the key size
+ * @param value the value to put
+ * @param value_size the value size
+ * @param ttl an expiration time for the node (optional)
+ * @return 0 if the key-value pair was put successfully, -1 otherwise
+ */
+int skiplist_put_no_lock(skiplist_t *list, const uint8_t *key, size_t key_size,
+                         const uint8_t *value, size_t value_size, time_t ttl);
+
 #endif /* SKIPLIST_H */

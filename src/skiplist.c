@@ -200,6 +200,70 @@ int skiplist_put(skiplist_t *list, const uint8_t *key, size_t key_size, const ui
     return 0;
 }
 
+int skiplist_put_no_lock(skiplist_t *list, const uint8_t *key, size_t key_size,
+                         const uint8_t *value, size_t value_size, time_t ttl)
+{
+    if (list == NULL || key == NULL || value == NULL) return -1;
+
+    skiplist_node_t *update[list->max_level];
+    skiplist_node_t *x = list->header;
+    for (int i = list->level - 1; i >= 0; i--)
+    {
+        while (x->forward[i] && skiplist_compare_keys(x->forward[i]->key, x->forward[i]->key_size,
+                                                      key, key_size) < 0)
+        {
+            x = x->forward[i];
+            skiplist_check_and_update_ttl(x);
+        }
+        update[i] = x;
+    }
+
+    x = x->forward[0];
+    skiplist_check_and_update_ttl(x);
+
+    if (x && skiplist_compare_keys(x->key, x->key_size, key, key_size) == 0)
+    {
+        list->total_size -= x->value_size; /* sub old value size */
+        free(x->value);
+
+        x->value = (uint8_t *)malloc(value_size);
+        if (x->value == NULL)
+        {
+            return -1;
+        }
+
+        memcpy(x->value, value, value_size);
+        x->value_size = value_size; /* ensure value_size is set */
+        x->ttl = ttl;
+        list->total_size += value_size; /* add up new value size */
+    }
+    else
+    {
+        int level = skiplist_random_level(list);
+        if (level > list->level)
+        {
+            for (int i = list->level; i < level; i++) update[i] = list->header;
+
+            list->level = level;
+        }
+
+        x = skiplist_create_node(level, key, key_size, value, value_size, ttl);
+        if (x == NULL)
+        {
+            return -1;
+        }
+        for (int i = 0; i < level; i++)
+        {
+            x->forward[i] = update[i]->forward[i];
+            update[i]->forward[i] = x;
+        }
+
+        list->total_size += sizeof(skiplist_node_t) + level * sizeof(skiplist_node_t *) + key_size +
+                            value_size; /* add to total size */
+    }
+    return 0;
+}
+
 int skiplist_delete(skiplist_t *list, const uint8_t *key, size_t key_size)
 {
     if (list == NULL || key == NULL) return -1;

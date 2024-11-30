@@ -101,6 +101,7 @@ typedef struct
         sstables_lock;    /* Read-write lock for SSTables mainly for when adding a new sstable */
     skiplist_t* memtable; /* the memtable for the column family */
     id_gen_t* id_gen; /* id generator for the column family; mainly used for sstable filenames */
+    pthread_rwlock_t compaction_or_flush_lock; /* lock for compaction or flush */
 } column_family_t;
 
 /*
@@ -123,12 +124,14 @@ typedef struct
  * @param ops the operations in the transaction
  * @param num_ops the number of operations in the transaction
  * @param column_family the column family for the transaction
+ * @param lock the lock for the transaction
  */
 typedef struct
 {
     tidesdb_txn_op_t* ops; /* the operations in the transaction */
     int num_ops;           /* the number of operations in the transaction */
     char* column_family;   /* the column family for the transaction */
+    pthread_mutex_t lock;  /* lock for the transaction */
 } tidesdb_txn_t;
 
 /*
@@ -142,7 +145,9 @@ typedef struct
  * @param flush_thread the thread for flushing memtables
  * @param flush_queue the queue for flushing memtables
  * @param flush_lock the flush lock
+ * @param compaction_lock the compaction lock
  * @param flush_cond the condition variable for flush thread
+ * @param compaction_cond the condition variable for compaction
  * @param stop_flush_thread flag to stop the flush thread
  */
 typedef struct
@@ -429,7 +434,7 @@ tidesdb_err_t* tidesdb_cursor_free(tidesdb_cursor_t* cursor);
  * @return 0 if the column family was created, -1 if not
  */
 int _new_column_family(const char* db_path, const char* name, int flush_threshold, int max_level,
-                        float probability, column_family_t** cf, bool compressed);
+                       float probability, column_family_t** cf, bool compressed);
 
 /*
  * _add_column_family
@@ -470,8 +475,8 @@ const char* _get_path_seperator();
  * @return 0 if the operation was appended, -1 if not
  */
 int _append_to_wal(tidesdb_t* tdb, wal_t* wal, const uint8_t* key, size_t key_size,
-                    const uint8_t* value, size_t value_size, time_t ttl, OP_CODE op_code,
-                    const char* cf);
+                   const uint8_t* value, size_t value_size, time_t ttl, OP_CODE op_code,
+                   const char* cf);
 
 /*
  * _open_wal

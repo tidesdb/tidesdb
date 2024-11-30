@@ -20,7 +20,6 @@
 #define SKIPLIST_H
 
 #include <pthread.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,10 +29,10 @@
 #define TOMBSTONE \
     0xDEADBEEF /* On expiration of a node if time to live is set we set the key's value to this */
 
-typedef struct skiplist_node skiplist_node;
+typedef struct skiplist_node_t skiplist_node_t;
 
 /*
- * skiplist_node
+ * skiplist_node_t
  * the node structure for the skiplist
  * @param key the key for the node
  * @param key_size the key size
@@ -42,18 +41,18 @@ typedef struct skiplist_node skiplist_node;
  * @param ttl an expiration time for the node (optional)
  * @param forward the forward pointers for the node
  */
-struct skiplist_node
+struct skiplist_node_t
 {
-    uint8_t *key;             /* the key for the node */
-    size_t key_size;          /* the key size */
-    uint8_t *value;           /* the value for the node */
-    size_t value_size;        /* the value size */
-    time_t ttl;               /* an expiration time for the node (optional) */
-    skiplist_node *forward[]; /* the forward pointers for the node */
+    uint8_t *key;               /* the key for the node */
+    size_t key_size;            /* the key size */
+    uint8_t *value;             /* the value for the node */
+    size_t value_size;          /* the value size */
+    time_t ttl;                 /* an expiration time for the node (optional) */
+    skiplist_node_t *forward[]; /* the forward pointers for the node */
 };
 
 /*
- * skiplist
+ * skiplist_t
  * the skiplist structure
  * @param level the current level of the skiplist
  * @param max_level the maximum level of the skiplist
@@ -64,25 +63,25 @@ struct skiplist_node
  */
 typedef struct
 {
-    int level;             /* the current level of the skiplist  */
-    int max_level;         /* the maximum level of the skiplist  */
-    float probability;     /* the probability of a node having a certain level  */
-    skiplist_node *header; /* the header node of the skiplist  */
-    size_t total_size;     /* total size in bytes  */
-    pthread_rwlock_t lock; /* read-write lock for list-level synchronization  */
-} skiplist;
+    int level;               /* the current level of the skiplist  */
+    int max_level;           /* the maximum level of the skiplist  */
+    float probability;       /* the probability of a node having a certain level  */
+    skiplist_node_t *header; /* the header node of the skiplist  */
+    size_t total_size;       /* total size in bytes  */
+    pthread_rwlock_t lock;   /* read-write lock for list-level synchronization  */
+} skiplist_t;
 
 /*
- * skiplist_cursor
+ * skiplist_cursor_t
  * the cursor structure for the skiplist
  * @param list the skiplist
  * @param current the current node
  */
 typedef struct
 {
-    skiplist *list;         /* the skiplist  */
-    skiplist_node *current; /* the current node  */
-} skiplist_cursor;
+    skiplist_t *list;         /* the skiplist  */
+    skiplist_node_t *current; /* the current node  */
+} skiplist_cursor_t;
 
 /* Skip list function prototypes */
 
@@ -97,16 +96,16 @@ typedef struct
  * @param ttl an expiration time for the node (optional)
  * @return the new skiplist node
  */
-skiplist_node *skiplist_create_node(int level, const uint8_t *key, size_t key_size,
-                                    const uint8_t *value, size_t value_size, time_t ttl);
+skiplist_node_t *skiplist_create_node(int level, const uint8_t *key, size_t key_size,
+                                      const uint8_t *value, size_t value_size, time_t ttl);
 
 /*
  * skiplist_destroy_node
  * destroy a skiplist node
  * @param node the node to destroy
- * @return true if the node was destroyed successfully, false otherwise
+ * @return 0 if the node was destroyed successfully, -1 otherwise
  */
-bool skiplist_destroy_node(skiplist_node *node);
+int skiplist_destroy_node(skiplist_node_t *node);
 
 /*
  * new_skiplist
@@ -115,7 +114,7 @@ bool skiplist_destroy_node(skiplist_node *node);
  * @param probability the probability of a node having a certain level
  * @return the new skiplist
  */
-skiplist *new_skiplist(int max_level, float probability);
+skiplist_t *new_skiplist(int max_level, float probability);
 
 /*
  * skiplist_destroy
@@ -123,7 +122,7 @@ skiplist *new_skiplist(int max_level, float probability);
  * @param list the skiplist to destroy
  * @return 0 if the skiplist was destroyed successfully, -1 otherwise
  */
-int skiplist_destroy(skiplist *list);
+int skiplist_destroy(skiplist_t *list);
 
 /*
  * skiplist_random_level
@@ -131,7 +130,7 @@ int skiplist_destroy(skiplist *list);
  * @param list the skiplist
  * @return the new level
  */
-int skiplist_random_level(skiplist *list);
+int skiplist_random_level(skiplist_t *list);
 
 /*
  * skiplist_compare_keys
@@ -151,9 +150,9 @@ int skiplist_compare_keys(const uint8_t *key1, size_t key1_size, const uint8_t *
  * @param list the skiplist
  * @param key the key to delete
  * @param key_size the key size
- * @return true if the key was deleted successfully, false otherwise
+ * @return 0 if the key-value pair was deleted successfully, -1 otherwise
  */
-bool skiplist_delete(skiplist *list, const uint8_t *key, size_t key_size);
+int skiplist_delete(skiplist_t *list, const uint8_t *key, size_t key_size);
 
 /*
  * skiplist_put
@@ -164,10 +163,10 @@ bool skiplist_delete(skiplist *list, const uint8_t *key, size_t key_size);
  * @param value the value to put
  * @param value_size the value size
  * @param ttl an expiration time for the node (optional)
- * @return true if the key-value pair was put successfully, false otherwise
+ * @return 0 if the key-value pair was put successfully, -1 otherwise
  */
-bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size, const uint8_t *value,
-                  size_t value_size, time_t ttl);
+int skiplist_put(skiplist_t *list, const uint8_t *key, size_t key_size, const uint8_t *value,
+                 size_t value_size, time_t ttl);
 
 /*
  * skiplist_get
@@ -177,10 +176,10 @@ bool skiplist_put(skiplist *list, const uint8_t *key, size_t key_size, const uin
  * @param key_size the key size
  * @param value the value
  * @param value_size the value size
- * @return true if the value was retrieved successfully, false otherwise
+ * @return 0 if the value was retrieved successfully, -1 otherwise
  */
-bool skiplist_get(skiplist *list, const uint8_t *key, size_t key_size, uint8_t **value,
-                  size_t *value_size);
+int skiplist_get(skiplist_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
+                 size_t *value_size);
 
 /*
  * skiplist_cursor_init
@@ -188,23 +187,23 @@ bool skiplist_get(skiplist *list, const uint8_t *key, size_t key_size, uint8_t *
  * @param list the skiplist
  * @return the new skiplist cursor
  */
-skiplist_cursor *skiplist_cursor_init(skiplist *list);
+skiplist_cursor_t *skiplist_cursor_init(skiplist_t *list);
 
 /*
  * skiplist_cursor_next
  * move the cursor to the next node
  * @param cursor the cursor
- * @return true if the cursor was moved successfully, false otherwise
+ * @return 0 if the cursor was moved successfully, -1 otherwise
  */
-bool skiplist_cursor_next(skiplist_cursor *cursor);
+int skiplist_cursor_next(skiplist_cursor_t *cursor);
 
 /*
  * skiplist_cursor_prev
  * move the cursor to the previous node
  * @param cursor the cursor
- * @return true if the cursor was moved successfully, false otherwise
+ * @return 0 if the cursor was moved successfully, -1 otherwise
  */
-bool skiplist_cursor_prev(skiplist_cursor *cursor);
+int skiplist_cursor_prev(skiplist_cursor_t *cursor);
 
 /*
  * skiplist_cursor_free
@@ -212,14 +211,15 @@ bool skiplist_cursor_prev(skiplist_cursor *cursor);
  * @param cursor the cursor
  * @return true if the cursor was freed successfully, false otherwise
  */
-void skiplist_cursor_free(skiplist_cursor *cursor);
+void skiplist_cursor_free(skiplist_cursor_t *cursor);
 
 /*
  * skiplist_clear
  * clear the skiplist
  * @param list the skiplist
+ * @return 0 if the skiplist was cleared successfully, -1 otherwise
  */
-int skiplist_clear(skiplist *list);
+int skiplist_clear(skiplist_t *list);
 
 /*
  * skiplist_copy
@@ -227,14 +227,14 @@ int skiplist_clear(skiplist *list);
  * @param list the skiplist
  * @return the copied skiplist
  */
-skiplist *skiplist_copy(skiplist *list);
+skiplist_t *skiplist_copy(skiplist_t *list);
 
 /*
  * skiplist_check_and_update_ttl
  * checks if a node has expired and updates the value to TOMBSTONE
  * @param node the node to check
- * @return true if the node has expired, false otherwise
+ * @return 0 if the node has not expired, 1 if the node has expired
  */
-bool skiplist_check_and_update_ttl(skiplist_node *node);
+int skiplist_check_and_update_ttl(skiplist_node_t *node);
 
 #endif /* SKIPLIST_H */

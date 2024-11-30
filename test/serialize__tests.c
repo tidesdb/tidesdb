@@ -26,7 +26,7 @@
 
 void test_serialize_key_value_pair_no_compression()
 {
-    key_value_pair kvp;
+    key_value_pair_t kvp;
     kvp.key = (uint8_t *)"test_key";
     kvp.key_size = strlen((char *)kvp.key);
     kvp.value = (uint8_t *)"test_value";
@@ -36,7 +36,7 @@ void test_serialize_key_value_pair_no_compression()
     uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
-    assert(serialize_key_value_pair(&kvp, &buffer, &encoded_size, false) == true);
+    assert(serialize_key_value_pair(&kvp, &buffer, &encoded_size, false) == 0);
     assert(encoded_size > 0);
     free(buffer);
 
@@ -45,7 +45,7 @@ void test_serialize_key_value_pair_no_compression()
 
 void test_deserialize_key_value_pair_no_compression()
 {
-    key_value_pair kvp;
+    key_value_pair_t kvp;
     kvp.key = (uint8_t *)"test_key";
     kvp.key_size = strlen((char *)kvp.key);
     kvp.value = (uint8_t *)"test_value";
@@ -57,9 +57,9 @@ void test_deserialize_key_value_pair_no_compression()
 
     serialize_key_value_pair(&kvp, &buffer, &encoded_size, false);
 
-    key_value_pair *deserialized_kvp = NULL;
+    key_value_pair_t *deserialized_kvp = NULL;
     assert(deserialize_key_value_pair((uint8_t *)buffer, encoded_size, &deserialized_kvp, false) ==
-           true);
+           0);
     assert(deserialized_kvp->key_size == kvp.key_size);
     assert(memcmp(deserialized_kvp->key, kvp.key, kvp.key_size) == 0);
     assert(deserialized_kvp->value_size == kvp.value_size);
@@ -76,15 +76,15 @@ void test_deserialize_key_value_pair_no_compression()
 
 void test_serialize_key_value_pair_compression()
 {
-    key_value_pair kvp = {.key = (uint8_t *)"key",
-                          .key_size = 3,
-                          .value = (uint8_t *)"value",
-                          .value_size = 5,
-                          .ttl = 12345};
+    key_value_pair_t kvp = {.key = (uint8_t *)"key",
+                            .key_size = 3,
+                            .value = (uint8_t *)"value",
+                            .value_size = 5,
+                            .ttl = 12345};
     uint8_t *buffer;
     size_t encoded_size;
 
-    assert(serialize_key_value_pair(&kvp, &buffer, &encoded_size, true) == true);
+    assert(serialize_key_value_pair(&kvp, &buffer, &encoded_size, true) == 0);
     assert(encoded_size > 0);
     free(buffer);
 
@@ -93,19 +93,19 @@ void test_serialize_key_value_pair_compression()
 
 void test_deserialize_key_value_pair_compression()
 {
-    key_value_pair kvp = {.key = (uint8_t *)"key",
-                          .key_size = 3,
-                          .value = (uint8_t *)"value",
-                          .value_size = 5,
-                          .ttl = 12345};
+    key_value_pair_t kvp = {.key = (uint8_t *)"key",
+                            .key_size = 3,
+                            .value = (uint8_t *)"value",
+                            .value_size = 5,
+                            .ttl = 12345};
     uint8_t *buffer;
     size_t encoded_size;
 
     serialize_key_value_pair(&kvp, &buffer, &encoded_size, true);
 
-    key_value_pair *deserialized_kvp = NULL;
+    key_value_pair_t *deserialized_kvp = NULL;
     assert(deserialize_key_value_pair((uint8_t *)buffer, encoded_size, &deserialized_kvp, true) ==
-           true);
+           0);
     assert(deserialized_kvp->key_size == kvp.key_size);
     assert(memcmp(deserialized_kvp->key, kvp.key, kvp.key_size) == 0);
     assert(deserialized_kvp->value_size == kvp.value_size);
@@ -122,16 +122,16 @@ void test_deserialize_key_value_pair_compression()
 
 void test_serialize_operation_compression()
 {
-    key_value_pair kvp = {.key = (uint8_t *)"key",
-                          .key_size = 3,
-                          .value = (uint8_t *)"value",
-                          .value_size = 5,
-                          .ttl = 12345};
-    operation op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
+    key_value_pair_t kvp = {.key = (uint8_t *)"key",
+                            .key_size = 3,
+                            .value = (uint8_t *)"value",
+                            .value_size = 5,
+                            .ttl = 12345};
+    operation_t op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
     uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
-    assert(serialize_operation(&op, &buffer, &encoded_size, true) == true);
+    assert(serialize_operation(&op, &buffer, &encoded_size, true) == 0);
     assert(encoded_size > 0);
     free(buffer);
 
@@ -140,19 +140,19 @@ void test_serialize_operation_compression()
 
 void test_deserialize_operation_compression()
 {
-    key_value_pair kvp = {.key = (uint8_t *)"key",
-                          .key_size = 3,
-                          .value = (uint8_t *)"value",
-                          .value_size = 5,
-                          .ttl = 12345};
-    operation op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
+    key_value_pair_t kvp = {.key = (uint8_t *)"key",
+                            .key_size = 3,
+                            .value = (uint8_t *)"value",
+                            .value_size = 5,
+                            .ttl = 12345};
+    operation_t op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
     uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
-    assert(serialize_operation(&op, &buffer, &encoded_size, true) == true);
+    assert(serialize_operation(&op, &buffer, &encoded_size, true) == 0);
 
-    operation *deserialized_op = NULL;
-    assert(deserialize_operation(buffer, encoded_size, &deserialized_op, true) == true);
+    operation_t *deserialized_op = NULL;
+    assert(deserialize_operation(buffer, encoded_size, &deserialized_op, true) == 0);
     assert(deserialized_op->op_code == op.op_code);
     assert(deserialized_op->kv->key_size == kvp.key_size);
     assert(memcmp(deserialized_op->kv->key, kvp.key, kvp.key_size) == 0);
@@ -173,15 +173,15 @@ void test_deserialize_operation_compression()
 
 void test_serialize_column_family_config_no_compression()
 {
-    column_family_config config = {.name = "test_cf",
-                                   .flush_threshold = 100,
-                                   .max_level = 5,
-                                   .probability = 0.01f,
-                                   .compressed = true};
+    column_family_config_t config = {.name = "test_cf",
+                                     .flush_threshold = 100,
+                                     .max_level = 5,
+                                     .probability = 0.01f,
+                                     .compressed = true};
     uint8_t *buffer;
     size_t encoded_size;
 
-    assert(serialize_column_family_config(&config, &buffer, &encoded_size) == true);
+    assert(serialize_column_family_config(&config, &buffer, &encoded_size) == 0);
     assert(encoded_size > 0);
     free(buffer);
 
@@ -190,18 +190,18 @@ void test_serialize_column_family_config_no_compression()
 
 void test_deserialize_column_family_config_no_compression()
 {
-    column_family_config config = {.name = "test_cf",
-                                   .flush_threshold = 100,
-                                   .max_level = 5,
-                                   .probability = 0.01f,
-                                   .compressed = true};
+    column_family_config_t config = {.name = "test_cf",
+                                     .flush_threshold = 100,
+                                     .max_level = 5,
+                                     .probability = 0.01f,
+                                     .compressed = true};
     uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
     serialize_column_family_config(&config, &buffer, &encoded_size);
 
-    column_family_config *deserialized_config = NULL;
-    assert(deserialize_column_family_config(buffer, encoded_size, &deserialized_config) == true);
+    column_family_config_t *deserialized_config = NULL;
+    assert(deserialize_column_family_config(buffer, encoded_size, &deserialized_config) == 0);
     assert(strcmp(deserialized_config->name, config.name) == 0);
     assert(deserialized_config->flush_threshold == config.flush_threshold);
     assert(deserialized_config->max_level == config.max_level);
@@ -217,16 +217,16 @@ void test_deserialize_column_family_config_no_compression()
 
 void test_serialize_operation_no_compression()
 {
-    key_value_pair kvp = {.key = (uint8_t *)"key",
-                          .key_size = 3,
-                          .value = (uint8_t *)"value",
-                          .value_size = 5,
-                          .ttl = 12345};
-    operation op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
+    key_value_pair_t kvp = {.key = (uint8_t *)"key",
+                            .key_size = 3,
+                            .value = (uint8_t *)"value",
+                            .value_size = 5,
+                            .ttl = 12345};
+    operation_t op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
     uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
-    assert(serialize_operation(&op, &buffer, &encoded_size, false) == true);
+    assert(serialize_operation(&op, &buffer, &encoded_size, false) == 0);
     assert(encoded_size > 0);
     free(buffer);
 
@@ -235,19 +235,19 @@ void test_serialize_operation_no_compression()
 
 void test_deserialize_operation_no_compression()
 {
-    key_value_pair kvp = {.key = (uint8_t *)"key",
-                          .key_size = 3,
-                          .value = (uint8_t *)"value",
-                          .value_size = 5,
-                          .ttl = 12345};
-    operation op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
+    key_value_pair_t kvp = {.key = (uint8_t *)"key",
+                            .key_size = 3,
+                            .value = (uint8_t *)"value",
+                            .value_size = 5,
+                            .ttl = 12345};
+    operation_t op = {.op_code = 1, .kv = &kvp, .column_family = "test_cf"};
     uint8_t *buffer = NULL;
     size_t encoded_size = 0;
 
     serialize_operation(&op, &buffer, &encoded_size, false);
 
-    operation *deserialized_op = NULL;
-    assert(deserialize_operation(buffer, encoded_size, &deserialized_op, false) == true);
+    operation_t *deserialized_op = NULL;
+    assert(deserialize_operation(buffer, encoded_size, &deserialized_op, false) == 0);
     assert(deserialized_op->op_code == op.op_code);
     assert(deserialized_op->kv->key_size == kvp.key_size);
     assert(memcmp(deserialized_op->kv->key, kvp.key, kvp.key_size) == 0);
@@ -269,7 +269,7 @@ void test_deserialize_operation_no_compression()
 void test_serialize_deserialize_full_bloomfilter_no_compression()
 {
     /* create a bloom filter with an initial size of 8 */
-    bloomfilter *bf = bloomfilter_create(8);
+    bloomfilter_t *bf = bloomfilter_create(8);
     assert(bf != NULL); /* assert creation success */
 
     const uint8_t data2[] = "test2";
@@ -286,25 +286,25 @@ void test_serialize_deserialize_full_bloomfilter_no_compression()
 
     /* add another element and check its presence */
     assert(bloomfilter_add(bf, data2, strlen((const char *)data2)) == 0);
-    assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == true);
+    assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == 0);
 
     /* check if all the data is in the bloom filter */
     for (int i = 0; i < 256; i++)
     {
         uint8_t data[2] = {(uint8_t)i, '\0'};
-        assert(bloomfilter_check(bf, data, 1) == true);
+        assert(bloomfilter_check(bf, data, 1) == 0);
     }
 
     /* serialize the bloom filter */
     uint8_t *buffer = NULL;
     size_t encoded_size;
-    assert(serialize_bloomfilter(bf, &buffer, &encoded_size, false) == true);
+    assert(serialize_bloomfilter(bf, &buffer, &encoded_size, false) == 0);
     assert(buffer != NULL);   /* assert buffer is not NULL */
     assert(encoded_size > 0); /*ssert encoded size is greater than 0*/
 
     /* deserialize the bloom filter */
-    bloomfilter *deserialized_bf = NULL;
-    assert(deserialize_bloomfilter(buffer, encoded_size, &deserialized_bf, false) == true);
+    bloomfilter_t *deserialized_bf = NULL;
+    assert(deserialize_bloomfilter(buffer, encoded_size, &deserialized_bf, false) == 0);
     assert(deserialized_bf != NULL);
 
     /* verify the deserialized bloom filter */
@@ -319,9 +319,9 @@ void test_serialize_deserialize_full_bloomfilter_no_compression()
     for (int i = 0; i < 256; i++)
     {
         uint8_t data[2] = {(uint8_t)i, '\0'};
-        assert(bloomfilter_check(deserialized_bf, data, 1) == true);
+        assert(bloomfilter_check(deserialized_bf, data, 1) == 0);
     }
-    assert(bloomfilter_check(deserialized_bf, data2, strlen((const char *)data2)) == true);
+    assert(bloomfilter_check(deserialized_bf, data2, strlen((const char *)data2)) == 0);
 
     /* clean upp */
     free(buffer);
@@ -333,7 +333,7 @@ void test_serialize_deserialize_full_bloomfilter_no_compression()
 void test_serialize_deserialize_full_bloomfilter_compression()
 {
     /* create a bloom filter with an initial size of 8 */
-    bloomfilter *bf = bloomfilter_create(8);
+    bloomfilter_t *bf = bloomfilter_create(8);
     assert(bf != NULL); /* assert creation success */
 
     const uint8_t data2[] = "test2";
@@ -350,25 +350,25 @@ void test_serialize_deserialize_full_bloomfilter_compression()
 
     /* add another element and check its presence */
     assert(bloomfilter_add(bf, data2, strlen((const char *)data2)) == 0);
-    assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == true);
+    assert(bloomfilter_check(bf, data2, strlen((const char *)data2)) == 0);
 
     /* check if all the data is in the bloom filter */
     for (int i = 0; i < 256; i++)
     {
         uint8_t data[2] = {(uint8_t)i, '\0'};
-        assert(bloomfilter_check(bf, data, 1) == true);
+        assert(bloomfilter_check(bf, data, 1) == 0);
     }
 
     /* serialize the bloom filter */
     uint8_t *buffer = NULL;
     size_t encoded_size;
-    assert(serialize_bloomfilter(bf, &buffer, &encoded_size, true) == true);
+    assert(serialize_bloomfilter(bf, &buffer, &encoded_size, true) == 0);
     assert(buffer != NULL);   /* assert buffer is not NULL */
     assert(encoded_size > 0); /* assert encoded size is greater than 0 */
 
     /* deserialize the bloom filter */
-    bloomfilter *deserialized_bf = NULL;
-    assert(deserialize_bloomfilter(buffer, encoded_size, &deserialized_bf, true) == true);
+    bloomfilter_t *deserialized_bf = NULL;
+    assert(deserialize_bloomfilter(buffer, encoded_size, &deserialized_bf, true) == 0);
     assert(deserialized_bf != NULL); /* assert deserialization success */
 
     /* verify the deserialized bloom filter */
@@ -383,9 +383,9 @@ void test_serialize_deserialize_full_bloomfilter_compression()
     for (int i = 0; i < 256; i++)
     {
         uint8_t data[2] = {(uint8_t)i, '\0'};
-        assert(bloomfilter_check(deserialized_bf, data, 1) == true);
+        assert(bloomfilter_check(deserialized_bf, data, 1) == 0);
     }
-    assert(bloomfilter_check(deserialized_bf, data2, strlen((const char *)data2)) == true);
+    assert(bloomfilter_check(deserialized_bf, data2, strlen((const char *)data2)) == 0);
 
     /* clean up */
     free(buffer);

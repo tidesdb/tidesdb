@@ -18,21 +18,21 @@
  */
 #include "pager.h"
 
-bool pager_open(const char* filename, pager** p)
+int pager_open(const char* filename, pager_t** p)
 {
     /* we check if the filename is NULL */
-    if (filename == NULL) return false;
+    if (filename == NULL) return -1;
 
     /* we allocate memory for the pager */
-    *p = malloc(sizeof(pager));
-    if (*p == NULL) return false;
+    *p = malloc(sizeof(pager_t));
+    if (*p == NULL) return -1;
 
     /* we open the file with provided filename */
     (*p)->file = fopen(filename, "a+b");
     if ((*p)->file == NULL)
     {
         free(*p);
-        return false;
+        return -1;
     }
 
     /* we copy over filename */
@@ -41,7 +41,7 @@ bool pager_open(const char* filename, pager** p)
     {
         fclose((*p)->file);
         free(*p);
-        return false;
+        return -1;
     }
     strcpy((*p)->filename, filename);
 
@@ -51,18 +51,18 @@ bool pager_open(const char* filename, pager** p)
         free((*p)->filename);
         fclose((*p)->file);
         free(*p);
-        return false;
+        return -1;
     }
 
     /* we get amount of pages */
     size_t page_count = 0;
-    if (pager_pages_count(*p, &page_count) == false)
+    if (pager_pages_count(*p, &page_count) == -1)
     {
         pthread_rwlock_destroy(&(*p)->file_lock);
         free((*p)->filename);
         fclose((*p)->file);
         free(*p);
-        return false;
+        return -1;
     }
 
     /* set the number of pages */
@@ -76,7 +76,7 @@ bool pager_open(const char* filename, pager** p)
         free((*p)->filename);
         fclose((*p)->file);
         free(*p);
-        return false;
+        return -1;
     }
 
     /* Initialize the page locks */
@@ -91,7 +91,7 @@ bool pager_open(const char* filename, pager** p)
             free((*p)->filename);
             fclose((*p)->file);
             free(*p);
-            return false;
+            return -1;
         }
     }
 
@@ -105,7 +105,7 @@ bool pager_open(const char* filename, pager** p)
         free((*p)->filename);
         fclose((*p)->file);
         free(*p);
-        return false;
+        return -1;
     }
 
     /* initialize the sync condition variable */
@@ -118,7 +118,7 @@ bool pager_open(const char* filename, pager** p)
         free((*p)->filename);
         fclose((*p)->file);
         free(*p);
-        return false;
+        return -1;
     }
 
     /* set the write count to 0 */
@@ -139,29 +139,29 @@ bool pager_open(const char* filename, pager** p)
         free((*p)->filename);
         fclose((*p)->file);
         free(*p);
-        return false;
+        return -1;
     }
 
-    return true;
+    return 0;
 }
 
-bool pager_close(pager* p)
+int pager_close(pager_t* p)
 {
     /* we check if the pager is NULL */
-    if (p == NULL) return false;
+    if (p == NULL) return -1;
 
     /* we close the file */
-    if (fclose(p->file) != 0) return false;
+    if (fclose(p->file) != 0) return -1;
 
     /* free filename */
     free(p->filename);
 
     /* we destroy the file lock */
-    if (pthread_rwlock_destroy(&p->file_lock) != 0) return false;
+    if (pthread_rwlock_destroy(&p->file_lock) != 0) return -1;
 
     /* we destroy the page locks */
     for (unsigned int i = 0; i < p->num_pages; i++)
-        if (pthread_rwlock_destroy(&p->page_locks[i]) != 0) return false;
+        if (pthread_rwlock_destroy(&p->page_locks[i]) != 0) return -1;
 
     /* we free the page locks */
     free(p->page_locks);
@@ -170,18 +170,18 @@ bool pager_close(pager* p)
     p->stop_sync_thread = true;
 
     /* we join the sync thread */
-    if (pthread_join(p->sync_thread, NULL) != 0) return false;
+    if (pthread_join(p->sync_thread, NULL) != 0) return -1;
 
     /* we destroy the sync mutex */
     if (pthread_mutex_destroy(&p->sync_mutex) != 0)
     {
-        return false;
+        return -1;
     }
 
     /* we destroy the sync condition variable */
     if (pthread_cond_destroy(&p->sync_cond) != 0)
     {
-        return false;
+        return -1;
     }
 
     /* we free the pager */
@@ -189,12 +189,12 @@ bool pager_close(pager* p)
 
     p = NULL;
 
-    return true;
+    return 0;
 }
 
-bool pager_write(pager* p, uint8_t* data, size_t data_len, unsigned int* init_page_number)
+int pager_write(pager_t* p, uint8_t* data, size_t data_len, unsigned int* init_page_number)
 {
-    if (!p || !p->file || !p->page_locks || !data || data_len == 0) return false;
+    if (!p || !p->file || !p->page_locks || !data || data_len == 0) return -1;
 
     size_t pages_needed = (data_len + PAGE_BODY - 1) / PAGE_BODY;
     size_t remaining_data = data_len;
@@ -216,7 +216,7 @@ bool pager_write(pager* p, uint8_t* data, size_t data_len, unsigned int* init_pa
             if (new_locks == NULL)
             {
                 pthread_rwlock_unlock(&p->file_lock);
-                return false;
+                return -1;
             }
 
             p->page_locks = new_locks;
@@ -224,7 +224,7 @@ bool pager_write(pager* p, uint8_t* data, size_t data_len, unsigned int* init_pa
             {
                 pthread_rwlock_unlock(&p->file_lock);
 
-                return false;
+                return -1;
             }
 
             p->num_pages++;
@@ -266,7 +266,7 @@ bool pager_write(pager* p, uint8_t* data, size_t data_len, unsigned int* init_pa
             pthread_rwlock_unlock(&p->page_locks[page_number]);
             pthread_rwlock_unlock(&p->file_lock);
 
-            return false;
+            return -1;
         }
         pthread_rwlock_unlock(&p->page_locks[page_number]);
 
@@ -284,12 +284,12 @@ bool pager_write(pager* p, uint8_t* data, size_t data_len, unsigned int* init_pa
 
     *init_page_number = initial_page_number; /* set the initial page number */
 
-    return true;
+    return 0;
 }
 
-bool pager_read(pager* p, unsigned int start_page_number, uint8_t** buffer, size_t* buffer_len)
+int pager_read(pager_t* p, unsigned int start_page_number, uint8_t** buffer, size_t* buffer_len)
 {
-    if (!p || !p->file || !p->page_locks || !buffer || !buffer_len) return false;
+    if (!p || !p->file || !p->page_locks || !buffer || !buffer_len) return -1;
 
     size_t offset = 0;
     uint8_t page_buffer[PAGE_SIZE];
@@ -302,13 +302,13 @@ bool pager_read(pager* p, unsigned int start_page_number, uint8_t** buffer, size
         if (fseek(p->file, page_number * PAGE_SIZE, SEEK_SET) != 0)
         {
             pthread_rwlock_unlock(&p->page_locks[page_number]);
-            return false;
+            return -1;
         }
 
         if (fread(page_buffer, 1, PAGE_SIZE, p->file) != PAGE_SIZE)
         {
             pthread_rwlock_unlock(&p->page_locks[page_number]);
-            return false;
+            return -1;
         }
 
         pthread_rwlock_unlock(&p->page_locks[page_number]);
@@ -323,7 +323,7 @@ bool pager_read(pager* p, unsigned int start_page_number, uint8_t** buffer, size
         if (new_buffer == NULL)
         {
             free(*buffer);
-            return false;
+            return -1;
         }
         *buffer = new_buffer;
 
@@ -343,16 +343,16 @@ bool pager_read(pager* p, unsigned int start_page_number, uint8_t** buffer, size
     /* adjust buffer length to the actual data length */
     *buffer_len = actual_data_len;
 
-    return true;
+    return 0;
 }
 
-bool pager_cursor_init(pager* p, pager_cursor** cursor)
+int pager_cursor_init(pager_t* p, pager_cursor_t** cursor)
 {
-    if (!p) return false;
+    if (!p) return -1;
 
     /* allocate memory for the cursor */
-    *cursor = (pager_cursor*)malloc(sizeof(pager_cursor));
-    if (!*cursor) return false;
+    *cursor = (pager_cursor_t*)malloc(sizeof(pager_cursor_t));
+    if (!*cursor) return -1;
 
     /* set the pager */
     (*cursor)->pager = p;
@@ -360,12 +360,12 @@ bool pager_cursor_init(pager* p, pager_cursor** cursor)
     /* set the initial page number */
     (*cursor)->page_number = 0;
 
-    return true;
+    return 0;
 }
 
-bool pager_cursor_next(pager_cursor* cursor)
+int pager_cursor_next(pager_cursor_t* cursor)
 {
-    if (!cursor || !cursor->pager) return false;
+    if (!cursor || !cursor->pager) return -1;
 
     while (cursor->page_number < (long)cursor->pager->num_pages - 1)
     {
@@ -375,28 +375,28 @@ bool pager_cursor_next(pager_cursor* cursor)
         if (fseek(cursor->pager->file, cursor->page_number * PAGE_SIZE, SEEK_SET) != 0)
         {
             pthread_rwlock_unlock(&cursor->pager->page_locks[cursor->page_number]);
-            return false;
+            return -1;
         }
 
         if (fread(page_buffer, 1, PAGE_SIZE, cursor->pager->file) != PAGE_SIZE)
         {
             pthread_rwlock_unlock(&cursor->pager->page_locks[cursor->page_number]);
-            return false;
+            return -1;
         }
         pthread_rwlock_unlock(&cursor->pager->page_locks[cursor->page_number]);
 
         long next_page_number;
         memcpy(&next_page_number, page_buffer, sizeof(next_page_number));
 
-        if (next_page_number == -1) return true; /* found a non-overflow page */
+        if (next_page_number == -1) return 0; /* found a non-overflow page */
     }
 
-    return false;
+    return -1;
 }
 
-bool pager_cursor_prev(pager_cursor* cursor)
+int pager_cursor_prev(pager_cursor_t* cursor)
 {
-    if (!cursor || !cursor->pager) return false;
+    if (!cursor || !cursor->pager) return -1;
 
     while (cursor->page_number > 0)
     {
@@ -406,12 +406,12 @@ bool pager_cursor_prev(pager_cursor* cursor)
         if (fseek(cursor->pager->file, cursor->page_number * PAGE_SIZE, SEEK_SET) != 0)
         {
             pthread_rwlock_unlock(&cursor->pager->page_locks[cursor->page_number]);
-            return false;
+            return -1;
         }
         if (fread(page_buffer, 1, PAGE_SIZE, cursor->pager->file) != PAGE_SIZE)
         {
             pthread_rwlock_unlock(&cursor->pager->page_locks[cursor->page_number]);
-            return false;
+            return -1;
         }
 
         pthread_rwlock_unlock(&cursor->pager->page_locks[cursor->page_number]);
@@ -419,19 +419,19 @@ bool pager_cursor_prev(pager_cursor* cursor)
         long next_page_number;
         memcpy(&next_page_number, page_buffer, sizeof(next_page_number));
 
-        if (next_page_number == -1) return true; /* found a non-overflow page */
+        if (next_page_number == -1) return 0; /* found a non-overflow page */
     }
 
-    return false;
+    return -1;
 }
 
-bool pager_cursor_get(pager_cursor* cursor, unsigned int* page_number)
+int pager_cursor_get(pager_cursor_t* cursor, unsigned int* page_number)
 {
-    if (!cursor || !cursor->pager || !page_number) return false;
+    if (!cursor || !cursor->pager || !page_number) return -1;
 
     *page_number = cursor->page_number;
 
-    return true;
+    return 0;
 }
 
 time_t get_last_modified(const char* filename)
@@ -442,44 +442,44 @@ time_t get_last_modified(const char* filename)
     return file_stat.st_mtime;
 }
 
-void pager_cursor_free(pager_cursor* cursor)
+void pager_cursor_free(pager_cursor_t* cursor)
 {
     if (cursor) free(cursor);
 
     cursor = NULL;
 }
 
-bool pager_truncate(pager* p, size_t size)
+int pager_truncate(pager_t* p, size_t size)
 {
-    if (!p || !p->file) return false;
+    if (!p || !p->file) return -1;
 
-    if (ftruncate(fileno(p->file), (long)size) != 0) return false;
+    if (ftruncate(fileno(p->file), (long)size) != 0) return -1;
 
-    return true;
+    return 0;
 }
 
-bool pager_pages_count(pager* p, size_t* num_pages)
+int pager_pages_count(pager_t* p, size_t* num_pages)
 {
-    if (!p || !p->file || !num_pages) return false;
+    if (!p || !p->file || !num_pages) return -1;
 
     struct stat file_stat;
-    if (fstat(fileno(p->file), &file_stat) != 0) return false;
+    if (fstat(fileno(p->file), &file_stat) != 0) return -1;
 
     *num_pages = (file_stat.st_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    return true;
+    return 0;
 }
 
-bool pager_size(pager* p, size_t* size)
+int pager_size(pager_t* p, size_t* size)
 {
-    if (!p || !p->file || !size) return false;
+    if (!p || !p->file || !size) return -1;
 
     struct stat file_stat;
-    if (fstat(fileno(p->file), &file_stat) != 0) return false;
+    if (fstat(fileno(p->file), &file_stat) != 0) return -1;
 
     *size = file_stat.st_size;
 
-    return true;
+    return 0;
 }
 
 void sleep_ms(int milliseconds)
@@ -496,7 +496,7 @@ void sleep_ms(int milliseconds)
 
 void* pager_sync_thread(void* arg)
 {
-    pager* p = arg;
+    pager_t* p = arg;
     struct timespec ts;
     while (1)
     {

@@ -18,7 +18,7 @@
  */
 #include "tidesdb.h"
 
-tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
+tidesdb_err_t* tidesdb_open(const tidesdb_config_t* config, tidesdb_t** tdb)
 {
     /* we check if the config is NULL */
     if (config == NULL) return tidesdb_err_new(1001, "Config is NULL");
@@ -30,7 +30,7 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
 
     /* first we allocate memory for the tidesdb struct */
-    *tdb = malloc(sizeof(tidesdb));
+    *tdb = malloc(sizeof(tidesdb_t));
 
     /* we check if allocation was successful */
     if (*tdb == NULL)
@@ -57,7 +57,7 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
             return tidesdb_err_new(1004, "Failed to create db directory");
         }
 
-    (*tdb)->wal = malloc(sizeof(wal));
+    (*tdb)->wal = malloc(sizeof(wal_t));
     if ((*tdb)->wal == NULL) /* could not allocate memory for wal */
     {
         free((*tdb)->config.db_path);
@@ -66,7 +66,7 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     }
 
     /* now we open the wal */
-    if (!_open_wal((*tdb)->config.db_path, &(*tdb)->wal))
+    if (_open_wal((*tdb)->config.db_path, &(*tdb)->wal) == -1)
     {
         _close_wal((*tdb)->wal);
         free((*tdb)->config.db_path);
@@ -75,7 +75,7 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     }
 
     /* now we load the column families */
-    if (!_load_column_families(*tdb))
+    if (_load_column_families(*tdb) == -1)
     {
         _close_wal((*tdb)->wal);
         free((*tdb)->config.db_path);
@@ -165,7 +165,7 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     }
 
     /* now we replay from the wal */
-    if (!_replay_from_wal((*tdb), (*tdb)->wal))
+    if (_replay_from_wal((*tdb), (*tdb)->wal) == -1)
     {
         pthread_rwlock_destroy(&(*tdb)->column_families_lock);
         pthread_cond_destroy(&(*tdb)->flush_cond);
@@ -181,8 +181,8 @@ tidesdb_err* tidesdb_open(const tidesdb_config* config, tidesdb** tdb)
     return NULL;
 }
 
-tidesdb_err* tidesdb_create_column_family(tidesdb* tdb, const char* name, int flush_threshold,
-                                          int max_level, float probability, bool compressed)
+tidesdb_err_t* tidesdb_create_column_family(tidesdb_t* tdb, const char* name, int flush_threshold,
+                                            int max_level, float probability, bool compressed)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -205,18 +205,18 @@ tidesdb_err* tidesdb_create_column_family(tidesdb* tdb, const char* name, int fl
      * the system expects at least a probability of 0.1 */
     if (probability < 0.1) return tidesdb_err_new(1019, "Probability is too low");
 
-    column_family* cf = NULL;
-    if (!_new_column_family(tdb->config.db_path, name, flush_threshold, max_level, probability, &cf,
-                            compressed))
+    column_family_t* cf = NULL;
+    if (_new_column_family(tdb->config.db_path, name, flush_threshold, max_level, probability, &cf,
+                            compressed) == -1)
         return tidesdb_err_new(1020, "Failed to create new column family");
 
     /* now we add the column family */
-    if (!_add_column_family(tdb, cf)) return tidesdb_err_new(1021, "Failed to add column family");
+    if (_add_column_family(tdb, cf) == -1) return tidesdb_err_new(1021, "Failed to add column family");
 
     return NULL;
 }
 
-tidesdb_err* tidesdb_drop_column_family(tidesdb* tdb, const char* name)
+tidesdb_err_t* tidesdb_drop_column_family(tidesdb_t* tdb, const char* name)
 {
     /* check if either tdb or name is NULL */
     if (tdb == NULL || name == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -282,8 +282,8 @@ tidesdb_err* tidesdb_drop_column_family(tidesdb* tdb, const char* name)
             tdb->column_families[i] = tdb->column_families[i + 1];
 
         tdb->num_column_families--;
-        column_family* temp_families = (column_family*)realloc(
-            tdb->column_families, tdb->num_column_families * sizeof(column_family));
+        column_family_t* temp_families = (column_family_t*)realloc(
+            tdb->column_families, tdb->num_column_families * sizeof(column_family_t));
         if (temp_families == NULL)
         {
             pthread_rwlock_unlock(&tdb->column_families_lock);
@@ -305,7 +305,7 @@ tidesdb_err* tidesdb_drop_column_family(tidesdb* tdb, const char* name)
     return NULL;
 }
 
-tidesdb_err* tidesdb_compact_sstables(tidesdb* tdb, column_family* cf, int max_threads)
+tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, column_family_t* cf, int max_threads)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -329,13 +329,13 @@ tidesdb_err* tidesdb_compact_sstables(tidesdb* tdb, column_family* cf, int max_t
     }
 
     /* sort sstables by last modified time (oldest first) */
-    qsort(cf->sstables, num_sstables, sizeof(sstable*), _compare_sstables);
+    qsort(cf->sstables, num_sstables, sizeof(sstable_t*), _compare_sstables);
 
     /* split the work based on max_threads */
     int sstables_per_thread = (num_sstables + max_threads - 1) / max_threads;
     pthread_t threads[max_threads];
-    compact_thread_args* thread_args = malloc(
-        max_threads * sizeof(compact_thread_args)); /* allocate memory for thread arguments */
+    compact_thread_args_t* thread_args = malloc(
+        max_threads * sizeof(compact_thread_args_t)); /* allocate memory for thread arguments */
 
     if (thread_args == NULL)
     {
@@ -382,8 +382,8 @@ tidesdb_err* tidesdb_compact_sstables(tidesdb* tdb, column_family* cf, int max_t
 
 void* _compact_sstables_thread(void* arg)
 {
-    compact_thread_args* args = arg;
-    column_family* cf = args->cf;
+    compact_thread_args_t* args = arg;
+    column_family_t* cf = args->cf;
     int start = args->start;
     int end = args->end;
 
@@ -393,7 +393,7 @@ void* _compact_sstables_thread(void* arg)
         if (i + 1 >= cf->num_sstables) break; /* ensure we do not exceed the number of sstables */
 
         /* merge sstables[i] and sstables[i+1] into a new sstable */
-        sstable* new_sstable = _merge_sstables(cf->sstables[i], cf->sstables[i + 1], cf);
+        sstable_t* new_sstable = _merge_sstables(cf->sstables[i], cf->sstables[i + 1], cf);
 
         /* we check if the new sstable is NULL */
         if (new_sstable == NULL) continue;
@@ -422,29 +422,29 @@ void* _compact_sstables_thread(void* arg)
     return NULL;
 }
 
-sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
+sstable_t* _merge_sstables(sstable_t* sst1, sstable_t* sst2, column_family_t* cf)
 {
     if (cf == NULL || sst1 == NULL || sst2 == NULL || sst1->pager->num_pages == 0 ||
         sst2->pager->num_pages == 0)
         return NULL;
 
     /* we used a skiplist to keep things in order */
-    skiplist* mergetable = new_skiplist(cf->config.max_level, cf->config.probability);
+    skiplist_t* mergetable = new_skiplist(cf->config.max_level, cf->config.probability);
     if (mergetable == NULL) return NULL;
 
     /* create a new bloomfilter for the merged sstable */
-    bloomfilter* bf = bloomfilter_create(BLOOMFILTER_SIZE);
+    bloomfilter_t* bf = bloomfilter_create(BLOOMFILTER_SIZE);
     if (bf == NULL)
     {
         skiplist_destroy(mergetable);
         return NULL;
     }
 
-    pager_cursor* cursor1 = NULL;
-    pager_cursor* cursor2 = NULL;
+    pager_cursor_t* cursor1 = NULL;
+    pager_cursor_t* cursor2 = NULL;
 
     /* we initialize a new cursor for each sstable */
-    if (!pager_cursor_init(sst1->pager, &cursor1) || !pager_cursor_init(sst2->pager, &cursor2))
+    if (pager_cursor_init(sst1->pager, &cursor1) == -1 || pager_cursor_init(sst2->pager, &cursor2) == -1)
     {
         skiplist_destroy(mergetable);
         bloomfilter_destroy(bf);
@@ -487,8 +487,8 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
             }
         }
 
-        key_value_pair* kv1 = NULL;
-        key_value_pair* kv2 = NULL;
+        key_value_pair_t* kv1 = NULL;
+        key_value_pair_t* kv2 = NULL;
 
         if (buffer1 &&
             !deserialize_key_value_pair(buffer1, buffer_len1, &kv1, cf->config.compressed))
@@ -512,8 +512,8 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
             /* check if ttl is set and if it has not expired */
             if (kv1 && kv1->ttl > 0 && kv1->ttl > time(NULL))
             {
-                if (!skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size,
-                                  kv1->ttl))
+                if (skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size,
+                                  kv1->ttl) == -1)
                 {
                     free(buffer1);
                     free(kv1->key);
@@ -536,8 +536,8 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
             /* check if ttl is set and if it has not expired */
             if (kv2 && kv2->ttl > 0 && kv2->ttl > time(NULL))
             {
-                if (!skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size,
-                                  kv2->ttl))
+                if (skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size,
+                                  kv2->ttl) == -1)
                 {
                     free(buffer2);
                     buffer2 = NULL;
@@ -570,13 +570,13 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
         }
     }
 
-    pager* new_pager = NULL;
+    pager_t* new_pager = NULL;
     char new_sstable_name[PATH_MAX];
 
     snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%lu.%s", cf->path, _get_path_seperator(),
              id_gen_new(cf->id_gen), SSTABLE_EXT);
 
-    if (!pager_open(new_sstable_name, &new_pager))
+    if (pager_open(new_sstable_name, &new_pager) == -1)
     {
         skiplist_destroy(mergetable);
         bloomfilter_destroy(bf);
@@ -586,7 +586,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
     uint8_t* bf_buffer = NULL;
     size_t bf_buffer_len = 0;
 
-    if (!serialize_bloomfilter(bf, &bf_buffer, &bf_buffer_len, cf->config.compressed))
+    if (serialize_bloomfilter(bf, &bf_buffer, &bf_buffer_len, cf->config.compressed) == -1)
     {
         skiplist_destroy(mergetable);
         bloomfilter_destroy(bf);
@@ -596,7 +596,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
 
     unsigned int page_num; /* bf page number */
 
-    if (!pager_write(new_pager, bf_buffer, bf_buffer_len, &page_num))
+    if (pager_write(new_pager, bf_buffer, bf_buffer_len, &page_num) == -1)
     {
         skiplist_destroy(mergetable);
         bloomfilter_destroy(bf);
@@ -609,7 +609,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
     free(bf_buffer);
     bloomfilter_destroy(bf);
 
-    skiplist_cursor* sl_cursor = skiplist_cursor_init(mergetable);
+    skiplist_cursor_t* sl_cursor = skiplist_cursor_init(mergetable);
 
     /* check mergetable size */
     if (mergetable->total_size == 0)
@@ -629,8 +629,8 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
         uint8_t* kv_buffer = NULL;
         size_t kv_buffer_len = 0;
 
-        key_value_pair* kvp = malloc(sizeof(key_value_pair));
-        if (!kvp) break;
+        key_value_pair_t* kvp = malloc(sizeof(key_value_pair_t));
+        if (kvp == NULL) break;
 
         kvp->key = sl_cursor->current->key;
         kvp->key_size = sl_cursor->current->key_size;
@@ -638,7 +638,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
         kvp->value_size = sl_cursor->current->value_size;
         kvp->ttl = sl_cursor->current->ttl;
 
-        if (!serialize_key_value_pair(kvp, &kv_buffer, &kv_buffer_len, cf->config.compressed))
+        if (serialize_key_value_pair(kvp, &kv_buffer, &kv_buffer_len, cf->config.compressed) == -1)
         {
             free(kvp);
             break;
@@ -648,7 +648,7 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
 
         unsigned int page_number;
 
-        if (!pager_write(new_pager, kv_buffer, kv_buffer_len, &page_number))
+        if (pager_write(new_pager, kv_buffer, kv_buffer_len, &page_number) == -1)
         {
             free(kv_buffer);
             break;
@@ -663,8 +663,8 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
 
     skiplist_destroy(mergetable);
 
-    sstable* new_sstable = malloc(sizeof(sstable));
-    if (!new_sstable)
+    sstable_t* new_sstable = malloc(sizeof(sstable_t));
+    if (new_sstable == NULL)
     {
         pager_close(new_pager);
         return NULL;
@@ -675,8 +675,8 @@ sstable* _merge_sstables(sstable* sst1, sstable* sst2, column_family* cf)
     return new_sstable;
 }
 
-tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uint8_t* key,
-                         size_t key_size, const uint8_t* value, size_t value_size, time_t ttl)
+tidesdb_err_t* tidesdb_put(tidesdb_t* tdb, const char* column_family_name, const uint8_t* key,
+                           size_t key_size, const uint8_t* value, size_t value_size, time_t ttl)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -691,18 +691,18 @@ tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uin
     if (value == NULL) return tidesdb_err_new(1027, "Value is NULL");
 
     /* we get column family */
-    column_family* cf = NULL;
+    column_family_t* cf = NULL;
 
-    if (!_get_column_family(tdb, column_family_name, &cf))
+    if (_get_column_family(tdb, column_family_name, &cf) == -1)
         return tidesdb_err_new(1028, "Column family not found");
 
     /* we append to the wal */
-    if (!_append_to_wal(tdb, tdb->wal, key, key_size, value, value_size, ttl, OP_PUT,
-                        column_family_name))
+    if (_append_to_wal(tdb, tdb->wal, key, key_size, value, value_size, ttl, OP_PUT,
+                        column_family_name) == -1)
         return tidesdb_err_new(1049, "Failed to append to wal");
 
     /* put in memtable */
-    if (!skiplist_put(cf->memtable, key, key_size, value, value_size, ttl))
+    if (skiplist_put(cf->memtable, key, key_size, value, value_size, ttl) == -1)
         return tidesdb_err_new(1050, "Failed to put into memtable");
 
     /* we check if the memtable has reached the flush threshold */
@@ -711,7 +711,7 @@ tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uin
         /* get flush mutex and lock it */
         pthread_mutex_lock(&tdb->flush_lock);
 
-        queue_entry* entry = malloc(sizeof(queue_entry)); /* we allocate a queue entry */
+        queue_entry_t* entry = malloc(sizeof(queue_entry_t)); /* we allocate a queue entry */
         if (entry == NULL)
         {
             /* unlock the flush mutex */
@@ -733,7 +733,7 @@ tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uin
         entry->cf = cf; /* we set the column family for the entry */
 
         /* we get the wal checkpoint */
-        if (!pager_size(tdb->wal->pager, &entry->wal_checkpoint))
+        if (pager_size(tdb->wal->pager, &entry->wal_checkpoint) == -1)
         {
             pthread_mutex_unlock(&tdb->flush_lock);
             free(entry);
@@ -756,8 +756,8 @@ tidesdb_err* tidesdb_put(tidesdb* tdb, const char* column_family_name, const uin
     return NULL;
 }
 
-tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uint8_t* key,
-                         size_t key_size, uint8_t** value, size_t* value_size)
+tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const uint8_t* key,
+                           size_t key_size, uint8_t** value, size_t* value_size)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -773,12 +773,12 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uin
         return tidesdb_err_new(1066, "Key's value cannot be a tombstone");
 
     /* we get column family */
-    column_family* cf = NULL;
-    if (!_get_column_family(tdb, column_family_name, &cf))
+    column_family_t* cf = NULL;
+    if (_get_column_family(tdb, column_family_name, &cf) == -1)
         return tidesdb_err_new(1028, "Column family not found");
 
     /* we check if the key exists in the memtable */
-    if (skiplist_get(cf->memtable, key, key_size, value, value_size))
+    if (skiplist_get(cf->memtable, key, key_size, value, value_size) != -1)
     {
         /* we found the key in the memtable
          * we check if the value is a tombstone */
@@ -802,17 +802,17 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uin
         uint8_t* bloom_filter_buffer = NULL;
         size_t bloom_filter_read = 0;
 
-        if (!pager_read(cf->sstables[i]->pager, 0, &bloom_filter_buffer, &bloom_filter_read))
+        if (pager_read(cf->sstables[i]->pager, 0, &bloom_filter_buffer, &bloom_filter_read) == -1)
         {
             pthread_mutex_unlock(&tdb->flush_lock);
             return tidesdb_err_new(1055, "Failed to read bloom filter");
         }
 
-        bloomfilter* bf = NULL;
+        bloomfilter_t* bf = NULL;
 
         /* we deserialize the bloom filter */
-        if (!deserialize_bloomfilter(bloom_filter_buffer, bloom_filter_read, &bf,
-                                     cf->config.compressed))
+        if (deserialize_bloomfilter(bloom_filter_buffer, bloom_filter_read, &bf,
+                                     cf->config.compressed) == -1)
         {
             free(bloom_filter_buffer);
             pthread_mutex_unlock(&tdb->flush_lock);
@@ -826,7 +826,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uin
             continue;
         }
 
-        bool key_exists = bloomfilter_check(bf, key, key_size);
+        bool key_exists = (bloomfilter_check(bf, key, key_size) == 0);
 
         bloomfilter_destroy(bf);
         free(bloom_filter_buffer);
@@ -837,15 +837,15 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uin
             continue;          /* go to the next sstable */
         }
 
-        pager_cursor* cursor = NULL;
-        if (!pager_cursor_init(cf->sstables[i]->pager, &cursor))
+        pager_cursor_t* cursor = NULL;
+        if (pager_cursor_init(cf->sstables[i]->pager, &cursor) == -1)
         {
             pthread_mutex_unlock(&tdb->flush_lock);
             return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
         }
 
         /* we skip the bloom filter page(s) */
-        if (!pager_cursor_next(cursor))
+        if (pager_cursor_next(cursor) == -1)
         {
             pager_cursor_free(cursor);
             if (i == 0) break; /* we have reached the end of the sstables */
@@ -858,7 +858,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uin
             uint8_t* buffer = NULL;
             size_t buffer_len = 0;
 
-            if (!pager_read(cf->sstables[i]->pager, cursor->page_number, &buffer, &buffer_len))
+            if (pager_read(cf->sstables[i]->pager, cursor->page_number, &buffer, &buffer_len) == -1)
             {
                 if (buffer != NULL) free(buffer);
                 pager_cursor_free(cursor);
@@ -866,9 +866,9 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uin
                 return tidesdb_err_new(1036, "Failed to read sstable");
             }
 
-            key_value_pair* kv = NULL;
+            key_value_pair_t* kv = NULL;
 
-            if (!deserialize_key_value_pair(buffer, buffer_len, &kv, cf->config.compressed))
+            if (deserialize_key_value_pair(buffer, buffer_len, &kv, cf->config.compressed) == -1)
             {
                 if (buffer != NULL) free(buffer);
                 pager_cursor_free(cursor);
@@ -938,7 +938,7 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uin
                 return NULL;
             }
 
-            if (pager_cursor_next(cursor))
+            if (pager_cursor_next(cursor) != -1)
             {
                 has_next = true;
             }
@@ -960,8 +960,8 @@ tidesdb_err* tidesdb_get(tidesdb* tdb, const char* column_family_name, const uin
     return tidesdb_err_new(1031, "Key not found");
 }
 
-tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const uint8_t* key,
-                            size_t key_size)
+tidesdb_err_t* tidesdb_delete(tidesdb_t* tdb, const char* column_family_name, const uint8_t* key,
+                              size_t key_size)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -971,8 +971,8 @@ tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const 
     if (key == NULL) return tidesdb_err_new(1026, "Key is NULL");
 
     /* get column family */
-    column_family* cf = NULL;
-    if (!_get_column_family(tdb, column_family_name, &cf))
+    column_family_t* cf = NULL;
+    if (_get_column_family(tdb, column_family_name, &cf) == -1)
         return tidesdb_err_new(1028, "Column family not found");
 
     uint8_t* tombstone = malloc(4);
@@ -987,12 +987,12 @@ tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const 
     }
 
     /* append to wal */
-    if (!_append_to_wal(tdb, tdb->wal, key, key_size, tombstone, 4, 0, OP_DELETE,
-                        column_family_name))
+    if (_append_to_wal(tdb, tdb->wal, key, key_size, tombstone, 4, 0, OP_DELETE,
+                        column_family_name) == -1)
         return tidesdb_err_new(1029, "Failed to append to wal");
 
     /* add to memtable */
-    if (!skiplist_put(cf->memtable, key, key_size, tombstone, 4, -1))
+    if (skiplist_put(cf->memtable, key, key_size, tombstone, 4, -1) == -1)
         return tidesdb_err_new(1030, "Failed to put into memtable");
 
     free(tombstone);
@@ -1000,7 +1000,7 @@ tidesdb_err* tidesdb_delete(tidesdb* tdb, const char* column_family_name, const 
     return NULL;
 }
 
-tidesdb_err* tidesdb_txn_begin(txn** transaction, const char* column_family)
+tidesdb_err_t* tidesdb_txn_begin(tidesdb_txn_t** transaction, const char* column_family)
 {
     /* we check if column family is NULL */
     if (column_family == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
@@ -1008,7 +1008,7 @@ tidesdb_err* tidesdb_txn_begin(txn** transaction, const char* column_family)
     /* we check if transaction is NULL */
     if (transaction == NULL) return tidesdb_err_new(1053, "Transaction pointer is NULL");
 
-    *transaction = (txn*)malloc(sizeof(txn));
+    *transaction = (tidesdb_txn_t*)malloc(sizeof(tidesdb_txn_t));
     if (*transaction == NULL)
         return tidesdb_err_new(1052, "Failed to allocate memory for transaction");
 
@@ -1026,8 +1026,8 @@ tidesdb_err* tidesdb_txn_begin(txn** transaction, const char* column_family)
     return NULL;
 }
 
-tidesdb_err* tidesdb_txn_put(txn* transaction, const uint8_t* key, size_t key_size,
-                             const uint8_t* value, size_t value_size, time_t ttl)
+tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, size_t key_size,
+                               const uint8_t* value, size_t value_size, time_t ttl)
 {
     /* we check if the transaction is NULL */
     if (transaction == NULL) return tidesdb_err_new(1054, "Transaction is NULL");
@@ -1038,14 +1038,15 @@ tidesdb_err* tidesdb_txn_put(txn* transaction, const uint8_t* key, size_t key_si
     /* we check if the value is NULL */
     if (value == NULL) return tidesdb_err_new(1027, "Value is NULL");
 
-    txn_op* temp_ops = realloc(transaction->ops, (transaction->num_ops + 1) * sizeof(txn_op));
+    tidesdb_txn_op_t* temp_ops =
+        realloc(transaction->ops, (transaction->num_ops + 1) * sizeof(tidesdb_txn_op_t));
     if (temp_ops == NULL)
     {
         return tidesdb_err_new(1056, "Failed to reallocate memory for transaction operations");
     }
     transaction->ops = temp_ops;
 
-    transaction->ops[transaction->num_ops].op = (operation*)malloc(sizeof(operation));
+    transaction->ops[transaction->num_ops].op = (operation_t*)malloc(sizeof(operation_t));
     if (transaction->ops[transaction->num_ops].op == NULL)
     {
         return tidesdb_err_new(1057, "Failed to allocate memory for operation");
@@ -1059,7 +1060,8 @@ tidesdb_err* tidesdb_txn_put(txn* transaction, const uint8_t* key, size_t key_si
         return tidesdb_err_new(1058, "Failed to allocate memory for column family name");
     }
 
-    transaction->ops[transaction->num_ops].op->kv = (key_value_pair*)malloc(sizeof(key_value_pair));
+    transaction->ops[transaction->num_ops].op->kv =
+        (key_value_pair_t*)malloc(sizeof(key_value_pair_t));
     if (transaction->ops[transaction->num_ops].op->kv == NULL)
     {
         free(transaction->ops[transaction->num_ops].op->column_family);
@@ -1097,7 +1099,7 @@ tidesdb_err* tidesdb_txn_put(txn* transaction, const uint8_t* key, size_t key_si
     return NULL;
 }
 
-tidesdb_err* tidesdb_txn_delete(txn* transaction, const uint8_t* key, size_t key_size)
+tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key, size_t key_size)
 {
     /* we check if the transaction is NULL */
     if (transaction == NULL) return tidesdb_err_new(1032, "Transaction is NULL");
@@ -1105,11 +1107,12 @@ tidesdb_err* tidesdb_txn_delete(txn* transaction, const uint8_t* key, size_t key
     /* we check if the key is NULL */
     if (key == NULL) return tidesdb_err_new(1026, "Key is NULL");
 
-    txn_op* temp_ops = realloc(transaction->ops, (transaction->num_ops + 1) * sizeof(txn_op));
+    tidesdb_txn_op_t* temp_ops =
+        realloc(transaction->ops, (transaction->num_ops + 1) * sizeof(tidesdb_txn_op_t));
     if (temp_ops == NULL) return tidesdb_err_new(1031, "Failed to allocate memory for transaction");
     transaction->ops = temp_ops;
 
-    transaction->ops[transaction->num_ops].op = (operation*)malloc(sizeof(operation));
+    transaction->ops[transaction->num_ops].op = (operation_t*)malloc(sizeof(operation_t));
     if (transaction->ops[transaction->num_ops].op == NULL)
         return tidesdb_err_new(1057, "Failed to allocate memory for operation");
 
@@ -1121,7 +1124,8 @@ tidesdb_err* tidesdb_txn_delete(txn* transaction, const uint8_t* key, size_t key
         return tidesdb_err_new(1058, "Failed to allocate memory for column family name");
     }
 
-    transaction->ops[transaction->num_ops].op->kv = (key_value_pair*)malloc(sizeof(key_value_pair));
+    transaction->ops[transaction->num_ops].op->kv =
+        (key_value_pair_t*)malloc(sizeof(key_value_pair_t));
     if (transaction->ops[transaction->num_ops].op->kv == NULL)
     {
         free(transaction->ops[transaction->num_ops].op->column_family);
@@ -1145,7 +1149,7 @@ tidesdb_err* tidesdb_txn_delete(txn* transaction, const uint8_t* key, size_t key
     transaction->ops[transaction->num_ops].op->kv->ttl = 0;
     transaction->ops[transaction->num_ops].committed = false;
 
-    transaction->ops[transaction->num_ops].rollback_op = (operation*)malloc(sizeof(operation));
+    transaction->ops[transaction->num_ops].rollback_op = (operation_t*)malloc(sizeof(operation_t));
     if (transaction->ops[transaction->num_ops].rollback_op == NULL)
     {
         free(transaction->ops[transaction->num_ops].op->kv->key);
@@ -1170,7 +1174,7 @@ tidesdb_err* tidesdb_txn_delete(txn* transaction, const uint8_t* key, size_t key
     }
 
     transaction->ops[transaction->num_ops].rollback_op->kv =
-        (key_value_pair*)malloc(sizeof(key_value_pair));
+        (key_value_pair_t*)malloc(sizeof(key_value_pair_t));
     if (transaction->ops[transaction->num_ops].rollback_op->kv == NULL)
     {
         free(transaction->ops[transaction->num_ops].rollback_op->column_family);
@@ -1206,7 +1210,7 @@ tidesdb_err* tidesdb_txn_delete(txn* transaction, const uint8_t* key, size_t key
     return NULL;
 }
 
-tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction)
+tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -1215,8 +1219,8 @@ tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction)
     if (transaction == NULL) return tidesdb_err_new(1032, "Transaction is NULL");
 
     /* we get column family */
-    column_family* cf = NULL;
-    if (!_get_column_family(tdb, transaction->column_family, &cf))
+    column_family_t* cf = NULL;
+    if (_get_column_family(tdb, transaction->column_family, &cf) == -1)
         return tidesdb_err_new(1028, "Column family not found");
 
     /* we lock the memtable */
@@ -1225,7 +1229,7 @@ tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction)
     /* we run the operations */
     for (int i = 0; i < transaction->num_ops; i++)
     {
-        operation op = *transaction->ops[i].op;
+        operation_t op = *transaction->ops[i].op;
         if (transaction->ops[i].committed) continue;
 
         switch (op.op_code)
@@ -1263,7 +1267,7 @@ tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction)
         /* get flush mutex */
         pthread_mutex_lock(&tdb->flush_lock);
 
-        queue_entry* entry = malloc(sizeof(queue_entry));
+        queue_entry_t* entry = malloc(sizeof(queue_entry_t));
         if (entry == NULL)
         {
             /* unlock the flush mutex */
@@ -1283,7 +1287,7 @@ tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction)
 
         entry->cf = cf;
 
-        if (!pager_size(tdb->wal->pager, &entry->wal_checkpoint))
+        if (pager_size(tdb->wal->pager, &entry->wal_checkpoint) == -1)
         {
             pthread_mutex_unlock(&tdb->flush_lock);
             free(entry);
@@ -1302,7 +1306,7 @@ tidesdb_err* tidesdb_txn_commit(tidesdb* tdb, txn* transaction)
     return NULL;
 }
 
-tidesdb_err* tidesdb_txn_rollback(tidesdb* tdb, txn* transaction)
+tidesdb_err_t* tidesdb_txn_rollback(tidesdb_t* tdb, tidesdb_txn_t* transaction)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
@@ -1314,10 +1318,10 @@ tidesdb_err* tidesdb_txn_rollback(tidesdb* tdb, txn* transaction)
     {
         if (transaction->ops[i].committed)
         {
-            operation op = *transaction->ops[i].rollback_op;
-            column_family* cf = NULL;
+            operation_t op = *transaction->ops[i].rollback_op;
+            column_family_t* cf = NULL;
 
-            if (!_get_column_family(tdb, op.column_family, &cf))
+            if (_get_column_family(tdb, op.column_family, &cf) == -1)
                 return tidesdb_err_new(1028, "Column family not found");
 
             switch (op.op_code)
@@ -1343,7 +1347,7 @@ tidesdb_err* tidesdb_txn_rollback(tidesdb* tdb, txn* transaction)
     return NULL;
 }
 
-void _free_key_value_pair(key_value_pair* kv)
+void _free_key_value_pair(key_value_pair_t* kv)
 {
     if (kv != NULL)
     {
@@ -1358,10 +1362,11 @@ void _free_key_value_pair(key_value_pair* kv)
             kv->value = NULL;
         }
         free(kv);
+        kv = NULL;
     }
 }
 
-void _free_operation(operation* op)
+void _free_operation(operation_t* op)
 {
     if (op != NULL)
     {
@@ -1378,7 +1383,7 @@ void _free_operation(operation* op)
     }
 }
 
-tidesdb_err* tidesdb_txn_free(txn* transaction)
+tidesdb_err_t* tidesdb_txn_free(tidesdb_txn_t* transaction)
 {
     if (transaction == NULL) return tidesdb_err_new(1032, "Transaction is NULL");
 
@@ -1398,279 +1403,50 @@ tidesdb_err* tidesdb_txn_free(txn* transaction)
     return NULL;
 }
 
-tidesdb_err* tidesdb_cursor_init(tidesdb* tdb, const char* column_family_name,
-                                 tidesdb_cursor** cursor)
+tidesdb_err_t* tidesdb_cursor_init(tidesdb_t* tdb, const char* column_family_name,
+                                   tidesdb_cursor_t** cursor)
 {
-    /* we check if the db is NULL */
-    if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
-
-    /* we check if the column name if null, it should not be */
-    if (column_family_name == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
-
-    /* we get the column family */
-    column_family* cf = NULL;
-
-    if (!_get_column_family(tdb, column_family_name, &cf))
-        return tidesdb_err_new(1028, "Column family not found");
-
-    /* we allocate memory for the new cursor */
-    *cursor = malloc(sizeof(tidesdb_cursor));
-    if (*cursor == NULL) return tidesdb_err_new(1057, "Failed to allocate memory for cursor");
-
-    /* now we set the member variables */
-    (*cursor)->tidesdb = tdb;
-    (*cursor)->cf = cf;
-    (*cursor)->sstable_cursor = NULL;
-    (*cursor)->memtable_cursor = NULL;
-
-    /* lock sstables */
-
-    if (pthread_rwlock_rdlock(&cf->sstables_lock) != 0)
-    {
-        free(*cursor);
-        return tidesdb_err_new(1024, "Failed to lock sstables");
-    }
-
-    (*cursor)->sstable_index = cf->num_sstables - 1; /* we start at the last sstable */
-
-    /* unlock sstables */
-    if (pthread_rwlock_unlock(&cf->sstables_lock) != 0)
-    {
-        free(*cursor);
-        return tidesdb_err_new(1025, "Failed to unlock sstables lock");
-    }
-
-    /* we lock create a memtable cursor */
-    (*cursor)->memtable_cursor = skiplist_cursor_init(cf->memtable);
-    if ((*cursor)->memtable_cursor == NULL)
-    {
-        free(*cursor);
-        return tidesdb_err_new(1058, "Failed to initialize memtable cursor");
-    }
-
-    /* we get current sstable cursor */
-
-    (*cursor)->sstable_cursor = NULL;
-    /* we initialize the sstable cursor */
-    if (!pager_cursor_init(cf->sstables[(*cursor)->sstable_index]->pager,
-                           &(*cursor)->sstable_cursor))
-    {
-        skiplist_cursor_free((*cursor)->memtable_cursor);
-        free(*cursor);
-        return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
-    }
-
-    /* we check if the sstable cursor is NULL */
-    if ((*cursor)->sstable_cursor == NULL)
-    {
-        skiplist_cursor_free((*cursor)->memtable_cursor);
-        free(*cursor);
-        return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
-    }
-
-    /** pager_cursor_next((*cursor)->sstable_cursor); */
+    /** TODO */
 
     return NULL;
 }
 
-tidesdb_err* tidesdb_cursor_next(tidesdb_cursor* cursor)
+tidesdb_err_t* tidesdb_cursor_next(tidesdb_cursor_t* cursor)
 {
-    /* we start at the memtable
-     * once the memtable is exhausted we move to the sstables
-     */
-
-    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
-
-    if (cursor->memtable_cursor->current != NULL)
-    {
-        /* we move to the next key in the memtable */
-        if (skiplist_cursor_next(cursor->memtable_cursor))
-        {
-            return NULL;
-        }
-        else
-        {
-            /* go next to the sstables */
-            if (pager_cursor_next(cursor->sstable_cursor))
-            {
-                return NULL;
-            }
-            else
-            {
-                /* we move to the next sstable */
-                cursor->sstable_index--;
-                if (cursor->sstable_index >= cursor->cf->num_sstables)
-                {
-                    return tidesdb_err_new(1062, "At end of cursor");
-                }
-
-                /* we initialize the new sstable cursor */
-                if (!pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
-                                       &cursor->sstable_cursor))
-                {
-                    return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
-                }
-
-                /**pager_cursor_next(cursor->sstable_cursor); */
-
-                return NULL;
-            }
-        }
-    }
+    /** TODO */
 
     return NULL;
 }
 
-tidesdb_err* tidesdb_cursor_prev(tidesdb_cursor* cursor)
+tidesdb_err_t* tidesdb_cursor_prev(tidesdb_cursor_t* cursor)
 {
-    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
-
-    if (cursor->sstable_cursor != NULL)
-    {
-        /* we move to the previous key in the sstable */
-        if (pager_cursor_prev(cursor->sstable_cursor))
-        {
-            return NULL;
-        }
-
-        /* we move to the previous sstable */
-        /* get sstables lock */
-        if (pthread_rwlock_rdlock(&cursor->cf->sstables_lock) != 0)
-        {
-            return tidesdb_err_new(1024, "Failed to lock sstables");
-        }
-        /* check if we are at the first sstable */
-        if (cursor->sstable_index == cursor->cf->num_sstables - 1)
-        {
-            /* if we are at the first sstable, move to the memtable */
-            if (skiplist_cursor_prev(cursor->memtable_cursor))
-            {
-                return NULL;
-            }
-            return tidesdb_err_new(1063, "At start of cursor");
-        }
-
-        cursor->sstable_index++;
-        if (!pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
-                               &cursor->sstable_cursor))
-        {
-            return tidesdb_err_new(1059, "Failed to initialize sstable cursor");
-        }
-
-        return NULL;
-    }
-
-    /* if sstable_cursor is NULL, move to the previous key in the memtable */
-    if (skiplist_cursor_prev(cursor->memtable_cursor))
-    {
-        return NULL;
-    }
-
-    return tidesdb_err_new(1063, "At start of cursor");
-}
-
-tidesdb_err* tidesdb_cursor_get(tidesdb_cursor* cursor, key_value_pair** kv)
-{
-    /* we get the key value pair from the cursor.
-     * could be from the memtable or an sstable
-     */
-
-    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
-
-    if (cursor->memtable_cursor->current != NULL)
-    {
-        (*kv)->key = cursor->memtable_cursor->current->key;
-        (*kv)->key_size = cursor->memtable_cursor->current->key_size;
-        (*kv)->value = cursor->memtable_cursor->current->value;
-        (*kv)->value_size = cursor->memtable_cursor->current->value_size;
-        return NULL;
-    }
-
-    uint8_t* kv_buffer = NULL; /* key value buffer reading from page */
-    size_t kv_buffer_len = 0;  /* key value buffer length */
-
-    /* read current page */
-    if (pager_read(cursor->cf->sstables[cursor->sstable_index]->pager,
-                   cursor->sstable_cursor->page_number, &kv_buffer, &kv_buffer_len))
-    {
-        key_value_pair* dkv = NULL;
-
-        /* deserialize key value pair */
-        if (deserialize_key_value_pair(kv_buffer, kv_buffer_len, &dkv,
-                                       cursor->cf->config.compressed))
-        {
-            if (dkv != NULL)
-            {
-                /* we check if the key is a tombstoned or has a ttl set and has expired
-                 * if so we report back this information so the user can decide what to do */
-                /* we don't know the direction the user is going thus we leave it up to them */
-                if (_is_tombstone(dkv->value, dkv->value_size))
-                {
-                    free(kv_buffer);
-                    free(dkv->key);
-                    free(dkv->value);
-                    free(dkv);
-                    dkv = NULL;
-                    return tidesdb_err_new(
-                        1064, "Key has a tombstone value.  To be deleted on next compaction");
-                }
-                else if (dkv->ttl != -1 && dkv->ttl < time(NULL))
-                {
-                    free(kv_buffer);
-                    free(dkv->key);
-                    free(dkv->value);
-                    free(dkv);
-                    dkv = NULL;
-                    return tidesdb_err_new(
-                        1065,
-                        "Key has expired.  To be deleted on next compaction"); /* only for sstable
-                                                                                  scans, the
-                                                                                  memtable cursor
-                                                                                  will not report
-                                                                                  back a key that
-                                                                                  has expired or is
-                                                                                  a tombstone */
-                }
-
-                (*kv)->key = dkv->key;
-                (*kv)->key_size = dkv->key_size;
-                (*kv)->value = dkv->value;
-                (*kv)->value_size = dkv->value_size;
-
-                return NULL;
-            }
-        }
-    }
-
-    return tidesdb_err_new(1060, "Failed to get key value pair from cursor");
-}
-
-tidesdb_err* tidesdb_cursor_free(tidesdb_cursor* cursor)
-{
-    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
-
-    /* we try to free the sstable cursor */
-    if (cursor->sstable_cursor != NULL) pager_cursor_free(cursor->sstable_cursor);
-
-    /* now we try to free the memtable cursor */
-    if (cursor->memtable_cursor != NULL) skiplist_cursor_free(cursor->memtable_cursor);
-
-    /* now we free the cursor */
-    free(cursor);
-
-    cursor = NULL;
+    /** TODO */
 
     return NULL;
 }
 
-bool _new_column_family(const char* db_path, const char* name, int flush_threshold, int max_level,
-                        float probability, column_family** cf, bool compressed)
+tidesdb_err_t* tidesdb_cursor_get(tidesdb_cursor_t* cursor, key_value_pair_t* kv)
+{
+    /** TODO */
+
+    return NULL;
+}
+
+tidesdb_err_t* tidesdb_cursor_free(tidesdb_cursor_t* cursor)
+{
+    /** TODO */
+
+    return NULL;
+}
+
+int _new_column_family(const char* db_path, const char* name, int flush_threshold, int max_level,
+                        float probability, column_family_t** cf, bool compressed)
 {
     /* we allocate memory for the column family */
-    *cf = malloc(sizeof(column_family));
+    *cf = malloc(sizeof(column_family_t));
 
     /* we check if allocation was successful */
-    if (*cf == NULL) return false;
+    if (*cf == NULL) return -1;
 
     /* we copy the name */
     (*cf)->config.name = strdup(name);
@@ -1679,7 +1455,7 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
     if ((*cf)->config.name == NULL)
     {
         free(*cf);
-        return false;
+        return -1;
     }
 
     /* we set the flush threshold */
@@ -1697,7 +1473,7 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
     {
         free((*cf)->config.name);
         free(*cf);
-        return false;
+        return -1;
     }
 
     /* set compressed to false */
@@ -1717,7 +1493,7 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
         {
             free((*cf)->config.name);
             free(*cf);
-            return false;
+            return -1;
         }
     }
 
@@ -1734,11 +1510,11 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
     size_t serialized_size;
     uint8_t* serialized_cf;
 
-    if (!serialize_column_family_config(&(*cf)->config, &serialized_cf, &serialized_size))
+    if (serialize_column_family_config(&(*cf)->config, &serialized_cf, &serialized_size) == -1)
     {
         free((*cf)->config.name);
         free(*cf);
-        return false;
+        return -1;
     }
 
     /* we open the config file (new file) */
@@ -1748,7 +1524,7 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
         free((*cf)->config.name);
         free(*cf);
         free(serialized_cf);
-        return false;
+        return -1;
     }
 
     /* we write the serialized column family struct to the config file */
@@ -1758,8 +1534,11 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
         free(*cf);
         free(serialized_cf);
         fclose(config_file);
-        return false;
+        return -1;
     }
+
+    /* sync the file */
+    fflush(config_file);
 
     /* we set the path */
     (*cf)->path = strdup(cf_path);
@@ -1771,7 +1550,7 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
         free(*cf);
         free(serialized_cf);
         fclose(config_file);
-        return false;
+        return -1;
     }
 
     /* we init sstables array and len */
@@ -1786,7 +1565,7 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
         free(*cf);
         free(serialized_cf);
         fclose(config_file);
-        return false;
+        return -1;
     }
 
     /* we create memtable */
@@ -1801,43 +1580,43 @@ bool _new_column_family(const char* db_path, const char* name, int flush_thresho
         free(*cf);
         free(serialized_cf);
         fclose(config_file);
-        return false;
+        return -1;
     }
 
     /* we free what we must */
     free(serialized_cf);
     fclose(config_file);
 
-    return true;
+    return 0;
 }
 
-bool _add_column_family(tidesdb* tdb, column_family* cf)
+int _add_column_family(tidesdb_t* tdb, column_family_t* cf)
 {
     /* we check if tdb or cf is NULL */
-    if (tdb == NULL || cf == NULL) return false;
+    if (tdb == NULL || cf == NULL) return -1;
 
     /* we lock the column families lock */
-    if (pthread_rwlock_wrlock(&tdb->column_families_lock) != 0) return false;
+    if (pthread_rwlock_wrlock(&tdb->column_families_lock) != 0) return -1;
 
     if (tdb->column_families == NULL)
     {
-        tdb->column_families = malloc(sizeof(column_family));
+        tdb->column_families = malloc(sizeof(column_family_t));
         if (tdb->column_families == NULL)
         {
             /* release the lock */
             pthread_rwlock_unlock(&tdb->column_families_lock);
-            return false;
+            return -1;
         }
     }
     else
     {
-        column_family* temp_families = (column_family*)realloc(
-            tdb->column_families, sizeof(column_family) * (tdb->num_column_families + 1));
+        column_family_t* temp_families = (column_family_t*)realloc(
+            tdb->column_families, sizeof(column_family_t) * (tdb->num_column_families + 1));
         /* we check if the reallocation was successful */
         if (temp_families == NULL)
         {
             pthread_rwlock_unlock(&tdb->column_families_lock);
-            return false;
+            return -1;
         }
 
         tdb->column_families = temp_families;
@@ -1851,20 +1630,25 @@ bool _add_column_family(tidesdb* tdb, column_family* cf)
 
     pthread_rwlock_unlock(&tdb->column_families_lock);
     free(cf);
-    return true;
+    return 0;
 }
 
-bool _get_column_family(tidesdb* tdb, const char* name, column_family** cf)
+int _get_column_family(tidesdb_t* tdb, const char* name, column_family_t** cf)
 {
     /* we check if tdb or name is NULL */
-    if (tdb == NULL || name == NULL) return false;
+    if (tdb == NULL || name == NULL) return -1;
 
     /* we check if column name is NULL */
-    if (name == NULL) return false;
+    if (name == NULL) return -1;
 
     /* lock the column families lock */
-    if (pthread_rwlock_rdlock(&tdb->column_families_lock) != 0) return false;
+    if (pthread_rwlock_rdlock(&tdb->column_families_lock) != 0) return -1;
 
+    if (tdb->num_column_families == 0)
+    {
+        pthread_rwlock_unlock(&tdb->column_families_lock);
+        return -1;
+    }
     /* we iterate over the column families and return the one with the matching name */
     for (int i = 0; i < tdb->num_column_families; i++)
     {
@@ -1876,25 +1660,25 @@ bool _get_column_family(tidesdb* tdb, const char* name, column_family** cf)
             /* match on name we return the column family */
             *cf = &tdb->column_families[i];
 
-            return true;
+            return 0;
         }
     }
 
     pthread_rwlock_unlock(&tdb->column_families_lock);
 
-    return false; /* no column family with that name */
+    return -1; /* no column family with that name */
 }
 
-bool _load_column_families(tidesdb* tdb)
+int _load_column_families(tidesdb_t* tdb)
 {
     /* check if tdb is NULL */
-    if (tdb == NULL) return false;
+    if (tdb == NULL) return -1;
 
     /* open the db directory */
     DIR* tdb_dir = opendir(tdb->config.db_path);
     if (tdb_dir == NULL)
     {
-        return false;
+        return -1;
     }
 
     struct dirent* tdb_entry; /* create a dirent struct for the db directory */
@@ -1929,7 +1713,7 @@ bool _load_column_families(tidesdb* tdb)
                 {
                     closedir(cf_dir);
                     closedir(tdb_dir);
-                    return false;
+                    return -1;
                 }
 
                 /* load the config file into memory */
@@ -1938,7 +1722,7 @@ bool _load_column_families(tidesdb* tdb)
                 {
                     closedir(cf_dir);
                     closedir(tdb_dir);
-                    return false;
+                    return -1;
                 }
 
                 fseek(config_file, 0, SEEK_END);         /* seek to end of file */
@@ -1952,32 +1736,32 @@ bool _load_column_families(tidesdb* tdb)
                     fclose(config_file);
                     closedir(cf_dir);
                     closedir(tdb_dir);
-                    return false;
+                    return -1;
                 }
 
                 fclose(config_file);
 
                 /* deserialize the cf config */
-                column_family_config* config;
+                column_family_config_t* config;
 
-                if (!deserialize_column_family_config(buffer, config_size, &config))
+                if (deserialize_column_family_config(buffer, config_size, &config) == -1)
                 {
                     free(buffer);
                     closedir(cf_dir);
                     closedir(tdb_dir);
-                    return false;
+                    return -1;
                 }
 
                 free(buffer);
 
                 /* initialize the column family and add it to tidesdb */
-                column_family* cf = (column_family*)malloc(sizeof(column_family));
+                column_family_t* cf = (column_family_t*)malloc(sizeof(column_family_t));
 
                 if (cf == NULL)
                 {
                     closedir(cf_dir);
                     closedir(tdb_dir);
-                    return false;
+                    return -1;
                 }
 
                 cf->config = *config;
@@ -1994,7 +1778,7 @@ bool _load_column_families(tidesdb* tdb)
                     free(cf);
                     closedir(cf_dir);
                     closedir(tdb_dir);
-                    return false;
+                    return -1;
                 }
 
                 /* we initialize sstables lock */
@@ -2004,17 +1788,17 @@ bool _load_column_families(tidesdb* tdb)
                     free(cf);
                     closedir(cf_dir);
                     closedir(tdb_dir);
-                    return false;
+                    return -1;
                 }
 
                 /* we add the column family yo db */
-                if (!_add_column_family(tdb, cf))
+                if (_add_column_family(tdb, cf) == -1)
                 {
                     free(cf->config.name);
                     free(cf);
                     closedir(cf_dir);
                     closedir(tdb_dir);
-                    return false;
+                    return -1;
                 }
             }
         }
@@ -2026,7 +1810,7 @@ bool _load_column_families(tidesdb* tdb)
     /* we free up resources */
     closedir(tdb_dir);
 
-    return true;
+    return 0;
 }
 
 const char* _get_path_seperator()
@@ -2038,17 +1822,17 @@ const char* _get_path_seperator()
 #endif
 }
 
-bool _append_to_wal(tidesdb* tdb, wal* wal, const uint8_t* key, size_t key_size,
-                    const uint8_t* value, size_t value_size, time_t ttl, enum OP_CODE op_code,
+int _append_to_wal(tidesdb_t* tdb, wal_t* wal, const uint8_t* key, size_t key_size,
+                    const uint8_t* value, size_t value_size, time_t ttl, OP_CODE op_code,
                     const char* cf)
 {
-    if (tdb == NULL || wal == NULL || key == NULL) return false;
+    if (tdb == NULL || wal == NULL || key == NULL) return -1;
 
-    column_family* column_family = NULL;
-    if (!_get_column_family(tdb, cf, &column_family)) return false;
+    column_family_t* column_family = NULL;
+    if (_get_column_family(tdb, cf, &column_family) == -1) return -1;
 
-    operation* op = malloc(sizeof(operation));
-    if (op == NULL) return false;
+    operation_t* op = malloc(sizeof(operation_t));
+    if (op == NULL) return -1;
 
     op->op_code = op_code;
     op->column_family = strdup(cf);
@@ -2056,15 +1840,15 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const uint8_t* key, size_t key_size,
     if (op->column_family == NULL)
     {
         free(op);
-        return false;
+        return -1;
     }
 
-    op->kv = (key_value_pair*)malloc(sizeof(key_value_pair));
+    op->kv = (key_value_pair_t*)malloc(sizeof(key_value_pair_t));
     if (op->kv == NULL)
     {
         free(op->column_family);
         free(op);
-        return false;
+        return -1;
     }
 
     op->kv->key = (uint8_t*)malloc(key_size);
@@ -2073,7 +1857,7 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const uint8_t* key, size_t key_size,
         free(op->column_family);
         free(op->kv);
         free(op);
-        return false;
+        return -1;
     }
 
     memcpy(op->kv->key, key, key_size);
@@ -2086,7 +1870,7 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const uint8_t* key, size_t key_size,
         free(op->kv->key);
         free(op->kv);
         free(op);
-        return false;
+        return -1;
     }
 
     /* could be a delete */
@@ -2101,19 +1885,19 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const uint8_t* key, size_t key_size,
     uint8_t* serialized_op_buffer = NULL;
     size_t serialized_op_buffer_size = 0;
 
-    if (!serialize_operation(op, &serialized_op_buffer, &serialized_op_buffer_size,
-                             tdb->config.compressed_wal))
+    if (serialize_operation(op, &serialized_op_buffer, &serialized_op_buffer_size,
+                             tdb->config.compressed_wal) == -1)
     {
         free(op->column_family);
         free(op->kv->key);
         free(op->kv->value);
         free(op->kv);
         free(op);
-        return false;
+        return -1;
     }
 
     unsigned int pg_num = 0;
-    if (!pager_write(wal->pager, serialized_op_buffer, serialized_op_buffer_size, &pg_num))
+    if (pager_write(wal->pager, serialized_op_buffer, serialized_op_buffer_size, &pg_num) == -1)
     {
         free(op->column_family);
         free(op->kv->key);
@@ -2121,7 +1905,7 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const uint8_t* key, size_t key_size,
         free(op->kv);
         free(op);
         free(serialized_op_buffer);
-        return false;
+        return -1;
     }
 
     free(op->column_family);
@@ -2131,35 +1915,35 @@ bool _append_to_wal(tidesdb* tdb, wal* wal, const uint8_t* key, size_t key_size,
     free(op);
     free(serialized_op_buffer);
 
-    return true;
+    return 0;
 }
 
-bool _open_wal(const char* db_path, wal** w)
+int _open_wal(const char* db_path, wal_t** w)
 {
     /* we check if the db path is NULL */
-    if (db_path == NULL) return false;
+    if (db_path == NULL) return -1;
 
     /* we check if wal is NULL */
-    if (w == NULL) return false;
+    if (w == NULL) return -1;
 
     char wal_path[PATH_MAX];
     snprintf(wal_path, sizeof(wal_path), "%s%s%s", db_path, _get_path_seperator(), WAL_EXT);
 
-    pager* p = NULL;
-    if (!pager_open(wal_path, &p)) return false;
+    pager_t* p = NULL;
+    if (pager_open(wal_path, &p) == -1) return -1;
 
     (*w)->pager = p;
     if (pthread_rwlock_init(&(*w)->lock, NULL) != 0)
     {
         free(*w);
         pager_close(p);
-        return false;
+        return -1;
     }
 
-    return true;
+    return 0;
 }
 
-void _close_wal(wal* wal)
+void _close_wal(wal_t* wal)
 {
     /* we check if the wal is NULL */
     if (wal == NULL) return;
@@ -2176,66 +1960,66 @@ void _close_wal(wal* wal)
     wal = NULL;
 }
 
-bool _truncate_wal(wal* wal, int checkpoint)
+int _truncate_wal(wal_t* wal, int checkpoint)
 {
-    if (wal == NULL) return false;
+    if (wal == NULL) return -1;
 
     /* lock wal */
     pthread_rwlock_wrlock(&wal->lock);
 
     /* truncate the wal to provided checkpoint */
-    if (!pager_truncate(wal->pager, checkpoint))
+    if (pager_truncate(wal->pager, checkpoint) == -1)
     {
         /* unlock wal */
         pthread_rwlock_unlock(&wal->lock);
-        return false;
+        return -1;
     }
 
     /* unlock wal */
     pthread_rwlock_unlock(&wal->lock);
 
-    return true;
+    return 0;
 }
 
-bool _replay_from_wal(tidesdb* tdb, wal* wal)
+int _replay_from_wal(tidesdb_t* tdb, wal_t* wal)
 {
-    if (wal == NULL || tdb == NULL) return false;
+    if (wal == NULL || tdb == NULL) return -1;
 
     /* we check if the wal is empty */
     size_t pages_count = 0;
-    if (!pager_pages_count(wal->pager, &pages_count)) return false; /* failed to get pages count */
+    if (pager_pages_count(wal->pager, &pages_count) == -1) return -1; /* failed to get pages count */
 
-    if (pages_count == 0) return true; /* wal is empty */
+    if (pages_count == 0) return 0; /* wal is empty */
 
-    pager_cursor* pc = NULL;
+    pager_cursor_t* pc = NULL;
 
-    if (pager_cursor_init(wal->pager, &pc))
+    if (pager_cursor_init(wal->pager, &pc) == 0)
     {
         do
         {
             unsigned int pg_num;
-            if (!pager_cursor_get(pc, &pg_num)) break;
+            if (pager_cursor_get(pc, &pg_num) == -1) break;
 
-            operation* op = NULL;
+            operation_t* op = NULL;
 
             uint8_t* op_buffer = NULL;
             size_t op_buffer_size = 0;
 
-            if (!pager_read(wal->pager, pg_num, &op_buffer, &op_buffer_size))
+            if (pager_read(wal->pager, pg_num, &op_buffer, &op_buffer_size) == -1)
             {
                 free(op_buffer);
                 break;
             }
 
-            if (!deserialize_operation(op_buffer, op_buffer_size, &op, tdb->config.compressed_wal))
+            if (deserialize_operation(op_buffer, op_buffer_size, &op, tdb->config.compressed_wal) == -1)
             {
                 free(op_buffer);
                 break;
             }
 
-            column_family* cf = NULL;
+            column_family_t* cf = NULL;
 
-            if (!_get_column_family(tdb, op->column_family, &cf))
+            if (_get_column_family(tdb, op->column_family, &cf) == -1)
             {
                 free(op_buffer);
                 free(op);
@@ -2258,8 +2042,8 @@ bool _replay_from_wal(tidesdb* tdb, wal* wal)
                     }
 
                     /* add to memtable */
-                    if (!skiplist_put(cf->memtable, op->kv->key, op->kv->key_size, tombstone, 4,
-                                      -1))
+                    if (skiplist_put(cf->memtable, op->kv->key, op->kv->key_size, tombstone, 4,
+                                      -1) == -1)
                     {
                         free(tombstone);
                         break;
@@ -2278,18 +2062,18 @@ bool _replay_from_wal(tidesdb* tdb, wal* wal)
             free(op);
             free(op_buffer);
 
-        } while (pager_cursor_next(pc));
+        } while (pager_cursor_next(pc) == 0);
     }
 
     pager_cursor_free(pc);
 
-    return true;
+    return 0;
 }
 
-bool _free_sstable(sstable* sst)
+int _free_sstable(sstable_t* sst)
 {
     /* we check if the sstable is NULL */
-    if (sst == NULL) return false;
+    if (sst == NULL) return -1;
 
     /* we close the pager */
     pager_close(sst->pager);
@@ -2299,15 +2083,15 @@ bool _free_sstable(sstable* sst)
 
     sst = NULL;
 
-    return true;
+    return 0;
 }
 
 int _compare_sstables(const void* a, const void* b)
 {
     if (a == NULL || b == NULL) return 0;
 
-    sstable* s1 = (sstable*)a;
-    sstable* s2 = (sstable*)b;
+    sstable_t* s1 = (sstable_t*)a;
+    sstable_t* s2 = (sstable_t*)b;
 
     time_t last_modified_s1 = get_last_modified(s1->pager->filename);
     time_t last_modified_s2 = get_last_modified(s2->pager->filename);
@@ -2323,18 +2107,19 @@ int _compare_sstables(const void* a, const void* b)
     }
 }
 
-bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wal_checkpoint)
+int _flush_memtable(tidesdb_t* tdb, column_family_t* cf, skiplist_t* memtable, int wal_checkpoint)
 {
     /* we check if the tidesdb is NULL */
-    if (tdb == NULL) return false;
+    if (tdb == NULL) return -1;
 
     /* we check if the column family is NULL */
-    if (cf == NULL) return false;
+    if (cf == NULL) return -1;
 
     /* we check if the memtable is NULL */
-    if (memtable == NULL) return false;
+    if (memtable == NULL) return -1;
 
-    pthread_rwlock_wrlock(&cf->sstables_lock); /* we get sstables lock for hte column family */
+    /* we lock the sstables for the column family */
+    pthread_rwlock_wrlock(&cf->sstables_lock); 
 
     char filename[1024];
 
@@ -2342,21 +2127,22 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
     snprintf(filename, sizeof(filename), "%s%ssstable_%lu%s", cf->path, _get_path_seperator(),
              id_gen_new(cf->id_gen), SSTABLE_EXT);
 
-    pager* p = NULL;
+    pager_t* p = NULL;
 
     /* we open a new pager for the sstable */
-    if (!pager_open(filename, &p))
+    if (pager_open(filename, &p) == -1)
     {
         pthread_rwlock_unlock(&cf->sstables_lock);
-        return false;
+        return -1;
     }
 
-    sstable* sst = malloc(sizeof(sstable)); /* allocate memory for sstable */
+    sstable_t* sst = malloc(sizeof(sstable_t)); /* allocate memory for sstable */
     if (sst == NULL)
     {
         pthread_rwlock_unlock(&cf->sstables_lock);
         pager_close(p);
-        return false;
+        remove(filename); /* remove the sstable file */
+        return -1;
     }
 
     sst->pager = p; /* set pager for sstable */
@@ -2364,24 +2150,25 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
     /* we create a bloom filter.
      * the bloom filter is used to determine if a key is within an sstable before a scan.
      * A bloomfilter can span multiple initial pages */
-    bloomfilter* bf = bloomfilter_create(BLOOMFILTER_SIZE);
+    bloomfilter_t* bf = bloomfilter_create(BLOOMFILTER_SIZE);
     if (bf == NULL)
     {
         pthread_rwlock_unlock(&cf->sstables_lock);
         free(sst);
         pager_close(p);
-        return false;
+        return -1;
     }
 
-    /* create new cursor */
-    skiplist_cursor* cursor = skiplist_cursor_init(memtable);
+    /* create new cursor for the provided memtable */
+    skiplist_cursor_t* cursor = skiplist_cursor_init(memtable);
     if (cursor == NULL)
     {
         pthread_rwlock_unlock(&cf->sstables_lock);
         bloomfilter_destroy(bf);
         free(sst);
         pager_close(p);
-        return false;
+        remove(filename); /* remove the sstable file */
+        return -1;
     }
 
     /* iterate over the memtable */
@@ -2397,43 +2184,46 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
 
         /* we add the key to the bloom filter */
         bloomfilter_add(bf, cursor->current->key, cursor->current->key_size);
-    } while (skiplist_cursor_next(cursor));
+    } while (skiplist_cursor_next(cursor) != -1);
 
     /* we free cursor and create a new one */
     skiplist_cursor_free(cursor);
 
-    if (bf->size == 0)
+    if (bf->size == 0) /* no keys in memtable */
     {
         pthread_rwlock_unlock(&cf->sstables_lock);
         bloomfilter_destroy(bf);
         free(sst);
         pager_close(p);
-        return false;
+        remove(filename); /* remove the sstable file */
+        return -1;
     }
 
     /* we serialize the bloom filter */
     uint8_t* bf_buffer = NULL;
     size_t bf_buffer_len = 0;
-    if (!serialize_bloomfilter(bf, &bf_buffer, &bf_buffer_len, cf->config.compressed))
+
+    if (serialize_bloomfilter(bf, &bf_buffer, &bf_buffer_len, cf->config.compressed) == -1)
     {
         pthread_rwlock_unlock(&cf->sstables_lock);
         bloomfilter_destroy(bf);
         free(sst);
         pager_close(p);
-        return false;
+        remove(filename); /* remove the sstable file */
+        return -1;
     }
 
     /* we write the bloom filter to the sstable */
     unsigned int pg_num = 0;
 
-    if (!pager_write(p, bf_buffer, bf_buffer_len, &pg_num))
+    if (pager_write(p, bf_buffer, bf_buffer_len, &pg_num) == -1)
     {
         pthread_rwlock_unlock(&cf->sstables_lock);
         bloomfilter_destroy(bf);
         free(bf_buffer);
         free(sst);
         pager_close(p);
-        return false;
+        return -1;
     }
 
     /* we free the bloom filter */
@@ -2446,7 +2236,8 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
         pthread_rwlock_unlock(&cf->sstables_lock);
         free(sst);
         pager_close(p);
-        return false;
+        remove(filename); /* remove the sstable file */
+        return -1;
     }
 
     /* we iterate over the memtable and write the key-value pairs to the sstable */
@@ -2462,11 +2253,11 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
 
         /* we serialize the key-value pair */
         size_t encoded_size;
-        key_value_pair kvp = {cursor->current->key, cursor->current->key_size,
-                              cursor->current->value, cursor->current->value_size, -1};
+        key_value_pair_t kvp = {cursor->current->key, cursor->current->key_size,
+                                cursor->current->value, cursor->current->value_size, -1};
         uint8_t* serialized_buffer = NULL;
-        if (!serialize_key_value_pair(&kvp, &serialized_buffer, &encoded_size,
-                                      cf->config.compressed))
+        if (serialize_key_value_pair(&kvp, &serialized_buffer, &encoded_size,
+                                      cf->config.compressed) == -1)
             continue;
 
         if (serialized_buffer == NULL)
@@ -2475,11 +2266,12 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
             skiplist_cursor_free(cursor);
             free(sst);
             pager_close(p);
-            return false;
+            remove(filename); /* remove the sstable file */
+            return -1;
         }
 
         /* we write the key-value pair to the sstable */
-        if (!pager_write(p, serialized_buffer, encoded_size, &pg_num))
+        if (pager_write(p, serialized_buffer, encoded_size, &pg_num) == -1)
         {
             free(serialized_buffer);
             continue;
@@ -2487,19 +2279,19 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
 
         /* we free the serialized key-value pair */
         free(serialized_buffer);
-    } while (skiplist_cursor_next(cursor));
+    } while (skiplist_cursor_next(cursor) != -1);
 
     /* we free the cursor */
     skiplist_cursor_free(cursor);
 
     /* we now add the sstable to the column family */
-    sstable** new_sstables = realloc(cf->sstables, (cf->num_sstables + 1) * sizeof(sstable*));
+    sstable_t** new_sstables = realloc(cf->sstables, (cf->num_sstables + 1) * sizeof(sstable_t*));
     if (new_sstables == NULL)
     {
         free(sst);
         pager_close(p);
         pthread_rwlock_unlock(&cf->sstables_lock);
-        return false;
+        return -1;
     }
 
     cf->sstables = new_sstables;
@@ -2511,15 +2303,15 @@ bool _flush_memtable(tidesdb* tdb, column_family* cf, skiplist* memtable, int wa
     skiplist_destroy(memtable);
 
     /* truncate the wal at the entries provided checkpoint */
-    if (!_truncate_wal(tdb->wal, wal_checkpoint)) return false;
+    if (_truncate_wal(tdb->wal, wal_checkpoint) == -1) return -1;
 
-    return true;
+    return 0;
 }
 
 void* _flush_memtable_thread(void* arg)
 {
     /* we set tidesdb */
-    tidesdb* tdb = arg;
+    tidesdb_t* tdb = arg;
 
     while (true)
     {
@@ -2537,7 +2329,7 @@ void* _flush_memtable_thread(void* arg)
         }
 
         /* dequeue the first memtable from the queue */
-        queue_entry* qe = queue_dequeue(tdb->flush_queue);
+        queue_entry_t* qe = queue_dequeue(tdb->flush_queue);
         if (qe == NULL)
         {
             pthread_mutex_unlock(&tdb->flush_lock);
@@ -2554,7 +2346,7 @@ void* _flush_memtable_thread(void* arg)
     /* escalate what's left in queue */
     while (tdb->flush_queue->size > 0)
     {
-        queue_entry* qe = queue_dequeue(tdb->flush_queue);
+        queue_entry_t* qe = queue_dequeue(tdb->flush_queue);
         if (qe != NULL)
         {
             _flush_memtable(tdb, qe->cf, qe->memtable, (int)qe->wal_checkpoint);
@@ -2565,12 +2357,12 @@ void* _flush_memtable_thread(void* arg)
     return NULL;
 }
 
-bool _is_tombstone(const uint8_t* value, size_t value_size)
+int _is_tombstone(const uint8_t* value, size_t value_size)
 {
     return value_size == 4 && *(uint32_t*)value == TOMBSTONE;
 }
 
-void _free_column_families(tidesdb* tdb)
+void _free_column_families(tidesdb_t* tdb)
 {
     /* we check if we have column families */
     if (tdb->num_column_families > 0)
@@ -2610,7 +2402,7 @@ void _free_column_families(tidesdb* tdb)
     }
 }
 
-tidesdb_err* tidesdb_close(tidesdb* tdb)
+tidesdb_err_t* tidesdb_close(tidesdb_t* tdb)
 {
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
 
@@ -2671,16 +2463,16 @@ tidesdb_err* tidesdb_close(tidesdb* tdb)
     return NULL;
 }
 
-bool _load_sstables(column_family* cf)
+int _load_sstables(column_family_t* cf)
 {
     /* we check if cf is NULL */
-    if (cf == NULL) return false;
+    if (cf == NULL) return -1;
 
     /* we open the column family directory */
     DIR* cf_dir = opendir(cf->path);
     if (cf_dir == NULL)
     { /* we check if the directory was opened */
-        return false;
+        return -1;
     }
 
     struct dirent* entry;
@@ -2700,19 +2492,19 @@ bool _load_sstables(column_family* cf)
                  entry->d_name);
 
         /* we open the sstable */
-        pager* sstable_pager = NULL;
+        pager_t* sstable_pager = NULL;
 
-        if (!pager_open(sstable_path, &sstable_pager))
+        if (pager_open(sstable_path, &sstable_pager) == -1)
         {
             /* free up resources */
             closedir(cf_dir);
 
-            return false;
+            return -1;
         }
 
         /* we create/alloc the sstable struct */
-        sstable* sst = malloc(sizeof(sstable));
-        if (sst == NULL) return false;
+        sstable_t* sst = malloc(sizeof(sstable_t));
+        if (sst == NULL) return -1;
 
         /* we set the pager */
         sst->pager = sstable_pager;
@@ -2720,15 +2512,15 @@ bool _load_sstables(column_family* cf)
         /* check if sstables is NULL */
         if (cf->sstables == NULL)
         {
-            cf->sstables = malloc(sizeof(sstable));
-            if (cf->sstables == NULL) return false;
+            cf->sstables = malloc(sizeof(sstable_t));
+            if (cf->sstables == NULL) return -1;
         }
         else
         {
             /* we add the sstable to the column family */
-            sstable** temp_sstables =
-                realloc(cf->sstables, sizeof(sstable) * (cf->num_sstables + 1));
-            if (temp_sstables == NULL) return false;
+            sstable_t** temp_sstables =
+                realloc(cf->sstables, sizeof(sstable_t) * (cf->num_sstables + 1));
+            if (temp_sstables == NULL) return -1;
 
             cf->sstables = temp_sstables;
         }
@@ -2741,25 +2533,25 @@ bool _load_sstables(column_family* cf)
         /* we free up resources */
         closedir(cf_dir);
 
-        return true;
+        return 0;
     }
 
-    return false;
+    return -1;
 }
 
-bool _sort_sstables(const column_family* cf)
+int _sort_sstables(const column_family_t* cf)
 {
     /* we check if the column family is NULL */
-    if (cf == NULL) return false;
+    if (cf == NULL) return -1;
 
     /* if we have more than 1 sstable we sort them by last modified time */
     if (cf->num_sstables > 1)
     {
-        qsort(cf->sstables, cf->num_sstables, sizeof(sstable), _compare_sstables);
-        return true;
+        qsort(cf->sstables, cf->num_sstables, sizeof(sstable_t), _compare_sstables);
+        return 0;
     }
 
-    return false;
+    return -1;
 }
 
 int _remove_directory(const char* path)

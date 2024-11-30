@@ -24,26 +24,25 @@
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
 #include <pthread.h>
 #endif
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 
-typedef struct queue_node queue_node;
+typedef struct queue_node_t queue_node_t;
 
 /*
- * queue_node
+ * queue_node_t
  * node for queue
  * @param data data in node
  * @param next next node
  */
-struct queue_node
+struct queue_node_t
 {
-    void *data;       /* data in node */
-    queue_node *next; /* next node */
+    void *data;         /* data in node */
+    queue_node_t *next; /* next node */
 };
 
 /*
- * queue
+ * queue_t
  * queue struct
  * @param head head of queue
  * @param tail tail of queue
@@ -59,55 +58,56 @@ typedef struct queue
     CRITICAL_SECTION lock; /* rw lock for queue */
 } queue;
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
-typedef struct queue
+typedef struct
 {
-    queue_node *head;      /* head of queue */
-    queue_node *tail;      /* tail of queue */
+    queue_node_t *head;    /* head of queue */
+    queue_node_t *tail;    /* tail of queue */
     size_t size;           /* size of queue */
     pthread_rwlock_t lock; /* rw lock for queue */
-} queue;
+} queue_t;
 #endif
 
 /*
  * queue_new
  * creates new queue
  */
-queue *queue_new();
+queue_t *queue_new();
 
 /*
  * queue_enqueue
  * adds data to end of queue
  * @param q queue
  * @param data data to add
+ * @return 0 if successful, -1 if not
  */
-bool queue_enqueue(queue *q, void *data);
+int queue_enqueue(queue_t *q, void *data);
 
 /*
  * queue_dequeue
  * removes data from front of queue
  * @param q queue
  */
-void *queue_dequeue(queue *q);
+void *queue_dequeue(queue_t *q);
 
 /*
  * queue_size
  * returns size of queue
  * @param q queue
  */
-size_t queue_size(queue *q);
+size_t queue_size(queue_t *q);
 
 /*
  * free_queue_node
  * frees queue node
  * @param node node to free
  */
-void free_queue_node(queue_node *node);
+void free_queue_node(queue_node_t *node);
 
 /*
  * queue_destroy
  * destroys queue
  * @param q queue
  */
-void queue_destroy(queue *q);
+void queue_destroy(queue_t *q);
 
 #endif /* QUEUE_H */

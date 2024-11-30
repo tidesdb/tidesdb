@@ -27,10 +27,10 @@ unsigned int hash2(const uint8_t *data, unsigned int data_len)
     return XXH32(data, data_len, 1); /* we hash using xxhash */
 }
 
-bloomfilter *bloomfilter_create(unsigned int size)
+bloomfilter_t *bloomfilter_create(unsigned int size)
 {
     /* we allocate memory for the bloom filter */
-    bloomfilter *bf = malloc(sizeof(bloomfilter));
+    bloomfilter_t *bf = malloc(sizeof(bloomfilter_t));
     if (bf == NULL) return NULL; /* we return NULL if we could not allocate memory */
 
     /* we set the size of the bloom filter */
@@ -49,12 +49,12 @@ bloomfilter *bloomfilter_create(unsigned int size)
     return bf;
 }
 
-void bloomfilter_destroy(bloomfilter *bf)
+void bloomfilter_destroy(bloomfilter_t *bf)
 {
     /* we iteratively free the bloom filters */
     while (bf != NULL)
     {
-        bloomfilter *next = bf->next;
+        bloomfilter_t *next = bf->next;
 
         if (bf->set != NULL)
         {
@@ -67,7 +67,7 @@ void bloomfilter_destroy(bloomfilter *bf)
     }
 }
 
-bool bloomfilter_check(bloomfilter *bf, const uint8_t *data, unsigned int data_len)
+int bloomfilter_check(bloomfilter_t *bf, const uint8_t *data, unsigned int data_len)
 {
     /* we hash the data */
     unsigned int hash_value1 = hash1(data, data_len);
@@ -80,38 +80,38 @@ bool bloomfilter_check(bloomfilter *bf, const uint8_t *data, unsigned int data_l
         if ((bf->set[(hash_value1 % bf->size) / 8] & (1 << (hash_value1 % 8))) &&
             (bf->set[(hash_value2 % bf->size) / 8] & (1 << (hash_value2 % 8))))
         {
-            return true; /* we return true if the data is in the bloom filter */
+            return 0; /* we return 0 if the data is in the bloom filter */
         }
         bf = bf->next; /* we move to the next bloom filter */
     }
-    return false;
+    return -1; /* we return -1 if the data is not in the bloom filter */
 }
 
-bool bloomfilter_is_full(bloomfilter *bf)
+int bloomfilter_is_full(bloomfilter_t *bf)
 {
     for (unsigned int i = 0; i < (bf->size + 7) / 8; i++) /* we iterate through the bitset */
-        if (bf->set[i] != 0xFF) return false; /* we return false if the bitset is not full */
+        if (bf->set[i] != 0xFF) return -1; /* we return false if the bitset is not full */
 
-    return true; /* we return true if the bitset is full */
+    return 0; /* we return 0 if the bitset is full */
 }
 
-int bloomfilter_add(bloomfilter *bf, const uint8_t *data, unsigned int data_len)
+int bloomfilter_add(bloomfilter_t *bf, const uint8_t *data, unsigned int data_len)
 {
     /* we hash the data */
     unsigned int hash_value1 = hash1(data, data_len);
     unsigned int hash_value2 = hash2(data, data_len);
 
     /* we iterate through the bloom filters */
-    bloomfilter *current = bf;
+    bloomfilter_t *current = bf;
     while (current->next != NULL)
     {
         current = current->next; /* we move to the next bloom filter */
     }
 
-    if (bloomfilter_is_full(current)) /* we check if the bloom filter is full */
+    if (bloomfilter_is_full(current) != -1) /* we check if the bloom filter is full */
     {
         /* we create a new bloom filter */
-        bloomfilter *new_bf = bloomfilter_create(current->size * 2);
+        bloomfilter_t *new_bf = bloomfilter_create(current->size * 2);
         if (new_bf == NULL) return 1;
 
         current->next = new_bf; /* we set the next bloom filter */

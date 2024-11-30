@@ -22,7 +22,7 @@
 #include <stdlib.h>
 
 /*
- * tidesdb_err
+ * tidesdb_err_t
  * the TidesDB error struct
  * used for error handling in TidesDB
  * @param code the error code
@@ -32,7 +32,7 @@ typedef struct
 {
     int code;      /* the error code */
     char* message; /* the error message */
-} tidesdb_err;
+} tidesdb_err_t;
 
 /*
  * tidesdb_err_new
@@ -40,13 +40,13 @@ typedef struct
  * @param code the error code
  * @param message the error message
  */
-tidesdb_err* tidesdb_err_new(int code, char* message);
+tidesdb_err_t* tidesdb_err_new(int code, char* message);
 
 /*
  * tidesdb_err_free
  * free a TidesDB error
  * @param e the error to free
  */
-void tidesdb_err_free(tidesdb_err* e);
+void tidesdb_err_free(tidesdb_err_t* e);
 
 #endif /* TIDESDB_ERR_H */

@@ -25,7 +25,7 @@
 
 void test_queue_new()
 {
-    queue *q = queue_new();
+    queue_t *q = queue_new();
     assert(q != NULL);
     assert(q->head == NULL);
     assert(q->tail == NULL);
@@ -37,12 +37,12 @@ void test_queue_new()
 
 void test_queue_enqueue_dequeue()
 {
-    queue *q = queue_new();
+    queue_t *q = queue_new();
     int data1 = 1, data2 = 2, data3 = 3;
 
-    assert(queue_enqueue(q, &data1) == true);
-    assert(queue_enqueue(q, &data2) == true);
-    assert(queue_enqueue(q, &data3) == true);
+    assert(queue_enqueue(q, &data1) == 0);
+    assert(queue_enqueue(q, &data2) == 0);
+    assert(queue_enqueue(q, &data3) == 0);
 
     assert(queue_size(q) == 3);
 
@@ -65,7 +65,7 @@ void test_queue_enqueue_dequeue()
 
 void test_queue_size()
 {
-    queue *q = queue_new();
+    queue_t *q = queue_new();
     int data1 = 1, data2 = 2;
 
     assert(queue_size(q) == 0);
@@ -89,7 +89,7 @@ void test_queue_size()
 
 void test_queue_destroy()
 {
-    queue *q = queue_new();
+    queue_t *q = queue_new();
     int data1 = 1, data2 = 2;
 
     queue_enqueue(q, &data1);
@@ -102,7 +102,7 @@ void test_queue_destroy()
 
 void test_dequeue_no_entries()
 {
-    queue *q = queue_new();
+    queue_t *q = queue_new();
     assert(queue_dequeue(q) == NULL);
     queue_destroy(q);
 

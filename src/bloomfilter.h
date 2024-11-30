@@ -19,7 +19,6 @@
 #ifndef BLOOMFILTER_H
 #define BLOOMFILTER_H
 
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,20 +27,20 @@
 
 /* we define the bloomfilter struct here so
  * we can use it in the struct definition for the next member */
-typedef struct bloomfilter bloomfilter;
+typedef struct bloomfilter_t bloomfilter_t;
 
-/* bloomfilter struct
+/* bloomfilter_t struct
  * @param size the size of the bloom filter (number of bits or slots)
  * @param count number of elements in the bloom filter
  * @param set array of integers representing the bloom filter's bitset
  * @param next pointer to the next bloomfilter (for chaining)
  */
-struct bloomfilter
+struct bloomfilter_t
 {
-    uint32_t size;     /* Size of the bloom filter (number of bits or slots) */
-    uint32_t count;    /* Number of elements in the bloom filter */
-    uint8_t *set;      /* Array of integers representing the bloom filter's bitset */
-    bloomfilter *next; /* Pointer to the next bloomfilter (for chaining) */
+    uint32_t size;       /* Size of the bloom filter (number of bits or slots) */
+    uint32_t count;      /* Number of elements in the bloom filter */
+    uint8_t *set;        /* Array of integers representing the bloom filter's bitset */
+    bloomfilter_t *next; /* Pointer to the next bloomfilter (for chaining) */
 };
 
 /* Bloom filter function prototypes */
@@ -52,22 +51,22 @@ struct bloomfilter
  * @param size the size of the bloomfilter
  * @return the new bloomfilter
  */
-bloomfilter *bloomfilter_create(unsigned int size);
+bloomfilter_t *bloomfilter_create(unsigned int size);
 
 /*
  * bloomfilter_destory
  * destroy a bloomfilter
  * @param bf the bloomfilter to destroy
  */
-void bloomfilter_destroy(bloomfilter *bf);
+void bloomfilter_destroy(bloomfilter_t *bf);
 
 /*
  * bloomfilter_is_full
  * check if the bloomfilter is full
  * @param bf the bloomfilter to check
- * @return true if the bloomfilter is full, false otherwise
+ * @return 0 if the bloomfilter is full, -1 otherwise
  */
-bool bloomfilter_is_full(bloomfilter *bf);
+int bloomfilter_is_full(bloomfilter_t *bf);
 
 /*
  * bloomfilter_add
@@ -75,9 +74,9 @@ bool bloomfilter_is_full(bloomfilter *bf);
  * @param bf the bloomfilter to add to
  * @param data the data to add
  * @param data_len the length of the data
- * @return whether the data was added to the bloomfilter
+ * @return 0 if the data was added, -1 otherwise
  */
-int bloomfilter_add(bloomfilter *bf, const uint8_t *data, unsigned int data_len);
+int bloomfilter_add(bloomfilter_t *bf, const uint8_t *data, unsigned int data_len);
 
 /*
  * bloomfilter_check
@@ -85,9 +84,9 @@ int bloomfilter_add(bloomfilter *bf, const uint8_t *data, unsigned int data_len)
  * @param bf the bloomfilter to check
  * @param data the data to check
  * @param data_len the length of the data
- * @return true if the data is in the bloomfilter, false otherwise
+ * @return 0 if the data is in the bloomfilter, -1 otherwise
  */
-bool bloomfilter_check(bloomfilter *bf, const uint8_t *data, unsigned int data_len);
+int bloomfilter_check(bloomfilter_t *bf, const uint8_t *data, unsigned int data_len);
 
 /*
  * hash1
@@ -113,6 +112,6 @@ unsigned int hash2(const uint8_t *data, unsigned int data_len);
  * @param bf the bloomfilter to get the size of
  * @return the size of the bloomfilter
  */
-unsigned int bloomfilter_get_size(bloomfilter *bf);
+unsigned int bloomfilter_get_size(bloomfilter_t *bf);
 
 #endif /* BLOOMFILTER_H */

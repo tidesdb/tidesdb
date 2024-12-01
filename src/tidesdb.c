@@ -1818,7 +1818,7 @@ tidesdb_err_t* tidesdb_cursor_prev(tidesdb_cursor_t* cursor)
     /* we unlock the sstables */
     pthread_rwlock_unlock(&cursor->cf->sstables_lock);
 
-    return tidesdb_err_new(1062, "At beginning of cursor");
+    return tidesdb_err_new(1085, "At beginning of cursor");
 }
 
 tidesdb_err_t* tidesdb_cursor_get(tidesdb_cursor_t* cursor, key_value_pair_t* kv)

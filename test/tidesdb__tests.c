@@ -1204,6 +1204,128 @@ void test_concurrent_put_get()
     printf(GREEN "test_concurrent_put_get passed\n" RESET);
 }
 
+void test_cursor()
+{
+    tidesdb_config_t* tdb_config = malloc(sizeof(tidesdb_config_t));
+    if (tdb_config == NULL)
+    {
+        printf(RED "Error: Failed to allocate memory for tdb_config\n" RESET);
+        return;
+    }
+
+    tdb_config->db_path = TEST_DIR;
+    tdb_config->compressed_wal = false;
+
+    tidesdb_t* tdb = NULL;
+
+    tidesdb_err_t* e = tidesdb_open(tdb_config, &tdb);
+    assert(e == NULL);
+    assert(tdb != NULL);
+
+    tidesdb_err_free(e);
+
+    /* create a column family */
+    e = tidesdb_create_column_family(tdb, TEST_COLUMN_FAMILY, (1024 * 1024), 12, 0.24f, false);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    assert(e == NULL);
+
+    tidesdb_err_free(e);
+
+    column_family_t* cf = NULL;
+
+    /* we should be able to get the column family */
+    assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
+
+    /* put 60000 key-value pairs */
+    for (int i = 0; i < 60000; i++)
+    {
+        uint8_t key[48];
+        uint8_t value[48];
+        snprintf(key, sizeof(key), "key%03d", i);
+        snprintf(value, sizeof(value), "value%03d", i);
+
+        e = tidesdb_put(tdb, cf->config.name, key, strlen(key), value, strlen(value), -1);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            break;
+        }
+    }
+
+    sleep(5); /* wait for the SST file to be written */
+
+    /* initialize cursor */
+    tidesdb_cursor_t* cursor;
+    e = tidesdb_cursor_init(tdb, TEST_COLUMN_FAMILY, &cursor);
+    if (e != NULL)
+    {
+        printf(RED "Error: %s\n" RESET, e->message);
+        tidesdb_err_free(e);
+        return;
+    }
+
+    key_value_pair_t kv;
+
+    /* iterate forward */
+    while ((e = tidesdb_cursor_next(cursor)) == NULL)
+    {
+        e = tidesdb_cursor_get(cursor, &kv);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            break;
+        }
+
+        /* use kv.key and kv.value */
+        free(kv.key);
+        free(kv.value);
+    }
+
+    if (e != NULL && e->code != 1062) /* 1062 means "At end of cursor" */
+    {
+        printf(RED "Error: %s\n" RESET, e->message);
+        tidesdb_err_free(e);
+    }
+
+    /* iterate backward */
+    while ((e = tidesdb_cursor_prev(cursor)) == NULL)
+    {
+        e = tidesdb_cursor_get(cursor, &kv);
+        if (e != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, e->message);
+            tidesdb_err_free(e);
+            break;
+        }
+
+        /* use kv.key and kv.value */
+        free(kv.key);
+        free(kv.value);
+    }
+
+    if (e != NULL && e->code != 1085) /* 1085 means "At start of cursor" */
+    {
+        printf(RED "Error: %s\n" RESET, e->message);
+        tidesdb_err_free(e);
+    }
+
+    tidesdb_cursor_free(cursor);
+
+    e = tidesdb_close(tdb);
+    if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
+
+    tidesdb_err_free(e);
+
+    remove_directory(TEST_DIR);
+
+    free(tdb_config);
+
+    printf(GREEN "test_cursor passed\n" RESET);
+}
+
 /** cc -g3 -fsanitize=address,undefined src/*.c external/*.c test/tidesdb__tests.c -lzstd
  * **/
 int main(void)
@@ -1222,6 +1344,7 @@ int main(void)
     test_put_compact_get();
     test_put_compact_reopen_get();
     test_txn_put_delete_get();
+    test_cursor();
 
     return 0;
 }

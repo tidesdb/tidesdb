@@ -8,7 +8,7 @@ The underlying data structure is based on a log-structured merge-tree (LSM-tree)
 It is not a full-featured database, but rather a library that can be used to build a database atop of.
 
 > [!CAUTION]
-> In very active beta development. Not ready for production use.  The library is not yet stable.
+> In beta
 
 ## Features
 - [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist uses an RW lock which means multiple readers and one true writer.  SSTables are sorted, immutable and can be read concurrently they are protected via page locks.  Transactions are also protected via a lock.
@@ -320,8 +320,6 @@ if (e != NULL)
 ```
 
 ## Errors
-> [!CAUTION]
-> Errors are not finalized and may change.
 
 | Error Code | Error Message                                                        |
 |------------|----------------------------------------------------------------------|

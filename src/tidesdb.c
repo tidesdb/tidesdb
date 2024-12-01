@@ -1653,7 +1653,7 @@ tidesdb_err_t* tidesdb_cursor_init(tidesdb_t* tdb, const char* column_family_nam
     if (pthread_rwlock_rdlock(&cf->sstables_lock) != 0)
     {
         free(*cursor);
-        return tidesdb_err_new(1024, "Failed to lock sstables lock");
+        return tidesdb_err_new(1024, "Failed to acquire sstables lock");
     }
 
     (*cursor)->sstable_index = cf->num_sstables - 1; /* we start at the last sstable */
@@ -1690,23 +1690,215 @@ tidesdb_err_t* tidesdb_cursor_init(tidesdb_t* tdb, const char* column_family_nam
 
 tidesdb_err_t* tidesdb_cursor_next(tidesdb_cursor_t* cursor)
 {
-    /** TODO */
+    /* check if cursor is NULL */
+    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
 
-    return NULL;
+    /* we move to the next key in the memtable */
+    if (skiplist_cursor_next(cursor->memtable_cursor) != -1)
+    {
+        return NULL;
+    }
+
+    /* if we are at the end of the memtable, we move to the sstable */
+
+    /* we move to the next key in the sstable */
+    if (pager_cursor_next(cursor->sstable_cursor) != -1)
+    {
+        return NULL;
+    }
+
+    /* if there is no next key in the sstable, we move to the next sstable */
+    if (cursor->sstable_index > 0)
+    {
+        /* we lock the sstables */
+        if (pthread_rwlock_rdlock(&cursor->cf->sstables_lock) != 0)
+            return tidesdb_err_new(1024, "Failed to acquire sstables lock");
+
+        cursor->sstable_index--;
+
+        /* we unlock the sstables */
+        if (pthread_rwlock_unlock(&cursor->cf->sstables_lock) != 0)
+            return tidesdb_err_new(1025, "Failed to unlock sstables");
+
+        /* we free the current sstable cursor */
+        pager_cursor_free(cursor->sstable_cursor);
+
+        /* we initialize the sstable cursor */
+        if (pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
+                              &cursor->sstable_cursor) == -1)
+            return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
+
+        return NULL;
+    }
+
+    return tidesdb_err_new(1062, "At end of cursor");
 }
 
 tidesdb_err_t* tidesdb_cursor_prev(tidesdb_cursor_t* cursor)
 {
-    /** TODO */
+    /* check if cursor is NULL */
+    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
 
-    return NULL;
+    /* we move to the previous key in the memtable */
+    if (skiplist_cursor_prev(cursor->memtable_cursor) != -1)
+    {
+        return NULL;
+    }
+
+    /* if we are at the beginning of the memtable, we move to the sstable */
+
+    /* we move to the previous key in the sstable */
+    if (pager_cursor_prev(cursor->sstable_cursor) != -1)
+    {
+        return NULL;
+    }
+
+    /* if there is no previous key in the sstable, we move to the previous sstable */
+    if (cursor->sstable_index < cursor->cf->num_sstables - 1)
+    {
+        /* we lock the sstables */
+        if (pthread_rwlock_rdlock(&cursor->cf->sstables_lock) != 0)
+            return tidesdb_err_new(1024, "Failed to acquire sstables lock");
+
+        cursor->sstable_index++;
+
+        /* we unlock the sstables */
+        if (pthread_rwlock_unlock(&cursor->cf->sstables_lock) != 0)
+            return tidesdb_err_new(1025, "Failed to unlock sstables");
+
+        /* we free the current sstable cursor */
+        pager_cursor_free(cursor->sstable_cursor);
+
+        /* we initialize the sstable cursor */
+        if (pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
+                              &cursor->sstable_cursor) == -1)
+            return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
+
+        return NULL;
+    }
+
+    return tidesdb_err_new(1062, "At beginning of cursor");
 }
 
 tidesdb_err_t* tidesdb_cursor_get(tidesdb_cursor_t* cursor, key_value_pair_t* kv)
 {
-    /** TODO */
+    /* we essentially get whats currently set in memtable if anything
+     * if nothing we get from the sstable */
+    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
 
-    return NULL;
+    if (cursor->memtable_cursor->current != NULL)
+    {
+        /* check if tombstone */
+        if (_is_tombstone(cursor->memtable_cursor->current->value,
+                          cursor->memtable_cursor->current->value_size))
+        {
+            /* get next */
+            tidesdb_cursor_next(cursor);
+            return tidesdb_cursor_get(cursor, kv);
+        }
+
+        /* we copy over the key and value, so the user can free it */
+        kv->key_size = cursor->memtable_cursor->current->key_size;
+        kv->key = malloc(kv->key_size);
+        if (kv->key == NULL) return tidesdb_err_new(1077, "Failed to allocate memory for key");
+        memcpy(kv->key, cursor->memtable_cursor->current->key, kv->key_size);
+
+        kv->value_size = cursor->memtable_cursor->current->value_size;
+        kv->value = malloc(kv->value_size);
+        if (kv->value == NULL)
+        {
+            free(kv->key);
+            return tidesdb_err_new(1069, "Failed to allocate memory for value copy");
+        }
+
+        memcpy(kv->value, cursor->memtable_cursor->current->value, kv->value_size);
+
+        /* we return */
+        return NULL;
+    }
+
+    /* we get from the sstable */
+    if (cursor->sstable_cursor != NULL)
+    {
+        unsigned int pg_num;
+        if (pager_cursor_get(cursor->sstable_cursor, &pg_num) == -1)
+        {
+            /* we free the cursor */
+            tidesdb_cursor_free(cursor);
+
+            /* we return */
+            return tidesdb_err_new(1062, "At end of cursor");
+        }
+
+        uint8_t* kv_buffer;    /* buffer to hold key-value pair from page */
+        size_t kv_buffer_size; /* size of buffer */
+
+        /* we read the key and value */
+        if (pager_read(cursor->cf->sstables[cursor->sstable_index]->pager, pg_num, &kv_buffer,
+                       &kv_buffer_size) == -1)
+        {
+            /* we free the cursor */
+            tidesdb_cursor_free(cursor);
+
+            /* we return */
+            return tidesdb_err_new(1060, "Failed to get key value pair from cursor");
+        }
+
+        /* now we deserialize the key-value pair */
+
+        key_value_pair_t* dkv = NULL;
+
+        if (deserialize_key_value_pair(kv_buffer, kv_buffer_size, &dkv,
+                                       cursor->cf->config.compressed) == -1)
+        {
+            /* we free the cursor */
+            tidesdb_cursor_free(cursor);
+
+            /* we return */
+            return tidesdb_err_new(1060, "Failed to get key value pair from cursor");
+        }
+
+        /* we copy over the key and value, so the user can free it */
+        kv->key_size = dkv->key_size;
+        kv->key = malloc(kv->key_size);
+        if (kv->key == NULL)
+        {
+            /* we free the cursor */
+
+            /* we free the key value pair */
+            _free_key_value_pair(dkv);
+
+            /* we return */
+            return tidesdb_err_new(1077, "Failed to allocate memory for key");
+        }
+
+        /* we copy the key */
+        memcpy(kv->key, dkv->key, kv->key_size);
+
+        kv->value_size = dkv->value_size;
+        kv->key = malloc(kv->value_size);
+        if (kv->value == NULL)
+        {
+            /* we free the cursor */
+
+            /* we free the key value pair */
+            _free_key_value_pair(dkv);
+
+            /* we return */
+            return tidesdb_err_new(1077, "Failed to allocate memory for value");
+        }
+
+        /* we copy the value */
+        memcpy(kv->value, dkv->value, kv->value_size);
+
+        /* we free the key value pair */
+        _free_key_value_pair(dkv);
+
+        /* we return */
+        return NULL;
+    }
+
+    return tidesdb_err_new(1062, "At end of cursor");
 }
 
 tidesdb_err_t* tidesdb_cursor_free(tidesdb_cursor_t* cursor)

@@ -300,7 +300,7 @@ if (e != NULL)
 | 1020       | Failed to create new column family                                   |
 | 1021       | Failed to add column family                                          |
 | 1022       | Failed to lock column families lock                                  |
-| 1024       | Failed to lock sstables lock                                         |
+| 1024       | Failed to acquire sstables lock                                      |
 | 1025       | Failed to unlock sstables                                            |
 | 1026       | Key is NULL                                                          |
 | 1027       | Value is NULL                                                        |

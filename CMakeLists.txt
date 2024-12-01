@@ -33,6 +33,7 @@ add_executable(bloomfilter_tests test/bloomfilter__tests.c)
 add_executable(serialize_tests test/serialize__tests.c)
 add_executable(id_gen_tests test/id_gen__tests.c)
 add_executable(tidesdb_tests test/tidesdb__tests.c)
+add_executable(tidesdb_benchmark bench/tidesdb__bench.c)
 
 target_link_libraries(tidesdb xxhash zstd)
 target_link_libraries(err_tests tidesdb)
@@ -43,6 +44,7 @@ target_link_libraries(bloomfilter_tests tidesdb xxhash)
 target_link_libraries(serialize_tests tidesdb)
 target_link_libraries(id_gen_tests tidesdb)
 target_link_libraries(tidesdb_tests tidesdb xxhash zstd)
+target_link_libraries(tidesdb_benchmark tidesdb xxhash zstd)
 
 add_test(NAME err_tests COMMAND err_tests)
 add_test(NAME pager_tests COMMAND pager_tests)
@@ -52,6 +54,7 @@ add_test(NAME bloomfilter_tests COMMAND bloomfilter_tests)
 add_test(NAME serialize_tests COMMAND serialize_tests)
 add_test(NAME id_gen_tests COMMAND id_gen_tests)
 add_test(NAME tidesdb_test COMMAND tidesdb_tests)
+add_test(NAME tidesdb_benchmark COMMAND tidesdb_benchmark)
 
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(

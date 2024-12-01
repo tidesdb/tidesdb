@@ -62,7 +62,7 @@ tidesdb_err_t* tidesdb_open(const tidesdb_config_t* config, tidesdb_t** tdb)
     {
         free((*tdb)->config.db_path);
         free(*tdb);
-        return tidesdb_err_new(1005, "Failed to allocate memory for wal");
+        return tidesdb_err_new(1067, "Failed to allocate memory for wal");
     }
 
     /* now we open the wal */
@@ -120,7 +120,7 @@ tidesdb_err_t* tidesdb_open(const tidesdb_config_t* config, tidesdb_t** tdb)
         _close_wal((*tdb)->wal);
         free((*tdb)->config.db_path);
         free(*tdb);
-        return tidesdb_err_new(1046, "Failed to initialize flush mutex");
+        return tidesdb_err_new(1046, "Failed to initialize flush lock");
     }
 
     /* initialize flush_cond **/
@@ -253,7 +253,7 @@ tidesdb_err_t* tidesdb_drop_column_family(tidesdb_t* tdb, const char* name)
         if (pthread_rwlock_wrlock(&tdb->column_families[index].sstables_lock) != 0)
         {
             pthread_rwlock_unlock(&tdb->column_families_lock);
-            return tidesdb_err_new(1024, "Failed to lock sstables lock");
+            return tidesdb_err_new(1030, "Failed to acquire sstables lock");
         }
 
         /* iterate over the sstables and free the resources */
@@ -273,6 +273,7 @@ tidesdb_err_t* tidesdb_drop_column_family(tidesdb_t* tdb, const char* name)
 
     /* remove all files in the column family directory */
     _remove_directory(tdb->column_families[index].path);
+
     free(tdb->column_families[index].sstables);
     free(tdb->column_families[index].path);
 
@@ -322,7 +323,7 @@ tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, column_family_t* cf, int
 
     /* lock compaction_or_flush_lock */
     if (pthread_rwlock_wrlock(&cf->compaction_or_flush_lock) != 0)
-        return tidesdb_err_new(1031, "Failed to lock compaction or flush lock");
+        return tidesdb_err_new(1068, "Failed to lock compaction or flush lock");
 
     /* lock the sstables lock */
     /* we do this so operations can't touch the sstables while we are compacting nor can we add
@@ -331,7 +332,7 @@ tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, column_family_t* cf, int
     {
         /* unlock compaction_or_flush_lock */
         pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
-        return tidesdb_err_new(1030, "Failed to lock sstables lock");
+        return tidesdb_err_new(1030, "Failed to acquire sstables lock");
     }
 
     /* number of sstables to compact */
@@ -803,7 +804,7 @@ tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const
 
     /* we get compaction_or_flush_lock and read lock it */
     if (pthread_rwlock_rdlock(&cf->compaction_or_flush_lock) != 0)
-        return tidesdb_err_new(1043, "Failed to lock compaction or flush lock");
+        return tidesdb_err_new(1068, "Failed to lock compaction or flush lock");
 
     /* we check if the key exists in the memtable */
     if (skiplist_get(cf->memtable, key, key_size, value, value_size) != -1)
@@ -945,7 +946,7 @@ tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const
                     pager_cursor_free(cursor);
                     /* unlock the compaction_or_flush_lock */
                     pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
-                    return tidesdb_err_new(1039, "Key not found");
+                    return tidesdb_err_new(1031, "Key not found");
                 }
 
                 /* copy the value */
@@ -959,7 +960,7 @@ tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const
                     pager_cursor_free(cursor);
                     /* unlock the compaction_or_flush_lock */
                     pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
-                    return tidesdb_err_new(1040, "Failed to allocate memory for value");
+                    return tidesdb_err_new(1069, "Failed to allocate memory for value copy");
                 }
 
                 /* copy the value size */
@@ -1026,24 +1027,24 @@ tidesdb_err_t* tidesdb_delete(tidesdb_t* tdb, const char* column_family_name, co
         memcpy(tombstone, &tombstone_value, sizeof(uint32_t));
 
         if (tombstone == NULL)
-            return tidesdb_err_new(1030, "Failed to allocate memory for tombstone");
+            return tidesdb_err_new(1070, "Failed to allocate memory for tombstone");
     }
 
     /* append to wal */
     if (_append_to_wal(tdb, tdb->wal, key, key_size, tombstone, 4, 0, OP_DELETE,
                        column_family_name) == -1)
-        return tidesdb_err_new(1029, "Failed to append to wal");
+        return tidesdb_err_new(1049, "Failed to append to wal");
 
     /* get compaction_or_flush_lock and lock it */
     if (pthread_rwlock_rdlock(&cf->compaction_or_flush_lock) != 0)
-        return tidesdb_err_new(1043, "Failed to lock compaction or flush lock");
+        return tidesdb_err_new(1068, "Failed to lock compaction or flush lock");
 
     /* add to memtable */
     if (skiplist_put(cf->memtable, key, key_size, tombstone, 4, -1) == -1)
     {
         /* unlock the compaction_or_flush_lock */
         pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
-        return tidesdb_err_new(1030, "Failed to put into memtable");
+        return tidesdb_err_new(1050, "Failed to put into memtable");
     }
 
     free(tombstone);
@@ -1060,7 +1061,7 @@ tidesdb_err_t* tidesdb_txn_begin(tidesdb_txn_t** transaction, const char* column
     if (column_family == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
 
     /* we check if transaction is NULL */
-    if (transaction == NULL) return tidesdb_err_new(1053, "Transaction pointer is NULL");
+    if (transaction == NULL) return tidesdb_err_new(1071, "Transaction pointer is NULL");
 
     *transaction = (tidesdb_txn_t*)malloc(sizeof(tidesdb_txn_t));
     if (*transaction == NULL)
@@ -1072,7 +1073,7 @@ tidesdb_err_t* tidesdb_txn_begin(tidesdb_txn_t** transaction, const char* column
     {
         free(*transaction);
         *transaction = NULL;
-        return tidesdb_err_new(1054, "Failed to allocate memory for column family name");
+        return tidesdb_err_new(1072, "Failed to allocate memory for column family name");
     }
 
     (*transaction)->ops = NULL;
@@ -1104,7 +1105,7 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
 
     /* lock the transaction */
     if (pthread_mutex_lock(&transaction->lock) != 0)
-        return tidesdb_err_new(1055, "Failed to lock transaction");
+        return tidesdb_err_new(1074, "Failed to acquire transaction lock");
 
     tidesdb_txn_op_t* temp_ops =
         realloc(transaction->ops, (transaction->num_ops + 1) * sizeof(tidesdb_txn_op_t));
@@ -1121,7 +1122,7 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
     {
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1057, "Failed to allocate memory for operation");
+        return tidesdb_err_new(1075, "Failed to allocate memory for operation");
     }
 
     transaction->ops[transaction->num_ops].op->op_code = OP_PUT;
@@ -1131,7 +1132,7 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1058, "Failed to allocate memory for column family name");
+        return tidesdb_err_new(1072, "Failed to allocate memory for column family name");
     }
 
     transaction->ops[transaction->num_ops].op->kv =
@@ -1142,7 +1143,7 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1059, "Failed to allocate memory for key-value pair");
+        return tidesdb_err_new(1076, "Failed to allocate memory for key-value pair");
     }
 
     transaction->ops[transaction->num_ops].op->kv->key_size = key_size;
@@ -1154,7 +1155,7 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1060, "Failed to allocate memory for key");
+        return tidesdb_err_new(1077, "Failed to allocate memory for key");
     }
     memcpy(transaction->ops[transaction->num_ops].op->kv->key, key, key_size);
 
@@ -1168,7 +1169,7 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1061, "Failed to allocate memory for value");
+        return tidesdb_err_new(1078, "Failed to allocate memory for value");
     }
     memcpy(transaction->ops[transaction->num_ops].op->kv->value, value, value_size);
 
@@ -1185,7 +1186,7 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1062, "Failed to allocate memory for rollback operation");
+        return tidesdb_err_new(1079, "Failed to allocate memory for rollback operation");
     }
 
     /* a rollback for put is a delete */
@@ -1202,7 +1203,7 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1063, "Failed to allocate memory for rollback column family name");
+        return tidesdb_err_new(1080, "Failed to allocate memory for rollback column family name");
     }
 
     transaction->ops[transaction->num_ops].rollback_op->kv =
@@ -1218,7 +1219,7 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1064, "Failed to allocate memory for rollback key-value pair");
+        return tidesdb_err_new(1081, "Failed to allocate memory for rollback key-value pair");
     }
 
     transaction->ops[transaction->num_ops].rollback_op->kv->key_size = key_size;
@@ -1235,7 +1236,7 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1065, "Failed to allocate memory for rollback key");
+        return tidesdb_err_new(1082, "Failed to allocate memory for rollback key");
     }
     memcpy(transaction->ops[transaction->num_ops].rollback_op->kv->key, key, key_size);
 
@@ -1250,14 +1251,14 @@ tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, s
 tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key, size_t key_size)
 {
     /* we check if the transaction is NULL */
-    if (transaction == NULL) return tidesdb_err_new(1032, "Transaction is NULL");
+    if (transaction == NULL) return tidesdb_err_new(1054, "Transaction is NULL");
 
     /* we check if the key is NULL */
     if (key == NULL) return tidesdb_err_new(1026, "Key is NULL");
 
     /* lock the transaction */
     if (pthread_mutex_lock(&transaction->lock) != 0)
-        return tidesdb_err_new(1055, "Failed to lock transaction");
+        return tidesdb_err_new(1074, "Failed to acquire transaction lock");
 
     tidesdb_txn_op_t* temp_ops =
         realloc(transaction->ops, (transaction->num_ops + 1) * sizeof(tidesdb_txn_op_t));
@@ -1265,7 +1266,7 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
     {
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1031, "Failed to allocate memory for transaction");
+        return tidesdb_err_new(1052, "Failed to allocate memory for transaction");
     }
     transaction->ops = temp_ops;
 
@@ -1274,7 +1275,7 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
     {
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1057, "Failed to allocate memory for operation");
+        return tidesdb_err_new(1075, "Failed to allocate memory for operation");
     }
 
     transaction->ops[transaction->num_ops].op->op_code = OP_DELETE;
@@ -1284,7 +1285,7 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1058, "Failed to allocate memory for column family name");
+        return tidesdb_err_new(1072, "Failed to allocate memory for column family name");
     }
 
     transaction->ops[transaction->num_ops].op->kv =
@@ -1295,7 +1296,7 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1059, "Failed to allocate memory for key-value pair");
+        return tidesdb_err_new(1076, "Failed to allocate memory for key-value pair");
     }
 
     transaction->ops[transaction->num_ops].op->kv->key_size = key_size;
@@ -1307,7 +1308,7 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1060, "Failed to allocate memory for key");
+        return tidesdb_err_new(1077, "Failed to allocate memory for key");
     }
     memcpy(transaction->ops[transaction->num_ops].op->kv->key, key, key_size);
 
@@ -1325,7 +1326,7 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1062, "Failed to allocate memory for rollback operation");
+        return tidesdb_err_new(1079, "Failed to allocate memory for rollback operation");
     }
 
     /* a rollback for delete is a put */
@@ -1341,7 +1342,7 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1058, "Failed to allocate memory for column family name");
+        return tidesdb_err_new(1072, "Failed to allocate memory for column family name");
     }
 
     transaction->ops[transaction->num_ops].rollback_op->kv =
@@ -1356,7 +1357,7 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1059, "Failed to allocate memory for key-value pair");
+        return tidesdb_err_new(1081, "Failed to allocate memory for rollback key-value pair");
     }
 
     transaction->ops[transaction->num_ops].rollback_op->kv->key_size = key_size;
@@ -1372,7 +1373,7 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
         free(transaction->ops[transaction->num_ops].op);
         /* unlock the transaction */
         pthread_mutex_unlock(&transaction->lock);
-        return tidesdb_err_new(1060, "Failed to allocate memory for key");
+        return tidesdb_err_new(1082, "Failed to allocate memory for rollback key");
     }
     memcpy(transaction->ops[transaction->num_ops].rollback_op->kv->key, key, key_size);
 
@@ -1394,7 +1395,7 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
 
     /* we check if the transaction is NULL */
-    if (transaction == NULL) return tidesdb_err_new(1032, "Transaction is NULL");
+    if (transaction == NULL) return tidesdb_err_new(1054, "Transaction is NULL");
 
     /* we get column family */
     column_family_t* cf = NULL;
@@ -1403,13 +1404,13 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
 
     /* we lock the memtable */
     if (pthread_rwlock_wrlock(&cf->memtable->lock) != 0)
-        return tidesdb_err_new(1055, "Failed to lock memtable");
+        return tidesdb_err_new(1055, "Failed to acquire memtable lock for commit");
 
     /* we lock the transaction */
     if (pthread_mutex_lock(&transaction->lock) != 0)
     {
         pthread_rwlock_unlock(&cf->memtable->lock);
-        return tidesdb_err_new(1055, "Failed to lock transaction");
+        return tidesdb_err_new(1074, "Failed to acquire transaction lock");
     }
 
     /* we run the operations */
@@ -1457,7 +1458,7 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
             pthread_rwlock_unlock(&cf->memtable->lock);
             /* unlock the transaction */
             pthread_mutex_unlock(&transaction->lock);
-            return tidesdb_err_new(1010, "Failed to allocate memory for queue entry");
+            return tidesdb_err_new(1045, "Failed to allocate memory for queue entry");
         }
 
         /* we make a copy of the memtable */
@@ -1511,11 +1512,11 @@ tidesdb_err_t* tidesdb_txn_rollback(tidesdb_t* tdb, tidesdb_txn_t* transaction)
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
 
     /* we check if the transaction is NULL */
-    if (transaction == NULL) return tidesdb_err_new(1032, "Transaction is NULL");
+    if (transaction == NULL) return tidesdb_err_new(1054, "Transaction is NULL");
 
     /* lock the transaction */
     if (pthread_mutex_lock(&transaction->lock) != 0)
-        return tidesdb_err_new(1055, "Failed to lock transaction");
+        return tidesdb_err_new(1074, "Failed to acquire transaction lock");
 
     for (int i = 0; i < transaction->num_ops; i++)
     {
@@ -1592,11 +1593,11 @@ void _free_operation(operation_t* op)
 
 tidesdb_err_t* tidesdb_txn_free(tidesdb_txn_t* transaction)
 {
-    if (transaction == NULL) return tidesdb_err_new(1032, "Transaction is NULL");
+    if (transaction == NULL) return tidesdb_err_new(1054, "Transaction is NULL");
 
     /* lock the transaction */
     if (pthread_mutex_lock(&transaction->lock) != 0)
-        return tidesdb_err_new(1055, "Failed to lock transaction");
+        return tidesdb_err_new(1074, "Failed to acquire transaction lock");
 
     for (int i = 0; i < transaction->num_ops; i++)
     {
@@ -2666,7 +2667,7 @@ tidesdb_err_t* tidesdb_close(tidesdb_t* tdb)
 
     /* we lock the column families lock */
     if (pthread_rwlock_wrlock(&tdb->column_families_lock) != 0)
-        return tidesdb_err_new(1003, "Failed to lock column families lock");
+        return tidesdb_err_new(1022, "Failed to lock column families lock");
 
     _free_column_families(tdb);
 

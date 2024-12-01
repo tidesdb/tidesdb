@@ -55,7 +55,7 @@
 typedef struct
 {
     char* db_path;       /* the path for/to TidesDB.  This is where column families are stored */
-    bool compressed_wal; /* whether the wal should be compressed */
+    bool compressed_wal; /* whether the wal entries should be compressed */
 } tidesdb_config_t;
 
 /*
@@ -90,6 +90,7 @@ typedef struct
  * @param sstables_lock Read-write lock for SSTables mainly for when adding a new sstable
  * @param memtable the memtable for the column family
  * @param id_gen id generator for the column family; mainly used for sstable filenames
+ * @param compaction_or_flush_lock lock for compaction or flush
  */
 typedef struct
 {
@@ -625,7 +626,7 @@ void _free_operation(operation_t* op);
  * @param key1_size the size of the first key
  * @param key2 the second key
  * @param key2_size the size of the second key
- * @return the comparison
+ * @return the comparison, 1, 0, or -1
  */
 int _compare_keys(const uint8_t* key1, size_t key1_size, const uint8_t* key2, size_t key2_size);
 

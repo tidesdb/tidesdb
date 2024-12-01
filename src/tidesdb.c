@@ -1422,8 +1422,15 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
         switch (op.op_code)
         {
             case OP_PUT:
-                skiplist_put_no_lock(cf->memtable, op.kv->key, op.kv->key_size, op.kv->value,
-                                     op.kv->value_size, op.kv->ttl);
+                if (skiplist_put_no_lock(cf->memtable, op.kv->key, op.kv->key_size, op.kv->value,
+                                         op.kv->value_size, op.kv->ttl) == -1)
+                {
+                    /* unlock the memtable */
+                    pthread_rwlock_unlock(&cf->memtable->lock);
+
+                    /* we rollback the transaction */
+                    return tidesdb_txn_rollback(tdb, transaction);
+                }
                 /* mark op committed */
                 transaction->ops[i].committed = true;
                 break;
@@ -1435,7 +1442,16 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
                     uint32_t tombstone_value = TOMBSTONE;
                     memcpy(tombstone, &tombstone_value, sizeof(uint32_t));
                 }
-                skiplist_put_no_lock(cf->memtable, op.kv->key, op.kv->key_size, tombstone, 4, 0);
+                if (skiplist_put_no_lock(cf->memtable, op.kv->key, op.kv->key_size, tombstone, 4,
+                                         0) == -1)
+                {
+                    /* unlock the memtable */
+                    pthread_rwlock_unlock(&cf->memtable->lock);
+
+                    /* we rollback the transaction */
+                    return tidesdb_txn_rollback(tdb, transaction);
+                }
+
                 /* mark op committed */
                 transaction->ops[i].committed = true;
                 break;

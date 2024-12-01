@@ -11,9 +11,9 @@ It is not a full-featured database, but rather a library that can be used to bui
 > In beta
 
 ## Features
-- [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist uses an RW lock which means multiple readers and one true writer.  SSTables are sorted, immutable and can be read concurrently they are protected via page locks.  Transactions are also protected via a lock.
-- [x] **Column Families** store data in separate key-value stores.
-- [x] **Atomic Transactions** commit or rollback multiple operations atomically.
+- [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist uses an RW lock which means multiple readers and one true writer.  SSTables are sorted, immutable and can be read concurrently they are protected via page locks.  Transactions are also thread-safe.
+- [x] **Column Families** store data in separate key-value stores.  Each column family has their own memtable and sstables.
+- [x] **Atomic Transactions** commit or rollback multiple operations atomically.  Rollsback all operations if one fails.
 - [x] **Cursor** iterate over key-value pairs forward and backward.
 - [x] **WAL** write-ahead logging for durability.  As operations are appended they are also truncated at specific points once persisted to an sstable(s).
 - [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
@@ -50,6 +50,8 @@ cmake --install build
 
 ## Usage
 Each database method returns a `tidesdb_err*` which returns an error code and message. If no error, TidesDB returns `NULL`.
+
+**Example of error structure**
 ```c
 typedef struct
 {
@@ -94,12 +96,12 @@ free(tdb_config);
 ### Creating a column family
 In order to store data in TidesDB you need a column family.
 You pass
-- the database
+- the database you want to create the column family in.  Must be open
 - the name of the column family
-- memtable flush threshold in bytes.  Example below is 128MB.
-- skiplist max level.  Example below is 12.
-- skiplist probability.  Example below is 0.24.
-- whether column family data is compressed
+- memtable flush threshold in bytes.  Example below is 128MB
+- skiplist max level.  Example below is 12
+- skiplist probability.  Example below is 0.24
+- whether column family sstable data is compressed
 
 ```c
 /* create a column family */
@@ -125,8 +127,8 @@ if (e != NULL)
 
 ### Putting a key-value pair
 You pass
-- the database
-- the column family name
+- the database you want to put the key-value pair in.  Must be open
+- the column family name you want to put the key-value pair in
 - the key
 - the key size
 - the value
@@ -163,7 +165,7 @@ if (e != NULL)
 
 ### Getting a key-value pair
 You pass
-- the database
+- the database you want to get the key-value pair from.  Must be open
 - the column family name
 - the key
 - the key size
@@ -184,7 +186,7 @@ if (e != NULL)
 
 ### Deleting a key-value pair
 You pass
-- the database
+- the database you want to delete the key-value pair from.  Must be open
 - the column family name
 - the key
 - the key size
@@ -205,8 +207,8 @@ You can perform a series of operations atomically.  This will block other thread
 You begin a transaction by calling `tidesdb_txn_begin`.
 
 You pass
-- the transaction
-- the column family name
+- the transaction pointer
+- the column family name you want to perform the operations in
 ```c
 tidesdb_txn_t* transaction;
 tidesdb_err_t *e = tidesdb_txn_begin(&transaction, "your_column_family");
@@ -270,7 +272,7 @@ if (e != NULL)
 
 key_value_pair_t kv;
 
-/* Iterate forward */
+/* iterate forward */
 while ((e = tidesdb_cursor_next(c)) == NULL)
 {
     e = tidesdb_cursor_get(c, &kv);
@@ -292,7 +294,7 @@ if (e != NULL && e->code != 1062) /* 1062 means "At end of cursor" */
     tidesdb_err_free(e);
 }
 
-/* Iterate backward */
+/* iterate backward */
 while ((e = tidesdb_cursor_prev(c)) == NULL)
 {
     e = tidesdb_cursor_get(c, &kv);

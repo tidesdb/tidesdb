@@ -11,7 +11,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 > In very active beta development. Not ready for production use.  The library is not yet stable.
 
 ## Features
-- [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist uses an RW lock which means multiple readers and one true writer.  SSTables are sorted, immutable and can be read concurrently they are protected via page locks.
+- [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist uses an RW lock which means multiple readers and one true writer.  SSTables are sorted, immutable and can be read concurrently they are protected via page locks.  Transactions are also protected via a lock.
 - [x] **Column Families** store data in separate key-value stores.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically.
 - [ ] **Cursor** iterate over key-value pairs forward and backward. (in progress)
@@ -22,7 +22,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Zstandard Compression** compression is achieved with Zstandard.  SStable entries can be compressed as well as WAL entries.
 - [x] **TTL** time-to-live for key-value pairs.
 - [x] **Configurable** many options are configurable for the engine, and column families.
-- [x] **Error Handling** majority of functions return an error code.
+- [x] **Error Handling** API functions return an error code and message.
 - [x] **Easy API** simple and easy to use api.
 
 ## Building
@@ -306,7 +306,7 @@ if (e != NULL)
 | 1027       | Value is NULL                                                        |
 | 1028       | Column family not found                                              |
 | 1029       | Max threads is too low                                               |
-| 1030       | Failed to lock sstables lock                                         |
+| 1030       | Failed to acquire sstables lock                                      |
 | 1031       | Key not found                                                        |
 | 1032       | Failed to create compaction thread                                   |
 | 1033       | Failed to allocate memory for thread arguments                       |
@@ -315,14 +315,13 @@ if (e != NULL)
 | 1036       | Failed to read sstable                                               |
 | 1037       | Failed to deserialize key value pair                                 |
 | 1038       | Key value pair is NULL                                               |
-| 1039       | Key not found                                                        |
 | 1040       | Failed to signal flush condition                                     |
 | 1041       | Failed to load column families                                       |
 | 1042       | Failed to open wal                                                   |
 | 1043       | Failed to destroy flush condition                                    |
 | 1044       | Failed to destroy column families lock                               |
 | 1045       | Failed to allocate memory for queue entry                            |
-| 1046       | Failed to initialize flush mutex                                     |
+| 1046       | Failed to initialize flush lock                                      |
 | 1047       | Failed to initialize flush condition variable                        |
 | 1048       | Failed to reallocate memory for column families                      |
 | 1049       | Failed to append to wal                                              |
@@ -344,9 +343,28 @@ if (e != NULL)
 | 1065       | Key has expired.  To be deleted on next compaction                   |
 | 1066       | Key's value cannot be a tombstone                                    |
 | 1067       | Failed to allocate memory for wal                                    |
+| 1068       | Failed to lock compaction or flush lock                              |
+| 1069       | Failed to allocate memory for value copy                             |
+| 1070       | Failed to allocate memory for tombstone                              |
+| 1071       | Transaction pointer is NULL                                          |
+| 1072       | Failed to allocate memory for column family name                     |
+| 1073       | Failed to initialize transaction lock                                |
+| 1074       | Failed to acquire transaction lock                                   |
+| 1075       | Failed to allocate memory for operation                              |
+| 1076       | Failed to allocate memory for key-value pair                         |
+| 1077       | Failed to allocate memory for key                                    |
+| 1078       | Failed to allocate memory for value                                  |
+| 1079       | Failed to allocate memory for rollback operations                    |
+| 1080       | Failed to allocate memory for rollback column family name            |
+| 1081       | Failed to allocate memory for rollback key-value pair                |
+| 1082       | Failed to allocate memory for rollback key                           |
+| 1083       | Failed to acquire memtable lock for commit                           |
+
+
 
 ## License
 Multiple
+
 ```
 Mozilla Public License Version 2.0
 BSD 2-Clause license

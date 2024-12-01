@@ -20,14 +20,18 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "../src/tidesdb.h"
 #include "../test/test_macros.h"
 #include "../test/test_utils.h"
 
-#define NUM_OPERATIONS 1000000
-#define NUM_THREADS    1
+#define NUM_OPERATIONS 1000 /* number of operations per thread */
+#define NUM_THREADS    1    /* you can increase this to test with more threads, usually slower */
+
+/* benchmarker puts 2MB keys and 2MB values into the database then gets them back, then deletes them
+ */
 
 /*
  * thread_arg_t
@@ -42,61 +46,92 @@ typedef struct
     int thread_id;
 } thread_arg_t;
 
+void pad_key_with_nines(uint8_t *key, size_t key_len, size_t target_len)
+{
+    size_t current_len = strlen((char *)key);
+    if (current_len < target_len)
+    {
+        memset(key + current_len, '9', target_len - current_len);
+        key[target_len] = '\0';
+    }
+}
+
 void *benchmark_put(void *arg)
 {
-    thread_arg_t *targ = (thread_arg_t *)arg;
+    thread_arg_t *targ = arg;
     tidesdb_t *tdb = targ->tdb;
     const char *cf_name = targ->column_family_name;
     int thread_id = targ->thread_id;
 
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {
-        char key[16];
-        snprintf(key, sizeof(key), "key_%d_%d", thread_id, i);
-        char value[16];
-        snprintf(value, sizeof(value), "value_%d_%d", thread_id, i);
-        tidesdb_put(tdb, cf_name, (uint8_t *)key, strlen(key), (uint8_t *)value, strlen(value), 0);
+        uint8_t key[(1024 * 1024) * 2];
+        uint8_t value[(1024 * 1024) * 2];
+        snprintf(key, sizeof(key), "key%03d", i);
+        snprintf(value, sizeof(value), "value%03d_%d", i, thread_id);
+        pad_key_with_nines(key, strlen((char *)key), (1024 * 1024) * 2 - 1);
+        pad_key_with_nines(value, strlen((char *)value), (1024 * 1024) * 2 - 1);
+
+        tidesdb_err_t *err = tidesdb_put(tdb, cf_name, key, strlen(key), value, strlen(value), -1);
+        if (err != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, err->message);
+            tidesdb_err_free(err);
+        }
     }
     return NULL;
 }
 
 void *benchmark_get(void *arg)
 {
-    thread_arg_t *targ = (thread_arg_t *)arg;
+    thread_arg_t *targ = arg;
     tidesdb_t *tdb = targ->tdb;
     const char *cf_name = targ->column_family_name;
     int thread_id = targ->thread_id;
 
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {
-        char key[16];
-        snprintf(key, sizeof(key), "key_%d_%d", thread_id, i);
-        uint8_t *value;
-        size_t value_size;
-        tidesdb_err_t *err =
-            tidesdb_get(tdb, cf_name, (uint8_t *)key, strlen(key), &value, &value_size);
+        uint8_t key[(1024 * 1024) * 2];
+        snprintf(key, sizeof(key), "key%03d", i);
+        pad_key_with_nines(key, strlen(key), (1024 * 1024) * 2 - 1);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        tidesdb_err_t *err = tidesdb_get(tdb, cf_name, key, strlen(key), &value, &value_size);
         if (err != NULL)
         {
+            printf(RED "Error: %s\n" RESET, err->message);
+            tidesdb_err_free(err);
             continue;
         }
-        free(value);
-        value = NULL;
+        if (value != NULL)
+        {
+            free(value);
+            value = NULL;
+        }
     }
     return NULL;
 }
 
 void *benchmark_delete(void *arg)
 {
-    thread_arg_t *targ = (thread_arg_t *)arg;
+    thread_arg_t *targ = arg;
     tidesdb_t *tdb = targ->tdb;
     const char *cf_name = targ->column_family_name;
     int thread_id = targ->thread_id;
 
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {
-        char key[16];
-        snprintf(key, sizeof(key), "key_%d_%d", thread_id, i);
-        tidesdb_delete(tdb, cf_name, (uint8_t *)key, strlen(key));
+        uint8_t key[(1024 * 1024) * 2];
+        snprintf(key, sizeof(key), "key%03d", i);
+        pad_key_with_nines(key, strlen(key), (1024 * 1024) * 2 - 1);
+
+        tidesdb_err_t *err = tidesdb_delete(tdb, cf_name, key, strlen(key));
+        if (err != NULL)
+        {
+            printf(RED "Error: %s\n" RESET, err->message);
+            tidesdb_err_free(err);
+        }
     }
     return NULL;
 }
@@ -135,10 +170,25 @@ int main()
     tdb_config->db_path = "benchmarktdb";
     tdb_config->compressed_wal = false;
 
-    tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t *err = tidesdb_open(tdb_config, &tdb);
+    if (err != NULL)
+    {
+        printf(RED "Error opening database: %s\n" RESET, err->message);
+        tidesdb_err_free(err);
+        free(tdb_config);
+        return -1;
+    }
 
     const char *cf_name = "benchmark_cf";
-    tidesdb_create_column_family(tdb, cf_name, (1024 * 1024) * 256, 12, 0.25f, false);
+    err = tidesdb_create_column_family(tdb, cf_name, (1024 * 1024) * 64, 12, 0.25f, false);
+    if (err != NULL)
+    {
+        printf(RED "Error creating column family: %s\n" RESET, err->message);
+        tidesdb_err_free(err);
+        tidesdb_close(tdb);
+        free(tdb_config);
+        return -1;
+    }
 
     printf(BOLDCYAN "Running PUT benchmark...\n" RESET);
     clock_t start = clock();

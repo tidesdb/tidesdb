@@ -43,7 +43,7 @@ typedef struct
 {
     uint64_t state;
     CRITICAL_SECTION lock;
-} id_gen;
+} id_gen_t;
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
 typedef struct
 {

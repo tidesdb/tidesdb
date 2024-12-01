@@ -1627,7 +1627,63 @@ tidesdb_err_t* tidesdb_txn_free(tidesdb_txn_t* transaction)
 tidesdb_err_t* tidesdb_cursor_init(tidesdb_t* tdb, const char* column_family_name,
                                    tidesdb_cursor_t** cursor)
 {
-    /** TODO */
+    /* we check if the db is NULL */
+    if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
+
+    /* we check if the column family name is NULL */
+    if (column_family_name == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
+
+    /* we get the column family */
+    column_family_t* cf = NULL;
+
+    if (_get_column_family(tdb, column_family_name, &cf) == -1)
+        return tidesdb_err_new(1028, "Column family not found");
+
+    /* we allocate memory for the new cursor */
+    *cursor = malloc(sizeof(tidesdb_cursor_t));
+    if (*cursor == NULL) return tidesdb_err_new(1057, "Failed to allocate memory for cursor");
+
+    (*cursor)->tidesdb = tdb;
+    (*cursor)->cf = cf;
+    (*cursor)->sstable_cursor = NULL;
+    (*cursor)->memtable_cursor = NULL;
+
+    /* lock sstables to get latest sstable index*/
+
+    if (pthread_rwlock_rdlock(&cf->sstables_lock) != 0)
+    {
+        free(*cursor);
+        return tidesdb_err_new(1024, "Failed to lock sstables lock");
+    }
+
+    (*cursor)->sstable_index = cf->num_sstables - 1; /* we start at the last sstable */
+
+    /* unlock sstables */
+    if (pthread_rwlock_unlock(&cf->sstables_lock) != 0)
+    {
+        free(*cursor);
+        return tidesdb_err_new(1025, "Failed to unlock sstables");
+    }
+
+    /* we lock create a memtable cursor */
+    (*cursor)->memtable_cursor = skiplist_cursor_init(cf->memtable);
+    if ((*cursor)->memtable_cursor == NULL)
+    {
+        free(*cursor);
+        return tidesdb_err_new(1058, "Failed to initialize memtable cursor");
+    }
+
+    /* we get current sstable cursor */
+    (*cursor)->sstable_cursor = NULL;
+
+    /* we initialize the sstable cursor */
+    if (pager_cursor_init(cf->sstables[(*cursor)->sstable_index]->pager,
+                          &(*cursor)->sstable_cursor) == -1)
+    {
+        skiplist_cursor_free((*cursor)->memtable_cursor);
+        free(*cursor);
+        return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
+    }
 
     return NULL;
 }
@@ -1655,7 +1711,18 @@ tidesdb_err_t* tidesdb_cursor_get(tidesdb_cursor_t* cursor, key_value_pair_t* kv
 
 tidesdb_err_t* tidesdb_cursor_free(tidesdb_cursor_t* cursor)
 {
-    /** TODO */
+    /* we check if the cursor is NULL */
+    if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
+
+    /* we free the sstable cursor */
+    if (cursor->sstable_cursor != NULL) pager_cursor_free(cursor->sstable_cursor);
+
+    /* we free the memtable cursor */
+    if (cursor->memtable_cursor != NULL) skiplist_cursor_free(cursor->memtable_cursor);
+
+    free(cursor);
+
+    cursor = NULL;
 
     return NULL;
 }

@@ -1658,17 +1658,13 @@ tidesdb_err_t* tidesdb_cursor_init(tidesdb_t* tdb, const char* column_family_nam
 
     (*cursor)->sstable_index = cf->num_sstables - 1; /* we start at the last sstable */
 
-    /* unlock sstables */
-    if (pthread_rwlock_unlock(&cf->sstables_lock) != 0)
-    {
-        free(*cursor);
-        return tidesdb_err_new(1025, "Failed to unlock sstables");
-    }
-
     /* we lock create a memtable cursor */
     (*cursor)->memtable_cursor = skiplist_cursor_init(cf->memtable);
     if ((*cursor)->memtable_cursor == NULL)
     {
+        /* unlock sstables */
+        pthread_rwlock_unlock(&cf->sstables_lock);
+
         free(*cursor);
         return tidesdb_err_new(1058, "Failed to initialize memtable cursor");
     }
@@ -1676,14 +1672,22 @@ tidesdb_err_t* tidesdb_cursor_init(tidesdb_t* tdb, const char* column_family_nam
     /* we get current sstable cursor */
     (*cursor)->sstable_cursor = NULL;
 
-    /* we initialize the sstable cursor */
-    if (pager_cursor_init(cf->sstables[(*cursor)->sstable_index]->pager,
-                          &(*cursor)->sstable_cursor) == -1)
+    if (cf->num_sstables > 0)
     {
-        skiplist_cursor_free((*cursor)->memtable_cursor);
-        free(*cursor);
-        return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
+        /* we initialize the sstable cursor */
+        if (pager_cursor_init(cf->sstables[(*cursor)->sstable_index]->pager,
+                              &(*cursor)->sstable_cursor) == -1)
+        {
+            /* unlock sstables */
+            pthread_rwlock_unlock(&cf->sstables_lock);
+            skiplist_cursor_free((*cursor)->memtable_cursor);
+            free(*cursor);
+            return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
+        }
     }
+
+    /* unlock sstables */
+    pthread_rwlock_unlock(&cf->sstables_lock);
 
     return NULL;
 }
@@ -1694,7 +1698,7 @@ tidesdb_err_t* tidesdb_cursor_next(tidesdb_cursor_t* cursor)
     if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
 
     /* we move to the next key in the memtable */
-    if (skiplist_cursor_next(cursor->memtable_cursor) != -1)
+    if (skiplist_cursor_next(cursor->memtable_cursor) == 0)
     {
         return NULL;
     }
@@ -1702,34 +1706,41 @@ tidesdb_err_t* tidesdb_cursor_next(tidesdb_cursor_t* cursor)
     /* if we are at the end of the memtable, we move to the sstable */
 
     /* we move to the next key in the sstable */
-    if (pager_cursor_next(cursor->sstable_cursor) != -1)
+    if (pager_cursor_next(cursor->sstable_cursor) == 0)
     {
         return NULL;
     }
 
     /* if there is no next key in the sstable, we move to the next sstable */
-    if (cursor->sstable_index > 0)
+
+    /* get sstables lock */
+    if (pthread_rwlock_rdlock(&cursor->cf->sstables_lock) != 0)
+        return tidesdb_err_new(1024, "Failed to acquire sstables lock");
+
+    if (cursor->cf->num_sstables > 0)
     {
-        /* we lock the sstables */
-        if (pthread_rwlock_rdlock(&cursor->cf->sstables_lock) != 0)
-            return tidesdb_err_new(1024, "Failed to acquire sstables lock");
+        if (cursor->sstable_index > 0)
+        {
+            cursor->sstable_index--;
 
-        cursor->sstable_index--;
+            /* we unlock the sstables */
+            if (pthread_rwlock_unlock(&cursor->cf->sstables_lock) != 0)
+                return tidesdb_err_new(1025, "Failed to unlock sstables");
 
-        /* we unlock the sstables */
-        if (pthread_rwlock_unlock(&cursor->cf->sstables_lock) != 0)
-            return tidesdb_err_new(1025, "Failed to unlock sstables");
+            /* we free the current sstable cursor */
+            pager_cursor_free(cursor->sstable_cursor);
 
-        /* we free the current sstable cursor */
-        pager_cursor_free(cursor->sstable_cursor);
+            /* we initialize the sstable cursor */
+            if (pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
+                                  &cursor->sstable_cursor) == -1)
+                return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
 
-        /* we initialize the sstable cursor */
-        if (pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
-                              &cursor->sstable_cursor) == -1)
-            return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
-
-        return NULL;
+            return NULL;
+        }
     }
+
+    if (pthread_rwlock_unlock(&cursor->cf->sstables_lock) != 0)
+        return tidesdb_err_new(1025, "Failed to unlock sstables");
 
     return tidesdb_err_new(1062, "At end of cursor");
 }
@@ -1740,7 +1751,7 @@ tidesdb_err_t* tidesdb_cursor_prev(tidesdb_cursor_t* cursor)
     if (cursor == NULL) return tidesdb_err_new(1061, "Cursor is NULL");
 
     /* we move to the previous key in the memtable */
-    if (skiplist_cursor_prev(cursor->memtable_cursor) != -1)
+    if (skiplist_cursor_prev(cursor->memtable_cursor) == 0)
     {
         return NULL;
     }
@@ -1748,34 +1759,41 @@ tidesdb_err_t* tidesdb_cursor_prev(tidesdb_cursor_t* cursor)
     /* if we are at the beginning of the memtable, we move to the sstable */
 
     /* we move to the previous key in the sstable */
-    if (pager_cursor_prev(cursor->sstable_cursor) != -1)
+    if (pager_cursor_prev(cursor->sstable_cursor) == 0)
     {
         return NULL;
     }
 
-    /* if there is no previous key in the sstable, we move to the previous sstable */
-    if (cursor->sstable_index < cursor->cf->num_sstables - 1)
+    /* we lock the sstables */
+    if (pthread_rwlock_rdlock(&cursor->cf->sstables_lock) != 0)
+        return tidesdb_err_new(1024, "Failed to acquire sstables lock");
+
+    if (cursor->cf->num_sstables > 0)
     {
-        /* we lock the sstables */
-        if (pthread_rwlock_rdlock(&cursor->cf->sstables_lock) != 0)
-            return tidesdb_err_new(1024, "Failed to acquire sstables lock");
+        /* if there is no previous key in the sstable, we move to the previous sstable */
+        if (cursor->sstable_index < cursor->cf->num_sstables - 1)
+        {
+            cursor->sstable_index++;
 
-        cursor->sstable_index++;
+            /* we unlock the sstables */
+            if (pthread_rwlock_unlock(&cursor->cf->sstables_lock) != 0)
+                return tidesdb_err_new(1025, "Failed to unlock sstables");
 
-        /* we unlock the sstables */
-        if (pthread_rwlock_unlock(&cursor->cf->sstables_lock) != 0)
-            return tidesdb_err_new(1025, "Failed to unlock sstables");
+            /* we free the current sstable cursor */
+            pager_cursor_free(cursor->sstable_cursor);
 
-        /* we free the current sstable cursor */
-        pager_cursor_free(cursor->sstable_cursor);
+            /* we initialize the sstable cursor */
+            if (pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
+                                  &cursor->sstable_cursor) == -1)
+                return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
 
-        /* we initialize the sstable cursor */
-        if (pager_cursor_init(cursor->cf->sstables[cursor->sstable_index]->pager,
-                              &cursor->sstable_cursor) == -1)
-            return tidesdb_err_new(1035, "Failed to initialize sstable cursor");
-
-        return NULL;
+            return NULL;
+        }
     }
+
+    /* we unlock the sstables */
+    if (pthread_rwlock_unlock(&cursor->cf->sstables_lock) != 0)
+        return tidesdb_err_new(1025, "Failed to unlock sstables");
 
     return tidesdb_err_new(1062, "At beginning of cursor");
 }

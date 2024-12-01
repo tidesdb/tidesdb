@@ -48,10 +48,10 @@ queue_t *queue_new()
 #endif
 
 #if defined(_WIN32) || defined(_WIN64)
-bool queue_enqueue(queue *q, void *data)
+bool queue_enqueue(queue_t *q, void *data)
 {
     /* allocate memory for the new node */
-    queue_node *new_node = malloc(sizeof(queue_node));
+    queue_node_t *new_node = malloc(sizeof(queue_node_t));
     if (new_node == NULL) return false;
 
     new_node->data = data;
@@ -103,7 +103,7 @@ int queue_enqueue(queue_t *q, void *data)
 #endif
 
 #if defined(_WIN32) || defined(_WIN64)
-void *queue_dequeue(queue *q)
+void *queue_dequeue(queue_t *q)
 {
     EnterCriticalSection(&q->lock); /* lock the queue */
     if (q->head == NULL)
@@ -112,7 +112,7 @@ void *queue_dequeue(queue *q)
         return NULL;
     }
 
-    queue_node *node = q->head; /* dequeue a node */
+    queue_node_t *node = q->head; /* dequeue a node */
     void *data = node->data;
     q->head = q->head->next;
 
@@ -154,7 +154,7 @@ void *queue_dequeue(queue_t *q)
 #endif
 
 #if defined(_WIN32) || defined(_WIN64)
-size_t queue_size(queue *q)
+size_t queue_size(queue_t *q)
 {
     EnterCriticalSection(&q->lock); /* lock the queue */
     size_t size = q->size;          /* get the size */
@@ -180,7 +180,7 @@ void free_queue_node(queue_node_t *node)
 }
 
 #if defined(_WIN32) || defined(_WIN64)
-void queue_destroy(queue *q)
+void queue_destroy(queue_t *q)
 {
     /* lock the queue */
     EnterCriticalSection(&q->lock);
@@ -189,7 +189,7 @@ void queue_destroy(queue *q)
 
     while (current != NULL)
     {
-        queue_node *next = current->next;
+        queue_node_t *next = current->next;
         free_queue_node(current);
         current = next; /* move to the next node */
     }

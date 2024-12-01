@@ -184,7 +184,6 @@ typedef struct
     size_t sstable_index;               /* the index of the sstable */
     pager_cursor_t* sstable_cursor;     /* the cursor for the sstable */
     key_value_pair_t* current;          /* the current key-value pair */
-    bool at_start;                      /* whether the cursor is at the start */
 } tidesdb_cursor_t;
 
 /*

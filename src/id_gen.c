@@ -21,7 +21,7 @@
 #if defined(_WIN32) || defined(_WIN64)
 id_gen* id_gen_init(uint64_t seed)
 {
-    id_gen* gen = malloc(sizeof(id_gen)); /* allocate memory for the id generator */
+    id_gen_t* gen = malloc(sizeof(id_gen)); /* allocate memory for the id generator */
     /* check if successful */
     if (gen == NULL)
     {
@@ -53,7 +53,7 @@ id_gen_t* id_gen_init(uint64_t seed)
 #endif
 
 #if defined(_WIN32) || defined(_WIN64)
-uint64_t id_gen_new(id_gen* gen)
+uint64_t id_gen_new(id_gen_t* gen)
 {
     uint64_t id; /* the new id */
 
@@ -89,7 +89,7 @@ uint64_t id_gen_new(id_gen_t* gen)
 #endif
 
 #if defined(_WIN32) || defined(_WIN64)
-void id_gen_destroy(id_gen* gen)
+void id_gen_destroy(id_gen_t* gen)
 {
     /* destroy the lock */
     DeleteCriticalSection(&gen->lock);

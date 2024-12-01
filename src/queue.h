@@ -56,7 +56,7 @@ typedef struct queue
     queue_node *tail;      /* tail of queue */
     size_t size;           /* size of queue */
     CRITICAL_SECTION lock; /* rw lock for queue */
-} queue;
+} queue_t;
 #elif __linux__ || defined(__unix__) || defined(__APPLE__)
 typedef struct
 {

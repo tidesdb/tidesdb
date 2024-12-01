@@ -919,6 +919,7 @@ tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const
                 pager_cursor_free(cursor);
                 /* unlock the compaction_or_flush_lock */
                 pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
+                _free_key_value_pair(kv);
                 return tidesdb_err_new(1038, "Key value pair is NULL");
             }
 
@@ -927,9 +928,7 @@ tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const
                 if (_is_tombstone(kv->value, kv->value_size))
                 {
                     free(buffer);
-                    free(kv->key);
-                    free(kv->value);
-                    free(kv);
+                    _free_key_value_pair(kv);
                     pager_cursor_free(cursor);
                     /* unlock the compaction_or_flush_lock */
                     pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
@@ -940,9 +939,7 @@ tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const
                 if (kv->ttl != -1 && kv->ttl < time(NULL))
                 {
                     free(buffer);
-                    free(kv->key);
-                    free(kv->value);
-                    free(kv);
+                    _free_key_value_pair(kv);
                     pager_cursor_free(cursor);
                     /* unlock the compaction_or_flush_lock */
                     pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
@@ -954,9 +951,7 @@ tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const
                 if (*value == NULL)
                 {
                     free(buffer);
-                    free(kv->key);
-                    free(kv->value);
-                    free(kv);
+                    _free_key_value_pair(kv);
                     pager_cursor_free(cursor);
                     /* unlock the compaction_or_flush_lock */
                     pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
@@ -971,9 +966,7 @@ tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const
 
                 free(buffer);
                 pager_cursor_free(cursor);
-                free(kv->key);
-                free(kv->value);
-                free(kv);
+                _free_key_value_pair(kv);
 
                 /* unlock the compaction_or_flush_lock */
                 pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
@@ -991,9 +984,7 @@ tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const
             }
 
             free(buffer);
-            free(kv->key);
-            free(kv->value);
-            free(kv);
+            _free_key_value_pair(kv);
         }
 
         pager_cursor_free(cursor);

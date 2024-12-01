@@ -1888,6 +1888,19 @@ tidesdb_err_t* tidesdb_cursor_get(tidesdb_cursor_t* cursor, key_value_pair_t* kv
             return tidesdb_err_new(1060, "Failed to get key value pair from cursor");
         }
 
+        /* check if tombstone */
+        if (_is_tombstone(dkv->value, dkv->value_size))
+        {
+            /* get next */
+            tidesdb_err_t* err = tidesdb_cursor_next(cursor);
+            if (err != NULL)
+            {
+                _free_key_value_pair(dkv);
+                return err;
+            }
+            return tidesdb_cursor_get(cursor, kv);
+        }
+
         /* copy over the key and value, so the user can free it */
         kv->key_size = dkv->key_size;
         kv->key = malloc(kv->key_size);

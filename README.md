@@ -14,7 +14,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Concurrent** multiple threads can read and write to the storage engine.  The skiplist uses an RW lock which means multiple readers and one true writer.  SSTables are sorted, immutable and can be read concurrently they are protected via page locks.  Transactions are also protected via a lock.
 - [x] **Column Families** store data in separate key-value stores.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically.
-- [ ] **Cursor** iterate over key-value pairs forward and backward. (in progress)
+- [x] **Cursor** iterate over key-value pairs forward and backward.
 - [x] **WAL** write-ahead logging for durability.  As operations are appended they are also truncated at specific points once persisted to an sstable(s).
 - [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
 - [x] **Background flush** memtable flushes are enqueued and then flushed in the background.
@@ -255,9 +255,57 @@ if (e != NULL)
 {
     /* handle error */
     tidesdb_err_free(e);
+    return;
 }
 
-/* COMING SOON */
+key_value_pair_t kv;
+
+/* Iterate forward */
+while ((e = tidesdb_cursor_next(c)) == NULL)
+{
+    e = tidesdb_cursor_get(c, &kv);
+    if (e != NULL)
+    {
+        /* handle error */
+        tidesdb_err_free(e);
+        break;
+    }
+
+    /* use kv.key and kv.value */
+    free(kv.key);
+    free(kv.value);
+}
+
+if (e != NULL && e->code != 1062) /* 1062 means "At end of cursor" */
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+/* Iterate backward */
+while ((e = tidesdb_cursor_prev(c)) == NULL)
+{
+    e = tidesdb_cursor_get(c, &kv);
+    if (e != NULL)
+    {
+        /* handle error */
+        tidesdb_err_free(e);
+        break;
+    }
+
+    /* use kv.key and kv.value */
+    free(kv.key);
+    free(kv.value);
+}
+
+if (e != NULL && e->code != 1085) /* 1085 means "At beginning of cursor" */
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+tidesdb_cursor_free(c);
+
 ```
 
 ### Compaction
@@ -360,6 +408,7 @@ if (e != NULL)
 | 1082       | Failed to allocate memory for rollback key                           |
 | 1083       | Failed to acquire memtable lock for commit                           |
 | 1084       | Failed to skip initial pages                                         |
+| 1085       | At beginning of cursor                                               |
 
 
 ## License

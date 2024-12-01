@@ -359,7 +359,7 @@ if (e != NULL)
 | 1081       | Failed to allocate memory for rollback key-value pair                |
 | 1082       | Failed to allocate memory for rollback key                           |
 | 1083       | Failed to acquire memtable lock for commit                           |
-
+| 1084       | Failed to skip initial pages                                         |
 
 
 ## License

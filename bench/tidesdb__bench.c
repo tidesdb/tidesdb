@@ -122,7 +122,7 @@ void run_benchmark(void *(*benchmark_func)(void *), tidesdb_t *tdb, const char *
 
 int main()
 {
-    remove_directory("tidesdb_benchmark");
+    remove_directory("benchmarktdb");
 
     tidesdb_t *tdb = NULL;
 
@@ -132,13 +132,13 @@ int main()
         return -1;
     }
 
-    tdb_config->db_path = "benchmark_cf";
+    tdb_config->db_path = "benchmarktdb";
     tdb_config->compressed_wal = false;
 
     tidesdb_open(tdb_config, &tdb);
 
     const char *cf_name = "benchmark_cf";
-    tidesdb_create_column_family(tdb, cf_name, (1024 * 1024) * 64, 12, 0.25f, false);
+    tidesdb_create_column_family(tdb, cf_name, (1024 * 1024) * 256, 12, 0.25f, false);
 
     printf(BOLDCYAN "Running PUT benchmark...\n" RESET);
     clock_t start = clock();
@@ -146,6 +146,8 @@ int main()
     clock_t end = clock();
     printf(BOLDGREEN "PUT benchmark completed in %f seconds\n" RESET,
            (double)(end - start) / CLOCKS_PER_SEC);
+
+    sleep(10); /* wait for flushes to complete */
 
     printf(BOLDCYAN "Running GET benchmark...\n" RESET);
     start = clock();

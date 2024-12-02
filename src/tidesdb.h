@@ -91,6 +91,7 @@ typedef struct
  * @param memtable the memtable for the column family
  * @param id_gen id generator for the column family; mainly used for sstable filenames
  * @param compaction_or_flush_lock lock for compaction or flush
+ * @param wal the write-ahead log for column family
  */
 typedef struct
 {
@@ -103,6 +104,7 @@ typedef struct
     skiplist_t* memtable; /* the memtable for the column family */
     id_gen_t* id_gen; /* id generator for the column family; mainly used for sstable filenames */
     pthread_rwlock_t compaction_or_flush_lock; /* lock for compaction or flush */
+    wal_t* wal;                                /* the write-ahead log for column family */
 } column_family_t;
 
 /*
@@ -142,7 +144,6 @@ typedef struct
  * @param column_families the column families currently
  * @param column_families_lock Read-write lock for column families
  * @param num_column_families the number of column families currently
- * @param wal the write-ahead log for TidesDB
  * @param flush_thread the thread for flushing memtables
  * @param flush_queue the queue for flushing memtables
  * @param flush_lock the flush lock
@@ -157,7 +158,6 @@ typedef struct
     column_family_t* column_families;      /* the column families currently */
     pthread_rwlock_t column_families_lock; /* Read-write lock for column families */
     int num_column_families;               /* the number of column families currently */
-    wal_t* wal;                            /* the write-ahead log for tidesdb */
     pthread_t flush_thread;                /* the thread for flushing memtables */
     queue_t* flush_queue;                  /* the queue for flushing memtables */
     pthread_mutex_t flush_lock;            /* flush lock */

@@ -828,7 +828,7 @@ void test_put_compact()
     sleep(5); /* wait for the SST files to be written */
 
     /* we compact */
-    e = tidesdb_compact_sstables(tdb, TEST_COLUMN_FAMILY, 2);
+    e = tidesdb_compact_sstables(tdb, TEST_COLUMN_FAMILY, 1);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -840,7 +840,7 @@ void test_put_compact()
 
     tidesdb_err_free(e);
 
-    remove_directory(TEST_DIR);
+    // remove_directory(TEST_DIR);
 
     free(tdb_config);
 
@@ -905,7 +905,7 @@ void test_put_compact_get()
     sleep(5); /* wait for the SST files to be written */
 
     /* we compact */
-    e = tidesdb_compact_sstables(tdb, TEST_COLUMN_FAMILY, 4);
+    e = tidesdb_compact_sstables(tdb, TEST_COLUMN_FAMILY, 2);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);

@@ -273,161 +273,124 @@ tidesdb_err_t* tidesdb_drop_column_family(tidesdb_t* tdb, const char* name)
     return NULL;
 }
 
-tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, const char* column_family, int max_threads)
-{
-    /* we check if the db is NULL */
-    if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
-
-    /* we check if column family is NULL */
-    if (column_family == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
-
-    /* check if column family exists */
-    column_family_t* cf = NULL;
-    if (_get_column_family(tdb, column_family, &cf) == -1)
-    {
-        return tidesdb_err_new(1028, "Column family not found");
-    }
-
-    /* we check if column family is NULL */
-    if (cf == NULL) return tidesdb_err_new(1028, "Column family not found");
-
-    /* minimum threads is 1 */
-    if (max_threads < 1) return tidesdb_err_new(1029, "Max threads is too low");
-
-    /* lock compaction_or_flush_lock */
-    if (pthread_rwlock_wrlock(&cf->compaction_or_flush_lock) != 0)
-        return tidesdb_err_new(1068, "Failed to lock compaction or flush lock");
-
-    /* lock the sstables lock */
-    /* we do this so operations can't touch the sstables while we are compacting nor can we add
-     * new sstables */
-    if (pthread_rwlock_wrlock(&cf->sstables_lock) != 0)
-    {
-        /* unlock compaction_or_flush_lock */
-        pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
-        return tidesdb_err_new(1030, "Failed to acquire sstables lock");
-    }
-
-    /* number of sstables to compact */
-    int num_sstables = cf->num_sstables;
-    if (num_sstables < 2)
-    {
-        pthread_rwlock_unlock(&cf->sstables_lock);
-        /* unlock compaction_or_flush_lock */
-        pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
-        return tidesdb_err_new(1051, "Not enough sstables to compact");
-    }
-
-    /* sort sstables by last modified time (oldest first) */
-    qsort(cf->sstables, num_sstables, sizeof(sstable_t*), _compare_sstables);
-
-    /* split the work based on max_threads */
-    int sstables_per_thread = (num_sstables + max_threads - 1) / max_threads;
-    pthread_t threads[max_threads];
-    compact_thread_args_t* thread_args = malloc(
-        max_threads * sizeof(compact_thread_args_t)); /* allocate memory for thread arguments */
-
-    if (thread_args == NULL)
-    {
-        pthread_rwlock_unlock(&cf->sstables_lock);
-        /* unlock compaction_or_flush_lock */
-        pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
-        return tidesdb_err_new(1033, "Failed to allocate memory for thread arguments");
-    }
-
-    for (int i = 0; i < max_threads; i++)
-    {
-        thread_args[i].cf = cf;
-        thread_args[i].start = i * sstables_per_thread;
-        thread_args[i].end = (i + 1) * sstables_per_thread;
-        if (thread_args[i].end > num_sstables) thread_args[i].end = num_sstables;
-
-        if (pthread_create(&threads[i], NULL, _compact_sstables_thread, (void*)&thread_args[i]) !=
-            0)
-        {
-            pthread_rwlock_unlock(&cf->sstables_lock);
-            free(thread_args);
-            /* unlock compaction_or_flush_lock */
-            pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
-            return tidesdb_err_new(1032, "Failed to create compaction thread");
-        }
-    }
-
-    /* wait for all threads to finish */
-    for (int i = 0; i < max_threads; i++) pthread_join(threads[i], NULL);
-
-    /* we remove the null sstables */
-    int j = 0;
-    for (int i = 0; i < num_sstables; i++)
-    {
-        if (cf->sstables[i] != NULL) cf->sstables[j++] = cf->sstables[i];
-    }
-
-    /* update the number of sstables */
-    cf->num_sstables = j;
-
-    /* unlock the sstables lock */
-    pthread_rwlock_unlock(&cf->sstables_lock);
-
-    free(thread_args); /* free allocated memory for thread arguments */
-
-    /* unlock compaction_or_flush_lock */
-    pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
-
-    return NULL;
-}
-
-void* _compact_sstables_thread(void* arg)
+void _compact_sstables_thread(void* arg)
 {
     compact_thread_args_t* args = arg;
     column_family_t* cf = args->cf;
     int start = args->start;
     int end = args->end;
 
-    /* perform the compaction for the given range of sstables */
-    for (int i = start; i < end - 1; i += 2)
+    /* merge the current and ith+1 sstables */
+    sstable_t* new_sstable = _merge_sstables(cf->sstables[start], cf->sstables[end], cf);
+
+    /* we check if the new sstable is NULL */
+    if (new_sstable == NULL)
     {
-        if (i + 1 >= cf->num_sstables) break; /* ensure we do not exceed the number of sstables */
-
-        /* merge sstables[i] and sstables[i+1] into a new sstable */
-        sstable_t* new_sstable = _merge_sstables(cf->sstables[i], cf->sstables[i + 1], cf);
-
-        /* we check if the new sstable is NULL */
-        if (new_sstable == NULL) continue;
-
-        /* remove old sstable files */
-        char sstable_path1[PATH_MAX];
-        char sstable_path2[PATH_MAX];
-
-        /* get the sstable paths */
-        snprintf(sstable_path1, PATH_MAX, "%s", cf->sstables[i]->pager->filename);
-        snprintf(sstable_path2, PATH_MAX, "%s", cf->sstables[i + 1]->pager->filename);
-
-        /* free the old sstables */
-        _free_sstable(cf->sstables[i]);
-        _free_sstable(cf->sstables[i + 1]);
-
-        /* remove the sstable files */
-        remove(sstable_path1);
-        remove(sstable_path2);
-
-        /* replace the old sstables with the new one */
-        cf->sstables[i] = new_sstable;
-        cf->sstables[i + 1] = NULL;
+        free(args);
+        return;
     }
+
+    /* remove old sstable files */
+    char sstable_path1[PATH_MAX];
+    char sstable_path2[PATH_MAX];
+
+    /* get the sstable paths */
+    snprintf(sstable_path1, PATH_MAX, "%s", cf->sstables[start]->pager->filename);
+    snprintf(sstable_path2, PATH_MAX, "%s", cf->sstables[end]->pager->filename);
+
+    /* free the old sstables */
+    _free_sstable(cf->sstables[start]);
+    _free_sstable(cf->sstables[end]);
+
+    /* remove the sstable files */
+    remove(sstable_path1);
+    remove(sstable_path2);
+
+    /* replace the old sstables with the new one */
+    cf->sstables[start] = new_sstable;
+    cf->sstables[end] = NULL;
+
+    sem_post(args->sem); /* signal compaction thread is done */
+    free(args);
+}
+
+tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, const char* column_family, int max_threads)
+{
+    if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
+    if (column_family == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
+
+    column_family_t* cf = NULL;
+    if (_get_column_family(tdb, column_family, &cf) == -1)
+    {
+        return tidesdb_err_new(1028, "Column family not found");
+    }
+    if (cf == NULL) return tidesdb_err_new(1028, "Column family not found");
+    if (max_threads < 1) return tidesdb_err_new(1029, "Max threads is too low");
+
+    if (pthread_rwlock_wrlock(&cf->compaction_or_flush_lock) != 0)
+        return tidesdb_err_new(1068, "Failed to lock compaction or flush lock");
+
+    int num_sstables = cf->num_sstables;
+    if (num_sstables < 2)
+    {
+        pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
+        return tidesdb_err_new(1051, "Not enough sstables to compact");
+    }
+
+    qsort(cf->sstables, num_sstables, sizeof(sstable_t*), _compare_sstables);
+
+    sem_t sem;
+    sem_init(&sem, 0, max_threads);
+
+    for (int i = 0; i < num_sstables - 1; i += 2)
+    {
+        sem_wait(&sem); /* we wait if the maximum number of threads is reached */
+
+        compact_thread_args_t* args = malloc(sizeof(compact_thread_args_t));
+        args->cf = cf;
+        args->start = i;
+        args->end = i + 1;
+        args->sem = &sem;
+
+        pthread_t thread;
+        pthread_create(&thread, NULL, _compact_sstables_thread, args);
+        pthread_detach(thread);
+    }
+
+    /* wait for all compaction threads to finish */
+    for (int i = 0; i < max_threads; i++)
+    {
+        sem_wait(&sem);
+    }
+
+    sem_destroy(&sem);
+
+    int j = 0;
+    for (int i = 0; i < num_sstables; i++)
+    {
+        if (cf->sstables[i] != NULL) cf->sstables[j++] = cf->sstables[i];
+    }
+
+    cf->num_sstables = j;
+
+    pthread_rwlock_unlock(&cf->compaction_or_flush_lock);
 
     return NULL;
 }
 
 sstable_t* _merge_sstables(sstable_t* sst1, sstable_t* sst2, column_family_t* cf)
 {
-    if (cf == NULL || sst1 == NULL || sst2 == NULL || sst1->pager->num_pages == 0 ||
-        sst2->pager->num_pages == 0)
+    if (cf == NULL || sst1 == NULL || sst2 == NULL)
+    {
         return NULL;
+    }
 
     /* we used a skiplist to keep things in order */
     skiplist_t* mergetable = new_skiplist(cf->config.max_level, cf->config.probability);
-    if (mergetable == NULL) return NULL;
+    if (mergetable == NULL)
+    {
+        return NULL;
+    }
 
     /* create a new bloomfilter for the merged sstable */
     bloomfilter_t* bf = bloomfilter_create(BLOOMFILTER_SIZE);
@@ -451,127 +414,100 @@ sstable_t* _merge_sstables(sstable_t* sst1, sstable_t* sst2, column_family_t* cf
         return NULL;
     }
 
-    /* whether there are more pages to read on either sstable */
-    bool has_next1 = true;
-    bool has_next2 = true;
-
-    while (has_next1 || has_next2)
+    /* skip bloom filter pages */
+    if (pager_cursor_next(cursor1) == -1 || pager_cursor_next(cursor2) == -1)
     {
-        uint8_t* buffer1 = NULL;
-        size_t buffer_len1 = 0;
-        uint8_t* buffer2 = NULL;
-        size_t buffer_len2 = 0;
+        skiplist_destroy(mergetable);
+        bloomfilter_destroy(bf);
+        pager_cursor_free(cursor1);
+        pager_cursor_free(cursor2);
+        return NULL;
+    }
 
-        if (has_next1)
+    unsigned int current_page = 0;
+
+    while (pager_cursor_get(cursor1, &current_page) != -1)
+    {
+        uint8_t* buffer = NULL;
+        size_t buffer_len = 0;
+
+        if (pager_read(sst1->pager, current_page, &buffer, &buffer_len) == -1)
         {
-            /* if there is a next page, read it */
-            has_next1 =
-                pager_cursor_next(cursor1); /* we are skipping the initial bloom filter pages */
-            if (has_next1 && !pager_read(sst1->pager, cursor1->page_number, &buffer1, &buffer_len1))
-            {
-                free(buffer1);
-                break;
-            }
-        }
-
-        if (has_next2)
-        {
-            has_next2 = pager_cursor_next(cursor2);
-            if (has_next2 && !pager_read(sst2->pager, cursor2->page_number, &buffer2, &buffer_len2))
-            {
-                free(buffer2);
-                free(buffer1);
-                break;
-            }
-        }
-
-        key_value_pair_t* kv1 = NULL;
-        key_value_pair_t* kv2 = NULL;
-
-        if (buffer1 &&
-            !deserialize_key_value_pair(buffer1, buffer_len1, &kv1, cf->config.compressed))
-        {
-            free(buffer1);
-            free(buffer2);
+            free(buffer);
             break;
         }
 
-        if (buffer2 &&
-            !deserialize_key_value_pair(buffer2, buffer_len2, &kv2, cf->config.compressed))
+        key_value_pair_t* kv = NULL;
+
+        if (deserialize_key_value_pair(buffer, buffer_len, &kv, cf->config.compressed) == -1)
         {
-            free(buffer1);
-            free(buffer2);
+            free(buffer);
             break;
         }
 
-        /* check if the key is not a tombstone */
-        if (kv1 && !_is_tombstone(kv1->value, kv1->value_size))
+        /* we check if the value is not a tombstone and if ttl is set if it is not expired */
+        if (kv && !_is_tombstone(kv->value, kv->value_size) &&
+            (kv->ttl == -1 || kv->ttl > time(NULL)))
         {
-            /* check if ttl is set and if it has not expired */
-            if (kv1 && kv1->ttl > 0 && kv1->ttl > time(NULL))
-            {
-                if (skiplist_put(mergetable, kv1->key, kv1->key_size, kv1->value, kv1->value_size,
-                                 kv1->ttl) == -1)
-                {
-                    free(buffer1);
-                    free(kv1->key);
-                    free(kv1->value);
-                    free(kv1);
-                    kv1 = NULL;
-                }
-                else
-                {
-                    bloomfilter_add(bf, kv1->key, kv1->key_size);
-                }
-            }
+            skiplist_put(mergetable, kv->key, kv->key_size, kv->value, kv->value_size, kv->ttl);
+            bloomfilter_add(bf, kv->key, kv->key_size);
         }
 
-        /* now onto the next key value pair */
+        free(kv);
 
-        /* check if the key is not a tombstone */
-        if (kv2 && !_is_tombstone(kv2->value, kv2->value_size))
-        {
-            /* check if ttl is set and if it has not expired */
-            if (kv2 && kv2->ttl > 0 && kv2->ttl > time(NULL))
-            {
-                if (skiplist_put(mergetable, kv2->key, kv2->key_size, kv2->value, kv2->value_size,
-                                 kv2->ttl) == -1)
-                {
-                    free(buffer2);
-                    buffer2 = NULL;
-                    free(kv2->key);
-                    free(kv2->value);
-                    free(kv2);
-                    kv2 = NULL;
-                }
-                else
-                {
-                    bloomfilter_add(bf, kv2->key, kv2->key_size);
-                }
-            }
-        }
+        free(buffer);
 
-        /* free the key value pairs */
-        if (buffer1 != NULL) free(buffer1);
-        if (buffer2 != NULL) free(buffer2);
-        if (kv1 != NULL)
+        if (pager_cursor_next(cursor1) == -1)
         {
-            free(kv1->key);
-            free(kv1->value);
-            free(kv1);
-        }
-        if (kv2 != NULL)
-        {
-            free(kv2->key);
-            free(kv2->value);
-            free(kv2);
+            break;
         }
     }
+
+    pager_cursor_free(cursor1);
+
+    while (pager_cursor_get(cursor2, &current_page) != -1)
+    {
+        uint8_t* buffer = NULL;
+        size_t buffer_len = 0;
+
+        if (pager_read(sst2->pager, current_page, &buffer, &buffer_len) == -1)
+        {
+            free(buffer);
+            break;
+        }
+
+        key_value_pair_t* kv = NULL;
+
+        if (deserialize_key_value_pair(buffer, buffer_len, &kv, cf->config.compressed) == -1)
+        {
+            free(buffer);
+            break;
+        }
+
+        /* we check if the value is not a tombstone and if ttl is set if it is not expired */
+        if (kv && !_is_tombstone(kv->value, kv->value_size) &&
+            (kv->ttl == -1 || kv->ttl > time(NULL)))
+        {
+            skiplist_put(mergetable, kv->key, kv->key_size, kv->value, kv->value_size, kv->ttl);
+            bloomfilter_add(bf, kv->key, kv->key_size);
+        }
+
+        free(kv);
+
+        free(buffer);
+
+        if (pager_cursor_next(cursor2) == -1)
+        {
+            break;
+        }
+    }
+
+    free(cursor2);
 
     pager_t* new_pager = NULL;
     char new_sstable_name[PATH_MAX];
 
-    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%lu.%s", cf->path, _get_path_seperator(),
+    snprintf(new_sstable_name, PATH_MAX, "%s%ssstable_%lu%s", cf->path, _get_path_seperator(),
              id_gen_new(cf->id_gen), SSTABLE_EXT);
 
     if (pager_open(new_sstable_name, &new_pager) == -1)
@@ -607,21 +543,20 @@ sstable_t* _merge_sstables(sstable_t* sst1, sstable_t* sst2, column_family_t* cf
     free(bf_buffer);
     bloomfilter_destroy(bf);
 
-    skiplist_cursor_t* sl_cursor = skiplist_cursor_init(mergetable);
-
     /* check mergetable size */
     if (mergetable->total_size == 0)
     {
         skiplist_destroy(mergetable);
         pager_close(new_pager);
+
         /* remove the sstable file */
         remove(new_sstable_name);
-
         return NULL;
     }
 
-    bool has_next = true;
+    skiplist_cursor_t* sl_cursor = skiplist_cursor_init(mergetable);
 
+    bool has_next = true;
     do
     {
         uint8_t* kv_buffer = NULL;
@@ -642,8 +577,6 @@ sstable_t* _merge_sstables(sstable_t* sst1, sstable_t* sst2, column_family_t* cf
             break;
         }
 
-        free(kvp);
-
         unsigned int page_number;
 
         if (pager_write(new_pager, kv_buffer, kv_buffer_len, &page_number) == -1)
@@ -653,9 +586,8 @@ sstable_t* _merge_sstables(sstable_t* sst1, sstable_t* sst2, column_family_t* cf
         }
 
         free(kv_buffer);
-        new_pager->num_pages++;
 
-        has_next = skiplist_cursor_next(sl_cursor);
+        has_next = skiplist_cursor_next(sl_cursor) == -1 ? false : true;
 
     } while (has_next);
 

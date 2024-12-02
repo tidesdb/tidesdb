@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <limits.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -208,12 +209,14 @@ typedef struct
  * @param cf the column family
  * @param start the start index for the sstables
  * @param end the end index for the sstables
+ * @param sem semaphore to limit concurrent threads
  */
 typedef struct
 {
     column_family_t* cf; /* the column family */
     int start;           /* the start index for the sstables */
     int end;             /* the end index for the sstables */
+    sem_t* sem;          /* semaphore to limit concurrent threads */
 } compact_thread_args_t;
 
 /* TidesDB function prototypes */
@@ -587,7 +590,7 @@ int _remove_directory(const char* path);
  * a thread for compacting sstable pairs
  * @param arg the arguments for the thread in this case a compact_thread_args struct
  */
-void* _compact_sstables_thread(void* arg);
+void _compact_sstables_thread(void* arg);
 
 /*
  * _merge_sstables

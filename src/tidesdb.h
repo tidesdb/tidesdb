@@ -122,22 +122,6 @@ typedef struct
 } tidesdb_txn_op_t;
 
 /*
- * tidesdb_txn_t
- * struct for a transaction
- * @param ops the operations in the transaction
- * @param num_ops the number of operations in the transaction
- * @param column_family the column family for the transaction
- * @param lock the lock for the transaction
- */
-typedef struct
-{
-    tidesdb_txn_op_t* ops; /* the operations in the transaction */
-    int num_ops;           /* the number of operations in the transaction */
-    char* column_family;   /* the column family for the transaction */
-    pthread_mutex_t lock;  /* lock for the transaction */
-} tidesdb_txn_t;
-
-/*
  * tidesdb_t
  * struct for TidesDB
  * @param config the configuration for TidesDB
@@ -164,6 +148,24 @@ typedef struct
     pthread_cond_t flush_cond;             /* condition variable for flush thread */
     bool stop_flush_thread;                /* flag to stop the flush thread */
 } tidesdb_t;
+
+/*
+ * tidesdb_txn_t
+ * struct for a transaction
+ * @param tdb the tidesdb instance
+ * @param ops the operations in the transaction
+ * @param num_ops the number of operations in the transaction
+ * @param column_family the column family for the transaction
+ * @param lock the lock for the transaction
+ */
+typedef struct
+{
+    tidesdb_t* tdb;        /* the tidesdb instance */
+    tidesdb_txn_op_t* ops; /* the operations in the transaction */
+    int num_ops;           /* the number of operations in the transaction */
+    char* column_family;   /* the column family for the transaction */
+    pthread_mutex_t lock;  /* lock for the transaction */
+} tidesdb_txn_t;
 
 /*
  * tidesdb_cursor_t
@@ -272,11 +274,11 @@ int _get_column_family(tidesdb_t* tdb, const char* name, column_family_t** cf);
  * tidesdb_compact_sstables
  * compact the sstables for a column family
  * @param tdb the TidesDB instance
- * @param cf the column family
+ * @param column_family the column family name
  * @param max_threads the maximum number of threads to use
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, column_family_t* cf, int max_threads);
+tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, const char* column_family, int max_threads);
 
 /*
  * tidesdb_put
@@ -322,11 +324,13 @@ tidesdb_err_t* tidesdb_delete(tidesdb_t* tdb, const char* column_family_name, co
 /*
  * tidesdb_txn_begin
  * begin a transaction
+ * @param tdb the TidesDB instance
  * @param transaction the transaction
  * @param column_family the column family
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_txn_begin(tidesdb_txn_t** transaction, const char* column_family);
+tidesdb_err_t* tidesdb_txn_begin(tidesdb_t* tdb, tidesdb_txn_t** transaction,
+                                 const char* column_family);
 
 /*
  * tidesdb_txn_put
@@ -355,20 +359,18 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
 /*
  * tidesdb_txn_commit
  * commit a transaction
- * @param tdb the TidesDB instance
  * @param transaction the transaction
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction);
+tidesdb_err_t* tidesdb_txn_commit(tidesdb_txn_t* transaction);
 
 /*
  * tidesdb_txn_rollback
  * rollback a transaction
- * @param tdb the TidesDB instance
  * @param transaction the transaction
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_txn_rollback(tidesdb_t* tdb, tidesdb_txn_t* transaction);
+tidesdb_err_t* tidesdb_txn_rollback(tidesdb_txn_t* transaction);
 
 /*
  * tidesdb_txn_free

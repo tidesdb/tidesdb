@@ -207,11 +207,12 @@ You can perform a series of operations atomically.  This will block other thread
 You begin a transaction by calling `tidesdb_txn_begin`.
 
 You pass
+- the database you want to perform the operations in.  Must be open
 - the transaction pointer
 - the column family name you want to perform the operations in
 ```c
 tidesdb_txn_t* transaction;
-tidesdb_err_t *e = tidesdb_txn_begin(&transaction, "your_column_family");
+tidesdb_err_t *e = tidesdb_txn_begin(tdb, &transaction, "your_column_family");
 if (e != NULL)
 {
     /* handle error */
@@ -239,7 +240,7 @@ if (e != NULL)
 }
 
 /* now we commit */
-e = tidesdb_txn_commit(tdb, transaction);
+e = tidesdb_txn_commit(transaction);
 if (e != NULL)
 {
     /* handle error */
@@ -247,7 +248,7 @@ if (e != NULL)
 }
 
 /* before you free, you can rollback */
-tidesdb_err_t *e = tidesdb_txn_rollback(tdb, transaction);
+tidesdb_err_t *e = tidesdb_txn_rollback(transaction);
 if (e != NULL)
 {
     /* handle error */

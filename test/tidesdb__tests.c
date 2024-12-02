@@ -669,7 +669,7 @@ void test_txn_put_delete_get()
     assert(_get_column_family(tdb, TEST_COLUMN_FAMILY, &cf) == 0);
 
     tidesdb_txn_t* transaction;
-    e = tidesdb_txn_begin(&transaction, TEST_COLUMN_FAMILY);
+    e = tidesdb_txn_begin(tdb, &transaction, TEST_COLUMN_FAMILY);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -708,7 +708,7 @@ void test_txn_put_delete_get()
     tidesdb_err_free(e);
 
     /* commit the transaction */
-    e = tidesdb_txn_commit(tdb, transaction);
+    e = tidesdb_txn_commit(transaction);
 
     assert(e == NULL);
 
@@ -828,7 +828,7 @@ void test_put_compact()
     sleep(5); /* wait for the SST files to be written */
 
     /* we compact */
-    e = tidesdb_compact_sstables(tdb, cf, 2);
+    e = tidesdb_compact_sstables(tdb, TEST_COLUMN_FAMILY, 2);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -905,7 +905,7 @@ void test_put_compact_get()
     sleep(5); /* wait for the SST files to be written */
 
     /* we compact */
-    e = tidesdb_compact_sstables(tdb, cf, 4);
+    e = tidesdb_compact_sstables(tdb, TEST_COLUMN_FAMILY, 4);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);
@@ -1009,7 +1009,7 @@ void test_put_compact_reopen_get()
     sleep(5); /* wait for the SST files to be written */
 
     /* we compact */
-    e = tidesdb_compact_sstables(tdb, cf, 2);
+    e = tidesdb_compact_sstables(tdb, TEST_COLUMN_FAMILY, 2);
     if (e != NULL) printf(RED "Error: %s\n" RESET, e->message);
 
     assert(e == NULL);

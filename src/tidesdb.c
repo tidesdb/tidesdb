@@ -273,10 +273,20 @@ tidesdb_err_t* tidesdb_drop_column_family(tidesdb_t* tdb, const char* name)
     return NULL;
 }
 
-tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, column_family_t* cf, int max_threads)
+tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, const char* column_family, int max_threads)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
+
+    /* we check if column family is NULL */
+    if (column_family == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
+
+    /* check if column family exists */
+    column_family_t* cf = NULL;
+    if (_get_column_family(tdb, column_family, &cf) == -1)
+    {
+        return tidesdb_err_new(1028, "Column family not found");
+    }
 
     /* we check if column family is NULL */
     if (cf == NULL) return tidesdb_err_new(1028, "Column family not found");
@@ -1009,8 +1019,12 @@ tidesdb_err_t* tidesdb_delete(tidesdb_t* tdb, const char* column_family_name, co
     return NULL;
 }
 
-tidesdb_err_t* tidesdb_txn_begin(tidesdb_txn_t** transaction, const char* column_family)
+tidesdb_err_t* tidesdb_txn_begin(tidesdb_t* tdb, tidesdb_txn_t** transaction,
+                                 const char* column_family)
 {
+    /* we check if the db is NULL */
+    if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
+
     /* we check if column family is NULL */
     if (column_family == NULL) return tidesdb_err_new(1015, "Column family name is NULL");
 
@@ -1020,6 +1034,15 @@ tidesdb_err_t* tidesdb_txn_begin(tidesdb_txn_t** transaction, const char* column
     *transaction = (tidesdb_txn_t*)malloc(sizeof(tidesdb_txn_t));
     if (*transaction == NULL)
         return tidesdb_err_new(1052, "Failed to allocate memory for transaction");
+
+    /* check if column family exists */
+    column_family_t* cf = NULL;
+    if (_get_column_family(tdb, column_family, &cf) == -1)
+    {
+        free(*transaction);
+        *transaction = NULL;
+        return tidesdb_err_new(1028, "Column family not found");
+    }
 
     /* copy the column family name */
     (*transaction)->column_family = strdup(column_family);
@@ -1041,6 +1064,8 @@ tidesdb_err_t* tidesdb_txn_begin(tidesdb_txn_t** transaction, const char* column
         *transaction = NULL;
         return tidesdb_err_new(1055, "Failed to initialize transaction lock");
     }
+
+    (*transaction)->tdb = tdb;
 
     return NULL;
 }
@@ -1343,17 +1368,17 @@ tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key
     return NULL;
 }
 
-tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
+tidesdb_err_t* tidesdb_txn_commit(tidesdb_txn_t* transaction)
 {
     /* we check if the db is NULL */
-    if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
+    if (transaction->tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
 
     /* we check if the transaction is NULL */
     if (transaction == NULL) return tidesdb_err_new(1054, "Transaction is NULL");
 
     /* we get column family */
     column_family_t* cf = NULL;
-    if (_get_column_family(tdb, transaction->column_family, &cf) == -1)
+    if (_get_column_family(transaction->tdb, transaction->column_family, &cf) == -1)
         return tidesdb_err_new(1028, "Column family not found");
 
     /* we lock the memtable */
@@ -1383,7 +1408,7 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
                     pthread_rwlock_unlock(&cf->memtable->lock);
 
                     /* we rollback the transaction */
-                    return tidesdb_txn_rollback(tdb, transaction);
+                    return tidesdb_txn_rollback(transaction);
                 }
                 /* mark op committed */
                 transaction->ops[i].committed = true;
@@ -1403,7 +1428,7 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
                     pthread_rwlock_unlock(&cf->memtable->lock);
 
                     /* we rollback the transaction */
-                    return tidesdb_txn_rollback(tdb, transaction);
+                    return tidesdb_txn_rollback(transaction);
                 }
 
                 /* mark op committed */
@@ -1417,13 +1442,13 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
     if ((int)cf->memtable->total_size >= cf->config.flush_threshold)
     {
         /* get flush mutex */
-        pthread_mutex_lock(&tdb->flush_lock);
+        pthread_mutex_lock(&transaction->tdb->flush_lock);
 
         queue_entry_t* entry = malloc(sizeof(queue_entry_t));
         if (entry == NULL)
         {
             /* unlock the flush mutex */
-            pthread_mutex_unlock(&tdb->flush_lock);
+            pthread_mutex_unlock(&transaction->tdb->flush_lock);
             /* unlock the memtable */
             pthread_rwlock_unlock(&cf->memtable->lock);
             /* unlock the transaction */
@@ -1436,7 +1461,7 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
         if (entry->memtable == NULL)
         {
             /* unlock the flush mutex */
-            pthread_mutex_unlock(&tdb->flush_lock);
+            pthread_mutex_unlock(&transaction->tdb->flush_lock);
             free(entry);
             /* unlock the memtable */
             pthread_rwlock_unlock(&cf->memtable->lock);
@@ -1449,7 +1474,7 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
 
         if (pager_size(cf->wal->pager, &entry->wal_checkpoint) == -1)
         {
-            pthread_mutex_unlock(&tdb->flush_lock);
+            pthread_mutex_unlock(&transaction->tdb->flush_lock);
             free(entry);
             /* unlock the memtable */
             pthread_rwlock_unlock(&cf->memtable->lock);
@@ -1458,13 +1483,13 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
             return tidesdb_err_new(1012, "Failed to get wal checkpoint");
         }
 
-        queue_enqueue(tdb->flush_queue, entry);
-        pthread_cond_signal(&tdb->flush_cond);
+        queue_enqueue(transaction->tdb->flush_queue, entry);
+        pthread_cond_signal(&transaction->tdb->flush_cond);
 
         /* now we clear the memtable */
         skiplist_clear(cf->memtable);
 
-        pthread_mutex_unlock(&tdb->flush_lock);
+        pthread_mutex_unlock(&transaction->tdb->flush_lock);
     }
 
     /* unlock the transaction */
@@ -1476,10 +1501,10 @@ tidesdb_err_t* tidesdb_txn_commit(tidesdb_t* tdb, tidesdb_txn_t* transaction)
     return NULL;
 }
 
-tidesdb_err_t* tidesdb_txn_rollback(tidesdb_t* tdb, tidesdb_txn_t* transaction)
+tidesdb_err_t* tidesdb_txn_rollback(tidesdb_txn_t* transaction)
 {
     /* we check if the db is NULL */
-    if (tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
+    if (transaction->tdb == NULL) return tidesdb_err_new(1002, "TidesDB is NULL");
 
     /* we check if the transaction is NULL */
     if (transaction == NULL) return tidesdb_err_new(1054, "Transaction is NULL");
@@ -1495,7 +1520,7 @@ tidesdb_err_t* tidesdb_txn_rollback(tidesdb_t* tdb, tidesdb_txn_t* transaction)
             operation_t op = *transaction->ops[i].rollback_op;
             column_family_t* cf = NULL;
 
-            if (_get_column_family(tdb, op.column_family, &cf) == -1)
+            if (_get_column_family(transaction->tdb, op.column_family, &cf) == -1)
             {
                 /* unlock the transaction */
                 pthread_mutex_unlock(&transaction->lock);

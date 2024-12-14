@@ -64,7 +64,7 @@ To open a new database you need to create a configuration and then open the data
 ```c
 
 tidesdb_t tdb = NULL;
-tidesdb_err_t* e = tidesdb_open("your_tdb_directory", &tdb);
+tidesdb_err_t *e = tidesdb_open("your_tdb_directory", &tdb);
 if (e != NULL)
 {
     /* handle error */
@@ -131,7 +131,7 @@ You pass
 uint8_t key[] = "key";
 uint8_t value[] = "value";
 
-tidesdb_err_t *e = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), -1);
+tidesdb_err_t *e = tidesdb_put(tdb, "your_column_family", key, sizeof(key), value, sizeof(value), -1);
 if (e != NULL)
 {
     /* handle error */
@@ -146,7 +146,7 @@ uint8_t key[] = "key";
 uint8_t value[] = "value";
 
 time_t ttl = time(NULL) + 10; /* 10 seconds */
-tidesdb_err_t *e  = tidesdb_put(tdb, "your_column_family", key, strlen(key), value, strlen(value), ttl);
+tidesdb_err_t *e  = tidesdb_put(tdb, "your_column_family", key, sizeof(key), value, sizeof(value), ttl);
 if (e != NULL)
 {
     /* handle error */
@@ -164,10 +164,10 @@ You pass
 - a pointer to the value size
 ```c
 size_t value_len = 0;
-uint8_t* value_out = NULL;
+uint8_t *value_out = NULL;
 uint8_t key[] = "key";
 
-tidesdb_err_t *e = tidesdb_get(tdb, "your_column_family", key, strlen(key), &value_out, &value_len);
+tidesdb_err_t *e = tidesdb_get(tdb, "your_column_family", key, sizeof(key), &value_out, &value_len);
 if (e != NULL)
 {
     /* handle error */
@@ -184,7 +184,7 @@ You pass
 ```c
 uint8_t key[] = "key";
 
-tidesdb_err_t *e = tidesdb_delete(tdb, "your_column_family", key, strlen(key));
+tidesdb_err_t *e = tidesdb_delete(tdb, "your_column_family", key, sizeof(key));
 if (e != NULL)
 {
     /* handle error */
@@ -202,7 +202,7 @@ You pass
 - the transaction pointer
 - the column family name you want to perform the operations in
 ```c
-tidesdb_txn_t* transaction;
+tidesdb_txn_t *transaction;
 tidesdb_err_t *e = tidesdb_txn_begin(tdb, &transaction, "your_column_family");
 if (e != NULL)
 {
@@ -253,7 +253,7 @@ tidesdb_txn_free(transaction);
 ### Cursors
 You can iterate over key-value pairs in a column family.
 ```c
-tidesdb_cursor_t* c;
+tidesdb_cursor_t *c;
 tidesdb_err_t *e = tidesdb_cursor_init(tdb, "your_column_family", &c);
 if (e != NULL)
 {
@@ -280,7 +280,7 @@ while ((e = tidesdb_cursor_next(c)) == NULL)
     free(kv.value);
 }
 
-if (e != NULL && e->code != 1062) /* 1062 means "At end of cursor" */
+if (e != NULL && e->code != TIDESDB_ERR_AT_END_OF_CURSOR)
 {
     /* handle error */
     tidesdb_err_free(e);
@@ -302,7 +302,7 @@ while ((e = tidesdb_cursor_prev(c)) == NULL)
     free(kv.value);
 }
 
-if (e != NULL && e->code != 1085) /* 1085 means "At beginning of cursor" */
+if (e != NULL && e->code != TIDESDB_ERR_AT_START_OF_CURSOR)
 {
     /* handle error */
     tidesdb_err_free(e);

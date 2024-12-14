@@ -5,56 +5,45 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 23)
-set(PROJECT_VERSION 0.1.0) # TidesDB v0.1.0
+set(PROJECT_VERSION 0.2.0) # TidesDB v0.2.0
 
-find_package(zstd REQUIRED)
+#find_package(zstd REQUIRED)
+#find_package(snappy REQUIRED)
+#find_package(lz4 REQUIRED)
 
-add_library(xxhash STATIC external/xxhash.c)
-add_library(tidesdb SHARED src/tidesdb.c src/tidesdb.h src/err.c src/err.h src/pager.c src/pager.h src/skiplist.c src/skiplist.h src/queue.c src/queue.h src/bloomfilter.c src/bloomfilter.h src/serializable_structures.h src/serialize.c src/serialize.h src/id_gen.c src/id_gen.h)
+# For development, we want to enable all warnings and sanitizers
+add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
+add_link_options(-fsanitize=address,undefined)
 
-
+add_library(tidesdb SHARED src/tidesdb.c src/tidesdb.h src/err.c src/err.h src/block_manager.c src/block_manager.h src/skip_list.c src/skip_list.h src/compress.c src/compress.h src/bloom_filter.c src/block_manager.h)
 
 install(TARGETS tidesdb
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
 
-
-
-install(FILES src/tidesdb.h src/err.h src/pager.h src/skiplist.h src/queue.h src/bloomfilter.h external/xxhash.h src/serializable_structures.h src/serialize.h src/id_gen.h DESTINATION include)
+install(FILES src/tidesdb.c src/tidesdb.h src/err.c src/err.h src/block_manager.c src/block_manager.h src/skip_list.c src/skip_list.h src/compress.c src/compress.h src/bloom_filter.c src/bloom_filter.h DESTINATION include)
 enable_testing()
 
-
-
 add_executable(err_tests test/err__tests.c)
-add_executable(pager_tests test/pager__tests.c)
-add_executable(skiplist_tests test/skiplist__tests.c)
-add_executable(queue_tests test/queue__tests.c)
-add_executable(bloomfilter_tests test/bloomfilter__tests.c)
-add_executable(serialize_tests test/serialize__tests.c)
-add_executable(id_gen_tests test/id_gen__tests.c)
+add_executable(block_manager_tests test/block_manager__tests.c)
+add_executable(skip_list_tests test/skip_list__tests.c)
+add_executable(compress_tests test/compress__tests.c)
+add_executable(bloom_filter_tests test/bloom_filter__tests.c)
 add_executable(tidesdb_tests test/tidesdb__tests.c)
-add_executable(tidesdb_benchmark bench/tidesdb__bench.c)
 
-target_link_libraries(tidesdb xxhash zstd)
-target_link_libraries(err_tests tidesdb)
-target_link_libraries(pager_tests tidesdb)
-target_link_libraries(skiplist_tests tidesdb)
-target_link_libraries(queue_tests tidesdb)
-target_link_libraries(bloomfilter_tests tidesdb xxhash)
-target_link_libraries(serialize_tests tidesdb)
-target_link_libraries(id_gen_tests tidesdb)
-target_link_libraries(tidesdb_tests tidesdb xxhash zstd)
-target_link_libraries(tidesdb_benchmark tidesdb xxhash zstd)
+target_link_libraries(err_tests tidesdb m zstd snappy lz4)
+target_link_libraries(block_manager_tests tidesdb m zstd snappy lz4)
+target_link_libraries(skip_list_tests tidesdb m zstd snappy lz4)
+target_link_libraries(compress_tests tidesdb m zstd snappy lz4)
+target_link_libraries(bloom_filter_tests tidesdb m zstd snappy lz4)
+target_link_libraries(tidesdb_tests tidesdb m zstd snappy lz4)
 
 add_test(NAME err_tests COMMAND err_tests)
-add_test(NAME pager_tests COMMAND pager_tests)
-add_test(NAME skiplist_tests COMMAND skiplist_tests)
-add_test(NAME queue_tests COMMAND queue_tests)
-add_test(NAME bloomfilter_tests COMMAND bloomfilter_tests)
-add_test(NAME serialize_tests COMMAND serialize_tests)
-add_test(NAME id_gen_tests COMMAND id_gen_tests)
-add_test(NAME tidesdb_test COMMAND tidesdb_tests)
-add_test(NAME tidesdb_benchmark COMMAND tidesdb_benchmark)
+add_test(NAME block_manager_tests COMMAND block_manager_tests)
+add_test(NAME skip_list_tests COMMAND skip_list_tests)
+add_test(NAME compress_tests COMMAND compress_tests)
+add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
+add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
 
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(

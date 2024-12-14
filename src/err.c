@@ -26,7 +26,22 @@ tidesdb_err_t* tidesdb_err_new(int code, char* message)
 
     /* We set the code and message */
     e->code = code;
-    e->message = message;
+    /* we check if the message is NULL */
+    if (message == NULL)
+    {
+        e->message = NULL;
+    }
+    else
+    {
+        /* we allocate memory for the message */
+        e->message = strdup(message);
+        if (e->message == NULL)
+        {
+            /* we free the error struct if the message allocation fails */
+            free(e);
+            return NULL;
+        }
+    }
 
     /* We return the error */
     return e;
@@ -37,8 +52,86 @@ void tidesdb_err_free(tidesdb_err_t* e)
     /* Check if e is NULL */
     if (e == NULL) return;
 
-    /* we don't free the message has it shouldn't be dynamically allocated */
-    /* we free the error */
+    /* Free the message if it was dynamically allocated */
+    if (e->message)
+    {
+        free(e->message);
+        e->message = NULL;
+    }
+
+    /* Free the error struct */
     free(e);
     e = NULL;
+}
+
+tidesdb_err_t* tidesdb_err_from_code(TIDESDB_ERR_CODE code, ...)
+{
+    char buffer[256];
+    va_list args;
+    va_start(args, code);
+
+    switch (code)
+    {
+        case TIDESDB_ERR_MEMORY_ALLOC:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_MKDIR:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_INIT_LOCK:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_DESTROY_LOCK:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_INVALID_NAME:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_RM_FAILED:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_REALLOC_FAILED:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_RELEASE_LOCK:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        default:
+            snprintf(buffer, sizeof(buffer), "%s", tidesdb_err_messages[code].message);
+    }
+
+    va_end(args);
+
+    tidesdb_err_t* err = tidesdb_err_new(tidesdb_err_messages[code].code, buffer);
+    return err;
 }

@@ -16,97 +16,147 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TIDESDB_H
-#define TIDESDB_H
-#include <dirent.h>
-#include <limits.h>
+#ifndef __TIDESDB_H__
+#define __TIDESDB_H__
+
 #include <pthread.h>
 #include <semaphore.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <stdbool.h>
 
-#include "bloomfilter.h"
+#include "block_manager.h"
+#include "compress.h"
 #include "err.h"
-#include "id_gen.h"
-#include "pager.h"
-#include "queue.h"
-#include "serialize.h"
-#include "skiplist.h"
+#include "skip_list.h"
 
-/* ** * @TODO windows support */
-
-#define BLOOMFILTER_SIZE                                                                      \
-    1000 /* size of each bloom filter.  Bloom filters are linked once they reach this size in \
-            occupied capacity */
 #define WAL_EXT                       ".wal"     /* extension for the write-ahead log file */
 #define SSTABLE_EXT                   ".sst"     /* extension for the SSTable file */
 #define COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"     /* configuration file for the column family */
 #define TOMBSTONE                     0xDEADBEEF /* tombstone value for deleted keys */
+#define SYNC_INTERVAL                 0.24       /* interval for syncing mainly WAL */
+#define BLOOMFILTER_P                 0.01       /*  the false positive rate for bloom filter */
 
 /*
- * tidesdb_config_t
- * create a new TidesDB config
- * @param db_path the path for/to TidesDB
- * @param compressed_wal whether the wal should be compressed
+ * tidesdb_compression_algo_t
+ * compression algorithm enum
+ * used for compression algorithms in TidesDB
+ */
+typedef enum
+{
+    TDB_NO_COMPRESSION,
+    TDB_COMPRESS_SNAPPY,
+    TDB_COMPRESS_LZ4,
+    TDB_COMPRESS_ZSTD
+} tidesdb_compression_algo_t;
+
+/*
+ * tidesdb_sstable_t
+ * struct for a TidesDB SSTable
+ * @param block_manager the block manager for the SSTable
  */
 typedef struct
 {
-    char* db_path;       /* the path for/to TidesDB.  This is where column families are stored */
-    bool compressed_wal; /* whether the wal entries should be compressed */
-} tidesdb_config_t;
+    block_manager_t *block_manager;
+} tidesdb_sstable_t;
 
 /*
- * sstable_t
- * struct for the SSTable
- * @param pager the pager for the SSTable
- */
-typedef struct
-{
-    pager_t* pager; /* the pager for the SSTable */
-} sstable_t;
-
-/*
- * wal_t
- * struct for the write-ahead log
+ * tidesdb_wal_t
+ * struct for write-ahead logs in TidesDB
  * @param pager the pager for the WAL
  * @param lock the read-write lock for the WAL
  */
 typedef struct
 {
-    pager_t* pager;        /* the pager for the WAL */
-    pthread_rwlock_t lock; /* Read-write lock for the SSTable */
-} wal_t;
+    block_manager_t *block_manager;
+    bool compress;
+    tidesdb_compression_algo_t compress_algo;
+} tidesdb_wal_t;
 
 /*
- * column_family_t
- * struct for a column family
+ * tidesdb_column_family_config_t
+ * struct for a column family configuration
+ * used for column family configuration in TidesDB
+ * @param name the name of the column family
+ * @param flush_threshold the flush threshold of the column family
+ * @param max_level the max level of the column family
+ * @param probability the probability of the column family
+ * @param compressed the compressed status of the column family
+ * @param bloom_filter whether to use a bloom filter for the column family sstables
+ */
+typedef struct
+{
+    char *name;
+    int32_t flush_threshold;
+    int32_t max_level;
+    float probability;
+    bool compressed;
+    tidesdb_compression_algo_t compress_algo;
+    bool bloom_filter;
+} tidesdb_column_family_config_t;
+
+/*
+ * tidesdb_column_family_t
+ * struct for a column family in TidesDB
  * @param config the configuration for the column family
  * @param path the path to the column family
  * @param sstables the sstables for the column family
  * @param num_sstables the number of sstables for the column family
- * @param sstables_lock Read-write lock for SSTables mainly for when adding a new sstable
+ * @param rwlock read-write lock for column family
  * @param memtable the memtable for the column family
- * @param id_gen id generator for the column family; mainly used for sstable filenames
- * @param compaction_or_flush_lock lock for compaction or flush
  * @param wal the write-ahead log for column family
  */
 typedef struct
 {
-    column_family_config_t config; /* the configuration for the column family */
-    char* path;                    /* the path to the column family */
-    sstable_t** sstables;          /* the sstables for the column family */
-    int num_sstables;              /* the number of sstables for the column family */
-    pthread_rwlock_t
-        sstables_lock;    /* Read-write lock for SSTables mainly for when adding a new sstable */
-    skiplist_t* memtable; /* the memtable for the column family */
-    id_gen_t* id_gen; /* id generator for the column family; mainly used for sstable filenames */
-    pthread_rwlock_t compaction_or_flush_lock; /* lock for compaction or flush */
-    wal_t* wal;                                /* the write-ahead log for column family */
-} column_family_t;
+    tidesdb_column_family_config_t config;
+    char *path;
+    tidesdb_sstable_t **sstables;
+    int num_sstables;
+    pthread_rwlock_t rwlock;
+    skip_list_t *memtable;
+    tidesdb_wal_t *wal;
+} tidesdb_column_family_t;
+
+/*
+ * tidesdb_key_value_pair_t
+ * key value pair struct for TidesDB SSTables and WAL
+ * @param key the key
+ * @param key_size the size of the key
+ * @param value the value
+ * @param value_size the size of the value
+ * @param ttl the time to live of the key value pair
+ */
+typedef struct
+{
+    uint8_t *key;
+    uint32_t key_size;
+    uint8_t *value;
+    uint32_t value_size;
+    int64_t ttl;
+} tidesdb_key_value_pair_t;
+
+/*
+ * TIDESDB_OP_CODE
+ * operation code enum
+ * used for operation codes in TidesDB mainly for transactions and WAL entries
+ */
+typedef enum
+{
+    TIDESDB_OP_PUT,   /* a put operation into a column family */
+    TIDESDB_OP_DELETE /* a delete operation from a column family */
+} TIDESDB_OP_CODE;
+
+/*
+ * tidesdb_operation_t
+ * struct for a TidesDB operation
+ * @param op_code the operation code
+ * @param kv the key value pair for the operation
+ * @param cf_name the column family name for the operation
+ */
+typedef struct
+{
+    TIDESDB_OP_CODE op_code;
+    tidesdb_key_value_pair_t *kv;
+    char *cf_name;
+} tidesdb_operation_t;
 
 /*
  * tidesdb_txn_op_t
@@ -117,37 +167,25 @@ typedef struct
  */
 typedef struct
 {
-    operation_t* op;          /* the operation for the transaction */
-    operation_t* rollback_op; /* the rollback operation for the operation */
-    bool committed;           /* whether the transaction op has been committed */
+    tidesdb_operation_t *op;
+    tidesdb_operation_t *rollback_op;
+    bool committed;
 } tidesdb_txn_op_t;
 
 /*
  * tidesdb_t
  * struct for TidesDB
- * @param config the configuration for TidesDB
+ * @param directory the directory for the database
  * @param column_families the column families currently
- * @param column_families_lock Read-write lock for column families
- * @param num_column_families the number of column families currently
- * @param flush_thread the thread for flushing memtables
- * @param flush_queue the queue for flushing memtables
- * @param flush_lock the flush lock
- * @param compaction_lock the compaction lock
- * @param flush_cond the condition variable for flush thread
- * @param compaction_cond the condition variable for compaction
- * @param stop_flush_thread flag to stop the flush thread
+ * @param num_column_families the number of column families
+ * @param rwlock read-write lock for the database
  */
 typedef struct
 {
-    tidesdb_config_t config;               /* the configuration for tidesdb */
-    column_family_t* column_families;      /* the column families currently */
-    pthread_rwlock_t column_families_lock; /* Read-write lock for column families */
-    int num_column_families;               /* the number of column families currently */
-    pthread_t flush_thread;                /* the thread for flushing memtables */
-    queue_t* flush_queue;                  /* the queue for flushing memtables */
-    pthread_mutex_t flush_lock;            /* flush lock */
-    pthread_cond_t flush_cond;             /* condition variable for flush thread */
-    bool stop_flush_thread;                /* flag to stop the flush thread */
+    char *directory;
+    tidesdb_column_family_t **column_families;
+    int num_column_families;
+    pthread_rwlock_t rwlock;
 } tidesdb_t;
 
 /*
@@ -156,16 +194,16 @@ typedef struct
  * @param tdb the tidesdb instance
  * @param ops the operations in the transaction
  * @param num_ops the number of operations in the transaction
- * @param column_family the column family for the transaction
+ * @param cf the column family for the transaction
  * @param lock the lock for the transaction
  */
 typedef struct
 {
-    tidesdb_t* tdb;        /* the tidesdb instance */
-    tidesdb_txn_op_t* ops; /* the operations in the transaction */
-    int num_ops;           /* the number of operations in the transaction */
-    char* column_family;   /* the column family for the transaction */
-    pthread_mutex_t lock;  /* lock for the transaction */
+    tidesdb_t *tdb;
+    tidesdb_txn_op_t *ops;
+    int num_ops;
+    tidesdb_column_family_t *cf;
+    pthread_mutex_t lock;
 } tidesdb_txn_t;
 
 /*
@@ -174,37 +212,22 @@ typedef struct
  * @param tidesdb the tidesdb instance
  * @param cf the column family
  * @param memtable_cursor the cursor for the memtable
- * @param sstable_index the index of the sstable
+ * @param sstable_index the current index of the sstable the cursor is on
  * @param sstable_cursor the cursor for the sstable
  * @param current the current key-value pair
- * @param at_start whether the cursor is at the start
  */
 typedef struct
 {
-    tidesdb_t* tidesdb;                 /* tidesdb instance */
-    column_family_t* cf;                /* the column family */
-    skiplist_cursor_t* memtable_cursor; /* the cursor for the memtable */
-    size_t sstable_index;               /* the index of the sstable */
-    pager_cursor_t* sstable_cursor;     /* the cursor for the sstable */
-    key_value_pair_t* current;          /* the current key-value pair */
+    tidesdb_t *tidesdb;
+    tidesdb_column_family_t *cf;
+    skip_list_cursor_t *memtable_cursor;
+    size_t sstable_index;
+    block_manager_cursor_t *sstable_cursor;
+    tidesdb_key_value_pair_t *current;
 } tidesdb_cursor_t;
 
 /*
- * queue_entry
- * struct for a queue entry
- * @param memtable the memtable
- * @param cf the column family
- * @param wal_checkpoint the point in the wal to truncate after flush
- */
-typedef struct
-{
-    skiplist_t* memtable;  /* the memtable */
-    column_family_t* cf;   /* the column family */
-    size_t wal_checkpoint; /* the point in the wal to truncate after flush */
-} queue_entry_t;
-
-/*
- * compact_thread_args
+ * tidesdb_compact_thread_args_t
  * struct for the arguments for a compact thread
  * @param cf the column family
  * @param start the start index for the sstables
@@ -213,13 +236,12 @@ typedef struct
  */
 typedef struct
 {
-    column_family_t* cf; /* the column family */
-    int start;           /* the start index for the sstables */
-    int end;             /* the end index for the sstables */
-    sem_t* sem;          /* semaphore to limit concurrent threads */
-} compact_thread_args_t;
-
-/* TidesDB function prototypes */
+    tidesdb_column_family_t *cf; /* the column family */
+    int start;                   /* the start index for the sstables */
+    int end;                     /* the end index for the sstables */
+    sem_t *sem;                  /* semaphore to limit concurrent threads */
+    pthread_mutex_t *lock;       /* lock for the path creation on parallel compaction */
+} tidesdb_compact_thread_args_t;
 
 /* functions prefixed with _ are internal functions */
 /* api functions return a tidesdb_err* */
@@ -227,11 +249,12 @@ typedef struct
 /*
  * tidesdb_open
  * open a TidesDB instance
- * @param config the configuration for TidesDB
+ * @param directory the directory for the database in which where
+ *** column families and their data will be stored or are stored
  * @param tdb the TidesDB instance (should be null)
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_open(const tidesdb_config_t* config, tidesdb_t** tdb);
+tidesdb_err_t *tidesdb_open(char *directory, tidesdb_t **tdb);
 
 /*
  * tidesdb_close
@@ -239,7 +262,7 @@ tidesdb_err_t* tidesdb_open(const tidesdb_config_t* config, tidesdb_t** tdb);
  * @param tdb the TidesDB instance
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_close(tidesdb_t* tdb);
+tidesdb_err_t *tidesdb_close(tidesdb_t *tdb);
 
 /*
  * tidesdb_create_column_family
@@ -249,10 +272,15 @@ tidesdb_err_t* tidesdb_close(tidesdb_t* tdb);
  * @param flush_threshold the threshold at which the memtable should be flushed to disk
  * @param max_level the maximum level for the memtable(skiplist)
  * @param probability the probability for skip list
+ * @param compressed whether the column family WAL and SSTables should be compressed
+ * @param compress_algo the compression algorithm to use if you want to compress the column family
+ * @param bloom_filter whether the column family should use a bloom filter
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_create_column_family(tidesdb_t* tdb, const char* name, int flush_threshold,
-                                            int max_level, float probability, bool compressed);
+tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, int flush_threshold,
+                                            int max_level, float probability, bool compressed,
+                                            tidesdb_compression_algo_t compress_algo,
+                                            bool bloom_filter);
 
 /*
  * tidesdb_drop_column_family
@@ -261,27 +289,18 @@ tidesdb_err_t* tidesdb_create_column_family(tidesdb_t* tdb, const char* name, in
  * @param name the name of the column family
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_drop_column_family(tidesdb_t* tdb, const char* name);
-
-/*
- * _get_column_family
- * get a column family by name
- * @param tdb the TidesDB instance
- * @param name the name of the column family
- * @param cf the column family
- * @return 0 if the column family was found, -1 if not
- */
-int _get_column_family(tidesdb_t* tdb, const char* name, column_family_t** cf);
+tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name);
 
 /*
  * tidesdb_compact_sstables
- * compact the sstables for a column family
+ * pairs and merges sstables in a column family
  * @param tdb the TidesDB instance
  * @param column_family the column family name
  * @param max_threads the maximum number of threads to use
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, const char* column_family, int max_threads);
+tidesdb_err_t *tidesdb_compact_sstables(tidesdb_t *tdb, const char *column_family_name,
+                                        int max_threads);
 
 /*
  * tidesdb_put
@@ -292,11 +311,11 @@ tidesdb_err_t* tidesdb_compact_sstables(tidesdb_t* tdb, const char* column_famil
  * @param key_size the size of the key
  * @param value the value
  * @param value_size the size of the value
- * @param ttl the time-to-live for the key-value pair
+ * @param ttl the time-to-live for the key-value pair, you can provide -1 for no ttl
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_put(tidesdb_t* tdb, const char* column_family_name, const uint8_t* key,
-                           size_t key_size, const uint8_t* value, size_t value_size, time_t ttl);
+tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const uint8_t *key,
+                           size_t key_size, const uint8_t *value, size_t value_size, time_t ttl);
 
 /*
  * tidesdb_get
@@ -309,8 +328,8 @@ tidesdb_err_t* tidesdb_put(tidesdb_t* tdb, const char* column_family_name, const
  * @param value_size the size of the value
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const uint8_t* key,
-                           size_t key_size, uint8_t** value, size_t* value_size);
+tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const uint8_t *key,
+                           size_t key_size, uint8_t **value, size_t *value_size);
 
 /*
  * tidesdb_delete
@@ -321,24 +340,23 @@ tidesdb_err_t* tidesdb_get(tidesdb_t* tdb, const char* column_family_name, const
  * @param key_size the size of the key
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_delete(tidesdb_t* tdb, const char* column_family_name, const uint8_t* key,
+tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, const uint8_t *key,
                               size_t key_size);
 
 /*
  * tidesdb_txn_begin
  * begin a transaction
  * @param tdb the TidesDB instance
- * @param transaction the transaction
+ * @param txn the transaction to begin
  * @param column_family the column family
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_txn_begin(tidesdb_t* tdb, tidesdb_txn_t** transaction,
-                                 const char* column_family);
+tidesdb_err_t *tidesdb_txn_begin(tidesdb_t *tdb, tidesdb_txn_t **txn, const char *column_family);
 
 /*
  * tidesdb_txn_put
  * put a key-value pair into a transaction
- * @param transaction the transaction
+ * @param txn the transaction
  * @param key the key
  * @param key_size the size of the key
  * @param value the value
@@ -346,42 +364,42 @@ tidesdb_err_t* tidesdb_txn_begin(tidesdb_t* tdb, tidesdb_txn_t** transaction,
  * @param ttl the time-to-live for the key-value pair
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_txn_put(tidesdb_txn_t* transaction, const uint8_t* key, size_t key_size,
-                               const uint8_t* value, size_t value_size, time_t ttl);
+tidesdb_err_t *tidesdb_txn_put(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size,
+                               const uint8_t *value, size_t value_size, time_t ttl);
 
 /*
  * tidesdb_txn_delete
  * delete a key-value pair from a transaction
- * @param transaction the transaction
+ * @param txn the transaction
  * @param key the key
  * @param key_size the size of the key
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_txn_delete(tidesdb_txn_t* transaction, const uint8_t* key, size_t key_size);
+tidesdb_err_t *tidesdb_txn_delete(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size);
 
 /*
  * tidesdb_txn_commit
  * commit a transaction
- * @param transaction the transaction
+ * @param txn the transaction to be commited
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_txn_commit(tidesdb_txn_t* transaction);
+tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn);
 
 /*
  * tidesdb_txn_rollback
  * rollback a transaction
- * @param transaction the transaction
+ * @param txn the transaction
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_txn_rollback(tidesdb_txn_t* transaction);
+tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn);
 
 /*
  * tidesdb_txn_free
- * free a transaction
- * @param transaction the transaction
+ * free a transaction and its operations
+ * @param txn the transaction
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_txn_free(tidesdb_txn_t* transaction);
+tidesdb_err_t *tidesdb_txn_free(tidesdb_txn_t *txn);
 
 /*
  * tidesdb_cursor_init
@@ -391,8 +409,8 @@ tidesdb_err_t* tidesdb_txn_free(tidesdb_txn_t* transaction);
  * @param cursor the TidesDB cursor
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_cursor_init(tidesdb_t* tdb, const char* column_family_name,
-                                   tidesdb_cursor_t** cursor);
+tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_name,
+                                   tidesdb_cursor_t **cursor);
 
 /*
  * tidesdb_cursor_next
@@ -400,7 +418,7 @@ tidesdb_err_t* tidesdb_cursor_init(tidesdb_t* tdb, const char* column_family_nam
  * @param cursor the TidesDB cursor
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_cursor_next(tidesdb_cursor_t* cursor);
+tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor);
 
 /*
  * tidesdb_cursor_prev
@@ -408,16 +426,20 @@ tidesdb_err_t* tidesdb_cursor_next(tidesdb_cursor_t* cursor);
  * @param cursor the TidesDB cursor
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_cursor_prev(tidesdb_cursor_t* cursor);
+tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor);
 
 /*
  * tidesdb_cursor_get
  * get the current key-value pair from the cursor
  * @param cursor the TidesDB cursor
- * @param kv the key-value pair
+ * @param key the key
+ * @param key_size the size of the key
+ * @param value the value
+ * @param value_size the size of the value
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_cursor_get(tidesdb_cursor_t* cursor, key_value_pair_t* kv);
+tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_t *key_size,
+                                  uint8_t **value, size_t *value_size);
 
 /*
  * tidesdb_cursor_free
@@ -425,10 +447,30 @@ tidesdb_err_t* tidesdb_cursor_get(tidesdb_cursor_t* cursor, key_value_pair_t* kv
  * @param cursor the TidesDB cursor
  * @return error or NULL
  */
-tidesdb_err_t* tidesdb_cursor_free(tidesdb_cursor_t* cursor);
+tidesdb_err_t *tidesdb_cursor_free(tidesdb_cursor_t *cursor);
 
 /*
- * _new_column_family
+ * tidesdb_list_column_families
+ * list the column families in TidesDB
+ * @param tdb the TidesDB instance
+ * @return the column families
+ */
+char *tidesdb_list_column_families(tidesdb_t *tdb);
+
+/* internal functions */
+
+/*
+ * _tidesdb_get_column_family
+ * get a column family by name
+ * @param tdb the TidesDB instance
+ * @param name the name of the column family
+ * @param cf the column family we found
+ * @return 0 if the column family was found, -1 if not
+ */
+int _tidesdb_get_column_family(tidesdb_t *tdb, const char *name, tidesdb_column_family_t **cf);
+
+/*
+ * _tidesdb_new_column_family
  * create a new column family
  * @param db_path the path for/to TidesDB
  * @param name the name of the column family
@@ -436,39 +478,43 @@ tidesdb_err_t* tidesdb_cursor_free(tidesdb_cursor_t* cursor);
  * @param max_level the maximum level for the memtable(skiplist)
  * @param probability the probability for skip list
  * @param cf the column family
+ * @param compressed whether the column family WAL and SSTables should be compressed
+ * @param compress_algo the compression algorithm to use if you want to compress the column family
+ * @param bloom_filter whether the column family should use a bloom filter
  * @return 0 if the column family was created, -1 if not
  */
-int _new_column_family(const char* db_path, const char* name, int flush_threshold, int max_level,
-                       float probability, column_family_t** cf, bool compressed);
+int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_threshold,
+                               int max_level, float probability, tidesdb_column_family_t **cf,
+                               bool compressed, tidesdb_compression_algo_t compress_algo,
+                               bool bloom_filter);
 
 /*
- * _add_column_family
+ * _tidesdb_add_column_family
  * adds a new column family to TidesDB
  * @param tdb the TidesDB instance
  * @param cf the column family
  * @return 0 if the column family was added, -1 if not
  */
-int _add_column_family(tidesdb_t* tdb, column_family_t* cf);
+int _tidesdb_add_column_family(tidesdb_t *tdb, tidesdb_column_family_t *cf);
 
 /*
- * _load_column_families
+ * _tidesdb_load_column_families
  * load the column families for TidesDB
  * @param tdb the TidesDB instance
  * @return 0 if the column families were loaded, -1 if not
  */
-int _load_column_families(tidesdb_t* tdb);
+int _tidesdb_load_column_families(tidesdb_t *tdb);
 
 /*
- * _get_path_seperator
+ * _tidesdb_get_path_seperator
  * get the path separator for the current OS
  * @return the path separator
  */
-const char* _get_path_seperator();
+const char *_tidesdb_get_path_seperator();
 
 /*
- * _append_to_wal
+ * _tidesdb_append_to_wal
  * append an operation to the write-ahead log
- * @param tdb the TidesDB instance
  * @param wal the write-ahead log
  * @param key the key
  * @param key_size the size of the key
@@ -479,159 +525,264 @@ const char* _get_path_seperator();
  * @param cf the column family
  * @return 0 if the operation was appended, -1 if not
  */
-int _append_to_wal(tidesdb_t* tdb, wal_t* wal, const uint8_t* key, size_t key_size,
-                   const uint8_t* value, size_t value_size, time_t ttl, OP_CODE op_code,
-                   const char* cf);
+int _tidesdb_append_to_wal(tidesdb_wal_t *wal, const uint8_t *key, size_t key_size,
+                           const uint8_t *value, size_t value_size, time_t ttl,
+                           TIDESDB_OP_CODE op_code, const char *cf);
 
 /*
- * _open_wal
+ * _tidesdb_open_wal
  * open the write-ahead log
- * @param db_path the path for/to TidesDB
+ * @param cf_path the path to the column family
  * @param w the write-ahead log
+ * @param compress whether to compress the wal
+ * @param compress_algo the compression algorithm to use
  * @return 0 if the wal was opened, -1 if not
  */
-int _open_wal(const char* db_path, wal_t** w);
+int _tidesdb_open_wal(const char *cf_path, tidesdb_wal_t **w, bool compress,
+                      tidesdb_compression_algo_t compress_algo);
 
 /*
- * _close_wal
+ * _tidesdb_close_wal
  * close the write-ahead log
  * @param wal the write-ahead log
  */
-void _close_wal(wal_t* wal);
+void _tidesdb_close_wal(tidesdb_wal_t *wal);
 
 /*
- * _truncate_wal
- * truncate the write-ahead log
+ * _tidesdb_truncate_wal
+ * truncate a write-ahead log
  * @param wal the write-ahead log
- * @param checkpoint the point in the wal to truncate
  * @return 0 if the wal was truncated, -1 if not
  */
-int _truncate_wal(wal_t* wal, int checkpoint);
+int _tidesdb_truncate_wal(tidesdb_wal_t *wal);
 
 /*
- * _replay_from_wal
- * replay the write-ahead log
- * @param tdb the TidesDB instance
- * @param wal the write-ahead log
+ * _tidesdb_replay_from_wal
+ * replay the write-ahead log and populate column family memtable
+ * @param cf the column family
  * @return 0 if the wal was replayed, -1 if not
  */
-int _replay_from_wal(tidesdb_t* tdb, wal_t* wal);
+int _tidesdb_replay_from_wal(tidesdb_column_family_t *cf);
 
 /*
- * _free_sstable
+ * _tidesdb_free_sstable
  * free the memory for an SSTable
  * @param sst the SSTable
  * @return 0 if the SSTable was freed, -1 if not
  */
-int _free_sstable(sstable_t* sst);
+int _tidesdb_free_sstable(tidesdb_sstable_t *sst);
 
 /*
- * _compare_sstables
+ * _tidesdb_compare_sstables
  * compare two sstables
  * @param a the first sstable
  * @param b the second sstable
  * @return the comparison
  */
-int _compare_sstables(const void* a, const void* b);
+int _tidesdb_compare_sstables(const void *a, const void *b);
 
 /*
- * _flush_memtable
+ * _tidesdb_flush_memtable
  * flushes a memtable to disk
- * @param tdb the TidesDB instance
  * @param cf the column family
- * @param memtable a memtable
- * @param wal_checkpoint the point in the wal to truncate after flush
  * @return 0 if the memtable was flushed, -1 if not
  */
-int _flush_memtable(tidesdb_t* tdb, column_family_t* cf, skiplist_t* memtable, int wal_checkpoint);
+int _tidesdb_flush_memtable(tidesdb_column_family_t *cf);
 
 /*
- * _flush_memtable_thread
- * thread for flushing memtables
- * @param arg the arguments for the thread in this case a tidesdb instance
+ * _tidesdb_flush_memtable_w_bloomfilter
+ * flushes a memtable to disk
+ * @param cf the column family
+ * @return 0 if the memtable was flushed, -1 if not
  */
-void* _flush_memtable_thread(void* arg);
+int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf);
 
 /*
- * _is_tombstone
+ * _tidesdb_is_tombstone
  * checks if value is a tombstone
  * @param value the value
  * @param value_size the size of the value
  * @return 1 if the value is a tombstone, 0 if not
  */
-int _is_tombstone(const uint8_t* value, size_t value_size);
+int _tidesdb_is_tombstone(const uint8_t *value, size_t value_size);
 
 /*
- * _load_sstables
+ * _tidesdb_load_sstables
  * load the sstables for a column family
  * @param cf the column family
  * @return 0 if the sstables were loaded, -1 if not
  */
-int _load_sstables(column_family_t* cf);
+int _tidesdb_load_sstables(tidesdb_column_family_t *cf);
 
 /*
- * _sort_sstables
+ * _tidesdb_sort_sstables
  * sort the sstables for a column family by last modified being last
  * @param cf the column family
  * @return 0 if the sstables were sorted, -1 if not
  */
-int _sort_sstables(const column_family_t* cf);
+int _tidesdb_sort_sstables(const tidesdb_column_family_t *cf);
 
 /*
- * remove_directory
- * recursively remove a directory and its contents
+ * _tidesdb_remove_directory
+ * remove a directory and its contents
  * @param path the path to the directory
  * @return 0 if the directory was removed, -1 if not
  */
-int _remove_directory(const char* path);
+int _tidesdb_remove_directory(const char *path);
 
 /*
- * _compact_sstables_thread
+ * _tidesdb_compact_sstables_thread
  * a thread for compacting sstable pairs
  * @param arg the arguments for the thread in this case a compact_thread_args struct
  */
-void _compact_sstables_thread(void* arg);
+void *_tidesdb_compact_sstables_thread(void *arg);
 
 /*
- * _merge_sstables
+ * _tidesdb_merge_sstables
  * merges two sstables into a new sstable
  * @param sst1 the first sstable
  * @param sst2 the second sstable
  * @param cf the column family
  * @return the new sstable
  */
-sstable_t* _merge_sstables(sstable_t* sst1, sstable_t* sst2, column_family_t* cf);
+tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_sstable_t *sst2,
+                                           tidesdb_column_family_t *cf,
+                                           pthread_mutex_t *shared_lock);
 
 /*
- * _free_column_families
- * free the memory for the column families
+ * _tidesdb_merge_sstables_w_bloomfilter
+ * merges two sstables into a new sstable and adds a bloom filter to initial block
+ * @param sst1 the first sstable
+ * @param sst2 the second sstable
+ * @param cf the column family
+ * @return the new sstable
+ */
+tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1,
+                                                         tidesdb_sstable_t *sst2,
+                                                         tidesdb_column_family_t *cf,
+                                                         pthread_mutex_t *shared_lock);
+
+/*
+ * _tidesdb_free_column_families
+ * free's and closes column families
  * @param tdb the TidesDB instance
  */
-void _free_column_families(tidesdb_t* tdb);
+void _tidesdb_free_column_families(tidesdb_t *tdb);
 
 /*
- * _free_key_value_pair
+ * _tidesdb_free_key_value_pair
  * free the memory for a key-value pair
  * @param kv the key-value pair
  */
-void _free_key_value_pair(key_value_pair_t* kv);
+void _tidesdb_free_key_value_pair(tidesdb_key_value_pair_t *kv);
 
 /*
- * _free_operation
+ * _tidesdb_free_operation
  * free the memory for an operation
  * @param op the operation
  */
-void _free_operation(operation_t* op);
+void _tidesdb_free_operation(tidesdb_operation_t *op);
 
 /*
- * _compare_keys
- * compare two keys
+ * _tidesdb_compare_keys
+ * compare two keys mainly for equality operations in TidesDB
  * @param key1 the first key
  * @param key1_size the size of the first key
  * @param key2 the second key
  * @param key2_size the size of the second key
  * @return the comparison, 1, 0, or -1
  */
-int _compare_keys(const uint8_t* key1, size_t key1_size, const uint8_t* key2, size_t key2_size);
+int _tidesdb_compare_keys(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                          size_t key2_size);
 
-#endif /* TIDESDB_H */
+/* serialization is used for tidesdb_key_value_pair_t and tidesdb_operation_t */
+
+/*
+ * _tidesdb_serialize_key_value_pair
+ * serialize a key-value pair
+ * @param kv the key-value pair
+ * @param out_size the size of the serialized data
+ * @param compress whether to compress the data
+ * @param compress_algo the compression algorithm to use
+ * @return the serialized data
+ */
+uint8_t *_tidesdb_serialize_key_value_pair(tidesdb_key_value_pair_t *kv, size_t *out_size,
+                                           bool compress, tidesdb_compression_algo_t compress_algo);
+
+/*
+ * _tidesdb_deserialize_key_value_pair
+ * deserialize a key-value pair
+ * @param data the serialized data
+ * @param data_size the size of the data
+ * @param decompress whether to decompress the data
+ * @return the deserialized key-value pair
+ */
+tidesdb_key_value_pair_t *_tidesdb_deserialize_key_value_pair(
+    uint8_t *data, size_t data_size, bool decompress, tidesdb_compression_algo_t compress_algo);
+
+/*
+ * _tidesdb_serialize_operation
+ * serialize an operation
+ * @param op the operation
+ * @param out_size the size of the serialized data
+ * @param compress whether to compress the data
+ * @param compress_algo the compression algorithm to use
+ * @return the serialized data
+ */
+uint8_t *_tidesdb_serialize_operation(tidesdb_operation_t *op, size_t *out_size, bool compress,
+                                      tidesdb_compression_algo_t compress_algo);
+
+/*
+ * _tidesdb_deserialize_operation
+ * deserialize an operation
+ * @param data the serialized data
+ * @param data_size the size of the data
+ * @param decompress whether to decompress the data
+ * @param compress_algo the compression algorithm used
+ * @return the deserialized operation
+ */
+tidesdb_operation_t *_tidesdb_deserialize_operation(uint8_t *data, size_t data_size,
+                                                    bool decompress,
+                                                    tidesdb_compression_algo_t compress_algo);
+
+/*
+ * _tidesdb_serialize_column_family_config
+ * serialize a column family configuration
+ * @param config the column family configuration
+ * @param out_size the size of the serialized data
+ * @return the serialized data
+ */
+uint8_t *_tidesdb_serialize_column_family_config(tidesdb_column_family_config_t *config,
+                                                 size_t *out_size);
+
+/*
+ * _tidesdb_deserialize_column_family_config
+ * deserialize a column family configuration
+ * @param data the serialized data
+ * @return the deserialized column family configuration
+ */
+tidesdb_column_family_config_t *_tidesdb_deserialize_column_family_config(const uint8_t *data);
+
+/*
+ * _tidesdb_key_value_pair_new
+ * create a new key-value pair
+ * @param key the key
+ * @param key_size the size of the key
+ * @param value the value
+ * @param value_size the size of the value
+ * @param ttl the time-to-live for the key-value pair
+ * @return the key-value pair
+ */
+tidesdb_key_value_pair_t *_tidesdb_key_value_pair_new(const uint8_t *key, size_t key_size,
+                                                      const uint8_t *value, size_t value_size,
+                                                      int64_t ttl);
+
+/*
+ * _tidesdb_is_expired
+ * checks if a key-value pair is expired by comparing the ttl with the current time or if set to -1
+ * @param ttl the time-to-live for the key-value pair
+ * @return 1 if the key-value pair is expired, 0 if not
+ */
+int _tidesdb_is_expired(int64_t ttl);
+
+#endif /* __TIDESDB_H__ */

@@ -61,7 +61,7 @@ typedef struct
 /*
  * tidesdb_wal_t
  * struct for write-ahead logs in TidesDB
- * @param pager the pager for the WAL
+ * @param block_manager the block manager for the WAL
  * @param lock the read-write lock for the WAL
  */
 typedef struct

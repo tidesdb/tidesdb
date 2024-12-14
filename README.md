@@ -11,13 +11,14 @@ It is not a full-featured database, but rather a library that can be used to bui
 > master is in active development.  v0.2.0 is the projected stable first release.  We are in the final stages of testing and documentation.
 
 ## Features
-- [x] **Concurrent** multiple threads can read and write to the storage engine.  The memtable(skip list) uses an RW lock which means multiple readers and one true writer.  SSTables are sorted, immutable and can be read concurrently they are protected via page locks.  Transactions are also thread-safe.
+- [x] **ACID** transactions are atomic, consistent, isolated, and durable.
+- [x] **Concurrent** multiple threads can read and write to the storage engine. The memtable(skip list) uses an RW lock which means multiple readers and one true writer. SSTables are sorted, immutable. Transactions are also thread-safe.
 - [x] **Column Families** store data in separate key-value stores.  Each column family has their own memtable and sstables.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically.  Rollback all operations if one fails.
 - [x] **Cursor** iterate over key-value pairs forward and backward.
 - [x] **WAL** write-ahead logging for durability. Replays memtable column families on startup.
 - [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
-- [x] **Bloom Filters** reduce disk reads by reading initial pages of sstables to check key existence.
+- [x] **Bloom Filters** reduce disk reads by reading initial blocks of sstables to check key existence.
 - [x] **Compression** compression is achieved with Snappy, or LZ4, or ZSTD.  SStable entries can be compressed as well as WAL entries.
 - [x] **TTL** time-to-live for key-value pairs.
 - [x] **Configurable** many options are configurable for the engine, and column families.

@@ -812,7 +812,7 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
         tidesdb_sstable_t *sst = malloc(sizeof(tidesdb_sstable_t));
         if (sst == NULL) return -1;
 
-        /* we set the pager */
+        /* we set the block manager */
         sst->block_manager = sstable_block_manager;
 
         /* check if sstables is NULL */

@@ -1,0 +1,201 @@
+/*
+ *
+ * Copyright (C) TidesDB
+ *
+ * Original Author: Alex Gaetano Padula
+ *
+ * Licensed under the Mozilla Public License, v. 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.mozilla.org/en-US/MPL/2.0/
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#ifndef __BLOCK_MANAGER_H__
+#define __BLOCK_MANAGER_H__
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define MAX_FILE_PATH_LENGTH 1024 /* the max file path length */
+
+/**
+ * block_manager_t
+ * block manager struct
+ * used for block managers in TidesDB
+ * @param file the file the block manager is on
+ * @param file_path the path of the file
+ * @param fsync_thread the fsync thread
+ * @param fsync_interval the fsync interval
+ * @param stop_fsync_thread the stop fsync thread
+ */
+typedef struct
+{
+    FILE *file;
+    char file_path[MAX_FILE_PATH_LENGTH];
+    pthread_t fsync_thread;
+    float fsync_interval;
+    int stop_fsync_thread;
+} block_manager_t;
+
+/**
+ * block_t
+ * block struct
+ * used for blocks in TidesDB
+ * @param size the size of the block
+ * @param data the data of the block
+ */
+typedef struct
+{
+    uint64_t size;
+    void *data;
+} block_manager_block_t;
+
+/**
+ * block_cursor_t
+ * block cursor struct
+ * used for block cursors in TidesDB
+ * @param bm the block manager
+ * @param current_pos the current position of the cursor
+ * @param previous_pos the previous position of the cursor
+ */
+typedef struct
+{
+    block_manager_t *bm;
+    uint64_t current_pos;
+    uint64_t current_block_size;
+} block_manager_cursor_t;
+
+/**
+ * block_manager_open
+ * opens a block manager
+ * @param bm the block manager to open
+ * @param file_path the path of the file
+ * @param fsync_interval the fsync interval
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_interval);
+
+/**
+ * block_manager_close
+ * closes a block manager
+ * @param bm the block manager to close
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_close(block_manager_t *bm);
+
+/**
+ * block_manager_block_create
+ * creates a new block
+ * @param size the size of the block
+ * @param data the data of the block
+ * @return a new block
+ */
+block_manager_block_t *block_manager_block_create(uint64_t size, void *data);
+
+/**
+ * block_manager_block_write
+ * writes a block to a file
+ * @param bm the block manager to write the block to
+ * @param block the block to write
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
+
+/**
+ * block_manager_block_read
+ * reads a block from a file
+ * @param bm the block manager to read the block from
+ * @return the block read from the file
+ */
+block_manager_block_t *block_manager_block_read(block_manager_t *bm);
+
+/**
+ * block_manager_block_free
+ * frees a block
+ * @param block the block to free
+ */
+void block_manager_block_free(block_manager_block_t *block);
+
+/**
+ * block_manager_cursor_init
+ * initializes a block manager cursor
+ * @param cursor the cursor to initialize
+ * @param bm the block manager to initialize the cursor on
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *bm);
+
+/**
+ * cursor_next
+ * moves the cursor to the next block
+ * @param cursor the cursor to move
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_next(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_read
+ * reads the block at the cursor
+ * @param cursor the cursor to read from
+ * @return the block read from the cursor
+ */
+block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_free
+ * frees a cursor
+ * @param cursor the cursor to free
+ */
+void block_manager_cursor_free(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_prev
+ * moves the cursor to the previous block
+ * @param cursor the cursor to move
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_prev(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_fsync_thread
+ * fsync thread for block manager
+ * @param arg the block manager
+ * @return NULL
+ */
+void *block_manager_fsync_thread(void *arg);
+
+/**
+ * block_manager_truncate
+ * truncates a block manager
+ * @param bm the block manager to truncate
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_truncate(block_manager_t *bm);
+
+/**
+ * block_manager_last_modified
+ * gets the last modified time of a block manager
+ * @param bm the block manager to get the last modified time of
+ * @return the last modified time of the block manager
+ */
+time_t block_manager_last_modified(block_manager_t *bm);
+
+/**
+ * block_manager_count_blocks
+ * counts the number of blocks in a block manager
+ * @param bm the block manager to count the blocks of
+ * @return the number of blocks in the block manager
+ */
+int block_manager_count_blocks(block_manager_t *bm);
+
+#endif /* __BLOCK_MANAGER_H__ */

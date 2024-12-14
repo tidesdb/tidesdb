@@ -28,7 +28,7 @@
 #include "../test/test_utils.h"
 
 #define NUM_OPERATIONS 1000 /* number of operations per thread */
-#define NUM_THREADS    1    /* you can increase this to test with more threads, usually slower */
+#define NUM_THREADS    2    /* you can increase this to test with more threads, usually slower */
 
 /* benchmarker puts 2MB keys and 2MB values into the database then gets them back, then deletes them
  */
@@ -157,36 +157,26 @@ void run_benchmark(void *(*benchmark_func)(void *), tidesdb_t *tdb, const char *
 
 int main()
 {
-    remove_directory("benchmarktdb");
+    _tidesdb_remove_directory("benchmarktdb");
 
     tidesdb_t *tdb = NULL;
 
-    tidesdb_config_t *tdb_config = (malloc(sizeof(tidesdb_config_t)));
-    if (tdb_config == NULL)
-    {
-        return -1;
-    }
-
-    tdb_config->db_path = "benchmarktdb";
-    tdb_config->compressed_wal = false;
-
-    tidesdb_err_t *err = tidesdb_open(tdb_config, &tdb);
+    tidesdb_err_t *err = tidesdb_open("benchmarktdb", &tdb);
     if (err != NULL)
     {
         printf(RED "Error opening database: %s\n" RESET, err->message);
         tidesdb_err_free(err);
-        free(tdb_config);
         return -1;
     }
 
     const char *cf_name = "benchmark_cf";
-    err = tidesdb_create_column_family(tdb, cf_name, (1024 * 1024) * 64, 12, 0.25f, false);
+    err = tidesdb_create_column_family(tdb, cf_name, (1024 * 1024) * 64, 12, 0.25f, false,
+                                       TDB_NO_COMPRESSION, false);
     if (err != NULL)
     {
         printf(RED "Error creating column family: %s\n" RESET, err->message);
         tidesdb_err_free(err);
         tidesdb_close(tdb);
-        free(tdb_config);
         return -1;
     }
 
@@ -214,6 +204,5 @@ int main()
            (double)(end - start) / CLOCKS_PER_SEC);
 
     tidesdb_close(tdb);
-    free(tdb_config);
     return 0;
 }

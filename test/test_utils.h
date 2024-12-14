@@ -16,70 +16,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <dirent.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
-/*
- * remove_directory
- * Recursively remove a directory and its contents
- */
-int remove_directory(const char *path)
+void generate_random_key_value(uint8_t *key, size_t key_size, uint8_t *value, size_t value_size)
 {
-    struct dirent *entry;
-    DIR *dir = opendir(path);
+    const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    size_t charset_size = sizeof(charset) - 1;
 
-    if (dir == NULL)
+    for (size_t i = 0; i < key_size; i++)
     {
-        perror("opendir");
-        return -1;
+        key[i] = charset[rand() % charset_size];
     }
-
-    while ((entry = readdir(dir)) != NULL)
+    for (size_t i = 0; i < value_size; i++)
     {
-        char full_path[1024];
-        struct stat statbuf;
-
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-
-        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-
-        if (stat(full_path, &statbuf) == -1)
-        {
-            perror("stat");
-            closedir(dir);
-            return -1;
-        }
-
-        if (S_ISDIR(statbuf.st_mode))
-        {
-            if (remove_directory(full_path) == -1)
-            {
-                closedir(dir);
-                return -1;
-            }
-        }
-        else
-        {
-            if (remove(full_path) == -1)
-            {
-                perror("remove");
-                closedir(dir);
-                return -1;
-            }
-        }
+        value[i] = charset[rand() % charset_size];
     }
-
-    closedir(dir);
-
-    if (rmdir(path) == -1)
-    {
-        perror("rmdir");
-        return -1;
-    }
-
-    return 0;
 }

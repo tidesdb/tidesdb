@@ -93,11 +93,12 @@ You pass
 - skiplist max level.  Example below is 12
 - skiplist probability.  Example below is 0.24
 - whether column family sstable data is compressed
+- the compression algorithim to use [TDB_NO_COMPRESSION, TDB_COMPRESS_SNAPPY, TDB_COMPRESS_LZ4, TDB_COMPRESS_ZSTD]
 - whether to use bloom filters
 
 ```c
 /* create a column family */
-tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false, true);
+tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false, TDB_NO_COMPRESSION, false);
 if (e != NULL)
 {
     /* handle error */
@@ -105,11 +106,23 @@ if (e != NULL)
 }
 ```
 
+Using Snappy compression and bloom filters for column family sstables
+```c
+/* create a column family */
+tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, true, TDB_COMPRESS_SNAPPY, true);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+```
+
+
 ### Dropping a column family
 
 ```c
 /* drop a column family */
-tidesdb_err_t *e = tidesdb_drop_column_family(tdb, "test_cf");
+tidesdb_err_t *e = tidesdb_drop_column_family(tdb, "your_column_family");
 if (e != NULL)
 {
     /* handle error */

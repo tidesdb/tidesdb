@@ -59,7 +59,7 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
                 return NULL;
             }
             *compressed_size = ZSTD_compress(compressed_data, *compressed_size, data, data_size,
-                                             1);  /* 1 is a compression level */
+                                             1); /* 1 is a compression level */
             if (ZSTD_isError(*compressed_size))
             {
                 free(compressed_data);

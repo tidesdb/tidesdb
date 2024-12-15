@@ -18,11 +18,6 @@
  */
 #include "tidesdb.h"
 
-#include <dirent.h>
-#include <sys/stat.h>
-
-#include "bloom_filter.h"
-
 const char *_tidesdb_get_path_seperator()
 {
 /* windows and unix path seperator differences */

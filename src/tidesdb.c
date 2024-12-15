@@ -534,7 +534,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
         if (strcmp(tdb_entry->d_name, ".") == 0 || strcmp(tdb_entry->d_name, "..") == 0) continue;
 
         /* each directory is a column family */
-        char cf_path[PATH_MAX];
+        char cf_path[MAX_FILE_PATH_LENGTH];
         (void)snprintf(cf_path, sizeof(cf_path), "%s%s%s", tdb->directory,
                        _tidesdb_get_path_seperator(), tdb_entry->d_name);
 
@@ -547,10 +547,10 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
         /* we iterate over the column family directory */
         while ((cf_entry = readdir(cf_dir)) != NULL)
         {
-            if (strstr(cf_entry->d_name, COLUMN_FAMILY_CONFIG_FILE_EXT) != NULL)
+            if (strstr(cf_entry->d_name, TDB_COLUMN_FAMILY_CONFIG_FILE_EXT) != NULL)
             { /* if the file is a column family config file */
 
-                char config_file_path[PATH_MAX];
+                char config_file_path[MAX_FILE_PATH_LENGTH];
                 if (snprintf(config_file_path, sizeof(config_file_path), "%s%s%s", cf_path,
                              _tidesdb_get_path_seperator(),
                              cf_entry->d_name) >= (long)sizeof(config_file_path))
@@ -790,17 +790,17 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 
         /* we check if the file ends with SSTABLE_EXT or contains */
-        if (strstr(entry->d_name, SSTABLE_EXT) == NULL) continue;
+        if (strstr(entry->d_name, TDB_SSTABLE_EXT) == NULL) continue;
 
         /* we construct the path to the sstable */
-        char sstable_path[PATH_MAX];
+        char sstable_path[MAX_FILE_PATH_LENGTH];
         (void)snprintf(sstable_path, sizeof(sstable_path), "%s%s%s", cf->path,
                        _tidesdb_get_path_seperator(), entry->d_name);
 
         /* we open the sstable */
         block_manager_t *sstable_block_manager = NULL;
 
-        if (block_manager_open(&sstable_block_manager, sstable_path, SYNC_INTERVAL) == -1)
+        if (block_manager_open(&sstable_block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
         {
             /* free up resources */
             (void)closedir(cf_dir);
@@ -857,12 +857,12 @@ int _tidesdb_open_wal(const char *cf_path, tidesdb_wal_t **w, bool compress,
     /* we check if wal is NULL */
     if (w == NULL) return -1;
 
-    char wal_path[PATH_MAX];
+    char wal_path[MAX_FILE_PATH_LENGTH];
     (void)snprintf(wal_path, sizeof(wal_path), "%s%s%s", cf_path, _tidesdb_get_path_seperator(),
-                   WAL_EXT);
+                   TDB_WAL_EXT);
 
     block_manager_t *wal_block_manager = NULL;
-    if (block_manager_open(&wal_block_manager, wal_path, SYNC_INTERVAL) == -1)
+    if (block_manager_open(&wal_block_manager, wal_path, TDB_SYNC_INTERVAL) == -1)
     {
         return -1;
     }
@@ -1088,10 +1088,10 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
     (void)_tidesdb_close_wal(tdb->column_families[index]->wal);
 
     /* wal path */
-    char wal_path[PATH_MAX];
+    char wal_path[MAX_FILE_PATH_LENGTH];
 
     snprintf(wal_path, sizeof(wal_path), "%s%s%s", tdb->column_families[index]->path,
-             _tidesdb_get_path_seperator(), WAL_EXT);
+             _tidesdb_get_path_seperator(), TDB_WAL_EXT);
 
     /* remove the wal file */
     if (unlink(wal_path) == -1)
@@ -1142,7 +1142,7 @@ int _tidesdb_remove_directory(const char *path)
 {
     struct dirent *entry;
     struct stat statbuf;
-    char fullpath[1024];
+    char fullpath[MAX_FILE_PATH_LENGTH];
     DIR *dir;
 
     dir = opendir(path);
@@ -1239,7 +1239,7 @@ int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_
     }
 
     /* we construct the path to the column family */
-    char cf_path[PATH_MAX];
+    char cf_path[MAX_FILE_PATH_LENGTH];
 
     /* we use snprintf to construct the path */
     snprintf(cf_path, sizeof(cf_path), "%s%s%s", db_path, _tidesdb_get_path_seperator(), name);
@@ -1259,11 +1259,11 @@ int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_
     /* we create config file name
      * each column family has a config file
      * this contains a serialized version of the column family struct */
-    char config_file_name[PATH_MAX];
+    char config_file_name[MAX_FILE_PATH_LENGTH];
 
     snprintf(config_file_name, sizeof(config_file_name), "%s%s%s%s%s%s", db_path,
              _tidesdb_get_path_seperator(), name, _tidesdb_get_path_seperator(), name,
-             COLUMN_FAMILY_CONFIG_FILE_EXT);
+             TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
 
     /* now we serialize the column family struct */
     size_t serialized_size;
@@ -1792,14 +1792,14 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     if (sst == NULL) return -1;
 
     /* we create a new sstable with a named based on the amount of sstables */
-    char sstable_path[1024];
-    snprintf(sstable_path, sizeof(sstable_path), "%s%ssstable_%d%s", cf->path,
-             _tidesdb_get_path_seperator(), cf->num_sstables, SSTABLE_EXT);
+    char sstable_path[MAX_FILE_PATH_LENGTH];
+    snprintf(sstable_path, sizeof(sstable_path), "%s%s%s%d%s", cf->path,
+             _tidesdb_get_path_seperator(), TDB_SSTABLE_PREFIX, cf->num_sstables, TDB_SSTABLE_EXT);
 
     /* we create a new block manager */
     block_manager_t *sstable_block_manager = NULL;
 
-    if (block_manager_open(&sstable_block_manager, sstable_path, SYNC_INTERVAL) == -1)
+    if (block_manager_open(&sstable_block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
         return -1;
     }
@@ -2094,12 +2094,14 @@ void *_tidesdb_compact_sstables_thread(void *arg)
     }
 
     /* remove old sstable files */
-    char sstable_path1[PATH_MAX];
-    char sstable_path2[PATH_MAX];
+    char sstable_path1[MAX_FILE_PATH_LENGTH];
+    char sstable_path2[MAX_FILE_PATH_LENGTH];
 
     /* get the sstable paths */
-    (void)snprintf(sstable_path1, PATH_MAX, "%s", cf->sstables[start]->block_manager->file_path);
-    (void)snprintf(sstable_path2, PATH_MAX, "%s", cf->sstables[end]->block_manager->file_path);
+    (void)snprintf(sstable_path1, MAX_FILE_PATH_LENGTH, "%s",
+                   cf->sstables[start]->block_manager->file_path);
+    (void)snprintf(sstable_path2, MAX_FILE_PATH_LENGTH, "%s",
+                   cf->sstables[end]->block_manager->file_path);
 
     /* free the old sstables */
     (void)_tidesdb_free_sstable(cf->sstables[start]);
@@ -2136,7 +2138,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
     }
 
     /* we create a new sstable with a named based on the amount of sstables */
-    char sstable_path[1024];
+    char sstable_path[MAX_FILE_PATH_LENGTH];
 
     /* lock to make sure path is unique */
     if (pthread_mutex_lock(shared_lock) != 0)
@@ -2146,8 +2148,8 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
         return NULL;
     }
 
-    snprintf(sstable_path, sizeof(sstable_path), "%s%ssstable_%d%s", cf->path,
-             _tidesdb_get_path_seperator(), cf->num_sstables, SSTABLE_EXT);
+    snprintf(sstable_path, sizeof(sstable_path), "%s%s%s%d%s", cf->path,
+             _tidesdb_get_path_seperator(), TDB_SSTABLE_PREFIX, cf->num_sstables, TDB_SSTABLE_EXT);
     cf->num_sstables++;
 
     /* unlock the shared lock */
@@ -2160,7 +2162,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
     }
 
     /* we open a new block manager for the merged sstable */
-    if (block_manager_open(&merged_sstable->block_manager, sstable_path, SYNC_INTERVAL) == -1)
+    if (block_manager_open(&merged_sstable->block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
         free(merged_sstable);
         cf->num_sstables--;
@@ -3257,7 +3259,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     }
 
     /* we create a new sstable with a named based on the amount of sstables */
-    char sstable_path[1024];
+    char sstable_path[MAX_FILE_PATH_LENGTH];
 
     /* lock to make sure path is unique */
     if (pthread_mutex_lock(shared_lock) != 0)
@@ -3267,8 +3269,8 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         return NULL;
     }
 
-    snprintf(sstable_path, sizeof(sstable_path), "%s%ssstable_%d%s", cf->path,
-             _tidesdb_get_path_seperator(), cf->num_sstables, SSTABLE_EXT);
+    snprintf(sstable_path, sizeof(sstable_path), "%s%s%s%d%s", cf->path,
+             _tidesdb_get_path_seperator(), TDB_SSTABLE_PREFIX, cf->num_sstables, TDB_SSTABLE_EXT);
     cf->num_sstables++;
 
     /* unlock the shared lock */
@@ -3281,7 +3283,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     }
 
     /* we open a new block manager for the merged sstable */
-    if (block_manager_open(&merged_sstable->block_manager, sstable_path, SYNC_INTERVAL) == -1)
+    if (block_manager_open(&merged_sstable->block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
         free(merged_sstable);
         cf->num_sstables--;
@@ -3296,7 +3298,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     int block_count1 = block_manager_count_blocks(sst1->block_manager);
     int block_count2 = block_manager_count_blocks(sst2->block_manager);
 
-    if (bloom_filter_new(&bf, BLOOMFILTER_P, block_count1 + block_count2) == -1)
+    if (bloom_filter_new(&bf, TDB_BLOOMFILTER_P, block_count1 + block_count2) == -1)
     {
         (void)block_manager_close(merged_sstable->block_manager);
         (void)remove(sstable_path);
@@ -3570,14 +3572,14 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
     if (sst == NULL) return -1;
 
     /* we create a new sstable with a named based on the amount of sstables */
-    char sstable_path[1024];
-    snprintf(sstable_path, sizeof(sstable_path), "%s%ssstable_%d%s", cf->path,
-             _tidesdb_get_path_seperator(), cf->num_sstables, SSTABLE_EXT);
+    char sstable_path[MAX_FILE_PATH_LENGTH];
+    snprintf(sstable_path, sizeof(sstable_path), "%s%s%s%d%s", cf->path,
+             _tidesdb_get_path_seperator(), TDB_SSTABLE_PREFIX, cf->num_sstables, TDB_SSTABLE_EXT);
 
     /* we create a new block manager */
     block_manager_t *sstable_block_manager = NULL;
 
-    if (block_manager_open(&sstable_block_manager, sstable_path, SYNC_INTERVAL) == -1)
+    if (block_manager_open(&sstable_block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
         return -1;
     }
@@ -3590,7 +3592,7 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
 
     /* we initialize the bloom filter */
     bloom_filter_t *bf = NULL;
-    if (bloom_filter_new(&bf, BLOOMFILTER_P, bloom_filter_size) == -1)
+    if (bloom_filter_new(&bf, TDB_BLOOMFILTER_P, bloom_filter_size) == -1)
     {
         free(sst);
         (void)remove(sstable_path);

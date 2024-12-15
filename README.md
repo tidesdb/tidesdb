@@ -93,7 +93,7 @@ You pass
 - skiplist max level.  Example below is 12
 - skiplist probability.  Example below is 0.24
 - whether column family sstable data is compressed
-- the compression algorithim to use [TDB_NO_COMPRESSION, TDB_COMPRESS_SNAPPY, TDB_COMPRESS_LZ4, TDB_COMPRESS_ZSTD]
+- the compression algorithim to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
 - whether to use bloom filters
 
 ```c
@@ -129,6 +129,24 @@ if (e != NULL)
     tidesdb_err_free(e);
 }
 ```
+
+### Listing column families
+```c
+/* list column families
+ * returns a char* of column family names separated by a newline
+*/
+char *column_families = tidesdb_list_column_families(tdb);
+if (column_families == NULL)
+{
+    /* handle error */
+}
+
+/* in this example we just print and free the column families */
+printf("%s\n", column_families);
+free(column_families);
+```
+
+
 
 ### Putting a key-value pair
 You pass

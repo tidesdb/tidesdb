@@ -22,11 +22,16 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdbool.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
+#include "bloom_filter.h"
 #include "block_manager.h"
 #include "compress.h"
 #include "err.h"
 #include "skip_list.h"
+
+/* TidesDB uses tidesdb, _tidesdb_, and TDB as prefixes for functions, types, and constants */
 
 #define TDB_WAL_EXT                       ".wal"     /* extension for the write-ahead log file */
 #define TDB_SSTABLE_EXT                   ".sst"     /* extension for the SSTable file */

@@ -28,12 +28,13 @@
 #include "err.h"
 #include "skip_list.h"
 
-#define WAL_EXT                       ".wal"     /* extension for the write-ahead log file */
-#define SSTABLE_EXT                   ".sst"     /* extension for the SSTable file */
-#define COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"     /* configuration file for the column family */
-#define TOMBSTONE                     0xDEADBEEF /* tombstone value for deleted keys */
-#define SYNC_INTERVAL                 0.24       /* interval for syncing mainly WAL */
-#define BLOOMFILTER_P                 0.01       /*  the false positive rate for bloom filter */
+#define TDB_WAL_EXT                       ".wal"     /* extension for the write-ahead log file */
+#define TDB_SSTABLE_EXT                   ".sst"     /* extension for the SSTable file */
+#define TDB_COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"     /* configuration file for the column family */
+#define TDB_TOMBSTONE                     0xDEADBEEF /* tombstone value for deleted keys */
+#define TDB_SYNC_INTERVAL                 0.24       /* interval for syncing mainly WAL */
+#define TDB_BLOOMFILTER_P                 0.01       /*  the false positive rate for bloom filter */
+#define TDB_SSTABLE_PREFIX                "sstable_" /* prefix for SSTable files */
 
 /*
  * tidesdb_compression_algo_t

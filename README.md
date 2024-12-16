@@ -294,35 +294,60 @@ if (e != NULL)
     return;
 }
 
-key_value_pair_t kv;
-
-/* setup key and value */
-uint8_t *key;
+uint8_t *retrieved_key = NULL;
 size_t key_size;
-uint8_t *value;
+uint8_t *retrieved_value = NULL;
 size_t value_size;
 
 /* iterate forward */
-while ((err = tidesdb_cursor_next(cursor, &key, &key_size, &value, &value_size)) == NULL)
+while ((e = tidesdb_cursor_next(c)) == NULL)
 {
-        /* do something with the key and value */
+    e = tidesdb_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
+    if (e != NULL)
+    {
+        /* handle error */
+        tidesdb_err_free(e);
+        break;
+    }
 
-        /* free the key and value */
-        free(key);
-        free(value);
+    /* use retrieved_key and retrieved_value
+     * .. */
+
+    /* free the key and value */
+    free(retrieved_key);
+    free(retrieved_value);
 }
-tidesdb_err_free(err);
+
+if (e != NULL && e->code != TIDESDB_ERR_AT_END_OF_CURSOR)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
 
 /* iterate backward */
-while ((err = tidesdb_cursor_prev(cursor, &key, &key_size, &value, &value_size)) == NULL)
+while ((e = tidesdb_cursor_prev(c)) == NULL)
 {
-        /* do something with the key and value */
+    e = tidesdb_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
+    if (e != NULL)
+    {
+        /* handle error */
+        tidesdb_err_free(e);
+        break;
+    }
 
-        /* free the key and value */
-        free(key);
-        free(value);
+    /* use retrieved_key and retrieved_value
+     * .. */
+
+    /* free the key and value */
+    free(retrieved_key);
+    free(retrieved_value);
 }
-tidesdb_err_free(err);
+
+if (e != NULL && e->code != TIDESDB_ERR_AT_START_OF_CURSOR)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
 
 tidesdb_cursor_free(c);
 

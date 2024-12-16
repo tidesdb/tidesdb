@@ -1588,12 +1588,14 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
         block_manager_block_t *block;
         while ((block = block_manager_cursor_read(cursor)) != NULL)
         {
+            if (block == NULL) break;
+
             /* we deserialize the kv */
             tidesdb_key_value_pair_t *kv = _tidesdb_deserialize_key_value_pair(
                 block->data, block->size, cf->config.compressed, cf->config.compress_algo);
             if (kv == NULL)
             {
-                free(block);
+                (void)block_manager_block_free(block);
                 break;
             }
 
@@ -2084,7 +2086,7 @@ void *_tidesdb_compact_sstables_thread(void *arg)
     int end = args->end;
 
     tidesdb_sstable_t *merged_sstable = NULL;
-    if (cf->config.bloom_filter)
+    if (!cf->config.bloom_filter)
     {
         /* merge the current and ith+1 sstables */
         merged_sstable =
@@ -2359,7 +2361,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
             break;
         }
 
-        block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_kv);
+        block = block_manager_block_create(serialized_size, serialized_kv);
         if (block == NULL)
         {
             free(kv);

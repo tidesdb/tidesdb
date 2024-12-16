@@ -3699,9 +3699,6 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
         /* add to bloom filter */
         (void)bloom_filter_add(bf, retrieved_key, key_size);
 
-        // free(retrieved_key);
-        // free(retrieved_value);
-
     } while (skip_list_cursor_next(cursor) != -1);
 
     /* we free the cursor */

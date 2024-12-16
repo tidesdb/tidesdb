@@ -21,6 +21,7 @@
 uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size, compress_type type)
 {
     uint8_t *compressed_data = NULL;
+    size_t total_size;
 
     switch (type)
     {
@@ -36,35 +37,35 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
             break;
 
         case COMPRESS_LZ4:
-            *compressed_size = LZ4_compressBound(data_size);
-            compressed_data = malloc(*compressed_size);
-            if (!compressed_data)
-            {
-                return NULL;
-            }
-            *compressed_size = LZ4_compress_default((const char *)data, (char *)compressed_data,
-                                                    data_size, *compressed_size);
-            if (*compressed_size <= 0)
-            {
-                free(compressed_data);
-                return NULL;
-            }
-            break;
-
         case COMPRESS_ZSTD:
-            *compressed_size = ZSTD_compressBound(data_size);
-            compressed_data = (uint8_t *)malloc(*compressed_size);
+            /* because lz4 and zstd require the original size to decompress, we need to prepend it
+             * to the compressed data */
+            *compressed_size = (type == COMPRESS_LZ4) ? (size_t)LZ4_compressBound((int)data_size)
+                                                      : ZSTD_compressBound(data_size);
+            total_size = *compressed_size + sizeof(size_t);
+            compressed_data = malloc(total_size);
             if (!compressed_data)
             {
                 return NULL;
             }
-            *compressed_size = ZSTD_compress(compressed_data, *compressed_size, data, data_size,
-                                             1); /* 1 is a compression level */
-            if (ZSTD_isError(*compressed_size))
+
+            memcpy(compressed_data, &data_size, sizeof(size_t));
+            int actual_compressed_size =
+                (type == COMPRESS_LZ4)
+                    ? (size_t)LZ4_compress_default((const char *)data,
+                                                   (char *)(compressed_data + sizeof(size_t)),
+                                                   (int)data_size, *compressed_size)
+                    : ZSTD_compress(compressed_data + sizeof(size_t), *compressed_size, data,
+                                    data_size, 1);
+
+            if (actual_compressed_size <= 0 ||
+                (type == COMPRESS_ZSTD && ZSTD_isError(actual_compressed_size)))
             {
                 free(compressed_data);
                 return NULL;
             }
+
+            *compressed_size = actual_compressed_size + sizeof(size_t);
             break;
 
         default:
@@ -87,7 +88,7 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
             {
                 return NULL;
             }
-            decompressed_data = (uint8_t *)malloc(*decompressed_size);
+            decompressed_data = malloc(*decompressed_size);
             if (!decompressed_data)
             {
                 return NULL;
@@ -101,29 +102,22 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
             break;
 
         case COMPRESS_LZ4:
-            decompressed_data = malloc(*decompressed_size);
-            if (!decompressed_data)
-            {
-                return NULL;
-            }
-            int decompressed = LZ4_decompress_safe((const char *)data, (char *)decompressed_data,
-                                                   data_size, *decompressed_size);
-            if (decompressed < 0)
-            {
-                free(decompressed_data);
-                return NULL;
-            }
-            *decompressed_size = decompressed;
-            break;
-
         case COMPRESS_ZSTD:
+            memcpy(decompressed_size, data, sizeof(size_t));
             decompressed_data = malloc(*decompressed_size);
             if (!decompressed_data)
             {
                 return NULL;
             }
-            size_t result = ZSTD_decompress(decompressed_data, *decompressed_size, data, data_size);
-            if (ZSTD_isError(result))
+            int decompressed =
+                (type == COMPRESS_LZ4)
+                    ? (size_t)LZ4_decompress_safe(
+                          (const char *)(data + sizeof(size_t)), (char *)decompressed_data,
+                          (int)data_size - sizeof(size_t), *decompressed_size)
+                    : ZSTD_decompress(decompressed_data, *decompressed_size, data + sizeof(size_t),
+                                      data_size - sizeof(size_t));
+
+            if (decompressed < 0 || (type == COMPRESS_ZSTD && ZSTD_isError(decompressed)))
             {
                 free(decompressed_data);
                 return NULL;

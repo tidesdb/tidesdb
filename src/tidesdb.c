@@ -67,8 +67,8 @@ uint8_t *_tidesdb_serialize_key_value_pair(tidesdb_key_value_pair_t *kv, size_t 
         /* compress the serialized data */
         uint8_t *compressed_data = NULL;
         size_t compressed_size = 0;
-        compressed_data =
-            compress_data(serialized_data, *out_size, &compressed_size, compress_algo - 1);
+        compressed_data = compress_data(serialized_data, *out_size, &compressed_size,
+                                        _tidesdb_map_compression_algo(compress_algo));
 
         free(serialized_data);
         serialized_data = compressed_data;
@@ -81,15 +81,16 @@ uint8_t *_tidesdb_serialize_key_value_pair(tidesdb_key_value_pair_t *kv, size_t 
 tidesdb_key_value_pair_t *_tidesdb_deserialize_key_value_pair(
     uint8_t *data, size_t data_size, bool decompress, tidesdb_compression_algo_t compress_algo)
 {
+    uint8_t *decompressed_data = NULL;
+
     /* if we are to decompress the data */
     if (decompress)
     {
-        uint8_t *decompressed_data = NULL;
         size_t decompressed_size = 0;
-        decompressed_data = decompress_data(data, data_size, &decompressed_size, compress_algo - 1);
+        decompressed_data = decompress_data(data, data_size, &decompressed_size,
+                                            _tidesdb_map_compression_algo(compress_algo));
 
         if (decompressed_data == NULL) return NULL;
-        free(data);
         data = decompressed_data;
         data_size = decompressed_size;
     }
@@ -103,7 +104,11 @@ tidesdb_key_value_pair_t *_tidesdb_deserialize_key_value_pair(
 
     /* deserialize key */
     uint8_t *key = malloc(key_size);
-    if (key == NULL) return NULL;
+    if (key == NULL)
+    {
+        if (decompressed_data) free(decompressed_data);
+        return NULL;
+    }
     memcpy(key, ptr, key_size);
     ptr += key_size;
 
@@ -117,6 +122,7 @@ tidesdb_key_value_pair_t *_tidesdb_deserialize_key_value_pair(
     if (value == NULL)
     {
         free(key);
+        if (decompressed_data) free(decompressed_data);
         return NULL;
     }
     memcpy(value, ptr, value_size);
@@ -133,6 +139,7 @@ tidesdb_key_value_pair_t *_tidesdb_deserialize_key_value_pair(
     /* free temporary allocations */
     free(key);
     free(value);
+    if (decompressed_data) free(decompressed_data);
 
     return kv;
 }
@@ -360,8 +367,8 @@ uint8_t *_tidesdb_serialize_operation(tidesdb_operation_t *op, size_t *out_size,
         /* compress the serialized data */
         uint8_t *compressed_data = NULL;
         size_t compressed_size = 0;
-        compressed_data =
-            compress_data(serialized_data, *out_size, &compressed_size, compress_algo - 1);
+        compressed_data = compress_data(serialized_data, *out_size, &compressed_size,
+                                        _tidesdb_map_compression_algo(compress_algo));
 
         free(serialized_data);
         serialized_data = compressed_data;
@@ -375,15 +382,17 @@ tidesdb_operation_t *_tidesdb_deserialize_operation(uint8_t *data, size_t data_s
                                                     bool decompress,
                                                     tidesdb_compression_algo_t compress_algo)
 {
+    uint8_t *decompressed_data = NULL;
+
     if (decompress)
     {
-        uint8_t *decompressed_data = NULL;
         size_t decompressed_size = 0;
-        decompressed_data = decompress_data(data, data_size, &decompressed_size, compress_algo - 1);
+        decompressed_data = decompress_data(data, data_size, &decompressed_size,
+                                            _tidesdb_map_compression_algo(compress_algo));
 
         if (decompressed_data == NULL) return NULL;
-        free(data);
         data = decompressed_data;
+        data_size = decompressed_size;
     }
 
     uint8_t *ptr = data;
@@ -400,17 +409,21 @@ tidesdb_operation_t *_tidesdb_deserialize_operation(uint8_t *data, size_t data_s
 
     /* deserialize cf_name */
     char *cf_name = malloc(cf_name_size);
-    if (cf_name == NULL) return NULL;
+    if (cf_name == NULL)
+    {
+        if (decompressed_data) free(decompressed_data);
+        return NULL;
+    }
     memcpy(cf_name, ptr, cf_name_size);
     ptr += cf_name_size;
 
     /* deserialize key-value pair */
-    /* dont need data size on no decompress */
     tidesdb_key_value_pair_t *kv =
         _tidesdb_deserialize_key_value_pair(ptr, 0, false, TDB_NO_COMPRESSION);
     if (kv == NULL)
     {
         free(cf_name);
+        if (decompressed_data) free(decompressed_data);
         return NULL;
     }
 
@@ -420,6 +433,7 @@ tidesdb_operation_t *_tidesdb_deserialize_operation(uint8_t *data, size_t data_s
     {
         free(cf_name);
         (void)_tidesdb_free_key_value_pair(kv);
+        if (decompressed_data) free(decompressed_data);
         return NULL;
     }
 
@@ -427,6 +441,8 @@ tidesdb_operation_t *_tidesdb_deserialize_operation(uint8_t *data, size_t data_s
     op->op_code = op_code;
     op->cf_name = cf_name;
     op->kv = kv;
+
+    if (decompressed_data) free(decompressed_data);
 
     return op;
 }
@@ -3883,4 +3899,19 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
     }
 
     return 0;
+}
+
+compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo)
+{
+    switch (algo)
+    {
+        case TDB_COMPRESS_SNAPPY:
+            return COMPRESS_SNAPPY;
+        case TDB_COMPRESS_LZ4:
+            return COMPRESS_LZ4;
+        case TDB_COMPRESS_ZSTD:
+            return COMPRESS_ZSTD;
+        default:
+            return COMPRESS_SNAPPY; /* default to snappy */
+    }
 }

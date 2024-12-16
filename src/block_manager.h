@@ -198,4 +198,36 @@ time_t block_manager_last_modified(block_manager_t *bm);
  */
 int block_manager_count_blocks(block_manager_t *bm);
 
+/**
+ * block_manager_cursor_has_next
+ * checks if the cursor has a next block
+ * @param cursor the cursor to check
+ * @return 1 if the cursor has a next block, 0 if not
+ */
+int block_manager_cursor_has_next(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_has_prev
+ * checks if the cursor has a previous block
+ * @param cursor the cursor to check
+ * @return 1 if the cursor has a previous block, 0 if not
+ */
+int block_manager_cursor_has_prev(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_goto_last
+ * moves the cursor to the last block
+ * @param cursor the cursor to move
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_goto_last(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_goto_first
+ * moves the cursor to the first block
+ * @param cursor the cursor to move
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_goto_first(block_manager_cursor_t *cursor);
+
 #endif /* __BLOCK_MANAGER_H__ */

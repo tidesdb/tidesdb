@@ -1443,6 +1443,16 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
         }
     } while (true);
 
+    /* ensure all values were found */
+    for (int i = 0; i < 11; i++)
+    {
+        if (!found[i])
+        {
+            printf(RED "Key not found: %s\n" RESET, keys[i]);
+        }
+        assert(found[i]);
+    }
+
     tidesdb_err_free(err);
 
     err = tidesdb_cursor_free(cursor);
@@ -1606,6 +1616,16 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
             free(retrieved_value);
         }
     } while (true);
+
+    /* ensure all values were found */
+    for (int i = 0; i < 11; i++)
+    {
+        if (!found[i])
+        {
+            printf(RED "Key not found: %s\n" RESET, keys[i]);
+        }
+        assert(found[i]);
+    }
 
     tidesdb_err_free(err);
 

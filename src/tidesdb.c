@@ -1583,6 +1583,12 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
 
             (void)bloom_filter_free(bf);
             (void)block_manager_block_free(block);
+            /* go next block */
+            if (block_manager_cursor_next(cursor) == -1)
+            {
+                (void)block_manager_cursor_free(cursor);
+                return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+            }
         }
 
         block_manager_block_t *block;
@@ -3675,17 +3681,6 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
 
     do
     {
-        /* we get the key value pair */
-        tidesdb_key_value_pair_t *kv = malloc(sizeof(tidesdb_key_value_pair_t));
-        if (kv == NULL)
-        {
-            free(sst);
-            (void)(void)remove(sstable_path);
-            return -1;
-        }
-
-        /* we get the key */
-
         uint8_t *retrieved_key;
         size_t key_size;
         uint8_t *retrieved_value;
@@ -3694,7 +3689,8 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
         if (skip_list_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size,
                                  &ttl) == -1)
         {
-            free(kv);
+            free(retrieved_key);
+            free(retrieved_value);
             free(sst);
             (void)remove(sstable_path);
             return -1;
@@ -3707,6 +3703,7 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
 
     /* we free the cursor */
     (void)skip_list_cursor_free(cursor);
+    cursor = NULL;
 
     size_t serialized_bf_size;
     uint8_t *serialized_bf = bloom_filter_serialize(bf, &serialized_bf_size);
@@ -3716,6 +3713,8 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
         (void)remove(sstable_path);
         return -1;
     }
+
+    bloom_filter_free(bf);
 
     /* we write the bloom filter to the sstable */
     block_manager_block_t *bf_block = block_manager_block_create(serialized_bf_size, serialized_bf);
@@ -3727,20 +3726,19 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
         return -1;
     }
 
+    free(serialized_bf);
+
     /* we write the block to the sstable */
     if (block_manager_block_write(sst->block_manager, bf_block) == -1)
     {
         (void)block_manager_block_free(bf_block);
         free(sst);
-        free(serialized_bf);
         (void)remove(sstable_path);
         return -1;
     }
 
     /* we free the resources */
     (void)block_manager_block_free(bf_block);
-
-    (void)skip_list_cursor_free(cursor);
 
     /* we reinitialize the cursor to populate the sstable with keyvalue pairs after bloomfilter */
     cursor = skip_list_cursor_init(cf->memtable);
@@ -3765,50 +3763,14 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
 
         /* we get the key */
 
-        uint8_t *retrieved_key;
-        size_t key_size;
-        uint8_t *retrieved_value;
-        size_t value_size;
-        time_t ttl;
-        if (skip_list_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size,
-                                 &ttl) == -1)
+        if (skip_list_cursor_get(cursor, &kv->key, &kv->key_size, &kv->value, &kv->value_size,
+                                 &kv->ttl) == -1)
         {
             free(kv);
             free(sst);
             (void)remove(sstable_path);
             return -1;
         }
-
-        /* we copy the key */
-        kv->key = malloc(key_size);
-        if (kv->key == NULL)
-        {
-            free(kv);
-            free(sst);
-            (void)remove(sstable_path);
-            return -1;
-        }
-        memcpy(kv->key, retrieved_key, key_size);
-
-        /* we copy the value */
-        kv->value = malloc(value_size);
-        if (kv->value == NULL)
-        {
-            free(kv->key);
-            free(kv);
-            free(sst);
-            (void)remove(sstable_path);
-            return -1;
-        }
-
-        memcpy(kv->value, retrieved_value, value_size);
-
-        /* we set the key size */
-        kv->key_size = key_size;
-        /* we set the value size */
-        kv->value_size = value_size;
-        /* we set the ttl */
-        kv->ttl = ttl;
 
         /* we serialize the key value pair */
         size_t serialized_size;
@@ -3822,7 +3784,7 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
             return -1;
         }
 
-        (void)_tidesdb_free_key_value_pair(kv);
+        free(kv);
 
         /* we create a new block */
         block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_kv);
@@ -3852,6 +3814,8 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
 
     /* we free the cursor */
     (void)skip_list_cursor_free(cursor);
+
+    cursor = NULL;
 
     /* we add the sstable to the column family */
     if (cf->sstables == NULL)

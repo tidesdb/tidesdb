@@ -14,7 +14,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **ACID** transactions are atomic, consistent, isolated, and durable.
 - [x] **Concurrent** multiple threads can read and write to the storage engine. The memtable(skip list) uses an RW lock which means multiple readers and one true writer. SSTables are sorted, immutable. Transactions are also thread-safe.
 - [x] **Column Families** store data in separate key-value stores.  Each column family has their own memtable and sstables.
-- [x] **Atomic Transactions** commit or rollback multiple operations atomically.  Rollback all operations if one fails.
+- [x] **Atomic Transactions** commit or rollback multiple operations atomically.  Rollsback all operations if one fails within a transaction.
 - [x] **Cursor** iterate over key-value pairs forward and backward.
 - [x] **WAL** write-ahead logging for durability. Replays memtable column families on startup.
 - [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
@@ -296,49 +296,33 @@ if (e != NULL)
 
 key_value_pair_t kv;
 
+/* setup key and value */
+uint8_t *key;
+size_t key_size;
+uint8_t *value;
+size_t value_size;
+
 /* iterate forward */
-while ((e = tidesdb_cursor_next(c)) == NULL)
+while ((err = tidesdb_cursor_next(cursor, &key, &key_size, &value, &value_size)) == NULL)
 {
-    e = tidesdb_cursor_get(c, &kv);
-    if (e != NULL)
-    {
-        /* handle error */
-        tidesdb_err_free(e);
-        break;
-    }
+        /* do something with the key and value */
 
-    /* use kv.key and kv.value */
-    free(kv.key);
-    free(kv.value);
+        /* free the key and value */
+        free(key);
+        free(value);
 }
-
-if (e != NULL && e->code != TIDESDB_ERR_AT_END_OF_CURSOR)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
+tidesdb_err_free(err);
 
 /* iterate backward */
-while ((e = tidesdb_cursor_prev(c)) == NULL)
+while ((err = tidesdb_cursor_prev(cursor, &key, &key_size, &value, &value_size)) == NULL)
 {
-    e = tidesdb_cursor_get(c, &kv);
-    if (e != NULL)
-    {
-        /* handle error */
-        tidesdb_err_free(e);
-        break;
-    }
+        /* do something with the key and value */
 
-    /* use kv.key and kv.value */
-    free(kv.key);
-    free(kv.value);
+        /* free the key and value */
+        free(key);
+        free(value);
 }
-
-if (e != NULL && e->code != TIDESDB_ERR_AT_START_OF_CURSOR)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
+tidesdb_err_free(err);
 
 tidesdb_cursor_free(c);
 

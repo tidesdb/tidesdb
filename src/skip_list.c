@@ -416,3 +416,44 @@ int skip_list_count_entries(skip_list_t *list)
 
     return count;
 }
+
+int skip_list_cursor_has_next(skip_list_cursor_t *cursor)
+{
+    if (cursor == NULL || cursor->current == NULL) return -1;
+
+    return cursor->current->forward[0] != NULL;
+}
+
+int skip_list_cursor_has_prev(skip_list_cursor_t *cursor)
+{
+    if (cursor == NULL || cursor->list == NULL || cursor->current == NULL) return -1;
+
+    skip_list_node_t *x = cursor->list->header;
+    while (x->forward[0] && x->forward[0] != cursor->current)
+    {
+        x = x->forward[0];
+    }
+
+    return x != cursor->list->header;
+}
+
+int skip_list_cursor_goto_first(skip_list_cursor_t *cursor)
+{
+    if (cursor == NULL || cursor->list == NULL) return -1;
+
+    cursor->current = cursor->list->header->forward[0];
+    return cursor->current == NULL ? -1 : 0;
+}
+
+int skip_list_cursor_goto_last(skip_list_cursor_t *cursor)
+{
+    if (cursor == NULL || cursor->list == NULL) return -1;
+
+    cursor->current = cursor->list->header;
+    while (cursor->current->forward[0] != NULL)
+    {
+        cursor->current = cursor->current->forward[0];
+    }
+
+    return cursor->current == cursor->list->header ? -1 : 0;
+}

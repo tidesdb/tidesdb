@@ -168,7 +168,7 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
     /* we read the size of the next block */
     if (fread(&block_size, sizeof(uint64_t), 1, cursor->bm->file) != 1)
     {
-        if (feof(cursor->bm->file)) return 1;
+        if (feof(cursor->bm->file)) return 1; /* if we reached the end of the file, return 1 */
         return -1;
     }
 
@@ -182,6 +182,103 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
     cursor->current_pos += sizeof(uint64_t) + block_size;
 
     return 0;
+}
+
+int block_manager_cursor_has_next(block_manager_cursor_t *cursor)
+{
+    /* save the current file pointer position */
+    long original_pos = ftell(cursor->bm->file);
+    if (original_pos == -1) return -1;
+
+    /* move the file pointer to the current position */
+    if (fseek(cursor->bm->file, cursor->current_pos, SEEK_SET) != 0) return -1;
+
+    /* read the size of the next block */
+    uint64_t block_size;
+    if (fread(&block_size, sizeof(uint64_t), 1, cursor->bm->file) != 1)
+    {
+        if (feof(cursor->bm->file)) return 0; /* if we reached the end of the file, return 0 */
+        return -1;
+    }
+
+    /* restore the original file pointer position */
+    if (fseek(cursor->bm->file, original_pos, SEEK_SET) != 0) return -1;
+
+    return 1;
+}
+
+int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
+{
+    if (cursor == NULL || cursor->bm == NULL) return -1; /* if the cursor is NULL, return -1 */
+
+    /* move to the end of the file */
+    if (fseek(cursor->bm->file, 0, SEEK_END) != 0) return -1;
+
+    /* get the file size */
+    long file_size = ftell(cursor->bm->file);
+    if (file_size == -1) return -1;
+
+    /* if the file is empty, return -1 */
+    if (file_size == 0) return -1;
+
+    /* move back to read the size of the last block */
+    if (fseek(cursor->bm->file, -sizeof(uint64_t), SEEK_END) != 0) return -1;
+
+    /* read the size of the last block */
+    uint64_t block_size;
+    if (fread(&block_size, sizeof(uint64_t), 1, cursor->bm->file) != 1) return -1;
+
+    /* calculate the position of the last block */
+    long last_block_pos = file_size - sizeof(uint64_t) - block_size;
+
+    /* move to the start of the last block */
+    if (fseek(cursor->bm->file, last_block_pos, SEEK_SET) != 0) return -1;
+
+    /* update the cursor position */
+    cursor->current_pos = last_block_pos;
+    cursor->current_block_size = block_size;
+
+    return 0;
+}
+
+int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)
+{
+    if (cursor == NULL || cursor->bm == NULL) return -1;
+
+    /* move to the beginning of the file */
+    if (fseek(cursor->bm->file, 0, SEEK_SET) != 0) return -1;
+
+    /* read the size of the first block */
+    uint64_t block_size;
+    if (fread(&block_size, sizeof(uint64_t), 1, cursor->bm->file) != 1) return -1;
+
+    /* update the cursor position */
+    cursor->current_pos = 0;
+    cursor->current_block_size = block_size;
+
+    return 0;
+}
+
+int block_manager_cursor_has_prev(block_manager_cursor_t *cursor)
+{
+    /* save the current file pointer position */
+    long original_pos = ftell(cursor->bm->file);
+    if (original_pos == -1) return -1;
+
+    /* if we are at the beginning of the file, there is no previous block */
+    if (cursor->current_pos == 0) return 0;
+
+    /* move the file pointer to the position of the previous block size */
+    if (fseek(cursor->bm->file, cursor->current_pos - sizeof(uint64_t), SEEK_SET) != 0) return -1;
+
+    /* read the size of the previous block */
+    uint64_t block_size;
+    if (fread(&block_size, sizeof(uint64_t), 1, cursor->bm->file) != 1) return -1;
+
+    /* restore the original file pointer position */
+    if (fseek(cursor->bm->file, original_pos, SEEK_SET) != 0) return -1;
+
+    return 1;
 }
 
 int block_manager_cursor_prev(block_manager_cursor_t *cursor)

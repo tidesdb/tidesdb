@@ -255,18 +255,50 @@ int skip_list_count_entries(skip_list_t *list);
 
 /*
  * skip_list_cursor_at_start
- * move the cursor to the start of the skip list
+ * check if the cursor is at the start of the skip list
  * @param cursor the cursor
- * @return 0 if the cursor was moved successfully, -1 otherwise
+ * @return 0 or 1 if the cursor is at the start of the skip list, -1 otherwise
  */
 int skip_list_cursor_at_start(skip_list_cursor_t *cursor);
 
 /*
  * skip_list_cursor_at_end
- * move the cursor to the end of the skip list
+ * check if the cursor is at the end of the skip list
+ * @param cursor the cursor
+ * @return 0 or 1 if the cursor is at the end of the skip list, -1 otherwise
+ */
+int skip_list_cursor_at_end(skip_list_cursor_t *cursor);
+
+/*
+ * skip_list_cursor_has_next
+ * check if the cursor has a next node
+ * @param cursor the cursor
+ * @return 0 or 1 if the cursor has a next node, -1 otherwise
+ */
+int skip_list_cursor_has_next(skip_list_cursor_t *cursor);
+
+/*
+ * skip_list_cursor_has_prev
+ * check if the cursor has a previous node
+ * @param cursor the cursor
+ * @return 0 or 1 if the cursor has a previous node, -1 otherwise
+ */
+int skip_list_cursor_has_prev(skip_list_cursor_t *cursor);
+
+/*
+ * skip_list_cursor_goto_last
+ * move the cursor to the last node in the skip list
  * @param cursor the cursor
  * @return 0 if the cursor was moved successfully, -1 otherwise
  */
-int skip_list_cursor_at_end(skip_list_cursor_t *cursor);
+int skip_list_cursor_goto_last(skip_list_cursor_t *cursor);
+
+/*
+ * skip_list_cursor_goto_first
+ * move the cursor to the first node in the skip list
+ * @param cursor the cursor
+ * @return 0 if the cursor was moved successfully, -1 otherwise
+ */
+int skip_list_cursor_goto_first(skip_list_cursor_t *cursor);
 
 #endif /* __SKIP_LIST_H__ */

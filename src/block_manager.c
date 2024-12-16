@@ -36,7 +36,7 @@ int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_
     /* we set the stop fsync thread flag to 0 */
     (*bm)->stop_fsync_thread = 0;
 
-    /* we create the fsync thread */
+    /* we create and start the fsync thread */
     if (pthread_create(&(*bm)->fsync_thread, NULL, block_manager_fsync_thread, *bm) != 0) return -1;
     return 0;
 }
@@ -209,33 +209,28 @@ int block_manager_cursor_has_next(block_manager_cursor_t *cursor)
 
 int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
 {
-    if (cursor == NULL || cursor->bm == NULL) return -1; /* if the cursor is NULL, return -1 */
+    if (cursor == NULL || cursor->bm == NULL)
+        return -1; /* if the cursor or the block manager is NULL, return -1 */
 
-    /* move to the end of the file */
-    if (fseek(cursor->bm->file, 0, SEEK_END) != 0) return -1;
+    /* seek to the beginning of the file */
+    if (fseek(cursor->bm->file, 0, SEEK_SET) != 0) return -1;
 
-    /* get the file size */
-    long file_size = ftell(cursor->bm->file);
-    if (file_size == -1) return -1;
-
-    /* if the file is empty, return -1 */
-    if (file_size == 0) return -1;
-
-    /* move back to read the size of the last block */
-    if (fseek(cursor->bm->file, -sizeof(uint64_t), SEEK_END) != 0) return -1;
-
-    /* read the size of the last block */
     uint64_t block_size;
-    if (fread(&block_size, sizeof(uint64_t), 1, cursor->bm->file) != 1) return -1;
+    long last_pos = 0;
+    long current_pos = 0;
 
-    /* calculate the position of the last block */
-    long last_block_pos = file_size - sizeof(uint64_t) - block_size;
+    /* traverse through each block until the end of the file */
+    while (fread(&block_size, sizeof(uint64_t), 1, cursor->bm->file) == 1)
+    {
+        last_pos = current_pos;
+        current_pos += sizeof(uint64_t) + block_size;
 
-    /* move to the start of the last block */
-    if (fseek(cursor->bm->file, last_block_pos, SEEK_SET) != 0) return -1;
+        /* move the file pointer to the next block */
+        if (fseek(cursor->bm->file, block_size, SEEK_CUR) != 0) return -1;
+    }
 
-    /* update the cursor position */
-    cursor->current_pos = last_block_pos;
+    /* update the cursor position and block size */
+    cursor->current_pos = last_pos;
     cursor->current_block_size = block_size;
 
     return 0;
@@ -361,7 +356,7 @@ time_t block_manager_last_modified(block_manager_t *bm)
 int block_manager_count_blocks(block_manager_t *bm)
 {
     block_manager_cursor_t *cursor;
-    int count = 1;
+    int count = 0;
 
     if (block_manager_cursor_init(&cursor, bm) != 0) return -1;
 

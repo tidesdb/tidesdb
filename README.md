@@ -56,7 +56,7 @@ Each database method returns a `tidesdb_err*` which returns an error code and me
 typedef struct
 {
     int code;
-    char* message;
+    char *message;
 } tidesdb_err_t;
 ```
 

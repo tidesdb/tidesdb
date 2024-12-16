@@ -15,13 +15,15 @@ set(PROJECT_VERSION 0.2.0) # TidesDB v0.2.0
 add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
 add_link_options(-fsanitize=address,undefined)
 
-add_library(tidesdb SHARED src/tidesdb.c src/tidesdb.h src/err.c src/err.h src/block_manager.c src/block_manager.h src/skip_list.c src/skip_list.h src/compress.c src/compress.h src/bloom_filter.c src/block_manager.h)
+add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c)
+
+target_include_directories(tidesdb PRIVATE src)
 
 install(TARGETS tidesdb
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
 
-install(FILES src/tidesdb.c src/tidesdb.h src/err.c src/err.h src/block_manager.c src/block_manager.h src/skip_list.c src/skip_list.h src/compress.c src/compress.h src/bloom_filter.c src/bloom_filter.h DESTINATION include)
+install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/compress.h src/bloom_filter.h DESTINATION include)
 enable_testing()
 
 add_executable(err_tests test/err__tests.c)

@@ -1670,16 +1670,16 @@ int main(void)
     test_tidesdb_txn_put_get(true, TDB_COMPRESS_SNAPPY, true);
     test_tidesdb_txn_put_get_rollback_get(true, TDB_COMPRESS_SNAPPY, true);
     test_tidesdb_txn_put_put_delete_get(true, TDB_COMPRESS_SNAPPY, true);
-    test_tidesdb_cursor(true, TDB_COMPRESS_SNAPPY, true);
-    test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true);
     test_tidesdb_put_delete_get(true, TDB_COMPRESS_SNAPPY, true);
-
     /* these tests take a while to run */
     test_tidesdb_put_flush_get(true, TDB_COMPRESS_SNAPPY, true);
     test_tidesdb_put_flush_close_get(true, TDB_COMPRESS_SNAPPY, true);
     test_tidesdb_put_flush_delete_get(true, TDB_COMPRESS_SNAPPY, true);
     test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true);
     test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true);
+
+    test_tidesdb_cursor(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true);
 
     return 0;
 }

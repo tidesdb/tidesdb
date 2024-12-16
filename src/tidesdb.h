@@ -791,4 +791,12 @@ tidesdb_key_value_pair_t *_tidesdb_key_value_pair_new(const uint8_t *key, size_t
  */
 int _tidesdb_is_expired(int64_t ttl);
 
+/*
+ * _tidesdb_map_compression_algo
+ * maps a tidesdb compression algo to a compress_type algo
+ * @param algo the tidesdb compression algo
+ * @return the compress_type algo
+ */
+compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo);
+
 #endif /* __TIDESDB_H__ */

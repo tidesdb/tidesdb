@@ -1665,8 +1665,11 @@ int main(void)
     /* the next batch of tests we will run with bloom filters and compression
      * same tests just with bloom filters and compression enabled */
     test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_SNAPPY);
-    test_tidesdb_serialize_deserialize_column_family_config();
     test_tidesdb_serialize_deserialize_operation(true, TDB_COMPRESS_SNAPPY);
+    test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_LZ4);
+    test_tidesdb_serialize_deserialize_operation(true, TDB_COMPRESS_LZ4);
+    test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_ZSTD);
+    test_tidesdb_serialize_deserialize_operation(true, TDB_COMPRESS_ZSTD);
     test_tidesdb_create_drop_column_family(true, TDB_COMPRESS_SNAPPY, true);
     test_tidesdb_put_get_memtable(true, TDB_COMPRESS_SNAPPY, true);
     test_tidesdb_put_close_replay_get(true, TDB_COMPRESS_SNAPPY, true);

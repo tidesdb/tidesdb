@@ -1372,15 +1372,18 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
                 printf(RED "Key not found in the list: %s\n" RESET, retrieved_key);
             }
 
-            assert(key_found);
-
             free(retrieved_key);
             free(retrieved_value);
+
+            assert(key_found);
         }
     } while ((err = tidesdb_cursor_next(cursor)) == NULL ||
              err->code != TIDESDB_ERR_AT_END_OF_CURSOR);
 
-    tidesdb_err_free(err);
+    if (err != NULL)
+    {
+        tidesdb_err_free(err);
+    }
 
     /* ensure all values were found */
     for (int i = 0; i < 11; i++)
@@ -1400,15 +1403,8 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
     }
 
     /* we use prev */
-    do
+    while (tidesdb_cursor_prev(cursor) == NULL)
     {
-        err = tidesdb_cursor_prev(cursor);
-        if (err != NULL && err->code == TIDESDB_ERR_AT_START_OF_CURSOR)
-        {
-            break;
-        }
-        assert(err == NULL);
-
         err = tidesdb_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size);
         if (err != NULL)
         {
@@ -1418,7 +1414,6 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
 
         if (retrieved_key != NULL)
         {
-            printf("retrieved key: %s\n", retrieved_key);
             /* check if the key is one of the keys we put */
             bool key_found = false;
             for (int i = 0; i < 11; i++)
@@ -1436,12 +1431,12 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
                 printf(RED "Key not found in the list: %s\n" RESET, retrieved_key);
             }
 
-            assert(key_found);
-
             free(retrieved_key);
             free(retrieved_value);
+
+            assert(key_found);
         }
-    } while (true);
+    }
 
     /* ensure all values were found */
     for (int i = 0; i < 11; i++)
@@ -1452,8 +1447,6 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
         }
         assert(found[i]);
     }
-
-    tidesdb_err_free(err);
 
     err = tidesdb_cursor_free(cursor);
     assert(err == NULL);
@@ -1651,8 +1644,6 @@ int main(void)
     test_tidesdb_txn_put_get(false, TDB_NO_COMPRESSION, false);
     test_tidesdb_txn_put_get_rollback_get(false, TDB_NO_COMPRESSION, false);
     test_tidesdb_txn_put_put_delete_get(false, TDB_NO_COMPRESSION, false);
-    test_tidesdb_cursor(false, TDB_NO_COMPRESSION, false);
-    test_tidesdb_cursor_memtable_sstables(false, TDB_NO_COMPRESSION, false);
     test_tidesdb_put_delete_get(false, TDB_NO_COMPRESSION, false);
 
     /* these tests take a while to run */
@@ -1661,6 +1652,9 @@ int main(void)
     test_tidesdb_put_flush_delete_get(false, TDB_NO_COMPRESSION, false);
     test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false);
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false);
+
+    test_tidesdb_cursor(false, TDB_NO_COMPRESSION, false);                   /* bit iffy */
+    test_tidesdb_cursor_memtable_sstables(false, TDB_NO_COMPRESSION, false); /* bit iffy */
 
     /* the next batch of tests we will run with bloom filters and compression
      * same tests just with bloom filters and compression enabled */

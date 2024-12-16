@@ -133,8 +133,8 @@ void test_skip_list_cursor_init()
     assert(cursor->list == list);
     assert(cursor->current == list->header->forward[0]);
 
-    skip_list_cursor_free(cursor);
-    skip_list_destroy(list);
+    (void)skip_list_cursor_free(cursor);
+    assert(skip_list_destroy(list) == 0);
     printf(GREEN "test_skip_list_cursor_init passed\n" RESET);
 }
 
@@ -157,8 +157,8 @@ void test_skip_list_cursor_next()
     assert(cursor->current != NULL);
     assert(memcmp(cursor->current->key, key2, sizeof(key2)) == 0);
 
-    skip_list_cursor_free(cursor);
-    skip_list_destroy(list);
+    (void)skip_list_cursor_free(cursor);
+    (void)skip_list_destroy(list);
     printf(GREEN "test_skip_list_cursor_next passed\n" RESET);
 }
 
@@ -182,21 +182,45 @@ void test_skip_list_cursor_prev()
     assert(cursor->current != NULL);
     assert(memcmp(cursor->current->key, key1, sizeof(key1)) == 0);
 
-    skip_list_cursor_free(cursor);
-    skip_list_destroy(list);
+    (void)skip_list_cursor_free(cursor);
+    (void)skip_list_destroy(list);
     printf(GREEN "test_skip_list_cursor_prev passed\n" RESET);
 }
 
 void benchmark_skip_list()
 {
+    /* random key-value pairs */
     skip_list_t *list = skip_list_new(12, 0.24f);
-    const size_t num_entries = 100000;
-    const size_t key_size = 10;
-    const size_t value_size = 20;
+    const size_t num_entries = 1000000;
+    const size_t key_size = 16;
+    const size_t value_size = 8;
 
     /* allocate memory for keys and values */
-    uint8_t keys[num_entries][key_size];
-    uint8_t values[num_entries][value_size];
+    uint8_t **keys = malloc(num_entries * sizeof(uint8_t *));
+    uint8_t **values = malloc(num_entries * sizeof(uint8_t *));
+    if (keys == NULL || values == NULL)
+    {
+        printf(RED "Failed to allocate memory for keys and values\n" RESET);
+        return;
+    }
+
+    for (size_t i = 0; i < num_entries; i++)
+    {
+        keys[i] = malloc(key_size * sizeof(uint8_t));
+        values[i] = malloc(value_size * sizeof(uint8_t));
+        if (keys[i] == NULL || values[i] == NULL)
+        {
+            for (size_t j = 0; j <= i; j++)
+            {
+                free(keys[j]);
+                free(values[j]);
+            }
+            free(keys);
+            free(values);
+            printf(RED "Failed to allocate memory for keys and values\n" RESET);
+            return;
+        }
+    }
 
     /* generate random key-value pairs */
     for (size_t i = 0; i < num_entries; i++)
@@ -212,7 +236,7 @@ void benchmark_skip_list()
     }
     clock_t end_write = clock();
     double write_time = (double)(end_write - start_write) / CLOCKS_PER_SEC;
-    printf(BLUE "Time taken to write %zu entries: %f seconds\n" RESET, num_entries, write_time);
+    printf("Time taken to write %zu entries: %f seconds\n", num_entries, write_time);
 
     /* benchmark reading and verifying */
     clock_t start_read = clock();
@@ -228,8 +252,16 @@ void benchmark_skip_list()
     }
     clock_t end_read = clock();
     double read_time = (double)(end_read - start_read) / CLOCKS_PER_SEC;
-    printf(BLUE "Time taken to read and verify %zu entries: %f seconds\n" RESET, num_entries,
-           read_time);
+    printf("Time taken to read and verify %zu entries: %f seconds\n", num_entries, read_time);
+
+    /* free allocated memory */
+    for (size_t i = 0; i < num_entries; i++)
+    {
+        free(keys[i]);
+        free(values[i]);
+    }
+    free(keys);
+    free(values);
 
     skip_list_destroy(list);
 }
@@ -309,8 +341,85 @@ void example()
         }
     } while (skip_list_cursor_next(cursor) == 0);
 
-    skip_list_cursor_free(cursor);
-    skip_list_destroy(list);
+    (void)skip_list_cursor_free(cursor);
+    (void)skip_list_destroy(list);
+}
+
+void test_skip_list_cursor_functions()
+{
+    /* create a new skip list */
+    skip_list_t *list = skip_list_new(4, 0.5);
+    assert(list != NULL);
+
+    /* initialize cursor */
+    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    assert(cursor != NULL);
+
+    /* test cursor on empty list */
+    assert(skip_list_cursor_has_next(cursor) == -1);
+    assert(skip_list_cursor_has_prev(cursor) == -1);
+    assert(skip_list_cursor_goto_first(cursor) == -1);
+    assert(skip_list_cursor_goto_last(cursor) == -1);
+
+    (void)skip_list_cursor_free(cursor);
+
+    /* add entries */
+    uint8_t key1[] = {1};
+    uint8_t value1[] = {10};
+    assert(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
+
+    uint8_t key2[] = {2};
+    uint8_t value2[] = {20};
+    assert(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
+
+    uint8_t key3[] = {3};
+    uint8_t value3[] = {30};
+    assert(skip_list_put(list, key3, sizeof(key3), value3, sizeof(value3), -1) == 0);
+
+    /* reinitialize cursor */
+    cursor = skip_list_cursor_init(list);
+    assert(cursor != NULL);
+
+    /* test cursor functionality */
+    assert(skip_list_cursor_goto_first(cursor) == 0);
+    assert(skip_list_cursor_has_next(cursor) == 1);
+    assert(skip_list_cursor_has_prev(cursor) == 0);
+
+    uint8_t *key;
+    size_t key_size;
+    uint8_t *value;
+    size_t value_size;
+    time_t ttl;
+
+    /* check first entry */
+    assert(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl) == 0);
+    assert(key_size == sizeof(key1));
+    assert(memcmp(key, key1, key_size) == 0);
+    assert(value_size == sizeof(value1));
+    assert(memcmp(value, value1, value_size) == 0);
+
+    assert(skip_list_cursor_next(cursor) == 0);
+    assert(skip_list_cursor_has_next(cursor) == 1);
+    assert(skip_list_cursor_has_prev(cursor) == 1);
+
+    assert(skip_list_cursor_next(cursor) == 0);
+    assert(skip_list_cursor_has_next(cursor) == 0);
+    assert(skip_list_cursor_has_prev(cursor) == 1);
+
+    /* check last entry */
+    assert(skip_list_cursor_goto_last(cursor) == 0);
+    assert(skip_list_cursor_has_next(cursor) == 0);
+    assert(skip_list_cursor_has_prev(cursor) == 1);
+
+    assert(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl) == 0);
+    assert(key_size == sizeof(key3));
+    assert(memcmp(key, key3, key_size) == 0);
+    assert(value_size == sizeof(value3));
+    assert(memcmp(value, value3, value_size) == 0);
+
+    /* clean upp */
+    (void)skip_list_cursor_free(cursor);
+    assert(skip_list_destroy(list) == 0);
 }
 
 int main(void)
@@ -325,6 +434,7 @@ int main(void)
     test_skip_list_cursor_init();
     test_skip_list_cursor_next();
     test_skip_list_cursor_prev();
+    test_skip_list_cursor_functions();
     test_skip_list_ttl();
     benchmark_skip_list();
 

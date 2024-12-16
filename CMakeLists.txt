@@ -21,7 +21,7 @@ install(TARGETS tidesdb
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
 
-install(FILES src/tidesdb.c src/tidesdb.h src/err.c src/err.h src/block_manager.c src/block_manager.h src/skip_list.c src/skip_list.h src/compress.c src/compress.h src/bloom_filter.c src/bloom_filter.h DESTINATION include)
+install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/compress.h src/bloom_filter.h DESTINATION include)
 enable_testing()
 
 add_executable(err_tests test/err__tests.c)

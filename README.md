@@ -12,7 +12,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 
 ## Features
 - [x] **ACID** transactions are atomic, consistent, isolated, and durable.  Transactions are tied to their respective column family.
-- [x] **Concurrent** multiple threads can read and write to the storage engine. The memtable(skip list) uses a read-write lock which means multiple readers and one writer. SSTables are sorted, immutable. Transactions are also thread-safe.  A memtable is created for each column family.
+- [x] **Concurrent** multiple threads can read and write to the storage engine. Column families use a read-write lock thus allowing multiple readers and a single writer per column family.  Transactions block other threads from reading or writing to the column family until the transaction is committed or rolled back.  A transaction is thread safe.
 - [x] **Column Families** store data in separate key-value stores.  Each column family has their own memtable and sstables.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically.  When a transaction fails, it rolls back all operations.
 - [x] **Cursor** iterate over key-value pairs forward and backward.

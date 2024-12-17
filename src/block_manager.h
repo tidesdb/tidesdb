@@ -26,17 +26,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define MAX_FILE_PATH_LENGTH 1024 /* the max file path length */
+#define MAX_FILE_PATH_LENGTH 1024 /* max file path length for block manager file(s) */
 
 /**
  * block_manager_t
  * block manager struct
  * used for block managers in TidesDB
- * @param file the file the block manager is on
+ * @param file the file the block manager is managing
  * @param file_path the path of the file
  * @param fsync_thread the fsync thread
  * @param fsync_interval the fsync interval
- * @param stop_fsync_thread the stop fsync thread
+ * @param stop_fsync_thread flag to stop fsync thread
  */
 typedef struct
 {
@@ -52,7 +52,7 @@ typedef struct
  * block struct
  * used for blocks in TidesDB
  * @param size the size of the block
- * @param data the data of the block
+ * @param data the data in the block
  */
 typedef struct
 {
@@ -87,7 +87,7 @@ int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_
 
 /**
  * block_manager_close
- * closes a block manager
+ * closes a block manager gracefully
  * @param bm the block manager to close
  * @return 0 if successful, -1 if not
  */
@@ -96,8 +96,8 @@ int block_manager_close(block_manager_t *bm);
 /**
  * block_manager_block_create
  * creates a new block
- * @param size the size of the block
- * @param data the data of the block
+ * @param size the size of the data in block
+ * @param data the data to be placed in block
  * @return a new block
  */
 block_manager_block_t *block_manager_block_create(uint64_t size, void *data);
@@ -113,7 +113,7 @@ int block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
 
 /**
  * block_manager_block_read
- * reads a block from a file
+ * reads a block from a file at current position
  * @param bm the block manager to read the block from
  * @return the block read from the file
  */
@@ -176,7 +176,7 @@ void *block_manager_fsync_thread(void *arg);
 
 /**
  * block_manager_truncate
- * truncates a block manager
+ * truncates a block manager to 0
  * @param bm the block manager to truncate
  * @return 0 if successful, -1 if not
  */
@@ -202,7 +202,7 @@ int block_manager_count_blocks(block_manager_t *bm);
  * block_manager_cursor_has_next
  * checks if the cursor has a next block
  * @param cursor the cursor to check
- * @return 1 if the cursor has a next block, 0 if not
+ * @return 1 if the cursor has a next block, 0 if not.  Can return -1 if error
  */
 int block_manager_cursor_has_next(block_manager_cursor_t *cursor);
 
@@ -210,7 +210,7 @@ int block_manager_cursor_has_next(block_manager_cursor_t *cursor);
  * block_manager_cursor_has_prev
  * checks if the cursor has a previous block
  * @param cursor the cursor to check
- * @return 1 if the cursor has a previous block, 0 if not
+ * @return 1 if the cursor has a previous block, 0 if not.  Can return -1 if error
  */
 int block_manager_cursor_has_prev(block_manager_cursor_t *cursor);
 

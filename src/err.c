@@ -49,24 +49,23 @@ tidesdb_err_t* tidesdb_err_new(int code, char* message)
 
 void tidesdb_err_free(tidesdb_err_t* e)
 {
-    /* Check if e is NULL */
+    /* check if err is NULL */
     if (e == NULL) return;
 
-    /* Free the message if it was dynamically allocated */
     if (e->message)
     {
         free(e->message);
         e->message = NULL;
     }
 
-    /* Free the error struct */
+    /* free the error struct */
     free(e);
     e = NULL;
 }
 
 tidesdb_err_t* tidesdb_err_from_code(TIDESDB_ERR_CODE code, ...)
 {
-    char buffer[256];
+    char buffer[TDB_ERR_MAX_MESSAGE_SIZE];
     va_list args;
     va_start(args, code);
 

@@ -145,13 +145,13 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
                                                        key, key_size) < 0)
         {
             x = x->forward[i];
-            skip_list_check_and_update_ttl(list, x);
+            (void)skip_list_check_and_update_ttl(list, x);
         }
         update[i] = x;
     }
 
     x = x->forward[0];
-    skip_list_check_and_update_ttl(list, x);
+    (void)skip_list_check_and_update_ttl(list, x);
 
     if (x && skip_list_compare_keys(x->key, x->key_size, key, key_size) == 0)
     {
@@ -222,12 +222,12 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
                                                        key, key_size) < 0)
         {
             x = x->forward[i];
-            skip_list_check_and_update_ttl(list, x);
+            (void)skip_list_check_and_update_ttl(list, x);
         }
     }
 
     x = x->forward[0];
-    skip_list_check_and_update_ttl(list, x);
+    (void)skip_list_check_and_update_ttl(list, x);
 
     if (x && skip_list_compare_keys(x->key, x->key_size, key, key_size) == 0)
     {
@@ -268,7 +268,7 @@ int skip_list_cursor_next(skip_list_cursor_t *cursor)
     if (cursor->current != NULL && cursor->current->forward[0] != NULL)
     {
         cursor->current = cursor->current->forward[0];
-        skip_list_check_and_update_ttl(cursor->list, cursor->current);
+        (void)skip_list_check_and_update_ttl(cursor->list, cursor->current);
 
         return 0;
     }
@@ -287,13 +287,13 @@ int skip_list_cursor_prev(skip_list_cursor_t *cursor)
     {
         prev = x->forward[0];
         x = x->forward[0];
-        skip_list_check_and_update_ttl(cursor->list, x);
+        (void)skip_list_check_and_update_ttl(cursor->list, x);
     }
 
     if (prev != NULL)
     {
         cursor->current = prev;
-        skip_list_check_and_update_ttl(cursor->list, cursor->current);
+        (void)skip_list_check_and_update_ttl(cursor->list, cursor->current);
         return 0;
     }
 
@@ -372,8 +372,8 @@ skip_list_t *skip_list_copy(skip_list_t *list)
     skip_list_node_t *current = list->header->forward[0];
     while (current != NULL)
     {
-        skip_list_put(new_list, current->key, current->key_size, current->value,
-                      current->value_size, current->ttl);
+        (void)skip_list_put(new_list, current->key, current->key_size, current->value,
+                            current->value_size, current->ttl);
         current = current->forward[0];
     }
 

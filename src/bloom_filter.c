@@ -20,14 +20,26 @@
 
 int bloom_filter_new(bloom_filter_t **bf, double p, int n)
 {
+    /* alloc memory for the bloom filter structure */
     *bf = malloc(sizeof(bloom_filter_t));
     if (*bf == NULL)
     {
         return -1;
     }
 
+    /* calculate the size of the bitset (m) using the formula
+     * m = -n * ln(p) / (ln(2)^2)
+     *
+     */
     (*bf)->m = (int)ceil(-((double)n) * log(p) / (M_LN2 * M_LN2));
+
+    /* calculate the number of hash functions (h) using the formula
+     * h = (m / n) * ln(2)
+     *
+     */
     (*bf)->h = (int)ceil(((double)(*bf)->m) / n * M_LN2);
+
+    /* alloc memory for the bitset and initialize it to 0 */
     (*bf)->bitset = calloc((*bf)->m, sizeof(int8_t));
     if ((*bf)->bitset == NULL)
     {
@@ -76,43 +88,47 @@ int bloom_filter_is_full(bloom_filter_t *bf)
 
 unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
 {
-    const uint32_t m = 0xc6a4a793;
-    const uint32_t r = 24;
-    const uint8_t *limit = entry + size;
-    uint32_t h = seed ^ (size * m);
+    /* local constants */
+    const uint32_t m = 0xc6a4a793;       /*  large prime */
+    const uint32_t r = 24;               /* right shift value */
+    const uint8_t *limit = entry + size; /* pointer to the end of the entry */
+    uint32_t h = seed ^ (size * m);      /* initial hash value based on seed and size */
 
-    /* four at a time */
+    /* we process the entry 4 bytes at a time */
     while (entry + 4 <= limit)
     {
+        /* we decode the 4 bytes into a 32-bit unsigned integer */
         uint32_t w = decode_fixed_32((const char *)entry);
-        entry += 4;
-        h += w;
-        h *= m;
-        h ^= (h >> 16);
+        entry += 4;     /* move the pointer forward by 4 bytes */
+        h += w;         /** add the decoded value to the hash */
+        h *= m;         /* multiply the hash by the large prime number */
+        h ^= (h >> 16); /* xor the hash with its right-shifted value */
     }
 
-    /* pick up remaining */
+    /* process any remaining bytes (less than 4) */
     switch (limit - entry)
     {
         case 3:
-            h += (uint8_t)entry[2] << 16;
+            h += (uint8_t)entry[2] << 16; /* add the third byte shifted left by 16 bits */
         /* fall through */
         case 2:
-            h += (uint8_t)entry[1] << 8;
+            h += (uint8_t)entry[1] << 8; /* add the second byte shifted left by 8 bits */
         /* fall through */
         case 1:
-            h += (uint8_t)entry[0];
-            h *= m;
-            h ^= (h >> r);
+            h += (uint8_t)entry[0]; /*add the first byte*/
+            h *= m;                 /* multiply the hash by the large prime */
+            h ^= (h >> r);          /* xor the hash with its right-shifted value */
             break;
     }
+
     return h;
 }
+
 uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
 {
     /* calculate the size of the serialized data */
     *out_size = sizeof(int32_t) * 2 + bf->m * sizeof(int8_t);
-    uint8_t *buffer = (uint8_t *)malloc(*out_size);
+    uint8_t *buffer = malloc(*out_size);
     uint8_t *ptr = buffer;
 
     /* write the size of the bitset (m) */
@@ -159,6 +175,7 @@ void bloom_filter_free(bloom_filter_t *bf)
 {
     free(bf->bitset);
     free(bf);
+    bf = NULL;
 }
 
 uint32_t decode_fixed_32(const char *data)

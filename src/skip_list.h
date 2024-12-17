@@ -117,7 +117,7 @@ skip_list_t *skip_list_new(int max_level, float probability);
  * skip_list_destroy
  * destroy a skip list
  * @param list the skip list to destroy
- * @return 0 if the skip list was destroyed successfully, -1 otherwise
+ * @return 0 if the skip list was destroyed successfully, -1 otherwise on error
  */
 int skip_list_destroy(skip_list_t *list);
 
@@ -163,7 +163,7 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
  * @param key_size the key size
  * @param value the value
  * @param value_size the value size
- * @return 0 if the value was retrieved successfully, -1 otherwise
+ * @return 0 if the value was retrieved successfully, -1 otherwise on error
  */
 int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
                   size_t *value_size);
@@ -180,7 +180,7 @@ skip_list_cursor_t *skip_list_cursor_init(skip_list_t *list);
  * skip_list_cursor_next
  * move the cursor to the next node
  * @param cursor the cursor
- * @return 0 if the cursor was moved successfully, -1 otherwise
+ * @return 0 if the cursor was moved successfully, -1 otherwise on error
  */
 int skip_list_cursor_next(skip_list_cursor_t *cursor);
 
@@ -188,7 +188,7 @@ int skip_list_cursor_next(skip_list_cursor_t *cursor);
  * skip_list_cursor_prev
  * move the cursor to the previous node
  * @param cursor the cursor
- * @return 0 if the cursor was moved successfully, -1 otherwise
+ * @return 0 if the cursor was moved successfully, -1 otherwise on error
  */
 int skip_list_cursor_prev(skip_list_cursor_t *cursor);
 
@@ -201,7 +201,7 @@ int skip_list_cursor_prev(skip_list_cursor_t *cursor);
  * @param value the value
  * @param value_size the value size
  * @param ttl the expiration time of the node
- * @return 0 if the key and value were retrieved successfully, -1 otherwise
+ * @return 0 if the key and value were retrieved successfully, -1 otherwise on error
  */
 int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_size,
                          uint8_t **value, size_t *value_size, time_t *ttl);
@@ -217,7 +217,7 @@ void skip_list_cursor_free(skip_list_cursor_t *cursor);
  * skip_list_clear
  * clear the skip list
  * @param list the skip list
- * @return 0 if the skip list was cleared successfully, -1 otherwise
+ * @return 0 if the skip list was cleared successfully, -1 otherwise on error
  */
 int skip_list_clear(skip_list_t *list);
 
@@ -273,7 +273,7 @@ int skip_list_cursor_at_end(skip_list_cursor_t *cursor);
  * skip_list_cursor_has_next
  * check if the cursor has a next node
  * @param cursor the cursor
- * @return 0 or 1 if the cursor has a next node, -1 otherwise
+ * @return 0 or 1 if the cursor has a next node, -1 otherwise on error
  */
 int skip_list_cursor_has_next(skip_list_cursor_t *cursor);
 
@@ -281,7 +281,7 @@ int skip_list_cursor_has_next(skip_list_cursor_t *cursor);
  * skip_list_cursor_has_prev
  * check if the cursor has a previous node
  * @param cursor the cursor
- * @return 0 or 1 if the cursor has a previous node, -1 otherwise
+ * @return 0 or 1 if the cursor has a previous node, -1 otherwise on error
  */
 int skip_list_cursor_has_prev(skip_list_cursor_t *cursor);
 
@@ -289,7 +289,7 @@ int skip_list_cursor_has_prev(skip_list_cursor_t *cursor);
  * skip_list_cursor_goto_last
  * move the cursor to the last node in the skip list
  * @param cursor the cursor
- * @return 0 if the cursor was moved successfully, -1 otherwise
+ * @return 0 if the cursor was moved successfully, -1 otherwise on error
  */
 int skip_list_cursor_goto_last(skip_list_cursor_t *cursor);
 
@@ -297,7 +297,7 @@ int skip_list_cursor_goto_last(skip_list_cursor_t *cursor);
  * skip_list_cursor_goto_first
  * move the cursor to the first node in the skip list
  * @param cursor the cursor
- * @return 0 if the cursor was moved successfully, -1 otherwise
+ * @return 0 if the cursor was moved successfully, -1 otherwise on error
  */
 int skip_list_cursor_goto_first(skip_list_cursor_t *cursor);
 

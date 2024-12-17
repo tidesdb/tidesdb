@@ -53,8 +53,8 @@ void test_tidesdb_serialize_deserialize_column_family_config()
 {
     tidesdb_column_family_config_t config = {.name = "test_family",
                                              .flush_threshold = 100,
-                                             .max_level = 5,
-                                             .probability = 0.75,
+                                             .max_level = 12,
+                                             .probability = 0.24f,
                                              .compressed = true,
                                              .compress_algo = TDB_COMPRESS_LZ4,
                                              .bloom_filter = false};

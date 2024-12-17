@@ -3323,6 +3323,7 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
 {
     /* we check if cursor is invalid */
     if (cursor == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
+
     /* get column family read lock */
     if (pthread_rwlock_rdlock(&cursor->cf->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");

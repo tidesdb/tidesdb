@@ -1,3 +1,4 @@
+# build instructions--
 # cmake -S . -B build
 # cmake --build build
 # cmake --install build
@@ -30,7 +31,7 @@ install(TARGETS tidesdb
 
 install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/compress.h src/bloom_filter.h DESTINATION include)
 
-if(TIDESDB_BUILD_TESTS)
+if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         enable_testing()
 
         add_executable(err_tests test/err__tests.c)
@@ -39,6 +40,7 @@ if(TIDESDB_BUILD_TESTS)
         add_executable(compress_tests test/compress__tests.c)
         add_executable(bloom_filter_tests test/bloom_filter__tests.c)
         add_executable(tidesdb_tests test/tidesdb__tests.c)
+        add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
         target_link_libraries(err_tests tidesdb m zstd snappy lz4)
         target_link_libraries(block_manager_tests tidesdb m zstd snappy lz4)
@@ -46,6 +48,7 @@ if(TIDESDB_BUILD_TESTS)
         target_link_libraries(compress_tests tidesdb m zstd snappy lz4)
         target_link_libraries(bloom_filter_tests tidesdb m zstd snappy lz4)
         target_link_libraries(tidesdb_tests tidesdb m zstd snappy lz4)
+        target_link_libraries(tidesdb_bench tidesdb m zstd snappy lz4)
 
         add_test(NAME err_tests COMMAND err_tests)
         add_test(NAME block_manager_tests COMMAND block_manager_tests)
@@ -53,6 +56,7 @@ if(TIDESDB_BUILD_TESTS)
         add_test(NAME compress_tests COMMAND compress_tests)
         add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
         add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
+        add_test(NAME tidesdb_bench COMMAND tidesdb_bench)
 endif()
 
 include(CMakePackageConfigHelpers)

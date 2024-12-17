@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define TDB_ERR_MAX_MESSAGE_SIZE 1024
+
 /*
  * tidesdb_err_t
  * the TidesDB error struct

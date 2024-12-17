@@ -20,8 +20,8 @@
 
 uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size, compress_type type)
 {
-    uint8_t *compressed_data = NULL;
-    size_t total_size;
+    uint8_t *compressed_data = NULL; /* the final compressed data */
+    size_t total_size;               /* the total size of the compressed data */
 
     switch (type)
     {
@@ -78,7 +78,7 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
 uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_size,
                          compress_type type)
 {
-    uint8_t *decompressed_data = NULL;
+    uint8_t *decompressed_data = NULL; /* the final decompressed data */
 
     switch (type)
     {

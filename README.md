@@ -5,23 +5,23 @@
 TidesDB is a fast and efficient key value storage engine library written in C.
 The underlying data structure is based on a log-structured merge-tree (LSM-tree).
 
-It is not a full-featured database, but rather a library that can be used to build a database atop of.
+It is not a full-featured database, but rather a library that can be used to build a database atop of or used as a standalone key-value/column store.
 
 > [!CAUTION]
 > master is in active development.  v0.2.0 is the projected stable first release.  We are in the final stages of testing and documentation.
 
 ## Features
-- [x] **ACID** transactions are atomic, consistent, isolated, and durable.
-- [x] **Concurrent** multiple threads can read and write to the storage engine. The memtable(skip list) uses an RW lock which means multiple readers and one true writer. SSTables are sorted, immutable. Transactions are also thread-safe.
+- [x] **ACID** transactions are atomic, consistent, isolated, and durable.  Transactions are tied to their respective column family.
+- [x] **Concurrent** multiple threads can read and write to the storage engine. The memtable(skip list) uses a read-write lock which means multiple readers and one writer. SSTables are sorted, immutable. Transactions are also thread-safe.  A memtable is created for each column family.
 - [x] **Column Families** store data in separate key-value stores.  Each column family has their own memtable and sstables.
-- [x] **Atomic Transactions** commit or rollback multiple operations atomically.  Rollsback all operations if one fails within a transaction.
+- [x] **Atomic Transactions** commit or rollback multiple operations atomically.  When a transaction fails, it rolls back all operations.
 - [x] **Cursor** iterate over key-value pairs forward and backward.
-- [x] **WAL** write-ahead logging for durability. Replays memtable column families on startup.
+- [x] **WAL** write-ahead logging for durability. Column families replay WAL on startup.  This reconstructs memtable if the column family did not reach threshold prior to shutdown.
 - [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
 - [x] **Bloom Filters** reduce disk reads by reading initial blocks of sstables to check key existence.
 - [x] **Compression** compression is achieved with Snappy, or LZ4, or ZSTD.  SStable entries can be compressed as well as WAL entries.
 - [x] **TTL** time-to-live for key-value pairs.
-- [x] **Configurable** many options are configurable for the engine, and column families.
+- [x] **Configurable** column families are configurable with memtable flush threshold, skiplist max level, skiplist probability, compression, and bloom filters.
 - [x] **Error Handling** API functions return an error code and message.
 - [x] **Easy API** simple and easy to use api.
 
@@ -34,7 +34,6 @@ cmake --install build
 ```
 
 ## Bindings
-
 <ul>
     <li><img src="artwork/cpp.png" width="16" style="float: left; margin-right: 10px;" /> <a href="https://github.com/tidesdb/tidesdb-cpp">tidesdb-cpp</a></li>
     <li><img src="artwork/go.png" width="16" style="float: left; margin-right: 10px;" /> <a href="https://github.com/tidesdb/tidesdb-go">tidesdb-go</a></li>
@@ -42,6 +41,14 @@ cmake --install build
     <li><img src="artwork/python.png" width="16" style="float: left; margin-right: 10px;" /> <a href="https://github.com/tidesdb/tidesdb-python">tidesdb-python</a></li>
     <li><img src="artwork/rust.png" width="16" style="float: left; margin-right: 10px;" /> <a href="https://github.com/tidesdb/tidesdb-rust">tidesdb-rust</a></li>
 </ul>
+
+## What's coming ?
+- [ ] **Windows Support** - Windows support is coming soon.
+
+## Dependencies
+- [Snappy](https://github.com/google/snappy)
+- [LZ4](https://github.com/lz4/lz4)
+- [Zstandard](https://github.com/facebook/zstd)
 
 ## Include
 ```c
@@ -61,7 +68,7 @@ typedef struct
 ```
 
 ### Opening a database
-To open a new database you need to create a configuration and then open the database.
+To open a database you pass the path to the database directory and a pointer to the database.
 ```c
 
 tidesdb_t tdb = NULL;
@@ -85,8 +92,9 @@ free(tdb_config);
 ```
 
 ### Creating a column family
-In order to store data in TidesDB you need a column family.
-You pass
+In order to store data in TidesDB you need a column family.  This is by design.
+
+**You pass**
 - the database you want to create the column family in.  Must be open
 - the name of the column family
 - memtable flush threshold in bytes.  Example below is 128MB
@@ -97,7 +105,7 @@ You pass
 - whether to use bloom filters
 
 ```c
-/* create a column family */
+/* create a column family with no compression and no bloom filters (slower reads) */
 tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false, TDB_NO_COMPRESSION, false);
 if (e != NULL)
 {
@@ -108,7 +116,7 @@ if (e != NULL)
 
 Using Snappy compression and bloom filters for column family sstables
 ```c
-/* create a column family */
+/* create a column family with compression and bloom filter (the bloom filter provides fast read speed) */
 tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, true, TDB_COMPRESS_SNAPPY, true);
 if (e != NULL)
 {
@@ -225,7 +233,7 @@ if (e != NULL)
 ```
 
 ### Transactions
-You can perform a series of operations atomically.  This will block other threads from reading or writing to the database until the transaction is committed or rolled back.
+You can perform a series of operations atomically.  This will block other threads from reading or writing to the column family until the transaction is committed or rolled back.
 
 You begin a transaction by calling `tidesdb_txn_begin`.
 
@@ -354,7 +362,8 @@ tidesdb_cursor_free(c);
 ```
 
 ### Compaction
-You can manually compact sstables.
+You can manually compact sstables.  This method pairs and merges column family sstables.
+Say you have 100, after compaction you will have 50; Always half the amount you had prior.  You can set the number of threads to use for compaction.
 ```c
 tidesdb_err_t *e = tidesdb_compact_sstables(tdb, "your_column_family", 10); /* use 10 threads */
 if (e != NULL)
@@ -369,6 +378,10 @@ if (e != NULL)
 Multiple
 
 ```
-Mozilla Public License Version 2.0
-BSD 2-Clause license
+Mozilla Public License Version 2.0 (TidesDB)
+
+-- AND --
+BSD 3 Clause (Snappy)
+BSD 2 (LZ4)
+BSD (Zstandard)
 ```

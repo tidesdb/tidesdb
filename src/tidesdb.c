@@ -2923,11 +2923,30 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
         switch (op.op_code)
         {
             case TIDESDB_OP_PUT:
+                /* append to wal */
+
+                if (_tidesdb_append_to_wal(txn->cf->wal, op.kv->key, op.kv->key_size, op.kv->value,
+                                           op.kv->value_size, op.kv->ttl, TIDESDB_OP_PUT,
+                                           op.cf_name) == -1)
+                {
+                    /* unlock the column family */
+                    (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+
+                    /* unlock the transaction */
+                    (void)pthread_mutex_unlock(&txn->lock);
+
+                    /* we rollback the transaction */
+                    return tidesdb_txn_rollback(txn);
+                }
+
                 if (skip_list_put(txn->cf->memtable, op.kv->key, op.kv->key_size, op.kv->value,
                                   op.kv->value_size, op.kv->ttl) == -1)
                 {
                     /* unlock the column family */
                     (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+
+                    /* unlock the transaction */
+                    (void)pthread_mutex_unlock(&txn->lock);
 
                     /* we rollback the transaction */
                     return tidesdb_txn_rollback(txn);
@@ -2936,11 +2955,27 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                 txn->ops[i].committed = true;
                 break;
             case TIDESDB_OP_DELETE:
+                if (_tidesdb_append_to_wal(txn->cf->wal, op.kv->key, op.kv->key_size, op.kv->value,
+                                           4, op.kv->ttl, TIDESDB_OP_PUT, op.cf_name) == -1)
+                {
+                    /* unlock the column family */
+                    (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+
+                    /* unlock the transaction */
+                    (void)pthread_mutex_unlock(&txn->lock);
+
+                    /* we rollback the transaction */
+                    return tidesdb_txn_rollback(txn);
+                }
+
                 if (skip_list_put(txn->cf->memtable, op.kv->key, op.kv->key_size, op.kv->value, 4,
                                   0) == -1)
                 {
-                    /* unlock the memtable */
+                    /* unlock the column family */
                     (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+
+                    /* unlock the transaction */
+                    (void)pthread_mutex_unlock(&txn->lock);
 
                     /* we rollback the transaction */
                     return tidesdb_txn_rollback(txn);
@@ -2994,6 +3029,20 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
         if (txn->ops[i].committed)
         {
             tidesdb_operation_t op = *txn->ops[i].rollback_op;
+
+            /* append to wal */
+            if (_tidesdb_append_to_wal(txn->cf->wal, op.kv->key, op.kv->key_size, op.kv->value,
+                                       op.kv->value_size, op.kv->ttl, TIDESDB_OP_PUT,
+                                       op.cf_name) == -1)
+            {
+                /* unlock the column family */
+                (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+
+                /* unlock the transaction */
+                (void)pthread_mutex_unlock(&txn->lock);
+
+                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_APPEND_TO_WAL);
+            }
 
             /* we put back the key-value pair */
             (void)skip_list_put(txn->cf->memtable, op.kv->key, op.kv->key_size, op.kv->value,

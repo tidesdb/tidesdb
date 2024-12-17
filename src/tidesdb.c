@@ -3093,7 +3093,6 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
     if (pthread_rwlock_unlock(&txn->cf->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
 
-
     return NULL;
 }
 
@@ -3140,8 +3139,19 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
     /* we get the column family */
     tidesdb_column_family_t *cf = NULL;
 
+    /* we need to get read lock for the db */
+    if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "db");
+
     if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
+    {
+        (void)pthread_rwlock_unlock(&tdb->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
+    }
+
+    /* we unlock the db */
+    if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
 
     /* we allocate memory for the new cursor */
     *cursor = malloc(sizeof(tidesdb_cursor_t));
@@ -3235,6 +3245,7 @@ tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
                     if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
                         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK,
                                                      "column family");
+
                     return NULL;
                 }
             }
@@ -3273,10 +3284,11 @@ tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
         return tidesdb_err_from_code(TIDESDB_ERR_AT_END_OF_CURSOR);
     }
 
+    cursor->sstable_index--; /* move to the next sstable */
+
     /* we check if there are more sstables */
-    if (cursor->sstable_index > 0)
+    if (cursor->sstable_index != -1)
     {
-        cursor->sstable_index--; /* move to the next sstable */
         if (block_manager_cursor_init(&cursor->sstable_cursor,
                                       cursor->cf->sstables[cursor->sstable_index]->block_manager) ==
             -1)
@@ -3327,6 +3339,12 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
                 (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
                 return NULL;
             }
+        }
+
+        if (cursor->cf->num_sstables == 0)
+        {
+            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+            return tidesdb_err_from_code(TIDESDB_ERR_AT_START_OF_CURSOR);
         }
 
         if (cursor->sstable_cursor == NULL)
@@ -3384,8 +3402,6 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
     if (pthread_rwlock_rdlock(&cursor->cf->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
 
-    time_t ttl = time(NULL); /* for memtable cursor */
-
     block_manager_block_t *block;
     while ((block = block_manager_cursor_read(cursor->sstable_cursor)) != NULL)
     {
@@ -3440,16 +3456,32 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
         return NULL;
     }
 
-    while (skip_list_cursor_get(cursor->memtable_cursor, key, key_size, value, value_size, &ttl) ==
-           0)
+    uint8_t *k;
+    uint8_t *v;
+    time_t ttl = time(NULL);
+
+    while (skip_list_cursor_get(cursor->memtable_cursor, &k, key_size, &v, value_size, &ttl) == 0)
     {
-        if (!_tidesdb_is_tombstone(*value, *value_size))
+        if (!_tidesdb_is_tombstone(v, *value_size))
         {
             (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+            *key = malloc(*key_size);
+            if (*key == NULL)
+            {
+                return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "key");
+            }
+
+            *value = malloc(*value_size);
+            if (*value == NULL)
+            {
+                free(*key);
+                return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "value");
+            }
+
+            memcpy(*key, k, *key_size);
+            memcpy(*value, v, *value_size);
             return NULL;
         }
-        free(*key);
-        free(*value);
     }
 
     if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)

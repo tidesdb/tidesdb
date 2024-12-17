@@ -40,6 +40,9 @@
 #define TDB_SYNC_INTERVAL                 0.24       /* interval for syncing mainly WAL */
 #define TDB_BLOOMFILTER_P                 0.01       /*  the false positive rate for bloom filter */
 #define TDB_SSTABLE_PREFIX                "sstable_" /* prefix for SSTable files */
+#define TDB_FLUSH_THRESHOLD               1048576    /* default flush threshold for column family */
+#define TDB_MIN_MAX_LEVEL                 5          /* minimum max level for column family */
+#define TDB_MIN_PROBABILITY               0.1        /* minimum probability for column family */
 
 /*
  * tidesdb_compression_algo_t

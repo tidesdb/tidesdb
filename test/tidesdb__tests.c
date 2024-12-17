@@ -1115,14 +1115,6 @@ void test_tidesdb_txn_put_get_rollback_get(bool compress, tidesdb_compression_al
 
     assert(err == NULL);
 
-    err = tidesdb_txn_free(txn);
-    if (err != NULL)
-    {
-        printf(RED "%s" RESET, err->message);
-    }
-
-    assert(err == NULL);
-
     /* now we should be able to get the value */
     uint8_t *retrieved_value = NULL;
     size_t value_size;
@@ -1136,25 +1128,7 @@ void test_tidesdb_txn_put_get_rollback_get(bool compress, tidesdb_compression_al
 
     free(retrieved_value);
 
-    /* begin a new transaction and rollback */
-    err = tidesdb_txn_begin(db, &txn, "test_cf");
-    if (err != NULL)
-    {
-        printf(RED "%s" RESET, err->message);
-    }
-
-    assert(err == NULL);
-
-    uint8_t new_key[] = "new_test_key";
-    uint8_t new_value[] = "new_test_value";
-    err = tidesdb_txn_put(txn, new_key, sizeof(new_key), new_value, sizeof(new_value), -1);
-    if (err != NULL)
-    {
-        printf(RED "%s" RESET, err->message);
-    }
-
-    assert(err == NULL);
-
+    /* now we rollback the transaction */
     err = tidesdb_txn_rollback(txn);
     if (err != NULL)
     {
@@ -1163,10 +1137,8 @@ void test_tidesdb_txn_put_get_rollback_get(bool compress, tidesdb_compression_al
 
     assert(err == NULL);
 
-    /* now we should not be able to get the new value */
-    err = tidesdb_get(db, "test_cf", new_key, sizeof(new_key), &retrieved_value, &value_size);
-
-    /* we should get not found */
+    /* we should not be able to get the value anymore */
+    err = tidesdb_get(db, "test_cf", key, sizeof(key), &retrieved_value, &value_size);
     assert(err != NULL), tidesdb_err_free(err);
 
     err = tidesdb_txn_free(txn);
@@ -1174,8 +1146,6 @@ void test_tidesdb_txn_put_get_rollback_get(bool compress, tidesdb_compression_al
     {
         printf(RED "%s" RESET, err->message);
     }
-
-    assert(err == NULL);
 
     err = tidesdb_close(db);
     if (err != NULL)

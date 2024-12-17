@@ -3064,6 +3064,10 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
         }
     }
 
+    /* unlock the transaction */
+    if (pthread_mutex_unlock(&txn->lock) != 0)
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "transaction");
+
     /* we check if the memtable needs to be flushed */
     if ((int)txn->cf->memtable->total_size >= txn->cf->config.flush_threshold)
     {
@@ -3089,9 +3093,6 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
     if (pthread_rwlock_unlock(&txn->cf->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
 
-    /* unlock the transaction */
-    if (pthread_mutex_unlock(&txn->lock) != 0)
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "transaction");
 
     return NULL;
 }

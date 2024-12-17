@@ -20,7 +20,7 @@
 
 const char *_tidesdb_get_path_seperator()
 {
-/* windows and unix path seperator differences */
+/* windows and unix path separator differences */
 #ifdef _WIN32
     return "\\";
 #else
@@ -631,6 +631,16 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                     continue;
                 }
 
+                /* initialize read-write lock */
+                if (pthread_rwlock_init(&cf->rwlock, NULL) != 0)
+                {
+                    free(cf->path);
+                    free(cf->wal);
+                    free(cf);
+                    (void)closedir(cf_dir);
+                    continue;
+                }
+
                 /* now we open the wal */
                 if (_tidesdb_open_wal(cf->path, &cf->wal, cf->config.compressed,
                                       cf->config.compress_algo) == -1)
@@ -1036,17 +1046,19 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
     if (strlen(name) < 2) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
 
     /* we check flush threshold
-     * the system expects at least a 1mb threshold */
-    if (flush_threshold < 1048576)
+     * the system expects at least TDB_FLUSH_THRESHOLD threshold */
+    if (flush_threshold < TDB_FLUSH_THRESHOLD)
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_FLUSH_THRESHOLD);
 
     /* we check max level
-     * the system expects at least a level of 5 */
-    if (max_level < 5) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_MAX_LEVEL);
+     * the system expects at least a level of TDB_MIN_MAX_LEVEL */
+    if (max_level < TDB_MIN_MAX_LEVEL)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_MAX_LEVEL);
 
     /* we check probability
-     * the system expects at least a probability of 0.1 */
-    if (probability < 0.1) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_PROBABILITY);
+     * the system expects at least a probability of TDB_MIN_PROBABILITY */
+    if (probability < TDB_MIN_PROBABILITY)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_PROBABILITY);
 
     tidesdb_column_family_t *cf = NULL;
     if (_tidesdb_new_column_family(tdb->directory, name, flush_threshold, max_level, probability,
@@ -1151,6 +1163,7 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
 
 int _tidesdb_remove_directory(const char *path)
 {
+    /* we could rework to remove recursion and use a stack-iterative approach */
     struct dirent *entry;
     struct stat statbuf;
     char fullpath[MAX_FILE_PATH_LENGTH];
@@ -1199,7 +1212,7 @@ int _tidesdb_remove_directory(const char *path)
     }
 
     (void)closedir(dir);
-    (void)rmdir(path); /* incase */
+    (void)rmdir(path); /* in case */
     return 0;
 }
 
@@ -1253,7 +1266,8 @@ int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_
     char cf_path[MAX_FILE_PATH_LENGTH];
 
     /* we use snprintf to construct the path */
-    snprintf(cf_path, sizeof(cf_path), "%s%s%s", db_path, _tidesdb_get_path_seperator(), name);
+    (void)snprintf(cf_path, sizeof(cf_path), "%s%s%s", db_path, _tidesdb_get_path_seperator(),
+                   name);
 
     /* we check if the column family path exists */
     if (access(cf_path, F_OK) == -1)
@@ -1272,9 +1286,9 @@ int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_
      * this contains a serialized version of the column family struct */
     char config_file_name[MAX_FILE_PATH_LENGTH];
 
-    snprintf(config_file_name, sizeof(config_file_name), "%s%s%s%s%s%s", db_path,
-             _tidesdb_get_path_seperator(), name, _tidesdb_get_path_seperator(), name,
-             TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
+    (void)snprintf(config_file_name, sizeof(config_file_name), "%s%s%s%s%s%s", db_path,
+                   _tidesdb_get_path_seperator(), name, _tidesdb_get_path_seperator(), name,
+                   TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
 
     /* now we serialize the column family struct */
     size_t serialized_size;
@@ -1441,7 +1455,7 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
     /* we check if the value is NULL */
     if (value == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_VALUE);
 
-    /* get db read lock */
+    /* get db read lock for column family */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
     {
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "db");
@@ -1450,7 +1464,10 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
     /* get column family */
     tidesdb_column_family_t *cf = NULL;
     if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
+    {
+        (void)pthread_rwlock_unlock(&tdb->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
+    }
 
     /* release db read lock */
     if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
@@ -1458,14 +1475,26 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
     }
 
+    /* get column family write lock */
+    if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
+    }
+
     /* we append to the wal */
     if (_tidesdb_append_to_wal(cf->wal, key, key_size, value, value_size, ttl, TIDESDB_OP_PUT,
                                column_family_name) == -1)
+    {
+        (void)pthread_rwlock_unlock(&cf->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_APPEND_TO_WAL);
+    }
 
     /* put in memtable */
     if (skip_list_put(cf->memtable, key, key_size, value, value_size, ttl) == -1)
+    {
+        (void)pthread_rwlock_unlock(&cf->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_PUT_TO_MEMTABLE);
+    }
 
     /* we check if the memtable has reached the flush threshold */
     if ((int)cf->memtable->total_size >= cf->config.flush_threshold)
@@ -1473,13 +1502,25 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
         if (cf->config.bloom_filter)
         {
             if (_tidesdb_flush_memtable_w_bloomfilter(cf) == -1)
+            {
+                (void)pthread_rwlock_unlock(&cf->rwlock);
                 return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+            }
         }
         else
         {
             if (_tidesdb_flush_memtable(cf) == -1)
+            {
+                (void)pthread_rwlock_unlock(&cf->rwlock);
                 return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+            }
         }
+    }
+
+    /* release column family write lock */
+    if (pthread_rwlock_unlock(&cf->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
     }
 
     return NULL;
@@ -1497,7 +1538,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
     /* we check if key is NULL */
     if (key == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_KEY);
 
-    /* get db read lock */
+    /* get db read lock to get column family */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
     {
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "db");
@@ -1506,12 +1547,21 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
     /* get column family */
     tidesdb_column_family_t *cf = NULL;
     if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
+    {
+        (void)pthread_rwlock_unlock(&tdb->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
+    }
 
     /* release db read lock */
     if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
     {
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
+    }
+
+    /* get column family read lock */
+    if (pthread_rwlock_rdlock(&cf->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
     }
 
     /* we check if the key exists in the memtable */
@@ -1522,8 +1572,11 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
         if (_tidesdb_is_tombstone(*value, *value_size))
         {
             free(*value);
+            (void)pthread_rwlock_unlock(&cf->rwlock);
             return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
         }
+
+        (void)pthread_rwlock_unlock(&cf->rwlock);
 
         return NULL;
     }
@@ -1533,6 +1586,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
     /* we check if any sstables */
     if (cf->num_sstables == 0)
     {
+        (void)pthread_rwlock_unlock(&cf->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
     }
 
@@ -1548,6 +1602,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
         /* we initialize the cursor */
         if (block_manager_cursor_init(&cursor, sst->block_manager) == -1)
         {
+            (void)pthread_rwlock_unlock(&cf->rwlock);
             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
         }
 
@@ -1559,6 +1614,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             if (block == NULL)
             {
                 (void)block_manager_cursor_free(cursor);
+                (void)pthread_rwlock_unlock(&cf->rwlock);
                 return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
             }
 
@@ -1568,6 +1624,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             {
                 (void)block_manager_cursor_free(cursor);
                 (void)block_manager_block_free(block);
+                (void)pthread_rwlock_unlock(&cf->rwlock);
                 return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_DESERIALIZE_BLOOM_FILTER);
             }
 
@@ -1583,10 +1640,12 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
 
             (void)bloom_filter_free(bf);
             (void)block_manager_block_free(block);
+
             /* go next block */
             if (block_manager_cursor_next(cursor) == -1)
             {
                 (void)block_manager_cursor_free(cursor);
+                (void)pthread_rwlock_unlock(&cf->rwlock);
                 return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
             }
         }
@@ -1614,6 +1673,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
                     (void)block_manager_cursor_free(cursor);
                     (void)block_manager_block_free(block);
                     (void)_tidesdb_free_key_value_pair(kv);
+                    (void)pthread_rwlock_unlock(&cf->rwlock);
                     return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
                 }
 
@@ -1623,6 +1683,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
                     (void)block_manager_cursor_free(cursor);
                     (void)block_manager_block_free(block);
                     (void)_tidesdb_free_key_value_pair(kv);
+                    (void)pthread_rwlock_unlock(&cf->rwlock);
                     return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
                 }
 
@@ -1633,6 +1694,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
                     (void)block_manager_cursor_free(cursor);
                     (void)block_manager_block_free(block);
                     (void)_tidesdb_free_key_value_pair(kv);
+                    (void)pthread_rwlock_unlock(&cf->rwlock);
                     return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "value");
                 }
 
@@ -1644,6 +1706,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
                 (void)block_manager_cursor_free(cursor);
                 (void)block_manager_block_free(block);
                 (void)_tidesdb_free_key_value_pair(kv);
+                (void)pthread_rwlock_unlock(&cf->rwlock);
 
                 return NULL;
             }
@@ -1655,6 +1718,12 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
         };
 
         (void)block_manager_cursor_free(cursor);
+    }
+
+    /* unlock column family */
+    if (pthread_rwlock_unlock(&cf->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
     }
 
     return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
@@ -1670,7 +1739,7 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
 
     if (key == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_KEY);
 
-    /* get db read lock */
+    /* get db read lock to get column family */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
     {
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "db");
@@ -1679,12 +1748,21 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
     /* get column family */
     tidesdb_column_family_t *cf = NULL;
     if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
+    {
+        (void)pthread_rwlock_unlock(&tdb->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
+    }
 
     /* release db read lock */
     if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
     {
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
+    }
+
+    /* get column family write lock */
+    if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
     }
 
     uint8_t *tombstone = malloc(4);
@@ -1698,12 +1776,14 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
                                column_family_name) == -1)
     {
         free(tombstone);
+        (void)pthread_rwlock_unlock(&cf->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_APPEND_TO_WAL);
     }
     /* add to memtable */
     if (skip_list_put(cf->memtable, key, key_size, tombstone, 4, -1) == -1)
     {
         free(tombstone);
+        (void)pthread_rwlock_unlock(&cf->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_PUT_TO_MEMTABLE);
     }
 
@@ -1712,8 +1792,28 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
     /* we check if the memtable has reached the flush threshold */
     if ((int)cf->memtable->total_size >= cf->config.flush_threshold)
     {
-        if (_tidesdb_flush_memtable(cf) == -1)
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+        if (cf->config.bloom_filter)
+        {
+            if (_tidesdb_flush_memtable_w_bloomfilter(cf) == -1)
+            {
+                (void)pthread_rwlock_unlock(&cf->rwlock);
+                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+            }
+        }
+        else
+        {
+            if (_tidesdb_flush_memtable(cf) == -1)
+            {
+                (void)pthread_rwlock_unlock(&cf->rwlock);
+                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+            }
+        }
+    }
+
+    /* release column family write lock */
+    if (pthread_rwlock_unlock(&cf->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
     }
 
     return NULL;
@@ -3763,8 +3863,8 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
 
         /* we get the key */
 
-        if (skip_list_cursor_get(cursor, &kv->key, &kv->key_size, &kv->value, &kv->value_size,
-                                 &kv->ttl) == -1)
+        if (skip_list_cursor_get(cursor, &kv->key, (size_t *)&kv->key_size, &kv->value,
+                                 (size_t *)&kv->value_size, &kv->ttl) == -1)
         {
             free(kv);
             free(sst);

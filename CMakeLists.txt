@@ -15,7 +15,7 @@ option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 #find_package(snappy REQUIRED)
 #find_package(lz4 REQUIRED)
 
-# For development, we want to enable all warnings and sanitizers
+# for development, we want to enable all warnings and sanitizers
 if(TIDESDB_WITH_SANITIZER)
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
         add_link_options(-fsanitize=address,undefined)

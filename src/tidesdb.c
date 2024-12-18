@@ -3257,38 +3257,38 @@ tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
      * starting at the most recent sstable
      */
 
-    /* we check if sstable cursor is valid and if it has a next block */
-    if (cursor->sstable_cursor != NULL && block_manager_cursor_next(cursor->sstable_cursor) == 0)
+    while (cursor->sstable_index > 0)
     {
-        if (block_manager_cursor_has_next(cursor->sstable_cursor) == 1)
+        /* we check if sstable cursor is valid and if it has a next block */
+        if (cursor->sstable_cursor != NULL &&
+            block_manager_cursor_next(cursor->sstable_cursor) == 0)
         {
-            if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
-            return NULL;
+            if (block_manager_cursor_has_next(cursor->sstable_cursor) == 1)
+            {
+                if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
+                    return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK,
+                                                 "column family");
+                return NULL;
+            }
         }
-    }
 
-    /* if sstable is exhausted we move to the next sstable */
-    if (cursor->sstable_cursor != NULL)
-    {
-        /* we free the sstable cursor for current */
-        (void)block_manager_cursor_free(cursor->sstable_cursor);
-        cursor->sstable_cursor = NULL;
-    }
+        /* if sstable is exhausted we move to the next sstable */
+        if (cursor->sstable_cursor != NULL)
+        {
+            /* we free the sstable cursor for current */
+            (void)block_manager_cursor_free(cursor->sstable_cursor);
+            cursor->sstable_cursor = NULL;
+        }
 
-    /* check if column family has any sstables */
-    if (cursor->cf->num_sstables == 0)
-    {
-        if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
-        return tidesdb_err_from_code(TIDESDB_ERR_AT_END_OF_CURSOR);
-    }
+        int current_idx = (int)cursor->sstable_index;
 
-    cursor->sstable_index--; /* move to the next sstable */
+        if (current_idx - 1 == -1) /* if we are at the absolute beginning, we break as we are at end
+                                      of forward iteration */
+            break;
 
-    /* we check if there are more sstables */
-    if (cursor->sstable_index != -1)
-    {
+        cursor->sstable_index--; /* move to the next sstable */
+
+        /* we check if there are more sstables */
         if (block_manager_cursor_init(&cursor->sstable_cursor,
                                       cursor->cf->sstables[cursor->sstable_index]->block_manager) ==
             -1)
@@ -3307,10 +3307,6 @@ tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
                 cursor->sstable_cursor = NULL;
             }
         }
-        if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
-
-        return NULL;
     }
 
     if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)

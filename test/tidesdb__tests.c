@@ -1632,9 +1632,9 @@ int main(void)
     test_tidesdb_put_flush_get(false, TDB_NO_COMPRESSION, false);
     test_tidesdb_put_flush_close_get(false, TDB_NO_COMPRESSION, false);
     test_tidesdb_put_flush_delete_get(false, TDB_NO_COMPRESSION, false);
-    test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false);
 
     /* these tests take a while to run */
+    test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false);
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false);
 
     /* the next batch of tests we will run with bloom filters and compression

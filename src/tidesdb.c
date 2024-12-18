@@ -214,7 +214,8 @@ uint8_t *_tidesdb_serialize_column_family_config(tidesdb_column_family_config_t 
 {
     /* calculate the size of the serialized data */
     *out_size = sizeof(uint32_t) + strlen(config->name) + 1 + sizeof(int32_t) * 2 + sizeof(float) +
-                sizeof(uint8_t) * 2 + sizeof(tidesdb_compression_algo_t);
+                sizeof(uint8_t) * 2 + sizeof(tidesdb_compression_algo_t) +
+                sizeof(tidesdb_memtable_ds_t);
 
     /* allocate memory for the serialized data */
     uint8_t *serialized_data = malloc(*out_size);
@@ -253,6 +254,9 @@ uint8_t *_tidesdb_serialize_column_family_config(tidesdb_column_family_config_t 
 
     /* serialize compression_algo */
     memcpy(ptr, &config->compress_algo, sizeof(tidesdb_compression_algo_t));
+
+    /* serialize memtable_ds */
+    memcpy(ptr, &config->memtable_ds, sizeof(tidesdb_memtable_ds_t));
 
     return serialized_data;
 }
@@ -301,6 +305,10 @@ tidesdb_column_family_config_t *_tidesdb_deserialize_column_family_config(const 
     tidesdb_compression_algo_t compress_algo;
     memcpy(&compress_algo, ptr, sizeof(tidesdb_compression_algo_t));
 
+    /* deserialize memtable_ds */
+    tidesdb_memtable_ds_t memtable_ds;
+    memcpy(&memtable_ds, ptr, sizeof(tidesdb_memtable_ds_t));
+
     /* create the column family config */
     tidesdb_column_family_config_t *config = malloc(sizeof(tidesdb_column_family_config_t));
     if (config == NULL)
@@ -317,6 +325,7 @@ tidesdb_column_family_config_t *_tidesdb_deserialize_column_family_config(const 
     config->compressed = (bool)compressed;
     config->bloom_filter = (bool)bloom_filter;
     config->compress_algo = compress_algo;
+    config->memtable_ds = memtable_ds;
 
     /* return the column family config */
     return config;
@@ -1030,7 +1039,7 @@ int _tidesdb_replay_from_wal(tidesdb_column_family_t *cf)
 tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, int flush_threshold,
                                             int max_level, float probability, bool compressed,
                                             tidesdb_compression_algo_t compression_algo,
-                                            bool bloom_filter)
+                                            bool bloom_filter, tidesdb_memtable_ds_t memtable_ds)
 {
     /* verify the compression algorithm */
     if (compressed && compression_algo == TDB_NO_COMPRESSION)
@@ -1044,6 +1053,10 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
 
     /* we check if the column family name is greater than 2 */
     if (strlen(name) < 2) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if memtable data structure is hash, if so return not implemented */
+    if (memtable_ds == TDB_MEMTABLE_HASH_TABLE)
+        return tidesdb_err_from_code(TIDESDB_ERR_NOT_IMPLEMENTED);
 
     /* we check flush threshold
      * the system expects at least TDB_FLUSH_THRESHOLD threshold */
@@ -1062,7 +1075,8 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
 
     tidesdb_column_family_t *cf = NULL;
     if (_tidesdb_new_column_family(tdb->directory, name, flush_threshold, max_level, probability,
-                                   &cf, compressed, compression_algo, bloom_filter) == -1)
+                                   &cf, compressed, compression_algo, bloom_filter,
+                                   memtable_ds) == -1)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_COLUMN_FAMILY);
 
     /* now we add the column family */
@@ -1219,7 +1233,7 @@ int _tidesdb_remove_directory(const char *path)
 int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_threshold,
                                int max_level, float probability, tidesdb_column_family_t **cf,
                                bool compressed, tidesdb_compression_algo_t compress_algo,
-                               bool bloom_filter)
+                               bool bloom_filter, tidesdb_memtable_ds_t memtable_ds)
 {
     /* we allocate memory for the column family */
     *cf = malloc(sizeof(tidesdb_column_family_t));
@@ -1254,6 +1268,9 @@ int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_
 
     /* set bloom filter to false */
     (*cf)->config.bloom_filter = bloom_filter;
+
+    /* set memtable data structure */
+    (*cf)->config.memtable_ds = memtable_ds;
 
     if (pthread_rwlock_init(&(*cf)->rwlock, NULL) != 0)
     {

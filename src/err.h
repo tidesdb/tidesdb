@@ -94,6 +94,7 @@ typedef enum
     TIDESDB_ERR_AT_START_OF_CURSOR,
     TIDESDB_ERR_INVALID_COMPRESSION_ALGO,
     TIDESDB_ERR_FAILED_TO_DESERIALIZE_BLOOM_FILTER,
+    TIDESDB_ERR_NOT_IMPLEMENTED,
 } TIDESDB_ERR_CODE;
 
 /* TidesDB error messages */
@@ -136,6 +137,7 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
     {TIDESDB_ERR_AT_START_OF_CURSOR, "At start of cursor.\n"},
     {TIDESDB_ERR_INVALID_COMPRESSION_ALGO, "Invalid compression algorithm.\n"},
     {TIDESDB_ERR_FAILED_TO_DESERIALIZE_BLOOM_FILTER, "Failed to deserialize bloom filter.\n"},
+    {TIDESDB_ERR_NOT_IMPLEMENTED, "Not implemented.\n"},
 
 };
 

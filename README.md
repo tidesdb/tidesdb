@@ -124,10 +124,11 @@ In order to store data in TidesDB you need a column family.  This is by design.
 - whether column family sstable data is compressed
 - the compression algorithim to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
 - whether to use bloom filters
+- what data structure to use for the memtable [`TDB_MEMTABLE_SKIP_LIST`, `TDB_MEMTABLE_HASH_TABLE`]
 
 ```c
 /* create a column family with no compression and no bloom filters (slower reads) */
-tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false, TDB_NO_COMPRESSION, false);
+tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
 if (e != NULL)
 {
     /* handle error */

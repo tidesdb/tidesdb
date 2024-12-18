@@ -58,7 +58,8 @@ void test_tidesdb_serialize_deserialize_column_family_config()
                                              .probability = 0.24f,
                                              .compressed = true,
                                              .compress_algo = TDB_COMPRESS_LZ4,
-                                             .bloom_filter = false};
+                                             .bloom_filter = false,
+                                             .memtable_ds = TDB_MEMTABLE_SKIP_LIST};
 
     size_t serialized_size;
     uint8_t *serialized = _tidesdb_serialize_column_family_config(&config, &serialized_size);
@@ -75,6 +76,7 @@ void test_tidesdb_serialize_deserialize_column_family_config()
     assert(deserialized->compressed == config.compressed);
     assert(deserialized->bloom_filter == config.bloom_filter);
     assert(deserialized->compress_algo == config.compress_algo);
+    assert(deserialized->memtable_ds == config.memtable_ds);
 
     free(deserialized->name);
     free(deserialized);
@@ -152,7 +154,7 @@ void test_tidesdb_create_drop_column_family(bool compress, tidesdb_compression_a
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -161,7 +163,7 @@ void test_tidesdb_create_drop_column_family(bool compress, tidesdb_compression_a
     assert(err == NULL);
 
     err = tidesdb_create_column_family(db, "test_cf2", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -228,7 +230,7 @@ void test_tidesdb_put_get_memtable(bool compress, tidesdb_compression_algo_t alg
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -237,7 +239,7 @@ void test_tidesdb_put_get_memtable(bool compress, tidesdb_compression_algo_t alg
     assert(err == NULL);
 
     err = tidesdb_create_column_family(db, "test_cf2", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -297,7 +299,7 @@ void test_tidesdb_put_close_replay_get(bool compress, tidesdb_compression_algo_t
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -376,7 +378,7 @@ void test_tidesdb_put_flush_get(bool compress, tidesdb_compression_algo_t algo, 
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -504,7 +506,7 @@ void test_tidesdb_put_flush_close_get(bool compress, tidesdb_compression_algo_t 
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -647,7 +649,7 @@ void test_tidesdb_put_delete_get(bool compress, tidesdb_compression_algo_t algo,
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -656,7 +658,7 @@ void test_tidesdb_put_delete_get(bool compress, tidesdb_compression_algo_t algo,
     assert(err == NULL);
 
     err = tidesdb_create_column_family(db, "test_cf2", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -725,7 +727,7 @@ void test_tidesdb_put_flush_delete_get(bool compress, tidesdb_compression_algo_t
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -853,7 +855,7 @@ void test_tidesdb_put_many_flush_get(bool compress, tidesdb_compression_algo_t a
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -927,7 +929,7 @@ void test_tidesdb_put_flush_compact_get(bool compress, tidesdb_compression_algo_
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -1009,7 +1011,7 @@ void test_tidesdb_txn_put_get(bool compress, tidesdb_compression_algo_t algo, bo
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -1092,7 +1094,7 @@ void test_tidesdb_txn_put_get_rollback_get(bool compress, tidesdb_compression_al
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -1186,7 +1188,7 @@ void test_tidesdb_txn_put_put_delete_get(bool compress, tidesdb_compression_algo
     tidesdb_err_free(err);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "%s" RESET, err->message);
@@ -1285,7 +1287,7 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
     assert(err == NULL);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024 * 4, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     assert(err == NULL);
 
     uint8_t keys[11][20];
@@ -1455,7 +1457,7 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
     assert(err == NULL);
 
     err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
+                                       bloom_filter, TDB_MEMTABLE_SKIP_LIST);
     assert(err == NULL);
 
     uint8_t keys[11][20];

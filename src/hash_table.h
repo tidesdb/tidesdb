@@ -23,7 +23,8 @@
 #define TOMBSTONE                                                                                 \
     0xDEADBEEF /* On expiration of a bucket if time to live is set we set the key's value to this \
                 */
-#define BUCKETS 1048576 /* the size of the hash table bucket */
+#define BUCKETS 1048576 /* the size of the hash table buckets.  We have this fixed for
+                         * now but we should make it so the hashtable can ultimately resize itself */
 
 /**
  * hash_table_bucket_t

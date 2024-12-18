@@ -110,8 +110,6 @@ if (e != NULL)
     tidesdb_err_free(e);
 }
 
-/* free the configuration */
-free(tdb_config);
 ```
 
 ### Creating a column family

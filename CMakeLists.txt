@@ -21,7 +21,7 @@ if(TIDESDB_WITH_SANITIZER)
         add_link_options(-fsanitize=address,undefined)
 endif()
 
-add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c)
+add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c)
 
 target_include_directories(tidesdb PRIVATE src)
 
@@ -37,6 +37,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         add_executable(err_tests test/err__tests.c)
         add_executable(block_manager_tests test/block_manager__tests.c)
         add_executable(skip_list_tests test/skip_list__tests.c)
+        add_executable(hash_table_tests test/hash_table__tests.c)
         add_executable(compress_tests test/compress__tests.c)
         add_executable(bloom_filter_tests test/bloom_filter__tests.c)
         add_executable(tidesdb_tests test/tidesdb__tests.c)
@@ -45,6 +46,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         target_link_libraries(err_tests tidesdb m zstd snappy lz4)
         target_link_libraries(block_manager_tests tidesdb m zstd snappy lz4)
         target_link_libraries(skip_list_tests tidesdb m zstd snappy lz4)
+        target_link_libraries(hash_table_tests tidesdb m zstd snappy lz4)
         target_link_libraries(compress_tests tidesdb m zstd snappy lz4)
         target_link_libraries(bloom_filter_tests tidesdb m zstd snappy lz4)
         target_link_libraries(tidesdb_tests tidesdb m zstd snappy lz4)
@@ -53,6 +55,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         add_test(NAME err_tests COMMAND err_tests)
         add_test(NAME block_manager_tests COMMAND block_manager_tests)
         add_test(NAME skip_list_tests COMMAND skip_list_tests)
+        add_test(NAME hash_table_tests COMMAND hash_table_tests)
         add_test(NAME compress_tests COMMAND compress_tests)
         add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
         add_test(NAME tidesdb_tests COMMAND tidesdb_tests)

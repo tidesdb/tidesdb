@@ -3257,7 +3257,7 @@ tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
      * starting at the most recent sstable
      */
 
-    while (cursor->sstable_index > 0)
+    while (cursor->sstable_index >= 0)
     {
         /* we check if sstable cursor is valid and if it has a next block */
         if (cursor->sstable_cursor != NULL &&
@@ -3268,6 +3268,8 @@ tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
                 if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
                     return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK,
                                                  "column family");
+
+                /* we return NULL as we have a next kv */
                 return NULL;
             }
         }
@@ -3275,18 +3277,18 @@ tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
         /* if sstable is exhausted we move to the next sstable */
         if (cursor->sstable_cursor != NULL)
         {
-            /* we free the sstable cursor for current */
+            /* we free the sstable cursor for current sstable */
             (void)block_manager_cursor_free(cursor->sstable_cursor);
             cursor->sstable_cursor = NULL;
         }
 
-        int current_idx = (int)cursor->sstable_index;
-
-        if (current_idx - 1 == -1) /* if we are at the absolute beginning, we break as we are at end
-                                      of forward iteration */
-            break;
-
         cursor->sstable_index--; /* move to the next sstable */
+
+        if (cursor->sstable_index < 0)
+        {
+            cursor->sstable_index = 0; /* reset to the first sstable */
+            break;
+        }
 
         /* we check if there are more sstables */
         if (block_manager_cursor_init(&cursor->sstable_cursor,
@@ -3306,6 +3308,14 @@ tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
                 block_manager_cursor_free(cursor->sstable_cursor);
                 cursor->sstable_cursor = NULL;
             }
+        }
+
+        if (cursor->sstable_cursor != NULL)
+        {
+            if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
+                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
+
+            return NULL;
         }
     }
 

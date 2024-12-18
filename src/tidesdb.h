@@ -82,6 +82,17 @@ typedef struct
 } tidesdb_wal_t;
 
 /*
+ * TIDESDB_MEMTABLE_DS
+ * memtable data structure enum
+ * used to select the data structure for a column family memtable
+ */
+typedef enum
+{
+    TDB_MEMTABLE_SKIP_LIST, /* a skip list data structure for the memtable */
+    TDB_MEMTABLE_HASH_TABLE /* a hash table data structure for the memtable */
+} tidesdb_memtable_ds_t;
+
+/*
  * tidesdb_column_family_config_t
  * struct for a column family configuration
  * used for column family configuration in TidesDB
@@ -100,6 +111,7 @@ typedef struct
     float probability;
     bool compressed;
     tidesdb_compression_algo_t compress_algo;
+    tidesdb_memtable_ds_t memtable_ds;
     bool bloom_filter;
 } tidesdb_column_family_config_t;
 
@@ -285,12 +297,13 @@ tidesdb_err_t *tidesdb_close(tidesdb_t *tdb);
  * @param compressed whether the column family WAL and SSTables should be compressed
  * @param compress_algo the compression algorithm to use if you want to compress the column family
  * @param bloom_filter whether the column family should use a bloom filter
+ * @param memtable_ds the data structure for the memtable
  * @return error or NULL
  */
 tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, int flush_threshold,
                                             int max_level, float probability, bool compressed,
                                             tidesdb_compression_algo_t compress_algo,
-                                            bool bloom_filter);
+                                            bool bloom_filter, tidesdb_memtable_ds_t memtable_ds);
 
 /*
  * tidesdb_drop_column_family
@@ -491,12 +504,13 @@ int _tidesdb_get_column_family(tidesdb_t *tdb, const char *name, tidesdb_column_
  * @param compressed whether the column family WAL and SSTables should be compressed
  * @param compress_algo the compression algorithm to use if you want to compress the column family
  * @param bloom_filter whether the column family should use a bloom filter
+ * @param memtable_ds the data structure for the memtable
  * @return 0 if the column family was created, -1 if not
  */
 int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_threshold,
                                int max_level, float probability, tidesdb_column_family_t **cf,
                                bool compressed, tidesdb_compression_algo_t compress_algo,
-                               bool bloom_filter);
+                               bool bloom_filter, tidesdb_memtable_ds_t memtable_ds);
 
 /*
  * _tidesdb_add_column_family

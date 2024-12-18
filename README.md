@@ -12,7 +12,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 
 ## Features
 - [x] **ACID** transactions are atomic, consistent, isolated, and durable.  Transactions are tied to their respective column family.
-- [x] **Concurrent** multiple threads can read and write to the storage engine. Column families use a read-write lock thus allowing multiple readers and a single writer per column family.  Transactions block other threads from reading or writing to the column family until the transaction is committed or rolled back.  A transaction is thread safe.
+- [x] **Concurrent** multiple threads can read and write to the storage engine. Column families use a read-write lock thus allowing multiple readers and a single writer per column family.  Transactions on commit block other threads from reading or writing to the column family until the transaction is completed.  A transaction is thread safe.
 - [x] **Column Families** store data in separate key-value stores.  Each column family has their own memtable and sstables.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically.  When a transaction fails, it rolls back all operations.
 - [x] **Cursor** iterate over key-value pairs forward and backward.
@@ -21,7 +21,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Bloom Filters** reduce disk reads by reading initial blocks of sstables to check key existence.
 - [x] **Compression** compression is achieved with Snappy, or LZ4, or ZSTD.  SStable entries can be compressed as well as WAL entries.
 - [x] **TTL** time-to-live for key-value pairs.
-- [x] **Configurable** column families are configurable with memtable flush threshold, skiplist max level, skiplist probability, compression, and bloom filters.
+- [x] **Configurable** column families are configurable with memtable flush threshold, skip list max level, skip list probability, compression, and bloom filters.
 - [x] **Error Handling** API functions return an error code and message.
 - [x] **Easy API** simple and easy to use api.
 
@@ -98,8 +98,8 @@ In order to store data in TidesDB you need a column family.  This is by design.
 - the database you want to create the column family in.  Must be open
 - the name of the column family
 - memtable flush threshold in bytes.  Example below is 128MB
-- skiplist max level.  Example below is 12
-- skiplist probability.  Example below is 0.24
+- skip list max level.  Example below is 12
+- skip list probability.  Example below is 0.24
 - whether column family sstable data is compressed
 - the compression algorithim to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
 - whether to use bloom filters

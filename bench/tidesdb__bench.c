@@ -28,11 +28,11 @@
 #include "../test/test_utils.h"
 
 /* test constants */
-#define NUM_OPERATIONS         10000 /* number of operations per thread */
-#define NUM_THREADS            1 /* you can increase this to test with more threads, usually slower */
-#define SIZE                   512 /* key and value size */
+#define NUM_OPERATIONS         500000 /* number of operations per thread */
+#define NUM_THREADS            2 /* you can increase this to test with more threads, usually slower */
+#define SIZE                   (1024 * 1024) /* key and value size, 1MB */
 #define DIR                    "benchmark_db"
-#define FLUSH_THRESHOLD        ((1024 * 1024) * 1)
+#define FLUSH_THRESHOLD        ((1024 * 1024) * 64)
 #define THREADS_FOR_COMPACTION 2
 
 /*

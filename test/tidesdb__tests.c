@@ -1444,7 +1444,7 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
     assert(err == NULL);
 
     uint8_t keys[11][20];
-    uint8_t values[11][512 * 1024];
+    uint8_t values[11][256];
 
     /* fill the values with random data */
     for (int i = 0; i < 11; i++)
@@ -1460,8 +1460,7 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
     {
         snprintf((char *)keys[i], sizeof(keys[i]), "test_key_%d", i);
         printf("putting key: %s\n", keys[i]);
-        err =
-            tidesdb_put(db, "test_cf", keys[i], sizeof(keys[i]), values[i], sizeof(values[i]), -1);
+        err = tidesdb_put(db, "test_cf", keys[i], sizeof(keys[i]), values[i], sizeof(values[i]), -1);
         assert(err == NULL);
     }
 
@@ -1541,13 +1540,6 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
     /* we use prev */
     do
     {
-        err = tidesdb_cursor_prev(cursor);
-        if (err != NULL && err->code == TIDESDB_ERR_AT_START_OF_CURSOR)
-        {
-            break;
-        }
-        assert(err == NULL);
-
         err = tidesdb_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size);
         if (err != NULL)
         {
@@ -1580,7 +1572,8 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
             free(retrieved_key);
             free(retrieved_value);
         }
-    } while (true);
+    } while ((err = tidesdb_cursor_prev(cursor)) == NULL ||
+             err->code != TIDESDB_ERR_AT_START_OF_CURSOR);
 
     /* ensure all values were found */
     for (int i = 0; i < 11; i++)

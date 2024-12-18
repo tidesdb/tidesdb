@@ -231,7 +231,7 @@ typedef struct
     tidesdb_t *tidesdb;
     tidesdb_column_family_t *cf;
     skip_list_cursor_t *memtable_cursor;
-    size_t sstable_index;
+    int sstable_index;
     block_manager_cursor_t *sstable_cursor;
     tidesdb_key_value_pair_t *current;
 } tidesdb_cursor_t;

@@ -95,7 +95,7 @@ typedef struct
 To open a database you pass the path to the database directory and a pointer to the database.
 ```c
 
-tidesdb_t tdb = NULL;
+tidesdb_t* tdb = NULL;
 tidesdb_err_t *e = tidesdb_open("your_tdb_directory", &tdb);
 if (e != NULL)
 {

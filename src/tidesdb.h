@@ -71,7 +71,8 @@ typedef struct
  * tidesdb_wal_t
  * struct for write-ahead logs in TidesDB
  * @param block_manager the block manager for the WAL
- * @param lock the read-write lock for the WAL
+ * @param compress whether to compress the WAL
+ * @param compress_algo the compression algorithm to use if you want to compress the WAL
  */
 typedef struct
 {
@@ -592,7 +593,7 @@ int _tidesdb_compare_sstables(const void *a, const void *b);
 
 /*
  * _tidesdb_flush_memtable
- * flushes a memtable to disk
+ * flushes a memtable to disk in an SSTable
  * @param cf the column family
  * @return 0 if the memtable was flushed, -1 if not
  */
@@ -600,7 +601,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf);
 
 /*
  * _tidesdb_flush_memtable_w_bloomfilter
- * flushes a memtable to disk
+ * flushes a memtable to disk in an SSTable with a bloom filter at initial block
  * @param cf the column family
  * @return 0 if the memtable was flushed, -1 if not
  */
@@ -608,9 +609,9 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf);
 
 /*
  * _tidesdb_is_tombstone
- * checks if value is a tombstone
- * @param value the value
- * @param value_size the size of the value
+ * checks if value is a tombstone TDB_TOMBSTONE
+ * @param value the value to check
+ * @param value_size the size of the value to check
  * @return 1 if the value is a tombstone, 0 if not
  */
 int _tidesdb_is_tombstone(const uint8_t *value, size_t value_size);
@@ -625,7 +626,7 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf);
 
 /*
  * _tidesdb_sort_sstables
- * sort the sstables for a column family by last modified being last
+ * sort the sstables for a column family by last modified being last in the array
  * @param cf the column family
  * @return 0 if the sstables were sorted, -1 if not
  */
@@ -652,7 +653,8 @@ void *_tidesdb_compact_sstables_thread(void *arg);
  * @param sst1 the first sstable
  * @param sst2 the second sstable
  * @param cf the column family
- * @return the new sstable
+ * @param shared_lock the lock for the path creation on parallel compaction
+ * @return the new merged sstable
  */
 tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_sstable_t *sst2,
                                            tidesdb_column_family_t *cf,
@@ -664,7 +666,8 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
  * @param sst1 the first sstable
  * @param sst2 the second sstable
  * @param cf the column family
- * @return the new sstable
+ * @param shared_lock the lock for the path creation on parallel compaction
+ * @return the new merged sstable
  */
 tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1,
                                                          tidesdb_sstable_t *sst2,
@@ -798,7 +801,7 @@ int _tidesdb_is_expired(int64_t ttl);
  * _tidesdb_map_compression_algo
  * maps a tidesdb compression algo to a compress_type algo
  * @param algo the tidesdb compression algo
- * @return the compress_type algo
+ * @return the correct compress_type algo
  */
 compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo);
 

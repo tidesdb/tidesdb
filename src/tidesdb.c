@@ -628,7 +628,17 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 cf->path = strdup(cf_path);
                 cf->sstables = NULL;
                 cf->num_sstables = 0;
-                cf->memtable = skip_list_new(cf->config.max_level, cf->config.probability);
+
+                switch (cf->config.memtable_ds)
+                {
+                    case TDB_MEMTABLE_SKIP_LIST:
+                        cf->memtable = skip_list_new(cf->config.max_level, cf->config.probability);
+                        break; /* create a skip list */
+                    case TDB_MEMTABLE_HASH_TABLE:
+                        (void)hash_table_new(cf->memtable);
+                        break;
+                }
+
                 free(config);
 
                 cf->wal = malloc(sizeof(tidesdb_wal_t));
@@ -1359,8 +1369,15 @@ int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_
     (*cf)->num_sstables = 0;
     (*cf)->sstables = NULL;
 
-    /* we create memtable */
-    (*cf)->memtable = skip_list_new((*cf)->config.max_level, (*cf)->config.probability);
+    switch ((*cf)->config.memtable_ds)
+    {
+        case TDB_MEMTABLE_SKIP_LIST:
+            (*cf)->memtable = skip_list_new((*cf)->config.max_level, (*cf)->config.probability);
+            break;
+        case TDB_MEMTABLE_HASH_TABLE:
+            (void)hash_table_new((*cf)->memtable);
+            break;
+    }
 
     /* we check if the memtable was created */
     if ((*cf)->memtable == NULL)
@@ -3046,6 +3063,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                             /* we rollback the transaction */
                             return tidesdb_txn_rollback(txn);
                         }
+                        break;
                     case TDB_MEMTABLE_HASH_TABLE:
                         if (hash_table_put(txn->cf->memtable, op.kv->key, op.kv->key_size,
                                            op.kv->value, op.kv->value_size, op.kv->ttl) == -1)
@@ -3059,6 +3077,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                             /* we rollback the transaction */
                             return tidesdb_txn_rollback(txn);
                         }
+                        break;
                 }
 
                 /* mark op committed */
@@ -3093,6 +3112,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                             /* we rollback the transaction */
                             return tidesdb_txn_rollback(txn);
                         }
+                        break;
                     case TDB_MEMTABLE_HASH_TABLE:
                         if (hash_table_put(txn->cf->memtable, op.kv->key, op.kv->key_size,
                                            op.kv->value, 4, 0) == -1)
@@ -3106,6 +3126,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                             /* we rollback the transaction */
                             return tidesdb_txn_rollback(txn);
                         }
+                        break;
                 }
 
                 /* mark op committed */
@@ -3145,6 +3166,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     }
                 }
             }
+            break;
         case TDB_MEMTABLE_HASH_TABLE:
             if (((int)((hash_table_t *)txn->cf->memtable)->total_size >=
                  txn->cf->config.flush_threshold))
@@ -3166,6 +3188,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     }
                 }
             }
+            break;
     }
 
     /* unlock the column family */
@@ -3222,6 +3245,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                 case TDB_MEMTABLE_HASH_TABLE:
                     (void)hash_table_put(txn->cf->memtable, op.kv->key, op.kv->key_size,
                                          op.kv->value, op.kv->value_size, op.kv->ttl);
+                    break;
                 default:
                     return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
             }
@@ -3256,6 +3280,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                     }
                 }
             }
+            break;
         case TDB_MEMTABLE_HASH_TABLE:
             if (((int)((hash_table_t *)txn->cf->memtable)->total_size >=
                  txn->cf->config.flush_threshold))
@@ -3277,6 +3302,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                     }
                 }
             }
+            break;
     }
 
     /* unlock the column family */

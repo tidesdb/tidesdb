@@ -29,6 +29,7 @@
 #include "bloom_filter.h"
 #include "compress.h"
 #include "err.h"
+#include "hash_table.h"
 #include "skip_list.h"
 
 /* TidesDB uses tidesdb, _tidesdb_, and TDB as prefixes for functions, types, and constants */
@@ -133,7 +134,7 @@ typedef struct
     tidesdb_sstable_t **sstables;
     int num_sstables;
     pthread_rwlock_t rwlock;
-    skip_list_t *memtable;
+    void *memtable; /* can be a skip list or hash table */
     tidesdb_wal_t *wal;
 } tidesdb_column_family_t;
 

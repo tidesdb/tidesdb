@@ -1034,6 +1034,7 @@ int _tidesdb_replay_from_wal(tidesdb_column_family_t *cf)
 
                 break;
             case TIDESDB_OP_DELETE:
+            {
                 uint8_t *tombstone = malloc(4);
                 if (tombstone == NULL) continue;
 
@@ -1057,7 +1058,8 @@ int _tidesdb_replay_from_wal(tidesdb_column_family_t *cf)
                 }
 
                 free(tombstone);
-                break;
+            }
+            break;
             default:
                 break;
         }

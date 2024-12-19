@@ -1016,8 +1016,22 @@ int _tidesdb_replay_from_wal(tidesdb_column_family_t *cf)
         switch (op->op_code)
         {
             case TIDESDB_OP_PUT:
-                (void)skip_list_put(cf->memtable, op->kv->key, op->kv->key_size, op->kv->value,
-                                    op->kv->value_size, op->kv->ttl);
+                switch (cf->config.memtable_ds)
+                {
+                    case TDB_MEMTABLE_SKIP_LIST:
+                    {
+                        (void)skip_list_put(cf->memtable, op->kv->key, op->kv->key_size,
+                                            op->kv->value, op->kv->value_size, op->kv->ttl);
+                    }
+                    break;
+                    case TDB_MEMTABLE_HASH_TABLE:
+                        (void)hash_table_put(cf->memtable, op->kv->key, op->kv->key_size,
+                                             op->kv->value, op->kv->value_size, op->kv->ttl);
+                        break;
+                    default:
+                        break;
+                }
+
                 break;
             case TIDESDB_OP_DELETE:
                 uint8_t *tombstone = malloc(4);
@@ -1026,8 +1040,22 @@ int _tidesdb_replay_from_wal(tidesdb_column_family_t *cf)
                 uint32_t tombstone_value = TOMBSTONE;
                 memcpy(tombstone, &tombstone_value, sizeof(uint32_t));
 
-                (void)skip_list_put(cf->memtable, op->kv->key, op->kv->key_size, tombstone, 4,
-                                    op->kv->ttl);
+                switch (cf->config.memtable_ds)
+                {
+                    case TDB_MEMTABLE_SKIP_LIST:
+                    {
+                        (void)skip_list_put(cf->memtable, op->kv->key, op->kv->key_size, tombstone,
+                                            4, op->kv->ttl);
+                    }
+                    break;
+                    case TDB_MEMTABLE_HASH_TABLE:
+                        (void)hash_table_put(cf->memtable, op->kv->key, op->kv->key_size, tombstone,
+                                             4, op->kv->ttl);
+                        break;
+                    default:
+                        break;
+                }
+
                 free(tombstone);
                 break;
             default:
@@ -1646,20 +1674,45 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
     }
 
     /* we check if the key exists in the memtable */
-    if (skip_list_get(cf->memtable, key, key_size, value, value_size) != -1)
+
+    switch (cf->config.memtable_ds)
     {
-        /* we found the key in the memtable
-         * we check if the value is a tombstone */
-        if (_tidesdb_is_tombstone(*value, *value_size))
-        {
-            free(*value);
-            (void)pthread_rwlock_unlock(&cf->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
-        }
+        case TDB_MEMTABLE_SKIP_LIST:
+            if (skip_list_get(cf->memtable, key, key_size, value, value_size) != -1)
+            {
+                /* we found the key in the memtable
+                 * we check if the value is a tombstone */
+                if (_tidesdb_is_tombstone(*value, *value_size))
+                {
+                    free(*value);
+                    (void)pthread_rwlock_unlock(&cf->rwlock);
+                    return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+                }
 
-        (void)pthread_rwlock_unlock(&cf->rwlock);
+                (void)pthread_rwlock_unlock(&cf->rwlock);
 
-        return NULL;
+                return NULL;
+            }
+            break;
+        case TDB_MEMTABLE_HASH_TABLE:
+            if (hash_table_get(cf->memtable, key, key_size, value, value_size) != -1)
+            {
+                /* we found the key in the memtable
+                 * we check if the value is a tombstone */
+                if (_tidesdb_is_tombstone(*value, *value_size))
+                {
+                    free(*value);
+                    (void)pthread_rwlock_unlock(&cf->rwlock);
+                    return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+                }
+
+                (void)pthread_rwlock_unlock(&cf->rwlock);
+
+                return NULL;
+            }
+            break;
+        default:
+            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
     }
 
     /* now we check sstables from latest to oldest */

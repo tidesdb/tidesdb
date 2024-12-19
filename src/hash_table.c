@@ -107,7 +107,15 @@ int hash_table_get(hash_table_t *ht, const uint8_t *key, size_t key_size, uint8_
         return -1;
     }
 
-    *value = bucket->value;
+    *value = malloc(bucket->value_size);
+    if (*value == NULL)
+    {
+        return -1;
+    }
+
+    /* we copy the value */
+    memcpy(*value, bucket->value, bucket->value_size);
+
     *value_size = bucket->value_size;
     return 0;
 }

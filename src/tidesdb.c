@@ -1506,32 +1506,74 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_APPEND_TO_WAL);
     }
 
-    /* put in memtable */
-    if (skip_list_put(cf->memtable, key, key_size, value, value_size, ttl) == -1)
+    /* we determine the data structure to use */
+    switch (cf->config.memtable_ds)
     {
-        (void)pthread_rwlock_unlock(&cf->rwlock);
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_PUT_TO_MEMTABLE);
-    }
+        case TDB_MEMTABLE_SKIP_LIST:
+            /* put in memtable */
+            if (skip_list_put(cf->memtable, key, key_size, value, value_size, ttl) == -1)
+            {
+                (void)pthread_rwlock_unlock(&cf->rwlock);
+                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_PUT_TO_MEMTABLE);
+            }
 
-    /* we check if the memtable has reached the flush threshold */
-    if ((int)cf->memtable->total_size >= cf->config.flush_threshold)
-    {
-        if (cf->config.bloom_filter)
-        {
-            if (_tidesdb_flush_memtable_w_bloomfilter(cf) == -1)
+            /* we check if the memtable has reached the flush threshold */
+            if ((int)((skip_list_t *)cf->memtable)->total_size >= cf->config.flush_threshold)
+            {
+                if (cf->config.bloom_filter)
+                {
+                    if (_tidesdb_flush_memtable_w_bloomfilter(cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
+                else
+                {
+                    if (_tidesdb_flush_memtable(cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
+            }
+            break;
+        case TDB_MEMTABLE_HASH_TABLE:
+            /* put in memtable */
+            if (hash_table_put(cf->memtable, key, key_size, value, value_size, ttl) == -1)
             {
                 (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_PUT_TO_MEMTABLE);
             }
-        }
-        else
-        {
-            if (_tidesdb_flush_memtable(cf) == -1)
+
+            /* we check if the memtable has reached the flush threshold */
+            if ((int)((hash_table_t *)cf->memtable)->total_size >= cf->config.flush_threshold)
             {
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                if (cf->config.bloom_filter)
+                {
+                    if (_tidesdb_flush_memtable_w_bloomfilter(cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
+                else
+                {
+                    if (_tidesdb_flush_memtable(cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
             }
-        }
+            break;
+        default:
+            if (pthread_rwlock_unlock(&cf->rwlock) != 0)
+            {
+                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
+            }
+
+            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
     }
 
     /* release column family write lock */
@@ -1807,24 +1849,57 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
     free(tombstone);
 
     /* we check if the memtable has reached the flush threshold */
-    if ((int)cf->memtable->total_size >= cf->config.flush_threshold)
+    switch (cf->config.memtable_ds)
     {
-        if (cf->config.bloom_filter)
-        {
-            if (_tidesdb_flush_memtable_w_bloomfilter(cf) == -1)
+        case TDB_MEMTABLE_SKIP_LIST:
+            if ((int)((skip_list_t *)cf->memtable)->total_size >= cf->config.flush_threshold)
             {
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                if (cf->config.bloom_filter)
+                {
+                    if (_tidesdb_flush_memtable_w_bloomfilter(cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
+                else
+                {
+                    if (_tidesdb_flush_memtable(cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
             }
-        }
-        else
-        {
-            if (_tidesdb_flush_memtable(cf) == -1)
+            break;
+        case TDB_MEMTABLE_HASH_TABLE:
+            if ((int)((hash_table_t *)cf->memtable)->total_size >= cf->config.flush_threshold)
             {
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                if (cf->config.bloom_filter)
+                {
+                    if (_tidesdb_flush_memtable_w_bloomfilter(cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
+                else
+                {
+                    if (_tidesdb_flush_memtable(cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
             }
-        }
+            break;
+        default:
+            if (pthread_rwlock_unlock(&cf->rwlock) != 0)
+            {
+                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
+            }
+
+            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
     }
 
     /* release column family write lock */
@@ -2956,18 +3031,36 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     return tidesdb_txn_rollback(txn);
                 }
 
-                if (skip_list_put(txn->cf->memtable, op.kv->key, op.kv->key_size, op.kv->value,
-                                  op.kv->value_size, op.kv->ttl) == -1)
+                switch (txn->cf->config.memtable_ds)
                 {
-                    /* unlock the column family */
-                    (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+                    case TDB_MEMTABLE_SKIP_LIST:
+                        if (skip_list_put(txn->cf->memtable, op.kv->key, op.kv->key_size,
+                                          op.kv->value, op.kv->value_size, op.kv->ttl) == -1)
+                        {
+                            /* unlock the column family */
+                            (void)pthread_rwlock_unlock(&txn->cf->rwlock);
 
-                    /* unlock the transaction */
-                    (void)pthread_mutex_unlock(&txn->lock);
+                            /* unlock the transaction */
+                            (void)pthread_mutex_unlock(&txn->lock);
 
-                    /* we rollback the transaction */
-                    return tidesdb_txn_rollback(txn);
+                            /* we rollback the transaction */
+                            return tidesdb_txn_rollback(txn);
+                        }
+                    case TDB_MEMTABLE_HASH_TABLE:
+                        if (hash_table_put(txn->cf->memtable, op.kv->key, op.kv->key_size,
+                                           op.kv->value, op.kv->value_size, op.kv->ttl) == -1)
+                        {
+                            /* unlock the column family */
+                            (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+
+                            /* unlock the transaction */
+                            (void)pthread_mutex_unlock(&txn->lock);
+
+                            /* we rollback the transaction */
+                            return tidesdb_txn_rollback(txn);
+                        }
                 }
+
                 /* mark op committed */
                 txn->ops[i].committed = true;
                 break;
@@ -2985,17 +3078,34 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     return tidesdb_txn_rollback(txn);
                 }
 
-                if (skip_list_put(txn->cf->memtable, op.kv->key, op.kv->key_size, op.kv->value, 4,
-                                  0) == -1)
+                switch (txn->cf->config.memtable_ds)
                 {
-                    /* unlock the column family */
-                    (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+                    case TDB_MEMTABLE_SKIP_LIST:
+                        if (skip_list_put(txn->cf->memtable, op.kv->key, op.kv->key_size,
+                                          op.kv->value, 4, 0) == -1)
+                        {
+                            /* unlock the column family */
+                            (void)pthread_rwlock_unlock(&txn->cf->rwlock);
 
-                    /* unlock the transaction */
-                    (void)pthread_mutex_unlock(&txn->lock);
+                            /* unlock the transaction */
+                            (void)pthread_mutex_unlock(&txn->lock);
 
-                    /* we rollback the transaction */
-                    return tidesdb_txn_rollback(txn);
+                            /* we rollback the transaction */
+                            return tidesdb_txn_rollback(txn);
+                        }
+                    case TDB_MEMTABLE_HASH_TABLE:
+                        if (hash_table_put(txn->cf->memtable, op.kv->key, op.kv->key_size,
+                                           op.kv->value, 4, 0) == -1)
+                        {
+                            /* unlock the column family */
+                            (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+
+                            /* unlock the transaction */
+                            (void)pthread_mutex_unlock(&txn->lock);
+
+                            /* we rollback the transaction */
+                            return tidesdb_txn_rollback(txn);
+                        }
                 }
 
                 /* mark op committed */
@@ -3011,24 +3121,51 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "transaction");
 
     /* we check if the memtable needs to be flushed */
-    if ((int)txn->cf->memtable->total_size >= txn->cf->config.flush_threshold)
+    switch (txn->cf->config.memtable_ds)
     {
-        if (txn->cf->config.bloom_filter)
-        {
-            if (_tidesdb_flush_memtable_w_bloomfilter(txn->cf) == -1)
+        case TDB_MEMTABLE_SKIP_LIST:
+
+            if (((int)((skip_list_t *)txn->cf->memtable)->total_size >=
+                 txn->cf->config.flush_threshold))
             {
-                (void)pthread_rwlock_unlock(&txn->cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                if (txn->cf->config.bloom_filter)
+                {
+                    if (_tidesdb_flush_memtable_w_bloomfilter(txn->cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
+                else
+                {
+                    if (_tidesdb_flush_memtable(txn->cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
             }
-        }
-        else
-        {
-            if (_tidesdb_flush_memtable(txn->cf) == -1)
+        case TDB_MEMTABLE_HASH_TABLE:
+            if (((int)((hash_table_t *)txn->cf->memtable)->total_size >=
+                 txn->cf->config.flush_threshold))
             {
-                (void)pthread_rwlock_unlock(&txn->cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                if (txn->cf->config.bloom_filter)
+                {
+                    if (_tidesdb_flush_memtable_w_bloomfilter(txn->cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
+                else
+                {
+                    if (_tidesdb_flush_memtable(txn->cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
             }
-        }
     }
 
     /* unlock the column family */
@@ -3076,8 +3213,18 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
             }
 
             /* we put back the key-value pair */
-            (void)skip_list_put(txn->cf->memtable, op.kv->key, op.kv->key_size, op.kv->value,
-                                op.kv->value_size, op.kv->ttl);
+            switch (txn->cf->config.memtable_ds)
+            {
+                case TDB_MEMTABLE_SKIP_LIST:
+                    (void)skip_list_put(txn->cf->memtable, op.kv->key, op.kv->key_size,
+                                        op.kv->value, op.kv->value_size, op.kv->ttl);
+                    break;
+                case TDB_MEMTABLE_HASH_TABLE:
+                    (void)hash_table_put(txn->cf->memtable, op.kv->key, op.kv->key_size,
+                                         op.kv->value, op.kv->value_size, op.kv->ttl);
+                default:
+                    return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
+            }
         }
     }
 
@@ -3086,24 +3233,50 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "transaction");
 
     /* we check if the memtable needs to be flushed */
-    if ((int)txn->cf->memtable->total_size >= txn->cf->config.flush_threshold)
+    switch (txn->cf->config.memtable_ds)
     {
-        if (txn->cf->config.bloom_filter)
-        {
-            if (_tidesdb_flush_memtable_w_bloomfilter(txn->cf) == -1)
+        case TDB_MEMTABLE_SKIP_LIST:
+            if (((int)((skip_list_t *)txn->cf->memtable)->total_size >=
+                 txn->cf->config.flush_threshold))
             {
-                (void)pthread_rwlock_unlock(&txn->cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                if (txn->cf->config.bloom_filter)
+                {
+                    if (_tidesdb_flush_memtable_w_bloomfilter(txn->cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
+                else
+                {
+                    if (_tidesdb_flush_memtable(txn->cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
             }
-        }
-        else
-        {
-            if (_tidesdb_flush_memtable(txn->cf) == -1)
+        case TDB_MEMTABLE_HASH_TABLE:
+            if (((int)((hash_table_t *)txn->cf->memtable)->total_size >=
+                 txn->cf->config.flush_threshold))
             {
-                (void)pthread_rwlock_unlock(&txn->cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                if (txn->cf->config.bloom_filter)
+                {
+                    if (_tidesdb_flush_memtable_w_bloomfilter(txn->cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
+                else
+                {
+                    if (_tidesdb_flush_memtable(txn->cf) == -1)
+                    {
+                        (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
+                    }
+                }
             }
-        }
     }
 
     /* unlock the column family */

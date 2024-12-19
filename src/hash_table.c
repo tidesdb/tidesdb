@@ -39,22 +39,39 @@ int hash_table_new(hash_table_t **ht)
     return 0;
 }
 
-void hash_table_put(hash_table_t *ht, const uint8_t *key, size_t key_size, const uint8_t *value,
-                    size_t value_size, time_t ttl)
+int hash_table_put(hash_table_t *ht, const uint8_t *key, size_t key_size, const uint8_t *value,
+                   size_t value_size, time_t ttl)
 {
     size_t index = bloom_filter_hash(key, key_size, 0) % BUCKETS;
 
     /* we initialize the bucket */
     hash_table_bucket_t *bucket = malloc(sizeof(hash_table_bucket_t));
+    if (bucket == NULL)
+    {
+        return -1;
+    }
 
     /* we set the key */
     bucket->key = malloc(key_size);
+    if (bucket->key == NULL)
+    {
+        free(bucket);
+        return -1;
+    }
+
     memcpy(bucket->key, key, key_size);
 
     bucket->key_size = key_size;
 
     /* we set the value */
     bucket->value = malloc(value_size);
+    if (bucket->value == NULL)
+    {
+        free(bucket->key);
+        free(bucket);
+        return -1;
+    }
+
     memcpy(bucket->value, value, value_size);
     bucket->value_size = value_size;
     bucket->ttl = ttl;
@@ -69,6 +86,8 @@ void hash_table_put(hash_table_t *ht, const uint8_t *key, size_t key_size, const
 
     ht->buckets[index] = bucket; /* we set the bucket */
     ht->total_size += key_size + value_size;
+
+    return 0;
 }
 
 int hash_table_get(hash_table_t *ht, const uint8_t *key, size_t key_size, uint8_t **value,

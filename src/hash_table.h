@@ -23,8 +23,9 @@
 #define TOMBSTONE                                                                                 \
     0xDEADBEEF /* On expiration of a bucket if time to live is set we set the key's value to this \
                 */
-#define BUCKETS 1048576 /* the size of the hash table buckets.  We have this fixed for
-                         * now but we should make it so the hashtable can ultimately resize itself */
+#define BUCKETS                                                            \
+    1048576 /* the size of the hash table buckets.  We have this fixed for \
+             * now but we should make it so the hashtable can ultimately resize itself */
 
 /**
  * hash_table_bucket_t
@@ -74,9 +75,10 @@ int hash_table_new(hash_table_t **ht);
  * @param value the value to put
  * @param value_size the size of the value
  * @param ttl the time to live for the key-value pair. -1 if no ttl
+ * @return 0 if successful, -1 if not
  */
-void hash_table_put(hash_table_t *ht, const uint8_t *key, size_t key_size, const uint8_t *value,
-                    size_t value_size, time_t ttl);
+int hash_table_put(hash_table_t *ht, const uint8_t *key, size_t key_size, const uint8_t *value,
+                   size_t value_size, time_t ttl);
 
 /**
  * hash_table_get

@@ -1073,15 +1073,20 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
     if (flush_threshold < TDB_FLUSH_THRESHOLD)
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_FLUSH_THRESHOLD);
 
-    /* we check max level
-     * the system expects at least a level of TDB_MIN_MAX_LEVEL */
-    if (max_level < TDB_MIN_MAX_LEVEL)
-        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_MAX_LEVEL);
+    /* only if the memtable data structure is skip list
+     * we check max level and probability */
+    if (memtable_ds == TDB_MEMTABLE_SKIP_LIST)
+    {
+        /* we check max level
+         * the system expects at least a level of TDB_MIN_MAX_LEVEL */
+        if (max_level < TDB_MIN_MAX_LEVEL)
+            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_MAX_LEVEL);
 
-    /* we check probability
-     * the system expects at least a probability of TDB_MIN_PROBABILITY */
-    if (probability < TDB_MIN_PROBABILITY)
-        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_PROBABILITY);
+        /* we check probability
+         * the system expects at least a probability of TDB_MIN_PROBABILITY */
+        if (probability < TDB_MIN_PROBABILITY)
+            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_PROBABILITY);
+    }
 
     tidesdb_column_family_t *cf = NULL;
     if (_tidesdb_new_column_family(tdb->directory, name, flush_threshold, max_level, probability,

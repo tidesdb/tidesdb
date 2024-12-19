@@ -4372,3 +4372,188 @@ compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo)
             return COMPRESS_SNAPPY; /* default to snappy */
     }
 }
+
+int _tidesdb_flush_memtable_f_hashtable(tidesdb_column_family_t *cf)
+{
+    /* we create a new sstable struct */
+    tidesdb_sstable_t *sst = malloc(sizeof(tidesdb_sstable_t));
+    if (sst == NULL) return -1;
+
+    /* we create a new sstable with a named based on the amount of sstables */
+    char sstable_path[MAX_FILE_PATH_LENGTH];
+    snprintf(sstable_path, sizeof(sstable_path), "%s%s%s%d%s", cf->path,
+             _tidesdb_get_path_seperator(), TDB_SSTABLE_PREFIX, cf->num_sstables, TDB_SSTABLE_EXT);
+
+    /* we create a new block manager */
+    block_manager_t *sstable_block_manager = NULL;
+
+    if (block_manager_open(&sstable_block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
+    {
+        return -1;
+    }
+
+    /* we set the block manager */
+    sst->block_manager = sstable_block_manager;
+
+    /* we create a new skip list cursor and populate the memtable
+     * with serialized key value pairs */
+
+    skip_list_cursor_t *cursor = skip_list_cursor_init(cf->memtable);
+    if (cursor == NULL)
+    {
+        free(sst);
+        (void)remove(sstable_path);
+        return -1;
+    }
+
+    /* we iterate over the memtable and write to the sstable */
+    do
+    {
+        /* we get the key value pair */
+        tidesdb_key_value_pair_t *kv = malloc(sizeof(tidesdb_key_value_pair_t));
+        if (kv == NULL)
+        {
+            free(sst);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we get the key */
+
+        uint8_t *retrieved_key;
+        size_t key_size;
+        uint8_t *retrieved_value;
+        size_t value_size;
+        time_t ttl;
+        if (skip_list_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size,
+                                 &ttl) == -1)
+        {
+            free(kv);
+            free(sst);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we copy the key */
+        kv->key = malloc(key_size);
+        if (kv->key == NULL)
+        {
+            free(kv);
+            free(sst);
+            (void)remove(sstable_path);
+            return -1;
+        }
+        memcpy(kv->key, retrieved_key, key_size);
+
+        /* we copy the value */
+        kv->value = malloc(value_size);
+        if (kv->value == NULL)
+        {
+            free(kv->key);
+            free(kv);
+            free(sst);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        memcpy(kv->value, retrieved_value, value_size);
+
+        /* we set the key size */
+        kv->key_size = key_size;
+        /* we set the value size */
+        kv->value_size = value_size;
+        /* we set the ttl */
+        kv->ttl = ttl;
+
+        /* we serialize the key value pair */
+        size_t serialized_size;
+        uint8_t *serialized_kv = _tidesdb_serialize_key_value_pair(
+            kv, &serialized_size, cf->config.compressed, cf->config.compress_algo);
+        if (serialized_kv == NULL)
+        {
+            (void)_tidesdb_free_key_value_pair(kv);
+            free(sst);
+            remove(sstable_path);
+            return -1;
+        }
+
+        (void)_tidesdb_free_key_value_pair(kv);
+
+        /* we create a new block */
+        block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_kv);
+        if (block == NULL)
+        {
+            free(sst);
+            free(serialized_kv);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we write the block to the sstable */
+        if (block_manager_block_write(sst->block_manager, block) == -1)
+        {
+            (void)block_manager_block_free(block);
+            free(sst);
+            free(serialized_kv);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we free the resources */
+        (void)block_manager_block_free(block);
+        free(serialized_kv);
+
+    } while (skip_list_cursor_next(cursor) != -1);
+
+    /* we free the cursor */
+    (void)skip_list_cursor_free(cursor);
+
+    /* we add the sstable to the column family */
+    if (cf->sstables == NULL)
+    {
+        cf->sstables = malloc(sizeof(tidesdb_sstable_t));
+        if (cf->sstables == NULL)
+        {
+            free(sst);
+            (void)remove(sstable_path);
+            return -1;
+        }
+    }
+    else
+    {
+        tidesdb_sstable_t **temp_sstables =
+            realloc(cf->sstables, sizeof(tidesdb_sstable_t) * (cf->num_sstables + 1));
+        if (temp_sstables == NULL)
+        {
+            free(sst);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        cf->sstables = temp_sstables;
+    }
+
+    /* we increment the number of sstables
+     * and set the sstable
+     */
+    cf->sstables[cf->num_sstables] = sst;
+    cf->num_sstables++;
+
+    /* clear memtable */
+    if (skip_list_clear(cf->memtable) == -1)
+    {
+        free(sst);
+        (void)remove(sstable_path);
+        return -1;
+    }
+
+    /* truncate the wal */
+    if (block_manager_truncate(cf->wal->block_manager) == -1)
+    {
+        free(sst);
+        (void)remove(sstable_path);
+        return -1;
+    }
+
+    return 0;
+}

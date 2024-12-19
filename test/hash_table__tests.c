@@ -16,144 +16,124 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 
 #include "../src/hash_table.h"
-#include "test_macros.h"
 
 void test_hash_table_new()
 {
     hash_table_t *ht;
-    int result = hash_table_new(&ht);
-    assert(result == 0);
+    assert(hash_table_new(&ht) == 0);
     assert(ht != NULL);
-    free(ht);
-    printf(GREEN "test_hash_table_new passed\n" RESET);
+    assert(ht->buckets != NULL);
+    assert(ht->bucket_count == INITIAL_BUCKETS);
+    assert(ht->count == 0);
+    assert(ht->total_size == 0);
+    hash_table_destroy(ht);
+    printf("test_hash_table_new passed\n");
 }
 
 void test_hash_table_put_get()
 {
     hash_table_t *ht;
-    hash_table_new(&ht);
+    assert(hash_table_new(&ht) == 0);
 
-    const char *key = "key";
-    const char *value = "value";
-    hash_table_put(ht, (const uint8_t *)key, strlen(key), (const uint8_t *)value, strlen(value),
-                   -1);
+    uint8_t key[] = "key";
+    uint8_t value[] = "value";
+    assert(hash_table_put(&ht, key, sizeof(key), value, sizeof(value), -1) == 0);
 
     uint8_t *retrieved_value;
     size_t retrieved_value_size;
-    int result = hash_table_get(ht, (const uint8_t *)key, strlen(key), &retrieved_value,
-                                &retrieved_value_size);
-    assert(result == 0);
+    assert(hash_table_get(ht, key, sizeof(key), &retrieved_value, &retrieved_value_size) == 0);
+    assert(retrieved_value_size == sizeof(value));
     assert(memcmp(retrieved_value, value, retrieved_value_size) == 0);
+    free(retrieved_value);
 
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key, strlen(key), 0) % BUCKETS]->key);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key, strlen(key), 0) % BUCKETS]->value);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key, strlen(key), 0) % BUCKETS]);
-    free(ht);
-    printf(GREEN "test_hash_table_put_get passed\n" RESET);
+    hash_table_destroy(ht);
+    printf("test_hash_table_put_get passed\n");
+}
+
+void test_hash_table_resize()
+{
+    hash_table_t *ht;
+    assert(hash_table_new(&ht) == 0);
+
+    for (size_t i = 0; i < INITIAL_BUCKETS * 2; i++)
+    {
+        uint8_t key[16];
+        uint8_t value[16];
+        snprintf((char *)key, sizeof(key), "key%zu", i);
+        snprintf((char *)value, sizeof(value), "value%zu", i);
+        assert(hash_table_put(&ht, key, sizeof(key), value, sizeof(value), -1) == 0);
+    }
+
+    assert(ht->bucket_count > INITIAL_BUCKETS);
+    hash_table_destroy(ht);
+    printf("test_hash_table_resize passed\n");
+}
+
+void test_hash_table_clear()
+{
+    hash_table_t *ht;
+    assert(hash_table_new(&ht) == 0);
+
+    uint8_t key[] = "key";
+    uint8_t value[] = "value";
+    assert(hash_table_put(&ht, key, sizeof(key), value, sizeof(value), -1) == 0);
+
+    hash_table_clear(ht);
+    assert(ht->count == 0);
+    assert(ht->total_size == 0);
+
+    uint8_t *retrieved_value;
+    size_t retrieved_value_size;
+    assert(hash_table_get(ht, key, sizeof(key), &retrieved_value, &retrieved_value_size) == -1);
+
+    hash_table_destroy(ht);
+    printf("test_hash_table_clear passed\n");
 }
 
 void test_hash_table_cursor()
 {
     hash_table_t *ht;
-    hash_table_new(&ht);
+    assert(hash_table_new(&ht) == 0);
 
-    const char *key1 = "key1";
-    const char *value1 = "value1";
-    hash_table_put(ht, (const uint8_t *)key1, strlen(key1), (const uint8_t *)value1, strlen(value1),
-                   -1);
-
-    const char *key2 = "key2";
-    const char *value2 = "value2";
-    hash_table_put(ht, (const uint8_t *)key2, strlen(key2), (const uint8_t *)value2, strlen(value2),
-                   -1);
+    uint8_t key[] = "key";
+    uint8_t value[] = "value";
+    assert(hash_table_put(&ht, key, sizeof(key), value, sizeof(value), -1) == 0);
 
     hash_table_cursor_t *cursor = hash_table_cursor_new(ht);
-    uint8_t *key;
-    size_t key_size;
-    uint8_t *value;
-    size_t value_size;
-
-    int result = hash_table_cursor_next(cursor, &key, &key_size, &value, &value_size);
-    assert(result == 0);
-    assert(memcmp(key, key1, key_size) == 0 || memcmp(key, key2, key_size) == 0);
-
-    result = hash_table_cursor_next(cursor, &key, &key_size, &value, &value_size);
-    assert(result == 0);
-    assert(memcmp(key, key1, key_size) == 0 || memcmp(key, key2, key_size) == 0);
-
-    result = hash_table_cursor_next(cursor, &key, &key_size, &value, &value_size);
-    assert(result == -1);
-
-    hash_table_cursor_destroy(cursor);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key1, strlen(key1), 0) % BUCKETS]->key);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key1, strlen(key1), 0) % BUCKETS]->value);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key1, strlen(key1), 0) % BUCKETS]);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key2, strlen(key2), 0) % BUCKETS]->key);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key2, strlen(key2), 0) % BUCKETS]->value);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key2, strlen(key2), 0) % BUCKETS]);
-    free(ht);
-    printf(GREEN "test_hash_table_cursor passed\n" RESET);
-}
-
-void test_hash_table_cursor_prev()
-{
-    hash_table_t *ht;
-    hash_table_new(&ht);
-
-    const char *key1 = "key1";
-    const char *value1 = "value1";
-    hash_table_put(ht, (const uint8_t *)key1, strlen(key1), (const uint8_t *)value1, strlen(value1),
-                   -1);
-
-    const char *key2 = "key2";
-    const char *value2 = "value2";
-    hash_table_put(ht, (const uint8_t *)key2, strlen(key2), (const uint8_t *)value2, strlen(value2),
-                   -1);
-
-    hash_table_cursor_t *cursor = hash_table_cursor_new(ht);
-    uint8_t *key;
-    size_t key_size;
-    uint8_t *value;
-    size_t value_size;
-
-    /* go to end of the hash table */
-    while (hash_table_cursor_next(cursor, &key, &key_size, &value, &value_size) == 0)
-        ;
-
-    /* test moving cursor backwards */
-    int result = hash_table_cursor_prev(cursor, &key, &key_size, &value, &value_size);
-    assert(result == 0);
-    assert(memcmp(key, key1, key_size) == 0 || memcmp(key, key2, key_size) == 0);
-
-    result = hash_table_cursor_prev(cursor, &key, &key_size, &value, &value_size);
-    assert(result == 0);
-    assert(memcmp(key, key1, key_size) == 0 || memcmp(key, key2, key_size) == 0);
-
-    result = hash_table_cursor_prev(cursor, &key, &key_size, &value, &value_size);
-    assert(result == -1);
+    uint8_t *retrieved_key;
+    size_t retrieved_key_size;
+    uint8_t *retrieved_value;
+    size_t retrieved_value_size;
+    do
+    {
+        if (hash_table_cursor_get(cursor, &retrieved_key, &retrieved_key_size, &retrieved_value,
+                                  &retrieved_value_size) == 0)
+        {
+            assert(retrieved_key_size == sizeof(key));
+            assert(memcmp(retrieved_key, key, retrieved_key_size) == 0);
+            assert(retrieved_value_size == sizeof(value));
+            assert(memcmp(retrieved_value, value, retrieved_value_size) == 0);
+        }
+    } while (hash_table_cursor_next(cursor) == 0);
 
     hash_table_cursor_destroy(cursor);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key1, strlen(key1), 0) % BUCKETS]->key);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key1, strlen(key1), 0) % BUCKETS]->value);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key1, strlen(key1), 0) % BUCKETS]);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key2, strlen(key2), 0) % BUCKETS]->key);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key2, strlen(key2), 0) % BUCKETS]->value);
-    free(ht->buckets[bloom_filter_hash((const uint8_t *)key2, strlen(key2), 0) % BUCKETS]);
-    free(ht);
-    printf(GREEN "test_hash_table_cursor_prev passed\n" RESET);
+    hash_table_destroy(ht);
+    printf("test_hash_table_cursor passed\n");
 }
 
-int main()
+int main(void)
 {
     test_hash_table_new();
     test_hash_table_put_get();
+    test_hash_table_clear();
     test_hash_table_cursor();
-    test_hash_table_cursor_prev();
+    test_hash_table_resize();
     return 0;
 }

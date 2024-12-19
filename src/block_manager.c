@@ -25,7 +25,11 @@ int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_
     if (!(*bm)) return -1; /* if allocation fails, return -1 */
 
     (*bm)->file = fopen(file_path, "a+b"); /* we open the desired file in append-binary mode */
-    if (!(*bm)->file) return -1;
+    if (!(*bm)->file)
+    {
+        free(*bm);
+        return -1;
+    }
 
     /* we copy the file path to the block manager */
     strcpy((*bm)->file_path, file_path);
@@ -37,7 +41,11 @@ int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_
     (*bm)->stop_fsync_thread = 0;
 
     /* we create and start the fsync thread */
-    if (pthread_create(&(*bm)->fsync_thread, NULL, block_manager_fsync_thread, *bm) != 0) return -1;
+    if (pthread_create(&(*bm)->fsync_thread, NULL, block_manager_fsync_thread, *bm) != 0)
+    {
+        free(*bm);
+        return -1;
+    }
     return 0;
 }
 
@@ -58,6 +66,7 @@ int block_manager_close(block_manager_t *bm)
     /* we free the block manager */
     free(bm);
     bm = NULL; /* we set the pointer to NULL */
+
     return 0;
 }
 

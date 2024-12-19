@@ -123,8 +123,8 @@ In order to store data in TidesDB you need a column family.  This is by design.
 - the database you want to create the column family in.  Must be open
 - the name of the column family
 - memtable flush threshold in bytes.  Example below is 128MB
-- skip list max level.  Example below is 12
-- skip list probability.  Example below is 0.24
+- skip list max level.  Example below is 12 ( only if using `TDB_MEMTABLE_SKIP_LIST` ) pass 0 if using `TDB_MEMTABLE_HASH_TABLE`
+- skip list probability.  Example below is 0.24 ( only if using `TDB_MEMTABLE_SKIP_LIST` ) pass 0.0 if using `TDB_MEMTABLE_HASH_TABLE`
 - whether column family sstable data is compressed
 - the compression algorithim to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
 - whether to use bloom filters

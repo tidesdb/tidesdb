@@ -23,6 +23,7 @@
 #include <time.h>
 
 #include "../src/hash_table.h"
+#include "test_macros.h"
 
 void test_hash_table_new()
 {
@@ -34,7 +35,7 @@ void test_hash_table_new()
     assert(ht->count == 0);
     assert(ht->total_size == 0);
     hash_table_destroy(ht);
-    printf("test_hash_table_new passed\n");
+    printf(GREEN "test_hash_table_new passed\n" RESET);
 }
 
 void test_hash_table_put_get()
@@ -54,7 +55,7 @@ void test_hash_table_put_get()
     free(retrieved_value);
 
     hash_table_destroy(ht);
-    printf("test_hash_table_put_get passed\n");
+    printf(GREEN "test_hash_table_put_get passed\n" RESET);
 }
 
 void test_hash_table_resize()
@@ -73,7 +74,7 @@ void test_hash_table_resize()
 
     assert(ht->bucket_count > INITIAL_BUCKETS);
     hash_table_destroy(ht);
-    printf("test_hash_table_resize passed\n");
+    printf(GREEN "test_hash_table_resize passed\n" RESET);
 }
 
 void test_hash_table_clear()
@@ -94,11 +95,13 @@ void test_hash_table_clear()
     assert(hash_table_get(ht, key, sizeof(key), &retrieved_value, &retrieved_value_size) == -1);
 
     hash_table_destroy(ht);
-    printf("test_hash_table_clear passed\n");
+    printf(GREEN "test_hash_table_clear passed\n" RESET);
 }
 
 void test_hash_table_cursor()
 {
+    /* we can add more
+     * here if needed */
     hash_table_t *ht;
     assert(hash_table_new(&ht) == 0);
 
@@ -126,7 +129,7 @@ void test_hash_table_cursor()
 
     hash_table_cursor_destroy(cursor);
     hash_table_destroy(ht);
-    printf("test_hash_table_cursor passed\n");
+    printf(GREEN "test_hash_table_cursor passed\n" RESET);
 }
 
 int main(void)

@@ -21,7 +21,7 @@ if(TIDESDB_WITH_SANITIZER)
         add_link_options(-fsanitize=address,undefined)
 endif()
 
-add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c)
+add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c src/compat.h)
 
 target_include_directories(tidesdb PRIVATE src)
 
@@ -29,7 +29,7 @@ install(TARGETS tidesdb
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
 
-install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/compress.h src/bloom_filter.h DESTINATION include)
+install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/compress.h src/bloom_filter.h src/compat.h DESTINATION include)
 
 if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         enable_testing()

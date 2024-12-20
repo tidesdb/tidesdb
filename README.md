@@ -34,6 +34,32 @@ cmake --build build
 cmake --install build
 ```
 
+## Requirements
+You need cmake and a C compiler that supports C.
+You also require the `snappy`, `lz4`, and `zstd` libraries.
+### Linux
+```bash
+sudo apt install libzstd-dev
+sudo apt install liblz4-dev
+sudo apt install libsnappy-dev
+```
+
+### MacOS
+```bash
+brew install zstd
+brew install lz4
+brew install snappy
+```
+
+### Windows
+Windows using vcpkg
+```bash
+vcpkg install zstd
+vcpkg install lz4
+vcpkg install snappy
+```
+
+
 ## Bindings
 Bindings are in the works in various languages.
 <ul>

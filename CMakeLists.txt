@@ -6,14 +6,18 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 23)
-set(PROJECT_VERSION 0.2.0) # TidesDB v0.2.0
+set(PROJECT_VERSION 0.3.0) # TidesDB v0.3.0b
 
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 
-#find_package(zstd REQUIRED)
-#find_package(snappy REQUIRED)
-#find_package(lz4 REQUIRED)
+IF (WIN32)
+        # install via vcpkg
+        find_package(zstd REQUIRED)
+        find_package(snappy REQUIRED)
+        find_package(lz4 REQUIRED)
+ENDIF() # on unix systems find_package will cause issues on make process usually looking for the packages even though installed apt-get or brew say.
+
 
 # for development, we want to enable all warnings and sanitizers
 if(TIDESDB_WITH_SANITIZER)

@@ -4553,7 +4553,6 @@ compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo)
 
 int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *cf)
 {
-    /* @TODO use hash table instead of skiplist */
     /* similar to _tidesdb_flush_memtable but with bloom filter */
 
     /* we create a new sstable struct */
@@ -4577,7 +4576,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
     sst->block_manager = sstable_block_manager;
 
     /* we figure out how large the bloom filter should be by getting amount of nodes in memtable */
-    int bloom_filter_size = skip_list_count_entries(cf->memtable);
+    int bloom_filter_size = (int)((hash_table_t *)cf->memtable)->count;
 
     /* we initialize the bloom filter */
     bloom_filter_t *bf = NULL;
@@ -4589,7 +4588,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
     }
 
     /* we iterate over memtable and populate the bloom filter */
-    skip_list_cursor_t *cursor = skip_list_cursor_init(cf->memtable);
+    hash_table_cursor_t *cursor = hash_table_cursor_new(cf->memtable);
     if (cursor == NULL)
     {
         free(sst);
@@ -4604,8 +4603,8 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
         uint8_t *retrieved_value;
         size_t value_size;
         time_t ttl;
-        if (skip_list_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size,
-                                 &ttl) == -1)
+        if (hash_table_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size,
+                                  &ttl) == -1)
         {
             free(retrieved_key);
             free(retrieved_value);
@@ -4617,10 +4616,10 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
         /* add to bloom filter */
         (void)bloom_filter_add(bf, retrieved_key, key_size);
 
-    } while (skip_list_cursor_next(cursor) != -1);
+    } while (hash_table_cursor_next(cursor) != -1);
 
     /* we free the cursor */
-    (void)skip_list_cursor_free(cursor);
+    (void)hash_table_cursor_destroy(cursor);
     cursor = NULL;
 
     size_t serialized_bf_size;
@@ -4659,7 +4658,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
     (void)block_manager_block_free(bf_block);
 
     /* we reinitialize the cursor to populate the sstable with keyvalue pairs after bloomfilter */
-    cursor = skip_list_cursor_init(cf->memtable);
+    cursor = hash_table_cursor_new(cf->memtable);
     if (cursor == NULL)
     {
         free(sst);
@@ -4681,8 +4680,8 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
 
         /* we get the key */
 
-        if (skip_list_cursor_get(cursor, &kv->key, (size_t *)&kv->key_size, &kv->value,
-                                 (size_t *)&kv->value_size, &kv->ttl) == -1)
+        if (hash_table_cursor_get(cursor, &kv->key, (size_t *)&kv->key_size, &kv->value,
+                                  (size_t *)&kv->value_size, &kv->ttl) == -1)
         {
             free(kv);
             free(sst);
@@ -4728,10 +4727,10 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
         (void)block_manager_block_free(block);
         free(serialized_kv);
 
-    } while (skip_list_cursor_next(cursor) != -1);
+    } while (hash_table_cursor_next(cursor) != -1);
 
     /* we free the cursor */
-    (void)skip_list_cursor_free(cursor);
+    (void)hash_table_cursor_destroy(cursor);
 
     cursor = NULL;
 
@@ -4767,12 +4766,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
     cf->num_sstables++;
 
     /* clear memtable */
-    if (skip_list_clear(cf->memtable) == -1)
-    {
-        free(sst);
-        (void)remove(sstable_path);
-        return -1;
-    }
+    (void)hash_table_clear(cf->memtable);
 
     /* truncate the wal */
     if (block_manager_truncate(cf->wal->block_manager) == -1)

@@ -1696,7 +1696,6 @@ int main(void)
     test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
 
     /* same tests as above but using a hash table as the memtable data structure */
-    /** not completed yet
     test_tidesdb_put_get_memtable(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_put_close_replay_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_txn_put_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
@@ -1710,7 +1709,6 @@ int main(void)
     test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
-    ****/
 
     return 0;
 }

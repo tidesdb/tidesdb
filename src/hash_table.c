@@ -223,6 +223,7 @@ int hash_table_cursor_next(hash_table_cursor_t *cursor)
     }
 
     cursor->current_bucket_index++;
+
     return 0;
 }
 

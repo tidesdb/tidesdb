@@ -111,10 +111,11 @@ void test_hash_table_cursor()
     size_t retrieved_key_size;
     uint8_t *retrieved_value;
     size_t retrieved_value_size;
+    time_t retrieved_ttl;
     do
     {
         if (hash_table_cursor_get(cursor, &retrieved_key, &retrieved_key_size, &retrieved_value,
-                                  &retrieved_value_size) == 0)
+                                  &retrieved_value_size, &retrieved_ttl) == 0)
         {
             assert(retrieved_key_size == sizeof(key));
             assert(memcmp(retrieved_key, key, retrieved_key_size) == 0);

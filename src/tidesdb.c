@@ -4787,8 +4787,6 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
 
 int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
 {
-    /* @TODO replace skip list with hash table */
-
     /* we create a new sstable struct */
     tidesdb_sstable_t *sst = malloc(sizeof(tidesdb_sstable_t));
     if (sst == NULL) return -1;
@@ -4809,10 +4807,10 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
     /* we set the block manager */
     sst->block_manager = sstable_block_manager;
 
-    /* we create a new skip list cursor and populate the memtable
+    /* we create a new hash table cursor and populate the memtable
      * with serialized key value pairs */
 
-    skip_list_cursor_t *cursor = skip_list_cursor_init(cf->memtable);
+    hash_table_cursor_t *cursor = hash_table_cursor_new(cf->memtable);
     if (cursor == NULL)
     {
         free(sst);
@@ -4839,8 +4837,8 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
         uint8_t *retrieved_value;
         size_t value_size;
         time_t ttl;
-        if (skip_list_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size,
-                                 &ttl) == -1)
+        if (hash_table_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size,
+                                  &ttl) == -1)
         {
             free(kv);
             free(sst);
@@ -4917,10 +4915,10 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
         (void)block_manager_block_free(block);
         free(serialized_kv);
 
-    } while (skip_list_cursor_next(cursor) != -1);
+    } while (hash_table_cursor_next(cursor) != -1);
 
     /* we free the cursor */
-    (void)skip_list_cursor_free(cursor);
+    (void)hash_table_cursor_destroy(cursor);
 
     /* we add the sstable to the column family */
     if (cf->sstables == NULL)
@@ -4954,12 +4952,7 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
     cf->num_sstables++;
 
     /* clear memtable */
-    if (skip_list_clear(cf->memtable) == -1)
-    {
-        free(sst);
-        (void)remove(sstable_path);
-        return -1;
-    }
+    (void)hash_table_clear(cf->memtable);
 
     /* truncate the wal */
     if (block_manager_truncate(cf->wal->block_manager) == -1)

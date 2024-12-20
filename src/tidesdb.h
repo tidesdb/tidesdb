@@ -615,12 +615,12 @@ int _tidesdb_compare_sstables(const void *a, const void *b);
 int _tidesdb_flush_memtable(tidesdb_column_family_t *cf);
 
 /*
- * _tidesdb_flush_memtable_f_hashtable
+ * _tidesdb_flush_memtable_f_hash_table
  * flushes a memtable to disk in an SSTable from a hash table memtable
  * @param cf the column family
  * @return 0 if the memtable was flushed, -1 if not
  */
-int _tidesdb_flush_memtable_f_hashtable(tidesdb_column_family_t *cf);
+int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf);
 
 /*
  * _tidesdb_flush_memtable_w_bloomfilter
@@ -632,13 +632,13 @@ int _tidesdb_flush_memtable_f_hashtable(tidesdb_column_family_t *cf);
 int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf);
 
 /*
- * _tidesdb_flush_memtable_w_bloomfilter_f_hashtable
+ * _tidesdb_flush_memtable_w_bloomfilter_f_hash_table
  * flushes a memtable to disk in an SSTable with a bloom filter at initial block from a hash table
  * memtable
  * @param cf the column family
  * @return 0 if the memtable was flushed, -1 if not
  */
-int _tidesdb_flush_memtable_w_bloomfilter_f_hashtable(tidesdb_column_family_t *cf);
+int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *cf);
 
 /*
  * _tidesdb_is_tombstone

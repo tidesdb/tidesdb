@@ -1584,7 +1584,7 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hashtable(cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -1603,7 +1603,7 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_f_hashtable(cf) == -1)
+                        if (_tidesdb_flush_memtable_f_hash_table(cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -1635,7 +1635,7 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hashtable(cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -1654,7 +1654,7 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_f_hashtable(cf) == -1)
+                        if (_tidesdb_flush_memtable_f_hash_table(cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -1986,7 +1986,7 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
                         }
                         else /* hash table */
                         {
-                            if (_tidesdb_flush_memtable_w_bloomfilter_f_hashtable(cf) == -1)
+                            if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(cf) == -1)
                             {
                                 (void)pthread_rwlock_unlock(&cf->rwlock);
                                 return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -2006,7 +2006,7 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
                     }
                     else /* hash table */
                     {
-                        if (_tidesdb_flush_memtable_f_hashtable(cf) == -1)
+                        if (_tidesdb_flush_memtable_f_hash_table(cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -2029,7 +2029,7 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
                         }
                         else /* hash table */
                         {
-                            if (_tidesdb_flush_memtable_w_bloomfilter_f_hashtable(cf) == -1)
+                            if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(cf) == -1)
                             {
                                 (void)pthread_rwlock_unlock(&cf->rwlock);
                                 return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -2049,7 +2049,7 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
                     }
                     else /* hash table */
                     {
-                        if (_tidesdb_flush_memtable_f_hashtable(cf) == -1)
+                        if (_tidesdb_flush_memtable_f_hash_table(cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3309,7 +3309,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hashtable(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3328,7 +3328,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_f_hashtable(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_f_hash_table(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3353,7 +3353,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hashtable(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3372,7 +3372,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_f_hashtable(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_f_hash_table(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3467,7 +3467,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hashtable(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3511,7 +3511,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hashtable(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3530,7 +3530,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_f_hashtable(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_f_hash_table(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -4551,9 +4551,9 @@ compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo)
     }
 }
 
-int _tidesdb_flush_memtable_w_bloomfilter_f_hashtable(tidesdb_column_family_t *cf)
+int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *cf)
 {
-    /* @TODO use hashtable instead of skiplist */
+    /* @TODO use hash table instead of skiplist */
     /* similar to _tidesdb_flush_memtable but with bloom filter */
 
     /* we create a new sstable struct */
@@ -4785,7 +4785,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hashtable(tidesdb_column_family_t *c
     return 0;
 }
 
-int _tidesdb_flush_memtable_f_hashtable(tidesdb_column_family_t *cf)
+int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
 {
     /* @TODO replace skip list with hash table */
 

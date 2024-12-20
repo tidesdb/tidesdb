@@ -218,7 +218,7 @@ int main(void)
 
     const char *cf_name = "cf1";
     err = tidesdb_create_column_family(tdb, cf_name, FLUSH_THRESHOLD, 12, 0.24f, false,
-                                       TDB_NO_COMPRESSION, false);
+                                       TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "Error creating column family: %s\n" RESET, err->message);
@@ -229,7 +229,7 @@ int main(void)
 
     const char *cf_name2 = "cf2";
     err = tidesdb_create_column_family(tdb, cf_name2, FLUSH_THRESHOLD, 12, 0.24f, false,
-                                       TDB_COMPRESS_SNAPPY, true);
+                                       TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "Error creating column family: %s\n" RESET, err->message);

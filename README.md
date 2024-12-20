@@ -169,7 +169,7 @@ if (e != NULL)
 Using Snappy compression and bloom filters for column family sstables
 ```c
 /* create a column family with compression and bloom filter (the bloom filter provides fast read speed) */
-tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, true, TDB_COMPRESS_SNAPPY, true);
+tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
 if (e != NULL)
 {
     /* handle error */

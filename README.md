@@ -21,10 +21,10 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Bloom Filters** reduce disk reads by reading initial blocks of sstables to check key existence.
 - [x] **Compression** compression is achieved with Snappy, or LZ4, or ZSTD.  SStable entries can be compressed as well as WAL entries.
 - [x] **TTL** time-to-live for key-value pairs.
-- [x] **Configurable** column families are configurable with memtable flush threshold, skip list max level, skip list probability, compression, and bloom filters.
+- [x] **Configurable** column families are configurable with memtable flush threshold, data structure, if skip list max level, if skip list probability, compression, and bloom filters.
 - [x] **Error Handling** API functions return an error code and message.
 - [x] **Easy API** simple and easy to use api.
-- [ ] **Multiple Memtable Data Structures** memtable can be a skip list or hash table.
+- [x] **Multiple Memtable Data Structures** memtable can be a skip list or hash table.
 
 ## Building
 Using cmake to build the shared library.

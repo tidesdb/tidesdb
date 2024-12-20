@@ -170,10 +170,11 @@ int hash_table_cursor_prev(hash_table_cursor_t *cursor);
  * @param key_size the size of the key
  * @param value the value to be returned
  * @param value_size the size of the value
+ * @param ttl the time to live of the key-value pair
  * @return 0 if successful, -1 if not
  */
 int hash_table_cursor_get(hash_table_cursor_t *cursor, uint8_t **key, size_t *key_size,
-                          uint8_t **value, size_t *value_size);
+                          uint8_t **value, size_t *value_size, time_t *ttl);
 
 /**
  * hash_table_cursor_destroy

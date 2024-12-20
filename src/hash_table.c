@@ -238,7 +238,7 @@ int hash_table_cursor_prev(hash_table_cursor_t *cursor)
 }
 
 int hash_table_cursor_get(hash_table_cursor_t *cursor, uint8_t **key, size_t *key_size,
-                          uint8_t **value, size_t *value_size)
+                          uint8_t **value, size_t *value_size, time_t *ttl)
 {
     if (cursor->current_bucket_index >= cursor->ht->bucket_count)
     {
@@ -264,6 +264,7 @@ int hash_table_cursor_get(hash_table_cursor_t *cursor, uint8_t **key, size_t *ke
         *key_size = bucket->key_size;
         *value = bucket->value;
         *value_size = bucket->value_size;
+        *ttl = bucket->ttl;
         return 0;
     }
     return -1;

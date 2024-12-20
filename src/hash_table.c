@@ -121,8 +121,9 @@ int hash_table_resize(hash_table_t **ht, size_t new_size)
 {
     /* we create a new hash table
      * with the new size and we add all buckets from the old hash table */
-    hash_table_t *new_ht;
-    if (hash_table_new(&new_ht) == -1)
+
+    hash_table_t *new_ht = malloc(sizeof(hash_table_t));
+    if (*ht == NULL)
     {
         return -1;
     }
@@ -280,6 +281,8 @@ int hash_table_should_resize(hash_table_t *ht)
 
 void hash_table_clear(hash_table_t *ht)
 {
+    if (ht == NULL || ht->buckets == NULL) return;
+
     for (size_t i = 0; i < ht->bucket_count; i++)
     {
         hash_table_bucket_t *bucket = ht->buckets[i];
@@ -297,8 +300,9 @@ void hash_table_clear(hash_table_t *ht)
 
 void hash_table_destroy(hash_table_t *ht)
 {
+    if (ht == NULL) return;
+
     hash_table_clear(ht);
     free(ht->buckets);
     free(ht);
-    ht = NULL;
 }

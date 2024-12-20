@@ -8,7 +8,7 @@ The underlying data structure is based on a log-structured merge-tree (LSM-tree)
 It is not a full-featured database, but rather a library that can be used to build a database atop of or used as a standalone key-value/column store.
 
 > [!CAUTION]
-> master is in active development.  v0.2.0 is the projected stable first release.  We are in the final stages of testing and documentation.
+> master is in active development.  TidesDB 1 is the projected stable first MAJOR release.  We are in the beta development stages.
 
 ## Features
 - [x] **ACID** transactions are atomic, consistent, isolated, and durable.  Transactions are tied to their respective column family.

@@ -1,1 +1,0 @@
-/usr/bin/cc -fsanitize=address,undefined CMakeFiles/compress_tests.dir/test/compress__tests.c.o -o compress_tests  -Wl,-rpath,/home/toge/src/github-tidesdb/_build libtidesdb.so -lm -lzstd -lsnappy -llz4

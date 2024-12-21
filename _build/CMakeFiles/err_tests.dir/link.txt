@@ -1,1 +1,0 @@
-/usr/bin/cc -fsanitize=address,undefined CMakeFiles/err_tests.dir/test/err__tests.c.o -o err_tests  -Wl,-rpath,/home/toge/src/github-tidesdb/_build libtidesdb.so -lm -lzstd -lsnappy -llz4

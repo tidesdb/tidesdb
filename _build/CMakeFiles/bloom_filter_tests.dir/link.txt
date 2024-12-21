@@ -1,1 +1,0 @@
-/usr/bin/cc -fsanitize=address,undefined CMakeFiles/bloom_filter_tests.dir/test/bloom_filter__tests.c.o -o bloom_filter_tests  -Wl,-rpath,/home/toge/src/github-tidesdb/_build libtidesdb.so -lm -lzstd -lsnappy -llz4

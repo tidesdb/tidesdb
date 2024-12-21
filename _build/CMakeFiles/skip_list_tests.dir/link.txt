@@ -1,1 +1,0 @@
-/usr/bin/cc -fsanitize=address,undefined CMakeFiles/skip_list_tests.dir/test/skip_list__tests.c.o -o skip_list_tests  -Wl,-rpath,/home/toge/src/github-tidesdb/_build libtidesdb.so -lm -lzstd -lsnappy -llz4

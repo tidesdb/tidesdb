@@ -235,25 +235,32 @@ void hash_table_cursor_reset(hash_table_cursor_t *cursor)
 
 int hash_table_cursor_next(hash_table_cursor_t *cursor)
 {
-    if (cursor->current_bucket_index >= cursor->ht->bucket_count)
+    while (cursor->current_bucket_index < cursor->ht->bucket_count)
     {
-        return -1; /* we are at the end */
+        cursor->current_bucket_index++;
+        if (cursor->current_bucket_index >= cursor->ht->bucket_count)
+        {
+            return -1; /* we are at the end */
+        }
+        if (cursor->ht->buckets[cursor->current_bucket_index] != NULL)
+        {
+            return 0; /* found a non-empty bucket */
+        }
     }
-
-    cursor->current_bucket_index++;
-
-    return 0;
+    return -1; /* no more non-empty buckets */
 }
 
 int hash_table_cursor_prev(hash_table_cursor_t *cursor)
 {
-    if (cursor->current_bucket_index == 0)
+    while (cursor->current_bucket_index > 0)
     {
-        return -1; /* we are at the beginning */
+        --cursor->current_bucket_index;
+        if (cursor->ht->buckets[cursor->current_bucket_index] != NULL)
+        {
+            return 0; /* found a non-empty bucket */
+        }
     }
-
-    --cursor->current_bucket_index;
-    return 0;
+    return -1; /* no more non-empty buckets */
 }
 
 int hash_table_cursor_get(hash_table_cursor_t *cursor, uint8_t **key, size_t *key_size,

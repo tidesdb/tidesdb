@@ -57,7 +57,16 @@ int hash_table_new(hash_table_t **ht)
 int hash_table_put(hash_table_t **ht, const uint8_t *key, size_t key_size, const uint8_t *value,
                    size_t value_size, time_t ttl)
 {
-    size_t index = bloom_filter_hash(key, key_size, 0) % (*ht)->bucket_count;
+    size_t original_index = bloom_filter_hash(key, key_size, 0) % (*ht)->bucket_count;
+    size_t index = original_index;
+    size_t i = 1;
+
+    /* Find the next available slot using quadratic probing */
+    while ((*ht)->buckets[index] != NULL && (*ht)->buckets[index]->key != NULL)
+    {
+        index = (original_index + i * i) % (*ht)->bucket_count;
+        i++;
+    }
 
     /* we initialize the bucket */
     hash_table_bucket_t *bucket = malloc(sizeof(hash_table_bucket_t));
@@ -174,31 +183,40 @@ int hash_table_resize(hash_table_t **ht, size_t new_size)
 int hash_table_get(hash_table_t *ht, const uint8_t *key, size_t key_size, uint8_t **value,
                    size_t *value_size)
 {
-    size_t index = bloom_filter_hash(key, key_size, 0) % ht->bucket_count;
-    hash_table_bucket_t *bucket = ht->buckets[index];
-    if (bucket == NULL || bucket->key_size != key_size || memcmp(bucket->key, key, key_size) != 0)
+    size_t original_index = bloom_filter_hash(key, key_size, 0) % ht->bucket_count;
+    size_t index = original_index;
+    size_t i = 1;
+
+    /* Find the correct slot using quadratic probing */
+    while (ht->buckets[index] != NULL)
     {
-        return -1; /* key not found */
+        hash_table_bucket_t *bucket = ht->buckets[index];
+        if (bucket->key_size == key_size && memcmp(bucket->key, key, key_size) == 0)
+        {
+            /* check if ttl is set and if the key has expired */
+            if (bucket->ttl != -1 && time(NULL) > bucket->ttl)
+            {
+                *(uint32_t *)bucket->value = TOMBSTONE;
+                return -1;
+            }
+
+            *value = malloc(bucket->value_size);
+            if (*value == NULL)
+            {
+                return -1;
+            }
+
+            /* we copy the value */
+            memcpy(*value, bucket->value, bucket->value_size);
+
+            *value_size = bucket->value_size;
+            return 0;
+        }
+        index = (original_index + i * i) % ht->bucket_count;
+        i++;
     }
 
-    /* check if ttl is set and if the key has expired */
-    if (bucket->ttl != -1 && time(NULL) > bucket->ttl)
-    {
-        *(uint32_t *)bucket->value = TOMBSTONE;
-        return -1;
-    }
-
-    *value = malloc(bucket->value_size);
-    if (*value == NULL)
-    {
-        return -1;
-    }
-
-    /* we copy the value */
-    memcpy(*value, bucket->value, bucket->value_size);
-
-    *value_size = bucket->value_size;
-    return 0;
+    return -1; /* key not found */
 }
 
 hash_table_cursor_t *hash_table_cursor_new(hash_table_t *ht)

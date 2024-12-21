@@ -21,7 +21,6 @@
 
 #include <stdbool.h>
 
-
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "compat.h"

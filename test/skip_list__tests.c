@@ -23,6 +23,8 @@
 #include "test_macros.h"
 #include "test_utils.h"
 
+#define BENCH_N 1000000 /* number of entries to write and retrieve */
+
 void test_skip_list_create_node()
 {
     uint8_t key[] = "test_key";
@@ -191,20 +193,19 @@ void benchmark_skip_list()
 {
     /* random key-value pairs */
     skip_list_t *list = skip_list_new(12, 0.24f);
-    const size_t num_entries = 1000000;
     const size_t key_size = 16;
     const size_t value_size = 8;
 
     /* allocate memory for keys and values */
-    uint8_t **keys = malloc(num_entries * sizeof(uint8_t *));
-    uint8_t **values = malloc(num_entries * sizeof(uint8_t *));
+    uint8_t **keys = malloc(BENCH_N * sizeof(uint8_t *));
+    uint8_t **values = malloc(BENCH_N * sizeof(uint8_t *));
     if (keys == NULL || values == NULL)
     {
         printf(RED "Failed to allocate memory for keys and values\n" RESET);
         return;
     }
 
-    for (size_t i = 0; i < num_entries; i++)
+    for (size_t i = 0; i < BENCH_N; i++)
     {
         keys[i] = malloc(key_size * sizeof(uint8_t));
         values[i] = malloc(value_size * sizeof(uint8_t));
@@ -223,24 +224,24 @@ void benchmark_skip_list()
     }
 
     /* generate random key-value pairs */
-    for (size_t i = 0; i < num_entries; i++)
+    for (size_t i = 0; i < BENCH_N; i++)
     {
         generate_random_key_value(keys[i], key_size, values[i], value_size);
     }
 
     /* benchmark writing */
     clock_t start_write = clock();
-    for (size_t i = 0; i < num_entries; i++)
+    for (size_t i = 0; i < BENCH_N; i++)
     {
         skip_list_put(list, keys[i], key_size, values[i], value_size, -1);
     }
     clock_t end_write = clock();
     double write_time = (double)(end_write - start_write) / CLOCKS_PER_SEC;
-    printf("Time taken to write %zu entries: %f seconds\n", num_entries, write_time);
+    printf(CYAN "Time taken to write %d entries: %f seconds\n" RESET, BENCH_N, write_time);
 
     /* benchmark reading and verifying */
     clock_t start_read = clock();
-    for (size_t i = 0; i < num_entries; i++)
+    for (size_t i = 0; i < BENCH_N; i++)
     {
         uint8_t *retrieved_value;
         size_t retrieved_value_size;
@@ -252,10 +253,10 @@ void benchmark_skip_list()
     }
     clock_t end_read = clock();
     double read_time = (double)(end_read - start_read) / CLOCKS_PER_SEC;
-    printf("Time taken to read and verify %zu entries: %f seconds\n", num_entries, read_time);
+    printf(CYAN "Time taken to read and verify %d entries: %f seconds\n" RESET, BENCH_N, read_time);
 
     /* free allocated memory */
-    for (size_t i = 0; i < num_entries; i++)
+    for (size_t i = 0; i < BENCH_N; i++)
     {
         free(keys[i]);
         free(values[i]);

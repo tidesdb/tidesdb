@@ -18,13 +18,11 @@
  */
 #ifndef __BLOCK_MANAGER_H__
 #define __BLOCK_MANAGER_H__
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "compat.h"
 
 #define MAX_FILE_PATH_LENGTH 1024 /* max file path length for block manager file(s) */
 

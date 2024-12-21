@@ -24,8 +24,8 @@
  * unknown type name time_t were coming so had to include for macos
  *
  */
-#include <time.h>
 #include <stdint.h>
+#include <time.h>
 #endif
 
 #define TOMBSTONE                                                                                 \

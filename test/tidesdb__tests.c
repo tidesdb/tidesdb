@@ -16,7 +16,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #include <assert.h>
 
 #include "../src/tidesdb.h"
@@ -46,8 +45,8 @@ void test_tidesdb_serialize_deserialize_key_value_pair(bool compress,
     _tidesdb_free_key_value_pair(deserialized);
     free(serialized);
 
-    printf(GREEN "test_tidesdb_serialize_deserialize_key_value_pair %s passed\n",
-           compress ? "with compression" : "", RESET);
+    printf(GREEN "test_tidesdb_serialize_deserialize_key_value_pair %s passed\n" RESET,
+           compress ? "with compression" : "");
 }
 
 void test_tidesdb_serialize_deserialize_column_family_config()
@@ -111,8 +110,8 @@ void test_tidesdb_serialize_deserialize_operation(bool compress, tidesdb_compres
     _tidesdb_free_operation(deserialized);
     free(serialized);
 
-    printf(GREEN "test_tidesdb_serialize_deserialize_operation %s passed\n",
-           compress ? "with compression" : "", RESET);
+    printf(GREEN "test_tidesdb_serialize_deserialize_operation %s passed\n" RESET,
+           compress ? "with compression" : "");
 }
 
 void test_tidesdb_tidesdb_open_close()

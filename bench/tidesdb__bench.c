@@ -58,6 +58,18 @@ void pad_key_with_nines(uint8_t *key, size_t target_len)
     }
 }
 
+void create_key(uint8_t *key, int index)
+{
+    snprintf((char *)key, SIZE, "key%03d", index);
+    pad_key_with_nines(key, SIZE - 1);
+}
+
+void create_value(uint8_t *value, int index, int thread_id)
+{
+    snprintf((char *)value, SIZE, "value%03d_%d", index, thread_id);
+    pad_key_with_nines(value, SIZE - 1);
+}
+
 void *benchmark_put(void *arg)
 {
     thread_arg_t *targ = arg;
@@ -69,12 +81,11 @@ void *benchmark_put(void *arg)
     {
         uint8_t key[SIZE];
         uint8_t value[SIZE];
-        snprintf(key, sizeof(key), "key%03d", i);
-        snprintf(value, sizeof(value), "value%03d_%d", i, thread_id);
-        pad_key_with_nines(key, SIZE - 1);
-        pad_key_with_nines(value, SIZE - 1);
+        create_key(key, i);
+        create_value(value, i, thread_id);
 
-        tidesdb_err_t *err = tidesdb_put(tdb, cf_name, key, strlen(key), value, strlen(value), -1);
+        tidesdb_err_t *err =
+            tidesdb_put(tdb, cf_name, key, strlen((char *)key), value, strlen((char *)value), -1);
         if (err != NULL)
         {
             printf(RED "Error: %s\n" RESET, err->message);
@@ -95,12 +106,11 @@ void *benchmark_put_compact(void *arg)
     {
         uint8_t key[SIZE];
         uint8_t value[SIZE];
-        snprintf(key, sizeof(key), "key%03d", i);
-        snprintf(value, sizeof(value), "value%03d_%d", i, thread_id);
-        pad_key_with_nines(key, SIZE - 1);
-        pad_key_with_nines(value, SIZE - 1);
+        create_key(key, i);
+        create_value(value, i, thread_id);
 
-        tidesdb_err_t *err = tidesdb_put(tdb, cf_name, key, strlen(key), value, strlen(value), -1);
+        tidesdb_err_t *err =
+            tidesdb_put(tdb, cf_name, key, strlen((char *)key), value, strlen((char *)value), -1);
         if (err != NULL)
         {
             printf(RED "Error: %s\n" RESET, err->message);
@@ -131,12 +141,12 @@ void *benchmark_get(void *arg)
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {
         uint8_t key[SIZE];
-        snprintf(key, sizeof(key), "key%03d", i);
-        pad_key_with_nines(key, SIZE - 1);
+        create_key(key, i);
 
         uint8_t *value = NULL;
         size_t value_size = 0;
-        tidesdb_err_t *err = tidesdb_get(tdb, cf_name, key, strlen(key), &value, &value_size);
+        tidesdb_err_t *err =
+            tidesdb_get(tdb, cf_name, key, strlen((char *)key), &value, &value_size);
         if (err != NULL)
         {
             printf(RED "Error: %s\n" RESET, err->message);
@@ -157,15 +167,14 @@ void *benchmark_delete(void *arg)
     thread_arg_t *targ = arg;
     tidesdb_t *tdb = targ->tdb;
     const char *cf_name = targ->column_family_name;
-    int thread_id = targ->thread_id; /* could be used for debugging if need be */
+    /* int thread_id = targ->thread_id; could be used for debugging if need be */
 
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {
         uint8_t key[SIZE];
-        snprintf(key, sizeof(key), "key%03d", i);
-        pad_key_with_nines(key, SIZE - 1);
+        create_key(key, i);
 
-        tidesdb_err_t *err = tidesdb_delete(tdb, cf_name, key, strlen(key));
+        tidesdb_err_t *err = tidesdb_delete(tdb, cf_name, key, strlen((char *)key));
         if (err != NULL)
         {
             printf(RED "Error: %s\n" RESET, err->message);

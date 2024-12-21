@@ -246,11 +246,6 @@ int hash_table_cursor_get(hash_table_cursor_t *cursor, uint8_t **key, size_t *ke
         return -1; /* we are at the end */
     }
 
-    if (cursor->current_bucket_index < 0)
-    {
-        return -1; /* we are at the beginning */
-    }
-
     hash_table_bucket_t *bucket = cursor->ht->buckets[cursor->current_bucket_index];
     /* we check if the bucket is not null and not a tombstone */
     if (bucket != NULL)

@@ -3897,7 +3897,7 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
         }
 
         /* if sstable is exhausted we move to the previous sstable */
-        if (cursor->sstable_index < (size_t)(cursor->cf->num_sstables - 1))
+        if ((size_t)cursor->sstable_index < (size_t)(cursor->cf->num_sstables - 1))
         {
             if (cursor->sstable_cursor != NULL)
             {
@@ -4045,6 +4045,7 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
                     return NULL;
                 }
             }
+            break;
         default:
             return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
     }

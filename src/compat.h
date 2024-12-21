@@ -24,12 +24,15 @@
 #ifdef _WIN32
 #include <direct.h>
 #include <io.h>
+#include <stdio.h>
+#include <sys/stat.h>
 #include <tchar.h>
 #include <windows.h>
 typedef HANDLE thread_t;
 typedef HANDLE mutex_t;
 typedef CONDITION_VARIABLE cond_t;
 typedef CRITICAL_SECTION crit_section_t;
+typedef SRWLOCK rwlock_t;
 
 struct dirent
 {
@@ -45,7 +48,7 @@ typedef struct
 
 DIR *opendir(const char *name)
 {
-    DIR *dir = (DIR *)malloc(sizeof(DIR));
+    DIR *dir = malloc(sizeof(DIR));
     if (dir == NULL)
     {
         return NULL;
@@ -117,67 +120,76 @@ int sem_destroy(sem_t *sem)
 }
 
 /* file ops */
-#define access _access
-#define mkdir  _mkdir
-#define remove _unlink
+#define access         _access
+#define mkdir          _mkdir
+#define stat           _stat
+#define S_ISDIR(m)     (((m)&S_IFMT) == S_IFDIR)
+#define rmdir          _rmdir
+#define unlink         _unlink
+#define remove         _unlink
+#define fclose         _fclose
+#define truncate       _chsize
+#define sleep(seconds) Sleep((seconds)*1000)
+#define fsync          _commit
+#define fileno         _fileno
+#define fseek          _fseek
+#define fread          _fread
+#define feof           _feof
+#define ftell          _ftell
 
 #else
 #include <dirent.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
 typedef pthread_t thread_t;
 typedef pthread_mutex_t mutex_t;
 typedef pthread_cond_t cond_t;
 typedef pthread_mutex_t crit_section_t;
+typedef pthread_rwlock_t rwlock_t;
 #endif
 
 /* thread creation and management */
 #ifdef _WIN32
-#define thread_create(thread, func, arg) \
+#define pthread_create(thread, attr, func, arg) \
     (*(thread) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(func), (arg), 0, NULL))
-#define thread_join(thread) (WaitForSingleObject((thread), INFINITE), CloseHandle(thread))
-#else
-#define thread_create(thread, func, arg) pthread_create((thread), NULL, (func), (arg))
-#define thread_join(thread)              pthread_join(*(thread), NULL)
+#define pthread_join(thread, retval) (WaitForSingleObject((thread), INFINITE), CloseHandle(thread))
 #endif
 
 /* mutex and synchronization */
 #ifdef _WIN32
-#define mutex_init(mutex)    (*(mutex) = CreateMutex(NULL, FALSE, NULL))
-#define mutex_lock(mutex)    WaitForSingleObject(*(mutex), INFINITE)
-#define mutex_unlock(mutex)  ReleaseMutex(*(mutex))
-#define mutex_destroy(mutex) CloseHandle(*(mutex))
-#else
-#define mutex_init(mutex)    pthread_mutex_init((mutex), NULL)
-#define mutex_lock(mutex)    pthread_mutex_lock((mutex))
-#define mutex_unlock(mutex)  pthread_mutex_unlock((mutex))
-#define mutex_destroy(mutex) pthread_mutex_destroy((mutex))
+#define pthread_mutex_init(mutex, attr) (*(mutex) = CreateMutex(NULL, FALSE, NULL))
+#define pthread_mutex_lock(mutex)       WaitForSingleObject(*(mutex), INFINITE)
+#define pthread_mutex_unlock(mutex)     ReleaseMutex(*(mutex))
+#define pthread_mutex_destroy(mutex)    CloseHandle(*(mutex))
 #endif
 
 /* conditions vars */
 #ifdef _WIN32
-#define cond_init(cond)        InitializeConditionVariable(cond)
-#define cond_wait(cond, mutex) SleepConditionVariableCS((cond), (mutex), INFINITE)
-#define cond_signal(cond)      WakeConditionVariable(cond)
-#else
-#define cond_init(cond)        pthread_cond_init((cond), NULL)
-#define cond_wait(cond, mutex) pthread_cond_wait((cond), (mutex))
-#define cond_signal(cond)      pthread_cond_signal((cond))
+#define pthread_cond_init(cond, attr)  InitializeConditionVariable(cond)
+#define pthread_cond_wait(cond, mutex) SleepConditionVariableCS((cond), (mutex), INFINITE)
+#define pthread_cond_signal(cond)      WakeConditionVariable(cond)
 #endif
 
 /* critical sections */
 #ifdef _WIN32
-#define crit_section_init(cs)    InitializeCriticalSection(cs)
-#define crit_section_enter(cs)   EnterCriticalSection(cs)
-#define crit_section_leave(cs)   LeaveCriticalSection(cs)
-#define crit_section_destroy(cs) DeleteCriticalSection(cs)
-#else
-#define crit_section_init(cs)    pthread_mutex_init((cs), NULL)
-#define crit_section_enter(cs)   pthread_mutex_lock((cs))
-#define crit_section_leave(cs)   pthread_mutex_unlock((cs))
-#define crit_section_destroy(cs) pthread_mutex_destroy((cs))
+#define pthread_mutex_init(cs, attr) InitializeCriticalSection(cs)
+#define pthread_mutex_lock(cs)       EnterCriticalSection(cs)
+#define pthread_mutex_unlock(cs)     LeaveCriticalSection(cs)
+#define pthread_mutex_destroy(cs)    DeleteCriticalSection(cs)
+#endif
+
+/* rwlocks */
+#ifdef _WIN32
+#define pthread_rwlock_init(rwlock, attr) InitializeSRWLock(rwlock)
+#define pthread_rwlock_rdlock(rwlock)     AcquireSRWLockShared(rwlock)
+#define pthread_rwlock_wrlock(rwlock)     AcquireSRWLockExclusive(rwlock)
+#define pthread_rwlock_unlock(rwlock) \
+    ReleaseSRWLockShared(rwlock);     \
+    ReleaseSRWLockExclusive(rwlock)
+#define pthread_rwlock_destroy(rwlock) /* No equivalent in Windows, no-op */
 #endif
 
 #endif /* __COMPAT_H__ */

@@ -136,7 +136,7 @@ void *benchmark_get(void *arg)
     thread_arg_t *targ = arg;
     tidesdb_t *tdb = targ->tdb;
     const char *cf_name = targ->column_family_name;
-    int thread_id = targ->thread_id;
+    /* int thread_id = targ->thread_id; not used */
 
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {

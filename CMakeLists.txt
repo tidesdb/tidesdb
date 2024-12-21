@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 23)
-set(PROJECT_VERSION 0.3.0) # TidesDB v0.3.0b
+set(PROJECT_VERSION 0.4.0) # TidesDB v0.4.0b
 
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)

@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 #include "compat.h"
 
 #define MAX_FILE_PATH_LENGTH 1024 /* max file path length for block manager file(s) */

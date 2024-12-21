@@ -21,9 +21,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include "test_utils.h"
+
 #include "../src/hash_table.h"
 #include "test_macros.h"
+#include "test_utils.h"
+
+#define BENCH_N 1000000 /* number of entries to write and retrieve */
 
 void test_hash_table_new()
 {
@@ -137,20 +140,19 @@ void benchmark_hash_table()
     /* random key-value pairs */
     hash_table_t *ht;
     assert(hash_table_new(&ht) == 0);
-    const size_t num_entries = 1000000;
     const size_t key_size = 16;
     const size_t value_size = 8;
 
     /* allocate memory for keys and values */
-    uint8_t **keys = malloc(num_entries * sizeof(uint8_t *));
-    uint8_t **values = malloc(num_entries * sizeof(uint8_t *));
+    uint8_t **keys = malloc(BENCH_N * sizeof(uint8_t *));
+    uint8_t **values = malloc(BENCH_N * sizeof(uint8_t *));
     if (keys == NULL || values == NULL)
     {
-        printf("Failed to allocate memory for keys and values\n");
+        printf(RED "Failed to allocate memory for keys and values\n" RESET);
         return;
     }
 
-    for (size_t i = 0; i < num_entries; i++)
+    for (size_t i = 0; i < BENCH_N; i++)
     {
         keys[i] = malloc(key_size * sizeof(uint8_t));
         values[i] = malloc(value_size * sizeof(uint8_t));
@@ -163,37 +165,37 @@ void benchmark_hash_table()
             }
             free(keys);
             free(values);
-            printf("Failed to allocate memory for keys and values\n");
+            printf(RED "Failed to allocate memory for keys and values\n" RESET);
             return;
         }
     }
 
     /* generate random key-value pairs */
-    for (size_t i = 0; i < num_entries; i++)
+    for (size_t i = 0; i < BENCH_N; i++)
     {
         generate_random_key_value(keys[i], key_size, values[i], value_size);
     }
 
     /* benchmark writing */
     clock_t start_write = clock();
-    for (size_t i = 0; i < num_entries; i++)
+    for (size_t i = 0; i < BENCH_N; i++)
     {
         assert(hash_table_put(&ht, keys[i], key_size, values[i], value_size, -1) == 0);
     }
     clock_t end_write = clock();
     double write_time = (double)(end_write - start_write) / CLOCKS_PER_SEC;
-    printf("Time taken to write %zu entries: %f seconds\n", num_entries, write_time);
+    printf(CYAN "Time taken to write %d entries: %f seconds\n" RESET, BENCH_N, write_time);
 
     /* benchmark reading and verifying */
     clock_t start_read = clock();
-    for (size_t i = 0; i < num_entries; i++)
+    for (size_t i = 0; i < BENCH_N; i++)
     {
         uint8_t *retrieved_value;
         size_t retrieved_value_size;
         int result = hash_table_get(ht, keys[i], key_size, &retrieved_value, &retrieved_value_size);
         if (result != 0)
         {
-            printf("Failed to retrieve key at index %zu\n", i);
+            printf(RED "Failed to retrieve key at index %zu\n" RESET, i);
             continue;
         }
         assert(memcmp(retrieved_value, values[i], value_size) == 0);
@@ -201,10 +203,10 @@ void benchmark_hash_table()
     }
     clock_t end_read = clock();
     double read_time = (double)(end_read - start_read) / CLOCKS_PER_SEC;
-    printf("Time taken to read and verify %zu entries: %f seconds\n", num_entries, read_time);
+    printf(CYAN "Time taken to read and verify %d entries: %f seconds\n" RESET, BENCH_N, read_time);
 
     /* free allocated memory */
-    for (size_t i = 0; i < num_entries; i++)
+    for (size_t i = 0; i < BENCH_N; i++)
     {
         free(keys[i]);
         free(values[i]);

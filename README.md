@@ -107,7 +107,7 @@ Join the [TidesDB Discord Community](https://discord.gg/VsafJxtj) to ask questio
 ```
 
 ## Usage
-Each database method returns a `tidesdb_err*` which returns an error code and message. If no error, TidesDB returns `NULL`.
+Each database method returns a `tidesdb_err_t*` which returns an error code and message. If no error, TidesDB returns `NULL`.
 
 **Example of error structure**
 ```c
@@ -150,7 +150,7 @@ In order to store data in TidesDB you need a column family.  This is by design.
 - skip list max level.  Example below is 12 ( only if using `TDB_MEMTABLE_SKIP_LIST` ) pass 0 if using `TDB_MEMTABLE_HASH_TABLE`
 - skip list probability.  Example below is 0.24 ( only if using `TDB_MEMTABLE_SKIP_LIST` ) pass 0.0 if using `TDB_MEMTABLE_HASH_TABLE`
 - whether column family sstable data is compressed
-- the compression algorithim to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
+- the compression algorithm to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
 - whether to use bloom filters
 - what data structure to use for the memtable [`TDB_MEMTABLE_SKIP_LIST`, `TDB_MEMTABLE_HASH_TABLE`]
 

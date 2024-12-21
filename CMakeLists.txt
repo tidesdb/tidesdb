@@ -16,7 +16,6 @@ IF (WIN32)
         find_package(zstd REQUIRED)
         find_package(snappy REQUIRED)
         find_package(lz4 REQUIRED)
-        set(CMAKE_TOOLCHAIN_FILE "${CMAKE_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
 ENDIF() # on unix systems find_package will cause issues on make process usually looking for the packages even though installed apt-get or brew say.
 
 

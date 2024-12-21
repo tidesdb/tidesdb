@@ -3872,6 +3872,7 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
                 }
                 break;
             default:
+                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
                 return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
         }
 
@@ -3921,6 +3922,9 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
         (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
         break;
     }
+
+    if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
 
     return tidesdb_err_from_code(TIDESDB_ERR_AT_START_OF_CURSOR);
 }

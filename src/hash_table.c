@@ -172,7 +172,7 @@ int hash_table_resize(hash_table_t **ht, size_t new_size)
     }
 
     /* we free the old hash table */
-    hash_table_destroy(*ht);
+    (void)hash_table_destroy(*ht);
 
     /* we set the new hash table */
     *ht = new_ht;
@@ -324,7 +324,7 @@ void hash_table_destroy(hash_table_t *ht)
 {
     if (ht == NULL) return;
 
-    hash_table_clear(ht);
+    (void)hash_table_clear(ht);
     free(ht->buckets);
     free(ht);
 }

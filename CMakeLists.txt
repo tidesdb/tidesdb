@@ -28,6 +28,29 @@ endif()
 add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c src/compat.h)
 
 target_include_directories(tidesdb PRIVATE src)
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+        # For Apple Silicon Macs, Homebrew installs packages in /opt/homebrew
+        target_include_directories(tidesdb PRIVATE /opt/homebrew/include)
+        target_link_directories(tidesdb PRIVATE /opt/homebrew/lib)
+        # Link against compression libraries for Apple Silicon
+        target_link_libraries(tidesdb PRIVATE
+                m       # math library
+                lz4     # LZ4 compression
+                zstd    # Zstandard compression
+                snappy  # Snappy compression
+        )
+elseif(APPLE)
+        # For Intel Macs, Homebrew typically installs in /usr/local
+        target_include_directories(tidesdb PRIVATE /usr/local/include)
+        target_link_directories(tidesdb PRIVATE /usr/local/lib)
+        # Link against compression libraries for Intel Mac
+        target_link_libraries(tidesdb PRIVATE
+                m       # math library
+                lz4     # LZ4 compression
+                zstd    # Zstandard compression
+                snappy  # Snappy compression
+        )
+endif()
 target_link_libraries(tidesdb PRIVATE zstd snappy lz4)
 find_library(MATH_LIBRARY m)
 if(MATH_LIBRARY)
@@ -52,14 +75,24 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         add_executable(tidesdb_tests test/tidesdb__tests.c)
         add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
-        target_link_libraries(err_tests tidesdb)
-        target_link_libraries(block_manager_tests tidesdb)
-        target_link_libraries(skip_list_tests tidesdb)
-        target_link_libraries(hash_table_tests tidesdb)
-        target_link_libraries(compress_tests tidesdb)
-        target_link_libraries(bloom_filter_tests tidesdb)
-        target_link_libraries(tidesdb_tests tidesdb)
-        target_link_libraries(tidesdb_bench tidesdb)
+        # Add include and link directories for test executables
+        if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+                foreach(test_target err_tests block_manager_tests skip_list_tests hash_table_tests compress_tests bloom_filter_tests tidesdb_tests tidesdb_bench)
+                        target_include_directories(${test_target} PRIVATE /opt/homebrew/include)
+                        target_link_directories(${test_target} PRIVATE /opt/homebrew/lib)
+                        target_link_libraries(${test_target} tidesdb m zstd snappy lz4)
+                endforeach()
+        elseif(APPLE)
+                foreach(test_target err_tests block_manager_tests skip_list_tests hash_table_tests compress_tests bloom_filter_tests tidesdb_tests tidesdb_bench)
+                        target_include_directories(${test_target} PRIVATE /usr/local/include)
+                        target_link_directories(${test_target} PRIVATE /usr/local/lib)
+                        target_link_libraries(${test_target} tidesdb m zstd snappy lz4)
+                endforeach()
+        else()
+                foreach(test_target err_tests block_manager_tests skip_list_tests hash_table_tests compress_tests bloom_filter_tests tidesdb_tests tidesdb_bench)
+                        target_link_libraries(${test_target} tidesdb m zstd snappy lz4)
+                endforeach()
+        endif()
 
         add_test(NAME err_tests COMMAND err_tests)
         add_test(NAME block_manager_tests COMMAND block_manager_tests)

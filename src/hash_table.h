@@ -19,6 +19,14 @@
 #ifndef __HASH_TABLE_H__
 #define __HASH_TABLE_H__
 #include "bloom_filter.h" /* for bloom_filter_hash */
+#ifdef __APPLE__
+/*
+ * unknown type name time_t were coming so had to include for macos
+ *
+ */
+#include <time.h>
+#include <stdint.h>
+#endif
 
 #define TOMBSTONE                                                                                 \
     0xDEADBEEF /* On expiration of a bucket if time to live is set we set the key's value to this \

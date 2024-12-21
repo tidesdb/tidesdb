@@ -20,7 +20,7 @@
 #define __TIDESDB_H__
 
 #include <stdbool.h>
-#include <sys/stat.h>
+
 
 #include "block_manager.h"
 #include "bloom_filter.h"

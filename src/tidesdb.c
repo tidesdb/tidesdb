@@ -254,6 +254,7 @@ uint8_t *_tidesdb_serialize_column_family_config(tidesdb_column_family_config_t 
 
     /* serialize compression_algo */
     memcpy(ptr, &config->compress_algo, sizeof(tidesdb_compression_algo_t));
+    ptr += sizeof(tidesdb_compression_algo_t);
 
     /* serialize memtable_ds */
     memcpy(ptr, &config->memtable_ds, sizeof(tidesdb_memtable_ds_t));
@@ -304,6 +305,7 @@ tidesdb_column_family_config_t *_tidesdb_deserialize_column_family_config(const 
     /* deserialize compression_algo */
     tidesdb_compression_algo_t compress_algo;
     memcpy(&compress_algo, ptr, sizeof(tidesdb_compression_algo_t));
+    ptr += sizeof(tidesdb_compression_algo_t);
 
     /* deserialize memtable_ds */
     tidesdb_memtable_ds_t memtable_ds;

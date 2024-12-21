@@ -210,10 +210,10 @@ void test_tidesdb_create_drop_column_family(bool compress, tidesdb_compression_a
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_create_drop_column_family %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_create_drop_column_family%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 void test_tidesdb_put_get_memtable(bool compress, tidesdb_compression_algo_t algo,
@@ -278,10 +278,10 @@ void test_tidesdb_put_get_memtable(bool compress, tidesdb_compression_algo_t alg
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_put_get_memtable %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_put_get_memtable%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 /* we put a value, we close the db, we reopen it and we should be able to get the value as the write
@@ -363,10 +363,10 @@ void test_tidesdb_put_close_replay_get(bool compress, tidesdb_compression_algo_t
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_put_close_replay_get %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_put_close_replay_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 void test_tidesdb_put_flush_get(bool compress, tidesdb_compression_algo_t algo, bool bloom_filter,
@@ -493,10 +493,10 @@ void test_tidesdb_put_flush_get(bool compress, tidesdb_compression_algo_t algo, 
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_put_flush_get %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_put_flush_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 void test_tidesdb_put_flush_close_get(bool compress, tidesdb_compression_algo_t algo,
@@ -639,10 +639,10 @@ void test_tidesdb_put_flush_close_get(bool compress, tidesdb_compression_algo_t 
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_put_flush_close_get %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_put_flush_close_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 void test_tidesdb_put_delete_get(bool compress, tidesdb_compression_algo_t algo, bool bloom_filter,
@@ -719,10 +719,10 @@ void test_tidesdb_put_delete_get(bool compress, tidesdb_compression_algo_t algo,
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_put_delete_get %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_put_delete_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 void test_tidesdb_put_flush_delete_get(bool compress, tidesdb_compression_algo_t algo,
@@ -849,10 +849,10 @@ void test_tidesdb_put_flush_delete_get(bool compress, tidesdb_compression_algo_t
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_put_flush_delete_get %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_put_flush_delete_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 void test_tidesdb_put_many_flush_get(bool compress, tidesdb_compression_algo_t algo,
@@ -925,10 +925,10 @@ void test_tidesdb_put_many_flush_get(bool compress, tidesdb_compression_algo_t a
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_put_flush_compact_get %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_put_flush_compact_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 void test_tidesdb_put_flush_compact_get(bool compress, tidesdb_compression_algo_t algo,
@@ -1010,10 +1010,10 @@ void test_tidesdb_put_flush_compact_get(bool compress, tidesdb_compression_algo_
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_put_flush_compact_get %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_put_flush_compact_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 void test_tidesdb_txn_put_get(bool compress, tidesdb_compression_algo_t algo, bool bloom_filter,
@@ -1095,10 +1095,10 @@ void test_tidesdb_txn_put_get(bool compress, tidesdb_compression_algo_t algo, bo
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_txn_put_get %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_txn_put_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 void test_tidesdb_txn_put_get_rollback_get(bool compress, tidesdb_compression_algo_t algo,
@@ -1191,10 +1191,10 @@ void test_tidesdb_txn_put_get_rollback_get(bool compress, tidesdb_compression_al
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_txn_put_get_rollback_get %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_txn_put_get_rollback_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 void test_tidesdb_txn_put_put_delete_get(bool compress, tidesdb_compression_algo_t algo,
@@ -1298,10 +1298,10 @@ void test_tidesdb_txn_put_put_delete_get(bool compress, tidesdb_compression_algo
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_txn_put_put_delete_get %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_txn_put_put_delete_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 /* mainly test going forward and backwards through column family memtable
@@ -1639,10 +1639,10 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_cursor_memtable_sstables %s %s %s passed\n" RESET,
-           compress ? "with compression" : "", bloom_filter ? "with bloom filter" : "",
-           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "with skip list memtable"
-                                                 : "with hash table memtable");
+    printf(GREEN "test_tidesdb_cursor_memtable_sstables%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
 }
 
 int main(void)

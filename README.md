@@ -25,6 +25,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Error Handling** API functions return an error code and message.
 - [x] **Easy API** simple and easy to use api.
 - [x] **Multiple Memtable Data Structures** memtable can be a skip list or hash table.
+- [x] **Multiplatform** Linux, MacOS, and Windows support.
 
 ## Building
 Using cmake to build the shared library.
@@ -94,9 +95,6 @@ Bindings are in the works in various languages.
 
 ## Discord Community
 Join the [TidesDB Discord Community](https://discord.gg/VsafJxtj) to ask questions, work on development, and discuss the future of TidesDB.
-
-## What's coming ?
-- [ ] **Windows Support** - Windows support is coming soon.
 
 ## Dependencies
 - [Snappy](https://github.com/google/snappy)

@@ -19,14 +19,12 @@
 #ifndef __TIDESDB_H__
 #define __TIDESDB_H__
 
-#include <dirent.h>
-#include <pthread.h>
-#include <semaphore.h>
 #include <stdbool.h>
 #include <sys/stat.h>
 
 #include "block_manager.h"
 #include "bloom_filter.h"
+#include "compat.h"
 #include "compress.h"
 #include "err.h"
 #include "hash_table.h"

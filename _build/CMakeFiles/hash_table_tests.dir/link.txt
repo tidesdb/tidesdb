@@ -1,0 +1,1 @@
+/usr/bin/cc -fsanitize=address,undefined CMakeFiles/hash_table_tests.dir/test/hash_table__tests.c.o -o hash_table_tests  -Wl,-rpath,/home/toge/src/github-tidesdb/_build libtidesdb.so -lm -lzstd -lsnappy -llz4

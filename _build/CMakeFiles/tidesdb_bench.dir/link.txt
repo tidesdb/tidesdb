@@ -1,0 +1,1 @@
+/usr/bin/cc -fsanitize=address,undefined CMakeFiles/tidesdb_bench.dir/bench/tidesdb__bench.c.o -o tidesdb_bench  -Wl,-rpath,/home/toge/src/github-tidesdb/_build libtidesdb.so -lm -lzstd -lsnappy -llz4

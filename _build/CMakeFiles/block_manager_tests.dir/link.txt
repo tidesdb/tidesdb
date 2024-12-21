@@ -1,0 +1,1 @@
+/usr/bin/cc -fsanitize=address,undefined CMakeFiles/block_manager_tests.dir/test/block_manager__tests.c.o -o block_manager_tests  -Wl,-rpath,/home/toge/src/github-tidesdb/_build libtidesdb.so -lm -lzstd -lsnappy -llz4

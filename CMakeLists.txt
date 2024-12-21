@@ -25,7 +25,7 @@ if(TIDESDB_WITH_SANITIZER)
         add_link_options(-fsanitize=address,undefined)
 endif()
 
-add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c src/compat.h)
+add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c)
 
 target_include_directories(tidesdb PRIVATE src)
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")

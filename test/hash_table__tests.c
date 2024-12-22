@@ -37,7 +37,7 @@ void test_hash_table_new()
     assert(ht->bucket_count == INITIAL_BUCKETS);
     assert(ht->count == 0);
     assert(ht->total_size == 0);
-    hash_table_destroy(ht);
+    hash_table_free(ht);
     printf(GREEN "test_hash_table_new passed\n" RESET);
 }
 
@@ -57,7 +57,7 @@ void test_hash_table_put_get()
     assert(memcmp(retrieved_value, value, retrieved_value_size) == 0);
     free(retrieved_value);
 
-    hash_table_destroy(ht);
+    hash_table_free(ht);
     printf(GREEN "test_hash_table_put_get passed\n" RESET);
 }
 
@@ -76,7 +76,7 @@ void test_hash_table_resize()
     }
 
     assert(ht->bucket_count > INITIAL_BUCKETS);
-    hash_table_destroy(ht);
+    hash_table_free(ht);
     printf(GREEN "test_hash_table_resize passed\n" RESET);
 }
 
@@ -97,7 +97,7 @@ void test_hash_table_clear()
     size_t retrieved_value_size;
     assert(hash_table_get(ht, key, sizeof(key), &retrieved_value, &retrieved_value_size) == -1);
 
-    hash_table_destroy(ht);
+    hash_table_free(ht);
     printf(GREEN "test_hash_table_clear passed\n" RESET);
 }
 
@@ -112,7 +112,7 @@ void test_hash_table_cursor()
     uint8_t value[] = "value";
     assert(hash_table_put(&ht, key, sizeof(key), value, sizeof(value), -1) == 0);
 
-    hash_table_cursor_t *cursor = hash_table_cursor_new(ht);
+    hash_table_cursor_t *cursor = hash_table_cursor_init(ht);
     uint8_t *retrieved_key;
     size_t retrieved_key_size;
     uint8_t *retrieved_value;
@@ -130,8 +130,8 @@ void test_hash_table_cursor()
         }
     } while (hash_table_cursor_next(cursor) == 0);
 
-    hash_table_cursor_destroy(cursor);
-    hash_table_destroy(ht);
+    hash_table_cursor_free(cursor);
+    hash_table_free(ht);
     printf(GREEN "test_hash_table_cursor passed\n" RESET);
 }
 
@@ -214,7 +214,7 @@ void benchmark_hash_table()
     free(keys);
     free(values);
 
-    hash_table_destroy(ht);
+    hash_table_free(ht);
 }
 
 int main(void)

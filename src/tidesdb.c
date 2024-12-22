@@ -739,7 +739,18 @@ void _tidesdb_free_column_families(tidesdb_t *tdb)
 
             if (tdb->column_families[i]->memtable != NULL)
             {
-                (void)skip_list_destroy(tdb->column_families[i]->memtable);
+                switch (tdb->column_families[i]->config.memtable_ds)
+                {
+                    case TDB_MEMTABLE_SKIP_LIST:
+                        (void)skip_list_free(tdb->column_families[i]->memtable);
+                        break;
+                    case TDB_MEMTABLE_HASH_TABLE:
+                        (void)hash_table_free(tdb->column_families[i]->memtable);
+                        break;
+                    default:
+                        break;
+                }
+
                 tdb->column_families[i]->memtable = NULL;
             }
 
@@ -1181,7 +1192,7 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
 
     (void)remove(wal_path); /*incase */
 
-    (void)skip_list_destroy(tdb->column_families[index]->memtable);
+    (void)skip_list_free(tdb->column_families[index]->memtable);
 
     /* remove all files in the column family directory */
     (void)_tidesdb_remove_directory(tdb->column_families[index]->path);
@@ -2517,7 +2528,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
     /* lock to make sure path is unique */
     if (pthread_mutex_lock(shared_lock) != 0)
     {
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         free(merged_sstable);
         return NULL;
     }
@@ -2529,7 +2540,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
     /* unlock the shared lock */
     if (pthread_mutex_unlock(shared_lock) != 0)
     {
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         free(merged_sstable);
         cf->num_sstables--;
         return NULL;
@@ -2550,7 +2561,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
     /* init cursor for sstable 1 */
     if (block_manager_cursor_init(&cursor, sst1->block_manager) == -1)
     {
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
         cf->num_sstables--;
@@ -2604,7 +2615,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
     /* init cursor for sstable 2 */
     if (block_manager_cursor_init(&cursor, sst2->block_manager) == -1)
     {
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
         cf->num_sstables--;
@@ -2654,7 +2665,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
     skip_list_cursor_t *mergetable_cursor = skip_list_cursor_init(mergetable);
     if (mergetable_cursor == NULL)
     {
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
         cf->num_sstables--;
@@ -2667,7 +2678,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
         if (kv == NULL)
         {
             (void)skip_list_cursor_free(mergetable_cursor);
-            (void)skip_list_destroy(mergetable);
+            (void)skip_list_free(mergetable);
             (void)remove(sstable_path);
             free(merged_sstable);
             cf->num_sstables--;
@@ -2746,7 +2757,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
 
     (void)skip_list_cursor_free(mergetable_cursor);
     (void)skip_list_clear(mergetable);
-    (void)skip_list_destroy(mergetable);
+    (void)skip_list_free(mergetable);
 
     return merged_sstable;
 }
@@ -3637,7 +3648,7 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
             }
             break;
         case TDB_MEMTABLE_HASH_TABLE:
-            (*cursor)->memtable_cursor = hash_table_cursor_new(cf->memtable);
+            (*cursor)->memtable_cursor = hash_table_cursor_init(cf->memtable);
             break;
         default:
             free(cursor);
@@ -4077,7 +4088,7 @@ tidesdb_err_t *tidesdb_cursor_free(tidesdb_cursor_t *cursor)
             if (cursor->memtable_cursor != NULL) skip_list_cursor_free(cursor->memtable_cursor);
             break;
         case TDB_MEMTABLE_HASH_TABLE:
-            if (cursor->memtable_cursor != NULL) hash_table_cursor_destroy(cursor->memtable_cursor);
+            if (cursor->memtable_cursor != NULL) hash_table_cursor_free(cursor->memtable_cursor);
             break;
         default:
             return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
@@ -4127,7 +4138,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     /* lock to make sure path is unique */
     if (pthread_mutex_lock(shared_lock) != 0)
     {
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         free(merged_sstable);
         return NULL;
     }
@@ -4139,7 +4150,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     /* unlock the shared lock */
     if (pthread_mutex_unlock(shared_lock) != 0)
     {
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         free(merged_sstable);
         cf->num_sstables--;
         return NULL;
@@ -4175,7 +4186,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     /* init cursor for sstable 1 */
     if (block_manager_cursor_init(&cursor, sst1->block_manager) == -1)
     {
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
         cf->num_sstables--;
@@ -4232,7 +4243,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     /* init cursor for sstable 2 */
     if (block_manager_cursor_init(&cursor, sst2->block_manager) == -1)
     {
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
         cf->num_sstables--;
@@ -4284,7 +4295,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     skip_list_cursor_t *mergetable_cursor = skip_list_cursor_init(mergetable);
     if (mergetable_cursor == NULL)
     {
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
         cf->num_sstables--;
@@ -4297,7 +4308,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     if (bf_serialized == NULL)
     {
         (void)skip_list_cursor_free(mergetable_cursor);
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
         cf->num_sstables--;
@@ -4310,7 +4321,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     {
         free(bf_serialized);
         (void)skip_list_cursor_free(mergetable_cursor);
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
         cf->num_sstables--;
@@ -4323,7 +4334,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         (void)block_manager_block_free(bf_block);
         free(bf_serialized);
         (void)skip_list_cursor_free(mergetable_cursor);
-        (void)skip_list_destroy(mergetable);
+        (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
         cf->num_sstables--;
@@ -4340,7 +4351,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         if (kv == NULL)
         {
             (void)skip_list_cursor_free(mergetable_cursor);
-            (void)skip_list_destroy(mergetable);
+            (void)skip_list_free(mergetable);
             (void)remove(sstable_path);
             free(merged_sstable);
             cf->num_sstables--;
@@ -4419,7 +4430,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
 
     (void)skip_list_cursor_free(mergetable_cursor);
     (void)skip_list_clear(mergetable);
-    (void)skip_list_destroy(mergetable);
+    (void)skip_list_free(mergetable);
 
     return merged_sstable;
 
@@ -4711,7 +4722,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
     }
 
     /* we iterate over memtable and populate the bloom filter */
-    hash_table_cursor_t *cursor = hash_table_cursor_new(cf->memtable);
+    hash_table_cursor_t *cursor = hash_table_cursor_init(cf->memtable);
     if (cursor == NULL)
     {
         free(sst);
@@ -4742,7 +4753,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
     } while (hash_table_cursor_next(cursor) != -1);
 
     /* we free the cursor */
-    (void)hash_table_cursor_destroy(cursor);
+    (void)hash_table_cursor_free(cursor);
     cursor = NULL;
 
     size_t serialized_bf_size;
@@ -4781,7 +4792,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
     (void)block_manager_block_free(bf_block);
 
     /* we reinitialize the cursor to populate the sstable with keyvalue pairs after bloomfilter */
-    cursor = hash_table_cursor_new(cf->memtable);
+    cursor = hash_table_cursor_init(cf->memtable);
     if (cursor == NULL)
     {
         free(sst);
@@ -4853,7 +4864,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
     } while (hash_table_cursor_next(cursor) != -1);
 
     /* we free the cursor */
-    (void)hash_table_cursor_destroy(cursor);
+    (void)hash_table_cursor_free(cursor);
 
     cursor = NULL;
 
@@ -4927,7 +4938,7 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
     /* we create a new hash table cursor and populate the memtable
      * with serialized key value pairs */
 
-    hash_table_cursor_t *cursor = hash_table_cursor_new(cf->memtable);
+    hash_table_cursor_t *cursor = hash_table_cursor_init(cf->memtable);
     if (cursor == NULL)
     {
         free(sst);
@@ -5035,7 +5046,7 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
     } while (hash_table_cursor_next(cursor) != -1);
 
     /* we free the cursor */
-    (void)hash_table_cursor_destroy(cursor);
+    (void)hash_table_cursor_free(cursor);
 
     /* we add the sstable to the column family */
     if (cf->sstables == NULL)

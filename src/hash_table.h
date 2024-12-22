@@ -19,6 +19,7 @@
 #ifndef __HASH_TABLE_H__
 #define __HASH_TABLE_H__
 #include "bloom_filter.h" /* for bloom_filter_hash */
+
 #ifdef __APPLE__
 /*
  * unknown type name time_t were coming so had to include for macos
@@ -33,7 +34,7 @@
                 */
 #define INITIAL_BUCKETS 1048576 /* The initial number of buckets in the hash table */
 
-#define LOAD_FACTOR 0.75 /* The load factor of the hash table */
+#define LOAD_FACTOR 0.50 /* The load factor of the hash table */
 
 /**
  * hash_table_bucket_t

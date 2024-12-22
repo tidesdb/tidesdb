@@ -742,10 +742,10 @@ void _tidesdb_free_column_families(tidesdb_t *tdb)
                 switch (tdb->column_families[i]->config.memtable_ds)
                 {
                     case TDB_MEMTABLE_SKIP_LIST:
-                        skip_list_free(tdb->column_families[i]->memtable);
+                        (void)skip_list_free(tdb->column_families[i]->memtable);
                         break;
                     case TDB_MEMTABLE_HASH_TABLE:
-                        hash_table_free(tdb->column_families[i]->memtable);
+                        (void)hash_table_free(tdb->column_families[i]->memtable);
                         break;
                     default:
                         break;

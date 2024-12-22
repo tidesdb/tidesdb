@@ -333,7 +333,7 @@ int skip_list_clear(skip_list_t *list)
     return 0;
 }
 
-int skip_list_destroy(skip_list_t *list)
+int skip_list_free(skip_list_t *list)
 {
     if (list == NULL) return -1;
 
@@ -347,7 +347,7 @@ int skip_list_destroy(skip_list_t *list)
     return 0;
 }
 
-int skip_list_destroy_node(skip_list_node_t *node)
+int skip_list_free_node(skip_list_node_t *node)
 {
     if (node == NULL) return -1;
 

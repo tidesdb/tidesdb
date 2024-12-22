@@ -172,7 +172,7 @@ int hash_table_resize(hash_table_t **ht, size_t new_size)
     }
 
     /* we free the old hash table */
-    (void)hash_table_destroy(*ht);
+    (void)hash_table_free(*ht);
 
     /* we set the new hash table */
     *ht = new_ht;
@@ -219,7 +219,7 @@ int hash_table_get(hash_table_t *ht, const uint8_t *key, size_t key_size, uint8_
     return -1; /* key not found */
 }
 
-hash_table_cursor_t *hash_table_cursor_new(hash_table_t *ht)
+hash_table_cursor_t *hash_table_cursor_init(hash_table_t *ht)
 {
     hash_table_cursor_t *cursor = malloc(sizeof(hash_table_cursor_t));
     cursor->ht = ht;
@@ -291,9 +291,12 @@ int hash_table_cursor_get(hash_table_cursor_t *cursor, uint8_t **key, size_t *ke
     return -1;
 }
 
-void hash_table_cursor_destroy(hash_table_cursor_t *cursor)
+void hash_table_cursor_free(hash_table_cursor_t *cursor)
 {
+    if (cursor == NULL) return;
+
     free(cursor);
+    cursor = NULL;
 }
 
 int hash_table_should_resize(hash_table_t *ht)
@@ -320,7 +323,7 @@ void hash_table_clear(hash_table_t *ht)
     ht->total_size = 0;
 }
 
-void hash_table_destroy(hash_table_t *ht)
+void hash_table_free(hash_table_t *ht)
 {
     if (ht == NULL) return;
 

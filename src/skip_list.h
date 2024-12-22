@@ -97,12 +97,12 @@ skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t ke
                                         const uint8_t *value, size_t value_size, time_t ttl);
 
 /*
- * skip_list_destroy_node
- * destroy a skip list node
- * @param node the node to destroy
- * @return 0 if the node was destroyed successfully, -1 otherwise
+ * skip_list_free_node
+ * free's a skip list node
+ * @param node the node to free
+ * @return 0 if the node was freed successfully, -1 otherwise
  */
-int skip_list_destroy_node(skip_list_node_t *node);
+int skip_list_free_node(skip_list_node_t *node);
 
 /*
  * skip_list_new
@@ -114,12 +114,12 @@ int skip_list_destroy_node(skip_list_node_t *node);
 skip_list_t *skip_list_new(int max_level, float probability);
 
 /*
- * skip_list_destroy
- * destroy a skip list
- * @param list the skip list to destroy
- * @return 0 if the skip list was destroyed successfully, -1 otherwise on error
+ * skip_list_free
+ * free's a skip list
+ * @param list the skip list to free
+ * @return 0 if the skip list was freed successfully, -1 otherwise on error
  */
-int skip_list_destroy(skip_list_t *list);
+int skip_list_free(skip_list_t *list);
 
 /*
  * skip_list_random_level

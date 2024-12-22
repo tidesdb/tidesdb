@@ -33,7 +33,7 @@ void test_skip_list_create_node()
     assert(node != NULL);
     assert(memcmp(node->key, key, sizeof(key)) == 0);
     assert(memcmp(node->value, value, sizeof(value)) == 0);
-    skip_list_destroy_node(node);
+    skip_list_free_node(node);
     printf(GREEN "test_skip_list_create_node passed\n" RESET);
 }
 
@@ -51,14 +51,14 @@ void test_skip_list_put_get()
     assert(memcmp(retrieved_value, value, sizeof(value)) == 0);
 
     free(retrieved_value);
-    skip_list_destroy(list);
+    skip_list_free(list);
     printf(GREEN "test_skip_list_put_get passed\n" RESET);
 }
 
 void test_skip_list_destroy()
 {
     skip_list_t *list = skip_list_new(12, 0.24f);
-    int result = skip_list_destroy(list);
+    int result = skip_list_free(list);
     assert(result == 0);
     printf(GREEN "test_skip_list_destroy passed\n" RESET);
 }
@@ -72,7 +72,7 @@ void test_skip_list_clear()
     int result = skip_list_clear(list);
     assert(result == 0);
     assert(skip_list_count_entries(list) == 0);
-    skip_list_destroy(list);
+    skip_list_free(list);
     printf(GREEN "test_skip_list_clear passed\n" RESET);
 }
 
@@ -86,7 +86,7 @@ void test_skip_list_count_entries()
     skip_list_put(list, key, sizeof(key), value, sizeof(value), -1);
     assert(skip_list_count_entries(list) == 1);
 
-    skip_list_destroy(list);
+    skip_list_free(list);
     printf(GREEN "test_skip_list_count_entries passed\n" RESET);
 }
 
@@ -100,7 +100,7 @@ void test_skip_list_get_size()
     skip_list_put(list, key, sizeof(key), value, sizeof(value), -1);
     assert(skip_list_get_size(list) > 0);
 
-    skip_list_destroy(list);
+    skip_list_free(list);
     printf(GREEN "test_skip_list_get_size passed\n" RESET);
 }
 
@@ -122,8 +122,8 @@ void test_skip_list_copy()
     assert(memcmp(retrieved_value, value, sizeof(value)) == 0);
 
     free(retrieved_value);
-    skip_list_destroy(copy);
-    skip_list_destroy(list);
+    skip_list_free(copy);
+    skip_list_free(list);
     printf(GREEN "test_skip_list_copy passed\n" RESET);
 }
 
@@ -136,7 +136,7 @@ void test_skip_list_cursor_init()
     assert(cursor->current == list->header->forward[0]);
 
     (void)skip_list_cursor_free(cursor);
-    assert(skip_list_destroy(list) == 0);
+    assert(skip_list_free(list) == 0);
     printf(GREEN "test_skip_list_cursor_init passed\n" RESET);
 }
 
@@ -160,7 +160,7 @@ void test_skip_list_cursor_next()
     assert(memcmp(cursor->current->key, key2, sizeof(key2)) == 0);
 
     (void)skip_list_cursor_free(cursor);
-    (void)skip_list_destroy(list);
+    (void)skip_list_free(list);
     printf(GREEN "test_skip_list_cursor_next passed\n" RESET);
 }
 
@@ -185,7 +185,7 @@ void test_skip_list_cursor_prev()
     assert(memcmp(cursor->current->key, key1, sizeof(key1)) == 0);
 
     (void)skip_list_cursor_free(cursor);
-    (void)skip_list_destroy(list);
+    (void)skip_list_free(list);
     printf(GREEN "test_skip_list_cursor_prev passed\n" RESET);
 }
 
@@ -264,7 +264,7 @@ void benchmark_skip_list()
     free(keys);
     free(values);
 
-    skip_list_destroy(list);
+    skip_list_free(list);
 }
 
 void test_skip_list_ttl()
@@ -289,7 +289,7 @@ void test_skip_list_ttl()
     assert(*(uint32_t *)retrieved_value == TOMBSTONE);
 
     free(retrieved_value);
-    skip_list_destroy(list);
+    skip_list_free(list);
     printf(GREEN "test_skip_list_ttl passed\n" RESET);
 }
 
@@ -312,7 +312,7 @@ void example()
                           strlen(value) + 1, -1) != 0)
         {
             fprintf(stderr, "Failed to insert key-value pair\n");
-            skip_list_destroy(list);
+            skip_list_free(list);
             return;
         }
     }
@@ -321,7 +321,7 @@ void example()
     if (cursor == NULL)
     {
         fprintf(stderr, "Failed to initialize cursor\n");
-        skip_list_destroy(list);
+        skip_list_free(list);
         return;
     }
 
@@ -343,7 +343,7 @@ void example()
     } while (skip_list_cursor_next(cursor) == 0);
 
     (void)skip_list_cursor_free(cursor);
-    (void)skip_list_destroy(list);
+    (void)skip_list_free(list);
 }
 
 void test_skip_list_cursor_functions()
@@ -420,7 +420,7 @@ void test_skip_list_cursor_functions()
 
     /* clean upp */
     (void)skip_list_cursor_free(cursor);
-    assert(skip_list_destroy(list) == 0);
+    assert(skip_list_free(list) == 0);
 }
 
 int main(void)

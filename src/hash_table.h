@@ -30,15 +30,20 @@
 #endif
 
 #define TOMBSTONE                                                                                 \
-    0xDEADBEEF /* On expiration of a bucket if time to live is set we set the key's value to this \
+    0xDEADBEEF /* on expiration of a bucket if time to live is set we set the key's value to this \
                 */
-#define INITIAL_BUCKETS 1048576 /* The initial number of buckets in the hash table */
+#define INITIAL_BUCKETS 1048576 /* the initial number of buckets in the hash table */
 
 #define LOAD_FACTOR 0.50 /* The load factor of the hash table */
 
 /**
  * hash_table_bucket_t
  * the hash table bucket structure
+ * @param key the key
+ * @param key_size the size of the key
+ * @param value the value
+ * @param value_size the size of the value
+ * @param ttl the time to live of the key-value pair
  */
 typedef struct
 {
@@ -54,7 +59,7 @@ typedef struct
  * the hash table structure
  * @param buckets the hash table buckets
  * @param bucket_count the number of buckets
- * @param total_size the total size in bytes
+ * @param total_size the total size of hash table (keys and values) in bytes
  * @param count the number of active buckets
  */
 typedef struct
@@ -65,6 +70,13 @@ typedef struct
     size_t count;
 } hash_table_t;
 
+/**
+ * hash_table_cursor_t
+ * the hash table cursor structure
+ * @param ht the hash table
+ * @param current_bucket_index the current bucket index
+ * @param last_bucket_index the last bucket index
+ */
 typedef struct
 {
     hash_table_t *ht;
@@ -125,11 +137,11 @@ int hash_table_resize(hash_table_t **ht, size_t new_size);
 int hash_table_should_resize(hash_table_t *ht);
 
 /**
- * hash_table_destroy
- * destroys the hash table
- * @param ht the hash table to destroy
+ * hash_table_free
+ * free's the hash table
+ * @param ht the hash table to free
  */
-void hash_table_destroy(hash_table_t *ht);
+void hash_table_free(hash_table_t *ht);
 
 /**
  * hash_table_clear
@@ -141,12 +153,12 @@ void hash_table_clear(hash_table_t *ht);
 /** cursor methods */
 
 /**
- * hash_table_cursor_new
+ * hash_table_cursor_init
  * creates a new hash table cursor
  * @param ht the hash table to create the cursor for
  * @return the new hash table cursor
  */
-hash_table_cursor_t *hash_table_cursor_new(hash_table_t *ht);
+hash_table_cursor_t *hash_table_cursor_init(hash_table_t *ht);
 
 /**
  * hash_table_cursor_reset
@@ -186,10 +198,10 @@ int hash_table_cursor_get(hash_table_cursor_t *cursor, uint8_t **key, size_t *ke
                           uint8_t **value, size_t *value_size, time_t *ttl);
 
 /**
- * hash_table_cursor_destroy
- * destroys the hash table cursor
- * @param cursor the cursor to destroy
+ * hash_table_cursor_free
+ * free's a hash table cursor
+ * @param cursor the cursor to free
  */
-void hash_table_cursor_destroy(hash_table_cursor_t *cursor);
+void hash_table_cursor_free(hash_table_cursor_t *cursor);
 
 #endif /* __HASH_TABLE_H__ */

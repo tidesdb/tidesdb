@@ -4764,8 +4764,6 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
         return -1;
     }
 
-    printf("here\n");
-
     do
     {
         uint8_t *retrieved_key;
@@ -4780,7 +4778,6 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
             free(retrieved_value);
             free(sst);
             (void)remove(sstable_path);
-            printf("here 2\n");
             return -1;
         }
 

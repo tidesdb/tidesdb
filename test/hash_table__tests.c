@@ -30,8 +30,8 @@
 
 void test_hash_table_new()
 {
-    hash_table_t *ht;
-    assert(hash_table_new(&ht) == 0);
+    hash_table_t *ht = hash_table_new();
+    assert(ht != NULL);
     assert(ht != NULL);
     assert(ht->buckets != NULL);
     assert(ht->bucket_count == INITIAL_BUCKETS);
@@ -43,8 +43,8 @@ void test_hash_table_new()
 
 void test_hash_table_put_get()
 {
-    hash_table_t *ht;
-    assert(hash_table_new(&ht) == 0);
+    hash_table_t *ht = hash_table_new();
+    assert(ht != NULL);
 
     uint8_t key[] = "key";
     uint8_t value[] = "value";
@@ -63,8 +63,8 @@ void test_hash_table_put_get()
 
 void test_hash_table_resize()
 {
-    hash_table_t *ht;
-    assert(hash_table_new(&ht) == 0);
+    hash_table_t *ht = hash_table_new();
+    assert(ht != NULL);
 
     for (size_t i = 0; i < INITIAL_BUCKETS * 2; i++)
     {
@@ -82,8 +82,8 @@ void test_hash_table_resize()
 
 void test_hash_table_clear()
 {
-    hash_table_t *ht;
-    assert(hash_table_new(&ht) == 0);
+    hash_table_t *ht = hash_table_new();
+    assert(ht != NULL);
 
     uint8_t key[] = "key";
     uint8_t value[] = "value";
@@ -105,8 +105,8 @@ void test_hash_table_cursor()
 {
     /* we can add more
      * here if needed */
-    hash_table_t *ht;
-    assert(hash_table_new(&ht) == 0);
+    hash_table_t *ht = hash_table_new();
+    assert(ht != NULL);
 
     uint8_t key[] = "key";
     uint8_t value[] = "value";
@@ -138,8 +138,8 @@ void test_hash_table_cursor()
 void benchmark_hash_table()
 {
     /* random key-value pairs */
-    hash_table_t *ht;
-    assert(hash_table_new(&ht) == 0);
+    hash_table_t *ht = hash_table_new();
+    assert(ht != NULL);
     const size_t key_size = 16;
     const size_t value_size = 8;
 

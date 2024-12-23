@@ -121,7 +121,8 @@ typedef struct
  * @param sstables the sstables for the column family
  * @param num_sstables the number of sstables for the column family
  * @param rwlock read-write lock for column family
- * @param memtable the memtable for the column family
+ * @param memtable_sl the skip list memtable for the column family. Can be NULL
+ * @param memtable_ht the hash table memtable for the column family. Can be NULL
  * @param wal the write-ahead log for column family
  */
 typedef struct
@@ -131,7 +132,8 @@ typedef struct
     tidesdb_sstable_t **sstables;
     int num_sstables;
     pthread_rwlock_t rwlock;
-    void *memtable; /* can be a skip list or hash table */
+    skip_list_t *memtable_sl;
+    hash_table_t *memtable_ht;
     tidesdb_wal_t *wal;
 } tidesdb_column_family_t;
 

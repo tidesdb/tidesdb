@@ -23,35 +23,35 @@
 #include <string.h>
 #include <time.h>
 
-int hash_table_new(hash_table_t **ht)
+hash_table_t *hash_table_new()
 {
     /* we alloc the hash table */
-    *ht = malloc(sizeof(hash_table_t));
-    if (*ht == NULL)
+    hash_table_t *ht = malloc(sizeof(hash_table_t));
+    if (ht == NULL)
     {
-        return -1;
+        return NULL;
     }
 
     /* we set the buckets to INITIAL_BUCKETS */
-    (*ht)->buckets = malloc(INITIAL_BUCKETS * sizeof(hash_table_bucket_t *));
-    if ((*ht)->buckets == NULL)
+    ht->buckets = malloc(INITIAL_BUCKETS * sizeof(hash_table_bucket_t *));
+    if (ht->buckets == NULL)
     {
-        free(*ht);
-        return -1;
+        free(ht);
+        return NULL;
     }
 
     /* we set the buckets to 0 */
-    memset((*ht)->buckets, 0, INITIAL_BUCKETS * sizeof(hash_table_bucket_t *));
+    memset(ht->buckets, 0, INITIAL_BUCKETS * sizeof(hash_table_bucket_t *));
 
     /* we set the bucket count */
-    (*ht)->bucket_count = INITIAL_BUCKETS;
+    ht->bucket_count = INITIAL_BUCKETS;
 
     /* we set the count to 0 */
-    (*ht)->count = 0;
+    ht->count = 0;
 
     /* we set the total size to 0 */
-    (*ht)->total_size = 0;
-    return 0;
+    ht->total_size = 0;
+    return ht;
 }
 
 int hash_table_put(hash_table_t **ht, const uint8_t *key, size_t key_size, const uint8_t *value,
@@ -61,32 +61,46 @@ int hash_table_put(hash_table_t **ht, const uint8_t *key, size_t key_size, const
     size_t index = original_index;
     size_t i = 1;
 
-    /* Find the next available slot using quadratic probing */
-    while ((*ht)->buckets[index] != NULL && (*ht)->buckets[index]->key != NULL)
+    /* find the correct slot using quadratic probing */
+    while ((*ht)->buckets[index] != NULL)
     {
+        hash_table_bucket_t *bucket = (*ht)->buckets[index];
+        if (bucket->key_size == key_size && memcmp(bucket->key, key, key_size) == 0)
+        {
+            /* key already exists, update the value */
+            free(bucket->value);
+            bucket->value = malloc(value_size);
+            if (bucket->value == NULL)
+            {
+                return -1;
+            }
+            memcpy(bucket->value, value, value_size);
+            bucket->value_size = value_size;
+            bucket->ttl = ttl;
+            return 0;
+        }
         index = (original_index + i * i) % (*ht)->bucket_count;
         i++;
     }
 
-    /* we initialize the bucket */
+    /* key does not exist, create a new bucket */
     hash_table_bucket_t *bucket = malloc(sizeof(hash_table_bucket_t));
     if (bucket == NULL)
     {
         return -1;
     }
 
-    /* we set the key */
+    /* set the key */
     bucket->key = malloc(key_size);
     if (bucket->key == NULL)
     {
         free(bucket);
         return -1;
     }
-
     memcpy(bucket->key, key, key_size);
     bucket->key_size = key_size;
 
-    /* we set the value */
+    /* set the value */
     bucket->value = malloc(value_size);
     if (bucket->value == NULL)
     {
@@ -94,12 +108,11 @@ int hash_table_put(hash_table_t **ht, const uint8_t *key, size_t key_size, const
         free(bucket);
         return -1;
     }
-
     memcpy(bucket->value, value, value_size);
     bucket->value_size = value_size;
     bucket->ttl = ttl;
 
-    /* we free the old bucket if it exists */
+    /* free the old bucket if it exists */
     if ((*ht)->buckets[index] != NULL)
     {
         free((*ht)->buckets[index]->key);
@@ -111,10 +124,10 @@ int hash_table_put(hash_table_t **ht, const uint8_t *key, size_t key_size, const
         (*ht)->count++;
     }
 
-    (*ht)->buckets[index] = bucket; /* we set the bucket */
+    (*ht)->buckets[index] = bucket; /* set the bucket */
     (*ht)->total_size += key_size + value_size;
 
-    /* we check if we should resize */
+    /* check if we should resize */
     if (hash_table_should_resize(*ht))
     {
         if (hash_table_resize(ht, (*ht)->bucket_count * 2) == -1)
@@ -187,7 +200,7 @@ int hash_table_get(hash_table_t *ht, const uint8_t *key, size_t key_size, uint8_
     size_t index = original_index;
     size_t i = 1;
 
-    /* Find the correct slot using quadratic probing */
+    /* find the correct slot using quadratic probing */
     while (ht->buckets[index] != NULL)
     {
         hash_table_bucket_t *bucket = ht->buckets[index];
@@ -196,8 +209,12 @@ int hash_table_get(hash_table_t *ht, const uint8_t *key, size_t key_size, uint8_
             /* check if ttl is set and if the key has expired */
             if (bucket->ttl != -1 && time(NULL) > bucket->ttl)
             {
+                ht->total_size -= bucket->value_size;
+                free(bucket->value);
+                bucket->value = malloc(4);
                 *(uint32_t *)bucket->value = TOMBSTONE;
-                return -1;
+                bucket->value_size = 4;
+                ht->total_size += 4;
             }
 
             *value = malloc(bucket->value_size);
@@ -235,7 +252,7 @@ void hash_table_cursor_reset(hash_table_cursor_t *cursor)
 
 int hash_table_cursor_next(hash_table_cursor_t *cursor)
 {
-    while (cursor->current_bucket_index < cursor->ht->bucket_count)
+    while (cursor->current_bucket_index < cursor->last_bucket_index)
     {
         cursor->current_bucket_index++;
         if (cursor->current_bucket_index >= cursor->ht->bucket_count)
@@ -252,7 +269,7 @@ int hash_table_cursor_next(hash_table_cursor_t *cursor)
 
 int hash_table_cursor_prev(hash_table_cursor_t *cursor)
 {
-    while (cursor->current_bucket_index > 0)
+    while (cursor->last_bucket_index > -1)
     {
         --cursor->current_bucket_index;
         if (cursor->ht->buckets[cursor->current_bucket_index] != NULL)
@@ -266,28 +283,37 @@ int hash_table_cursor_prev(hash_table_cursor_t *cursor)
 int hash_table_cursor_get(hash_table_cursor_t *cursor, uint8_t **key, size_t *key_size,
                           uint8_t **value, size_t *value_size, time_t *ttl)
 {
-    if (cursor->current_bucket_index >= cursor->ht->bucket_count)
+    while (cursor->current_bucket_index <= cursor->last_bucket_index)
     {
-        return -1; /* we are at the end */
-    }
-
-    hash_table_bucket_t *bucket = cursor->ht->buckets[cursor->current_bucket_index];
-    /* we check if the bucket is not null and not a tombstone */
-    if (bucket != NULL)
-    {
-        if (bucket->ttl != -1 && time(NULL) > bucket->ttl)
+        hash_table_bucket_t *bucket = cursor->ht->buckets[cursor->current_bucket_index];
+        /* we check if the bucket is not null and not a tombstone */
+        if (bucket != NULL)
         {
-            *(uint32_t *)bucket->value = TOMBSTONE;
-            return -1;
-        }
+            if (bucket->ttl != -1 && time(NULL) > bucket->ttl)
+            {
+                cursor->ht->total_size -= bucket->value_size;
+                free(bucket->value);
+                bucket->value = malloc(4);
+                if (bucket->value == NULL)
+                {
+                    return -1; /* malloc failed */
+                }
+                *(uint32_t *)bucket->value = TOMBSTONE;
+                bucket->value_size = 4;
+                cursor->ht->total_size += 4;
+            }
 
-        *key = bucket->key;
-        *key_size = bucket->key_size;
-        *value = bucket->value;
-        *value_size = bucket->value_size;
-        *ttl = bucket->ttl;
-        return 0;
+            *key = bucket->key;
+            *key_size = bucket->key_size;
+            *value = bucket->value;
+            *value_size = bucket->value_size;
+            *ttl = bucket->ttl;
+            return 0;
+        }
+        /* skip and go to the next bucket */
+        cursor->current_bucket_index++;
     }
+
     return -1;
 }
 

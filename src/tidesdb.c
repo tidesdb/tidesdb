@@ -4847,7 +4847,6 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
         }
 
         /* we get the key */
-
         if (hash_table_cursor_get(cursor, &kv->key, (size_t *)&kv->key_size, &kv->value,
                                   (size_t *)&kv->value_size, &kv->ttl) == -1)
         {

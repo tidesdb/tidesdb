@@ -283,12 +283,7 @@ int hash_table_cursor_prev(hash_table_cursor_t *cursor)
 int hash_table_cursor_get(hash_table_cursor_t *cursor, uint8_t **key, size_t *key_size,
                           uint8_t **value, size_t *value_size, time_t *ttl)
 {
-    if (cursor->current_bucket_index >= cursor->ht->bucket_count)
-    {
-        return -1; /* we are at the end */
-    }
-
-    while (cursor->current_bucket_index < cursor->ht->bucket_count)
+    while (cursor->current_bucket_index <= cursor->last_bucket_index)
     {
         hash_table_bucket_t *bucket = cursor->ht->buckets[cursor->current_bucket_index];
         /* we check if the bucket is not null and not a tombstone */

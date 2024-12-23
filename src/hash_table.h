@@ -87,10 +87,9 @@ typedef struct
 /**
  * hash_table_new
  * creates a new hash table
- * @param ht the hash table to create
- * @return 0 if successful, -1 if not
+ * @return the new hash table
  */
-int hash_table_new(hash_table_t **ht);
+hash_table_t *hash_table_new();
 
 /**
  * hash_table_put

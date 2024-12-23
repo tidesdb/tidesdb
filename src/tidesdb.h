@@ -131,7 +131,8 @@ typedef struct
     tidesdb_sstable_t **sstables;
     int num_sstables;
     pthread_rwlock_t rwlock;
-    void *memtable; /* can be a skip list or hash table */
+    skip_list_t *memtable_sl;
+    hash_table_t *memtable_ht;
     tidesdb_wal_t *wal;
 } tidesdb_column_family_t;
 

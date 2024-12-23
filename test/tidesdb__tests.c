@@ -1333,7 +1333,7 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
     for (int i = 0; i < 11; i++)
     {
         snprintf((char *)keys[i], sizeof(keys[i]), "test_key_%d", i);
-        printf("putting key: %s\n", keys[i]);
+        /*printf("putting key: %s\n", keys[i]);*/
         err =
             tidesdb_put(db, "test_cf", keys[i], sizeof(keys[i]), values[i], sizeof(values[i]), -1);
         assert(err == NULL);
@@ -1367,7 +1367,7 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
 
         if (retrieved_key != NULL)
         {
-            printf("retrieved key: %s\n", retrieved_key);
+            /*printf("retrieved key: %s\n", retrieved_key);*/
             /* check if the key is one of the keys we put */
             bool key_found = false;
             for (int i = 0; i < 11; i++)
@@ -1463,8 +1463,6 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
         assert(found[i]);
     }
 
-    printf("ddd\n");
-
     err = tidesdb_cursor_free(cursor);
     assert(err == NULL);
 
@@ -1505,7 +1503,7 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
     for (int i = 0; i < 11; i++)
     {
         snprintf((char *)keys[i], sizeof(keys[i]), "test_key_%d", i);
-        printf("putting key: %s\n", keys[i]);
+        /*printf("putting key: %s\n", keys[i]);*/
         err =
             tidesdb_put(db, "test_cf", keys[i], sizeof(keys[i]), values[i], sizeof(values[i]), -1);
         assert(err == NULL);
@@ -1539,7 +1537,7 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
 
         if (retrieved_key != NULL)
         {
-            printf("retrieved key: %s\n", retrieved_key);
+            /*printf("retrieved key: %s\n", retrieved_key);*/
             /* check if the key is one of the keys we put */
             bool key_found = false;
             for (int i = 0; i < 11; i++)
@@ -1596,7 +1594,7 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
 
         if (retrieved_key != NULL)
         {
-            printf("retrieved key: %s\n", retrieved_key);
+            /*printf("retrieved key: %s\n", retrieved_key);*/
             /* check if the key is one of the keys we put */
             bool key_found = false;
             for (int i = 0; i < 11; i++)

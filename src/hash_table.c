@@ -18,11 +18,6 @@
  */
 #include "hash_table.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
 hash_table_t *hash_table_new()
 {
     /* we alloc the hash table */

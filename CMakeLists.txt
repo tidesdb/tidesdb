@@ -6,8 +6,9 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 23)
-set(PROJECT_VERSION 0.4.0) # TidesDB v0.4.0b
+set(PROJECT_VERSION 0.5.0) # TidesDB v0.5.0b
 
+# when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 
@@ -29,26 +30,26 @@ add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_
 
 target_include_directories(tidesdb PRIVATE src)
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
-        # For Apple Silicon Macs, Homebrew installs packages in /opt/homebrew
+        # for apple silicon macs, homebrew installs packages in /opt/homebrew
         target_include_directories(tidesdb PUBLIC /opt/homebrew/include)
         target_link_directories(tidesdb PUBLIC /opt/homebrew/lib)
-        # Link against compression libraries for Apple Silicon
+        # link against compression libraries for apple silicon
         target_link_libraries(tidesdb PUBLIC
                 m       # math library
-                lz4     # LZ4 compression
-                zstd    # Zstandard compression
-                snappy  # Snappy compression
+                lz4     # lz4 compression
+                zstd    # zstandard compression
+                snappy  # snappy compression
         )
 elseif(APPLE)
-        # For Intel Macs, Homebrew typically installs in /usr/local
+        # for intel macs, homebrew typically installs in /usr/local
         target_include_directories(tidesdb PUBLIC /usr/local/include)
         target_link_directories(tidesdb PUBLIC /usr/local/lib)
-        # Link against compression libraries for Intel Mac
+        # link against compression libraries for intel mac
         target_link_libraries(tidesdb PUBLIC
                 m       # math library
-                lz4     # LZ4 compression
-                zstd    # Zstandard compression
-                snappy  # Snappy compression
+                lz4     # lz4 compression
+                zstd    # zstandard compression
+                snappy  # snappy compression
         )
 else()
         target_link_libraries(tidesdb PUBLIC zstd snappy lz4)
@@ -76,7 +77,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         add_executable(tidesdb_tests test/tidesdb__tests.c)
         add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
-        # Add include and link directories for test executables
+        # add include and link directories for test executables
         foreach(test_target err_tests block_manager_tests skip_list_tests hash_table_tests compress_tests bloom_filter_tests tidesdb_tests tidesdb_bench)
                 target_link_libraries(${test_target} PRIVATE tidesdb)
         endforeach()

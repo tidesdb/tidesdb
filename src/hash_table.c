@@ -234,9 +234,29 @@ int hash_table_get(hash_table_t *ht, const uint8_t *key, size_t key_size, uint8_
 hash_table_cursor_t *hash_table_cursor_init(hash_table_t *ht)
 {
     hash_table_cursor_t *cursor = malloc(sizeof(hash_table_cursor_t));
+    if (cursor == NULL)
+    {
+        return NULL;
+    }
+
     cursor->ht = ht;
     cursor->current_bucket_index = 0;
     cursor->last_bucket_index = ht->bucket_count - 1;
+
+    /* find the first non-NULL bucket */
+    while (cursor->current_bucket_index < ht->bucket_count &&
+           ht->buckets[cursor->current_bucket_index] == NULL)
+    {
+        cursor->current_bucket_index++;
+    }
+
+    /* if no non-NULL bucket is found, we can't setup the cursor */
+    if (cursor->current_bucket_index == ht->bucket_count)
+    {
+        free(cursor);
+        return NULL;
+    }
+
     return cursor;
 }
 
@@ -247,26 +267,33 @@ void hash_table_cursor_reset(hash_table_cursor_t *cursor)
 
 int hash_table_cursor_next(hash_table_cursor_t *cursor)
 {
-    while (cursor->current_bucket_index < cursor->last_bucket_index)
+    while (cursor->current_bucket_index < cursor->ht->bucket_count - 1)
     {
         cursor->current_bucket_index++;
-        if (cursor->current_bucket_index >= (ssize_t)cursor->ht->bucket_count)
-        {
-            return -1; /* we are at the end */
-        }
         if (cursor->ht->buckets[cursor->current_bucket_index] != NULL)
         {
             return 0; /* found a non-empty bucket */
         }
     }
+
+    /* if no more non-empty buckets, find the last non-NULL bucket */
+    for (size_t i = cursor->ht->bucket_count - 1; i > 0; i--)
+    {
+        if (cursor->ht->buckets[i] != NULL)
+        {
+            cursor->current_bucket_index = i;
+            return -1;
+        }
+    }
+
     return -1; /* no more non-empty buckets */
 }
 
 int hash_table_cursor_prev(hash_table_cursor_t *cursor)
 {
-    while (cursor->last_bucket_index > -1)
+    while (cursor->current_bucket_index > 0)
     {
-        --cursor->current_bucket_index;
+        cursor->current_bucket_index--;
         if (cursor->ht->buckets[cursor->current_bucket_index] != NULL)
         {
             return 0; /* found a non-empty bucket */
@@ -278,38 +305,32 @@ int hash_table_cursor_prev(hash_table_cursor_t *cursor)
 int hash_table_cursor_get(hash_table_cursor_t *cursor, uint8_t **key, size_t *key_size,
                           uint8_t **value, size_t *value_size, time_t *ttl)
 {
-    while (cursor->current_bucket_index <= cursor->last_bucket_index)
+    hash_table_bucket_t *bucket = cursor->ht->buckets[cursor->current_bucket_index];
+    if (bucket == NULL)
     {
-        hash_table_bucket_t *bucket = cursor->ht->buckets[cursor->current_bucket_index];
-        /* we check if the bucket is not null and not a tombstone */
-        if (bucket != NULL)
-        {
-            if (bucket->ttl != -1 && time(NULL) > bucket->ttl)
-            {
-                cursor->ht->total_size -= bucket->value_size;
-                free(bucket->value);
-                bucket->value = malloc(4);
-                if (bucket->value == NULL)
-                {
-                    return -1; /* malloc failed */
-                }
-                *(uint32_t *)bucket->value = TOMBSTONE;
-                bucket->value_size = 4;
-                cursor->ht->total_size += 4;
-            }
-
-            *key = bucket->key;
-            *key_size = bucket->key_size;
-            *value = bucket->value;
-            *value_size = bucket->value_size;
-            *ttl = bucket->ttl;
-            return 0;
-        }
-        /* skip and go to the next bucket */
-        cursor->current_bucket_index++;
+        return -1;
     }
 
-    return -1;
+    if (bucket->ttl != -1 && time(NULL) > bucket->ttl)
+    {
+        cursor->ht->total_size -= bucket->value_size;
+        free(bucket->value);
+        bucket->value = malloc(4);
+        if (bucket->value == NULL)
+        {
+            return -1; /* malloc failed */
+        }
+        *(uint32_t *)bucket->value = TOMBSTONE;
+        bucket->value_size = 4;
+        cursor->ht->total_size += 4;
+    }
+
+    *key = bucket->key;
+    *key_size = bucket->key_size;
+    *value = bucket->value;
+    *value_size = bucket->value_size;
+    *ttl = bucket->ttl;
+    return 0;
 }
 
 void hash_table_cursor_free(hash_table_cursor_t *cursor)

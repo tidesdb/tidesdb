@@ -76,8 +76,8 @@ typedef struct
 typedef struct
 {
     hash_table_t *ht;
-    size_t current_bucket_index;
-    size_t last_bucket_index;
+    ssize_t current_bucket_index;
+    ssize_t last_bucket_index;
 } hash_table_cursor_t;
 
 /**

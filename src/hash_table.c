@@ -250,7 +250,7 @@ int hash_table_cursor_next(hash_table_cursor_t *cursor)
     while (cursor->current_bucket_index < cursor->last_bucket_index)
     {
         cursor->current_bucket_index++;
-        if (cursor->current_bucket_index >= cursor->ht->bucket_count)
+        if (cursor->current_bucket_index >= (ssize_t)cursor->ht->bucket_count)
         {
             return -1; /* we are at the end */
         }

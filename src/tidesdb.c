@@ -4744,11 +4744,11 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
     sst->block_manager = sstable_block_manager;
 
     /* we figure out how large the bloom filter should be by getting amount of nodes in memtable */
-    int bloom_filter_size = (int)((hash_table_t *)cf->memtable_ht->count);
+    size_t bloom_filter_size = cf->memtable_ht->count;
 
     /* we initialize the bloom filter */
     bloom_filter_t *bf = NULL;
-    if (bloom_filter_new(&bf, TDB_BLOOMFILTER_P, bloom_filter_size) == -1)
+    if (bloom_filter_new(&bf, TDB_BLOOMFILTER_P, (int)bloom_filter_size) == -1)
     {
         free(sst);
         (void)remove(sstable_path);

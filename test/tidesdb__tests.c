@@ -1766,7 +1766,7 @@ int main(void)
     test_tidesdb_cursor(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
-    test_tidesdb_put_flush_compact_get(false, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
 
     return 0;
 }

@@ -244,14 +244,14 @@ hash_table_cursor_t *hash_table_cursor_init(hash_table_t *ht)
     cursor->last_bucket_index = ht->bucket_count - 1;
 
     /* find the first non-NULL bucket */
-    while (cursor->current_bucket_index < ht->bucket_count &&
+    while ((size_t)cursor->current_bucket_index < ht->bucket_count &&
            ht->buckets[cursor->current_bucket_index] == NULL)
     {
         cursor->current_bucket_index++;
     }
 
     /* if no non-NULL bucket is found, we can't setup the cursor */
-    if (cursor->current_bucket_index == ht->bucket_count)
+    if ((size_t)cursor->current_bucket_index == ht->bucket_count)
     {
         free(cursor);
         return NULL;
@@ -267,7 +267,7 @@ void hash_table_cursor_reset(hash_table_cursor_t *cursor)
 
 int hash_table_cursor_next(hash_table_cursor_t *cursor)
 {
-    while (cursor->current_bucket_index < cursor->ht->bucket_count - 1)
+    while ((size_t)cursor->current_bucket_index < cursor->ht->bucket_count - 1)
     {
         cursor->current_bucket_index++;
         if (cursor->ht->buckets[cursor->current_bucket_index] != NULL)

@@ -4159,7 +4159,8 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     if (merged_sstable == NULL) return NULL;
 
     /* we initialize a new skiplist as a mergetable with column family configurations */
-    skip_list_t *mergetable = skip_list_new(cf->config.max_level, cf->config.probability);
+    /* for merge we will set fixed 12 and 0.24f as a column family can use a hash table */
+    skip_list_t *mergetable = skip_list_new(12, 0.24f);
     if (mergetable == NULL)
     {
         free(merged_sstable);
@@ -4227,9 +4228,17 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         return NULL;
     }
 
-    block_manager_block_t *block;
-    while ((block = block_manager_cursor_read(cursor)) != NULL)
+    /* skip block if bloom filter is set */
+    if (cf->config.bloom_filter)
     {
+        (void)block_manager_cursor_next(cursor);
+    }
+
+    block_manager_block_t *block;
+    do
+    {
+        block = block_manager_cursor_read(cursor);
+        if (block == NULL) break;
         tidesdb_key_value_pair_t *kv = _tidesdb_deserialize_key_value_pair(
             block->data, block->size, cf->config.compressed, cf->config.compress_algo);
         if (kv == NULL)
@@ -4266,11 +4275,10 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         (void)block_manager_block_free(block);
         (void)_tidesdb_free_key_value_pair(kv);
 
-        if (block_manager_cursor_next(cursor) != 0) break;
-    }
+    } while (block_manager_cursor_next(cursor) != 0);
 
-    (void)block_manager_block_free(block);
     block = NULL;
+
     (void)block_manager_cursor_free(cursor);
     cursor = NULL;
 
@@ -4284,8 +4292,17 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         return NULL;
     }
 
-    while ((block = block_manager_cursor_read(cursor)) != NULL)
+    /* skip block if bloom filter is set */
+    if (cf->config.bloom_filter)
     {
+        (void)block_manager_cursor_next(cursor);
+    }
+
+    do
+    {
+        block = block_manager_cursor_read(cursor);
+        if (block == NULL) break;
+
         tidesdb_key_value_pair_t *kv = _tidesdb_deserialize_key_value_pair(
             block->data, block->size, cf->config.compressed, cf->config.compress_algo);
         if (kv == NULL)
@@ -4321,8 +4338,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         (void)block_manager_block_free(block);
         (void)_tidesdb_free_key_value_pair(kv);
 
-        if (block_manager_cursor_next(cursor) != 0) break;
-    }
+    } while (block_manager_cursor_next(cursor) != 0);
 
     (void)block_manager_cursor_free(cursor);
 
@@ -4374,6 +4390,10 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         cf->num_sstables--;
         return NULL;
     }
+
+    (void)block_manager_block_free(bf_block);
+    free(bf_serialized);
+    bloom_filter_free(bf);
 
     /* now we write the key-value pairs to the merged sstable
      * the mergetable will have keys sorted
@@ -4440,7 +4460,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
             break;
         }
 
-        block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_kv);
+        block = block_manager_block_create(serialized_size, serialized_kv);
         if (block == NULL)
         {
             free(kv);

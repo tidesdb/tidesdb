@@ -879,7 +879,7 @@ void test_tidesdb_put_many_flush_get(bool compress, tidesdb_compression_algo_t a
     assert(err == NULL);
 
     uint8_t key[20];
-    uint8_t value[1000];
+    uint8_t value[1024 * 1024];
 
     /* Fill the value with random data */
     for (size_t i = 0; i < sizeof(value); i++)
@@ -887,8 +887,8 @@ void test_tidesdb_put_many_flush_get(bool compress, tidesdb_compression_algo_t a
         value[i] = (uint8_t)(rand() % 256);
     }
 
-    /* Put 10,000 keys to trigger 10 flushes */
-    for (int i = 0; i < 10000; i++)
+    /* Put 12 keys which would be 12 sstables */
+    for (int i = 0; i < 12; i++)
     {
         snprintf((char *)key, sizeof(key), "key_%d", i);
         err = tidesdb_put(db, "test_cf", key, strlen((char *)key) + 1, value, sizeof(value), -1);
@@ -899,8 +899,24 @@ void test_tidesdb_put_many_flush_get(bool compress, tidesdb_compression_algo_t a
         assert(err == NULL);
     }
 
+    /* we will put one more key which should be in the memtable */
+    snprintf((char *)key, sizeof(key), "key_%d", 12);
+    uint8_t value2[128];
+    for (size_t i = 0; i < sizeof(value2); i++)
+    {
+        value2[i] = (uint8_t)(rand() % 256);
+    }
+
+    /* we put the second value */
+    err = tidesdb_put(db, "test_cf", key, strlen((char *)key) + 1, value2, sizeof(value2), -1);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
     /* now we check all keys */
-    for (int i = 0; i < 10000; i++)
+    for (int i = 0; i < 12; i++)
     {
         snprintf((char *)key, sizeof(key), "key_%d", i);
         uint8_t *retrieved_value = NULL;
@@ -916,6 +932,22 @@ void test_tidesdb_put_many_flush_get(bool compress, tidesdb_compression_algo_t a
 
         free(retrieved_value);
     }
+
+    /* check last key */
+    snprintf((char *)key, sizeof(key), "key_%d", 12);
+
+    uint8_t *retrieved_value2 = NULL;
+    size_t value_size;
+
+    err = tidesdb_get(db, "test_cf", key, strlen((char *)key) + 1, &retrieved_value2, &value_size);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+
+    free(retrieved_value2);
+
+    assert(err == NULL);
 
     err = tidesdb_close(db);
     if (err != NULL)
@@ -955,7 +987,7 @@ void test_tidesdb_put_flush_compact_get(bool compress, tidesdb_compression_algo_
     assert(err == NULL);
 
     uint8_t key[20];
-    uint8_t value[1000];
+    uint8_t value[1024 * 1024];
 
     /* Fill the value with random data */
     for (size_t i = 0; i < sizeof(value); i++)
@@ -963,8 +995,8 @@ void test_tidesdb_put_flush_compact_get(bool compress, tidesdb_compression_algo_
         value[i] = (uint8_t)(rand() % 256);
     }
 
-    /* Put 10,000 keys to trigger 10 flushes */
-    for (int i = 0; i < 10000; i++)
+    /* Put 12 keys which would be 12 sstables */
+    for (int i = 0; i < 12; i++)
     {
         snprintf((char *)key, sizeof(key), "key_%d", i);
         err = tidesdb_put(db, "test_cf", key, strlen((char *)key) + 1, value, sizeof(value), -1);
@@ -981,11 +1013,26 @@ void test_tidesdb_put_flush_compact_get(bool compress, tidesdb_compression_algo_
     {
         printf(RED "%s" RESET, err->message);
     }
+    assert(err == NULL);
 
+    /* we will put one more key which should be in the memtable */
+    snprintf((char *)key, sizeof(key), "key_%d", 12);
+    uint8_t value2[128];
+    for (size_t i = 0; i < sizeof(value2); i++)
+    {
+        value2[i] = (uint8_t)(rand() % 256);
+    }
+
+    /* we put the second value */
+    err = tidesdb_put(db, "test_cf", key, strlen((char *)key) + 1, value2, sizeof(value2), -1);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
     assert(err == NULL);
 
     /* now we check all keys */
-    for (int i = 0; i < 10000; i++)
+    for (int i = 0; i < 12; i++)
     {
         snprintf((char *)key, sizeof(key), "key_%d", i);
         uint8_t *retrieved_value = NULL;
@@ -1001,6 +1048,22 @@ void test_tidesdb_put_flush_compact_get(bool compress, tidesdb_compression_algo_
 
         free(retrieved_value);
     }
+
+    /* check last key */
+    snprintf((char *)key, sizeof(key), "key_%d", 12);
+
+    uint8_t *retrieved_value2 = NULL;
+    size_t value_size;
+
+    err = tidesdb_get(db, "test_cf", key, strlen((char *)key) + 1, &retrieved_value2, &value_size);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+
+    free(retrieved_value2);
+
+    assert(err == NULL);
 
     err = tidesdb_close(db);
     if (err != NULL)
@@ -1664,8 +1727,6 @@ int main(void)
     test_tidesdb_put_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_flush_close_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_flush_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
-
-    /* these tests take a while to run */
     test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
 
@@ -1689,8 +1750,6 @@ int main(void)
     test_tidesdb_put_flush_delete_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_cursor(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
-
-    /* these tests take a while to run */
     test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
 
@@ -1706,8 +1765,6 @@ int main(void)
     test_tidesdb_put_flush_delete_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_cursor(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
-
-    /* these tests take a while to run */
     test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
 

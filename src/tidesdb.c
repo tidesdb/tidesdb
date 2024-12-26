@@ -506,7 +506,7 @@ tidesdb_err_t *tidesdb_open(char *directory, tidesdb_t **tdb)
     (*tdb)->column_families = NULL;
     (*tdb)->num_column_families = 0; /* 0 for now until we read db path */
 
-    /* initialize the lock */
+    /* initialize the db lock */
     if (pthread_rwlock_init(&(*tdb)->rwlock, NULL) != 0)
     {
         free((*tdb)->directory);
@@ -932,6 +932,9 @@ int _tidesdb_open_wal(const char *cf_path, tidesdb_wal_t **w, bool compress,
 
 int _tidesdb_add_column_family(tidesdb_t *tdb, tidesdb_column_family_t *cf)
 {
+    /* we get write lock */
+    if (pthread_rwlock_wrlock(&tdb->rwlock) != 0) return -1;
+
     /* we check if tdb or cf is NULL */
     if (tdb == NULL || cf == NULL) return -1;
 
@@ -940,6 +943,7 @@ int _tidesdb_add_column_family(tidesdb_t *tdb, tidesdb_column_family_t *cf)
         tdb->column_families = malloc(sizeof(tidesdb_column_family_t *));
         if (tdb->column_families == NULL)
         {
+            (void)pthread_rwlock_unlock(&tdb->rwlock);
             return -1;
         }
     }
@@ -951,6 +955,7 @@ int _tidesdb_add_column_family(tidesdb_t *tdb, tidesdb_column_family_t *cf)
         /* we check if the reallocation was successful */
         if (temp_families == NULL)
         {
+            (void)pthread_rwlock_unlock(&tdb->rwlock);
             return -1;
         }
 
@@ -962,6 +967,9 @@ int _tidesdb_add_column_family(tidesdb_t *tdb, tidesdb_column_family_t *cf)
 
     /* we add the column family */
     tdb->column_families[tdb->num_column_families - 1] = cf;
+
+    /* we release the write lock */
+    (void)pthread_rwlock_unlock(&tdb->rwlock);
 
     return 0;
 }
@@ -1116,18 +1124,36 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_FLUSH_THRESHOLD);
 
     /* only if the memtable data structure is skip list
-     * we check max level and probability */
-    if (memtable_ds == TDB_MEMTABLE_SKIP_LIST)
+     * we check max level and probability.  We also check if valid ds */
+    switch (memtable_ds)
     {
-        /* we check max level
-         * the system expects at least a level of TDB_MIN_MAX_LEVEL */
-        if (max_level < TDB_MIN_MAX_LEVEL)
-            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_MAX_LEVEL);
+        case TDB_MEMTABLE_SKIP_LIST:
+            break;
+            /* we check max level
+             * the system expects at least a level of TDB_MIN_MAX_LEVEL */
+            if (max_level < TDB_MIN_MAX_LEVEL)
+                return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_MAX_LEVEL);
 
-        /* we check probability
-         * the system expects at least a probability of TDB_MIN_PROBABILITY */
-        if (probability < TDB_MIN_PROBABILITY)
-            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_PROBABILITY);
+            /* we check probability
+             * the system expects at least a probability of TDB_MIN_PROBABILITY */
+            if (probability < TDB_MIN_PROBABILITY)
+                return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_PROBABILITY);
+        case TDB_MEMTABLE_HASH_TABLE:
+            break;
+        default: /* invalid memtable data structure */
+            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
+    }
+
+    /* we check the compression algorithm */
+    switch (compression_algo)
+    {
+        case TDB_NO_COMPRESSION:
+        case TDB_COMPRESS_SNAPPY:
+        case TDB_COMPRESS_ZSTD:
+        case TDB_COMPRESS_LZ4:
+            break;
+        default:
+            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COMPRESSION_ALGO);
     }
 
     tidesdb_column_family_t *cf = NULL;
@@ -1135,6 +1161,34 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
                                    &cf, compressed, compression_algo, bloom_filter,
                                    memtable_ds) == -1)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_COLUMN_FAMILY);
+
+    /* check if column family already exists */
+
+    /* we acquire read lock */
+    if (pthread_rwlock_wrlock(&tdb->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "tidesdb_t");
+    }
+
+    for (int i = 0; i < tdb->num_column_families; i++)
+    {
+        if (strcmp(tdb->column_families[i]->config.name, name) == 0)
+        {
+            /* we release the lock */
+            if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+            {
+                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "tidesdb_t");
+            }
+
+            return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_ALREADY_EXISTS);
+        }
+    }
+
+    /* we release the lock */
+    if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "tidesdb_t");
+    }
 
     /* now we add the column family */
     if (_tidesdb_add_column_family(tdb, cf) == -1)
@@ -1147,6 +1201,51 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
 {
     /* check if either tdb or name is NULL */
     if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
+
+    /* we check if the name is NULL */
+    if (name == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we acquire read lock */
+    if (pthread_rwlock_wrlock(&tdb->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "tidesdb_t");
+    }
+
+    /* check if column family exists */
+    bool found = false;
+    for (int i = 0; i < tdb->num_column_families; i++)
+    {
+        if (strcmp(tdb->column_families[i]->config.name, name) == 0)
+        {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found)
+    {
+        /* we release the lock */
+        if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+        {
+            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "tidesdb_t");
+        }
+
+        return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
+    }
+
+    /* we releas read lock */
+    if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "tidesdb_t");
+    }
+
+    /* we acquire write lock */
+    if (pthread_rwlock_wrlock(&tdb->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "tidesdb_t");
+    }
+
+    /* now we remove the column family */
 
     /* iterate over the column families to find the one to remove */
     int index = -1;
@@ -1161,6 +1260,7 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
 
     if (index == -1)
     {
+        (void)pthread_rwlock_unlock(&tdb->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
     }
 
@@ -1190,10 +1290,11 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
     /* remove the wal file */
     if (unlink(wal_path) == -1)
     {
+        (void)pthread_rwlock_unlock(&tdb->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_RM_FAILED, wal_path);
     }
 
-    (void)remove(wal_path); /*incase */
+    (void)remove(wal_path); /*in case */
 
     switch (tdb->column_families[index]->config.memtable_ds)
     {
@@ -1226,6 +1327,7 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
             tdb->column_families, tdb->num_column_families * sizeof(tidesdb_column_family_t *));
         if (temp_families == NULL)
         {
+            (void)pthread_rwlock_unlock(&tdb->rwlock);
             return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "column families");
         }
 
@@ -1237,6 +1339,12 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
         free(tdb->column_families);
         tdb->num_column_families = 0;
         tdb->column_families = NULL;
+    }
+
+    /* we release the lock */
+    if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "tidesdb_t");
     }
 
     return NULL;

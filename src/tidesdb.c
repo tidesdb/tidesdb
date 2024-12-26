@@ -477,7 +477,7 @@ void _tidesdb_free_operation(tidesdb_operation_t *op)
     op = NULL;
 }
 
-tidesdb_err_t *tidesdb_open(char *directory, tidesdb_t **tdb)
+tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
 {
     /* we check if the provided tidesdb instance is NULL */
     if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);

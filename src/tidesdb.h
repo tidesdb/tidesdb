@@ -281,7 +281,7 @@ typedef struct
  * @param tdb the TidesDB instance (should be null)
  * @return error or NULL
  */
-tidesdb_err_t *tidesdb_open(char *directory, tidesdb_t **tdb);
+tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb);
 
 /*
  * tidesdb_close

@@ -377,3 +377,11 @@ int block_manager_count_blocks(block_manager_t *bm)
     block_manager_cursor_free(cursor);
     return count;
 }
+
+int block_manager_get_size(block_manager_t *bm, uint64_t *size)
+{
+    struct stat st;
+    if (stat(bm->file_path, &st) != 0) return -1;
+    *size = st.st_size;
+    return 0;
+}

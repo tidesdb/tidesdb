@@ -25,12 +25,11 @@
 
 #include "../src/tidesdb.h"
 #include "../test/test_macros.h"
-#include "../test/test_utils.h"
 
 /* test constants */
 #define NUM_OPERATIONS         500000 /* number of operations per thread */
 #define NUM_THREADS            2 /* you can increase this to test with more threads, usually slower */
-#define SIZE                   (1024 * 1024) /* key and value size, 1MB */
+#define SIZE                   64 /* key and value size, in bytes */
 #define DIR                    "benchmark_db"
 #define FLUSH_THRESHOLD        ((1024 * 1024) * 64)
 #define THREADS_FOR_COMPACTION 2
@@ -61,13 +60,13 @@ void pad_key_with_nines(uint8_t *key, size_t target_len)
 void create_key(uint8_t *key, int index)
 {
     snprintf((char *)key, SIZE, "key%03d", index);
-    pad_key_with_nines(key, SIZE - 1);
+    (void)pad_key_with_nines(key, SIZE - 1);
 }
 
 void create_value(uint8_t *value, int index, int thread_id)
 {
     snprintf((char *)value, SIZE, "value%03d_%d", index, thread_id);
-    pad_key_with_nines(value, SIZE - 1);
+    (void)pad_key_with_nines(value, SIZE - 1);
 }
 
 void *benchmark_put(void *arg)
@@ -81,15 +80,15 @@ void *benchmark_put(void *arg)
     {
         uint8_t key[SIZE];
         uint8_t value[SIZE];
-        create_key(key, i);
-        create_value(value, i, thread_id);
+        (void)create_key(key, i);
+        (void)create_value(value, i, thread_id);
 
         tidesdb_err_t *err =
             tidesdb_put(tdb, cf_name, key, strlen((char *)key), value, strlen((char *)value), -1);
         if (err != NULL)
         {
             printf(RED "Error: %s\n" RESET, err->message);
-            tidesdb_err_free(err);
+            (void)tidesdb_err_free(err);
         }
     }
     return NULL;
@@ -106,15 +105,15 @@ void *benchmark_put_compact(void *arg)
     {
         uint8_t key[SIZE];
         uint8_t value[SIZE];
-        create_key(key, i);
-        create_value(value, i, thread_id);
+        (void)create_key(key, i);
+        (void)create_value(value, i, thread_id);
 
         tidesdb_err_t *err =
             tidesdb_put(tdb, cf_name, key, strlen((char *)key), value, strlen((char *)value), -1);
         if (err != NULL)
         {
             printf(RED "Error: %s\n" RESET, err->message);
-            tidesdb_err_free(err);
+            (void)tidesdb_err_free(err);
         }
 
         /* compact sstables in the middle of the benchmark */
@@ -124,7 +123,7 @@ void *benchmark_put_compact(void *arg)
             if (err != NULL)
             {
                 printf(RED "Error: %s\n" RESET, err->message);
-                tidesdb_err_free(err);
+                (void)tidesdb_err_free(err);
             }
         }
     }
@@ -141,7 +140,7 @@ void *benchmark_get(void *arg)
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {
         uint8_t key[SIZE];
-        create_key(key, i);
+        (void)create_key(key, i);
 
         uint8_t *value = NULL;
         size_t value_size = 0;
@@ -150,7 +149,7 @@ void *benchmark_get(void *arg)
         if (err != NULL)
         {
             printf(RED "Error: %s\n" RESET, err->message);
-            tidesdb_err_free(err);
+            (void)tidesdb_err_free(err);
             continue;
         }
         if (value != NULL)
@@ -172,13 +171,13 @@ void *benchmark_delete(void *arg)
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {
         uint8_t key[SIZE];
-        create_key(key, i);
+        (void)create_key(key, i);
 
         tidesdb_err_t *err = tidesdb_delete(tdb, cf_name, key, strlen((char *)key));
         if (err != NULL)
         {
             printf(RED "Error: %s\n" RESET, err->message);
-            tidesdb_err_free(err);
+            (void)tidesdb_err_free(err);
         }
     }
     return NULL;
@@ -194,12 +193,12 @@ void run_benchmark(void *(*benchmark_func)(void *), tidesdb_t *tdb, const char *
         args[i].tdb = tdb;
         args[i].column_family_name = cf_name;
         args[i].thread_id = i;
-        pthread_create(&threads[i], NULL, benchmark_func, &args[i]);
+        (void)pthread_create(&threads[i], NULL, benchmark_func, &args[i]);
     }
 
     for (int i = 0; i < NUM_THREADS; i++)
     {
-        pthread_join(threads[i], NULL);
+        (void)pthread_join(threads[i], NULL);
     }
 }
 
@@ -219,7 +218,7 @@ int main(void)
     if (err != NULL)
     {
         printf(RED "Error opening database: %s\n" RESET, err->message);
-        tidesdb_err_free(err);
+        (void)tidesdb_err_free(err);
         return -1;
     }
 
@@ -231,32 +230,32 @@ int main(void)
     if (err != NULL)
     {
         printf(RED "Error creating column family: %s\n" RESET, err->message);
-        tidesdb_err_free(err);
-        tidesdb_close(tdb);
+        (void)tidesdb_err_free(err);
+        (void)tidesdb_close(tdb);
         return -1;
     }
 
     const char *cf_name2 = "cf2";
-    err = tidesdb_create_column_family(tdb, cf_name2, FLUSH_THRESHOLD, 12, 0.24f, false,
+    err = tidesdb_create_column_family(tdb, cf_name2, FLUSH_THRESHOLD, 12, 0.24f, true,
                                        TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
     if (err != NULL)
     {
         printf(RED "Error creating column family: %s\n" RESET, err->message);
-        tidesdb_err_free(err);
-        tidesdb_close(tdb);
+        (void)tidesdb_err_free(err);
+        (void)tidesdb_close(tdb);
         return -1;
     }
 
     printf(BOLDCYAN "Running PUT (no compression, bloom filter) benchmark...\n" RESET);
     clock_t start = clock();
-    run_benchmark(benchmark_put, tdb, cf_name);
+    (void)run_benchmark(benchmark_put, tdb, cf_name);
     clock_t end = clock();
     printf(BOLDGREEN "PUT (no compression, bloom filter) benchmark completed in %f seconds\n" RESET,
            (double)(end - start) / CLOCKS_PER_SEC);
 
     printf(BOLDCYAN "Running PUT (no compression, bloom filter) compact benchmark...\n" RESET);
     start = clock();
-    run_benchmark(benchmark_put_compact, tdb, cf_name);
+    (void)run_benchmark(benchmark_put_compact, tdb, cf_name);
     end = clock();
     printf(BOLDGREEN
            "PUT (no compression, bloom filter) compact benchmark completed in %f seconds\n" RESET,
@@ -264,14 +263,14 @@ int main(void)
 
     printf(BOLDCYAN "Running GET (no compression, bloom filter) benchmark...\n" RESET);
     start = clock();
-    run_benchmark(benchmark_get, tdb, cf_name);
+    (void)run_benchmark(benchmark_get, tdb, cf_name);
     end = clock();
     printf(BOLDGREEN "GET (no compression, bloom filter) benchmark completed in %f seconds\n" RESET,
            (double)(end - start) / CLOCKS_PER_SEC);
 
     printf(BOLDCYAN "Running DELETE (no compression, bloom filter) benchmark...\n" RESET);
     start = clock();
-    run_benchmark(benchmark_delete, tdb, cf_name);
+    (void)run_benchmark(benchmark_delete, tdb, cf_name);
     end = clock();
     printf(BOLDGREEN
            "DELETE (no compression, bloom filter) benchmark completed in %f seconds\n" RESET,
@@ -280,14 +279,14 @@ int main(void)
     /* with snappy compression and bloom filter */
     printf(BOLDCYAN "Running PUT (compression, bloom filter) benchmark...\n" RESET);
     start = clock();
-    run_benchmark(benchmark_put, tdb, cf_name);
+    (void)run_benchmark(benchmark_put, tdb, cf_name2);
     end = clock();
     printf(BOLDGREEN "PUT benchmark completed in %f seconds\n" RESET,
            (double)(end - start) / CLOCKS_PER_SEC);
 
     printf(BOLDCYAN "Running PUT (compression, bloom filter) compact benchmark...\n" RESET);
     start = clock();
-    run_benchmark(benchmark_put_compact, tdb, cf_name);
+    (void)run_benchmark(benchmark_put_compact, tdb, cf_name2);
     end = clock();
     printf(BOLDGREEN
            "PUT (compression, bloom filter) compact benchmark completed in %f seconds\n" RESET,
@@ -295,14 +294,14 @@ int main(void)
 
     printf(BOLDCYAN "Running GET (compression, bloom filter) benchmark...\n" RESET);
     start = clock();
-    run_benchmark(benchmark_get, tdb, cf_name);
+    (void)run_benchmark(benchmark_get, tdb, cf_name2);
     end = clock();
     printf(BOLDGREEN "GET (compression, bloom filter) benchmark completed in %f seconds\n" RESET,
            (double)(end - start) / CLOCKS_PER_SEC);
 
     printf(BOLDCYAN "Running DELETE (compression, bloom filter) benchmark...\n" RESET);
     start = clock();
-    run_benchmark(benchmark_delete, tdb, cf_name);
+    (void)run_benchmark(benchmark_delete, tdb, cf_name2);
     end = clock();
     printf(BOLDGREEN "DELETE (compression, bloom filter) benchmark completed in %f seconds\n" RESET,
            (double)(end - start) / CLOCKS_PER_SEC);

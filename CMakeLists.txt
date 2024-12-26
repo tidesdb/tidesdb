@@ -39,6 +39,7 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
                 lz4     # lz4 compression
                 zstd    # zstandard compression
                 snappy  # snappy compression
+                pthread # pthread library
         )
 elseif(APPLE)
         # for intel macs, homebrew typically installs in /usr/local
@@ -50,9 +51,10 @@ elseif(APPLE)
                 lz4     # lz4 compression
                 zstd    # zstandard compression
                 snappy  # snappy compression
+                pthread # pthread library
         )
 else()
-        target_link_libraries(tidesdb PUBLIC zstd snappy lz4)
+        target_link_libraries(tidesdb PUBLIC zstd snappy lz4 pthread)
         find_library(MATH_LIBRARY m)
         if(MATH_LIBRARY)
                 target_link_libraries(tidesdb PUBLIC ${MATH_LIBRARY})

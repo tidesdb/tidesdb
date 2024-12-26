@@ -229,4 +229,13 @@ int block_manager_cursor_goto_last(block_manager_cursor_t *cursor);
  */
 int block_manager_cursor_goto_first(block_manager_cursor_t *cursor);
 
+/**
+ * block_manager_get_size
+ * gets the size of a block manager
+ * @param bm the block manager to get the size of
+ * @param size the size of the block manager
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_get_size(block_manager_t *bm, uint64_t *size);
+
 #endif /* __BLOCK_MANAGER_H__ */

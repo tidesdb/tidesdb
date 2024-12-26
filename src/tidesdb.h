@@ -42,8 +42,9 @@
 #define TDB_MIN_MAX_LEVEL                 5          /* minimum max level for column family */
 #define TDB_MIN_PROBABILITY               0.1        /* minimum probability for column family */
 #define TDB_MERGE_MULTIPLIER                                                                      \
-    4 /* if either pair in a merge is larger than column family configured flush threshold * this \
-      multiplier, they will not get merged but cleaned of expired keys if any */
+    12 /* if either pair in a merge is larger than column family configured flush threshold * this \
+      multiplier, they will not get merged but cleaned of expired keys and tombstones if any.
+      say memtable is 128mb, sstable would not merge with another if their size is greater than 1.5 gigabytes */
 
 /*
  * tidesdb_compression_algo_t

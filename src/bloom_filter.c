@@ -43,6 +43,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, int n)
     (*bf)->bitset = calloc((*bf)->m, sizeof(int8_t));
     if ((*bf)->bitset == NULL)
     {
+        free(*bf);
         return -1;
     }
 

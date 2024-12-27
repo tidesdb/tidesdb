@@ -1533,8 +1533,8 @@ void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bl
     assert(err == NULL);
 
     _tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_cursor %s %s passed\n" RESET, compress ? "with compression" : "",
-           bloom_filter ? "with bloom filter" : "");
+    printf(GREEN "test_tidesdb_cursor%s%s passed\n" RESET, compress ? " with compression" : "",
+           bloom_filter ? " with bloom filter" : "");
 }
 
 /* we flush multiple sstables and iterate through them

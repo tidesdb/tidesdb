@@ -25,7 +25,7 @@
 #include <string.h>
 #include <zstd.h>
 
-/* snappy, lz4, zstd supported */
+/* snappy, lz4, zstd supported to use for compression purposes */
 typedef enum
 {
     COMPRESS_SNAPPY,

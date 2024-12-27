@@ -57,7 +57,7 @@ struct skip_list_node_t
  * @param max_level the maximum level of the skip list
  * @param probability the probability of a node having a certain level
  * @param header the header node of the skip list
- * @param total_size the total size in bytes
+ * @param total_size the total size in bytes of kv pairs in the skip list
  */
 typedef struct
 {
@@ -247,7 +247,7 @@ int skip_list_get_size(skip_list_t *list);
 
 /*
  * skip_list_count_entries
- * count the number of entries in the skip list
+ * count the number of entries/nodes in the skip list
  * @param list the skip list
  * @return the number of entries in the skip list
  */

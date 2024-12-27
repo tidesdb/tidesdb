@@ -32,9 +32,9 @@
  */
 typedef struct
 {
-    int8_t *bitset; /* bloom filter bitset */
-    int m;          /* size of the bloom filter bitset */
-    int h;          /* number of hash functions */
+    int8_t *bitset;
+    int m;
+    int h;
 } bloom_filter_t;
 
 /**

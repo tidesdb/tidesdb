@@ -34,7 +34,7 @@
  * @param file the file the block manager is managing
  * @param file_path the path of the file
  * @param fsync_thread the fsync thread
- * @param fsync_interval the fsync interval
+ * @param fsync_interval the fsync interval in seconds
  * @param stop_fsync_thread flag to stop fsync thread
  */
 typedef struct
@@ -50,7 +50,7 @@ typedef struct
  * block_t
  * block struct
  * used for blocks in TidesDB
- * @param size the size of the block
+ * @param size the size of the data in the block
  * @param data the data in the block
  */
 typedef struct
@@ -65,7 +65,7 @@ typedef struct
  * used for block cursors in TidesDB
  * @param bm the block manager
  * @param current_pos the current position of the cursor
- * @param previous_pos the previous position of the cursor
+ * @param current_block_size the size of the current block
  */
 typedef struct
 {
@@ -112,7 +112,7 @@ int block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
 
 /**
  * block_manager_block_read
- * reads a block from a file at current position
+ * reads a block from a file at current file position
  * @param bm the block manager to read the block from
  * @return the block read from the file
  */
@@ -144,7 +144,7 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor);
 
 /**
  * block_manager_cursor_read
- * reads the block at the cursor
+ * reads the block at the cursor current position
  * @param cursor the cursor to read from
  * @return the block read from the cursor
  */
@@ -175,7 +175,7 @@ void *block_manager_fsync_thread(void *arg);
 
 /**
  * block_manager_truncate
- * truncates a block manager to 0
+ * truncates a block manager to 0 removing all blocks
  * @param bm the block manager to truncate
  * @return 0 if successful, -1 if not
  */
@@ -183,7 +183,7 @@ int block_manager_truncate(block_manager_t *bm);
 
 /**
  * block_manager_last_modified
- * gets the last modified time of a block manager
+ * gets the last modified time of a block manager file
  * @param bm the block manager to get the last modified time of
  * @return the last modified time of the block manager
  */
@@ -191,7 +191,7 @@ time_t block_manager_last_modified(block_manager_t *bm);
 
 /**
  * block_manager_count_blocks
- * counts the number of blocks in a block manager
+ * counts the number of blocks in a block managed file
  * @param bm the block manager to count the blocks of
  * @return the number of blocks in the block manager
  */

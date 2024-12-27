@@ -414,8 +414,6 @@ tidesdb_cursor_free(c);
 You can manually compact sstables.  This method pairs and merges column family sstables.
 Say you have 100, after compaction you will have 50; Always half the amount you had prior.  You can set the number of threads to use for compaction.
 
-**SStables are paired and merged from the latest to the oldest. Mind you if an sstable has be compacted multiple times and has reached a size of your column family flush threshold * TDB_MERGE_MULTIPLIER (default 12) the pairs will not be merged but cleaned up of any expired or tombstoned keys**
-
 ```c
 tidesdb_err_t *e = tidesdb_compact_sstables(tdb, "your_column_family", 10); /* use 10 threads */
 if (e != NULL)

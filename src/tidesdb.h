@@ -41,10 +41,6 @@
 #define TDB_FLUSH_THRESHOLD               1048576    /* default flush threshold for column family */
 #define TDB_MIN_MAX_LEVEL                 5          /* minimum max level for column family */
 #define TDB_MIN_PROBABILITY               0.1        /* minimum probability for column family */
-#define TDB_MERGE_MULTIPLIER                                                                      \
-    12 /* if either pair in a merge is larger than column family configured flush threshold * this \
-      multiplier, they will not get merged but cleaned of expired keys and tombstones if any.
-      say memtable is 128mb, sstable would not merge with another if their size is greater than 1.5 gigabytes */
 
 /*
  * tidesdb_compression_algo_t
@@ -841,14 +837,5 @@ int _tidesdb_is_expired(int64_t ttl);
  * @return the correct compress_type algo
  */
 compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo);
-
-/*
- * _tidesdb_scan_update_sstable
- * scans sstable for tombstones, and expired keys, removes them, and updates the sstable
- * @param cf the column family
- * @param sst the sstable
- * @return 0 if the sstable was updated, -1 if not
- */
-int _tidesdb_scan_update_sstable(tidesdb_column_family_t *cf, tidesdb_sstable_t *sst);
 
 #endif /* __TIDESDB_H__ */

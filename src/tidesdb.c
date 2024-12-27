@@ -2792,28 +2792,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
                                            tidesdb_column_family_t *cf,
                                            pthread_mutex_t *shared_lock)
 {
-    /* we check the size of sst1 and sst2,
-     * we don't merge small sstables.
-     * the sstables must be < cf->config.flush_threshold * 4
-     */
-    uint64_t sst1_size = 0;
-    uint64_t sst2_size = 0;
-    if (block_manager_get_size(sst1->block_manager, &sst1_size) == -1) return NULL;
-    if (block_manager_get_size(sst2->block_manager, &sst2_size) == -1) return NULL;
-
-    if ((int)sst1_size > cf->config.flush_threshold * (int)TDB_MERGE_MULTIPLIER ||
-        (int)sst2_size > cf->config.flush_threshold * (int)TDB_MERGE_MULTIPLIER)
-    {
-        /* instead we scan the sstables looking for expired keys.
-         * If any we will update and write the sstable back to disk.
-         */
-        if (_tidesdb_scan_update_sstable(cf, sst1) == -1) return NULL;
-
-        if (_tidesdb_scan_update_sstable(cf, sst2) == -1) return NULL;
-
-        return NULL;
-    }
-
     /* we initialize a new sstable */
     tidesdb_sstable_t *merged_sstable = malloc(sizeof(tidesdb_sstable_t));
     if (merged_sstable == NULL) return NULL;
@@ -4381,28 +4359,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     /*
      * similar to _tidesdb_merge_sstables but with bloom filter
      */
-
-    /* we check the size of sst1 and sst2,
-     * we don't merge small sstables.
-     * the sstables must be < cf->config.flush_threshold * 4
-     */
-    uint64_t sst1_size = 0;
-    uint64_t sst2_size = 0;
-    if (block_manager_get_size(sst1->block_manager, &sst1_size) == -1) return NULL;
-    if (block_manager_get_size(sst2->block_manager, &sst2_size) == -1) return NULL;
-
-    if ((int)sst1_size > cf->config.flush_threshold * (int)TDB_MERGE_MULTIPLIER ||
-        (int)sst2_size > cf->config.flush_threshold * (int)TDB_MERGE_MULTIPLIER)
-    {
-        /* instead we scan the sstables looking for expired keys.
-         * If any we remove and update
-         */
-        if (_tidesdb_scan_update_sstable(cf, sst1) == -1) return NULL;
-
-        if (_tidesdb_scan_update_sstable(cf, sst2) == -1) return NULL;
-
-        return NULL;
-    }
 
     /* we initialize a new sstable */
     tidesdb_sstable_t *merged_sstable = malloc(sizeof(tidesdb_sstable_t));

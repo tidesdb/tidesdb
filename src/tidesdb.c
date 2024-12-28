@@ -1160,12 +1160,6 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
             return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COMPRESSION_ALGO);
     }
 
-    tidesdb_column_family_t *cf = NULL;
-    if (_tidesdb_new_column_family(tdb->directory, name, flush_threshold, max_level, probability,
-                                   &cf, compressed, compression_algo, bloom_filter,
-                                   memtable_ds) == -1)
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_COLUMN_FAMILY);
-
     /* check if column family already exists */
 
     /* we acquire read lock */
@@ -1193,6 +1187,12 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
     {
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "tidesdb_t");
     }
+
+    tidesdb_column_family_t *cf = NULL;
+    if (_tidesdb_new_column_family(tdb->directory, name, flush_threshold, max_level, probability,
+                                   &cf, compressed, compression_algo, bloom_filter,
+                                   memtable_ds) == -1)
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_COLUMN_FAMILY);
 
     /* now we add the column family */
     if (_tidesdb_add_column_family(tdb, cf) == -1)

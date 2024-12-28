@@ -281,7 +281,7 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb);
 
 /*
  * tidesdb_close
- * close a TidesDB instance
+ * close a TidesDB instance gracefully
  * @param tdb the TidesDB instance
  * @return error or NULL
  */

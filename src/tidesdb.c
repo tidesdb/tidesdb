@@ -770,7 +770,7 @@ void _tidesdb_free_column_families(tidesdb_t *tdb)
             /* we close the wal */
             if (tdb->column_families[i]->wal != NULL)
             {
-                (void)_tidesdb_close_wal(tdb->column_families[i]->wal); /* flushes on close */
+                (void)_tidesdb_close_wal(tdb->column_families[i]->wal);
                 tdb->column_families[i]->wal = NULL;
             }
 
@@ -875,7 +875,11 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
         if (cf->sstables == NULL)
         {
             cf->sstables = malloc(sizeof(tidesdb_sstable_t));
-            if (cf->sstables == NULL) return -1;
+            if (cf->sstables == NULL)
+            {
+                free(sst);
+                return -1;
+            }
         }
         else
         {

@@ -16,13 +16,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <pthread.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
 #include "../src/tidesdb.h"
 #include "../test/test_macros.h"
 

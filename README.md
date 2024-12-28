@@ -146,8 +146,8 @@ In order to store data in TidesDB you need a column family.  This is by design.
 - the database you want to create the column family in.  Must be open
 - the name of the column family
 - memtable flush threshold in bytes.  Example below is 128MB
-- skip list max level.  Example below is 12 ( only if using `TDB_MEMTABLE_SKIP_LIST` ) pass 0 if using `TDB_MEMTABLE_HASH_TABLE`
-- skip list probability.  Example below is 0.24 ( only if using `TDB_MEMTABLE_SKIP_LIST` ) pass 0.0 if using `TDB_MEMTABLE_HASH_TABLE`
+- skip list max level.  Example below is 12 ( only if using `TDB_MEMTABLE_SKIP_LIST` ) pass `TDB_USING_HT_MAX_LEVEL` if using `TDB_MEMTABLE_HASH_TABLE`
+- skip list probability.  Example below is 0.24 ( only if using `TDB_MEMTABLE_SKIP_LIST` ) pass `TDB_USING_HT_PROBABILITY` if using `TDB_MEMTABLE_HASH_TABLE`
 - whether column family sstable data is compressed
 - the compression algorithm to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
 - whether to use bloom filters
@@ -163,10 +163,10 @@ if (e != NULL)
 }
 ```
 
-Using Snappy compression and bloom filters for column family sstables
+Using Snappy compression, bloom filters and hash table memtable.
 ```c
 /* create a column family with compression and bloom filter (the bloom filter provides fast read speed) */
-tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, TDB_USING_HT_MAX_LEVEL, TDB_USING_HT_PROBABILITY, true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
 if (e != NULL)
 {
     /* handle error */

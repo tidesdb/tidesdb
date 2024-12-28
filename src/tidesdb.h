@@ -41,6 +41,10 @@
 #define TDB_FLUSH_THRESHOLD               1048576    /* default flush threshold for column family */
 #define TDB_MIN_MAX_LEVEL                 5          /* minimum max level for column family */
 #define TDB_MIN_PROBABILITY               0.1        /* minimum probability for column family */
+#define TDB_USING_HT_MAX_LEVEL            0          /* max level for using hash table memtable */
+#define TDB_USING_HT_PROBABILITY          0.0f       /* probability for using hash table memtable */
+#define TDB_DEFAULT_SKIP_LIST_MAX_LEVEL   12         /* default max level for skip list memtable */
+#define TDB_DEFAULT_SKIP_LIST_PROBABILITY 0.24f /* default probability for skip list memtable */
 
 /*
  * tidesdb_compression_algo_t

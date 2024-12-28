@@ -12,18 +12,11 @@ set(PROJECT_VERSION 0.5.0) # TidesDB v0.5.0b
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 
-IF (WIN32)
-        # install via vcpkg
-        find_package(zstd REQUIRED)
-        find_package(snappy REQUIRED)
-        find_package(lz4 REQUIRED)
-ENDIF() # on unix systems find_package will cause issues on make process usually looking for the packages even though installed apt-get or brew say.
-
-
 # for development, we want to enable all warnings and sanitizers
 if(TIDESDB_WITH_SANITIZER)
         if(WIN32)
-                # debug flags for windows
+                # debug flags for windows, this is mainly for visual studio users
+                # if not using visual studio 2019+ comment out the below lines
                 add_compile_options(/W4 /fsanitize=address /fsanitize=undefined)
                 add_link_options(/fsanitize=address /fsanitize=undefined)
         else()

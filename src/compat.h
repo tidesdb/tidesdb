@@ -19,20 +19,22 @@
 #ifndef __COMPAT_H__
 #define __COMPAT_H__
 
-/* for multi-platform compatibility */
+/* compat header for multi-platform support (Windows, POSIX, posix includes macOS) */
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #ifdef _WIN32
 #include <direct.h>
 #include <io.h>
-#include <stdio.h>
 #include <sys/stat.h>
-#include <tchar.h>
 #include <windows.h>
-typedef HANDLE thread_t;
-typedef HANDLE mutex_t;
-typedef CONDITION_VARIABLE cond_t;
+
+typedef HANDLE pthread_t;
+typedef HANDLE pthread_mutex_t;
+typedef CONDITION_VARIABLE pthread_cond_t;
 typedef CRITICAL_SECTION crit_section_t;
-typedef SRWLOCK rwlock_t;
+typedef SRWLOCK pthread_rwlock_t;
 
 struct dirent
 {
@@ -51,6 +53,7 @@ DIR *opendir(const char *name)
     DIR *dir = malloc(sizeof(DIR));
     if (dir == NULL)
     {
+        errno = ENOMEM;
         return NULL;
     }
     char search_path[MAX_PATH];
@@ -78,6 +81,7 @@ struct dirent *readdir(DIR *dir)
         }
     }
     strncpy(dir->dirent.d_name, dir->findFileData.cFileName, MAX_PATH);
+    dir->findFileData.cFileName[0] = '\0'; /* reset */
     return &dir->dirent;
 }
 
@@ -95,31 +99,21 @@ int closedir(DIR *dir)
     return 0;
 }
 
-/* semaphores */
+/* semaphore functions for Windows */
 typedef HANDLE sem_t;
 
 int sem_init(sem_t *sem, int pshared, unsigned int value)
 {
     *sem = CreateSemaphore(NULL, value, LONG_MAX, NULL);
-    return (*sem == NULL) ? -1 : 0;
+    if (*sem == NULL)
+    {
+        errno = GetLastError();
+        return -1;
+    }
+    return 0;
 }
 
-int sem_wait(sem_t *sem)
-{
-    return (WaitForSingleObject(*sem, INFINITE) == WAIT_OBJECT_0) ? 0 : -1;
-}
-
-int sem_post(sem_t *sem)
-{
-    return (ReleaseSemaphore(*sem, 1, NULL) == 0) ? -1 : 0;
-}
-
-int sem_destroy(sem_t *sem)
-{
-    return (CloseHandle(*sem) == 0) ? -1 : 0;
-}
-
-/* file ops */
+/* file operations macros for cross-platform compatibility */
 #define access         _access
 #define mkdir          _mkdir
 #define stat           _stat
@@ -137,59 +131,18 @@ int sem_destroy(sem_t *sem)
 #define feof           _feof
 #define ftell          _ftell
 
-#else
+#else /* posix systems */
 #include <dirent.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include <stdio.h>
-#include <sys/stat.h>
 #include <unistd.h>
+#include <sys/stat.h>
+
 typedef pthread_t thread_t;
 typedef pthread_mutex_t mutex_t;
 typedef pthread_cond_t cond_t;
 typedef pthread_mutex_t crit_section_t;
 typedef pthread_rwlock_t rwlock_t;
-#endif
-
-/* thread creation and management */
-#ifdef _WIN32
-#define pthread_create(thread, attr, func, arg) \
-    (*(thread) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(func), (arg), 0, NULL))
-#define pthread_join(thread, retval) (WaitForSingleObject((thread), INFINITE), CloseHandle(thread))
-#endif
-
-/* mutex and synchronization */
-#ifdef _WIN32
-#define pthread_mutex_init(mutex, attr) (*(mutex) = CreateMutex(NULL, FALSE, NULL))
-#define pthread_mutex_lock(mutex)       WaitForSingleObject(*(mutex), INFINITE)
-#define pthread_mutex_unlock(mutex)     ReleaseMutex(*(mutex))
-#define pthread_mutex_destroy(mutex)    CloseHandle(*(mutex))
-#endif
-
-/* conditions vars */
-#ifdef _WIN32
-#define pthread_cond_init(cond, attr)  InitializeConditionVariable(cond)
-#define pthread_cond_wait(cond, mutex) SleepConditionVariableCS((cond), (mutex), INFINITE)
-#define pthread_cond_signal(cond)      WakeConditionVariable(cond)
-#endif
-
-/* critical sections */
-#ifdef _WIN32
-#define pthread_mutex_init(cs, attr) InitializeCriticalSection(cs)
-#define pthread_mutex_lock(cs)       EnterCriticalSection(cs)
-#define pthread_mutex_unlock(cs)     LeaveCriticalSection(cs)
-#define pthread_mutex_destroy(cs)    DeleteCriticalSection(cs)
-#endif
-
-/* rwlocks */
-#ifdef _WIN32
-#define pthread_rwlock_init(rwlock, attr) InitializeSRWLock(rwlock)
-#define pthread_rwlock_rdlock(rwlock)     AcquireSRWLockShared(rwlock)
-#define pthread_rwlock_wrlock(rwlock)     AcquireSRWLockExclusive(rwlock)
-#define pthread_rwlock_unlock(rwlock) \
-    ReleaseSRWLockShared(rwlock);     \
-    ReleaseSRWLockExclusive(rwlock)
-#define pthread_rwlock_destroy(rwlock) /* No equivalent in Windows, no-op */
 #endif
 
 #endif /* __COMPAT_H__ */

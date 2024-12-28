@@ -22,8 +22,14 @@ ENDIF() # on unix systems find_package will cause issues on make process usually
 
 # for development, we want to enable all warnings and sanitizers
 if(TIDESDB_WITH_SANITIZER)
-        add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
-        add_link_options(-fsanitize=address,undefined)
+        if(WIN32)
+                # debug flags for windows
+                add_compile_options(/W4 /fsanitize=address /fsanitize=undefined)
+                add_link_options(/fsanitize=address /fsanitize=undefined)
+        else()
+                add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
+                add_link_options(-fsanitize=address,undefined)
+        endif()
 endif()
 
 add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c)

@@ -5247,13 +5247,12 @@ void *_tidesdb_partial_merge_thread(void *arg)
         /* we check if sstables is at minimum */
         if (cf->num_sstables < cf->partial_merge_min_sstables)
         {
-            if (pthread_rwlock_unlock(&cf->rwlock) != 0)
-            {
-                continue;
-            }
+            (void)pthread_rwlock_unlock(&cf->rwlock);
             sleep(cf->partial_merge_interval);
             continue;
         }
+
+        (void)pthread_rwlock_unlock(&cf->rwlock);
 
         /* keep track of merged sstables */
         bool *merged_sstables = calloc(cf->num_sstables, sizeof(bool));
@@ -5268,11 +5267,6 @@ void *_tidesdb_partial_merge_thread(void *arg)
         while (cf->partial_merging)
         {
             sleep(cf->partial_merge_interval);
-
-            if (pthread_rwlock_rdlock(&cf->rwlock) != 0)
-            {
-                continue;
-            }
 
             for (int i = 0; i < cf->num_sstables - 1; i++)
             {
@@ -5306,13 +5300,13 @@ void *_tidesdb_partial_merge_thread(void *arg)
                         merged_sstables[i] = true;
                         merged_sstables[j] = true;
 
-                        /* get column family write lock */
+                        char merged_sstable_path[MAX_FILE_PATH_LENGTH];
+
+                        /* we lock column family for writes temporarily */
                         if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
                         {
                             continue;
                         }
-
-                        char merged_sstable_path[MAX_FILE_PATH_LENGTH];
 
                         (void)snprintf(merged_sstable_path, MAX_FILE_PATH_LENGTH, "%s",
                                        merged_sstable->block_manager->file_path);
@@ -5329,6 +5323,9 @@ void *_tidesdb_partial_merge_thread(void *arg)
                                                TDB_SYNC_INTERVAL) == -1)
                         {
                             free(args);
+                            (void)pthread_mutex_destroy(args->lock);
+                            free(merged_sstable);
+                            (void)pthread_rwlock_unlock(&cf->rwlock);
                             return NULL;
                         }
 
@@ -5343,6 +5340,7 @@ void *_tidesdb_partial_merge_thread(void *arg)
                         /* close block manager */
                         if (block_manager_close(cf->sstables[j]->block_manager) == -1)
                         {
+                            (void)pthread_rwlock_unlock(&cf->rwlock);
                             continue;
                         }
 
@@ -5351,7 +5349,6 @@ void *_tidesdb_partial_merge_thread(void *arg)
 
                         cf->sstables[j] = NULL;
 
-                        /*unlock column family */
                         if (pthread_rwlock_unlock(&cf->rwlock) != 0)
                         {
                             continue;

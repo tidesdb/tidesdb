@@ -135,8 +135,8 @@ int sem_init(sem_t *sem, int pshared, unsigned int value)
 #include <dirent.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include <unistd.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 typedef pthread_t thread_t;
 typedef pthread_mutex_t mutex_t;

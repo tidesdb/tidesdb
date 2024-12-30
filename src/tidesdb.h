@@ -34,6 +34,7 @@
 #define TDB_WAL_EXT                       ".wal"     /* extension for the write-ahead log file */
 #define TDB_SSTABLE_EXT                   ".sst"     /* extension for the SSTable file */
 #define TDB_COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"     /* configuration file for the column family */
+#define TDB_TEMP_EXT                      ".tmp"     /* extension for temporary files, names */
 #define TDB_TOMBSTONE                     0xDEADBEEF /* tombstone value for deleted keys */
 #define TDB_SYNC_INTERVAL                 0.24       /* interval for syncing mainly WAL */
 #define TDB_BLOOMFILTER_P                 0.01       /*  the false positive rate for bloom filter */
@@ -128,6 +129,11 @@ typedef struct
  * @param memtable_sl the skip list memtable for the column family. Can be NULL
  * @param memtable_ht the hash table memtable for the column family. Can be NULL
  * @param wal the write-ahead log for column family
+ * @param partial_merging whether the column family has been started with partially merging.  If so
+ * you cannot manually compact the column family.
+ * @param partial_merge_thread the thread for partial merging
+ * @param partial_merge_interval the interval for partial merging
+ * @param partial_merge_min_sstables the minimum number of sstables to trigger a partial merge
  */
 typedef struct
 {
@@ -140,6 +146,10 @@ typedef struct
                                  separate memtables */
     hash_table_t *memtable_ht;
     tidesdb_wal_t *wal;
+    bool partial_merging;
+    pthread_t partial_merge_thread;
+    int partial_merge_interval;
+    int partial_merge_min_sstables;
 } tidesdb_column_family_t;
 
 /*
@@ -260,6 +270,7 @@ typedef struct
  * @param start the start index for the sstables
  * @param end the end index for the sstables
  * @param sem semaphore to limit concurrent threads
+ * @param lock for the path creation on parallel compaction
  */
 typedef struct
 {
@@ -269,6 +280,20 @@ typedef struct
     sem_t *sem;                  /* semaphore to limit concurrent threads */
     pthread_mutex_t *lock;       /* lock for the path creation on parallel compaction */
 } tidesdb_compact_thread_args_t;
+
+/*
+ * tidesdb_partial_merge_thread_args_t
+ * struct for the arguments for a partial merge thread
+ * @param tdb the TidesDB instance
+ * @param cf the column family
+ * @param lock for the path creation on compaction (required as its part of merge method)
+ */
+typedef struct
+{
+    tidesdb_t *tdb;
+    tidesdb_column_family_t *cf;
+    pthread_mutex_t *lock;
+} tidesdb_partial_merge_thread_args_t;
 
 /* functions prefixed with _ are internal functions */
 /* api functions return a tidesdb_err* */
@@ -484,6 +509,20 @@ tidesdb_err_t *tidesdb_cursor_free(tidesdb_cursor_t *cursor);
  * @return the column families
  */
 char *tidesdb_list_column_families(tidesdb_t *tdb);
+
+/*
+ * tidesdb_start_partial_merge
+ * starts background partial merge for column family. Blocks less than full compaction as sstables
+ * are copied and merged in the background then replaced
+ * @param tdb the TidesDB instance
+ * @param column_family_name the name of the column family
+ * @param seconds the interval in seconds for the partial merges, each provided seconds a partial
+ * merge will occur from oldest sstable making its way to newest
+ * @param min_sstables the minimum number of sstables to trigger a partial merge
+ * @return error or NULL if thread was started
+ */
+tidesdb_err_t *tidesdb_start_partial_merge(tidesdb_t *tdb, const char *column_family_name,
+                                           int seconds, int min_sstables);
 
 /* internal functions */
 
@@ -841,5 +880,12 @@ int _tidesdb_is_expired(int64_t ttl);
  * @return the correct compress_type algo
  */
 compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo);
+
+/*
+ * _tidesdb_partial_merge_thread
+ * a thread for pair merging column family sstables partially, incrementally
+ * @param arg the arguments for the thread in this case a partial_merge_thread_args struct
+ */
+void *_tidesdb_partial_merge_thread(void *arg);
 
 #endif /* __TIDESDB_H__ */

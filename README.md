@@ -18,6 +18,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Cursor** iterate over key-value pairs forward and backward.
 - [x] **WAL** write-ahead logging for durability. Column families replay WAL on startup.  This reconstructs memtable if the column family did not reach threshold prior to shutdown.
 - [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
+- [x] **Background Partial Merge Compaction** background merge compaction can be started.  If started the system will incrementally merge sstables in the background from oldest to newest.  Merges are done every n seconds. Merges are not done in parallel but incrementally.
 - [x] **Bloom Filters** reduce disk reads by reading initial blocks of sstables to check key existence.
 - [x] **Compression** compression is achieved with Snappy, or LZ4, or ZSTD.  SStable entries can be compressed as well as WAL entries.
 - [x] **TTL** time-to-live for key-value pairs.
@@ -411,6 +412,8 @@ tidesdb_cursor_free(c);
 ```
 
 ### Compaction
+
+#### Manual
 You can manually compact sstables.  This method pairs and merges column family sstables.
 Say you have 100, after compaction you will have 50; Always half the amount you had prior.  You can set the number of threads to use for compaction.
 
@@ -421,6 +424,18 @@ if (e != NULL)
     /* handle error */
     tidesdb_err_free(e);
 }
+```
+
+#### Automatic / Background Partial Merge Compaction
+You can start a background partial merge compaction.  This will incrementally merge sstables in the background from oldest to newest.  Merges are done every n seconds.  Merges are not done in parallel but incrementally.  Less blocking than manual compaction.
+
+You pass
+- the database you want to start the background partial merge compaction in.  Must be open
+- the column family name
+- the number of seconds to wait before going to next pair and merging
+- the minimum number of sstables to trigger a merge
+```c
+tidesdb_err_t *e = tidesdb_start_partial_merge(tdb, "your_column_family", 10, 10); /* merge a pair every 10 seconds and if there are a minimum 10 sstables */
 ```
 
 ## License

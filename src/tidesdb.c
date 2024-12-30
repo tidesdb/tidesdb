@@ -5322,8 +5322,8 @@ void *_tidesdb_partial_merge_thread(void *arg)
                                                cf->sstables[i]->block_manager->file_path,
                                                TDB_SYNC_INTERVAL) == -1)
                         {
-                            free(args);
                             (void)pthread_mutex_destroy(args->lock);
+                            free(args);
                             free(merged_sstable);
                             (void)pthread_rwlock_unlock(&cf->rwlock);
                             return NULL;

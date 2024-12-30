@@ -630,6 +630,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 cf->path = strdup(cf_path);
                 cf->sstables = NULL;
                 cf->num_sstables = 0;
+                cf->partial_merging = false;
 
                 switch (cf->config.memtable_ds)
                 {
@@ -733,6 +734,13 @@ void _tidesdb_free_column_families(tidesdb_t *tdb)
         /* we iterate over the column families and free them */
         for (int i = 0; i < tdb->num_column_families; i++)
         {
+            if (tdb->column_families[i]->partial_merging)
+            {
+                tdb->column_families[i]->partial_merging = false;
+                /* wait for thread to finish */
+                (void)pthread_join(tdb->column_families[i]->partial_merge_thread, NULL);
+            }
+
             if (tdb->column_families[i]->config.name != NULL)
                 free(tdb->column_families[i]->config.name);
 
@@ -1450,6 +1458,8 @@ int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_
 
     /* set memtable data structure */
     (*cf)->config.memtable_ds = memtable_ds;
+
+    (*cf)->partial_merging = false;
 
     if (pthread_rwlock_init(&(*cf)->rwlock, NULL) != 0)
     {
@@ -2432,6 +2442,18 @@ tidesdb_err_t *tidesdb_compact_sstables(tidesdb_t *tdb, const char *column_famil
     if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
         return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
 
+    /* we check if column family has partial merge started */
+    if (cf->partial_merging)
+    {
+        /* release db read lock */
+        if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+        {
+            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
+        }
+
+        return tidesdb_err_from_code(TIDESDB_ERR_PARTIAL_MERGE_ALREADY_STARTED, column_family_name);
+    }
+
     /* release db read lock */
     if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
     {
@@ -2552,6 +2574,26 @@ void *_tidesdb_compact_sstables_thread(void *arg)
     (void)remove(sstable_path1);
     (void)remove(sstable_path2);
 
+    /* we close the merged sstable as it has TDB_TEMP_EXT extension
+     * we must rename it and remove TDB_TEMP_EXT extension */
+
+    char merged_sstable_path[MAX_FILE_PATH_LENGTH];
+
+    (void)snprintf(merged_sstable_path, MAX_FILE_PATH_LENGTH, "%s",
+                   merged_sstable->block_manager->file_path);
+
+    /* the merged sstable path is the sst1 path */
+    (void)block_manager_close(merged_sstable->block_manager);
+
+    (void)rename(merged_sstable_path, sstable_path1);
+
+    /* now we open the sstable */
+    if (block_manager_open(&merged_sstable->block_manager, sstable_path1, TDB_SYNC_INTERVAL) == -1)
+    {
+        free(args);
+        return NULL;
+    }
+
     /* replace the old sstables with the new one */
     cf->sstables[start] = merged_sstable;
     cf->sstables[end] = NULL;
@@ -2560,236 +2602,6 @@ void *_tidesdb_compact_sstables_thread(void *arg)
     free(args);                /* free the args */
 
     return NULL;
-}
-
-int _tidesdb_scan_update_sstable(tidesdb_column_family_t *cf, tidesdb_sstable_t *sst)
-{
-    /* we initialize a new sstable
-     * we iterate over the sstable and check for expired keys and tombstones
-     * we populate the new sstable with only valid keys
-     */
-
-    skip_list_t *temp_memtable = skip_list_new(12, 0.24f);
-    if (temp_memtable == NULL) return -1;
-
-    block_manager_cursor_t *cursor = NULL;
-
-    /* init cursor for sstable */
-    if (block_manager_cursor_init(&cursor, sst->block_manager) == -1)
-    {
-        (void)skip_list_free(temp_memtable);
-        free(temp_memtable);
-        return -1;
-    }
-
-    bloom_filter_t *bf = NULL;
-
-    if (cf->config.bloom_filter)
-    {
-        /* we must recreate the bloom filter */
-        if (bloom_filter_new(&bf, TDB_BLOOMFILTER_P,
-                             block_manager_count_blocks(sst->block_manager) == -1))
-        {
-            (void)block_manager_cursor_free(cursor);
-            (void)skip_list_free(temp_memtable);
-            free(temp_memtable);
-            return -1;
-        }
-
-        /* skip first block as it contains the bloom filter */
-        if (block_manager_cursor_next(cursor) == -1)
-        {
-            (void)block_manager_cursor_free(cursor);
-            (void)skip_list_free(temp_memtable);
-            free(temp_memtable);
-            return -1;
-        }
-    }
-
-    block_manager_block_t *block;
-    while ((block = block_manager_cursor_read(cursor)) != NULL)
-    {
-        tidesdb_key_value_pair_t *kv = _tidesdb_deserialize_key_value_pair(
-            block->data, block->size, cf->config.compressed, cf->config.compress_algo);
-        if (kv == NULL)
-        {
-            (void)block_manager_block_free(block);
-            continue;
-        }
-
-        if (_tidesdb_is_tombstone(kv->value, kv->value_size))
-        {
-            (void)block_manager_block_free(block);
-            (void)_tidesdb_free_key_value_pair(kv);
-            continue;
-        }
-
-        if (_tidesdb_is_expired(kv->ttl))
-        {
-            (void)block_manager_block_free(block);
-            (void)_tidesdb_free_key_value_pair(kv);
-            continue;
-        }
-
-        if (bf != NULL)
-        {
-            (void)bloom_filter_add(bf, kv->key, kv->key_size);
-        }
-
-        if (skip_list_put(temp_memtable, kv->key, kv->key_size, kv->value, kv->value_size,
-                          kv->ttl) == -1)
-        {
-            (void)block_manager_block_free(block);
-            (void)_tidesdb_free_key_value_pair(kv);
-            continue;
-        }
-
-        (void)block_manager_block_free(block);
-        (void)_tidesdb_free_key_value_pair(kv);
-
-        if (block_manager_cursor_next(cursor) != 0) break;
-    }
-
-    (void)block_manager_block_free(block);
-    block = NULL;
-    (void)block_manager_cursor_free(cursor);
-    cursor = NULL;
-
-    /* truncate the sstable */
-    if (block_manager_truncate(sst->block_manager) == -1)
-    {
-        (void)skip_list_free(temp_memtable);
-        free(temp_memtable);
-        return -1;
-    }
-
-    /* we iterate over the temp memtable and write to the sstable */
-    skip_list_cursor_t *temp_memtable_cursor = skip_list_cursor_init(temp_memtable);
-    if (temp_memtable_cursor == NULL)
-    {
-        (void)skip_list_free(temp_memtable);
-        return -1;
-    }
-
-    /* if the bloom filter is configured we write it as the first block */
-    if (cf->config.bloom_filter)
-    {
-        size_t bf_size;
-        uint8_t *bf_serialized = bloom_filter_serialize(bf, &bf_size);
-        if (bf_serialized == NULL)
-        {
-            (void)skip_list_cursor_free(temp_memtable_cursor);
-            (void)skip_list_free(temp_memtable);
-            return -1;
-        }
-
-        block = block_manager_block_create(bf_size, bf_serialized);
-        if (block == NULL)
-        {
-            (void)skip_list_cursor_free(temp_memtable_cursor);
-            (void)skip_list_free(temp_memtable);
-            return -1;
-        }
-
-        if (block_manager_block_write(sst->block_manager, block) == -1)
-        {
-            (void)block_manager_block_free(block);
-            free(bf_serialized);
-            (void)skip_list_cursor_free(temp_memtable_cursor);
-            (void)skip_list_free(temp_memtable);
-            return -1;
-        }
-
-        (void)block_manager_block_free(block);
-        free(bf_serialized);
-        bloom_filter_free(bf);
-    }
-
-    do
-    {
-        tidesdb_key_value_pair_t *kv = malloc(sizeof(tidesdb_key_value_pair_t));
-        if (kv == NULL)
-        {
-            (void)skip_list_cursor_free(temp_memtable_cursor);
-            (void)skip_list_free(temp_memtable);
-            return -1;
-        }
-
-        uint8_t *retrieved_key;
-        size_t key_size;
-        uint8_t *retrieved_value;
-        size_t value_size;
-        time_t ttl;
-        if (skip_list_cursor_get(temp_memtable_cursor, &retrieved_key, &key_size, &retrieved_value,
-                                 &value_size, &ttl) == -1)
-        {
-            free(kv);
-            continue;
-        }
-
-        /* we copy the key */
-        kv->key = malloc(key_size);
-        if (kv->key == NULL)
-        {
-            free(kv);
-            continue;
-        }
-        memcpy(kv->key, retrieved_key, key_size);
-
-        /* we copy the value */
-        kv->value = malloc(value_size);
-        if (kv->value == NULL)
-        {
-            free(kv->key);
-            free(kv);
-            continue;
-        }
-
-        memcpy(kv->value, retrieved_value, value_size);
-
-        /* we set the key size */
-        kv->key_size = key_size;
-        /* we set the value size */
-        kv->value_size = value_size;
-        /* we set the ttl */
-        kv->ttl = ttl;
-
-        size_t serialized_size;
-        uint8_t *serialized_kv = _tidesdb_serialize_key_value_pair(
-            kv, &serialized_size, cf->config.compressed, cf->config.compress_algo);
-        if (serialized_kv == NULL)
-        {
-            free(kv);
-            break;
-        }
-
-        block = block_manager_block_create(serialized_size, serialized_kv);
-        if (block == NULL)
-        {
-            free(kv);
-            free(serialized_kv);
-            break;
-        }
-
-        if (block_manager_block_write(sst->block_manager, block) == -1)
-        {
-            (void)block_manager_block_free(block);
-            free(kv);
-            free(serialized_kv);
-            break;
-        }
-
-        (void)block_manager_block_free(block);
-        free(serialized_kv);
-        (void)_tidesdb_free_key_value_pair(kv);
-
-    } while (skip_list_cursor_next(temp_memtable_cursor) != -1);
-
-    (void)skip_list_cursor_free(temp_memtable_cursor);
-    (void)skip_list_clear(temp_memtable);
-    (void)skip_list_free(temp_memtable);
-
-    return 0;
 }
 
 tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_sstable_t *sst2,
@@ -2809,7 +2621,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
     }
 
     /* we create a new sstable with a named based on the amount of sstables */
-    char sstable_path[MAX_FILE_PATH_LENGTH];
+    char sstable_path[MAX_FILE_PATH_LENGTH * 2];
 
     /* lock to make sure path is unique */
     if (pthread_mutex_lock(shared_lock) != 0)
@@ -2819,16 +2631,14 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
         return NULL;
     }
 
-    snprintf(sstable_path, sizeof(sstable_path), "%s%s%s%d%s", cf->path,
-             _tidesdb_get_path_seperator(), TDB_SSTABLE_PREFIX, cf->num_sstables, TDB_SSTABLE_EXT);
-    cf->num_sstables++;
+    snprintf(sstable_path, sizeof(sstable_path), "%s%s", sst1->block_manager->file_path,
+             TDB_TEMP_EXT);
 
     /* unlock the shared lock */
     if (pthread_mutex_unlock(shared_lock) != 0)
     {
         (void)skip_list_free(mergetable);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -2836,7 +2646,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
     if (block_manager_open(&merged_sstable->block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -2850,7 +2659,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
         (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -2904,7 +2712,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
         (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -2954,7 +2761,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
         (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -2967,7 +2773,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
             (void)skip_list_free(mergetable);
             (void)remove(sstable_path);
             free(merged_sstable);
-            cf->num_sstables--;
             return NULL;
         }
 
@@ -4378,7 +4183,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     }
 
     /* we create a new sstable with a named based on the amount of sstables */
-    char sstable_path[MAX_FILE_PATH_LENGTH];
+    char sstable_path[MAX_FILE_PATH_LENGTH * 2];
 
     /* lock to make sure path is unique */
     if (pthread_mutex_lock(shared_lock) != 0)
@@ -4388,16 +4193,14 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         return NULL;
     }
 
-    snprintf(sstable_path, sizeof(sstable_path), "%s%s%s%d%s", cf->path,
-             _tidesdb_get_path_seperator(), TDB_SSTABLE_PREFIX, cf->num_sstables, TDB_SSTABLE_EXT);
-    cf->num_sstables++;
+    snprintf(sstable_path, sizeof(sstable_path), "%s%s", sst1->block_manager->file_path,
+             TDB_TEMP_EXT);
 
     /* unlock the shared lock */
     if (pthread_mutex_unlock(shared_lock) != 0)
     {
         (void)skip_list_free(mergetable);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -4405,7 +4208,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     if (block_manager_open(&merged_sstable->block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -4422,7 +4224,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         (void)block_manager_close(merged_sstable->block_manager);
         (void)remove(sstable_path);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -4434,7 +4235,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -4498,7 +4298,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -4558,7 +4357,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -4571,7 +4369,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -4584,7 +4381,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -4597,7 +4393,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         (void)skip_list_free(mergetable);
         (void)remove(sstable_path);
         free(merged_sstable);
-        cf->num_sstables--;
         return NULL;
     }
 
@@ -4618,7 +4413,6 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
             (void)skip_list_free(mergetable);
             (void)remove(sstable_path);
             free(merged_sstable);
-            cf->num_sstables--;
             return NULL;
         }
 
@@ -5354,4 +5148,229 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
     }
 
     return 0;
+}
+
+tidesdb_err_t *tidesdb_start_partial_merge(tidesdb_t *tdb, const char *column_family_name,
+                                           int seconds, int min_sstables)
+{
+    /* we check if tidesdb is NULL */
+    if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
+
+    /* we check column family name */
+    if (column_family_name == NULL)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if seconds is > 0 */
+    if (seconds <= 0) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_PARTIAL_MERGE_INTERVAL);
+
+    /* we check if min_sstables is at least 2 */
+    if (min_sstables < 2) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_PARTIAL_MERGE_MIN_SST);
+
+    /* release db read lock */
+    if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
+    }
+
+    /* we get column family */
+    tidesdb_column_family_t *cf;
+
+    if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
+    {
+        (void)pthread_rwlock_rdlock(&tdb->rwlock);
+        return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
+    }
+
+    /* we check if column family is already partially merging */
+    if (cf->partial_merging)
+    {
+        (void)pthread_rwlock_rdlock(&tdb->rwlock);
+        return tidesdb_err_from_code(TIDESDB_ERR_PARTIAL_MERGE_ALREADY_STARTED, column_family_name);
+    }
+
+    /* we unlock the the db read lock */
+    if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+    {
+        (void)pthread_rwlock_rdlock(&tdb->rwlock);
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
+    }
+
+    tidesdb_partial_merge_thread_args_t *args = malloc(sizeof(tidesdb_partial_merge_thread_args_t));
+
+    args->cf = cf;
+    args->tdb = tdb;
+
+    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    args->lock = &lock;
+
+    /* we lock column family for writes temporarily */
+    if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
+    {
+        (void)pthread_rwlock_rdlock(&tdb->rwlock);
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
+    }
+
+    /* setup partial merge on column family */
+    cf->partial_merge_interval = seconds;
+    cf->partial_merge_min_sstables = min_sstables;
+    cf->partial_merging = true;
+
+    /* we unlock the column family */
+    if (pthread_rwlock_unlock(&cf->rwlock) != 0)
+    {
+        (void)pthread_rwlock_rdlock(&tdb->rwlock);
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
+    }
+
+    /* we create a new thread */
+    pthread_create(&cf->partial_merge_thread, NULL, _tidesdb_partial_merge_thread, args);
+
+    /* we return success */
+    return NULL;
+}
+
+void *_tidesdb_partial_merge_thread(void *arg)
+{
+    tidesdb_partial_merge_thread_args_t *args = (tidesdb_partial_merge_thread_args_t *)arg;
+    tidesdb_column_family_t *cf = args->cf;
+
+    while (cf->partial_merging)
+    {
+        if (pthread_rwlock_rdlock(&cf->rwlock) != 0)
+        {
+            continue;
+        }
+
+        /* we check if sstables is at minimum */
+        if (cf->num_sstables < cf->partial_merge_min_sstables)
+        {
+            if (pthread_rwlock_unlock(&cf->rwlock) != 0)
+            {
+                continue;
+            }
+            sleep(cf->partial_merge_interval);
+            continue;
+        }
+
+        /* keep track of merged sstables */
+        bool *merged_sstables = calloc(cf->num_sstables, sizeof(bool));
+        if (merged_sstables == NULL)
+        {
+            /* destroy args lock */
+            (void)pthread_mutex_destroy(args->lock);
+            free(args);
+            return NULL;
+        }
+
+        while (cf->partial_merging)
+        {
+            sleep(cf->partial_merge_interval);
+
+            if (pthread_rwlock_rdlock(&cf->rwlock) != 0)
+            {
+                continue;
+            }
+
+            for (int i = 0; i < cf->num_sstables - 1; i++)
+            {
+                if (merged_sstables[i])
+                {
+                    continue;
+                }
+
+                for (int j = i + 1; j < cf->num_sstables; j++)
+                {
+                    if (merged_sstables[j])
+                    {
+                        continue;
+                    }
+                    tidesdb_sstable_t *merged_sstable;
+                    /* merge SSTables i and j */
+
+                    if (cf->config.bloom_filter == false)
+                    {
+                        merged_sstable = _tidesdb_merge_sstables(cf->sstables[i], cf->sstables[j],
+                                                                 cf, args->lock);
+                    }
+                    else
+                    {
+                        merged_sstable = _tidesdb_merge_sstables_w_bloomfilter(
+                            cf->sstables[i], cf->sstables[j], cf, args->lock);
+                    }
+                    if (merged_sstable != NULL)
+                    {
+                        /* mark sstables as merged */
+                        merged_sstables[i] = true;
+                        merged_sstables[j] = true;
+
+                        /* get column family write lock */
+                        if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
+                        {
+                            continue;
+                        }
+
+                        char merged_sstable_path[MAX_FILE_PATH_LENGTH];
+
+                        (void)snprintf(merged_sstable_path, MAX_FILE_PATH_LENGTH, "%s",
+                                       merged_sstable->block_manager->file_path);
+
+                        /* the merged sstable path is the sst1 path .tmp */
+                        (void)block_manager_close(merged_sstable->block_manager);
+
+                        (void)rename(merged_sstable_path,
+                                     cf->sstables[i]->block_manager->file_path);
+
+                        /* now we open the sstable */
+                        if (block_manager_open(&merged_sstable->block_manager,
+                                               cf->sstables[i]->block_manager->file_path,
+                                               TDB_SYNC_INTERVAL) == -1)
+                        {
+                            free(args);
+                            return NULL;
+                        }
+
+                        /* set merged sstable */
+                        cf->sstables[i] = merged_sstable;
+
+                        /* j path */
+                        char sstable_path[MAX_FILE_PATH_LENGTH];
+                        snprintf(sstable_path, sizeof(sstable_path), "%s",
+                                 cf->sstables[j]->block_manager->file_path);
+
+                        /* close block manager */
+                        if (block_manager_close(cf->sstables[j]->block_manager) == -1)
+                        {
+                            continue;
+                        }
+
+                        /* remove ith+1 sstable */
+                        (void)remove(sstable_path);
+
+                        cf->sstables[j] = NULL;
+
+                        /*unlock column family */
+                        if (pthread_rwlock_unlock(&cf->rwlock) != 0)
+                        {
+                            continue;
+                        }
+
+                        /* we break out to only merge one pair of sstables at a time per iteration
+                         */
+                        break;
+                    }
+                }
+
+                if (merged_sstables[i])
+                {
+                    break;
+                }
+            }
+        }
+
+        free(merged_sstables);
+    }
+
+    (void)pthread_mutex_destroy(args->lock);
+    free(args);
+    return NULL;
 }

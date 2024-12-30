@@ -5368,6 +5368,27 @@ void *_tidesdb_partial_merge_thread(void *arg)
         }
 
         free(merged_sstables);
+
+        /* remove the sstables that were compacted
+         * the ones that are NULL; one would be null the ith+1 sstable
+         */
+        /* we lock column family for writes temporarily */
+        if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
+        {
+            continue;
+        }
+
+        int j = 0;
+        for (int i = 0; i < cf->num_sstables; i++)
+        {
+            if (cf->sstables[i] != NULL) cf->sstables[j++] = cf->sstables[i];
+        }
+
+        /* set the new number of sstables */
+        cf->num_sstables = j;
+
+        /* we unlock the column family */
+        (void)pthread_rwlock_unlock(&cf->rwlock);
     }
 
     (void)pthread_mutex_destroy(args->lock);

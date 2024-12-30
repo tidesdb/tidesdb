@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 23)
-set(PROJECT_VERSION 0.5.0) # TidesDB v0.5.0b
+set(PROJECT_VERSION 0.6.0) # TidesDB v0.6.0b
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)

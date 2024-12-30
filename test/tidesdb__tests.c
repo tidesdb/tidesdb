@@ -1708,6 +1708,65 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
                                                  : " with hash table memtable");
 }
 
+void test_tidesdb_start_partial_merge(bool compress, tidesdb_compression_algo_t algo,
+                                      bool bloom_filter, tidesdb_memtable_ds_t memtable_ds)
+{
+    tidesdb_t *db = NULL;
+    tidesdb_err_t *err = tidesdb_open("test_db", &db);
+    assert(err == NULL);
+    tidesdb_err_free(err);
+
+    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
+                                       bloom_filter, memtable_ds);
+    assert(err == NULL);
+    tidesdb_err_free(err);
+
+    uint8_t key[20];
+    uint8_t value[1024 * 1024];
+
+    for (size_t i = 0; i < sizeof(value); i++)
+    {
+        value[i] = (uint8_t)(rand() % 256);
+    }
+
+    for (int i = 0; i < 12; i++)
+    {
+        snprintf((char *)key, sizeof(key), "key_%d", i);
+        err = tidesdb_put(db, "test_cf", key, strlen((char *)key) + 1, value, sizeof(value), -1);
+        assert(err == NULL);
+        tidesdb_err_free(err);
+    }
+
+    err = tidesdb_start_partial_merge(db, "test_cf", 1, 2);
+    assert(err == NULL);
+    tidesdb_err_free(err);
+
+    sleep(2);
+
+    for (int i = 0; i < 12; i++)
+    {
+        snprintf((char *)key, sizeof(key), "key_%d", i);
+        uint8_t *retrieved_value = NULL;
+        size_t value_size;
+        err =
+            tidesdb_get(db, "test_cf", key, strlen((char *)key) + 1, &retrieved_value, &value_size);
+        if (err != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+        }
+        assert(err == NULL);
+        free(retrieved_value);
+        tidesdb_err_free(err);
+    }
+
+    err = tidesdb_close(db);
+    assert(err == NULL);
+    tidesdb_err_free(err);
+
+    _tidesdb_remove_directory("test_db");
+    printf(GREEN "test_tidesdb_start_partial_merge passed\n" RESET);
+}
+
 int main(void)
 {
     test_tidesdb_serialize_deserialize_key_value_pair(false, TDB_NO_COMPRESSION);
@@ -1729,6 +1788,7 @@ int main(void)
     test_tidesdb_put_flush_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+    test_tidesdb_start_partial_merge(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
 
     /* the next batch of tests we will run with bloom filters and compression
      * same tests just with bloom filters and compression enabled */
@@ -1752,6 +1812,7 @@ int main(void)
     test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+    test_tidesdb_start_partial_merge(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
 
     /* same tests as above but using a hash table as the memtable data structure */
     test_tidesdb_put_get_memtable(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
@@ -1767,6 +1828,7 @@ int main(void)
     test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_start_partial_merge(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
 
     return 0;
 }

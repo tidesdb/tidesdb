@@ -5166,10 +5166,10 @@ tidesdb_err_t *tidesdb_start_partial_merge(tidesdb_t *tdb, const char *column_fa
     /* we check if min_sstables is at least 2 */
     if (min_sstables < 2) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_PARTIAL_MERGE_MIN_SST);
 
-    /* release db read lock */
-    if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+    /* we get db read lock */
+    if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
     {
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "db");
     }
 
     /* we get column family */
@@ -5206,7 +5206,8 @@ tidesdb_err_t *tidesdb_start_partial_merge(tidesdb_t *tdb, const char *column_fa
     /* we lock column family for writes temporarily */
     if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
     {
-        (void)pthread_rwlock_rdlock(&tdb->rwlock);
+        (void)pthread_mutex_destroy(args->lock);
+        free(args);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
     }
 
@@ -5218,7 +5219,9 @@ tidesdb_err_t *tidesdb_start_partial_merge(tidesdb_t *tdb, const char *column_fa
     /* we unlock the column family */
     if (pthread_rwlock_unlock(&cf->rwlock) != 0)
     {
-        (void)pthread_rwlock_rdlock(&tdb->rwlock);
+        /* destroy args lock */
+        (void)pthread_mutex_destroy(args->lock);
+        free(args);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
     }
 

@@ -22,13 +22,11 @@ jobs:
         sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev
 
     - name: configure cmake build for tidesdb
-      run: | 
-        cd tidesdb
-        cmake --debug-output  -S . -B build && make -C build/
+      run: cmake --debug-output  -S . -B build && make -C build/
 
     - name: run tests
       run: |
         export ASAN_OPTIONS=verify_asan_link_order=0
-        cd tidesdb/build
-        ctest
+        cd build
+        ctest --output-on-failure
 

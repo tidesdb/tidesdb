@@ -30,11 +30,14 @@
 #include <sys/stat.h>
 #include <windows.h>
 
-typedef HANDLE pthread_t;
-typedef HANDLE pthread_mutex_t;
-typedef CONDITION_VARIABLE pthread_cond_t;
-typedef CRITICAL_SECTION crit_section_t;
-typedef SRWLOCK pthread_rwlock_t;
+#include "pthread.h" /* pthreads-win32 library (https://github.com/tidesdb/tidesdb/issues/241) */
+
+/* Access flags are normally defined in unistd.h, which unavailable under
+ * Windows. Instead, define the flags as documented at
+ * https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/access-waccess */
+#define F_OK 00
+#define W_OK 02
+#define R_OK 04
 
 struct dirent
 {

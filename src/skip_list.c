@@ -137,7 +137,9 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
 {
     if (list == NULL || key == NULL || value == NULL) return -1;
 
-    skip_list_node_t *update[list->max_level];
+    skip_list_node_t **update = malloc(list->max_level * sizeof(skip_list_node_t *));
+    if (update == NULL) return -1;
+
     skip_list_node_t *x = list->header;
     for (int i = list->level - 1; i >= 0; i--)
     {
@@ -161,6 +163,7 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
         x->value = malloc(value_size);
         if (x->value == NULL)
         {
+            free(update);
             return -1;
         }
 
@@ -182,6 +185,7 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
         x = skip_list_create_node(level, key, key_size, value, value_size, ttl);
         if (x == NULL)
         {
+            free(update);
             return -1;
         }
         for (int i = 0; i < level; i++)
@@ -192,6 +196,8 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
 
         list->total_size += key_size + value_size + sizeof(time_t); /* add to total size */
     }
+
+    free(update);
     return 0;
 }
 

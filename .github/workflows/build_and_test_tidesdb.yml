@@ -1,0 +1,34 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout tidesdb repo
+      uses: actions/checkout@v4
+
+    - name: Install libzstd-dev,liblz4-dev and libsnappy-dev
+      run: |
+        sudo apt update
+        sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev
+
+    - name: configure cmake build for tidesdb
+      run: | 
+        cd tidesdb
+        cmake --debug-output  -S . -B build && make -C build/
+
+    - name: run tests
+      run: |
+        export ASAN_OPTIONS=verify_asan_link_order=0
+        cd tidesdb/build
+        ctest
+

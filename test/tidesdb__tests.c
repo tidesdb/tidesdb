@@ -1721,6 +1721,11 @@ void test_tidesdb_start_partial_merge(bool compress, tidesdb_compression_algo_t 
     assert(err == NULL);
     tidesdb_err_free(err);
 
+    /* start partial merging in background */
+    err = tidesdb_start_partial_merge(db, "test_cf", 1, 2);
+    assert(err == NULL);
+    tidesdb_err_free(err);
+
     uint8_t key[20];
     uint8_t value[1024 * 1024];
 
@@ -1737,11 +1742,8 @@ void test_tidesdb_start_partial_merge(bool compress, tidesdb_compression_algo_t 
         tidesdb_err_free(err);
     }
 
-    err = tidesdb_start_partial_merge(db, "test_cf", 1, 2);
-    assert(err == NULL);
-    tidesdb_err_free(err);
 
-    sleep(2);
+    sleep(5);
 
     for (int i = 0; i < 12; i++)
     {

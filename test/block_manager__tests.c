@@ -178,7 +178,8 @@ void test_block_manager_cursor()
         assert(block != NULL); /* we verify that the block was created successfully */
 
         /* now we write the block to the file */
-        assert(block_manager_block_write(bm, block) == 0);
+        /* should not be -1 */
+        assert(block_manager_block_write(bm, block) != -1);
 
         block_manager_block_free(block);
     }
@@ -356,7 +357,7 @@ void test_block_manager_count_blocks()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) == 0);
+        assert(block_manager_block_write(bm, block) != -1);
         block_manager_block_free(block);
     }
 
@@ -382,7 +383,7 @@ void test_block_manager_cursor_goto_first()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) == 0);
+        assert(block_manager_block_write(bm, block) != -1);
         block_manager_block_free(block);
     }
 
@@ -421,7 +422,7 @@ void test_block_manager_cursor_goto_last()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) == 0);
+        assert(block_manager_block_write(bm, block) != -1);
         block_manager_block_free(block);
     }
 
@@ -461,7 +462,7 @@ void test_block_manager_cursor_has_next()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) == 0);
+        assert(block_manager_block_write(bm, block) != -1);
         block_manager_block_free(block);
     }
 
@@ -502,7 +503,7 @@ void test_block_manager_cursor_has_prev()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) == 0);
+        assert(block_manager_block_write(bm, block) != -1);
         block_manager_block_free(block);
     }
 

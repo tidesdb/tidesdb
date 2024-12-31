@@ -27,6 +27,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Easy API** simple and easy to use api.
 - [x] **Multiple Memtable Data Structures** memtable can be a skip list or hash table.
 - [x] **Multiplatform** Linux, MacOS, and Windows support.
+- [ ] **Block Indices** more info coming soon.
 
 ## Building
 Using cmake to build the shared library.

@@ -39,6 +39,10 @@
 #define W_OK 02
 #define R_OK 04
 
+#define mkdir(path, mode) \
+    _mkdir(               \
+        path) /*  (https://github.com/tidesdb/tidesdb/issues/241) windows does not require mode */
+
 struct dirent
 {
     char d_name[MAX_PATH];

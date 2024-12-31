@@ -37,7 +37,7 @@
 #define TDB_TEMP_EXT                      ".tmp"     /* extension for temporary files, names */
 #define TDB_TOMBSTONE                     0xDEADBEEF /* tombstone value for deleted keys */
 #define TDB_SYNC_INTERVAL                 0.24       /* interval for syncing mainly WAL */
-#define TDB_BLOOMFILTER_P                 0.01       /*  the false positive rate for bloom filter */
+#define TDB_BLOOM_FILTER_P                0.01       /*  the false positive rate for bloom filter */
 #define TDB_SSTABLE_PREFIX                "sstable_" /* prefix for SSTable files */
 #define TDB_FLUSH_THRESHOLD               1048576    /* default flush threshold for column family */
 #define TDB_MIN_MAX_LEVEL                 5          /* minimum max level for column family */
@@ -666,22 +666,22 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf);
 int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf);
 
 /*
- * _tidesdb_flush_memtable_w_bloomfilter
+ * _tidesdb_flush_memtable_w_bloom_filter
  * flushes a memtable to disk in an SSTable with a bloom filter at initial block from a skip list
  * memtable
  * @param cf the column family
  * @return 0 if the memtable was flushed, -1 if not
  */
-int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf);
+int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf);
 
 /*
- * _tidesdb_flush_memtable_w_bloomfilter_f_hash_table
+ * _tidesdb_flush_memtable_w_bloom_filter_f_hash_table
  * flushes a memtable to disk in an SSTable with a bloom filter at initial block from a hash table
  * memtable
  * @param cf the column family
  * @return 0 if the memtable was flushed, -1 if not
  */
-int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *cf);
+int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t *cf);
 
 /*
  * _tidesdb_is_tombstone
@@ -737,7 +737,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
                                            pthread_mutex_t *shared_lock);
 
 /*
- * _tidesdb_merge_sstables_w_bloomfilter
+ * _tidesdb_merge_sstables_w_bloom_filter
  * merges two sstables into a new sstable and adds a bloom filter to initial block
  * @param sst1 the first sstable
  * @param sst2 the second sstable
@@ -745,10 +745,10 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
  * @param shared_lock the lock for the path creation on parallel compaction
  * @return the new merged sstable
  */
-tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1,
-                                                         tidesdb_sstable_t *sst2,
-                                                         tidesdb_column_family_t *cf,
-                                                         pthread_mutex_t *shared_lock);
+tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloom_filter(tidesdb_sstable_t *sst1,
+                                                          tidesdb_sstable_t *sst2,
+                                                          tidesdb_column_family_t *cf,
+                                                          pthread_mutex_t *shared_lock);
 
 /*
  * _tidesdb_free_column_families

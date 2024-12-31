@@ -1718,7 +1718,7 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
             {
                 if (cf->config.bloom_filter)
                 {
-                    if (_tidesdb_flush_memtable_w_bloomfilter(cf) == -1)
+                    if (_tidesdb_flush_memtable_w_bloom_filter(cf) == -1)
                     {
                         (void)pthread_rwlock_unlock(&cf->rwlock);
                         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -1747,7 +1747,7 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
             {
                 if (cf->config.bloom_filter)
                 {
-                    if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(cf) == -1)
+                    if (_tidesdb_flush_memtable_w_bloom_filter_f_hash_table(cf) == -1)
                     {
                         (void)pthread_rwlock_unlock(&cf->rwlock);
                         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -2096,7 +2096,7 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
             {
                 if (cf->config.bloom_filter)
                 {
-                    if (_tidesdb_flush_memtable_w_bloomfilter(cf) == -1)
+                    if (_tidesdb_flush_memtable_w_bloom_filter(cf) == -1)
                     {
                         (void)pthread_rwlock_unlock(&cf->rwlock);
                         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -2117,7 +2117,7 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
             {
                 if (cf->config.bloom_filter)
                 {
-                    if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(cf) == -1)
+                    if (_tidesdb_flush_memtable_w_bloom_filter_f_hash_table(cf) == -1)
                     {
                         (void)pthread_rwlock_unlock(&cf->rwlock);
                         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -2545,8 +2545,8 @@ void *_tidesdb_compact_sstables_thread(void *arg)
     else
     {
         /* with bloom filter */
-        merged_sstable = _tidesdb_merge_sstables_w_bloomfilter(cf->sstables[start],
-                                                               cf->sstables[end], cf, args->lock);
+        merged_sstable = _tidesdb_merge_sstables_w_bloom_filter(cf->sstables[start],
+                                                                cf->sstables[end], cf, args->lock);
     }
 
     /* we check if the merged is NULL */
@@ -3399,7 +3399,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
             {
                 if (txn->cf->config.bloom_filter)
                 {
-                    if (_tidesdb_flush_memtable_w_bloomfilter(txn->cf) == -1)
+                    if (_tidesdb_flush_memtable_w_bloom_filter(txn->cf) == -1)
                     {
                         (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3421,7 +3421,7 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
             {
                 if (txn->cf->config.bloom_filter)
                 {
-                    if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(txn->cf) == -1)
+                    if (_tidesdb_flush_memtable_w_bloom_filter_f_hash_table(txn->cf) == -1)
                     {
                         (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3515,7 +3515,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                 {
                     if (txn->cf->config.memtable_ds == TDB_MEMTABLE_SKIP_LIST)
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloom_filter(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3523,7 +3523,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloom_filter_f_hash_table(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3542,7 +3542,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloom_filter(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3559,7 +3559,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                 {
                     if (txn->cf->config.memtable_ds == TDB_MEMTABLE_SKIP_LIST)
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloom_filter(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -3567,7 +3567,7 @@ tidesdb_err_t *tidesdb_txn_rollback(tidesdb_txn_t *txn)
                     }
                     else
                     {
-                        if (_tidesdb_flush_memtable_w_bloomfilter_f_hash_table(txn->cf) == -1)
+                        if (_tidesdb_flush_memtable_w_bloom_filter_f_hash_table(txn->cf) == -1)
                         {
                             (void)pthread_rwlock_unlock(&txn->cf->rwlock);
                             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
@@ -4160,10 +4160,10 @@ int _tidesdb_is_expired(int64_t ttl)
     return 0; /* key either has no ttl or has not expired */
 }
 
-tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1,
-                                                         tidesdb_sstable_t *sst2,
-                                                         tidesdb_column_family_t *cf,
-                                                         pthread_mutex_t *shared_lock)
+tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloom_filter(tidesdb_sstable_t *sst1,
+                                                          tidesdb_sstable_t *sst2,
+                                                          tidesdb_column_family_t *cf,
+                                                          pthread_mutex_t *shared_lock)
 {
     /*
      * similar to _tidesdb_merge_sstables but with bloom filter
@@ -4211,7 +4211,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
         return NULL;
     }
 
-    /* we populate the merge table with the sstables and bloomfilter */
+    /* we populate the merge table with the sstables and bloom filter */
     /* we create a bloom filter for the merged sstable */
     bloom_filter_t *bf;
 
@@ -4219,7 +4219,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     int block_count1 = block_manager_count_blocks(sst1->block_manager);
     int block_count2 = block_manager_count_blocks(sst2->block_manager);
 
-    if (bloom_filter_new(&bf, TDB_BLOOMFILTER_P, block_count1 + block_count2) == -1)
+    if (bloom_filter_new(&bf, TDB_BLOOM_FILTER_P, block_count1 + block_count2) == -1)
     {
         (void)block_manager_close(merged_sstable->block_manager);
         (void)remove(sstable_path);
@@ -4495,7 +4495,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloomfilter(tidesdb_sstable_t *sst1
     return NULL;
 }
 
-int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
+int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
 {
     /* similar to _tidesdb_flush_memtable but with bloom filter */
 
@@ -4524,7 +4524,7 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
 
     /* we initialize the bloom filter */
     bloom_filter_t *bf = NULL;
-    if (bloom_filter_new(&bf, TDB_BLOOMFILTER_P, bloom_filter_size) == -1)
+    if (bloom_filter_new(&bf, TDB_BLOOM_FILTER_P, bloom_filter_size) == -1)
     {
         free(sst);
         (void)remove(sstable_path);
@@ -4601,7 +4601,7 @@ int _tidesdb_flush_memtable_w_bloomfilter(tidesdb_column_family_t *cf)
     /* we free the resources */
     (void)block_manager_block_free(bf_block);
 
-    /* we reinitialize the cursor to populate the sstable with keyvalue pairs after bloomfilter */
+    /* we reinitialize the cursor to populate the sstable with keyvalue pairs after bloom filter */
     cursor = skip_list_cursor_init(cf->memtable_sl);
     if (cursor == NULL)
     {
@@ -4743,7 +4743,7 @@ compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo)
     }
 }
 
-int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *cf)
+int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t *cf)
 {
     /* similar to _tidesdb_flush_memtable but with bloom filter */
 
@@ -4772,7 +4772,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
 
     /* we initialize the bloom filter */
     bloom_filter_t *bf = NULL;
-    if (bloom_filter_new(&bf, TDB_BLOOMFILTER_P, (int)bloom_filter_size) == -1)
+    if (bloom_filter_new(&bf, TDB_BLOOM_FILTER_P, (int)bloom_filter_size) == -1)
     {
         free(sst);
         (void)remove(sstable_path);
@@ -4849,7 +4849,7 @@ int _tidesdb_flush_memtable_w_bloomfilter_f_hash_table(tidesdb_column_family_t *
     /* we free the resources */
     (void)block_manager_block_free(bf_block);
 
-    /* we reinitialize the cursor to populate the sstable with keyvalue pairs after bloomfilter */
+    /* we reinitialize the cursor to populate the sstable with keyvalue pairs after bloom filter */
     cursor = hash_table_cursor_init(cf->memtable_ht);
     if (cursor == NULL)
     {
@@ -5291,7 +5291,7 @@ void *_tidesdb_partial_merge_thread(void *arg)
                     }
                     else
                     {
-                        merged_sstable = _tidesdb_merge_sstables_w_bloomfilter(
+                        merged_sstable = _tidesdb_merge_sstables_w_bloom_filter(
                             cf->sstables[i], cf->sstables[j], cf, args->lock);
                     }
                     if (merged_sstable != NULL)

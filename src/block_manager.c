@@ -93,17 +93,22 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
     return block;
 }
 
-int block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
+long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
 {
     /* seek to end of file */
     if (fseek(bm->file, 0, SEEK_END) != 0) return -1;
+
+    /* get the current file position */
+    long offset = ftell(bm->file);
+    if (offset == -1) return -1;
 
     /* write the size of the block */
     if (fwrite(&block->size, sizeof(uint64_t), 1, bm->file) != 1) return -1;
 
     /* write the data of the block */
     if (fwrite(block->data, block->size, 1, bm->file) != 1) return -1;
-    return 0;
+
+    return offset;
 }
 
 block_manager_block_t *block_manager_block_read(block_manager_t *bm)
@@ -383,5 +388,11 @@ int block_manager_get_size(block_manager_t *bm, uint64_t *size)
     struct stat st;
     if (stat(bm->file_path, &st) != 0) return -1;
     *size = st.st_size;
+    return 0;
+}
+
+int block_manager_seek(block_manager_t *bm, uint64_t pos)
+{
+    if (fseek(bm->file, pos, SEEK_SET) != 0) return -1;
     return 0;
 }

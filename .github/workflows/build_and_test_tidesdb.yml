@@ -1,4 +1,4 @@
-name: C/C++ CI
+name: TidesDB CI
 
 on:
   push:
@@ -26,7 +26,6 @@ jobs:
 
     - name: run tests
       run: |
-        export ASAN_OPTIONS=verify_asan_link_order=0
         cd build
         ctest --output-on-failure
 

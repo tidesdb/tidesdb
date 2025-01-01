@@ -30,6 +30,8 @@
 #include <sys/stat.h>
 #include <windows.h>
 
+#pragma warning(disable : 4996) /* disable deprecated warning for Windows */
+
 #include "pthread.h" /* pthreads-win32 library (https://github.com/tidesdb/tidesdb/issues/241) */
 
 /* Access flags are normally defined in unistd.h, which unavailable under
@@ -39,9 +41,9 @@
 #define W_OK 02
 #define R_OK 04
 
-#define mkdir(path, mode) \
-    _mkdir(               \
-        path) /*  (https://github.com/tidesdb/tidesdb/issues/241) windows does not require mode */
+typedef int64_t ssize_t; /* ssize_t is not defined in Windows */
+
+#define M_LN2 0.69314718055994530942 /* log_e 2 */
 
 struct dirent
 {
@@ -121,22 +123,18 @@ int sem_init(sem_t *sem, int pshared, unsigned int value)
 }
 
 /* file operations macros for cross-platform compatibility */
-#define access         _access
-#define mkdir          _mkdir
-#define stat           _stat
 #define S_ISDIR(m)     (((m)&S_IFMT) == S_IFDIR)
-#define rmdir          _rmdir
-#define unlink         _unlink
-#define remove         _unlink
-#define fclose         _fclose
-#define truncate       _chsize
 #define sleep(seconds) Sleep((seconds)*1000)
-#define fsync          _commit
-#define fileno         _fileno
-#define fseek          _fseek
-#define fread          _fread
-#define feof           _feof
-#define ftell          _ftell
+
+int fsync(int fd)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return -1;
+    }
+    return FlushFileBuffers(h) ? 0 : -1;
+}
 
 #else /* posix systems */
 #include <dirent.h>

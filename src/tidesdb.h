@@ -27,6 +27,7 @@
 #include "compress.h"
 #include "err.h"
 #include "hash_table.h"
+#include "log.h"
 #include "skip_list.h"
 
 /* TidesDB uses tidesdb, _tidesdb_, and TDB as prefixes for functions, types, and constants */
@@ -45,7 +46,12 @@
 #define TDB_USING_HT_MAX_LEVEL            0          /* max level for using hash table memtable */
 #define TDB_USING_HT_PROBABILITY          0.0f       /* probability for using hash table memtable */
 #define TDB_DEFAULT_SKIP_LIST_MAX_LEVEL   12         /* default max level for skip list memtable */
-#define TDB_DEFAULT_SKIP_LIST_PROBABILITY 0.24f /* default probability for skip list memtable */
+#define TDB_DEFAULT_SKIP_LIST_PROBABILITY 0.24f  /* default probability for skip list memtable */
+#define TDB_DEBUG_LOG                     1      /* or 0 */
+#define TDB_LOG_EXT                       ".log" /* extension for the log file */
+#define TDB_DEBUG_LOG_TRUNCATE_AT                    \
+    (int)100000 /* if not -1 we truncate log file at \
+              TDB_DEBUG_LOG_TRUNCATE_AT entries */
 
 /*
  * tidesdb_compression_algo_t
@@ -223,6 +229,7 @@ typedef struct
     tidesdb_column_family_t **column_families;
     int num_column_families;
     pthread_rwlock_t rwlock;
+    log_t *log;
 } tidesdb_t;
 
 /*

@@ -1734,7 +1734,7 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
     if (value == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_VALUE);
 
     /* we check if the key and value size exceed available system memory */
-    if (key_size > tdb->available_mem || value_size > tdb->available_mem)
+    if (key_size + value_size > tdb->available_mem)
         return tidesdb_err_from_code(TIDESDB_ERR_PUT_MEMORY_OVERFLOW);
 
     /* get db read lock for column family */
@@ -3035,6 +3035,10 @@ tidesdb_err_t *tidesdb_txn_put(tidesdb_txn_t *txn, const uint8_t *key, size_t ke
 
     /* we check if the value is NULL */
     if (value == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_VALUE);
+
+    /* we check if the key and value exceed the system memory */
+    if (key_size + value_size > txn->tdb->available_mem)
+        return tidesdb_err_from_code(TIDESDB_ERR_PUT_MEMORY_OVERFLOW);
 
     /* lock the transaction */
     if (pthread_mutex_lock(&txn->lock) != 0)

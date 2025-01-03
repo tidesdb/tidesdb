@@ -545,9 +545,9 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
     }
 
     if (new_instance)
-        log_write((*tdb)->log, "Initialized new TidesDB instance at %s", directory);
+        (void)log_write((*tdb)->log, "Initialized new TidesDB instance at %s", directory);
     else
-        log_write((*tdb)->log, "Reopening TidesDB instance at %s", directory);
+        (void)log_write((*tdb)->log, "Reopening TidesDB instance at %s", directory);
 
     /* now we load the column families */
     if (_tidesdb_load_column_families(*tdb) == -1)
@@ -557,7 +557,7 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
         return tidesdb_err_from_code(TIDESDB_ERR_LOAD_COLUMN_FAMILIES);
     }
 
-    log_write((*tdb)->log, "Opened TidesDB instance at %s", directory);
+    (void)log_write((*tdb)->log, "Opened TidesDB instance at %s", directory);
 
     return NULL;
 }
@@ -571,7 +571,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
     DIR *tdb_dir = opendir(tdb->directory);
     if (tdb_dir == NULL)
     {
-        log_write(tdb->log, "Failed to open db directory %s", tdb->directory);
+        (void)log_write(tdb->log, "Failed to open db directory %s", tdb->directory);
         return -1;
     }
 
@@ -661,7 +661,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 cf->partial_merging = false;
                 cf->tdb = tdb;
 
-                log_write(tdb->log, "Setting up column family %s", cf->config.name);
+                (void)log_write(tdb->log, "Setting up column family %s", cf->config.name);
 
                 switch (cf->config.memtable_ds)
                 {
@@ -674,7 +674,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                         break;
                 }
 
-                log_write(
+                (void)log_write(
                     tdb->log, "Column family using %s memtable data structure",
                     cf->config.memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "Skip List" : "Hash Table");
 
@@ -703,7 +703,8 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 if (_tidesdb_open_wal(cf->path, &cf->wal, cf->config.compressed,
                                       cf->config.compress_algo) == -1)
                 {
-                    log_write(tdb->log, "Failed to open WAL for column family %s", cf->config.name);
+                    (void)log_write(tdb->log, "Failed to open WAL for column family %s",
+                                    cf->config.name);
                     free(cf->path);
                     free(cf->wal);
                     free(cf);
@@ -711,7 +712,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                     continue;
                 }
 
-                log_write(tdb->log, "Opened WAL for column family %s", cf->config.name);
+                (void)log_write(tdb->log, "Opened WAL for column family %s", cf->config.name);
 
                 /* we add the column family to tidesdb arr */
                 if (_tidesdb_add_column_family(tdb, cf) == -1)
@@ -726,7 +727,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 /* we load the sstable files into memory */
                 (void)_tidesdb_load_sstables(cf);
 
-                log_write(tdb->log, "Loaded SSTables for column family %s", cf->config.name);
+                (void)log_write(tdb->log, "Loaded SSTables for column family %s", cf->config.name);
 
                 /* we sort sstables if any */
                 (void)_tidesdb_sort_sstables(cf);
@@ -734,7 +735,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 /* now we replay from the wal and populate column family memtable */
                 (void)_tidesdb_replay_from_wal(cf);
 
-                log_write(tdb->log, "Replayed WAL for column family %s", cf->config.name);
+                (void)log_write(tdb->log, "Replayed WAL for column family %s", cf->config.name);
             }
         }
 
@@ -752,7 +753,7 @@ tidesdb_err_t *tidesdb_close(tidesdb_t *tdb)
 {
     if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
 
-    log_write(tdb->log, "Closing TidesDB instance at %s", tdb->directory);
+    (void)log_write(tdb->log, "Closing TidesDB instance at %s", tdb->directory);
 
     (void)_tidesdb_free_column_families(tdb);
 
@@ -2300,6 +2301,9 @@ int _tidesdb_append_to_wal(tidesdb_wal_t *wal, const uint8_t *key, size_t key_si
 
 int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 {
+    (void)log_write(cf->tdb->log, "Flushing column family %s at size %zu", cf->config.name,
+                    cf->memtable_sl->total_size);
+
     /* we create a new sstable struct */
     tidesdb_sstable_t *sst = malloc(sizeof(tidesdb_sstable_t));
     if (sst == NULL) return -1;
@@ -2315,6 +2319,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     if (block_manager_open(&sstable_block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
         free(sst);
+        (void)log_write(cf->tdb->log, "Column family %s failed to open block manager for flush",
+                        cf->config.name);
         return -1;
     }
 
@@ -2329,6 +2335,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     {
         free(sst);
         (void)remove(sstable_path);
+        (void)log_write(cf->tdb->log, "Column family %s failed to init cursor for flush",
+                        cf->config.name);
         return -1;
     }
 
@@ -2341,6 +2349,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             free(sst);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -2357,6 +2366,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(kv);
             free(sst);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -2367,6 +2377,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(kv);
             free(sst);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
         memcpy(kv->key, retrieved_key, key_size);
@@ -2379,6 +2390,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(kv);
             free(sst);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -2400,6 +2412,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             (void)_tidesdb_free_key_value_pair(kv);
             free(sst);
             remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -2412,6 +2425,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -2422,6 +2436,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -2480,6 +2495,9 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         (void)remove(sstable_path);
         return -1;
     }
+
+    (void)log_write(cf->tdb->log, "Flushed column family %s to sstable %s", cf->config.name,
+                    sstable_path);
 
     return 0;
 }
@@ -4560,6 +4578,9 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloom_filter(tidesdb_sstable_t *sst
 
 int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
 {
+    (void)log_write(cf->tdb->log, "Flushing column family %s at size %zu", cf->config.name,
+                    cf->memtable_sl->total_size);
+
     /* similar to _tidesdb_flush_memtable but with bloom filter */
 
     /* we create a new sstable struct */
@@ -4576,6 +4597,9 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
 
     if (block_manager_open(&sstable_block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
+        (void)log_write(cf->tdb->log, "Column family %s failed to open block manager for flush",
+                        cf->config.name);
+        free(sst);
         return -1;
     }
 
@@ -4617,6 +4641,7 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
             free(retrieved_value);
             free(sst);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -4682,6 +4707,7 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
         {
             free(sst);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -4693,6 +4719,7 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
             free(kv);
             free(sst);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -4705,6 +4732,7 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
             (void)_tidesdb_free_key_value_pair(kv);
             free(sst);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -4717,6 +4745,7 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -4727,6 +4756,7 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
@@ -4788,6 +4818,8 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
         return -1;
     }
 
+    (void)log_write(cf->tdb->log, "Flushed column family %s", cf->config.name);
+
     return 0;
 }
 
@@ -4808,6 +4840,9 @@ compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo)
 
 int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t *cf)
 {
+    (void)log_write(cf->tdb->log, "Flushing column family %s at size %zu", cf->config.name,
+                    cf->memtable_ht->total_size);
+
     /* similar to _tidesdb_flush_memtable but with bloom filter */
 
     /* we create a new sstable struct */
@@ -4824,6 +4859,9 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
 
     if (block_manager_open(&sstable_block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
+        (void)log_write(cf->tdb->log, "Column family %s failed to open block manager for flush",
+                        cf->config.name);
+        free(sst);
         return -1;
     }
 
@@ -4865,6 +4903,7 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
             free(retrieved_value);
             free(sst);
             (void)remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -4930,6 +4969,7 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
         {
             free(sst);
             (void)remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -4940,6 +4980,7 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
             free(kv);
             free(sst);
             (void)remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -4952,6 +4993,7 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
             (void)_tidesdb_free_key_value_pair(kv);
             free(sst);
             (void)remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -4964,6 +5006,7 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -4974,6 +5017,7 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -5030,11 +5074,16 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
         return -1;
     }
 
+    (void)log_write(cf->tdb->log, "Flushed column family %s", cf->config.name);
+
     return 0;
 }
 
 int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
 {
+    (void)log_write(cf->tdb->log, "Flushing column family %s at size %zu", cf->config.name,
+                    cf->memtable_ht->total_size);
+
     /* we create a new sstable struct */
     tidesdb_sstable_t *sst = malloc(sizeof(tidesdb_sstable_t));
     if (sst == NULL) return -1;
@@ -5049,6 +5098,9 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
 
     if (block_manager_open(&sstable_block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
+        (void)log_write(cf->tdb->log, "Column family %s failed to open block manager for flush",
+                        cf->config.name);
+        free(sst);
         return -1;
     }
 
@@ -5075,6 +5127,7 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
         {
             free(sst);
             (void)remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -5091,6 +5144,7 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
             free(kv);
             free(sst);
             (void)remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -5134,6 +5188,7 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
             (void)_tidesdb_free_key_value_pair(kv);
             free(sst);
             remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -5146,6 +5201,7 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -5156,6 +5212,7 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
@@ -5209,6 +5266,8 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
         (void)remove(sstable_path);
         return -1;
     }
+
+    (void)log_write(cf->tdb->log, "Flushed column family %s", cf->config.name);
 
     return 0;
 }

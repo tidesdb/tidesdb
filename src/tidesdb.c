@@ -514,15 +514,40 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_LOCK, "tidesdb_t");
     }
 
+    int new_instance = 0;
+
     /* we check to see if the db path exists
      * if not we create it */
     if (access(directory, F_OK) == -1) /* we create the directory **/
+    {
+        new_instance = 1;
         if (mkdir(directory, 0777) == -1)
         {
             free((*tdb)->directory);
             free(*tdb);
             return tidesdb_err_from_code(TIDESDB_ERR_MKDIR, directory);
         }
+    }
+
+    if (TDB_DEBUG_LOG == 1)
+    {
+        char log_path[MAX_FILE_PATH_LENGTH];
+        (void)snprintf(log_path, sizeof(log_path), "%s%s%s", directory,
+                       _tidesdb_get_path_seperator(), TDB_LOG_EXT);
+
+        /* we setup the log file */
+        if (log_init(&(*tdb)->log, log_path, TDB_DEBUG_LOG_TRUNCATE_AT) == -1)
+        {
+            free((*tdb)->directory);
+            free(*tdb);
+            return tidesdb_err_from_code(TIDESDB_ERR_LOG_INIT_FAILED);
+        }
+    }
+
+    if (new_instance)
+        log_write((*tdb)->log, "Initialized new TidesDB instance at %s", directory);
+    else
+        log_write((*tdb)->log, "Reopening TidesDB instance at %s", directory);
 
     /* now we load the column families */
     if (_tidesdb_load_column_families(*tdb) == -1)
@@ -531,6 +556,8 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
         free(*tdb);
         return tidesdb_err_from_code(TIDESDB_ERR_LOAD_COLUMN_FAMILIES);
     }
+
+    log_write((*tdb)->log, "Opened TidesDB instance at %s", directory);
 
     return NULL;
 }
@@ -544,6 +571,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
     DIR *tdb_dir = opendir(tdb->directory);
     if (tdb_dir == NULL)
     {
+        log_write(tdb->log, "Failed to open db directory %s", tdb->directory);
         return -1;
     }
 
@@ -632,6 +660,8 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 cf->num_sstables = 0;
                 cf->partial_merging = false;
 
+                log_write(tdb->log, "Setting up column family %s", cf->config.name);
+
                 switch (cf->config.memtable_ds)
                 {
                     case TDB_MEMTABLE_SKIP_LIST:
@@ -642,6 +672,10 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                         cf->memtable_ht = hash_table_new();
                         break;
                 }
+
+                log_write(
+                    tdb->log, "Column family using %s memtable data structure",
+                    cf->config.memtable_ds == TDB_MEMTABLE_SKIP_LIST ? "Skip List" : "Hash Table");
 
                 free(config);
 
@@ -668,12 +702,15 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 if (_tidesdb_open_wal(cf->path, &cf->wal, cf->config.compressed,
                                       cf->config.compress_algo) == -1)
                 {
+                    log_write(tdb->log, "Failed to open WAL for column family %s", cf->config.name);
                     free(cf->path);
                     free(cf->wal);
                     free(cf);
                     (void)closedir(cf_dir);
                     continue;
                 }
+
+                log_write(tdb->log, "Opened WAL for column family %s", cf->config.name);
 
                 /* we add the column family to tidesdb arr */
                 if (_tidesdb_add_column_family(tdb, cf) == -1)
@@ -688,11 +725,15 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 /* we load the sstable files into memory */
                 (void)_tidesdb_load_sstables(cf);
 
+                log_write(tdb->log, "Loaded SSTables for column family %s", cf->config.name);
+
                 /* we sort sstables if any */
                 (void)_tidesdb_sort_sstables(cf);
 
                 /* now we replay from the wal and populate column family memtable */
                 (void)_tidesdb_replay_from_wal(cf);
+
+                log_write(tdb->log, "Replayed WAL for column family %s", cf->config.name);
             }
         }
 
@@ -710,6 +751,8 @@ tidesdb_err_t *tidesdb_close(tidesdb_t *tdb)
 {
     if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
 
+    log_write(tdb->log, "Closing TidesDB instance at %s", tdb->directory);
+
     (void)_tidesdb_free_column_families(tdb);
 
     /* we destroy the db lock */
@@ -717,6 +760,12 @@ tidesdb_err_t *tidesdb_close(tidesdb_t *tdb)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_DESTROY_LOCK, "tidesdb_t");
 
     free(tdb->directory);
+
+    /* we close the log if configured */
+    if (TDB_DEBUG_LOG == 1)
+    {
+        (void)log_close(tdb->log);
+    }
 
     /* we free the tidesdb */
     free(tdb);

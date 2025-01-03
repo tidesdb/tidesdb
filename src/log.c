@@ -37,7 +37,7 @@ int log_init(log_t **log, const char *filename, int truncate_at)
     /* initialize the lock */
     if (pthread_mutex_init(&(*log)->lock, NULL) != 0)
     {
-        fclose((*log)->file);
+        (void)fclose((*log)->file);
         free(*log);
         *log = NULL;
         return -1;
@@ -49,8 +49,8 @@ int log_init(log_t **log, const char *filename, int truncate_at)
         /* lock the log */
         if (pthread_mutex_lock(&(*log)->lock) != 0)
         {
-            pthread_mutex_destroy(&(*log)->lock);
-            fclose((*log)->file);
+            (void)pthread_mutex_destroy(&(*log)->lock);
+            (void)fclose((*log)->file);
             free(*log);
             *log = NULL;
             return -1;
@@ -64,9 +64,9 @@ int log_init(log_t **log, const char *filename, int truncate_at)
             FILE *tmp = fopen("tmp.log", "w");
             if (!tmp)
             {
-                pthread_mutex_unlock(&(*log)->lock);
-                pthread_mutex_destroy(&(*log)->lock);
-                fclose((*log)->file);
+                (void)pthread_mutex_unlock(&(*log)->lock);
+                (void)pthread_mutex_destroy(&(*log)->lock);
+                (void)fclose((*log)->file);
                 free(*log);
                 *log = NULL;
                 return -1;
@@ -74,7 +74,7 @@ int log_init(log_t **log, const char *filename, int truncate_at)
             /* we read the log line by line */
             char line[BUFFER_SIZE];
             int i = 0;
-            rewind((*log)->file);
+            (void)rewind((*log)->file);
             while (fgets(line, sizeof(line), (*log)->file))
             {
                 /* we write the line to the tmp file */
@@ -82,18 +82,18 @@ int log_init(log_t **log, const char *filename, int truncate_at)
                 i++;
             }
             /* we close the files */
-            fclose((*log)->file);
-            fclose(tmp);
+            (void)fclose((*log)->file);
+            (void)fclose(tmp);
             /* we remove the old log */
-            remove(filename);
+            (void)remove(filename);
             /* we rename the tmp log */
-            rename("tmp.log", filename);
+            (void)rename("tmp.log", filename);
             /* we open the log in read/append mode */
             (*log)->file = fopen(filename, "a+");
             if (!(*log)->file)
             {
-                pthread_mutex_unlock(&(*log)->lock);
-                pthread_mutex_destroy(&(*log)->lock);
+                (void)pthread_mutex_unlock(&(*log)->lock);
+                (void)pthread_mutex_destroy(&(*log)->lock);
                 free(*log);
                 *log = NULL;
                 return -1;
@@ -101,7 +101,7 @@ int log_init(log_t **log, const char *filename, int truncate_at)
         }
 
         /* unlock the log */
-        pthread_mutex_unlock(&(*log)->lock);
+        (void)pthread_mutex_unlock(&(*log)->lock);
     }
 
     return 0;
@@ -121,7 +121,7 @@ int log_write(log_t *log, const char *format, ...)
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     char time_str[20]; /* yyyy-mm-dd hh:mm:ss */
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", t);
+    (void)strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", t);
 
     /* format the message */
     va_list args;
@@ -132,8 +132,8 @@ int log_write(log_t *log, const char *format, ...)
 
     /* we write log message with timestamp and newline */
     fprintf(log->file, "[%s] %s\n", time_str, buffer);
-    fflush(log->file);        /* flush the buffer */
-    fsync(fileno(log->file)); /* fsync the file */
+    (void)fflush(log->file);        /* flush the buffer */
+    (void)fsync(fileno(log->file)); /* fsync the file */
 
     /* unlock the log */
     (void)pthread_mutex_unlock(&log->lock);
@@ -145,7 +145,7 @@ int log_count_lines(log_t *log)
 {
     if (!log->file) return -1;
 
-    rewind(log->file);
+    (void)rewind(log->file); /* rewind the file to the beginning */
 
     int lines = 0;
     char line[BUFFER_SIZE];
@@ -169,6 +169,7 @@ int log_close(log_t *log)
     /* we close the log file */
     (void)fclose(log->file);
     free(log);
+    log = NULL;
 
     return 0;
 }

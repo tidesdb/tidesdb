@@ -506,9 +506,10 @@ tidesdb_err_t *tidesdb_cursor_free(tidesdb_cursor_t *cursor);
  * tidesdb_list_column_families
  * list the column families in TidesDB
  * @param tdb the TidesDB instance
- * @return the column families
+ * @param list the list of column families
+ * @return error or NULL
  */
-char *tidesdb_list_column_families(tidesdb_t *tdb);
+tidesdb_err_t *tidesdb_list_column_families(tidesdb_t *tdb, char **list);
 
 /*
  * tidesdb_start_partial_merge

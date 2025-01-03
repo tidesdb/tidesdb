@@ -659,6 +659,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 cf->sstables = NULL;
                 cf->num_sstables = 0;
                 cf->partial_merging = false;
+                cf->tdb = tdb;
 
                 log_write(tdb->log, "Setting up column family %s", cf->config.name);
 
@@ -1246,7 +1247,7 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
     }
 
     tidesdb_column_family_t *cf = NULL;
-    if (_tidesdb_new_column_family(tdb->directory, name, flush_threshold, max_level, probability,
+    if (_tidesdb_new_column_family(tdb, name, flush_threshold, max_level, probability,
                                    &cf, compressed, compression_algo, bloom_filter,
                                    memtable_ds) == -1)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_COLUMN_FAMILY);
@@ -1466,7 +1467,7 @@ int _tidesdb_remove_directory(const char *path)
     return 0;
 }
 
-int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_threshold,
+int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_threshold,
                                int max_level, float probability, tidesdb_column_family_t **cf,
                                bool compressed, tidesdb_compression_algo_t compress_algo,
                                bool bloom_filter, tidesdb_memtable_ds_t memtable_ds)
@@ -1510,6 +1511,8 @@ int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_
 
     (*cf)->partial_merging = false;
 
+    (*cf)->tdb = tdb;
+
     if (pthread_rwlock_init(&(*cf)->rwlock, NULL) != 0)
     {
         free((*cf)->config.name);
@@ -1521,7 +1524,7 @@ int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_
     char cf_path[MAX_FILE_PATH_LENGTH];
 
     /* we use snprintf to construct the path */
-    (void)snprintf(cf_path, sizeof(cf_path), "%s%s%s", db_path, _tidesdb_get_path_seperator(),
+    (void)snprintf(cf_path, sizeof(cf_path), "%s%s%s", tdb->directory, _tidesdb_get_path_seperator(),
                    name);
 
     /* we check if the column family path exists */
@@ -1541,7 +1544,7 @@ int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_
      * this contains a serialized version of the column family struct */
     char config_file_name[MAX_FILE_PATH_LENGTH];
 
-    (void)snprintf(config_file_name, sizeof(config_file_name), "%s%s%s%s%s%s", db_path,
+    (void)snprintf(config_file_name, sizeof(config_file_name), "%s%s%s%s%s%s", tdb->directory,
                    _tidesdb_get_path_seperator(), name, _tidesdb_get_path_seperator(), name,
                    TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
 

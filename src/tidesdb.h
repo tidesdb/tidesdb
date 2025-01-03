@@ -53,6 +53,8 @@
     (int)100000 /* if not -1 we truncate log file at \
               TDB_DEBUG_LOG_TRUNCATE_AT entries */
 
+
+
 /*
  * tidesdb_compression_algo_t
  * compression algorithm enum
@@ -124,9 +126,12 @@ typedef struct
     bool bloom_filter;
 } tidesdb_column_family_config_t;
 
+/* forward declaration of tidesdb_t */
+typedef struct tidesdb_t tidesdb_t;
 /*
  * tidesdb_column_family_t
  * struct for a column family in TidesDB
+ * @param tdb the TidesDB instance
  * @param config the configuration for the column family
  * @param path the path to the column family
  * @param sstables the sstables for the column family
@@ -143,6 +148,7 @@ typedef struct
  */
 typedef struct
 {
+    tidesdb_t *tdb;
     tidesdb_column_family_config_t config;
     char *path;
     tidesdb_sstable_t **sstables;
@@ -223,14 +229,14 @@ typedef struct
  * @param num_column_families the number of column families
  * @param rwlock read-write lock for the database
  */
-typedef struct
+struct tidesdb_t
 {
     char *directory;
     tidesdb_column_family_t **column_families;
     int num_column_families;
     pthread_rwlock_t rwlock;
     log_t *log;
-} tidesdb_t;
+};
 
 /*
  * tidesdb_txn_t
@@ -549,7 +555,7 @@ int _tidesdb_get_column_family(tidesdb_t *tdb, const char *name, tidesdb_column_
 /*
  * _tidesdb_new_column_family
  * create a new column family
- * @param db_path the path for/to TidesDB
+ * @param tdb the TidesDB instance
  * @param name the name of the column family
  * @param flush_threshold the threshold at which the memtable should be flushed to disk
  * @param max_level the maximum level for the memtable(skiplist)
@@ -561,7 +567,7 @@ int _tidesdb_get_column_family(tidesdb_t *tdb, const char *name, tidesdb_column_
  * @param memtable_ds the data structure for the memtable
  * @return 0 if the column family was created, -1 if not
  */
-int _tidesdb_new_column_family(const char *db_path, const char *name, int flush_threshold,
+int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_threshold,
                                int max_level, float probability, tidesdb_column_family_t **cf,
                                bool compressed, tidesdb_compression_algo_t compress_algo,
                                bool bloom_filter, tidesdb_memtable_ds_t memtable_ds);

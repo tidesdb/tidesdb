@@ -226,6 +226,10 @@ typedef struct
  * @param column_families the column families currently
  * @param num_column_families the number of column families
  * @param rwlock read-write lock for the database
+ * @param log the log for the database
+ * @param available_mem the available memory for the system.  TidesDB gets available memory on start
+ * up and will not allow a value and key pair to be inserted if the value is larger than the
+ * available memory.
  */
 struct tidesdb_t
 {
@@ -234,6 +238,7 @@ struct tidesdb_t
     int num_column_families;
     pthread_rwlock_t rwlock;
     log_t *log;
+    size_t available_mem;
 };
 
 /*
@@ -901,5 +906,12 @@ compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo);
  * @param arg the arguments for the thread in this case a partial_merge_thread_args struct
  */
 void *_tidesdb_partial_merge_thread(void *arg);
+
+/*
+ * _tidesdb_get_available_mem
+ * get the available memory for the system
+ * @return the available memory
+ */
+size_t _tidesdb_get_available_mem();
 
 #endif /* __TIDESDB_H__ */

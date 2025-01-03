@@ -141,6 +141,7 @@ int fsync(int fd)
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <unistd.h>
 
 typedef pthread_t thread_t;

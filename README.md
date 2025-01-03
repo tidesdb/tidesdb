@@ -27,6 +27,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Easy API** simple and easy to use api.
 - [x] **Multiple Memtable Data Structures** memtable can be a skip list or hash table.
 - [x] **Multiplatform** Linux, MacOS, and Windows support.
+- [x] **Logging** system logs debug messages to log file.  This can be disabled.  Log file is created in the database directory.
 - [ ] **Block Indices** more info coming soon.
 
 ## Building

@@ -134,7 +134,7 @@ void test_tidesdb_tidesdb_open_close()
     }
     assert(err == NULL);
 
-    // _tidesdb_remove_directory("test_db");
+    _tidesdb_remove_directory("test_db");
     printf(GREEN "test_tidesdb_tidesdb_open_close passed\n" RESET);
 }
 

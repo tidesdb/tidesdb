@@ -426,7 +426,7 @@ if (e != NULL)
 ```
 
 #### Automatic / Background Partial Merge Compaction
-You can start a background partial merge compaction.  This will incrementally merge sstables in the background from oldest to newest.  Merges are done every n seconds.  Merges are not done in parallel but incrementally.  Less blocking than manual compaction.
+You can start a background partial merge compaction.  This will incrementally merge sstables in the background from oldest to newest when minimum sstables are reached.  Merges are done every n seconds.  Merges are not done in parallel but incrementally.  Less blocking than manual compaction.
 
 You pass
 - the database you want to start the background partial merge compaction in.  Must be open
@@ -434,7 +434,7 @@ You pass
 - the number of seconds to wait before going to next pair and merging
 - the minimum number of sstables to trigger a merge
 ```c
-tidesdb_err_t *e = tidesdb_start_partial_merge(tdb, "your_column_family", 10, 10); /* merge a pair every 10 seconds and if there are a minimum 10 sstables */
+tidesdb_err_t *e = tidesdb_start_background_partial_merge(tdb, "your_column_family", 10, 10); /* merge a pair every 10 seconds and if there are a minimum 10 sstables */
 ```
 
 ## License

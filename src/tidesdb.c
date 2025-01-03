@@ -2263,6 +2263,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
     if (block_manager_open(&sstable_block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
     {
+        free(sst);
         return -1;
     }
 
@@ -5161,8 +5162,9 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
     return 0;
 }
 
-tidesdb_err_t *tidesdb_start_partial_merge(tidesdb_t *tdb, const char *column_family_name,
-                                           int seconds, int min_sstables)
+tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
+                                                      const char *column_family_name, int seconds,
+                                                      int min_sstables)
 {
     /* we check if tidesdb is NULL */
     if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
@@ -5188,36 +5190,43 @@ tidesdb_err_t *tidesdb_start_partial_merge(tidesdb_t *tdb, const char *column_fa
 
     if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
     {
-        (void)pthread_rwlock_rdlock(&tdb->rwlock);
+        (void)pthread_rwlock_unlock(&tdb->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
     }
 
     /* we check if column family is already partially merging */
     if (cf->partial_merging)
     {
-        (void)pthread_rwlock_rdlock(&tdb->rwlock);
+        (void)pthread_rwlock_unlock(&tdb->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_PARTIAL_MERGE_ALREADY_STARTED, column_family_name);
     }
 
-    /* we unlock the the db read lock */
+    /* we unlock the db read lock */
     if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
     {
-        (void)pthread_rwlock_rdlock(&tdb->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
     }
 
     tidesdb_partial_merge_thread_args_t *args = malloc(sizeof(tidesdb_partial_merge_thread_args_t));
+    if (args == NULL) return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC);
 
     args->cf = cf;
     args->tdb = tdb;
 
-    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-    args->lock = &lock;
+    pthread_mutex_t *lock = malloc(sizeof(pthread_mutex_t)); /* shared lock for unique file names */
+    if (lock == NULL)
+    {
+        free(args);
+        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC);
+    }
+    pthread_mutex_init(lock, NULL);
+    args->lock = lock;
 
     /* we lock column family for writes temporarily */
     if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
     {
-        (void)pthread_mutex_destroy(args->lock);
+        pthread_mutex_destroy(lock);
+        free(lock);
         free(args);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
     }
@@ -5230,14 +5239,20 @@ tidesdb_err_t *tidesdb_start_partial_merge(tidesdb_t *tdb, const char *column_fa
     /* we unlock the column family */
     if (pthread_rwlock_unlock(&cf->rwlock) != 0)
     {
-        /* destroy args lock */
-        (void)pthread_mutex_destroy(args->lock);
+        pthread_mutex_destroy(lock);
+        free(lock);
         free(args);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
     }
 
     /* we create a new thread */
-    pthread_create(&cf->partial_merge_thread, NULL, _tidesdb_partial_merge_thread, args);
+    if (pthread_create(&cf->partial_merge_thread, NULL, _tidesdb_partial_merge_thread, args) != 0)
+    {
+        pthread_mutex_destroy(lock);
+        free(lock);
+        free(args);
+        return tidesdb_err_from_code(TIDESDB_ERR_THREAD_CREATION_FAILED);
+    }
 
     /* we return success */
     return NULL;
@@ -5250,6 +5265,9 @@ void *_tidesdb_partial_merge_thread(void *arg)
 
     while (cf->partial_merging)
     {
+        sleep(cf->partial_merge_interval); /* sleep for interval */
+
+        /* we lock column family for reads temporarily */
         if (pthread_rwlock_rdlock(&cf->rwlock) != 0)
         {
             continue;
@@ -5259,150 +5277,96 @@ void *_tidesdb_partial_merge_thread(void *arg)
         if (cf->num_sstables < cf->partial_merge_min_sstables)
         {
             (void)pthread_rwlock_unlock(&cf->rwlock);
-            sleep(cf->partial_merge_interval);
             continue;
         }
-
-        (void)pthread_rwlock_unlock(&cf->rwlock);
-
-        /* keep track of merged sstables */
-        bool *merged_sstables = calloc(cf->num_sstables, sizeof(bool));
-        if (merged_sstables == NULL)
-        {
-            /* destroy args lock */
-            (void)pthread_mutex_destroy(args->lock);
-            free(args);
-            return NULL;
-        }
-
-        while (cf->partial_merging)
-        {
-            sleep(cf->partial_merge_interval);
-
-            for (int i = 0; i < cf->num_sstables - 1; i++)
-            {
-                if (merged_sstables[i])
-                {
-                    continue;
-                }
-
-                for (int j = i + 1; j < cf->num_sstables; j++)
-                {
-                    if (merged_sstables[j])
-                    {
-                        continue;
-                    }
-                    tidesdb_sstable_t *merged_sstable;
-                    /* merge SSTables i and j */
-
-                    if (cf->config.bloom_filter == false)
-                    {
-                        merged_sstable = _tidesdb_merge_sstables(cf->sstables[i], cf->sstables[j],
-                                                                 cf, args->lock);
-                    }
-                    else
-                    {
-                        merged_sstable = _tidesdb_merge_sstables_w_bloom_filter(
-                            cf->sstables[i], cf->sstables[j], cf, args->lock);
-                    }
-                    if (merged_sstable != NULL)
-                    {
-                        /* mark sstables as merged */
-                        merged_sstables[i] = true;
-                        merged_sstables[j] = true;
-
-                        char merged_sstable_path[MAX_FILE_PATH_LENGTH];
-
-                        /* we lock column family for writes temporarily */
-                        if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
-                        {
-                            continue;
-                        }
-
-                        (void)snprintf(merged_sstable_path, MAX_FILE_PATH_LENGTH, "%s",
-                                       merged_sstable->block_manager->file_path);
-
-                        /* the merged sstable path is the sst1 path .tmp */
-                        (void)block_manager_close(merged_sstable->block_manager);
-
-                        (void)rename(merged_sstable_path,
-                                     cf->sstables[i]->block_manager->file_path);
-
-                        /* now we open the sstable */
-                        if (block_manager_open(&merged_sstable->block_manager,
-                                               cf->sstables[i]->block_manager->file_path,
-                                               TDB_SYNC_INTERVAL) == -1)
-                        {
-                            (void)pthread_mutex_destroy(args->lock);
-                            free(args);
-                            free(merged_sstable);
-                            (void)pthread_rwlock_unlock(&cf->rwlock);
-                            return NULL;
-                        }
-
-                        /* set merged sstable */
-                        cf->sstables[i] = merged_sstable;
-
-                        /* j path */
-                        char sstable_path[MAX_FILE_PATH_LENGTH];
-                        snprintf(sstable_path, sizeof(sstable_path), "%s",
-                                 cf->sstables[j]->block_manager->file_path);
-
-                        /* close block manager */
-                        if (block_manager_close(cf->sstables[j]->block_manager) == -1)
-                        {
-                            (void)pthread_rwlock_unlock(&cf->rwlock);
-                            continue;
-                        }
-
-                        /* remove ith+1 sstable */
-                        (void)remove(sstable_path);
-
-                        cf->sstables[j] = NULL;
-
-                        if (pthread_rwlock_unlock(&cf->rwlock) != 0)
-                        {
-                            continue;
-                        }
-
-                        /* we break out to only merge one pair of sstables at a time per iteration
-                         */
-                        break;
-                    }
-                }
-
-                if (merged_sstables[i])
-                {
-                    break;
-                }
-            }
-        }
-
-        free(merged_sstables);
-
-        /* remove the sstables that were compacted
-         * the ones that are NULL; one would be null the ith+1 sstable
-         */
-        /* we lock column family for writes temporarily */
-        if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
-        {
-            continue;
-        }
-
-        int j = 0;
-        for (int i = 0; i < cf->num_sstables; i++)
-        {
-            if (cf->sstables[i] != NULL) cf->sstables[j++] = cf->sstables[i];
-        }
-
-        /* set the new number of sstables */
-        cf->num_sstables = j;
 
         /* we unlock the column family */
         (void)pthread_rwlock_unlock(&cf->rwlock);
+
+        for (int sst_idx = 0; sst_idx < cf->num_sstables - 1; sst_idx += 2)
+        {
+            tidesdb_sstable_t *merged_sstable;
+            /* merge SSTables i and j */
+
+            if (cf->config.bloom_filter == false)
+            {
+                merged_sstable = _tidesdb_merge_sstables(cf->sstables[sst_idx],
+                                                         cf->sstables[sst_idx + 1], cf, args->lock);
+            }
+            else
+            {
+                merged_sstable = _tidesdb_merge_sstables_w_bloom_filter(
+                    cf->sstables[sst_idx], cf->sstables[sst_idx + 1], cf, args->lock);
+            }
+
+            /* lock column family for writes */
+            if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
+            {
+                continue;
+            }
+
+            /* remove old sstable files */
+            char sstable_path1[MAX_FILE_PATH_LENGTH];
+            char sstable_path2[MAX_FILE_PATH_LENGTH];
+
+            /* get the sstable paths */
+            (void)snprintf(sstable_path1, MAX_FILE_PATH_LENGTH, "%s",
+                           cf->sstables[sst_idx]->block_manager->file_path);
+            (void)snprintf(sstable_path2, MAX_FILE_PATH_LENGTH, "%s",
+                           cf->sstables[sst_idx + 1]->block_manager->file_path);
+
+            /* free the old sstables */
+            (void)_tidesdb_free_sstable(cf->sstables[sst_idx]);
+            (void)_tidesdb_free_sstable(cf->sstables[sst_idx + 1]);
+
+            /* remove the sstable files */
+            (void)remove(sstable_path1);
+            (void)remove(sstable_path2);
+
+            /* we close the merged sstable as it has TDB_TEMP_EXT extension
+             * we must rename it and remove TDB_TEMP_EXT extension */
+
+            char merged_sstable_path[MAX_FILE_PATH_LENGTH];
+
+            (void)snprintf(merged_sstable_path, MAX_FILE_PATH_LENGTH, "%s",
+                           merged_sstable->block_manager->file_path);
+
+            /* the merged sstable path is the sst1 path */
+            (void)block_manager_close(merged_sstable->block_manager);
+
+            (void)rename(merged_sstable_path, sstable_path1);
+
+            /* now we open the sstable */
+            if (block_manager_open(&merged_sstable->block_manager, sstable_path1,
+                                   TDB_SYNC_INTERVAL) == -1)
+            {
+                (void)pthread_rwlock_unlock(&cf->rwlock);
+                free(args);
+                return NULL;
+            }
+
+            /* replace the old sstables with the new one */
+            cf->sstables[sst_idx] = merged_sstable;
+            cf->sstables[sst_idx + 1] = NULL;
+
+            /* remove the sstables that were compacted
+             * the ones that are NULL; one would be null the ith+1 sstable
+             */
+            int j = 0;
+            for (int i = 0; i < cf->num_sstables; i++)
+            {
+                if (cf->sstables[i] != NULL) cf->sstables[j++] = cf->sstables[i];
+            }
+
+            cf->num_sstables = j;
+
+            /* we unlock the column family */
+            (void)pthread_rwlock_unlock(&cf->rwlock);
+        }
     }
 
     (void)pthread_mutex_destroy(args->lock);
+    free(args->lock);
     free(args);
     return NULL;
 }

@@ -99,7 +99,8 @@ typedef enum
     TIDESDB_ERR_COLUMN_FAMILY_ALREADY_EXISTS,
     TIDESDB_ERR_INVALID_PARTIAL_MERGE_INTERVAL,
     TIDESDB_ERR_INVALID_PARTIAL_MERGE_MIN_SST,
-    TIDESDB_ERR_PARTIAL_MERGE_ALREADY_STARTED
+    TIDESDB_ERR_PARTIAL_MERGE_ALREADY_STARTED,
+    TIDESDB_ERR_THREAD_CREATION_FAILED
 } TIDESDB_ERR_CODE;
 
 /* TidesDB error messages */
@@ -148,7 +149,8 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
     {TIDESDB_ERR_INVALID_PARTIAL_MERGE_INTERVAL, "Invalid partial merge interval.\n"},
     {TIDESDB_ERR_INVALID_PARTIAL_MERGE_MIN_SST, "Invalid partial merge min SSTables.\n"},
     {TIDESDB_ERR_PARTIAL_MERGE_ALREADY_STARTED,
-     "Partial merge already started for column family %s.\n"}
+     "Partial merge already started for column family %s.\n"},
+    {TIDESDB_ERR_THREAD_CREATION_FAILED, "Failed to create thread.\n"}
 
 };
 

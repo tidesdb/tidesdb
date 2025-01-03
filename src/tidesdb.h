@@ -512,9 +512,10 @@ tidesdb_err_t *tidesdb_cursor_free(tidesdb_cursor_t *cursor);
 tidesdb_err_t *tidesdb_list_column_families(tidesdb_t *tdb, char **list);
 
 /*
- * tidesdb_start_partial_merge
- * starts background partial merge for column family. Blocks less than full compaction as sstables
- * are copied and merged in the background then replaced
+ * tidesdb_start_background_partial_merge
+ * starts background partial merge for column family. Will incrementally when minimum is reached
+ * pair and merge sstables. Blocks less than full compaction as sstables are copied and merged in
+ * the background then replaced.
  * @param tdb the TidesDB instance
  * @param column_family_name the name of the column family
  * @param seconds the interval in seconds for the partial merges, each provided seconds a partial
@@ -522,8 +523,9 @@ tidesdb_err_t *tidesdb_list_column_families(tidesdb_t *tdb, char **list);
  * @param min_sstables the minimum number of sstables to trigger a partial merge
  * @return error or NULL if thread was started
  */
-tidesdb_err_t *tidesdb_start_partial_merge(tidesdb_t *tdb, const char *column_family_name,
-                                           int seconds, int min_sstables);
+tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
+                                                      const char *column_family_name, int seconds,
+                                                      int min_sstables);
 
 /* internal functions */
 

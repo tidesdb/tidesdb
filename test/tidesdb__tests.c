@@ -1722,7 +1722,7 @@ void test_tidesdb_start_partial_merge(bool compress, tidesdb_compression_algo_t 
     tidesdb_err_free(err);
 
     /* start partial merging in background */
-    err = tidesdb_start_partial_merge(db, "test_cf", 1, 2);
+    err = tidesdb_start_background_partial_merge(db, "test_cf", 1, 2);
     assert(err == NULL);
     tidesdb_err_free(err);
 
@@ -1831,8 +1831,7 @@ int main(void)
     test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
     test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
 
-    /* test_tidesdb_start_partial_merge(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
-     * bit flaky */
+    test_tidesdb_start_partial_merge(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
 
     return 0;
 }

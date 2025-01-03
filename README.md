@@ -190,14 +190,12 @@ if (e != NULL)
 ```
 
 ### Listing column families
+You can list all column families in the database list as a string.  You must free the string when done.
 ```c
-/* list column families
- * returns a char* of column family names separated by a newline
-*/
-char *column_families = tidesdb_list_column_families(tdb);
-if (column_families == NULL)
-{
-    /* handle error */
+char *column_families = NULL;
+tidesdb_err_t *err = tidesdb_list_column_families(tdb, &column_families);
+if (err != NULL) {
+/* handle error */
 }
 
 /* in this example we just print and free the column families */

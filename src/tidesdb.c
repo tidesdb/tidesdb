@@ -1619,12 +1619,18 @@ int _tidesdb_get_column_family(tidesdb_t *tdb, const char *name, tidesdb_column_
     return -1; /* no column family with that name */
 }
 
-char *tidesdb_list_column_families(tidesdb_t *tdb)
+tidesdb_err_t *tidesdb_list_column_families(tidesdb_t *tdb, char **list)
 {
-    if (tdb == NULL) return NULL;
+    if (tdb == NULL)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
+    }
 
     /* get read lock for database */
-    if (pthread_rwlock_rdlock(&tdb->rwlock) != 0) return NULL;
+    if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "tidesdb_t");
+    }
 
     size_t total_size = 1; /* +1 for null terminator */
     for (int i = 0; i < tdb->num_column_families; i++)
@@ -1632,25 +1638,30 @@ char *tidesdb_list_column_families(tidesdb_t *tdb)
         total_size += strlen(tdb->column_families[i]->config.name) + 1; /* +1 for newline */
     }
 
-    char *list = malloc(total_size);
-    if (list == NULL) return NULL;
+    *list = malloc(total_size);
+    if (list == NULL)
+    {
+        /* failed to allocate memory */
+        (void)pthread_rwlock_unlock(&tdb->rwlock);
+        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "list");
+    }
 
-    list[0] = '\0'; /* null terminate the string */
+    (*list)[0] = '\0'; /* null terminate the string */
 
     for (int i = 0; i < tdb->num_column_families; i++)
     {
-        strcat(list, tdb->column_families[i]->config.name);
-        strcat(list, "\n");
+        strcat(*list, tdb->column_families[i]->config.name);
+        strcat(*list, "\n");
     }
 
-    /* release the read lock */
+    /* release the db read lock */
     if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
     {
-        free(list);
-        return NULL;
+        free(*list);
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "tidesdb_t");
     }
 
-    return list;
+    return NULL;
 }
 
 tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const uint8_t *key,

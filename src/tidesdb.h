@@ -53,8 +53,6 @@
     (int)100000 /* if not -1 we truncate log file at \
               TDB_DEBUG_LOG_TRUNCATE_AT entries */
 
-
-
 /*
  * tidesdb_compression_algo_t
  * compression algorithm enum
@@ -567,10 +565,10 @@ int _tidesdb_get_column_family(tidesdb_t *tdb, const char *name, tidesdb_column_
  * @param memtable_ds the data structure for the memtable
  * @return 0 if the column family was created, -1 if not
  */
-int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_threshold,
-                               int max_level, float probability, tidesdb_column_family_t **cf,
-                               bool compressed, tidesdb_compression_algo_t compress_algo,
-                               bool bloom_filter, tidesdb_memtable_ds_t memtable_ds);
+int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_threshold, int max_level,
+                               float probability, tidesdb_column_family_t **cf, bool compressed,
+                               tidesdb_compression_algo_t compress_algo, bool bloom_filter,
+                               tidesdb_memtable_ds_t memtable_ds);
 
 /*
  * _tidesdb_add_column_family

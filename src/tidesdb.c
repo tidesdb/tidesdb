@@ -1247,9 +1247,8 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
     }
 
     tidesdb_column_family_t *cf = NULL;
-    if (_tidesdb_new_column_family(tdb, name, flush_threshold, max_level, probability,
-                                   &cf, compressed, compression_algo, bloom_filter,
-                                   memtable_ds) == -1)
+    if (_tidesdb_new_column_family(tdb, name, flush_threshold, max_level, probability, &cf,
+                                   compressed, compression_algo, bloom_filter, memtable_ds) == -1)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_COLUMN_FAMILY);
 
     /* now we add the column family */
@@ -1467,10 +1466,10 @@ int _tidesdb_remove_directory(const char *path)
     return 0;
 }
 
-int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_threshold,
-                               int max_level, float probability, tidesdb_column_family_t **cf,
-                               bool compressed, tidesdb_compression_algo_t compress_algo,
-                               bool bloom_filter, tidesdb_memtable_ds_t memtable_ds)
+int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_threshold, int max_level,
+                               float probability, tidesdb_column_family_t **cf, bool compressed,
+                               tidesdb_compression_algo_t compress_algo, bool bloom_filter,
+                               tidesdb_memtable_ds_t memtable_ds)
 {
     /* we allocate memory for the column family */
     *cf = malloc(sizeof(tidesdb_column_family_t));
@@ -1524,8 +1523,8 @@ int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_thres
     char cf_path[MAX_FILE_PATH_LENGTH];
 
     /* we use snprintf to construct the path */
-    (void)snprintf(cf_path, sizeof(cf_path), "%s%s%s", tdb->directory, _tidesdb_get_path_seperator(),
-                   name);
+    (void)snprintf(cf_path, sizeof(cf_path), "%s%s%s", tdb->directory,
+                   _tidesdb_get_path_seperator(), name);
 
     /* we check if the column family path exists */
     if (access(cf_path, F_OK) == -1)

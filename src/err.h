@@ -102,6 +102,7 @@ typedef enum
     TIDESDB_ERR_PARTIAL_MERGE_ALREADY_STARTED,
     TIDESDB_ERR_THREAD_CREATION_FAILED,
     TIDESDB_ERR_LOG_INIT_FAILED,
+    TIDESDB_ERR_PUT_MEMORY_OVERFLOW,
 } TIDESDB_ERR_CODE;
 
 /* TidesDB error messages */
@@ -153,7 +154,9 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
      "Partial merge already started for column family %s.\n"},
     {TIDESDB_ERR_THREAD_CREATION_FAILED, "Failed to create thread.\n"},
     {TIDESDB_ERR_LOG_INIT_FAILED, "Failed to initialize db debug log.\n"},
-
+    {TIDESDB_ERR_PUT_MEMORY_OVERFLOW,
+     "Memory overflow while putting key-value pair.  Attempting to write data greater than "
+     "available memory.\n"},
 };
 
 /*

@@ -557,6 +557,8 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
         return tidesdb_err_from_code(TIDESDB_ERR_LOAD_COLUMN_FAMILIES);
     }
 
+    (*tdb)->available_mem = _tidesdb_get_available_mem();
+
     (void)log_write((*tdb)->log, "Opened TidesDB instance at %s", directory);
 
     return NULL;
@@ -1730,6 +1732,10 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
 
     /* we check if the value is NULL */
     if (value == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_VALUE);
+
+    /* we check if the key and value size exceed available system memory */
+    if (key_size > tdb->available_mem || value_size > tdb->available_mem)
+        return tidesdb_err_from_code(TIDESDB_ERR_PUT_MEMORY_OVERFLOW);
 
     /* get db read lock for column family */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
@@ -5479,4 +5485,28 @@ void *_tidesdb_partial_merge_thread(void *arg)
     free(args->lock);
     free(args);
     return NULL;
+}
+
+size_t _tidesdb_get_available_mem()
+{
+#ifdef _WIN32
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status))
+    {
+        return status.ullAvailPhys;
+    }
+
+    return 0;
+#else
+    struct sysinfo info;
+    if (sysinfo(&info) == 0)
+    {
+        return info.freeram;
+    }
+    else
+    {
+        return 0;
+    }
+#endif
 }

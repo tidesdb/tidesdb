@@ -558,6 +558,10 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
     }
 
     (*tdb)->available_mem = _tidesdb_get_available_mem();
+    (*tdb)->available_mem =
+        (size_t)((double)(*tdb)->available_mem * TDB_AVAILABLE_MEMORY_THRESHOLD);
+
+    (void)log_write((*tdb)->log, "Available memory: %zu bytes", (*tdb)->available_mem);
 
     (void)log_write((*tdb)->log, "Opened TidesDB instance at %s", directory);
 
@@ -5513,4 +5517,68 @@ size_t _tidesdb_get_available_mem()
         return 0;
     }
 #endif
+}
+
+int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block_manager_t *bm2,
+                        block_manager_t *bm_out)
+{
+    block_manager_cursor_t *cursor1, *cursor2;
+    block_manager_block_t *block1 = NULL, *block2 = NULL;
+
+    if (block_manager_cursor_init(&cursor1, bm1) != 0) return -1;
+    if (block_manager_cursor_init(&cursor2, bm2) != 0) return -1;
+
+    while (block_manager_cursor_has_next(cursor1) || block_manager_cursor_has_next(cursor2))
+    {
+        if (block1 == NULL && block_manager_cursor_has_next(cursor1))
+        {
+            (void)block_manager_cursor_next(cursor1);
+            block1 = block_manager_cursor_read(cursor1);
+        }
+
+        if (block2 == NULL && block_manager_cursor_has_next(cursor2))
+        {
+            (void)block_manager_cursor_next(cursor2);
+            block2 = block_manager_cursor_read(cursor2);
+        }
+
+        /* deserialize the blocks into key value pairs */
+        tidesdb_key_value_pair_t *kv1 = _tidesdb_deserialize_key_value_pair(
+            block1->data, block1->size, cf->config.compressed, cf->config.compress_algo);
+
+        tidesdb_key_value_pair_t *kv2 = _tidesdb_deserialize_key_value_pair(
+            block2->data, block2->size, cf->config.compressed, cf->config.compress_algo);
+
+        if (block1 && (!block2 || memcmp(kv1->key, kv2->key, kv1->key_size) < 0))
+        {
+            if (block_manager_block_write(bm_out, block1) == -1)
+            {
+                block_manager_block_free(block1);
+                block_manager_block_free(block2);
+                (void)block_manager_cursor_free(cursor1);
+                (void)block_manager_cursor_free(cursor2);
+                return -1;
+            }
+            block1 = NULL;
+        }
+        else
+        {
+            if (block_manager_block_write(bm_out, block2) == -1)
+            {
+                block_manager_block_free(block1);
+                block_manager_block_free(block2);
+                (void)block_manager_cursor_free(cursor1);
+                (void)block_manager_cursor_free(cursor2);
+            }
+            block2 = NULL;
+        }
+
+        block_manager_block_free(block1);
+        block_manager_block_free(block2);
+    }
+
+    (void)block_manager_cursor_free(cursor1);
+    (void)block_manager_cursor_free(cursor2);
+
+    return 0;
 }

@@ -1722,7 +1722,7 @@ void test_tidesdb_start_partial_merge(bool compress, tidesdb_compression_algo_t 
     tidesdb_err_free(err);
 
     /* start partial merging in background */
-    err = tidesdb_start_background_partial_merge(db, "test_cf", 1, 2);
+    err = tidesdb_start_background_partial_merge(db, "test_cf", 1, 10);
     assert(err == NULL);
     tidesdb_err_free(err);
 
@@ -1792,7 +1792,7 @@ int main(void)
     test_tidesdb_put_flush_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
-
+    //
     /* the next batch of tests we will run with bloom filters and compression
      * same tests just with bloom filters and compression enabled */
     test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_SNAPPY);

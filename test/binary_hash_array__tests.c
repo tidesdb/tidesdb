@@ -20,7 +20,7 @@
 #include <stdio.h>
 
 #include "../src/binary_hash_array.h"
-#include "compat.h"
+#include "../src/compat.h"
 #include "test_macros.h"
 
 void test_binary_hash_array_new()

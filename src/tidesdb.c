@@ -1523,7 +1523,6 @@ int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_thres
 
     (*cf)->memtable_ht = NULL;
 
-
     if (pthread_rwlock_init(&(*cf)->rwlock, NULL) != 0)
     {
         free((*cf)->config.name);

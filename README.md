@@ -450,5 +450,6 @@ Mozilla Public License Version 2.0 (TidesDB)
 -- AND --
 BSD 3 Clause (Snappy)
 BSD 2 (LZ4)
+BSD 2 (xxHash - Yann Collet)
 BSD (Zstandard)
 ```

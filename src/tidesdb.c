@@ -1519,6 +1519,11 @@ int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_thres
 
     (*cf)->tdb = tdb;
 
+    (*cf)->memtable_sl = NULL;
+
+    (*cf)->memtable_ht = NULL;
+
+
     if (pthread_rwlock_init(&(*cf)->rwlock, NULL) != 0)
     {
         free((*cf)->config.name);
@@ -1617,7 +1622,7 @@ int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_thres
     }
 
     /* we check if the memtable was created */
-    if ((*cf)->memtable_sl == NULL || (*cf)->memtable_ht == NULL)
+    if ((*cf)->memtable_sl == NULL && (*cf)->memtable_ht == NULL)
     {
         free((*cf)->config.name);
         free((*cf)->path);

@@ -46,9 +46,11 @@
 #define TDB_USING_HT_MAX_LEVEL            0          /* max level for using hash table memtable */
 #define TDB_USING_HT_PROBABILITY          0.0f       /* probability for using hash table memtable */
 #define TDB_DEFAULT_SKIP_LIST_MAX_LEVEL   12         /* default max level for skip list memtable */
-#define TDB_DEFAULT_SKIP_LIST_PROBABILITY 0.24f  /* default probability for skip list memtable */
-#define TDB_DEBUG_LOG                     1      /* or 0 */
-#define TDB_LOG_EXT                       ".log" /* extension for the log file */
+#define TDB_DEFAULT_SKIP_LIST_PROBABILITY 0.24f /* default probability for skip list memtable */
+#define TDB_AVAILABLE_MEMORY_THRESHOLD \
+    0.6f                     /* allow key value pairs that take up 60% of available system memory */
+#define TDB_DEBUG_LOG 1      /* or 0 */
+#define TDB_LOG_EXT   ".log" /* extension for the log file */
 #define TDB_DEBUG_LOG_TRUNCATE_AT                    \
     (int)100000 /* if not -1 we truncate log file at \
               TDB_DEBUG_LOG_TRUNCATE_AT entries */
@@ -227,9 +229,9 @@ typedef struct
  * @param num_column_families the number of column families
  * @param rwlock read-write lock for the database
  * @param log the log for the database
- * @param available_mem the available memory for the system.  TidesDB gets available memory on start
- * up and will not allow a value and key pair to be inserted if the value is larger than the
- * available memory.
+ * @param available_mem the available memory for the system.  TidesDB gets
+ * TDB_AVAILABLE_MEMORY_THRESHOLD % of available memory on start up and will not allow kvp to be
+ * added if exceeds available memory.
  */
 struct tidesdb_t
 {
@@ -913,5 +915,18 @@ void *_tidesdb_partial_merge_thread(void *arg);
  * @return the available memory
  */
 size_t _tidesdb_get_available_mem();
+
+/*
+ * _tidesdb_merge_sort
+ * merges 2 sstables into a new sstable using block managers.  A memory efficient approach to
+ * merging ssts.
+ * @param cf the column family
+ * @param bm1 the block manager for the first sstable
+ * @param bm2 the block manager for the second sstable
+ * @param bm_out the block manager for the new sstable
+ * @return 0 if the sstables were merged, -1 if not
+ */
+int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block_manager_t *bm2,
+                        block_manager_t *bm_out);
 
 #endif /* __TIDESDB_H__ */

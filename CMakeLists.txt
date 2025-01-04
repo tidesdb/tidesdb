@@ -25,7 +25,7 @@ if(TIDESDB_WITH_SANITIZER)
         endif()
 endif()
 
-add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c src/log.c)
+add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c src/binary_hash_array.c src/log.c external/xxhash.c)
 
 target_include_directories(tidesdb PRIVATE src)
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
@@ -64,7 +64,7 @@ install(TARGETS tidesdb
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
 
-install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/hash_table.h src/compress.h src/bloom_filter.h src/compat.h src/log.h DESTINATION include)
+install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/hash_table.h src/compress.h src/bloom_filter.h src/compat.h src/log.h src/binary_hash_array.h DESTINATION include)
 
 if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         enable_testing()
@@ -76,11 +76,12 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         add_executable(compress_tests test/compress__tests.c)
         add_executable(bloom_filter_tests test/bloom_filter__tests.c)
         add_executable(log_tests test/log__tests.c)
+        add_executable(binary_hash_array_tests test/binary_hash_array__tests.c)
         add_executable(tidesdb_tests test/tidesdb__tests.c)
         add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
         # add include and link directories for test executables
-        foreach(test_target err_tests block_manager_tests skip_list_tests hash_table_tests compress_tests bloom_filter_tests log_tests tidesdb_tests tidesdb_bench)
+        foreach(test_target err_tests block_manager_tests skip_list_tests hash_table_tests compress_tests bloom_filter_tests log_tests binary_hash_array_tests tidesdb_tests tidesdb_bench)
                 target_link_libraries(${test_target} PRIVATE tidesdb)
         endforeach()
 
@@ -90,6 +91,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         add_test(NAME hash_table_tests COMMAND hash_table_tests)
         add_test(NAME compress_tests COMMAND compress_tests)
         add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
+        add_test(NAME binary_hash_array_tests COMMAND binary_hash_array_tests)
         add_test(NAME log_tests COMMAND log_tests)
         add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
         add_test(NAME tidesdb_bench COMMAND tidesdb_bench)

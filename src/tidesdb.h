@@ -128,6 +128,7 @@ typedef struct
 
 /* forward declaration of tidesdb_t */
 typedef struct tidesdb_t tidesdb_t;
+
 /*
  * tidesdb_column_family_t
  * struct for a column family in TidesDB

@@ -21,6 +21,7 @@
 
 #include <stdbool.h>
 
+#include "binary_hash_array.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "compat.h"
@@ -39,6 +40,9 @@
 #define TDB_TOMBSTONE                     0xDEADBEEF /* tombstone value for deleted keys */
 #define TDB_SYNC_INTERVAL                 0.24       /* interval for syncing mainly WAL */
 #define TDB_BLOOM_FILTER_P                0.01       /*  the false positive rate for bloom filter */
+#define TDB_BLOCK_INDICES                                                                          \
+    1 /* whether to store block indices in SSTable. Will cause more memory usage but reads will be \
+         faster */
 #define TDB_SSTABLE_PREFIX                "sstable_" /* prefix for SSTable files */
 #define TDB_FLUSH_THRESHOLD               1048576    /* default flush threshold for column family */
 #define TDB_MIN_MAX_LEVEL                 5          /* minimum max level for column family */

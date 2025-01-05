@@ -396,3 +396,10 @@ int block_manager_seek(block_manager_t *bm, uint64_t pos)
     if (fseek(bm->file, pos, SEEK_SET) != 0) return -1;
     return 0;
 }
+
+int block_manager_cursor_goto(block_manager_cursor_t *cursor, uint64_t pos)
+{
+    if (fseek(cursor->bm->file, pos, SEEK_SET) != 0) return -1;
+    cursor->current_pos = pos;
+    return 0;
+}

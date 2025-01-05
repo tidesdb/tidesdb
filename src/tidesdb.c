@@ -4898,7 +4898,7 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
         {
             (void)_tidesdb_free_key_value_pair(kv);
             free(sst);
-            remove(sstable_path);
+            (void)remove(sstable_path);
             (void)hash_table_cursor_free(cursor);
             return -1;
         }
@@ -5040,13 +5040,19 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
         free(args);
         return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC);
     }
-    pthread_mutex_init(lock, NULL);
+    if (pthread_mutex_init(lock, NULL) != 0)
+    {
+        free(args);
+        free(lock);
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_LOCK, "shared merge");
+    }
+
     args->lock = lock;
 
     /* we lock column family for writes temporarily */
     if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
     {
-        pthread_mutex_destroy(lock);
+        (void)pthread_mutex_destroy(lock);
         free(lock);
         free(args);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
@@ -5060,7 +5066,7 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
     /* we unlock the column family */
     if (pthread_rwlock_unlock(&cf->rwlock) != 0)
     {
-        pthread_mutex_destroy(lock);
+        (void)pthread_mutex_destroy(lock);
         free(lock);
         free(args);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
@@ -5069,7 +5075,7 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
     /* we create a new thread */
     if (pthread_create(&cf->partial_merge_thread, NULL, _tidesdb_partial_merge_thread, args) != 0)
     {
-        pthread_mutex_destroy(lock);
+        (void)pthread_mutex_destroy(lock);
         free(lock);
         free(args);
         return tidesdb_err_from_code(TIDESDB_ERR_THREAD_CREATION_FAILED);
@@ -5239,8 +5245,10 @@ size_t _tidesdb_get_available_mem()
 int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block_manager_t *bm2,
                         block_manager_t *bm_out)
 {
+    /* we check if the block managers are NULL */
     if (bm1 == NULL || bm2 == NULL || bm_out == NULL) return -1;
 
+    /* initialize cursors for both input block managers */
     block_manager_cursor_t *cursor1 = NULL;
     block_manager_cursor_t *cursor2 = NULL;
     block_manager_block_t *block1 = NULL;
@@ -5250,15 +5258,15 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
     if (block_manager_cursor_init(&cursor1, bm1) != 0) return -1;
     if (block_manager_cursor_init(&cursor2, bm2) != 0)
     {
-        block_manager_cursor_free(cursor1);
+        (void)block_manager_cursor_free(cursor1);
         return -1;
     }
 
     if (cf->config.bloom_filter)
     {
         /* skip the initial bloom blocks */
-        block_manager_cursor_next(cursor1);
-        block_manager_cursor_next(cursor2);
+        (void)block_manager_cursor_next(cursor1);
+        (void)block_manager_cursor_next(cursor2);
     }
 
     /* read the first block from each block manager */
@@ -5272,22 +5280,22 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             /* write remaining blocks from bm2 */
             tidesdb_key_value_pair_t *kv2 = _tidesdb_deserialize_key_value_pair(
                 block2->data, block2->size, cf->config.compressed, cf->config.compress_algo);
-            if (!_tidesdb_is_tombstone(block2->data, block2->size) &&
+            if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                 !_tidesdb_is_expired(kv2->ttl))
             {
                 if (block_manager_block_write(bm_out, block2) != 0)
                 {
-                    block_manager_block_free(block2);
-                    _tidesdb_free_key_value_pair(kv2);
+                    (void)block_manager_block_free(block2);
+                    (void)_tidesdb_free_key_value_pair(kv2);
                     break;
                 }
             }
             else
             {
                 /* free the key value pair */
-                _tidesdb_free_key_value_pair(kv2);
+                (void)_tidesdb_free_key_value_pair(kv2);
             }
-            block_manager_block_free(block2);
+            (void)block_manager_block_free(block2);
             block2 = block_manager_cursor_read(cursor2);
         }
         else if (block2 == NULL)
@@ -5295,22 +5303,22 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             /* write remaining blocks from bm1 */
             tidesdb_key_value_pair_t *kv1 = _tidesdb_deserialize_key_value_pair(
                 block1->data, block1->size, cf->config.compressed, cf->config.compress_algo);
-            if (!_tidesdb_is_tombstone(block1->data, block1->size) &&
+            if (!_tidesdb_is_tombstone(kv1->value, kv1->value_size) &&
                 !_tidesdb_is_expired(kv1->ttl))
             {
                 if (block_manager_block_write(bm_out, block1) != 0)
                 {
-                    block_manager_block_free(block1);
-                    _tidesdb_free_key_value_pair(kv1);
+                    (void)block_manager_block_free(block1);
+                    (void)_tidesdb_free_key_value_pair(kv1);
                     break;
                 }
             }
             else
             {
                 /* free the key value pair */
-                _tidesdb_free_key_value_pair(kv1);
+                (void)_tidesdb_free_key_value_pair(kv1);
             }
-            block_manager_block_free(block1);
+            (void)block_manager_block_free(block1);
             block1 = block_manager_cursor_read(cursor1);
         }
         else
@@ -5325,19 +5333,19 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             if (_tidesdb_compare_keys(kv1->key, kv1->key_size, kv2->key, kv2->key_size) == 0)
             {
                 /* always prefer the value from bm2 */
-                if (!_tidesdb_is_tombstone(block2->data, block2->size) &&
+                if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                     !_tidesdb_is_expired(kv2->ttl))
                 {
                     if (block_manager_block_write(bm_out, block2) != 0)
                     {
-                        block_manager_block_free(block2);
-                        _tidesdb_free_key_value_pair(kv1);
-                        _tidesdb_free_key_value_pair(kv2);
-                        block_manager_block_free(block1); /* free block1 before breaking */
+                        (void)block_manager_block_free(block2);
+                        (void)_tidesdb_free_key_value_pair(kv1);
+                        (void)_tidesdb_free_key_value_pair(kv2);
+                        (void)block_manager_block_free(block1); /* free block1 before breaking */
                         break;
                     }
                 }
-                block_manager_block_free(block2);
+                (void)block_manager_block_free(block2);
                 block2 = block_manager_cursor_read(cursor2);
             }
             else if (_tidesdb_compare_keys(kv1->key, kv1->key_size, kv2->key, kv2->key_size) < 0)
@@ -5347,36 +5355,36 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 {
                     if (block_manager_block_write(bm_out, block1) != 0)
                     {
-                        block_manager_block_free(block1);
-                        _tidesdb_free_key_value_pair(kv1);
-                        _tidesdb_free_key_value_pair(kv2);
-                        block_manager_block_free(block2); /* free block2 before breaking */
+                        (void)block_manager_block_free(block1);
+                        (void)_tidesdb_free_key_value_pair(kv1);
+                        (void)_tidesdb_free_key_value_pair(kv2);
+                        (void)block_manager_block_free(block2); /* free block2 before breaking */
                         break;
                     }
                 }
-                block_manager_block_free(block1);
+                (void)block_manager_block_free(block1);
                 block1 = block_manager_cursor_read(cursor1);
             }
             else
             {
-                if (!_tidesdb_is_tombstone(block2->data, block2->size) &&
+                if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                     !_tidesdb_is_expired(kv2->ttl))
                 {
                     if (block_manager_block_write(bm_out, block2) != 0)
                     {
-                        block_manager_block_free(block2);
-                        _tidesdb_free_key_value_pair(kv1);
-                        _tidesdb_free_key_value_pair(kv2);
-                        block_manager_block_free(block1); /* free block1 before breaking */
+                        (void)block_manager_block_free(block2);
+                        (void)_tidesdb_free_key_value_pair(kv1);
+                        (void)_tidesdb_free_key_value_pair(kv2);
+                        (void)block_manager_block_free(block1); /* free block1 before breaking */
                         break;
                     }
                 }
-                block_manager_block_free(block2);
+                (void)block_manager_block_free(block2);
                 block2 = block_manager_cursor_read(cursor2);
             }
 
-            _tidesdb_free_key_value_pair(kv1);
-            _tidesdb_free_key_value_pair(kv2);
+            (void)_tidesdb_free_key_value_pair(kv1);
+            (void)_tidesdb_free_key_value_pair(kv2);
         }
     }
 
@@ -5386,21 +5394,21 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         if (block1 == NULL) break;
         tidesdb_key_value_pair_t *kv1 = _tidesdb_deserialize_key_value_pair(
             block1->data, block1->size, cf->config.compressed, cf->config.compress_algo);
-        if (!_tidesdb_is_tombstone(block1->data, block1->size) && !_tidesdb_is_expired(kv1->ttl))
+        if (!_tidesdb_is_tombstone(kv1->value, kv1->value_size) && !_tidesdb_is_expired(kv1->ttl))
         {
             if (block_manager_block_write(bm_out, block1) != 0)
             {
-                block_manager_block_free(block1);
-                _tidesdb_free_key_value_pair(kv1);
+                (void)block_manager_block_free(block1);
+                (void)_tidesdb_free_key_value_pair(kv1);
                 break;
             }
         }
         else
         {
             /* free the key value pair */
-            _tidesdb_free_key_value_pair(kv1);
+            (void)_tidesdb_free_key_value_pair(kv1);
         }
-        block_manager_block_free(block1);
+        (void)block_manager_block_free(block1);
     }
 
     while ((block2 = block_manager_cursor_read(cursor2)))
@@ -5408,26 +5416,26 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         if (block2 == NULL) break;
         tidesdb_key_value_pair_t *kv2 = _tidesdb_deserialize_key_value_pair(
             block2->data, block2->size, cf->config.compressed, cf->config.compress_algo);
-        if (!_tidesdb_is_tombstone(block2->data, block2->size) && !_tidesdb_is_expired(kv2->ttl))
+        if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) && !_tidesdb_is_expired(kv2->ttl))
         {
             if (block_manager_block_write(bm_out, block2) != 0)
             {
-                block_manager_block_free(block2);
-                _tidesdb_free_key_value_pair(kv2);
+                (void)block_manager_block_free(block2);
+                (void)_tidesdb_free_key_value_pair(kv2);
                 break;
             }
         }
         else
         {
             /* free the key value pair */
-            _tidesdb_free_key_value_pair(kv2);
+            (void)_tidesdb_free_key_value_pair(kv2);
         }
-        block_manager_block_free(block2);
+        (void)block_manager_block_free(block2);
     }
 
-    /* free */
-    block_manager_cursor_free(cursor1);
-    block_manager_cursor_free(cursor2);
+    /* free input bm cursors */
+    (void)block_manager_cursor_free(cursor1);
+    (void)block_manager_cursor_free(cursor2);
 
     return 0;
 }

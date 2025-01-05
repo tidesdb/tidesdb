@@ -85,7 +85,7 @@ void benchmark_binary_hash_array()
     binary_hash_array_free(bha);
 
     /* we print the size of the serialized sorted binary hash array */
-    printf(BOLDWHITE "Bloom filter size: %f MB\n" RESET, (float)serialized_size / 1000000);
+    printf(BOLDWHITE "Sorted binary hash array size: %f MB\n" RESET, (float)serialized_size / 1000000);
 
     binary_hash_array_t *deserialized_bha = binary_hash_array_deserialize(serialized_data);
     free(serialized_data);

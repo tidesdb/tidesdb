@@ -2008,12 +2008,57 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
                 return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
             }
         }
-
         block_manager_block_t *block;
+
+        /* we check if block indices are enabled */
+        if (TDB_BLOCK_INDICES == 1)
+        {
+            /* we seek to last block */
+            if (block_manager_cursor_goto_last(cursor) == -1)
+            {
+                (void)block_manager_cursor_free(cursor);
+                (void)pthread_rwlock_unlock(&cf->rwlock);
+                return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+            }
+
+            /* we deserialize the block into a binary hash array */
+            block = block_manager_cursor_read(cursor);
+            if (block == NULL)
+            {
+                (void)block_manager_cursor_free(cursor);
+                (void)pthread_rwlock_unlock(&cf->rwlock);
+                return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+            }
+
+            /* we deserialize the binary hash array */
+            binary_hash_array_t *bha = binary_hash_array_deserialize(block->data);
+
+            int64_t offset = binary_hash_array_contains(bha, (uint8_t *)key, key_size);
+            if (offset == -1)
+            {
+                (void)block_manager_cursor_free(cursor);
+                (void)block_manager_block_free(block);
+                (void)binary_hash_array_free(bha);
+                /* we go onto the next sstable */
+                continue;
+            }
+
+            if (block_manager_cursor_goto(cursor, offset) == -1)
+            {
+                (void)block_manager_cursor_free(cursor);
+                (void)block_manager_block_free(block);
+                (void)binary_hash_array_free(bha);
+                (void)pthread_rwlock_unlock(&cf->rwlock);
+                return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+            }
+            /* we free the binary hash array */
+            (void)binary_hash_array_free(bha);
+            (void)block_manager_block_free(block);
+        }
+
         while ((block = block_manager_cursor_read(cursor)) != NULL)
         {
             if (block == NULL) break;
-
             /* we deserialize the kv */
             tidesdb_key_value_pair_t *kv = _tidesdb_deserialize_key_value_pair(
                 block->data, block->size, cf->config.compressed, cf->config.compress_algo);
@@ -2354,6 +2399,21 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         return -1;
     }
 
+    /* we have a placeholder here for block indices for each key value pair */
+    binary_hash_array_t *bha = NULL;
+    if (TDB_BLOCK_INDICES == 1)
+    {
+        /* we get count of key value pairs */
+        bha = binary_hash_array_new(skip_list_count_entries(cf->memtable_sl));
+        if (bha == NULL)
+        {
+            free(sst);
+            (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
+            return -1;
+        }
+    }
+
     /* we iterate over the memtable and write to the sstable */
     do
     {
@@ -2430,8 +2490,6 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             return -1;
         }
 
-        (void)_tidesdb_free_key_value_pair(kv);
-
         /* we create a new block */
         block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_kv);
         if (block == NULL)
@@ -2439,20 +2497,32 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            (void)_tidesdb_free_key_value_pair(kv);
             (void)skip_list_cursor_free(cursor);
             return -1;
         }
 
+        long offset = -1; /* blocks offset in the sstable */
+
         /* we write the block to the sstable */
-        if (block_manager_block_write(sst->block_manager, block) == -1)
+        if (((offset = block_manager_block_write(sst->block_manager, block))) && offset == -1)
         {
             (void)block_manager_block_free(block);
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            (void)_tidesdb_free_key_value_pair(kv);
             (void)skip_list_cursor_free(cursor);
             return -1;
         }
+
+        if (TDB_BLOCK_INDICES == 1)
+        {
+            /* we add the block index */
+            binary_hash_array_add(bha, kv->key, kv->key_size, offset);
+        }
+
+        (void)_tidesdb_free_key_value_pair(kv);
 
         /* we free the resources */
         (void)block_manager_block_free(block);
@@ -2462,6 +2532,48 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
     /* we free the cursor */
     (void)skip_list_cursor_free(cursor);
+
+    /* if block indices enabled we write to end of sstable */
+    if (TDB_BLOCK_INDICES == 1)
+    {
+        /* we serialize the block indices */
+        size_t serialized_size;
+        uint8_t *serialized_bha = binary_hash_array_serialize(bha, &serialized_size);
+        if (serialized_bha == NULL)
+        {
+            binary_hash_array_free(bha);
+            free(sst);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we create a new block */
+        block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_bha);
+        if (block == NULL)
+        {
+            binary_hash_array_free(bha);
+            free(sst);
+            free(serialized_bha);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we write the block to the sstable */
+        if (block_manager_block_write(sst->block_manager, block) == -1)
+        {
+            (void)block_manager_block_free(block);
+            binary_hash_array_free(bha);
+            free(sst);
+            free(serialized_bha);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we free the resources */
+        (void)block_manager_block_free(block);
+        binary_hash_array_free(bha);
+        free(serialized_bha);
+    }
 
     /* we add the sstable to the column family */
     if (cf->sstables == NULL)
@@ -4409,6 +4521,21 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
         return -1;
     }
 
+    /* we have a placeholder here for block indices for each key value pair */
+    binary_hash_array_t *bha = NULL;
+    if (TDB_BLOCK_INDICES == 1)
+    {
+        /* we get count of key value pairs */
+        bha = binary_hash_array_new(skip_list_count_entries(cf->memtable_sl));
+        if (bha == NULL)
+        {
+            free(sst);
+            (void)remove(sstable_path);
+            (void)skip_list_cursor_free(cursor);
+            return -1;
+        }
+    }
+
     /* we iterate over the memtable and write to the sstable */
     do
     {
@@ -4447,8 +4574,6 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
             return -1;
         }
 
-        free(kv);
-
         /* we create a new block */
         block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_kv);
         if (block == NULL)
@@ -4457,19 +4582,31 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
             free(serialized_kv);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
+            free(kv);
             return -1;
         }
 
+        long offset = -1; /* blocks offset in the sstable */
+
         /* we write the block to the sstable */
-        if (block_manager_block_write(sst->block_manager, block) == -1)
+        if (((offset = block_manager_block_write(sst->block_manager, block))) && offset == -1)
         {
             (void)block_manager_block_free(block);
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            free(kv);
             (void)skip_list_cursor_free(cursor);
             return -1;
         }
+
+        if (TDB_BLOCK_INDICES == 1)
+        {
+            /* we add the block index */
+            binary_hash_array_add(bha, kv->key, kv->key_size, offset);
+        }
+
+        free(kv);
 
         /* we free the resources */
         (void)block_manager_block_free(block);
@@ -4481,6 +4618,48 @@ int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf)
     (void)skip_list_cursor_free(cursor);
 
     cursor = NULL;
+
+    /* if block indices enabled we write to end of sstable */
+    if (TDB_BLOCK_INDICES == 1)
+    {
+        /* we serialize the block indices */
+        size_t serialized_size;
+        uint8_t *serialized_bha = binary_hash_array_serialize(bha, &serialized_size);
+        if (serialized_bha == NULL)
+        {
+            binary_hash_array_free(bha);
+            free(sst);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we create a new block */
+        block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_bha);
+        if (block == NULL)
+        {
+            binary_hash_array_free(bha);
+            free(sst);
+            free(serialized_bha);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we write the block to the sstable */
+        if (block_manager_block_write(sst->block_manager, block) == -1)
+        {
+            (void)block_manager_block_free(block);
+            binary_hash_array_free(bha);
+            free(sst);
+            free(serialized_bha);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we free the resources */
+        (void)block_manager_block_free(block);
+        binary_hash_array_free(bha);
+        free(serialized_bha);
+    }
 
     /* we add the sstable to the column family */
     if (cf->sstables == NULL)
@@ -4671,6 +4850,15 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
         return -1;
     }
 
+    /* placeholder for block indices */
+    binary_hash_array_t *bha = NULL;
+
+    if (TDB_BLOCK_INDICES)
+    {
+        /* we create a new binary hash array */
+        bha = binary_hash_array_new(cf->memtable_ht->count);
+    }
+
     /* we iterate over the memtable and write to the sstable */
     do
     {
@@ -4708,8 +4896,6 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
             return -1;
         }
 
-        free(kv);
-
         /* we create a new block */
         block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_kv);
         if (block == NULL)
@@ -4717,20 +4903,27 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
+            free(kv);
             (void)hash_table_cursor_free(cursor);
             return -1;
         }
 
+        long offset = block_manager_block_write(sst->block_manager, block);
         /* we write the block to the sstable */
-        if (block_manager_block_write(sst->block_manager, block) == -1)
+        if (offset == -1)
         {
             (void)block_manager_block_free(block);
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
             (void)hash_table_cursor_free(cursor);
+            free(kv);
             return -1;
         }
+
+        if (TDB_BLOCK_INDICES) (void)binary_hash_array_add(bha, kv->key, kv->key_size, offset);
+
+        free(kv);
 
         /* we free the resources */
         (void)block_manager_block_free(block);
@@ -4742,6 +4935,45 @@ int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t 
     (void)hash_table_cursor_free(cursor);
 
     cursor = NULL;
+
+    /* write block indices to end of sstable if enabled */
+    if (TDB_BLOCK_INDICES)
+    {
+        /* we serialize the binary hash array */
+        size_t serialized_size;
+        uint8_t *serialized_bha = binary_hash_array_serialize(bha, &serialized_size);
+        if (serialized_bha == NULL)
+        {
+            free(sst);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we create a new block */
+        block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_bha);
+        if (block == NULL)
+        {
+            free(sst);
+            free(serialized_bha);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we write the block to the sstable */
+        if (block_manager_block_write(sst->block_manager, block) == -1)
+        {
+            (void)block_manager_block_free(block);
+            free(sst);
+            free(serialized_bha);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we free the resources */
+        (void)block_manager_block_free(block);
+        free(serialized_bha);
+        binary_hash_array_free(bha);
+    }
 
     /* we add the sstable to the column family */
     if (cf->sstables == NULL)
@@ -4829,6 +5061,15 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
         return -1;
     }
 
+    /* placeholder for block indices */
+    binary_hash_array_t *bha = NULL;
+
+    if (TDB_BLOCK_INDICES)
+    {
+        /* we create a new binary hash array */
+        bha = binary_hash_array_new(cf->memtable_ht->count);
+    }
+
     /* we iterate over the memtable and write to the sstable */
     do
     {
@@ -4903,8 +5144,6 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
             return -1;
         }
 
-        (void)_tidesdb_free_key_value_pair(kv);
-
         /* we create a new block */
         block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_kv);
         if (block == NULL)
@@ -4913,19 +5152,26 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
             free(serialized_kv);
             (void)remove(sstable_path);
             (void)hash_table_cursor_free(cursor);
+            (void)_tidesdb_free_key_value_pair(kv);
             return -1;
         }
 
+        long offset = block_manager_block_write(sst->block_manager, block);
         /* we write the block to the sstable */
-        if (block_manager_block_write(sst->block_manager, block) == -1)
+        if (offset == -1)
         {
             (void)block_manager_block_free(block);
             free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
             (void)hash_table_cursor_free(cursor);
+            (void)_tidesdb_free_key_value_pair(kv);
             return -1;
         }
+
+        if (TDB_BLOCK_INDICES) (void)binary_hash_array_add(bha, kv->key, kv->key_size, offset);
+
+        (void)_tidesdb_free_key_value_pair(kv);
 
         /* we free the resources */
         (void)block_manager_block_free(block);
@@ -4935,6 +5181,45 @@ int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf)
 
     /* we free the cursor */
     (void)hash_table_cursor_free(cursor);
+
+    /* write block indices to end of sstable if enabled */
+    if (TDB_BLOCK_INDICES)
+    {
+        /* we serialize the binary hash array */
+        size_t serialized_size;
+        uint8_t *serialized_bha = binary_hash_array_serialize(bha, &serialized_size);
+        if (serialized_bha == NULL)
+        {
+            free(sst);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we create a new block */
+        block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_bha);
+        if (block == NULL)
+        {
+            free(sst);
+            free(serialized_bha);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we write the block to the sstable */
+        if (block_manager_block_write(sst->block_manager, block) == -1)
+        {
+            (void)block_manager_block_free(block);
+            free(sst);
+            free(serialized_bha);
+            (void)remove(sstable_path);
+            return -1;
+        }
+
+        /* we free the resources */
+        (void)block_manager_block_free(block);
+        free(serialized_bha);
+        binary_hash_array_free(bha);
+    }
 
     /* we add the sstable to the column family */
     if (cf->sstables == NULL)
@@ -5142,7 +5427,7 @@ void *_tidesdb_partial_merge_thread(void *arg)
                 continue;
             }
 
-            /* Check if SSTables are still valid */
+            /* check if SSTables are still valid */
             if (cf->sstables[sst_idx] == NULL || cf->sstables[sst_idx + 1] == NULL)
             {
                 (void)pthread_rwlock_unlock(&cf->rwlock);
@@ -5254,12 +5539,27 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
     block_manager_block_t *block1 = NULL;
     block_manager_block_t *block2 = NULL;
 
+    binary_hash_array_t *bha = NULL; /* in case configured */
+
     /* initialize cursors for both input block managers */
     if (block_manager_cursor_init(&cursor1, bm1) != 0) return -1;
     if (block_manager_cursor_init(&cursor2, bm2) != 0)
     {
         (void)block_manager_cursor_free(cursor1);
         return -1;
+    }
+
+    if (TDB_BLOCK_INDICES)
+    {
+        int block_count1 = block_manager_count_blocks(bm1);
+        int block_count2 = block_manager_count_blocks(bm2);
+        bha = binary_hash_array_new(block_count1 + block_count2);
+        if (bha == NULL)
+        {
+            (void)block_manager_cursor_free(cursor1);
+            (void)block_manager_cursor_free(cursor2);
+            return -1;
+        }
     }
 
     if (cf->config.bloom_filter)
@@ -5283,11 +5583,20 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                 !_tidesdb_is_expired(kv2->ttl))
             {
-                if (block_manager_block_write(bm_out, block2) != 0)
+                int64_t offset = block_manager_block_write(bm_out, block2);
+                if (offset != 0)
                 {
                     (void)block_manager_block_free(block2);
+                    if (TDB_BLOCK_INDICES)
+                    {
+                        binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
+                    }
                     (void)_tidesdb_free_key_value_pair(kv2);
                     break;
+                }
+                if (TDB_BLOCK_INDICES)
+                {
+                    binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
                 }
             }
             else
@@ -5306,11 +5615,20 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             if (!_tidesdb_is_tombstone(kv1->value, kv1->value_size) &&
                 !_tidesdb_is_expired(kv1->ttl))
             {
-                if (block_manager_block_write(bm_out, block1) != 0)
+                int64_t offset = block_manager_block_write(bm_out, block1);
+                if (offset != 0)
                 {
                     (void)block_manager_block_free(block1);
+                    if (TDB_BLOCK_INDICES)
+                    {
+                        binary_hash_array_add(bha, kv1->key, kv1->key_size, offset);
+                    }
                     (void)_tidesdb_free_key_value_pair(kv1);
                     break;
+                }
+                if (TDB_BLOCK_INDICES)
+                {
+                    binary_hash_array_add(bha, kv1->key, kv1->key_size, offset);
                 }
             }
             else
@@ -5336,13 +5654,22 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                     !_tidesdb_is_expired(kv2->ttl))
                 {
-                    if (block_manager_block_write(bm_out, block2) != 0)
+                    int64_t offset = block_manager_block_write(bm_out, block2);
+                    if (offset != 0)
                     {
+                        if (TDB_BLOCK_INDICES)
+                        {
+                            binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
+                        }
                         (void)block_manager_block_free(block2);
                         (void)_tidesdb_free_key_value_pair(kv1);
                         (void)_tidesdb_free_key_value_pair(kv2);
                         (void)block_manager_block_free(block1); /* free block1 before breaking */
                         break;
+                    }
+                    if (TDB_BLOCK_INDICES)
+                    {
+                        binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
                     }
                 }
                 (void)block_manager_block_free(block2);
@@ -5353,13 +5680,22 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 if (!_tidesdb_is_tombstone(block1->data, block1->size) &&
                     !_tidesdb_is_expired(kv1->ttl))
                 {
-                    if (block_manager_block_write(bm_out, block1) != 0)
+                    int64_t offset = block_manager_block_write(bm_out, block1);
+                    if (offset != 0)
                     {
+                        if (TDB_BLOCK_INDICES)
+                        {
+                            binary_hash_array_add(bha, kv1->key, kv1->key_size, offset);
+                        }
                         (void)block_manager_block_free(block1);
                         (void)_tidesdb_free_key_value_pair(kv1);
                         (void)_tidesdb_free_key_value_pair(kv2);
                         (void)block_manager_block_free(block2); /* free block2 before breaking */
                         break;
+                    }
+                    if (TDB_BLOCK_INDICES)
+                    {
+                        binary_hash_array_add(bha, kv1->key, kv1->key_size, offset);
                     }
                 }
                 (void)block_manager_block_free(block1);
@@ -5370,13 +5706,22 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                     !_tidesdb_is_expired(kv2->ttl))
                 {
-                    if (block_manager_block_write(bm_out, block2) != 0)
+                    int64_t offset = block_manager_block_write(bm_out, block2);
+                    if (offset != 0)
                     {
+                        if (TDB_BLOCK_INDICES)
+                        {
+                            binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
+                        }
                         (void)block_manager_block_free(block2);
                         (void)_tidesdb_free_key_value_pair(kv1);
                         (void)_tidesdb_free_key_value_pair(kv2);
                         (void)block_manager_block_free(block1); /* free block1 before breaking */
                         break;
+                    }
+                    if (TDB_BLOCK_INDICES)
+                    {
+                        binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
                     }
                 }
                 (void)block_manager_block_free(block2);
@@ -5396,11 +5741,20 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             block1->data, block1->size, cf->config.compressed, cf->config.compress_algo);
         if (!_tidesdb_is_tombstone(kv1->value, kv1->value_size) && !_tidesdb_is_expired(kv1->ttl))
         {
-            if (block_manager_block_write(bm_out, block1) != 0)
+            int64_t offset = block_manager_block_write(bm_out, block1);
+            if (offset != 0)
             {
+                if (TDB_BLOCK_INDICES)
+                {
+                    binary_hash_array_add(bha, kv1->key, kv1->key_size, offset);
+                }
                 (void)block_manager_block_free(block1);
                 (void)_tidesdb_free_key_value_pair(kv1);
                 break;
+            }
+            if (TDB_BLOCK_INDICES)
+            {
+                binary_hash_array_add(bha, kv1->key, kv1->key_size, offset);
             }
         }
         else
@@ -5411,6 +5765,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         (void)block_manager_block_free(block1);
     }
 
+    /* write remaining blocks from bm2 */
     while ((block2 = block_manager_cursor_read(cursor2)))
     {
         if (block2 == NULL) break;
@@ -5418,11 +5773,20 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             block2->data, block2->size, cf->config.compressed, cf->config.compress_algo);
         if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) && !_tidesdb_is_expired(kv2->ttl))
         {
-            if (block_manager_block_write(bm_out, block2) != 0)
+            int64_t offset = block_manager_block_write(bm_out, block2);
+            if (offset != 0)
             {
+                if (TDB_BLOCK_INDICES)
+                {
+                    binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
+                }
                 (void)block_manager_block_free(block2);
                 (void)_tidesdb_free_key_value_pair(kv2);
                 break;
+            }
+            if (TDB_BLOCK_INDICES)
+            {
+                binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
             }
         }
         else
@@ -5436,6 +5800,38 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
     /* free input bm cursors */
     (void)block_manager_cursor_free(cursor1);
     (void)block_manager_cursor_free(cursor2);
+
+    if (TDB_BLOCK_INDICES)
+    {
+        /* write the binary hash array to the output block manager */
+        size_t bha_size;
+        uint8_t *bha_data = binary_hash_array_serialize(bha, &bha_size);
+        if (bha_data == NULL)
+        {
+            binary_hash_array_free(bha);
+            return -1;
+        }
+
+        block_manager_block_t *bha_block = block_manager_block_create(bha_size, bha_data);
+        if (bha_block == NULL)
+        {
+            free(bha_data);
+            binary_hash_array_free(bha);
+            return -1;
+        }
+
+        free(bha_data);
+
+        if (block_manager_block_write(bm_out, bha_block) == -1)
+        {
+            (void)block_manager_block_free(bha_block);
+            binary_hash_array_free(bha);
+            return -1;
+        }
+
+        (void)block_manager_block_free(bha_block);
+        binary_hash_array_free(bha);
+    }
 
     return 0;
 }

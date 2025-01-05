@@ -222,6 +222,15 @@ int block_manager_cursor_has_prev(block_manager_cursor_t *cursor);
 int block_manager_cursor_goto_last(block_manager_cursor_t *cursor);
 
 /**
+ * block_manager_cursor_goto
+ * moves the cursor to a specific block
+ * @param cursor the cursor to move
+ * @param pos the position to move the cursor to
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_goto(block_manager_cursor_t *cursor, uint64_t pos);
+
+/**
  * block_manager_cursor_goto_first
  * moves the cursor to the first block
  * @param cursor the cursor to move

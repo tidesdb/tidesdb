@@ -1793,6 +1793,23 @@ int main(void)
     test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
 
+    /* using hash table memtable */
+    test_tidesdb_put_get_memtable(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_put_close_replay_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_txn_put_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_txn_put_get_rollback_get(false, TDB_NO_COMPRESSION, false,
+                                          TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_txn_put_put_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_put_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_cursor(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_cursor_memtable_sstables(false, TDB_NO_COMPRESSION, false,
+                                          TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_put_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_put_flush_close_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_put_flush_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+    test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
     /* the next batch of tests we will run with bloom filters and compression
      * same tests just with bloom filters and compression enabled */
     test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_SNAPPY);

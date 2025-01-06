@@ -148,6 +148,15 @@ int fsync(int fd)
     return FlushFileBuffers(h) ? 0 : -1;
 }
 
+#elif defined (__APPLE__)
+#include <dirent.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <unistd.h>
+
 #else /* posix systems */
 #include <dirent.h>
 #include <pthread.h>

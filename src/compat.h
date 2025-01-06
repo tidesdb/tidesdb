@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -33,6 +34,10 @@
 #pragma warning(disable : 4996) /* disable deprecated warning for Windows */
 
 #include "pthread.h" /* pthreads-win32 library (https://github.com/tidesdb/tidesdb/issues/241) */
+
+#define truncate                                                                                                                                            \
+    _chsize /* https://github.com/tidesdb/tidesdb/issues/241#:~:text=back%20and%20added%3A-,%23define%20truncate%20%20%20%20%20%20%20_chsize,-to%20compat.h \
+             */
 
 /* Access flags are normally defined in unistd.h, which unavailable under
  * Windows. Instead, define the flags as documented at

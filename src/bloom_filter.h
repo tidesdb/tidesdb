@@ -19,9 +19,9 @@
 #ifndef __BLOOM_FILTER_H__
 #define __BLOOM_FILTER_H__
 #include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
 #include <tgmath.h>
+
+#include "compat.h"
 
 /**
  * bloom_filter_t

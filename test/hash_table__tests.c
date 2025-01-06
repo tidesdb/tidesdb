@@ -18,9 +18,6 @@
  */
 
 #include <assert.h>
-#include <stdio.h>
-#include <string.h>
-#include <time.h>
 
 #include "../src/hash_table.h"
 #include "test_macros.h"

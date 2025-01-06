@@ -62,6 +62,13 @@ typedef struct
     struct dirent dirent;
 } DIR;
 
+/* https://github.com/tidesdb/tidesdb/issues/241#:~:text=if%20(mkdir(directory)%20%3D%3D%20%2D1)%20//%20%2C%200777%20and%20if%20(mkdir(cf_path)%20%3D%3D%20%2D1)%20//%20%2C%200777%20i%20get%20the%20following%3A
+ */
+external int mkdir(const char *path, mode_t mode)
+{
+    return _mkdir(path);
+}
+
 DIR *opendir(const char *name)
 {
     DIR *dir = malloc(sizeof(DIR));

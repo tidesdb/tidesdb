@@ -24,7 +24,7 @@
 #include "binary_hash_array.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
-#include "compat.h"
+/* we include compat.h in above headers already */
 #include "compress.h"
 #include "err.h"
 #include "hash_table.h"

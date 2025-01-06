@@ -1,3 +1,5 @@
+[![Linux Build Status](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml/badge.svg)](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml)
+
 <div>
     <h1 align="left"><img width="128" src="artwork/tidesdb-logo-v0.1.png"></h1>
 </div>

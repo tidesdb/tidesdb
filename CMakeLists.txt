@@ -28,6 +28,7 @@ endif()
 add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c src/binary_hash_array.c src/log.c external/xxhash.c)
 
 target_include_directories(tidesdb PRIVATE src)
+target_include_directories(tidesdb PRIVATE external)
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
         # for apple silicon macs, homebrew installs packages in /opt/homebrew
         target_include_directories(tidesdb PUBLIC /opt/homebrew/include)
@@ -64,7 +65,7 @@ install(TARGETS tidesdb
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
 
-install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/hash_table.h src/compress.h src/bloom_filter.h src/compat.h src/log.h src/binary_hash_array.h DESTINATION include)
+install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/hash_table.h src/compress.h src/bloom_filter.h src/compat.h src/log.h src/binary_hash_array.h external/xxhash.h DESTINATION include)
 
 if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         enable_testing()
@@ -83,6 +84,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         # add include and link directories for test executables
         foreach(test_target err_tests block_manager_tests skip_list_tests hash_table_tests compress_tests bloom_filter_tests log_tests binary_hash_array_tests tidesdb_tests tidesdb_bench)
                 target_link_libraries(${test_target} PRIVATE tidesdb)
+                target_include_directories(${test_target} PRIVATE external)
         endforeach()
 
         add_test(NAME err_tests COMMAND err_tests)

@@ -5515,6 +5515,23 @@ size_t _tidesdb_get_available_mem()
     }
 
     return 0;
+#elif defined(__APPLE__)
+    mach_port_t host_port = mach_host_self();
+    vm_size_t page_size;
+    kern_return_t kr;
+    kr = host_page_size(host_port, &page_size);
+    if (kr != KERN_SUCCESS) 
+    {
+        return 0;
+    }
+    vm_statistics64_data_t vm_stat;
+    mach_msg_type_number_t host_size = sizeof(vm_statistics64_data_t) / sizeof(integer_t);
+    kr = host_statistics64(host_port, HOST_VM_INFO64, (host_info_t)&vm_stat, &host_size);
+    if (kr != KERN_SUCCESS) 
+    {
+        return 0;
+    }
+    return (vm_stat.free_count + vm_stat.inactive_count) * page_size;
 #else
     struct sysinfo info;
     if (sysinfo(&info) == 0)

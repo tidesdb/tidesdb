@@ -131,6 +131,217 @@ tidesdb_err_t* tidesdb_err_from_code(TIDESDB_ERR_CODE code, ...)
             snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
             break;
         }
+        case TIDESDB_ERR_FAILED_TO_OPEN_DIRECTORY:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_OPEN_WAL:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_ADD_COLUMN_FAMILY:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_COLUMN_FAMILY_WAL_REPLAY:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_CLOSE_DIRECTORY:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_OPEN_SSTABLE:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_INIT_WAL_CURSOR:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_OPEN_BLOCK_MANAGER:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_OPEN_BLOCK_MANAGER_FOR_FLUSH:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_INIT_CURSOR_FOR_FLUSH:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_CREATE_SORTED_BINARY_HASH_ARR:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_SERIALIZE_KEY_VALUE_PAIR:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_CREATE_BLOCK_ON_FLUSH:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_WRITE_BLOCK_ON_FLUSH:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOCK_INDICES:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_CREATE_BLOCK_FOR_INDICES:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_WRITE_BLOCK_FOR_INDICES:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_CLEAR_MEMTABLE:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_TRUNCATE_WAL:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_MERGE_SSTABLES:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+
+        case TIDESDB_ERR_FAILED_TO_REMOVE_SSTABLES_ON_COMPACTION:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_GET_MERGED_SSTABLE_PATH:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_CLOSE_RENAME_MERGED_SSTABLE:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_OPEN_BLOCK_MANAGER_FOR_MERGED_SSTABLE:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK_FOR_MERGE:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_OPEN_BLOCK_MANAGER_FOR_MERGE:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_MERGE_SORT_BLOCK_WRITE_FAILED:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_MERGE_SORT_BLOCK_CREATE_FAILED:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_MERGE_SORT_BHA_SERIALIZE_FAILED:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_INVALID_BLOCK_MANAGER:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_WRITE_BLOOM_BLOCK_ON_FLUSH:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOOM:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_CREATE_BLOOM:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_CREATE_BLOOM_FILTER:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
+        case TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOOM_FILTER:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
         default:
             snprintf(buffer, sizeof(buffer), "%s", tidesdb_err_messages[code].message);
     }

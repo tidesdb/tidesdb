@@ -114,6 +114,38 @@ extern "C"
     } tidesdb_memtable_ds_t;
 
     /*
+     * tidesdb_debug_log_t
+     * debug log type enum
+     * used for debug logs in TidesDB, mainly to reuse logs
+     */
+    typedef enum
+    {
+        TIDESDB_DEBUG_INIT_NEW_DATABASE,
+        TIDESDB_DEBUG_BLOCK_INDICES_ENABLED,
+        TIDESDB_DEBUG_REOPEN_DATABASE,
+        TIDESDB_DEBUG_AVAIL_MEMORY,
+        TIDESDB_DEBUG_OPENED_SUCCESS,
+        TIDESDB_DEBUG_COLUMN_FAMILY_SETTING_UP,
+        TIDESDB_DEBUG_COLUMN_FAMILY_USING_DATA_STRUCTURE,
+        TIDESDB_DEBUG_OPENED_WAL,
+        TIDESDB_DEBUG_LOADED_COLUMN_FAMILY_SSTABLES,
+        TIDESDB_DEBUG_REPLAYED_COLUMN_FAMILY_WAL,
+        TIDESDB_DEBUG_CLOSING_DATABASE,
+        TIDESDB_DEBUG_NEW_COLUMN_FAMILY,
+        TIDESDB_DEBUG_DROP_COLUMN_FAMILY,
+        TIDESDB_DEBUG_FLUSHING_COLUMN_FAMILY,
+        TIDESDB_DEBUG_WAL_TRUNCATED,
+        TIDESDB_DEBUG_FLUSHED_MEMTABLE,
+        TIDESDB_DEBUG_COMPACTING_SSTABLES,
+        TIDESDB_DEBUG_COMPACTED_SSTABLES,
+        TIDESDB_DEBUG_MERGING_PAIR_SSTABLES,
+        TIDESDB_DEBUG_MERGED_PAIR_SSTABLES,
+        TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_AWOKE,
+        TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_STARTED,
+        TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_LIMIT_CONTINUE,
+    } tidesdb_debug_log_t;
+
+    /*
      * tidesdb_column_family_config_t
      * struct for a column family configuration
      * used for column family configuration in TidesDB
@@ -941,6 +973,14 @@ extern "C"
      */
     int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block_manager_t *bm2,
                             block_manager_t *bm_out);
+
+    /*
+     * _tidesdb_get_debug_log_format
+     * get the format for a debug log message
+     * @param log_type the type of log message
+     * @return the format for the log message
+     */
+    char *_tidesdb_get_debug_log_format(tidesdb_debug_log_t log_type);
 
 #ifdef __cplusplus
 }

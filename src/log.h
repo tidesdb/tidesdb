@@ -56,7 +56,7 @@ int log_init(log_t **log, const char *filename, int truncate_at);
  * @param format the format of the message
  * @return 0 on success, -1 on failure
  */
-int log_write(log_t *log, const char *format, ...);
+int log_write(log_t *log, char *format, ...);
 
 /*
  * log_count_lines
@@ -73,5 +73,20 @@ int log_count_lines(log_t *log);
  * @return 0 on success, -1 on failure
  */
 int log_close(log_t *log);
+
+/*
+ * _if_end_with_newline
+ * check if a string ends with a newline character
+ * @param str the string to check
+ * @return 1 if the string ends with a newline character, 0 otherwise
+ */
+int _if_end_with_newline(char *str);
+
+/*
+ * remove_lf_from_end
+ * remove suffixed newline character
+ * @param str the string to remove the newline character from end
+ */
+void _remove_newline_from_end(char *str);
 
 #endif /* __LOG_H__ */

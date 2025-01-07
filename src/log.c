@@ -107,7 +107,7 @@ int log_init(log_t **log, const char *filename, int truncate_at)
     return 0;
 }
 
-int log_write(log_t *log, const char *format, ...)
+int log_write(log_t *log, char *format, ...)
 {
     if (!log) return -1; /* we check if the log is set */
 
@@ -116,6 +116,12 @@ int log_write(log_t *log, const char *format, ...)
 
     /* we lock the log */
     (void)pthread_mutex_lock(&log->lock);
+
+    /* we trim the newline from the end of the format */
+    if (_if_end_with_newline(format))
+    {
+        (void)_remove_newline_from_end(format);
+    }
 
     /* we get the current time */
     time_t now = time(NULL);
@@ -172,4 +178,23 @@ int log_close(log_t *log)
     log = NULL;
 
     return 0;
+}
+
+int _if_end_with_newline(char *str)
+{
+    size_t length = strlen(str);
+    if (length > 0 && str[length - 1] == '\n')
+    {
+        return 1;
+    }
+    return 0;
+}
+
+void _remove_newline_from_end(char *str)
+{
+    size_t length = strlen(str);
+    if (length > 0 && str[length - 1] == '\n')
+    {
+        str[length - 1] = '\0'; /* rep with null */
+    }
 }

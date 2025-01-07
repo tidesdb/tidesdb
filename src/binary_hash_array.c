@@ -20,6 +20,21 @@
 
 int binary_hash_array_compare(const void *a, const void *b)
 {
+    /* check if either a or b are NULL */
+    if (!a)
+    {
+        if (!b)
+        {
+            return 0; /* both are NULL */
+        }
+        return -1; /* a is NULL */
+    }
+
+    if (!b)
+    {
+        return 1; /* b is NULL */
+    }
+
     binary_hash_array_entry_t *ae = (binary_hash_array_entry_t *)a;
     binary_hash_array_entry_t *be = (binary_hash_array_entry_t *)b;
 
@@ -127,6 +142,7 @@ void binary_hash_array_free(binary_hash_array_t *bha)
 {
     free(bha->entries);
     free(bha);
+    bha = NULL;
 }
 
 int64_t binary_hash_array_contains(binary_hash_array_t *bha, uint8_t *key, size_t key_len)

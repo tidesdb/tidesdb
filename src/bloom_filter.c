@@ -130,6 +130,11 @@ uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
     /* calculate the size of the serialized data */
     *out_size = sizeof(int32_t) * 2 + bf->m * sizeof(int8_t);
     uint8_t *buffer = malloc(*out_size);
+    if (buffer == NULL)
+    {
+        return NULL;
+    }
+
     uint8_t *ptr = buffer;
 
     /* write the size of the bitset (m) */
@@ -162,9 +167,20 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
 
     /* read the bitset */
     int8_t *bitset = malloc(m * sizeof(int8_t));
+    if (bitset == NULL)
+    {
+        return NULL;
+    }
+
     memcpy(bitset, ptr, m * sizeof(int8_t));
 
     bloom_filter_t *bf = malloc(sizeof(bloom_filter_t));
+    if (bf == NULL)
+    {
+        free(bitset);
+        return NULL;
+    }
+
     bf->m = m;
     bf->h = h;
     bf->bitset = bitset;

@@ -23,6 +23,13 @@
 #include <string.h>
 #include <xxhash.h>
 
+/* sorted* binary hash array
+ * on serialization, the entries are sorted by hashed key.
+ *
+ * Entries are fixed at 16 bytes for the key and 8 bytes for the value for a total of 24 bytes per
+ * entry
+ */
+
 /**
  * binary_hash_array_entry_t
  * binary hash array entry struct
@@ -98,7 +105,7 @@ void binary_hash_array_free(binary_hash_array_t *bha);
  * compares two entries
  * @param a the first entry
  * @param b the second entry
- * @return the comparison
+ * @return the comparison 1 or 0 can be -1 on error
  */
 int binary_hash_array_compare(const void *a, const void *b);
 

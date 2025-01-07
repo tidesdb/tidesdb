@@ -207,6 +207,11 @@ int hash_table_get(hash_table_t *ht, const uint8_t *key, size_t key_size, uint8_
                 ht->total_size -= bucket->value_size;
                 free(bucket->value);
                 bucket->value = malloc(4);
+                if (bucket->value == NULL)
+                {
+                    return -1; /* malloc failed */
+                }
+
                 *(uint32_t *)bucket->value = TOMBSTONE;
                 bucket->value_size = 4;
                 ht->total_size += 4;

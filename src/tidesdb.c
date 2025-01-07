@@ -1145,7 +1145,8 @@ int _tidesdb_replay_from_wal(tidesdb_column_family_t *cf)
     /* initialize the cursor */
     if (block_manager_cursor_init(&cursor, cf->wal->block_manager) == -1)
     {
-        (void)log_write("Failed to initiate WAL cursor for column family %s", cf->config.name);
+        (void)log_write(cf->tdb->log, "Failed to initiate WAL cursor for column family %s",
+                        cf->config.name);
         return -1;
     }
 

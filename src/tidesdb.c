@@ -20,7 +20,7 @@
 
 const char *_tidesdb_get_path_seperator()
 {
-/* windows and unix path separator differences */
+/* windows and unix (posix) path separator differences */
 #ifdef _WIN32
     return "\\";
 #else
@@ -535,13 +535,18 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
         (void)snprintf(log_path, sizeof(log_path), "%s%s%s", directory,
                        _tidesdb_get_path_seperator(), TDB_LOG_EXT);
 
-        /* we setup the log file */
+        /* we set up the log file */
         if (log_init(&(*tdb)->log, log_path, TDB_DEBUG_LOG_TRUNCATE_AT) == -1)
         {
             free((*tdb)->directory);
             free(*tdb);
             return tidesdb_err_from_code(TIDESDB_ERR_LOG_INIT_FAILED);
         }
+    }
+
+    if (TDB_BLOCK_INDICES == 1)
+    {
+        (void)log_write((*tdb)->log, "Block indices enabled");
     }
 
     if (new_instance)
@@ -723,6 +728,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 /* we add the column family to tidesdb arr */
                 if (_tidesdb_add_column_family(tdb, cf) == -1)
                 {
+                    (void)log_write(tdb->log, "Failed to add column family %s", cf->config.name);
                     (void)_tidesdb_close_wal(cf->wal);
                     free(cf->path);
                     free(cf);
@@ -735,22 +741,34 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
 
                 (void)log_write(tdb->log, "Loaded SSTables for column family %s", cf->config.name);
 
-                /* we sort sstables if any */
+                /* we sort sstables if any, don't worry about the return here */
                 (void)_tidesdb_sort_sstables(cf);
 
                 /* now we replay from the wal and populate column family memtable */
-                (void)_tidesdb_replay_from_wal(cf);
-
-                (void)log_write(tdb->log, "Replayed WAL for column family %s", cf->config.name);
+                if (_tidesdb_replay_from_wal(cf) == -1)
+                {
+                    (void)log_write(tdb->log, "Failed to replay WAL for column family %s",
+                                    cf->config.name);
+                }
+                else
+                {
+                    (void)log_write(tdb->log, "Replayed WAL for column family %s", cf->config.name);
+                }
             }
         }
 
         /* we free up resources */
-        (void)closedir(cf_dir);
+        if (closedir(cf_dir) == -1)
+        {
+            (void)log_write(tdb->log, "Failed to close column family directory %s", cf_path);
+        }
     }
 
     /* we free up resources */
-    (void)closedir(tdb_dir);
+    if (closedir(tdb_dir) == -1)
+    {
+        (void)log_write(tdb->log, "Failed to close db directory %s", tdb->directory);
+    }
 
     return 0;
 }
@@ -891,14 +909,23 @@ void _tidesdb_close_wal(tidesdb_wal_t *wal)
 int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
 {
     /* we check if cf is NULL */
-    if (cf == NULL) return -1;
+    if (cf == NULL)
+    {
+        (void)log_write(cf->tdb->log, "Column family is NULL");
+        return -1;
+    }
 
-    if (cf->path == NULL) return -1;
+    if (cf->path == NULL)
+    {
+        (void)log_write(cf->tdb->log, "Column family path is NULL");
+        return -1;
+    }
 
     /* we open the column family directory */
     DIR *cf_dir = opendir(cf->path);
     if (cf_dir == NULL)
     { /* we check if the directory was opened */
+        (void)log_write(cf->tdb->log, "Failed to open column family directory %s", cf->path);
         return -1;
     }
 
@@ -923,6 +950,7 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
 
         if (block_manager_open(&sstable_block_manager, sstable_path, TDB_SYNC_INTERVAL) == -1)
         {
+            (void)log_write(cf->tdb->log, "Failed to open SSTable %s", sstable_path);
             /* free up resources */
             (void)closedir(cf_dir);
 
@@ -931,7 +959,11 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
 
         /* we create/alloc the sstable struct */
         tidesdb_sstable_t *sst = malloc(sizeof(tidesdb_sstable_t));
-        if (sst == NULL) return -1;
+        if (sst == NULL)
+        {
+            (void)log_write(cf->tdb->log, "Failed to allocate memory for SSTable %s", sstable_path);
+            return -1;
+        }
 
         /* we set the block manager */
         sst->block_manager = sstable_block_manager;
@@ -942,7 +974,10 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
             cf->sstables = malloc(sizeof(tidesdb_sstable_t));
             if (cf->sstables == NULL)
             {
-                free(sst);
+                (void)_tidesdb_free_sstable(sst);
+                (void)closedir(cf_dir);
+                (void)log_write(cf->tdb->log, "Failed to allocate memory for SSTable %s",
+                                sstable_path);
                 return -1;
             }
         }
@@ -951,7 +986,14 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
             /* we add the sstable to the column family */
             tidesdb_sstable_t **temp_sstables =
                 realloc(cf->sstables, sizeof(tidesdb_sstable_t) * (cf->num_sstables + 1));
-            if (temp_sstables == NULL) return -1;
+            if (temp_sstables == NULL)
+            {
+                (void)_tidesdb_free_sstable(sst);
+                (void)closedir(cf_dir);
+                (void)log_write(cf->tdb->log, "Failed to allocate memory for SSTable %s",
+                                sstable_path);
+                return -1;
+            }
 
             cf->sstables = temp_sstables;
         }
@@ -962,13 +1004,21 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
         cf->num_sstables++;
 
         /* we free up resources */
-        (void)closedir(cf_dir);
+        if (closedir(cf_dir) == -1)
+        {
+            (void)log_write(cf->tdb->log, "Failed to close column family directory %s", cf->path);
+            return -1;
+        }
 
         return 0;
     }
 
     /* we free up resources */
-    (void)closedir(cf_dir);
+    if (closedir(cf_dir) == -1)
+    {
+        (void)log_write(cf->tdb->log, "Failed to close column family directory %s", cf->path);
+        return -1;
+    }
 
     /* we return -1 if no sstables were found */
     return -1;
@@ -5520,14 +5570,14 @@ size_t _tidesdb_get_available_mem()
     vm_size_t page_size;
     kern_return_t kr;
     kr = host_page_size(host_port, &page_size);
-    if (kr != KERN_SUCCESS) 
+    if (kr != KERN_SUCCESS)
     {
         return 0;
     }
     vm_statistics64_data_t vm_stat;
     mach_msg_type_number_t host_size = sizeof(vm_statistics64_data_t) / sizeof(integer_t);
     kr = host_statistics64(host_port, HOST_VM_INFO64, (host_info_t)&vm_stat, &host_size);
-    if (kr != KERN_SUCCESS) 
+    if (kr != KERN_SUCCESS)
     {
         return 0;
     }

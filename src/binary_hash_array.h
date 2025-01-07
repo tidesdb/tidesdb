@@ -21,7 +21,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include <xxhash.h>
 
 /**
@@ -130,4 +129,3 @@ binary_hash_array_t *binary_hash_array_deserialize(const uint8_t *data);
 void binary_hash_array_resize(binary_hash_array_t *bha, size_t new_capacity);
 
 #endif /* __BINARY_HASH_ARRAY_H__ */
-

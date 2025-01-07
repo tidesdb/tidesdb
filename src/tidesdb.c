@@ -2909,7 +2909,7 @@ void *_tidesdb_compact_sstables_thread(void *arg)
     int end = args->end;
 
     (void)log_write(cf->tdb->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_COMPACTING_SSTABLES),
-                    start, end);
+                    start, end, cf->config.name);
 
     tidesdb_sstable_t *merged_sstable = NULL;
     if (!cf->config.bloom_filter)
@@ -3008,7 +3008,7 @@ void *_tidesdb_compact_sstables_thread(void *arg)
     (void)sem_post(args->sem); /* signal compaction thread is done */
 
     (void)log_write(cf->tdb->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_COMPACTED_SSTABLES),
-                    start, end);
+                    start, end, cf->config.name);
 
     free(args); /* free the args */
 

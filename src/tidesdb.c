@@ -566,6 +566,13 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
     (*tdb)->available_mem =
         (size_t)((double)(*tdb)->available_mem * TDB_AVAILABLE_MEMORY_THRESHOLD);
 
+    if ((*tdb)->available_mem == 0)
+    {
+        (void)log_write((*tdb)->log, "Failed to get available memory");
+        tidesdb_close(*tdb);
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SYSTEM_MEMORY);
+    }
+
     (void)log_write((*tdb)->log, "Available memory: %zu bytes", (*tdb)->available_mem);
 
     (void)log_write((*tdb)->log, "Opened TidesDB instance at %s", directory);

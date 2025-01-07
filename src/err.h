@@ -158,7 +158,7 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
     {TIDESDB_ERR_PUT_MEMORY_OVERFLOW,
      "Memory overflow while putting key-value pair.  Attempting to write data greater than "
      "available memory.\n"},
-     {TIDESDB_ERR_FAILED_TO_GET_SYSTEM_MEMORY, "Failed to get system memory.\n"},
+    {TIDESDB_ERR_FAILED_TO_GET_SYSTEM_MEMORY, "Failed to get system memory.\n"},
 };
 
 /*

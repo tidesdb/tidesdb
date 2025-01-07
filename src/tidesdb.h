@@ -643,14 +643,6 @@ int _tidesdb_open_wal(const char *cf_path, tidesdb_wal_t **w, bool compress,
 void _tidesdb_close_wal(tidesdb_wal_t *wal);
 
 /*
- * _tidesdb_truncate_wal
- * truncate a write-ahead log
- * @param wal the write-ahead log
- * @return 0 if the wal was truncated, -1 if not
- */
-int _tidesdb_truncate_wal(tidesdb_wal_t *wal);
-
-/*
  * _tidesdb_replay_from_wal
  * replay the write-ahead log and populate column family memtable
  * @param cf the column family
@@ -909,14 +901,15 @@ compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo);
 
 /*
  * _tidesdb_partial_merge_thread
- * a thread for pair merging column family sstables partially, incrementally
+ * a thread for pair merging column family sstables partially, and incrementally.  Merges are only
+ * trigger when a threshold of sstables are reached.
  * @param arg the arguments for the thread in this case a partial_merge_thread_args struct
  */
 void *_tidesdb_partial_merge_thread(void *arg);
 
 /*
  * _tidesdb_get_available_mem
- * get the available memory for the system
+ * get the available memory for the system, usually on start up.
  * @return the available memory
  */
 size_t _tidesdb_get_available_mem();
@@ -924,7 +917,8 @@ size_t _tidesdb_get_available_mem();
 /*
  * _tidesdb_merge_sort
  * merges 2 sstables into a new sstable using block managers.  A memory efficient approach to
- * merging ssts.
+ * merging ssts.  Method will also removed expired keys if ttl set and tombstones.  The second
+ * sstable block manager supercedes the first sstable block manager.
  * @param cf the column family
  * @param bm1 the block manager for the first sstable
  * @param bm2 the block manager for the second sstable

@@ -1145,6 +1145,7 @@ int _tidesdb_replay_from_wal(tidesdb_column_family_t *cf)
     /* initialize the cursor */
     if (block_manager_cursor_init(&cursor, cf->wal->block_manager) == -1)
     {
+        (void)log_write("Failed to initiate WAL cursor for column family %s", cf->config.name);
         return -1;
     }
 
@@ -5606,7 +5607,11 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                         block_manager_t *bm_out)
 {
     /* we check if the block managers are NULL */
-    if (bm1 == NULL || bm2 == NULL || bm_out == NULL) return -1;
+    if (bm1 == NULL || bm2 == NULL || bm_out == NULL)
+    {
+        (void)log_write(cf->tdb->log, "Failed merge sort as provded block managers are NULL");
+        return -1;
+    }
 
     /* initialize cursors for both input block managers */
     block_manager_cursor_t *cursor1 = NULL;
@@ -5617,9 +5622,17 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
     binary_hash_array_t *bha = NULL; /* in case configured */
 
     /* initialize cursors for both input block managers */
-    if (block_manager_cursor_init(&cursor1, bm1) != 0) return -1;
+    if (block_manager_cursor_init(&cursor1, bm1) != 0)
+    {
+        (void)log_write(cf->tdb->log,
+                        "Failed merge sort.  Failed to initialize cursor for block manager 1");
+        return -1;
+    }
+
     if (block_manager_cursor_init(&cursor2, bm2) != 0)
     {
+        (void)log_write(cf->tdb->log,
+                        "Failed merge sort.  Failed to initialize cursor for block manager 2");
         (void)block_manager_cursor_free(cursor1);
         return -1;
     }
@@ -5631,6 +5644,8 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         bha = binary_hash_array_new(block_count1 + block_count2);
         if (bha == NULL)
         {
+            (void)log_write(cf->tdb->log,
+                            "Failed merge sort.  Failed to initialize sorted binary hash array");
             (void)block_manager_cursor_free(cursor1);
             (void)block_manager_cursor_free(cursor2);
             return -1;
@@ -5883,6 +5898,8 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         uint8_t *bha_data = binary_hash_array_serialize(bha, &bha_size);
         if (bha_data == NULL)
         {
+            (void)log_write(cf->tdb->log,
+                            "Failed merge sort.  Failed to serialize sorted binary hash array");
             (void)binary_hash_array_free(bha);
             return -1;
         }
@@ -5890,6 +5907,9 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         block_manager_block_t *bha_block = block_manager_block_create(bha_size, bha_data);
         if (bha_block == NULL)
         {
+            (void)log_write(cf->tdb->log,
+                            "Failed merge sort.  Failed to create block for serialized sorted "
+                            "binary hash array");
             free(bha_data);
             (void)binary_hash_array_free(bha);
             return -1;
@@ -5899,6 +5919,9 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
 
         if (block_manager_block_write(bm_out, bha_block) == -1)
         {
+            (void)log_write(cf->tdb->log,
+                            "Failed merge sort.  Failed to write block for serialized sorted "
+                            "binary hash array");
             (void)block_manager_block_free(bha_block);
             (void)binary_hash_array_free(bha);
             return -1;

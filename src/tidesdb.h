@@ -19,6 +19,10 @@
 #ifndef __TIDESDB_H__
 #define __TIDESDB_H__
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdbool.h>
 
 #include "binary_hash_array.h"
@@ -928,4 +932,7 @@ size_t _tidesdb_get_available_mem();
 int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block_manager_t *bm2,
                         block_manager_t *bm_out);
 
+#ifdef __cplusplus
+}
+#endif
 #endif /* __TIDESDB_H__ */

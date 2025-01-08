@@ -31,6 +31,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Multiplatform** Linux, MacOS, and Windows support.
 - [x] **Logging** system logs debug messages to log file.  This can be disabled.  Log file is created in the database directory.
 - [x] **Block Indices** by default `TDB_BLOCK_INDICES` is set to 1.  This means TidesDB for each column family sstable there is a last block containing a sorted binary hash array.  This compact data structure gives us the ability to retrieve the specific offset for a key and seek to its containing key value pair block within an sstable without having to scan an entire sstable.  If `TDB_BLOCK_INDICES` is set to 0 then block indices aren't used nor created and reads are slower and consume more IO and CPU having to scan and compare.
+- [x] **Statistics** column family statistics, configs, information can be retrieved through public API.
 
 ## Building
 Using cmake to build the shared library.

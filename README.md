@@ -443,6 +443,52 @@ You pass
 tidesdb_err_t *e = tidesdb_start_background_partial_merge(tdb, "your_column_family", 10, 10); /* merge a pair every 10 seconds and if there are a minimum 10 sstables */
 ```
 
+### Column Family Statistics
+You can get statistics on a column family.
+#### Structs
+```c
+    typedef struct
+    {
+        tidesdb_column_family_config_t config;
+        char *cf_name;
+        int num_sstables;
+        size_t memtable_size;
+        size_t memtable_entries_count;
+        bool partial_merging;
+        tidesdb_column_family_sstable_stat_t **sstable_stats;
+    } tidesdb_column_family_stat_t;
+
+    typedef struct
+    {
+        char *sstable_path;
+        size_t size;
+        size_t num_blocks;
+    } tidesdb_column_family_sstable_stat_t;
+
+    typedef struct
+    {
+        char *name;
+        int32_t flush_threshold;
+        int32_t max_level;
+        float probability;
+        bool compressed;
+        tidesdb_compression_algo_t compress_algo;
+        tidesdb_memtable_ds_t memtable_ds;
+        bool bloom_filter;
+    } tidesdb_column_family_config_t;
+```
+
+#### Getting a column family stat
+```c
+tidesdb_column_family_stat_t *stat = NULL;
+err = tidesdb_get_column_family_stat(tdb, "your_column_family", &stat);
+if (err != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+```
+
 ## License
 Multiple
 

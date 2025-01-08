@@ -65,7 +65,7 @@ install(TARGETS tidesdb
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
 
-install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/hash_table.h src/compress.h src/bloom_filter.h src/compat.h src/log.h src/binary_hash_array.h external/xxhash.h DESTINATION include)
+install(FILES src/tidesdb.h src/err.h src/block_manager.h src/skip_list.h src/hash_table.h src/compress.h src/bloom_filter.h src/compat.h src/log.h src/binary_hash_array.h DESTINATION include)
 
 if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         enable_testing()

@@ -16,6 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <xxhash.h>
+
 #include "binary_hash_array.h"
 
 int binary_hash_array_compare(const void *a, const void *b)

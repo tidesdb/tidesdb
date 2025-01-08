@@ -6354,3 +6354,175 @@ char *_tidesdb_get_debug_log_format(tidesdb_debug_log_t log_type)
             return "invalid log type";
     }
 }
+
+tidesdb_err_t *tidesdb_get_column_family_stat(tidesdb_t *tdb, const char *column_family_name,
+                                              tidesdb_column_family_stat_t **stat)
+{
+    /* we check if db is NULL */
+    if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
+
+    /* we check if column family name is NULL */
+    if (column_family_name == NULL)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we get db read lock */
+    if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "db");
+    }
+
+    /* we get column family */
+    tidesdb_column_family_t *cf;
+
+    /* we get column family */
+    if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
+    {
+        (void)pthread_rwlock_unlock(&tdb->rwlock); /* unlock db lock */
+        return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
+    }
+
+    /* we unlock the db read lock */
+    if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
+    }
+
+    /* we get column family read lock */
+    if (pthread_rwlock_rdlock(&cf->rwlock) != 0)
+    {
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
+    }
+
+    /* we create a new column family stat */
+    *stat = malloc(sizeof(tidesdb_column_family_stat_t));
+    if (*stat == NULL)
+    {
+        (void)pthread_rwlock_unlock(&cf->rwlock); /* unlock column family lock */
+        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC);
+    }
+
+    /* we copy the column family config */
+    (*stat)->config = cf->config;
+
+    /* we copy the number of sstables */
+    (*stat)->num_sstables = cf->num_sstables;
+
+    /* we copy the number of memtable entries */
+    switch (cf->config.memtable_ds)
+    {
+        case TDB_MEMTABLE_SKIP_LIST:
+            (*stat)->memtable_entries_count = skip_list_count_entries(cf->memtable_sl);
+            break;
+        case TDB_MEMTABLE_HASH_TABLE:
+            (*stat)->memtable_entries_count = cf->memtable_ht->count;
+            break;
+        default:
+            /* we should never reach here */
+            break;
+    }
+
+    /* set partial merge started status */
+    (*stat)->partial_merging = cf->partial_merging;
+
+    /* create sstable stats */
+
+    /* we allocate memory for the sstable stats */
+    (*stat)->sstable_stats =
+        malloc(sizeof(tidesdb_column_family_sstable_stat_t) * cf->num_sstables);
+    if ((*stat)->sstable_stats == NULL)
+    {
+        (void)pthread_rwlock_unlock(&cf->rwlock); /* unlock column family lock */
+        free(*stat);
+        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC);
+    }
+
+    /* we iterate through the sstables populating the stats */
+    for (int i = 0; i < cf->num_sstables; i++)
+    {
+        tidesdb_column_family_sstable_stat_t *sstat =
+            malloc(sizeof(tidesdb_column_family_sstable_stat_t));
+        if (sstat == NULL)
+        {
+            (void)pthread_rwlock_unlock(&cf->rwlock); /* unlock column family lock */
+            for (int j = 0; j < i; j++)
+            {
+                free((*stat)->sstable_stats[j]->sstable_path);
+            }
+            free((*stat)->sstable_stats);
+            free(*stat);
+            return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "sstable stat");
+        }
+
+        /* we copy the sstable path */
+        sstat->sstable_path = strdup(cf->sstables[i]->block_manager->file_path);
+        if (sstat->sstable_path == NULL)
+        {
+            (void)pthread_rwlock_unlock(&cf->rwlock); /* unlock column family lock */
+            for (int j = 0; j < i; j++)
+            {
+                free((*stat)->sstable_stats[j]->sstable_path);
+            }
+            free((*stat)->sstable_stats);
+            free(*stat);
+            return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC);
+        }
+
+        /* we get the number of blocks */
+        sstat->num_blocks = block_manager_count_blocks(cf->sstables[i]->block_manager);
+
+        /* we check if bloom enabled if so -1 the number of blocks */
+        if (cf->config.bloom_filter) sstat->num_blocks--;
+
+        if (block_manager_get_size(cf->sstables[i]->block_manager, &sstat->size) == -1)
+        {
+            (void)pthread_rwlock_unlock(&cf->rwlock); /* unlock column family lock */
+            for (int j = 0; j < i; j++)
+            {
+                free((*stat)->sstable_stats[j]->sstable_path);
+            }
+            free((*stat)->sstable_stats);
+            free(*stat);
+            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SSTABLE_SIZE);
+        }
+
+        /* we set the sstable stat */
+        (*stat)->sstable_stats[i] = sstat;
+    }
+
+    /* now we mus release the column family lock */
+    if (pthread_rwlock_unlock(&cf->rwlock) != 0)
+    {
+        for (int i = 0; i < cf->num_sstables; i++)
+        {
+            free((*stat)->sstable_stats[i]->sstable_path);
+        }
+        free((*stat)->sstable_stats);
+        free(*stat);
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
+    }
+
+    return NULL;
+}
+
+tidesdb_err_t *tidesdb_free_column_family_stat(tidesdb_column_family_stat_t *stat)
+{
+    /* we check if stat is NULL */
+    if (stat == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_STAT);
+
+    /* we free the sstable stats */
+    for (int i = 0; i < stat->num_sstables; i++)
+    {
+        free(stat->sstable_stats[i]->sstable_path);
+        free(stat->sstable_stats[i]);
+    }
+
+    /* we free the sstable stats */
+    free(stat->sstable_stats);
+
+    /* we free the stat */
+    free(stat);
+
+    stat = NULL;
+
+    return NULL;
+}

@@ -208,6 +208,41 @@ extern "C"
     } tidesdb_column_family_t;
 
     /*
+     * tidesdb_column_family_sstable_stat_t
+     * struct for column family sstable stats
+     * @param sstable_path the path to the sstable
+     * @param size the size of the sstable
+     * @param num_blocks the number of blocks in the sstable
+     */
+    typedef struct
+    {
+        char *sstable_path;
+        size_t size;
+        size_t num_blocks;
+    } tidesdb_column_family_sstable_stat_t;
+
+    /*
+     * tidesdb_column_family_stat_t
+     * struct for column family stats and information
+     * @param name the name of the column family
+     * @param num_sstables the number of sstables in the column family
+     * @param memtable_size the size of the memtable in the column family
+     * @param memtable_entries_count the number of entries in the memtable
+     * @param partial_merging whether the column family has been started with partially merging.
+     * @param sstable_stats the stats for the sstables in the column family
+     */
+    typedef struct
+    {
+        tidesdb_column_family_config_t config;
+        char *cf_name;
+        int num_sstables;
+        size_t memtable_size;
+        size_t memtable_entries_count;
+        bool partial_merging;
+        tidesdb_column_family_sstable_stat_t **sstable_stats;
+    } tidesdb_column_family_stat_t;
+
+    /*
      * tidesdb_key_value_pair_t
      * key value pair struct for TidesDB SSTables and WAL
      * @param key the key
@@ -981,6 +1016,25 @@ extern "C"
      * @return the format for the log message
      */
     char *_tidesdb_get_debug_log_format(tidesdb_debug_log_t log_type);
+
+    /*
+     * tidesdb_get_column_family_stat
+     * get the stats for a column family
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param stat the column family stat
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_get_column_family_stat(tidesdb_t *tdb, const char *column_family_name,
+                                                  tidesdb_column_family_stat_t **stat);
+
+    /*
+     * tidesdb_free_column_family_stat
+     * free the memory for a column family stat
+     * @param stat the column family stat
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_free_column_family_stat(tidesdb_column_family_stat_t *stat);
 
 #ifdef __cplusplus
 }

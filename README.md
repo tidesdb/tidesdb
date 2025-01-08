@@ -31,6 +31,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Multiplatform** Linux, MacOS, and Windows support.
 - [x] **Logging** system logs debug messages to log file.  This can be disabled.  Log file is created in the database directory.
 - [x] **Block Indices** by default `TDB_BLOCK_INDICES` is set to 1.  This means TidesDB for each column family sstable there is a last block containing a sorted binary hash array.  This compact data structure gives us the ability to retrieve the specific offset for a key and seek to its containing key value pair block within an sstable without having to scan an entire sstable.  If `TDB_BLOCK_INDICES` is set to 0 then block indices aren't used nor created and reads are slower and consume more IO and CPU having to scan and compare.
+- [x] **Statistics** column family statistics, configs, information can be retrieved through public API.
 
 ## Building
 Using cmake to build the shared library.
@@ -441,6 +442,52 @@ You pass
 - the minimum number of sstables to trigger a merge
 ```c
 tidesdb_err_t *e = tidesdb_start_background_partial_merge(tdb, "your_column_family", 10, 10); /* merge a pair every 10 seconds and if there are a minimum 10 sstables */
+```
+
+### Column Family Statistics
+You can get statistics on a column family.
+#### Structs
+```c
+    typedef struct
+    {
+        tidesdb_column_family_config_t config;
+        char *cf_name;
+        int num_sstables;
+        size_t memtable_size;
+        size_t memtable_entries_count;
+        bool partial_merging;
+        tidesdb_column_family_sstable_stat_t **sstable_stats;
+    } tidesdb_column_family_stat_t;
+
+    typedef struct
+    {
+        char *sstable_path;
+        size_t size;
+        size_t num_blocks;
+    } tidesdb_column_family_sstable_stat_t;
+
+    typedef struct
+    {
+        char *name;
+        int32_t flush_threshold;
+        int32_t max_level;
+        float probability;
+        bool compressed;
+        tidesdb_compression_algo_t compress_algo;
+        tidesdb_memtable_ds_t memtable_ds;
+        bool bloom_filter;
+    } tidesdb_column_family_config_t;
+```
+
+#### Getting a column family stat
+```c
+tidesdb_column_family_stat_t *stat = NULL;
+err = tidesdb_get_column_family_stat(tdb, "your_column_family", &stat);
+if (err != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
 ```
 
 ## License

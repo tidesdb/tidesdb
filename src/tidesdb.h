@@ -187,6 +187,8 @@ extern "C"
      * @param wal the write-ahead log for column family
      * @param partial_merging whether the column family has been started with partially merging.  If
      * so you cannot manually compact the column family.
+     * @param require_sst_shift whether the column family requires a shift of sstables after a
+     * merge.  This is for tidesdb_get and the tidesdb cursor
      * @param partial_merge_thread the thread for partial merging
      * @param partial_merge_interval the interval for partial merging
      * @param partial_merge_min_sstables the minimum number of sstables to trigger a partial merge
@@ -204,6 +206,7 @@ extern "C"
         hash_table_t *memtable_ht;
         tidesdb_wal_t *wal;
         bool partial_merging;
+        bool require_sst_shift;
         pthread_t partial_merge_thread;
         int partial_merge_interval;
         int partial_merge_min_sstables;

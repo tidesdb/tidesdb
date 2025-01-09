@@ -707,6 +707,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 cf->num_sstables = 0;
                 cf->partial_merging = false;
                 cf->tdb = tdb;
+                cf->require_sst_shift = false;
 
                 (void)log_write(
                     tdb->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_COLUMN_FAMILY_SETTING_UP),
@@ -1669,6 +1670,8 @@ int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_thres
 
     (*cf)->memtable_ht = NULL;
 
+    (*cf)->require_sst_shift = false;
+
     if (pthread_rwlock_init(&(*cf)->rwlock, NULL) != 0)
     {
         free((*cf)->config.name);
@@ -2102,8 +2105,6 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
     }
 
-    /* now we check sstables from latest to oldest */
-
     /* we check if any sstables */
     if (cf->num_sstables == 0)
     {
@@ -2111,7 +2112,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
         return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
     }
 
-    /* we iterate over the sstables */
+    /* now we check sstables from latest to oldest using iteration */
     for (int i = cf->num_sstables - 1; i >= 0; i--)
     {
         /* we get the sstable */
@@ -4153,6 +4154,46 @@ tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
 
     while (cursor->sstable_index >= 0)
     {
+        if (cursor->cf->require_sst_shift)
+        {
+            cursor->cf->require_sst_shift = false;
+            /* we check if index exceeds number of sstables */
+            if (cursor->sstable_index >= cursor->cf->num_sstables)
+            {
+                cursor->sstable_index =
+                    cursor->cf->num_sstables -
+                    1; /* we shift back the current sstable index as we paired and merged.  This
+                          would only be important on background merges.  */
+                /* reopen the sstable cursor */
+                if (cursor->sstable_cursor != NULL)
+                {
+                    (void)block_manager_cursor_free(cursor->sstable_cursor);
+                    cursor->sstable_cursor = NULL;
+                }
+
+                /* we open new sstable cursor */
+                if (block_manager_cursor_init(
+                        &cursor->sstable_cursor,
+                        cursor->cf->sstables[cursor->sstable_index]->block_manager) == -1)
+                {
+                    if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
+                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK,
+                                                     "column family");
+                    return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
+                }
+
+                /* we check if bloom filter is set */
+                if (cursor->cf->config.bloom_filter)
+                {
+                    if (block_manager_cursor_next(cursor->sstable_cursor) == 0)
+                    {
+                        block_manager_cursor_free(cursor->sstable_cursor);
+                        cursor->sstable_cursor = NULL;
+                    }
+                }
+            }
+        }
+
         /* we check if sstable cursor is valid and if it has a next block */
         if (cursor->sstable_cursor != NULL &&
             block_manager_cursor_next(cursor->sstable_cursor) == 0)
@@ -6005,6 +6046,8 @@ void *_tidesdb_partial_merge_thread(void *arg)
             }
 
             cf->num_sstables = j;
+
+            cf->require_sst_shift = true;
 
             /* we unlock the column family */
             (void)pthread_rwlock_unlock(&cf->rwlock);

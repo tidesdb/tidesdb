@@ -108,7 +108,10 @@ Join the [TidesDB Discord Community](https://discord.gg/8eJmWtec) to ask questio
 
 ## Include
 ```c
-#include <tidesdb.h>
+#include <tidesdb/tidesdb.h> /* you can use other components of TidesDB such has hash table,
+                                skip list, bloom filter etc.. under tidesdb/
+                                this also prevents collisions.  */
+
 ```
 
 ## Usage

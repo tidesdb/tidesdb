@@ -43,6 +43,7 @@ int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_
     /* we create and start the fsync thread */
     if (pthread_create(&(*bm)->fsync_thread, NULL, block_manager_fsync_thread, *bm) != 0)
     {
+        fclose((*bm)->file);
         free(*bm);
         return -1;
     }

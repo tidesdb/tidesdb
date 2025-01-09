@@ -21,7 +21,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <xxhash.h>
+#include "../external/xxhash.h"
 
 /* sorted* binary hash array
  * on serialization, the entries are sorted by hashed key.

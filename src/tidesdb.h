@@ -502,11 +502,11 @@ extern "C"
      * begin a transaction
      * @param tdb the TidesDB instance
      * @param txn the transaction to begin
-     * @param column_family the column family
+     * @param column_family_name the column family
      * @return error or NULL
      */
     tidesdb_err_t *tidesdb_txn_begin(tidesdb_t *tdb, tidesdb_txn_t **txn,
-                                     const char *column_family);
+                                     const char *column_family_name);
 
     /*
      * tidesdb_txn_put

@@ -2105,9 +2105,14 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MEMTABLE_DATA_STRUCTURE);
     }
 
-    /* now we check sstables from latest to oldest */
+    /* we check if any sstables */
+    if (cf->num_sstables == 0)
+    {
+        (void)pthread_rwlock_unlock(&cf->rwlock);
+        return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+    }
 
-    /* we iterate over the sstables */
+    /* now we check sstables from latest to oldest using iteration */
     for (int i = cf->num_sstables - 1; i >= 0; i--)
     {
         /* we get the sstable */

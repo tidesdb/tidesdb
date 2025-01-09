@@ -141,6 +141,7 @@ typedef enum
     TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOOM_FILTER,
     TIDESDB_ERR_FAILED_TO_GET_SSTABLE_SIZE,
     TIDESDB_ERR_INVALID_STAT,
+    TIDESDB_ERR_INVALID_NAME_LENGTH,
 } TIDESDB_ERR_CODE;
 
 /* TidesDB error messages */
@@ -256,6 +257,7 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
     {TIDESDB_ERR_FAILED_TO_GET_SSTABLE_SIZE,
      "Failed to get SSTable size from block manager for column family %s.\n"},
     {TIDESDB_ERR_INVALID_STAT, "Invalid stat for column family %s.\n"},
+    {TIDESDB_ERR_INVALID_NAME_LENGTH, "Invalid name length for %s.\n"},
 };
 
 /*

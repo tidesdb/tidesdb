@@ -1290,9 +1290,17 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
     /* we check if the column family name is greater than 2 */
     if (strlen(name) < 2) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
 
+    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
+    if (strlen(name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
+
     /* we check flush threshold
      * the system expects at least TDB_FLUSH_THRESHOLD threshold */
     if (flush_threshold < TDB_FLUSH_THRESHOLD)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_FLUSH_THRESHOLD);
+
+    /* don't allow flush threshold greater than available memory */
+    if (flush_threshold > tdb->available_mem)
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_FLUSH_THRESHOLD);
 
     /* only if the memtable data structure is skip list

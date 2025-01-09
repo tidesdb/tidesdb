@@ -569,7 +569,7 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
     if (_tidesdb_load_column_families(*tdb) == -1)
     {
         free((*tdb)->directory);
-        free(*tdb);
+        tidesdb_close(*tdb);
         return tidesdb_err_from_code(TIDESDB_ERR_LOAD_COLUMN_FAMILIES);
     }
 
@@ -1308,7 +1308,7 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_FLUSH_THRESHOLD);
 
     /* don't allow flush threshold greater than available memory */
-    if (flush_threshold > tdb->available_mem)
+    if ((size_t)flush_threshold > tdb->available_mem)
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_FLUSH_THRESHOLD);
 
     /* only if the memtable data structure is skip list

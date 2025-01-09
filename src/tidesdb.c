@@ -585,8 +585,21 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SYSTEM_MEMORY);
     }
 
+    /* we get available system threads */
+    (*tdb)->avail_threads = _tidesdb_get_max_sys_threads();
+    if ((*tdb)->avail_threads == 0 || (*tdb)->avail_threads == -1)
+    {
+        (void)log_write((*tdb)->log,
+                        tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SYSTEM_THREADS)->message);
+        tidesdb_close(*tdb);
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SYSTEM_THREADS);
+    }
+
     (void)log_write((*tdb)->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_AVAIL_MEMORY),
                     (*tdb)->available_mem);
+
+    (void)log_write((*tdb)->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_AVAIL_THREADS),
+                    (*tdb)->avail_threads);
 
     (void)log_write((*tdb)->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_OPENED_SUCCESS),
                     directory);
@@ -2863,6 +2876,13 @@ tidesdb_err_t *tidesdb_compact_sstables(tidesdb_t *tdb, const char *column_famil
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
     {
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "db");
+    }
+
+    /* we check if provided max_threads exceeds system available threads */
+    if (max_threads > tdb->avail_threads)
+    {
+        (void)pthread_rwlock_unlock(&tdb->rwlock); /* release db read lock */
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MAX_THREADS);
     }
 
     /* get column family */
@@ -6391,6 +6411,8 @@ char *_tidesdb_get_debug_log_format(tidesdb_debug_log_t log_type)
             return "Reopening TidesDB instance at %s";
         case TIDESDB_DEBUG_AVAIL_MEMORY:
             return "Available memory: %zu bytes";
+        case TIDESDB_DEBUG_AVAIL_THREADS:
+            return "Available threads: %d";
         case TIDESDB_DEBUG_OPENED_SUCCESS:
             return "Opened TidesDB instance at %s";
         case TIDESDB_DEBUG_COLUMN_FAMILY_SETTING_UP:
@@ -6613,4 +6635,30 @@ tidesdb_err_t *tidesdb_free_column_family_stat(tidesdb_column_family_stat_t *sta
     stat = NULL;
 
     return NULL;
+}
+
+int _tidesdb_get_max_sys_threads()
+{
+    int max_threads = 0;
+
+#if defined(_WIN32) || defined(_WIN64)
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    max_threads = sysInfo.dwNumberOfProcessors;
+
+#elif defined(__linux__) || defined(__APPLE__) || defined(__unix__)
+#if defined(__APPLE__) /* macOS specific */
+    int mib[2] = {CTL_HW, HW_NCPU};
+    size_t len = sizeof(max_threads);
+    if (sysctl(mib, 2, &max_threads, &len, NULL, 0) != 0)
+    {
+        return -1; /* ret -1 on error, tidesdb_open will catch this */
+    }
+#else                  /* unix-posix specific */
+    max_threads = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+
+#endif
+
+    return max_threads;
 }

@@ -125,6 +125,7 @@ extern "C"
         TIDESDB_DEBUG_BLOCK_INDICES_ENABLED,
         TIDESDB_DEBUG_REOPEN_DATABASE,
         TIDESDB_DEBUG_AVAIL_MEMORY,
+        TIDESDB_DEBUG_AVAIL_THREADS,
         TIDESDB_DEBUG_OPENED_SUCCESS,
         TIDESDB_DEBUG_COLUMN_FAMILY_SETTING_UP,
         TIDESDB_DEBUG_COLUMN_FAMILY_USING_DATA_STRUCTURE,
@@ -311,6 +312,7 @@ extern "C"
      * @param available_mem the available memory for the system.  TidesDB gets
      * TDB_AVAILABLE_MEMORY_THRESHOLD % of available memory on start up and will not allow kvp to be
      * added if exceeds available memory.
+     * @param avail_threads the available threads for the system
      */
     struct tidesdb_t
     {
@@ -320,6 +322,7 @@ extern "C"
         pthread_rwlock_t rwlock;
         log_t *log;
         size_t available_mem;
+        int avail_threads;
     };
 
     /*
@@ -1036,6 +1039,13 @@ extern "C"
      * @return error or NULL
      */
     tidesdb_err_t *tidesdb_free_column_family_stat(tidesdb_column_family_stat_t *stat);
+
+    /*
+     * _tidesdb_get_max_sys_threads
+     * get the maximum number of available system threads
+     * @return the maximum number of available system threads
+     */
+    int _tidesdb_get_max_sys_threads();
 
 #ifdef __cplusplus
 }

@@ -2879,7 +2879,7 @@ tidesdb_err_t *tidesdb_compact_sstables(tidesdb_t *tdb, const char *column_famil
     }
 
     /* we check if provided max_threads exceeds system available threads */
-    if (tdb->avail_threads > max_threads)
+    if (max_threads > tdb->avail_threads)
     {
         (void)pthread_rwlock_unlock(&tdb->rwlock); /* release db read lock */
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MAX_THREADS);

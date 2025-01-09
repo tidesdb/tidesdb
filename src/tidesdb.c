@@ -494,6 +494,14 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
         return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "tidesdb_t");
     }
 
+    /* we make sure the db path is not too long
+     * we use block manager MAX_FILE_PATH_LENGTH to check against */
+    if (strlen(directory) > MAX_FILE_PATH_LENGTH)
+    {
+        free(*tdb);
+        return tidesdb_err_from_code(TIDESDB_ERR_PATH_TOO_LONG, "db path");
+    }
+
     /* we set the db path */
     (*tdb)->directory = strdup(directory);
     if ((*tdb)->directory == NULL)

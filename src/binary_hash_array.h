@@ -21,7 +21,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../external/xxhash.h"
+
+#include "xxhash.h" /* use install location based on cmake */
 
 /* sorted* binary hash array
  * on serialization, the entries are sorted by hashed key.

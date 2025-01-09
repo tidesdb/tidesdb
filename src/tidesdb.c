@@ -1387,6 +1387,13 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
     /* we check if the name is NULL */
     if (name == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
 
+    /* we check if the column family name is greater than 2 */
+    if (strlen(name) < 2) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
+    if (strlen(name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
+
     /* we acquire read lock */
     if (pthread_rwlock_wrlock(&tdb->rwlock) != 0)
     {
@@ -1863,6 +1870,14 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
     if (key_size + value_size > tdb->available_mem)
         return tidesdb_err_from_code(TIDESDB_ERR_PUT_MEMORY_OVERFLOW);
 
+    /* we check if the column family name is greater than 2 */
+    if (strlen(column_family_name) < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
+    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
+
     /* get db read lock for column family */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
     {
@@ -1987,6 +2002,14 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
 
     /* we check if key is NULL */
     if (key == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_KEY);
+
+    /* we check if the column family name is greater than 2 */
+    if (strlen(column_family_name) < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
+    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
 
     /* get db read lock to get column family */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
@@ -2260,6 +2283,14 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
     if (column_family_name == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COLUMN_FAMILY);
 
     if (key == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_KEY);
+
+    /* we check if the column family name is greater than 2 */
+    if (strlen(column_family_name) < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
+    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
 
     /* get db read lock to get column family */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
@@ -2812,6 +2843,14 @@ tidesdb_err_t *tidesdb_compact_sstables(tidesdb_t *tdb, const char *column_famil
 
     if (max_threads < 1) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_MAX_THREADS);
 
+    /* we check if the column family name is greater than 2 */
+    if (strlen(column_family_name) < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
+    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
+
     /* get db read lock */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
     {
@@ -3126,13 +3165,22 @@ int _tidesdb_compare_keys(const uint8_t *key1, size_t key1_size, const uint8_t *
     return 0;
 }
 
-tidesdb_err_t *tidesdb_txn_begin(tidesdb_t *tdb, tidesdb_txn_t **txn, const char *column_family)
+tidesdb_err_t *tidesdb_txn_begin(tidesdb_t *tdb, tidesdb_txn_t **txn,
+                                 const char *column_family_name)
 {
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
 
     /* we check if column family is NULL */
-    if (column_family == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COLUMN_FAMILY);
+    if (column_family_name == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COLUMN_FAMILY);
+
+    /* we check if the column family name is greater than 2 */
+    if (strlen(column_family_name) < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
+    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
 
     /* we check if transaction is NULL */
     if (txn == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_TXN);
@@ -3151,7 +3199,7 @@ tidesdb_err_t *tidesdb_txn_begin(tidesdb_t *tdb, tidesdb_txn_t **txn, const char
 
     /* check if column family exists and get it */
     tidesdb_column_family_t *cf = NULL;
-    if (_tidesdb_get_column_family(tdb, column_family, &cf) == -1)
+    if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
     {
         free(*txn);
         *txn = NULL;
@@ -3899,6 +3947,14 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
 
     /* we get the column family */
     tidesdb_column_family_t *cf = NULL;
+
+    /* we check if the column family name is greater than 2 */
+    if (strlen(column_family_name) < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
+    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
 
     /* we need to get read lock for the db */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
@@ -5705,6 +5761,14 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
     /* we check if min_sstables is at least 2 */
     if (min_sstables < 2) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_PARTIAL_MERGE_MIN_SST);
 
+    /* we check if the column family name is greater than 2 */
+    if (strlen(column_family_name) < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
+    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
+
     /* we get db read lock */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
     {
@@ -6372,6 +6436,14 @@ tidesdb_err_t *tidesdb_get_column_family_stat(tidesdb_t *tdb, const char *column
     /* we check if column family name is NULL */
     if (column_family_name == NULL)
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if the column family name is greater than 2 */
+    if (strlen(column_family_name) < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+
+    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
+    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
 
     /* we get db read lock */
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)

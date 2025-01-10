@@ -999,6 +999,25 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
         /* we skip the . and .. directories */
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 
+        /* if the file ends with TDB_TEMP_EXT, we remove it as this is possibly unfinished merge
+         * which did not complete prior to shutdown */
+        if (strstr(entry->d_name, TDB_TEMP_EXT) != NULL)
+        {
+            char temp_file_path[MAX_FILE_PATH_LENGTH]; /* we construct the path to the temp file we
+                                                          identified */
+            (void)snprintf(temp_file_path, sizeof(temp_file_path), "%s%s%s", cf->path,
+                           _tidesdb_get_path_seperator(), entry->d_name);
+
+            /* we remove the temp file */
+            if (remove(temp_file_path) == -1)
+            {
+                (void)log_write(
+                    cf->tdb->log,
+                    tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_REMOVE_TEMP_FILE, temp_file_path)
+                        ->message);
+                return -1;
+            }
+        }
         /* we check if the file ends with SSTABLE_EXT or contains */
         if (strstr(entry->d_name, TDB_SSTABLE_EXT) == NULL) continue;
 

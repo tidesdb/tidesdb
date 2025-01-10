@@ -366,6 +366,12 @@ tidesdb_err_t* tidesdb_err_from_code(TIDESDB_ERR_CODE code, ...)
             snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
             break;
         }
+        case TIDESDB_ERR_FAILED_TO_REMOVE_TEMP_FILE:
+        {
+            const char* obj = va_arg(args, const char*);
+            snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
+            break;
+        }
         default:
             snprintf(buffer, sizeof(buffer), "%s", tidesdb_err_messages[code].message);
     }

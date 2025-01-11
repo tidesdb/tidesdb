@@ -418,12 +418,12 @@ tidesdb_cursor_free(c);
 ```
 
 ### Compaction
-There are 2 ways to compact sstables.  Manual multi-threaded paired and merged compaction and automatic background partial merge compaction.
+There are 2 ways to compact sstables.  Manual multi-threaded paired and merged compaction and automatic background incremental partial merge compaction.
 Compaction removes tombstones and expired keys if ttl is set.  Because merging merges and older and newer sstables only the newest version of key lives on.
 
 #### Manual Multi-Threaded Parallel Compaction
 You can manually compact sstables.  This method pairs and merges column family sstables from oldest to latest.  It will remove tombstones and expired keys if ttl is set.
-Say you have 100, after compaction you will have 50; Always half the amount you had prior.  You can set the number of threads to use for compaction. Each thread handles 1 pair.
+Say you have 100 sstables within a column family, after compaction you will have 50 sstables; Always half the amount you had prior (if even).  You can set the number of threads to use for compaction. Each thread handles 1 pair.
 
 ```c
 tidesdb_err_t *e = tidesdb_compact_sstables(tdb, "your_column_family", 10); /* use 10 threads */
@@ -435,7 +435,7 @@ if (e != NULL)
 ```
 
 #### Automatic / Background Partial Merge Compaction
-You can start a background partial merge compaction.  This will incrementally merge sstables in the background from oldest to newest when minimum sstables are reached.  Merges are done every n seconds.  Merges are not done in parallel but incrementally.
+You can start a background partial merge compaction.  This will incrementally merge sstables in the background from oldest to newest when minimum sstables are reached. Will run in background until shutdown.  Merges are done every n seconds.  Merges are not done in parallel but incrementally.
 You can set the minimum amount of column family sstables to trigger a background partial merge. Background merging blocks less than manual compaction.
 
 You pass
@@ -448,7 +448,7 @@ tidesdb_err_t *e = tidesdb_start_background_partial_merge(tdb, "your_column_fami
 ```
 
 ### Column Family Statistics
-You can get statistics on a column family.
+You can get statistics on a column family.  This includes the column family configuration, number of sstables, memtable size, memtable entries count, and sstable stats, etc!
 #### Structs
 ```c
     typedef struct

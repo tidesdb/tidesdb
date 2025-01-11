@@ -1089,17 +1089,6 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
 
         /* we increment the number of sstables */
         cf->num_sstables++;
-
-        /* we free up resources */
-        if (closedir(cf_dir) == -1)
-        {
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CLOSE_DIRECTORY, cf->path)->message);
-            return -1;
-        }
-
-        return 0;
     }
 
     /* we free up resources */

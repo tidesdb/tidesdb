@@ -170,19 +170,6 @@ extern "C"
         bool bloom_filter;
     } tidesdb_column_family_config_t;
 
-    /*
-     * tidesdb_sst_range_t
-     * struct for a range of SSTables
-     * used to check if a key's prefix exists in the SSTable
-     * @param sstable the SSTable
-     * @param prefixes the prefixes for the SSTable
-     */
-    typedef struct
-    {
-        tidesdb_sstable_t *sstable;
-        int8_t prefixes[256]; /* 0 if not a prefix, 1 if a prefix */
-    } tidesdb_sst_range_t;
-
     /* forward declaration of tidesdb_t */
     typedef struct tidesdb_t tidesdb_t;
 

@@ -4012,7 +4012,7 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
     if (*cursor == NULL) return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "cursor");
 
     /* we setup defaults */
-    (*cursor)->tidesdb = tdb;
+    (*cursor)->tdb = tdb;
     (*cursor)->cf = cf;
     (*cursor)->sstable_cursor = NULL;
     (*cursor)->memtable_cursor = NULL;

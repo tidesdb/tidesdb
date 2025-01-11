@@ -156,6 +156,8 @@ extern "C"
      * @param max_level the max level of the column family
      * @param probability the probability of the column family
      * @param compressed the compressed status of the column family
+     * @param compress_algo the compression algorithm for the column family
+     * @param memtable_ds the data structure for the column family memtable
      * @param bloom_filter whether to use a bloom filter for the column family sstables
      */
     typedef struct
@@ -349,7 +351,7 @@ extern "C"
     /*
      * tidesdb_cursor_t
      * struct for a TidesDB cursor
-     * @param tidesdb the tidesdb instance
+     * @param tdb the tidesdb instance
      * @param cf the column family
      * @param memtable_cursor the cursor for the memtable
      * @param sstable_index the current index of the sstable the cursor is on
@@ -358,7 +360,7 @@ extern "C"
      */
     typedef struct
     {
-        tidesdb_t *tidesdb;
+        tidesdb_t *tdb;
         tidesdb_column_family_t *cf;
         void *memtable_cursor;
         int sstable_index;
@@ -634,6 +636,25 @@ extern "C"
     tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
                                                           const char *column_family_name,
                                                           int seconds, int min_sstables);
+
+    /*
+     * tidesdb_get_column_family_stat
+     * get the stats for a column family
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param stat the column family stat
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_get_column_family_stat(tidesdb_t *tdb, const char *column_family_name,
+                                                  tidesdb_column_family_stat_t **stat);
+
+    /*
+     * tidesdb_free_column_family_stat
+     * free the memory for a column family stat
+     * @param stat the column family stat
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_free_column_family_stat(tidesdb_column_family_stat_t *stat);
 
     /* internal functions */
 
@@ -1023,25 +1044,6 @@ extern "C"
      * @return the format for the log message
      */
     char *_tidesdb_get_debug_log_format(tidesdb_debug_log_t log_type);
-
-    /*
-     * tidesdb_get_column_family_stat
-     * get the stats for a column family
-     * @param tdb the TidesDB instance
-     * @param column_family_name the name of the column family
-     * @param stat the column family stat
-     * @return error or NULL
-     */
-    tidesdb_err_t *tidesdb_get_column_family_stat(tidesdb_t *tdb, const char *column_family_name,
-                                                  tidesdb_column_family_stat_t **stat);
-
-    /*
-     * tidesdb_free_column_family_stat
-     * free the memory for a column family stat
-     * @param stat the column family stat
-     * @return error or NULL
-     */
-    tidesdb_err_t *tidesdb_free_column_family_stat(tidesdb_column_family_stat_t *stat);
 
     /*
      * _tidesdb_get_max_sys_threads

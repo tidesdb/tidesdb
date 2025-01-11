@@ -1883,6 +1883,137 @@ void test_tidesdb_put_flush_stat(bool compress, tidesdb_compression_algo_t algo,
                                                  : " with hash table memtable");
 }
 
+void test_tidesdb_put_flush_shutdown_compact_get(bool compress, tidesdb_compression_algo_t algo,
+                                                 bool bloom_filter,
+                                                 tidesdb_memtable_ds_t memtable_ds)
+{
+    tidesdb_t *db = NULL;
+
+    tidesdb_err_t *err = tidesdb_open("test_db", &db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)tidesdb_err_free(err);
+
+    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
+                                       bloom_filter, memtable_ds);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+
+    assert(err == NULL);
+
+    uint8_t key[20];
+    uint8_t value[1024 * 1024];
+
+    /* Fill the value with random data */
+    for (size_t i = 0; i < sizeof(value); i++)
+    {
+        value[i] = (uint8_t)(rand() % 256);
+    }
+
+    /* Put 12 keys which would be 12 sstables */
+    for (int i = 0; i < 12; i++)
+    {
+        snprintf((char *)key, sizeof(key), "key_%d", i);
+        err = tidesdb_put(db, "test_cf", key, strlen((char *)key) + 1, value, sizeof(value), -1);
+        if (err != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+        }
+        assert(err == NULL);
+    }
+
+    err = tidesdb_close(db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    err = tidesdb_open("test_db", &db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    /* now we compact the column family */
+    err = tidesdb_compact_sstables(db, "test_cf", 2);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    /* we will put one more key which should be in the memtable */
+    snprintf((char *)key, sizeof(key), "key_%d", 12);
+    uint8_t value2[128];
+    for (size_t i = 0; i < sizeof(value2); i++)
+    {
+        value2[i] = (uint8_t)(rand() % 256);
+    }
+
+    /* we put the second value */
+    err = tidesdb_put(db, "test_cf", key, strlen((char *)key) + 1, value2, sizeof(value2), -1);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    /* now we check all keys */
+    for (int i = 0; i < 12; i++)
+    {
+        snprintf((char *)key, sizeof(key), "key_%d", i);
+        uint8_t *retrieved_value = NULL;
+        size_t value_size;
+
+        err =
+            tidesdb_get(db, "test_cf", key, strlen((char *)key) + 1, &retrieved_value, &value_size);
+        if (err != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+        }
+        assert(err == NULL);
+
+        free(retrieved_value);
+    }
+
+    /* check last key */
+    snprintf((char *)key, sizeof(key), "key_%d", 12);
+
+    uint8_t *retrieved_value2 = NULL;
+    size_t value_size;
+
+    err = tidesdb_get(db, "test_cf", key, strlen((char *)key) + 1, &retrieved_value2, &value_size);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+
+    free(retrieved_value2);
+
+    assert(err == NULL);
+
+    err = tidesdb_close(db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)_tidesdb_remove_directory("test_db");
+    printf(GREEN "test_tidesdb_put_flush_shutdown_compact_get%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
+}
+
 int main(void)
 {
     test_tidesdb_serialize_deserialize_key_value_pair(false, TDB_NO_COMPRESSION);
@@ -1905,6 +2036,8 @@ int main(void)
     test_tidesdb_put_flush_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+    test_tidesdb_put_flush_shutdown_compact_get(false, TDB_NO_COMPRESSION, false,
+                                                TDB_MEMTABLE_SKIP_LIST);
 
     /* using hash table memtable */
     test_tidesdb_put_get_memtable(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);

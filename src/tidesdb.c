@@ -5940,7 +5940,7 @@ void *_tidesdb_partial_merge_thread(void *arg)
                     _tidesdb_get_debug_log_format(TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_STARTED),
                     cf->config.name);
 
-    int sst_index = 0;
+    int sst_index = 0; /* what index we are on in the sstables */
 
     while (cf->partial_merging)
     {
@@ -5997,6 +5997,11 @@ void *_tidesdb_partial_merge_thread(void *arg)
         if (cf->sstables[sst_index] == NULL || cf->sstables[sst_index + 1] == NULL)
         {
             (void)pthread_rwlock_unlock(&cf->rwlock);
+            char sstable_path[MAX_FILE_PATH_LENGTH];
+            (void)snprintf(sstable_path, MAX_FILE_PATH_LENGTH, "%s",
+                                   merged_sstable->block_manager->file_path);
+            (void)_tidesdb_free_sstable(merged_sstable);
+            (void)remove(sstable_path);
             continue;
         }
 

@@ -29,7 +29,7 @@ void test_block_manager_open()
     assert(bm->file != NULL);
     assert(strcmp(bm->file_path, "test.db") == 0);
     assert(bm->fsync_interval == 0.2f);
-    block_manager_close(bm);
+    (void)block_manager_close(bm);
 
     remove("test.db"); /* remove created file */
     printf(GREEN "test_block_manager_open passed\n" RESET);
@@ -46,7 +46,7 @@ void test_block_manager_block_create()
 
     /* we verify that the data is copied correctly */
     assert(memcmp(block->data, data, size) == 0);
-    block_manager_block_free(block);
+    (void)block_manager_block_free(block);
 
     printf(GREEN "test_block_manager_block_create passed\n" RESET);
 }
@@ -66,13 +66,13 @@ void test_block_manager_block_write()
     /* now we write the block to the file */
     assert(block_manager_block_write(bm, block) == 0);
 
-    block_manager_block_free(block);
+    (void)block_manager_block_free(block);
 
     /* we close the block manager */
     assert(block_manager_close(bm) == 0);
 
     /* we remove the file */
-    remove("test.db");
+    (void)remove("test.db");
 
     printf(GREEN "test_block_manager_block_write passed\n" RESET);
 }
@@ -92,7 +92,7 @@ void test_block_manager_block_write_close_reopen_read()
     /* now we write the block to the file */
     assert(block_manager_block_write(bm, block) == 0);
 
-    block_manager_block_free(block);
+    (void)block_manager_block_free(block);
 
     /* we close the block manager */
     assert(block_manager_close(bm) == 0);
@@ -108,7 +108,7 @@ void test_block_manager_block_write_close_reopen_read()
     assert(block->size == size);
     assert(memcmp(block->data, data, size) == 0);
 
-    block_manager_block_free(block);
+    (void)block_manager_block_free(block);
 
     /* we close the block manager */
     assert(block_manager_close(bm) == 0);
@@ -134,7 +134,7 @@ void test_block_manager_truncate()
     /* now we write the block to the file */
     assert(block_manager_block_write(bm, block) == 0);
 
-    block_manager_block_free(block);
+    (void)block_manager_block_free(block);
 
     /* we truncate the file */
     assert(block_manager_truncate(bm) == 0);
@@ -153,7 +153,7 @@ void test_block_manager_truncate()
     assert(block_manager_close(bm) == 0);
 
     /* we remove the file */
-    remove("test.db");
+    (void)remove("test.db");
 
     printf(GREEN "test_block_manager_truncate passed\n" RESET);
 }
@@ -181,7 +181,7 @@ void test_block_manager_cursor()
         /* should not be -1 */
         assert(block_manager_block_write(bm, block) != -1);
 
-        block_manager_block_free(block);
+        (void)block_manager_block_free(block);
     }
 
     /* now we create a cursor */
@@ -189,7 +189,7 @@ void test_block_manager_cursor()
 
     if (block_manager_cursor_init(&cursor, bm) != 0)
     {
-        block_manager_close(bm);
+        (void)block_manager_close(bm);
         return;
     }
 
@@ -197,14 +197,14 @@ void test_block_manager_cursor()
     block_manager_block_t *read_block = block_manager_cursor_read(cursor);
     if (read_block == NULL)
     {
-        block_manager_cursor_free(cursor);
-        block_manager_close(bm);
+        (void)block_manager_cursor_free(cursor);
+        (void)block_manager_close(bm);
         return;
     }
     assert(read_block->size == 10);
     assert(memcmp(read_block->data, "testdata0", 10) == 0);
 
-    block_manager_block_free(read_block);
+    (void)block_manager_block_free(read_block);
 
     /* we go next */
     assert(block_manager_cursor_next(cursor) == 0);
@@ -213,15 +213,15 @@ void test_block_manager_cursor()
     read_block = block_manager_cursor_read(cursor);
     if (read_block == NULL)
     {
-        block_manager_cursor_free(cursor);
-        block_manager_close(bm);
+        (void)block_manager_cursor_free(cursor);
+        (void)block_manager_close(bm);
         return;
     }
 
     assert(read_block->size == 10);
     assert(memcmp(read_block->data, "testdata1", 10) == 0);
 
-    block_manager_block_free(read_block);
+    (void)block_manager_block_free(read_block);
 
     /* we go next */
     assert(block_manager_cursor_next(cursor) == 0);
@@ -230,8 +230,8 @@ void test_block_manager_cursor()
     read_block = block_manager_cursor_read(cursor);
     if (read_block == NULL)
     {
-        block_manager_cursor_free(cursor);
-        block_manager_close(bm);
+        (void)block_manager_cursor_free(cursor);
+        (void)block_manager_close(bm);
         return;
     }
 
@@ -239,7 +239,7 @@ void test_block_manager_cursor()
     assert(read_block->size == 10);
     assert(memcmp(read_block->data, "testdata2", 10) == 0);
 
-    block_manager_block_free(read_block);
+    (void)block_manager_block_free(read_block);
 
     /* we go back */
     assert(block_manager_cursor_prev(cursor) == 0);
@@ -248,8 +248,8 @@ void test_block_manager_cursor()
     read_block = block_manager_cursor_read(cursor);
     if (read_block == NULL)
     {
-        block_manager_cursor_free(cursor);
-        block_manager_close(bm);
+        (void)block_manager_cursor_free(cursor);
+        (void)block_manager_close(bm);
         return;
     }
 
@@ -257,7 +257,7 @@ void test_block_manager_cursor()
     assert(read_block->size == 10);
     assert(memcmp(read_block->data, "testdata1", 10) == 0);
 
-    block_manager_block_free(read_block);
+    (void)block_manager_block_free(read_block);
 
     /* we go back */
     assert(block_manager_cursor_prev(cursor) == 0);
@@ -266,8 +266,8 @@ void test_block_manager_cursor()
     read_block = block_manager_cursor_read(cursor);
     if (read_block == NULL)
     {
-        block_manager_cursor_free(cursor);
-        block_manager_close(bm);
+        (void)block_manager_cursor_free(cursor);
+        (void)block_manager_close(bm);
         return;
     }
 
@@ -275,16 +275,16 @@ void test_block_manager_cursor()
     assert(read_block->size == 10);
     assert(memcmp(read_block->data, "testdata0", 10) == 0);
 
-    block_manager_block_free(read_block);
+    (void)block_manager_block_free(read_block);
 
     /* we free the cursor */
-    block_manager_cursor_free(cursor);
+    (void)block_manager_cursor_free(cursor);
 
     /* we close the block manager */
     assert(block_manager_close(bm) == 0);
 
     /* we remove the file */
-    remove("test.db");
+    (void)remove("test.db");
 
     printf(GREEN "test_block_manager_cursor passed\n" RESET);
 }
@@ -308,7 +308,7 @@ void example()
         assert(block != NULL);
 
         assert(block_manager_block_write(bm, block) == 0);
-        block_manager_block_free(block);
+        (void)block_manager_block_free(block);
     }
 
     block_manager_cursor_t *cursor;
@@ -324,7 +324,7 @@ void example()
     while ((read_block = block_manager_cursor_read(cursor)) != NULL)
     {
         printf("Block data: %.*s\n", (int)read_block->size, (char *)read_block->data);
-        block_manager_block_free(read_block);
+        (void)block_manager_block_free(read_block);
         if (block_manager_cursor_next(cursor) != 0) break;
     }
 
@@ -334,12 +334,12 @@ void example()
         read_block = block_manager_cursor_read(cursor);
         if (read_block == NULL) break;
         printf("Block data: %.*s\n", (int)read_block->size, (char *)read_block->data);
-        block_manager_block_free(read_block);
+        (void)block_manager_block_free(read_block);
     }
 
-    block_manager_cursor_free(cursor);
+    (void)block_manager_cursor_free(cursor);
     assert(block_manager_close(bm) == 0);
-    remove("test.db");
+    (void)remove("test.db");
 }
 
 void test_block_manager_count_blocks()
@@ -358,13 +358,13 @@ void test_block_manager_count_blocks()
         assert(block != NULL);
 
         assert(block_manager_block_write(bm, block) != -1);
-        block_manager_block_free(block);
+        (void)block_manager_block_free(block);
     }
 
     assert(block_manager_count_blocks(bm) == 3);
 
     assert(block_manager_close(bm) == 0);
-    remove("test.db");
+    (void)remove("test.db");
 
     printf(GREEN "test_block_manager_count_blocks passed\n" RESET);
 }
@@ -384,7 +384,7 @@ void test_block_manager_cursor_goto_first()
         assert(block != NULL);
 
         assert(block_manager_block_write(bm, block) != -1);
-        block_manager_block_free(block);
+        (void)block_manager_block_free(block);
     }
 
     block_manager_cursor_t *cursor;
@@ -399,11 +399,11 @@ void test_block_manager_cursor_goto_first()
     block_manager_block_t *read_block = block_manager_cursor_read(cursor);
     assert(read_block != NULL);
     assert(memcmp(read_block->data, "testdata0", 10) == 0);
-    block_manager_block_free(read_block);
+    (void)block_manager_block_free(read_block);
 
-    block_manager_cursor_free(cursor);
+    (void)block_manager_cursor_free(cursor);
     assert(block_manager_close(bm) == 0);
-    remove("test.db");
+    (void)remove("test.db");
 
     printf(GREEN "test_block_manager_cursor_goto_first passed\n" RESET);
 }
@@ -423,7 +423,7 @@ void test_block_manager_cursor_goto_last()
         assert(block != NULL);
 
         assert(block_manager_block_write(bm, block) != -1);
-        block_manager_block_free(block);
+        (void)block_manager_block_free(block);
     }
 
     block_manager_cursor_t *cursor;
@@ -439,11 +439,11 @@ void test_block_manager_cursor_goto_last()
     assert(read_block != NULL);
 
     assert(memcmp(read_block->data, "testdata2", 10) == 0);
-    block_manager_block_free(read_block);
+    (void)block_manager_block_free(read_block);
 
-    block_manager_cursor_free(cursor);
+    (void)block_manager_cursor_free(cursor);
     assert(block_manager_close(bm) == 0);
-    remove("test.db");
+    (void)remove("test.db");
 
     printf(GREEN "test_block_manager_cursor_goto_last passed\n" RESET);
 }
@@ -463,13 +463,13 @@ void test_block_manager_cursor_has_next()
         assert(block != NULL);
 
         assert(block_manager_block_write(bm, block) != -1);
-        block_manager_block_free(block);
+        (void)block_manager_block_free(block);
     }
 
     block_manager_cursor_t *cursor;
     if (block_manager_cursor_init(&cursor, bm) != 0)
     {
-        block_manager_close(bm);
+        (void)block_manager_close(bm);
         return;
     }
 
@@ -482,9 +482,9 @@ void test_block_manager_cursor_has_next()
     assert(block_manager_cursor_next(cursor) == 0);
     assert(block_manager_cursor_has_next(cursor) == 1);
 
-    block_manager_cursor_free(cursor);
+    (void)block_manager_cursor_free(cursor);
     assert(block_manager_close(bm) == 0);
-    remove("test.db");
+    (void)remove("test.db");
 
     printf(GREEN "test_block_manager_cursor_has_next passed\n" RESET);
 }
@@ -504,13 +504,13 @@ void test_block_manager_cursor_has_prev()
         assert(block != NULL);
 
         assert(block_manager_block_write(bm, block) != -1);
-        block_manager_block_free(block);
+        (void)block_manager_block_free(block);
     }
 
     block_manager_cursor_t *cursor;
     if (block_manager_cursor_init(&cursor, bm) != 0)
     {
-        block_manager_close(bm);
+        (void)block_manager_close(bm);
         return;
     }
 
@@ -523,9 +523,9 @@ void test_block_manager_cursor_has_prev()
     assert(block_manager_cursor_prev(cursor) == 0);
     assert(block_manager_cursor_has_prev(cursor) == 0);
 
-    block_manager_cursor_free(cursor);
+    (void)block_manager_cursor_free(cursor);
     assert(block_manager_close(bm) == 0);
-    remove("test.db");
+    (void)remove("test.db");
 
     printf(GREEN "test_block_manager_cursor_has_prev passed\n" RESET);
 }

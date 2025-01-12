@@ -569,7 +569,7 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
     if (_tidesdb_load_column_families(*tdb) == -1)
     {
         free((*tdb)->directory);
-        tidesdb_close(*tdb);
+        (void)tidesdb_close(*tdb);
         return tidesdb_err_from_code(TIDESDB_ERR_LOAD_COLUMN_FAMILIES);
     }
 
@@ -581,7 +581,7 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
     {
         (void)log_write((*tdb)->log,
                         tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SYSTEM_MEMORY)->message);
-        tidesdb_close(*tdb);
+        (void)tidesdb_close(*tdb);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SYSTEM_MEMORY);
     }
 
@@ -591,7 +591,7 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
     {
         (void)log_write((*tdb)->log,
                         tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SYSTEM_THREADS)->message);
-        tidesdb_close(*tdb);
+        (void)tidesdb_close(*tdb);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SYSTEM_THREADS);
     }
 

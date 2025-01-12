@@ -163,7 +163,7 @@ In order to store data in TidesDB you need a column family.  This is by design. 
 - whether to use bloom filters
 - what data structure to use for the memtable [`TDB_MEMTABLE_SKIP_LIST`, `TDB_MEMTABLE_HASH_TABLE`]
 
-A skip list is a bit slower on writes but faster on reads.  A hash table is faster on writes but slower on reads.
+A skip list is a bit slower on writes but faster on reads.  A hash table in TidesDB is faster on writes and reads.
 A hash table will cause more write amplification than a skip list internally as sstables are not sorted right away.
 
 The flush threshold is an accumilation of the size of your key value pairs in the memtable.  When the threshold is reached the memtable is flushed to an sstable.

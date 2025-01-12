@@ -30,54 +30,54 @@ void test_bloom_filter_new()
     assert(bf != NULL);
     assert(bf->m > 0);
     assert(bf->h > 0);
-    bloom_filter_free(bf);
+    (void)bloom_filter_free(bf);
     printf(GREEN "test_bloom_filter_new passed\n" RESET);
 }
 
 void test_bloom_filter_add_and_contains()
 {
     bloom_filter_t *bf;
-    bloom_filter_new(&bf, 0.01, 1000);
+    (void)bloom_filter_new(&bf, 0.01, 1000);
 
     const char *key = "test_key";
-    bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
+    (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
     assert(bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)) == 1);
 
     const char *non_existent_key = "non_existent_key";
     assert(bloom_filter_contains(bf, (const uint8_t *)non_existent_key, strlen(non_existent_key)) ==
            0);
 
-    bloom_filter_free(bf);
+    (void)bloom_filter_free(bf);
     printf(GREEN "test_bloom_filter_add_and_contains passed\n" RESET);
 }
 
 void test_bloom_filter_is_full()
 {
     bloom_filter_t *bf;
-    bloom_filter_new(&bf, 0.01, 10);
+    (void)bloom_filter_new(&bf, 0.01, 10);
 
     const char *key = "test_key";
     for (int i = 0; i < 10; i++)
     {
-        bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
+        (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
     }
     assert(bloom_filter_is_full(bf) == 0);
 
-    bloom_filter_free(bf);
+    (void)bloom_filter_free(bf);
     printf(GREEN "test_bloom_filter_is_full passed\n" RESET);
 }
 
 void benchmark_bloom_filter()
 {
     bloom_filter_t *bf;
-    bloom_filter_new(&bf, 0.01, 1000000);
+    (void)bloom_filter_new(&bf, 0.01, 1000000);
 
     clock_t start_add = clock();
     for (int i = 0; i < 1000000; i++)
     {
         char key[20];
         sprintf(key, "key_%d", i);
-        bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
+        (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
     }
     clock_t end_add = clock();
     double time_spent_add = (double)(end_add - start_add) / CLOCKS_PER_SEC;
@@ -103,7 +103,7 @@ void benchmark_bloom_filter()
     double time_spent_check = (double)(end_check - start_check) / CLOCKS_PER_SEC;
     printf(CYAN "Checking 1,000,000 elements took %f seconds\n" RESET, time_spent_check);
 
-    bloom_filter_free(bf);
+    (void)bloom_filter_free(bf);
 }
 
 int main(void)

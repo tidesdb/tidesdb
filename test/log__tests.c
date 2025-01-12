@@ -30,33 +30,33 @@ void test_log_init()
     assert(result == 0);
     assert(log->file != NULL);
     assert(log->truncate_at == 10);
-    log_close(log);
-    remove("test.log");
+    (void)log_close(log);
+    (void)remove("test.log");
     printf(GREEN "test_log_init passed\n" RESET);
 }
 
 void test_log_write()
 {
     log_t *log = NULL;
-    log_init(&log, "test.log", -1);
+    (void)log_init(&log, "test.log", -1);
     int result = log_write(log, "This is a test message");
     assert(result == 0);
-    log_close(log);
-    remove("test.log");
+    (void)log_close(log);
+    (void)remove("test.log");
     printf(GREEN "test_log_write passed\n" RESET);
 }
 
 void test_log_count_lines()
 {
     log_t *log = NULL;
-    log_init(&log, "test.log", -1);
-    log_write(log, "Line 1");
-    log_write(log, "Line 2");
-    log_write(log, "Line 3");
+    assert(log_init(&log, "test.log", -1) == 0);
+    assert(log_write(log, "Line 1") == 0);
+    assert(log_write(log, "Line 2") == 0);
+    assert(log_write(log, "Line 3") == 0);
     int lines = log_count_lines(log);
     assert(lines == 3);
-    log_close(log);
-    remove("test.log");
+    (void)log_close(log);
+    (void)remove("test.log");
     printf(GREEN "test_log_count_lines passed\n" RESET);
 }
 

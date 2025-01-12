@@ -29,7 +29,7 @@ void test_tidesdb_err_new()
 
     assert(strcmp(e->message, "test") == 0);
 
-    tidesdb_err_free(e);
+    (void)tidesdb_err_free(e);
     printf(GREEN "test_tidesdb_err_new passed\n" RESET);
 }
 
@@ -40,7 +40,7 @@ void test_tidesdb_err_from_code()
 
     assert(strcmp(e->message, tidesdb_err_messages[TIDESDB_ERR_INVALID_DB].message) == 0);
 
-    tidesdb_err_free(e);
+    (void)tidesdb_err_free(e);
     printf(GREEN "test_tidesdb_err_from_code passed\n" RESET);
 }
 

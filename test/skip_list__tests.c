@@ -33,7 +33,7 @@ void test_skip_list_create_node()
     assert(node != NULL);
     assert(memcmp(node->key, key, sizeof(key)) == 0);
     assert(memcmp(node->value, value, sizeof(value)) == 0);
-    skip_list_free_node(node);
+    (void)skip_list_free_node(node);
     printf(GREEN "test_skip_list_create_node passed\n" RESET);
 }
 
@@ -42,7 +42,7 @@ void test_skip_list_put_get()
     skip_list_t *list = skip_list_new(12, 0.24f);
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
-    skip_list_put(list, key, sizeof(key), value, sizeof(value), -1);
+    assert(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
 
     uint8_t *retrieved_value;
     size_t retrieved_value_size;
@@ -68,11 +68,11 @@ void test_skip_list_clear()
     skip_list_t *list = skip_list_new(12, 0.24f);
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
-    skip_list_put(list, key, sizeof(key), value, sizeof(value), -1);
+    assert(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
     int result = skip_list_clear(list);
     assert(result == 0);
     assert(skip_list_count_entries(list) == 0);
-    skip_list_free(list);
+    (void)skip_list_free(list);
     printf(GREEN "test_skip_list_clear passed\n" RESET);
 }
 
@@ -83,10 +83,10 @@ void test_skip_list_count_entries()
 
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
-    skip_list_put(list, key, sizeof(key), value, sizeof(value), -1);
+    assert(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
     assert(skip_list_count_entries(list) == 1);
 
-    skip_list_free(list);
+    (void)skip_list_free(list);
     printf(GREEN "test_skip_list_count_entries passed\n" RESET);
 }
 
@@ -97,10 +97,10 @@ void test_skip_list_get_size()
 
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
-    skip_list_put(list, key, sizeof(key), value, sizeof(value), -1);
+    assert(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
     assert(skip_list_get_size(list) > 0);
 
-    skip_list_free(list);
+    (void)skip_list_free(list);
     printf(GREEN "test_skip_list_get_size passed\n" RESET);
 }
 
@@ -109,7 +109,7 @@ void test_skip_list_copy()
     skip_list_t *list = skip_list_new(12, 0.24f);
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
-    skip_list_put(list, key, sizeof(key), value, sizeof(value), -1);
+    assert(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
 
     skip_list_t *copy = skip_list_copy(list);
     assert(copy != NULL);
@@ -122,8 +122,8 @@ void test_skip_list_copy()
     assert(memcmp(retrieved_value, value, sizeof(value)) == 0);
 
     free(retrieved_value);
-    skip_list_free(copy);
-    skip_list_free(list);
+    (void)skip_list_free(copy);
+    (void)skip_list_free(list);
     printf(GREEN "test_skip_list_copy passed\n" RESET);
 }
 
@@ -147,8 +147,8 @@ void test_skip_list_cursor_next()
     uint8_t value1[] = "value1";
     uint8_t key2[] = "key2";
     uint8_t value2[] = "value2";
-    skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1);
-    skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1);
+    assert(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
+    assert(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
 
     skip_list_cursor_t *cursor = skip_list_cursor_init(list);
     assert(cursor != NULL);
@@ -171,14 +171,14 @@ void test_skip_list_cursor_prev()
     uint8_t value1[] = "value1";
     uint8_t key2[] = "key2";
     uint8_t value2[] = "value2";
-    skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1);
-    skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1);
+    assert(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
+    assert(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
 
     skip_list_cursor_t *cursor = skip_list_cursor_init(list);
     assert(cursor != NULL);
     assert(cursor->current != NULL);
 
-    skip_list_cursor_next(cursor);
+    assert(skip_list_cursor_next(cursor) == 0);
     int result = skip_list_cursor_prev(cursor);
     assert(result == 0);
     assert(cursor->current != NULL);
@@ -233,7 +233,7 @@ void benchmark_skip_list()
     clock_t start_write = clock();
     for (size_t i = 0; i < BENCH_N; i++)
     {
-        skip_list_put(list, keys[i], key_size, values[i], value_size, -1);
+        assert(skip_list_put(list, keys[i], key_size, values[i], value_size, -1) == 0);
     }
     clock_t end_write = clock();
     double write_time = (double)(end_write - start_write) / CLOCKS_PER_SEC;
@@ -264,7 +264,7 @@ void benchmark_skip_list()
     free(keys);
     free(values);
 
-    skip_list_free(list);
+    (void)skip_list_free(list);
 }
 
 void test_skip_list_ttl()
@@ -274,7 +274,7 @@ void test_skip_list_ttl()
     uint8_t value[] = "test_value";
     time_t ttl = 1; /* 1 second */
 
-    skip_list_put(list, key, sizeof(key), value, sizeof(value), time(NULL) + ttl);
+    assert(skip_list_put(list, key, sizeof(key), value, sizeof(value), time(NULL) + ttl) == 0);
 
     /* take a snooze */
     sleep(ttl + 1);
@@ -289,61 +289,8 @@ void test_skip_list_ttl()
     assert(*(uint32_t *)retrieved_value == TOMBSTONE);
 
     free(retrieved_value);
-    skip_list_free(list);
-    printf(GREEN "test_skip_list_ttl passed\n" RESET);
-}
-
-void example()
-{
-    skip_list_t *list = skip_list_new(12, 0.24f);
-    if (list == NULL)
-    {
-        fprintf(stderr, "Failed to create skip list\n");
-        return;
-    }
-
-    for (int i = 0; i < 10; i++)
-    {
-        char key[5];
-        char value[5];
-        snprintf(key, sizeof(key), "key%d", i);
-        snprintf(value, sizeof(value), "val%d", i);
-        if (skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                          strlen(value) + 1, -1) != 0)
-        {
-            fprintf(stderr, "Failed to insert key-value pair\n");
-            skip_list_free(list);
-            return;
-        }
-    }
-
-    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
-    if (cursor == NULL)
-    {
-        fprintf(stderr, "Failed to initialize cursor\n");
-        skip_list_free(list);
-        return;
-    }
-
-    do
-    {
-        uint8_t *key;
-        size_t key_size;
-        uint8_t *value;
-        size_t value_size;
-        time_t ttl;
-        if (skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl) == 0)
-        {
-            printf("Key: %.*s, Value: %.*s\n", (int)key_size, key, (int)value_size, value);
-        }
-        else
-        {
-            printf("Failed to get key-value pair\n");
-        }
-    } while (skip_list_cursor_next(cursor) == 0);
-
-    (void)skip_list_cursor_free(cursor);
     (void)skip_list_free(list);
+    printf(GREEN "test_skip_list_ttl passed\n" RESET);
 }
 
 void test_skip_list_cursor_functions()

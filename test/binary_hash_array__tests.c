@@ -29,7 +29,7 @@ void test_binary_hash_array_new()
     assert(bha != NULL);
     assert(bha->entries != NULL);
     assert(bha->capacity == 1000);
-    binary_hash_array_free(bha);
+    (void)binary_hash_array_free(bha);
     printf(GREEN "test_binary_hash_array_new passed\n" RESET);
 }
 
@@ -39,7 +39,7 @@ void test_binary_hash_array_add_and_contains()
 
     uint8_t key[] = "test_key";
 
-    binary_hash_array_add(bha, key, sizeof(key), 42);
+    (void)binary_hash_array_add(bha, key, sizeof(key), 42);
 
     size_t serialized_size;
     /* we serialize the entries to sort them */
@@ -50,11 +50,11 @@ void test_binary_hash_array_add_and_contains()
     uint8_t non_existent_key[] = "non_existent_key";
     size_t non_existent_key_len = strlen((const char *)non_existent_key);
     uint8_t non_existent_hash[16];
-    binary_hash_array_hash_key(non_existent_key, non_existent_key_len, non_existent_hash);
+    (void)binary_hash_array_hash_key(non_existent_key, non_existent_key_len, non_existent_hash);
     assert(binary_hash_array_contains(sorted_bha, non_existent_hash, non_existent_key_len) == -1);
 
-    binary_hash_array_free(bha);
-    binary_hash_array_free(sorted_bha);
+    (void)binary_hash_array_free(bha);
+    (void)binary_hash_array_free(sorted_bha);
     free(serialized_data);
     printf(GREEN "test_binary_hash_array_add_and_contains passed\n" RESET);
 }
@@ -82,7 +82,7 @@ void benchmark_binary_hash_array()
     uint8_t *serialized_data = binary_hash_array_serialize(bha, &serialized_size);
     assert(serialized_data != NULL);
 
-    binary_hash_array_free(bha);
+    (void)binary_hash_array_free(bha);
 
     /* we print the size of the serialized sorted binary hash array */
     printf(BOLDWHITE "Sorted binary hash array size: %f MB\n" RESET,
@@ -104,7 +104,7 @@ void benchmark_binary_hash_array()
     cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
     printf(CYAN "Time taken to check entries: %f seconds\n" RESET, cpu_time_used);
 
-    binary_hash_array_free(deserialized_bha);
+    (void)binary_hash_array_free(deserialized_bha);
     printf(GREEN "benchmark_binary_hash_array passed\n" RESET);
 }
 

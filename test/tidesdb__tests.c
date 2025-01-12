@@ -2014,84 +2014,279 @@ void test_tidesdb_put_flush_shutdown_compact_get(bool compress, tidesdb_compress
                                                  : " with hash table memtable");
 }
 
+/* for concurrency tests */
+#define NUM_THREADS         4   /* n of threads */
+#define NUM_KEYS_PER_THREAD 100 /* n of keys per thread */
+
+/*
+ * thread_data_t
+ * used for concurrent tests
+ */
+typedef struct
+{
+    tidesdb_t *db;
+    const char *cf_name;
+    int thread_id;
+} thread_data_t;
+
+void *put_operation(void *arg)
+{
+    thread_data_t *data = (thread_data_t *)arg;
+    char key[20];
+    char value[20];
+    tidesdb_err_t *err;
+
+    for (int i = 0; i < NUM_KEYS_PER_THREAD; i++)
+    {
+        (void)snprintf(key, sizeof(key), "key_%d_%d", data->thread_id, i);
+        (void)snprintf(value, sizeof(value), "value_%d_%d", data->thread_id, i);
+        err = tidesdb_put(data->db, data->cf_name, (uint8_t *)key, strlen(key) + 1,
+                          (uint8_t *)value, strlen(value) + 1, -1);
+        if (err != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+        }
+        assert(err == NULL);
+    }
+
+    (void)pthread_exit(NULL);
+}
+
+void *get_operation(void *arg)
+{
+    thread_data_t *data = (thread_data_t *)arg;
+    char key[20];
+    char expected_value[20];
+    uint8_t *retrieved_value = NULL;
+    size_t value_size;
+    tidesdb_err_t *err;
+
+    for (int i = 0; i < NUM_KEYS_PER_THREAD; i++)
+    {
+        (void)snprintf(key, sizeof(key), "key_%d_%d", data->thread_id, i);
+        (void)snprintf(expected_value, sizeof(expected_value), "value_%d_%d", data->thread_id, i);
+        err = tidesdb_get(data->db, data->cf_name, (uint8_t *)key, strlen(key) + 1,
+                          &retrieved_value, &value_size);
+        if (err != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+            assert(err == NULL);
+        }
+        assert(memcmp(retrieved_value, expected_value, value_size) == 0);
+        free(retrieved_value);
+    }
+
+    (void)pthread_exit(NULL);
+}
+
+void test_tidesdb_put_get_concurrent(bool compress, tidesdb_compression_algo_t algo,
+                                     bool bloom_filter, tidesdb_memtable_ds_t memtable_ds)
+{
+    tidesdb_t *db = NULL;
+    tidesdb_err_t *err = tidesdb_open("test_db", &db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)tidesdb_err_free(err);
+
+    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
+                                       bloom_filter, memtable_ds);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    pthread_t put_threads[NUM_THREADS];
+    pthread_t get_threads[NUM_THREADS];
+    thread_data_t thread_data[NUM_THREADS];
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        thread_data[i].db = db;
+        thread_data[i].cf_name = "test_cf";
+        thread_data[i].thread_id = i;
+        pthread_create(&put_threads[i], NULL, put_operation, (void *)&thread_data[i]);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_join(put_threads[i], NULL);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_create(&get_threads[i], NULL, get_operation, (void *)&thread_data[i]);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_join(get_threads[i], NULL);
+    }
+
+    err = tidesdb_close(db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)_tidesdb_remove_directory("test_db");
+    printf(GREEN "test_tidesdb_put_get_concurrent%s%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
+}
+
 int main(void)
 {
     test_tidesdb_serialize_deserialize_key_value_pair(false, TDB_NO_COMPRESSION);
+
     test_tidesdb_serialize_deserialize_column_family_config();
+
     test_tidesdb_serialize_deserialize_operation(false, TDB_NO_COMPRESSION);
+
     test_tidesdb_tidesdb_open_close();
+
     test_tidesdb_create_drop_column_family(false, TDB_NO_COMPRESSION, false,
                                            TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_get_memtable(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_close_replay_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_txn_put_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_txn_put_get_rollback_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_txn_put_put_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_flush_stat(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_cursor(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_cursor_memtable_sstables(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_flush_close_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_flush_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_flush_shutdown_compact_get(false, TDB_NO_COMPRESSION, false,
                                                 TDB_MEMTABLE_SKIP_LIST);
 
+    test_tidesdb_put_get_concurrent(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+
     /* using hash table memtable */
     test_tidesdb_put_get_memtable(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_close_replay_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_txn_put_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_txn_put_get_rollback_get(false, TDB_NO_COMPRESSION, false,
                                           TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_txn_put_put_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
-    test_tidesdb_cursor(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
+    test_tidesdb_put_flush_stat(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_cursor_memtable_sstables(false, TDB_NO_COMPRESSION, false,
                                           TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_flush_close_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_flush_delete_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
+    test_tidesdb_put_get_concurrent(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
 
     /* the next batch of tests we will run with bloom filters and compression
      * same tests just with bloom filters and compression enabled */
     test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_SNAPPY);
+
     test_tidesdb_serialize_deserialize_operation(true, TDB_COMPRESS_SNAPPY);
+
     test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_LZ4);
+
     test_tidesdb_serialize_deserialize_operation(true, TDB_COMPRESS_LZ4);
+
     test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_ZSTD);
+
     test_tidesdb_serialize_deserialize_operation(true, TDB_COMPRESS_ZSTD);
+
     test_tidesdb_create_drop_column_family(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_get_memtable(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_close_replay_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_txn_put_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_txn_put_get_rollback_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_txn_put_put_delete_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_delete_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_flush_close_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_flush_delete_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_cursor(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
     test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
+
+    test_tidesdb_put_get_concurrent(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
 
     /* same tests as above but using a hash table as the memtable data structure */
     test_tidesdb_put_get_memtable(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_close_replay_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_txn_put_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_txn_put_get_rollback_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_txn_put_put_delete_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_delete_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_flush_close_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_flush_delete_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_cursor(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+
     test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
 
     test_tidesdb_start_partial_merge(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);

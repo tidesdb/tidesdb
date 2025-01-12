@@ -44,6 +44,12 @@ cmake --install build
 ## Requirements
 You need cmake and a C compiler.
 You also require the `snappy`, `lz4`, and `zstd` libraries.
+
+### Dependencies
+- [Snappy](https://github.com/google/snappy)
+- [LZ4](https://github.com/lz4/lz4)
+- [Zstandard](https://github.com/facebook/zstd)
+
 ### Linux
 ```bash
 sudo apt install libzstd-dev
@@ -101,11 +107,6 @@ Bindings are in the works in various languages.
 ## Discord Community
 Join the [TidesDB Discord Community](https://discord.gg/8eJmWtec) to ask questions, work on development, and discuss the future of TidesDB.
 
-## Dependencies
-- [Snappy](https://github.com/google/snappy)
-- [LZ4](https://github.com/lz4/lz4)
-- [Zstandard](https://github.com/facebook/zstd)
-
 ## Include
 ```c
 #include <tidesdb/tidesdb.h> /* you can use other components of TidesDB such has hash table,
@@ -149,7 +150,7 @@ if (e != NULL)
 ```
 
 ### Creating a column family
-In order to store data in TidesDB you need a column family.  This is by design.
+In order to store data in TidesDB you need a column family.  This is by design.  There is no default.
 
 **You pass**
 - the database you want to create the column family in.  Must be open
@@ -161,6 +162,12 @@ In order to store data in TidesDB you need a column family.  This is by design.
 - the compression algorithm to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
 - whether to use bloom filters
 - what data structure to use for the memtable [`TDB_MEMTABLE_SKIP_LIST`, `TDB_MEMTABLE_HASH_TABLE`]
+
+A skip list is a bit slower on writes but faster on reads.  A hash table in TidesDB is faster on writes and reads.
+A hash table will cause more write amplification than a skip list internally as sstables are not sorted right away.
+
+The flush threshold is an accumilation of the size of your key value pairs in the memtable.  When the threshold is reached the memtable is flushed to an sstable.
+The threshold is up to you and the system you're running on.  The minimum size is 1mb. The larger the threshold the more data you can store in memory before flushing to disk.
 
 ```c
 /* create a column family with no compression and no bloom filters (slower reads) */
@@ -209,8 +216,6 @@ if (err != NULL) {
 printf("%s\n", column_families);
 free(column_families);
 ```
-
-
 
 ### Putting a key-value pair
 You pass

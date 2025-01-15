@@ -11,6 +11,7 @@ set(PROJECT_VERSION 0.8.0) # TidesDB v0.8.0b
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
+option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 
 # for development, we want to enable all warnings and sanitizers
 if(TIDESDB_WITH_SANITIZER)
@@ -27,7 +28,7 @@ endif()
 
 include_directories(external) # for external libraries linking internally
 
-add_library(tidesdb SHARED src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c src/binary_hash_array.c src/log.c external/xxhash.c)
+add_library(tidesdb src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c src/binary_hash_array.c src/log.c external/xxhash.c)
 
 target_include_directories(tidesdb PRIVATE src)
 

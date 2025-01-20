@@ -148,6 +148,45 @@ int fsync(int fd)
     return FlushFileBuffers(h) ? 0 : -1;
 }
 
+/* gettimeofday function for win */
+int gettimeofday(struct timeval *tp, struct timezone *tzp)
+{
+    FILETIME ft;
+    unsigned __int64 tmpres = 0;
+    static int tzflag;
+
+    if (NULL != tp)
+    {
+        GetSystemTimeAsFileTime(&ft);
+
+        tmpres |= ft.dwHighDateTime;
+        tmpres <<= 32;
+        tmpres |= ft.dwLowDateTime;
+
+        /* convert into microseconds */
+        tmpres /= 10;
+
+        /* converting file time to unix epoch */
+        tmpres -= 11644473600000000ULL;
+
+        tp->tv_sec = (long)(tmpres / 1000000UL);
+        tp->tv_usec = (long)(tmpres % 1000000UL);
+    }
+
+    if (NULL != tzp)
+    {
+        if (!tzflag)
+        {
+            _tzset();
+            tzflag++;
+        }
+        tzp->tz_minuteswest = _timezone / 60;
+        tzp->tz_dsttime = _daylight;
+    }
+
+    return 0;
+}
+
 #elif defined(__APPLE__)
 #include <dirent.h>
 #include <mach/mach.h>
@@ -155,6 +194,7 @@ int fsync(int fd)
 #include <semaphore.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #else /* posix systems */
@@ -163,6 +203,7 @@ int fsync(int fd)
 #include <semaphore.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 typedef pthread_t thread_t;

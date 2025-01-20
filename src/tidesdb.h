@@ -480,6 +480,36 @@ extern "C"
                                time_t ttl);
 
     /*
+     * tidesdb_range
+     * get a range of key-value pairs from TidesDB
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param start_key the start key
+     * @param start_key_size the size of the start key
+     * @param end_key the end key
+     * @param end_key_size the size of the end key
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
+                                 const uint8_t *start_key, size_t start_key_size,
+                                 const uint8_t *end_key, size_t end_key_size,
+                                 tidesdb_key_value_pair_t ***result, size_t *result_size);
+
+    /*
+     * tidesdb_filter
+     * filter key-value pairs from TidesDB based on a comparison method
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param comparison_method the comparison method to use
+     * @param result an array to store the filtered key-value pairs
+     * @param result_size the size of the result array
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
+                                  bool (*comparison_method)(const tidesdb_key_value_pair_t *),
+                                  tidesdb_key_value_pair_t ***result, size_t *result_size);
+
+    /*
      * tidesdb_get
      * get a value from TidesDB
      * @param tdb the TidesDB instance
@@ -1051,6 +1081,18 @@ extern "C"
      * @return the maximum number of available system threads
      */
     int _tidesdb_get_max_sys_threads();
+
+    /*
+     * _tidesdb_key_exists
+     * check if a key exists in a result set
+     * @param key the key
+     * @param key_size the size of the key
+     * @param result the key-value pair if the key exists
+     * @param result_size the size of the result
+     * @return 1 if the key exists, 0 if not
+     */
+    int _tidesdb_key_exists(const uint8_t *key, size_t key_size, tidesdb_key_value_pair_t **result,
+                            size_t result_size);
 
 #ifdef __cplusplus
 }

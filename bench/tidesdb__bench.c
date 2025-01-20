@@ -19,287 +19,224 @@
 #include "../src/tidesdb.h"
 #include "../test/test_macros.h"
 
-/* test constants */
-#define NUM_OPERATIONS         500000 /* number of operations per thread */
-#define NUM_THREADS            2 /* you can increase this to test with more threads, usually slower */
-#define SIZE                   64 /* key and value size, in bytes */
-#define DIR                    "benchmark_db"
-#define FLUSH_THRESHOLD        ((1024 * 1024) * 64)
-#define THREADS_FOR_COMPACTION 2
+#define NUM_OPERATIONS 1000000
+#define KEY_SIZE       16
+#define VALUE_SIZE     100
+#define CF_NAME        "benchmark_cf"
+#define NUM_THREADS    4
 
 /*
- * thread_arg_t
- * @param tdb the tidesdb instance
- * @param column_family_name the column family name
- * @param thread_id the thread id
+ * thread_data_t struct is used to pass data to the thread functions
  */
 typedef struct
 {
     tidesdb_t *tdb;
-    const char *column_family_name;
-    int thread_id;
-} thread_arg_t;
+    char **keys;
+    char **values;
+    int start;
+    int end;
+} thread_data_t;
 
-void pad_key_with_nines(uint8_t *key, size_t target_len)
+void generate_random_string(char *str, size_t size)
 {
-    size_t current_len = strlen((char *)key);
-    if (current_len < target_len)
+    const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (size_t i = 0; i < size - 1; i++)
     {
-        memset(key + current_len, '9', target_len - current_len);
-        key[target_len] = '\0';
+        str[i] = charset[rand() % (sizeof(charset) - 1)];
     }
+    str[size - 1] = '\0';
 }
 
-void create_key(uint8_t *key, int index)
+double get_time_ms()
 {
-    snprintf((char *)key, SIZE, "key%03d", index);
-    (void)pad_key_with_nines(key, SIZE - 1);
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (tv.tv_sec * 1000.0) + (tv.tv_usec / 1000.0);
 }
 
-void create_value(uint8_t *value, int index, int thread_id)
+void *thread_put(void *arg)
 {
-    snprintf((char *)value, SIZE, "value%03d_%d", index, thread_id);
-    (void)pad_key_with_nines(value, SIZE - 1);
-}
-
-void *benchmark_put(void *arg)
-{
-    thread_arg_t *targ = arg;
-    tidesdb_t *tdb = targ->tdb;
-    const char *cf_name = targ->column_family_name;
-    int thread_id = targ->thread_id;
-
-    for (int i = 0; i < NUM_OPERATIONS; i++)
+    thread_data_t *data = (thread_data_t *)arg;
+    tidesdb_err_t *err = NULL;
+    for (int i = data->start; i < data->end; i++)
     {
-        uint8_t key[SIZE];
-        uint8_t value[SIZE];
-        (void)create_key(key, i);
-        (void)create_value(value, i, thread_id);
-
-        tidesdb_err_t *err =
-            tidesdb_put(tdb, cf_name, key, strlen((char *)key), value, strlen((char *)value), -1);
+        err = tidesdb_put(data->tdb, CF_NAME, (uint8_t *)data->keys[i], strlen(data->keys[i]),
+                          (uint8_t *)data->values[i], strlen(data->values[i]), -1);
         if (err != NULL)
         {
-            printf(RED "Error: %s\n" RESET, err->message);
+            printf(BOLDRED "Put operation failed: %s\n" RESET, err->message);
             (void)tidesdb_err_free(err);
+            (void)pthread_exit(NULL);
         }
     }
-    return NULL;
+    (void)pthread_exit(NULL);
 }
 
-void *benchmark_put_compact(void *arg)
+void *thread_get(void *arg)
 {
-    thread_arg_t *targ = arg;
-    tidesdb_t *tdb = targ->tdb;
-    const char *cf_name = targ->column_family_name;
-    int thread_id = targ->thread_id;
-
-    for (int i = 0; i < NUM_OPERATIONS; i++)
+    thread_data_t *data = (thread_data_t *)arg;
+    tidesdb_err_t *err = NULL;
+    for (int i = data->start; i < data->end; i++)
     {
-        uint8_t key[SIZE];
-        uint8_t value[SIZE];
-        (void)create_key(key, i);
-        (void)create_value(value, i, thread_id);
-
-        tidesdb_err_t *err =
-            tidesdb_put(tdb, cf_name, key, strlen((char *)key), value, strlen((char *)value), -1);
+        uint8_t *value_out;
+        size_t value_len;
+        err = tidesdb_get(data->tdb, CF_NAME, (uint8_t *)data->keys[i], strlen(data->keys[i]),
+                          &value_out, &value_len);
         if (err != NULL)
         {
-            printf(RED "Error: %s\n" RESET, err->message);
+            printf(BOLDRED "Get operation failed: %s\n" RESET, err->message);
             (void)tidesdb_err_free(err);
+            (void)pthread_exit(NULL);
         }
-
-        /* compact sstables in the middle of the benchmark */
-        if (i == (NUM_OPERATIONS / 2))
-        {
-            err = tidesdb_compact_sstables(tdb, cf_name, THREADS_FOR_COMPACTION);
-            if (err != NULL)
-            {
-                printf(RED "Error: %s\n" RESET, err->message);
-                (void)tidesdb_err_free(err);
-            }
-        }
+        free(value_out);
     }
-    return NULL;
+    (void)pthread_exit(NULL);
 }
 
-void *benchmark_get(void *arg)
+void *thread_delete(void *arg)
 {
-    thread_arg_t *targ = arg;
-    tidesdb_t *tdb = targ->tdb;
-    const char *cf_name = targ->column_family_name;
-    /* int thread_id = targ->thread_id; not used */
-
-    for (int i = 0; i < NUM_OPERATIONS; i++)
+    thread_data_t *data = (thread_data_t *)arg;
+    tidesdb_err_t *err = NULL;
+    for (int i = data->start; i < data->end; i++)
     {
-        uint8_t key[SIZE];
-        (void)create_key(key, i);
-
-        uint8_t *value = NULL;
-        size_t value_size = 0;
-        tidesdb_err_t *err =
-            tidesdb_get(tdb, cf_name, key, strlen((char *)key), &value, &value_size);
+        err = tidesdb_delete(data->tdb, CF_NAME, (uint8_t *)data->keys[i], strlen(data->keys[i]));
         if (err != NULL)
         {
-            printf(RED "Error: %s\n" RESET, err->message);
+            printf(BOLDRED "Delete operation failed: %s\n" RESET, err->message);
             (void)tidesdb_err_free(err);
-            continue;
-        }
-        if (value != NULL)
-        {
-            free(value);
-            value = NULL;
+            (void)pthread_exit(NULL);
         }
     }
-    return NULL;
+    (void)pthread_exit(NULL);
 }
 
-void *benchmark_delete(void *arg)
+int main()
 {
-    thread_arg_t *targ = arg;
-    tidesdb_t *tdb = targ->tdb;
-    const char *cf_name = targ->column_family_name;
-    /* int thread_id = targ->thread_id; could be used for debugging if need be */
-
-    for (int i = 0; i < NUM_OPERATIONS; i++)
+    tidesdb_t *tdb = NULL;
+    tidesdb_err_t *err = NULL;
+    double start_time, end_time;
+    char **keys = malloc(NUM_OPERATIONS * sizeof(char *));
+    if (keys == NULL)
     {
-        uint8_t key[SIZE];
-        (void)create_key(key, i);
-
-        tidesdb_err_t *err = tidesdb_delete(tdb, cf_name, key, strlen((char *)key));
-        if (err != NULL)
-        {
-            printf(RED "Error: %s\n" RESET, err->message);
-            (void)tidesdb_err_free(err);
-        }
+        printf(BOLDRED "Failed to allocate memory for keys\n" RESET);
+        return 1;
     }
-    return NULL;
-}
 
-void run_benchmark(void *(*benchmark_func)(void *), tidesdb_t *tdb, const char *cf_name)
-{
+    char **values = malloc(NUM_OPERATIONS * sizeof(char *));
+    if (values == NULL)
+    {
+        printf(BOLDRED "Failed to allocate memory for values\n" RESET);
+        free(keys);
+        return 1;
+    }
+
     pthread_t threads[NUM_THREADS];
-    thread_arg_t args[NUM_THREADS];
+    thread_data_t thread_data[NUM_THREADS];
 
+    srand(time(NULL));
+
+    for (int i = 0; i < NUM_OPERATIONS; i++)
+    {
+        keys[i] = malloc(KEY_SIZE);
+        values[i] = malloc(VALUE_SIZE);
+        (void)generate_random_string(keys[i], KEY_SIZE);
+        (void)generate_random_string(values[i], VALUE_SIZE);
+    }
+
+    err = tidesdb_open("benchmark_db", &tdb);
+    if (err != NULL)
+    {
+        printf(BOLDRED "Failed to open database: %s\n" RESET, err->message);
+        (void)tidesdb_err_free(err);
+        free(keys);
+        free(values);
+        return 1;
+    }
+
+    err = tidesdb_create_column_family(tdb, CF_NAME, (1024 * 1024) * 128, TDB_USING_HT_MAX_LEVEL,
+                                       TDB_USING_HT_PROBABILITY, false, TDB_NO_COMPRESSION, true,
+                                       TDB_MEMTABLE_HASH_TABLE);
+    if (err != NULL)
+    {
+        printf(BOLDRED "Failed to create column family: %s\n" RESET, err->message);
+        (void)tidesdb_err_free(err);
+        free(keys);
+        free(values);
+        return 1;
+    }
+
+    printf(BOLDGREEN "\nBenchmarking Put operations...\n" RESET);
+    start_time = get_time_ms();
     for (int i = 0; i < NUM_THREADS; i++)
     {
-        args[i].tdb = tdb;
-        args[i].column_family_name = cf_name;
-        args[i].thread_id = i;
-        (void)pthread_create(&threads[i], NULL, benchmark_func, &args[i]);
+        thread_data[i].tdb = tdb;
+        thread_data[i].keys = keys;
+        thread_data[i].values = values;
+        thread_data[i].start = i * (NUM_OPERATIONS / NUM_THREADS);
+        thread_data[i].end = (i + 1) * (NUM_OPERATIONS / NUM_THREADS);
+        (void)pthread_create(&threads[i], NULL, thread_put, &thread_data[i]);
     }
-
     for (int i = 0; i < NUM_THREADS; i++)
     {
         (void)pthread_join(threads[i], NULL);
     }
-}
+    end_time = get_time_ms();
+    printf(BOLDGREEN "Put: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, NUM_OPERATIONS,
+           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
-/* benchmarks put with many flushes, put with compaction triggered in the middle of write operations
- * get, delete operations
- *
- * We also benchmark with different column family configurations with compression and bloom filter
- * and without
- */
-int main(void)
-{
-    (void)_tidesdb_remove_directory(DIR);
+    printf(BOLDGREEN "\nBenchmarking Get operations...\n" RESET);
+    start_time = get_time_ms();
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_create(&threads[i], NULL, thread_get, &thread_data[i]);
+    }
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_join(threads[i], NULL);
+    }
+    end_time = get_time_ms();
+    printf(BOLDGREEN "Get: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, NUM_OPERATIONS,
+           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
-    tidesdb_t *tdb = NULL;
+    printf(BOLDGREEN "\nBenchmarking Delete operations...\n" RESET);
+    start_time = get_time_ms();
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_create(&threads[i], NULL, thread_delete, &thread_data[i]);
+    }
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_join(threads[i], NULL);
+    }
+    end_time = get_time_ms();
+    printf(BOLDGREEN "Delete: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, NUM_OPERATIONS,
+           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
-    tidesdb_err_t *err = tidesdb_open(DIR, &tdb);
+    for (int i = 0; i < NUM_OPERATIONS; i++)
+    {
+        free(keys[i]);
+        free(values[i]);
+    }
+    free(keys);
+    free(values);
+
+    err = tidesdb_drop_column_family(tdb, CF_NAME);
     if (err != NULL)
     {
-        printf(RED "Error opening database: %s\n" RESET, err->message);
-        (void)tidesdb_err_free(err);
-        return -1;
+        printf(BOLDRED "Failed to drop column family: %s\n" RESET, err->message);
+        tidesdb_err_free(err);
     }
 
-    /* we can run one more benchmark with different column family configurations */
-
-    const char *cf_name = "cf1";
-    err = tidesdb_create_column_family(tdb, cf_name, FLUSH_THRESHOLD, 12, 0.24f, false,
-                                       TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+    err = tidesdb_close(tdb);
     if (err != NULL)
     {
-        printf(RED "Error creating column family: %s\n" RESET, err->message);
+        printf(BOLDRED "Failed to close database: %s\n" RESET, err->message);
         (void)tidesdb_err_free(err);
-        (void)tidesdb_close(tdb);
-        return -1;
+        return 1;
     }
 
-    const char *cf_name2 = "cf2";
-    err = tidesdb_create_column_family(tdb, cf_name2, FLUSH_THRESHOLD, 12, 0.24f, true,
-                                       TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_SKIP_LIST);
-    if (err != NULL)
-    {
-        printf(RED "Error creating column family: %s\n" RESET, err->message);
-        (void)tidesdb_err_free(err);
-        (void)tidesdb_close(tdb);
-        return -1;
-    }
+    (void)_tidesdb_remove_directory("benchmark_db");
+    printf(MAGENTA "\nCleanup completed\n" RESET);
 
-    printf(BOLDCYAN "Running PUT (no compression, bloom filter) benchmark...\n" RESET);
-    clock_t start = clock();
-    (void)run_benchmark(benchmark_put, tdb, cf_name);
-    clock_t end = clock();
-    printf(BOLDGREEN "PUT (no compression, bloom filter) benchmark completed in %f seconds\n" RESET,
-           (double)(end - start) / CLOCKS_PER_SEC);
-
-    printf(BOLDCYAN "Running PUT (no compression, bloom filter) compact benchmark...\n" RESET);
-    start = clock();
-    (void)run_benchmark(benchmark_put_compact, tdb, cf_name);
-    end = clock();
-    printf(BOLDGREEN
-           "PUT (no compression, bloom filter) compact benchmark completed in %f seconds\n" RESET,
-           (double)(end - start) / CLOCKS_PER_SEC);
-
-    printf(BOLDCYAN "Running GET (no compression, bloom filter) benchmark...\n" RESET);
-    start = clock();
-    (void)run_benchmark(benchmark_get, tdb, cf_name);
-    end = clock();
-    printf(BOLDGREEN "GET (no compression, bloom filter) benchmark completed in %f seconds\n" RESET,
-           (double)(end - start) / CLOCKS_PER_SEC);
-
-    printf(BOLDCYAN "Running DELETE (no compression, bloom filter) benchmark...\n" RESET);
-    start = clock();
-    (void)run_benchmark(benchmark_delete, tdb, cf_name);
-    end = clock();
-    printf(BOLDGREEN
-           "DELETE (no compression, bloom filter) benchmark completed in %f seconds\n" RESET,
-           (double)(end - start) / CLOCKS_PER_SEC);
-
-    /* with snappy compression and bloom filter */
-    printf(BOLDCYAN "Running PUT (compression, bloom filter) benchmark...\n" RESET);
-    start = clock();
-    (void)run_benchmark(benchmark_put, tdb, cf_name2);
-    end = clock();
-    printf(BOLDGREEN "PUT benchmark completed in %f seconds\n" RESET,
-           (double)(end - start) / CLOCKS_PER_SEC);
-
-    printf(BOLDCYAN "Running PUT (compression, bloom filter) compact benchmark...\n" RESET);
-    start = clock();
-    (void)run_benchmark(benchmark_put_compact, tdb, cf_name2);
-    end = clock();
-    printf(BOLDGREEN
-           "PUT (compression, bloom filter) compact benchmark completed in %f seconds\n" RESET,
-           (double)(end - start) / CLOCKS_PER_SEC);
-
-    printf(BOLDCYAN "Running GET (compression, bloom filter) benchmark...\n" RESET);
-    start = clock();
-    (void)run_benchmark(benchmark_get, tdb, cf_name2);
-    end = clock();
-    printf(BOLDGREEN "GET (compression, bloom filter) benchmark completed in %f seconds\n" RESET,
-           (double)(end - start) / CLOCKS_PER_SEC);
-
-    printf(BOLDCYAN "Running DELETE (compression, bloom filter) benchmark...\n" RESET);
-    start = clock();
-    (void)run_benchmark(benchmark_delete, tdb, cf_name2);
-    end = clock();
-    printf(BOLDGREEN "DELETE (compression, bloom filter) benchmark completed in %f seconds\n" RESET,
-           (double)(end - start) / CLOCKS_PER_SEC);
-
-    (void)tidesdb_close(tdb);
-    (void)_tidesdb_remove_directory(DIR);
     return 0;
 }

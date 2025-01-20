@@ -372,14 +372,17 @@ if (e != NULL)
 ### Filter queries
 You can filter key-value pairs based on a filter function.
 ```c
-uint8_t key2[] = "key2";
-tidesdb_key_value_pair_t **result = NULL;
-size_t result_size = 0;
-
+/* define a filter function */
 bool comparison_method(const tidesdb_key_value_pair_t *kv)
 {
         return kv->key_size == sizeof(key2) && memcmp(kv->key, key2, sizeof(key2)) == 0;
 }
+
+/* then.. */
+
+uint8_t key2[] = "key2";
+tidesdb_key_value_pair_t **result = NULL;
+size_t result_size = 0;
 
 tidesdb_key_value_pair_t **result = NULL;
 size_t result_size = 0;

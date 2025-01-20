@@ -566,6 +566,13 @@ void test_tidesdb_range(bool compress, tidesdb_compression_algo_t algo, bool blo
                                                  : " with hash table memtable");
 }
 
+/* for test_tidesdb_filter */
+bool comparison_method(const tidesdb_key_value_pair_t *kv)
+{
+    uint8_t key2[] = "key2";
+    return kv->key_size == sizeof(key2) && memcmp(kv->key, key2, sizeof(key2)) == 0;
+}
+
 void test_tidesdb_filter(bool compress, tidesdb_compression_algo_t algo, bool bloom_filter,
                          tidesdb_memtable_ds_t memtable_ds)
 {
@@ -603,11 +610,6 @@ void test_tidesdb_filter(bool compress, tidesdb_compression_algo_t algo, bool bl
     uint8_t value3[] = "value3";
     err = tidesdb_put(db, "test_cf", key3, sizeof(key3), value3, sizeof(value3), -1);
     assert(err == NULL);
-
-    bool comparison_method(const tidesdb_key_value_pair_t *kv)
-    {
-        return kv->key_size == sizeof(key2) && memcmp(kv->key, key2, sizeof(key2)) == 0;
-    }
 
     tidesdb_key_value_pair_t **result = NULL;
     size_t result_size = 0;

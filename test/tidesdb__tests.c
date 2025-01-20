@@ -499,6 +499,144 @@ void test_tidesdb_put_flush_get(bool compress, tidesdb_compression_algo_t algo, 
                                                  : " with hash table memtable");
 }
 
+void test_tidesdb_range(bool compress, tidesdb_compression_algo_t algo, bool bloom_filter,
+                        tidesdb_memtable_ds_t memtable_ds)
+{
+    tidesdb_t *db = NULL;
+
+    tidesdb_err_t *err = tidesdb_open("test_db", &db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)tidesdb_err_free(err);
+
+    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
+                                       bloom_filter, memtable_ds);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+
+    assert(err == NULL);
+
+    uint8_t key1[] = "key1";
+    uint8_t value1[] = "value1";
+    err = tidesdb_put(db, "test_cf", key1, sizeof(key1), value1, sizeof(value1), -1);
+    assert(err == NULL);
+
+    uint8_t key2[] = "key2";
+    uint8_t value2[] = "value2";
+    err = tidesdb_put(db, "test_cf", key2, sizeof(key2), value2, sizeof(value2), -1);
+    assert(err == NULL);
+
+    uint8_t key3[] = "key3";
+    uint8_t value3[] = "value3";
+    err = tidesdb_put(db, "test_cf", key3, sizeof(key3), value3, sizeof(value3), -1);
+    assert(err == NULL);
+
+    tidesdb_key_value_pair_t **result = NULL;
+    size_t result_size = 0;
+    err =
+        tidesdb_range(db, "test_cf", key1, sizeof(key1), key3, sizeof(key3), &result, &result_size);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    assert(result_size == 3);
+    for (size_t i = 0; i < result_size; i++)
+    {
+        free(result[i]->key);
+        free(result[i]->value);
+        free(result[i]);
+    }
+    free(result);
+
+    err = tidesdb_close(db);
+    assert(err == NULL);
+
+    (void)_tidesdb_remove_directory("test_db");
+    printf(GREEN "test_tidesdb_range%s%s%s passed\n" RESET, compress ? " with compression" : "",
+           bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
+}
+
+void test_tidesdb_filter(bool compress, tidesdb_compression_algo_t algo, bool bloom_filter,
+                         tidesdb_memtable_ds_t memtable_ds)
+{
+    tidesdb_t *db = NULL;
+
+    tidesdb_err_t *err = tidesdb_open("test_db", &db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)tidesdb_err_free(err);
+
+    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
+                                       bloom_filter, memtable_ds);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+
+    assert(err == NULL);
+
+    uint8_t key1[] = "key1";
+    uint8_t value1[] = "value1";
+    err = tidesdb_put(db, "test_cf", key1, sizeof(key1), value1, sizeof(value1), -1);
+    assert(err == NULL);
+
+    uint8_t key2[] = "key2";
+    uint8_t value2[] = "value2";
+    err = tidesdb_put(db, "test_cf", key2, sizeof(key2), value2, sizeof(value2), -1);
+    assert(err == NULL);
+
+    uint8_t key3[] = "key3";
+    uint8_t value3[] = "value3";
+    err = tidesdb_put(db, "test_cf", key3, sizeof(key3), value3, sizeof(value3), -1);
+    assert(err == NULL);
+
+    bool comparison_method(const tidesdb_key_value_pair_t *kv)
+    {
+        return kv->key_size == sizeof(key2) && memcmp(kv->key, key2, sizeof(key2)) == 0;
+    }
+
+    tidesdb_key_value_pair_t **result = NULL;
+    size_t result_size = 0;
+    err = tidesdb_filter(db, "test_cf", comparison_method, &result, &result_size);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    assert(result_size == 1);
+    for (size_t i = 0; i < result_size; i++)
+    {
+        free(result[i]->key);
+        free(result[i]->value);
+        free(result[i]);
+    }
+    free(result);
+
+    err = tidesdb_close(db);
+    assert(err == NULL);
+
+    (void)_tidesdb_remove_directory("test_db");
+    printf(GREEN "test_tidesdb_filter%s%s%s passed\n" RESET, compress ? " with compression" : "",
+           bloom_filter ? " with bloom filter" : "",
+           memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"
+                                                 : " with hash table memtable");
+}
+
 void test_tidesdb_put_flush_close_get(bool compress, tidesdb_compression_algo_t algo,
                                       bool bloom_filter, tidesdb_memtable_ds_t memtable_ds)
 {
@@ -2217,6 +2355,10 @@ int main(void)
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
 
     test_tidesdb_put_get_concurrent(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
+    test_tidesdb_range(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
+
+    test_tidesdb_filter(false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_HASH_TABLE);
 
     /* the next batch of tests we will run with bloom filters and compression
      * same tests just with bloom filters and compression enabled */

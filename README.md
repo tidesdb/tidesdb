@@ -107,7 +107,7 @@ Bindings are in the works in various languages.
 </ul>
 
 ## Discord Community
-Join the [TidesDB Discord Community](https://discord.gg/PKRAtmRK) to ask questions, work on development, and discuss the future of TidesDB.
+Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask questions, work on development, and discuss the future of TidesDB.
 
 ## Include
 ```c

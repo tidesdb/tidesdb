@@ -24,6 +24,8 @@ extern "C"
 {
 #endif
 
+    /* @todo on commit on txns escalate fsync to disk */
+
 #include <stdbool.h>
 
 #include "binary_hash_array.h"

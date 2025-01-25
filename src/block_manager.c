@@ -56,7 +56,7 @@ int block_manager_close(block_manager_t *bm)
     bm->stop_fsync_thread = 1;
 
     /* we flush the file to disk */
-    fsync(fileno(bm->file)); /* flush file to disk */
+    (void)fsync(fileno(bm->file)); /* flush file to disk */
 
     /* we join the fsync thread */
     if (pthread_join(bm->fsync_thread, NULL) != 0) return -1;
@@ -404,3 +404,9 @@ int block_manager_cursor_goto(block_manager_cursor_t *cursor, uint64_t pos)
     cursor->current_pos = pos;
     return 0;
 }
+
+/** int block_manager_escalate_fsync(block_manager_t *bm)
+{
+     @TODO NithinSastry
+    return 0;
+} */

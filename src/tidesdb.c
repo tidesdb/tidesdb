@@ -4183,6 +4183,9 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     return tidesdb_txn_rollback(txn);
                 }
 
+                /* SYNC HERE ***/
+                /* I.E (void)block_manager_escalate_fsync(txn->cf->sstables[0]->block_manager); */
+
                 switch (txn->cf->config.memtable_ds)
                 {
                     case TDB_MEMTABLE_SKIP_LIST:
@@ -4231,6 +4234,8 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     /* we rollback the transaction */
                     return tidesdb_txn_rollback(txn);
                 }
+
+                /* SYNC HERE ***/
 
                 switch (txn->cf->config.memtable_ds)
                 {

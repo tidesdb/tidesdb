@@ -1212,7 +1212,7 @@ void test_tidesdb_put_flush_compact_get(bool compress, tidesdb_compression_algo_
     }
     assert(err == NULL);
 
-    //(void)_tidesdb_remove_directory("test_db");
+    (void)_tidesdb_remove_directory("test_db");
     printf(GREEN "test_tidesdb_put_flush_compact_get%s%s%s passed\n" RESET,
            compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
            memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"

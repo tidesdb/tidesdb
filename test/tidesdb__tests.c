@@ -1129,13 +1129,13 @@ void test_tidesdb_put_flush_compact_get(bool compress, tidesdb_compression_algo_
     uint8_t key[20];
     uint8_t value[1024 * 1024];
 
-    /* Fill the value with random data */
+    /* fill the value with random data */
     for (size_t i = 0; i < sizeof(value); i++)
     {
         value[i] = (uint8_t)(rand() % 256);
     }
 
-    /* Put 12 keys which would be 12 sstables */
+    /* put 12 keys which would be 12 sstables */
     for (int i = 0; i < 12; i++)
     {
         snprintf((char *)key, sizeof(key), "key_%d", i);
@@ -1212,7 +1212,7 @@ void test_tidesdb_put_flush_compact_get(bool compress, tidesdb_compression_algo_
     }
     assert(err == NULL);
 
-    (void)_tidesdb_remove_directory("test_db");
+    //(void)_tidesdb_remove_directory("test_db");
     printf(GREEN "test_tidesdb_put_flush_compact_get%s%s%s passed\n" RESET,
            compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "",
            memtable_ds == TDB_MEMTABLE_SKIP_LIST ? " with skip list memtable"

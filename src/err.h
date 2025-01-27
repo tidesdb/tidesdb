@@ -146,6 +146,7 @@ typedef enum
     TIDESDB_ERR_FAILED_TO_GET_SYSTEM_THREADS,
     TIDESDB_ERR_FAILED_TO_REMOVE_TEMP_FILE,
     TIDESDB_ERR_INVALID_COMPARISON_METHOD,
+    TIDESDB_ERR_FAILED_TO_ESCALATE_FSYNC,
 } TIDESDB_ERR_CODE;
 
 /* TidesDB error messages */
@@ -266,6 +267,7 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
     {TIDESDB_ERR_FAILED_TO_GET_SYSTEM_THREADS, "Failed to get system threads.\n"},
     {TIDESDB_ERR_FAILED_TO_REMOVE_TEMP_FILE, "Failed to remove temporary file %s.\n"},
     {TIDESDB_ERR_INVALID_COMPARISON_METHOD, "Invalid comparison method for %s.\n"},
+    {TIDESDB_ERR_FAILED_TO_ESCALATE_FSYNC, "Failed to escalate fsync.\n"},
 };
 
 /*

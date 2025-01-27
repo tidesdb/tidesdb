@@ -258,8 +258,8 @@ int block_manager_seek(block_manager_t *bm, uint64_t pos);
 
 /**
  * block_manager_escalate_fsync
- * escalates an fsync to the block manager
+ * escalates an fsync to the underlying block manager file
  */
-/** TODO int block_manager_escalate_fsync(block_manager_t *bm); */
+int block_manager_escalate_fsync(block_manager_t *bm);
 
 #endif /* __BLOCK_MANAGER_H__ */

@@ -4183,8 +4183,18 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     return tidesdb_txn_rollback(txn);
                 }
 
-                /* SYNC HERE ***/
-                /* I.E (void)block_manager_escalate_fsync(txn->cf->sstables[0]->block_manager); */
+                /* escalate fsync */
+                if (block_manager_escalate_fsync(txn->cf->sstables[0]->block_manager) == -1)
+                {
+                    /* unlock the column family */
+                    (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+
+                    /* unlock the transaction */
+                    (void)pthread_mutex_unlock(&txn->lock);
+
+                    /* we rollback the transaction */
+                    return tidesdb_txn_rollback(txn);
+                }
 
                 switch (txn->cf->config.memtable_ds)
                 {
@@ -4235,7 +4245,18 @@ tidesdb_err_t *tidesdb_txn_commit(tidesdb_txn_t *txn)
                     return tidesdb_txn_rollback(txn);
                 }
 
-                /* SYNC HERE ***/
+                /* escalate fsync */
+                if (block_manager_escalate_fsync(txn->cf->sstables[0]->block_manager) == -1)
+                {
+                    /* unlock the column family */
+                    (void)pthread_rwlock_unlock(&txn->cf->rwlock);
+
+                    /* unlock the transaction */
+                    (void)pthread_mutex_unlock(&txn->lock);
+
+                    /* we rollback the transaction */
+                    return tidesdb_txn_rollback(txn);
+                }
 
                 switch (txn->cf->config.memtable_ds)
                 {

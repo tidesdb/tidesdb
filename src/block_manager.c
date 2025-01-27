@@ -405,8 +405,7 @@ int block_manager_cursor_goto(block_manager_cursor_t *cursor, uint64_t pos)
     return 0;
 }
 
-/** int block_manager_escalate_fsync(block_manager_t *bm)
+int block_manager_escalate_fsync(block_manager_t *bm)
 {
-     @TODO NithinSastry
-    return 0;
-} */
+    return fsync(fileno(bm->file));
+}

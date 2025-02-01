@@ -2358,176 +2358,170 @@ tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
     if (cf->config.memtable_ds == TDB_MEMTABLE_SKIP_LIST)
     {
         sl_cursor = skip_list_cursor_init(cf->memtable_sl);
-        if (sl_cursor == NULL)
+        if (sl_cursor != NULL)
         {
-            (void)pthread_rwlock_unlock(&cf->rwlock);
-            free(*result);
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
-        }
-
-        do
-        {
-            uint8_t *retrieved_key;
-            size_t key_size;
-            uint8_t *retrieved_value;
-            size_t value_size;
-            time_t ttl;
-            if (skip_list_cursor_get(sl_cursor, &retrieved_key, &key_size, &retrieved_value,
-                                     &value_size, &ttl) == -1)
+            do
             {
-                (void)skip_list_cursor_free(sl_cursor);
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                free(*result);
-                return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
-            }
-
-            if (_tidesdb_compare_keys(retrieved_key, key_size, start_key, start_key_size) >= 0 &&
-                _tidesdb_compare_keys(retrieved_key, key_size, end_key, end_key_size) <= 0 &&
-                !_tidesdb_key_exists(retrieved_key, key_size, *result, *result_size))
-            {
-                if (*result_size >= capacity)
+                uint8_t *retrieved_key;
+                size_t key_size;
+                uint8_t *retrieved_value;
+                size_t value_size;
+                time_t ttl;
+                if (skip_list_cursor_get(sl_cursor, &retrieved_key, &key_size, &retrieved_value,
+                                         &value_size, &ttl) == -1)
                 {
-                    capacity *= 2;
-                    tidesdb_key_value_pair_t **new_result =
-                        realloc(*result, capacity * sizeof(tidesdb_key_value_pair_t *));
-                    if (new_result == NULL)
+                    (void)skip_list_cursor_free(sl_cursor);
+                    (void)pthread_rwlock_unlock(&cf->rwlock);
+                    free(*result);
+                    return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
+                }
+
+                if (_tidesdb_compare_keys(retrieved_key, key_size, start_key, start_key_size) >=
+                        0 &&
+                    _tidesdb_compare_keys(retrieved_key, key_size, end_key, end_key_size) <= 0 &&
+                    !_tidesdb_key_exists(retrieved_key, key_size, *result, *result_size))
+                {
+                    if (*result_size >= capacity)
+                    {
+                        capacity *= 2;
+                        tidesdb_key_value_pair_t **new_result =
+                            realloc(*result, capacity * sizeof(tidesdb_key_value_pair_t *));
+                        if (new_result == NULL)
+                        {
+                            (void)skip_list_cursor_free(sl_cursor);
+                            (void)pthread_rwlock_unlock(&cf->rwlock);
+                            free(*result);
+                            return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                        }
+                        *result = new_result;
+                    }
+
+                    (*result)[*result_size] = malloc(sizeof(tidesdb_key_value_pair_t));
+                    if ((*result)[*result_size] == NULL)
                     {
                         (void)skip_list_cursor_free(sl_cursor);
                         (void)pthread_rwlock_unlock(&cf->rwlock);
                         free(*result);
                         return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
                     }
-                    *result = new_result;
+
+                    (*result)[*result_size]->key = malloc(key_size);
+                    if ((*result)[*result_size]->key == NULL)
+                    {
+                        (void)skip_list_cursor_free(sl_cursor);
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free((*result)[*result_size]);
+                        free(*result);
+                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                    }
+
+                    (*result)[*result_size]->value = malloc(value_size);
+                    if ((*result)[*result_size]->value == NULL)
+                    {
+                        (void)skip_list_cursor_free(sl_cursor);
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free((*result)[*result_size]->key);
+                        free((*result)[*result_size]);
+                        free(*result);
+                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                    }
+
+                    memcpy((*result)[*result_size]->key, retrieved_key, key_size);
+                    (*result)[*result_size]->key_size = key_size;
+                    memcpy((*result)[*result_size]->value, retrieved_value, value_size);
+                    (*result)[*result_size]->value_size = value_size;
+
+                    (*result_size)++;
                 }
 
-                (*result)[*result_size] = malloc(sizeof(tidesdb_key_value_pair_t));
-                if ((*result)[*result_size] == NULL)
-                {
-                    (void)skip_list_cursor_free(sl_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    free(*result);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
+            } while (skip_list_cursor_next(sl_cursor) != -1);
 
-                (*result)[*result_size]->key = malloc(key_size);
-                if ((*result)[*result_size]->key == NULL)
-                {
-                    (void)skip_list_cursor_free(sl_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    free((*result)[*result_size]);
-                    free(*result);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
-
-                (*result)[*result_size]->value = malloc(value_size);
-                if ((*result)[*result_size]->value == NULL)
-                {
-                    (void)skip_list_cursor_free(sl_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    free((*result)[*result_size]->key);
-                    free((*result)[*result_size]);
-                    free(*result);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
-
-                memcpy((*result)[*result_size]->key, retrieved_key, key_size);
-                (*result)[*result_size]->key_size = key_size;
-                memcpy((*result)[*result_size]->value, retrieved_value, value_size);
-                (*result)[*result_size]->value_size = value_size;
-
-                (*result_size)++;
-            }
-
-        } while (skip_list_cursor_next(sl_cursor) != -1);
-
-        (void)skip_list_cursor_free(sl_cursor);
+            (void)skip_list_cursor_free(sl_cursor);
+        }
     }
     else if (cf->config.memtable_ds == TDB_MEMTABLE_HASH_TABLE)
     {
         ht_cursor = hash_table_cursor_init(cf->memtable_ht);
-        if (ht_cursor == NULL)
+        if (ht_cursor != NULL)
         {
-            (void)pthread_rwlock_unlock(&cf->rwlock);
-            free(*result);
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
-        }
-
-        do
-        {
-            uint8_t *retrieved_key;
-            size_t key_size;
-            uint8_t *retrieved_value;
-            size_t value_size;
-            time_t ttl;
-            if (hash_table_cursor_get(ht_cursor, &retrieved_key, &key_size, &retrieved_value,
-                                      &value_size, &ttl) == -1)
+            do
             {
-                (void)hash_table_cursor_free(ht_cursor);
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                free(*result);
-                return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
-            }
-
-            if (_tidesdb_compare_keys(retrieved_key, key_size, start_key, start_key_size) >= 0 &&
-                _tidesdb_compare_keys(retrieved_key, key_size, end_key, end_key_size) <= 0 &&
-                !_tidesdb_key_exists(retrieved_key, key_size, *result, *result_size))
-            {
-                if (*result_size >= capacity)
+                uint8_t *retrieved_key;
+                size_t key_size;
+                uint8_t *retrieved_value;
+                size_t value_size;
+                time_t ttl;
+                if (hash_table_cursor_get(ht_cursor, &retrieved_key, &key_size, &retrieved_value,
+                                          &value_size, &ttl) == -1)
                 {
-                    capacity *= 2;
-                    tidesdb_key_value_pair_t **new_result =
-                        realloc(*result, capacity * sizeof(tidesdb_key_value_pair_t *));
-                    if (new_result == NULL)
+                    (void)hash_table_cursor_free(ht_cursor);
+                    (void)pthread_rwlock_unlock(&cf->rwlock);
+                    free(*result);
+                    return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
+                }
+
+                if (_tidesdb_compare_keys(retrieved_key, key_size, start_key, start_key_size) >=
+                        0 &&
+                    _tidesdb_compare_keys(retrieved_key, key_size, end_key, end_key_size) <= 0 &&
+                    !_tidesdb_key_exists(retrieved_key, key_size, *result, *result_size))
+                {
+                    if (*result_size >= capacity)
+                    {
+                        capacity *= 2;
+                        tidesdb_key_value_pair_t **new_result =
+                            realloc(*result, capacity * sizeof(tidesdb_key_value_pair_t *));
+                        if (new_result == NULL)
+                        {
+                            (void)hash_table_cursor_free(ht_cursor);
+                            (void)pthread_rwlock_unlock(&cf->rwlock);
+                            free(*result);
+                            return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                        }
+                        *result = new_result;
+                    }
+
+                    (*result)[*result_size] = malloc(sizeof(tidesdb_key_value_pair_t));
+                    if ((*result)[*result_size] == NULL)
                     {
                         (void)hash_table_cursor_free(ht_cursor);
                         (void)pthread_rwlock_unlock(&cf->rwlock);
                         free(*result);
                         return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
                     }
-                    *result = new_result;
+
+                    (*result)[*result_size]->key = malloc(key_size);
+                    if ((*result)[*result_size]->key == NULL)
+                    {
+                        (void)hash_table_cursor_free(ht_cursor);
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free((*result)[*result_size]);
+                        free(*result);
+                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                    }
+
+                    (*result)[*result_size]->value = malloc(value_size);
+                    if ((*result)[*result_size]->value == NULL)
+                    {
+                        (void)hash_table_cursor_free(ht_cursor);
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free((*result)[*result_size]->key);
+                        free((*result)[*result_size]);
+                        free(*result);
+                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                    }
+
+                    memcpy((*result)[*result_size]->key, retrieved_key, key_size);
+                    (*result)[*result_size]->key_size = key_size;
+                    memcpy((*result)[*result_size]->value, retrieved_value, value_size);
+                    (*result)[*result_size]->value_size = value_size;
+
+                    (*result_size)++;
                 }
 
-                (*result)[*result_size] = malloc(sizeof(tidesdb_key_value_pair_t));
-                if ((*result)[*result_size] == NULL)
-                {
-                    (void)hash_table_cursor_free(ht_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    free(*result);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
+            } while (hash_table_cursor_next(ht_cursor) != -1);
 
-                (*result)[*result_size]->key = malloc(key_size);
-                if ((*result)[*result_size]->key == NULL)
-                {
-                    (void)hash_table_cursor_free(ht_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    free((*result)[*result_size]);
-                    free(*result);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
-
-                (*result)[*result_size]->value = malloc(value_size);
-                if ((*result)[*result_size]->value == NULL)
-                {
-                    (void)hash_table_cursor_free(ht_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    free((*result)[*result_size]->key);
-                    free((*result)[*result_size]);
-                    free(*result);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
-
-                memcpy((*result)[*result_size]->key, retrieved_key, key_size);
-                (*result)[*result_size]->key_size = key_size;
-                memcpy((*result)[*result_size]->value, retrieved_value, value_size);
-                (*result)[*result_size]->value_size = value_size;
-
-                (*result_size)++;
-            }
-
-        } while (hash_table_cursor_next(ht_cursor) != -1);
-
-        (void)hash_table_cursor_free(ht_cursor);
+            (void)hash_table_cursor_free(ht_cursor);
+        }
     }
 
     for (int i = cf->num_sstables - 1; i >= 0; i--)
@@ -2541,8 +2535,15 @@ tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
         }
 
-        block_manager_block_t *block;
-        while ((block = block_manager_cursor_read(cursor)) != NULL)
+        /* check if bloom filter is enabled */
+        if (cf->config.bloom_filter)
+        {
+            (void)block_manager_cursor_next(cursor);
+        }
+
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+
+        do
         {
             tidesdb_key_value_pair_t *kv = _tidesdb_deserialize_key_value_pair(
                 block->data, block->size, cf->config.compressed, cf->config.compress_algo);
@@ -2578,12 +2579,12 @@ tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
             }
             else
             {
-                _tidesdb_free_key_value_pair(kv);
+                (void)_tidesdb_free_key_value_pair(kv);
             }
 
             (void)block_manager_block_free(block);
-            if (block_manager_cursor_next(cursor) != 0) break;
-        }
+            if (block_manager_cursor_next(cursor) != 1) break;
+        } while ((block = block_manager_cursor_read(cursor)) != NULL);
 
         (void)block_manager_cursor_free(cursor);
     }
@@ -2602,6 +2603,7 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
     if (column_family_name == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COLUMN_FAMILY);
     if (comparison_method == NULL)
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COMPARISON_METHOD);
+
     if (strlen(column_family_name) < 2 ||
         strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
@@ -2637,160 +2639,170 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
     if (cf->config.memtable_ds == TDB_MEMTABLE_SKIP_LIST)
     {
         sl_cursor = skip_list_cursor_init(cf->memtable_sl);
-        if (sl_cursor == NULL)
+        if (sl_cursor != NULL)
         {
-            (void)pthread_rwlock_unlock(&cf->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
-        }
-
-        do
-        {
-            uint8_t *retrieved_key;
-            size_t key_size;
-            uint8_t *retrieved_value;
-            size_t value_size;
-            time_t ttl;
-            if (skip_list_cursor_get(sl_cursor, &retrieved_key, &key_size, &retrieved_value,
-                                     &value_size, &ttl) == -1)
+            do
             {
-                (void)skip_list_cursor_free(sl_cursor);
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
-            }
-
-            tidesdb_key_value_pair_t kv = {retrieved_key, key_size, retrieved_value, value_size,
-                                           ttl};
-            if (comparison_method(&kv) &&
-                !_tidesdb_key_exists(retrieved_key, key_size, *result, *result_size))
-            {
-                if (*result_size >= capacity)
+                uint8_t *retrieved_key;
+                size_t key_size;
+                uint8_t *retrieved_value;
+                size_t value_size;
+                time_t ttl;
+                if (skip_list_cursor_get(sl_cursor, &retrieved_key, &key_size, &retrieved_value,
+                                         &value_size, &ttl) == -1)
                 {
-                    capacity *= 2;
-                    tidesdb_key_value_pair_t **new_result =
-                        realloc(*result, capacity * sizeof(tidesdb_key_value_pair_t *));
-                    if (new_result == NULL)
+                    (void)skip_list_cursor_free(sl_cursor);
+                    (void)pthread_rwlock_unlock(&cf->rwlock);
+                    free(*result);
+                    return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
+                }
+
+                tidesdb_key_value_pair_t kv = {retrieved_key, key_size, retrieved_value,
+                                               value_size, ttl};
+                if (comparison_method(&kv) &&
+                    !_tidesdb_key_exists(retrieved_key, key_size, *result, *result_size))
+                {
+                    if (*result_size >= capacity)
+                    {
+                        capacity *= 2;
+                        tidesdb_key_value_pair_t **new_result =
+                            realloc(*result, capacity * sizeof(tidesdb_key_value_pair_t *));
+                        if (new_result == NULL)
+                        {
+                            (void)skip_list_cursor_free(sl_cursor);
+                            (void)pthread_rwlock_unlock(&cf->rwlock);
+                            free(*result);
+                            return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                        }
+                        *result = new_result;
+                    }
+
+                    (*result)[*result_size] = malloc(sizeof(tidesdb_key_value_pair_t));
+                    if ((*result)[*result_size] == NULL)
                     {
                         (void)skip_list_cursor_free(sl_cursor);
                         (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free(*result);
                         return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
                     }
-                    *result = new_result;
+
+                    (*result)[*result_size]->key = malloc(key_size);
+                    if ((*result)[*result_size]->key == NULL)
+                    {
+                        (void)skip_list_cursor_free(sl_cursor);
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free((*result)[*result_size]);
+                        free(*result);
+                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                    }
+
+                    (*result)[*result_size]->value = malloc(value_size);
+                    if ((*result)[*result_size]->value == NULL)
+                    {
+                        (void)skip_list_cursor_free(sl_cursor);
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free((*result)[*result_size]->key);
+                        free((*result)[*result_size]);
+                        free(*result);
+                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                    }
+
+                    memcpy((*result)[*result_size]->key, retrieved_key, key_size);
+                    (*result)[*result_size]->key_size = key_size;
+                    memcpy((*result)[*result_size]->value, retrieved_value, value_size);
+                    (*result)[*result_size]->value_size = value_size;
+
+                    (*result_size)++;
                 }
 
-                (*result)[*result_size] = malloc(sizeof(tidesdb_key_value_pair_t));
-                if ((*result)[*result_size] == NULL)
-                {
-                    (void)skip_list_cursor_free(sl_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
+            } while (skip_list_cursor_next(sl_cursor) != -1);
 
-                (*result)[*result_size]->key = malloc(key_size);
-                if ((*result)[*result_size]->key == NULL)
-                {
-                    (void)skip_list_cursor_free(sl_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
-
-                (*result)[*result_size]->value = malloc(value_size);
-                if ((*result)[*result_size]->value == NULL)
-                {
-                    (void)skip_list_cursor_free(sl_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
-
-                memcpy((*result)[*result_size]->key, retrieved_key, key_size);
-                (*result)[*result_size]->key_size = key_size;
-                memcpy((*result)[*result_size]->value, retrieved_value, value_size);
-                (*result)[*result_size]->value_size = value_size;
-
-                (*result_size)++;
-            }
-
-        } while (skip_list_cursor_next(sl_cursor) != -1);
-
-        (void)skip_list_cursor_free(sl_cursor);
+            (void)skip_list_cursor_free(sl_cursor);
+        }
     }
     else if (cf->config.memtable_ds == TDB_MEMTABLE_HASH_TABLE)
     {
         ht_cursor = hash_table_cursor_init(cf->memtable_ht);
-        if (ht_cursor == NULL)
+        if (ht_cursor != NULL)
         {
-            (void)pthread_rwlock_unlock(&cf->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
-        }
-
-        do
-        {
-            uint8_t *retrieved_key;
-            size_t key_size;
-            uint8_t *retrieved_value;
-            size_t value_size;
-            time_t ttl;
-            if (hash_table_cursor_get(ht_cursor, &retrieved_key, &key_size, &retrieved_value,
-                                      &value_size, &ttl) == -1)
+            do
             {
-                (void)hash_table_cursor_free(ht_cursor);
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
-            }
-
-            tidesdb_key_value_pair_t kv = {retrieved_key, key_size, retrieved_value, value_size,
-                                           ttl};
-            if (comparison_method(&kv) &&
-                !_tidesdb_key_exists(retrieved_key, key_size, *result, *result_size))
-            {
-                if (*result_size >= capacity)
+                uint8_t *retrieved_key;
+                size_t key_size;
+                uint8_t *retrieved_value;
+                size_t value_size;
+                time_t ttl;
+                if (hash_table_cursor_get(ht_cursor, &retrieved_key, &key_size, &retrieved_value,
+                                          &value_size, &ttl) == -1)
                 {
-                    capacity *= 2;
-                    tidesdb_key_value_pair_t **new_result =
-                        realloc(*result, capacity * sizeof(tidesdb_key_value_pair_t *));
-                    if (new_result == NULL)
+                    (void)hash_table_cursor_free(ht_cursor);
+                    (void)pthread_rwlock_unlock(&cf->rwlock);
+                    free(*result);
+                    return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
+                }
+
+                tidesdb_key_value_pair_t kv = {retrieved_key, key_size, retrieved_value,
+                                               value_size, ttl};
+                if (comparison_method(&kv) &&
+                    !_tidesdb_key_exists(retrieved_key, key_size, *result, *result_size))
+                {
+                    if (*result_size >= capacity)
+                    {
+                        capacity *= 2;
+                        tidesdb_key_value_pair_t **new_result =
+                            realloc(*result, capacity * sizeof(tidesdb_key_value_pair_t *));
+                        if (new_result == NULL)
+                        {
+                            (void)hash_table_cursor_free(ht_cursor);
+                            (void)pthread_rwlock_unlock(&cf->rwlock);
+                            free(*result);
+                            return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                        }
+                        *result = new_result;
+                    }
+
+                    (*result)[*result_size] = malloc(sizeof(tidesdb_key_value_pair_t));
+                    if ((*result)[*result_size] == NULL)
                     {
                         (void)hash_table_cursor_free(ht_cursor);
                         (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free(*result);
                         return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
                     }
-                    *result = new_result;
+
+                    (*result)[*result_size]->key = malloc(key_size);
+                    if ((*result)[*result_size]->key == NULL)
+                    {
+                        (void)hash_table_cursor_free(ht_cursor);
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free((*result)[*result_size]);
+                        free(*result);
+                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                    }
+
+                    (*result)[*result_size]->value = malloc(value_size);
+                    if ((*result)[*result_size]->value == NULL)
+                    {
+                        (void)hash_table_cursor_free(ht_cursor);
+                        (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free((*result)[*result_size]->key);
+                        free((*result)[*result_size]);
+                        free(*result);
+                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                    }
+
+                    memcpy((*result)[*result_size]->key, retrieved_key, key_size);
+                    (*result)[*result_size]->key_size = key_size;
+                    memcpy((*result)[*result_size]->value, retrieved_value, value_size);
+                    (*result)[*result_size]->value_size = value_size;
+
+                    (*result_size)++;
                 }
 
-                (*result)[*result_size] = malloc(sizeof(tidesdb_key_value_pair_t));
-                if ((*result)[*result_size] == NULL)
-                {
-                    (void)hash_table_cursor_free(ht_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
+            } while (hash_table_cursor_next(ht_cursor) != -1);
 
-                (*result)[*result_size]->key = malloc(key_size);
-                if ((*result)[*result_size]->key == NULL)
-                {
-                    (void)hash_table_cursor_free(ht_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
-
-                (*result)[*result_size]->value = malloc(value_size);
-                if ((*result)[*result_size]->value == NULL)
-                {
-                    (void)hash_table_cursor_free(ht_cursor);
-                    (void)pthread_rwlock_unlock(&cf->rwlock);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
-                }
-
-                memcpy((*result)[*result_size]->key, retrieved_key, key_size);
-                (*result)[*result_size]->key_size = key_size;
-                memcpy((*result)[*result_size]->value, retrieved_value, value_size);
-                (*result)[*result_size]->value_size = value_size;
-
-                (*result_size)++;
-            }
-
-        } while (hash_table_cursor_next(ht_cursor) != -1);
-
-        (void)hash_table_cursor_free(ht_cursor);
+            (void)hash_table_cursor_free(ht_cursor);
+        }
     }
 
     for (int i = cf->num_sstables - 1; i >= 0; i--)
@@ -2800,11 +2812,19 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
         if (block_manager_cursor_init(&cursor, sst->block_manager) == -1)
         {
             (void)pthread_rwlock_unlock(&cf->rwlock);
+            free(*result);
             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
         }
 
-        block_manager_block_t *block;
-        while ((block = block_manager_cursor_read(cursor)) != NULL)
+        /* check if bloom filter is enabled */
+        if (cf->config.bloom_filter)
+        {
+            (void)block_manager_cursor_next(cursor);
+        }
+
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+
+        do
         {
             tidesdb_key_value_pair_t *kv = _tidesdb_deserialize_key_value_pair(
                 block->data, block->size, cf->config.compressed, cf->config.compress_algo);
@@ -2812,6 +2832,7 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
             {
                 (void)block_manager_cursor_free(cursor);
                 (void)pthread_rwlock_unlock(&cf->rwlock);
+                free(*result);
                 return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "key-value pair");
             }
 
@@ -2827,6 +2848,7 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
                     {
                         (void)block_manager_cursor_free(cursor);
                         (void)pthread_rwlock_unlock(&cf->rwlock);
+                        free(*result);
                         return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
                     }
                     *result = new_result;
@@ -2837,12 +2859,12 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
             }
             else
             {
-                _tidesdb_free_key_value_pair(kv);
+                (void)_tidesdb_free_key_value_pair(kv);
             }
 
             (void)block_manager_block_free(block);
-            if (block_manager_cursor_next(cursor) != 0) break;
-        }
+            if (block_manager_cursor_next(cursor) != 1) break;
+        } while ((block = block_manager_cursor_read(cursor)) != NULL);
 
         (void)block_manager_cursor_free(cursor);
     }

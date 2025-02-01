@@ -2657,8 +2657,8 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
                     return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
                 }
 
-                tidesdb_key_value_pair_t kv = {retrieved_key, key_size, retrieved_value,
-                                               value_size, ttl};
+                tidesdb_key_value_pair_t kv = {retrieved_key, key_size, retrieved_value, value_size,
+                                               ttl};
                 if (comparison_method(&kv) &&
                     !_tidesdb_key_exists(retrieved_key, key_size, *result, *result_size))
                 {
@@ -2741,8 +2741,8 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
                     return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
                 }
 
-                tidesdb_key_value_pair_t kv = {retrieved_key, key_size, retrieved_value,
-                                               value_size, ttl};
+                tidesdb_key_value_pair_t kv = {retrieved_key, key_size, retrieved_value, value_size,
+                                               ttl};
                 if (comparison_method(&kv) &&
                     !_tidesdb_key_exists(retrieved_key, key_size, *result, *result_size))
                 {

@@ -135,8 +135,8 @@ int sem_init(sem_t *sem, int pshared, unsigned int value)
 }
 
 /* file operations macros for cross-platform compatibility */
-#define S_ISDIR(m)     (((m)&S_IFMT) == S_IFDIR)
-#define sleep(seconds) Sleep((seconds)*1000)
+#define S_ISDIR(m)     (((m) & S_IFMT) == S_IFDIR)
+#define sleep(seconds) Sleep((seconds) * 1000)
 
 int fsync(int fd)
 {

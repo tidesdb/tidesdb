@@ -463,3 +463,96 @@ int skip_list_cursor_goto_last(skip_list_cursor_t *cursor)
 
     return cursor->current == cursor->list->header ? -1 : 0;
 }
+
+int skip_list_get_min_key(skip_list_t *list, uint8_t **key, size_t *key_size)
+{
+    if (list == NULL || key == NULL || key_size == NULL) return -1;
+
+    /* iterate through the skip list to find the first node that isn't a TOMBSTONE */
+    skip_list_node_t *current = list->header->forward[0];
+
+    /* check if the list is empty */
+    if (current == NULL) return -1;
+
+    /* skip nodes with TOMBSTONE values */
+    while (current != NULL)
+    {
+        /* check if the node has expired */
+        (void)skip_list_check_and_update_ttl(list, current);
+
+        /* skip this node if it's a TOMBSTONE */
+        if (current->value_size == 4 && *(uint32_t *)current->value == TOMBSTONE)
+        {
+            current = current->forward[0];
+            continue;
+        }
+
+        /* we found a valid node */
+        break;
+    }
+
+    /* if we reached the end without finding a valid node */
+    if (current == NULL) return -1;
+
+    /* allocate memory for the key */
+    *key = malloc(current->key_size);
+    if (*key == NULL) return -1;
+
+    /* copy the key and key size */
+    memcpy(*key, current->key, current->key_size);
+    *key_size = current->key_size;
+
+    return 0;
+}
+
+int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size)
+{
+    if (list == NULL || key == NULL || key_size == NULL) return -1;
+
+    /* first, find the last node */
+    skip_list_node_t *last = list->header;
+    while (last->forward[0] != NULL)
+    {
+        last = last->forward[0];
+        /* check if the node has expired */
+        (void)skip_list_check_and_update_ttl(list, last);
+    }
+
+    /* check if we're still at the header (empty list) */
+    if (last == list->header) return -1;
+
+    /* now, start from the last node and move backward
+     * until we find a node that isn't a TOMBSTONE */
+    skip_list_node_t *current = last;
+    while (current != list->header)
+    {
+        /* skip this node if it's a TOMBSTONE */
+        if (current->value_size == 4 && *(uint32_t *)current->value == TOMBSTONE)
+        {
+            /* we need to find the previous node */
+            skip_list_node_t *prev = list->header;
+            while (prev->forward[0] != current)
+            {
+                prev = prev->forward[0];
+            }
+            current = prev;
+            continue;
+        }
+
+        /* we found a valid node */
+        break;
+    }
+
+    /* if we couldn't find a valid node */
+    if (current == list->header) return -1;
+
+    /* allocate memory for the key */
+    *key = malloc(current->key_size);
+    if (*key == NULL) return -1;
+
+    /* copy the key and key size */
+    memcpy(*key, current->key, current->key_size);
+    *key_size = current->key_size;
+
+    return 0;
+}

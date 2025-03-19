@@ -301,4 +301,24 @@ int skip_list_cursor_goto_last(skip_list_cursor_t *cursor);
  */
 int skip_list_cursor_goto_first(skip_list_cursor_t *cursor);
 
+/**
+ * Get the minimum key from the skip list
+ *
+ * @param list The skip list
+ * @param key Pointer to store the key (will be allocated)
+ * @param key_size Pointer to store the key size
+ * @return 0 on success, -1 on failure
+ */
+int skip_list_get_min_key(skip_list_t *list, uint8_t **key, size_t *key_size);
+
+/**
+ * Get the maximum key from the skip list
+ *
+ * @param list The skip list
+ * @param key Pointer to store the key (will be allocated)
+ * @param key_size Pointer to store the key size
+ * @return 0 on success, -1 on failure
+ */
+int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size);
+
 #endif /* __SKIP_LIST_H__ */

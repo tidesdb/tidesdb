@@ -370,12 +370,83 @@ void test_skip_list_cursor_functions()
     assert(skip_list_free(list) == 0);
 }
 
+void test_skip_list_min_max_key()
+{
+    /* create a new skip list */
+    skip_list_t *list = skip_list_new(4, 0.5);
+    assert(list != NULL);
+
+    /* test on empty list */
+    uint8_t *min_key = NULL;
+    size_t min_key_size;
+    uint8_t *max_key = NULL;
+    size_t max_key_size;
+
+    assert(skip_list_get_min_key(list, &min_key, &min_key_size) == -1);
+    assert(skip_list_get_max_key(list, &max_key, &max_key_size) == -1);
+
+    /* add entries in non-sequential order to test sorting */
+    uint8_t key2[] = {2};
+    uint8_t value2[] = {20};
+    assert(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
+
+    uint8_t key1[] = {1};
+    uint8_t value1[] = {10};
+    assert(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
+
+    uint8_t key3[] = {3};
+    uint8_t value3[] = {30};
+    assert(skip_list_put(list, key3, sizeof(key3), value3, sizeof(value3), -1) == 0);
+
+    /* test min key */
+    assert(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);
+    assert(min_key != NULL);
+    assert(min_key_size == sizeof(key1));
+    assert(memcmp(min_key, key1, min_key_size) == 0);
+    free(min_key);
+
+    /* test max key */
+    assert(skip_list_get_max_key(list, &max_key, &max_key_size) == 0);
+    assert(max_key != NULL);
+    assert(max_key_size == sizeof(key3));
+    assert(memcmp(max_key, key3, max_key_size) == 0);
+    free(max_key);
+
+    /* test with TTL */
+    uint8_t key0[] = {0};
+    uint8_t value0[] = {5};
+    time_t ttl = 1; /* 1 second */
+    assert(skip_list_put(list, key0, sizeof(key0), value0, sizeof(value0), time(NULL) + ttl) == 0);
+
+    /* Verify key0 is now the min key */
+    assert(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);
+    assert(min_key != NULL);
+    assert(min_key_size == sizeof(key0));
+    assert(memcmp(min_key, key0, min_key_size) == 0);
+    free(min_key);
+
+    /* Wait for TTL to expire */
+    sleep(ttl + 1);
+
+    /* Should still be able to get min key (now key1 again) after key0 expired */
+    assert(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);
+    assert(min_key != NULL);
+    assert(min_key_size == sizeof(key1));
+    assert(memcmp(min_key, key1, min_key_size) == 0);
+    free(min_key);
+
+    /* Clean up */
+    assert(skip_list_free(list) == 0);
+    printf(GREEN "test_skip_list_min_max_key passed\n" RESET);
+}
+
 int main(void)
 {
     test_skip_list_create_node();
     test_skip_list_put_get();
     test_skip_list_destroy();
     test_skip_list_clear();
+    test_skip_list_min_max_key();
     test_skip_list_count_entries();
     test_skip_list_get_size();
     test_skip_list_copy();

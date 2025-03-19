@@ -153,9 +153,9 @@ int main()
         return 1;
     }
 
-    err = tidesdb_create_column_family(tdb, CF_NAME, (1024 * 1024) * 128, TDB_USING_HT_MAX_LEVEL,
-                                       TDB_USING_HT_PROBABILITY, false, TDB_NO_COMPRESSION, true,
-                                       TDB_MEMTABLE_HASH_TABLE);
+    err = tidesdb_create_column_family(tdb, CF_NAME, (1024 * 1024) * 128, TDB_DEFAULT_SKIP_LIST_MAX_LEVEL,
+                                       TDB_DEFAULT_SKIP_LIST_MAX_LEVEL, false, TDB_NO_COMPRESSION, true
+                                       );
     if (err != NULL)
     {
         printf(BOLDRED "Failed to create column family: %s\n" RESET, err->message);

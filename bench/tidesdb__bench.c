@@ -66,10 +66,8 @@ void *thread_put(void *arg)
         {
             printf(BOLDRED "Put operation failed: %s\n" RESET, err->message);
             (void)tidesdb_err_free(err);
-            (void)pthread_exit(NULL);
         }
     }
-    (void)pthread_exit(NULL);
 }
 
 void *thread_get(void *arg)
@@ -86,11 +84,9 @@ void *thread_get(void *arg)
         {
             printf(BOLDRED "Get operation failed: %s\n" RESET, err->message);
             (void)tidesdb_err_free(err);
-            (void)pthread_exit(NULL);
         }
         free(value_out);
     }
-    (void)pthread_exit(NULL);
 }
 
 void *thread_delete(void *arg)
@@ -104,10 +100,8 @@ void *thread_delete(void *arg)
         {
             printf(BOLDRED "Delete operation failed: %s\n" RESET, err->message);
             (void)tidesdb_err_free(err);
-            (void)pthread_exit(NULL);
         }
     }
-    (void)pthread_exit(NULL);
 }
 
 int main()
@@ -115,6 +109,7 @@ int main()
     tidesdb_t *tdb = NULL;
     tidesdb_err_t *err = NULL;
     double start_time, end_time;
+
     char **keys = malloc(NUM_OPERATIONS * sizeof(char *));
     if (keys == NULL)
     {
@@ -138,7 +133,22 @@ int main()
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {
         keys[i] = malloc(KEY_SIZE);
+        if (keys[i] == NULL)
+        {
+            printf(BOLDRED "Failed to allocate memory for key\n" RESET);
+            free(keys);
+            free(values);
+            return 1;
+        }
+
         values[i] = malloc(VALUE_SIZE);
+        if (values[i] == NULL)
+        {
+            printf(BOLDRED "Failed to allocate memory for value\n" RESET);
+            free(keys);
+            free(values);
+            return 1;
+        }
         (void)generate_random_string(keys[i], KEY_SIZE);
         (void)generate_random_string(values[i], VALUE_SIZE);
     }
@@ -148,20 +158,31 @@ int main()
     {
         printf(BOLDRED "Failed to open database: %s\n" RESET, err->message);
         (void)tidesdb_err_free(err);
+        for (int i = 0; i < NUM_OPERATIONS; i++)
+        {
+            free(keys[i]);
+            free(values[i]);
+        }
         free(keys);
         free(values);
         return 1;
     }
 
-    err = tidesdb_create_column_family(tdb, CF_NAME, (1024 * 1024) * 128, TDB_USING_HT_MAX_LEVEL,
-                                       TDB_USING_HT_PROBABILITY, false, TDB_NO_COMPRESSION, true,
-                                       TDB_MEMTABLE_HASH_TABLE);
+    err = tidesdb_create_column_family(
+        tdb, "benchmark_cf", (1024 * 1024) * 128, TDB_DEFAULT_SKIP_LIST_MAX_LEVEL,
+        TDB_DEFAULT_SKIP_LIST_PROBABILITY, false, TDB_NO_COMPRESSION, true);
     if (err != NULL)
     {
         printf(BOLDRED "Failed to create column family: %s\n" RESET, err->message);
         (void)tidesdb_err_free(err);
+        for (int i = 0; i < NUM_OPERATIONS; i++)
+        {
+            free(keys[i]);
+            free(values[i]);
+        }
         free(keys);
         free(values);
+        (void)tidesdb_close(tdb);
         return 1;
     }
 
@@ -220,7 +241,7 @@ int main()
     free(keys);
     free(values);
 
-    err = tidesdb_drop_column_family(tdb, CF_NAME);
+    err = tidesdb_drop_column_family(tdb, "benchmark_cf");
     if (err != NULL)
     {
         printf(BOLDRED "Failed to drop column family: %s\n" RESET, err->message);

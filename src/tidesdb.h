@@ -32,7 +32,6 @@ extern "C"
 /* we include compat.h in above headers already */
 #include "compress.h"
 #include "err.h"
-#include "hash_table.h"
 #include "log.h"
 #include "skip_list.h"
 
@@ -53,8 +52,6 @@ extern "C"
 #define TDB_FLUSH_THRESHOLD               1048576    /* default flush threshold for column family */
 #define TDB_MIN_MAX_LEVEL                 5          /* minimum max level for column family */
 #define TDB_MIN_PROBABILITY               0.1        /* minimum probability for column family */
-#define TDB_USING_HT_MAX_LEVEL            0          /* max level for using hash table memtable */
-#define TDB_USING_HT_PROBABILITY          0.0f       /* probability for using hash table memtable */
 #define TDB_DEFAULT_SKIP_LIST_MAX_LEVEL   12         /* default max level for skip list memtable */
 #define TDB_DEFAULT_SKIP_LIST_PROBABILITY 0.24f /* default probability for skip list memtable */
 #define TDB_AVAILABLE_MEMORY_THRESHOLD \
@@ -104,17 +101,6 @@ extern "C"
     } tidesdb_wal_t;
 
     /*
-     * TIDESDB_MEMTABLE_DS
-     * memtable data structure enum
-     * used to select the data structure for a column family memtable
-     */
-    typedef enum
-    {
-        TDB_MEMTABLE_SKIP_LIST, /* a skip list data structure for the memtable */
-        TDB_MEMTABLE_HASH_TABLE /* a hash table data structure for the memtable */
-    } tidesdb_memtable_ds_t;
-
-    /*
      * tidesdb_debug_log_t
      * debug log type enum
      * used for debug logs in TidesDB, mainly to reuse logs
@@ -128,7 +114,6 @@ extern "C"
         TIDESDB_DEBUG_AVAIL_THREADS,
         TIDESDB_DEBUG_OPENED_SUCCESS,
         TIDESDB_DEBUG_COLUMN_FAMILY_SETTING_UP,
-        TIDESDB_DEBUG_COLUMN_FAMILY_USING_DATA_STRUCTURE,
         TIDESDB_DEBUG_OPENED_WAL,
         TIDESDB_DEBUG_LOADED_COLUMN_FAMILY_SSTABLES,
         TIDESDB_DEBUG_REPLAYED_COLUMN_FAMILY_WAL,
@@ -157,7 +142,6 @@ extern "C"
      * @param probability the probability of the column family
      * @param compressed the compressed status of the column family
      * @param compress_algo the compression algorithm for the column family
-     * @param memtable_ds the data structure for the column family memtable
      * @param bloom_filter whether to use a bloom filter for the column family sstables
      */
     typedef struct
@@ -168,7 +152,6 @@ extern "C"
         float probability;
         bool compressed;
         tidesdb_compression_algo_t compress_algo;
-        tidesdb_memtable_ds_t memtable_ds;
         bool bloom_filter;
     } tidesdb_column_family_config_t;
 
@@ -184,8 +167,7 @@ extern "C"
      * @param sstables the sstables for the column family
      * @param num_sstables the number of sstables for the column family
      * @param rwlock read-write lock for column family
-     * @param memtable_sl the skip list memtable for the column family. Can be NULL
-     * @param memtable_ht the hash table memtable for the column family. Can be NULL
+     * @param memtable the skip list memtable for the column family. Can be NULL
      * @param wal the write-ahead log for column family
      * @param partial_merging whether the column family has been started with partially merging.  If
      * so you cannot manually compact the column family.
@@ -203,9 +185,7 @@ extern "C"
         tidesdb_sstable_t **sstables;
         int num_sstables;
         pthread_rwlock_t rwlock;
-        skip_list_t *memtable_sl; /* we once had a void* for the memtable but found it safer to have
-                                     separate memtables */
-        hash_table_t *memtable_ht;
+        skip_list_t *memtable;
         tidesdb_wal_t *wal;
         bool partial_merging;
         bool require_sst_shift;
@@ -433,15 +413,13 @@ extern "C"
      * @param compress_algo the compression algorithm to use if you want to compress the column
      * family
      * @param bloom_filter whether the column family should use a bloom filter
-     * @param memtable_ds the data structure for the memtable
      * @return error or NULL
      */
     tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name,
                                                 int flush_threshold, int max_level,
                                                 float probability, bool compressed,
                                                 tidesdb_compression_algo_t compress_algo,
-                                                bool bloom_filter,
-                                                tidesdb_memtable_ds_t memtable_ds);
+                                                bool bloom_filter);
 
     /*
      * tidesdb_drop_column_family
@@ -711,13 +689,12 @@ extern "C"
      * @param compress_algo the compression algorithm to use if you want to compress the column
      * family
      * @param bloom_filter whether the column family should use a bloom filter
-     * @param memtable_ds the data structure for the memtable
      * @return 0 if the column family was created, -1 if not
      */
     int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_threshold,
                                    int max_level, float probability, tidesdb_column_family_t **cf,
                                    bool compressed, tidesdb_compression_algo_t compress_algo,
-                                   bool bloom_filter, tidesdb_memtable_ds_t memtable_ds);
+                                   bool bloom_filter);
 
     /*
      * _tidesdb_add_column_family
@@ -813,14 +790,6 @@ extern "C"
     int _tidesdb_flush_memtable(tidesdb_column_family_t *cf);
 
     /*
-     * _tidesdb_flush_memtable_f_hash_table
-     * flushes a memtable to disk in an SSTable from a hash table memtable
-     * @param cf the column family
-     * @return 0 if the memtable was flushed, -1 if not
-     */
-    int _tidesdb_flush_memtable_f_hash_table(tidesdb_column_family_t *cf);
-
-    /*
      * _tidesdb_flush_memtable_w_bloom_filter
      * flushes a memtable to disk in an SSTable with a bloom filter at initial block from a skip
      * list memtable
@@ -828,15 +797,6 @@ extern "C"
      * @return 0 if the memtable was flushed, -1 if not
      */
     int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf);
-
-    /*
-     * _tidesdb_flush_memtable_w_bloom_filter_f_hash_table
-     * flushes a memtable to disk in an SSTable with a bloom filter at initial block from a hash
-     * table memtable
-     * @param cf the column family
-     * @return 0 if the memtable was flushed, -1 if not
-     */
-    int _tidesdb_flush_memtable_w_bloom_filter_f_hash_table(tidesdb_column_family_t *cf);
 
     /*
      * _tidesdb_is_tombstone

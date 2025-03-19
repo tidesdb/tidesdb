@@ -27,7 +27,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Configurable** column families are configurable with memtable flush threshold, data structure, if skip list max level, if skip list probability, compression, and bloom filters.
 - [x] **Error Handling** API functions return an error code and message.
 - [x] **Easy API** simple and easy to use api.
-- [x] **Multiple Memtable Data Structures** memtable can be a skip list or hash table.
+- [x] **Skip List** skip list is used for memtable data structure.
 - [x] **Multiplatform** Linux, MacOS, and Windows support.
 - [x] **Logging** system logs debug messages to log file.  This can be disabled.  Log file is created in the database directory.
 - [x] **Block Indices** by default `TDB_BLOCK_INDICES` is set to 1.  This means TidesDB for each column family sstable there is a last block containing a sorted binary hash array.  This compact data structure gives us the ability to retrieve the specific offset for a key and seek to its containing key value pair block within an sstable without having to scan an entire sstable.  If `TDB_BLOCK_INDICES` is set to 0 then block indices aren't used nor created and reads are slower and consume more IO and CPU having to scan and compare.
@@ -114,7 +114,6 @@ Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask quest
 #include <tidesdb/tidesdb.h> /* you can use other components of TidesDB such has hash table,
                                 skip list, bloom filter etc.. under tidesdb/
                                 this also prevents collisions.  */
-
 ```
 
 ## Usage
@@ -158,22 +157,18 @@ In order to store data in TidesDB you need a column family.  This is by design. 
 - the database you want to create the column family in.  Must be open
 - the name of the column family
 - memtable flush threshold in bytes.  Example below is 128MB
-- skip list max level.  Example below is 12 ( only if using `TDB_MEMTABLE_SKIP_LIST` ) pass `TDB_USING_HT_MAX_LEVEL` if using `TDB_MEMTABLE_HASH_TABLE`
-- skip list probability.  Example below is 0.24 ( only if using `TDB_MEMTABLE_SKIP_LIST` ) pass `TDB_USING_HT_PROBABILITY` if using `TDB_MEMTABLE_HASH_TABLE`
+- skip list max level.  Example below is 12 ( you can use `TDB_DEFAULT_SKIP_LIST_MAX_LEVEL`)
+- skip list probability.  Example below is 0.24 ( you can use `TDB_DEFAULT_SKIP_LIST_PROBABILITY`)
 - whether column family sstable data is compressed
 - the compression algorithm to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
 - whether to use bloom filters
-- what data structure to use for the memtable [`TDB_MEMTABLE_SKIP_LIST`, `TDB_MEMTABLE_HASH_TABLE`]
-
-A skip list is a bit slower on writes but faster on reads.  A hash table in TidesDB is faster on writes and reads.
-A hash table will cause more write amplification than a skip list internally as sstables are not sorted right away.
 
 The flush threshold is an accumilation of the size of your key value pairs in the memtable.  When the threshold is reached the memtable is flushed to an sstable.
 The threshold is up to you and the system you're running on.  The minimum size is 1mb. The larger the threshold the more data you can store in memory before flushing to disk.
 
 ```c
 /* create a column family with no compression and no bloom filters (slower reads) */
-tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, 12, 0.24f, false, TDB_NO_COMPRESSION, false, TDB_MEMTABLE_SKIP_LIST);
+tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, TDB_DEFAULT_SKIP_LIST_MAX_LEVEL, TDB_DEFAULT_SKIP_LIST_PROBABILITY, false, TDB_NO_COMPRESSION, false);
 if (e != NULL)
 {
     /* handle error */
@@ -181,10 +176,10 @@ if (e != NULL)
 }
 ```
 
-Using Snappy compression, bloom filters and hash table memtable.
+Using Snappy compression, bloom filters
 ```c
 /* create a column family with compression and bloom filter (the bloom filter provides fast read speed) */
-tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, TDB_USING_HT_MAX_LEVEL, TDB_USING_HT_PROBABILITY, true, TDB_COMPRESS_SNAPPY, true, TDB_MEMTABLE_HASH_TABLE);
+tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, TDB_DEFAULT_SKIP_LIST_MAX_LEVEL, TDB_DEFAULT_SKIP_LIST_PROBABILITY, true, TDB_COMPRESS_SNAPPY, true);
 if (e != NULL)
 {
     /* handle error */

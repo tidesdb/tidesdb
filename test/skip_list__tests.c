@@ -418,24 +418,24 @@ void test_skip_list_min_max_key()
     time_t ttl = 1; /* 1 second */
     assert(skip_list_put(list, key0, sizeof(key0), value0, sizeof(value0), time(NULL) + ttl) == 0);
 
-    /* Verify key0 is now the min key */
+    /* verify key0 is now the min key */
     assert(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);
     assert(min_key != NULL);
     assert(min_key_size == sizeof(key0));
     assert(memcmp(min_key, key0, min_key_size) == 0);
     free(min_key);
 
-    /* Wait for TTL to expire */
+    /* wait for TTL to expire */
     sleep(ttl + 1);
 
-    /* Should still be able to get min key (now key1 again) after key0 expired */
+    /* should still be able to get min key (now key1 again) after key0 expired */
     assert(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);
     assert(min_key != NULL);
     assert(min_key_size == sizeof(key1));
     assert(memcmp(min_key, key1, min_key_size) == 0);
     free(min_key);
 
-    /* Clean up */
+    /* clean up */
     assert(skip_list_free(list) == 0);
     printf(GREEN "test_skip_list_min_max_key passed\n" RESET);
 }

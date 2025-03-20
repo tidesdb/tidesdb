@@ -99,7 +99,7 @@ void test_tidesdb_serialize_deserialize_sst_min_max()
     size_t expected_size = sizeof(size_t) + min_key_size + sizeof(size_t) + max_key_size;
     assert(serialized_size == expected_size);
 
-    tidesdb_sst_min_max *deserialized = _tidesdb_deserialize_sst_min_max(serialized);
+    tidesdb_sst_min_max_t *deserialized = _tidesdb_deserialize_sst_min_max(serialized);
     assert(deserialized != NULL);
 
     assert(deserialized->min_key_size == min_key_size);

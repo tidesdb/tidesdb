@@ -25,6 +25,8 @@
 
 #include "compat.h"
 
+/* more time equals more results, but remember to take breaks to refresh your mind. */
+
 #define MAX_FILE_PATH_LENGTH 1024 /* max file path length for block manager file(s) */
 
 /**

@@ -772,7 +772,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 cf->path = strdup(cf_path);
                 cf->sstables = NULL;
                 cf->num_sstables = 0;
-                cf->partial_merging = false;
+                cf->incremental_merging = false;
                 cf->tdb = tdb;
                 cf->require_sst_shift = false;
 
@@ -920,11 +920,11 @@ void _tidesdb_free_column_families(tidesdb_t *tdb)
         /* we iterate over the column families and free them */
         for (int i = 0; i < tdb->num_column_families; i++)
         {
-            if (tdb->column_families[i]->partial_merging)
+            if (tdb->column_families[i]->incremental_merging)
             {
-                tdb->column_families[i]->partial_merging = false;
+                tdb->column_families[i]->incremental_merging = false;
                 /* wait for thread to finish */
-                (void)pthread_join(tdb->column_families[i]->partial_merge_thread, NULL);
+                (void)pthread_join(tdb->column_families[i]->incremental_merge_thread, NULL);
             }
 
             if (tdb->column_families[i]->config.name != NULL)
@@ -1660,7 +1660,7 @@ int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_thres
     /* set bloom filter to false */
     (*cf)->config.bloom_filter = bloom_filter;
 
-    (*cf)->partial_merging = false;
+    (*cf)->incremental_merging = false;
 
     (*cf)->tdb = tdb;
 
@@ -3458,8 +3458,8 @@ tidesdb_err_t *tidesdb_compact_sstables(tidesdb_t *tdb, const char *column_famil
     if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
         return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
 
-    /* we check if column family has partial merge started */
-    if (cf->partial_merging)
+    /* we check if column family has incremental merge started */
+    if (cf->incremental_merging)
     {
         /* release db read lock */
         if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
@@ -3467,7 +3467,8 @@ tidesdb_err_t *tidesdb_compact_sstables(tidesdb_t *tdb, const char *column_famil
             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
         }
 
-        return tidesdb_err_from_code(TIDESDB_ERR_PARTIAL_MERGE_ALREADY_STARTED, column_family_name);
+        return tidesdb_err_from_code(TIDESDB_ERR_INCREMENTAL_MERGE_ALREADY_STARTED,
+                                     column_family_name);
     }
 
     /* release db read lock */
@@ -5071,9 +5072,8 @@ compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo)
     }
 }
 
-tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
-                                                      const char *column_family_name, int seconds,
-                                                      int min_sstables)
+tidesdb_err_t *tidesdb_start_incremental_merge(tidesdb_t *tdb, const char *column_family_name,
+                                               int seconds, int min_sstables)
 {
     /* we check if tidesdb is NULL */
     if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
@@ -5083,10 +5083,11 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
 
     /* we check if seconds is > 0 */
-    if (seconds <= 0) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_PARTIAL_MERGE_INTERVAL);
+    if (seconds <= 0) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_INCREMENTAL_MERGE_INTERVAL);
 
     /* we check if min_sstables is at least 2 */
-    if (min_sstables < 2) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_PARTIAL_MERGE_MIN_SST);
+    if (min_sstables < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_INCREMENTAL_MERGE_MIN_SST);
 
     /* we check if the column family name is greater than 2 */
     if (strlen(column_family_name) < 2)
@@ -5111,11 +5112,12 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
         return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
     }
 
-    /* we check if column family is already partially merging */
-    if (cf->partial_merging)
+    /* we check if column family is already incrementally merging */
+    if (cf->incremental_merging)
     {
         (void)pthread_rwlock_unlock(&tdb->rwlock);
-        return tidesdb_err_from_code(TIDESDB_ERR_PARTIAL_MERGE_ALREADY_STARTED, column_family_name);
+        return tidesdb_err_from_code(TIDESDB_ERR_INCREMENTAL_MERGE_ALREADY_STARTED,
+                                     column_family_name);
     }
 
     /* we unlock the db read lock */
@@ -5124,7 +5126,8 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
     }
 
-    tidesdb_partial_merge_thread_args_t *args = malloc(sizeof(tidesdb_partial_merge_thread_args_t));
+    tidesdb_incremental_merge_thread_args_t *args =
+        malloc(sizeof(tidesdb_incremental_merge_thread_args_t));
     if (args == NULL) return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC);
 
     args->cf = cf;
@@ -5154,10 +5157,10 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
     }
 
-    /* setup partial merge on column family */
-    cf->partial_merge_interval = seconds;
-    cf->partial_merge_min_sstables = min_sstables;
-    cf->partial_merging = true;
+    /* setup incremental merge on column family */
+    cf->incremental_merge_interval = seconds;
+    cf->incremental_merge_min_sstables = min_sstables;
+    cf->incremental_merging = true;
 
     /* we unlock the column family */
     if (pthread_rwlock_unlock(&cf->rwlock) != 0)
@@ -5169,7 +5172,8 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
     }
 
     /* we create a new thread */
-    if (pthread_create(&cf->partial_merge_thread, NULL, _tidesdb_partial_merge_thread, args) != 0)
+    if (pthread_create(&cf->incremental_merge_thread, NULL, _tidesdb_incremental_merge_thread,
+                       args) != 0)
     {
         (void)pthread_mutex_destroy(lock);
         free(lock);
@@ -5181,22 +5185,22 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
     return NULL;
 }
 
-void *_tidesdb_partial_merge_thread(void *arg)
+void *_tidesdb_incremental_merge_thread(void *arg)
 {
-    tidesdb_partial_merge_thread_args_t *args = (tidesdb_partial_merge_thread_args_t *)arg;
+    tidesdb_incremental_merge_thread_args_t *args = (tidesdb_incremental_merge_thread_args_t *)arg;
     tidesdb_column_family_t *cf = args->cf;
 
     (void)log_write(cf->tdb->log,
-                    _tidesdb_get_debug_log_format(TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_STARTED),
+                    _tidesdb_get_debug_log_format(TIDESDB_DEBUG_INCREMENTAL_MERGE_THREAD_STARTED),
                     cf->config.name);
 
     int sst_index = 0; /* what index we are on in the sstables */
 
-    while (cf->partial_merging)
+    while (cf->incremental_merging)
     {
-        sleep(cf->partial_merge_interval); /* sleep for interval */
+        sleep(cf->incremental_merge_interval); /* sleep for interval */
         (void)log_write(cf->tdb->log,
-                        _tidesdb_get_debug_log_format(TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_AWOKE),
+                        _tidesdb_get_debug_log_format(TIDESDB_DEBUG_INCREMENTAL_MERGE_THREAD_AWOKE),
                         cf->config.name);
 
         /* we lock column family for reads temporarily */
@@ -5206,12 +5210,12 @@ void *_tidesdb_partial_merge_thread(void *arg)
         }
 
         /* we check if sstables is at minimum */
-        if (cf->num_sstables < cf->partial_merge_min_sstables)
+        if (cf->num_sstables < cf->incremental_merge_min_sstables)
         {
-            (void)log_write(
-                cf->tdb->log,
-                _tidesdb_get_debug_log_format(TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_LIMIT_CONTINUE),
-                cf->config.name, cf->partial_merge_min_sstables);
+            (void)log_write(cf->tdb->log,
+                            _tidesdb_get_debug_log_format(
+                                TIDESDB_DEBUG_INCREMENTAL_MERGE_THREAD_LIMIT_CONTINUE),
+                            cf->config.name, cf->incremental_merge_min_sstables);
             (void)pthread_rwlock_unlock(&cf->rwlock);
             continue;
         }
@@ -5805,11 +5809,11 @@ char *_tidesdb_get_debug_log_format(tidesdb_debug_log_t log_type)
             return "Merging sstables %s and %s for column family %s";
         case TIDESDB_DEBUG_MERGED_PAIR_SSTABLES:
             return "Merged sstables %s and %s for column family %s";
-        case TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_AWOKE:
-            return "Partial merge thread woke up for column family %s";
-        case TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_STARTED:
-            return "Started partial merge thread for column family %s";
-        case TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_LIMIT_CONTINUE:
+        case TIDESDB_DEBUG_INCREMENTAL_MERGE_THREAD_AWOKE:
+            return "Incremental merge thread woke up for column family %s";
+        case TIDESDB_DEBUG_INCREMENTAL_MERGE_THREAD_STARTED:
+            return "Started incremental merge thread for column family %s";
+        case TIDESDB_DEBUG_INCREMENTAL_MERGE_THREAD_LIMIT_CONTINUE:
             return "Column family %s has less than %d sstables";
 
         default:
@@ -5880,8 +5884,8 @@ tidesdb_err_t *tidesdb_get_column_family_stat(tidesdb_t *tdb, const char *column
     /* we copy the number of memtable entries */
     (*stat)->memtable_entries_count = skip_list_count_entries(cf->memtable);
 
-    /* set partial merge started status */
-    (*stat)->partial_merging = cf->partial_merging;
+    /* set incremental merge started status */
+    (*stat)->incremental_merging = cf->incremental_merging;
 
     /* create sstable stats */
 
@@ -6165,4 +6169,213 @@ tidesdb_err_t *tidesdb_txn_get(tidesdb_txn_t *txn, const uint8_t *key, size_t ke
     /* if we get here, the key wasn't found in the transaction's operations.
      ** fall back to the database to get the value. */
     return tidesdb_get(txn->tdb, txn->cf->config.name, key, key_size, value, value_size);
+}
+
+tidesdb_err_t *tidesdb_delete_by_range(tidesdb_t *tdb, const char *column_family_name,
+                                       const uint8_t *start_key, size_t start_key_size,
+                                       const uint8_t *end_key, size_t end_key_size)
+{
+    /* Check prereqs */
+    if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
+    if (column_family_name == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COLUMN_FAMILY);
+    if (start_key == NULL || end_key == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_KEY);
+
+    /* validate column family name */
+    if (strlen(column_family_name) < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
+
+    tidesdb_key_value_pair_t **result = NULL;
+    size_t result_size = 0;
+
+    tidesdb_err_t *err = tidesdb_range(tdb, column_family_name, start_key, start_key_size, end_key,
+                                       end_key_size, &result, &result_size);
+
+    if (err != NULL)
+    {
+        return err; /* return the error from tidesdb_range */
+    }
+
+    /* no matches found - return success */
+    if (result_size == 0)
+    {
+        free(result);
+        return NULL;
+    }
+
+    /* begin a transaction for atomic deletion */
+    tidesdb_txn_t *txn = NULL;
+    err = tidesdb_txn_begin(tdb, &txn, column_family_name);
+    if (err != NULL)
+    {
+        /* free the result array and its contents */
+        for (size_t i = 0; i < result_size; i++)
+        {
+            free(result[i]->key);
+            free(result[i]->value);
+            free(result[i]);
+        }
+        free(result);
+        return err;
+    }
+
+    /* delete each key-value pair in the range */
+    for (size_t i = 0; i < result_size; i++)
+    {
+        err = tidesdb_txn_delete(txn, result[i]->key, result[i]->key_size);
+        if (err != NULL)
+        {
+            /* rollback and clean up on error */
+            (void)tidesdb_txn_rollback(txn);
+            (void)tidesdb_txn_free(txn);
+
+            for (size_t j = 0; j < result_size; j++)
+            {
+                free(result[j]->key);
+                free(result[j]->value);
+                free(result[j]);
+            }
+            free(result);
+
+            return err;
+        }
+    }
+
+    /* commit the transaction */
+    err = tidesdb_txn_commit(txn);
+    if (err != NULL)
+    {
+        /* rollback and clean up on error */
+        (void)tidesdb_txn_rollback(txn);
+        (void)tidesdb_txn_free(txn);
+
+        for (size_t i = 0; i < result_size; i++)
+        {
+            free(result[i]->key);
+            free(result[i]->value);
+            free(result[i]);
+        }
+        free(result);
+
+        return err;
+    }
+
+    (void)tidesdb_txn_free(txn);
+
+    /* free the result array and its contents */
+    for (size_t i = 0; i < result_size; i++)
+    {
+        free(result[i]->key);
+        free(result[i]->value);
+        free(result[i]);
+    }
+    free(result);
+
+    return err;
+}
+
+tidesdb_err_t *tidesdb_delete_by_filter(tidesdb_t *tdb, const char *column_family_name,
+                                        bool (*filter_function)(const tidesdb_key_value_pair_t *))
+{
+    /* check prereqs*/
+    if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
+    if (column_family_name == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COLUMN_FAMILY);
+    if (filter_function == NULL)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COMPARISON_METHOD);
+
+    /* validate column family name */
+    if (strlen(column_family_name) < 2)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
+    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
+
+    /* get the matching key-value pairs */
+    tidesdb_key_value_pair_t **result = NULL;
+    size_t result_size = 0;
+
+    tidesdb_err_t *err =
+        tidesdb_filter(tdb, column_family_name, filter_function, &result, &result_size);
+
+    if (err != NULL)
+    {
+        return err; /* return the error from tidesdb_filter */
+    }
+
+    /* no matches found - return success */
+    if (result_size == 0)
+    {
+        free(result);
+        return NULL;
+    }
+
+    /* begin a transaction for atomic deletion */
+    tidesdb_txn_t *txn = NULL;
+    err = tidesdb_txn_begin(tdb, &txn, column_family_name);
+    if (err != NULL)
+    {
+        /* free the result array and its contents */
+        for (size_t i = 0; i < result_size; i++)
+        {
+            free(result[i]->key);
+            free(result[i]->value);
+            free(result[i]);
+        }
+        free(result);
+        return err;
+    }
+
+    /*delete each matching key-value pair */
+    for (size_t i = 0; i < result_size; i++)
+    {
+        err = tidesdb_txn_delete(txn, result[i]->key, result[i]->key_size);
+        if (err != NULL)
+        {
+            /* rollback and clean up on error */
+            (void)tidesdb_txn_rollback(txn);
+            (void)tidesdb_txn_free(txn);
+
+            for (size_t j = 0; j < result_size; j++)
+            {
+                free(result[j]->key);
+                free(result[j]->value);
+                free(result[j]);
+            }
+            free(result);
+
+            return err;
+        }
+    }
+
+    /* commit the transaction */
+    err = tidesdb_txn_commit(txn);
+    if (err != NULL)
+    {
+        /* rollback and clean up on error */
+        (void)tidesdb_txn_rollback(txn);
+        (void)tidesdb_txn_free(txn);
+
+        for (size_t i = 0; i < result_size; i++)
+        {
+            free(result[i]->key);
+            free(result[i]->value);
+            free(result[i]);
+        }
+        free(result);
+
+        return err;
+    }
+
+    (void)tidesdb_txn_free(txn);
+
+    /* free the result array and its contents */
+    for (size_t i = 0; i < result_size; i++)
+    {
+        free(result[i]->key);
+        free(result[i]->value);
+        free(result[i]);
+    }
+    free(result);
+
+    return err;
 }

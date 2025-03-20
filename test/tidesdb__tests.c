@@ -84,6 +84,39 @@ void test_tidesdb_serialize_deserialize_column_family_config()
     printf(GREEN "test_tidesdb_serialize_deserialize_column_family_config passed\n" RESET);
 }
 
+void test_tidesdb_serialize_deserialize_sst_min_max()
+{
+    const uint8_t min_key[] = {0x01, 0x02, 0x03, 0x04};
+    size_t min_key_size = sizeof(min_key);
+    const uint8_t max_key[] = {0x09, 0x08, 0x07, 0x06, 0x05};
+    size_t max_key_size = sizeof(max_key);
+
+    size_t serialized_size;
+    uint8_t *serialized = _tidesdb_serialize_sst_min_max(min_key, min_key_size,
+                                                        max_key, max_key_size,
+                                                        &serialized_size);
+    assert(serialized != NULL);
+
+    size_t expected_size = sizeof(size_t) + min_key_size + sizeof(size_t) + max_key_size;
+    assert(serialized_size == expected_size);
+
+    tidesdb_sst_min_max *deserialized = _tidesdb_deserialize_sst_min_max(serialized);
+    assert(deserialized != NULL);
+
+    assert(deserialized->min_key_size == min_key_size);
+    assert(deserialized->max_key_size == max_key_size);
+    assert(memcmp(deserialized->min_key, min_key, min_key_size) == 0);
+    assert(memcmp(deserialized->max_key, max_key, max_key_size) == 0);
+
+    // Free allocated memory
+    free(deserialized->min_key);
+    free(deserialized->max_key);
+    free(deserialized);
+    free(serialized);
+
+    printf(GREEN "test_tidesdb_serialize_deserialize_sst_min_max passed\n" RESET);
+}
+
 void test_tidesdb_serialize_deserialize_operation(bool compress, tidesdb_compression_algo_t algo)
 {
     tidesdb_key_value_pair_t *kv = _tidesdb_key_value_pair_new(
@@ -2367,6 +2400,8 @@ int main(void)
     test_tidesdb_serialize_deserialize_key_value_pair(false, TDB_NO_COMPRESSION);
 
     test_tidesdb_serialize_deserialize_column_family_config();
+
+    test_tidesdb_serialize_deserialize_sst_min_max();
 
     test_tidesdb_serialize_deserialize_operation(false, TDB_NO_COMPRESSION);
 

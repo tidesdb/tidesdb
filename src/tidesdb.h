@@ -155,6 +155,22 @@ extern "C"
         bool bloom_filter;
     } tidesdb_column_family_config_t;
 
+    /*
+     * tidesdb_sst_min_max
+     * struct for the min and max keys in a SSTable
+     * @param min_key the minimum key
+     * @param min_key_size the size of the minimum key
+     * @param max_key the maximum key
+     * @param max_key_size the size of the maximum key
+     */
+    typedef struct
+    {
+        uint8_t *min_key;
+        uint32_t min_key_size;
+        uint8_t *max_key;
+        uint32_t max_key_size;
+    } tidesdb_sst_min_max;
+
     /* forward declaration of tidesdb_t */
     typedef struct tidesdb_t tidesdb_t;
 
@@ -898,7 +914,26 @@ extern "C"
     int _tidesdb_compare_keys(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                               size_t key2_size);
 
-    /* serialization is used for tidesdb_key_value_pair_t and tidesdb_operation_t */
+    /*
+     * _tidesdb_serialize_sst_min_max
+     * serialize a sst min max key
+     * @param min_key the min key
+     * @param min_key_size the size of the min key
+     * @param max_key the max key
+     * @param max_key_size the size of the max key
+     * @param out_size the size of the serialized data
+     * @return the serialized data
+     */
+    uint8_t *_tidesdb_serialize_sst_min_max(const uint8_t *min_key, size_t min_key_size,
+                                            const uint8_t *max_key, size_t max_key_size,
+                                            size_t *out_size);
+
+    /*
+     * _tidesdb_deserialize_sst_min_max
+     * @param data the serialized data
+     * @return the deserialized sst min max struct
+     */
+    tidesdb_sst_min_max *_tidesdb_deserialize_sst_min_max(const uint8_t *data);
 
     /*
      * _tidesdb_serialize_key_value_pair

@@ -209,6 +209,82 @@ void _tidesdb_free_key_value_pair(tidesdb_key_value_pair_t *kv)
     kv = NULL;
 }
 
+uint8_t *_tidesdb_serialize_sst_min_max(const uint8_t *min_key, size_t min_key_size,
+                                        const uint8_t *max_key, size_t max_key_size,
+                                        size_t *out_size)
+{
+    /* calculate the size of the serialized data */
+    *out_size = sizeof(size_t) + min_key_size + sizeof(size_t) + max_key_size;
+
+    /* allocate memory for the serialized data */
+    uint8_t *serialized_data = malloc(*out_size);
+    if (serialized_data == NULL) return NULL;
+
+    uint8_t *ptr = serialized_data;
+
+    /* serialize min_key_size and min_key */
+    memcpy(ptr, &min_key_size, sizeof(size_t));
+    ptr += sizeof(size_t);
+    memcpy(ptr, min_key, min_key_size);
+    ptr += min_key_size;
+
+    /* serialize max_key_size and max_key */
+    memcpy(ptr, &max_key_size, sizeof(size_t));
+    ptr += sizeof(size_t);
+    memcpy(ptr, max_key, max_key_size);
+    ptr += max_key_size;
+
+    return serialized_data;
+}
+
+tidesdb_sst_min_max *_tidesdb_deserialize_sst_min_max(const uint8_t *data)
+{
+    const uint8_t *ptr = data;
+
+    /* deserialize min_key_size */
+    size_t min_key_size;
+    memcpy(&min_key_size, ptr, sizeof(size_t));
+    ptr += sizeof(size_t);
+
+    /* deserialize min_key */
+    uint8_t *min_key = malloc(min_key_size);
+    if (min_key == NULL) return NULL;
+    memcpy(min_key, ptr, min_key_size);
+    ptr += min_key_size;
+
+    /* deserialize max_key_size */
+    size_t max_key_size;
+    memcpy(&max_key_size, ptr, sizeof(size_t));
+    ptr += sizeof(size_t);
+
+    /* deserialize max_key */
+    uint8_t *max_key = malloc(max_key_size);
+    if (max_key == NULL)
+    {
+        free(min_key);
+        return NULL;
+    }
+    memcpy(max_key, ptr, max_key_size);
+    ptr += max_key_size;
+
+    /* create the sst min max struct */
+    tidesdb_sst_min_max *min_max = malloc(sizeof(tidesdb_sst_min_max));
+    if (min_max == NULL)
+    {
+        free(min_key);
+        free(max_key);
+        return NULL;
+    }
+
+    /* set the values */
+    min_max->min_key = min_key;
+    min_max->min_key_size = min_key_size;
+    min_max->max_key = max_key;
+    min_max->max_key_size = max_key_size;
+
+    return min_max;
+}
+
 uint8_t *_tidesdb_serialize_column_family_config(tidesdb_column_family_config_t *config,
                                                  size_t *out_size)
 {

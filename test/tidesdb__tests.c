@@ -92,9 +92,8 @@ void test_tidesdb_serialize_deserialize_sst_min_max()
     size_t max_key_size = sizeof(max_key);
 
     size_t serialized_size;
-    uint8_t *serialized = _tidesdb_serialize_sst_min_max(min_key, min_key_size,
-                                                        max_key, max_key_size,
-                                                        &serialized_size);
+    uint8_t *serialized = _tidesdb_serialize_sst_min_max(min_key, min_key_size, max_key,
+                                                         max_key_size, &serialized_size);
     assert(serialized != NULL);
 
     size_t expected_size = sizeof(size_t) + min_key_size + sizeof(size_t) + max_key_size;

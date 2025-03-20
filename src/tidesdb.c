@@ -210,8 +210,8 @@ void _tidesdb_free_key_value_pair(tidesdb_key_value_pair_t *kv)
 }
 
 uint8_t *_tidesdb_serialize_sst_min_max(const uint8_t *min_key, size_t min_key_size,
-                                            const uint8_t *max_key, size_t max_key_size,
-                                            size_t *out_size)
+                                        const uint8_t *max_key, size_t max_key_size,
+                                        size_t *out_size)
 {
     /* calculate the size of the serialized data */
     *out_size = sizeof(size_t) + min_key_size + sizeof(size_t) + max_key_size;
@@ -259,7 +259,8 @@ tidesdb_sst_min_max *_tidesdb_deserialize_sst_min_max(const uint8_t *data)
 
     /* deserialize max_key */
     uint8_t *max_key = malloc(max_key_size);
-    if (max_key == NULL) {
+    if (max_key == NULL)
+    {
         free(min_key);
         return NULL;
     }
@@ -268,7 +269,8 @@ tidesdb_sst_min_max *_tidesdb_deserialize_sst_min_max(const uint8_t *data)
 
     /* create the sst min max struct */
     tidesdb_sst_min_max *min_max = malloc(sizeof(tidesdb_sst_min_max));
-    if (min_max == NULL) {
+    if (min_max == NULL)
+    {
         free(min_key);
         free(max_key);
         return NULL;

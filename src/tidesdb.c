@@ -282,7 +282,6 @@ tidesdb_sst_min_max *_tidesdb_deserialize_sst_min_max(const uint8_t *data)
     min_max->max_key = max_key;
     min_max->max_key_size = max_key_size;
 
-    /* return the sst min max struct */
     return min_max;
 }
 

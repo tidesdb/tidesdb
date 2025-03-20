@@ -107,7 +107,6 @@ void test_tidesdb_serialize_deserialize_sst_min_max()
     assert(memcmp(deserialized->min_key, min_key, min_key_size) == 0);
     assert(memcmp(deserialized->max_key, max_key, max_key_size) == 0);
 
-    // Free allocated memory
     free(deserialized->min_key);
     free(deserialized->max_key);
     free(deserialized);

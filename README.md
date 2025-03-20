@@ -32,7 +32,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Logging** system logs debug messages to log file.  This can be disabled.  Log file is created in the database directory.
 - [x] **Block Indices** by default `TDB_BLOCK_INDICES` is set to 1.  This means TidesDB for each column family sstable there is a last block containing a sorted binary hash array.  This compact data structure gives us the ability to retrieve the specific offset for a key and seek to its containing key value pair block within an sstable without having to scan an entire sstable.  If `TDB_BLOCK_INDICES` is set to 0 then block indices aren't used nor created and reads are slower and consume more IO and CPU having to scan and compare.
 - [x] **Statistics** column family statistics, configs, information can be retrieved through public API.
-- [x] **Range queries** are supported.  You can retrieve a range of key-value pairs.
+- [x] **Range queries** are supported.  You can retrieve a range of key-value pairs.  Each sstable initial block contains a min-max key range.  This allows for fast(er) range queries.
 - [x] **Filter queries** are supported.  You can filter key-value pairs based on a filter function.
 
 ## Building
@@ -320,7 +320,7 @@ if (e != NULL)
     tidesdb_err_free(e);
 }
 
-/* you can add delete operations as well */
+/* you can add get (tidesdb_txn_get) or delete operations as well */
 e = tidesdb_txn_delete(transaction, key, sizeof(key));
 if (e != NULL)
 {

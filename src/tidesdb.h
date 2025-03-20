@@ -19,6 +19,8 @@
 #ifndef __TIDESDB_H__
 #define __TIDESDB_H__
 
+/* follow your passion, be obsessed, don't worry too much. */
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -156,7 +158,7 @@ extern "C"
     } tidesdb_column_family_config_t;
 
     /*
-     * tidesdb_sst_min_max
+     * tidesdb_sst_min_max_t
      * struct for the min and max keys in a SSTable
      * @param min_key the minimum key
      * @param min_key_size the size of the minimum key
@@ -169,7 +171,7 @@ extern "C"
         uint32_t min_key_size;
         uint8_t *max_key;
         uint32_t max_key_size;
-    } tidesdb_sst_min_max;
+    } tidesdb_sst_min_max_t;
 
     /* forward declaration of tidesdb_t */
     typedef struct tidesdb_t tidesdb_t;
@@ -541,6 +543,19 @@ extern "C"
                                      const char *column_family_name);
 
     /*
+     * tidesdb_txn_get
+     * get a value from a transaction
+     * @param txn the transaction
+     * @param key the key
+     * @param key_size the size of the key
+     * @param value the value
+     * @param value_size the size of the value
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_txn_get(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size,
+                                   uint8_t **value, size_t *value_size);
+
+    /*
      * tidesdb_txn_put
      * put a key-value pair into a transaction
      * @param txn the transaction
@@ -806,15 +821,6 @@ extern "C"
     int _tidesdb_flush_memtable(tidesdb_column_family_t *cf);
 
     /*
-     * _tidesdb_flush_memtable_w_bloom_filter
-     * flushes a memtable to disk in an SSTable with a bloom filter at initial block from a skip
-     * list memtable
-     * @param cf the column family
-     * @return 0 if the memtable was flushed, -1 if not
-     */
-    int _tidesdb_flush_memtable_w_bloom_filter(tidesdb_column_family_t *cf);
-
-    /*
      * _tidesdb_is_tombstone
      * checks if value is a tombstone TDB_TOMBSTONE
      * @param value the value to check
@@ -933,7 +939,7 @@ extern "C"
      * @param data the serialized data
      * @return the deserialized sst min max struct
      */
-    tidesdb_sst_min_max *_tidesdb_deserialize_sst_min_max(const uint8_t *data);
+    tidesdb_sst_min_max_t *_tidesdb_deserialize_sst_min_max(const uint8_t *data);
 
     /*
      * _tidesdb_serialize_key_value_pair
@@ -1088,6 +1094,23 @@ extern "C"
      */
     int _tidesdb_key_exists(const uint8_t *key, size_t key_size, tidesdb_key_value_pair_t **result,
                             size_t result_size);
+
+    /*
+     * _tidesdb_merge_min_max
+     * merge two min max keys
+     * @param a the first min max key
+     * @param b the second min max key
+     * @return the merged min max key
+     */
+    tidesdb_sst_min_max_t *_tidesdb_merge_min_max(const tidesdb_sst_min_max_t *a,
+                                                  const tidesdb_sst_min_max_t *b);
+
+    /*
+     * _tidesdb_free_sst_min_max
+     *  free the memory for a sst min max key
+     * @param min_max the sst min max key
+     */
+    void _tidesdb_free_sst_min_max(tidesdb_sst_min_max_t *min_max);
 
 #ifdef __cplusplus
 }

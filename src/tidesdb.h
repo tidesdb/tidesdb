@@ -129,9 +129,9 @@ extern "C"
         TIDESDB_DEBUG_COMPACTED_SSTABLES,
         TIDESDB_DEBUG_MERGING_PAIR_SSTABLES,
         TIDESDB_DEBUG_MERGED_PAIR_SSTABLES,
-        TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_AWOKE,
-        TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_STARTED,
-        TIDESDB_DEBUG_PARTIAL_MERGE_THREAD_LIMIT_CONTINUE,
+        TIDESDB_DEBUG_INCREMENTAL_MERGE_THREAD_AWOKE,
+        TIDESDB_DEBUG_INCREMENTAL_MERGE_THREAD_STARTED,
+        TIDESDB_DEBUG_INCREMENTAL_MERGE_THREAD_LIMIT_CONTINUE,
     } tidesdb_debug_log_t;
 
     /*
@@ -187,13 +187,14 @@ extern "C"
      * @param rwlock read-write lock for column family
      * @param memtable the skip list memtable for the column family. Can be NULL
      * @param wal the write-ahead log for column family
-     * @param partial_merging whether the column family has been started with partially merging.  If
-     * so you cannot manually compact the column family.
+     * @param incremental_merging whether the column family has been started with incremental
+     * merging.  If so you cannot manually compact the column family.
      * @param require_sst_shift whether the column family requires a shift of sstables after a
      * merge.  This is for tidesdb_get and the tidesdb cursor
-     * @param partial_merge_thread the thread for partial merging
-     * @param partial_merge_interval the interval for partial merging
-     * @param partial_merge_min_sstables the minimum number of sstables to trigger a partial merge
+     * @param incremental_merge_thread the thread for incremental merging
+     * @param incremental_merge_interval the interval for incremental merging
+     * @param incremental_merge_min_sstables the minimum number of sstables to trigger a incremental
+     * merge
      */
     typedef struct
     {
@@ -205,11 +206,11 @@ extern "C"
         pthread_rwlock_t rwlock;
         skip_list_t *memtable;
         tidesdb_wal_t *wal;
-        bool partial_merging;
+        bool incremental_merging;
         bool require_sst_shift;
-        pthread_t partial_merge_thread;
-        int partial_merge_interval;
-        int partial_merge_min_sstables;
+        pthread_t incremental_merge_thread;
+        int incremental_merge_interval;
+        int incremental_merge_min_sstables;
     } tidesdb_column_family_t;
 
     /*
@@ -233,7 +234,8 @@ extern "C"
      * @param num_sstables the number of sstables in the column family
      * @param memtable_size the size of the memtable in the column family
      * @param memtable_entries_count the number of entries in the memtable
-     * @param partial_merging whether the column family has been started with partially merging.
+     * @param incremental_merging whether the column family has been started with incremental
+     * merging.
      * @param sstable_stats the stats for the sstables in the column family
      */
     typedef struct
@@ -243,7 +245,7 @@ extern "C"
         int num_sstables;
         size_t memtable_size;
         size_t memtable_entries_count;
-        bool partial_merging;
+        bool incremental_merging;
         tidesdb_column_family_sstable_stat_t **sstable_stats;
     } tidesdb_column_family_stat_t;
 
@@ -385,8 +387,8 @@ extern "C"
     } tidesdb_compact_thread_args_t;
 
     /*
-     * tidesdb_partial_merge_thread_args_t
-     * struct for the arguments for a partial merge thread
+     * tidesdb_incremental_merge_thread_args_t
+     * struct for the arguments for a incremental merge thread
      * @param tdb the TidesDB instance
      * @param cf the column family
      * @param lock for the path creation on compaction (required as its part of merge method)
@@ -396,7 +398,7 @@ extern "C"
         tidesdb_t *tdb;
         tidesdb_column_family_t *cf;
         pthread_mutex_t *lock;
-    } tidesdb_partial_merge_thread_args_t;
+    } tidesdb_incremental_merge_thread_args_t;
 
     /* functions prefixed with _ are internal functions */
     /* api functions return a tidesdb_err* */
@@ -661,20 +663,19 @@ extern "C"
     tidesdb_err_t *tidesdb_list_column_families(tidesdb_t *tdb, char **list);
 
     /*
-     * tidesdb_start_background_partial_merge
-     * starts background partial merge for column family. Will incrementally when minimum is reached
-     * pair and merge sstables. Blocks less than full compaction as sstables are copied and merged
-     * in the background then replaced.
+     * tidesdb_start_background_incremental_merge
+     * starts background incremental merge for column family. Will incrementally when minimum is
+     * reached pair and merge sstables. Blocks less than full compaction as sstables are copied and
+     * merged in the background then replaced.
      * @param tdb the TidesDB instance
      * @param column_family_name the name of the column family
-     * @param seconds the interval in seconds for the partial merges, each provided seconds a
-     * partial merge will occur from oldest sstable making its way to newest
-     * @param min_sstables the minimum number of sstables to trigger a partial merge
+     * @param seconds the interval in seconds for the incremental merges, each provided seconds a
+     * incremental merge will occur from oldest sstable making its way to newest
+     * @param min_sstables the minimum number of sstables to trigger a incremental merge
      * @return error or NULL if thread was started
      */
-    tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
-                                                          const char *column_family_name,
-                                                          int seconds, int min_sstables);
+    tidesdb_err_t *tidesdb_start_incremental_merge(tidesdb_t *tdb, const char *column_family_name,
+                                                   int seconds, int min_sstables);
 
     /*
      * tidesdb_get_column_family_stat
@@ -1040,12 +1041,12 @@ extern "C"
     compress_type _tidesdb_map_compression_algo(tidesdb_compression_algo_t algo);
 
     /*
-     * _tidesdb_partial_merge_thread
-     * a thread for pair merging column family sstables partially, and incrementally.  Merges are
+     * _tidesdb_incremental_merge_thread
+     * a thread for pair merging column family sstables incrementally.  Merges are
      * only trigger when a threshold of sstables are reached.
-     * @param arg the arguments for the thread in this case a partial_merge_thread_args struct
+     * @param arg the arguments for the thread in this case a incremental_merge_thread_args struct
      */
-    void *_tidesdb_partial_merge_thread(void *arg);
+    void *_tidesdb_incremental_merge_thread(void *arg);
 
     /*
      * _tidesdb_get_available_mem
@@ -1111,6 +1112,33 @@ extern "C"
      * @param min_max the sst min max key
      */
     void _tidesdb_free_sst_min_max(tidesdb_sst_min_max_t *min_max);
+
+    /*
+     * tidesdb_delete_by_range
+     * delete a range of key value pairs atomically
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param start_key the start key
+     * @param start_key_size the size of the start key
+     * @param end_key the end key
+     * @param end_key_size the size of the end key
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_delete_by_range(tidesdb_t *tdb, const char *column_family_name,
+                                           const uint8_t *start_key, size_t start_key_size,
+                                           const uint8_t *end_key, size_t end_key_size);
+
+    /*
+     * tidesdb_delete_by_filter
+     * delete key value pairs by a filter function
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param filter_function the filter function
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_delete_by_filter(
+        tidesdb_t *tdb, const char *column_family_name,
+        bool (*filter_function)(const tidesdb_key_value_pair_t *));
 
 #ifdef __cplusplus
 }

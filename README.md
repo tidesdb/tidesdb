@@ -20,7 +20,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Cursor** iterate over key-value pairs forward and backward.
 - [x] **WAL** write-ahead logging for durability. Column families replay WAL on startup.  This reconstructs memtable if the column family did not reach threshold prior to shutdown.
 - [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
-- [x] **Background Partial Merge Compaction** background partial merge compaction can be started.  If started the system will incrementally merge sstables in the background from oldest to newest once column family sstables have reached a specific provided limit.  Merges are done every n seconds. Merges are not done in parallel but incrementally.
+- [x] **Background Incremental Paired Merge Compaction** background incremental merge compaction can be started.  If started the system will incrementally merge sstables in the background from oldest to newest once column family sstables have reached a specific provided limit.  Merges are done every n seconds. Merges are not done in parallel but incrementally.
 - [x] **Bloom Filters** reduce disk reads by reading initial blocks of sstables to check key existence.
 - [x] **Compression** compression is achieved with Snappy, or LZ4, or ZSTD.  SStable entries can be compressed as well as WAL entries.
 - [x] **TTL** time-to-live for key-value pairs.
@@ -462,7 +462,7 @@ tidesdb_cursor_free(c);
 ```
 
 ### Compaction
-There are 2 ways to compact sstables.  Manual multi-threaded paired and merged compaction and automatic background incremental partial merge compaction.
+There are 2 ways to compact sstables.  Manual multi-threaded paired and merged compaction and background incremental merge compaction.
 Compaction removes tombstones and expired keys if ttl is set.  Because merging merges and older and newer sstables only the newest version of key lives on.
 
 #### Manual Multi-Threaded Parallel Compaction
@@ -478,17 +478,17 @@ if (e != NULL)
 }
 ```
 
-#### Automatic / Background Partial Merge Compaction
-You can start a background partial merge compaction.  This will incrementally merge sstables in the background from oldest to newest when minimum sstables are reached. Will run in background until shutdown.  Merges are done every n seconds.  Merges are not done in parallel but incrementally.
-You can set the minimum amount of column family sstables to trigger a background partial merge. Background merging blocks less than manual compaction.
+#### Automatic / Background Incremental Merge Compaction
+You can start a background incremental merge compaction.  This will incrementally merge sstables in the background from oldest to newest when minimum sstables are reached. Will run in background until shutdown.  Merges are done every n seconds.  Merges are not done in parallel but incrementally.
+You can set the minimum amount of column family sstables to trigger a background incremental merge. Background merging blocks less than manual compaction.
 
 You pass
-- the database you want to start the background partial merge compaction in.  Must be open
-- the column family name
+- the database you want to start the background incremental merge compaction in.  Must be open
+- the column family name within that database
 - the number of seconds to wait before going to next pair and merging
 - the minimum number of sstables to trigger a merge
 ```c
-tidesdb_err_t *e = tidesdb_start_background_partial_merge(tdb, "your_column_family", 10, 10); /* merge a pair every 10 seconds and if there are a minimum 10 sstables */
+tidesdb_err_t *e = tidesdb_start_incremental_merge(tdb, "your_column_family", 10, 10); /* merge a pair every 10 seconds and if there are a minimum 10 sstables */
 ```
 
 ### Column Family Statistics
@@ -502,7 +502,7 @@ You can get statistics on a column family.  This includes the column family conf
         int num_sstables;
         size_t memtable_size;
         size_t memtable_entries_count;
-        bool partial_merging;
+        bool incremental_merging;
         tidesdb_column_family_sstable_stat_t **sstable_stats;
     } tidesdb_column_family_stat_t;
 
@@ -521,7 +521,6 @@ You can get statistics on a column family.  This includes the column family conf
         float probability;
         bool compressed;
         tidesdb_compression_algo_t compress_algo;
-        tidesdb_memtable_ds_t memtable_ds;
         bool bloom_filter;
     } tidesdb_column_family_config_t;
 ```

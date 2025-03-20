@@ -1970,8 +1970,8 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
            compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
 }
 
-void test_tidesdb_start_partial_merge(bool compress, tidesdb_compression_algo_t algo,
-                                      bool bloom_filter)
+void test_tidesdb_start_incremental_merge(bool compress, tidesdb_compression_algo_t algo,
+                                          bool bloom_filter)
 {
     tidesdb_t *db = NULL;
     tidesdb_err_t *err = tidesdb_open("test_db", &db);
@@ -1983,8 +1983,8 @@ void test_tidesdb_start_partial_merge(bool compress, tidesdb_compression_algo_t 
     assert(err == NULL);
     (void)tidesdb_err_free(err);
 
-    /* start partial merging in background */
-    err = tidesdb_start_background_partial_merge(db, "test_cf", 1, 10);
+    /* start incremental merging in background */
+    err = tidesdb_start_incremental_merge(db, "test_cf", 1, 10);
     assert(err == NULL);
     (void)tidesdb_err_free(err);
 
@@ -2027,7 +2027,7 @@ void test_tidesdb_start_partial_merge(bool compress, tidesdb_compression_algo_t 
     (void)tidesdb_err_free(err);
 
     (void)_tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_start_partial_merge%s%s passed\n" RESET,
+    printf(GREEN "test_tidesdb_start_incremental_merge%s%s passed\n" RESET,
            compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
 }
 
@@ -2481,7 +2481,7 @@ int main(void)
 
     test_tidesdb_put_get_concurrent(true, TDB_COMPRESS_SNAPPY, true);
 
-    test_tidesdb_start_partial_merge(false, TDB_NO_COMPRESSION, false);
+    test_tidesdb_start_incremental_merge(false, TDB_NO_COMPRESSION, false);
 
     return 0;
 }

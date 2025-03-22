@@ -117,8 +117,15 @@ void test_tidesdb_serialize_deserialize_sst_min_max()
 
 void test_tidesdb_serialize_deserialize_operation(bool compress, tidesdb_compression_algo_t algo)
 {
-    tidesdb_key_value_pair_t *kv = _tidesdb_key_value_pair_new(
-        (const uint8_t *)"test_key", 8, (const uint8_t *)"test_value", 10, 1000);
+    uint8_t key_str[10];
+    uint8_t value_str[10];
+
+    strncpy((char *)key_str, "username", sizeof(key_str));
+    strncpy((char *)value_str, "johndoe", sizeof(value_str));
+
+    tidesdb_key_value_pair_t *kv =
+        _tidesdb_key_value_pair_new(key_str, sizeof(key_str), value_str, sizeof(value_str), 3600);
+
     tidesdb_operation_t op = {.op_code = TIDESDB_OP_PUT, .kv = kv, .cf_name = "test_cf"};
 
     size_t serialized_size;
@@ -2393,6 +2400,560 @@ void test_tidesdb_put_get_concurrent(bool compress, tidesdb_compression_algo_t a
            compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
 }
 
+/* filter function for tidesdb_delete_by_filter */
+bool delete_filter_function(const tidesdb_key_value_pair_t *kv)
+{
+    /* delete keys that contain "_even_" */
+    return strstr((const char *)kv->key, "_even_") != NULL;
+}
+
+void test_tidesdb_delete_by_range(bool compress, tidesdb_compression_algo_t algo, bool bloom_filter)
+{
+    tidesdb_t *db = NULL;
+
+    tidesdb_err_t *err = tidesdb_open("test_db", &db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)tidesdb_err_free(err);
+
+    /* we create column family with minimum 1MB flush threshold as required */
+    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
+                                       bloom_filter);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    /*  we insert keys with values large enough to trigger flushes */
+    const size_t MAX_KEY_SIZE = 20;
+    char key_buffer[MAX_KEY_SIZE];
+
+    /* we use a value size that will allow us to control flushing */
+    const size_t VALUE_SIZE = 300 * 1024; /** 300KB values (about 3-4 will exceed 1MB) */
+    uint8_t *value_buffer = malloc(VALUE_SIZE);
+    assert(value_buffer != NULL);
+
+    /* we insert the keys in a pattern to create multiple SSTables */
+    for (int batch = 0; batch < 5; batch++)
+    {
+        printf("Inserting batch %d (keys %d-%d)\n", batch, batch * 4, batch * 4 + 3);
+
+        /* we insert 4 keys per batch, each with a large value */
+        for (int i = 0; i < 4; i++)
+        {
+            int index = batch * 4 + i;
+
+            /* we create the key with binary-safe handling */
+            int key_length = snprintf(key_buffer, MAX_KEY_SIZE, "range_key_%02d", index);
+            assert(key_length > 0 && key_length < (int)MAX_KEY_SIZE);
+
+            /* we create a simple pattern in the value buffer */
+            memset(value_buffer, index % 256, VALUE_SIZE);
+
+            /* we add a readable marker at the beginning */
+            snprintf((char *)value_buffer, 16, "value_%02d", index);
+
+            /* insert the key-value pair */
+            err = tidesdb_put(db, "test_cf", (uint8_t *)key_buffer, key_length, value_buffer,
+                              VALUE_SIZE, -1);
+
+            if (err != NULL)
+            {
+                printf(RED "%s" RESET, err->message);
+            }
+            assert(err == NULL);
+        }
+
+        /* after each batch, force a flush by adding extra keys until we exceed 1MB */
+        printf("  Adding flush trigger keys...\n");
+        for (int j = 0; j < 5; j++)
+        {
+            char extra_key[30];
+            int extra_key_length =
+                snprintf(extra_key, sizeof(extra_key), "flush_key_%d_%d", batch, j);
+
+            /* Fill value with a pattern */
+            memset(value_buffer, (batch + j) % 256, VALUE_SIZE);
+
+            err = tidesdb_put(db, "test_cf", (uint8_t *)extra_key, extra_key_length, value_buffer,
+                              VALUE_SIZE, -1);
+
+            if (err != NULL)
+            {
+                printf(RED "%s" RESET, err->message);
+            }
+            assert(err == NULL);
+        }
+    }
+
+    free(value_buffer);
+
+    /* we get column family stat to verify we have multiple SSTs */
+    tidesdb_column_family_stat_t *stat = NULL;
+    err = tidesdb_get_column_family_stat(db, "test_cf", &stat);
+
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    /* we log and verify we have multiple SSTs */
+    printf("Number of SSTs before delete: %d\n", stat->num_sstables);
+
+    if (stat->num_sstables < 2)
+    {
+        printf(YELLOW
+               "Warning: Expected multiple SSTables but only have %d. Test may not fully validate "
+               "multi-SSTable deletion.\n" RESET,
+               stat->num_sstables);
+    }
+
+    /* we print SSTable sizes to verify they contain data */
+    for (int i = 0; i < stat->num_sstables; i++)
+    {
+        printf("SSTable %d: %zu bytes at %s\n", i, stat->sstable_stats[i]->size,
+               stat->sstable_stats[i]->sstable_path);
+    }
+
+    (void)tidesdb_free_column_family_stat(stat);
+
+    /* we define our range to delete (keys 00-09) */
+    char start_key[] = "range_key_00";
+    size_t start_key_length = strlen(start_key);
+    char end_key[] = "range_key_09";
+    size_t end_key_length = strlen(end_key);
+
+    /* we delete the range */
+    printf("Deleting range from %s to %s\n", start_key, end_key);
+    err = tidesdb_delete_by_range(db, "test_cf", (uint8_t *)start_key, start_key_length,
+                                  (uint8_t *)end_key, end_key_length);
+
+    if (err != NULL)
+    {
+        printf(RED "Range delete failed: %s" RESET, err->message);
+        (void)tidesdb_err_free(err);
+        assert(err == NULL);
+    }
+
+    /* we verify the deleted keys are gone */
+    uint8_t *retrieved_value = NULL;
+    size_t value_size;
+
+    /* we check that the deleted keys (00-09) are gone */
+    for (int i = 0; i < 10; i++)
+    {
+        int key_length = snprintf(key_buffer, MAX_KEY_SIZE, "range_key_%02d", i);
+
+        err = tidesdb_get(db, "test_cf", (uint8_t *)key_buffer, key_length, &retrieved_value,
+                          &value_size);
+
+        /* should return key not found error */
+        if (err == NULL)
+        {
+            printf(RED "Key %s was found but should have been deleted! Value size: %zu\n" RESET,
+                   key_buffer, value_size);
+            free(retrieved_value);
+        }
+        else
+        {
+            printf("Key %s correctly not found\n", key_buffer);
+            (void)tidesdb_err_free(err);
+        }
+        assert(err != NULL);
+    }
+
+    /* we check that the kept keys (10-19) still exist */
+    for (int i = 10; i < 20; i++)
+    {
+        int key_length = snprintf(key_buffer, MAX_KEY_SIZE, "range_key_%02d", i);
+
+        err = tidesdb_get(db, "test_cf", (uint8_t *)key_buffer, key_length, &retrieved_value,
+                          &value_size);
+
+        if (err != NULL)
+        {
+            printf(RED "Failed to find key %s: %s" RESET, key_buffer, err->message);
+            (void)tidesdb_err_free(err);
+        }
+        else
+        {
+            printf("Key %s correctly found, value size: %zu\n", key_buffer, value_size);
+            /* Verify value has expected pattern */
+            char expected_marker[16];
+            snprintf(expected_marker, sizeof(expected_marker), "value_%02d", i);
+            if (memcmp(retrieved_value, expected_marker, strlen(expected_marker)) != 0)
+            {
+                printf(RED "Value for key %s has unexpected content\n" RESET, key_buffer);
+            }
+            free(retrieved_value);
+        }
+        assert(err == NULL);
+    }
+
+    /* we get column family stat again to verify sstables after deletion */
+    err = tidesdb_get_column_family_stat(db, "test_cf", &stat);
+    if (err == NULL)
+    {
+        printf("Number of SSTs after delete: %d\n", stat->num_sstables);
+        (void)tidesdb_free_column_family_stat(stat);
+    }
+
+    err = tidesdb_close(db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)_tidesdb_remove_directory("test_db");
+    printf(GREEN "test_tidesdb_delete_by_range%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
+}
+
+void test_tidesdb_delete_range(bool compress, tidesdb_compression_algo_t algo, bool bloom_filter)
+{
+    tidesdb_t *db = NULL;
+
+    tidesdb_err_t *err = tidesdb_open("test_db", &db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)tidesdb_err_free(err);
+
+    /* create column family with minimum 1MB flush threshold as required */
+    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
+                                       bloom_filter);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    /* use much smaller values but still enough to get multiple SSTables */
+    const size_t MAX_KEY_SIZE = 20;
+    char key_buffer[MAX_KEY_SIZE];
+
+    /*use a small value size to avoid memory issues */
+    const size_t VALUE_SIZE = 1024; /** 1KB values */
+    uint8_t value_buffer[VALUE_SIZE];
+
+    /* insert many small keys to generate multiple SSTables */
+    printf("Inserting test keys...\n");
+
+    /* insert a large number of keys with small values to generate multiple SSTables */
+    for (int i = 0; i < 6000; i++)
+    {
+        /* create the key with binary-safe handling */
+        int key_length = snprintf(key_buffer, MAX_KEY_SIZE, "range_key_%04d", i);
+
+        /* create a simple pattern in the value buffer */
+        memset(value_buffer, i % 256, VALUE_SIZE);
+
+        /* add a readable marker at the beginning */
+        snprintf((char *)value_buffer, 16, "value_%04d", i);
+
+        /* insert the key-value pair */
+        err = tidesdb_put(db, "test_cf", (uint8_t *)key_buffer, key_length, value_buffer,
+                          VALUE_SIZE, -1);
+
+        if (err != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+            (void)tidesdb_err_free(err);
+            assert(err == NULL);
+        }
+
+        /* occasionally log progress */
+        if (i % 500 == 0)
+        {
+            printf("  Inserted %d keys...\n", i);
+        }
+    }
+
+    /* get column family stat to verify we have multiple SSTs */
+    tidesdb_column_family_stat_t *stat = NULL;
+    err = tidesdb_get_column_family_stat(db, "test_cf", &stat);
+
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+        (void)tidesdb_err_free(err);
+    }
+    assert(err == NULL);
+
+    /* log and verify we have multiple SSTs */
+    printf("Number of SSTs before delete: %d\n", stat->num_sstables);
+
+    if (stat->num_sstables < 2)
+    {
+        printf(YELLOW
+               "Warning: Expected multiple SSTables but only have %d. Test may not fully validate "
+               "multi-SSTable deletion.\n" RESET,
+               stat->num_sstables);
+    }
+
+    (void)tidesdb_free_column_family_stat(stat);
+
+    /* define our range to delete (keys 0200-0299) */
+    printf("Individually deleting keys 0200-0299\n");
+
+    for (int i = 200; i <= 299; i++)
+    {
+        int key_length = snprintf(key_buffer, MAX_KEY_SIZE, "range_key_%04d", i);
+
+        err = tidesdb_delete(db, "test_cf", (uint8_t *)key_buffer, key_length);
+
+        if (err != NULL)
+        {
+            printf(RED "Failed to delete key %s: %s" RESET, key_buffer, err->message);
+            (void)tidesdb_err_free(err);
+        }
+        else
+        {
+            if (i % 25 == 0)
+            {
+                printf("Deleted key %s\n", key_buffer);
+            }
+        }
+        assert(err == NULL);
+    }
+
+    /* verify the deleted keys are gone */
+    uint8_t *retrieved_value = NULL;
+    size_t value_size;
+
+    /* check that the deleted keys (0200-0299) are gone */
+    printf("Verifying deleted keys are gone...\n");
+    for (int i = 200; i <= 299; i++)
+    {
+        if (i % 25 == 0)
+        { /* subset to keep output manageable */
+            int key_length = snprintf(key_buffer, MAX_KEY_SIZE, "range_key_%04d", i);
+
+            err = tidesdb_get(db, "test_cf", (uint8_t *)key_buffer, key_length, &retrieved_value,
+                              &value_size);
+
+            /* should return key not found error */
+            if (err == NULL)
+            {
+                printf(RED "Key %s was found but should have been deleted! Value size: %zu\n" RESET,
+                       key_buffer, value_size);
+                free(retrieved_value);
+            }
+            else
+            {
+                printf("Key %s correctly not found\n", key_buffer);
+                (void)tidesdb_err_free(err);
+            }
+            assert(err != NULL);
+        }
+    }
+
+    /* check that other keys still exist */
+    printf("Verifying other keys still exist...\n");
+    for (int i = 100; i < 150; i++)
+    {
+        if (i % 25 == 0)
+        { /* subset to keep output manageable */
+            int key_length = snprintf(key_buffer, MAX_KEY_SIZE, "range_key_%04d", i);
+
+            err = tidesdb_get(db, "test_cf", (uint8_t *)key_buffer, key_length, &retrieved_value,
+                              &value_size);
+
+            if (err != NULL)
+            {
+                printf(RED "Failed to find key %s: %s" RESET, key_buffer, err->message);
+                (void)tidesdb_err_free(err);
+            }
+            else
+            {
+                printf("Key %s correctly found, value size: %zu\n", key_buffer, value_size);
+
+                /* verify value has expected pattern */
+                char expected_marker[16];
+                snprintf(expected_marker, sizeof(expected_marker), "value_%04d", i);
+                if (memcmp(retrieved_value, expected_marker, strlen(expected_marker)) != 0)
+                {
+                    printf(RED "Value for key %s has unexpected content\n" RESET, key_buffer);
+                }
+                free(retrieved_value);
+            }
+            assert(err == NULL);
+        }
+    }
+
+    printf("Testing completed successfully without using range delete API\n");
+    printf(
+        "This suggests the issue is in the tidesdb_delete_by_range or tidesdb_range "
+        "implementation\n");
+
+    err = tidesdb_close(db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+        (void)tidesdb_err_free(err);
+    }
+    assert(err == NULL);
+
+    (void)_tidesdb_remove_directory("test_db");
+    printf(GREEN "test_tidesdb_delete_range%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
+}
+
+void test_tidesdb_delete_by_filter(bool compress, tidesdb_compression_algo_t algo,
+                                   bool bloom_filter)
+{
+    tidesdb_t *db = NULL;
+
+    tidesdb_err_t *err = tidesdb_open("test_db", &db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)tidesdb_err_free(err);
+
+    /* we create column family with 1MB flush threshold to ensure multiple flushes */
+    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
+                                       bloom_filter);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    /* we insert 20 keys with values of ~128KB each to trigger multiple flushes */
+
+    /* these will be organized as:
+     * - filter_key_even_00, filter_key_even_02, ...: even numbers (to delete)
+     * - filter_key_odd_01, filter_key_odd_03, ...: odd numbers (to keep)
+     */
+
+    uint8_t key[30];
+    uint8_t value[128 * 1024]; /* 128KB values */
+
+    /* fill values with random data */
+    for (size_t i = 0; i < sizeof(value); i++)
+    {
+        value[i] = (uint8_t)(rand() % 256);
+    }
+
+    /* insert 20 keys with large values to create multiple SSTs */
+    for (int i = 0; i < 20; i++)
+    {
+        if (i % 2 == 0)
+        {
+            snprintf((char *)key, sizeof(key), "filter_key_even_%02d", i);
+        }
+        else
+        {
+            snprintf((char *)key, sizeof(key), "filter_key_odd_%02d", i);
+        }
+
+        /* put a marker in the value to identify it */
+        snprintf((char *)value, 20, "value_%02d", i);
+
+        err = tidesdb_put(db, "test_cf", key, strlen((char *)key) + 1, value, sizeof(value), -1);
+
+        if (err != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+        }
+        assert(err == NULL);
+    }
+
+    /* we get column family stat to verify we have multiple SSTs */
+    tidesdb_column_family_stat_t *stat = NULL;
+    err = tidesdb_get_column_family_stat(db, "test_cf", &stat);
+
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    /* ensure we have at least 2 SSTs */
+    printf("Number of SSTs before delete: %d\n", stat->num_sstables);
+    assert(stat->num_sstables >= 2);
+    (void)tidesdb_free_column_family_stat(stat);
+
+    /* delete keys containing "_even_" using our filter function */
+    err = tidesdb_delete_by_filter(db, "test_cf", delete_filter_function);
+
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    /* we verify the deleted keys are gone */
+    uint8_t *retrieved_value = NULL;
+    size_t value_size;
+
+    /* we check that the even keys (with "_even_") are gone */
+    for (int i = 0; i < 20; i += 2)
+    {
+        snprintf((char *)key, sizeof(key), "filter_key_even_%02d", i);
+
+        err =
+            tidesdb_get(db, "test_cf", key, strlen((char *)key) + 1, &retrieved_value, &value_size);
+
+        if (err == NULL)
+        {
+            printf(RED "Key %s was found but should have been deleted! Value size: %zu\n" RESET,
+                   key, value_size);
+            free(retrieved_value);
+        }
+
+        /* should return key not found error */
+        assert(err != NULL);
+        (void)tidesdb_err_free(err);
+    }
+
+    /* check that the odd keys (with "_odd_") still exist */
+    for (int i = 1; i < 20; i += 2)
+    {
+        snprintf((char *)key, sizeof(key), "filter_key_odd_%02d", i);
+
+        err =
+            tidesdb_get(db, "test_cf", key, strlen((char *)key) + 1, &retrieved_value, &value_size);
+
+        if (err != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+        }
+        assert(err == NULL);
+
+        /* verify value starts with correct marker */
+        char expected_marker[20];
+        snprintf(expected_marker, sizeof(expected_marker), "value_%02d", i);
+        assert(memcmp(retrieved_value, expected_marker, strlen(expected_marker)) == 0);
+
+        free(retrieved_value);
+    }
+
+    err = tidesdb_close(db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)_tidesdb_remove_directory("test_db");
+    printf(GREEN "test_tidesdb_delete_by_filter%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
+}
+
 int main(void)
 {
     test_tidesdb_serialize_deserialize_key_value_pair(false, TDB_NO_COMPRESSION);
@@ -2438,6 +2999,16 @@ int main(void)
     test_tidesdb_put_flush_shutdown_compact_get(false, TDB_NO_COMPRESSION, false);
 
     test_tidesdb_put_get_concurrent(false, TDB_NO_COMPRESSION, false);
+
+    test_tidesdb_delete_range(false, TDB_NO_COMPRESSION, false);
+
+    test_tidesdb_delete_by_range(false, TDB_NO_COMPRESSION, false);
+
+    test_tidesdb_delete_by_range(true, TDB_COMPRESS_ZSTD, true);
+
+    test_tidesdb_delete_by_filter(false, TDB_NO_COMPRESSION, false);
+
+    test_tidesdb_delete_by_filter(true, TDB_COMPRESS_ZSTD, true);
 
     test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_SNAPPY);
 

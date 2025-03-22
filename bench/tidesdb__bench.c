@@ -68,6 +68,8 @@ void *thread_put(void *arg)
             (void)tidesdb_err_free(err);
         }
     }
+
+    return NULL;
 }
 
 void *thread_get(void *arg)
@@ -87,6 +89,8 @@ void *thread_get(void *arg)
         }
         free(value_out);
     }
+
+    return NULL;
 }
 
 void *thread_delete(void *arg)
@@ -102,6 +106,8 @@ void *thread_delete(void *arg)
             (void)tidesdb_err_free(err);
         }
     }
+
+    return NULL;
 }
 
 int main()

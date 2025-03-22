@@ -461,6 +461,63 @@ tidesdb_cursor_free(c);
 
 ```
 
+## Deleting multiple key-value pairs
+
+### Deleting by range
+You can delete a range of key-value pairs.
+
+You pass
+- the database you want to delete the key-value pairs from. Must be open
+- the column family name
+- the start key
+- the start key size
+- the end key
+- the end key size
+
+```c
+uint8_t start_key[] = "key1";
+uint8_t end_key[] = "key5";
+
+tidesdb_err_t *e = tidesdb_delete_by_range(tdb, "your_column_family", start_key, sizeof(start_key), end_key, sizeof(end_key));
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+```
+
+### Deleting by filter
+You can delete key-value pairs that match a filter function.
+
+You pass
+- the database you want to delete the key-value pairs from. Must be open
+- the column family name
+- the filter function
+- a pointer to store the count of deleted items (optional, can be NULL)
+
+```c
+/* define a filter function */
+bool deletion_filter(const tidesdb_key_value_pair_t *kv)
+{
+    /* delete keys that start with "temp_" */
+    const char prefix[] = "temp_";
+    size_t prefix_len = sizeof(prefix) - 1;  /* exclude null terminator */
+
+    return kv->key_size >= prefix_len && memcmp(kv->key, prefix, prefix_len) == 0;
+}
+
+/* delete all key-value pairs that match the filter */
+size_t deleted_count = 0;
+tidesdb_err_t *e = tidesdb_delete_by_filter(tdb, "your_column_family", deletion_filter, &deleted_count);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+printf("Deleted %zu items\n", deleted_count);
+```
+
 ### Compaction
 There are 2 ways to compact sstables.  Manual multi-threaded paired and merged compaction and background incremental merge compaction.
 Compaction removes tombstones and expired keys if ttl is set.  Because merging merges and older and newer sstables only the newest version of key lives on.

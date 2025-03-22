@@ -22,7 +22,8 @@
 
 #include "compat.h"
 
-#define BUFFER_SIZE 1024 /* buffer size for log messages */
+#define BUFFER_SIZE         1024 /* buffer size for log messages */
+#define MAX_FILENAME_LENGTH 256  /* maximum length for filename */
 
 /* format [yyyy-mm-dd hh:mm:ss] message \n */
 
@@ -30,13 +31,17 @@
  * log_t
  * the log struct
  * @param file the file to write to
+ * @param filename the filename of the log
  * @param truncate_at the size to truncate the log at or -1 to disable truncation
+ * @param cached_lines the number of lines cached in memory
  * @param lock the lock for the log
  */
 typedef struct
 {
     FILE *file;
+    char filename[MAX_FILENAME_LENGTH];
     int truncate_at; /* can be -1 to disable truncation */
+    int cached_lines;
     pthread_mutex_t lock;
 } log_t;
 

@@ -23,6 +23,15 @@ int log_init(log_t **log, const char *filename, int truncate_at)
     *log = malloc(sizeof(log_t));
     if (*log == NULL) return -1;
 
+    /* we store the filename */
+    if (strlen(filename) >= MAX_FILENAME_LENGTH)
+    {
+        free(*log);
+        *log = NULL;
+        return -1;
+    }
+    strcpy((*log)->filename, filename);
+
     /* open log in append mode */
     (*log)->file = fopen(filename, "a+");
     if (!(*log)->file)
@@ -71,6 +80,7 @@ int log_init(log_t **log, const char *filename, int truncate_at)
                 *log = NULL;
                 return -1;
             }
+
             /* we read the log line by line */
             char line[BUFFER_SIZE];
             int i = 0;
@@ -84,12 +94,15 @@ int log_init(log_t **log, const char *filename, int truncate_at)
             /* we close the files */
             (void)fclose((*log)->file);
             (void)fclose(tmp);
+
             /* we remove the old log */
-            (void)remove(filename);
+            (void)remove((*log)->filename);
+
             /* we rename the tmp log */
-            (void)rename("tmp.log", filename);
+            (void)rename("tmp.log", (*log)->filename);
+
             /* we open the log in read/append mode */
-            (*log)->file = fopen(filename, "a+");
+            (*log)->file = fopen((*log)->filename, "a+");
             if (!(*log)->file)
             {
                 (void)pthread_mutex_unlock(&(*log)->lock);
@@ -98,10 +111,21 @@ int log_init(log_t **log, const char *filename, int truncate_at)
                 *log = NULL;
                 return -1;
             }
+
+            (*log)->cached_lines = truncate_at;
+        }
+        else
+        {
+            (*log)->cached_lines = lines;
         }
 
         /* unlock the log */
         (void)pthread_mutex_unlock(&(*log)->lock);
+    }
+    else
+    {
+        /* if truncation is disabled, still initialize cached_lines */
+        (*log)->cached_lines = log_count_lines(*log);
     }
 
     return 0;
@@ -141,6 +165,50 @@ int log_write(log_t *log, char *format, ...)
     (void)fflush(log->file);        /* flush the buffer */
     (void)fsync(fileno(log->file)); /* fsync the file */
 
+    /* we check increment the number of cached lines */
+    if (log->cached_lines != -1) log->cached_lines++;
+
+    /* we check if we need to truncate the log */
+    if (log->truncate_at != -1 && log->cached_lines > log->truncate_at)
+    {
+        /* we need to truncate the log */
+        FILE *tmp = fopen("tmp.log", "w");
+        if (!tmp)
+        {
+            (void)pthread_mutex_unlock(&log->lock);
+            return -1;
+        }
+        /* we read the log line by line */
+        char line[BUFFER_SIZE];
+        int i = 0;
+        (void)rewind(log->file);
+        while (fgets(line, sizeof(line), log->file))
+        {
+            /* we write the line to the tmp file */
+            if (i >= log->cached_lines - log->truncate_at) fprintf(tmp, "%s", line);
+            i++;
+        }
+
+        /* we close the files */
+        (void)fclose(log->file);
+        (void)fclose(tmp);
+        /* we remove the old log */
+        (void)remove(log->filename);
+
+        /* we rename the tmp log */
+        (void)rename("tmp.log", log->filename);
+
+        /* we open the log in read/append mode */
+        log->file = fopen(log->filename, "a+");
+        if (!log->file)
+        {
+            (void)pthread_mutex_unlock(&log->lock);
+            return -1;
+        }
+
+        log->cached_lines = log->truncate_at;
+    }
+
     /* unlock the log */
     (void)pthread_mutex_unlock(&log->lock);
 
@@ -166,6 +234,8 @@ int log_count_lines(log_t *log)
 
 int log_close(log_t *log)
 {
+    if (!log) return -1; /* check if log is NULL */
+
     /* we check if the log file is set */
     if (!log->file) return -1;
 

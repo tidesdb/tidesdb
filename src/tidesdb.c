@@ -125,6 +125,16 @@ tidesdb_key_value_pair_t *_tidesdb_deserialize_key_value_pair(
         if (decompressed_data) free(decompressed_data);
         return NULL;
     }
+
+    /* check for heap buffer overflow */
+    if (ptr + value_size > data + data_size)
+    {
+        free(key);
+        free(value);
+        if (decompressed_data) free(decompressed_data);
+        return NULL;
+    }
+
     memcpy(value, ptr, value_size);
     ptr += value_size;
 
@@ -412,7 +422,9 @@ uint8_t *_tidesdb_serialize_operation(tidesdb_operation_t *op, size_t *out_size,
         _tidesdb_serialize_key_value_pair(op->kv, &kv_size, false, TDB_NO_COMPRESSION);
     if (kv_serialized == NULL) return NULL;
 
-    *out_size = sizeof(TIDESDB_OP_CODE) + sizeof(uint32_t) + cf_name_size + kv_size;
+    /* include the size of kv_size in the total size calculation */
+    *out_size =
+        sizeof(TIDESDB_OP_CODE) + sizeof(uint32_t) + cf_name_size + sizeof(size_t) + kv_size;
 
     /* allocate memory for the serialized data */
     uint8_t *serialized_data = malloc(*out_size);
@@ -435,7 +447,9 @@ uint8_t *_tidesdb_serialize_operation(tidesdb_operation_t *op, size_t *out_size,
     memcpy(ptr, op->cf_name, cf_name_size);
     ptr += cf_name_size;
 
-    /* serialize key-value pair */
+    /* serialize kv_size first, then the key-value pair */
+    memcpy(ptr, &kv_size, sizeof(size_t));
+    ptr += sizeof(size_t);
     memcpy(ptr, kv_serialized, kv_size);
 
     free(kv_serialized);
@@ -473,6 +487,13 @@ tidesdb_operation_t *_tidesdb_deserialize_operation(uint8_t *data, size_t data_s
         data_size = decompressed_size;
     }
 
+    /* Check if data is large enough for basic header */
+    if (data_size < sizeof(TIDESDB_OP_CODE) + sizeof(uint32_t))
+    {
+        if (decompressed_data) free(decompressed_data);
+        return NULL;
+    }
+
     uint8_t *ptr = data;
 
     /* deserialize op_code */
@@ -485,6 +506,13 @@ tidesdb_operation_t *_tidesdb_deserialize_operation(uint8_t *data, size_t data_s
     memcpy(&cf_name_size, ptr, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
 
+    /* Check if data is large enough for cf_name */
+    if (data_size < sizeof(TIDESDB_OP_CODE) + sizeof(uint32_t) + cf_name_size)
+    {
+        if (decompressed_data) free(decompressed_data);
+        return NULL;
+    }
+
     /* deserialize cf_name */
     char *cf_name = malloc(cf_name_size);
     if (cf_name == NULL)
@@ -495,9 +523,31 @@ tidesdb_operation_t *_tidesdb_deserialize_operation(uint8_t *data, size_t data_s
     memcpy(cf_name, ptr, cf_name_size);
     ptr += cf_name_size;
 
+    /* Check if data is large enough for kv_size */
+    if (data_size < sizeof(TIDESDB_OP_CODE) + sizeof(uint32_t) + cf_name_size + sizeof(size_t))
+    {
+        free(cf_name);
+        if (decompressed_data) free(decompressed_data);
+        return NULL;
+    }
+
+    /* deserialize kv_size */
+    size_t kv_size;
+    memcpy(&kv_size, ptr, sizeof(size_t));
+    ptr += sizeof(size_t);
+
+    /* we check if data is large enough for key-value pair */
+    if (data_size <
+        sizeof(TIDESDB_OP_CODE) + sizeof(uint32_t) + cf_name_size + sizeof(size_t) + kv_size)
+    {
+        free(cf_name);
+        if (decompressed_data) free(decompressed_data);
+        return NULL;
+    }
+
     /* deserialize key-value pair */
     tidesdb_key_value_pair_t *kv =
-        _tidesdb_deserialize_key_value_pair(ptr, 0, false, TDB_NO_COMPRESSION);
+        _tidesdb_deserialize_key_value_pair(ptr, kv_size, false, TDB_NO_COMPRESSION);
     if (kv == NULL)
     {
         free(cf_name);
@@ -2381,11 +2431,11 @@ tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
         if (block_manager_cursor_init(&cursor, sst->block_manager) == -1)
         {
             (void)pthread_rwlock_unlock(&cf->rwlock);
-            for (size_t i = 0; i < *result_size; i++)
+            for (size_t j = 0; j < *result_size; j++)
             {
-                free((*result)[i]->key);
-                free((*result)[i]->value);
-                free((*result)[i]);
+                free((*result)[j]->key);
+                free((*result)[j]->value);
+                free((*result)[j]);
             }
             free(*result);
             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
@@ -2450,6 +2500,7 @@ tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
 
         /* read each key-value pair and check if in range */
         block_manager_block_t *block;
+
         while ((block = block_manager_cursor_read(cursor)) != NULL)
         {
             tidesdb_key_value_pair_t *kv = _tidesdb_deserialize_key_value_pair(
@@ -2458,7 +2509,7 @@ tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
             if (kv == NULL)
             {
                 (void)block_manager_block_free(block);
-                continue;
+                break;
             }
 
             /* check if key is in range, not a tombstone, not expired, and not already in result */
@@ -2662,7 +2713,7 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
         {
             (void)block_manager_cursor_free(cursor);
             (void)pthread_rwlock_unlock(&cf->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+            continue;
         }
 
         /* check if bloom filter is enabled */
@@ -2672,18 +2723,23 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
         }
 
         block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (block == NULL)
+        {
+            (void)block_manager_cursor_free(cursor);
+            (void)pthread_rwlock_unlock(&cf->rwlock);
+            continue;
+        }
 
-        do
+        while (block != NULL)
         {
             tidesdb_key_value_pair_t *kv = _tidesdb_deserialize_key_value_pair(
                 block->data, block->size, cf->config.compressed, cf->config.compress_algo);
             if (kv == NULL)
             {
-                (void)block_manager_cursor_free(cursor);
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                free(*result);
-                return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "key-value pair");
+                break;
             }
+
+            printf("got key: %s\n", kv->key);
 
             if (comparison_method(kv) &&
                 !_tidesdb_key_exists(kv->key, kv->key_size, *result, *result_size))
@@ -2712,8 +2768,10 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
             }
 
             (void)block_manager_block_free(block);
-            if (block_manager_cursor_next(cursor) != 1) break;
-        } while ((block = block_manager_cursor_read(cursor)) != NULL);
+            if (block_manager_cursor_next(cursor) != 0) break;
+            block = block_manager_cursor_read(cursor);
+        }
+        if (block != NULL) (void)block_manager_block_free(block);
 
         (void)block_manager_cursor_free(cursor);
     }
@@ -6175,7 +6233,7 @@ tidesdb_err_t *tidesdb_delete_by_range(tidesdb_t *tdb, const char *column_family
                                        const uint8_t *start_key, size_t start_key_size,
                                        const uint8_t *end_key, size_t end_key_size)
 {
-    /* Check prereqs */
+    /* check prereqs */
     if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
     if (column_family_name == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COLUMN_FAMILY);
     if (start_key == NULL || end_key == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_KEY);
@@ -6328,6 +6386,7 @@ tidesdb_err_t *tidesdb_delete_by_filter(tidesdb_t *tdb, const char *column_famil
     /*delete each matching key-value pair */
     for (size_t i = 0; i < result_size; i++)
     {
+        printf("Deleting key: %s\n", result[i]->key);
         err = tidesdb_txn_delete(txn, result[i]->key, result[i]->key_size);
         if (err != NULL)
         {

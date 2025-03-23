@@ -5039,7 +5039,6 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
 
             if (kv != NULL)
             {
-
                 /* we check if the value is a tombstone or expired */
                 if (_tidesdb_is_tombstone(kv->value, kv->value_size) ||
                     _tidesdb_is_expired(kv->ttl))

@@ -1642,10 +1642,10 @@ void test_tidesdb_txn_put_put_delete_get(bool compress, tidesdb_compression_algo
 void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bloom_filter)
 {
     /* @todo
-    * test memtable-sstable(s) bidirectional cursor
-    * has been tested on FFIs
-    * need to write tests for C API
-    */
+     * test memtable-sstable(s) bidirectional cursor
+     * has been tested on FFIs
+     * need to write tests for C API
+     */
     printf(GREEN "test_tidesdb_cursor%s%s passed\n" RESET, compress ? " with compression" : "",
            bloom_filter ? " with bloom filter" : "");
 }

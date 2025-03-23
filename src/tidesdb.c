@@ -5891,6 +5891,8 @@ tidesdb_err_t *tidesdb_get_column_family_stat(tidesdb_t *tdb, const char *column
     /* we copy the column family config */
     (*stat)->config = cf->config;
 
+    (*stat)->cf_name = strdup(cf->config.name); /* we copy the column family name */
+
     /* we copy the number of sstables */
     (*stat)->num_sstables = cf->num_sstables;
 

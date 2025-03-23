@@ -5994,6 +5994,8 @@ tidesdb_err_t *tidesdb_free_column_family_stat(tidesdb_column_family_stat_t *sta
         free(stat->sstable_stats[i]);
     }
 
+    if (stat->cf_name != NULL) free(stat->cf_name);
+
     /* we free the sstable stats */
     free(stat->sstable_stats);
 

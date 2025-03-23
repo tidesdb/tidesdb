@@ -111,8 +111,7 @@ Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask quest
 
 ## Include
 ```c
-#include <tidesdb/tidesdb.h> /* you can use other components of TidesDB such has hash table,
-                                skip list, bloom filter etc.. under tidesdb/
+#include <tidesdb/tidesdb.h> /* you can use other components of TidesDB such as skip list, bloom filter etc.. under tidesdb/
                                 this also prevents collisions.  */
 ```
 

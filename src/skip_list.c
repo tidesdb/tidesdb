@@ -556,3 +556,40 @@ int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size)
 
     return 0;
 }
+
+int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
+{
+    if (list == NULL || list->header == NULL || cursor == NULL) return -1;
+
+    /* Allocate memory for the cursor if it doesn't exist */
+    if (*cursor == NULL)
+    {
+        *cursor = malloc(sizeof(skip_list_cursor_t));
+        if (*cursor == NULL) return -1;
+    }
+
+    (*cursor)->list = list;
+
+    /* Start at the header */
+    skip_list_node_t *current = list->header;
+
+    /* Traverse to the last node */
+    while (current->forward[0] != NULL)
+    {
+        current = current->forward[0];
+        /* Check if the node has expired */
+        (void)skip_list_check_and_update_ttl(list, current);
+    }
+
+    /* If we're still at the header, that means the list is empty */
+    if (current == list->header)
+    {
+        (*cursor)->current = NULL;
+        return -1; /* No valid node at the end */
+    }
+    else
+    {
+        (*cursor)->current = current;
+        return 0; /* Success */
+    }
+}

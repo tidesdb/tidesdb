@@ -319,4 +319,13 @@ int skip_list_get_min_key(skip_list_t *list, uint8_t **key, size_t *key_size);
  */
 int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size);
 
+/*
+ * skip_list_cursor_init_at_end
+ * initialize an existing cursor and position it at the end of the skip list
+ * @param cursor pointer to an existing cursor to initialize
+ * @param list the skip list
+ * @return 0 if the cursor was initialized successfully, -1 otherwise on error
+ */
+int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list);
+
 #endif /* __SKIP_LIST_H__ */

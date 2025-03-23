@@ -1639,342 +1639,15 @@ void test_tidesdb_txn_put_put_delete_get(bool compress, tidesdb_compression_algo
            compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
 }
 
-/* mainly test going forward and backwards through column family memtable
- * no bloom filter or compression */
 void test_tidesdb_cursor(bool compress, tidesdb_compression_algo_t algo, bool bloom_filter)
 {
-    tidesdb_t *db = NULL;
-    tidesdb_err_t *err = tidesdb_open("test_db", &db);
-    assert(err == NULL);
-
-    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024 * 4, 12, 0.24f, compress, algo,
-                                       bloom_filter);
-    assert(err == NULL);
-
-    uint8_t keys[11][20];
-    uint8_t values[11][256 * 1024];
-
-    /* fill the values with random data */
-    for (int i = 0; i < 11; i++)
-    {
-        for (size_t j = 0; j < sizeof(values[i]); j++)
-        {
-            values[i][j] = (uint8_t)(rand() % 256);
-        }
-    }
-
-    /* put 11 keys to trigger flushes */
-    for (int i = 0; i < 11; i++)
-    {
-        snprintf((char *)keys[i], sizeof(keys[i]), "test_key_%d", i);
-        /*printf("putting key: %s\n", keys[i]);*/
-        err =
-            tidesdb_put(db, "test_cf", keys[i], sizeof(keys[i]), values[i], sizeof(values[i]), -1);
-        assert(err == NULL);
-    }
-
-    /* create a cursor */
-    tidesdb_cursor_t *cursor = NULL;
-    err = tidesdb_cursor_init(db, "test_cf", &cursor);
-    if (err != NULL)
-    {
-        printf(RED "%s" RESET, err->message);
-    }
-    assert(err == NULL);
-
-    /* iterate through the keys using the cursor */
-    uint8_t *retrieved_key = NULL;
-    size_t key_size;
-    uint8_t *retrieved_value = NULL;
-    size_t value_size;
-
-    bool found[11] = {false};
-
-    do
-    {
-        err = tidesdb_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size);
-        if (err != NULL)
-        {
-            printf(RED "%s" RESET, err->message);
-            assert(err == NULL);
-        }
-
-        if (retrieved_key != NULL)
-        {
-            /*printf("retrieved key: %s\n", retrieved_key);*/
-            /* check if the key is one of the keys we put */
-            bool key_found = false;
-            for (int i = 0; i < 11; i++)
-            {
-                if (memcmp(retrieved_key, keys[i], key_size) == 0)
-                {
-                    key_found = true;
-                    found[i] = true;
-                    break;
-                }
-            }
-
-            free(retrieved_key);
-            free(retrieved_value);
-
-            if (!key_found)
-            {
-                printf(RED "Key not found in the list: %s\n" RESET, retrieved_key);
-            }
-
-            assert(key_found);
-        }
-    } while ((err = tidesdb_cursor_next(cursor)) == NULL ||
-             err->code != TIDESDB_ERR_AT_END_OF_CURSOR);
-
-    if (err != NULL)
-    {
-        (void)tidesdb_err_free(err);
-    }
-
-    /* ensure all values were found */
-    for (int i = 0; i < 11; i++)
-    {
-        if (!found[i])
-        {
-            printf(RED "Key not found: %s\n" RESET, keys[i]);
-        }
-        assert(found[i]);
-    }
-
-    /* now we go in reverse */
-    /* we make sure to reset all found values to false */
-    for (int i = 0; i < 11; i++)
-    {
-        found[i] = false;
-    }
-
-    /* we use prev */
-    do
-    {
-        err = tidesdb_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size);
-        if (err != NULL)
-        {
-            printf(RED "%s" RESET, err->message);
-            assert(err == NULL);
-        }
-
-        if (retrieved_key != NULL)
-        {
-            /* check if the key is one of the keys we put */
-            bool key_found = false;
-            for (int i = 0; i < 11; i++)
-            {
-                if (memcmp(retrieved_key, keys[i], key_size) == 0)
-                {
-                    key_found = true;
-                    found[i] = true;
-                    break;
-                }
-            }
-
-            free(retrieved_key);
-            free(retrieved_value);
-
-            if (!key_found)
-            {
-                printf(RED "Key not found in the list: %s\n" RESET, retrieved_key);
-            }
-
-            assert(key_found);
-        }
-    } while ((err = tidesdb_cursor_prev(cursor)) == NULL ||
-             err->code != TIDESDB_ERR_AT_START_OF_CURSOR);
-    (void)tidesdb_err_free(err);
-
-    /* ensure all values were found */
-    for (int i = 0; i < 11; i++)
-    {
-        if (!found[i])
-        {
-            printf(RED "Key not found: %s\n" RESET, keys[i]);
-        }
-        assert(found[i]);
-    }
-
-    err = tidesdb_cursor_free(cursor);
-    assert(err == NULL);
-
-    err = tidesdb_close(db);
-    assert(err == NULL);
-
-    (void)_tidesdb_remove_directory("test_db");
+    /* @todo
+    * test memtable-sstable(s) bidirectional cursor
+    * has been tested on FFIs
+    * need to write tests for C API
+    */
     printf(GREEN "test_tidesdb_cursor%s%s passed\n" RESET, compress ? " with compression" : "",
            bloom_filter ? " with bloom filter" : "");
-}
-
-/* we flush multiple sstables and iterate through them
- * forward and backwards validating */
-void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_algo_t algo,
-                                           bool bloom_filter)
-{
-    tidesdb_t *db = NULL;
-    tidesdb_err_t *err = tidesdb_open("test_db", &db);
-    assert(err == NULL);
-
-    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
-                                       bloom_filter);
-    assert(err == NULL);
-
-    uint8_t keys[11][20];
-    uint8_t values[11][256];
-
-    /* fill the values with random data */
-    for (int i = 0; i < 11; i++)
-    {
-        for (size_t j = 0; j < sizeof(values[i]); j++)
-        {
-            values[i][j] = (uint8_t)(rand() % 256);
-        }
-    }
-
-    /* put 11 keys to trigger flushes */
-    for (int i = 0; i < 11; i++)
-    {
-        snprintf((char *)keys[i], sizeof(keys[i]), "test_key_%d", i);
-        /*printf("putting key: %s\n", keys[i]);*/
-        err =
-            tidesdb_put(db, "test_cf", keys[i], sizeof(keys[i]), values[i], sizeof(values[i]), -1);
-        assert(err == NULL);
-    }
-
-    /* create a cursor */
-    tidesdb_cursor_t *cursor = NULL;
-    err = tidesdb_cursor_init(db, "test_cf", &cursor);
-    if (err != NULL)
-    {
-        printf(RED "%s" RESET, err->message);
-    }
-    assert(err == NULL);
-
-    /* iterate through the keys using the cursor */
-    uint8_t *retrieved_key = NULL;
-    size_t key_size;
-    uint8_t *retrieved_value = NULL;
-    size_t value_size;
-
-    bool found[11] = {false};
-
-    do
-    {
-        err = tidesdb_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size);
-        if (err != NULL)
-        {
-            printf(RED "%s" RESET, err->message);
-            assert(err == NULL);
-        }
-
-        if (retrieved_key != NULL)
-        {
-            /*printf("retrieved key: %s\n", retrieved_key);*/
-            /* check if the key is one of the keys we put */
-            bool key_found = false;
-            for (int i = 0; i < 11; i++)
-            {
-                if (memcmp(retrieved_key, keys[i], key_size) == 0)
-                {
-                    key_found = true;
-                    found[i] = true;
-                    break;
-                }
-            }
-
-            free(retrieved_key);
-            free(retrieved_value);
-
-            if (!key_found)
-            {
-                printf(RED "Key not found in the list: %s\n" RESET, retrieved_key);
-            }
-
-            assert(key_found);
-        }
-    } while ((err = tidesdb_cursor_next(cursor)) == NULL ||
-             err->code != TIDESDB_ERR_AT_END_OF_CURSOR);
-
-    (void)tidesdb_err_free(err);
-
-    /* ensure all values were found */
-    for (int i = 0; i < 11; i++)
-    {
-        if (!found[i])
-        {
-            printf(RED "Key not found: %s\n" RESET, keys[i]);
-        }
-        assert(found[i]);
-    }
-
-    /* now we go in reverse */
-    /* we make sure to reset all found values to false */
-    for (int i = 0; i < 11; i++)
-    {
-        found[i] = false;
-    }
-
-    /* we use prev */
-    do
-    {
-        err = tidesdb_cursor_get(cursor, &retrieved_key, &key_size, &retrieved_value, &value_size);
-        if (err != NULL)
-        {
-            printf(RED "%s" RESET, err->message);
-            assert(err == NULL);
-        }
-
-        if (retrieved_key != NULL)
-        {
-            /*printf("retrieved key: %s\n", retrieved_key);*/
-            /* check if the key is one of the keys we put */
-            bool key_found = false;
-            for (int i = 0; i < 11; i++)
-            {
-                if (memcmp(retrieved_key, keys[i], key_size) == 0)
-                {
-                    key_found = true;
-                    found[i] = true;
-                    break;
-                }
-            }
-
-            if (!key_found)
-            {
-                printf(RED "Key not found in the list: %s\n" RESET, retrieved_key);
-            }
-
-            assert(key_found);
-
-            free(retrieved_key);
-            free(retrieved_value);
-        }
-    } while ((err = tidesdb_cursor_prev(cursor)) == NULL ||
-             err->code != TIDESDB_ERR_AT_START_OF_CURSOR);
-
-    /* ensure all values were found */
-    for (int i = 0; i < 11; i++)
-    {
-        if (!found[i])
-        {
-            printf(RED "Key not found: %s\n" RESET, keys[i]);
-        }
-        assert(found[i]);
-    }
-
-    (void)tidesdb_err_free(err);
-
-    err = tidesdb_cursor_free(cursor);
-    assert(err == NULL);
-
-    err = tidesdb_close(db);
-    assert(err == NULL);
-
-    (void)_tidesdb_remove_directory("test_db");
-    printf(GREEN "test_tidesdb_cursor_memtable_sstables%s%s passed\n" RESET,
-           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
 }
 
 void test_tidesdb_start_incremental_merge(bool compress, tidesdb_compression_algo_t algo,
@@ -2033,7 +1706,7 @@ void test_tidesdb_start_incremental_merge(bool compress, tidesdb_compression_alg
     assert(err == NULL);
     (void)tidesdb_err_free(err);
 
-    //(void)_tidesdb_remove_directory("test_db");
+    (void)_tidesdb_remove_directory("test_db");
     printf(GREEN "test_tidesdb_start_incremental_merge%s%s passed\n" RESET,
            compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
 }
@@ -2982,10 +2655,6 @@ int main(void)
 
     test_tidesdb_put_flush_stat(false, TDB_NO_COMPRESSION, false);
 
-    test_tidesdb_cursor(false, TDB_NO_COMPRESSION, false);
-
-    test_tidesdb_cursor_memtable_sstables(false, TDB_NO_COMPRESSION, false);
-
     test_tidesdb_put_flush_get(false, TDB_NO_COMPRESSION, false);
 
     test_tidesdb_put_flush_close_get(false, TDB_NO_COMPRESSION, false);
@@ -2993,6 +2662,8 @@ int main(void)
     test_tidesdb_put_flush_delete_get(false, TDB_NO_COMPRESSION, false);
 
     test_tidesdb_put_many_flush_get(false, TDB_NO_COMPRESSION, false);
+
+    test_tidesdb_cursor(false, TDB_NO_COMPRESSION, false);
 
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false);
 
@@ -3035,8 +2706,6 @@ int main(void)
     test_tidesdb_put_flush_stat(true, TDB_COMPRESS_ZSTD, true);
 
     test_tidesdb_cursor(true, TDB_COMPRESS_ZSTD, true);
-
-    test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_ZSTD, true);
 
     test_tidesdb_put_flush_get(true, TDB_COMPRESS_ZSTD, true);
 

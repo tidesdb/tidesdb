@@ -4497,7 +4497,6 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
     (*cursor)->cf = cf;
     (*cursor)->sstable_cursor = NULL;
     (*cursor)->memtable_cursor = NULL;
-    (*cursor)->current_direction = 0;
 
     /* get column family read lock */
     if (pthread_rwlock_rdlock(&cf->rwlock) != 0)

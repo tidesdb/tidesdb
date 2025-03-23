@@ -356,7 +356,6 @@ extern "C"
      * @param memtable_cursor the cursor for the memtable
      * @param sstable_index the current index of the sstable the cursor is on
      * @param sstable_cursor the cursor for the sstable
-     * @param current the current key-value pair
      */
     typedef struct
     {
@@ -365,8 +364,6 @@ extern "C"
         void *memtable_cursor;
         int sstable_index;
         block_manager_cursor_t *sstable_cursor;
-        tidesdb_key_value_pair_t *current;
-        int current_direction; /* 0 for forward, 1 for reverse */
     } tidesdb_cursor_t;
 
     /*

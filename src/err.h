@@ -154,6 +154,14 @@ typedef enum
     TIDESDB_ERR_FAILED_TO_ESCALATE_FSYNC,
     TIDESDB_ERR_FAILED_TO_GET_MIN_KEY_FOR_FLUSH,
     TIDESDB_ERR_FAILED_TO_GET_MAX_KEY_FOR_FLUSH,
+    TIDESDB_ERR_FAILED_TO_COUNT_BLOCKS,
+    TIDESDB_ERR_FAILED_TO_READ_BLOCK,
+    TIDESDB_ERR_FAILED_TO_DESERIALIZE_SST_MIN_MAX,
+    TIDESDB_ERR_FAILED_TO_MERGE_MIN_MAX,
+    TIDESDB_ERR_FAILED_TO_SERIALIZE_MIN_MAX,
+    TIDESDB_ERR_FAILED_TO_CREATE_BLOCK,
+    TIDESDB_ERR_CURSOR_NAVIGATION_FAILED,
+    TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
 } TIDESDB_ERR_CODE;
 
 /* TidesDB error messages */
@@ -320,7 +328,31 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
     {TIDESDB_ERR_FAILED_TO_GET_MIN_KEY_FOR_FLUSH,
      "Failed to get minimum key for flush for column family %s.\n", TIDESDB_ERR_WITH_CONTEXT},
     {TIDESDB_ERR_FAILED_TO_GET_MAX_KEY_FOR_FLUSH,
-     "Failed to get maximum key for flush for column family %s.\n", TIDESDB_ERR_WITH_CONTEXT}};
+     "Failed to get maximum key for flush for column family %s.\n", TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_COUNT_BLOCKS, "Failed to count blocks for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_READ_BLOCK, "Failed to read block for %s.\n", TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_DESERIALIZE_SST_MIN_MAX,
+     "Failed to deserialize SSTable min max for %s.\n", TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_MERGE_MIN_MAX, "Failed to merge SSTable min max for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_SERIALIZE_MIN_MAX, "Failed to serialize SSTable min max for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+
+    {TIDESDB_ERR_FAILED_TO_CREATE_BLOCK, "Failed to create block for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+
+    {TIDESDB_ERR_CURSOR_NAVIGATION_FAILED, "Failed to navigate cursor for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_WRITE_BLOCK, "Failed to write block for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOOM_FILTER, "Failed to serialize bloom filter for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_CREATE_BLOOM_FILTER, "Failed to create bloom filter for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOOM, "Failed to serialize bloom filter for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+};
 
 /*
  * tidesdb_err_new

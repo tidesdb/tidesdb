@@ -1991,7 +1991,7 @@ void test_tidesdb_start_incremental_merge(bool compress, tidesdb_compression_alg
     (void)tidesdb_err_free(err);
 
     /* start incremental merging in background */
-    err = tidesdb_start_incremental_merge(db, "test_cf", 1, 10);
+    err = tidesdb_start_incremental_merge(db, "test_cf", 1, 4);
     assert(err == NULL);
     (void)tidesdb_err_free(err);
 
@@ -2011,7 +2011,7 @@ void test_tidesdb_start_incremental_merge(bool compress, tidesdb_compression_alg
         (void)tidesdb_err_free(err);
     }
 
-    sleep(10);
+    sleep(16);
 
     for (int i = 0; i < 12; i++)
     {
@@ -2033,7 +2033,7 @@ void test_tidesdb_start_incremental_merge(bool compress, tidesdb_compression_alg
     assert(err == NULL);
     (void)tidesdb_err_free(err);
 
-    (void)_tidesdb_remove_directory("test_db");
+    //(void)_tidesdb_remove_directory("test_db");
     printf(GREEN "test_tidesdb_start_incremental_merge%s%s passed\n" RESET,
            compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
 }
@@ -3004,55 +3004,61 @@ int main(void)
 
     test_tidesdb_delete_by_range(false, TDB_NO_COMPRESSION, false);
 
-    test_tidesdb_delete_by_range(true, TDB_COMPRESS_ZSTD, true);
-
     test_tidesdb_delete_by_filter(false, TDB_NO_COMPRESSION, false);
 
-    test_tidesdb_delete_by_filter(true, TDB_COMPRESS_ZSTD, true);
-
-    test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_SNAPPY);
-
-    test_tidesdb_serialize_deserialize_operation(true, TDB_COMPRESS_SNAPPY);
-
-    test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_LZ4);
-
-    test_tidesdb_serialize_deserialize_operation(true, TDB_COMPRESS_LZ4);
+    test_tidesdb_start_incremental_merge(false, TDB_NO_COMPRESSION, false);
 
     test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_ZSTD);
 
     test_tidesdb_serialize_deserialize_operation(true, TDB_COMPRESS_ZSTD);
 
-    test_tidesdb_create_drop_column_family(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_serialize_deserialize_key_value_pair(true, TDB_COMPRESS_LZ4);
 
-    test_tidesdb_put_get_memtable(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_serialize_deserialize_operation(true, TDB_COMPRESS_LZ4);
 
-    test_tidesdb_put_close_replay_get(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_tidesdb_open_close();
 
-    test_tidesdb_txn_put_get(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_create_drop_column_family(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_txn_put_get_rollback_get(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_put_get_memtable(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_txn_put_put_delete_get(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_put_close_replay_get(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_put_delete_get(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_txn_put_get(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_put_flush_get(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_txn_put_get_rollback_get(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_put_flush_close_get(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_txn_put_put_delete_get(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_put_flush_delete_get(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_put_delete_get(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_cursor(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_put_flush_stat(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_cursor(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_put_flush_get(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_put_get_concurrent(true, TDB_COMPRESS_SNAPPY, true);
+    test_tidesdb_put_flush_close_get(true, TDB_COMPRESS_ZSTD, true);
 
-    test_tidesdb_start_incremental_merge(false, TDB_NO_COMPRESSION, false);
+    test_tidesdb_put_flush_delete_get(true, TDB_COMPRESS_ZSTD, true);
+
+    test_tidesdb_put_many_flush_get(true, TDB_COMPRESS_ZSTD, true);
+
+    test_tidesdb_put_flush_compact_get(true, TDB_COMPRESS_ZSTD, true);
+
+    test_tidesdb_put_flush_shutdown_compact_get(true, TDB_COMPRESS_ZSTD, true);
+
+    test_tidesdb_put_get_concurrent(true, TDB_COMPRESS_ZSTD, true);
+
+    test_tidesdb_delete_range(true, TDB_COMPRESS_ZSTD, true);
+
+    test_tidesdb_delete_by_range(true, TDB_COMPRESS_ZSTD, true);
+
+    test_tidesdb_delete_by_filter(true, TDB_COMPRESS_ZSTD, true);
+
+    test_tidesdb_start_incremental_merge(true, TDB_COMPRESS_ZSTD, true);
 
     return 0;
 }

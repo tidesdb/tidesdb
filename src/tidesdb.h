@@ -875,20 +875,6 @@ extern "C"
                                                pthread_mutex_t *shared_lock);
 
     /*
-     * _tidesdb_merge_sstables_w_bloom_filter
-     * merges two sstables into a new sstable and adds a bloom filter to initial block
-     * @param sst1 the first sstable
-     * @param sst2 the second sstable
-     * @param cf the column family
-     * @param shared_lock the lock for the path creation on parallel compaction
-     * @return the new merged sstable
-     */
-    tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloom_filter(tidesdb_sstable_t *sst1,
-                                                              tidesdb_sstable_t *sst2,
-                                                              tidesdb_column_family_t *cf,
-                                                              pthread_mutex_t *shared_lock);
-
-    /*
      * _tidesdb_free_column_families
      * free's and closes column families
      * @param tdb the TidesDB instance

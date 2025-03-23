@@ -1,6 +1,6 @@
 {
   "name": "tidesdb",
-  "version-string": "0.8.0b",
+  "version-string": "0.9.0b",
   "description": "TidesDB is a high-performance log structured storage engine for fast key-value storage and time series data.",
   "dependencies": [
     "zstd",

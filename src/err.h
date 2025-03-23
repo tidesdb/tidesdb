@@ -320,7 +320,14 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
     {TIDESDB_ERR_FAILED_TO_GET_MIN_KEY_FOR_FLUSH,
      "Failed to get minimum key for flush for column family %s.\n", TIDESDB_ERR_WITH_CONTEXT},
     {TIDESDB_ERR_FAILED_TO_GET_MAX_KEY_FOR_FLUSH,
-     "Failed to get maximum key for flush for column family %s.\n", TIDESDB_ERR_WITH_CONTEXT}};
+     "Failed to get maximum key for flush for column family %s.\n", TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOOM_FILTER, "Failed to serialize bloom filter for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_CREATE_BLOOM_FILTER, "Failed to create bloom filter for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOOM, "Failed to serialize bloom filter for %s.\n",
+     TIDESDB_ERR_WITH_CONTEXT},
+};
 
 /*
  * tidesdb_err_new

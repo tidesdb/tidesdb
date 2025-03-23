@@ -9,8 +9,8 @@ set(CMAKE_C_STANDARD 99)
 set(PROJECT_VERSION 0.9.0) # TidesDB v0.9.0b
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
-option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
-option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" OFF)
+option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
+option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 
 # for development, we want to enable all warnings and sanitizers

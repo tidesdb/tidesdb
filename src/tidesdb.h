@@ -696,6 +696,33 @@ extern "C"
      */
     tidesdb_err_t *tidesdb_free_column_family_stat(tidesdb_column_family_stat_t *stat);
 
+    /*
+     * tidesdb_delete_by_range
+     * delete a range of key value pairs atomically
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param start_key the start key
+     * @param start_key_size the size of the start key
+     * @param end_key the end key
+     * @param end_key_size the size of the end key
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_delete_by_range(tidesdb_t *tdb, const char *column_family_name,
+                                           const uint8_t *start_key, size_t start_key_size,
+                                           const uint8_t *end_key, size_t end_key_size);
+
+    /*
+     * tidesdb_delete_by_filter
+     * delete key value pairs by a filter function
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param filter_function the filter function
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_delete_by_filter(
+        tidesdb_t *tdb, const char *column_family_name,
+        bool (*filter_function)(const tidesdb_key_value_pair_t *));
+
     /* internal functions */
 
     /*
@@ -1098,33 +1125,6 @@ extern "C"
      * @param min_max the sst min max key
      */
     void _tidesdb_free_sst_min_max(tidesdb_sst_min_max_t *min_max);
-
-    /*
-     * tidesdb_delete_by_range
-     * delete a range of key value pairs atomically
-     * @param tdb the TidesDB instance
-     * @param column_family_name the name of the column family
-     * @param start_key the start key
-     * @param start_key_size the size of the start key
-     * @param end_key the end key
-     * @param end_key_size the size of the end key
-     * @return error or NULL
-     */
-    tidesdb_err_t *tidesdb_delete_by_range(tidesdb_t *tdb, const char *column_family_name,
-                                           const uint8_t *start_key, size_t start_key_size,
-                                           const uint8_t *end_key, size_t end_key_size);
-
-    /*
-     * tidesdb_delete_by_filter
-     * delete key value pairs by a filter function
-     * @param tdb the TidesDB instance
-     * @param column_family_name the name of the column family
-     * @param filter_function the filter function
-     * @return error or NULL
-     */
-    tidesdb_err_t *tidesdb_delete_by_filter(
-        tidesdb_t *tdb, const char *column_family_name,
-        bool (*filter_function)(const tidesdb_key_value_pair_t *));
 
 #ifdef __cplusplus
 }

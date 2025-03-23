@@ -2739,8 +2739,6 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
                 break;
             }
 
-            printf("got key: %s\n", kv->key);
-
             if (comparison_method(kv) &&
                 !_tidesdb_key_exists(kv->key, kv->key_size, *result, *result_size))
             {
@@ -4462,7 +4460,7 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
     /* we check if the column family name is NULL */
     if (column_family_name == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_COLUMN_FAMILY);
 
-    /* we get the column family */
+    /* we create the column family variable and set it to be null initially */
     tidesdb_column_family_t *cf = NULL;
 
     /* we check if the column family name is greater than 2 */
@@ -4477,6 +4475,7 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
     if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "db");
 
+    /* we get column family */
     if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
     {
         (void)pthread_rwlock_unlock(&tdb->rwlock);
@@ -4532,13 +4531,16 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
         }
 
-        /* if column family has bloom filter set we skip first block */
+        /* if column family has bloom filter set we skip second block */
         if (cf->config.bloom_filter)
         {
-            if (block_manager_cursor_next((*cursor)->sstable_cursor) == 0)
+            if ((*cursor)->sstable_cursor != NULL)
             {
-                (void)block_manager_cursor_free((*cursor)->sstable_cursor);
-                (*cursor)->sstable_cursor = NULL;
+                if (block_manager_cursor_next((*cursor)->sstable_cursor) != 0)
+                {
+                    (void)block_manager_cursor_free((*cursor)->sstable_cursor);
+                    (*cursor)->sstable_cursor = NULL;
+                }
             }
         }
     }
@@ -4557,338 +4559,551 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
 
 tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
 {
-    /* we check if cursor is invalid */
+    tidesdb_err_t *err = NULL;
+
+    /* we check if cursor is NULL */
     if (cursor == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
 
-    /* we get read lock for column family */
+    /* we get column family read lock */
     if (pthread_rwlock_rdlock(&cursor->cf->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
 
-    /* we check if memtable has a next kv */
-    while (1)
+    if (cursor->cf->require_sst_shift)
     {
-        if (cursor->memtable_cursor != NULL && skip_list_cursor_next(cursor->memtable_cursor) == 0)
+        cursor->cf->require_sst_shift = false;
+        /* we check if index exceeds number of sstables */
+        if (cursor->sstable_index >= cursor->cf->num_sstables)
         {
-            if (((skip_list_cursor_t *)cursor->memtable_cursor)->current !=
-                NULL) /* check if current is not NULL */
-            {
-                /* check if the value is not a tombstone */
-                if (!_tidesdb_is_tombstone(
-                        ((skip_list_cursor_t *)cursor->memtable_cursor)->current->value,
-                        ((skip_list_cursor_t *)cursor->memtable_cursor)->current->value_size))
-                {
-                    if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK,
-                                                     "column family");
-
-                    return NULL;
-                }
-            }
-        }
-
-        break;
-    }
-
-    /* if memtable is exhausted we check sstables
-     * starting at the most recent sstable
-     */
-
-    while (cursor->sstable_index >= 0)
-    {
-        if (cursor->cf->require_sst_shift)
-        {
-            cursor->cf->require_sst_shift = false;
-            /* we check if index exceeds number of sstables */
-            if (cursor->sstable_index >= cursor->cf->num_sstables)
-            {
-                cursor->sstable_index =
-                    cursor->cf->num_sstables -
-                    1; /* we shift back the current sstable index as we paired and merged.  This
-                          would only be important on background merges.  */
-                /* reopen the sstable cursor */
-                if (cursor->sstable_cursor != NULL)
-                {
-                    (void)block_manager_cursor_free(cursor->sstable_cursor);
-                    cursor->sstable_cursor = NULL;
-                }
-
-                /* we open new sstable cursor */
-                if (block_manager_cursor_init(
-                        &cursor->sstable_cursor,
-                        cursor->cf->sstables[cursor->sstable_index]->block_manager) == -1)
-                {
-                    if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-                        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK,
-                                                     "column family");
-                    return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
-                }
-
-                /* we check if bloom filter is set */
-                if (cursor->cf->config.bloom_filter)
-                {
-                    if (block_manager_cursor_next(cursor->sstable_cursor) == 0)
-                    {
-                        block_manager_cursor_free(cursor->sstable_cursor);
-                        cursor->sstable_cursor = NULL;
-                    }
-                }
-            }
-        }
-
-        /* we check if sstable cursor is valid and if it has a next block */
-        if (cursor->sstable_cursor != NULL &&
-            block_manager_cursor_next(cursor->sstable_cursor) == 0)
-        {
-            if (block_manager_cursor_has_next(cursor->sstable_cursor) == 1)
-            {
-                if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-                    return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK,
-                                                 "column family");
-
-                /* we return NULL as we have a next kv */
-                return NULL;
-            }
-        }
-
-        /* if sstable is exhausted we move to the next sstable */
-        if (cursor->sstable_cursor != NULL)
-        {
-            /* we free the sstable cursor for current sstable */
-            (void)block_manager_cursor_free(cursor->sstable_cursor);
-            cursor->sstable_cursor = NULL;
-        }
-
-        cursor->sstable_index--; /* move to the next sstable */
-
-        if (cursor->sstable_index < 0)
-        {
-            cursor->sstable_index = 0; /* reset to the first sstable */
-            break;
-        }
-
-        /* we check if there are more sstables */
-        if (block_manager_cursor_init(&cursor->sstable_cursor,
-                                      cursor->cf->sstables[cursor->sstable_index]->block_manager) ==
-            -1)
-        {
-            if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
-        }
-
-        /* if bloom is set we skip first block */
-        if (cursor->cf->config.bloom_filter)
-        {
-            if (block_manager_cursor_next(cursor->sstable_cursor) == 0)
-            {
-                block_manager_cursor_free(cursor->sstable_cursor);
-                cursor->sstable_cursor = NULL;
-            }
-        }
-
-        if (cursor->sstable_cursor != NULL)
-        {
-            if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
-
-            return NULL;
-        }
-    }
-
-    if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
-
-    return tidesdb_err_from_code(TIDESDB_ERR_AT_END_OF_CURSOR);
-}
-
-tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
-{
-    /* we check if cursor is invalid */
-    if (cursor == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
-
-    /* get column family read lock */
-    if (pthread_rwlock_rdlock(&cursor->cf->rwlock) != 0)
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
-
-    /* we check if memtable has a previous kv */
-    while (1)
-    {
-        while (cursor->memtable_cursor != NULL &&
-               skip_list_cursor_prev(cursor->memtable_cursor) == 0)
-        {
-            if (!_tidesdb_is_tombstone(
-                    ((skip_list_cursor_t *)cursor->memtable_cursor)->current->value,
-                    ((skip_list_cursor_t *)cursor->memtable_cursor)->current->value_size))
-            {
-                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                return NULL;
-            }
-        }
-
-        if (cursor->cf->num_sstables == 0)
-        {
-            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_AT_START_OF_CURSOR);
-        }
-
-        if (cursor->sstable_cursor == NULL)
-        {
-            /* reset to the first sstable */
+            /* we reset the index to the first sstable */
             cursor->sstable_index = 0;
-            (void)block_manager_cursor_goto_last(cursor->sstable_cursor);
-        }
 
-        if (cursor->sstable_cursor != NULL &&
-            block_manager_cursor_prev(cursor->sstable_cursor) == 0)
-        { /* go to the previous block */
-            if (block_manager_cursor_has_prev(cursor->sstable_cursor) == 1)
-            { /* check if there is a previous block after previous */
-                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                return NULL;
-            }
-        }
-
-        /* if sstable is exhausted we move to the previous sstable */
-        if ((size_t)cursor->sstable_index < (size_t)(cursor->cf->num_sstables - 1))
-        {
+            /* we must reopen the sstable cursor */
             if (cursor->sstable_cursor != NULL)
             {
                 (void)block_manager_cursor_free(cursor->sstable_cursor);
                 cursor->sstable_cursor = NULL;
             }
-            cursor->sstable_index++;
+
+            /* we open new sstable cursor */
             if (block_manager_cursor_init(
                     &cursor->sstable_cursor,
                     cursor->cf->sstables[cursor->sstable_index]->block_manager) == -1)
             {
-                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                continue; /* retry */
+                err = tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
             }
-            /* go to the last block */
-            (void)block_manager_cursor_goto_last(cursor->sstable_cursor);
-        }
 
-        (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-        break;
+            /* we skip the min-max block */
+            if (block_manager_cursor_next(cursor->sstable_cursor) == -1)
+            {
+                (void)block_manager_cursor_free(cursor->sstable_cursor);
+                cursor->sstable_cursor = NULL;
+            }
+
+            /* we skip the bloom filter block if configured */
+            if (cursor->cf->config.bloom_filter)
+            {
+                if (cursor->sstable_cursor != NULL)
+                {
+                    if (block_manager_cursor_next(cursor->sstable_cursor) == -1)
+                    {
+                        (void)block_manager_cursor_free(cursor->sstable_cursor);
+                        cursor->sstable_cursor = NULL;
+                    }
+                }
+            }
+        }
     }
 
-    if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
+    /* we ensure lock gets released in all cases by using a single point of exit */
+    do
+    {
+        /* we check if we need to reset the sstable index */
+        if (cursor->sstable_index == -1)
+        {
+            cursor->sstable_index = cursor->cf->num_sstables - 1;
 
-    return tidesdb_err_from_code(TIDESDB_ERR_AT_START_OF_CURSOR);
+            /* we reopen the sstable cursor */
+            if (cursor->sstable_cursor != NULL)
+            {
+                (void)block_manager_cursor_free(cursor->sstable_cursor);
+                cursor->sstable_cursor = NULL;
+            }
+
+            if (cursor->cf->num_sstables > 0)
+            {
+                /* we open new sstable cursor */
+                if (block_manager_cursor_init(
+                        &cursor->sstable_cursor,
+                        cursor->cf->sstables[cursor->sstable_index]->block_manager) == -1)
+                {
+                    err = tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
+                    break;
+                }
+
+                /* we skip the min-max block */
+                if (block_manager_cursor_next(cursor->sstable_cursor) == -1)
+                {
+                    (void)block_manager_cursor_free(cursor->sstable_cursor);
+                    cursor->sstable_cursor = NULL;
+                }
+
+                if (cursor->cf->config.bloom_filter)
+                {
+                    if (cursor->sstable_cursor != NULL)
+                    {
+                        /* skip the bloom filter block if configured */
+                        if (block_manager_cursor_next(cursor->sstable_cursor) == -1)
+                        {
+                            (void)block_manager_cursor_free(cursor->sstable_cursor);
+                            cursor->sstable_cursor = NULL;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* try to advance memtable cursor first */
+        if (cursor->memtable_cursor != NULL)
+        {
+            if (skip_list_cursor_next(cursor->memtable_cursor) == 0)
+            {
+                /* successfully advanced memtable cursor */
+                break;
+            }
+
+            /* end of memtable reached, free the cursor */
+            (void)skip_list_cursor_free(cursor->memtable_cursor);
+            cursor->memtable_cursor = NULL;
+        }
+
+        /* check if there is next block in the sstable */
+        if (cursor->sstable_cursor != NULL)
+        {
+            /* we advance the cursor */
+            if (block_manager_cursor_next(cursor->sstable_cursor) == 0)
+            {
+                /* check if at last block while still holding the lock */
+                if (block_manager_cursor_at_last(cursor->sstable_cursor))
+                {
+                    /* skipping sorted binary hash array */
+                    /* end of SSTable reached, free the cursor */
+                    (void)block_manager_cursor_free(cursor->sstable_cursor);
+                    cursor->sstable_cursor = NULL;
+
+                    /* continue to try the next SSTable */
+                }
+                else
+                {
+                    /* successfully advanced SSTable cursor */
+                    break;
+                }
+            }
+            else
+            {
+                /* failed to advance, free the cursor */
+                (void)block_manager_cursor_free(cursor->sstable_cursor);
+                cursor->sstable_cursor = NULL;
+            }
+        }
+
+        /* if we reach here, we need to move to the next SSTable */
+        while (cursor->sstable_cursor == NULL && cursor->sstable_index > 0)
+        {
+            cursor->sstable_index--;
+
+            if (block_manager_cursor_init(
+                    &cursor->sstable_cursor,
+                    cursor->cf->sstables[cursor->sstable_index]->block_manager) == -1)
+            {
+                err = tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
+                break;
+            }
+
+            /* we skip the min-max block */
+            if (block_manager_cursor_next(cursor->sstable_cursor) == -1)
+            {
+                (void)block_manager_cursor_free(cursor->sstable_cursor);
+                cursor->sstable_cursor = NULL;
+                continue;
+            }
+
+            /* we skip the bloom filter block if configured */
+            if (cursor->cf->config.bloom_filter)
+            {
+                if (block_manager_cursor_next(cursor->sstable_cursor) == -1)
+                {
+                    (void)block_manager_cursor_free(cursor->sstable_cursor);
+                    cursor->sstable_cursor = NULL;
+                    continue;
+                }
+            }
+
+            /* we successfully initialized the next SSTable cursor */
+            break;
+        }
+
+        /* if we couldn't initialize a cursor and broke out of the loop with an error */
+        if (err != NULL) break;
+
+        /* if we've exhausted all SSTables */
+        if (cursor->sstable_cursor == NULL)
+        {
+            cursor->sstable_index = -1;
+            err = tidesdb_err_from_code(TIDESDB_ERR_AT_END_OF_CURSOR);
+        }
+
+    } while (0);
+
+    /* we always release the lock before returning */
+    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+    return err;
+}
+
+tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
+{
+    tidesdb_err_t *err = NULL;
+
+    /* we check if cursor is NULL */
+    if (cursor == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
+
+    /* we get column family read lock */
+    if (pthread_rwlock_rdlock(&cursor->cf->rwlock) != 0)
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
+
+    if (cursor->cf->require_sst_shift)
+    {
+        cursor->cf->require_sst_shift = false;
+        /* we check if index exceeds number of sstables */
+        if (cursor->sstable_index >= cursor->cf->num_sstables)
+        {
+            /* we reset the index to the first sstable */
+            cursor->sstable_index = 0;
+
+            /* we must reopen the sstable cursor */
+            if (cursor->sstable_cursor != NULL)
+            {
+                (void)block_manager_cursor_free(cursor->sstable_cursor);
+                cursor->sstable_cursor = NULL;
+            }
+
+            /* we open new sstable cursor */
+            if (block_manager_cursor_init(
+                    &cursor->sstable_cursor,
+                    cursor->cf->sstables[cursor->sstable_index]->block_manager) == -1)
+            {
+                err = tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
+            }
+
+            /* we go to the last block */
+            if (block_manager_cursor_goto_last(cursor->sstable_cursor) == -1)
+            {
+                (void)block_manager_cursor_free(cursor->sstable_cursor);
+                cursor->sstable_cursor = NULL;
+            }
+
+            /* we skip sbha block */
+            if (cursor->sstable_cursor != NULL &&
+                block_manager_cursor_prev(cursor->sstable_cursor) == -1)
+            {
+                (void)block_manager_cursor_free(cursor->sstable_cursor);
+                cursor->sstable_cursor = NULL;
+            }
+        }
+    }
+
+    /* we ensure lock gets released in all cases by using a single point of exit */
+    do
+    {
+        /* we check if we need to reset the sstable index */
+        if (cursor->sstable_index == -1)
+        {
+            /* we start from the oldest SSTable for reverse traversal
+             * this would be if a user made it to end of the cursor
+             */
+            cursor->sstable_index = 0;
+
+            /* we reopen the sstable cursor */
+            if (cursor->sstable_cursor != NULL)
+            {
+                (void)block_manager_cursor_free(cursor->sstable_cursor);
+                cursor->sstable_cursor = NULL;
+            }
+
+            /* If no valid memtable cursor, try the newest SSTable */
+            if (cursor->cf->num_sstables > 0)
+            {
+                if (cursor->sstable_cursor == NULL)
+                {
+                    /* we open new sstable cursor for the newest SSTable */
+                    if (block_manager_cursor_init(
+                            &cursor->sstable_cursor,
+                            cursor->cf->sstables[cursor->sstable_index]->block_manager) == -1)
+                    {
+                        err = tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
+                        break;
+                    }
+
+                    /* Go to last block (skip metadata at the end) */
+                    if (block_manager_cursor_goto_last(cursor->sstable_cursor) == -1)
+                    {
+                        (void)block_manager_cursor_free(cursor->sstable_cursor);
+                        cursor->sstable_cursor = NULL;
+                    }
+
+                    /* we skip sorted binary hash array (last block) */
+                    if (cursor->sstable_cursor != NULL &&
+                        block_manager_cursor_prev(cursor->sstable_cursor) == -1)
+                    {
+                        (void)block_manager_cursor_free(cursor->sstable_cursor);
+                        cursor->sstable_cursor = NULL;
+                    }
+                }
+            }
+        }
+        else
+        {
+            /* if we're here, we need to continue iteration from current position */
+
+            /* try to move the current SSTable cursor backward */
+            if (cursor->sstable_cursor != NULL)
+            {
+                if (block_manager_cursor_prev(cursor->sstable_cursor) == 0)
+                {
+                    /* check if we've reached the metadata blocks at the beginning */
+                    if (block_manager_cursor_at_first(cursor->sstable_cursor) ||
+                        (cursor->cf->config.bloom_filter &&
+                         block_manager_cursor_at_second(cursor->sstable_cursor)))
+                    {
+                        /* at beginning of SSTable data blocks, free cursor */
+                        (void)block_manager_cursor_free(cursor->sstable_cursor);
+                        cursor->sstable_cursor = NULL;
+
+                        /* continue to next SSTable */
+                    }
+                    else
+                    {
+                        /* successfully moved to previous block in current SSTable */
+                        break;
+                    }
+                }
+                else
+                {
+                    /* failed to move cursor, free it */
+                    (void)block_manager_cursor_free(cursor->sstable_cursor);
+                    cursor->sstable_cursor = NULL;
+
+                    /* continue to next SSTable */
+                }
+            }
+        }
+
+        /* if we reach here, we need to move to the next SSTable (older one) */
+        while (cursor->sstable_cursor == NULL &&
+               cursor->sstable_index < cursor->cf->num_sstables - 1)
+        {
+            cursor->sstable_index++;
+
+            /* initialize cursor for the older SSTable */
+            if (block_manager_cursor_init(
+                    &cursor->sstable_cursor,
+                    cursor->cf->sstables[cursor->sstable_index]->block_manager) == -1)
+            {
+                err = tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
+                break;
+            }
+
+            /* go to the last data block (skipping metadata at the end) */
+            if (block_manager_cursor_goto_last(cursor->sstable_cursor) == -1)
+            {
+                (void)block_manager_cursor_free(cursor->sstable_cursor);
+                cursor->sstable_cursor = NULL;
+                continue;
+            }
+
+            /* skip sorted binary hash array (last metadata block) */
+            if (block_manager_cursor_prev(cursor->sstable_cursor) == -1)
+            {
+                (void)block_manager_cursor_free(cursor->sstable_cursor);
+                cursor->sstable_cursor = NULL;
+                continue;
+            }
+
+            /* successfully positioned at last data block of older SSTable */
+            break;
+        }
+
+        /* if we still don't have a valid cursor and no error occurred yet */
+        if (cursor->sstable_cursor == NULL && err == NULL)
+        {
+            /* check if we can initialize memtable cursor as a last resort */
+            if (cursor->memtable_cursor == NULL && cursor->cf->memtable != NULL)
+            {
+                cursor->memtable_cursor = skip_list_cursor_init(cursor->cf->memtable);
+                if (cursor->memtable_cursor == NULL)
+                {
+                    err = tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
+                    break;
+                }
+
+                /* move to the last element in the memtable */
+                if (skip_list_cursor_goto_last(cursor->memtable_cursor) == -1)
+                {
+                    (void)skip_list_cursor_free(cursor->memtable_cursor);
+                    cursor->memtable_cursor = NULL;
+                    err = tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
+                    break;
+                }
+
+                return NULL;
+            }
+            else
+            {
+                /* get from memtable */
+                if (skip_list_cursor_prev(cursor->memtable_cursor) == 0)
+                {
+                    /* successfully moved to previous element in memtable */
+                    break;
+                }
+            }
+
+            /* we've exhausted all SSTables and memtable */
+            cursor->sstable_index = -1;
+            err = tidesdb_err_from_code(TIDESDB_ERR_AT_START_OF_CURSOR);
+        }
+
+    } while (0);
+
+    /* we always release the lock before returning */
+    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+    return err;
 }
 
 tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_t *key_size,
                                   uint8_t **value, size_t *value_size)
 {
+    /* we check if cursor is NULL */
     if (cursor == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
+
+    /* we validate output pointers */
     if (key == NULL || key_size == NULL || value == NULL || value_size == NULL)
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_ARGUMENT);
 
-    /* get column family read lock */
+    /* we get column family read lock */
     if (pthread_rwlock_rdlock(&cursor->cf->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
 
-    block_manager_block_t *block;
-    while ((block = block_manager_cursor_read(cursor->sstable_cursor)) != NULL)
+    if (cursor->cf->require_sst_shift)
     {
-        tidesdb_key_value_pair_t *dkv = _tidesdb_deserialize_key_value_pair(
-            block->data, block->size, cursor->cf->config.compressed,
-            cursor->cf->config.compress_algo);
-        if (dkv == NULL)
+        cursor->cf->require_sst_shift = false;
+        /* we check if index exceeds number of sstables */
+        if (cursor->sstable_index >= cursor->cf->num_sstables)
         {
-            (void)block_manager_block_free(block);
-            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
+            /* we reset the index to the first sstable */
+            cursor->sstable_index = 0;
+            return tidesdb_err_from_code(TIDESDB_ERR_AT_END_OF_CURSOR);
         }
-
-        (void)block_manager_block_free(block);
-
-        if (_tidesdb_is_tombstone(dkv->value, dkv->value_size) || _tidesdb_is_expired(dkv->ttl))
-        {
-            (void)_tidesdb_free_key_value_pair(dkv);
-            continue;
-        }
-
-        *key = malloc(dkv->key_size);
-        if (*key == NULL)
-        {
-            (void)_tidesdb_free_key_value_pair(dkv);
-            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "key");
-        }
-        memcpy(*key, dkv->key, dkv->key_size);
-
-        *value = malloc(dkv->value_size);
-        if (*value == NULL)
-        {
-            free(*key);
-            (void)_tidesdb_free_key_value_pair(dkv);
-            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "value");
-        }
-        memcpy(*value, dkv->value, dkv->value_size);
-
-        *key_size = dkv->key_size;
-        *value_size = dkv->value_size;
-        /* unlock the column family */
-        if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-        {
-            free(*key);
-            free(*value);
-            (void)_tidesdb_free_key_value_pair(dkv);
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
-        }
-        (void)_tidesdb_free_key_value_pair(dkv);
-        return NULL;
     }
 
-    uint8_t *k;
-    uint8_t *v;
-    time_t ttl = time(NULL);
-
-    while (skip_list_cursor_get(cursor->memtable_cursor, &k, key_size, &v, value_size, &ttl) == 0)
+    /* we try memtable first if it exists */
+    if (cursor->memtable_cursor != NULL)
     {
-        if (!_tidesdb_is_tombstone(v, *value_size))
+        time_t ttl;
+        if (skip_list_cursor_get(cursor->memtable_cursor, key, key_size, value, value_size, &ttl) ==
+            0)
         {
-            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-            *key = malloc(*key_size);
-            if (*key == NULL)
-            {
-                return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "key");
-            }
-
-            *value = malloc(*value_size);
-            if (*value == NULL)
+            /* Check if the value is a tombstone or expired */
+            if (_tidesdb_is_tombstone(*value, *value_size) || _tidesdb_is_expired(ttl))
             {
                 free(*key);
-                return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "value");
+                free(*value);
+                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+                return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
             }
 
-            memcpy(*key, k, *key_size);
-            memcpy(*value, v, *value_size);
-            return NULL;
+            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+            return NULL; /* Successfully retrieved from memtable */
         }
     }
 
-    if (pthread_rwlock_unlock(&cursor->cf->rwlock) != 0)
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
+    /* we try SSTable if memtable didn't have it */
+    if (cursor->sstable_cursor != NULL)
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor->sstable_cursor);
+        if (block != NULL)
+        {
+            tidesdb_key_value_pair_t *kv = _tidesdb_deserialize_key_value_pair(
+                block->data, block->size, cursor->cf->config.compressed,
+                cursor->cf->config.compress_algo);
 
-    return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
+            (void)block_manager_block_free(block);
+
+            if (kv != NULL)
+            {
+                /* we check if the value is a tombstone or expired */
+                if (_tidesdb_is_tombstone(kv->value, kv->value_size) ||
+                    _tidesdb_is_expired(kv->ttl))
+                {
+                    (void)_tidesdb_free_key_value_pair(kv);
+                    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+                    return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+                }
+
+                /* we allocate and copy the key */
+                *key = malloc(kv->key_size);
+                if (*key == NULL)
+                {
+                    (void)_tidesdb_free_key_value_pair(kv);
+                    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "key");
+                }
+                memcpy(*key, kv->key, kv->key_size);
+                *key_size = kv->key_size;
+
+                /* we allocate and copy the value */
+                *value = malloc(kv->value_size);
+                if (*value == NULL)
+                {
+                    free(*key);
+                    (void)_tidesdb_free_key_value_pair(kv);
+                    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "value");
+                }
+                memcpy(*value, kv->value, kv->value_size);
+                *value_size = kv->value_size;
+
+                (void)_tidesdb_free_key_value_pair(kv);
+                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+                return NULL; /* Successfully retrieved from SSTable */
+            }
+        }
+    }
+
+    /* no data found or position invalid */
+    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+
+    return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
 }
 
 tidesdb_err_t *tidesdb_cursor_free(tidesdb_cursor_t *cursor)
 {
-    /* we check if the cursor is NULL */
     if (cursor == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
 
-    /* we free the sstable cursor */
-    if (cursor->sstable_cursor != NULL) block_manager_cursor_free(cursor->sstable_cursor);
+    /*  we free memtable cursor if it exists */
+    if (cursor->memtable_cursor != NULL)
+    {
+        (void)skip_list_cursor_free(cursor->memtable_cursor);
+        cursor->memtable_cursor = NULL;
+    }
 
-    if (cursor->memtable_cursor != NULL) skip_list_cursor_free(cursor->memtable_cursor);
+    /* we free sstable cursor if it exists */
+    if (cursor->sstable_cursor != NULL)
+    {
+        (void)block_manager_cursor_free(cursor->sstable_cursor);
+        cursor->sstable_cursor = NULL;
+    }
 
+    /* we free the cursor structure */
     free(cursor);
-
     cursor = NULL;
 
     return NULL;
@@ -6345,7 +6560,6 @@ tidesdb_err_t *tidesdb_delete_by_filter(tidesdb_t *tdb, const char *column_famil
     /*delete each matching key-value pair */
     for (size_t i = 0; i < result_size; i++)
     {
-        printf("Deleting key: %s\n", result[i]->key);
         err = tidesdb_txn_delete(txn, result[i]->key, result[i]->key_size);
         if (err != NULL)
         {

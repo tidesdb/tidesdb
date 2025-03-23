@@ -264,4 +264,28 @@ int block_manager_seek(block_manager_t *bm, uint64_t pos);
  */
 int block_manager_escalate_fsync(block_manager_t *bm);
 
+/**
+ * block_manager_cursor_at_last
+ * checks if the cursor is at the last block
+ * @param cursor the cursor to check
+ * @return 1 if the cursor is at the last block, 0 if not.  Can return -1 if error
+ */
+int block_manager_cursor_at_last(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_at_first
+ * checks if the cursor is at the first block
+ * @param cursor the cursor to check
+ * @return 1 if the cursor is at the first block, 0 if not.  Can return -1 if error
+ */
+int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_at_second
+ * checks if the cursor is at the second block
+ * @param cursor the cursor to check
+ * @return 1 if the cursor is at the second block, 0 if not.  Can return -1 if error
+ */
+int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
+
 #endif /* __BLOCK_MANAGER_H__ */

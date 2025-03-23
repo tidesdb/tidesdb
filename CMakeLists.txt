@@ -9,8 +9,8 @@ set(CMAKE_C_STANDARD 99)
 set(PROJECT_VERSION 0.9.0) # TidesDB v0.9.0b
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
-option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
-option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
+option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
+option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" OFF)
 option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 
 # for development, we want to enable all warnings and sanitizers
@@ -28,7 +28,7 @@ endif()
 
 include_directories(external) # for external libraries linking internally
 
-add_library(tidesdb src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c src/binary_hash_array.c src/log.c external/xxhash.c)
+add_library(tidesdb src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/binary_hash_array.c src/log.c external/xxhash.c)
 
 target_include_directories(tidesdb PRIVATE src)
 
@@ -77,7 +77,6 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         add_executable(err_tests test/err__tests.c)
         add_executable(block_manager_tests test/block_manager__tests.c)
         add_executable(skip_list_tests test/skip_list__tests.c)
-        add_executable(hash_table_tests test/hash_table__tests.c)
         add_executable(compress_tests test/compress__tests.c)
         add_executable(bloom_filter_tests test/bloom_filter__tests.c)
         add_executable(log_tests test/log__tests.c)
@@ -86,7 +85,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
         # add include and link directories for test executables
-        foreach(test_target err_tests block_manager_tests skip_list_tests hash_table_tests compress_tests bloom_filter_tests log_tests binary_hash_array_tests tidesdb_tests tidesdb_bench)
+        foreach(test_target err_tests block_manager_tests skip_list_tests compress_tests bloom_filter_tests log_tests binary_hash_array_tests tidesdb_tests tidesdb_bench)
                 target_link_libraries(${test_target} PRIVATE tidesdb)
                 target_include_directories(${test_target} PRIVATE external)
         endforeach()
@@ -94,7 +93,6 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         add_test(NAME err_tests COMMAND err_tests)
         add_test(NAME block_manager_tests COMMAND block_manager_tests)
         add_test(NAME skip_list_tests COMMAND skip_list_tests)
-        add_test(NAME hash_table_tests COMMAND hash_table_tests)
         add_test(NAME compress_tests COMMAND compress_tests)
         add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
         add_test(NAME binary_hash_array_tests COMMAND binary_hash_array_tests)

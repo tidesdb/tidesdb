@@ -2739,8 +2739,6 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
                 break;
             }
 
-            printf("got key: %s\n", kv->key);
-
             if (comparison_method(kv) &&
                 !_tidesdb_key_exists(kv->key, kv->key_size, *result, *result_size))
             {
@@ -4505,12 +4503,8 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
     }
 
-    printf("num sstables: %d\n", cf->num_sstables);
-
     (*cursor)->sstable_index =
         cf->num_sstables - 1; /* we start at the last sstable, the latest sstable */
-
-    printf("sstable index: %d\n", (*cursor)->sstable_index);
 
     (*cursor)->memtable_cursor = skip_list_cursor_init(cf->memtable);
     if ((*cursor)->memtable_cursor == NULL)
@@ -4944,7 +4938,6 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
             /* check if we can initialize memtable cursor as a last resort */
             if (cursor->memtable_cursor == NULL && cursor->cf->memtable != NULL)
             {
-                printf("ehhhhh\n");
                 cursor->memtable_cursor = skip_list_cursor_init(cursor->cf->memtable);
                 if (cursor->memtable_cursor == NULL)
                 {
@@ -4961,7 +4954,6 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
                     break;
                 }
 
-                printf("memtable cursor initialized\n");
                 return NULL;
             }
             else
@@ -5029,11 +5021,9 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
             }
 
             (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-            printf("from memtable:\n");
             return NULL; /* Successfully retrieved from memtable */
         }
     }
-    printf("from sstable index: %d\n", cursor->sstable_index);
 
     /* we try SSTable if memtable didn't have it */
     if (cursor->sstable_cursor != NULL)
@@ -5049,7 +5039,6 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
 
             if (kv != NULL)
             {
-                printf("got kv from sstable\n");
 
                 /* we check if the value is a tombstone or expired */
                 if (_tidesdb_is_tombstone(kv->value, kv->value_size) ||
@@ -6572,7 +6561,6 @@ tidesdb_err_t *tidesdb_delete_by_filter(tidesdb_t *tdb, const char *column_famil
     /*delete each matching key-value pair */
     for (size_t i = 0; i < result_size; i++)
     {
-        printf("Deleting key: %s\n", result[i]->key);
         err = tidesdb_txn_delete(txn, result[i]->key, result[i]->key_size);
         if (err != NULL)
         {

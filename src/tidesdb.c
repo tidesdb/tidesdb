@@ -4801,12 +4801,17 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
                 cursor->sstable_cursor = NULL;
             }
 
-            /* we skip sbha block */
-            if (cursor->sstable_cursor != NULL &&
-                block_manager_cursor_prev(cursor->sstable_cursor) == -1)
+            /* we skip sbha block
+             * we only skip if TDB_BLOCK_INDICES is set to 1
+             */
+            if (TDB_BLOCK_INDICES)
             {
-                (void)block_manager_cursor_free(cursor->sstable_cursor);
-                cursor->sstable_cursor = NULL;
+                if (cursor->sstable_cursor != NULL &&
+                    block_manager_cursor_prev(cursor->sstable_cursor) == -1)
+                {
+                    (void)block_manager_cursor_free(cursor->sstable_cursor);
+                    cursor->sstable_cursor = NULL;
+                }
             }
         }
     }
@@ -4850,12 +4855,17 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
                         cursor->sstable_cursor = NULL;
                     }
 
-                    /* we skip sorted binary hash array (last block) */
-                    if (cursor->sstable_cursor != NULL &&
-                        block_manager_cursor_prev(cursor->sstable_cursor) == -1)
+                    /* we skip sorted binary hash array (last block)
+                     * if enabled
+                     */
+                    if (TDB_BLOCK_INDICES)
                     {
-                        (void)block_manager_cursor_free(cursor->sstable_cursor);
-                        cursor->sstable_cursor = NULL;
+                        if (cursor->sstable_cursor != NULL &&
+                            block_manager_cursor_prev(cursor->sstable_cursor) == -1)
+                        {
+                            (void)block_manager_cursor_free(cursor->sstable_cursor);
+                            cursor->sstable_cursor = NULL;
+                        }
                     }
                 }
             }
@@ -4920,12 +4930,16 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
                 continue;
             }
 
-            /* skip sorted binary hash array (last metadata block) */
-            if (block_manager_cursor_prev(cursor->sstable_cursor) == -1)
+            /* skip sorted binary hash array (last metadata block) if enabled */
+            if (TDB_BLOCK_INDICES)
             {
-                (void)block_manager_cursor_free(cursor->sstable_cursor);
-                cursor->sstable_cursor = NULL;
-                continue;
+                /* skip sorted binary hash array (last metadata block) */
+                if (block_manager_cursor_prev(cursor->sstable_cursor) == -1)
+                {
+                    (void)block_manager_cursor_free(cursor->sstable_cursor);
+                    cursor->sstable_cursor = NULL;
+                    continue;
+                }
             }
 
             /* successfully positioned at last data block of older SSTable */

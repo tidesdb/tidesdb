@@ -17,7 +17,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Concurrent** multiple threads can read and write to the storage engine. Column families use a read-write lock thus allowing multiple readers and a single writer per column family.  Transactions on commit and rollback block other threads from reading or writing to the column family until the transaction is completed.  A transaction in itself is also is thread safe.
 - [x] **Column Families** store data in separate key-value stores.  Each column family has their own memtable and sstables.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically.  When a transaction fails, it rolls back all commited operations.
-- [x] **Cursor** iterate over key-value pairs forward and backward.
+- [x] **Bidirectional Cursor** iterate over key-value pairs forward and backward.
 - [x] **WAL** write-ahead logging for durability. Column families replay WAL on startup.  This reconstructs memtable if the column family did not reach threshold prior to shutdown.
 - [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
 - [x] **Background Incremental Paired Merge Compaction** background incremental merge compaction can be started.  If started the system will incrementally merge sstables in the background from oldest to newest once column family sstables have reached a specific provided limit.  Merges are done every n seconds. Merges are not done in parallel but incrementally.

@@ -348,6 +348,13 @@ extern "C"
         pthread_mutex_t lock;
     } tidesdb_txn_t;
 
+    /* tidesdb_cursor_direction_t */
+    typedef enum
+    {
+        TIDESDB_CURSOR_FORWARD,
+        TIDESDB_CURSOR_REVERSE
+    } tidesdb_cursor_direction_t;
+
     /*
      * tidesdb_cursor_t
      * struct for a TidesDB cursor
@@ -356,6 +363,7 @@ extern "C"
      * @param memtable_cursor the cursor for the memtable
      * @param sstable_index the current index of the sstable the cursor is on
      * @param sstable_cursor the cursor for the sstable
+     * @param direction the direction of the cursor
      */
     typedef struct
     {
@@ -364,6 +372,7 @@ extern "C"
         skip_list_cursor_t *memtable_cursor;
         int sstable_index;
         block_manager_cursor_t *sstable_cursor;
+        tidesdb_cursor_direction_t direction;
     } tidesdb_cursor_t;
 
     /*

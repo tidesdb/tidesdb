@@ -3453,7 +3453,6 @@ void test_tidesdb_delete_by_filter(bool compress, tidesdb_compression_algo_t alg
 
 int main(void)
 {
-
     test_tidesdb_serialize_deserialize_key_value_pair(false, TDB_NO_COMPRESSION);
 
     test_tidesdb_serialize_deserialize_column_family_config();
@@ -3573,7 +3572,6 @@ int main(void)
     test_tidesdb_start_incremental_merge(true, TDB_COMPRESS_ZSTD, true);
 
     test_tidesdb_cursor_background_compaction_shift(true, TDB_COMPRESS_ZSTD, true);
-
 
     return 0;
 }

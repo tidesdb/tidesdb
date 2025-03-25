@@ -4495,6 +4495,7 @@ tidesdb_err_t *tidesdb_cursor_init(tidesdb_t *tdb, const char *column_family_nam
     (*cursor)->cf = cf;
     (*cursor)->sstable_cursor = NULL;
     (*cursor)->memtable_cursor = NULL;
+    (*cursor)->direction = TIDESDB_CURSOR_FORWARD;
 
     /* get column family read lock */
     if (pthread_rwlock_rdlock(&cf->rwlock) != 0)
@@ -4577,6 +4578,9 @@ tidesdb_err_t *tidesdb_cursor_next(tidesdb_cursor_t *cursor)
     /* we get column family read lock */
     if (pthread_rwlock_rdlock(&cursor->cf->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
+
+    /* we check if cursor is not set to forward, if not we set it to forward */
+    if (cursor->direction != TIDESDB_CURSOR_FORWARD) cursor->direction = TIDESDB_CURSOR_FORWARD;
 
     if (cursor->cf->require_sst_shift)
     {
@@ -4775,13 +4779,16 @@ tidesdb_err_t *tidesdb_cursor_prev(tidesdb_cursor_t *cursor)
     if (pthread_rwlock_rdlock(&cursor->cf->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
 
+    /* we check if cursor is not set to reverse, if not we set it to reverse */
+    if (cursor->direction != TIDESDB_CURSOR_REVERSE) cursor->direction = TIDESDB_CURSOR_REVERSE;
+
     if (cursor->cf->require_sst_shift)
     {
         cursor->cf->require_sst_shift = false;
         /* we check if index exceeds number of sstables */
 
-        /* we reset the index to the first sstable */
-        cursor->sstable_index = 0;
+        /* we reset the index to the last sstable */
+        cursor->sstable_index = cursor->cf->num_sstables - 1;
 
         /* we must reopen the sstable cursor */
         if (cursor->sstable_cursor != NULL)
@@ -5011,11 +5018,36 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
 
     if (cursor->cf->require_sst_shift)
     {
-        cursor->cf->require_sst_shift = false;
-        /* we check if index exceeds number of sstables */
-        /* we reset the index to the first sstable */
-        cursor->sstable_index = 0;
-        return tidesdb_err_from_code(TIDESDB_ERR_AT_END_OF_CURSOR);
+        if (cursor->direction == TIDESDB_CURSOR_FORWARD)
+        {
+            /* we call next to shift to the next sstable */
+            (void)tidesdb_cursor_next(cursor);
+
+            /* we call get to get the key-value pair */
+            if (tidesdb_cursor_get(cursor, key, key_size, value, value_size) == NULL)
+            {
+                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+                return NULL;
+            }
+
+            /* we return invalid cursor */
+            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+
+            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
+        } /* else is TIDESDB_CURSOR_REVERSE */
+
+        /* we call prev to shift to the previous sstable */
+        (void)tidesdb_cursor_prev(cursor);
+
+        if (tidesdb_cursor_get(cursor, key, key_size, value, value_size) == NULL)
+        {
+            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+            return NULL;
+        }
+
+        /* we return invalid cursor */
+        (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
     }
 
     /* we try memtable first if it exists */

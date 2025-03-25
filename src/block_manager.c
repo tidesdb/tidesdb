@@ -242,7 +242,7 @@ int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
     /* seek to the beginning of the file */
     if (fseek(cursor->bm->file, 0, SEEK_SET) != 0) return -1;
 
-    /* het the file size to check if it's empty */
+    /* we get the file size to check if it's empty */
     if (fseek(cursor->bm->file, 0, SEEK_END) != 0) return -1;
     long file_size = ftell(cursor->bm->file);
     if (file_size == -1) return -1;

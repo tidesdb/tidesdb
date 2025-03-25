@@ -506,7 +506,7 @@ tidesdb_operation_t *_tidesdb_deserialize_operation(uint8_t *data, size_t data_s
     memcpy(&cf_name_size, ptr, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
 
-    /* Check if data is large enough for cf_name */
+    /* we check if data is large enough for cf_name */
     if (data_size < sizeof(TIDESDB_OP_CODE) + sizeof(uint32_t) + cf_name_size)
     {
         if (decompressed_data) free(decompressed_data);
@@ -5798,10 +5798,6 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                     }
                     (void)_tidesdb_free_key_value_pair(kv2);
                     break;
-                }
-                if (TDB_BLOCK_INDICES)
-                {
-                    (void)binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
                 }
             }
             else

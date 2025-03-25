@@ -66,7 +66,7 @@ binary_hash_array_t *binary_hash_array_new(size_t initial_capacity)
     return bha;
 }
 
-void binary_hash_array_resize(binary_hash_array_t *bha, size_t new_capacity)
+int binary_hash_array_resize(binary_hash_array_t *bha, size_t new_capacity)
 {
     binary_hash_array_entry_t *new_entries =
         realloc(bha->entries, new_capacity * sizeof(binary_hash_array_entry_t));
@@ -74,14 +74,20 @@ void binary_hash_array_resize(binary_hash_array_t *bha, size_t new_capacity)
     {
         bha->entries = new_entries;
         bha->capacity = new_capacity;
+
+        return 0;
     }
+    return -1; /* could not resize */
 }
 
-void binary_hash_array_add(binary_hash_array_t *bha, uint8_t *key, size_t key_len, int64_t value)
+int binary_hash_array_add(binary_hash_array_t *bha, uint8_t *key, size_t key_len, int64_t value)
 {
     if (bha->size == bha->capacity)
     {
-        binary_hash_array_resize(bha, bha->capacity * 2);
+        if (binary_hash_array_resize(bha, bha->capacity * 2) == -1)
+        {
+            return -1; /* could not resize */
+        }
     }
 
     uint8_t hash[16];
@@ -89,6 +95,8 @@ void binary_hash_array_add(binary_hash_array_t *bha, uint8_t *key, size_t key_le
     memcpy(bha->entries[bha->size].key, hash, sizeof(hash));
     bha->entries[bha->size].value = value;
     bha->size++;
+
+    return 0;
 }
 
 uint8_t *binary_hash_array_serialize(binary_hash_array_t *bha, size_t *out_size)

@@ -415,7 +415,7 @@ int skip_list_get_size(skip_list_t *list)
     if (list == NULL) return -1;
 
     /* we simply return the total size */
-    return list->total_size;
+    return (int)list->total_size;
 }
 
 int skip_list_count_entries(skip_list_t *list)
@@ -423,6 +423,7 @@ int skip_list_count_entries(skip_list_t *list)
     if (list == NULL) return -1;
 
     int count = 0;
+
     /* we iterate through the skip list and count each node */
     skip_list_node_t *current = list->header->forward[0];
     while (current != NULL)
@@ -598,9 +599,6 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
         (*cursor)->current = NULL;
         return -1; /*no valid node at the end */
     }
-    else
-    {
-        (*cursor)->current = current;
-        return 0; /* success */
-    }
+    (*cursor)->current = current;
+    return 0; /* success */
 }

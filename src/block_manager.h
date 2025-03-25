@@ -242,7 +242,7 @@ int block_manager_cursor_goto_first(block_manager_cursor_t *cursor);
 
 /**
  * block_manager_get_size
- * gets the size of a block manager
+ * gets the total size of a block manager file
  * @param bm the block manager to get the size of
  * @param size the size of the block manager
  * @return 0 if successful, -1 if not
@@ -282,7 +282,7 @@ int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
 
 /**
  * block_manager_cursor_at_second
- * checks if the cursor is at the second block
+ * checks if the cursor is at the second block from start
  * @param cursor the cursor to check
  * @return 1 if the cursor is at the second block, 0 if not.  Can return -1 if error
  */

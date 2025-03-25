@@ -154,6 +154,7 @@ typedef enum
     TIDESDB_ERR_FAILED_TO_ESCALATE_FSYNC,
     TIDESDB_ERR_FAILED_TO_GET_MIN_KEY_FOR_FLUSH,
     TIDESDB_ERR_FAILED_TO_GET_MAX_KEY_FOR_FLUSH,
+    TIDESDB_ERR_PUT_TOMBSTONE,
 } TIDESDB_ERR_CODE;
 
 /* TidesDB error messages */
@@ -327,6 +328,7 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
      TIDESDB_ERR_WITH_CONTEXT},
     {TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOOM, "Failed to serialize bloom filter for %s.\n",
      TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_PUT_TOMBSTONE, "Cannot write tombstone value.\n", TIDESDB_ERR_WITHOUT_CONTEXT},
 };
 
 /*

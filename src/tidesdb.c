@@ -1916,6 +1916,28 @@ tidesdb_err_t *tidesdb_list_column_families(tidesdb_t *tdb, char **list)
 tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const uint8_t *key,
                            size_t key_size, const uint8_t *value, size_t value_size, time_t ttl)
 {
+    /* we check if the value is NULL */
+    if (value == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_VALUE);
+
+    /* we check if the key and value size exceed available system memory */
+    if (key_size + value_size > tdb->available_mem)
+        return tidesdb_err_from_code(TIDESDB_ERR_PUT_MEMORY_OVERFLOW);
+
+    /* we check if value is a tombstone, a user cannot put a tombstone value */
+    if (value_size == 4)
+    {
+        uint32_t tombstone_value;
+        memcpy(&tombstone_value, value, sizeof(uint32_t));
+
+        if (tombstone_value == TOMBSTONE) return tidesdb_err_from_code(TIDESDB_ERR_PUT_TOMBSTONE);
+    }
+
+    return _tidesdb_put(tdb, column_family_name, key, key_size, value, value_size, ttl);
+}
+
+tidesdb_err_t *_tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const uint8_t *key,
+                            size_t key_size, const uint8_t *value, size_t value_size, time_t ttl)
+{
     /* we check if the db is NULL */
     if (tdb == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_DB);
 
@@ -1924,13 +1946,6 @@ tidesdb_err_t *tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const
 
     /* we check if the key is NULL */
     if (key == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_KEY);
-
-    /* we check if the value is NULL */
-    if (value == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_VALUE);
-
-    /* we check if the key and value size exceed available system memory */
-    if (key_size + value_size > tdb->available_mem)
-        return tidesdb_err_from_code(TIDESDB_ERR_PUT_MEMORY_OVERFLOW);
 
     /* we check if the column family name is greater than 2 */
     if (strlen(column_family_name) < 2)
@@ -2790,81 +2805,21 @@ tidesdb_err_t *tidesdb_delete(tidesdb_t *tdb, const char *column_family_name, co
 
     if (key == NULL) return tidesdb_err_from_code(TIDESDB_ERR_INVALID_KEY);
 
-    /* we check if the column family name is greater than 2 */
-    if (strlen(column_family_name) < 2)
-        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME, "column family");
-
-    /* we check if column name length exceeds TDB_MAX_COLUMN_FAMILY_NAME_LEN */
-    if (strlen(column_family_name) > TDB_MAX_COLUMN_FAMILY_NAME_LEN)
-        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_NAME_LENGTH, "column family");
-
-    /* get db read lock to get column family */
-    if (pthread_rwlock_rdlock(&tdb->rwlock) != 0)
-    {
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "db");
-    }
-
-    /* get column family */
-    tidesdb_column_family_t *cf = NULL;
-    if (_tidesdb_get_column_family(tdb, column_family_name, &cf) == -1)
-    {
-        (void)pthread_rwlock_unlock(&tdb->rwlock);
-        return tidesdb_err_from_code(TIDESDB_ERR_COLUMN_FAMILY_NOT_FOUND);
-    }
-
-    /* release db read lock */
-    if (pthread_rwlock_unlock(&tdb->rwlock) != 0)
-    {
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "db");
-    }
-
-    /* get column family write lock */
-    if (pthread_rwlock_wrlock(&cf->rwlock) != 0)
-    {
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
-    }
-
     uint8_t *tombstone = malloc(4);
     if (tombstone == NULL) return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "tombstone");
 
     uint32_t tombstone_value = TOMBSTONE;
     memcpy(tombstone, &tombstone_value, sizeof(uint32_t));
 
-    /* append to wal */
-    if (_tidesdb_append_to_wal(cf->wal, key, key_size, tombstone, 4, 0, TIDESDB_OP_DELETE,
-                               column_family_name) == -1)
+    /* we use _tidesdb_put to delete the key */
+    tidesdb_err_t *err = _tidesdb_put(tdb, column_family_name, key, key_size, tombstone, 4, -1);
+    if (err != NULL)
     {
         free(tombstone);
-        (void)pthread_rwlock_unlock(&cf->rwlock);
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_APPEND_TO_WAL);
-    }
-    /* add to memtable */
-
-    if (skip_list_put(cf->memtable, key, key_size, tombstone, 4, -1) == -1)
-    {
-        free(tombstone);
-        (void)pthread_rwlock_unlock(&cf->rwlock);
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_PUT_TO_MEMTABLE);
+        return err;
     }
 
     free(tombstone);
-
-    /* we check if the memtable has reached the flush threshold */
-
-    if ((int)((skip_list_t *)cf->memtable)->total_size >= cf->config.flush_threshold)
-    {
-        if (_tidesdb_flush_memtable(cf) == -1)
-        {
-            (void)pthread_rwlock_unlock(&cf->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_FLUSH_MEMTABLE);
-        }
-    }
-
-    /* release column family write lock */
-    if (pthread_rwlock_unlock(&cf->rwlock) != 0)
-    {
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
-    }
 
     return NULL;
 }
@@ -6185,6 +6140,8 @@ tidesdb_err_t *tidesdb_get_column_family_stat(tidesdb_t *tdb, const char *column
 
     /* set incremental merge started status */
     (*stat)->incremental_merging = cf->incremental_merging;
+    (*stat)->incremental_merge_interval = cf->incremental_merge_interval;
+    (*stat)->incremental_merge_min_sstables = cf->incremental_merge_min_sstables;
 
     /* create sstable stats */
 

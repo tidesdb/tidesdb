@@ -10,30 +10,30 @@ It is not a full-featured database, but rather a library that can be used to bui
 [![Linux Build Status](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml/badge.svg)](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml)
 
 > [!CAUTION]
-> master is in active development.  TidesDB 1 is the projected stable first MAJOR release.  We are in the beta development stages.
+> master is in active development. TidesDB 1 is the projected stable first MAJOR release. We are in the beta development stages.
 
 ## Features
-- [x] **ACID** transactions are atomic, consistent, isolated, and durable.  Transactions are tied to their respective column family.
-- [x] **Concurrent** multiple threads can read and write to the storage engine. Column families use a read-write lock thus allowing multiple readers and a single writer per column family.  Transactions on commit and rollback block other threads from reading or writing to the column family until the transaction is completed.  A transaction in itself is also is thread safe.
-- [x] **Column Families** store data in separate key-value stores.  Each column family has their own memtable and sstables.
-- [x] **Atomic Transactions** commit or rollback multiple operations atomically.  When a transaction fails, it rolls back all commited operations.
+- [x] **ACID** transactions are atomic, consistent, isolated, and durable. Transactions are tied to their respective column family.
+- [x] **Concurrent** multiple threads can read and write to the storage engine. Column families use a read-write lock thus allowing multiple readers and a single writer per column family. Transactions on commit and rollback block other threads from reading or writing to the column family until the transaction is completed. A transaction in itself is also is thread safe.
+- [x] **Column Families** store data in separate key-value stores. Each column family has their own memtable and sstables.
+- [x] **Atomic Transactions** commit or rollback multiple operations atomically. When a transaction fails, it rolls back all commited operations.
 - [x] **Bidirectional Cursor** iterate over key-value pairs forward and backward with background compaction awareness.
-- [x] **WAL** write-ahead logging for durability. Column families replay WAL on startup.  This reconstructs memtable if the column family did not reach threshold prior to shutdown.
-- [x] **Parallel Paired Merge Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
-- [x] **Background Incremental Paired Merge Compaction** background incremental merge compaction can be started.  If started the system will incrementally merge sstables in the background from oldest to newest once column family sstables have reached a specific provided limit.  Merges are done every n seconds. Merges are not done in parallel but incrementally.
+- [x] **WAL** write-ahead logging for durability. Column families replay WAL on startup. This reconstructs memtable if the column family did not reach threshold prior to shutdown.
+- [x] **Parallel Paired Merge Compaction** manual multi-threaded paired and merged compaction of sstables. When run for example 10 sstables compacts into 5 as their paired and merged. Each thread is responsible for one pair - you can set the number of threads to use for compaction.
+- [x] **Background Incremental Paired Merge Compaction** background incremental merge compaction can be started. If started the system will incrementally merge sstables in the background from oldest to newest once column family sstables have reached a specific provided limit. Merges are done every n seconds. Merges are not done in parallel but incrementally.
 - [x] **Bloom Filters** reduce disk reads by reading initial blocks of sstables to check key existence.
-- [x] **Compression** compression is achieved with Snappy, LZ4, or ZSTD.  If enabled at column family level sstable entries as well as WAL entries are compressed with configured algorithm.
-- [x] **TTL** time-to-live for key-value pairs.  Key-value pairs expire in real time with effective skip list traversal expiration checks.
+- [x] **Compression** compression is achieved with Snappy, LZ4, or ZSTD. If enabled at column family level sstable entries as well as WAL entries are compressed with configured algorithm.
+- [x] **TTL** time-to-live for key-value pairs. Key-value pairs expire in real time with effective skip list traversal expiration checks.
 - [x] **Configurable** column families are configurable with memtable flush threshold, skip list max level, skip list probability, compression, and bloom filters.
 - [x] **Error Handling** API functions return an error code and message.
 - [x] **Easy API** simple and easy to use api.
 - [x] **Skip List** skip list is used for memtable data structure.
 - [x] **Multiplatform** Linux, MacOS, and Windows support.
-- [x] **Logging** system logs debug messages to log file.  This can be disabled.  Log file is created in the database directory.  Logging automatically rotates/truncates at `100000` entries by default, configured with `TDB_DEBUG_LOG_TRUNCATE_AT`.
-- [x] **Block Indices** by default `TDB_BLOCK_INDICES` is set to 1.  This means TidesDB for each column family sstable there is a last block containing a sorted binary hash array(SBHA).  This compact data structure gives us the ability to retrieve the specific offset for a key and seek to its containing key value pair block within an sstable without having to scan an entire sstable.  If `TDB_BLOCK_INDICES` is set to 0 then block indices aren't used nor created and reads are slower and consume more IO and CPU having to scan and compare.
+- [x] **Logging** system logs debug messages to log file. This can be disabled. Log file is created in the database directory. Logging automatically rotates/truncates at `100000` entries by default, configured with `TDB_DEBUG_LOG_TRUNCATE_AT`.
+- [x] **Block Indices** by default `TDB_BLOCK_INDICES` is set to 1. This means TidesDB for each column family sstable there is a last block containing a sorted binary hash array(SBHA). This compact data structure gives us the ability to retrieve the specific offset for a key and seek to its containing key value pair block within an sstable without having to scan an entire sstable. If `TDB_BLOCK_INDICES` is set to 0 then block indices aren't used nor created and reads are slower and consume more IO and CPU having to scan and compare.
 - [x] **Statistics** column family statistics, configs, information can be retrieved through public API.
-- [x] **Range queries** are supported.  You can retrieve a range of key-value pairs.  Each sstable initial block contains a min-max key range.  This allows for fast(er) range queries.
-- [x] **Filter queries** are supported.  You can filter key-value pairs based on a filter function.
+- [x] **Range queries** are supported. You can retrieve a range of key-value pairs. Each sstable initial block contains a min-max key range. This allows for fast(er) range queries.
+- [x] **Filter queries** are supported. You can filter key-value pairs based on a filter function.
 
 ## Building
 Using cmake to build the shared library.
@@ -112,7 +112,7 @@ Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask quest
 ## Include
 ```c
 #include <tidesdb/tidesdb.h> /* you can use other components of TidesDB such as skip list, bloom filter etc.. under tidesdb/
-                                this also prevents collisions.  */
+                                this also prevents collisions. */
 ```
 
 ## Usage
@@ -150,20 +150,20 @@ if (e != NULL)
 ```
 
 ### Creating a column family
-In order to store data in TidesDB you need a column family.  This is by design.  There is no default.
+In order to store data in TidesDB you need a column family. This is by design. There is no default.
 
 **You pass**
-- the database you want to create the column family in.  Must be open
+- the database you want to create the column family in. Must be open
 - the name of the column family
-- memtable flush threshold in bytes.  Example below is 128MB
-- skip list max level.  Example below is 12 ( you can use `TDB_DEFAULT_SKIP_LIST_MAX_LEVEL`)
-- skip list probability.  Example below is 0.24 ( you can use `TDB_DEFAULT_SKIP_LIST_PROBABILITY`)
+- memtable flush threshold in bytes. Example below is 128MB
+- skip list max level. Example below is 12 ( you can use `TDB_DEFAULT_SKIP_LIST_MAX_LEVEL`)
+- skip list probability. Example below is 0.24 ( you can use `TDB_DEFAULT_SKIP_LIST_PROBABILITY`)
 - whether column family sstable data is compressed
 - the compression algorithm to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
 - whether to use bloom filters
 
-The flush threshold is an accumilation of the size of your key value pairs in the memtable.  When the threshold is reached the memtable is flushed to an sstable.
-The threshold is up to you and the system you're running on.  The minimum size is 1mb. The larger the threshold the more data you can store in memory before flushing to disk.
+The flush threshold is an accumilation of the size of your key value pairs in the memtable. When the threshold is reached the memtable is flushed to an sstable.
+The threshold is up to you and the system you're running on. The minimum size is 1mb. The larger the threshold the more data you can store in memory before flushing to disk.
 
 ```c
 /* create a column family with no compression and no bloom filters (slower reads) */
@@ -200,7 +200,7 @@ if (e != NULL)
 ```
 
 ### Listing column families
-You can list all column families in the database list as a string.  You must free the string when done.
+You can list all column families in the database list as a string. You must free the string when done.
 ```c
 char *column_families = NULL;
 tidesdb_err_t *err = tidesdb_list_column_families(tdb, &column_families);
@@ -215,13 +215,13 @@ free(column_families);
 
 ### Putting a key-value pair
 You pass
-- the database you want to put the key-value pair in.  Must be open
+- the database you want to put the key-value pair in. Must be open
 - the column family name you want to put the key-value pair in
 - the key
 - the key size
 - the value
 - the value size
-- when the key-value pair should expire.  If -1 then it never expires.
+- when the key-value pair should expire. If -1 then it never expires.
 
 ```c
 /* put a key-value pair */
@@ -253,7 +253,7 @@ if (e != NULL)
 
 ### Getting a key-value pair
 You pass
-- the database you want to get the key-value pair from.  Must be open
+- the database you want to get the key-value pair from. Must be open
 - the column family name
 - the key
 - the key size
@@ -274,7 +274,7 @@ if (e != NULL)
 
 ### Deleting a key-value pair
 You pass
-- the database you want to delete the key-value pair from.  Must be open
+- the database you want to delete the key-value pair from. Must be open
 - the column family name
 - the key
 - the key size
@@ -290,12 +290,12 @@ if (e != NULL)
 ```
 
 ### Transactions
-You can perform a series of operations atomically.  This will block other threads from reading or writing to the column family until the transaction is committed or rolled back.
+You can perform a series of operations atomically. This will block other threads from reading or writing to the column family until the transaction is committed or rolled back.
 
 You begin a transaction by calling `tidesdb_txn_begin`.
 
 You pass
-- the database you want to perform the operations in.  Must be open
+- the database you want to perform the operations in. Must be open
 - the transaction pointer
 - the column family name you want to perform the operations in
 ```c
@@ -518,12 +518,12 @@ printf("Deleted %zu items\n", deleted_count);
 ```
 
 ### Compaction
-There are 2 ways to compact sstables.  Manual multi-threaded paired and merged compaction and background incremental merge compaction.
-Compaction removes tombstones and expired keys if ttl is set.  Because merging merges and older and newer sstables only the newest version of key lives on.
+There are 2 ways to compact sstables. Manual multi-threaded paired and merged compaction and background incremental merge compaction.
+Compaction removes tombstones and expired keys if ttl is set. Because merging merges and older and newer sstables only the newest version of key lives on.
 
 #### Manual Multi-Threaded Parallel Compaction
-You can manually compact sstables.  This method pairs and merges column family sstables from oldest to latest.  It will remove tombstones and expired keys if ttl is set.
-Say you have 100 sstables within a column family, after compaction you will have 50 sstables; Always half the amount you had prior (if even).  You can set the number of threads to use for compaction. Each thread handles 1 pair.
+You can manually compact sstables. This method pairs and merges column family sstables from oldest to latest. It will remove tombstones and expired keys if ttl is set.
+Say you have 100 sstables within a column family, after compaction you will have 50 sstables; Always half the amount you had prior (if even). You can set the number of threads to use for compaction. Each thread handles 1 pair.
 
 ```c
 tidesdb_err_t *e = tidesdb_compact_sstables(tdb, "your_column_family", 10); /* use 10 threads */
@@ -535,11 +535,11 @@ if (e != NULL)
 ```
 
 #### Automatic / Background Incremental Merge Compaction
-You can start a background incremental merge compaction.  This will incrementally merge sstables in the background from oldest to newest when minimum sstables are reached. Will run in background until shutdown.  Merges are done every n seconds.  Merges are not done in parallel but incrementally.
+You can start a background incremental merge compaction. This will incrementally merge sstables in the background from oldest to newest when minimum sstables are reached. Will run in background until shutdown. Merges are done every n seconds. Merges are not done in parallel but incrementally.
 You can set the minimum amount of column family sstables to trigger a background incremental merge. Background merging blocks less than manual compaction.
 
 You pass
-- the database you want to start the background incremental merge compaction in.  Must be open
+- the database you want to start the background incremental merge compaction in. Must be open
 - the column family name within that database
 - the number of seconds to wait before going to next pair and merging
 - the minimum number of sstables to trigger a merge
@@ -548,7 +548,7 @@ tidesdb_err_t *e = tidesdb_start_incremental_merge(tdb, "your_column_family", 10
 ```
 
 ### Column Family Statistics
-You can get statistics on a column family.  This includes the column family configuration, number of sstables, memtable size, memtable entries count, and sstable stats, etc!
+You can get statistics on a column family. This includes the column family configuration, number of sstables, memtable size, memtable entries count, and sstable stats, etc!
 #### Structs
 ```c
     typedef struct

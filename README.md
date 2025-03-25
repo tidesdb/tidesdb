@@ -559,6 +559,8 @@ You can get statistics on a column family. This includes the column family confi
         size_t memtable_size;
         size_t memtable_entries_count;
         bool incremental_merging;
+        int incremental_merge_interval;
+        int incremental_merge_min_sstables;
         tidesdb_column_family_sstable_stat_t **sstable_stats;
     } tidesdb_column_family_stat_t;
 

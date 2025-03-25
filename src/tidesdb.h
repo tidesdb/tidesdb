@@ -236,6 +236,8 @@ extern "C"
      * @param memtable_entries_count the number of entries in the memtable
      * @param incremental_merging whether the column family has been started with incremental
      * merging.
+     * @param incremental_merge_interval the interval for incremental merging
+     * @param incremental_merge_min_sstables the minimum number of sstables to trigger a incremental
      * @param sstable_stats the stats for the sstables in the column family
      */
     typedef struct
@@ -246,6 +248,8 @@ extern "C"
         size_t memtable_size;
         size_t memtable_entries_count;
         bool incremental_merging;
+        int incremental_merge_interval;
+        int incremental_merge_min_sstables;
         tidesdb_column_family_sstable_stat_t **sstable_stats;
     } tidesdb_column_family_stat_t;
 
@@ -493,6 +497,8 @@ extern "C"
      * @param start_key_size the size of the start key
      * @param end_key the end key
      * @param end_key_size the size of the end key
+     * @param result an array to store the key-value pairs
+     * @param result_size the size of the result array
      * @return error or NULL
      */
     tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
@@ -1079,7 +1085,7 @@ extern "C"
      * _tidesdb_merge_sort
      * merges 2 sstables into a new sstable using block managers.  A memory efficient approach to
      * merging ssts.  Method will also removed expired keys if ttl set and tombstones.  The second
-     * sstable block manager supercedes the first sstable block manager.
+     * sstable block manager supersedes the first sstable block manager.
      * @param cf the column family
      * @param bm1 the block manager for the first sstable
      * @param bm2 the block manager for the second sstable
@@ -1136,11 +1142,16 @@ extern "C"
     /*
      * _tidesdb_print_keys_tree
      * print the keys tree for a column family
+     * mainly used for debugging.  Will print memtable and sstable(s) keys.
      * @param tdb the TidesDB instance
      * @param column_family_name the name of the column family
      * @return 0 if the keys tree was printed, -1 if not
      */
     int _tidesdb_print_keys_tree(tidesdb_t *tdb, const char *column_family_name);
+
+    tidesdb_err_t *_tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const uint8_t *key,
+                                size_t key_size, const uint8_t *value, size_t value_size,
+                                time_t ttl);
 
 #ifdef __cplusplus
 }

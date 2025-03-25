@@ -18,6 +18,9 @@
  */
 #include "skip_list.h"
 
+/* the skip list should be optimized for backwards iteration** currently the way we do it.. not so
+ * optimal */
+
 skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t key_size,
                                         const uint8_t *value, size_t value_size, time_t ttl)
 {
@@ -321,8 +324,15 @@ int skip_list_clear(skip_list_t *list)
     while (current != NULL)
     {
         skip_list_node_t *next = current->forward[0];
-        free(current->key);
-        free(current->value);
+
+        if (current->value != NULL)
+        {
+            free(current->value);
+        }
+        if (current->key != NULL)
+        {
+            free(current->key);
+        }
         free(current);
         current = next;
     }
@@ -345,8 +355,9 @@ int skip_list_free(skip_list_t *list)
 
     if (skip_list_clear(list) != 0) return -1;
 
-    free(list->header->key);
-    free(list->header->value);
+    if (list->header->key != NULL) free(list->header->key);
+
+    if (list->header->value != NULL) free(list->header->value);
     free(list->header);
     free(list);
     list = NULL;
@@ -561,7 +572,7 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
 {
     if (list == NULL || list->header == NULL || cursor == NULL) return -1;
 
-    /* Allocate memory for the cursor if it doesn't exist */
+    /* we allocate memory for the cursor if it doesn't exist */
     if (*cursor == NULL)
     {
         *cursor = malloc(sizeof(skip_list_cursor_t));
@@ -570,26 +581,26 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
 
     (*cursor)->list = list;
 
-    /* Start at the header */
+    /* we start at the header */
     skip_list_node_t *current = list->header;
 
-    /* Traverse to the last node */
+    /* we traverse to the last node */
     while (current->forward[0] != NULL)
     {
         current = current->forward[0];
-        /* Check if the node has expired */
+        /* we check if the node has expired */
         (void)skip_list_check_and_update_ttl(list, current);
     }
 
-    /* If we're still at the header, that means the list is empty */
+    /* if we're still at the header, that means the list is empty */
     if (current == list->header)
     {
         (*cursor)->current = NULL;
-        return -1; /* No valid node at the end */
+        return -1; /*no valid node at the end */
     }
     else
     {
         (*cursor)->current = current;
-        return 0; /* Success */
+        return 0; /* success */
     }
 }

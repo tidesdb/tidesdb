@@ -361,7 +361,7 @@ extern "C"
     {
         tidesdb_t *tdb;
         tidesdb_column_family_t *cf;
-        void *memtable_cursor;
+        skip_list_cursor_t *memtable_cursor;
         int sstable_index;
         block_manager_cursor_t *sstable_cursor;
     } tidesdb_cursor_t;
@@ -1123,6 +1123,15 @@ extern "C"
      * @param min_max the sst min max key
      */
     void _tidesdb_free_sst_min_max(tidesdb_sst_min_max_t *min_max);
+
+    /*
+     * _tidesdb_print_keys_tree
+     * print the keys tree for a column family
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @return 0 if the keys tree was printed, -1 if not
+     */
+    int _tidesdb_print_keys_tree(tidesdb_t *tdb, const char *column_family_name);
 
 #ifdef __cplusplus
 }

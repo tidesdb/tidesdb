@@ -407,7 +407,7 @@ uint8_t *retrieved_value = NULL;
 size_t value_size;
 
 /* iterate forward */
-while ((e = tidesdb_cursor_next(c)) == NULL)
+do
 {
     e = tidesdb_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
     if (e != NULL)
@@ -423,7 +423,7 @@ while ((e = tidesdb_cursor_next(c)) == NULL)
     /* free the key and value */
     free(retrieved_key);
     free(retrieved_value);
-}
+} while ((e = tidesdb_cursor_next(c)) == NULL);
 
 if (e != NULL && e->code != TIDESDB_ERR_AT_END_OF_CURSOR)
 {
@@ -432,7 +432,7 @@ if (e != NULL && e->code != TIDESDB_ERR_AT_END_OF_CURSOR)
 }
 
 /* iterate backward */
-while ((e = tidesdb_cursor_prev(c)) == NULL)
+do
 {
     e = tidesdb_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
     if (e != NULL)
@@ -448,7 +448,7 @@ while ((e = tidesdb_cursor_prev(c)) == NULL)
     /* free the key and value */
     free(retrieved_key);
     free(retrieved_value);
-}
+} while ((e = tidesdb_cursor_prev(c)) == NULL);
 
 if (e != NULL && e->code != TIDESDB_ERR_AT_START_OF_CURSOR)
 {

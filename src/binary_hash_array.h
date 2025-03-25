@@ -24,11 +24,13 @@
 
 #include "xxhash.h" /* use install location based on cmake */
 
-/* sorted* binary hash array
+/* sorted binary hash array (SBHA)
  * on serialization, the entries are sorted by hashed key.
  *
- * Entries are fixed at 16 bytes for the key and 8 bytes for the value for a total of 24 bytes per
+ * entries are fixed at 16 bytes for the key and 8 bytes for the value for a total of 24 bytes per
  * entry
+ *
+ * on search we utilize binary search on sorted hashes to find the key
  */
 
 /**
@@ -81,8 +83,9 @@ binary_hash_array_t *binary_hash_array_new(size_t size);
  * @param key the key of the entry
  * @param key_len the length of the key
  * @param value the value of the entry
+ * @return 0 if successful, -1 if not
  */
-void binary_hash_array_add(binary_hash_array_t *bha, uint8_t *key, size_t key_len, int64_t value);
+int binary_hash_array_add(binary_hash_array_t *bha, uint8_t *key, size_t key_len, int64_t value);
 
 /**
  * binary_hash_array_contains
@@ -123,7 +126,6 @@ uint8_t *binary_hash_array_serialize(binary_hash_array_t *bha, size_t *out_size)
  * binary_hash_array_deserialize
  * deserializes a binary hash array
  * @param data the data to deserialize
- * @param size the size of the data
  * @return the deserialized binary hash array
  */
 binary_hash_array_t *binary_hash_array_deserialize(const uint8_t *data);
@@ -133,7 +135,8 @@ binary_hash_array_t *binary_hash_array_deserialize(const uint8_t *data);
  * resizes the binary hash array
  * @param bha the binary hash array to resize
  * @param new_capacity the new capacity of the array
+ * @return 0 if successful, -1 if not
  */
-void binary_hash_array_resize(binary_hash_array_t *bha, size_t new_capacity);
+int binary_hash_array_resize(binary_hash_array_t *bha, size_t new_capacity);
 
 #endif /* __BINARY_HASH_ARRAY_H__ */

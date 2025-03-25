@@ -530,6 +530,163 @@ void test_block_manager_cursor_has_prev()
     printf(GREEN "test_block_manager_cursor_has_prev passed\n" RESET);
 }
 
+void test_block_manager_cursor_position_checks()
+{
+    block_manager_t *bm;
+    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+
+    /* we write 3 blocks */
+    for (int i = 0; i < 3; i++)
+    {
+        uint64_t size = 10;
+        char data[10];
+        snprintf(data, 10, "testdata%d", i);
+
+        block_manager_block_t *block = block_manager_block_create(size, data);
+        assert(block != NULL);
+
+        assert(block_manager_block_write(bm, block) != -1);
+        (void)block_manager_block_free(block);
+    }
+
+    block_manager_cursor_t *cursor;
+    if (block_manager_cursor_init(&cursor, bm) != 0)
+    {
+        (void)block_manager_close(bm);
+        return;
+    }
+
+    /* test at_first */
+    assert(block_manager_cursor_goto_first(cursor) == 0);
+    assert(block_manager_cursor_at_first(cursor) == 1);
+    assert(block_manager_cursor_at_second(cursor) == 0);
+    assert(block_manager_cursor_at_last(cursor) == 0);
+
+    /* test at_second */
+    assert(block_manager_cursor_next(cursor) == 0);
+    assert(block_manager_cursor_at_first(cursor) == 0);
+    assert(block_manager_cursor_at_second(cursor) == 1);
+    assert(block_manager_cursor_at_last(cursor) == 0);
+
+    /* test at_last */
+    assert(block_manager_cursor_next(cursor) == 0);
+    assert(block_manager_cursor_at_first(cursor) == 0);
+    assert(block_manager_cursor_at_second(cursor) == 0);
+    assert(block_manager_cursor_at_last(cursor) == 1);
+
+    (void)block_manager_cursor_free(cursor);
+    assert(block_manager_close(bm) == 0);
+    (void)remove("test.db");
+
+    printf(GREEN "test_block_manager_cursor_position_checks passed\n" RESET);
+}
+
+void test_block_manager_get_size()
+{
+    block_manager_t *bm;
+    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+
+    uint64_t initial_size;
+    assert(block_manager_get_size(bm, &initial_size) == 0);
+    assert(initial_size == 0); /* file should be empty initially */
+
+    /* we write some data and check size increases */
+    for (int i = 0; i < 3; i++)
+    {
+        uint64_t size = 10;
+        char data[10];
+        snprintf(data, 10, "testdata%d", i);
+
+        block_manager_block_t *block = block_manager_block_create(size, data);
+        assert(block != NULL);
+
+        assert(block_manager_block_write(bm, block) != -1);
+        (void)block_manager_block_free(block);
+    }
+
+    uint64_t after_write_size;
+    assert(block_manager_get_size(bm, &after_write_size) == 0);
+    assert(after_write_size > 0);
+
+    assert(after_write_size == 36);
+
+    /* we trunc and verify size is 0 again */
+    assert(block_manager_truncate(bm) == 0);
+
+    uint64_t after_truncate_size;
+    assert(block_manager_get_size(bm, &after_truncate_size) == 0);
+    assert(after_truncate_size == 0);
+
+    assert(block_manager_close(bm) == 0);
+    (void)remove("test.db");
+
+    printf(GREEN "test_block_manager_get_size passed\n" RESET);
+}
+
+void test_block_manager_seek_and_goto()
+{
+    block_manager_t *bm;
+    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+
+    /* we write 3 blocks */
+    long block_offsets[3];
+    for (int i = 0; i < 3; i++)
+    {
+        uint64_t size = 10;
+        char data[10];
+        snprintf(data, 10, "testdata%d", i);
+
+        block_manager_block_t *block = block_manager_block_create(size, data);
+        assert(block != NULL);
+
+        /* we save the offset for each block */
+        block_offsets[i] = block_manager_block_write(bm, block);
+        assert(block_offsets[i] >= 0);
+        (void)block_manager_block_free(block);
+    }
+
+    /* we test block_manager_seek **/
+    assert(block_manager_seek(bm, block_offsets[1]) == 0);
+
+    /* we read the block and verify */
+    block_manager_block_t *read_block = block_manager_block_read(bm);
+    assert(read_block != NULL);
+    assert(memcmp(read_block->data, "testdata1", 10) == 0);
+    (void)block_manager_block_free(read_block);
+
+    /* we test block_manager_cursor_goto */
+    block_manager_cursor_t *cursor;
+    if (block_manager_cursor_init(&cursor, bm) != 0)
+    {
+        (void)block_manager_close(bm);
+        return;
+    }
+
+    /* go to third block using its offset */
+    assert(block_manager_cursor_goto(cursor, block_offsets[2]) == 0);
+
+    /* we read the block and verify */
+    read_block = block_manager_cursor_read(cursor);
+    assert(read_block != NULL);
+    assert(memcmp(read_block->data, "testdata2", 10) == 0);
+    (void)block_manager_block_free(read_block);
+
+    /* now go to first block */
+    assert(block_manager_cursor_goto(cursor, block_offsets[0]) == 0);
+
+    /* we read the block and verify */
+    read_block = block_manager_cursor_read(cursor);
+    assert(read_block != NULL);
+    assert(memcmp(read_block->data, "testdata0", 10) == 0);
+    (void)block_manager_block_free(read_block);
+
+    (void)block_manager_cursor_free(cursor);
+    assert(block_manager_close(bm) == 0);
+    (void)remove("test.db");
+
+    printf(GREEN "test_block_manager_seek_and_goto passed\n" RESET);
+}
+
 int main(void)
 {
     test_block_manager_open();
@@ -543,6 +700,8 @@ int main(void)
     test_block_manager_cursor_goto_last();
     test_block_manager_cursor_has_next();
     test_block_manager_cursor_has_prev();
-
+    test_block_manager_cursor_position_checks();
+    test_block_manager_get_size();
+    test_block_manager_seek_and_goto();
     return 0;
 }

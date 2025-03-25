@@ -26,7 +26,7 @@
 #include <time.h>
 
 #define TOMBSTONE \
-    0xDEADBEEF /* On expiration of a node if time to live is set we set the key's value to this */
+    0xDEADBEEF /* on expiration of a node if time to live is set we set the key's value to this */
 
 typedef struct skip_list_node_t skip_list_node_t; /* forward declaration */
 
@@ -80,7 +80,7 @@ typedef struct
     skip_list_node_t *current;
 } skip_list_cursor_t;
 
-/* Skip list function prototypes */
+/*** skip list function prototypes */
 
 /*
  * skip_list_create_node
@@ -232,6 +232,7 @@ skip_list_t *skip_list_copy(skip_list_t *list);
 /*
  * skip_list_check_and_update_ttl
  * checks if a node has expired and updates the value to TOMBSTONE
+ * @param list the skip list
  * @param node the node to check
  * @return 0 if the node has not expired, 1 if the node has expired
  */

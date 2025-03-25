@@ -17,20 +17,20 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Concurrent** multiple threads can read and write to the storage engine. Column families use a read-write lock thus allowing multiple readers and a single writer per column family.  Transactions on commit and rollback block other threads from reading or writing to the column family until the transaction is completed.  A transaction in itself is also is thread safe.
 - [x] **Column Families** store data in separate key-value stores.  Each column family has their own memtable and sstables.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically.  When a transaction fails, it rolls back all commited operations.
-- [x] **Bidirectional Cursor** iterate over key-value pairs forward and backward.
+- [x] **Bidirectional Cursor** iterate over key-value pairs forward and backward with background compaction awareness.
 - [x] **WAL** write-ahead logging for durability. Column families replay WAL on startup.  This reconstructs memtable if the column family did not reach threshold prior to shutdown.
-- [x] **Multithreaded Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
+- [x] **Parallel Paired Merge Compaction** manual multi-threaded paired and merged compaction of sstables.  When run for example 10 sstables compacts into 5 as their paired and merged.  Each thread is responsible for one pair - you can set the number of threads to use for compaction.
 - [x] **Background Incremental Paired Merge Compaction** background incremental merge compaction can be started.  If started the system will incrementally merge sstables in the background from oldest to newest once column family sstables have reached a specific provided limit.  Merges are done every n seconds. Merges are not done in parallel but incrementally.
 - [x] **Bloom Filters** reduce disk reads by reading initial blocks of sstables to check key existence.
-- [x] **Compression** compression is achieved with Snappy, or LZ4, or ZSTD.  SStable entries can be compressed as well as WAL entries.
-- [x] **TTL** time-to-live for key-value pairs.
+- [x] **Compression** compression is achieved with Snappy, LZ4, or ZSTD.  If enabled at column family level sstable entries as well as WAL entries are compressed with configured algorithm.
+- [x] **TTL** time-to-live for key-value pairs.  Key-value pairs expire in real time with effective skip list traversal expiration checks.
 - [x] **Configurable** column families are configurable with memtable flush threshold, skip list max level, skip list probability, compression, and bloom filters.
 - [x] **Error Handling** API functions return an error code and message.
 - [x] **Easy API** simple and easy to use api.
 - [x] **Skip List** skip list is used for memtable data structure.
 - [x] **Multiplatform** Linux, MacOS, and Windows support.
-- [x] **Logging** system logs debug messages to log file.  This can be disabled.  Log file is created in the database directory.
-- [x] **Block Indices** by default `TDB_BLOCK_INDICES` is set to 1.  This means TidesDB for each column family sstable there is a last block containing a sorted binary hash array.  This compact data structure gives us the ability to retrieve the specific offset for a key and seek to its containing key value pair block within an sstable without having to scan an entire sstable.  If `TDB_BLOCK_INDICES` is set to 0 then block indices aren't used nor created and reads are slower and consume more IO and CPU having to scan and compare.
+- [x] **Logging** system logs debug messages to log file.  This can be disabled.  Log file is created in the database directory.  Logging automatically rotates/truncates at `100000` entries by default, configured with `TDB_DEBUG_LOG_TRUNCATE_AT`.
+- [x] **Block Indices** by default `TDB_BLOCK_INDICES` is set to 1.  This means TidesDB for each column family sstable there is a last block containing a sorted binary hash array(SBHA).  This compact data structure gives us the ability to retrieve the specific offset for a key and seek to its containing key value pair block within an sstable without having to scan an entire sstable.  If `TDB_BLOCK_INDICES` is set to 0 then block indices aren't used nor created and reads are slower and consume more IO and CPU having to scan and compare.
 - [x] **Statistics** column family statistics, configs, information can be retrieved through public API.
 - [x] **Range queries** are supported.  You can retrieve a range of key-value pairs.  Each sstable initial block contains a min-max key range.  This allows for fast(er) range queries.
 - [x] **Filter queries** are supported.  You can filter key-value pairs based on a filter function.

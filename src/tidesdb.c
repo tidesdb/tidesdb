@@ -616,7 +616,7 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
     if (strlen(directory) > MAX_FILE_PATH_LENGTH)
     {
         free(*tdb);
-        return tidesdb_err_from_code(TIDESDB_ERR_PATH_TOO_LONG, "db path");
+        return tidesdb_err_from_code(TIDESDB_ERR_PATH_TOO_LONG, "directory");
     }
 
     /* we set the db path */
@@ -1163,9 +1163,9 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
             {
                 (void)_tidesdb_free_sstable(sst);
                 (void)closedir(cf_dir);
-                (void)log_write(
-                    cf->tdb->log,
-                    tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "tidesdb_sstable_t")->message);
+                (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC,
+                                                                    "temp tidesdb_sstable_t")
+                                                  ->message);
                 return -1;
             }
 
@@ -1242,6 +1242,9 @@ int _tidesdb_add_column_family(tidesdb_t *tdb, tidesdb_column_family_t *cf)
         if (temp_families == NULL)
         {
             (void)pthread_rwlock_unlock(&tdb->rwlock);
+            (void)log_write(tdb->log, tidesdb_err_from_code(TIDESDB_ERR_REALLOC_FAILED,
+                                                            "temp tidesdb_column_family_t")
+                                          ->message);
             return -1;
         }
 
@@ -1572,7 +1575,11 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
     (void)skip_list_free(tdb->column_families[index]->memtable);
 
     /* remove all files in the column family directory */
-    (void)_tidesdb_remove_directory(tdb->column_families[index]->path);
+    if (_tidesdb_remove_directory(tdb->column_families[index]->path) == -1)
+    {
+        (void)pthread_rwlock_unlock(&tdb->rwlock);
+        return tidesdb_err_from_code(TIDESDB_ERR_RM_FAILED, tdb->column_families[index]->path);
+    }
 
     free(tdb->column_families[index]->sstables);
     free(tdb->column_families[index]->path);
@@ -1591,7 +1598,7 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
         if (temp_families == NULL)
         {
             (void)pthread_rwlock_unlock(&tdb->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "column families");
+            return tidesdb_err_from_code(TIDESDB_ERR_REALLOC_FAILED, "column families");
         }
 
         tdb->column_families = temp_families;
@@ -2131,7 +2138,8 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
                 (void)block_manager_cursor_free(cursor);
                 (void)block_manager_block_free(block);
                 (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_DESERIALIZE_BLOOM_FILTER);
+                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_DESERIALIZE, "bloom filter",
+                                             cf->config.name);
             }
 
             /* we check if the key exists in the bloom filter */
@@ -2348,7 +2356,7 @@ tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
                 (void)skip_list_cursor_free(sl_cursor);
                 (void)pthread_rwlock_unlock(&cf->rwlock);
                 free(*result);
-                return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
+                continue;
             }
 
             /* check if key is in range and not already in result */
@@ -2368,7 +2376,7 @@ tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
                         (void)skip_list_cursor_free(sl_cursor);
                         (void)pthread_rwlock_unlock(&cf->rwlock);
                         free(*result);
-                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                        return tidesdb_err_from_code(TIDESDB_ERR_REALLOC_FAILED, "result");
                     }
                     *result = new_result;
                 }
@@ -2552,7 +2560,7 @@ tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
                             free((*result)[i]);
                         }
                         free(*result);
-                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                        return tidesdb_err_from_code(TIDESDB_ERR_REALLOC_FAILED, "result");
                     }
                     *result = new_result;
                 }
@@ -2646,7 +2654,7 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
                 (void)skip_list_cursor_free(sl_cursor);
                 (void)pthread_rwlock_unlock(&cf->rwlock);
                 free(*result);
-                return tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR);
+                continue;
             }
 
             tidesdb_key_value_pair_t kv = {retrieved_key, key_size, retrieved_value, value_size,
@@ -2664,7 +2672,7 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
                         (void)skip_list_cursor_free(sl_cursor);
                         (void)pthread_rwlock_unlock(&cf->rwlock);
                         free(*result);
-                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                        return tidesdb_err_from_code(TIDESDB_ERR_REALLOC_FAILED, "result");
                     }
                     *result = new_result;
                 }
@@ -2767,7 +2775,7 @@ tidesdb_err_t *tidesdb_filter(tidesdb_t *tdb, const char *column_family_name,
                         (void)block_manager_cursor_free(cursor);
                         (void)pthread_rwlock_unlock(&cf->rwlock);
                         free(*result);
-                        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "result");
+                        return tidesdb_err_from_code(TIDESDB_ERR_REALLOC_FAILED, "result");
                     }
                     *result = new_result;
                 }
@@ -2953,8 +2961,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             (void)remove(sstable_path);
             (void)log_write(
                 cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_BLOOM_FILTER, cf->config.name)
-                    ->message);
+                tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "bloom filter")->message);
             return -1;
         }
     }
@@ -3027,10 +3034,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         free(max_key);
         (void)remove(sstable_path);
         (void)skip_list_cursor_free(cursor);
-        (void)log_write(
-            cf->tdb->log,
-            tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_BLOCK_ON_FLUSH, cf->config.name)
-                ->message);
+        (void)log_write(cf->tdb->log,
+                        tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "min max block")->message);
         return -1;
     }
 
@@ -3045,10 +3050,9 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         free(min_max_serialized);
         (void)remove(sstable_path);
         (void)skip_list_cursor_free(cursor);
-        (void)log_write(
-            cf->tdb->log,
-            tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK_ON_FLUSH, cf->config.name)
-                ->message);
+        (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
+                                                            "min max", cf->config.name)
+                                          ->message);
         return -1;
     }
 
@@ -3068,9 +3072,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(sst);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
-            (void)log_write(cf->tdb->log, tidesdb_err_from_code(
-                                              TIDESDB_ERR_FAILED_TO_CREATE_SORTED_BINARY_HASH_ARR,
-                                              cf->config.name)
+            (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC,
+                                                                "sorted binary hash array")
                                               ->message);
             return -1;
         }
@@ -3095,10 +3098,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
                 free(sst);
                 (void)remove(sstable_path);
                 (void)skip_list_cursor_free(cursor);
-                (void)log_write(cf->tdb->log, tidesdb_err_from_code(
-                                                  TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR)
-                                                  ->message);
-                return -1;
+                continue;
             }
 
             /* add to bloom filter */
@@ -3116,10 +3116,9 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             free(sst);
             (void)remove(sstable_path);
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOOM_FILTER, cf->config.name)
-                    ->message);
+            (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_SERIALIZE,
+                                                                "bloom filter", cf->config.name)
+                                              ->message);
             return -1;
         }
 
@@ -3133,10 +3132,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(sst);
             free(serialized_bf);
             (void)remove(sstable_path);
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_BLOCK_ON_FLUSH)->message,
-                cf->config.name);
+            (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC)->message,
+                            "bloom filter block");
             return -1;
         }
 
@@ -3148,10 +3145,9 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             (void)block_manager_block_free(bf_block);
             free(sst);
             (void)remove(sstable_path);
-            (void)log_write(cf->tdb->log,
-                            tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOOM_BLOCK_ON_FLUSH,
-                                                  cf->config.name)
-                                ->message);
+            (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
+                                                                "bloom filter", cf->config.name)
+                                              ->message);
             return -1;
         }
 
@@ -3203,10 +3199,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(sst);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_COULD_NOT_GET_KEY_VALUE_FROM_CURSOR)->message);
-            return -1;
+            continue;
         }
 
         /* we copy the key */
@@ -3256,10 +3249,11 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(sst);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_SERIALIZE_KEY_VALUE_PAIR)->message,
-                cf->config.name);
+            (void)log_write(cf->tdb->log,
+                            tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_SERIALIZE, "key-value pair",
+                                                  cf->config.name)
+                                ->message,
+                            cf->config.name);
             return -1;
         }
 
@@ -3272,10 +3266,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             (void)remove(sstable_path);
             (void)_tidesdb_free_key_value_pair(kv);
             (void)skip_list_cursor_free(cursor);
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_BLOCK_ON_FLUSH)->message,
-                cf->config.name);
+            (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC)->message,
+                            cf->config.name);
             return -1;
         }
 
@@ -3290,10 +3282,11 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             (void)remove(sstable_path);
             (void)_tidesdb_free_key_value_pair(kv);
             (void)skip_list_cursor_free(cursor);
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK_ON_FLUSH)->message,
-                cf->config.name);
+            (void)log_write(cf->tdb->log,
+                            tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK, "key-value",
+                                                  cf->config.name)
+                                ->message,
+                            cf->config.name);
             return -1;
         }
 
@@ -3325,10 +3318,11 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             (void)binary_hash_array_free(bha);
             free(sst);
             (void)remove(sstable_path);
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_SERIALIZE_BLOCK_INDICES)->message,
-                cf->config.name);
+            (void)log_write(cf->tdb->log,
+                            tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_SERIALIZE,
+                                                  "sorted binary hash array", cf->config.name)
+                                ->message,
+                            cf->config.name);
             return -1;
         }
 
@@ -3342,7 +3336,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             (void)remove(sstable_path);
             (void)log_write(
                 cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CREATE_BLOCK_FOR_INDICES)->message,
+                tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "sorted binary hash array block")
+                    ->message,
                 cf->config.name);
             return -1;
         }
@@ -3355,10 +3350,11 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(sst);
             free(serialized_bha);
             (void)remove(sstable_path);
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK_FOR_INDICES)->message,
-                cf->config.name);
+            (void)log_write(cf->tdb->log,
+                            tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
+                                                  "sorted binary hash array", cf->config.name)
+                                ->message,
+                            cf->config.name);
             return -1;
         }
 
@@ -3388,8 +3384,9 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             free(sst);
             (void)remove(sstable_path);
-            (void)log_write(cf->tdb->log,
-                            tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "sstables")->message);
+            (void)log_write(
+                cf->tdb->log,
+                tidesdb_err_from_code(TIDESDB_ERR_REALLOC_FAILED, "flush temp sstables")->message);
             return -1;
         }
 
@@ -5545,6 +5542,9 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
     /* write the min-max block to the output block manager */
     if (block_manager_block_write(bm_out, min_max_block) == -1)
     {
+        (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
+                                                            "min-max", cf->config.name)
+                                          ->message);
         (void)block_manager_block_free(min_max_block);
         free(min_max_serialized);
         if (TDB_BLOCK_INDICES)
@@ -5694,6 +5694,9 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         /* we write the block to the merged sstable */
         if (block_manager_block_write(bm_out, bf_block) == -1)
         {
+            (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
+                                                                "bloom filter", cf->config.name)
+                                              ->message);
             (void)block_manager_block_free(bf_block);
             (void)bloom_filter_free(bf);
             free(bf_serialized);
@@ -5754,6 +5757,24 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                     (void)_tidesdb_free_key_value_pair(kv2);
                     break;
                 }
+
+                /* free resources as write failed */
+                if (TDB_BLOCK_INDICES)
+                {
+                    (void)binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
+                }
+
+                /* free the key value pair */
+                (void)_tidesdb_free_key_value_pair(kv2);
+
+                /* free the block */
+                (void)block_manager_block_free(block2);
+
+                /* read the next block */
+                block2 = block_manager_cursor_read(cursor2);
+
+                /* continue to next iteration */
+                continue;
             }
             else
             {
@@ -5954,10 +5975,31 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 (void)_tidesdb_free_key_value_pair(kv2);
                 break;
             }
+            /* we failed to write the block */
+            /* free resources */
+            (void)_tidesdb_free_key_value_pair(kv2);
+
+            /* free the block */
+            (void)block_manager_block_free(block2);
+
+            /* free the input bm cursors */
+            (void)block_manager_cursor_free(cursor1);
+
+            /* free the input bm cursors */
+            (void)block_manager_cursor_free(cursor2);
+
+            /* free the binary hash array */
             if (TDB_BLOCK_INDICES)
             {
-                (void)binary_hash_array_add(bha, kv2->key, kv2->key_size, offset);
+                (void)binary_hash_array_free(bha);
             }
+
+            /* return error */
+            (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
+                                                                "merged block", cf->config.name)
+                                              ->message);
+
+            return -1;
         }
         else
         {
@@ -5978,9 +6020,10 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         uint8_t *bha_data = binary_hash_array_serialize(bha, &bha_size);
         if (bha_data == NULL)
         {
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_MERGE_SORT_BHA_SERIALIZE_FAILED)->message);
+            (void)log_write(cf->tdb->log,
+                            tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_SERIALIZE,
+                                                  "sorted binary hash array", cf->config.name)
+                                ->message);
             (void)binary_hash_array_free(bha);
             return -1;
         }
@@ -5988,9 +6031,10 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         block_manager_block_t *bha_block = block_manager_block_create(bha_size, bha_data);
         if (bha_block == NULL)
         {
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_MERGE_SORT_BLOCK_CREATE_FAILED)->message);
+            (void)log_write(cf->tdb->log,
+                            tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC,
+                                                  "sorted binary hash array block", cf->config.name)
+                                ->message);
             free(bha_data);
             (void)binary_hash_array_free(bha);
             return -1;
@@ -6000,10 +6044,10 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
 
         if (block_manager_block_write(bm_out, bha_block) == -1)
         {
-            (void)log_write(
-                cf->tdb->log,
-                tidesdb_err_from_code(TIDESDB_ERR_MERGE_SORT_BLOCK_WRITE_FAILED, bm_out->file_path)
-                    ->message);
+            (void)log_write(cf->tdb->log,
+                            tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
+                                                  "sorted binary hash array", cf->config.name)
+                                ->message);
             (void)block_manager_block_free(bha_block);
             (void)binary_hash_array_free(bha);
             return -1;
@@ -6201,7 +6245,8 @@ tidesdb_err_t *tidesdb_get_column_family_stat(tidesdb_t *tdb, const char *column
             }
             free((*stat)->sstable_stats);
             free(*stat);
-            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SSTABLE_SIZE);
+            return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_GET_SSTABLE_SIZE,
+                                         sstat->sstable_path, cf->config.name);
         }
 
         /* we set the sstable stat */

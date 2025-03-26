@@ -2841,7 +2841,7 @@ int _tidesdb_append_to_wal(tidesdb_wal_t *wal, const uint8_t *key, size_t key_si
                            const uint8_t *value, size_t value_size, time_t ttl,
                            TIDESDB_OP_CODE op_code, const char *cf)
 {
-    /* we append to column families write ahead log */
+    /* we append operation to column families write ahead log */
 
     /* we create an operation struct */
     tidesdb_operation_t *op = malloc(sizeof(tidesdb_operation_t));
@@ -2893,6 +2893,7 @@ int _tidesdb_append_to_wal(tidesdb_wal_t *wal, const uint8_t *key, size_t key_si
         return -1;
     }
 
+    /* we create a new block with the serialize operation */
     block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_op);
     if (block == NULL)
     {
@@ -2947,14 +2948,17 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     }
 
     /* depending on column family configuration, the second block in the sstable could be a bloom
-     * filter */
+     * filter so we initiate one */
     bloom_filter_t *bf = NULL;
 
     /* we allocate a new bloom filter if the column family configuration has bloom filter enabled */
     if (cf->config.bloom_filter)
     {
-        int bloom_filter_size = skip_list_count_entries(cf->memtable);
+        int bloom_filter_size = skip_list_count_entries(
+            cf->memtable); /* we determine the size of
+                            * the bloom filter by counting entries in the memory table */
 
+        /* we create a new bloom filter with the size and default p value */
         if (bloom_filter_new(&bf, TDB_BLOOM_FILTER_P, bloom_filter_size) == -1)
         {
             free(sst);
@@ -2973,7 +2977,6 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
      * with serialized key value pairs. Prior to creating serialized key value blocks
      * we create a tidesdb_sst_min_max structure which is the 1st block (block 0 in the sstable
      * file) */
-
     skip_list_cursor_t *cursor = skip_list_cursor_init(cf->memtable);
     if (cursor == NULL)
     {
@@ -3079,8 +3082,9 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         }
     }
 
-    /* if a bloom is enabled we have to run an iteration to populate the bloom filter and serialize
-     * prior to key value pairs */
+    /* if a bloom filter is enabled for column family
+     * we have to run a forward iteration to populate the bloom filter and serialize
+     * prior to key value pair blocks */
     if (cf->config.bloom_filter)
     {
         do
@@ -3122,7 +3126,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             return -1;
         }
 
-        bloom_filter_free(bf);
+        /* we free the bloom filter we no longer need it */
+        (void)bloom_filter_free(bf);
 
         /* we write the bloom filter to the sstable */
         block_manager_block_t *bf_block =
@@ -3154,8 +3159,9 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         /* we free the resources */
         (void)block_manager_block_free(bf_block);
 
-        /* we reinitialize the cursor to populate the sstable with keyvalue pairs after bloom filter
-         */
+        /* we reinitialize the cursor to populate the sstable with key value pairs after bloom
+         * filter in this process we also populate the sorted binary hash array if block indices are
+         * enabled */
         cursor = skip_list_cursor_init(cf->memtable);
         if (cursor == NULL)
         {
@@ -3304,7 +3310,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
     } while (skip_list_cursor_next(cursor) != -1);
 
-    /* we free the cursor */
+    /* we free the skip list cursor, we are done with it */
     (void)skip_list_cursor_free(cursor);
 
     /* if block indices enabled we write to end of sstable */

@@ -19,7 +19,7 @@
 #include "../src/tidesdb.h"
 #include "../test/test_macros.h"
 
-#define NUM_OPERATIONS 10000000
+#define NUM_OPERATIONS 100000
 #define KEY_SIZE       64
 #define VALUE_SIZE     156
 #define CF_NAME        "benchmark_cf"

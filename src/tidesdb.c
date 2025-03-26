@@ -1581,7 +1581,6 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
         return tidesdb_err_from_code(TIDESDB_ERR_RM_FAILED, tdb->column_families[index]->path);
     }
 
-    free(tdb->column_families[index]->sstables);
     free(tdb->column_families[index]->path);
 
     free(tdb->column_families[index]);
@@ -2115,8 +2114,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
         if (block_manager_cursor_next(cursor) == -1)
         {
             (void)block_manager_cursor_free(cursor);
-            (void)pthread_rwlock_unlock(&cf->rwlock);
-            return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+            continue;
         }
 
         /* if the column family has bloom filters enabled then, well we read
@@ -2127,8 +2125,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             if (block == NULL)
             {
                 (void)block_manager_cursor_free(cursor);
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+                continue;
             }
 
             /* we deserialize the bloom filter */
@@ -2137,9 +2134,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             {
                 (void)block_manager_cursor_free(cursor);
                 (void)block_manager_block_free(block);
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_DESERIALIZE, "bloom filter",
-                                             cf->config.name);
+                continue;
             }
 
             /* we check if the key exists in the bloom filter */
@@ -2159,8 +2154,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             if (block_manager_cursor_next(cursor) == -1)
             {
                 (void)block_manager_cursor_free(cursor);
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+                continue;
             }
         }
         block_manager_block_t *block;
@@ -2172,8 +2166,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             if (block_manager_cursor_goto_last(cursor) == -1)
             {
                 (void)block_manager_cursor_free(cursor);
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+                continue;
             }
 
             /* we deserialize the block into a binary hash array */
@@ -2181,8 +2174,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             if (block == NULL)
             {
                 (void)block_manager_cursor_free(cursor);
-                (void)pthread_rwlock_unlock(&cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+                continue;
             }
 
             /* we deserialize the binary hash array */
@@ -2208,10 +2200,13 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             }
             /* we free the binary hash array */
             (void)binary_hash_array_free(bha);
+
             (void)block_manager_block_free(block);
         }
 
-        while ((block = block_manager_cursor_read(cursor)) != NULL)
+        block = block_manager_cursor_read(cursor);
+
+        do
         {
             if (block == NULL) break;
             /* we deserialize the kv */
@@ -2274,7 +2269,7 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             (void)_tidesdb_free_key_value_pair(kv);
 
             if (block_manager_cursor_next(cursor) != 0) break;
-        };
+        } while ((block = block_manager_cursor_read(cursor)) != NULL);
 
         (void)block_manager_cursor_free(cursor);
     }
@@ -2284,7 +2279,6 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
     {
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_RELEASE_LOCK, "column family");
     }
-
     return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
 }
 
@@ -6634,7 +6628,7 @@ tidesdb_err_t *tidesdb_delete_by_filter(tidesdb_t *tdb, const char *column_famil
         return err;
     }
 
-    /*delete each matching key-value pair */
+    /* delete each matching key-value pair */
     for (size_t i = 0; i < result_size; i++)
     {
         err = tidesdb_txn_delete(txn, result[i]->key, result[i]->key_size);
@@ -6739,7 +6733,7 @@ int _tidesdb_print_keys_tree(tidesdb_t *tdb, const char *column_family_name)
 
             if (_tidesdb_is_tombstone(value, value_size) || _tidesdb_is_expired(ttl)) continue;
 
-            /* Print the key with indentation */
+            /* print the key with indentation */
             printf("%*s%.*s\n", indent, "├── ", (int)key_size, key);
             count++;
 
@@ -6768,7 +6762,7 @@ int _tidesdb_print_keys_tree(tidesdb_t *tdb, const char *column_family_name)
             continue;
         }
 
-        /* Skip min-max block */
+        /* we skip min-max block */
         if (block_manager_cursor_next(cursor) == -1)
         {
             (void)block_manager_cursor_free(cursor);
@@ -6776,7 +6770,7 @@ int _tidesdb_print_keys_tree(tidesdb_t *tdb, const char *column_family_name)
             continue;
         }
 
-        /* Skip bloom filter block if configured */
+        /* we skip bloom filter block if configured */
         if (cf->config.bloom_filter)
         {
             if (block_manager_cursor_next(cursor) == -1)

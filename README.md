@@ -37,8 +37,16 @@ It is not a full-featured database, but rather a library that can be used to bui
 
 ## Building
 Using cmake to build the shared library.
+### Unix
 ```bash
-cmake -S . -B build
+rm -rf build && cmake -S . -B build
+cmake --build build
+cmake --install build
+```
+
+### Windows
+```bash
+rmdir /s /q build && cmake -S . -B build
 cmake --build build
 cmake --install build
 ```

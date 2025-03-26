@@ -3453,6 +3453,8 @@ void test_tidesdb_delete_by_filter(bool compress, tidesdb_compression_algo_t alg
 
 int main(void)
 {
+    (void)_tidesdb_remove_directory("test_db"); /* remove previous test database, if any */
+
     test_tidesdb_serialize_deserialize_key_value_pair(false, TDB_NO_COMPRESSION);
 
     test_tidesdb_serialize_deserialize_column_family_config();

@@ -18,17 +18,15 @@
  */
 #include "skip_list.h"
 
-/* the skip list should be optimized for backwards iteration** currently the way we do it.. not so
- * optimal */
-
 skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t key_size,
                                         const uint8_t *value, size_t value_size, time_t ttl)
 {
     /* validate level to prevent overflow */
     if (level <= 0) return NULL;
 
-    /* allocate memory for the node, including space for forward pointers */
-    skip_list_node_t *node = malloc(sizeof(skip_list_node_t) + level * sizeof(skip_list_node_t *));
+    /* allocate memory for the node, including space for forward and backward pointers */
+    skip_list_node_t *node =
+        malloc(sizeof(skip_list_node_t) + 2 * level * sizeof(skip_list_node_t *));
     if (node == NULL) return NULL;
 
     /* allocate memory for the key */
@@ -57,8 +55,8 @@ skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t ke
     /* set the TTL */
     node->ttl = ttl;
 
-    /* init forward pointers to NULL */
-    for (int i = 0; i < level; i++)
+    /* init forward and backward pointers to NULL */
+    for (int i = 0; i < level * 2; i++)
     {
         node->forward[i] = NULL;
     }
@@ -102,7 +100,7 @@ skip_list_t *skip_list_new(int max_level, float probability)
 
     uint8_t header_key[1] = {0};
     uint8_t header_value[1] = {0};
-    list->header = skip_list_create_node(max_level, header_key, 1, header_value, 1, -1);
+    list->header = skip_list_create_node(max_level * 2, header_key, 1, header_value, 1, -1);
 
     if (list->header == NULL)
     {
@@ -110,8 +108,8 @@ skip_list_t *skip_list_new(int max_level, float probability)
         return NULL;
     }
 
-    /* we don't calculate the size of the header node because its key and values aren't actually
-     * counted */
+    /* we initialize tail to be the same as header for an empty list */
+    list->tail = list->header;
 
     return list;
 }
@@ -160,6 +158,7 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
 
     if (x && skip_list_compare_keys(x->key, x->key_size, key, key_size) == 0)
     {
+        /* we update existing node */
         list->total_size -= x->value_size; /* sub old value size */
         free(x->value);
 
@@ -185,16 +184,34 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
             list->level = level;
         }
 
-        x = skip_list_create_node(level, key, key_size, value, value_size, ttl);
+        x = skip_list_create_node(list->max_level * 2, key, key_size, value, value_size, ttl);
         if (x == NULL)
         {
             free(update);
             return -1;
         }
+
+        /* we update forward pointers */
         for (int i = 0; i < level; i++)
         {
             x->forward[i] = update[i]->forward[i];
             update[i]->forward[i] = x;
+        }
+
+        /* we update backward pointers */
+        for (int i = 0; i < level; i++)
+        {
+            if (x->forward[i] != NULL)
+            {
+                BACKWARD_PTR(x->forward[i], i, list->max_level) = x;
+            }
+            BACKWARD_PTR(x, i, list->max_level) = update[i];
+        }
+
+        /* update tail if necessary */
+        if (x->forward[0] == NULL)
+        {
+            list->tail = x;
         }
 
         list->total_size += key_size + value_size + sizeof(time_t); /* add to total size */
@@ -289,19 +306,13 @@ int skip_list_cursor_prev(skip_list_cursor_t *cursor)
 {
     if (cursor == NULL || cursor->list == NULL || cursor->current == NULL) return -1;
 
-    skip_list_node_t *x = cursor->list->header;
-    skip_list_node_t *prev = NULL;
+    /* if we're at the first node, we can't go back further */
+    if (cursor->current == cursor->list->header->forward[0]) return -1;
 
-    while (x->forward[0] && x->forward[0] != cursor->current)
+    /* we use backward pointer to go to previous node */
+    if (BACKWARD_PTR(cursor->current, 0, cursor->list->max_level) != cursor->list->header)
     {
-        prev = x->forward[0];
-        x = x->forward[0];
-        (void)skip_list_check_and_update_ttl(cursor->list, x);
-    }
-
-    if (prev != NULL)
-    {
-        cursor->current = prev;
+        cursor->current = BACKWARD_PTR(cursor->current, 0, cursor->list->max_level);
         (void)skip_list_check_and_update_ttl(cursor->list, cursor->current);
         return 0;
     }
@@ -337,11 +348,14 @@ int skip_list_clear(skip_list_t *list)
         current = next;
     }
 
-    /* reset the header node's forward pointers */
-    for (int i = 0; i < list->max_level; i++)
+    /* reset the header node's forward and backward pointers */
+    for (int i = 0; i < list->max_level * 2; i++)
     {
         list->header->forward[i] = NULL;
     }
+
+    /* reset tail to header for empty list */
+    list->tail = list->header;
 
     list->level = 1;
     list->total_size = 0; /* reset total size */
@@ -446,13 +460,7 @@ int skip_list_cursor_has_prev(skip_list_cursor_t *cursor)
 {
     if (cursor == NULL || cursor->list == NULL || cursor->current == NULL) return -1;
 
-    skip_list_node_t *x = cursor->list->header;
-    while (x->forward[0] && x->forward[0] != cursor->current)
-    {
-        x = x->forward[0];
-    }
-
-    return x != cursor->list->header;
+    return BACKWARD_PTR(cursor->current, 0, cursor->list->max_level) != cursor->list->header;
 }
 
 int skip_list_cursor_goto_first(skip_list_cursor_t *cursor)
@@ -467,12 +475,10 @@ int skip_list_cursor_goto_last(skip_list_cursor_t *cursor)
 {
     if (cursor == NULL || cursor->list == NULL) return -1;
 
-    cursor->current = cursor->list->header;
-    while (cursor->current->forward[0] != NULL)
-    {
-        cursor->current = cursor->current->forward[0];
-    }
+    /* we simply use the tail pointer */
+    cursor->current = cursor->list->tail;
 
+    /* if tail is the header, the list is empty */
     return cursor->current == cursor->list->header ? -1 : 0;
 }
 
@@ -521,33 +527,21 @@ int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size)
 {
     if (list == NULL || key == NULL || key_size == NULL) return -1;
 
-    /* first, find the last node */
-    skip_list_node_t *last = list->header;
-    while (last->forward[0] != NULL)
-    {
-        last = last->forward[0];
-        /* check if the node has expired */
-        (void)skip_list_check_and_update_ttl(list, last);
-    }
+    /* if list is empty (tail is header) */
+    if (list->tail == list->header) return -1;
 
-    /* check if we're still at the header (empty list) */
-    if (last == list->header) return -1;
+    /* start from tail and find non-TOMBSTONE node */
+    skip_list_node_t *current = list->tail;
 
-    /* now, start from the last node and move backward
-     * until we find a node that isn't a TOMBSTONE */
-    skip_list_node_t *current = last;
     while (current != list->header)
     {
-        /* skip this node if it's a TOMBSTONE */
+        /* check if the node has expired */
+        (void)skip_list_check_and_update_ttl(list, current);
+
+        /* we skip TOMBSTONE nodes */
         if (current->value_size == 4 && *(uint32_t *)current->value == TOMBSTONE)
         {
-            /* we need to find the previous node */
-            skip_list_node_t *prev = list->header;
-            while (prev->forward[0] != current)
-            {
-                prev = prev->forward[0];
-            }
-            current = prev;
+            current = BACKWARD_PTR(current, 0, list->max_level);
             continue;
         }
 
@@ -558,11 +552,10 @@ int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size)
     /* if we couldn't find a valid node */
     if (current == list->header) return -1;
 
-    /* allocate memory for the key */
+    /* allocate and copy the key */
     *key = malloc(current->key_size);
     if (*key == NULL) return -1;
 
-    /* copy the key and key size */
     memcpy(*key, current->key, current->key_size);
     *key_size = current->key_size;
 
@@ -571,7 +564,7 @@ int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size)
 
 int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
 {
-    if (list == NULL || list->header == NULL || cursor == NULL) return -1;
+    if (list == NULL || cursor == NULL) return -1;
 
     /* we allocate memory for the cursor if it doesn't exist */
     if (*cursor == NULL)
@@ -582,23 +575,18 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
 
     (*cursor)->list = list;
 
-    /* we start at the header */
-    skip_list_node_t *current = list->header;
-
-    /* we traverse to the last node */
-    while (current->forward[0] != NULL)
-    {
-        current = current->forward[0];
-        /* we check if the node has expired */
-        (void)skip_list_check_and_update_ttl(list, current);
-    }
-
-    /* if we're still at the header, that means the list is empty */
-    if (current == list->header)
+    /* if list is empty (tail is header) */
+    if (list->tail == list->header)
     {
         (*cursor)->current = NULL;
-        return -1; /*no valid node at the end */
+        return -1;
     }
-    (*cursor)->current = current;
-    return 0; /* success */
+
+    /* we set cursor to tail */
+    (*cursor)->current = list->tail;
+
+    /* we heck if the node has expired */
+    (void)skip_list_check_and_update_ttl(list, (*cursor)->current);
+
+    return 0;
 }

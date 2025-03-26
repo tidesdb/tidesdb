@@ -30,6 +30,9 @@
 
 typedef struct skip_list_node_t skip_list_node_t; /* forward declaration */
 
+/* macro to access backward pointers at a specific level */
+#define BACKWARD_PTR(node, level, max_level) (node->forward[max_level + level])
+
 /*
  * skip_list_node_t
  * the node structure for the skip list
@@ -57,6 +60,7 @@ struct skip_list_node_t
  * @param max_level the maximum level of the skip list
  * @param probability the probability of a node having a certain level
  * @param header the header node of the skip list
+ * @param tail the tail node of the skip list
  * @param total_size the total size in bytes of kv pairs in the skip list
  */
 typedef struct
@@ -65,6 +69,7 @@ typedef struct
     int max_level;
     float probability;
     skip_list_node_t *header;
+    skip_list_node_t *tail;
     size_t total_size;
 } skip_list_t;
 

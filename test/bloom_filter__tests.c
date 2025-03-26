@@ -67,6 +67,112 @@ void test_bloom_filter_is_full()
     printf(GREEN "test_bloom_filter_is_full passed\n" RESET);
 }
 
+void test_bloom_filter_serialize_deserialize()
+{
+    bloom_filter_t *bf;
+    (void)bloom_filter_new(&bf, 0.01, 1000);
+
+    const char *keys[] = {"key1", "key2", "key3", "key4", "key5"};
+    for (int i = 0; i < 5; i++)
+    {
+        (void)bloom_filter_add(bf, (const uint8_t *)keys[i], strlen(keys[i]));
+    }
+
+    size_t serialized_size;
+    uint8_t *serialized_data = bloom_filter_serialize(bf, &serialized_size);
+    assert(serialized_data != NULL);
+
+    bloom_filter_t *deserialized_bf = bloom_filter_deserialize(serialized_data);
+    assert(deserialized_bf != NULL);
+
+    /* we verify same properties */
+    assert(deserialized_bf->m == bf->m);
+    assert(deserialized_bf->h == bf->h);
+
+    /* we verify contains the same keys */
+    for (int i = 0; i < 5; i++)
+    {
+        assert(bloom_filter_contains(deserialized_bf, (const uint8_t *)keys[i], strlen(keys[i])) ==
+               1);
+    }
+
+    /* we check a key that should not be present */
+    assert(bloom_filter_contains(deserialized_bf, (const uint8_t *)"nonexistent", 10) == 0);
+
+    free(serialized_data);
+    (void)bloom_filter_free(bf);
+    (void)bloom_filter_free(deserialized_bf);
+
+    printf(GREEN "test_bloom_filter_serialize_deserialize passed\n" RESET);
+}
+
+void test_false_positive_rate()
+{
+    double p = 0.01; /** false positive rate of 1% */
+    int n = 10000;
+    bloom_filter_t *bf;
+    (void)bloom_filter_new(&bf, p, n);
+
+    // we write n elements
+    for (int i = 0; i < n; i++)
+    {
+        char key[20];
+        sprintf(key, "inserted_key_%d", i);
+        (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
+    }
+
+    /* with m different elements that were not inserted */
+    int m = 10000;
+    int false_positives = 0;
+    for (int i = 0; i < m; i++)
+    {
+        char key[20];
+        sprintf(key, "test_key_%d", i + n);  // Different from inserted keys
+        if (bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)))
+        {
+            false_positives++;
+        }
+    }
+
+    double actual_fp_rate = (double)false_positives / m;
+    printf("Expected false positive rate: %f\n", p);
+    printf("Actual false positive rate: %f\n", actual_fp_rate);
+
+    /* some deviation since its a probabilistic data structure */
+    assert(fabs(actual_fp_rate - p) < 0.01);
+
+    (void)bloom_filter_free(bf);
+    printf(GREEN "test_false_positive_rate passed\n" RESET);
+}
+
+void test_boundary_conditions()
+{
+    bloom_filter_t *bf;
+
+    /* very low false positive rate */
+    (void)bloom_filter_new(&bf, 0.0001, 1000);
+    assert(bf != NULL);
+    assert(bf->m > 0);
+    assert(bf->h > 0);
+    (void)bloom_filter_free(bf);
+
+    /* very high false positive rate */
+    (void)bloom_filter_new(&bf, 0.9, 1000);
+    assert(bf != NULL);
+    assert(bf->m > 0);
+    assert(bf->h > 0);
+    (void)bloom_filter_free(bf);
+
+    /* empty key */
+    (void)bloom_filter_new(&bf, 0.01, 1000);
+    const char *empty_key = "";
+    (void)bloom_filter_add(bf, (const uint8_t *)empty_key, strlen(empty_key));
+    assert(bloom_filter_contains(bf, (const uint8_t *)empty_key, strlen(empty_key)) == 1);
+    (void)bloom_filter_free(bf);
+
+    printf(GREEN "test_boundary_conditions passed\n" RESET);
+}
+
 void benchmark_bloom_filter()
 {
     bloom_filter_t *bf;
@@ -111,6 +217,9 @@ int main(void)
     test_bloom_filter_new();
     test_bloom_filter_add_and_contains();
     test_bloom_filter_is_full();
+    test_bloom_filter_serialize_deserialize();
+    test_false_positive_rate();
+    test_boundary_conditions();
     benchmark_bloom_filter();
     return 0;
 }

@@ -281,7 +281,7 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
     {TIDESDB_ERR_FAILED_TO_SERIALIZE, "Failed to serialize %s for column family %s\n",
      TIDESDB_ERR_WITH_CONTEXT},
     {TIDESDB_ERR_FAILED_TO_WRITE_TO_MEMTABLE,
-     "Failed to write key-value pair to memtable for column family %s\n"},
+     "Failed to write key-value pair to memtable for column family %s\n", TIDESDB_ERR_WITH_CONTEXT},
     {TIDESDB_ERR_PUT_TOMBSTONE, "Cannot write a tombstone\n", TIDESDB_ERR_WITHOUT_CONTEXT}};
 
 /*

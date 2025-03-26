@@ -1149,6 +1149,18 @@ extern "C"
      */
     int _tidesdb_print_keys_tree(tidesdb_t *tdb, const char *column_family_name);
 
+    /*
+     * _tidesdb_put
+     * put a key-value pair into TidesDB (mainly used for deletion.)
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param key the key
+     * @param key_size the size of the key
+     * @param value the value
+     * @param value_size the size of the value
+     * @param ttl the time-to-live for the key-value pair
+     * @return error or NULL
+     */
     tidesdb_err_t *_tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const uint8_t *key,
                                 size_t key_size, const uint8_t *value, size_t value_size,
                                 time_t ttl);

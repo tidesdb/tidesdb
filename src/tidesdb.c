@@ -2002,7 +2002,7 @@ tidesdb_err_t *_tidesdb_put(tidesdb_t *tdb, const char *column_family_name, cons
     if (skip_list_put(cf->memtable, key, key_size, value, value_size, ttl) == -1)
     {
         (void)pthread_rwlock_unlock(&cf->rwlock);
-        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_PUT_TO_MEMTABLE);
+        return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_TO_MEMTABLE);
     }
 
     /* we check if the memtable has reached the flush threshold */

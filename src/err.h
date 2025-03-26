@@ -140,6 +140,7 @@ typedef enum
     TIDESDB_ERR_FAILED_TO_GET_MIN_KEY_FOR_FLUSH,
     TIDESDB_ERR_FAILED_TO_GET_MAX_KEY_FOR_FLUSH,
     TIDESDB_ERR_PUT_TOMBSTONE,
+    TIDESDB_ERR_FAILED_TO_WRITE_TO_MEMTABLE,
 } TIDESDB_ERR_CODE;
 
 /* TidesDB error messages */
@@ -279,6 +280,8 @@ static const tidesdb_err_info_t tidesdb_err_messages[] = {
      TIDESDB_ERR_WITH_CONTEXT},
     {TIDESDB_ERR_FAILED_TO_SERIALIZE, "Failed to serialize %s for column family %s\n",
      TIDESDB_ERR_WITH_CONTEXT},
+    {TIDESDB_ERR_FAILED_TO_WRITE_TO_MEMTABLE,
+     "Failed to write key-value pair to memtable for column family %s\n"},
     {TIDESDB_ERR_PUT_TOMBSTONE, "Cannot write a tombstone\n", TIDESDB_ERR_WITHOUT_CONTEXT}};
 
 /*

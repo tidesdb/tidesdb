@@ -1,5 +1,10 @@
-# build instructions--
-# cmake -S . -B build
+## cmake build instructions unix
+# rm -rf build && cmake -S . -B build
+# cmake --build build
+# cmake --install build
+
+## cmake build instructions windows
+# rmdir /s /q build && cmake -S . -B build
 # cmake --build build
 # cmake --install build
 cmake_minimum_required(VERSION 3.25)

@@ -113,7 +113,7 @@ void test_false_positive_rate()
     bloom_filter_t *bf;
     (void)bloom_filter_new(&bf, p, n);
 
-    // we write n elements
+    /* we write n elements */
     for (int i = 0; i < n; i++)
     {
         char key[20];
@@ -127,7 +127,7 @@ void test_false_positive_rate()
     for (int i = 0; i < m; i++)
     {
         char key[20];
-        sprintf(key, "test_key_%d", i + n);  // Different from inserted keys
+        sprintf(key, "test_key_%d", i + n); /** different from inserted keys */
         if (bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)))
         {
             false_positives++;

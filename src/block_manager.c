@@ -503,7 +503,7 @@ void *block_manager_fsync_thread(void *arg)
     /* we fsync the file every fsync interval */
     while (bm->stop_fsync_thread == 0)
     {
-        sleep(bm->fsync_interval);
+        usleep((useconds_t)(bm->fsync_interval));
         pthread_mutex_lock(&bm->mutex);
         fsync(fileno(bm->file));
         pthread_mutex_unlock(&bm->mutex);

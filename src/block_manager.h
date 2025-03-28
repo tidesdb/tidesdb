@@ -38,6 +38,7 @@
  * @param fsync_thread the fsync thread
  * @param fsync_interval the fsync interval in seconds
  * @param stop_fsync_thread flag to stop fsync thread
+ * @param mutex mutex for safe concurrent access
  */
 typedef struct
 {
@@ -46,6 +47,7 @@ typedef struct
     pthread_t fsync_thread;
     float fsync_interval;
     int stop_fsync_thread;
+    pthread_mutex_t mutex;
 } block_manager_t;
 
 /**
@@ -66,12 +68,14 @@ typedef struct
  * block cursor struct
  * used for block cursors in TidesDB
  * @param bm the block manager
+ * @param file private file handle for cursor operations
  * @param current_pos the current position of the cursor
  * @param current_block_size the size of the current block
  */
 typedef struct
 {
     block_manager_t *bm;
+    FILE *file;
     uint64_t current_pos;
     uint64_t current_block_size;
 } block_manager_cursor_t;
@@ -287,5 +291,21 @@ int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
  * @return 1 if the cursor is at the second block, 0 if not.  Can return -1 if error
  */
 int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_lock
+ * locks the block manager mutex
+ * @param bm the block manager to lock
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_lock(block_manager_t *bm);
+
+/**
+ * block_manager_unlock
+ * unlocks the block manager mutex
+ * @param bm the block manager to unlock
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_unlock(block_manager_t *bm);
 
 #endif /* __BLOCK_MANAGER_H__ */

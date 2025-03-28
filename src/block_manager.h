@@ -112,9 +112,10 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data);
  * writes a block to a file
  * @param bm the block manager to write the block to
  * @param block the block to write
+ * @param lock whether to lock the block manager or not
  * @return block offset if successful, -1 if not
  */
-long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
+long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block, uint8_t lock);
 
 /**
  * block_manager_block_read

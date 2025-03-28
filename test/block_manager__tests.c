@@ -64,7 +64,7 @@ void test_block_manager_block_write()
     assert(block != NULL); /* we verify that the block was created successfully */
 
     /* now we write the block to the file */
-    assert(block_manager_block_write(bm, block) == 0);
+    assert(block_manager_block_write(bm, block, 1) == 0);
 
     (void)block_manager_block_free(block);
 
@@ -90,7 +90,7 @@ void test_block_manager_block_write_close_reopen_read()
     assert(block != NULL); /* we verify that the block was created successfully */
 
     /* now we write the block to the file */
-    assert(block_manager_block_write(bm, block) == 0);
+    assert(block_manager_block_write(bm, block, 1) == 0);
 
     (void)block_manager_block_free(block);
 
@@ -132,7 +132,7 @@ void test_block_manager_truncate()
     assert(block != NULL); /* we verify that the block was created successfully */
 
     /* now we write the block to the file */
-    assert(block_manager_block_write(bm, block) == 0);
+    assert(block_manager_block_write(bm, block, 1) == 0);
 
     (void)block_manager_block_free(block);
 
@@ -179,7 +179,7 @@ void test_block_manager_cursor()
 
         /* now we write the block to the file */
         /* should not be -1 */
-        assert(block_manager_block_write(bm, block) != -1);
+        assert(block_manager_block_write(bm, block, 1) != -1);
 
         (void)block_manager_block_free(block);
     }
@@ -289,59 +289,6 @@ void test_block_manager_cursor()
     printf(GREEN "test_block_manager_cursor passed\n" RESET);
 }
 
-void example()
-{
-    block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0)
-    {
-        fprintf(stderr, "Failed to open block manager\n");
-        return;
-    }
-
-    for (int i = 0; i < 3; i++)
-    {
-        uint64_t size = 10;
-        char data[10];
-        snprintf(data, 10, "testdata%d", i);
-
-        block_manager_block_t *block = block_manager_block_create(size, data);
-        assert(block != NULL);
-
-        assert(block_manager_block_write(bm, block) == 0);
-        (void)block_manager_block_free(block);
-    }
-
-    block_manager_cursor_t *cursor;
-    if (block_manager_cursor_init(&cursor, bm) != 0)
-    {
-        fprintf(stderr, "Failed to initialize cursor\n");
-        block_manager_close(bm);
-        return;
-    }
-
-    printf("Iterating forwards:\n");
-    block_manager_block_t *read_block;
-    while ((read_block = block_manager_cursor_read(cursor)) != NULL)
-    {
-        printf("Block data: %.*s\n", (int)read_block->size, (char *)read_block->data);
-        (void)block_manager_block_free(read_block);
-        if (block_manager_cursor_next(cursor) != 0) break;
-    }
-
-    printf("Iterating backwards:\n");
-    while (block_manager_cursor_prev(cursor) == 0)
-    {
-        read_block = block_manager_cursor_read(cursor);
-        if (read_block == NULL) break;
-        printf("Block data: %.*s\n", (int)read_block->size, (char *)read_block->data);
-        (void)block_manager_block_free(read_block);
-    }
-
-    (void)block_manager_cursor_free(cursor);
-    assert(block_manager_close(bm) == 0);
-    (void)remove("test.db");
-}
-
 void test_block_manager_count_blocks()
 {
     block_manager_t *bm;
@@ -357,7 +304,7 @@ void test_block_manager_count_blocks()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) != -1);
+        assert(block_manager_block_write(bm, block, 1) != -1);
         (void)block_manager_block_free(block);
     }
 
@@ -383,7 +330,7 @@ void test_block_manager_cursor_goto_first()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) != -1);
+        assert(block_manager_block_write(bm, block, 1) != -1);
         (void)block_manager_block_free(block);
     }
 
@@ -422,7 +369,7 @@ void test_block_manager_cursor_goto_last()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) != -1);
+        assert(block_manager_block_write(bm, block, 1) != -1);
         (void)block_manager_block_free(block);
     }
 
@@ -462,7 +409,7 @@ void test_block_manager_cursor_has_next()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) != -1);
+        assert(block_manager_block_write(bm, block, 1) != -1);
         (void)block_manager_block_free(block);
     }
 
@@ -503,7 +450,7 @@ void test_block_manager_cursor_has_prev()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) != -1);
+        assert(block_manager_block_write(bm, block, 1) != -1);
         (void)block_manager_block_free(block);
     }
 
@@ -545,7 +492,7 @@ void test_block_manager_cursor_position_checks()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) != -1);
+        assert(block_manager_block_write(bm, block, 1) != -1);
         (void)block_manager_block_free(block);
     }
 
@@ -600,7 +547,7 @@ void test_block_manager_get_size()
         block_manager_block_t *block = block_manager_block_create(size, data);
         assert(block != NULL);
 
-        assert(block_manager_block_write(bm, block) != -1);
+        assert(block_manager_block_write(bm, block, 1) != -1);
         (void)block_manager_block_free(block);
     }
 
@@ -640,7 +587,7 @@ void test_block_manager_seek_and_goto()
         assert(block != NULL);
 
         /* we save the offset for each block */
-        block_offsets[i] = block_manager_block_write(bm, block);
+        block_offsets[i] = block_manager_block_write(bm, block, 1);
         assert(block_offsets[i] >= 0);
         (void)block_manager_block_free(block);
     }
@@ -719,7 +666,7 @@ void *writer_thread(void *arg)
 
         pthread_mutex_lock(&bm_mutex);
 
-        long offset = block_manager_block_write(bm, block);
+        long offset = block_manager_block_write(bm, block, 1);
         assert(offset != -1);
 
         pthread_mutex_unlock(&bm_mutex);
@@ -934,7 +881,7 @@ void benchmark_block_manager()
         block_manager_block_t *block = block_manager_block_create(BLOCK_SIZE, block_data[i]);
         assert(block != NULL);
 
-        block_offsets[i] = block_manager_block_write(bm, block);
+        block_offsets[i] = block_manager_block_write(bm, block, 1);
         assert(block_offsets[i] != -1);
 
         block_manager_block_free(block);

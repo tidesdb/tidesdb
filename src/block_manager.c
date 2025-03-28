@@ -114,17 +114,17 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
     return block;
 }
 
-long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
+long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block, uint8_t lock)
 {
     long offset;
 
     /* we need to lock before accessing the file */
-    pthread_mutex_lock(&bm->mutex);
+    if (lock) (void)pthread_mutex_lock(&bm->mutex);
 
     /* seek to end of file */
     if (fseek(bm->file, 0, SEEK_END) != 0)
     {
-        pthread_mutex_unlock(&bm->mutex);
+        if (lock) (void)pthread_mutex_unlock(&bm->mutex);
         return -1;
     }
 
@@ -132,28 +132,25 @@ long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block
     offset = ftell(bm->file);
     if (offset == -1)
     {
-        pthread_mutex_unlock(&bm->mutex);
+        if (lock) (void)pthread_mutex_unlock(&bm->mutex);
         return -1;
     }
 
     /* write the size of the block */
     if (fwrite(&block->size, sizeof(uint64_t), 1, bm->file) != 1)
     {
-        pthread_mutex_unlock(&bm->mutex);
+        if (lock) (void)pthread_mutex_unlock(&bm->mutex);
         return -1;
     }
 
     /* write the data of the block */
     if (fwrite(block->data, block->size, 1, bm->file) != 1)
     {
-        pthread_mutex_unlock(&bm->mutex);
+        if (lock) (void)pthread_mutex_unlock(&bm->mutex);
         return -1;
     }
 
-    /* we make sure data is flushed to disk */
-    fflush(bm->file);
-
-    pthread_mutex_unlock(&bm->mutex);
+    if (lock) (void)pthread_mutex_unlock(&bm->mutex);
     return offset;
 }
 

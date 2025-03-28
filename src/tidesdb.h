@@ -45,7 +45,7 @@ extern "C"
 #define TDB_TEMP_EXT                      ".tmp"     /* extension for temporary files, names */
 #define TDB_TOMBSTONE                     0xDEADBEEF /* tombstone value for deleted keys */
 #define TDB_MAX_COLUMN_FAMILY_NAME_LEN    256        /* max length for column family name */
-#define TDB_SYNC_INTERVAL                 0.24       /* interval for syncing mainly WAL */
+#define TDB_SYNC_INTERVAL                 0.01       /* interval for syncing mainly WAL */
 #define TDB_BLOOM_FILTER_P                0.01       /*  the false positive rate for bloom filter */
 #define TDB_BLOCK_INDICES                                                                          \
     1 /* whether to store block indices in SSTable. Will cause more memory usage but reads will be \

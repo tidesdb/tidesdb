@@ -1398,9 +1398,6 @@ tidesdb_err_t *tidesdb_create_column_family(tidesdb_t *tdb, const char *name, in
     if ((size_t)flush_threshold > tdb->available_mem)
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_FLUSH_THRESHOLD);
 
-    /* only if the memtable data structure is skip list
-     * we check max level and probability.  We also check if valid ds */
-
     /* we check max level
      * the system expects at least a level of TDB_MIN_MAX_LEVEL */
     if (max_level < TDB_MIN_MAX_LEVEL)
@@ -1994,8 +1991,6 @@ tidesdb_err_t *_tidesdb_put(tidesdb_t *tdb, const char *column_family_name, cons
         (void)pthread_rwlock_unlock(&cf->rwlock);
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_APPEND_TO_WAL);
     }
-
-    /* we determine the data structure to use */
 
     /* put in memtable */
     if (skip_list_put(cf->memtable, key, key_size, value, value_size, ttl) == -1)
@@ -2897,7 +2892,7 @@ int _tidesdb_append_to_wal(tidesdb_wal_t *wal, const uint8_t *key, size_t key_si
     }
 
     /* we append to the wal */
-    if (block_manager_block_write(wal->block_manager, block) == -1)
+    if (block_manager_block_write(wal->block_manager, block, 0) == -1)
     {
         (void)block_manager_block_free(block);
         (void)_tidesdb_free_operation(op);
@@ -3040,7 +3035,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     free(max_key);
 
     /* we write the block to the sstable */
-    if (block_manager_block_write(sst->block_manager, min_max_block) == -1)
+    if (block_manager_block_write(sst->block_manager, min_max_block, 0) == -1)
     {
         (void)block_manager_block_free(min_max_block);
         free(sst);
@@ -3139,7 +3134,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         free(serialized_bf);
 
         /* we write the block to the sstable */
-        if (block_manager_block_write(sst->block_manager, bf_block) == -1)
+        if (block_manager_block_write(sst->block_manager, bf_block, 0) == -1)
         {
             (void)block_manager_block_free(bf_block);
             free(sst);
@@ -3274,7 +3269,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         long offset = -1; /* blocks offset in the sstable */
 
         /* we write the block to the sstable */
-        if (((offset = block_manager_block_write(sst->block_manager, block))) && offset == -1)
+        if (((offset = block_manager_block_write(sst->block_manager, block, 0))) && offset == -1)
         {
             (void)block_manager_block_free(block);
             free(sst);
@@ -3343,7 +3338,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         }
 
         /* we write the block to the sstable */
-        if (block_manager_block_write(sst->block_manager, block) == -1)
+        if (block_manager_block_write(sst->block_manager, block, 0) == -1)
         {
             (void)block_manager_block_free(block);
             (void)binary_hash_array_free(bha);
@@ -5540,7 +5535,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         block_manager_block_create(min_max_size, min_max_serialized);
 
     /* write the min-max block to the output block manager */
-    if (block_manager_block_write(bm_out, min_max_block) == -1)
+    if (block_manager_block_write(bm_out, min_max_block, 0) == -1)
     {
         (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
                                                             "min-max", cf->config.name)
@@ -5692,7 +5687,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         }
 
         /* we write the block to the merged sstable */
-        if (block_manager_block_write(bm_out, bf_block) == -1)
+        if (block_manager_block_write(bm_out, bf_block, 0) == -1)
         {
             (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
                                                                 "bloom filter", cf->config.name)
@@ -5746,7 +5741,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                 !_tidesdb_is_expired(kv2->ttl))
             {
-                int64_t offset = block_manager_block_write(bm_out, block2);
+                int64_t offset = block_manager_block_write(bm_out, block2, 0);
                 if (offset != 0)
                 {
                     (void)block_manager_block_free(block2);
@@ -5792,7 +5787,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             if (!_tidesdb_is_tombstone(kv1->value, kv1->value_size) &&
                 !_tidesdb_is_expired(kv1->ttl))
             {
-                int64_t offset = block_manager_block_write(bm_out, block1);
+                int64_t offset = block_manager_block_write(bm_out, block1, 0);
                 if (offset != 0)
                 {
                     (void)block_manager_block_free(block1);
@@ -5840,7 +5835,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                     !_tidesdb_is_expired(kv2->ttl))
                 {
-                    int64_t offset = block_manager_block_write(bm_out, block2);
+                    int64_t offset = block_manager_block_write(bm_out, block2, 0);
                     if (offset != 0)
                     {
                         if (TDB_BLOCK_INDICES)
@@ -5866,7 +5861,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 if (!_tidesdb_is_tombstone(block1->data, block1->size) &&
                     !_tidesdb_is_expired(kv1->ttl))
                 {
-                    int64_t offset = block_manager_block_write(bm_out, block1);
+                    int64_t offset = block_manager_block_write(bm_out, block1, 0);
                     if (offset != 0)
                     {
                         if (TDB_BLOCK_INDICES)
@@ -5892,7 +5887,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                     !_tidesdb_is_expired(kv2->ttl))
                 {
-                    int64_t offset = block_manager_block_write(bm_out, block2);
+                    int64_t offset = block_manager_block_write(bm_out, block2, 0);
                     if (offset != 0)
                     {
                         if (TDB_BLOCK_INDICES)
@@ -5927,7 +5922,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             block1->data, block1->size, cf->config.compressed, cf->config.compress_algo);
         if (!_tidesdb_is_tombstone(kv1->value, kv1->value_size) && !_tidesdb_is_expired(kv1->ttl))
         {
-            int64_t offset = block_manager_block_write(bm_out, block1);
+            int64_t offset = block_manager_block_write(bm_out, block1, 0);
             if (offset != 0)
             {
                 if (TDB_BLOCK_INDICES)
@@ -5964,7 +5959,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
         }
         if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) && !_tidesdb_is_expired(kv2->ttl))
         {
-            int64_t offset = block_manager_block_write(bm_out, block2);
+            int64_t offset = block_manager_block_write(bm_out, block2, 0);
             if (offset != 0)
             {
                 if (TDB_BLOCK_INDICES)
@@ -6042,7 +6037,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
 
         free(bha_data);
 
-        if (block_manager_block_write(bm_out, bha_block) == -1)
+        if (block_manager_block_write(bm_out, bha_block, 0) == -1)
         {
             (void)log_write(cf->tdb->log,
                             tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,

@@ -150,6 +150,13 @@ long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block
         return -1;
     }
 
+    /* we flush the file to disk */
+    if (fflush(bm->file) != 0)
+    {
+        if (lock) (void)pthread_mutex_unlock(&bm->mutex);
+        return -1;
+    }
+
     if (lock) (void)pthread_mutex_unlock(&bm->mutex);
     return offset;
 }

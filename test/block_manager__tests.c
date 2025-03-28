@@ -24,11 +24,11 @@
 void test_block_manager_open()
 {
     block_manager_t *bm;
-    assert(block_manager_open(&bm, "test.db", 0.2f) == 0);
+    assert(block_manager_open(&bm, "test.db", 10000) == 0);
     assert(bm != NULL);
     assert(bm->file != NULL);
     assert(strcmp(bm->file_path, "test.db") == 0);
-    assert(bm->fsync_interval == 0.2f);
+    assert(bm->fsync_interval == 10000);
     (void)block_manager_close(bm);
 
     remove("test.db"); /* remove created file */
@@ -55,7 +55,7 @@ void test_block_manager_block_write()
 {
     /* we set up a new block manager */
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     /* we set up a new block */
     uint64_t size = 10;
@@ -81,7 +81,7 @@ void test_block_manager_block_write_close_reopen_read()
 {
     /* we set up a new block manager */
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     /* we set up a new block */
     uint64_t size = 10;
@@ -98,7 +98,7 @@ void test_block_manager_block_write_close_reopen_read()
     assert(block_manager_close(bm) == 0);
 
     /* we reopen the block manager */
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     /* we read the block from the file */
     block = block_manager_block_read(bm);
@@ -123,7 +123,7 @@ void test_block_manager_truncate()
 {
     /* we set up a new block manager */
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     /* we set up a new block */
     uint64_t size = 10;
@@ -143,7 +143,7 @@ void test_block_manager_truncate()
     assert(block_manager_close(bm) == 0);
 
     /* we reopen the block manager */
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     /* we read the block from the file */
     block = block_manager_block_read(bm);
@@ -164,7 +164,7 @@ void test_block_manager_cursor()
 
     /* we set up a new block manager */
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     for (int i = 0; i < 3; i++)
     {
@@ -292,7 +292,7 @@ void test_block_manager_cursor()
 void test_block_manager_count_blocks()
 {
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     for (int i = 0; i < 3; i++)
     {
@@ -319,7 +319,7 @@ void test_block_manager_count_blocks()
 void test_block_manager_cursor_goto_first()
 {
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     for (int i = 0; i < 3; i++)
     {
@@ -358,7 +358,7 @@ void test_block_manager_cursor_goto_first()
 void test_block_manager_cursor_goto_last()
 {
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     for (int i = 0; i < 3; i++)
     {
@@ -398,7 +398,7 @@ void test_block_manager_cursor_goto_last()
 void test_block_manager_cursor_has_next()
 {
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     for (int i = 0; i < 3; i++)
     {
@@ -439,7 +439,7 @@ void test_block_manager_cursor_has_next()
 void test_block_manager_cursor_has_prev()
 {
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     for (int i = 0; i < 3; i++)
     {
@@ -480,7 +480,7 @@ void test_block_manager_cursor_has_prev()
 void test_block_manager_cursor_position_checks()
 {
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     /* we write 3 blocks */
     for (int i = 0; i < 3; i++)
@@ -531,7 +531,7 @@ void test_block_manager_cursor_position_checks()
 void test_block_manager_get_size()
 {
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     uint64_t initial_size;
     assert(block_manager_get_size(bm, &initial_size) == 0);
@@ -573,7 +573,7 @@ void test_block_manager_get_size()
 void test_block_manager_seek_and_goto()
 {
     block_manager_t *bm;
-    if (block_manager_open(&bm, "test.db", 0.2f) != 0) return;
+    if (block_manager_open(&bm, "test.db", 10000) != 0) return;
 
     /* we write 3 blocks */
     long block_offsets[3];
@@ -774,7 +774,7 @@ void test_block_manager_concurrent_rw()
     srand(time(NULL));
 
     /* we initialize the block manager */
-    assert(block_manager_open(&bm, "concurrent_test.db", 0.2f) == 0);
+    assert(block_manager_open(&bm, "concurrent_test.db", 10000) == 0);
 
     /* we create thread IDs */
     pthread_t writer_threads[NUM_WRITERS];
@@ -849,7 +849,7 @@ void benchmark_block_manager()
     printf(BOLDWHITE "Running block manager benchmark...\n" RESET);
 
     block_manager_t *bm;
-    assert(block_manager_open(&bm, "benchmark.db", 0.2f) == 0);
+    assert(block_manager_open(&bm, "benchmark.db", 10000) == 0);
 
     uint8_t **block_data = malloc(NUM_BLOCKS * sizeof(uint8_t *));
     assert(block_data != NULL);
@@ -904,7 +904,7 @@ void benchmark_block_manager()
 
     /* we reopen the database to ensure data is read from disk */
     assert(block_manager_close(bm) == 0);
-    assert(block_manager_open(&bm, "benchmark.db", 0.2f) == 0);
+    assert(block_manager_open(&bm, "benchmark.db", 10000) == 0);
 
     clock_t start_read_seq = clock();
 

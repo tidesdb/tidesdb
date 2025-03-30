@@ -112,11 +112,12 @@ int skip_list_free_node(skip_list_node_t *node);
 /*
  * skip_list_new
  * create a new skip list
+ * @param list the skip list to create
  * @param max_level the maximum level of the skip list
  * @param probability the probability of a node having a certain level
- * @return the new skip_list
+ * @return 0 if successful, -1 if not
  */
-skip_list_t *skip_list_new(int max_level, float probability);
+int skip_list_new(skip_list_t **list, int max_level, float probability);
 
 /*
  * skip_list_free

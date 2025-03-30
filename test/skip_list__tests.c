@@ -39,7 +39,12 @@ void test_skip_list_create_node()
 
 void test_skip_list_put_get()
 {
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
     assert(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
@@ -57,7 +62,12 @@ void test_skip_list_put_get()
 
 void test_skip_list_destroy()
 {
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     int result = skip_list_free(list);
     assert(result == 0);
     printf(GREEN "test_skip_list_destroy passed\n" RESET);
@@ -65,7 +75,12 @@ void test_skip_list_destroy()
 
 void test_skip_list_clear()
 {
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
     assert(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
@@ -78,7 +93,12 @@ void test_skip_list_clear()
 
 void test_skip_list_count_entries()
 {
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     assert(skip_list_count_entries(list) == 0);
 
     uint8_t key[] = "test_key";
@@ -92,7 +112,12 @@ void test_skip_list_count_entries()
 
 void test_skip_list_get_size()
 {
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     assert(skip_list_get_size(list) == 0);
 
     uint8_t key[] = "test_key";
@@ -106,7 +131,12 @@ void test_skip_list_get_size()
 
 void test_skip_list_copy()
 {
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
     assert(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
@@ -129,7 +159,12 @@ void test_skip_list_copy()
 
 void test_skip_list_cursor_init()
 {
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     skip_list_cursor_t *cursor = skip_list_cursor_init(list);
     assert(cursor != NULL);
     assert(cursor->list == list);
@@ -142,7 +177,12 @@ void test_skip_list_cursor_init()
 
 void test_skip_list_cursor_next()
 {
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     uint8_t key1[] = "key1";
     uint8_t value1[] = "value1";
     uint8_t key2[] = "key2";
@@ -166,7 +206,12 @@ void test_skip_list_cursor_next()
 
 void test_skip_list_cursor_prev()
 {
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     uint8_t key1[] = "key1";
     uint8_t value1[] = "value1";
     uint8_t key2[] = "key2";
@@ -192,7 +237,12 @@ void test_skip_list_cursor_prev()
 void benchmark_skip_list()
 {
     /* random key-value pairs */
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     const size_t key_size = 16;
     const size_t value_size = 8;
 
@@ -269,7 +319,12 @@ void benchmark_skip_list()
 
 void test_skip_list_ttl()
 {
-    skip_list_t *list = skip_list_new(12, 0.24f);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
     time_t ttl = 1; /* 1 second */
@@ -296,7 +351,12 @@ void test_skip_list_ttl()
 void test_skip_list_cursor_functions()
 {
     /* create a new skip list */
-    skip_list_t *list = skip_list_new(4, 0.5);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     assert(list != NULL);
 
     /* initialize cursor */
@@ -373,7 +433,12 @@ void test_skip_list_cursor_functions()
 void test_skip_list_min_max_key()
 {
     /* create a new skip list */
-    skip_list_t *list = skip_list_new(4, 0.5);
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
     assert(list != NULL);
 
     /* test on empty list */

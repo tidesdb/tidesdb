@@ -830,7 +830,18 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                     tdb->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_COLUMN_FAMILY_SETTING_UP),
                     cf->config.name);
 
-                cf->memtable = skip_list_new(cf->config.max_level, cf->config.probability);
+                cf->memtable = NULL;
+                if (skip_list_new(&cf->memtable, cf->config.max_level, cf->config.probability) ==
+                    -1)
+                {
+                    (void)log_write(
+                        tdb->log,
+                        tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "memtable")->message);
+                    free(cf->path);
+                    free(cf);
+                    (void)closedir(cf_dir);
+                    continue;
+                }
 
                 free(config);
 
@@ -1808,7 +1819,18 @@ int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_thres
     (*cf)->num_sstables = 0;
     (*cf)->sstables = NULL;
 
-    (*cf)->memtable = skip_list_new((*cf)->config.max_level, (*cf)->config.probability);
+    (*cf)->memtable = NULL;
+    if (skip_list_new(&(*cf)->memtable, (*cf)->config.max_level, (*cf)->config.probability) == -1)
+    {
+        (void)log_write(tdb->log,
+                        tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "cf memtable")->message);
+        free((*cf)->config.name);
+        free((*cf)->path);
+        free(*cf);
+        free(serialized_cf);
+        (void)fclose(config_file);
+        return -1;
+    }
 
     /* we check if the memtable was created */
     if ((*cf)->memtable == NULL)

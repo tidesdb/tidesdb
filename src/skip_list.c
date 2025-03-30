@@ -85,33 +85,33 @@ int skip_list_check_and_update_ttl(skip_list_t *list, skip_list_node_t *node)
     return -1;
 }
 
-skip_list_t *skip_list_new(int max_level, float probability)
+int skip_list_new(skip_list_t **list, int max_level, float probability)
 {
     /* validate max_level and probability */
-    if (max_level <= 0 || probability <= 0.0 || probability >= 1.0) return NULL;
+    if (max_level <= 0 || probability <= 0.0 || probability >= 1.0) return -1;
 
-    skip_list_t *list = malloc(sizeof(skip_list_t));
-    if (list == NULL) return NULL;
+    *list = malloc(sizeof(skip_list_t));
+    if (list == NULL) return -1;
 
-    list->level = 1;
-    list->max_level = max_level;
-    list->probability = probability;
-    list->total_size = 0;
+    (*list)->level = 1;
+    (*list)->max_level = max_level;
+    (*list)->probability = probability;
+    (*list)->total_size = 0;
 
     uint8_t header_key[1] = {0};
     uint8_t header_value[1] = {0};
-    list->header = skip_list_create_node(max_level * 2, header_key, 1, header_value, 1, -1);
+    (*list)->header = skip_list_create_node(max_level * 2, header_key, 1, header_value, 1, -1);
 
-    if (list->header == NULL)
+    if ((*list)->header == NULL)
     {
         free(list);
-        return NULL;
+        return -1;
     }
 
     /* we initialize tail to be the same as header for an empty list */
-    list->tail = list->header;
+    (*list)->tail = (*list)->header;
 
-    return list;
+    return 0;
 }
 
 int skip_list_random_level(skip_list_t *list)
@@ -396,8 +396,8 @@ skip_list_t *skip_list_copy(skip_list_t *list)
     if (list == NULL) return NULL;
 
     /* create a new skip list with the same max level and probability */
-    skip_list_t *new_list = skip_list_new(list->max_level, list->probability);
-    if (new_list == NULL) return NULL;
+    skip_list_t *new_list = NULL;
+    if (skip_list_new(&new_list, list->max_level, list->probability) != 0) return NULL;
 
     /* iterate through the original skip list and copy each node */
     skip_list_node_t *current = list->header->forward[0];

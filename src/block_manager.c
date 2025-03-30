@@ -31,6 +31,9 @@ int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_
         return -1;
     }
 
+    /* we check if the file already exists */
+    int file_exists = access(file_path, F_OK) == 0;
+
     /* we copy the file path to the block manager */
     strcpy((*bm)->file_path, file_path);
 
@@ -46,6 +49,19 @@ int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_
         fclose((*bm)->file);
         free(*bm);
         return -1;
+    }
+
+    /* if the file existed, validate the last block for potential corruption */
+    if (file_exists)
+    {
+        int validation_result = block_manager_validate_last_block(*bm);
+        if (validation_result != 0)
+        {
+            pthread_mutex_destroy(&(*bm)->mutex);
+            fclose((*bm)->file);
+            free(*bm);
+            return -1;
+        }
     }
 
     /* we create and start the fsync thread */
@@ -709,4 +725,109 @@ int block_manager_count_blocks(block_manager_t *bm)
 
     block_manager_cursor_free(cursor);
     return count;
+}
+
+/* because this is an append only block manager, on system crash or power loss, the last block may
+ * be corrupt thus we need to run a validation and ensure the last block is complete, if not, we
+ * truncate the file accordingly to allow for more data to be written properly
+ */
+int block_manager_validate_last_block(block_manager_t *bm)
+{
+    if (!bm || !bm->file) return -1;
+
+    /* we get the current file size */
+    uint64_t file_size;
+    if (block_manager_get_size(bm, &file_size) != 0)
+    {
+        return -1;
+    }
+
+    /* if file is empty, it's valid */
+    if (file_size == 0)
+    {
+        return 0;
+    }
+
+    /* we check if the file size is valid - must be at least complete a block */
+    /* each block has=8 bytes (uint64_t size of block) + data in block */
+
+    /* we ensure we have at least 8 bytes (enough for a size field) */
+    if (file_size < sizeof(uint64_t))
+    {
+        /* the file too small, so we truncate to zero */
+        (void)pthread_mutex_lock(&bm->mutex);
+        (void)fclose(bm->file);
+        (void)truncate(bm->file_path, 0);
+        bm->file = fopen(bm->file_path, "a+b");
+        (void)pthread_mutex_unlock(&bm->mutex);
+        return (bm->file) ? 0 : -1;
+    }
+
+    /* we scan through blocks to find the last complete one */
+    FILE *temp_file = fopen(bm->file_path, "rb");
+    if (!temp_file) return -1;
+
+    uint64_t valid_size = 0;
+    uint64_t block_size;
+
+    while (1)
+    {
+        /* we remember position before reading size */
+        long pos = ftell(temp_file);
+        if (pos == -1) break;
+
+        /* we try to read a block size */
+        if (fread(&block_size, sizeof(uint64_t), 1, temp_file) != 1)
+        {
+            /* end of file reached */
+            break;
+        }
+
+        /* we check if we have enough data for this block */
+        if (pos + sizeof(uint64_t) + block_size > file_size)
+        {
+            /* if not enough data, truncate at this position */
+            valid_size = pos;
+            break;
+        }
+
+        /* this block is complete, move to next one */
+        valid_size = pos + sizeof(uint64_t) + block_size;
+
+        /* we seek to the next block */
+        if (fseek(temp_file, (long)block_size, SEEK_CUR) != 0)
+        {
+            break;
+        }
+    }
+
+    (void)fclose(temp_file);
+
+    /* if valid_size is different from file_size, truncate the file */
+    if (valid_size != file_size)
+    {
+        (void)pthread_mutex_lock(&bm->mutex);
+
+        /* we close the file before truncating */
+        (void)fclose(bm->file);
+
+        /* we truncate the file */
+        if (truncate(bm->file_path, valid_size) != 0)
+        {
+            (void)pthread_mutex_unlock(&bm->mutex);
+            return -1;
+        }
+
+        /* we reopen the file */
+        bm->file = fopen(bm->file_path, "a+b");
+        if (!bm->file)
+        {
+            (void)pthread_mutex_unlock(&bm->mutex);
+            return -1;
+        }
+
+        (void)pthread_mutex_unlock(&bm->mutex);
+    }
+
+    return 0;
 }

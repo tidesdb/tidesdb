@@ -294,19 +294,12 @@ int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
 int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
 
 /**
- * block_manager_lock
- * locks the block manager mutex
- * @param bm the block manager to lock
- * @return 0 if successful, -1 if not
+ * block_manager_validate_last_block
+ * validates the integrity of the last block in a block manager file
+ * returns 0 if the last block is valid, -1 if validation fails
+ *
+ *** if the validation fails, the file is truncated to the last valid block.
  */
-int block_manager_lock(block_manager_t *bm);
-
-/**
- * block_manager_unlock
- * unlocks the block manager mutex
- * @param bm the block manager to unlock
- * @return 0 if successful, -1 if not
- */
-int block_manager_unlock(block_manager_t *bm);
+int block_manager_validate_last_block(block_manager_t *bm);
 
 #endif /* __BLOCK_MANAGER_H__ */

@@ -140,6 +140,9 @@ int sem_init(sem_t *sem, int pshared, unsigned int value)
 #define S_ISDIR(m)           (((m)&S_IFMT) == S_IFDIR)
 #define sleep(seconds)       Sleep((seconds)*1000)
 #define usleep(microseconds) Sleep((microseconds) / 1000) /* usleep for Windows */
+#define access               _access
+#define ftell                _ftelli64
+#define fseek                _fseeki64
 
 int fsync(int fd)
 {

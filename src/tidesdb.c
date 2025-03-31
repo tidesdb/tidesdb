@@ -6842,14 +6842,14 @@ int _tidesdb_print_keys_tree(tidesdb_t *tdb, const char *column_family_name)
     return 0;
 }
 
-void min_heap_swap(int *heap, int idx1, int idx2)
+void _min_heap_swap(int *heap, int idx1, int idx2)
 {
     int temp = heap[idx1];
     heap[idx1] = heap[idx2];
     heap[idx2] = temp;
 }
 
-void min_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end)
+void _min_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end)
 {
     int root = start;
 
@@ -6905,21 +6905,21 @@ void min_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end)
             return;
         }
 
-        (void)min_heap_swap(cursor->min_heap, root, swap_idx);
+        (void)_min_heap_swap(cursor->min_heap, root, swap_idx);
         root = swap_idx;
     }
 }
 
-void min_heap_heapify(tidesdb_merge_cursor_t *cursor)
+void _min_heap_heapify(tidesdb_merge_cursor_t *cursor)
 {
     int count = cursor->min_heap_size;
     for (int i = (count - 2) / 2; i >= 0; i--)
     {
-        (void)min_heap_sift_down(cursor, i, count - 1);
+        (void)_min_heap_sift_down(cursor, i, count - 1);
     }
 }
 
-void max_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end)
+void _max_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end)
 {
     int root = start;
 
@@ -6985,19 +6985,19 @@ void max_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end)
             return;
         }
 
-        (void)min_heap_swap(cursor->min_heap, root, swap_idx);
+        (void)_min_heap_swap(cursor->min_heap, root, swap_idx);
         root = swap_idx;
     }
 }
 
-void max_heap_heapify(tidesdb_merge_cursor_t *cursor)
+void _max_heap_heapify(tidesdb_merge_cursor_t *cursor)
 {
     int count = cursor->min_heap_size;
 
     /* we build the max heap from the bottom up */
     for (int i = (count - 2) / 2; i >= 0; i--)
     {
-        (void)max_heap_sift_down(cursor, i, count - 1);
+        (void)_max_heap_sift_down(cursor, i, count - 1);
     }
 }
 
@@ -7148,11 +7148,11 @@ tidesdb_err_t *_tidesdb_merge_cursor_init_entries(tidesdb_merge_cursor_t *cursor
     /* we build the heap */
     if (cursor->direction == TIDESDB_CURSOR_FORWARD)
     {
-        (void)min_heap_heapify(cursor);
+        (void)_min_heap_heapify(cursor);
     }
     else
     {
-        (void)max_heap_heapify(cursor);
+        (void)_max_heap_heapify(cursor);
     }
 
     return NULL;
@@ -7645,7 +7645,7 @@ tidesdb_err_t *tidesdb_merge_cursor_prev(tidesdb_merge_cursor_t *cursor)
         {
             cursor->min_heap[i] = i;
         }
-        (void)max_heap_heapify(cursor);
+        (void)_max_heap_heapify(cursor);
 
         /* when we're switching directions, we don't need to advance.. just return the current entry
          * which should be at the end */
@@ -8089,11 +8089,11 @@ tidesdb_err_t *_tidesdb_merge_cursor_advance(tidesdb_merge_cursor_t *cursor, int
 
     if (cursor->direction == TIDESDB_CURSOR_FORWARD)
     {
-        (void)min_heap_heapify(cursor);
+        (void)_min_heap_heapify(cursor);
     }
     else
     {
-        (void)max_heap_heapify(cursor);
+        (void)_max_heap_heapify(cursor);
     }
 
     return NULL;

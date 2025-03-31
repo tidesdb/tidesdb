@@ -1296,7 +1296,7 @@ extern "C"
     /* min-heap methods in-which assist us with merge iteration */
 
     /**
-     * min_heap_swap
+     * _min_heap_swap
      *
      * swaps two elements in the heap array.
      * used by both min-heap and max-heap operations.
@@ -1305,13 +1305,15 @@ extern "C"
      * @param idx1 index of first element to swap
      * @param idx2 index of second element to swap
      */
-    void min_heap_swap(int *heap, int idx1, int idx2);
+    void _min_heap_swap(int *heap, int idx1, int idx2);
 
     /**
-     * min_heap_sift_down
+     * _min_heap_sift_down
      *
      * restores min-heap property by moving the element at the root position down
-     * to its correct position. Used after extraction or when building a heap.
+     * to its correct position.
+     *
+     * used after extraction or when building a heap.
      *
      * the min-heap ensures the smallest element is always at the root, which supports
      * forward iteration through merge sources.
@@ -1320,10 +1322,10 @@ extern "C"
      * @param start the index of the root element to sift down
      * @param end the last valid index in the heap
      */
-    void min_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end);
+    void _min_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end);
 
     /**
-     * min_heap_heapify
+     * _min_heap_heapify
      *
      * builds a min-heap from an unordered array by repeatedly applying sift_down
      * from the bottom up.
@@ -1333,25 +1335,25 @@ extern "C"
      *
      * @param cursor the merge cursor containing the array to heapify
      */
-    void min_heap_heapify(tidesdb_merge_cursor_t *cursor);
+    void _min_heap_heapify(tidesdb_merge_cursor_t *cursor);
 
     /**
-     * max_heap_sift_down
+     * _max_heap_sift_down
      *
      * restores max-heap property by moving the element at the root position down
      * to its correct position.
      *
-     * similar to min_heap_sift_down but ensures largest
+     * similar to _min_heap_sift_down but ensures largest
      * elements are at the root, which supports backward iteration through merge sources.
      *
      * @param cursor the merge cursor containing the heap
      * @param start the index of the root element to sift down
      * @param end the last valid index in the heap
      */
-    void max_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end);
+    void _max_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end);
 
     /**
-     * max_heap_heapify
+     * _max_heap_heapify
      *
      * builds a max-heap from an unordered array.
      *
@@ -1360,7 +1362,7 @@ extern "C"
      *
      * @param cursor the merge cursor containing the array to heapify
      */
-    void max_heap_heapify(tidesdb_merge_cursor_t *cursor);
+    void _max_heap_heapify(tidesdb_merge_cursor_t *cursor);
 
 #ifdef __cplusplus
 }

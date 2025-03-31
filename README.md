@@ -468,6 +468,77 @@ tidesdb_cursor_free(c);
 
 ```
 
+#### Merge Cursor
+
+You can also use `tidesdb_merge_cursor` which keeps keys sorted during iteration.
+```c
+tidesdb_merge_cursor_t *c;
+tidesdb_err_t *e = tidesdb_merge_cursor_init(tdb, "your_column_family", &c);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+    return;
+}
+
+uint8_t *retrieved_key = NULL;
+size_t key_size;
+uint8_t *retrieved_value = NULL;
+size_t value_size;
+
+/* iterate forward */
+do
+{
+    e = tidesdb_merge_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
+    if (e != NULL)
+    {
+        /* handle error */
+        tidesdb_err_free(e);
+        break;
+    }
+
+    /* use retrieved_key and retrieved_value
+     * .. */
+
+    /* free the key and value */
+    free(retrieved_key);
+    free(retrieved_value);
+} while ((e = tidesdb_merge_cursor_next(c)) == NULL);
+
+if (e != NULL && e->code != TIDESDB_ERR_AT_END_OF_CURSOR)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+/* iterate backward */
+do
+{
+    e = tidesdb_merge_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
+    if (e != NULL)
+    {
+        /* handle error */
+        tidesdb_err_free(e);
+        break;
+    }
+
+    /* use retrieved_key and retrieved_value
+     * .. */
+
+    /* free the key and value */
+    free(retrieved_key);
+    free(retrieved_value);
+} while ((e = tidesdb_merge_cursor_prev(c)) == NULL);
+
+if (e != NULL && e->code != TIDESDB_ERR_AT_START_OF_CURSOR)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+tidesdb_merge_cursor_free(c);
+```
+
 ## Deleting multiple key-value pairs
 
 ### Deleting by range

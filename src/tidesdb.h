@@ -379,6 +379,51 @@ extern "C"
         tidesdb_cursor_direction_t direction;
     } tidesdb_cursor_t;
 
+    /* forward declaration of merge cursor */
+    typedef struct tidesdb_merge_cursor_t tidesdb_merge_cursor_t;
+
+    /*
+     * tidesdb_merge_cursor_entry_t
+     * struct for a merge cursor entry
+     * @param kv the key value pair
+     * @param source_index the source index (memtable=0, sstable index+1) *
+     * @param valid whether the entry is valid
+     */
+    typedef struct
+    {
+        tidesdb_key_value_pair_t kv;
+        int source_index;
+        bool valid;
+    } tidesdb_merge_cursor_entry_t;
+
+    /*
+     * tidesdb_merge_cursor_t
+     * struct for a merge cursor
+     * @param tdb the TidesDB instance
+     * @param cf the column family
+     * @param memtable_cursor the cursor for the memtable
+     * @param sstable_cursors the cursors for the sstables
+     * @param num_sstables the number of sstables
+     * @param current_entries the current entries for the merge cursor
+     * @param direction the direction of the cursor
+     * @param initialized whether the cursor is initialized
+     * @param min_heap_size the size of the min heap
+     * @param min_heap the min heap for the merge cursor
+     */
+    struct tidesdb_merge_cursor_t
+    {
+        tidesdb_t *tdb;
+        tidesdb_column_family_t *cf;
+        skip_list_cursor_t *memtable_cursor;
+        block_manager_cursor_t **sstable_cursors;
+        int num_sstables;
+        tidesdb_merge_cursor_entry_t *current_entries;
+        tidesdb_cursor_direction_t direction;
+        bool initialized;
+        int min_heap_size;
+        int *min_heap;
+    };
+
     /*
      * tidesdb_compact_thread_args_t
      * struct for the arguments for a compact thread
@@ -665,6 +710,65 @@ extern "C"
      * @return error or NULL
      */
     tidesdb_err_t *tidesdb_cursor_free(tidesdb_cursor_t *cursor);
+
+    /*
+     * tidesdb_merge_cursor_init
+     * initialize a new merge cursor for sorted iteration across memtable and sstables
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param cursor the merge cursor to initialize
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_init(tidesdb_t *tdb, const char *column_family_name,
+                                             tidesdb_merge_cursor_t **cursor);
+
+    /*
+     * tidesdb_merge_cursor_next
+     * move the merge cursor to the next key-value pair in sorted order
+     * @param cursor the merge cursor
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_next(tidesdb_merge_cursor_t *cursor);
+
+    /*
+     * tidesdb_merge_cursor_prev
+     * move the merge cursor to the previous key-value pair in sorted order
+     * @param cursor the merge cursor
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_prev(tidesdb_merge_cursor_t *cursor);
+
+    /*
+     * tidesdb_merge_cursor_get
+     * get the current key-value pair from the merge cursor
+     * @param cursor the merge cursor
+     * @param key the key
+     * @param key_size the size of the key
+     * @param value the value
+     * @param value_size the size of the value
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_get(tidesdb_merge_cursor_t *cursor, uint8_t **key,
+                                            size_t *key_size, uint8_t **value, size_t *value_size);
+
+    /*
+     * tidesdb_merge_cursor_free
+     * free the memory for the merge cursor
+     * @param cursor the merge cursor
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_free(tidesdb_merge_cursor_t *cursor);
+
+    /*
+     * tidesdb_merge_cursor_seek
+     * seek to the specified key or the nearest key in forward direction
+     * @param cursor the merge cursor
+     * @param key the key to seek to
+     * @param key_size the size of the key
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_seek(tidesdb_merge_cursor_t *cursor, const uint8_t *key,
+                                             size_t key_size);
 
     /*
      * tidesdb_list_column_families
@@ -1164,6 +1268,99 @@ extern "C"
     tidesdb_err_t *_tidesdb_put(tidesdb_t *tdb, const char *column_family_name, const uint8_t *key,
                                 size_t key_size, const uint8_t *value, size_t value_size,
                                 time_t ttl);
+
+    /*
+     * _tidesdb_merge_cursor_advance
+     * @param cursor the merge cursor
+     * @param source_idx the source index to advance
+     * @return error or NULL
+     */
+    tidesdb_err_t *_tidesdb_merge_cursor_advance(tidesdb_merge_cursor_t *cursor, int source_idx);
+
+    /*
+     * _tidesdb_merge_cursor_init_entries
+     * initialize the entries from each source (memtable and sstables)
+     * @param cursor the merge cursor
+     * @return error or NULL
+     */
+    tidesdb_err_t *_tidesdb_merge_cursor_init_entries(tidesdb_merge_cursor_t *cursor);
+
+    /*
+     * _tidesdb_merge_cursor_has_valid_entries
+     * check if there are any valid entries remaining in the cursor
+     * @param cursor the merge cursor
+     * @return 1 if the merge cursor has valid entries, 0 if not
+     */
+    bool _tidesdb_merge_cursor_has_valid_entries(tidesdb_merge_cursor_t *cursor);
+
+    /* min-heap methods in-which assist us with merge iteration */
+
+    /**
+     * min_heap_swap
+     *
+     * swaps two elements in the heap array.
+     * used by both min-heap and max-heap operations.
+     *
+     * @param heap the heap array
+     * @param idx1 index of first element to swap
+     * @param idx2 index of second element to swap
+     */
+    void min_heap_swap(int *heap, int idx1, int idx2);
+
+    /**
+     * min_heap_sift_down
+     *
+     * restores min-heap property by moving the element at the root position down
+     * to its correct position. Used after extraction or when building a heap.
+     *
+     * the min-heap ensures the smallest element is always at the root, which supports
+     * forward iteration through merge sources.
+     *
+     * @param cursor the merge cursor containing the heap
+     * @param start the index of the root element to sift down
+     * @param end the last valid index in the heap
+     */
+    void min_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end);
+
+    /**
+     * min_heap_heapify
+     *
+     * builds a min-heap from an unordered array by repeatedly applying sift_down
+     * from the bottom up.
+     *
+     * after heapification, the smallest element will be at
+     * the root (index 0).
+     *
+     * @param cursor the merge cursor containing the array to heapify
+     */
+    void min_heap_heapify(tidesdb_merge_cursor_t *cursor);
+
+    /**
+     * max_heap_sift_down
+     *
+     * restores max-heap property by moving the element at the root position down
+     * to its correct position.
+     *
+     * similar to min_heap_sift_down but ensures largest
+     * elements are at the root, which supports backward iteration through merge sources.
+     *
+     * @param cursor the merge cursor containing the heap
+     * @param start the index of the root element to sift down
+     * @param end the last valid index in the heap
+     */
+    void max_heap_sift_down(tidesdb_merge_cursor_t *cursor, int start, int end);
+
+    /**
+     * max_heap_heapify
+     *
+     * builds a max-heap from an unordered array.
+     *
+     * after heapification, the largest
+     * element will be at the root (index 0), which is needed for reverse cursor traversal.
+     *
+     * @param cursor the merge cursor containing the array to heapify
+     */
+    void max_heap_heapify(tidesdb_merge_cursor_t *cursor);
 
 #ifdef __cplusplus
 }

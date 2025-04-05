@@ -2155,6 +2155,204 @@ void test_tidesdb_cursor_memtable_sstables(bool compress, tidesdb_compression_al
            compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
 }
 
+void test_tidesdb_merge_cursor_memtable_sstables(bool compress, tidesdb_compression_algo_t algo,
+                                                 bool bloom_filter)
+{
+    tidesdb_t *db = NULL;
+
+    tidesdb_err_t *err = tidesdb_open("test_db", &db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)tidesdb_err_free(err);
+
+    err = tidesdb_create_column_family(db, "test_cf", 1024 * 1024, 12, 0.24f, compress, algo,
+                                       bloom_filter);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    uint8_t key[20];
+    uint8_t value[1024 * 1024];
+    uint8_t smaller_value[20];
+
+    cursor_test_entry_t entries[24];
+
+    /* fill the value with random data */
+    for (size_t i = 0; i < sizeof(value); i++)
+    {
+        value[i] = (uint8_t)(rand() % 256);
+    }
+
+    /* fill the smaller value with random data */
+    for (size_t i = 0; i < sizeof(smaller_value); i++)
+    {
+        smaller_value[i] = (uint8_t)(rand() % 256);
+    }
+
+    for (int i = 0; i < 12; i++)
+    {
+        snprintf((char *)key, sizeof(key), "key_%03d", i);
+        err = tidesdb_put(db, "test_cf", key, strlen((char *)key) + 1, value, sizeof(value), -1);
+        if (err != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+        }
+        assert(err == NULL);
+
+        /* add the key to the entries */
+        memcpy(entries[i].key, key, sizeof(key));
+        entries[i].found = false;
+    }
+
+    /* put 12 more keys with smaller values */
+    for (int i = 0; i < 12; i++)
+    {
+        snprintf((char *)key, sizeof(key), "key_%03d", i + 12);
+        err = tidesdb_put(db, "test_cf", key, strlen((char *)key) + 1, smaller_value,
+                          sizeof(smaller_value), -1);
+        if (err != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+        }
+        assert(err == NULL);
+
+        /* add the key to the entries */
+        memcpy(entries[i + 12].key, key, sizeof(key));
+        entries[i + 12].found = false;
+    }
+
+    /** _tidesdb_print_keys_tree(db, "test_cf"); */
+
+    tidesdb_merge_cursor_t *c;
+    tidesdb_err_t *e = tidesdb_merge_cursor_init(db, "test_cf", &c);
+    if (e != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+        tidesdb_err_free(e);
+        return;
+    }
+
+    uint8_t *retrieved_key = NULL;
+    size_t key_size;
+    uint8_t *retrieved_value = NULL;
+    size_t value_size;
+
+    /* iterate forward */
+    do
+    {
+        e = tidesdb_merge_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
+        if (e != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+            tidesdb_err_free(e);
+            break;
+        }
+
+        /** printf("key: %s\n", retrieved_key); */
+
+        /* check if the key is in the entries */
+        for (int i = 0; i < 24; i++)
+        {
+            if (memcmp(entries[i].key, retrieved_key, key_size) == 0)
+            {
+                entries[i].found = true;
+                break;
+            }
+        }
+
+        free(retrieved_key);
+        free(retrieved_value);
+
+    } while ((e = tidesdb_merge_cursor_next(c)) == NULL);
+
+    if (e != NULL && e->code != TIDESDB_ERR_AT_END_OF_CURSOR)
+    {
+        printf(RED "%s" RESET, e->message);
+    }
+    tidesdb_err_free(e);
+
+    /* check if all keys are found */
+    for (int i = 0; i < 24; i++)
+    {
+        if (!entries[i].found)
+        {
+            printf(RED "key %s not found\n" RESET, entries[i].key);
+            assert(entries[i].found);
+        }
+    }
+
+    /* reset the found flags */
+    for (int i = 0; i < 24; i++)
+    {
+        entries[i].found = false;
+    }
+
+    /** printf("going backward\n"); */
+
+    /* iterate backward */
+    while ((e = tidesdb_merge_cursor_prev(c)) == NULL)
+    {
+        e = tidesdb_merge_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
+        if (e != NULL)
+        {
+            printf(RED "%s" RESET, err->message);
+            tidesdb_err_free(e);
+            break;
+        }
+
+        /** printf("key: %s\n", retrieved_key); */
+
+        /* check if the key is in the entries */
+        for (int i = 0; i < 24; i++)
+        {
+            if (memcmp(entries[i].key, retrieved_key, key_size) == 0)
+            {
+                entries[i].found = true;
+                break;
+            }
+        }
+
+        free(retrieved_key);
+        free(retrieved_value);
+    }
+
+    if (e != NULL && e->code != TIDESDB_ERR_AT_START_OF_CURSOR)
+    {
+        printf(RED "%s" RESET, e->message);
+    }
+
+    /* check if all keys are found */
+    for (int i = 0; i < 24; i++)
+    {
+        if (!entries[i].found)
+        {
+            printf(RED "key %s not found\n" RESET, entries[i].key);
+            assert(entries[i].found);
+        }
+    }
+
+    tidesdb_err_free(e);
+
+    tidesdb_merge_cursor_free(c);
+
+    err = tidesdb_close(db);
+    if (err != NULL)
+    {
+        printf(RED "%s" RESET, err->message);
+    }
+    assert(err == NULL);
+
+    (void)_tidesdb_remove_directory("test_db");
+    printf(GREEN "test_tidesdb_cursor_memtable_sstables%s%s passed\n" RESET,
+           compress ? " with compression" : "", bloom_filter ? " with bloom filter" : "");
+}
+
 void test_tidesdb_cursor_background_compaction_shift(bool compress, tidesdb_compression_algo_t algo,
                                                      bool bloom_filter)
 {
@@ -3497,6 +3695,8 @@ int main(void)
 
     test_tidesdb_cursor_sstables_only(false, TDB_NO_COMPRESSION, false);
 
+    test_tidesdb_merge_cursor_memtable_sstables(false, TDB_NO_COMPRESSION, false);
+
     test_tidesdb_cursor_memtable_sstables(false, TDB_NO_COMPRESSION, false);
 
     test_tidesdb_put_flush_compact_get(false, TDB_NO_COMPRESSION, false);
@@ -3550,6 +3750,8 @@ int main(void)
     test_tidesdb_cursor_sstables_only(true, TDB_COMPRESS_ZSTD, true);
 
     test_tidesdb_cursor_memtable_sstables(true, TDB_COMPRESS_ZSTD, true);
+
+    test_tidesdb_merge_cursor_memtable_sstables(true, TDB_COMPRESS_ZSTD, true);
 
     test_tidesdb_put_flush_get(true, TDB_COMPRESS_ZSTD, true);
 

@@ -159,7 +159,7 @@ extern "C"
 
     /*
      * tidesdb_sst_min_max_t
-     * struct for the min and max keys in a SSTable
+     * struct for the min and max keys in an SSTable
      * @param min_key the minimum key
      * @param min_key_size the size of the minimum key
      * @param max_key the maximum key
@@ -378,6 +378,28 @@ extern "C"
         block_manager_cursor_t *sstable_cursor;
         tidesdb_cursor_direction_t direction;
     } tidesdb_cursor_t;
+
+    /*
+     * tidesdb_merge_cursor_t
+     * struct for a TidesDB merge cursor that keeps keys sorted across memtable and SSTables
+     * @param tdb the tidesdb instance
+     * @param cf the column family
+     * @param memtable_cursor the cursor for the memtable
+     * @param sstable_cursors array of cursors for each sstable
+     * @param num_sstable_cursors number of sstable cursors
+     * @param current_kvs array of current key-value pairs from each source
+     * @param direction the direction of the cursor
+     */
+    typedef struct
+    {
+        tidesdb_t *tdb;
+        tidesdb_column_family_t *cf;
+        skip_list_cursor_t *memtable_cursor;
+        block_manager_cursor_t **sstable_cursors;
+        int num_sstable_cursors;
+        tidesdb_key_value_pair_t **current_kvs;
+        tidesdb_cursor_direction_t direction;
+    } tidesdb_merge_cursor_t;
 
     /*
      * tidesdb_compact_thread_args_t
@@ -667,6 +689,54 @@ extern "C"
     tidesdb_err_t *tidesdb_cursor_free(tidesdb_cursor_t *cursor);
 
     /*
+     * tidesdb_merge_cursor_init
+     * initialize a new TidesDB merge cursor that keeps keys sorted across sources
+     * @param tdb the TidesDB instance
+     * @param column_family_name the name of the column family
+     * @param cursor the TidesDB merge cursor
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_init(tidesdb_t *tdb, const char *column_family_name,
+                                             tidesdb_merge_cursor_t **cursor);
+
+    /*
+     * tidesdb_merge_cursor_next
+     * move the merge cursor to the next key-value pair
+     * @param cursor the TidesDB merge cursor
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_next(tidesdb_merge_cursor_t *cursor);
+
+    /*
+     * tidesdb_merge_cursor_prev
+     * move the merge cursor to the previous key-value pair
+     * @param cursor the TidesDB merge cursor
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_prev(tidesdb_merge_cursor_t *cursor);
+
+    /*
+     * tidesdb_merge_cursor_get
+     * get the current key-value pair from the merge cursor
+     * @param cursor the TidesDB merge cursor
+     * @param key the key
+     * @param key_size the size of the key
+     * @param value the value
+     * @param value_size the size of the value
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_get(tidesdb_merge_cursor_t *cursor, uint8_t **key,
+                                            size_t *key_size, uint8_t **value, size_t *value_size);
+
+    /*
+     * tidesdb_merge_cursor_free
+     * free the memory for the merge cursor
+     * @param cursor the TidesDB merge cursor
+     * @return error or NULL
+     */
+    tidesdb_err_t *tidesdb_merge_cursor_free(tidesdb_merge_cursor_t *cursor);
+
+    /*
      * tidesdb_list_column_families
      * list the column families in TidesDB
      * @param tdb the TidesDB instance
@@ -846,7 +916,7 @@ extern "C"
 
     /*
      * _tidesdb_compare_sstables
-     * compare two sstables
+     * compare two sstables by their modified time
      * @param a the first sstable
      * @param b the second sstable
      * @return the comparison
@@ -855,7 +925,7 @@ extern "C"
 
     /*
      * _tidesdb_flush_memtable
-     * flushes a memtable to disk in an SSTable from a skip list memtable
+     * flushes a memtable as a sorted run to disk as an SSTable
      * @param cf the column family
      * @return 0 if the memtable was flushed, -1 if not
      */

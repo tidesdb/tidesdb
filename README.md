@@ -18,6 +18,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Column Families** store data in separate key-value stores. Each column family has their own memtable and sstables.
 - [x] **Atomic Transactions** commit or rollback multiple operations atomically. When a transaction fails, it rolls back all commited operations.
 - [x] **Bidirectional Cursor** iterate over key-value pairs forward and backward with background compaction awareness.
+- [x] **Bidirectional Merge Cursor** iterate over key-value pairs in sorted order forward and backward.
 - [x] **WAL** write-ahead logging for durability. Column families replay WAL on startup. This reconstructs memtable if the column family did not reach threshold prior to shutdown.
 - [x] **Parallel Paired Merge Compaction** manual multi-threaded paired and merged compaction of sstables. When run for example 10 sstables compacts into 5 as their paired and merged. Each thread is responsible for one pair - you can set the number of threads to use for compaction.
 - [x] **Background Incremental Paired Merge Compaction** background incremental merge compaction can be started. If started the system will incrementally merge sstables in the background from oldest to newest once column family sstables have reached a specific provided limit. Merges are done every n seconds. Merges are not done in parallel but incrementally.
@@ -465,6 +466,77 @@ if (e != NULL && e->code != TIDESDB_ERR_AT_START_OF_CURSOR)
 }
 
 tidesdb_cursor_free(c);
+
+```
+
+#### Merge Cursor
+You can iterate over key-value pairs in a column family in absolute sorted order regardless of source.
+```c
+tidesdb_merge_cursor_t *c;
+tidesdb_err_t *e = tidesdb_merge_cursor_init(tdb, "your_column_family", &c);
+if (e != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+    return;
+}
+
+uint8_t *retrieved_key = NULL;
+size_t key_size;
+uint8_t *retrieved_value = NULL;
+size_t value_size;
+
+/* iterate forward */
+do
+{
+    e = tidesdb_merge_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
+    if (e != NULL)
+    {
+        /* handle error */
+        tidesdb_err_free(e);
+        break;
+    }
+
+    /* use retrieved_key and retrieved_value
+     * .. */
+
+    /* free the key and value */
+    free(retrieved_key);
+    free(retrieved_value);
+} while ((e = tidesdb_merge_cursor_next(c)) == NULL);
+
+if (e != NULL && e->code != TIDESDB_ERR_AT_END_OF_CURSOR)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+/* iterate backward */
+do
+{
+    e = tidesdb_merge_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
+    if (e != NULL)
+    {
+        /* handle error */
+        tidesdb_err_free(e);
+        break;
+    }
+
+    /* use retrieved_key and retrieved_value
+     * .. */
+
+    /* free the key and value */
+    free(retrieved_key);
+    free(retrieved_value);
+} while ((e = tidesdb_merge_cursor_prev(c)) == NULL);
+
+if (e != NULL && e->code != TIDESDB_ERR_AT_START_OF_CURSOR)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
+
+tidesdb_merge_cursor_free(c);
 
 ```
 

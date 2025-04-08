@@ -5102,7 +5102,7 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
     if (pthread_rwlock_rdlock(&cursor->cf->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
 
-    /* we handle the shift if required */
+    /* we handle the shift if required (set if background compaction is started) */
     while (cursor->cf->require_sst_shift)
     {
         was_shifted = true;
@@ -5117,7 +5117,6 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
             (void)tidesdb_cursor_prev(cursor);
         }
 
-        /* A successfully shifted cursor should later return INVALID_CURSOR */
         break; /* only shift once */
     }
 

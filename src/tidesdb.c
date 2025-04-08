@@ -1631,57 +1631,172 @@ tidesdb_err_t *tidesdb_drop_column_family(tidesdb_t *tdb, const char *name)
 
 int _tidesdb_remove_directory(const char *path)
 {
-    /* we could rework to remove recursion and use a stack-iterative approach */
-    struct dirent *entry;
-    struct stat statbuf;
-    char fullpath[MAX_FILE_PATH_LENGTH];
-    DIR *dir;
-
-    dir = opendir(path);
-    if (!dir)
+    typedef struct dir_node
     {
-        return -1;
-    }
+        char path[MAX_FILE_PATH_LENGTH];
+        struct dir_node *next;
+    } dir_node;
 
-    while ((entry = readdir(dir)) != NULL)
+    dir_node *stack = NULL;
+    dir_node *visited = NULL;
+    int result = 0;
+
+    /** we push initial directory */
+    dir_node *node = malloc(sizeof(dir_node));
+    if (!node) return -1;
+    strncpy(node->path, path, MAX_FILE_PATH_LENGTH - 1);
+    node->path[MAX_FILE_PATH_LENGTH - 1] = '\0';
+    node->next = stack;
+    stack = node;
+
+    while (stack != NULL)
     {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+        /* we get current directory path */
+        char current_path[MAX_FILE_PATH_LENGTH];
+        strncpy(current_path, stack->path, MAX_FILE_PATH_LENGTH);
+
+        /* we check if we've already visited this directory */
+        bool already_visited = false;
+        dir_node *v = visited;
+        while (v != NULL)
         {
+            if (strcmp(v->path, current_path) == 0)
+            {
+                already_visited = true;
+                break;
+            }
+            v = v->next;
+        }
+
+        if (already_visited)
+        {
+            /* we remove directory now that contents are processed */
+            if (rmdir(current_path) == -1)
+            {
+                result = -1;
+            }
+
+            /* pop from stack */
+            dir_node *temp = stack;
+            stack = stack->next;
+            free(temp);
             continue;
         }
 
-        snprintf(fullpath, sizeof(fullpath), "%s%s%s", path, _tidesdb_get_path_seperator(),
-                 entry->d_name);
-        if (stat(fullpath, &statbuf) == -1)
+        /* mark as visited */
+        node = malloc(sizeof(dir_node));
+        if (!node)
         {
-            (void)closedir(dir);
-            return -1;
+            result = -1;
+            break;
         }
 
-        if (S_ISDIR(statbuf.st_mode))
+        strncpy(node->path, current_path, MAX_FILE_PATH_LENGTH - 1);
+
+        node->path[MAX_FILE_PATH_LENGTH - 1] = '\0';
+        node->next = visited;
+        visited = node;
+
+        /* we process directory contents */
+        DIR *dir = opendir(current_path);
+        if (!dir)
         {
-            /* should maybe try to avoid recursion :) */
-            if (_tidesdb_remove_directory(fullpath) == -1)
-            {
-                (void)closedir(dir);
-                return -1;
-            }
-            /* remove the directory */
-            (void)rmdir(fullpath);
+            /* pop from stack */
+            dir_node *temp = stack;
+            stack = stack->next;
+            free(temp);
+            result = -1;
+            continue;
         }
-        else
+
+        /* we find all entries */
+        struct dirent *entry;
+        int has_subdirs = 0;
+
+        while ((entry = readdir(dir)) != NULL)
         {
-            if (unlink(fullpath) == -1)
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             {
-                (void)closedir(dir);
-                return -1;
+                continue;
             }
+
+            char fullpath[MAX_FILE_PATH_LENGTH];
+            size_t current_len = strlen(current_path);
+            size_t sep_len = strlen(_tidesdb_get_path_seperator());
+            size_t entry_len = strlen(entry->d_name);
+
+            if (current_len + sep_len + entry_len + 1 <= MAX_FILE_PATH_LENGTH)
+            {
+                memcpy(fullpath, current_path, current_len);
+                memcpy(fullpath + current_len, _tidesdb_get_path_seperator(), sep_len);
+                memcpy(fullpath + current_len + sep_len, entry->d_name, entry_len);
+                fullpath[current_len + sep_len + entry_len] = '\0';
+            }
+            else
+            {
+                result = -1;
+                continue;
+            }
+
+            struct stat statbuf;
+            if (stat(fullpath, &statbuf) == -1)
+            {
+                result = -1;
+                continue;
+            }
+
+            if (S_ISDIR(statbuf.st_mode))
+            {
+                /* we push subdir onto stack */
+                has_subdirs = 1;
+                node = malloc(sizeof(dir_node));
+                if (!node)
+                {
+                    closedir(dir);
+                    result = -1;
+                    break;
+                }
+                strncpy(node->path, fullpath, MAX_FILE_PATH_LENGTH - 1);
+                node->path[MAX_FILE_PATH_LENGTH - 1] = '\0';
+                node->next = stack;
+                stack = node;
+            }
+            else
+            {
+                /* remove **/
+                if (unlink(fullpath) == -1)
+                {
+                    result = -1;
+                }
+            }
+        }
+
+        closedir(dir);
+
+        /* if no subdirs, remove this dir and pop it like its hot */
+        if (!has_subdirs)
+        {
+            if (rmdir(current_path) == -1)
+            {
+                result = -1;
+            }
+
+            /* pop from stack */
+            dir_node *temp = stack;
+            stack = stack->next;
+            free(temp);
         }
     }
 
-    (void)closedir(dir);
-    (void)rmdir(path); /* in case */
-    return 0;
+    /* we clean up any remaining nodes in visited list */
+    while (visited != NULL)
+    {
+        dir_node *temp = visited;
+        visited = visited->next;
+        free(temp);
+    }
+
+    return result;
 }
 
 int _tidesdb_new_column_family(tidesdb_t *tdb, const char *name, int flush_threshold, int max_level,
@@ -2562,11 +2677,11 @@ tidesdb_err_t *tidesdb_range(tidesdb_t *tdb, const char *column_family_name,
                         (void)block_manager_block_free(block);
                         (void)_tidesdb_free_key_value_pair(kv);
                         (void)pthread_rwlock_unlock(&cf->rwlock);
-                        for (size_t i = 0; i < *result_size; i++)
+                        for (size_t j = 0; j < *result_size; j++)
                         {
-                            free((*result)[i]->key);
-                            free((*result)[i]->value);
-                            free((*result)[i]);
+                            free((*result)[j]->key);
+                            free((*result)[j]->value);
+                            free((*result)[j]);
                         }
                         free(*result);
                         return tidesdb_err_from_code(TIDESDB_ERR_REALLOC_FAILED, "result");
@@ -4979,43 +5094,35 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
     if (key == NULL || key_size == NULL || value == NULL || value_size == NULL)
         return tidesdb_err_from_code(TIDESDB_ERR_INVALID_ARGUMENT);
 
-    /* we get column family read lock */
+    /* we handle SST shift case iteratively instead of recursively */
+    bool was_shifted = false;
+
+    /* initial lock
+     ** this will be released in all exit paths */
     if (pthread_rwlock_rdlock(&cursor->cf->rwlock) != 0)
         return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_ACQUIRE_LOCK, "column family");
 
-    if (cursor->cf->require_sst_shift)
+    /* we handle the shift if required (set if background compaction is started) */
+    while (cursor->cf->require_sst_shift)
     {
+        was_shifted = true;
+
+        /* we move cursor according to direction */
         if (cursor->direction == TIDESDB_CURSOR_FORWARD)
         {
-            /* we call next to shift to the next sstable */
             (void)tidesdb_cursor_next(cursor);
-
-            /* we call get to get the key-value pair */
-            if (tidesdb_cursor_get(cursor, key, key_size, value, value_size) == NULL)
-            {
-                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                return NULL;
-            }
-
-            /* we return invalid cursor */
-            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-
-            return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
-        } /* else is TIDESDB_CURSOR_REVERSE */
-
-        /* we call prev to shift to the previous sstable */
-        (void)tidesdb_cursor_prev(cursor);
-
-        if (tidesdb_cursor_get(cursor, key, key_size, value, value_size) == NULL)
-        {
-            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-            return NULL;
+        }
+        else
+        { /* TIDESDB_CURSOR_REVERSE */
+            (void)tidesdb_cursor_prev(cursor);
         }
 
-        /* we return invalid cursor */
-        (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-        return tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
+        break; /* only shift once */
     }
+
+    /* now we handle regular data retrieval */
+    tidesdb_err_t *result = NULL;
+    bool data_found = false;
 
     /* we try memtable first if it exists */
     if (cursor->memtable_cursor != NULL)
@@ -5025,48 +5132,48 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
         size_t k_size, v_size;
         if (skip_list_cursor_get(cursor->memtable_cursor, &k, &k_size, &v, &v_size, &ttl) == 0)
         {
-            /* Check if the value is a tombstone or expired */
+            /* we check if the value is a tombstone or expired */
             if (_tidesdb_is_tombstone(v, v_size) || _tidesdb_is_expired(ttl))
             {
-                free(*key);
-                free(*value);
-                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+                result = tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
             }
-
-            /* we allocate and copy the key */
-            *key = malloc(k_size);
-            if (*key == NULL)
+            else
             {
-                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "key");
+                /* we allocate and copy the key */
+                *key = malloc(k_size);
+                if (*key == NULL)
+                {
+                    result = tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "key");
+                }
+                else
+                {
+                    memcpy(*key, k, k_size); /* copy the key */
+
+                    /* we allocate and copy the value */
+                    *value = malloc(v_size);
+                    if (*value == NULL)
+                    {
+                        free(*key);
+                        result = tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "value");
+                    }
+                    else
+                    {
+                        /* copy the value */
+                        memcpy(*value, v, v_size);
+
+                        /* set the key and value sizes */
+                        *key_size = k_size;
+                        *value_size = v_size;
+
+                        data_found = true;
+                    }
+                }
             }
-
-            memcpy(*key, k, k_size); /* copy the key */
-
-            /* we allocate and copy the value */
-            *value = malloc(v_size);
-            if (*value == NULL)
-            {
-                free(*key);
-                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "value");
-            }
-
-            /* copy the value */
-            memcpy(*value, v, v_size);
-
-            /* set the key and value sizes */
-            *key_size = k_size;
-            *value_size = v_size;
-
-            (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-            return NULL; /* successfully retrieved from memtable */
         }
     }
 
     /* we try SSTable if memtable didn't have it */
-    if (cursor->sstable_cursor != NULL)
+    if (!data_found && result == NULL && cursor->sstable_cursor != NULL)
     {
         block_manager_block_t *block = block_manager_cursor_read(cursor->sstable_cursor);
         if (block != NULL)
@@ -5084,44 +5191,55 @@ tidesdb_err_t *tidesdb_cursor_get(tidesdb_cursor_t *cursor, uint8_t **key, size_
                     _tidesdb_is_expired(kv->ttl))
                 {
                     (void)_tidesdb_free_key_value_pair(kv);
-                    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                    return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+                    result = tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
                 }
-
-                /* we allocate and copy the key */
-                *key = malloc(kv->key_size);
-                if (*key == NULL)
+                else
                 {
-                    (void)_tidesdb_free_key_value_pair(kv);
-                    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "key");
-                }
-                memcpy(*key, kv->key, kv->key_size);
-                *key_size = kv->key_size;
+                    /* we allocate and copy the key */
+                    *key = malloc(kv->key_size);
+                    if (*key == NULL)
+                    {
+                        (void)_tidesdb_free_key_value_pair(kv);
+                        result = tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "key");
+                    }
+                    else
+                    {
+                        memcpy(*key, kv->key, kv->key_size);
+                        *key_size = kv->key_size;
 
-                /* we allocate and copy the value */
-                *value = malloc(kv->value_size);
-                if (*value == NULL)
-                {
-                    free(*key);
-                    (void)_tidesdb_free_key_value_pair(kv);
-                    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                    return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "value");
+                        /* we allocate and copy the value */
+                        *value = malloc(kv->value_size);
+                        if (*value == NULL)
+                        {
+                            free(*key);
+                            (void)_tidesdb_free_key_value_pair(kv);
+                            result = tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "value");
+                        }
+                        else
+                        {
+                            memcpy(*value, kv->value, kv->value_size);
+                            *value_size = kv->value_size;
+                            data_found = true;
+                        }
+                    }
                 }
-                memcpy(*value, kv->value, kv->value_size);
-                *value_size = kv->value_size;
-
                 (void)_tidesdb_free_key_value_pair(kv);
-                (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
-                return NULL; /* successfully retrieved from SSTable */
             }
         }
     }
 
-    /* no data found or position invalid */
-    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+    if (result == NULL && !data_found)
+    {
+        result = tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+    }
+    else if (result == NULL && was_shifted)
+    {
+        result = tidesdb_err_from_code(TIDESDB_ERR_INVALID_CURSOR);
+    }
 
-    return tidesdb_err_from_code(TIDESDB_ERR_KEY_NOT_FOUND);
+    /* always unlock before returning */
+    (void)pthread_rwlock_unlock(&cursor->cf->rwlock);
+    return result;
 }
 
 tidesdb_err_t *tidesdb_cursor_free(tidesdb_cursor_t *cursor)
@@ -6315,18 +6433,25 @@ int _tidesdb_get_max_sys_threads()
 #if defined(_WIN32) || defined(_WIN64)
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
-    max_threads = sysInfo.dwNumberOfProcessors;
+    max_threads = (int)sysInfo.dwNumberOfProcessors;
 
 #elif defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 #if defined(__APPLE__) /* macOS specific */
     int mib[2] = {CTL_HW, HW_NCPU};
-    size_t len = sizeof(max_threads);
-    if (sysctl(mib, 2, &max_threads, &len, NULL, 0) != 0)
+    long num_cpus;
+    size_t len = sizeof(num_cpus);
+    if (sysctl(mib, 2, &num_cpus, &len, NULL, 0) != 0 || num_cpus > INT_MAX)
     {
         return -1; /* ret -1 on error, tidesdb_open will catch this */
     }
+    max_threads = (int)num_cpus;
 #else                  /* unix-posix specific */
-    max_threads = sysconf(_SC_NPROCESSORS_ONLN);
+    long num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_cpus == -1 || num_cpus > INT_MAX)
+    {
+        return -1; /* ret -1 on error, tidesdb_open will catch this */
+    }
+    max_threads = (int)num_cpus;
 #endif
 
 #endif
@@ -6727,7 +6852,7 @@ int _tidesdb_print_keys_tree(tidesdb_t *tdb, const char *column_family_name)
     printf("Key Tree for Column Family: %s\n", column_family_name);
     printf("===========================================\n");
 
-    printf("MemTable:\n");
+    printf("Memtable:\n");
     skip_list_cursor_t *memtable_cursor = skip_list_cursor_init(cf->memtable);
     if (memtable_cursor != NULL)
     {
@@ -6749,7 +6874,7 @@ int _tidesdb_print_keys_tree(tidesdb_t *tdb, const char *column_family_name)
             if (_tidesdb_is_tombstone(value, value_size) || _tidesdb_is_expired(ttl)) continue;
 
             /* print the key with indentation */
-            printf("%*s%.*s\n", indent, "├── ", (int)key_size, key);
+            printf("%*s%.*s\n", indent, "├── ", (int)key_size, (char *)key);
             count++;
 
         } while (skip_list_cursor_next(memtable_cursor) != -1);
@@ -6815,7 +6940,7 @@ int _tidesdb_print_keys_tree(tidesdb_t *tdb, const char *column_family_name)
 
             if (!_tidesdb_is_tombstone(kv->value, kv->value_size) && !_tidesdb_is_expired(kv->ttl))
             {
-                printf("%*s%.*s\n", indent, "├── ", (int)kv->key_size, kv->key);
+                printf("%*s%.*s\n", indent, "├── ", (int)kv->key_size, (char *)kv->key);
                 count++;
             }
 

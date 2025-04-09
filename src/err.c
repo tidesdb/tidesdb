@@ -18,14 +18,15 @@
  */
 #include "err.h"
 
-tidesdb_err_t* tidesdb_err_new(int code, char* message)
+tidesdb_err_t *tidesdb_err_new(int code, char *message)
 {
     /* we allocate memory for the error struct */
-    tidesdb_err_t* e = malloc(sizeof(tidesdb_err_t));
+    tidesdb_err_t *e = malloc(sizeof(tidesdb_err_t));
     if (e == NULL) return NULL;
 
-    /* We set the code and message */
+    /* we set the code and message */
     e->code = code;
+
     /* we check if the message is NULL */
     if (message == NULL)
     {
@@ -43,11 +44,11 @@ tidesdb_err_t* tidesdb_err_new(int code, char* message)
         }
     }
 
-    /* We return the error */
+    /* we return the error */
     return e;
 }
 
-void tidesdb_err_free(tidesdb_err_t* e)
+void tidesdb_err_free(tidesdb_err_t *e)
 {
     /* check if err is NULL */
     if (e == NULL) return;
@@ -63,7 +64,7 @@ void tidesdb_err_free(tidesdb_err_t* e)
     e = NULL;
 }
 
-tidesdb_err_t* tidesdb_err_from_code(TIDESDB_ERR_CODE code, ...)
+tidesdb_err_t *tidesdb_err_from_code(TIDESDB_ERR_CODE code, ...)
 {
     char buffer[TDB_ERR_MAX_MESSAGE_SIZE];
     va_list args;
@@ -71,7 +72,7 @@ tidesdb_err_t* tidesdb_err_from_code(TIDESDB_ERR_CODE code, ...)
 
     if (tidesdb_err_messages[code].has_context)
     {
-        const char* obj = va_arg(args, const char*);
+        const char *obj = va_arg(args, const char *);
         snprintf(buffer, sizeof(buffer), tidesdb_err_messages[code].message, obj);
     }
     else
@@ -81,6 +82,6 @@ tidesdb_err_t* tidesdb_err_from_code(TIDESDB_ERR_CODE code, ...)
 
     va_end(args);
 
-    tidesdb_err_t* err = tidesdb_err_new(tidesdb_err_messages[code].code, buffer);
+    tidesdb_err_t *err = tidesdb_err_new(tidesdb_err_messages[code].code, buffer);
     return err;
 }

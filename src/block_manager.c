@@ -132,8 +132,6 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
 
 long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block, uint8_t lock)
 {
-    long offset;
-
     /* we need to lock before accessing the file */
     if (lock) (void)pthread_mutex_lock(&bm->mutex);
 
@@ -145,7 +143,7 @@ long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block
     }
 
     /* get the current file position */
-    offset = ftell(bm->file);
+    long offset = ftell(bm->file);
     if (offset == -1)
     {
         if (lock) (void)pthread_mutex_unlock(&bm->mutex);
@@ -179,13 +177,11 @@ long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block
 
 block_manager_block_t *block_manager_block_read(block_manager_t *bm)
 {
-    block_manager_block_t *block;
-
     /* we need to lock before accessing the file */
     pthread_mutex_lock(&bm->mutex);
 
     /* we allocate memory for the new block */
-    block = malloc(sizeof(block_manager_block_t));
+    block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
     if (!block)
     {
         pthread_mutex_unlock(&bm->mutex);
@@ -274,7 +270,7 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
 int block_manager_cursor_next(block_manager_cursor_t *cursor)
 {
     /* we need to move the file pointer to the current position first */
-    if (fseek(cursor->file, cursor->current_pos, SEEK_SET) != 0) return -1;
+    if (fseek(cursor->file, (long)cursor->current_pos, SEEK_SET) != 0) return -1;
 
     /* read the size of the current block */
     uint64_t block_size;
@@ -303,7 +299,7 @@ int block_manager_cursor_has_next(block_manager_cursor_t *cursor)
     if (original_pos == -1) return -1;
 
     /* move the file pointer to the current position */
-    if (fseek(cursor->file, cursor->current_pos, SEEK_SET) != 0) return -1;
+    if (fseek(cursor->file, (long)cursor->current_pos, SEEK_SET) != 0) return -1;
 
     /* read the size of the next block */
     uint64_t block_size;
@@ -367,10 +363,10 @@ int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
 
         /* save the position of this block */
         last_pos = current_pos;
-        current_pos += sizeof(uint64_t) + block_size;
+        current_pos += (long)(sizeof(uint64_t) + block_size);
 
         /* move the file pointer to the next block */
-        if (fseek(cursor->file, block_size, SEEK_CUR) != 0) return -1;
+        if (fseek(cursor->file, (long)block_size, SEEK_CUR) != 0) return -1;
     }
 
     /* update the cursor position and block size */
@@ -457,7 +453,7 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
         pos += sizeof(uint64_t) + block_size;
 
         /* we skip the block data */
-        if (fseek(cursor->file, block_size, SEEK_CUR) != 0) return -1;
+        if (fseek(cursor->file, (long)block_size, SEEK_CUR) != 0) return -1;
     }
 
     /* we update cursor to point to the previous block */
@@ -465,7 +461,7 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
     cursor->current_block_size = prev_block_size;
 
     /* we seek back to the start of the previous block */
-    if (fseek(cursor->file, prev_pos, SEEK_SET) != 0) return -1;
+    if (fseek(cursor->file, (long)prev_pos, SEEK_SET) != 0) return -1;
 
     return 0;
 }
@@ -475,7 +471,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
     if (cursor == NULL || cursor->file == NULL) return NULL;
 
     /* we need to move the file pointer to the current position */
-    if (fseek(cursor->file, cursor->current_pos, SEEK_SET) != 0) return NULL;
+    if (fseek(cursor->file, (long)cursor->current_pos, SEEK_SET) != 0) return NULL;
 
     /* we allocate memory for the new block */
     block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
@@ -624,7 +620,7 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
 
     /* we move to the position after the current block */
     uint64_t next_pos = cursor->current_pos + sizeof(uint64_t) + cursor->current_block_size;
-    if (fseek(cursor->file, next_pos, SEEK_SET) != 0)
+    if (fseek(cursor->file, (long)next_pos, SEEK_SET) != 0)
     {
         /* if we can't seek to the next position, we're likely at EOF */
         fseek(cursor->file, original_pos, SEEK_SET);
@@ -656,10 +652,8 @@ int block_manager_seek(block_manager_t *bm, uint64_t pos)
 {
     if (!bm) return -1;
 
-    int result;
-
     pthread_mutex_lock(&bm->mutex);
-    result = fseek(bm->file, pos, SEEK_SET);
+    int result = fseek(bm->file, (long)pos, SEEK_SET);
     pthread_mutex_unlock(&bm->mutex);
 
     if (result != 0) return -1;
@@ -670,7 +664,7 @@ int block_manager_cursor_goto(block_manager_cursor_t *cursor, uint64_t pos)
 {
     if (!cursor || !cursor->file) return -1;
 
-    if (fseek(cursor->file, pos, SEEK_SET) != 0) return -1;
+    if (fseek(cursor->file, (long)pos, SEEK_SET) != 0) return -1;
     cursor->current_pos = pos;
     return 0;
 }
@@ -679,10 +673,8 @@ int block_manager_escalate_fsync(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    int result;
-
     pthread_mutex_lock(&bm->mutex);
-    result = fsync(fileno(bm->file));
+    int result = fsync(fileno(bm->file));
     pthread_mutex_unlock(&bm->mutex);
 
     return result;
@@ -812,7 +804,7 @@ int block_manager_validate_last_block(block_manager_t *bm)
         (void)fclose(bm->file);
 
         /* we truncate the file */
-        if (truncate(bm->file_path, valid_size) != 0)
+        if (truncate(bm->file_path, (long)valid_size) != 0)
         {
             (void)pthread_mutex_unlock(&bm->mutex);
             return -1;

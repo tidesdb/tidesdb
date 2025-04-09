@@ -72,7 +72,7 @@ void binary_hash_array_hash_key(const uint8_t *key, size_t key_len, uint8_t *has
  * binary_hash_array_new
  * creates a new binary hash array
  * @param size the size of the array
- * @return the new binary hash array
+ * @return the new binary hash array or NULL if failed
  */
 binary_hash_array_t *binary_hash_array_new(size_t size);
 

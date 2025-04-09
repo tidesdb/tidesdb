@@ -120,6 +120,10 @@ unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
             h *= m;                 /* multiply the hash by the large prime */
             h ^= (h >> r);          /* xor the hash with its right-shifted value */
             break;
+        default:
+            /* no real action required here, break is just to avoid
+             * compiler warnings */
+            break;
     }
 
     return h;

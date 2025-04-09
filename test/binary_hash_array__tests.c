@@ -199,7 +199,7 @@ void benchmark_binary_hash_array()
     }
     end = clock();
     cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
-    printf(CYAN "Time taken to add entries: %f seconds\n" RESET, cpu_time_used);
+    printf(CYAN "Time taken to add %d entries: %f seconds\n" RESET, 1000000, cpu_time_used);
 
     size_t serialized_size;
     uint8_t *serialized_data = binary_hash_array_serialize(bha, &serialized_size);
@@ -225,7 +225,7 @@ void benchmark_binary_hash_array()
     }
     end = clock();
     cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
-    printf(CYAN "Time taken to check entries: %f seconds\n" RESET, cpu_time_used);
+    printf(CYAN "Time taken to check %d entries: %f seconds\n" RESET, 1000000, cpu_time_used);
 
     (void)binary_hash_array_free(deserialized_bha);
     printf(GREEN "benchmark_binary_hash_array passed\n" RESET);

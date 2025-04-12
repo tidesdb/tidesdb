@@ -19,7 +19,7 @@
 #include "../src/tidesdb.h"
 #include "../test/test_macros.h"
 
-#define NUM_OPERATIONS 100000
+#define NUM_OPERATIONS 1000000
 #define KEY_SIZE       64
 #define VALUE_SIZE     156
 #define CF_NAME        "benchmark_cf"
@@ -346,7 +346,7 @@ int main()
     free(key_sizes);
     free(value_sizes);
 
-    (void)_tidesdb_remove_directory("benchmark_db");
+    //(void)_tidesdb_remove_directory("benchmark_db");
 
     printf(MAGENTA "\nCleanup completed\n" RESET);
     return 0;

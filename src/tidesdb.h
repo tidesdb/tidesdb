@@ -83,11 +83,13 @@ extern "C"
      * struct for a TidesDB SSTable
      * @param block_manager the block manager for the SSTable
      * @param bloom_filter cached bloom filter for the SSTable
+     * @param block_indices the block indices for the SSTable
      */
     typedef struct
     {
         block_manager_t *block_manager;
         bloom_filter_t *bloom_filter;
+        binary_hash_array_t *block_indices;
     } tidesdb_sstable_t;
 
     /*
@@ -1163,10 +1165,12 @@ extern "C"
      * @param bm2 the block manager for the second sstable
      * @param bm_out the block manager for the new sstable
      * @param bf_out the bloom filter for the new sstable (if configured)
+     * @param sbha_out the sorted binary hash array for the new sstable (if configured)
      * @return 0 if the sstables were merged, -1 if not
      */
     int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block_manager_t *bm2,
-                            block_manager_t *bm_out, bloom_filter_t **bf_out);
+                            block_manager_t *bm_out, bloom_filter_t **bf_out,
+                            binary_hash_array_t **sbha_out);
 
     /*
      * _tidesdb_get_debug_log_format

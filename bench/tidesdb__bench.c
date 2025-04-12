@@ -346,7 +346,7 @@ int main()
     free(key_sizes);
     free(value_sizes);
 
-    //(void)_tidesdb_remove_directory("benchmark_db");
+    (void)_tidesdb_remove_directory("benchmark_db");
 
     printf(MAGENTA "\nCleanup completed\n" RESET);
     return 0;

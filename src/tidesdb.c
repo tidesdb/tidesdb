@@ -1207,7 +1207,7 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
 
         if (TDB_BLOCK_INDICES)
         {
-            /* we create a block manager cursor and get the sstable bloom filter
+            /* we create a block manager cursor and get the sstable block indices
              * and bring into memory */
             block_manager_cursor_t *sbha_cursor;
 

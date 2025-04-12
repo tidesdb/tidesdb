@@ -2294,13 +2294,6 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
         }
 
-        /* we skip min-max block */
-        if (block_manager_cursor_next(cursor) == -1)
-        {
-            (void)block_manager_cursor_free(cursor);
-            continue;
-        }
-
         /* if the column family has bloom filters enabled then, well we read
          * the first block which contains the bloom filter and check if the key exists */
         if (cf->config.bloom_filter && sst->bloom_filter != NULL)

@@ -1034,6 +1034,12 @@ int _tidesdb_free_sstable(tidesdb_sstable_t *sst)
         sst->block_manager = NULL;
     }
 
+    if (sst->bloom_filter != NULL)
+    {
+        (void)bloom_filter_free(sst->bloom_filter);
+        sst->bloom_filter = NULL;
+    }
+
     /* we free the sstable */
     free(sst);
 
@@ -1148,6 +1154,54 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
 
         /* we set the block manager */
         sst->block_manager = sstable_block_manager;
+
+        if (cf->config.bloom_filter)
+        {
+            /* we create a block manager cursor and get the sstable bloom filter
+             * and bring into memory */
+            block_manager_cursor_t *bf_cursor;
+
+            if (block_manager_cursor_init(&bf_cursor, sst->block_manager) != 0)
+            {
+                (void)block_manager_close(sst->block_manager);
+                (void)_tidesdb_free_sstable(sst);
+                (void)closedir(cf_dir);
+                (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC,
+                                                                    "block_manager_cursor_t")
+                                                  ->message);
+
+                return -1;
+            }
+
+            /* we skip min-max keys */
+            if (block_manager_cursor_next(bf_cursor) != 0)
+            {
+                (void)block_manager_cursor_free(bf_cursor);
+                (void)block_manager_close(sst->block_manager);
+                (void)_tidesdb_free_sstable(sst);
+                (void)closedir(cf_dir);
+                (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC,
+                                                                    "block_manager_cursor_t")
+                                                  ->message);
+
+                return -1;
+            }
+
+            /* we get the block from block manager */
+            block_manager_block_t *bf_block = block_manager_cursor_read(bf_cursor);
+
+            bloom_filter_t *deserialized_bf = bloom_filter_deserialize(bf_block->data);
+
+            sst->bloom_filter = deserialized_bf;
+
+            (void)block_manager_block_free(bf_block);
+
+            (void)block_manager_cursor_free(bf_cursor);
+        }
+        else
+        {
+            sst->bloom_filter = NULL;
+        }
 
         /* check if sstables is NULL */
         if (cf->sstables == NULL)
@@ -1280,7 +1334,8 @@ int _tidesdb_sort_sstables(const tidesdb_column_family_t *cf)
     /* if we have more than 1 sstable we sort them by last modified time */
     if (cf->num_sstables > 1)
     {
-        qsort(cf->sstables, cf->num_sstables, sizeof(tidesdb_sstable_t), _tidesdb_compare_sstables);
+        qsort(cf->sstables, cf->num_sstables, sizeof(tidesdb_sstable_t *),
+              _tidesdb_compare_sstables);
         return 0;
     }
 
@@ -2200,7 +2255,6 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
     }
 
     /* we check if the key exists in the memtable */
-
     if (skip_list_get(cf->memtable, key, key_size, value, value_size) != -1)
     {
         /* we found the key in the memtable
@@ -2240,45 +2294,24 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
             return tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_CURSOR);
         }
 
-        /* we skip min-max block */
-        if (block_manager_cursor_next(cursor) == -1)
-        {
-            (void)block_manager_cursor_free(cursor);
-            continue;
-        }
-
         /* if the column family has bloom filters enabled then, well we read
          * the first block which contains the bloom filter and check if the key exists */
-        if (cf->config.bloom_filter)
+        if (cf->config.bloom_filter && sst->bloom_filter != NULL)
         {
-            block_manager_block_t *block = block_manager_cursor_read(cursor);
-            if (block == NULL)
-            {
-                (void)block_manager_cursor_free(cursor);
-                continue;
-            }
-
-            /* we deserialize the bloom filter */
-            bloom_filter_t *bf = bloom_filter_deserialize(block->data);
-            if (bf == NULL)
-            {
-                (void)block_manager_cursor_free(cursor);
-                (void)block_manager_block_free(block);
-                continue;
-            }
-
             /* we check if the key exists in the bloom filter */
-            if (!bloom_filter_contains(bf, key, key_size))
+            if (!bloom_filter_contains(sst->bloom_filter, key, key_size))
             {
                 (void)block_manager_cursor_free(cursor);
-                (void)block_manager_block_free(block);
-                (void)bloom_filter_free(bf);
                 /* we go onto the next sstable */
                 continue;
             }
 
-            (void)bloom_filter_free(bf);
-            (void)block_manager_block_free(block);
+            /* skip block with bloom filter */
+            if (block_manager_cursor_next(cursor) == -1)
+            {
+                (void)block_manager_cursor_free(cursor);
+                continue;
+            }
 
             /* go next block */
             if (block_manager_cursor_next(cursor) == -1)
@@ -3073,7 +3106,6 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
     /* depending on column family configuration, the second block in the sstable could be a bloom
      * filter so we initiate one */
-    bloom_filter_t *bf = NULL;
 
     /* we allocate a new bloom filter if the column family configuration has bloom filter enabled */
     if (cf->config.bloom_filter)
@@ -3083,7 +3115,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
                             * the bloom filter by counting entries in the memory table */
 
         /* we create a new bloom filter with the size and default p value */
-        if (bloom_filter_new(&bf, TDB_BLOOM_FILTER_P, bloom_filter_size) == -1)
+        if (bloom_filter_new(&sst->bloom_filter, TDB_BLOOM_FILTER_P, bloom_filter_size) == -1)
         {
             free(sst);
             (void)remove(sstable_path);
@@ -3092,6 +3124,10 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
                 tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "bloom filter")->message);
             return -1;
         }
+    }
+    else
+    {
+        sst->bloom_filter = NULL;
     }
 
     /* we set the block manager */
@@ -3230,7 +3266,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             }
 
             /* add to bloom filter */
-            (void)bloom_filter_add(bf, retrieved_key, key_size);
+            (void)bloom_filter_add(sst->bloom_filter, retrieved_key, key_size);
 
         } while (skip_list_cursor_next(cursor) != -1);
 
@@ -3239,7 +3275,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         cursor = NULL;
 
         size_t serialized_bf_size;
-        uint8_t *serialized_bf = bloom_filter_serialize(bf, &serialized_bf_size);
+        uint8_t *serialized_bf = bloom_filter_serialize(sst->bloom_filter, &serialized_bf_size);
         if (serialized_bf == NULL)
         {
             free(sst);
@@ -3250,15 +3286,13 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             return -1;
         }
 
-        /* we free the bloom filter we no longer need it */
-        (void)bloom_filter_free(bf);
-
         /* we write the bloom filter to the sstable */
         block_manager_block_t *bf_block =
             block_manager_block_create(serialized_bf_size, serialized_bf);
         if (bf_block == NULL)
         {
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             free(serialized_bf);
             (void)remove(sstable_path);
             (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC)->message,
@@ -3273,6 +3307,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             (void)block_manager_block_free(bf_block);
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             (void)remove(sstable_path);
             (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
                                                                 "bloom filter", cf->config.name)
@@ -3290,6 +3325,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (cursor == NULL)
         {
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             (void)remove(sstable_path);
             (void)log_write(
                 cf->tdb->log,
@@ -3307,6 +3343,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (kv == NULL)
         {
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
             (void)log_write(
@@ -3327,6 +3364,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             free(kv);
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
             continue;
@@ -3338,6 +3376,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             free(kv);
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
             (void)log_write(cf->tdb->log,
@@ -3353,6 +3392,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             free(kv->key);
             free(kv);
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
             (void)log_write(cf->tdb->log,
@@ -3377,6 +3417,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             (void)_tidesdb_free_key_value_pair(kv);
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
             (void)log_write(cf->tdb->log,
@@ -3392,6 +3433,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (block == NULL)
         {
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             free(serialized_kv);
             (void)remove(sstable_path);
             (void)_tidesdb_free_key_value_pair(kv);
@@ -3408,6 +3450,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             (void)block_manager_block_free(block);
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             free(serialized_kv);
             (void)remove(sstable_path);
             (void)_tidesdb_free_key_value_pair(kv);
@@ -3447,6 +3490,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             (void)binary_hash_array_free(bha);
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             (void)remove(sstable_path);
             (void)log_write(cf->tdb->log,
                             tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_SERIALIZE,
@@ -3462,6 +3506,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             (void)binary_hash_array_free(bha);
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             free(serialized_bha);
             (void)remove(sstable_path);
             (void)log_write(
@@ -3478,6 +3523,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             (void)block_manager_block_free(block);
             (void)binary_hash_array_free(bha);
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             free(serialized_bha);
             (void)remove(sstable_path);
             (void)log_write(cf->tdb->log,
@@ -3501,6 +3547,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (cf->sstables == NULL)
         {
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             (void)remove(sstable_path);
             (void)log_write(cf->tdb->log,
                             tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "sstables")->message);
@@ -3513,6 +3560,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (temp_sstables == NULL)
         {
             free(sst);
+            (void)bloom_filter_free(sst->bloom_filter);
             (void)remove(sstable_path);
             (void)log_write(
                 cf->tdb->log,
@@ -3533,6 +3581,7 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     if (skip_list_clear(cf->memtable) == -1)
     {
         free(sst);
+        (void)bloom_filter_free(sst->bloom_filter);
         (void)remove(sstable_path);
         (void)log_write(cf->tdb->log,
                         tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CLEAR_MEMTABLE)->message);
@@ -3543,16 +3592,15 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     if (block_manager_truncate(cf->wal->block_manager) == -1)
     {
         free(sst);
+        (void)bloom_filter_free(sst->bloom_filter);
         (void)remove(sstable_path);
         (void)log_write(cf->tdb->log,
                         tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_TRUNCATE_WAL)->message);
         return -1;
     }
-    else
-    {
-        (void)log_write(cf->tdb->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_WAL_TRUNCATED),
-                        cf->config.name, sstable_path);
-    }
+
+    (void)log_write(cf->tdb->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_WAL_TRUNCATED),
+                    cf->config.name, sstable_path);
 
     (void)log_write(cf->tdb->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_FLUSHED_MEMTABLE),
                     cf->config.name, sstable_path);
@@ -3837,8 +3885,10 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
         return NULL;
     }
 
+    bloom_filter_t *bf = NULL; /* if configured for column family */
+
     if (_tidesdb_merge_sort(cf, sst1->block_manager, sst2->block_manager,
-                            merged_sstable->block_manager) == -1)
+                            merged_sstable->block_manager, &bf) == -1)
     {
         (void)block_manager_close(merged_sstable->block_manager);
         (void)remove(sstable_path);
@@ -3848,6 +3898,8 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
             tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_MERGE_SSTABLES, cf->config.name)->message);
         return NULL;
     }
+
+    merged_sstable->bloom_filter = bf;
 
     if (merged_sstable == NULL)
     {
@@ -5594,7 +5646,7 @@ size_t _tidesdb_get_available_mem()
 }
 
 int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block_manager_t *bm2,
-                        block_manager_t *bm_out)
+                        block_manager_t *bm_out, bloom_filter_t **bf_out)
 {
     /* we check if the block managers are NULL */
     if (bm1 == NULL || bm2 == NULL || bm_out == NULL)
@@ -5708,13 +5760,12 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
 
         /* we populate the merge table with the sstables and bloom filter */
         /* we create a bloom filter for the merged sstable */
-        bloom_filter_t *bf;
 
         /* we block counts from sst1 and sst2 */
         int block_count1 = block_manager_count_blocks(bm1);
         int block_count2 = block_manager_count_blocks(bm2);
 
-        if (bloom_filter_new(&bf, TDB_BLOOM_FILTER_P, block_count1 + block_count2) == -1)
+        if (bloom_filter_new(bf_out, TDB_BLOOM_FILTER_P, block_count1 + block_count2) == -1)
         {
             (void)log_write(
                 cf->tdb->log,
@@ -5723,6 +5774,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             (void)block_manager_cursor_free(cursor2);
             return -1;
         }
+
         block_manager_block_t *block;
         do
         {
@@ -5751,7 +5803,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             }
 
             /* add to bloom filter */
-            (void)bloom_filter_add(bf, kv->key, kv->key_size);
+            (void)bloom_filter_add(*bf_out, kv->key, kv->key_size);
 
             (void)block_manager_block_free(block);
             (void)_tidesdb_free_key_value_pair(kv);
@@ -5790,7 +5842,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 continue;
             }
 
-            (void)bloom_filter_add(bf, kv->key, kv->key_size);
+            (void)bloom_filter_add(*bf_out, kv->key, kv->key_size);
 
             (void)block_manager_block_free(block);
             (void)_tidesdb_free_key_value_pair(kv);
@@ -5802,13 +5854,13 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
 
         /* now we write the bloom filter to the merged sstable */
         size_t bf_size;
-        uint8_t *bf_serialized = bloom_filter_serialize(bf, &bf_size);
+        uint8_t *bf_serialized = bloom_filter_serialize(*bf_out, &bf_size);
         if (bf_serialized == NULL)
         {
             (void)log_write(
                 cf->tdb->log,
                 tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "bloom filter")->message);
-            (void)bloom_filter_free(bf);
+            (void)bloom_filter_free(*bf_out);
             return -1;
         }
 
@@ -5819,7 +5871,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             (void)log_write(
                 cf->tdb->log,
                 tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "bloom filter block")->message);
-            (void)bloom_filter_free(bf);
+            (void)bloom_filter_free(*bf_out);
             free(bf_serialized);
             return -1;
         }
@@ -5831,14 +5883,13 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                                                                 "bloom filter", cf->config.name)
                                               ->message);
             (void)block_manager_block_free(bf_block);
-            (void)bloom_filter_free(bf);
+            (void)bloom_filter_free(*bf_out);
             free(bf_serialized);
             return -1;
         }
 
         (void)block_manager_block_free(bf_block);
         free(bf_serialized);
-        bloom_filter_free(bf);
 
         /* reintialize the cursors */
         if (block_manager_cursor_init(&cursor1, bm1) != 0)

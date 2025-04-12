@@ -194,6 +194,11 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
 
 void bloom_filter_free(bloom_filter_t *bf)
 {
+    if (bf == NULL)
+    {
+        return;
+    }
+
     free(bf->bitset);
     free(bf);
     bf = NULL;

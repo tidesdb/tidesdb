@@ -2305,20 +2305,6 @@ tidesdb_err_t *tidesdb_get(tidesdb_t *tdb, const char *column_family_name, const
                 /* we go onto the next sstable */
                 continue;
             }
-
-            /* skip block with bloom filter */
-            if (block_manager_cursor_next(cursor) == -1)
-            {
-                (void)block_manager_cursor_free(cursor);
-                continue;
-            }
-
-            /* go next block */
-            if (block_manager_cursor_next(cursor) == -1)
-            {
-                (void)block_manager_cursor_free(cursor);
-                continue;
-            }
         }
         block_manager_block_t *block;
 
@@ -3291,8 +3277,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             block_manager_block_create(serialized_bf_size, serialized_bf);
         if (bf_block == NULL)
         {
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             free(serialized_bf);
             (void)remove(sstable_path);
             (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC)->message,
@@ -3306,8 +3292,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (block_manager_block_write(sst->block_manager, bf_block, 0) == -1)
         {
             (void)block_manager_block_free(bf_block);
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             (void)remove(sstable_path);
             (void)log_write(cf->tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_WRITE_BLOCK,
                                                                 "bloom filter", cf->config.name)
@@ -3324,8 +3310,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         cursor = skip_list_cursor_init(cf->memtable);
         if (cursor == NULL)
         {
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             (void)remove(sstable_path);
             (void)log_write(
                 cf->tdb->log,
@@ -3342,8 +3328,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         tidesdb_key_value_pair_t *kv = malloc(sizeof(tidesdb_key_value_pair_t));
         if (kv == NULL)
         {
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
             (void)log_write(
@@ -3363,8 +3349,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
                                  &ttl) == -1)
         {
             free(kv);
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
             continue;
@@ -3375,8 +3361,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (kv->key == NULL)
         {
             free(kv);
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
             (void)log_write(cf->tdb->log,
@@ -3391,8 +3377,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             free(kv->key);
             free(kv);
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
             (void)log_write(cf->tdb->log,
@@ -3416,8 +3402,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (serialized_kv == NULL)
         {
             (void)_tidesdb_free_key_value_pair(kv);
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             (void)remove(sstable_path);
             (void)skip_list_cursor_free(cursor);
             (void)log_write(cf->tdb->log,
@@ -3432,8 +3418,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         block_manager_block_t *block = block_manager_block_create(serialized_size, serialized_kv);
         if (block == NULL)
         {
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
             (void)_tidesdb_free_key_value_pair(kv);
@@ -3449,8 +3435,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (((offset = block_manager_block_write(sst->block_manager, block, 0))) && offset == -1)
         {
             (void)block_manager_block_free(block);
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             free(serialized_kv);
             (void)remove(sstable_path);
             (void)_tidesdb_free_key_value_pair(kv);
@@ -3489,8 +3475,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (serialized_bha == NULL)
         {
             (void)binary_hash_array_free(bha);
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             (void)remove(sstable_path);
             (void)log_write(cf->tdb->log,
                             tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_SERIALIZE,
@@ -3505,8 +3491,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         if (block == NULL)
         {
             (void)binary_hash_array_free(bha);
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             free(serialized_bha);
             (void)remove(sstable_path);
             (void)log_write(
@@ -3522,8 +3508,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         {
             (void)block_manager_block_free(block);
             (void)binary_hash_array_free(bha);
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             free(serialized_bha);
             (void)remove(sstable_path);
             (void)log_write(cf->tdb->log,
@@ -3546,8 +3532,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         cf->sstables = malloc(sizeof(tidesdb_sstable_t));
         if (cf->sstables == NULL)
         {
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             (void)remove(sstable_path);
             (void)log_write(cf->tdb->log,
                             tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "sstables")->message);
@@ -3559,8 +3545,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
             realloc(cf->sstables, sizeof(tidesdb_sstable_t) * (cf->num_sstables + 1));
         if (temp_sstables == NULL)
         {
-            free(sst);
             (void)bloom_filter_free(sst->bloom_filter);
+            free(sst);
             (void)remove(sstable_path);
             (void)log_write(
                 cf->tdb->log,
@@ -3580,8 +3566,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     /* clear memtable */
     if (skip_list_clear(cf->memtable) == -1)
     {
-        free(sst);
         (void)bloom_filter_free(sst->bloom_filter);
+        free(sst);
         (void)remove(sstable_path);
         (void)log_write(cf->tdb->log,
                         tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_CLEAR_MEMTABLE)->message);
@@ -3591,8 +3577,8 @@ int _tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     /* truncate the wal */
     if (block_manager_truncate(cf->wal->block_manager) == -1)
     {
-        free(sst);
         (void)bloom_filter_free(sst->bloom_filter);
+        free(sst);
         (void)remove(sstable_path);
         (void)log_write(cf->tdb->log,
                         tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_TRUNCATE_WAL)->message);

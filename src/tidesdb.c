@@ -897,9 +897,6 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                     free(cf->wal);
                     free(cf);
                     (void)closedir(cf_dir);
-                    (void)log_write(tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_OPEN_WAL,
-                                                                    cf->config.name)
-                                                  ->message);
                     continue;
                 }
 

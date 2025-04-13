@@ -672,6 +672,14 @@ if (err != NULL)
     /* handle error */
     tidesdb_err_free(e);
 }
+
+/* free the column family stat */
+err = tidesdb_free_column_family_stat(stat);
+if (err != NULL)
+{
+    /* handle error */
+    tidesdb_err_free(e);
+}
 ```
 
 ## License

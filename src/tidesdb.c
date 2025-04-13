@@ -521,7 +521,7 @@ tidesdb_operation_t *_tidesdb_deserialize_operation(uint8_t *data, size_t data_s
     memcpy(cf_name, ptr, cf_name_size);
     ptr += cf_name_size;
 
-    /* Check if data is large enough for kv_size */
+    /* we check if data is large enough for kv_size */
     if (data_size < sizeof(TIDESDB_OP_CODE) + sizeof(uint32_t) + cf_name_size + sizeof(size_t))
     {
         free(cf_name);
@@ -768,6 +768,9 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                              cf_entry->d_name) >= (long)sizeof(config_file_path))
                 {
                     (void)closedir(cf_dir);
+                    (void)log_write(
+                        tdb->log, tidesdb_err_from_code(TIDESDB_ERR_PATH_TOO_LONG, config_file_path)
+                                      ->message);
                     continue;
                 }
 
@@ -775,6 +778,10 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 FILE *config_file = fopen(config_file_path, "rb");
                 if (config_file == NULL)
                 {
+                    (void)log_write(tdb->log, tidesdb_err_from_code(
+                                                  TIDESDB_ERR_FAILED_TO_OPEN_COLUMN_FAMILY_CONFIG,
+                                                  config_file_path)
+                                                  ->message);
                     (void)closedir(cf_dir);
                     continue;
                 }
@@ -789,6 +796,10 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                     free(buffer);
                     (void)fclose(config_file);
                     (void)closedir(cf_dir);
+                    (void)log_write(tdb->log, tidesdb_err_from_code(
+                                                  TIDESDB_ERR_FAILED_TO_READ_COLUMN_FAMILY_CONFIG,
+                                                  config_file_path)
+                                                  ->message);
                     continue;
                 }
 
@@ -801,6 +812,10 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 {
                     free(buffer);
                     (void)closedir(cf_dir);
+                    (void)log_write(
+                        tdb->log,
+                        tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_DESERIALIZE, config_file_path)
+                            ->message);
                     continue;
                 }
 
@@ -813,6 +828,9 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                     free(config->name);
                     free(config);
                     (void)closedir(cf_dir);
+                    (void)log_write(
+                        tdb->log,
+                        tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "column family")->message);
                     continue;
                 }
 
@@ -832,9 +850,9 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                 if (skip_list_new(&cf->memtable, cf->config.max_level, cf->config.probability) ==
                     -1)
                 {
-                    (void)log_write(
-                        tdb->log,
-                        tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "memtable")->message);
+                    (void)log_write(tdb->log, tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC,
+                                                                    "memtable (skip list)")
+                                                  ->message);
                     free(cf->path);
                     free(cf);
                     (void)closedir(cf_dir);
@@ -849,6 +867,9 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                     free(cf->path);
                     free(cf);
                     (void)closedir(cf_dir);
+                    (void)log_write(tdb->log, tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC,
+                                                                    "column family wal")
+                                                  ->message);
                     continue;
                 }
 
@@ -859,6 +880,9 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                     free(cf->wal);
                     free(cf);
                     (void)closedir(cf_dir);
+                    (void)log_write(tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_INIT_LOCK,
+                                                                    "column family")
+                                                  ->message);
                     continue;
                 }
 
@@ -873,6 +897,9 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                     free(cf->wal);
                     free(cf);
                     (void)closedir(cf_dir);
+                    (void)log_write(tdb->log, tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_OPEN_WAL,
+                                                                    cf->config.name)
+                                                  ->message);
                     continue;
                 }
 
@@ -901,7 +928,7 @@ int _tidesdb_load_column_families(tidesdb_t *tdb)
                     _tidesdb_get_debug_log_format(TIDESDB_DEBUG_LOADED_COLUMN_FAMILY_SSTABLES),
                     cf->config.name);
 
-                /* we sort sstables if any, don't worry about the return here */
+                /* we sort sstables by last modified if any, don't worry about the return here */
                 (void)_tidesdb_sort_sstables(cf);
 
                 /* now we replay from the wal and populate column family memtable */
@@ -982,7 +1009,8 @@ void _tidesdb_free_column_families(tidesdb_t *tdb)
             if (tdb->column_families[i]->incremental_merging)
             {
                 tdb->column_families[i]->incremental_merging = false;
-                /* wait for thread to finish */
+
+                /* wait for incremental merge thread to finish */
                 (void)pthread_join(tdb->column_families[i]->incremental_merge_thread, NULL);
             }
 
@@ -1104,7 +1132,8 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 
         /* if the file ends with TDB_TEMP_EXT, we remove it as this is possibly unfinished merge
-         * which did not complete prior to shutdown */
+         * which did not complete prior to shutdown.  We don't care for it as prior pair's are still
+         * available. */
         if (strstr(entry->d_name, TDB_TEMP_EXT) != NULL)
         {
             char temp_file_path[MAX_FILE_PATH_LENGTH]; /* we construct the path to the temp file we
@@ -1122,6 +1151,7 @@ int _tidesdb_load_sstables(tidesdb_column_family_t *cf)
                 return -1;
             }
         }
+
         /* we check if the file ends with SSTABLE_EXT or contains */
         if (strstr(entry->d_name, TDB_SSTABLE_EXT) == NULL) continue;
 

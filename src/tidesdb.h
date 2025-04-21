@@ -39,14 +39,14 @@ extern "C"
 
     /* TidesDB uses tidesdb, _tidesdb_, and TDB as prefixes for functions, types, and constants */
 
-#define TDB_WAL_EXT                       ".wal"     /* extension for the write-ahead log file */
-#define TDB_SSTABLE_EXT                   ".sst"     /* extension for the SSTable file */
-#define TDB_COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"     /* configuration file for the column family */
-#define TDB_TEMP_EXT                      ".tmp"     /* extension for temporary files, names */
-#define TDB_TOMBSTONE                     0xDEADBEEF /* tombstone value for deleted keys */
-#define TDB_MAX_COLUMN_FAMILY_NAME_LEN    256        /* max length for column family name */
-#define TDB_SYNC_INTERVAL                 10000      /* interval for syncing mainly WAL, 10ms */
-#define TDB_BLOOM_FILTER_P                0.01       /*  the false positive rate for bloom filter */
+#define TDB_WAL_EXT                       ".wal"    /* extension for the write-ahead log file */
+#define TDB_SSTABLE_EXT                   ".sst"    /* extension for the SSTable file */
+#define TDB_COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"    /* configuration file for the column family */
+#define TDB_TEMP_EXT                      ".tmp"    /* extension for temporary files, names */
+#define TDB_TOMBSTONE                     TOMBSTONE /* tombstone value for deleted keys */
+#define TDB_MAX_COLUMN_FAMILY_NAME_LEN    256       /* max length for column family name */
+#define TDB_SYNC_INTERVAL                 10000     /* interval for syncing mainly WAL, 10ms */
+#define TDB_BLOOM_FILTER_P                0.01      /*  the false positive rate for bloom filter */
 #define TDB_BLOCK_INDICES                                                                          \
     1 /* whether to store block indices in SSTable. Will cause more memory usage but reads will be \
          faster */
@@ -1189,7 +1189,7 @@ extern "C"
 
     /*
      * _tidesdb_key_exists
-     * check if a key exists in a result set
+     * check if a key exists in a result set (used for range and filter)
      * @param key the key
      * @param key_size the size of the key
      * @param result the key-value pair if the key exists

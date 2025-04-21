@@ -25,8 +25,9 @@
 #include <string.h>
 #include <time.h>
 
-#define TOMBSTONE \
-    0xDEADBEEF /* on expiration of a node if time to live is set we set the key's value to this */
+#define TOMBSTONE                                                                                  \
+    0xDEADBEEF /* on expiration of a node if time to live(ttl) is set we update the key's value to \
+                  this.  Is TidesDB specific. */
 
 typedef struct skip_list_node_t skip_list_node_t; /* forward declaration */
 

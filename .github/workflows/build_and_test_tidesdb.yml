@@ -31,10 +31,17 @@ jobs:
         run: |
           brew install zstd lz4 snappy openssl
 
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          git pull
+          .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows openssl:x64-windows pthreads:x64-windows
+          
       - name: Configure CMake (Windows)
         if: runner.os == 'Windows'
         run: |
-          cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_MANIFEST_MODE=ON
+          cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Configure CMake (Linux/macOS)
         if: runner.os != 'Windows'

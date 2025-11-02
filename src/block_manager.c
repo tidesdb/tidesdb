@@ -830,13 +830,13 @@ int block_manager_truncate(block_manager_t *bm)
 
     pthread_mutex_lock(&bm->write_mutex);
 
-    if (close(bm->fd) != 0)
+    if (ftruncate(bm->fd, 0) != 0)
     {
         pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
-    if (truncate(bm->file_path, 0) != 0)
+    if (close(bm->fd) != 0)
     {
         pthread_mutex_unlock(&bm->write_mutex);
         return -1;
@@ -1070,9 +1070,8 @@ int block_manager_validate_last_block(block_manager_t *bm)
     {
         /* truncate to header only */
         pthread_mutex_lock(&bm->write_mutex);
-        close(bm->fd);
-        truncate(bm->file_path, BLOCK_MANAGER_HEADER_SIZE);
-        open(bm->file_path, O_RDWR | O_CREAT, 0644);
+        ftruncate(bm->fd, BLOCK_MANAGER_HEADER_SIZE);
+        lseek(bm->fd, 0, SEEK_SET);
         pthread_mutex_unlock(&bm->write_mutex);
         return (bm->fd != -1) ? 0 : -1;
     }
@@ -1158,15 +1157,15 @@ done_scanning:
     if (valid_size != file_size)
     {
         pthread_mutex_lock(&bm->write_mutex);
-        close(bm->fd);
 
-        if (truncate(bm->file_path, (long)valid_size) != 0)
+        if (ftruncate(bm->fd, (long)valid_size) != 0)
         {
             pthread_mutex_unlock(&bm->write_mutex);
             return -1;
         }
 
-        open(bm->file_path, O_RDWR | O_CREAT, 0644);
+        close(bm->fd);
+        bm->fd = open(bm->file_path, O_RDWR | O_CREAT, 0644);
         if (bm->fd == -1)
         {
             pthread_mutex_unlock(&bm->write_mutex);

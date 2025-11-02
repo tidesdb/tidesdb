@@ -63,7 +63,14 @@ struct skip_list_node_t
     size_t value_size;
     time_t ttl;
     _Atomic(uint8_t) deleted;
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4200) /* nonstandard extension: zero-sized array */
+#endif
     _Atomic(skip_list_node_t *) forward[];
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 };
 
 /*

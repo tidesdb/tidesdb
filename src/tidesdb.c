@@ -18,8 +18,10 @@
  */
 
 /* disable format-truncation warnings. all path buffers use TDB_MAX_PATH_LENGTH (1024) */
+#ifndef _MSC_VER
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
 
 #include "tidesdb.h"
 
@@ -134,7 +136,7 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .enable_background_compaction = 1,
         .use_sbha = 1,
         .sync_mode = TDB_SYNC_BACKGROUND,
-        .sync_interval = 1.0f,  /* 1 second default */
+        .sync_interval = 1,  /* 1 second default */
         .comparator_name = NULL /* NULL = use "memcmp" */
     };
     return config;

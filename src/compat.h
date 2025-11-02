@@ -33,12 +33,12 @@
 #include <windows.h>
 
 #pragma warning(disable : 4996) /* disable deprecated warning for Windows */
+#pragma warning(disable : 4029) /* declared formal parameter list different from definition */
+#pragma warning(disable : 4211) /* nonstandard extension used: redefined extern to static */
 
 #include "pthread.h" /* pthreads-win32 library (https://github.com/tidesdb/tidesdb/issues/241) */
 
-#define truncate                                                                                                                                            \
-    _chsize /* https://github.com/tidesdb/tidesdb/issues/241#:~:text=back%20and%20added%3A-,%23define%20truncate%20%20%20%20%20%20%20_chsize,-to%20compat.h \
-             */
+#define ftruncate _chsize /* Windows uses _chsize(fd, size) for file truncation */
 
 /* access flags are normally defined in unistd.h, which unavailable under
  * windows.
@@ -286,12 +286,10 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     }
 
     OVERLAPPED overlapped = {0};
-    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFFULL);
-#if defined(_WIN64) || (LONG_MAX > 2147483647L)
-    overlapped.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFFULL);
-#else
-    overlapped.OffsetHigh = 0;
-#endif
+    LARGE_INTEGER li;
+    li.QuadPart = offset;
+    overlapped.Offset = li.LowPart;
+    overlapped.OffsetHigh = li.HighPart;
 
     DWORD bytes_read;
     if (!ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped))
@@ -313,12 +311,10 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
     }
 
     OVERLAPPED overlapped = {0};
-    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFFULL);
-#if defined(_WIN64) || (LONG_MAX > 2147483647L)
-    overlapped.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFFULL);
-#else
-    overlapped.OffsetHigh = 0;
-#endif
+    LARGE_INTEGER li;
+    li.QuadPart = offset;
+    overlapped.Offset = li.LowPart;
+    overlapped.OffsetHigh = li.HighPart;
 
     DWORD bytes_written;
     if (!WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped))

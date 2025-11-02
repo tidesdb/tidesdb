@@ -406,7 +406,7 @@ tidesdb_txn_commit(txn);
 tidesdb_txn_free(txn);
 ```
 
-**TTL Examples:**
+**TTL Examples**
 ```c
 /* No expiration */
 time_t ttl = -1;

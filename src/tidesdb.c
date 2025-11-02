@@ -2185,7 +2185,7 @@ static int tidesdb_recover_wal(tidesdb_column_family_t *cf)
             tidesdb_kv_pair_header_t header;
             memcpy(&header, block->data, sizeof(tidesdb_kv_pair_header_t));
 
-            uint8_t *ptr = block->data + sizeof(tidesdb_kv_pair_header_t);
+            uint8_t *ptr = (uint8_t *)block->data + sizeof(tidesdb_kv_pair_header_t);
             uint8_t *key = ptr;
             ptr += header.key_size;
             uint8_t *value = ptr;

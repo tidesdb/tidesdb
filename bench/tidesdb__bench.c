@@ -24,6 +24,15 @@
 #define VALUE_SIZE     156
 #define CF_NAME        "benchmark_cf"
 #define NUM_THREADS    2
+#define BENCH_DB_PATH  "benchmark_db"
+
+/* helper to clean benchmark directory */
+static inline void cleanup_benchmark_dir(void)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", BENCH_DB_PATH);
+    system(cmd);
+}
 
 /*
  * thread_data_t struct is used to pass data to the thread functions
@@ -46,7 +55,7 @@ void generate_random_string(uint8_t *buffer, size_t size)
     /*  we fill buffer with random characters from charset (leaving room for null terminator) */
     for (size_t i = 0; i < size - 1; i++)
     {
-        buffer[i] = charset[rand() % (sizeof(charset) - 1)];
+        buffer[i] = (uint8_t)charset[rand() % (int)(sizeof(charset) - 1)];
     }
 
     /* ensure null termination */
@@ -57,24 +66,35 @@ double get_time_ms()
 {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    return (tv.tv_sec * 1000.0) + (tv.tv_usec / 1000.0);
+    return ((double)tv.tv_sec * 1000.0) + ((double)tv.tv_usec / 1000.0);
 }
 
 void *thread_put(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
-    tidesdb_err_t *err = NULL;
 
     for (int i = data->start; i < data->end; i++)
     {
-        err = tidesdb_put(data->tdb, CF_NAME, data->keys[i], data->key_sizes[i], data->values[i],
-                          data->value_sizes[i], -1);
-
-        if (err != NULL)
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(data->tdb, &txn) != 0)
         {
-            printf(BOLDRED "Put operation failed: %s\n" RESET, err->message);
-            (void)tidesdb_err_free(err);
+            printf(BOLDRED "Failed to begin transaction\n" RESET);
+            continue;
         }
+
+        if (tidesdb_txn_put(txn, CF_NAME, data->keys[i], data->key_sizes[i], data->values[i],
+                            data->value_sizes[i], -1) != 0)
+        {
+            printf(BOLDRED "Put operation failed\n" RESET);
+            tidesdb_txn_free(txn);
+            continue;
+        }
+
+        if (tidesdb_txn_commit(txn) != 0)
+        {
+            printf(BOLDRED "Failed to commit transaction\n" RESET);
+        }
+        tidesdb_txn_free(txn);
     }
 
     return NULL;
@@ -83,25 +103,26 @@ void *thread_put(void *arg)
 void *thread_get(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
-    tidesdb_err_t *err = NULL;
 
     for (int i = data->start; i < data->end; i++)
     {
-        uint8_t *value_out;
-        size_t value_len;
-
-        err = tidesdb_get(data->tdb, CF_NAME, data->keys[i], data->key_sizes[i], &value_out,
-                          &value_len);
-
-        if (err != NULL)
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
         {
-            printf(BOLDRED "Get operation failed: %s\n" RESET, err->message);
-            (void)tidesdb_err_free(err);
+            printf(BOLDRED "Failed to begin read transaction\n" RESET);
+            continue;
         }
-        else
+
+        uint8_t *value_out = NULL;
+        size_t value_len = 0;
+
+        if (tidesdb_txn_get(txn, CF_NAME, data->keys[i], data->key_sizes[i], &value_out,
+                            &value_len) == 0)
         {
             free(value_out);
         }
+
+        tidesdb_txn_free(txn);
     }
 
     return NULL;
@@ -110,17 +131,28 @@ void *thread_get(void *arg)
 void *thread_delete(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
-    tidesdb_err_t *err = NULL;
 
     for (int i = data->start; i < data->end; i++)
     {
-        err = tidesdb_delete(data->tdb, CF_NAME, data->keys[i], data->key_sizes[i]);
-
-        if (err != NULL)
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(data->tdb, &txn) != 0)
         {
-            printf(BOLDRED "Delete operation failed: %s\n" RESET, err->message);
-            (void)tidesdb_err_free(err);
+            printf(BOLDRED "Failed to begin transaction\n" RESET);
+            continue;
         }
+
+        if (tidesdb_txn_delete(txn, CF_NAME, data->keys[i], data->key_sizes[i]) != 0)
+        {
+            printf(BOLDRED "Delete operation failed\n" RESET);
+            tidesdb_txn_free(txn);
+            continue;
+        }
+
+        if (tidesdb_txn_commit(txn) != 0)
+        {
+            printf(BOLDRED "Failed to commit transaction\n" RESET);
+        }
+        tidesdb_txn_free(txn);
     }
 
     return NULL;
@@ -128,13 +160,12 @@ void *thread_delete(void *arg)
 
 int main()
 {
-    (void)_tidesdb_remove_directory("benchmark_db");
+    cleanup_benchmark_dir();
     tidesdb_t *tdb = NULL;
-    tidesdb_err_t *err = NULL;
     double start_time, end_time;
 
     /* we seed random number generator */
-    srand(time(NULL));
+    srand((unsigned int)time(NULL));
 
     /* we allocate arrays for keys and values */
     uint8_t **keys = malloc(NUM_OPERATIONS * sizeof(uint8_t *));
@@ -214,11 +245,10 @@ int main()
         value_sizes[i] = VALUE_SIZE - 1;
     }
 
-    err = tidesdb_open("benchmark_db", &tdb);
-    if (err != NULL)
+    tidesdb_config_t config = {.db_path = "benchmark_db", .enable_debug_logging = 0};
+    if (tidesdb_open(&config, &tdb) != 0)
     {
-        printf(BOLDRED "Failed to open database: %s\n" RESET, err->message);
-        (void)tidesdb_err_free(err);
+        printf(BOLDRED "Failed to open database\n" RESET);
 
         for (int i = 0; i < NUM_OPERATIONS; i++)
         {
@@ -232,14 +262,17 @@ int main()
         return 1;
     }
 
-    err = tidesdb_create_column_family(
-        tdb, CF_NAME, (1024 * 1024) * 64, TDB_DEFAULT_SKIP_LIST_MAX_LEVEL,
-        TDB_DEFAULT_SKIP_LIST_PROBABILITY, false, TDB_NO_COMPRESSION, true);
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.memtable_flush_size = (1024 * 1024) * 64; /* 64MB */
+    cf_config.max_sstables_before_compaction = 512;
+    cf_config.compaction_threads = 4; /* Enable parallel compaction */
+    cf_config.compressed = 1;
+    cf_config.compress_algo = COMPRESS_LZ4;
+    cf_config.enable_background_compaction = 1;
 
-    if (err != NULL)
+    if (tidesdb_create_column_family(tdb, CF_NAME, &cf_config) != 0)
     {
-        printf(BOLDRED "Failed to create column family: %s\n" RESET, err->message);
-        (void)tidesdb_err_free(err);
+        printf(BOLDRED "Failed to create column family\n" RESET);
 
         /* we free allocated memory */
         for (int i = 0; i < NUM_OPERATIONS; i++)
@@ -251,7 +284,7 @@ int main()
         free(values);
         free(key_sizes);
         free(value_sizes);
-        (void)tidesdb_close(tdb);
+        tidesdb_close(tdb);
         return 1;
     }
 
@@ -321,19 +354,12 @@ int main()
     printf(BOLDGREEN "Delete: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, NUM_OPERATIONS,
            end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
-    err = tidesdb_drop_column_family(tdb, CF_NAME);
-    if (err != NULL)
+    if (tidesdb_drop_column_family(tdb, CF_NAME) != 0)
     {
-        printf(BOLDRED "Failed to drop column family: %s\n" RESET, err->message);
-        tidesdb_err_free(err);
+        printf(BOLDRED "Failed to drop column family\n" RESET);
     }
 
-    err = tidesdb_close(tdb);
-    if (err != NULL)
-    {
-        printf(BOLDRED "Failed to close database: %s\n" RESET, err->message);
-        (void)tidesdb_err_free(err);
-    }
+    tidesdb_close(tdb);
 
     /* we free allocated memory */
     for (int i = 0; i < NUM_OPERATIONS; i++)
@@ -346,7 +372,7 @@ int main()
     free(key_sizes);
     free(value_sizes);
 
-    (void)_tidesdb_remove_directory("benchmark_db");
+    cleanup_benchmark_dir();
 
     printf(MAGENTA "\nCleanup completed\n" RESET);
     return 0;

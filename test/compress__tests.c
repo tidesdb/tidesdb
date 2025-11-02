@@ -17,12 +17,11 @@
  * limitations under the License.
  */
 
-#include <assert.h>
-#include <stdio.h>
-#include <string.h>
-
 #include "../src/compress.h"
-#include "test_macros.h"
+#include "test_utils.h"
+
+static int tests_passed = 0;
+static int tests_failed = 0;
 
 void test_compress_decompress_snappy()
 {
@@ -31,17 +30,15 @@ void test_compress_decompress_snappy()
     size_t compressed_size;
     size_t decompressed_size;
     uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, COMPRESS_SNAPPY);
-    assert(compressed_data != NULL);
+    ASSERT_TRUE(compressed_data != NULL);
 
     uint8_t *decompressed_data =
         decompress_data(compressed_data, compressed_size, &decompressed_size, COMPRESS_SNAPPY);
-    assert(decompressed_data != NULL);
-    assert(decompressed_size == data_size);
-    assert(memcmp(data, decompressed_data, data_size) == 0);
-
+    ASSERT_TRUE(decompressed_data != NULL);
+    ASSERT_EQ(decompressed_size, data_size);
+    ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);
     free(compressed_data);
     free(decompressed_data);
-    printf(GREEN "test_compress_decompress_snappy passed\n" RESET);
 }
 
 void test_compress_decompress_lz4()
@@ -51,17 +48,15 @@ void test_compress_decompress_lz4()
     size_t compressed_size;
     size_t decompressed_size;
     uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, COMPRESS_LZ4);
-    assert(compressed_data != NULL);
+    ASSERT_TRUE(compressed_data != NULL);
 
     uint8_t *decompressed_data =
         decompress_data(compressed_data, compressed_size, &decompressed_size, COMPRESS_LZ4);
-    assert(decompressed_data != NULL);
-    assert(decompressed_size == data_size);
-    assert(memcmp(data, decompressed_data, data_size) == 0);
-
+    ASSERT_TRUE(decompressed_data != NULL);
+    ASSERT_EQ(decompressed_size, data_size);
+    ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);
     free(compressed_data);
     free(decompressed_data);
-    printf(GREEN "test_compress_decompress_lz4 passed\n" RESET);
 }
 
 void test_compress_decompress_zstd()
@@ -71,23 +66,23 @@ void test_compress_decompress_zstd()
     size_t compressed_size;
     size_t decompressed_size;
     uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, COMPRESS_ZSTD);
-    assert(compressed_data != NULL);
+    ASSERT_TRUE(compressed_data != NULL);
 
     uint8_t *decompressed_data =
         decompress_data(compressed_data, compressed_size, &decompressed_size, COMPRESS_ZSTD);
-    assert(decompressed_data != NULL);
-    assert(decompressed_size == data_size);
-    assert(memcmp(data, decompressed_data, data_size) == 0);
-
+    ASSERT_TRUE(decompressed_data != NULL);
+    ASSERT_EQ(decompressed_size, data_size);
+    ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);
     free(compressed_data);
     free(decompressed_data);
-    printf(GREEN "test_compress_decompress_zstd passed\n" RESET);
 }
 
 int main(void)
 {
-    test_compress_decompress_snappy();
-    test_compress_decompress_lz4();
-    test_compress_decompress_zstd();
-    return 0;
+    RUN_TEST(test_compress_decompress_snappy, tests_passed);
+    RUN_TEST(test_compress_decompress_lz4, tests_passed);
+    RUN_TEST(test_compress_decompress_zstd, tests_passed);
+
+    PRINT_TEST_RESULTS(tests_passed, tests_failed);
+    return tests_failed > 0 ? 1 : 0;
 }

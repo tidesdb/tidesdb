@@ -27,27 +27,45 @@
 
 /* more time equals more results, but remember to take breaks to refresh your mind. */
 
-#define MAX_FILE_PATH_LENGTH 1024 /* max file path length for block manager file(s) */
+#define MAX_FILE_PATH_LENGTH             1024 /* max file path length for block manager file(s) */
+#define BLOCK_MANAGER_MAGIC              0x544442 /* TDB in hex */
+#define BLOCK_MANAGER_VERSION            1
+#define BLOCK_MANAGER_SHA1_DIGEST_LENGTH 20
+#define BLOCK_MANAGER_HEADER_SIZE        12 /* 3 + 1 + 4 + 4 (padding) */
+#define BLOCK_MANAGER_BLOCK_HEADER_SIZE  (sizeof(uint64_t) + SHA1_DIGEST_LENGTH + sizeof(uint64_t))
+#define MAX_INLINE_BLOCK_SIZE            (32 * 1024) /* 32KB inline, larger blocks use overflow */
+
+/* sync mode enum for block manager and tidesdb */
+typedef enum
+{
+    TDB_SYNC_NONE,       /* no sync - fastest, least durable */
+    TDB_SYNC_FULL,       /* full sync on every write - slowest, most durable */
+    TDB_SYNC_BACKGROUND, /* background sync with interval - balanced */
+} tidesdb_sync_mode_t;
 
 /**
  * block_manager_t
  * block manager struct
  * used for block managers in TidesDB
- * @param file the file the block manager is managing
+ * @param fd the file descriptor the block manager is managing
  * @param file_path the path of the file
  * @param fsync_thread the fsync thread
- * @param fsync_interval the fsync interval in seconds
+ * @param fsync_interval the fsync interval in milliseconds
  * @param stop_fsync_thread flag to stop fsync thread
- * @param mutex mutex for safe concurrent access
+ * @param write_mutex mutex for write operations only
+ * @param block_size the default block size for this block manager
  */
 typedef struct
 {
-    FILE *file;
+    int fd;
     char file_path[MAX_FILE_PATH_LENGTH];
     pthread_t fsync_thread;
-    float fsync_interval;
+    int fsync_interval;
     int stop_fsync_thread;
-    pthread_mutex_t mutex;
+    tidesdb_sync_mode_t sync_mode;
+    pthread_mutex_t write_mutex;
+    pthread_cond_t fsync_cond;
+    uint32_t block_size;
 } block_manager_t;
 
 /**
@@ -68,14 +86,12 @@ typedef struct
  * block cursor struct
  * used for block cursors in TidesDB
  * @param bm the block manager
- * @param file private file handle for cursor operations
  * @param current_pos the current position of the cursor
  * @param current_block_size the size of the current block
  */
 typedef struct
 {
     block_manager_t *bm;
-    FILE *file;
     uint64_t current_pos;
     uint64_t current_block_size;
 } block_manager_cursor_t;
@@ -85,10 +101,12 @@ typedef struct
  * opens a block manager
  * @param bm the block manager to open
  * @param file_path the path of the file
- * @param fsync_interval the fsync interval
+ * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL, TDB_SYNC_BACKGROUND)
+ * @param fsync_interval the fsync interval in milliseconds (only used for TDB_SYNC_BACKGROUND)
  * @return 0 if successful, -1 if not
  */
-int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_interval);
+int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode,
+                       int fsync_interval);
 
 /**
  * block_manager_close
@@ -112,18 +130,9 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data);
  * writes a block to a file
  * @param bm the block manager to write the block to
  * @param block the block to write
- * @param lock whether to lock the block manager or not
  * @return block offset if successful, -1 if not
  */
-long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block, uint8_t lock);
-
-/**
- * block_manager_block_read
- * reads a block from a file at current file position
- * @param bm the block manager to read the block from
- * @return the block read from the file
- */
-block_manager_block_t *block_manager_block_read(block_manager_t *bm);
+long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
 
 /**
  * block_manager_block_free
@@ -253,15 +262,6 @@ int block_manager_cursor_goto_first(block_manager_cursor_t *cursor);
  * @return 0 if successful, -1 if not
  */
 int block_manager_get_size(block_manager_t *bm, uint64_t *size);
-
-/**
- * block_manager_seek
- * seeks to a position in a block manager
- * @param bm the block manager to seek in
- * @param pos the position to seek to
- * @return 0 if successful, -1 if not
- */
-int block_manager_seek(block_manager_t *bm, uint64_t pos);
 
 /**
  * block_manager_escalate_fsync

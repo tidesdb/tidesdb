@@ -27,6 +27,7 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
 #include <windows.h>
@@ -48,6 +49,23 @@
 #define W_OK 02
 #define R_OK 04
 
+/* fcntl.h flags for Windows - use _O_* equivalents */
+#ifndef O_RDWR
+#define O_RDWR _O_RDWR
+#endif
+#ifndef O_CREAT
+#define O_CREAT _O_CREAT
+#endif
+#ifndef O_RDONLY
+#define O_RDONLY _O_RDONLY
+#endif
+#ifndef O_WRONLY
+#define O_WRONLY _O_WRONLY
+#endif
+#ifndef O_BINARY
+#define O_BINARY _O_BINARY
+#endif
+
 typedef int64_t ssize_t; /* ssize_t is not defined in Windows */
 
 #define M_LN2 0.69314718055994530942 /* log_e 2 */
@@ -66,8 +84,9 @@ typedef struct
 
 /* https://github.com/tidesdb/tidesdb/issues/241#:~:text=if%20(mkdir(directory)%20%3D%3D%20%2D1)%20//%20%2C%200777%20and%20if%20(mkdir(cf_path)%20%3D%3D%20%2D1)%20//%20%2C%200777%20i%20get%20the%20following%3A
  */
-external int mkdir(const char *path, mode_t mode)
+static inline int mkdir(const char *path, mode_t mode)
 {
+    (void)mode; /* unused on Windows */
     return _mkdir(path);
 }
 
@@ -154,6 +173,12 @@ int fsync(int fd)
     return FlushFileBuffers(h) ? 0 : -1;
 }
 
+/* fdatasync for Windows, same as fsync (Windows doesn't distinguish) */
+int fdatasync(int fd)
+{
+    return fsync(fd);
+}
+
 /* gettimeofday function for win */
 int gettimeofday(struct timeval *tp, struct timezone *tzp)
 {
@@ -193,8 +218,56 @@ int gettimeofday(struct timeval *tp, struct timezone *tzp)
     return 0;
 }
 
+/* pread and pwrite for Windows */
+ssize_t pread(int fd, void *buf, size_t count, off_t offset)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    OVERLAPPED overlapped = {0};
+    overlapped.Offset = (DWORD)offset;
+    overlapped.OffsetHigh = (DWORD)(offset >> 32);
+
+    DWORD bytes_read;
+    if (!ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped))
+    {
+        errno = GetLastError();
+        return -1;
+    }
+
+    return (ssize_t)bytes_read;
+}
+
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    OVERLAPPED overlapped = {0};
+    overlapped.Offset = (DWORD)offset;
+    overlapped.OffsetHigh = (DWORD)(offset >> 32);
+
+    DWORD bytes_written;
+    if (!WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped))
+    {
+        errno = GetLastError();
+        return -1;
+    }
+
+    return (ssize_t)bytes_written;
+}
+
 #elif defined(__APPLE__)
 #include <dirent.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -203,14 +276,38 @@ int gettimeofday(struct timeval *tp, struct timezone *tzp)
 #include <sys/time.h>
 #include <unistd.h>
 
+/* pread and pwrite are available natively on macOS via unistd.h */
+/* no additional implementation needed - using system pread/pwrite */
+
+/* fdatasync for macOS - use F_FULLFSYNC for proper data sync */
+static inline int fdatasync(int fd)
+{
+#ifdef F_FULLFSYNC
+    /* macOS requires F_FULLFSYNC to actually flush to disk */
+    if (fcntl(fd, F_FULLFSYNC) == -1)
+    {
+        /* fall back to fsync if F_FULLFSYNC fails */
+        return fsync(fd);
+    }
+    return 0;
+#else
+    /* fall back to fsync if F_FULLFSYNC not available */
+    return fsync(fd);
+#endif
+}
+
 #else /* posix systems */
 #include <dirent.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+/* pread, pwrite, and fdatasync are available natively on POSIX systems via unistd.h */
+/* no additional implementation needed - using system pread/pwrite/fdatasync */
 
 typedef pthread_t thread_t;
 typedef pthread_mutex_t mutex_t;

@@ -18,91 +18,234 @@
  */
 #include "block_manager.h"
 
-int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_interval)
+#include <openssl/sha.h>
+#include <time.h>
+
+/* fcntl.h and sys/stat.h are included via compat.h in block_manager.h */
+
+/* file format:
+ * [HEADER]
+ * - magic (3 bytes) 0x544442 "TDB"
+ * - version (1 byte) 1
+ * - block_size (4 bytes) default block size
+ * - padding (4 bytes) reserved
+ * [BLOCKS]
+ * - block_size (8 bytes)
+ * - checksum (20 bytes) SHA1 of data
+ * - data (variable size)
+ * - overflow_offset (8 bytes): 0 if no overflow, otherwise offset to next overflow block
+ *
+ * CONCURRENCY MODEL:
+ * - Single file descriptor shared by all operations
+ * - pread/pwrite for lock-free reads (readers don't block readers or writers)
+ * - write_mutex only for serializing writes (writers block writers)
+ * - Readers NEVER block - they can read while writes happen
+ */
+
+/* internal helper to compute SHA1 checksum */
+static void compute_sha1(const void *data, size_t size, unsigned char *digest)
+{
+    SHA1((const unsigned char *)data, size, digest);
+}
+
+/* internal helper to verify SHA1 checksum */
+static int verify_sha1(const void *data, size_t size, const unsigned char *expected_digest)
+{
+    unsigned char computed_digest[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
+    compute_sha1(data, size, computed_digest);
+    return memcmp(computed_digest, expected_digest, BLOCK_MANAGER_SHA1_DIGEST_LENGTH) == 0 ? 0 : -1;
+}
+
+/* internal helper to write file header using pwrite */
+static int write_header(int fd, uint32_t block_size)
+{
+    unsigned char header[BLOCK_MANAGER_HEADER_SIZE];
+    uint32_t magic = BLOCK_MANAGER_MAGIC;
+    uint8_t version = BLOCK_MANAGER_VERSION;
+    uint32_t padding = 0;
+
+    /* build header buffer */
+    memcpy(header, &magic, 3);
+    memcpy(header + 3, &version, sizeof(uint8_t));
+    memcpy(header + 4, &block_size, sizeof(uint32_t));
+    memcpy(header + 8, &padding, sizeof(uint32_t));
+
+    /* write atomically at offset 0 */
+    ssize_t written = pwrite(fd, header, BLOCK_MANAGER_HEADER_SIZE, 0);
+    return (written == BLOCK_MANAGER_HEADER_SIZE) ? 0 : -1;
+}
+
+/* internal helper to read and validate file header using pread */
+static int read_header(int fd, uint32_t *block_size)
+{
+    unsigned char header[BLOCK_MANAGER_HEADER_SIZE];
+
+    /* read header atomically */
+    ssize_t nread = pread(fd, header, BLOCK_MANAGER_HEADER_SIZE, 0);
+    if (nread != BLOCK_MANAGER_HEADER_SIZE) return -1;
+
+    /* extract and validate magic */
+    uint32_t magic;
+    memcpy(&magic, header, 3);
+    magic &= 0xFFFFFF; /* mask to 3 bytes */
+
+    if (magic != BLOCK_MANAGER_MAGIC) return -1;
+
+    /* extract and validate version */
+    uint8_t version;
+    memcpy(&version, header + 3, sizeof(uint8_t));
+    if (version != BLOCK_MANAGER_VERSION) return -1;
+
+    /* extract block size */
+    memcpy(block_size, header + 4, sizeof(uint32_t));
+
+    return 0;
+}
+
+/* internal helper to get file size */
+static int get_file_size(int fd, uint64_t *size)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0) return -1;
+    *size = (uint64_t)st.st_size;
+    return 0;
+}
+
+int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode,
+                       int fsync_interval)
 {
     /* we allocate memory for the new block manager */
     (*bm) = malloc(sizeof(block_manager_t));
-    if (!(*bm)) return -1; /* if allocation fails, return -1 */
+    if (!(*bm)) return -1;
 
-    (*bm)->file = fopen(file_path, "a+b"); /* we open the desired file in append-binary mode */
-    if (!(*bm)->file)
+    /* we check if the file already exists */
+    int file_exists = access(file_path, F_OK) == 0;
+
+    /* open with O_RDWR for read/write, O_CREAT to create if needed */
+    int flags = O_RDWR | O_CREAT;
+    mode_t mode = 0644;
+
+    (*bm)->fd = open(file_path, flags, mode);
+    if ((*bm)->fd == -1)
     {
         free(*bm);
         return -1;
     }
 
-    /* we check if the file already exists */
-    int file_exists = access(file_path, F_OK) == 0;
-
     /* we copy the file path to the block manager */
-    strcpy((*bm)->file_path, file_path);
+    strncpy((*bm)->file_path, file_path, MAX_FILE_PATH_LENGTH - 1);
+    (*bm)->file_path[MAX_FILE_PATH_LENGTH - 1] = '\0';
 
-    /* we set the fsync interval */
+    /* set sync mode and interval */
+    (*bm)->sync_mode = sync_mode;
     (*bm)->fsync_interval = fsync_interval;
 
     /* we set the stop fsync thread flag to 0 */
     (*bm)->stop_fsync_thread = 0;
 
-    /* initialize mutex for thread safety */
-    if (pthread_mutex_init(&(*bm)->mutex, NULL) != 0)
+    /* initialize write mutex for thread safety on writes only */
+    if (pthread_mutex_init(&(*bm)->write_mutex, NULL) != 0)
     {
-        fclose((*bm)->file);
+        close((*bm)->fd);
         free(*bm);
         return -1;
     }
 
-    /* if the file existed, validate the last block for potential corruption */
+    if (pthread_cond_init(&(*bm)->fsync_cond, NULL) != 0)
+    {
+        pthread_mutex_destroy(&(*bm)->write_mutex);
+        close((*bm)->fd);
+        free(*bm);
+        return -1;
+    }
+
+    /* handle file header */
     if (file_exists)
     {
+        /* read existing header */
+        if (read_header((*bm)->fd, &(*bm)->block_size) != 0)
+        {
+            pthread_mutex_destroy(&(*bm)->write_mutex);
+            close((*bm)->fd);
+            free(*bm);
+            return -1;
+        }
+
+        /* validate last block */
         int validation_result = block_manager_validate_last_block(*bm);
         if (validation_result != 0)
         {
-            pthread_mutex_destroy(&(*bm)->mutex);
-            fclose((*bm)->file);
+            pthread_mutex_destroy(&(*bm)->write_mutex);
+            close((*bm)->fd);
+            free(*bm);
+            return -1;
+        }
+    }
+    else
+    {
+        /* new file, write header */
+        (*bm)->block_size = MAX_INLINE_BLOCK_SIZE;
+        if (write_header((*bm)->fd, (*bm)->block_size) != 0)
+        {
+            pthread_mutex_destroy(&(*bm)->write_mutex);
+            close((*bm)->fd);
+            free(*bm);
+            return -1;
+        }
+        if (fdatasync((*bm)->fd) != 0)
+        {
+            pthread_mutex_destroy(&(*bm)->write_mutex);
+            close((*bm)->fd);
             free(*bm);
             return -1;
         }
     }
 
-    /* we create and start the fsync thread */
-    if (pthread_create(&(*bm)->fsync_thread, NULL, block_manager_fsync_thread, *bm) != 0)
+    /* create and start the fsync thread only for background sync */
+    if (sync_mode == TDB_SYNC_BACKGROUND)
     {
-        pthread_mutex_destroy(&(*bm)->mutex);
-        fclose((*bm)->file);
-        free(*bm);
-        return -1;
+        if (pthread_create(&(*bm)->fsync_thread, NULL, block_manager_fsync_thread, *bm) != 0)
+        {
+            pthread_mutex_destroy(&(*bm)->write_mutex);
+            pthread_cond_destroy(&(*bm)->fsync_cond);
+            close((*bm)->fd);
+            free(*bm);
+            return -1;
+        }
     }
+
     return 0;
 }
 
 int block_manager_close(block_manager_t *bm)
 {
-    /* we stop the fsync thread */
-    bm->stop_fsync_thread = 1;
-
-    /* we flush the file to disk */
-    pthread_mutex_lock(&bm->mutex);
-    (void)fsync(fileno(bm->file)); /* flush file to disk */
-    pthread_mutex_unlock(&bm->mutex);
-
-    /* we join the fsync thread */
-    if (pthread_join(bm->fsync_thread, NULL) != 0) return -1;
-
-    /* we close the file */
-    pthread_mutex_lock(&bm->mutex);
-    if (fclose(bm->file) != 0)
+    /* signal the fsync thread to stop and wait for it (only if background sync) */
+    if (bm->sync_mode == TDB_SYNC_BACKGROUND)
     {
-        pthread_mutex_unlock(&bm->mutex);
-        return -1;
+        bm->stop_fsync_thread = 1;
+
+        /* wake up the fsync thread if it's sleeping on the condition variable */
+        pthread_mutex_lock(&bm->write_mutex);
+        pthread_cond_signal(&bm->fsync_cond);
+        pthread_mutex_unlock(&bm->write_mutex);
+
+        /* wait for the fsync thread to finish */
+        if (pthread_join(bm->fsync_thread, NULL) != 0) return -1;
     }
-    pthread_mutex_unlock(&bm->mutex);
 
-    /* destroy the mutex */
-    pthread_mutex_destroy(&bm->mutex);
+    /* flush the file to disk one final time */
+    (void)fdatasync(bm->fd);
 
-    /* we free the block manager */
+    /* close the file descriptor */
+    if (close(bm->fd) != 0) return -1;
+
+    /* destroy synchronization primitives */
+    pthread_cond_destroy(&bm->fsync_cond);
+    pthread_mutex_destroy(&bm->write_mutex);
+
+    /* free the block manager */
     free(bm);
-    bm = NULL; /* we set the pointer to NULL */
+    bm = NULL;
 
     return 0;
 }
@@ -111,14 +254,14 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
 {
     /* we allocate memory for the new block */
     block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
-    if (!block) return NULL; /* if allocation fails, return NULL */
+    if (!block) return NULL;
 
     /* we set the size of the block */
     block->size = size;
 
     /* we allocate memory for the data of the block */
     block->data = malloc(size);
-    if (!block->data) /* if allocation fails, free the block and return NULL */
+    if (!block->data)
     {
         free(block);
         block = NULL;
@@ -130,92 +273,160 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
     return block;
 }
 
-long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block, uint8_t lock)
+long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
 {
-    /* we need to lock before accessing the file */
-    if (lock) (void)pthread_mutex_lock(&bm->mutex);
+    if (!bm || !block || !block->data) return -1;
 
-    /* seek to end of file */
-    if (fseek(bm->file, 0, SEEK_END) != 0)
+    /* we lock writes only (writers block writers, but NOT readers) */
+    (void)pthread_mutex_lock(&bm->write_mutex);
+
+    /* get current file size for append position */
+    uint64_t file_size;
+    if (get_file_size(bm->fd, &file_size) != 0)
     {
-        if (lock) (void)pthread_mutex_unlock(&bm->mutex);
+        (void)pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
-    /* get the current file position */
-    long offset = ftell(bm->file);
-    if (offset == -1)
+    long offset = (long)file_size;
+
+    /* compute SHA1 checksum */
+    unsigned char checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
+    compute_sha1(block->data, block->size, checksum);
+
+    /* determine if we need overflow blocks */
+    uint64_t inline_size = block->size <= bm->block_size ? block->size : bm->block_size;
+    uint64_t remaining = block->size > bm->block_size ? block->size - bm->block_size : 0;
+
+    /* build main block in memory buffer for atomic write */
+    size_t main_block_total_size =
+        sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + inline_size + sizeof(uint64_t);
+    unsigned char *main_block_buffer = malloc(main_block_total_size);
+    if (!main_block_buffer)
     {
-        if (lock) (void)pthread_mutex_unlock(&bm->mutex);
+        (void)pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
-    /* write the size of the block */
-    if (fwrite(&block->size, sizeof(uint64_t), 1, bm->file) != 1)
+    size_t buf_offset = 0;
+
+    /* write block size */
+    memcpy(main_block_buffer + buf_offset, &block->size, sizeof(uint64_t));
+    buf_offset += sizeof(uint64_t);
+
+    /* write checksum */
+    memcpy(main_block_buffer + buf_offset, checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH);
+    buf_offset += BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
+
+    /* write inline data */
+    memcpy(main_block_buffer + buf_offset, block->data, inline_size);
+    buf_offset += inline_size;
+
+    /* placeholder for overflow offset */
+    uint64_t overflow_offset = 0;
+    memcpy(main_block_buffer + buf_offset, &overflow_offset, sizeof(uint64_t));
+
+    /* write main block atomically using pwrite */
+    ssize_t written = pwrite(bm->fd, main_block_buffer, main_block_total_size, offset);
+    free(main_block_buffer);
+
+    if (written != (ssize_t)main_block_total_size)
     {
-        if (lock) (void)pthread_mutex_unlock(&bm->mutex);
+        (void)pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
-    /* write the data of the block */
-    if (fwrite(block->data, block->size, 1, bm->file) != 1)
+    /* handle overflow if needed */
+    if (remaining > 0)
     {
-        if (lock) (void)pthread_mutex_unlock(&bm->mutex);
-        return -1;
+        uint64_t overflow_link_pos =
+            (uint64_t)offset + sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + inline_size;
+        uint64_t data_offset = inline_size;
+        uint64_t current_write_pos = (uint64_t)offset + main_block_total_size;
+
+        while (remaining > 0)
+        {
+            /* determine chunk size */
+            uint64_t chunk_size = remaining <= bm->block_size ? remaining : bm->block_size;
+
+            /* compute checksum for this chunk */
+            unsigned char chunk_checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
+            compute_sha1((unsigned char *)block->data + data_offset, chunk_size, chunk_checksum);
+
+            /* build overflow block buffer */
+            size_t overflow_block_size =
+                sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + chunk_size + sizeof(uint64_t);
+            unsigned char *overflow_buffer = malloc(overflow_block_size);
+            if (!overflow_buffer)
+            {
+                (void)pthread_mutex_unlock(&bm->write_mutex);
+                return -1;
+            }
+
+            size_t obuf_offset = 0;
+
+            /* write chunk size */
+            memcpy(overflow_buffer + obuf_offset, &chunk_size, sizeof(uint64_t));
+            obuf_offset += sizeof(uint64_t);
+
+            /* write chunk checksum */
+            memcpy(overflow_buffer + obuf_offset, chunk_checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH);
+            obuf_offset += BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
+
+            /* write chunk data */
+            memcpy(overflow_buffer + obuf_offset, (unsigned char *)block->data + data_offset,
+                   chunk_size);
+            obuf_offset += chunk_size;
+
+            /* next overflow offset (0 if last) */
+            uint64_t next_overflow =
+                (remaining - chunk_size > 0) ? (current_write_pos + overflow_block_size) : 0;
+            memcpy(overflow_buffer + obuf_offset, &next_overflow, sizeof(uint64_t));
+
+            /* update previous overflow link to point to this block using pwrite */
+            if (pwrite(bm->fd, &current_write_pos, sizeof(uint64_t), ( __off_t)overflow_link_pos) !=
+                sizeof(uint64_t))
+            {
+                free(overflow_buffer);
+                (void)pthread_mutex_unlock(&bm->write_mutex);
+                return -1;
+            }
+
+            /* write overflow block atomically using pwrite */
+            if (pwrite(bm->fd, overflow_buffer, overflow_block_size, ( __off_t)current_write_pos) !=
+                (ssize_t)overflow_block_size)
+            {
+                free(overflow_buffer);
+                (void)pthread_mutex_unlock(&bm->write_mutex);
+                return -1;
+            }
+
+            free(overflow_buffer);
+
+            /* update for next iteration */
+            overflow_link_pos = current_write_pos + sizeof(uint64_t) +
+                                BLOCK_MANAGER_SHA1_DIGEST_LENGTH + chunk_size;
+            data_offset += chunk_size;
+            remaining -= chunk_size;
+            current_write_pos += overflow_block_size;
+        }
     }
 
-    /* we flush the file to disk */
-    if (fflush(bm->file) != 0)
+    /* perform sync based on sync_mode */
+    if (bm->sync_mode == TDB_SYNC_FULL)
     {
-        if (lock) (void)pthread_mutex_unlock(&bm->mutex);
-        return -1;
+        /* full sync on every write */
+        if (fdatasync(bm->fd) != 0)
+        {
+            (void)pthread_mutex_unlock(&bm->write_mutex);
+            return -1;
+        }
     }
+    /* TDB_SYNC_BACKGROUND fsync thread handles it */
+    /* TDB_SYNC_NONE no sync */
 
-    if (lock) (void)pthread_mutex_unlock(&bm->mutex);
+    (void)pthread_mutex_unlock(&bm->write_mutex);
     return offset;
-}
-
-block_manager_block_t *block_manager_block_read(block_manager_t *bm)
-{
-    /* we need to lock before accessing the file */
-    pthread_mutex_lock(&bm->mutex);
-
-    /* we allocate memory for the new block */
-    block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
-    if (!block)
-    {
-        pthread_mutex_unlock(&bm->mutex);
-        return NULL;
-    }
-
-    /* we read the size of the block */
-    if (fread(&block->size, sizeof(uint64_t), 1, bm->file) != 1)
-    {
-        free(block);
-        pthread_mutex_unlock(&bm->mutex);
-        return NULL;
-    }
-
-    /* we allocate memory for the data of the block */
-    block->data = malloc(block->size);
-    if (!block->data)
-    {
-        free(block);
-        pthread_mutex_unlock(&bm->mutex);
-        return NULL;
-    }
-
-    /* we read the data of the block */
-    if (fread(block->data, block->size, 1, bm->file) != 1)
-    {
-        free(block->data);
-        free(block);
-        pthread_mutex_unlock(&bm->mutex);
-        return NULL;
-    }
-
-    pthread_mutex_unlock(&bm->mutex);
-    return block;
 }
 
 void block_manager_block_free(block_manager_block_t *block)
@@ -231,62 +442,84 @@ void block_manager_block_free(block_manager_block_t *block)
 
 int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *bm)
 {
+    if (!bm) return -1;
+
     /* allocate memory for the new cursor */
     (*cursor) = malloc(sizeof(block_manager_cursor_t));
     if (!(*cursor)) return -1;
 
-    /* set the block manager of the cursor */
+    /* set the block manager of the cursor - shares same fd, no extra file handles */
     (*cursor)->bm = bm;
-    if (!(*cursor)->bm)
-    {
-        free(*cursor);
-        return -1;
-    }
 
-    /* we create a separate file handle for the cursor,
-     * makes concurrent read safe ! */
-    (*cursor)->file = fopen(bm->file_path, "r+b");
-    if (!(*cursor)->file)
-    {
-        free(*cursor);
-        return -1;
-    }
-
-    /* initialize to beginning of file */
-    (*cursor)->current_pos = 0;
+    /* initialize to position after header */
+    (*cursor)->current_pos = BLOCK_MANAGER_HEADER_SIZE;
     (*cursor)->current_block_size = 0;
-
-    /* seek to beginning of file with the cursor's file handle */
-    if (fseek((*cursor)->file, 0, SEEK_SET) != 0)
-    {
-        fclose((*cursor)->file);
-        free(*cursor);
-        return -1;
-    }
 
     return 0;
 }
 
 int block_manager_cursor_next(block_manager_cursor_t *cursor)
 {
-    /* we need to move the file pointer to the current position first */
-    if (fseek(cursor->file, (long)cursor->current_pos, SEEK_SET) != 0) return -1;
+    if (!cursor) return -1;
 
-    /* read the size of the current block */
+    /* NO LOCKING - read using pread at specific offset, doesn't block anyone */
+
+    /* read block size at current position using pread */
     uint64_t block_size;
-    if (fread(&block_size, sizeof(uint64_t), 1, cursor->file) != 1)
+    ssize_t nread = pread(cursor->bm->fd, &block_size, sizeof(uint64_t), ( __off_t)cursor->current_pos);
+    if (nread != sizeof(uint64_t))
     {
-        if (feof(cursor->file)) return 1; /* end of file reached */
+        if (nread == 0) return 1; /* EOF */
         return -1;
     }
 
-    /* store the current position before advancing */
-    uint64_t prev_pos = cursor->current_pos;
+    /* calculate inline size */
+    uint64_t inline_size =
+        block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
 
-    /* update the current position to the next block */
-    cursor->current_pos = prev_pos + sizeof(uint64_t) + block_size;
+    /* calculate overflow offset position */
+    off_t overflow_offset_pos =
+        (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
 
-    /* we set the current block size */
+    /* read overflow offset using pread */
+    uint64_t overflow_offset;
+    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+        sizeof(uint64_t))
+        return -1;
+
+    /* if no overflow, next block starts immediately after this one */
+    if (overflow_offset == 0)
+    {
+        cursor->current_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+        cursor->current_block_size = block_size;
+        return 0;
+    }
+
+    /* skip overflow chain to find end */
+    uint64_t last_overflow_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+    while (overflow_offset != 0)
+    {
+        off_t chunk_offset = (off_t)overflow_offset;
+
+        /* read chunk size using pread */
+        uint64_t chunk_size;
+        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)chunk_offset) != sizeof(uint64_t))
+            return -1;
+
+        /* calculate next overflow offset position */
+        off_t next_overflow_pos =
+            chunk_offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+
+        /* read next overflow offset using pread */
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+            sizeof(uint64_t))
+            return -1;
+
+        last_overflow_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
+    }
+
+    /* update cursor position to after last overflow block */
+    cursor->current_pos = last_overflow_pos;
     cursor->current_block_size = block_size;
 
     return 0;
@@ -294,206 +527,143 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
 
 int block_manager_cursor_has_next(block_manager_cursor_t *cursor)
 {
-    /* save the current file pointer position */
-    long original_pos = ftell(cursor->file);
-    if (original_pos == -1) return -1;
+    if (!cursor) return -1;
 
-    /* move the file pointer to the current position */
-    if (fseek(cursor->file, (long)cursor->current_pos, SEEK_SET) != 0) return -1;
+    /* save current state */
+    uint64_t saved_cursor_pos = cursor->current_pos;
+    uint64_t saved_block_size = cursor->current_block_size;
 
-    /* read the size of the next block */
-    uint64_t block_size;
-    if (fread(&block_size, sizeof(uint64_t), 1, cursor->file) != 1)
-    {
-        if (feof(cursor->file)) return 0; /* if we reached the end of the file, return 0 */
-        return -1;
-    }
+    /* try to move to next */
+    int result = block_manager_cursor_next(cursor);
 
-    /* restore the original file pointer position */
-    if (fseek(cursor->file, original_pos, SEEK_SET) != 0) return -1;
+    /* restore cursor state */
+    cursor->current_pos = saved_cursor_pos;
+    cursor->current_block_size = saved_block_size;
 
-    return 1;
-}
-
-int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
-{
-    if (cursor == NULL || cursor->file == NULL)
-        return -1; /* if the cursor or the file is NULL, return -1 */
-
-    /* seek to the beginning of the file */
-    if (fseek(cursor->file, 0, SEEK_SET) != 0) return -1;
-
-    /* we get the file size to check if it's empty */
-    if (fseek(cursor->file, 0, SEEK_END) != 0) return -1;
-    long file_size = ftell(cursor->file);
-    if (file_size == -1) return -1;
-
-    /* if the file is empty, set cursor position to 0 and block size to 0 */
-    if (file_size == 0)
-    {
-        cursor->current_pos = 0;
-        cursor->current_block_size = 0;
-        return 0;
-    }
-
-    /* seek back to the beginning of the file */
-    if (fseek(cursor->file, 0, SEEK_SET) != 0) return -1;
-
-    uint64_t block_size = 0;
-    long last_pos = 0;
-    long current_pos = 0;
-
-    /* traverse through each block until the end of the file */
-    while (1)
-    {
-        size_t read_result = fread(&block_size, sizeof(uint64_t), 1, cursor->file);
-
-        /* check if we've reached the end of file or encountered an error */
-        if (read_result != 1)
-        {
-            if (feof(cursor->file))
-            {
-                break; /* end of file reached, exit loop */
-            }
-            else
-            {
-                return -1; /* error reading file */
-            }
-        }
-
-        /* save the position of this block */
-        last_pos = current_pos;
-        current_pos += (long)(sizeof(uint64_t) + block_size);
-
-        /* move the file pointer to the next block */
-        if (fseek(cursor->file, (long)block_size, SEEK_CUR) != 0) return -1;
-    }
-
-    /* update the cursor position and block size */
-    cursor->current_pos = last_pos;
-
-    /* position the file pointer to read the last block's size again */
-    if (fseek(cursor->file, last_pos, SEEK_SET) != 0) return -1;
-
-    /* read the size of the last block */
-    if (fread(&block_size, sizeof(uint64_t), 1, cursor->file) != 1) return -1;
-
-    cursor->current_block_size = block_size;
-
-    /* position the file pointer at the beginning of the last block */
-    if (fseek(cursor->file, last_pos, SEEK_SET) != 0) return -1;
-
-    return 0;
-}
-
-int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)
-{
-    if (cursor == NULL || cursor->file == NULL) return -1;
-
-    /* we move to the beginning of the file */
-    if (fseek(cursor->file, 0, SEEK_SET) != 0) return -1;
-
-    /* we set the current position to 0 */
-    cursor->current_pos = 0;
-
-    /* try to read the size of the first block */
-    uint64_t block_size;
-    if (fread(&block_size, sizeof(uint64_t), 1, cursor->file) == 1)
-    {
-        cursor->current_block_size = block_size;
-        /* we move back to the beginning */
-        fseek(cursor->file, 0, SEEK_SET);
-    }
-    else
-    {
-        /* file is empty or error */
-        cursor->current_block_size = 0;
-    }
-
-    return 0;
+    if (result == 0) return 1; /* has next */
+    if (result == 1) return 0; /* EOF */
+    return -1;                 /* error */
 }
 
 int block_manager_cursor_has_prev(block_manager_cursor_t *cursor)
 {
-    /* if we are at the beginning of the file, there is no previous block */
-    if (cursor->current_pos == 0) return 0;
-
-    return 1; /* If we're not at position 0, we have a previous block */
-}
-
-int block_manager_cursor_prev(block_manager_cursor_t *cursor)
-{
-    /* check for NULL cursor */
-    if (cursor == NULL || cursor->file == NULL) return -1;
-
-    /* we can't go back if we are at the beginning of the file */
-    if (cursor->current_pos == 0) return -1;
-
-    /* we'll scan from the beginning of the file to find the block just before current_pos */
-    if (fseek(cursor->file, 0, SEEK_SET) != 0) return -1;
-
-    uint64_t block_size;
-    uint64_t pos = 0;
-    uint64_t prev_pos = 0;
-    uint64_t prev_block_size = 0;
-
-    /* scan through blocks until we reach our current position */
-    while (pos < cursor->current_pos)
-    {
-        /* remember the position before this block */
-        prev_pos = pos;
-
-        /* read block size */
-        if (fread(&block_size, sizeof(uint64_t), 1, cursor->file) != 1) return -1;
-
-        /* remember the size of this block */
-        prev_block_size = block_size;
-
-        /* update position to the next block */
-        pos += sizeof(uint64_t) + block_size;
-
-        /* we skip the block data */
-        if (fseek(cursor->file, (long)block_size, SEEK_CUR) != 0) return -1;
-    }
-
-    /* we update cursor to point to the previous block */
-    cursor->current_pos = prev_pos;
-    cursor->current_block_size = prev_block_size;
-
-    /* we seek back to the start of the previous block */
-    if (fseek(cursor->file, (long)prev_pos, SEEK_SET) != 0) return -1;
-
-    return 0;
+    if (!cursor) return -1;
+    return (cursor->current_pos > BLOCK_MANAGER_HEADER_SIZE) ? 1 : 0;
 }
 
 block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 {
-    if (cursor == NULL || cursor->file == NULL) return NULL;
+    if (!cursor) return NULL;
 
-    /* we need to move the file pointer to the current position */
-    if (fseek(cursor->file, (long)cursor->current_pos, SEEK_SET) != 0) return NULL;
+    /* NO LOCKING - use pread for all reads, doesn't block anyone */
 
-    /* we allocate memory for the new block */
+    /* read block size using pread */
+    uint64_t block_size;
+    if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (__off_t)cursor->current_pos) !=
+        sizeof(uint64_t))
+        return NULL;
+
+    /* read checksum using pread */
+    unsigned char checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
+    off_t checksum_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t);
+    if (pread(cursor->bm->fd, checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH, (__off_t)checksum_pos) !=
+        BLOCK_MANAGER_SHA1_DIGEST_LENGTH)
+        return NULL;
+
+    /* allocate block */
     block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
     if (!block) return NULL;
 
-    /* we read the size of the block */
-    if (fread(&block->size, sizeof(uint64_t), 1, cursor->file) != 1)
-    {
-        free(block);
-        return NULL;
-    }
-
-    /* we allocate memory for the data of the block */
-    block->data = malloc(block->size);
+    block->size = block_size;
+    block->data = malloc(block_size);
     if (!block->data)
     {
         free(block);
         return NULL;
     }
 
-    /* read the data of the block */
-    if (fread(block->data, block->size, 1, cursor->file) != 1)
+    /* read inline data using pread */
+    uint64_t inline_size =
+        block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
+    off_t data_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
+
+    if (pread(cursor->bm->fd, block->data, inline_size, (__off_t)data_pos) != (ssize_t)inline_size)
+    {
+        free(block->data);
+        free(block);
+        return NULL;
+    }
+
+    /* read overflow offset using pread */
+    off_t overflow_offset_pos = data_pos + (off_t)inline_size;
+    uint64_t overflow_offset;
+    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+        sizeof(uint64_t))
+    {
+        free(block->data);
+        free(block);
+        return NULL;
+    }
+
+    /* read overflow blocks using pread */
+    uint64_t data_offset = inline_size;
+    while (overflow_offset != 0)
+    {
+        /* read chunk size using pread */
+        uint64_t chunk_size;
+        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)overflow_offset) !=
+            sizeof(uint64_t))
+        {
+            free(block->data);
+            free(block);
+            return NULL;
+        }
+
+        /* read chunk checksum using pread */
+        unsigned char chunk_checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
+        off_t chunk_checksum_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t);
+        if (pread(cursor->bm->fd, chunk_checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH,
+                  (__off_t)chunk_checksum_pos) != BLOCK_MANAGER_SHA1_DIGEST_LENGTH)
+        {
+            free(block->data);
+            free(block);
+            return NULL;
+        }
+
+        /* read chunk data using pread */
+        off_t chunk_data_pos = chunk_checksum_pos + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
+        if (pread(cursor->bm->fd, (unsigned char *)block->data + data_offset, chunk_size,
+                  (__off_t)chunk_data_pos) != (ssize_t)chunk_size)
+        {
+            free(block->data);
+            free(block);
+            return NULL;
+        }
+
+        /* verify chunk checksum */
+        if (verify_sha1((unsigned char *)block->data + data_offset, chunk_size, chunk_checksum) !=
+            0)
+        {
+            free(block->data);
+            free(block);
+            return NULL;
+        }
+
+        /* read next overflow offset using pread */
+        off_t next_overflow_pos = chunk_data_pos + (off_t)chunk_size;
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+            sizeof(uint64_t))
+        {
+            free(block->data);
+            free(block);
+            return NULL;
+        }
+
+        data_offset += chunk_size;
+    }
+
+    /* verify main block checksum */
+    if (verify_sha1(block->data, block_size, checksum) != 0)
     {
         free(block->data);
         free(block);
@@ -505,137 +675,301 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 
 void block_manager_cursor_free(block_manager_cursor_t *cursor)
 {
-    /* we free the cursor */
     if (cursor)
     {
-        if (cursor->file) fclose(cursor->file);
-        cursor->bm = NULL;
+        /* no file descriptor to close - we share bm->fd */
         free(cursor);
         cursor = NULL;
     }
 }
 
+int block_manager_cursor_prev(block_manager_cursor_t *cursor)
+{
+    if (!cursor) return -1;
+
+    /* can't go back from first block */
+    if (cursor->current_pos <= BLOCK_MANAGER_HEADER_SIZE) return -1;
+
+    /* scan from beginning using pread to find previous block */
+    uint64_t scan_pos = BLOCK_MANAGER_HEADER_SIZE;
+
+    while (scan_pos < cursor->current_pos)
+    {
+        /* read block size using pread */
+        uint64_t block_size;
+        if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (__off_t)scan_pos) != sizeof(uint64_t))
+            return -1;
+
+        /* calculate inline size */
+        uint64_t inline_size =
+            block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
+
+        /* read overflow offset using pread */
+        off_t overflow_offset_pos =
+            (off_t)scan_pos + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+        uint64_t overflow_offset;
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+            sizeof(uint64_t))
+            return -1;
+
+        /* calculate next block position */
+        uint64_t next_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+
+        /* skip overflow chain using pread */
+        while (overflow_offset != 0)
+        {
+            uint64_t chunk_size;
+            if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)overflow_offset) !=
+                sizeof(uint64_t))
+                return -1;
+
+            off_t next_overflow_pos =
+                (off_t)overflow_offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+            if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+                sizeof(uint64_t))
+                return -1;
+
+            next_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
+        }
+
+        /* check if next block is our current position */
+        if (next_pos >= cursor->current_pos)
+        {
+            cursor->current_pos = scan_pos;
+            cursor->current_block_size = block_size;
+            return 0;
+        }
+
+        scan_pos = next_pos;
+    }
+
+    return -1;
+}
+
 void *block_manager_fsync_thread(void *arg)
 {
-    /* we cast the argument to a block manager */
-    block_manager_t *bm = arg;
-    /* we fsync the file every fsync interval */
-    while (bm->stop_fsync_thread == 0)
+    block_manager_t *bm = (block_manager_t *)arg;
+
+    struct timespec ts;
+
+    pthread_mutex_lock(&bm->write_mutex);
+
+    while (!bm->stop_fsync_thread)
     {
-        usleep((useconds_t)(bm->fsync_interval));
-        pthread_mutex_lock(&bm->mutex);
-        fsync(fileno(bm->file));
-        pthread_mutex_unlock(&bm->mutex);
+        /* calculate absolute timeout time from milliseconds */
+        clock_gettime(CLOCK_REALTIME, &ts);
+        
+        /* convert milliseconds to seconds and nanoseconds */
+        long ms = bm->fsync_interval;
+        ts.tv_sec += ms / 1000;
+        ts.tv_nsec += (ms % 1000) * 1000000;
+        
+        /* handle nanosecond overflow */
+        if (ts.tv_nsec >= 1000000000)
+        {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000;
+        }
+
+        /* wait on condition variable with timeout */
+        int result = pthread_cond_timedwait(&bm->fsync_cond, &bm->write_mutex, &ts);
+
+        /* if we were signaled to stop, exit loop */
+        if (bm->stop_fsync_thread) break;
+
+        /* if timeout occurred (not spurious wakeup or signal), perform fdatasync */
+        if (result == ETIMEDOUT)
+        {
+            pthread_mutex_unlock(&bm->write_mutex);
+            (void)fdatasync(bm->fd);
+            pthread_mutex_lock(&bm->write_mutex);
+        }
     }
+
+    pthread_mutex_unlock(&bm->write_mutex);
+
     return NULL;
+}
+
+int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)
+{
+    if (!cursor) return -1;
+
+    cursor->current_pos = BLOCK_MANAGER_HEADER_SIZE;
+    cursor->current_block_size = 0;
+
+    return 0;
+}
+
+int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
+{
+    if (!cursor) return -1;
+
+    /* position to first block position (before any data) */
+    if (block_manager_cursor_goto_first(cursor) != 0) return -1;
+
+    /* move forward until we hit EOF (no more blocks to read) */
+    while (block_manager_cursor_next(cursor) == 0)
+    {
+        /* keep advancing through blocks */
+    }
+
+    /* at this point, cursor is positioned after the last block.
+     * move back one block to be AT the last block (readable). */
+    return block_manager_cursor_prev(cursor);
 }
 
 int block_manager_truncate(block_manager_t *bm)
 {
-    pthread_mutex_lock(&bm->mutex);
+    if (!bm) return -1;
 
-    /* we close the file */
-    if (fclose(bm->file) != 0)
+    pthread_mutex_lock(&bm->write_mutex);
+
+    /* we close the file descriptor */
+    if (close(bm->fd) != 0)
     {
-        pthread_mutex_unlock(&bm->mutex);
+        pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
     /* we truncate the file */
     if (truncate(bm->file_path, 0) != 0)
     {
-        pthread_mutex_unlock(&bm->mutex);
+        pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
     /* we open the file again */
-    bm->file = fopen(bm->file_path, "a+b");
-    if (!bm->file)
+    bm->fd = open(bm->file_path, O_RDWR | O_CREAT, 0644);
+    if (bm->fd == -1)
     {
-        pthread_mutex_unlock(&bm->mutex);
+        pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
-    pthread_mutex_unlock(&bm->mutex);
+    /* write new header */
+    if (write_header(bm->fd, bm->block_size) != 0)
+    {
+        pthread_mutex_unlock(&bm->write_mutex);
+        return -1;
+    }
+
+    if (fdatasync(bm->fd) != 0)
+    {
+        pthread_mutex_unlock(&bm->write_mutex);
+        return -1;
+    }
+
+    pthread_mutex_unlock(&bm->write_mutex);
     return 0;
 }
 
 int block_manager_cursor_at_first(block_manager_cursor_t *cursor)
 {
-    if (cursor == NULL) return -1;
-
-    /* if the current position is 0, we're at the first block */
-    return (cursor->current_pos == 0) ? 1 : 0;
+    if (!cursor) return -1;
+    return (cursor->current_pos == BLOCK_MANAGER_HEADER_SIZE) ? 1 : 0;
 }
 
 int block_manager_cursor_at_second(block_manager_cursor_t *cursor)
 {
-    if (cursor == NULL || cursor->file == NULL)
-        return -1; /* if the cursor or the file is NULL, return -1 */
+    if (!cursor) return -1;
 
-    /* save the current file pointer position */
-    long original_pos = ftell(cursor->file);
-    if (original_pos == -1) return -1;
+    /* if at first block, not at second */
+    if (cursor->current_pos == BLOCK_MANAGER_HEADER_SIZE) return 0;
 
-    /* if we're at position 0, we're at the first block, not the second */
-    if (cursor->current_pos == 0)
-    {
-        return 0;
-    }
-
-    /* we seek to the beginning of the file */
-    if (fseek(cursor->file, 0, SEEK_SET) != 0)
-    {
-        fseek(cursor->file, original_pos, SEEK_SET); /* Restore position on error */
-        return -1;
-    }
-
-    /* we read the first block's size */
+    /* read first block size using pread */
     uint64_t first_block_size;
-    if (fread(&first_block_size, sizeof(uint64_t), 1, cursor->file) != 1)
-    {
-        fseek(cursor->file, original_pos, SEEK_SET); /* Restore position on error */
+    if (pread(cursor->bm->fd, &first_block_size, sizeof(uint64_t), (__off_t)BLOCK_MANAGER_HEADER_SIZE) !=
+        sizeof(uint64_t))
         return -1;
+
+    /* calculate inline size */
+    uint64_t inline_size =
+        first_block_size <= cursor->bm->block_size ? first_block_size : cursor->bm->block_size;
+
+    /* calculate overflow offset position */
+    off_t overflow_offset_pos = (off_t)BLOCK_MANAGER_HEADER_SIZE + (off_t)sizeof(uint64_t) +
+                                (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+
+    /* read overflow offset using pread */
+    uint64_t overflow_offset;
+    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+        sizeof(uint64_t))
+        return -1;
+
+    /* calculate second block position */
+    uint64_t second_block_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+
+    /* skip overflow chain if present using pread */
+    while (overflow_offset != 0)
+    {
+        uint64_t chunk_size;
+        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)overflow_offset) !=
+            sizeof(uint64_t))
+            return -1;
+
+        off_t next_overflow_pos =
+            (off_t)overflow_offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+            sizeof(uint64_t))
+            return -1;
+
+        second_block_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
     }
 
-    /* we calculate the position of the second block */
-    uint64_t second_block_pos = sizeof(uint64_t) + first_block_size;
-
-    /* we compare with the current cursor position */
-    int is_at_second = (cursor->current_pos == second_block_pos) ? 1 : 0;
-
-    /* restore the original file pointer position */
-    if (fseek(cursor->file, original_pos, SEEK_SET) != 0) return -1;
-
-    return is_at_second;
+    return (cursor->current_pos == second_block_pos) ? 1 : 0;
 }
 
 int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
 {
-    if (cursor == NULL || cursor->file == NULL) return -1;
+    if (!cursor) return -1;
 
-    /* we save the current file pointer position */
-    long original_pos = ftell(cursor->file);
-    if (original_pos == -1) return -1;
+    /* read current block size using pread */
+    uint64_t block_size;
+    if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (__off_t)cursor->current_pos) !=
+        sizeof(uint64_t))
+        return -1;
 
-    /* we move to the position after the current block */
-    uint64_t next_pos = cursor->current_pos + sizeof(uint64_t) + cursor->current_block_size;
-    if (fseek(cursor->file, (long)next_pos, SEEK_SET) != 0)
+    /* calculate inline size */
+    uint64_t inline_size =
+        block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
+
+    /* calculate overflow offset position */
+    off_t overflow_offset_pos =
+        (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+
+    /* read overflow offset using pread */
+    uint64_t overflow_offset;
+    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+        sizeof(uint64_t))
+        return -1;
+
+    /* calculate position after current block */
+    uint64_t after_current_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+
+    /* skip overflow chain using pread */
+    while (overflow_offset != 0)
     {
-        /* if we can't seek to the next position, we're likely at EOF */
-        fseek(cursor->file, original_pos, SEEK_SET);
-        return 1;
+        uint64_t chunk_size;
+        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)overflow_offset) !=
+            sizeof(uint64_t))
+            return -1;
+
+        off_t next_overflow_pos =
+            (off_t)overflow_offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+            sizeof(uint64_t))
+            return -1;
+
+        after_current_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
     }
 
-    /* try to read the next block's size */
+    /* try to read next block using pread */
     uint64_t next_block_size;
-    size_t read_result = fread(&next_block_size, sizeof(uint64_t), 1, cursor->file);
+    ssize_t read_result =
+        pread(cursor->bm->fd, &next_block_size, sizeof(uint64_t), (__off_t)after_current_pos);
 
-    /* we restore the original file pointer position */
-    fseek(cursor->file, original_pos, SEEK_SET);
-
-    /* if we couldn't read a block size, we're at the last block */
-    return (read_result != 1) ? 1 : 0;
+    return (read_result != sizeof(uint64_t)) ? 1 : 0;
 }
 
 int block_manager_get_size(block_manager_t *bm, uint64_t *size)
@@ -644,27 +978,14 @@ int block_manager_get_size(block_manager_t *bm, uint64_t *size)
 
     struct stat st;
     if (stat(bm->file_path, &st) != 0) return -1;
-    *size = st.st_size;
-    return 0;
-}
-
-int block_manager_seek(block_manager_t *bm, uint64_t pos)
-{
-    if (!bm) return -1;
-
-    pthread_mutex_lock(&bm->mutex);
-    int result = fseek(bm->file, (long)pos, SEEK_SET);
-    pthread_mutex_unlock(&bm->mutex);
-
-    if (result != 0) return -1;
+    *size = (uint64_t)st.st_size;
     return 0;
 }
 
 int block_manager_cursor_goto(block_manager_cursor_t *cursor, uint64_t pos)
 {
-    if (!cursor || !cursor->file) return -1;
+    if (!cursor) return -1;
 
-    if (fseek(cursor->file, (long)pos, SEEK_SET) != 0) return -1;
     cursor->current_pos = pos;
     return 0;
 }
@@ -672,12 +993,7 @@ int block_manager_cursor_goto(block_manager_cursor_t *cursor, uint64_t pos)
 int block_manager_escalate_fsync(block_manager_t *bm)
 {
     if (!bm) return -1;
-
-    pthread_mutex_lock(&bm->mutex);
-    int result = fsync(fileno(bm->file));
-    pthread_mutex_unlock(&bm->mutex);
-
-    return result;
+    return fdatasync(bm->fd);
 }
 
 time_t block_manager_last_modified(block_manager_t *bm)
@@ -698,17 +1014,17 @@ int block_manager_count_blocks(block_manager_t *bm)
 
     if (block_manager_cursor_init(&cursor, bm) != 0) return -1;
 
-    /* we count all blocks in the file */
+    /* position at first block */
     block_manager_cursor_goto_first(cursor);
 
-    /* we check if there are any blocks */
+    /* check if there are any blocks */
     if (block_manager_cursor_has_next(cursor) > 0)
     {
-        /* we move to the first block and count it */
+        /* move to first block and count it */
         block_manager_cursor_next(cursor);
         count++;
 
-        /* we count remaining blocks */
+        /* count remaining blocks */
         while (block_manager_cursor_next(cursor) == 0)
         {
             count++;
@@ -719,106 +1035,141 @@ int block_manager_count_blocks(block_manager_t *bm)
     return count;
 }
 
-/* because this is an append only block manager, on system crash or power loss, the last block may
- * be corrupt thus we need to run a validation and ensure the last block is complete, if not, we
- * truncate the file accordingly to allow for more data to be written properly
- */
 int block_manager_validate_last_block(block_manager_t *bm)
 {
-    if (!bm || !bm->file) return -1;
+    if (!bm) return -1;
 
-    /* we get the current file size */
+    /* get file size using pread-compatible approach */
     uint64_t file_size;
-    if (block_manager_get_size(bm, &file_size) != 0)
-    {
-        return -1;
-    }
+    if (get_file_size(bm->fd, &file_size) != 0) return -1;
 
-    /* if file is empty, it's valid */
+    /* if file is empty, write header */
     if (file_size == 0)
     {
+        pthread_mutex_lock(&bm->write_mutex);
+        if (write_header(bm->fd, bm->block_size) != 0)
+        {
+            pthread_mutex_unlock(&bm->write_mutex);
+            return -1;
+        }
+        fdatasync(bm->fd);
+        pthread_mutex_unlock(&bm->write_mutex);
         return 0;
     }
 
-    /* we check if the file size is valid - must be at least complete a block */
-    /* each block has=8 bytes (uint64_t size of block) + data in block */
-
-    /* we ensure we have at least 8 bytes (enough for a size field) */
-    if (file_size < sizeof(uint64_t))
+    if (file_size == BLOCK_MANAGER_HEADER_SIZE)
     {
-        /* the file too small, so we truncate to zero */
-        (void)pthread_mutex_lock(&bm->mutex);
-        (void)fclose(bm->file);
-        (void)truncate(bm->file_path, 0);
-        bm->file = fopen(bm->file_path, "a+b");
-        (void)pthread_mutex_unlock(&bm->mutex);
-        return (bm->file) ? 0 : -1;
+        return 0; /* valid empty file with header */
     }
 
-    /* we scan through blocks to find the last complete one */
-    FILE *temp_file = fopen(bm->file_path, "rb");
-    if (!temp_file) return -1;
-
-    uint64_t valid_size = 0;
-    uint64_t block_size;
-
-    while (1)
+    /* ensure we have at least header + one block header */
+    if (file_size < BLOCK_MANAGER_HEADER_SIZE + sizeof(uint64_t) +
+                        BLOCK_MANAGER_SHA1_DIGEST_LENGTH + sizeof(uint64_t))
     {
-        /* we remember position before reading size */
-        long pos = ftell(temp_file);
-        if (pos == -1) break;
-
-        /* we try to read a block size */
-        if (fread(&block_size, sizeof(uint64_t), 1, temp_file) != 1)
-        {
-            /* end of file reached */
-            break;
-        }
-
-        /* we check if we have enough data for this block */
-        if (pos + sizeof(uint64_t) + block_size > file_size)
-        {
-            /* if not enough data, truncate at this position */
-            valid_size = pos;
-            break;
-        }
-
-        /* this block is complete, move to next one */
-        valid_size = pos + sizeof(uint64_t) + block_size;
-
-        /* we seek to the next block */
-        if (fseek(temp_file, (long)block_size, SEEK_CUR) != 0)
-        {
-            break;
-        }
+        /* truncate to header only */
+        pthread_mutex_lock(&bm->write_mutex);
+        close(bm->fd);
+        truncate(bm->file_path, BLOCK_MANAGER_HEADER_SIZE);
+        open(bm->file_path, O_RDWR | O_CREAT, 0644);
+        pthread_mutex_unlock(&bm->write_mutex);
+        return (bm->fd != -1) ? 0 : -1;
     }
 
-    (void)fclose(temp_file);
+    /* scan through blocks to find last complete one using pread */
+    uint64_t valid_size = BLOCK_MANAGER_HEADER_SIZE;
+    uint64_t scan_pos = BLOCK_MANAGER_HEADER_SIZE;
 
-    /* if valid_size is different from file_size, truncate the file */
+    while (scan_pos < file_size)
+    {
+        /* try to read block size using pread */
+        uint64_t block_size;
+        if (pread(bm->fd, &block_size, sizeof(uint64_t), (__off_t)scan_pos) != sizeof(uint64_t)) break;
+
+        /* calculate inline size */
+        uint64_t inline_size = block_size <= bm->block_size ? block_size : bm->block_size;
+
+        /* check if we have complete inline block */
+        if (scan_pos + sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + inline_size +
+                sizeof(uint64_t) >
+            file_size)
+        {
+            valid_size = scan_pos;
+            break;
+        }
+
+        /* read overflow offset using pread */
+        off_t overflow_offset_pos =
+            (off_t)scan_pos + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+        uint64_t overflow_offset;
+        if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+            sizeof(uint64_t))
+            break;
+
+        uint64_t next_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+
+        /* validate overflow chain using pread */
+        while (overflow_offset != 0)
+        {
+            if (overflow_offset >= file_size)
+            {
+                valid_size = scan_pos;
+                goto done_scanning;
+            }
+
+            uint64_t chunk_size;
+            if (pread(bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)overflow_offset) != sizeof(uint64_t))
+            {
+                valid_size = scan_pos;
+                goto done_scanning;
+            }
+
+            /* check if complete overflow block exists */
+            if (overflow_offset + sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + chunk_size +
+                    sizeof(uint64_t) >
+                file_size)
+            {
+                valid_size = scan_pos;
+                goto done_scanning;
+            }
+
+            off_t next_overflow_pos =
+                (off_t)overflow_offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+            if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+                sizeof(uint64_t))
+            {
+                valid_size = scan_pos;
+                goto done_scanning;
+            }
+
+            next_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
+        }
+
+        /* this block and its overflow chain are complete */
+        valid_size = next_pos;
+        scan_pos = next_pos;
+    }
+
+done_scanning:
+    /* truncate if needed */
     if (valid_size != file_size)
     {
-        (void)pthread_mutex_lock(&bm->mutex);
+        pthread_mutex_lock(&bm->write_mutex);
+        close(bm->fd);
 
-        /* we close the file before truncating */
-        (void)fclose(bm->file);
-
-        /* we truncate the file */
         if (truncate(bm->file_path, (long)valid_size) != 0)
         {
-            (void)pthread_mutex_unlock(&bm->mutex);
+            pthread_mutex_unlock(&bm->write_mutex);
             return -1;
         }
 
-        /* we reopen the file */
-        bm->file = fopen(bm->file_path, "a+b");
-        if (!bm->file)
+        open(bm->file_path, O_RDWR | O_CREAT, 0644);
+        if (bm->fd == -1)
         {
-            (void)pthread_mutex_unlock(&bm->mutex);
+            pthread_mutex_unlock(&bm->write_mutex);
             return -1;
         }
 
-        (void)pthread_mutex_unlock(&bm->mutex);
+        pthread_mutex_unlock(&bm->write_mutex);
     }
 
     return 0;

@@ -17,21 +17,21 @@
  * limitations under the License.
  */
 
-#include <assert.h>
-
 #include "../src/bloom_filter.h"
-#include "test_macros.h"
+#include "test_utils.h"
+
+static int tests_passed = 0;
+static int tests_failed = 0;
 
 void test_bloom_filter_new()
 {
     bloom_filter_t *bf;
     int result = bloom_filter_new(&bf, 0.01, 1000);
-    assert(result == 0);
-    assert(bf != NULL);
-    assert(bf->m > 0);
-    assert(bf->h > 0);
+    ASSERT_EQ(result, 0);
+    ASSERT_TRUE(bf != NULL);
+    ASSERT_TRUE(bf->m > 0);
+    ASSERT_TRUE(bf->h > 0);
     (void)bloom_filter_free(bf);
-    printf(GREEN "test_bloom_filter_new passed\n" RESET);
 }
 
 void test_bloom_filter_add_and_contains()
@@ -41,14 +41,13 @@ void test_bloom_filter_add_and_contains()
 
     const char *key = "test_key";
     (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
-    assert(bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)) == 1);
+    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)), 1);
 
     const char *non_existent_key = "non_existent_key";
-    assert(bloom_filter_contains(bf, (const uint8_t *)non_existent_key, strlen(non_existent_key)) ==
-           0);
+    ASSERT_EQ(
+        bloom_filter_contains(bf, (const uint8_t *)non_existent_key, strlen(non_existent_key)), 0);
 
     (void)bloom_filter_free(bf);
-    printf(GREEN "test_bloom_filter_add_and_contains passed\n" RESET);
 }
 
 void test_bloom_filter_is_full()
@@ -61,7 +60,7 @@ void test_bloom_filter_is_full()
     {
         (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
     }
-    assert(bloom_filter_is_full(bf) == 0);
+    ASSERT_EQ(bloom_filter_is_full(bf), 0);
 
     (void)bloom_filter_free(bf);
     printf(GREEN "test_bloom_filter_is_full passed\n" RESET);
@@ -80,24 +79,24 @@ void test_bloom_filter_serialize_deserialize()
 
     size_t serialized_size;
     uint8_t *serialized_data = bloom_filter_serialize(bf, &serialized_size);
-    assert(serialized_data != NULL);
+    ASSERT_TRUE(serialized_data != NULL);
 
     bloom_filter_t *deserialized_bf = bloom_filter_deserialize(serialized_data);
-    assert(deserialized_bf != NULL);
+    ASSERT_TRUE(deserialized_bf != NULL);
 
     /* we verify same properties */
-    assert(deserialized_bf->m == bf->m);
-    assert(deserialized_bf->h == bf->h);
+    ASSERT_EQ(deserialized_bf->m, bf->m);
+    ASSERT_EQ(deserialized_bf->h, bf->h);
 
     /* we verify contains the same keys */
     for (int i = 0; i < 5; i++)
     {
-        assert(bloom_filter_contains(deserialized_bf, (const uint8_t *)keys[i], strlen(keys[i])) ==
-               1);
+        ASSERT_EQ(bloom_filter_contains(deserialized_bf, (const uint8_t *)keys[i], strlen(keys[i])),
+                  1);
     }
 
     /* we check a key that should not be present */
-    assert(bloom_filter_contains(deserialized_bf, (const uint8_t *)"nonexistent", 10) == 0);
+    ASSERT_EQ(bloom_filter_contains(deserialized_bf, (const uint8_t *)"nonexistent", 10), 0);
 
     free(serialized_data);
     (void)bloom_filter_free(bf);
@@ -139,7 +138,7 @@ void test_false_positive_rate()
     printf("Actual false positive rate: %f\n", actual_fp_rate);
 
     /* some deviation since its a probabilistic data structure */
-    assert(fabs(actual_fp_rate - p) < 0.01);
+    ASSERT_TRUE(fabs(actual_fp_rate - p) < 0.01);
 
     (void)bloom_filter_free(bf);
     printf(GREEN "test_false_positive_rate passed\n" RESET);
@@ -151,23 +150,23 @@ void test_boundary_conditions()
 
     /* very low false positive rate */
     (void)bloom_filter_new(&bf, 0.0001, 1000);
-    assert(bf != NULL);
-    assert(bf->m > 0);
-    assert(bf->h > 0);
+    ASSERT_TRUE(bf != NULL);
+    ASSERT_TRUE(bf->m > 0);
+    ASSERT_TRUE(bf->h > 0);
     (void)bloom_filter_free(bf);
 
     /* very high false positive rate */
     (void)bloom_filter_new(&bf, 0.9, 1000);
-    assert(bf != NULL);
-    assert(bf->m > 0);
-    assert(bf->h > 0);
+    ASSERT_TRUE(bf != NULL);
+    ASSERT_TRUE(bf->m > 0);
+    ASSERT_TRUE(bf->h > 0);
     (void)bloom_filter_free(bf);
 
     /* empty key */
     (void)bloom_filter_new(&bf, 0.01, 1000);
     const char *empty_key = "";
     (void)bloom_filter_add(bf, (const uint8_t *)empty_key, strlen(empty_key));
-    assert(bloom_filter_contains(bf, (const uint8_t *)empty_key, strlen(empty_key)) == 1);
+    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)empty_key, strlen(empty_key)), 1);
     (void)bloom_filter_free(bf);
 
     printf(GREEN "test_boundary_conditions passed\n" RESET);
@@ -192,7 +191,7 @@ void benchmark_bloom_filter()
     /* serializing and deserializing the bloom filter */
     size_t serialized_bf_size = 0;
     uint8_t *serialized_bf = bloom_filter_serialize(bf, &serialized_bf_size);
-    assert(serialized_bf != NULL);
+    ASSERT_TRUE(serialized_bf != NULL);
     free(serialized_bf);
 
     /* we print the size of the serialized bloom filter */
@@ -203,7 +202,7 @@ void benchmark_bloom_filter()
     {
         char key[20];
         sprintf(key, "key_%d", i);
-        assert(bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)) == 1);
+        ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)), 1);
     }
     clock_t end_check = clock();
     double time_spent_check = (double)(end_check - start_check) / CLOCKS_PER_SEC;
@@ -214,12 +213,13 @@ void benchmark_bloom_filter()
 
 int main(void)
 {
-    test_bloom_filter_new();
-    test_bloom_filter_add_and_contains();
-    test_bloom_filter_is_full();
-    test_bloom_filter_serialize_deserialize();
-    test_false_positive_rate();
-    test_boundary_conditions();
-    benchmark_bloom_filter();
-    return 0;
+    RUN_TEST(test_bloom_filter_new, tests_passed);
+    RUN_TEST(test_bloom_filter_add_and_contains, tests_passed);
+    RUN_TEST(test_bloom_filter_serialize_deserialize, tests_passed);
+    RUN_TEST(test_false_positive_rate, tests_passed);
+    RUN_TEST(test_boundary_conditions, tests_passed);
+    RUN_TEST(benchmark_bloom_filter, tests_passed);
+
+    PRINT_TEST_RESULTS(tests_passed, tests_failed);
+    return tests_failed > 0 ? 1 : 0;
 }

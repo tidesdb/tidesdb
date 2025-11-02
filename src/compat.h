@@ -100,7 +100,7 @@ static inline int mkdir(const char *path, mode_t mode)
     return _mkdir(path);
 }
 
-DIR *opendir(const char *name)
+static inline DIR *opendir(const char *name)
 {
     DIR *dir = malloc(sizeof(DIR));
     if (dir == NULL)
@@ -119,7 +119,7 @@ DIR *opendir(const char *name)
     return dir;
 }
 
-struct dirent *readdir(DIR *dir)
+static inline struct dirent *readdir(DIR *dir)
 {
     if (dir == NULL || dir->hFind == INVALID_HANDLE_VALUE)
     {
@@ -137,7 +137,7 @@ struct dirent *readdir(DIR *dir)
     return &dir->dirent;
 }
 
-int closedir(DIR *dir)
+static inline int closedir(DIR *dir)
 {
     if (dir == NULL)
     {
@@ -195,7 +195,7 @@ static inline int sem_post(sem_t *sem)
 #define ftell                _ftelli64
 #define fseek                _fseeki64
 
-int fsync(int fd)
+static inline int fsync(int fd)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE)
@@ -206,13 +206,13 @@ int fsync(int fd)
 }
 
 /* fdatasync for Windows, same as fsync (Windows doesn't distinguish) */
-int fdatasync(int fd)
+static inline int fdatasync(int fd)
 {
     return fsync(fd);
 }
 
 /* clock_gettime for Windows */
-int clock_gettime(int clk_id, struct timespec *tp)
+static inline int clock_gettime(int clk_id, struct timespec *tp)
 {
     (void)clk_id; /* unused */
     FILETIME ft;
@@ -237,7 +237,7 @@ int clock_gettime(int clk_id, struct timespec *tp)
 }
 
 /* gettimeofday function for win */
-int gettimeofday(struct timeval *tp, struct timezone *tzp)
+static inline int gettimeofday(struct timeval *tp, struct timezone *tzp)
 {
     FILETIME ft;
     unsigned __int64 tmpres = 0;
@@ -276,7 +276,7 @@ int gettimeofday(struct timeval *tp, struct timezone *tzp)
 }
 
 /* pread and pwrite for Windows */
-ssize_t pread(int fd, void *buf, size_t count, off_t offset)
+static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE)
@@ -301,7 +301,7 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     return (ssize_t)bytes_read;
 }
 
-ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
+static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE)

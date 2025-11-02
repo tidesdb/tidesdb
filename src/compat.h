@@ -154,8 +154,9 @@ int closedir(DIR *dir)
 /* semaphore functions for Windows */
 typedef HANDLE sem_t;
 
-int sem_init(sem_t *sem, int pshared, unsigned int value)
+static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
 {
+    (void)pshared; /* unused on Windows */
     *sem = CreateSemaphore(NULL, value, LONG_MAX, NULL);
     if (*sem == NULL)
     {
@@ -163,6 +164,27 @@ int sem_init(sem_t *sem, int pshared, unsigned int value)
         return -1;
     }
     return 0;
+}
+
+static inline int sem_destroy(sem_t *sem)
+{
+    if (*sem != NULL)
+    {
+        CloseHandle(*sem);
+        *sem = NULL;
+    }
+    return 0;
+}
+
+static inline int sem_wait(sem_t *sem)
+{
+    DWORD result = WaitForSingleObject(*sem, INFINITE);
+    return (result == WAIT_OBJECT_0) ? 0 : -1;
+}
+
+static inline int sem_post(sem_t *sem)
+{
+    return ReleaseSemaphore(*sem, 1, NULL) ? 0 : -1;
 }
 
 /* file operations macros for cross-platform compatibility */
@@ -264,8 +286,8 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     }
 
     OVERLAPPED overlapped = {0};
-    overlapped.Offset = (DWORD)offset;
-    overlapped.OffsetHigh = (DWORD)(offset >> 32);
+    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFF);
+    overlapped.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFF);
 
     DWORD bytes_read;
     if (!ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped))
@@ -287,8 +309,8 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
     }
 
     OVERLAPPED overlapped = {0};
-    overlapped.Offset = (DWORD)offset;
-    overlapped.OffsetHigh = (DWORD)(offset >> 32);
+    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFF);
+    overlapped.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFF);
 
     DWORD bytes_written;
     if (!WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped))

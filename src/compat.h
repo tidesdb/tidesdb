@@ -27,17 +27,18 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
 #include <windows.h>
 
 #pragma warning(disable : 4996) /* disable deprecated warning for Windows */
+#pragma warning(disable : 4029) /* declared formal parameter list different from definition */
+#pragma warning(disable : 4211) /* nonstandard extension used: redefined extern to static */
 
 #include "pthread.h" /* pthreads-win32 library (https://github.com/tidesdb/tidesdb/issues/241) */
 
-#define truncate                                                                                                                                            \
-    _chsize /* https://github.com/tidesdb/tidesdb/issues/241#:~:text=back%20and%20added%3A-,%23define%20truncate%20%20%20%20%20%20%20_chsize,-to%20compat.h \
-             */
+#define ftruncate _chsize /* Windows uses _chsize(fd, size) for file truncation */
 
 /* access flags are normally defined in unistd.h, which unavailable under
  * windows.
@@ -48,9 +49,36 @@
 #define W_OK 02
 #define R_OK 04
 
+/* fcntl.h flags for Windows - use _O_* equivalents */
+#ifndef O_RDWR
+#define O_RDWR _O_RDWR
+#endif
+#ifndef O_CREAT
+#define O_CREAT _O_CREAT
+#endif
+#ifndef O_RDONLY
+#define O_RDONLY _O_RDONLY
+#endif
+#ifndef O_WRONLY
+#define O_WRONLY _O_WRONLY
+#endif
+#ifndef O_BINARY
+#define O_BINARY _O_BINARY
+#endif
+
 typedef int64_t ssize_t; /* ssize_t is not defined in Windows */
+typedef int mode_t;      /* mode_t is not defined in Windows */
 
 #define M_LN2 0.69314718055994530942 /* log_e 2 */
+
+/* clock_gettime support for Windows */
+#define CLOCK_REALTIME 0
+
+struct timezone
+{
+    int tz_minuteswest;
+    int tz_dsttime;
+};
 
 struct dirent
 {
@@ -66,12 +94,13 @@ typedef struct
 
 /* https://github.com/tidesdb/tidesdb/issues/241#:~:text=if%20(mkdir(directory)%20%3D%3D%20%2D1)%20//%20%2C%200777%20and%20if%20(mkdir(cf_path)%20%3D%3D%20%2D1)%20//%20%2C%200777%20i%20get%20the%20following%3A
  */
-external int mkdir(const char *path, mode_t mode)
+static inline int mkdir(const char *path, mode_t mode)
 {
+    (void)mode; /* unused on Windows */
     return _mkdir(path);
 }
 
-DIR *opendir(const char *name)
+static inline DIR *opendir(const char *name)
 {
     DIR *dir = malloc(sizeof(DIR));
     if (dir == NULL)
@@ -90,7 +119,7 @@ DIR *opendir(const char *name)
     return dir;
 }
 
-struct dirent *readdir(DIR *dir)
+static inline struct dirent *readdir(DIR *dir)
 {
     if (dir == NULL || dir->hFind == INVALID_HANDLE_VALUE)
     {
@@ -108,7 +137,7 @@ struct dirent *readdir(DIR *dir)
     return &dir->dirent;
 }
 
-int closedir(DIR *dir)
+static inline int closedir(DIR *dir)
 {
     if (dir == NULL)
     {
@@ -123,17 +152,42 @@ int closedir(DIR *dir)
 }
 
 /* semaphore functions for Windows */
-typedef HANDLE sem_t;
-
-int sem_init(sem_t *sem, int pshared, unsigned int value)
+typedef struct
 {
-    *sem = CreateSemaphore(NULL, value, LONG_MAX, NULL);
-    if (*sem == NULL)
+    HANDLE handle;
+} sem_t;
+
+static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
+{
+    (void)pshared; /* unused on Windows */
+    sem->handle = CreateSemaphore(NULL, value, LONG_MAX, NULL);
+    if (sem->handle == NULL)
     {
         errno = GetLastError();
         return -1;
     }
     return 0;
+}
+
+static inline int sem_destroy(sem_t *sem)
+{
+    if (sem->handle != NULL)
+    {
+        CloseHandle(sem->handle);
+        sem->handle = NULL;
+    }
+    return 0;
+}
+
+static inline int sem_wait(sem_t *sem)
+{
+    DWORD result = WaitForSingleObject(sem->handle, INFINITE);
+    return (result == WAIT_OBJECT_0) ? 0 : -1;
+}
+
+static inline int sem_post(sem_t *sem)
+{
+    return ReleaseSemaphore(sem->handle, 1, NULL) ? 0 : -1;
 }
 
 /* file operations macros for cross-platform compatibility */
@@ -144,7 +198,7 @@ int sem_init(sem_t *sem, int pshared, unsigned int value)
 #define ftell                _ftelli64
 #define fseek                _fseeki64
 
-int fsync(int fd)
+static inline int fsync(int fd)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE)
@@ -154,8 +208,39 @@ int fsync(int fd)
     return FlushFileBuffers(h) ? 0 : -1;
 }
 
+/* fdatasync for Windows, same as fsync (Windows doesn't distinguish) */
+static inline int fdatasync(int fd)
+{
+    return fsync(fd);
+}
+
+/* clock_gettime for Windows */
+static inline int clock_gettime(int clk_id, struct timespec *tp)
+{
+    (void)clk_id; /* unused */
+    FILETIME ft;
+    unsigned __int64 tmpres = 0;
+
+    GetSystemTimeAsFileTime(&ft);
+
+    tmpres |= ft.dwHighDateTime;
+    tmpres <<= 32;
+    tmpres |= ft.dwLowDateTime;
+
+    /* convert to microseconds */
+    tmpres /= 10;
+
+    /* convert file time to unix epoch */
+    tmpres -= 11644473600000000ULL;
+
+    tp->tv_sec = (long)(tmpres / 1000000UL);
+    tp->tv_nsec = (long)((tmpres % 1000000UL) * 1000);
+
+    return 0;
+}
+
 /* gettimeofday function for win */
-int gettimeofday(struct timeval *tp, struct timezone *tzp)
+static inline int gettimeofday(struct timeval *tp, struct timezone *tzp)
 {
     FILETIME ft;
     unsigned __int64 tmpres = 0;
@@ -193,24 +278,185 @@ int gettimeofday(struct timeval *tp, struct timezone *tzp)
     return 0;
 }
 
+/* pread and pwrite for Windows */
+static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    OVERLAPPED overlapped = {0};
+    LARGE_INTEGER li;
+    li.QuadPart = offset;
+    overlapped.Offset = li.LowPart;
+    overlapped.OffsetHigh = li.HighPart;
+
+    /* Create event for synchronous operation */
+    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (overlapped.hEvent == NULL)
+    {
+        errno = GetLastError();
+        return -1;
+    }
+
+    DWORD bytes_read;
+    BOOL result = ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped);
+
+    if (!result)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING)
+        {
+            /* Wait for async operation to complete */
+            if (!GetOverlappedResult(h, &overlapped, &bytes_read, TRUE))
+            {
+                CloseHandle(overlapped.hEvent);
+                errno = GetLastError();
+                return -1;
+            }
+        }
+        else
+        {
+            CloseHandle(overlapped.hEvent);
+            errno = err;
+            return -1;
+        }
+    }
+
+    CloseHandle(overlapped.hEvent);
+    return (ssize_t)bytes_read;
+}
+
+static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    OVERLAPPED overlapped = {0};
+    LARGE_INTEGER li;
+    li.QuadPart = offset;
+    overlapped.Offset = li.LowPart;
+    overlapped.OffsetHigh = li.HighPart;
+
+    /* Create event for synchronous operation */
+    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (overlapped.hEvent == NULL)
+    {
+        errno = GetLastError();
+        return -1;
+    }
+
+    DWORD bytes_written;
+    BOOL result = WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped);
+
+    if (!result)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING)
+        {
+            /* Wait for async operation to complete */
+            if (!GetOverlappedResult(h, &overlapped, &bytes_written, TRUE))
+            {
+                CloseHandle(overlapped.hEvent);
+                errno = GetLastError();
+                return -1;
+            }
+        }
+        else
+        {
+            CloseHandle(overlapped.hEvent);
+            errno = err;
+            return -1;
+        }
+    }
+
+    CloseHandle(overlapped.hEvent);
+    return (ssize_t)bytes_written;
+}
+
 #elif defined(__APPLE__)
 #include <dirent.h>
+#include <dispatch/dispatch.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+/* pread and pwrite are available natively on macOS via unistd.h */
+/* no additional implementation needed - using system pread/pwrite */
+
+/* fdatasync for macOS - use F_FULLFSYNC for proper data sync */
+static inline int fdatasync(int fd)
+{
+#ifdef F_FULLFSYNC
+    /* macOS requires F_FULLFSYNC to actually flush to disk */
+    if (fcntl(fd, F_FULLFSYNC) == -1)
+    {
+        /* fall back to fsync if F_FULLFSYNC fails */
+        return fsync(fd);
+    }
+    return 0;
+#else
+    /* fall back to fsync if F_FULLFSYNC not available */
+    return fsync(fd);
+#endif
+}
+
+/* semaphore compatibility for macOS using Grand Central Dispatch
+ * macOS deprecated POSIX semaphores (sem_init, sem_destroy, etc.)
+ * use dispatch_semaphore instead */
+typedef dispatch_semaphore_t sem_t;
+
+static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
+{
+    (void)pshared; /* unused on macOS */
+    *sem = dispatch_semaphore_create(value);
+    return (*sem == NULL) ? -1 : 0;
+}
+
+static inline int sem_destroy(sem_t *sem)
+{
+    if (*sem)
+    {
+        dispatch_release(*sem);
+        *sem = NULL;
+    }
+    return 0;
+}
+
+static inline int sem_wait(sem_t *sem)
+{
+    return (dispatch_semaphore_wait(*sem, DISPATCH_TIME_FOREVER) == 0) ? 0 : -1;
+}
+
+static inline int sem_post(sem_t *sem)
+{
+    dispatch_semaphore_signal(*sem);
+    return 0;
+}
+
 #else /* posix systems */
 #include <dirent.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+/* pread, pwrite, and fdatasync are available natively on POSIX systems via unistd.h */
+/* no additional implementation needed - using system pread/pwrite/fdatasync */
 
 typedef pthread_t thread_t;
 typedef pthread_mutex_t mutex_t;

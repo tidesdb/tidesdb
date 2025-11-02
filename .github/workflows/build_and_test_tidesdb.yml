@@ -8,24 +8,50 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
 
     steps:
-    - name: Checkout tidesdb repo
-      uses: actions/checkout@v4
+      - name: Checkout tidesdb repo
+        uses: actions/checkout@v4
 
-    - name: Install libzstd-dev,liblz4-dev and libsnappy-dev
-      run: |
-        sudo apt update
-        sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev libssl-dev
 
-    - name: configure cmake build for tidesdb
-      run: cmake --debug-output  -S . -B build && make -C build/
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install zstd lz4 snappy openssl
 
-    - name: run tests
-      run: |
-        cd build
-        ctest --output-on-failure
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          git pull
+          .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows openssl:x64-windows pthreads:x64-windows
+          
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Configure CMake (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run tests
+        run: |
+          cd build
+          ctest --output-on-failure --build-config Release
 

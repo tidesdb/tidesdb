@@ -40,7 +40,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, int n)
     (*bf)->h = (int)ceil(((double)(*bf)->m) / n * M_LN2);
 
     /* alloc memory for the bitset and initialize it to 0 */
-    (*bf)->bitset = calloc((*bf)->m, sizeof(int8_t));
+    (*bf)->bitset = calloc((size_t)(*bf)->m, sizeof(int8_t));
     if ((*bf)->bitset == NULL)
     {
         free(*bf);
@@ -56,7 +56,8 @@ void bloom_filter_add(bloom_filter_t *bf, const uint8_t *entry, size_t size)
     for (int i = 0; i < bf->h; i++)
     {
         unsigned int hash = bloom_filter_hash(entry, size, i);
-        bf->bitset[hash % bf->m] = 1;
+        int index = (int)(hash % (unsigned int)bf->m);
+        bf->bitset[index] = 1;
     }
 }
 
@@ -66,7 +67,8 @@ int bloom_filter_contains(bloom_filter_t *bf, const uint8_t *entry, size_t size)
     for (int i = 0; i < bf->h; i++)
     {
         unsigned int hash = bloom_filter_hash(entry, size, i);
-        if (bf->bitset[hash % bf->m] == 0)
+        int index = (int)(hash % (unsigned int)bf->m);
+        if (bf->bitset[index] == 0)
         {
             return 0;
         }
@@ -93,15 +95,14 @@ unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
     const uint32_t m = 0xc6a4a793;       /*  large prime */
     const uint32_t r = 24;               /* right shift value */
     const uint8_t *limit = entry + size; /* pointer to the end of the entry */
-    uint32_t h = seed ^ (size * m);      /* initial hash value based on seed and size */
+    uint32_t h =
+        (uint32_t)seed ^ ((uint32_t)size * m); /* initial hash value based on seed and size */
 
-    /* we process the entry 4 bytes at a time */
     while (entry + 4 <= limit)
     {
-        /* we decode the 4 bytes into a 32-bit unsigned integer */
         uint32_t w = decode_fixed_32((const char *)entry);
-        entry += 4;     /* move the pointer forward by 4 bytes */
-        h += w;         /** add the decoded value to the hash */
+        entry += 4;
+        h += w;
         h *= m;         /* multiply the hash by the large prime number */
         h ^= (h >> 16); /* xor the hash with its right-shifted value */
     }
@@ -110,10 +111,12 @@ unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
     switch (limit - entry)
     {
         case 3:
-            h += (uint8_t)entry[2] << 16; /* add the third byte shifted left by 16 bits */
+            h += (unsigned int)((uint8_t)entry[2])
+                 << 16; /* add the third byte shifted left by 16 bits */
         /* fall through */
         case 2:
-            h += (uint8_t)entry[1] << 8; /* add the second byte shifted left by 8 bits */
+            h += (unsigned int)((uint8_t)entry[1])
+                 << 8; /* add the second byte shifted left by 8 bits */
         /* fall through */
         case 1:
             h += (uint8_t)entry[0]; /*add the first byte*/
@@ -132,7 +135,7 @@ unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
 uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
 {
     /* calculate the size of the serialized data */
-    *out_size = sizeof(int32_t) * 2 + bf->m * sizeof(int8_t);
+    *out_size = sizeof(int32_t) * 2 + (size_t)bf->m * sizeof(int8_t);
     uint8_t *buffer = malloc(*out_size);
     if (buffer == NULL)
     {
@@ -150,7 +153,7 @@ uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
     ptr += sizeof(int32_t);
 
     /* write the bitset */
-    memcpy(ptr, bf->bitset, bf->m * sizeof(int8_t));
+    memcpy(ptr, bf->bitset, (size_t)bf->m * sizeof(int8_t));
 
     return buffer;
 }
@@ -170,13 +173,13 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
     ptr += sizeof(int32_t);
 
     /* read the bitset */
-    int8_t *bitset = malloc(m * sizeof(int8_t));
+    int8_t *bitset = malloc((size_t)m * sizeof(int8_t));
     if (bitset == NULL)
     {
         return NULL;
     }
 
-    memcpy(bitset, ptr, m * sizeof(int8_t));
+    memcpy(bitset, ptr, (size_t)m * sizeof(int8_t));
 
     bloom_filter_t *bf = malloc(sizeof(bloom_filter_t));
     if (bf == NULL)

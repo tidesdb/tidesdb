@@ -13,28 +13,25 @@ It is not a full-featured database, but rather a library that can be used to bui
 > master is in active development. TidesDB 1 is the projected stable first MAJOR release. We are in the beta development stages.
 
 ## Features
-- [x] **ACID** transactions are atomic, consistent, isolated, and durable. Transactions are tied to their respective column family.
-- [x] **Concurrent** multiple threads can read and write to the storage engine. Column families use a read-write lock thus allowing multiple readers and a single writer per column family. Transactions on commit and rollback block other threads from reading or writing to the column family until the transaction is completed. A transaction in itself is also is thread safe.
-- [x] **Column Families** store data in separate key-value stores. Each column family has their own memtable and sstables.
-- [x] **Atomic Transactions** commit or rollback multiple operations atomically. When a transaction fails, it rolls back all commited operations.
-- [x] **Bidirectional Cursor** iterate over key-value pairs forward and backward with background compaction awareness.
-- [x] **Bidirectional Merge Cursor** iterate over key-value pairs in sorted order forward and backward.
-- [x] **WAL** write-ahead logging for durability. Column families replay WAL on startup. This reconstructs memtable if the column family did not reach threshold prior to shutdown.
-- [x] **Parallel Paired Merge Compaction** manual multi-threaded paired and merged compaction of sstables. When run for example 10 sstables compacts into 5 as their paired and merged. Each thread is responsible for one pair - you can set the number of threads to use for compaction.
-- [x] **Background Incremental Paired Merge Compaction** background incremental merge compaction can be started. If started the system will incrementally merge sstables in the background from oldest to newest once column family sstables have reached a specific provided limit. Merges are done every n seconds. Merges are not done in parallel but incrementally.
-- [x] **Bloom Filters** reduce disk reads by reading initial blocks of sstables to check key existence.
-- [x] **Compression** compression is achieved with Snappy, LZ4, or ZSTD. If enabled at column family level sstable entries as well as WAL entries are compressed with configured algorithm.
-- [x] **TTL** time-to-live for key-value pairs. Key-value pairs expire in real time with effective skip list traversal expiration checks.
-- [x] **Configurable** column families are configurable with memtable flush threshold, skip list max level, skip list probability, compression, and bloom filters.
-- [x] **Error Handling** API functions return an error code and message.
-- [x] **Easy API** simple and easy to use api.
-- [x] **Skip List** skip list is used for memtable data structure.
-- [x] **Multiplatform** Linux, MacOS, and Windows support.
-- [x] **Logging** system logs debug messages to log file. This can be disabled. Log file is created in the database directory. Logging automatically rotates/truncates at `100000` entries by default, configured with `TDB_DEBUG_LOG_TRUNCATE_AT`.
-- [x] **Block Indices** by default `TDB_BLOCK_INDICES` is set to 1. This means TidesDB for each column family sstable there is a last block containing a sorted binary hash array(SBHA). This compact data structure gives us the ability to retrieve the specific offset for a key and seek to its containing key value pair block within an sstable without having to scan an entire sstable. If `TDB_BLOCK_INDICES` is set to 0 then block indices aren't used nor created and reads are slower and consume more IO and CPU having to scan and compare.
-- [x] **Statistics** column family statistics, configs, information can be retrieved through public API.
-- [x] **Range queries** are supported. You can retrieve a range of key-value pairs. Each sstable initial block contains a min-max key range. This allows for fast(er) range queries.
-- [x] **Filter queries** are supported. You can filter key-value pairs based on a filter function.
+- [x] **ACID Transactions** - Atomic, consistent, isolated, and durable. Transactions support multiple operations across column families.
+- [x] **Optimized Concurrency** - Writers don't block readers, readers don't block readers. Column families use reader-writer locks allowing multiple concurrent readers. Only writers block other writers on the same column family.
+- [x] **Column Families** - Isolated key-value stores. Each column family has its own memtable, SSTables, and WAL.
+- [x] **Atomic Transactions** - Commit or rollback multiple operations atomically. Failed transactions automatically rollback.
+- [x] **Bidirectional Iterators** - Iterate forward and backward over key-value pairs with merge-sort across memtable and SSTables.
+- [x] **Write-Ahead Log (WAL)** - Durability through WAL. Automatic recovery on startup reconstructs memtable from WAL.
+- [x] **Background Compaction** - Automatic background compaction when SSTable count reaches threshold. Configurable compaction interval and capacity.
+- [x] **Bloom Filters** - Reduce disk reads by checking key existence before reading SSTables. Configurable false positive rate.
+- [x] **Compression** - Snappy, LZ4, or ZSTD compression for SSTables and WAL entries. Configurable per column family.
+- [x] **TTL Support** - Time-to-live for key-value pairs. Expired entries automatically skipped during reads.
+- [x] **Custom Comparators** - Register custom key comparison functions. Built-in comparators `memcmp, string, numeric`.
+- [x] **Sync Modes** - Three sync modes `NONE (fastest), BACKGROUND (balanced), FULL (most durable)`.
+- [x] **Configurable** - Per-column-family configuration `memtable size, compaction settings, compression, bloom filters, sync mode`.
+- [x] **Simple API** - Clean, easy-to-use C API. Returns 0 on success, -1 on error.
+- [x] **Skip List Memtable** - Lock-free skip list for in-memory storage with configurable max level and probability.
+- [x] **Cross-Platform** - Linux, macOS, and Windows support with platform abstraction layer.
+- [x] **Sorted Binary Hash Array (SBHA)** - Fast SSTable lookups. Direct key-to-block offset mapping without full SSTable scans.
+- [x] **Tombstones** - Efficient deletion through tombstone markers. Removed during compaction.
+- [x] **Streamlined Serialization** - Compact binary format with versioning and bit-packed flags.
 
 ## Building
 Using cmake to build the shared library.
@@ -54,18 +51,20 @@ cmake --install build
 
 ## Requirements
 You need cmake and a C compiler.
-You also require the `snappy`, `lz4`, and `zstd` libraries.
+You also require the `snappy`, `lz4`, `zstd`, and `openssl` libraries.
 
 ### Dependencies
-- [Snappy](https://github.com/google/snappy)
-- [LZ4](https://github.com/lz4/lz4)
-- [Zstandard](https://github.com/facebook/zstd)
+- [Snappy](https://github.com/google/snappy) - Compression
+- [LZ4](https://github.com/lz4/lz4) - Compression
+- [Zstandard](https://github.com/facebook/zstd) - Compression
+- [OpenSSL](https://www.openssl.org/) - Cryptographic hashing (SHA1)
 
 ### Linux
 ```bash
 sudo apt install libzstd-dev
 sudo apt install liblz4-dev
 sudo apt install libsnappy-dev
+sudo apt install libssl-dev
 ```
 
 ### MacOS
@@ -73,6 +72,7 @@ sudo apt install libsnappy-dev
 brew install zstd
 brew install lz4
 brew install snappy
+brew install openssl
 ```
 
 ### Windows
@@ -81,6 +81,7 @@ Windows using vcpkg
 vcpkg install zstd
 vcpkg install lz4
 vcpkg install snappy
+vcpkg install openssl
 ```
 
 ## Bindings
@@ -120,78 +121,174 @@ Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask quest
 
 ## Include
 ```c
-#include <tidesdb/tidesdb.h> /* you can use other components of TidesDB such as skip list, bloom filter etc.. under tidesdb/
+#include <tidesdb/tidesdb.h> /* You can use other components of TidesDB such as skip list, bloom filter etc.. under tidesdb/
                                 this also prevents collisions. */
 ```
 
-## Usage
-Each database method returns a `tidesdb_err_t*` which returns an error code and message. If no error, TidesDB returns `NULL`.
+## Error Codes
+TidesDB provides detailed error codes for production use. All functions return `0` on success or a negative error code on failure.
 
-**Example of error structure**
+| Error Code | Value | Description |
+|------------|-------|-------------|
+| `TDB_SUCCESS` | 0 | operation successful |
+| `TDB_ERROR` | -1 | generic error |
+| `TDB_ERR_MEMORY` | -2 | memory allocation failed |
+| `TDB_ERR_INVALID_ARGS` | -3 | invalid arguments passed to function |
+| `TDB_ERR_IO` | -4 | I/O error (file operations) |
+| `TDB_ERR_NOT_FOUND` | -5 | key not found |
+| `TDB_ERR_EXISTS` | -6 | resource already exists |
+| `TDB_ERR_CORRUPT` | -7 | data corruption detected |
+| `TDB_ERR_LOCK` | -8 | lock acquisition failed |
+| `TDB_ERR_TXN_COMMITTED` | -9 | transaction already committed |
+| `TDB_ERR_TXN_ABORTED` | -10 | transaction aborted |
+| `TDB_ERR_READONLY` | -11 | write operation on read-only transaction |
+| `TDB_ERR_FULL` | -12 | database or resource full |
+| `TDB_ERR_INVALID_NAME` | -13 | invalid name (too long or empty) |
+| `TDB_ERR_COMPARATOR_NOT_FOUND` | -14 | comparator not found in registry |
+| `TDB_ERR_MAX_COMPARATORS` | -15 | maximum number of comparators reached |
+| `TDB_ERR_INVALID_CF` | -16 | invalid column family |
+| `TDB_ERR_THREAD` | -17 | thread creation or operation failed |
+| `TDB_ERR_CHECKSUM` | -18 | checksum verification failed |
+
+**Example error handling**
 ```c
-typedef struct
+int result = tidesdb_txn_put(txn, "my_cf", key, key_size, value, value_size, -1);
+if (result != TDB_SUCCESS)
 {
-    int code;
-    char *message;
-} tidesdb_err_t;
+    switch (result)
+    {
+        case TDB_ERR_MEMORY:
+            fprintf(stderr, "out of memory\n");
+            break;
+        case TDB_ERR_INVALID_ARGS:
+            fprintf(stderr, "invalid arguments\n");
+            break;
+        case TDB_ERR_READONLY:
+            fprintf(stderr, "cannot write to read-only transaction\n");
+            break;
+        default:
+            fprintf(stderr, "operation failed with error code: %d\n", result);
+            break;
+    }
+    return -1;
+}
 ```
 
+## Usage
+TidesDB v1 uses a simplified API. All functions return `0` on success and a negative error code on failure.
+
 ### Opening a database
-To open a database you pass the path to the database directory and a pointer to the database.
+To open a database you pass a config struct and a pointer to the database.
 ```c
+tidesdb_config_t config = {
+    .db_path = "./mydb",
+    .enable_debug_logging = 0  /* Optional enable debug logging */
+};
 
-tidesdb_t *tdb = NULL;
-tidesdb_err_t *e = tidesdb_open("your_tdb_directory", &tdb);
-if (e != NULL)
+tidesdb_t *db = NULL;
+if (tidesdb_open(&config, &db) != 0)
 {
-    /* handle error */
-    tidesdb_err_free(e);
+    /* Handle error */
+    return -1;
 }
 
-/* close the database */
-e = tidesdb_close(tdb);
-if (e != NULL)
+/* Close the database */
+if (tidesdb_close(db) != 0)
 {
-    /* handle error */
-    tidesdb_err_free(e);
+    /* Handle error */
+    return -1;
 }
+```
 
+### Debug Logging
+TidesDB provides runtime debug logging that can be enabled/disabled dynamically.
+
+**Enable at startup**
+```c
+tidesdb_config_t config = {
+    .db_path = "./mydb",
+    .enable_debug_logging = 1  /* Enable debug logging */
+};
+
+tidesdb_t *db = NULL;
+tidesdb_open(&config, &db);
+```
+
+**Enable/disable at runtime**
+```c
+extern int _tidesdb_debug_enabled;  /* Global debug flag */
+
+/* Enable debug logging */
+_tidesdb_debug_enabled = 1;
+
+/* Your operations here - debug logs will be written to stderr */
+
+/* Disable debug logging */
+_tidesdb_debug_enabled = 0;
+```
+
+**Output**
+Debug logs are written to **stderr** with the format
+```
+[TidesDB DEBUG] filename:line: message
+```
+
+**Redirect to file**
+```bash
+./your_program 2> tidesdb_debug.log  # Redirect stderr to file
 ```
 
 ### Creating a column family
-In order to store data in TidesDB you need a column family. This is by design. There is no default.
-
-**You pass**
-- the database you want to create the column family in. Must be open
-- the name of the column family
-- memtable flush threshold in bytes. Example below is 128MB
-- skip list max level. Example below is 12 ( you can use `TDB_DEFAULT_SKIP_LIST_MAX_LEVEL`)
-- skip list probability. Example below is 0.24 ( you can use `TDB_DEFAULT_SKIP_LIST_PROBABILITY`)
-- whether column family sstable data is compressed
-- the compression algorithm to use [`TDB_NO_COMPRESSION`, `TDB_COMPRESS_SNAPPY`, `TDB_COMPRESS_LZ4`, `TDB_COMPRESS_ZSTD`]
-- whether to use bloom filters
-
-The flush threshold is an accumilation of the size of your key value pairs in the memtable. When the threshold is reached the memtable is flushed to an sstable.
-The threshold is up to you and the system you're running on. The minimum size is 1mb. The larger the threshold the more data you can store in memory before flushing to disk.
+Column families are isolated key-value stores. Use the config struct for customization or use defaults.
 
 ```c
-/* create a column family with no compression and no bloom filters (slower reads) */
-tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, TDB_DEFAULT_SKIP_LIST_MAX_LEVEL, TDB_DEFAULT_SKIP_LIST_PROBABILITY, false, TDB_NO_COMPRESSION, false);
-if (e != NULL)
+/* Create with default configuration */
+tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+if (tidesdb_create_column_family(db, "my_cf", &cf_config) != 0)
 {
-    /* handle error */
-    tidesdb_err_free(e);
+    /* Handle error */
+    return -1;
 }
 ```
 
-Using Snappy compression, bloom filters
+**Custom configuration example**
 ```c
-/* create a column family with compression and bloom filter (the bloom filter provides fast read speed) */
-tidesdb_err_t *e = tidesdb_create_column_family(tdb, "your_column_family", (1024 * 1024) * 128, TDB_DEFAULT_SKIP_LIST_MAX_LEVEL, TDB_DEFAULT_SKIP_LIST_PROBABILITY, true, TDB_COMPRESS_SNAPPY, true);
-if (e != NULL)
+tidesdb_column_family_config_t cf_config = {
+    .memtable_flush_size = 128 * 1024 * 1024,   /* 128MB */
+    .max_sstables_before_compaction = 512,      /* trigger compaction at 512 SSTables (min 2 required) */
+    .compaction_threads = 4,                    /* use 4 threads for parallel compaction (0 = single-threaded) */
+    .max_level = 12,                            /* skip list max level */
+    .probability = 0.25f,                       /* skip list probability */
+    .compressed = 1,                            /* enable compression */
+    .compress_algo = COMPRESS_LZ4,              /* use LZ4 */
+    .bloom_filter_fp_rate = 0.01,               /* 1% false positive rate */
+    .enable_background_compaction = 1,          /* enable background compaction */
+    .use_sbha = 1,                              /* use sorted binary hash array */
+    .sync_mode = TDB_SYNC_BACKGROUND,           /* background fsync */
+    .sync_interval = 1000,                      /* fsync every 1000ms (1 second) */
+    .comparator_name = NULL                     /* NULL = use default "memcmp" */
+};
+
+if (tidesdb_create_column_family(db, "my_cf", &cf_config) != 0)
 {
-    /* handle error */
-    tidesdb_err_free(e);
+    /* Handle error */
+    return -1;
+}
+```
+
+**Using custom comparator**
+```c
+/* Register custom comparator first (see examples/custom_comparator.c) */
+tidesdb_register_comparator("reverse", my_reverse_compare);
+
+tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+cf_config.comparator_name = "reverse";  /* use registered comparator */
+
+if (tidesdb_create_column_family(db, "sorted_cf", &cf_config) != 0)
+{
+    /* Handle error */
+    return -1;
 }
 ```
 
@@ -199,487 +296,382 @@ if (e != NULL)
 ### Dropping a column family
 
 ```c
-/* drop a column family */
-tidesdb_err_t *e = tidesdb_drop_column_family(tdb, "your_column_family");
-if (e != NULL)
+if (tidesdb_drop_column_family(db, "my_cf") != 0)
 {
-    /* handle error */
-    tidesdb_err_free(e);
+    /* Handle error */
+    return -1;
+}
+```
+
+### Getting a column family
+Retrieve a column family pointer to use in operations.
+```c
+tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "my_cf");
+if (cf == NULL)
+{
+    /* Column family not found */
+    return -1;
 }
 ```
 
 ### Listing column families
-You can list all column families in the database list as a string. You must free the string when done.
+Get all column family names in the database.
 ```c
-char *column_families = NULL;
-tidesdb_err_t *err = tidesdb_list_column_families(tdb, &column_families);
-if (err != NULL) {
-/* handle error */
-}
+char **names = NULL;
+int count = 0;
 
-/* in this example we just print and free the column families */
-printf("%s\n", column_families);
-free(column_families);
-```
-
-### Putting a key-value pair
-You pass
-- the database you want to put the key-value pair in. Must be open
-- the column family name you want to put the key-value pair in
-- the key
-- the key size
-- the value
-- the value size
-- when the key-value pair should expire. If -1 then it never expires.
-
-```c
-/* put a key-value pair */
-uint8_t key[] = "key";
-uint8_t value[] = "value";
-
-tidesdb_err_t *e = tidesdb_put(tdb, "your_column_family", key, sizeof(key), value, sizeof(value), -1);
-if (e != NULL)
+if (tidesdb_list_column_families(db, &names, &count) == 0)
 {
-    /* handle error */
-    tidesdb_err_free(e);
+    printf("Found %d column families:\n", count);
+    for (int i = 0; i < count; i++)
+    {
+        printf("  - %s\n", names[i]);
+        free(names[i]);  /* Free each name */
+    }
+    free(names);  /* Free the array */
 }
 ```
 
-### Putting a key-value pair with TTL
+### Column family statistics
+Get detailed statistics about a column family.
 ```c
-/* put a key-value pair with TTL */
-uint8_t key[] = "key";
-uint8_t value[] = "value";
+tidesdb_column_family_stat_t *stats = NULL;
 
-time_t ttl = time(NULL) + 10; /* 10 seconds */
-tidesdb_err_t *e  = tidesdb_put(tdb, "your_column_family", key, sizeof(key), value, sizeof(value), ttl);
-if (e != NULL)
+if (tidesdb_get_column_family_stats(db, "my_cf", &stats) == 0)
 {
-    /* handle error */
-    tidesdb_err_free(e);
+    printf("Column Family: %s\n", stats->name);
+    printf("Comparator: %s\n", stats->comparator_name);
+    printf("SSTables: %d\n", stats->num_sstables);
+    printf("Total SSTable Size: %zu bytes\n", stats->total_sstable_size);
+    printf("Memtable Size: %zu bytes\n", stats->memtable_size);
+    printf("Memtable Entries: %d\n", stats->memtable_entries);
+    printf("Compression: %s\n", stats->config.compressed ? "enabled" : "disabled");
+    printf("Bloom Filter FP Rate: %.4f\n", stats->config.bloom_filter_fp_rate);
+    
+    free(stats);
 }
 ```
 
-### Getting a key-value pair
-You pass
-- the database you want to get the key-value pair from. Must be open
-- the column family name
-- the key
-- the key size
-- a pointer to the value
-- a pointer to the value size
-```c
-size_t value_len = 0;
-uint8_t *value_out = NULL;
-uint8_t key[] = "key";
-
-tidesdb_err_t *e = tidesdb_get(tdb, "your_column_family", key, sizeof(key), &value_out, &value_len);
-if (e != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
-```
-
-### Deleting a key-value pair
-You pass
-- the database you want to delete the key-value pair from. Must be open
-- the column family name
-- the key
-- the key size
-```c
-uint8_t key[] = "key";
-
-tidesdb_err_t *e = tidesdb_delete(tdb, "your_column_family", key, sizeof(key));
-if (e != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
-```
+**Statistics include**
+- Column family name and comparator
+- Number of SSTables and total size
+- Memtable size and entry count
+- Full configuration (compression, bloom filters, sync mode, etc.)
 
 ### Transactions
-You can perform a series of operations atomically. This will block other threads from reading or writing to the column family until the transaction is committed or rolled back.
+All operations in TidesDB v1 are done through transactions for ACID guarantees.
 
-You begin a transaction by calling `tidesdb_txn_begin`.
-
-You pass
-- the database you want to perform the operations in. Must be open
-- the transaction pointer
-- the column family name you want to perform the operations in
+**Basic transaction**
 ```c
-tidesdb_txn_t *transaction;
-tidesdb_err_t *e = tidesdb_txn_begin(tdb, &transaction, "your_column_family");
-if (e != NULL)
+tidesdb_txn_t *txn = NULL;
+if (tidesdb_txn_begin(db, &txn) != 0)
 {
-    /* handle error */
-    tidesdb_err_free(e);
+    return -1;
 }
+
+/* Put a key-value pair */
+const uint8_t *key = (uint8_t *)"mykey";
+const uint8_t *value = (uint8_t *)"myvalue";
+
+if (tidesdb_txn_put(txn, "my_cf", key, 5, value, 7, -1) != 0)
+{
+    tidesdb_txn_free(txn);
+    return -1;
+}
+
+/* Commit the transaction */
+if (tidesdb_txn_commit(txn) != 0)
+{
+    tidesdb_txn_free(txn);
+    return -1;
+}
+
+tidesdb_txn_free(txn);
 ```
 
-Now we can add operations to the transaction.
+**With TTL (time-to-live)**
 ```c
-const uint8_t key[] = "example_key";
-const uint8_t value[] = "example_value";
-tidesdb_err_t *e = tidesdb_txn_put(transaction, key, sizeof(key), value, sizeof(value), -1); /* you can pass a ttl, similar to put */
-if (e != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
+tidesdb_txn_t *txn = NULL;
+tidesdb_txn_begin(db, &txn);
 
-/* you can add get (tidesdb_txn_get) or delete operations as well */
-e = tidesdb_txn_delete(transaction, key, sizeof(key));
-if (e != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
+const uint8_t *key = (uint8_t *)"temp_key";
+const uint8_t *value = (uint8_t *)"temp_value";
 
-/* now we commit */
-e = tidesdb_txn_commit(transaction);
-if (e != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
+/* TTL is Unix timestamp (seconds since epoch) - absolute expiration time */
+time_t ttl = time(NULL) + 60;  /* Expires 60 seconds from now */
 
-/* before you free, you can rollback */
-tidesdb_err_t *e = tidesdb_txn_rollback(transaction);
-if (e != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
-
-/* free the transaction */
-tidesdb_txn_free(transaction);
+/* Use -1 for no expiration */
+tidesdb_txn_put(txn, "my_cf", key, 8, value, 10, ttl);
+tidesdb_txn_commit(txn);
+tidesdb_txn_free(txn);
 ```
 
-### Range queries
-You can retrieve a range of key-value pairs.
+**TTL Examples**
 ```c
-uint8_t key1[] = "key1";
-uint8_t key3[] = "key3";
-tidesdb_key_value_pair_t **result = NULL;
-size_t result_size = 0;
+/* No expiration */
+time_t ttl = -1;
 
-tidesdb_err_t *e = tidesdb_range(tdb, "your_column_family", key1, sizeof(key1), key3, sizeof(key3), &result, &result_size);
-if (e != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
+/* Expire in 5 minutes */
+time_t ttl = time(NULL) + (5 * 60);
+
+/* Expire in 1 hour */
+time_t ttl = time(NULL) + (60 * 60);
+
+/* Expire at specific time (e.g., midnight) */
+time_t ttl = 1730592000;  /* Specific Unix timestamp */
 ```
 
-### Filter queries
-You can filter key-value pairs based on a filter function.
+**Getting a key-value pair**
 ```c
-/* define a filter function */
-bool comparison_method(const tidesdb_key_value_pair_t *kv)
+tidesdb_txn_t *txn = NULL;
+tidesdb_txn_begin_read(db, &txn);  /* Read-only transaction */
+
+const uint8_t *key = (uint8_t *)"mykey";
+uint8_t *value = NULL;
+size_t value_size = 0;
+
+if (tidesdb_txn_get(txn, "my_cf", key, 5, &value, &value_size) == 0)
 {
-        return kv->key_size == sizeof(key2) && memcmp(kv->key, key2, sizeof(key2)) == 0;
+    /* Use value */
+    printf("Value: %.*s\n", (int)value_size, value);
+    free(value);
 }
 
-/* then.. */
-
-uint8_t key2[] = "key2";
-tidesdb_key_value_pair_t **result = NULL;
-size_t result_size = 0;
-
-tidesdb_key_value_pair_t **result = NULL;
-size_t result_size = 0;
-
-tidesdb_err_t *e = tidesdb_filter(tdb, "your_column_family", comparison_method, &result, &result_size);
-if (err != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
+tidesdb_txn_free(txn);
 ```
 
-### Cursors
-You can iterate over key-value pairs in a column family.
+**Deleting a key-value pair**
 ```c
-tidesdb_cursor_t *c;
-tidesdb_err_t *e = tidesdb_cursor_init(tdb, "your_column_family", &c);
-if (e != NULL)
+tidesdb_txn_t *txn = NULL;
+tidesdb_txn_begin(db, &txn);
+
+const uint8_t *key = (uint8_t *)"mykey";
+tidesdb_txn_delete(txn, "my_cf", key, 5);
+
+tidesdb_txn_commit(txn);
+tidesdb_txn_free(txn);
+```
+
+**Multi-operation transaction**
+```c
+tidesdb_txn_t *txn = NULL;
+tidesdb_txn_begin(db, &txn);
+
+/* Multiple operations in one transaction */
+tidesdb_txn_put(txn, "my_cf", (uint8_t *)"key1", 4, (uint8_t *)"value1", 6, -1);
+tidesdb_txn_put(txn, "my_cf", (uint8_t *)"key2", 4, (uint8_t *)"value2", 6, -1);
+tidesdb_txn_delete(txn, "my_cf", (uint8_t *)"old_key", 7);
+
+/* Commit atomically - all or nothing */
+if (tidesdb_txn_commit(txn) != 0)
 {
-    /* handle error */
-    tidesdb_err_free(e);
-    return;
+    /* On error, transaction is automatically rolled back */
+    tidesdb_txn_free(txn);
+    return -1;
 }
 
-uint8_t *retrieved_key = NULL;
-size_t key_size;
-uint8_t *retrieved_value = NULL;
-size_t value_size;
+tidesdb_txn_free(txn);
+```
 
-/* iterate forward */
-do
+**Transaction rollback**
+```c
+tidesdb_txn_t *txn = NULL;
+tidesdb_txn_begin(db, &txn);
+
+tidesdb_txn_put(txn, "my_cf", (uint8_t *)"key", 3, (uint8_t *)"value", 5, -1);
+
+/* Decide to rollback instead of commit */
+tidesdb_txn_rollback(txn);
+tidesdb_txn_free(txn);
+/* No changes were applied */
+```
+
+### Iterators
+Iterators provide efficient forward and backward traversal over key-value pairs.
+
+**Forward iteration**
+```c
+tidesdb_txn_t *txn = NULL;
+tidesdb_txn_begin_read(db, &txn);
+
+tidesdb_iter_t *iter = NULL;
+if (tidesdb_iter_new(txn, "my_cf", &iter) != 0)
 {
-    e = tidesdb_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
-    if (e != NULL)
+    tidesdb_txn_free(txn);
+    return -1;
+}
+
+/* Seek to first entry */
+tidesdb_iter_seek_to_first(iter);
+
+while (tidesdb_iter_valid(iter))
+{
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    
+    if (tidesdb_iter_key(iter, &key, &key_size) == 0 &&
+        tidesdb_iter_value(iter, &value, &value_size) == 0)
     {
-        /* handle error */
-        tidesdb_err_free(e);
-        break;
+        /* Use key and value */
+        printf("Key: %.*s, Value: %.*s\n", 
+               (int)key_size, key, (int)value_size, value);
+        free(key);
+        free(value);
     }
-
-    /* use retrieved_key and retrieved_value
-     * .. */
-
-    /* free the key and value */
-    free(retrieved_key);
-    free(retrieved_value);
-} while ((e = tidesdb_cursor_next(c)) == NULL);
-
-if (e != NULL && e->code != TIDESDB_ERR_AT_END_OF_CURSOR)
-{
-    /* handle error */
-    tidesdb_err_free(e);
+    
+    tidesdb_iter_next(iter);
 }
 
-/* iterate backward */
-do
-{
-    e = tidesdb_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
-    if (e != NULL)
-    {
-        /* handle error */
-        tidesdb_err_free(e);
-        break;
-    }
-
-    /* use retrieved_key and retrieved_value
-     * .. */
-
-    /* free the key and value */
-    free(retrieved_key);
-    free(retrieved_value);
-} while ((e = tidesdb_cursor_prev(c)) == NULL);
-
-if (e != NULL && e->code != TIDESDB_ERR_AT_START_OF_CURSOR)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
-
-tidesdb_cursor_free(c);
-
+tidesdb_iter_free(iter);
+tidesdb_txn_free(txn);
 ```
 
-#### Merge Cursor
-You can iterate over key-value pairs in a column family in absolute sorted order regardless of source.
+**Backward iteration**
 ```c
-tidesdb_merge_cursor_t *c;
-tidesdb_err_t *e = tidesdb_merge_cursor_init(tdb, "your_column_family", &c);
-if (e != NULL)
+tidesdb_txn_t *txn = NULL;
+tidesdb_txn_begin_read(db, &txn);
+
+tidesdb_iter_t *iter = NULL;
+tidesdb_iter_new(txn, "my_cf", &iter);
+
+/* Seek to last entry */
+tidesdb_iter_seek_to_last(iter);
+
+while (tidesdb_iter_valid(iter))
 {
-    /* handle error */
-    tidesdb_err_free(e);
-    return;
+    /* Process entries in reverse order */
+    tidesdb_iter_prev(iter);
 }
 
-uint8_t *retrieved_key = NULL;
-size_t key_size;
-uint8_t *retrieved_value = NULL;
-size_t value_size;
-
-/* iterate forward */
-do
-{
-    e = tidesdb_merge_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
-    if (e != NULL)
-    {
-        /* handle error */
-        tidesdb_err_free(e);
-        break;
-    }
-
-    /* use retrieved_key and retrieved_value
-     * .. */
-
-    /* free the key and value */
-    free(retrieved_key);
-    free(retrieved_value);
-} while ((e = tidesdb_merge_cursor_next(c)) == NULL);
-
-if (e != NULL && e->code != TIDESDB_ERR_AT_END_OF_CURSOR)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
-
-/* iterate backward */
-do
-{
-    e = tidesdb_merge_cursor_get(c, &retrieved_key, &key_size, &retrieved_value, &value_size);
-    if (e != NULL)
-    {
-        /* handle error */
-        tidesdb_err_free(e);
-        break;
-    }
-
-    /* use retrieved_key and retrieved_value
-     * .. */
-
-    /* free the key and value */
-    free(retrieved_key);
-    free(retrieved_value);
-} while ((e = tidesdb_merge_cursor_prev(c)) == NULL);
-
-if (e != NULL && e->code != TIDESDB_ERR_AT_START_OF_CURSOR)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
-
-tidesdb_merge_cursor_free(c);
-
+tidesdb_iter_free(iter);
+tidesdb_txn_free(txn);
 ```
 
-## Deleting multiple key-value pairs
+### Custom Comparators
+Register custom key comparison functions for specialized sorting.
 
-### Deleting by range
-You can delete a range of key-value pairs.
-
-You pass
-- the database you want to delete the key-value pairs from. Must be open
-- the column family name
-- the start key
-- the start key size
-- the end key
-- the end key size
-
+**Register a comparator**
 ```c
-uint8_t start_key[] = "key1";
-uint8_t end_key[] = "key5";
-
-tidesdb_err_t *e = tidesdb_delete_by_range(tdb, "your_column_family", start_key, sizeof(start_key), end_key, sizeof(end_key));
-if (e != NULL)
+/* Define your comparison function */
+int my_reverse_compare(const uint8_t *key1, size_t key1_size,
+                       const uint8_t *key2, size_t key2_size, void *ctx)
 {
-    /* handle error */
-    tidesdb_err_free(e);
+    int result = memcmp(key1, key2, key1_size < key2_size ? key1_size : key2_size);
+    return -result;  /* reverse order */
 }
+
+/* Register it before creating column families */
+tidesdb_register_comparator("reverse", my_reverse_compare);
+
+/* Use in column family */
+tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+cf_config.comparator_name = "reverse";
+tidesdb_create_column_family(db, "sorted_cf", &cf_config);
 ```
 
-### Deleting by filter
-You can delete key-value pairs that match a filter function.
+**Built-in comparators**
+- `"memcmp"` - Binary comparison (default)
+- `"string"` - Lexicographic string comparison
+- `"numeric"` - Numeric comparison for uint64_t keys
 
-You pass
-- the database you want to delete the key-value pairs from. Must be open
-- the column family name
-- the filter function
-- a pointer to store the count of deleted items (optional, can be NULL)
+See `examples/custom_comparator.c` for more examples.
+
+### Sync Modes
+Control durability vs performance tradeoff.
 
 ```c
-/* define a filter function */
-bool deletion_filter(const tidesdb_key_value_pair_t *kv)
-{
-    /* delete keys that start with "temp_" */
-    const char prefix[] = "temp_";
-    size_t prefix_len = sizeof(prefix) - 1;  /* exclude null terminator */
+tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
-    return kv->key_size >= prefix_len && memcmp(kv->key, prefix, prefix_len) == 0;
-}
+/* TDB_SYNC_NONE - Fastest, least durable (OS handles flushing) */
+cf_config.sync_mode = TDB_SYNC_NONE;
 
-/* delete all key-value pairs that match the filter */
-size_t deleted_count = 0;
-tidesdb_err_t *e = tidesdb_delete_by_filter(tdb, "your_column_family", deletion_filter, &deleted_count);
-if (e != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
+/* TDB_SYNC_BACKGROUND - Balanced (fsync every N milliseconds in background) */
+cf_config.sync_mode = TDB_SYNC_BACKGROUND;
+cf_config.sync_interval = 1000;  /* fsync every 1000ms (1 second) */
 
-printf("Deleted %zu items\n", deleted_count);
+/* TDB_SYNC_FULL - Most durable (fsync on every write) */
+cf_config.sync_mode = TDB_SYNC_FULL;
+
+tidesdb_create_column_family(db, "my_cf", &cf_config);
 ```
 
-### Compaction
-There are 2 ways to compact sstables. Manual multi-threaded paired and merged compaction and background incremental merge compaction.
-Compaction removes tombstones and expired keys if ttl is set. Because merging merges and older and newer sstables only the newest version of key lives on.
+## Background Compaction
+TidesDB v1 features automatic background compaction with optional parallel execution.
 
-#### Manual Multi-Threaded Parallel Compaction
-You can manually compact sstables. This method pairs and merges column family sstables from oldest to latest. It will remove tombstones and expired keys if ttl is set.
-Say you have 100 sstables within a column family, after compaction you will have 50 sstables; Always half the amount you had prior (if even). You can set the number of threads to use for compaction. Each thread handles 1 pair.
+**Automatic background compaction** runs when SSTable count reaches the configured threshold:
 
 ```c
-tidesdb_err_t *e = tidesdb_compact_sstables(tdb, "your_column_family", 10); /* use 10 threads */
-if (e != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
+tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+cf_config.enable_background_compaction = 1;       /* Enable background compaction */
+cf_config.max_sstables_before_compaction = 512;   /* Trigger at 512 SSTables (default) */
+cf_config.compaction_threads = 4;                 /* Use 4 threads for parallel compaction */
+
+tidesdb_create_column_family(db, "my_cf", &cf_config);
+/* Background thread automatically compacts when threshold is reached */
 ```
 
-#### Automatic / Background Incremental Merge Compaction
-You can start a background incremental merge compaction. This will incrementally merge sstables in the background from oldest to newest when minimum sstables are reached. Will run in background until shutdown. Merges are done every n seconds. Merges are not done in parallel but incrementally.
-You can set the minimum amount of column family sstables to trigger a background incremental merge. Background merging blocks less than manual compaction.
+**Parallel Compaction**
+- Set `compaction_threads > 0` to enable parallel compaction
+- Uses semaphore-based thread pool for concurrent SSTable pair merging
+- Each thread compacts one pair of SSTables independently
+- Automatically limits threads to available CPU cores
+- Set `compaction_threads = 0` for single-threaded compaction (default 4 threads)
 
-You pass
-- the database you want to start the background incremental merge compaction in. Must be open
-- the column family name within that database
-- the number of seconds to wait before going to next pair and merging
-- the minimum number of sstables to trigger a merge
+**Manual compaction** can be triggered at any time (requires minimum 2 SSTables)
+
 ```c
-tidesdb_err_t *e = tidesdb_start_incremental_merge(tdb, "your_column_family", 10, 10); /* merge a pair every 10 seconds and if there are a minimum 10 sstables */
+tidesdb_compact(cf);  /* Automatically uses parallel compaction if compaction_threads > 0 */
 ```
 
-### Column Family Statistics
-You can get statistics on a column family. This includes the column family configuration, number of sstables, memtable size, memtable entries count, and sstable stats, etc!
-#### Structs
+**Benefits**
+- Removes tombstones and expired TTL entries
+- Merges duplicate keys (keeps latest version)
+- Reduces SSTable count
+- Background compaction runs in separate thread (non-blocking)
+- Parallel compaction significantly speeds up large compactions
+- Manual compaction requires minimum 2 SSTables to merge
+
+## Concurrency Model
+
+TidesDB is designed for high concurrency with minimal blocking
+
+**Reader-Writer Locks**
+- Each column family has a reader-writer lock
+- **Multiple readers can read concurrently** - no blocking between readers
+- **Writers don't block readers** - readers can access data while writes are in progress
+- **Writers block other writers** - only one writer per column family at a time
+
+**Transaction Isolation**
+- Read transactions (`tidesdb_txn_begin_read`) acquire read locks
+- Write transactions (`tidesdb_txn_begin`) acquire write locks on commit
+- Transactions are isolated - changes not visible until commit
+
+**Optimal for**
+- Read-heavy workloads (unlimited concurrent readers)
+- Mixed read/write workloads (readers never wait for writers)
+- Multi-column-family applications (different CFs can be written concurrently)
+
+**Example - Concurrent Operations**
 ```c
-    typedef struct
-    {
-        tidesdb_column_family_config_t config;
-        char *cf_name;
-        int num_sstables;
-        size_t memtable_size;
-        size_t memtable_entries_count;
-        bool incremental_merging;
-        int incremental_merge_interval;
-        int incremental_merge_min_sstables;
-        tidesdb_column_family_sstable_stat_t **sstable_stats;
-    } tidesdb_column_family_stat_t;
+/* Thread 1 Reading */
+tidesdb_txn_t *read_txn;
+tidesdb_txn_begin_read(db, &read_txn);
+tidesdb_txn_get(read_txn, "my_cf", key, key_size, &value, &value_size);
+/* Can read while Thread 2 is writing */
 
-    typedef struct
-    {
-        char *sstable_path;
-        size_t size;
-        size_t num_blocks;
-    } tidesdb_column_family_sstable_stat_t;
+/* Thread 2 Writing */
+tidesdb_txn_t *write_txn;
+tidesdb_txn_begin(db, &write_txn);
+tidesdb_txn_put(write_txn, "my_cf", key, key_size, value, value_size, -1);
+tidesdb_txn_commit(write_txn);  /* Briefly blocks other writers only */
 
-    typedef struct
-    {
-        char *name;
-        int32_t flush_threshold;
-        int32_t max_level;
-        float probability;
-        bool compressed;
-        tidesdb_compression_algo_t compress_algo;
-        bool bloom_filter;
-    } tidesdb_column_family_config_t;
-```
-
-#### Getting a column family stat
-```c
-tidesdb_column_family_stat_t *stat = NULL;
-err = tidesdb_get_column_family_stat(tdb, "your_column_family", &stat);
-if (err != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
-
-/* free the column family stat */
-err = tidesdb_free_column_family_stat(stat);
-if (err != NULL)
-{
-    /* handle error */
-    tidesdb_err_free(e);
-}
+/* Thread 3 Reading different CF */
+tidesdb_txn_t *other_txn;
+tidesdb_txn_begin_read(db, &other_txn);
+tidesdb_txn_get(other_txn, "other_cf", key, key_size, &value, &value_size);
+/* No blocking different column family */
 ```
 
 ## License
@@ -693,4 +685,5 @@ BSD 3 Clause (Snappy)
 BSD 2 (LZ4)
 BSD 2 (xxHash - Yann Collet)
 BSD (Zstandard)
+Apache 2.0 (OpenSSL 3.0+) / OpenSSL License (OpenSSL 1.x)
 ```

@@ -67,8 +67,18 @@
 #endif
 
 typedef int64_t ssize_t; /* ssize_t is not defined in Windows */
+typedef int mode_t; /* mode_t is not defined in Windows */
 
 #define M_LN2 0.69314718055994530942 /* log_e 2 */
+
+/* clock_gettime support for Windows */
+#define CLOCK_REALTIME 0
+
+struct timezone
+{
+    int tz_minuteswest;
+    int tz_dsttime;
+};
 
 struct dirent
 {
@@ -177,6 +187,31 @@ int fsync(int fd)
 int fdatasync(int fd)
 {
     return fsync(fd);
+}
+
+/* clock_gettime for Windows */
+int clock_gettime(int clk_id, struct timespec *tp)
+{
+    (void)clk_id; /* unused */
+    FILETIME ft;
+    unsigned __int64 tmpres = 0;
+
+    GetSystemTimeAsFileTime(&ft);
+
+    tmpres |= ft.dwHighDateTime;
+    tmpres <<= 32;
+    tmpres |= ft.dwLowDateTime;
+
+    /* convert to microseconds */
+    tmpres /= 10;
+
+    /* convert file time to unix epoch */
+    tmpres -= 11644473600000000ULL;
+
+    tp->tv_sec = (long)(tmpres / 1000000UL);
+    tp->tv_nsec = (long)((tmpres % 1000000UL) * 1000);
+
+    return 0;
 }
 
 /* gettimeofday function for win */

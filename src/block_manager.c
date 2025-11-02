@@ -462,7 +462,6 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-
     /* read block size at current position using pread */
     uint64_t block_size;
     ssize_t nread =
@@ -724,8 +723,8 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
         off_t overflow_offset_pos = (off_t)scan_pos + (off_t)sizeof(uint64_t) +
                                     (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
         uint64_t overflow_offset;
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t),
-                  (off_t)overflow_offset_pos) != sizeof(uint64_t))
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
+            sizeof(uint64_t))
             return -1;
 
         /* calculate next block position */

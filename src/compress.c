@@ -84,7 +84,6 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
                 SNAPPY_OK)
                 return NULL;
 
-
             decompressed_data = malloc(*decompressed_size);
             if (!decompressed_data) return NULL;
 

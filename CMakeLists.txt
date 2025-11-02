@@ -23,15 +23,16 @@ if(TIDESDB_WITH_SANITIZER)
     if(WIN32)
         # debug flags for windows
         # MSVC ASAN can be unstable, so we only enable warnings for CI
-        add_compile_options(/W4 /std:c11)
+        # MSVC requires /experimental:c11atomics for C11 atomic support
+        add_compile_options(/W4 /std:c17 /experimental:c11atomics)
     else()
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
         add_link_options(-fsanitize=address,undefined)
     endif()
 else()
     if(WIN32)
-        # ensure C11 support is enabled even without sanitizers
-        add_compile_options(/std:c11)
+        # ensure C17 support and C11 atomics are enabled even without sanitizers
+        add_compile_options(/std:c17 /experimental:c11atomics)
     endif()
 endif()
 

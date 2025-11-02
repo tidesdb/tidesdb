@@ -2118,10 +2118,10 @@ static void test_iterator_metadata_boundary(void)
     /* force flush to create SSTable */
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "boundary_test");
     ASSERT_TRUE(cf != NULL);
-    
+
     /* manually flush memtable */
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
-    
+
     ASSERT_TRUE(atomic_load(&cf->num_sstables) > 0);
 
     /* get the SSTable and verify num_entries */
@@ -2145,10 +2145,10 @@ static void test_iterator_metadata_boundary(void)
         ASSERT_TRUE(iter->current_key != NULL);
         ASSERT_TRUE(iter->current_key_size > 0);
         ASSERT_TRUE(iter->current_value != NULL);
-        
+
         /* if we read more than 5 entries, we're reading metadata blocks */
         ASSERT_TRUE(count <= 5);
-        
+
         tidesdb_iter_next(iter);
     }
 
@@ -2191,7 +2191,8 @@ static void test_sstable_num_entries_accuracy(void)
         {
             char key[64], value[256];
             snprintf(key, sizeof(key), "sst%d_key%d", sst_idx, i);
-            snprintf(value, sizeof(value), "sst%d_value%d_padding_xxxxxxxxxxxxxxxxxxxx", sst_idx, i);
+            snprintf(value, sizeof(value), "sst%d_value%d_padding_xxxxxxxxxxxxxxxxxxxx", sst_idx,
+                     i);
             ASSERT_EQ(tidesdb_txn_put(txn, "entries_test", (uint8_t *)key, strlen(key),
                                       (uint8_t *)value, strlen(value), -1),
                       0);
@@ -2204,7 +2205,7 @@ static void test_sstable_num_entries_accuracy(void)
     /* verify SSTables were created */
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "entries_test");
     ASSERT_TRUE(cf != NULL);
-    
+
     int actual_sstables = atomic_load(&cf->num_sstables);
     ASSERT_TRUE(actual_sstables > 0); /* at least one SSTable created */
 

@@ -32,7 +32,8 @@ if(TIDESDB_WITH_SANITIZER)
 else()
     if(WIN32)
         # ensure C17 support and C11 atomics are enabled even without sanitizers
-        add_compile_options(/std:c17 /experimental:c11atomics)
+        # disable common test warnings that clutter output
+        add_compile_options(/std:c17 /experimental:c11atomics /wd4189 /wd4101 /wd4459 /wd4700)
     endif()
 endif()
 

@@ -294,13 +294,39 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
 
-    DWORD bytes_read;
-    if (!ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped))
+    /* Create event for synchronous operation */
+    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (overlapped.hEvent == NULL)
     {
         errno = GetLastError();
         return -1;
     }
 
+    DWORD bytes_read;
+    BOOL result = ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped);
+
+    if (!result)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING)
+        {
+            /* Wait for async operation to complete */
+            if (!GetOverlappedResult(h, &overlapped, &bytes_read, TRUE))
+            {
+                CloseHandle(overlapped.hEvent);
+                errno = GetLastError();
+                return -1;
+            }
+        }
+        else
+        {
+            CloseHandle(overlapped.hEvent);
+            errno = err;
+            return -1;
+        }
+    }
+
+    CloseHandle(overlapped.hEvent);
     return (ssize_t)bytes_read;
 }
 
@@ -319,13 +345,39 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
 
-    DWORD bytes_written;
-    if (!WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped))
+    /* Create event for synchronous operation */
+    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (overlapped.hEvent == NULL)
     {
         errno = GetLastError();
         return -1;
     }
 
+    DWORD bytes_written;
+    BOOL result = WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped);
+
+    if (!result)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING)
+        {
+            /* Wait for async operation to complete */
+            if (!GetOverlappedResult(h, &overlapped, &bytes_written, TRUE))
+            {
+                CloseHandle(overlapped.hEvent);
+                errno = GetLastError();
+                return -1;
+            }
+        }
+        else
+        {
+            CloseHandle(overlapped.hEvent);
+            errno = err;
+            return -1;
+        }
+    }
+
+    CloseHandle(overlapped.hEvent);
     return (ssize_t)bytes_written;
 }
 

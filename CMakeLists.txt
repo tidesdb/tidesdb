@@ -32,8 +32,13 @@ if(TIDESDB_WITH_SANITIZER)
 else()
     if(WIN32)
         # ensure C17 support and C11 atomics are enabled even without sanitizers
-        # disable common test warnings that clutter output
-        add_compile_options(/std:c17 /experimental:c11atomics /wd4189 /wd4101 /wd4459 /wd4700)
+        # disable common test warnings that clutter output:
+        # 4189: local variable initialized but not referenced
+        # 4101: unreferenced local variable
+        # 4459: declaration hides global declaration
+        # 4700: uninitialized local variable used
+        # 4013: undefined function (implicit declaration)
+        add_compile_options(/std:c17 /experimental:c11atomics /wd4189 /wd4101 /wd4459 /wd4700 /wd4013)
     endif()
 endif()
 

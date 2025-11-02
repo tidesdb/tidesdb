@@ -509,7 +509,11 @@ void test_skip_list_min_max_key()
     free(min_key);
 
     /* wait for TTL to expire */
+#ifdef _WIN32
+    Sleep((ttl + 1) * 1000);
+#else
     sleep(ttl + 1);
+#endif
 
     /* should still be able to get min key (now key1 again) after key0 expired */
     ASSERT_TRUE(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);

@@ -34,7 +34,7 @@ jobs:
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
-          vcpkg install zstd lz4 snappy openssl
+          vcpkg install
 
       - name: Configure CMake
         run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON

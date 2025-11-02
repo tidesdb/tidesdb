@@ -384,7 +384,7 @@ long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block
             memcpy(overflow_buffer + obuf_offset, &next_overflow, sizeof(uint64_t));
 
             /* update previous overflow link to point to this block using pwrite */
-            if (pwrite(bm->fd, &current_write_pos, sizeof(uint64_t), ( __off_t)overflow_link_pos) !=
+            if (pwrite(bm->fd, &current_write_pos, sizeof(uint64_t), (off_t)overflow_link_pos) !=
                 sizeof(uint64_t))
             {
                 free(overflow_buffer);
@@ -393,7 +393,7 @@ long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block
             }
 
             /* write overflow block atomically using pwrite */
-            if (pwrite(bm->fd, overflow_buffer, overflow_block_size, ( __off_t)current_write_pos) !=
+            if (pwrite(bm->fd, overflow_buffer, overflow_block_size, (off_t)current_write_pos) !=
                 (ssize_t)overflow_block_size)
             {
                 free(overflow_buffer);
@@ -466,7 +466,8 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
 
     /* read block size at current position using pread */
     uint64_t block_size;
-    ssize_t nread = pread(cursor->bm->fd, &block_size, sizeof(uint64_t), ( __off_t)cursor->current_pos);
+    ssize_t nread =
+        pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (off_t)cursor->current_pos);
     if (nread != sizeof(uint64_t))
     {
         if (nread == 0) return 1; /* EOF */
@@ -478,12 +479,12 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
         block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
 
     /* calculate overflow offset position */
-    off_t overflow_offset_pos =
-        (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+    off_t overflow_offset_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) +
+                                (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
 
     /* read overflow offset using pread */
     uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
         sizeof(uint64_t))
         return -1;
 
@@ -503,15 +504,16 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
 
         /* read chunk size using pread */
         uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)chunk_offset) != sizeof(uint64_t))
+        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)chunk_offset) !=
+            sizeof(uint64_t))
             return -1;
 
         /* calculate next overflow offset position */
-        off_t next_overflow_pos =
-            chunk_offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+        off_t next_overflow_pos = chunk_offset + (off_t)sizeof(uint64_t) +
+                                  (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
 
         /* read next overflow offset using pread */
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
             sizeof(uint64_t))
             return -1;
 
@@ -559,14 +561,14 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 
     /* read block size using pread */
     uint64_t block_size;
-    if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (__off_t)cursor->current_pos) !=
+    if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (off_t)cursor->current_pos) !=
         sizeof(uint64_t))
         return NULL;
 
     /* read checksum using pread */
     unsigned char checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
     off_t checksum_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t);
-    if (pread(cursor->bm->fd, checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH, (__off_t)checksum_pos) !=
+    if (pread(cursor->bm->fd, checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH, (off_t)checksum_pos) !=
         BLOCK_MANAGER_SHA1_DIGEST_LENGTH)
         return NULL;
 
@@ -585,9 +587,10 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
     /* read inline data using pread */
     uint64_t inline_size =
         block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
-    off_t data_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
+    off_t data_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) +
+                     (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
 
-    if (pread(cursor->bm->fd, block->data, inline_size, (__off_t)data_pos) != (ssize_t)inline_size)
+    if (pread(cursor->bm->fd, block->data, inline_size, (off_t)data_pos) != (ssize_t)inline_size)
     {
         free(block->data);
         free(block);
@@ -597,7 +600,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
     /* read overflow offset using pread */
     off_t overflow_offset_pos = data_pos + (off_t)inline_size;
     uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
         sizeof(uint64_t))
     {
         free(block->data);
@@ -611,7 +614,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
     {
         /* read chunk size using pread */
         uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)overflow_offset) !=
+        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
             sizeof(uint64_t))
         {
             free(block->data);
@@ -623,7 +626,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
         unsigned char chunk_checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
         off_t chunk_checksum_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t);
         if (pread(cursor->bm->fd, chunk_checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH,
-                  (__off_t)chunk_checksum_pos) != BLOCK_MANAGER_SHA1_DIGEST_LENGTH)
+                  (off_t)chunk_checksum_pos) != BLOCK_MANAGER_SHA1_DIGEST_LENGTH)
         {
             free(block->data);
             free(block);
@@ -633,7 +636,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
         /* read chunk data using pread */
         off_t chunk_data_pos = chunk_checksum_pos + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
         if (pread(cursor->bm->fd, (unsigned char *)block->data + data_offset, chunk_size,
-                  (__off_t)chunk_data_pos) != (ssize_t)chunk_size)
+                  (off_t)chunk_data_pos) != (ssize_t)chunk_size)
         {
             free(block->data);
             free(block);
@@ -651,7 +654,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 
         /* read next overflow offset using pread */
         off_t next_overflow_pos = chunk_data_pos + (off_t)chunk_size;
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
             sizeof(uint64_t))
         {
             free(block->data);
@@ -697,7 +700,8 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
     {
         /* read block size using pread */
         uint64_t block_size;
-        if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (__off_t)scan_pos) != sizeof(uint64_t))
+        if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (off_t)scan_pos) !=
+            sizeof(uint64_t))
             return -1;
 
         /* calculate inline size */
@@ -705,11 +709,11 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
             block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
 
         /* read overflow offset using pread */
-        off_t overflow_offset_pos =
-            (off_t)scan_pos + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+        off_t overflow_offset_pos = (off_t)scan_pos + (off_t)sizeof(uint64_t) +
+                                    (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
         uint64_t overflow_offset;
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
-            sizeof(uint64_t))
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t),
+                  (off_t)overflow_offset_pos) != sizeof(uint64_t))
             return -1;
 
         /* calculate next block position */
@@ -719,14 +723,14 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
         while (overflow_offset != 0)
         {
             uint64_t chunk_size;
-            if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)overflow_offset) !=
+            if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
                 sizeof(uint64_t))
                 return -1;
 
-            off_t next_overflow_pos =
-                (off_t)overflow_offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
-            if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
-                sizeof(uint64_t))
+            off_t next_overflow_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t) +
+                                      (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+            if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t),
+                      (off_t)next_overflow_pos) != sizeof(uint64_t))
                 return -1;
 
             next_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
@@ -758,12 +762,12 @@ void *block_manager_fsync_thread(void *arg)
     {
         /* calculate absolute timeout time from milliseconds */
         clock_gettime(CLOCK_REALTIME, &ts);
-        
+
         /* convert milliseconds to seconds and nanoseconds */
         long ms = bm->fsync_interval;
         ts.tv_sec += ms / 1000;
         ts.tv_nsec += (ms % 1000) * 1000000;
-        
+
         /* handle nanosecond overflow */
         if (ts.tv_nsec >= 1000000000)
         {
@@ -879,8 +883,8 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor)
 
     /* read first block size using pread */
     uint64_t first_block_size;
-    if (pread(cursor->bm->fd, &first_block_size, sizeof(uint64_t), (__off_t)BLOCK_MANAGER_HEADER_SIZE) !=
-        sizeof(uint64_t))
+    if (pread(cursor->bm->fd, &first_block_size, sizeof(uint64_t),
+              (off_t)BLOCK_MANAGER_HEADER_SIZE) != sizeof(uint64_t))
         return -1;
 
     /* calculate inline size */
@@ -893,7 +897,7 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor)
 
     /* read overflow offset using pread */
     uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
         sizeof(uint64_t))
         return -1;
 
@@ -904,13 +908,13 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor)
     while (overflow_offset != 0)
     {
         uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)overflow_offset) !=
+        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
             sizeof(uint64_t))
             return -1;
 
-        off_t next_overflow_pos =
-            (off_t)overflow_offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+        off_t next_overflow_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t) +
+                                  (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
             sizeof(uint64_t))
             return -1;
 
@@ -926,7 +930,7 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
 
     /* read current block size using pread */
     uint64_t block_size;
-    if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (__off_t)cursor->current_pos) !=
+    if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (off_t)cursor->current_pos) !=
         sizeof(uint64_t))
         return -1;
 
@@ -935,12 +939,12 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
         block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
 
     /* calculate overflow offset position */
-    off_t overflow_offset_pos =
-        (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+    off_t overflow_offset_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) +
+                                (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
 
     /* read overflow offset using pread */
     uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
         sizeof(uint64_t))
         return -1;
 
@@ -951,13 +955,13 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
     while (overflow_offset != 0)
     {
         uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)overflow_offset) !=
+        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
             sizeof(uint64_t))
             return -1;
 
-        off_t next_overflow_pos =
-            (off_t)overflow_offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+        off_t next_overflow_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t) +
+                                  (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
             sizeof(uint64_t))
             return -1;
 
@@ -967,7 +971,7 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
     /* try to read next block using pread */
     uint64_t next_block_size;
     ssize_t read_result =
-        pread(cursor->bm->fd, &next_block_size, sizeof(uint64_t), (__off_t)after_current_pos);
+        pread(cursor->bm->fd, &next_block_size, sizeof(uint64_t), (off_t)after_current_pos);
 
     return (read_result != sizeof(uint64_t)) ? 1 : 0;
 }
@@ -1083,7 +1087,8 @@ int block_manager_validate_last_block(block_manager_t *bm)
     {
         /* try to read block size using pread */
         uint64_t block_size;
-        if (pread(bm->fd, &block_size, sizeof(uint64_t), (__off_t)scan_pos) != sizeof(uint64_t)) break;
+        if (pread(bm->fd, &block_size, sizeof(uint64_t), (off_t)scan_pos) != sizeof(uint64_t))
+            break;
 
         /* calculate inline size */
         uint64_t inline_size = block_size <= bm->block_size ? block_size : bm->block_size;
@@ -1098,10 +1103,10 @@ int block_manager_validate_last_block(block_manager_t *bm)
         }
 
         /* read overflow offset using pread */
-        off_t overflow_offset_pos =
-            (off_t)scan_pos + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+        off_t overflow_offset_pos = (off_t)scan_pos + (off_t)sizeof(uint64_t) +
+                                    (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
         uint64_t overflow_offset;
-        if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)overflow_offset_pos) !=
+        if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
             sizeof(uint64_t))
             break;
 
@@ -1117,7 +1122,8 @@ int block_manager_validate_last_block(block_manager_t *bm)
             }
 
             uint64_t chunk_size;
-            if (pread(bm->fd, &chunk_size, sizeof(uint64_t), (__off_t)overflow_offset) != sizeof(uint64_t))
+            if (pread(bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
+                sizeof(uint64_t))
             {
                 valid_size = scan_pos;
                 goto done_scanning;
@@ -1132,9 +1138,9 @@ int block_manager_validate_last_block(block_manager_t *bm)
                 goto done_scanning;
             }
 
-            off_t next_overflow_pos =
-                (off_t)overflow_offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
-            if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (__off_t)next_overflow_pos) !=
+            off_t next_overflow_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t) +
+                                      (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+            if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
                 sizeof(uint64_t))
             {
                 valid_size = scan_pos;

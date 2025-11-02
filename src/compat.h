@@ -267,10 +267,10 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 
 #elif defined(__APPLE__)
 #include <dirent.h>
+#include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -294,6 +294,39 @@ static inline int fdatasync(int fd)
     /* fall back to fsync if F_FULLFSYNC not available */
     return fsync(fd);
 #endif
+}
+
+/* semaphore compatibility for macOS using Grand Central Dispatch
+ * macOS deprecated POSIX semaphores (sem_init, sem_destroy, etc.)
+ * use dispatch_semaphore instead */
+typedef dispatch_semaphore_t sem_t;
+
+static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
+{
+    (void)pshared; /* unused on macOS */
+    *sem = dispatch_semaphore_create(value);
+    return (*sem == NULL) ? -1 : 0;
+}
+
+static inline int sem_destroy(sem_t *sem)
+{
+    if (*sem)
+    {
+        dispatch_release(*sem);
+        *sem = NULL;
+    }
+    return 0;
+}
+
+static inline int sem_wait(sem_t *sem)
+{
+    return (dispatch_semaphore_wait(*sem, DISPATCH_TIME_FOREVER) == 0) ? 0 : -1;
+}
+
+static inline int sem_post(sem_t *sem)
+{
+    dispatch_semaphore_signal(*sem);
+    return 0;
 }
 
 #else /* posix systems */

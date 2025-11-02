@@ -66,8 +66,8 @@ skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t ke
     if (level <= 0) return NULL;
 
     /* allocate memory for the node, including space for forward and backward pointers */
-    skip_list_node_t *node =
-        malloc(sizeof(skip_list_node_t) + (size_t)(2 * level) * sizeof(_Atomic(skip_list_node_t *)));
+    skip_list_node_t *node = malloc(sizeof(skip_list_node_t) +
+                                    (size_t)(2 * level) * sizeof(_Atomic(skip_list_node_t *)));
     if (node == NULL) return NULL;
 
     /* allocate memory for the key */
@@ -181,7 +181,8 @@ int skip_list_random_level(skip_list_t *list)
 {
     int level = 1;
     float rand_max_inv = 1.0f / (float)RAND_MAX;
-    while (((float)rand() * rand_max_inv) < list->probability && level < list->max_level) level++;  // NOLINT(cert-msc30-c,cert-msc50-cpp) - acceptable for skip list randomization
+    while (((float)rand() * rand_max_inv) < list->probability && level < list->max_level)
+        level++;  // NOLINT(cert-msc30-c,cert-msc50-cpp) - acceptable for skip list randomization
 
     return level;
 }
@@ -227,7 +228,8 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
     (void)skip_list_check_and_update_ttl(list, x);
 
     /* x can be NULL if key not found, or valid if found */
-    if (x && skip_list_compare_keys(list, x->key, x->key_size, key, key_size) == 0)  // NOLINT(clang-analyzer-core.NullDereference)
+    if (x && skip_list_compare_keys(list, x->key, x->key_size, key, key_size) ==
+                 0)  // NOLINT(clang-analyzer-core.NullDereference)
     {
         /* we update existing node */
         size_t old_total = atomic_load_explicit(&list->total_size, memory_order_relaxed);
@@ -337,7 +339,8 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
     x = atomic_load_explicit(&x->forward[0], memory_order_acquire);
 
     /* x can be NULL if key not found, or valid if found */
-    if (x && skip_list_compare_keys(list, x->key, x->key_size, key, key_size) == 0)  // NOLINT(clang-analyzer-core.NullDereference)
+    if (x && skip_list_compare_keys(list, x->key, x->key_size, key, key_size) ==
+                 0)  // NOLINT(clang-analyzer-core.NullDereference)
     {
         /* check if node has expired */
         skip_list_check_and_update_ttl(list, x);
@@ -385,7 +388,8 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size)
     (void)skip_list_check_and_update_ttl(list, x);
 
     /* x can be NULL if key not found, or valid if found */
-    if (x && skip_list_compare_keys(list, x->key, x->key_size, key, key_size) == 0)  // NOLINT(clang-analyzer-core.NullDereference)
+    if (x && skip_list_compare_keys(list, x->key, x->key_size, key, key_size) ==
+                 0)  // NOLINT(clang-analyzer-core.NullDereference)
     {
         /* mark node as deleted */
         uint8_t was_deleted = atomic_exchange_explicit(&x->deleted, 1, memory_order_release);

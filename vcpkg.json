@@ -8,5 +8,5 @@
     "lz4",
     "openssl"
   ],
-  "builtin-baseline": "latest"
+  "builtin-baseline": "7220a4eebf20515cdd9c34721e15ca082bae9038"
 }

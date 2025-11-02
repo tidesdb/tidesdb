@@ -961,8 +961,7 @@ void test_block_manager_validation_edge_cases()
 
     /* Test 1: Opening a fresh empty database */
     (void)remove("empty_test.db");
-    ASSERT_TRUE(block_manager_open(&bm, "empty_test.db", TDB_SYNC_NONE, 0) ==
-                0); /* ← FAILS HERE */
+    ASSERT_TRUE(block_manager_open(&bm, "empty_test.db", TDB_SYNC_NONE, 0) == 0); /* ← FAILS HERE */
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
     /* Test 2: Opening an existing empty database */
@@ -1141,7 +1140,8 @@ void benchmark_block_manager()
     /* we shuffle the offsets array to randomize access */
     for (int i = 0; i < NUM_BLOCKS; i++)
     {
-        int j = rand() % NUM_BLOCKS;  // NOLINT(cert-msc30-c,cert-msc50-cpp) - acceptable for test code
+        int j =
+            rand() % NUM_BLOCKS;  // NOLINT(cert-msc30-c,cert-msc50-cpp) - acceptable for test code
         long temp = block_offsets[i];
         block_offsets[i] = block_offsets[j];
         block_offsets[j] = temp;

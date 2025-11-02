@@ -630,5 +630,4 @@ int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size
  */
 void tidesdb_iter_free(tidesdb_iter_t *iter);
 
-
 #endif /* __TIDESDB_H__ */

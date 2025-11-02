@@ -16,6 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <inttypes.h>
+
 #include "../src/binary_hash_array.h"
 #include "../src/compat.h"
 #include "test_utils.h"
@@ -149,7 +151,7 @@ void test_binary_hash_array_duplicate_keys()
     /* with current implementation, contains() will return the first value inserted, disregarding
      * the second. */
     int64_t result = binary_hash_array_contains(sorted_bha, key, sizeof(key));
-    printf("Duplicate key test result: %ld\n", result);
+    printf("Duplicate key test result: %" PRId64 "\n", result);
 
     ASSERT_EQ(result, 42);
 

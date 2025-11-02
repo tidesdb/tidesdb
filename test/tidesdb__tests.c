@@ -20,7 +20,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "../src/tidesdb.h"
 #include "test_utils.h"

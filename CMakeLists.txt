@@ -38,7 +38,12 @@ endif()
 
 include_directories(external) # for external libraries linking internally
 
-add_library(tidesdb src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/binary_hash_array.c external/xxhash.c)
+# Build as STATIC on Windows to avoid DLL export/import complexity in tests
+if(WIN32)
+    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/binary_hash_array.c external/xxhash.c)
+else()
+    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/binary_hash_array.c external/xxhash.c)
+endif()
 
 target_include_directories(tidesdb PRIVATE src)
 

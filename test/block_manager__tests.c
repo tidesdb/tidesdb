@@ -16,6 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <inttypes.h>
+
 #include "../src/block_manager.h"
 #include "test_utils.h"
 
@@ -783,7 +785,11 @@ void *reader_thread(void *arg)
 
         /* we sleep a short random time to simulate
          * variable processing time */
+#ifdef _WIN32
+        Sleep((rand() % 5000) / 1000);  // NOLINT(cert-msc30-c,cert-msc50-cpp)
+#else
         usleep((useconds_t)(rand() % 5000));  // NOLINT(cert-msc30-c,cert-msc50-cpp)
+#endif
     }
 
     return NULL;
@@ -895,7 +901,7 @@ void test_block_manager_validate_last_block()
     struct stat st;
     ASSERT_TRUE(stat("validate_test.db", &st) == 0);
     uint64_t corrupted_size = (uint64_t)st.st_size;
-    printf("File size after corruption: %lu bytes\n", corrupted_size);
+    printf("File size after corruption: %" PRIu64 " bytes\n", corrupted_size);
 
     /* now reopen the block manager, which should validate and fix the last block */
     ASSERT_TRUE(block_manager_open(&bm, "validate_test.db", TDB_SYNC_NONE, 0) == 0);
@@ -903,7 +909,7 @@ void test_block_manager_validate_last_block()
     /* we get the file size after validation/repair */
     ASSERT_TRUE(stat("validate_test.db", &st) == 0);
     uint64_t repaired_size = (uint64_t)st.st_size;
-    printf("File size after repair: %lu bytes\n", repaired_size);
+    printf("File size after repair: %" PRIu64 " bytes\n", repaired_size);
 
     /* the repaired size should be less than the corrupted size */
     ASSERT_TRUE(repaired_size < corrupted_size);

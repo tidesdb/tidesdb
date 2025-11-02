@@ -21,7 +21,7 @@
 int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                 size_t key2_size, void *ctx)
 {
-    (void)ctx; /* unused */
+    (void)ctx;
 
     size_t min_size = key1_size < key2_size ? key1_size : key2_size;
     int cmp = memcmp(key1, key2, min_size);
@@ -33,9 +33,9 @@ int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uin
 int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                 size_t key2_size, void *ctx)
 {
-    (void)key1_size; /* unused */
-    (void)key2_size; /* unused */
-    (void)ctx;       /* unused */
+    (void)key1_size;
+    (void)key2_size;
+    (void)ctx;
 
     int cmp = strcmp((const char *)key1, (const char *)key2);
     return cmp == 0 ? 0 : (cmp < 0 ? -1 : 1);
@@ -44,9 +44,9 @@ int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, const uin
 int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                  size_t key2_size, void *ctx)
 {
-    (void)key1_size; /* unused */
-    (void)key2_size; /* unused */
-    (void)ctx;       /* unused */
+    (void)key1_size;
+    (void)key2_size;
+    (void)ctx;
 
     uint64_t val1, val2;
 
@@ -171,7 +171,6 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
         return -1;
     }
 
-    /* we initialize tail to be the same as header for an empty list */
     atomic_store_explicit(&(*list)->tail, (*list)->header, memory_order_release);
 
     return 0;
@@ -231,7 +230,6 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
     if (x && skip_list_compare_keys(list, x->key, x->key_size, key, key_size) ==
                  0)  // NOLINT(clang-analyzer-core.NullDereference)
     {
-        /* we update existing node */
         size_t old_total = atomic_load_explicit(&list->total_size, memory_order_relaxed);
         atomic_store_explicit(&list->total_size, old_total - x->value_size, memory_order_relaxed);
 
@@ -275,7 +273,6 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
             return -1;
         }
 
-        /* we update forward pointers atomically */
         for (int i = 0; i < level; i++)
         {
             skip_list_node_t *old_next =
@@ -284,7 +281,6 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
             atomic_store_explicit(&update[i]->forward[i], x, memory_order_release);
         }
 
-        /* we update backward pointers */
         for (int i = 0; i < level; i++)
         {
             skip_list_node_t *next = atomic_load_explicit(&x->forward[i], memory_order_relaxed);
@@ -635,7 +631,6 @@ int skip_list_cursor_goto_last(skip_list_cursor_t *cursor)
 {
     if (cursor == NULL || cursor->list == NULL) return -1;
 
-    /* we simply use the tail pointer */
     cursor->current = atomic_load_explicit(&cursor->list->tail, memory_order_acquire);
 
     /* if tail is the header, the list is empty */
@@ -701,7 +696,6 @@ int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size)
         /* check if the node has expired */
         skip_list_check_and_update_ttl(list, current);
 
-        /* we skip deleted nodes */
         uint8_t is_deleted = atomic_load_explicit(&current->deleted, memory_order_acquire);
         if (is_deleted)
         {
@@ -731,7 +725,6 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
 {
     if (list == NULL || cursor == NULL) return -1;
 
-    /* we allocate memory for the cursor if it doesn't exist */
     if (*cursor == NULL)
     {
         *cursor = malloc(sizeof(skip_list_cursor_t));
@@ -749,10 +742,8 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
         return -1;
     }
 
-    /* we set cursor to tail */
     (*cursor)->current = tail;
 
-    /* we check if the node has expired */
     (void)skip_list_check_and_update_ttl(list, (*cursor)->current);
 
     return 0;

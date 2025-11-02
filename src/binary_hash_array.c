@@ -104,7 +104,6 @@ int binary_hash_array_add(binary_hash_array_t *bha, uint8_t *key, size_t key_len
 
 uint8_t *binary_hash_array_serialize(binary_hash_array_t *bha, size_t *out_size)
 {
-    /* we sort the entries */
     qsort(bha->entries, bha->size, sizeof(binary_hash_array_entry_t), binary_hash_array_compare);
 
     *out_size = sizeof(size_t) + bha->size * sizeof(binary_hash_array_entry_t);
@@ -173,13 +172,11 @@ int64_t binary_hash_array_contains(binary_hash_array_t *bha, uint8_t *key, size_
     {
         size_t mid = low + (high - low) / 2;
 
-        /* we ensure mid is within bounds (really just an edge case) **/
         if (mid >= bha->size)
         {
             break; /* prevent out of bounds access */
         }
 
-        /* we compare the hash of the key with the hash of the entry */
         int cmp_result = memcmp(hash, bha->entries[mid].key, sizeof(hash));
 
         if (cmp_result == 0)
@@ -201,6 +198,5 @@ int64_t binary_hash_array_contains(binary_hash_array_t *bha, uint8_t *key, size_
         }
     }
 
-    /* we didn't find the key */
     return -1;
 }

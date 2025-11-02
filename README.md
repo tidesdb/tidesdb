@@ -125,8 +125,57 @@ Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask quest
                                 this also prevents collisions. */
 ```
 
+## Error Codes
+TidesDB provides detailed error codes for production use. All functions return `0` on success or a negative error code on failure.
+
+| Error Code | Value | Description |
+|------------|-------|-------------|
+| `TDB_SUCCESS` | 0 | operation successful |
+| `TDB_ERROR` | -1 | generic error |
+| `TDB_ERR_MEMORY` | -2 | memory allocation failed |
+| `TDB_ERR_INVALID_ARGS` | -3 | invalid arguments passed to function |
+| `TDB_ERR_IO` | -4 | I/O error (file operations) |
+| `TDB_ERR_NOT_FOUND` | -5 | key not found |
+| `TDB_ERR_EXISTS` | -6 | resource already exists |
+| `TDB_ERR_CORRUPT` | -7 | data corruption detected |
+| `TDB_ERR_LOCK` | -8 | lock acquisition failed |
+| `TDB_ERR_TXN_COMMITTED` | -9 | transaction already committed |
+| `TDB_ERR_TXN_ABORTED` | -10 | transaction aborted |
+| `TDB_ERR_READONLY` | -11 | write operation on read-only transaction |
+| `TDB_ERR_FULL` | -12 | database or resource full |
+| `TDB_ERR_INVALID_NAME` | -13 | invalid name (too long or empty) |
+| `TDB_ERR_COMPARATOR_NOT_FOUND` | -14 | comparator not found in registry |
+| `TDB_ERR_MAX_COMPARATORS` | -15 | maximum number of comparators reached |
+| `TDB_ERR_INVALID_CF` | -16 | invalid column family |
+| `TDB_ERR_THREAD` | -17 | thread creation or operation failed |
+| `TDB_ERR_CHECKSUM` | -18 | checksum verification failed |
+
+**Example error handling**
+```c
+int result = tidesdb_txn_put(txn, "my_cf", key, key_size, value, value_size, -1);
+if (result != TDB_SUCCESS)
+{
+    switch (result)
+    {
+        case TDB_ERR_MEMORY:
+            fprintf(stderr, "out of memory\n");
+            break;
+        case TDB_ERR_INVALID_ARGS:
+            fprintf(stderr, "invalid arguments\n");
+            break;
+        case TDB_ERR_READONLY:
+            fprintf(stderr, "cannot write to read-only transaction\n");
+            break;
+        default:
+            fprintf(stderr, "operation failed with error code: %d\n", result);
+            break;
+    }
+    return -1;
+}
+```
+
 ## Usage
-TidesDB v1 uses a simplified API. All functions return `0` on success and `-1` on error.
+TidesDB v1 uses a simplified API. All functions return `0` on success and a negative error code on failure.
 
 ### Opening a database
 To open a database you pass a config struct and a pointer to the database.

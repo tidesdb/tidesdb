@@ -1809,7 +1809,7 @@ static void test_parallel_compaction(void)
         tidesdb_txn_t *txn = NULL;
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
-        /* insert 10 keys per SSTable */
+        /* insert 10 keys per sst */
         for (int i = 0; i < 10; i++)
         {
             char key[32], value[64];
@@ -2178,7 +2178,7 @@ static void test_sstable_num_entries_accuracy(void)
 
     ASSERT_EQ(tidesdb_create_column_family(db, "entries_test", &cf_config), 0);
 
-    /* create multiple SSTables with known entry counts */
+    /* create multiple ssts with known entry counts */
     int expected_counts[] = {3, 7, 5, 10};
     int num_sstables = sizeof(expected_counts) / sizeof(expected_counts[0]);
 
@@ -2202,7 +2202,7 @@ static void test_sstable_num_entries_accuracy(void)
         tidesdb_txn_free(txn);
     }
 
-    /* verify SSTables were created */
+    /* verify ssts were created */
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "entries_test");
     ASSERT_TRUE(cf != NULL);
 
@@ -2284,8 +2284,6 @@ int main(void)
     RUN_TEST(test_parallel_compaction, tests_passed);
     RUN_TEST(test_max_key_size, tests_passed);
     RUN_TEST(test_true_concurrency, tests_passed);
-
-    /* regression tests for metadata block issue */
     RUN_TEST(test_iterator_metadata_boundary, tests_passed);
     RUN_TEST(test_sstable_num_entries_accuracy, tests_passed);
 

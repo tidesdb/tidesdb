@@ -73,6 +73,18 @@ extern int _tidesdb_debug_enabled;
  * @param value_size size of value in bytes
  * @param ttl time-to-live (expiration time)
  */
+#ifdef _MSC_VER
+#pragma pack(push, 1)
+typedef struct
+{
+    uint8_t version;     /* format version */
+    uint8_t flags;       /* bit 0 = tombstone (1=deleted, 0=active) */
+    uint32_t key_size;   /* key size */
+    uint32_t value_size; /* value size */
+    int64_t ttl;         /* time-to-live */
+} tidesdb_kv_pair_header_t;
+#pragma pack(pop)
+#else
 typedef struct __attribute__((packed))
 {
     uint8_t version;     /* format version */
@@ -81,6 +93,7 @@ typedef struct __attribute__((packed))
     uint32_t value_size; /* value size */
     int64_t ttl;         /* time-to-live */
 } tidesdb_kv_pair_header_t;
+#endif
 
 #define TDB_KV_FLAG_TOMBSTONE 0x01 /* bit flag for tombstone/deleted entry */
 
@@ -114,19 +127,25 @@ int tidesdb_register_comparator(const char *name, skip_list_comparator_fn compar
 skip_list_comparator_fn tidesdb_get_comparator(const char *name);
 
 /* error codes */
-#define TDB_SUCCESS           0   /* operation successful */
-#define TDB_ERROR             -1  /* generic error */
-#define TDB_ERR_MEMORY        -2  /* memory allocation failed */
-#define TDB_ERR_INVALID_ARGS  -3  /* invalid arguments */
-#define TDB_ERR_IO            -4  /* I/O error */
-#define TDB_ERR_NOT_FOUND     -5  /* key not found */
-#define TDB_ERR_EXISTS        -6  /* already exists */
-#define TDB_ERR_CORRUPT       -7  /* data corruption detected */
-#define TDB_ERR_LOCK          -8  /* lock acquisition failed */
-#define TDB_ERR_TXN_COMMITTED -9  /* transaction already committed */
-#define TDB_ERR_TXN_ABORTED   -10 /* transaction aborted */
-#define TDB_ERR_READONLY      -11 /* read-only transaction */
-#define TDB_ERR_FULL          -12 /* database or resource full */
+#define TDB_SUCCESS              0   /* operation successful */
+#define TDB_ERROR                -1  /* generic error */
+#define TDB_ERR_MEMORY           -2  /* memory allocation failed */
+#define TDB_ERR_INVALID_ARGS     -3  /* invalid arguments */
+#define TDB_ERR_IO               -4  /* I/O error */
+#define TDB_ERR_NOT_FOUND        -5  /* key not found */
+#define TDB_ERR_EXISTS           -6  /* already exists */
+#define TDB_ERR_CORRUPT          -7  /* data corruption detected */
+#define TDB_ERR_LOCK             -8  /* lock acquisition failed */
+#define TDB_ERR_TXN_COMMITTED    -9  /* transaction already committed */
+#define TDB_ERR_TXN_ABORTED      -10 /* transaction aborted */
+#define TDB_ERR_READONLY         -11 /* read-only transaction */
+#define TDB_ERR_FULL             -12 /* database or resource full */
+#define TDB_ERR_INVALID_NAME     -13 /* invalid name (too long or empty) */
+#define TDB_ERR_COMPARATOR_NOT_FOUND -14 /* comparator not found in registry */
+#define TDB_ERR_MAX_COMPARATORS  -15 /* maximum number of comparators reached */
+#define TDB_ERR_INVALID_CF       -16 /* invalid column family */
+#define TDB_ERR_THREAD           -17 /* thread creation or operation failed */
+#define TDB_ERR_CHECKSUM         -18 /* checksum verification failed */
 
 /* forward declarations */
 typedef struct tidesdb_t tidesdb_t;

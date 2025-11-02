@@ -114,11 +114,9 @@ static int get_file_size(int fd, uint64_t *size)
 int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode,
                        int fsync_interval)
 {
-    /* we allocate memory for the new block manager */
     (*bm) = malloc(sizeof(block_manager_t));
     if (!(*bm)) return -1;
 
-    /* we check if the file already exists */
     int file_exists = access(file_path, F_OK) == 0;
 
     /* open with O_RDWR for read/write, O_CREAT to create if needed */
@@ -132,7 +130,6 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
         return -1;
     }
 
-    /* we copy the file path to the block manager */
     strncpy((*bm)->file_path, file_path, MAX_FILE_PATH_LENGTH - 1);
     (*bm)->file_path[MAX_FILE_PATH_LENGTH - 1] = '\0';
 
@@ -140,7 +137,6 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
     (*bm)->sync_mode = sync_mode;
     (*bm)->fsync_interval = fsync_interval;
 
-    /* we set the stop fsync thread flag to 0 */
     (*bm)->stop_fsync_thread = 0;
 
     /* initialize write mutex for thread safety on writes only */
@@ -252,14 +248,11 @@ int block_manager_close(block_manager_t *bm)
 
 block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
 {
-    /* we allocate memory for the new block */
     block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
     if (!block) return NULL;
 
-    /* we set the size of the block */
     block->size = size;
 
-    /* we allocate memory for the data of the block */
     block->data = malloc(size);
     if (!block->data)
     {
@@ -268,7 +261,6 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
         return NULL;
     }
 
-    /* we copy the data to the block */
     memcpy(block->data, data, size);
     return block;
 }
@@ -277,7 +269,6 @@ long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block
 {
     if (!bm || !block || !block->data) return -1;
 
-    /* we lock writes only (writers block writers, but NOT readers) */
     (void)pthread_mutex_lock(&bm->write_mutex);
 
     /* get current file size for append position */
@@ -431,7 +422,6 @@ long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block
 
 void block_manager_block_free(block_manager_block_t *block)
 {
-    /* we free the data and the block */
     if (block)
     {
         if (block->data) free(block->data);
@@ -840,21 +830,18 @@ int block_manager_truncate(block_manager_t *bm)
 
     pthread_mutex_lock(&bm->write_mutex);
 
-    /* we close the file descriptor */
     if (close(bm->fd) != 0)
     {
         pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
-    /* we truncate the file */
     if (truncate(bm->file_path, 0) != 0)
     {
         pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
-    /* we open the file again */
     bm->fd = open(bm->file_path, O_RDWR | O_CREAT, 0644);
     if (bm->fd == -1)
     {

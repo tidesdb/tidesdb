@@ -98,13 +98,11 @@ unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
     uint32_t h =
         (uint32_t)seed ^ ((uint32_t)size * m); /* initial hash value based on seed and size */
 
-    /* we process the entry 4 bytes at a time */
     while (entry + 4 <= limit)
     {
-        /* we decode the 4 bytes into a 32-bit unsigned integer */
         uint32_t w = decode_fixed_32((const char *)entry);
-        entry += 4;     /* move the pointer forward by 4 bytes */
-        h += w;         /** add the decoded value to the hash */
+        entry += 4;
+        h += w;
         h *= m;         /* multiply the hash by the large prime number */
         h ^= (h >> 16); /* xor the hash with its right-shifted value */
     }

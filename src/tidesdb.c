@@ -38,16 +38,28 @@ static int num_comparators = 0;
 static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* register built-in comparators automatically */
-static void __attribute__((constructor)) init_builtin_comparators(void)
+#ifdef _MSC_VER
+static void init_builtin_comparators(void)
 {
     tidesdb_register_comparator("memcmp", skip_list_comparator_memcmp);
     tidesdb_register_comparator("string", skip_list_comparator_string);
     tidesdb_register_comparator("numeric", skip_list_comparator_numeric);
 }
 
+#pragma section(".CRT$XCU", read)
+__declspec(allocate(".CRT$XCU")) void (*init_builtin_comparators_ptr)(void) = init_builtin_comparators;
+#else
+static void __attribute__((constructor)) init_builtin_comparators(void)
+{
+    tidesdb_register_comparator("memcmp", skip_list_comparator_memcmp);
+    tidesdb_register_comparator("string", skip_list_comparator_string);
+    tidesdb_register_comparator("numeric", skip_list_comparator_numeric);
+}
+#endif
+
 int tidesdb_register_comparator(const char *name, skip_list_comparator_fn compare_fn)
 {
-    if (!name || !compare_fn) return -1;
+    if (!name || !compare_fn) return TDB_ERR_INVALID_ARGS;
 
     pthread_mutex_lock(&registry_lock);
 
@@ -67,7 +79,7 @@ int tidesdb_register_comparator(const char *name, skip_list_comparator_fn compar
     if (num_comparators >= TDB_MAX_COMPARATORS)
     {
         pthread_mutex_unlock(&registry_lock);
-        return -1;
+        return TDB_ERR_MAX_COMPARATORS;
     }
 
     strncpy(comparator_registry[num_comparators].name, name, TDB_MAX_COMPARATOR_NAME - 1);
@@ -167,7 +179,7 @@ static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable
 
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 {
-    if (!config || !db) return -1;
+    if (!config || !db) return TDB_ERR_INVALID_ARGS;
 
     /* set global debug flag */
     _tidesdb_debug_enabled = config->enable_debug_logging;
@@ -175,7 +187,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     TDB_DEBUG_LOG("Opening TidesDB at path: %s", config->db_path);
 
     *db = malloc(sizeof(tidesdb_t));
-    if (!*db) return -1;
+    if (!*db) return TDB_ERR_MEMORY;
 
     memcpy(&(*db)->config, config, sizeof(tidesdb_config_t));
     (*db)->column_families = NULL;
@@ -185,7 +197,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     if (pthread_rwlock_init(&(*db)->db_lock, NULL) != 0)
     {
         free(*db);
-        return -1;
+        return TDB_ERR_LOCK;
     }
 
     /* create database directory */
@@ -193,7 +205,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     {
         pthread_rwlock_destroy(&(*db)->db_lock);
         free(*db);
-        return -1;
+        return TDB_ERR_IO;
     }
 
     TDB_DEBUG_LOG("Database directory created/verified");
@@ -224,8 +236,19 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL)
         {
-            if (entry->d_type == DT_DIR && strcmp(entry->d_name, ".") != 0 &&
-                strcmp(entry->d_name, "..") != 0)
+            /* skip . and .. */
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+                continue;
+
+#ifdef _WIN32
+            /* on windows, check if it's a directory using stat */
+            char entry_path[TDB_MAX_PATH_LENGTH];
+            (void)snprintf(entry_path, TDB_MAX_PATH_LENGTH, "%s/%s", config->db_path, entry->d_name);
+            struct stat st;
+            if (stat(entry_path, &st) == 0 && S_ISDIR(st.st_mode))
+#else
+            if (entry->d_type == DT_DIR)
+#endif
             {
                 /* load existing column family with default config */
                 tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
@@ -245,7 +268,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
 int tidesdb_close(tidesdb_t *db)
 {
-    if (!db) return -1;
+    if (!db) return TDB_ERR_INVALID_ARGS;
 
     pthread_rwlock_wrlock(&db->db_lock);
 
@@ -307,7 +330,8 @@ int tidesdb_close(tidesdb_t *db)
 int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config)
 {
-    if (!db || !name || strlen(name) >= TDB_MAX_CF_NAME_LENGTH) return -1;
+    if (!db || !name) return TDB_ERR_INVALID_ARGS;
+    if (strlen(name) >= TDB_MAX_CF_NAME_LENGTH) return TDB_ERR_INVALID_NAME;
 
     TDB_DEBUG_LOG("Creating column family: %s", name);
 
@@ -329,7 +353,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     if (!cf)
     {
         pthread_rwlock_unlock(&db->db_lock);
-        return -1;
+        return TDB_ERR_MEMORY;
     }
 
     strncpy(cf->name, name, TDB_MAX_CF_NAME_LENGTH - 1);
@@ -360,7 +384,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         TDB_DEBUG_LOG("Comparator '%s' not found in registry", cmp_name);
         free(cf);
         pthread_rwlock_unlock(&db->db_lock);
-        return -1;
+        return TDB_ERR_COMPARATOR_NOT_FOUND;
     }
 
     /* save comparator name */
@@ -374,7 +398,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     {
         free(cf);
         pthread_rwlock_unlock(&db->db_lock);
-        return -1;
+        return TDB_ERR_LOCK;
     }
 
     if (pthread_mutex_init(&cf->flush_lock, NULL) != 0)
@@ -382,7 +406,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         pthread_rwlock_destroy(&cf->cf_lock);
         free(cf);
         pthread_rwlock_unlock(&db->db_lock);
-        return -1;
+        return TDB_ERR_LOCK;
     }
 
     if (pthread_mutex_init(&cf->compaction_lock, NULL) != 0)
@@ -391,7 +415,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         pthread_mutex_destroy(&cf->flush_lock);
         free(cf);
         pthread_rwlock_unlock(&db->db_lock);
-        return -1;
+        return TDB_ERR_LOCK;
     }
 
     /* create column family directory */
@@ -404,7 +428,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         pthread_mutex_destroy(&cf->compaction_lock);
         free(cf);
         pthread_rwlock_unlock(&db->db_lock);
-        return -1;
+        return TDB_ERR_IO;
     }
 
     /* create memtable with comparator */
@@ -416,7 +440,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         pthread_mutex_destroy(&cf->compaction_lock);
         free(cf);
         pthread_rwlock_unlock(&db->db_lock);
-        return -1;
+        return TDB_ERR_MEMORY;
     }
 
     /* init sstables array (grows dynamically) */
@@ -435,7 +459,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         pthread_mutex_destroy(&cf->compaction_lock);
         free(cf);
         pthread_rwlock_unlock(&db->db_lock);
-        return -1;
+        return TDB_ERR_IO;
     }
 
     /* recover from WAL if it exists */
@@ -498,6 +522,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         {
             /* failed to create thread, but continue anyway */
             cf->config.enable_background_compaction = 0;
+            return TDB_ERR_THREAD;
         }
     }
 
@@ -516,7 +541,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             pthread_mutex_destroy(&cf->compaction_lock);
             free(cf);
             pthread_rwlock_unlock(&db->db_lock);
-            return -1;
+            return TDB_ERR_MEMORY;
         }
         db->column_families = new_cfs;
         db->cf_capacity = new_cap;
@@ -530,7 +555,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 {
-    if (!db || !name) return -1;
+    if (!db || !name) return TDB_ERR_INVALID_ARGS;
 
     pthread_rwlock_wrlock(&db->db_lock);
 
@@ -547,7 +572,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     if (found == -1)
     {
         pthread_rwlock_unlock(&db->db_lock);
-        return -1;
+        return TDB_ERR_NOT_FOUND;
     }
 
     tidesdb_column_family_t *cf = db->column_families[found];
@@ -556,7 +581,10 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     if (cf->config.enable_background_compaction)
     {
         atomic_store(&cf->compaction_stop, 1);
-        pthread_join(cf->compaction_thread, NULL);
+        if (pthread_join(cf->compaction_thread, NULL) != 0)
+        {
+            return TDB_ERR_THREAD;
+        }
     }
 
     /* close and delete WAL */
@@ -587,7 +615,10 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     /* delete directory */
     char cf_path[TDB_MAX_PATH_LENGTH];
     get_cf_path(db, name, cf_path);
-    rmdir(cf_path);
+    if (rmdir(cf_path) == -1)
+    {
+        return TDB_ERR_IO;
+    }
 
     pthread_rwlock_destroy(&cf->cf_lock);
     pthread_mutex_destroy(&cf->flush_lock);
@@ -627,7 +658,7 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
 
 int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
 {
-    if (!db || !names || !count) return -1;
+    if (!db || !names || !count) return TDB_ERR_INVALID_ARGS;
 
     pthread_rwlock_rdlock(&db->db_lock);
 
@@ -645,7 +676,7 @@ int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
     if (!*names)
     {
         pthread_rwlock_unlock(&db->db_lock);
-        return -1;
+        return TDB_ERR_MEMORY;
     }
 
     /* copy each column family name */
@@ -661,7 +692,7 @@ int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
             }
             free(*names);
             pthread_rwlock_unlock(&db->db_lock);
-            return -1;
+            return TDB_ERR_MEMORY;
         }
         strncpy((*names)[i], db->column_families[i]->name, TDB_MAX_CF_NAME_LENGTH - 1);
         (*names)[i][TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
@@ -674,14 +705,14 @@ int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
 int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
                                     tidesdb_column_family_stat_t **stats)
 {
-    if (!db || !name || !stats) return -1;
+    if (!db || !name || !stats) return TDB_ERR_INVALID_ARGS;
 
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, name);
-    if (!cf) return -1;
+    if (!cf) return TDB_ERR_NOT_FOUND;
 
     /* alloc stats struct */
     *stats = malloc(sizeof(tidesdb_column_family_stat_t));
-    if (!*stats) return -1;
+    if (!*stats) return TDB_ERR_MEMORY;
 
     pthread_rwlock_rdlock(&cf->cf_lock);
 
@@ -722,7 +753,7 @@ int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
 
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 {
-    if (!cf) return -1;
+    if (!cf) return TDB_ERR_INVALID_ARGS;
 
     TDB_DEBUG_LOG("Flushing memtable for column family: %s", cf->name);
 
@@ -959,7 +990,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
 int tidesdb_compact(tidesdb_column_family_t *cf)
 {
-    if (!cf) return -1;
+    if (!cf) return TDB_ERR_INVALID_ARGS;
 
     /* route to parallel compaction if threads > 0 */
     if (cf->config.compaction_threads > 0)
@@ -1569,7 +1600,7 @@ static void *tidesdb_compaction_worker(void *arg)
 
 int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
 {
-    if (!cf) return -1;
+    if (!cf) return TDB_ERR_INVALID_ARGS;
 
     TDB_DEBUG_LOG("Starting parallel compaction for column family: %s (sstables: %d, threads: %d)",
                   cf->name, atomic_load(&cf->num_sstables), cf->config.compaction_threads);
@@ -1719,7 +1750,7 @@ static void *tidesdb_background_compaction_thread(void *arg)
 
 static int tidesdb_check_and_flush(tidesdb_column_family_t *cf)
 {
-    if (!cf) return -1;
+    if (!cf) return TDB_ERR_INVALID_ARGS;
 
     size_t memtable_size = (size_t)skip_list_get_size(cf->memtable);
     if (memtable_size >= cf->config.memtable_flush_size)
@@ -1742,13 +1773,13 @@ static int tidesdb_check_and_flush(tidesdb_column_family_t *cf)
 static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id,
                                 tidesdb_sstable_t **sstable)
 {
-    if (!cf || !sstable) return -1;
+    if (!cf || !sstable) return TDB_ERR_INVALID_ARGS;
 
     char path[TDB_MAX_PATH_LENGTH];
     get_sstable_path(cf, sstable_id, path);
 
     tidesdb_sstable_t *sst = malloc(sizeof(tidesdb_sstable_t));
-    if (!sst) return -1;
+    if (!sst) return TDB_ERR_MEMORY;
 
     sst->id = sstable_id;
     sst->cf = cf;
@@ -1762,7 +1793,7 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
                            cf->config.sync_interval) == -1)
     {
         free(sst);
-        return -1;
+        return TDB_ERR_IO;
     }
 
     /* load metadata, index, and bloom filter from last blocks */
@@ -2173,10 +2204,10 @@ static int tidesdb_recover_wal(tidesdb_column_family_t *cf)
 
 int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn)
 {
-    if (!db || !txn) return -1;
+    if (!db || !txn) return TDB_ERR_INVALID_ARGS;
 
     *txn = malloc(sizeof(tidesdb_txn_t));
-    if (!*txn) return -1;
+    if (!*txn) return TDB_ERR_MEMORY;
 
     (*txn)->db = db;
     (*txn)->operations = NULL;
@@ -2191,10 +2222,10 @@ int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn)
 
 int tidesdb_txn_begin_read(tidesdb_t *db, tidesdb_txn_t **txn)
 {
-    if (!db || !txn) return -1;
+    if (!db || !txn) return TDB_ERR_INVALID_ARGS;
 
     *txn = malloc(sizeof(tidesdb_txn_t));
-    if (!*txn) return -1;
+    if (!*txn) return TDB_ERR_MEMORY;
 
     (*txn)->db = db;
     (*txn)->operations = NULL;
@@ -2210,10 +2241,10 @@ int tidesdb_txn_begin_read(tidesdb_t *db, tidesdb_txn_t **txn)
 int tidesdb_txn_get(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key, size_t key_size,
                     uint8_t **value, size_t *value_size)
 {
-    if (!txn || !cf_name || !key || !value || !value_size) return -1;
+    if (!txn || !cf_name || !key || !value || !value_size) return TDB_ERR_INVALID_ARGS;
 
     tidesdb_column_family_t *cf = tidesdb_get_column_family(txn->db, cf_name);
-    if (!cf) return -1;
+    if (!cf) return TDB_ERR_NOT_FOUND;
 
     /* check pending writes in transaction first (read your own writes) */
     if (!txn->read_only)
@@ -2226,7 +2257,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
             {
                 if (op->type == TIDESDB_OP_DELETE)
                 {
-                    return -1; /* deleted in this transaction */
+                    return TDB_ERR_NOT_FOUND;
                 }
                 else if (op->type == TIDESDB_OP_PUT)
                 {
@@ -2237,7 +2268,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
                         *value_size = op->value_size;
                         return 0;
                     }
-                    return -1;
+                    return TDB_ERR_MEMORY;
                 }
             }
         }
@@ -2250,9 +2281,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
 int tidesdb_txn_put(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key, size_t key_size,
                     const uint8_t *value, size_t value_size, time_t ttl)
 {
-    if (!txn || !cf_name || !key || !value) return -1;
-    if (txn->committed) return -1;
-    if (txn->read_only) return -1; /* cannot write in read-only transaction */
+    if (!txn || !cf_name || !key || !value) return TDB_ERR_INVALID_ARGS;
+    if (txn->committed) return TDB_ERR_TXN_COMMITTED;
+    if (txn->read_only) return TDB_ERR_READONLY;
 
     /* expand operations array if needed */
     if (txn->num_ops >= txn->op_capacity)
@@ -2260,7 +2291,7 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
         int new_cap = txn->op_capacity == 0 ? 8 : txn->op_capacity * 2;
         tidesdb_operation_t *new_ops =
             realloc(txn->operations, (size_t)new_cap * sizeof(tidesdb_operation_t));
-        if (!new_ops) return -1;
+        if (!new_ops) return TDB_ERR_MEMORY;
         txn->operations = new_ops;
         txn->op_capacity = new_cap;
     }
@@ -2272,7 +2303,7 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
 
     /* allocate and copy key */
     op->key = malloc(key_size);
-    if (!op->key) return -1;
+    if (!op->key) return TDB_ERR_MEMORY;
     memcpy(op->key, key, key_size);
     op->key_size = key_size;
 
@@ -2281,7 +2312,7 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
     if (!op->value)
     {
         free(op->key);
-        return -1;
+        return TDB_ERR_MEMORY;
     }
     memcpy(op->value, value, value_size);
     op->value_size = value_size;
@@ -2293,9 +2324,9 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
 
 int tidesdb_txn_delete(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key, size_t key_size)
 {
-    if (!txn || !cf_name || !key) return -1;
-    if (txn->committed) return -1;
-    if (txn->read_only) return -1; /* cannot write in read-only transaction */
+    if (!txn || !cf_name || !key) return TDB_ERR_INVALID_ARGS;
+    if (txn->committed) return TDB_ERR_TXN_COMMITTED;
+    if (txn->read_only) return TDB_ERR_READONLY;
 
     /* expand operations array if needed */
     if (txn->num_ops >= txn->op_capacity)
@@ -2303,7 +2334,7 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *k
         int new_cap = txn->op_capacity == 0 ? 8 : txn->op_capacity * 2;
         tidesdb_operation_t *new_ops =
             realloc(txn->operations, (size_t)new_cap * sizeof(tidesdb_operation_t));
-        if (!new_ops) return -1;
+        if (!new_ops) return TDB_ERR_MEMORY;
         txn->operations = new_ops;
         txn->op_capacity = new_cap;
     }
@@ -2315,7 +2346,7 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *k
 
     /* allocate and copy key */
     op->key = malloc(key_size);
-    if (!op->key) return -1;
+    if (!op->key) return TDB_ERR_MEMORY;
     memcpy(op->key, key, key_size);
     op->key_size = key_size;
     op->value = NULL;
@@ -2328,7 +2359,8 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *k
 
 int tidesdb_txn_commit(tidesdb_txn_t *txn)
 {
-    if (!txn || txn->committed) return -1;
+    if (!txn) return TDB_ERR_INVALID_ARGS;
+    if (txn->committed) return TDB_ERR_TXN_COMMITTED;
     if (txn->read_only)
     {
         txn->committed = 1;
@@ -2341,7 +2373,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         tidesdb_operation_t *op = &txn->operations[i];
 
         tidesdb_column_family_t *cf = tidesdb_get_column_family(txn->db, op->cf_name);
-        if (!cf) return -1;
+        if (!cf) return TDB_ERR_NOT_FOUND;
 
         pthread_rwlock_wrlock(&cf->cf_lock); /* write lock for modifications */
 
@@ -2568,13 +2600,13 @@ static int compare_keys_with_cf(tidesdb_column_family_t *cf, const uint8_t *key1
 
 int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **iter)
 {
-    if (!txn || !cf_name || !iter) return -1;
+    if (!txn || !cf_name || !iter) return TDB_ERR_INVALID_ARGS;
 
     tidesdb_column_family_t *cf = tidesdb_get_column_family(txn->db, cf_name);
-    if (!cf) return -1;
+    if (!cf) return TDB_ERR_NOT_FOUND;
 
     *iter = malloc(sizeof(tidesdb_iter_t));
-    if (!*iter) return -1;
+    if (!*iter) return TDB_ERR_MEMORY;
 
     (*iter)->txn = txn;
     (*iter)->cf = cf;
@@ -2608,7 +2640,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
             if ((*iter)->sstables) free((*iter)->sstables);
             if ((*iter)->sstable_blocks_read) free((*iter)->sstable_blocks_read);
             free(*iter);
-            return -1;
+            return TDB_ERR_MEMORY;
         }
 
         for (int i = 0; i < num_ssts; i++)
@@ -2629,7 +2661,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
 
 int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter)
 {
-    if (!iter) return -1;
+    if (!iter) return TDB_ERR_INVALID_ARGS;
 
     iter->direction = 1;
     iter->valid = 0;

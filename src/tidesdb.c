@@ -47,7 +47,8 @@ static void init_builtin_comparators(void)
 }
 
 #pragma section(".CRT$XCU", read)
-__declspec(allocate(".CRT$XCU")) void (*init_builtin_comparators_ptr)(void) = init_builtin_comparators;
+__declspec(allocate(".CRT$XCU")) void (*init_builtin_comparators_ptr)(void) =
+    init_builtin_comparators;
 #else
 static void __attribute__((constructor)) init_builtin_comparators(void)
 {
@@ -237,13 +238,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         while ((entry = readdir(dir)) != NULL)
         {
             /* skip . and .. */
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-                continue;
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 
 #ifdef _WIN32
             /* on windows, check if it's a directory using stat */
             char entry_path[TDB_MAX_PATH_LENGTH];
-            (void)snprintf(entry_path, TDB_MAX_PATH_LENGTH, "%s/%s", config->db_path, entry->d_name);
+            (void)snprintf(entry_path, TDB_MAX_PATH_LENGTH, "%s/%s", config->db_path,
+                           entry->d_name);
             struct stat st;
             if (stat(entry_path, &st) == 0 && S_ISDIR(st.st_mode))
 #else

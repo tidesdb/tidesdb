@@ -34,11 +34,11 @@ jobs:
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
-          vcpkg install
+          vcpkg install --triplet x64-windows
 
       - name: Configure CMake (Windows)
         if: runner.os == 'Windows'
-        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake
 
       - name: Configure CMake (Linux/macOS)
         if: runner.os != 'Windows'

@@ -286,8 +286,12 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     }
 
     OVERLAPPED overlapped = {0};
-    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFF);
-    overlapped.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFF);
+    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFFULL);
+#if defined(_WIN64) || (LONG_MAX > 2147483647L)
+    overlapped.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFFULL);
+#else
+    overlapped.OffsetHigh = 0;
+#endif
 
     DWORD bytes_read;
     if (!ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped))
@@ -309,8 +313,12 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
     }
 
     OVERLAPPED overlapped = {0};
-    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFF);
-    overlapped.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFF);
+    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFFULL);
+#if defined(_WIN64) || (LONG_MAX > 2147483647L)
+    overlapped.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFFULL);
+#else
+    overlapped.OffsetHigh = 0;
+#endif
 
     DWORD bytes_written;
     if (!WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped))

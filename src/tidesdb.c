@@ -2614,6 +2614,7 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter)
             /* reset cursor position to before first block */
             iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
             iter->sstable_cursors[i]->current_block_size = 0;
+            iter->sstable_blocks_read[i] = 0; /* reset block counter */
         }
     }
 

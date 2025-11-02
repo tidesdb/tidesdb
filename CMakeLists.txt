@@ -45,8 +45,11 @@ target_include_directories(tidesdb PRIVATE src)
 # find OpenSSL for SHA1 checksums
 find_package(OpenSSL REQUIRED)
 
-# find PThreads4W for Windows
+# find compression libraries (use CONFIG mode on Windows with vcpkg)
 if(WIN32)
+    find_package(zstd CONFIG REQUIRED)
+    find_package(Snappy CONFIG REQUIRED)
+    find_package(lz4 CONFIG REQUIRED)
     find_package(PThreads4W REQUIRED)
 endif()
 
@@ -79,9 +82,9 @@ elseif(APPLE)
 elseif(WIN32)
     # for windows, link against compression libraries and pthreads
     target_link_libraries(tidesdb PUBLIC
-            zstd
-            snappy
-            lz4
+            $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
+            Snappy::snappy
+            lz4::lz4
             PThreads4W::PThreads4W
             OpenSSL::Crypto
     )

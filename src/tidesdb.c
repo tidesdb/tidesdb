@@ -2562,16 +2562,19 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
     int num_ssts = atomic_load(&cf->num_sstables);
     (*iter)->num_sstable_cursors = num_ssts;
     (*iter)->sstable_cursors = NULL;
+    (*iter)->sstables = NULL;
     (*iter)->sstable_blocks_read = NULL;
 
     if (num_ssts > 0)
     {
         (*iter)->sstable_cursors = malloc((size_t)num_ssts * sizeof(block_manager_cursor_t *));
+        (*iter)->sstables = malloc((size_t)num_ssts * sizeof(tidesdb_sstable_t *));
         (*iter)->sstable_blocks_read = calloc((size_t)num_ssts, sizeof(int));
-        if (!(*iter)->sstable_cursors || !(*iter)->sstable_blocks_read)
+        if (!(*iter)->sstable_cursors || !(*iter)->sstables || !(*iter)->sstable_blocks_read)
         {
             if ((*iter)->memtable_cursor) skip_list_cursor_free((*iter)->memtable_cursor);
             if ((*iter)->sstable_cursors) free((*iter)->sstable_cursors);
+            if ((*iter)->sstables) free((*iter)->sstables);
             if ((*iter)->sstable_blocks_read) free((*iter)->sstable_blocks_read);
             free(*iter);
             return -1;
@@ -2580,6 +2583,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
         for (int i = 0; i < num_ssts; i++)
         {
             (*iter)->sstable_cursors[i] = NULL;
+            (*iter)->sstables[i] = cf->sstables[i]; /* snapshot pointer */
             (*iter)->sstable_blocks_read[i] = 0;
             if (cf->sstables[i] && cf->sstables[i]->block_manager)
             {
@@ -2640,7 +2644,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
         if (iter->sstable_cursors[i])
         {
             /* position at last KV block, not absolute last block (which would be metadata) */
-            tidesdb_sstable_t *sst = iter->cf->sstables[i];
+            tidesdb_sstable_t *sst = iter->sstables[i];
             if (sst && sst->num_entries > 0)
             {
                 /* goto the block at position num_entries - 1 (0-indexed) */
@@ -2728,7 +2732,7 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         if (!iter->sstable_cursors[i]) continue;
 
         /* check if we've already read all KV blocks from this sstable */
-        tidesdb_sstable_t *sst = iter->cf->sstables[i];
+        tidesdb_sstable_t *sst = iter->sstables[i];
         if (sst && iter->sstable_blocks_read[i] >= sst->num_entries) continue;
 
         /* keep advancing this sst cursor until we find a valid entry */
@@ -2964,6 +2968,7 @@ void tidesdb_iter_free(tidesdb_iter_t *iter)
         free(iter->sstable_cursors);
     }
 
+    if (iter->sstables) free(iter->sstables);
     if (iter->sstable_blocks_read) free(iter->sstable_blocks_read);
 
     free(iter);

@@ -344,6 +344,7 @@ struct tidesdb_iter_t
     tidesdb_column_family_t *cf;
     skip_list_cursor_t *memtable_cursor;
     block_manager_cursor_t **sstable_cursors;
+    tidesdb_sstable_t **sstables; /* snapshot of sstable pointers to avoid race conditions */
     int num_sstable_cursors;
     int *sstable_blocks_read; /* tracks blocks read per sstable to avoid reading metadata blocks */
     uint8_t *current_key;

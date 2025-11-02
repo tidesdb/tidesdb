@@ -959,16 +959,16 @@ void test_block_manager_validation_edge_cases()
 
     block_manager_t *bm;
 
-    /* Test 1: Opening a fresh empty database */
+    /* 1 opening a fresh empty database */
     (void)remove("empty_test.db");
-    ASSERT_TRUE(block_manager_open(&bm, "empty_test.db", TDB_SYNC_NONE, 0) == 0); /* ← FAILS HERE */
-    ASSERT_TRUE(block_manager_close(bm) == 0);
-
-    /* Test 2: Opening an existing empty database */
     ASSERT_TRUE(block_manager_open(&bm, "empty_test.db", TDB_SYNC_NONE, 0) == 0);
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
-    /* Test 3: Test with some data and validation */
+    /* 2 opening an existing empty database */
+    ASSERT_TRUE(block_manager_open(&bm, "empty_test.db", TDB_SYNC_NONE, 0) == 0);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    /* 3 test with some data and validation */
     if (block_manager_open(&bm, "empty_test.db", TDB_SYNC_NONE, 0) == 0)
     {
         uint64_t size = 10;

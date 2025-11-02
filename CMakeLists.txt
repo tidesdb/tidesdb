@@ -23,10 +23,15 @@ if(TIDESDB_WITH_SANITIZER)
     if(WIN32)
         # debug flags for windows
         # MSVC ASAN can be unstable, so we only enable warnings for CI
-        add_compile_options(/W4)
+        add_compile_options(/W4 /std:c11)
     else()
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
         add_link_options(-fsanitize=address,undefined)
+    endif()
+else()
+    if(WIN32)
+        # ensure C11 support is enabled even without sanitizers
+        add_compile_options(/std:c11)
     endif()
 endif()
 

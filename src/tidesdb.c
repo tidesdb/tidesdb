@@ -2428,7 +2428,8 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             /* now mark it as deleted */
             if (skip_list_delete(cf->memtable, op->key, op->key_size) != 0)
             {
-                /* if delete fails, the put succeeded so we have a valid entry - continue */
+                /* if delete fails, the put succeeded so we have a valid entry continue */
+                
             }
         }
 
@@ -2446,7 +2447,7 @@ int tidesdb_txn_rollback(tidesdb_txn_t *txn)
 {
     if (!txn) return -1;
 
-    /* mark as rolled back - operations won't be committed */
+    /* mark as rolled back, operations won't be committed */
     txn->committed = -1;
     return 0;
 }
@@ -2455,7 +2456,7 @@ void tidesdb_txn_free(tidesdb_txn_t *txn)
 {
     if (!txn) return;
 
-    /* free all operations */
+
     for (int i = 0; i < txn->num_ops; i++)
     {
         tidesdb_operation_t *op = &txn->operations[i];
@@ -2477,7 +2478,6 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
     uint8_t *data = block->data;
     size_t data_size = block->size;
 
-    /* decompress if needed */
     if (cf->config.compressed)
     {
         size_t decompressed_size = 0;
@@ -2485,7 +2485,7 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
             decompress_data(data, data_size, &decompressed_size, cf->config.compress_algo);
         if (!decompressed)
         {
-            /* decompression failed - corrupted or invalid data */
+
             return -1;
         }
         data = decompressed;
@@ -2504,7 +2504,6 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
     memcpy(&header, ptr, sizeof(tidesdb_kv_pair_header_t));
     ptr += sizeof(tidesdb_kv_pair_header_t);
 
-    /* check version */
     if (header.version != TDB_KV_FORMAT_VERSION)
     {
         if (data != block->data) free(data);
@@ -2704,7 +2703,6 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
 
     iter->direction = 1;
 
-    /* free previous current key/value */
     if (iter->current_key)
     {
         free(iter->current_key);
@@ -2716,7 +2714,6 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         iter->current_value = NULL;
     }
 
-    /* merge iteration, find smallest key across all sources */
     uint8_t *min_key = NULL;
     size_t min_key_size = 0;
     uint8_t *min_value = NULL;
@@ -2728,7 +2725,7 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
     {
         while (skip_list_cursor_has_next(iter->memtable_cursor))
         {
-            /* adv cursor first before reading */
+         
             if (skip_list_cursor_next(iter->memtable_cursor) != 0) break;
 
             uint8_t *k = NULL, *v = NULL;
@@ -2774,10 +2771,10 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         /* keep advancing this sst cursor until we find a valid entry */
         while (block_manager_cursor_has_next(iter->sstable_cursors[i]))
         {
-            /* check limit before reading next block */
+         
             if (sst && iter->sstable_blocks_read[i] >= sst->num_entries) break;
 
-            /* adv cursor first before reading */
+  
             if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0) break;
 
             iter->sstable_blocks_read[i]++;
@@ -2796,7 +2793,7 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
 
             if (parse_result != 0) break;
 
-            /* skip expired entries ,continue to next block */
+        
             int is_expired = (ttl > 0 && time(NULL) > ttl);
             if (is_expired)
             {
@@ -2860,14 +2857,13 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         iter->current_value = NULL;
     }
 
-    /* merge iteration find largest key across all sources */
+
     uint8_t *max_key = NULL;
     size_t max_key_size = 0;
     uint8_t *max_value = NULL;
     size_t max_value_size = 0;
     uint8_t max_deleted = 0;
 
-    /* check memtable */
     if (iter->memtable_cursor && skip_list_cursor_has_prev(iter->memtable_cursor))
     {
         if (skip_list_cursor_prev(iter->memtable_cursor) == 0)
@@ -2897,7 +2893,6 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         }
     }
 
-    /* check sstables */
     for (int i = 0; i < iter->num_sstable_cursors; i++)
     {
         if (!iter->sstable_cursors[i]) continue;
@@ -2976,7 +2971,7 @@ int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size
 {
     if (!iter || !iter->valid || !value || !value_size) return -1;
 
-    if (iter->current_deleted) return -1; /* deleted entry */
+    if (iter->current_deleted) return -1; 
 
     *value = iter->current_value;
     *value_size = iter->current_value_size;

@@ -2084,7 +2084,7 @@ static void test_true_concurrency(void)
     cleanup_test_dir();
 }
 
-/* regression test: verify iterator stops at num_entries and doesn't read metadata blocks */
+/* regression test verify iterator stops at num_entries and doesn't read metadata blocks */
 static void test_iterator_metadata_boundary(void)
 {
     printf("\n  [Regression] Testing iterator metadata boundary... ");
@@ -2165,7 +2165,7 @@ static void test_iterator_metadata_boundary(void)
     cleanup_test_dir();
 }
 
-/* regression test: verify num_entries is correctly set in SSTables */
+/* regression test verify num_entries is correctly set in SSTables */
 static void test_sstable_num_entries_accuracy(void)
 {
     printf("\n  [Regression] Testing SSTable num_entries accuracy... ");
@@ -2223,7 +2223,7 @@ static void test_sstable_num_entries_accuracy(void)
     while (tidesdb_iter_valid(iter))
     {
         total_count++;
-        /* safety: if we read way more than expected, we're reading metadata */
+        /* if we read way more than expected, we're reading metadata */
         ASSERT_TRUE(total_count <= expected_total * 2);
         tidesdb_iter_next(iter);
     }

@@ -21,10 +21,9 @@ option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 # for development, we want to enable all warnings and sanitizers
 if(TIDESDB_WITH_SANITIZER)
     if(WIN32)
-        # debug flags for windows, this is mainly for visual studio users
-        # if not using visual studio 2019+ comment out the below lines
-        add_compile_options(/W4 /fsanitize=address /fsanitize=undefined)
-        add_link_options(/fsanitize=address /fsanitize=undefined)
+        # debug flags for windows
+        # MSVC ASAN can be unstable, so we only enable warnings for CI
+        add_compile_options(/W4)
     else()
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
         add_link_options(-fsanitize=address,undefined)
@@ -67,11 +66,12 @@ elseif(APPLE)
             OpenSSL::Crypto  # openssl for SHA1
     )
 elseif(WIN32)
-    # for windows, link against OpenSSL
+    # for windows, link against compression libraries and pthreads
     target_link_libraries(tidesdb PUBLIC
             zstd
             snappy
             lz4
+            PThreads4W::PThreads4W
             OpenSSL::Crypto
     )
 else()

@@ -2014,14 +2014,16 @@ static void test_true_concurrency(void)
     fflush(stdout);
 
     _Atomic(int) errors = 0;
-    const int num_writer_threads = 4;
-    const int num_reader_threads = 4;
+#define NUM_WRITER_THREADS 4
+#define NUM_READER_THREADS 4
+    const int num_writer_threads = NUM_WRITER_THREADS;
+    const int num_reader_threads = NUM_READER_THREADS;
     const int ops_per_thread = 100;
 
-    pthread_t writers[num_writer_threads];
-    pthread_t readers[num_reader_threads];
-    thread_args_t writer_args[num_writer_threads];
-    thread_args_t reader_args[num_reader_threads];
+    pthread_t writers[NUM_WRITER_THREADS];
+    pthread_t readers[NUM_READER_THREADS];
+    thread_args_t writer_args[NUM_WRITER_THREADS];
+    thread_args_t reader_args[NUM_READER_THREADS];
 
     for (int i = 0; i < num_writer_threads; i++)
     {

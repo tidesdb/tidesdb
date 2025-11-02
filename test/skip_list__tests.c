@@ -341,7 +341,11 @@ void test_skip_list_ttl()
     ASSERT_TRUE(skip_list_put(list, key, sizeof(key), value, sizeof(value), time(NULL) + ttl) == 0);
 
     /* take a snooze */
+#ifdef _WIN32
+    Sleep((ttl + 1) * 1000);
+#else
     sleep(ttl + 1);
+#endif
 
     uint8_t *retrieved_value;
     size_t retrieved_value_size;

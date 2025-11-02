@@ -39,6 +39,11 @@ target_include_directories(tidesdb PRIVATE src)
 # find OpenSSL for SHA1 checksums
 find_package(OpenSSL REQUIRED)
 
+# find PThreads4W for Windows
+if(WIN32)
+    find_package(PThreads4W REQUIRED)
+endif()
+
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
     # for apple silicon macs, homebrew installs packages in /opt/homebrew
     target_include_directories(tidesdb PUBLIC /opt/homebrew/include)

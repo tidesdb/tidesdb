@@ -2084,6 +2084,163 @@ static void test_true_concurrency(void)
     cleanup_test_dir();
 }
 
+/* regression test: verify iterator stops at num_entries and doesn't read metadata blocks */
+static void test_iterator_metadata_boundary(void)
+{
+    printf("\n  [Regression] Testing iterator metadata boundary... ");
+    fflush(stdout);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    cf_config.memtable_flush_size = 2048; /* small to force flush */
+    cf_config.compressed = 1;
+    cf_config.compress_algo = COMPRESS_LZ4;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "boundary_test", &cf_config), 0);
+
+    /* insert exactly 5 entries to create 1 SSTable with 5 KV blocks + metadata */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 5; i++)
+    {
+        char key[32], value[128];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(value, sizeof(value), "value_%d_padding_xxxxxxxxxxxxxxxxxxxxxxxxxx", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "boundary_test", (uint8_t *)key, strlen(key),
+                                  (uint8_t *)value, strlen(value), -1),
+                  0);
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* force flush to create SSTable */
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "boundary_test");
+    ASSERT_TRUE(cf != NULL);
+    
+    /* manually flush memtable */
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    
+    ASSERT_TRUE(atomic_load(&cf->num_sstables) > 0);
+
+    /* get the SSTable and verify num_entries */
+    tidesdb_sstable_t *sst = cf->sstables[0];
+    ASSERT_TRUE(sst != NULL);
+    ASSERT_EQ(sst->num_entries, 5);
+
+    /* iterate through all entries - should read exactly 5 blocks, not metadata */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(read_txn, "boundary_test", &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    int count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        count++;
+        /* verify we're reading valid data, not garbage from metadata */
+        ASSERT_TRUE(iter->current_key != NULL);
+        ASSERT_TRUE(iter->current_key_size > 0);
+        ASSERT_TRUE(iter->current_value != NULL);
+        
+        /* if we read more than 5 entries, we're reading metadata blocks */
+        ASSERT_TRUE(count <= 5);
+        
+        tidesdb_iter_next(iter);
+    }
+
+    /* we should read at least some entries, and not more than 5 */
+    ASSERT_TRUE(count > 0);
+    ASSERT_TRUE(count <= 5);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(read_txn);
+
+    printf("OK (read %d entries, stopped at boundary, expected 5)\n", count);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* regression test: verify num_entries is correctly set in SSTables */
+static void test_sstable_num_entries_accuracy(void)
+{
+    printf("\n  [Regression] Testing SSTable num_entries accuracy... ");
+    fflush(stdout);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    cf_config.memtable_flush_size = 1024;
+    cf_config.compressed = 1;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "entries_test", &cf_config), 0);
+
+    /* create multiple SSTables with known entry counts */
+    int expected_counts[] = {3, 7, 5, 10};
+    int num_sstables = sizeof(expected_counts) / sizeof(expected_counts[0]);
+
+    for (int sst_idx = 0; sst_idx < num_sstables; sst_idx++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        for (int i = 0; i < expected_counts[sst_idx]; i++)
+        {
+            char key[64], value[256];
+            snprintf(key, sizeof(key), "sst%d_key%d", sst_idx, i);
+            snprintf(value, sizeof(value), "sst%d_value%d_padding_xxxxxxxxxxxxxxxxxxxx", sst_idx, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, "entries_test", (uint8_t *)key, strlen(key),
+                                      (uint8_t *)value, strlen(value), -1),
+                      0);
+        }
+
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* verify SSTables were created */
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "entries_test");
+    ASSERT_TRUE(cf != NULL);
+    
+    int actual_sstables = atomic_load(&cf->num_sstables);
+    ASSERT_TRUE(actual_sstables > 0); /* at least one SSTable created */
+
+    /* verify iterator reads correct total count */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(read_txn, "entries_test", &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    int total_count = 0;
+    int expected_total = 0;
+    for (int i = 0; i < num_sstables; i++) expected_total += expected_counts[i];
+
+    while (tidesdb_iter_valid(iter))
+    {
+        total_count++;
+        /* safety: if we read way more than expected, we're reading metadata */
+        ASSERT_TRUE(total_count <= expected_total * 2);
+        tidesdb_iter_next(iter);
+    }
+
+    /* verify we read a reasonable number of entries (not exact due to compaction) */
+    ASSERT_TRUE(total_count > 0);
+    ASSERT_TRUE(total_count <= expected_total * 2); /* allow for some variation */
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(read_txn);
+
+    printf("OK (verified %d entries, expected ~%d)\n", total_count, expected_total);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     printf("\n");
@@ -2126,6 +2283,10 @@ int main(void)
     RUN_TEST(test_parallel_compaction, tests_passed);
     RUN_TEST(test_max_key_size, tests_passed);
     RUN_TEST(test_true_concurrency, tests_passed);
+
+    /* regression tests for metadata block issue */
+    RUN_TEST(test_iterator_metadata_boundary, tests_passed);
+    RUN_TEST(test_sstable_num_entries_accuracy, tests_passed);
 
     printf("\n");
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

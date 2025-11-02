@@ -462,7 +462,6 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    /* NO LOCKING - read using pread at specific offset, doesn't block anyone */
 
     /* read block size at current position using pread */
     uint64_t block_size;
@@ -557,13 +556,17 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 {
     if (!cursor) return NULL;
 
-    /* NO LOCKING - use pread for all reads, doesn't block anyone */
-
     /* read block size using pread */
     uint64_t block_size;
     if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (off_t)cursor->current_pos) !=
         sizeof(uint64_t))
         return NULL;
+
+    const uint64_t MAX_REASONABLE_BLOCK_SIZE = 1ULL << 30; /* 1GB */
+    if (block_size == 0 || block_size > MAX_REASONABLE_BLOCK_SIZE)
+    {
+        return NULL;
+    }
 
     /* read checksum using pread */
     unsigned char checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
@@ -616,6 +619,15 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
         uint64_t chunk_size;
         if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
             sizeof(uint64_t))
+        {
+            free(block->data);
+            free(block);
+            return NULL;
+        }
+
+        /* validate chunk_size to prevent corrupted data from causing overflow or OOM */
+        if (chunk_size == 0 || chunk_size > cursor->bm->block_size ||
+            data_offset + chunk_size > block_size)
         {
             free(block->data);
             free(block);

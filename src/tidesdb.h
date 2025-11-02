@@ -373,8 +373,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
  */
 int tidesdb_close(tidesdb_t *db);
 
-/*** Column Family Functions ***/
-
 /*
  * tidesdb_default_column_family_config
  * returns default column family configuration

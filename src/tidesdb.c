@@ -1034,6 +1034,10 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
 
         int has1 = cursor1 ? block_manager_cursor_has_next(cursor1) : 0;
         int has2 = cursor2 ? block_manager_cursor_has_next(cursor2) : 0;
+        
+        /* track blocks read to avoid reading metadata blocks */
+        int blocks_read1 = 0;
+        int blocks_read2 = 0;
 
         while (has1 || has2)
         {
@@ -1043,15 +1047,29 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
 
             if (use1 && has1)
             {
+                /* check if we've read all KV blocks from sst1 */
+                if (blocks_read1 >= sst1->num_entries)
+                {
+                    has1 = 0;
+                    continue;
+                }
                 block = block_manager_cursor_read(cursor1);
+                blocks_read1++;
                 block_manager_cursor_next(cursor1);
-                has1 = block_manager_cursor_has_next(cursor1);
+                has1 = block_manager_cursor_has_next(cursor1) && (blocks_read1 < sst1->num_entries);
             }
             else if (has2)
             {
+                /* check if we've read all KV blocks from sst2 */
+                if (blocks_read2 >= sst2->num_entries)
+                {
+                    has2 = 0;
+                    continue;
+                }
                 block = block_manager_cursor_read(cursor2);
+                blocks_read2++;
                 block_manager_cursor_next(cursor2);
-                has2 = block_manager_cursor_has_next(cursor2);
+                has2 = block_manager_cursor_has_next(cursor2) && (blocks_read2 < sst2->num_entries);
             }
 
             if (block && block->data)
@@ -1327,6 +1345,10 @@ static void *tidesdb_compaction_worker(void *arg)
 
     int has1 = cursor1 ? block_manager_cursor_has_next(cursor1) : 0;
     int has2 = cursor2 ? block_manager_cursor_has_next(cursor2) : 0;
+    
+    /* track blocks read to avoid reading metadata blocks */
+    int blocks_read1 = 0;
+    int blocks_read2 = 0;
 
     while (has1 || has2)
     {
@@ -1336,15 +1358,29 @@ static void *tidesdb_compaction_worker(void *arg)
 
         if (use1 && has1)
         {
+            /* check if we've read all KV blocks from sst1 */
+            if (blocks_read1 >= sst1->num_entries)
+            {
+                has1 = 0;
+                continue;
+            }
             block = block_manager_cursor_read(cursor1);
+            blocks_read1++;
             block_manager_cursor_next(cursor1);
-            has1 = block_manager_cursor_has_next(cursor1);
+            has1 = block_manager_cursor_has_next(cursor1) && (blocks_read1 < sst1->num_entries);
         }
         else if (has2)
         {
+            /* check if we've read all KV blocks from sst2 */
+            if (blocks_read2 >= sst2->num_entries)
+            {
+                has2 = 0;
+                continue;
+            }
             block = block_manager_cursor_read(cursor2);
+            blocks_read2++;
             block_manager_cursor_next(cursor2);
-            has2 = block_manager_cursor_has_next(cursor2);
+            has2 = block_manager_cursor_has_next(cursor2) && (blocks_read2 < sst2->num_entries);
         }
 
         if (block && block->data)

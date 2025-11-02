@@ -23,8 +23,6 @@
 
 #include "tidesdb.h"
 
-#include <semaphore.h>
-
 /* global debug logging flag */
 int _tidesdb_debug_enabled = 0;
 
@@ -2477,13 +2475,6 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
         return -1;
     }
 
-    /* sanity check: validate sizes to prevent huge allocations from corrupted data
-     * 10MB should be more than enough for any reasonable key or value */
-    if (header.key_size > 10 * 1024 * 1024 || header.value_size > 10 * 1024 * 1024)
-    {
-        if (data != block->data) free(data);
-        return -1;
-    }
 
     /* verify we have enough data for key and value */
     if (data_size < sizeof(tidesdb_kv_pair_header_t) + header.key_size + header.value_size)

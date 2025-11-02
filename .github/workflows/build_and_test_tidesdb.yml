@@ -38,7 +38,9 @@ jobs:
 
       - name: Configure CMake (Windows)
         if: runner.os == 'Windows'
-        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake
+        run: |
+          $toolchain = "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$toolchain"
 
       - name: Configure CMake (Linux/macOS)
         if: runner.os != 'Windows'

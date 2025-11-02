@@ -67,7 +67,7 @@
 #endif
 
 typedef int64_t ssize_t; /* ssize_t is not defined in Windows */
-typedef int mode_t; /* mode_t is not defined in Windows */
+typedef int mode_t;      /* mode_t is not defined in Windows */
 
 #define M_LN2 0.69314718055994530942 /* log_e 2 */
 

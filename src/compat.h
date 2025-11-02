@@ -152,13 +152,16 @@ static inline int closedir(DIR *dir)
 }
 
 /* semaphore functions for Windows */
-typedef HANDLE sem_t;
+typedef struct
+{
+    HANDLE handle;
+} sem_t;
 
 static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
 {
     (void)pshared; /* unused on Windows */
-    *sem = CreateSemaphore(NULL, value, LONG_MAX, NULL);
-    if (*sem == NULL)
+    sem->handle = CreateSemaphore(NULL, value, LONG_MAX, NULL);
+    if (sem->handle == NULL)
     {
         errno = GetLastError();
         return -1;
@@ -168,23 +171,23 @@ static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
 
 static inline int sem_destroy(sem_t *sem)
 {
-    if (*sem != NULL)
+    if (sem->handle != NULL)
     {
-        CloseHandle(*sem);
-        *sem = NULL;
+        CloseHandle(sem->handle);
+        sem->handle = NULL;
     }
     return 0;
 }
 
 static inline int sem_wait(sem_t *sem)
 {
-    DWORD result = WaitForSingleObject(*sem, INFINITE);
+    DWORD result = WaitForSingleObject(sem->handle, INFINITE);
     return (result == WAIT_OBJECT_0) ? 0 : -1;
 }
 
 static inline int sem_post(sem_t *sem)
 {
-    return ReleaseSemaphore(*sem, 1, NULL) ? 0 : -1;
+    return ReleaseSemaphore(sem->handle, 1, NULL) ? 0 : -1;
 }
 
 /* file operations macros for cross-platform compatibility */

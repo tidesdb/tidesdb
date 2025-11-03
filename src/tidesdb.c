@@ -637,15 +637,15 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     {
         char wal_path[TDB_MAX_PATH_LENGTH];
         get_wal_path(cf, wal_path);
-        
+
         /* evict from cache first (closes the file handle,bm) */
         if (db->block_manager_cache)
         {
             lru_cache_remove(db->block_manager_cache, wal_path);
         }
-        
+
         cf->wal = NULL;
-        
+
         if (unlink(wal_path) == -1 && errno != ENOENT)
         {
             cleanup_error = TDB_ERR_IO;

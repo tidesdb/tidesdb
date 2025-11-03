@@ -189,8 +189,7 @@ static void block_manager_evict_cb(const char *key, void *value, void *user_data
     if (bm)
     {
         TDB_DEBUG_LOG("Evicting block manager from cache: %s", key);
-        block_manager_close(bm);
-        free(bm);
+        block_manager_close(bm); /* block_manager_close already frees bm */
     }
 }
 

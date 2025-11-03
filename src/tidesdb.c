@@ -644,6 +644,8 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
             lru_cache_remove(db->block_manager_cache, wal_path);
         }
 
+    
+        block_manager_close(cf->wal);
         cf->wal = NULL;
 
         if (unlink(wal_path) == -1 && errno != ENOENT)

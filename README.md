@@ -685,7 +685,7 @@ tidesdb_create_column_family(db, "my_cf", &cf_config);
 ## Background Compaction
 TidesDB v1 features automatic background compaction with optional parallel execution.
 
-**Automatic background compaction** runs when SSTable count reaches the configured threshold:
+**Automatic background compaction** runs when SSTable count reaches the configured threshold
 
 ```c
 tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();

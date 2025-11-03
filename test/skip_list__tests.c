@@ -18,6 +18,8 @@
  */
 #ifndef _WIN32
 #include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 #include "../src/skip_list.h"
@@ -54,9 +56,9 @@ void test_skip_list_put_get()
     uint8_t *retrieved_value;
     size_t retrieved_value_size;
     uint8_t deleted;
-    int result =
+    int get_result =
         skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size, &deleted);
-    ASSERT_EQ(result, 0);
+    ASSERT_EQ(get_result, 0);
     ASSERT_TRUE(memcmp(retrieved_value, value, sizeof(value)) == 0);
 
     free(retrieved_value);

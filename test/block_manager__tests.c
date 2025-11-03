@@ -18,6 +18,12 @@
  */
 #include <inttypes.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "../src/block_manager.h"
 #include "test_utils.h"
 
@@ -783,13 +789,8 @@ void *reader_thread(void *arg)
         (void)block_manager_cursor_free(cursor);
         (void)pthread_mutex_unlock(&bm_mutex);
 
-        /* we sleep a short random time to simulate
-         * variable processing time */
-#ifdef _WIN32
-        Sleep((rand() % 5000) / 1000);  // NOLINT(cert-msc30-c,cert-msc50-cpp)
-#else
-        usleep((useconds_t)(rand() % 5000));  // NOLINT(cert-msc30-c,cert-msc50-cpp)
-#endif
+        /* we sleep a short random time to simulate variable processing time */
+        usleep(rand() % 5000);  // 0-5ms
     }
 
     return NULL;
@@ -1116,7 +1117,7 @@ void benchmark_block_manager()
         sprintf(expected_id, "block_%d", blocks_read);
 
         ASSERT_TRUE(
-            memcmp((char *)(block->data + BLOCK_SIZE - 20), expected_id, strlen(expected_id)) == 0);
+            memcmp((char *)block->data + BLOCK_SIZE - 20, expected_id, strlen(expected_id)) == 0);
 
         (void)block_manager_block_free(block);
         blocks_read++;

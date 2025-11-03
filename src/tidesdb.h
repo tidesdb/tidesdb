@@ -20,12 +20,16 @@
 #define __TIDESDB_H__
 
 #include <errno.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* C11 atomics - skip_list.h provides the implementation for MSVC < 2022 */
+#if !defined(_MSC_VER) || _MSC_VER >= 1930
+#include <stdatomic.h>
+#endif
 
 #include "binary_hash_array.h"
 #include "block_manager.h"

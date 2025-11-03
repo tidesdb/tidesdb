@@ -132,7 +132,7 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data);
  * @param block the block to write
  * @return block offset if successful, -1 if not
  */
-long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
+int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
 
 /**
  * block_manager_block_free

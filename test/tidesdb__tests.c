@@ -2206,9 +2206,10 @@ static void test_sstable_num_entries_accuracy(void)
         tidesdb_txn_free(txn);
     }
 
-    /* verify ssts were created */
+    /* force memtable flush to create SSTables */
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "entries_test");
     ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
     int actual_sstables = atomic_load(&cf->num_sstables);
     ASSERT_TRUE(actual_sstables > 0); /* at least one SSTable created */

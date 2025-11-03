@@ -114,7 +114,8 @@ static int get_file_size(int fd, uint64_t *size)
 int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode,
                        int fsync_interval)
 {
-    (*bm) = malloc(sizeof(block_manager_t));
+    *bm = NULL;  /* Initialize to NULL in case of early failure */
+    *bm = malloc(sizeof(block_manager_t));
     if (!(*bm)) return -1;
 
     int file_exists = access(file_path, F_OK) == 0;
@@ -265,7 +266,7 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
     return block;
 }
 
-long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
+int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
 {
     if (!bm || !block || !block->data) return -1;
 
@@ -279,7 +280,7 @@ long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block
         return -1;
     }
 
-    long offset = (long)file_size;
+    int64_t offset = (int64_t)file_size;
 
     /* compute SHA1 checksum */
     unsigned char checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];

@@ -288,13 +288,7 @@ int tidesdb_close(tidesdb_t *db)
             pthread_join(cf->compaction_thread, NULL);
         }
 
-        /* flush memtable to ensure data persistence */
-        if (cf->memtable && atomic_load(&cf->memtable->total_size) > 0)
-        {
-            tidesdb_flush_memtable(cf);
-        }
-
-        /* close wal */
+        /* close wal - unflushed memtable data will be recovered on next open via WAL replay */
         if (cf->wal)
         {
             block_manager_close(cf->wal);
@@ -2168,37 +2162,45 @@ static int tidesdb_recover_wal(tidesdb_column_family_t *cf)
     block_manager_cursor_t *cursor = NULL;
     if (block_manager_cursor_init(&cursor, cf->wal) != 0) return -1;
 
-    block_manager_cursor_goto_first(cursor);
-
-    while (block_manager_cursor_has_next(cursor))
+    if (block_manager_cursor_goto_first(cursor) != 0)
     {
-        /* adv cursor first before reading */
-        if (block_manager_cursor_next(cursor) != 0) break;
+        block_manager_cursor_free(cursor);
+        return 0; /* empty WAL, nothing to recover */
+    }
 
-        block_manager_block_t *block = block_manager_cursor_read(cursor);
-        if (block && block->data)
+    /* read first entry */
+    block_manager_block_t *block = block_manager_cursor_read(cursor);
+    
+    while (block != NULL)
+    {
+        if (block->data)
         {
             /* parse WAL entry using format [header][key][value] */
-            if (block->size < sizeof(tidesdb_kv_pair_header_t))
+            if (block->size >= sizeof(tidesdb_kv_pair_header_t))
             {
-                block_manager_block_free(block);
-                continue;
+                tidesdb_kv_pair_header_t header;
+                memcpy(&header, block->data, sizeof(tidesdb_kv_pair_header_t));
+
+                uint8_t *ptr = (uint8_t *)block->data + sizeof(tidesdb_kv_pair_header_t);
+                uint8_t *key = ptr;
+                ptr += header.key_size;
+                uint8_t *value = ptr;
+
+                /* restore to memtable (WAL entries are never tombstones) */
+                skip_list_put(cf->memtable, key, header.key_size, value, header.value_size,
+                              (time_t)header.ttl);
             }
-
-            tidesdb_kv_pair_header_t header;
-            memcpy(&header, block->data, sizeof(tidesdb_kv_pair_header_t));
-
-            uint8_t *ptr = (uint8_t *)block->data + sizeof(tidesdb_kv_pair_header_t);
-            uint8_t *key = ptr;
-            ptr += header.key_size;
-            uint8_t *value = ptr;
-
-            /* restore to memtable (WAL entries are never tombstones) */
-            skip_list_put(cf->memtable, key, header.key_size, value, header.value_size,
-                          (time_t)header.ttl);
-
-            block_manager_block_free(block);
         }
+        
+        block_manager_block_free(block);
+        
+        /* advance to next entry */
+        if (block_manager_cursor_next(cursor) != 0)
+        {
+            break; /* no more entries */
+        }
+        
+        block = block_manager_cursor_read(cursor);
     }
 
     block_manager_cursor_free(cursor);

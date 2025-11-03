@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -32,22 +33,175 @@
 #include <sys/stat.h>
 #include <windows.h>
 
+/* mingw provides most POSIX compatibility, so only apply msvc-specific fixes */
+#if defined(_MSC_VER)
 #pragma warning(disable : 4996) /* disable deprecated warning for Windows */
 #pragma warning(disable : 4029) /* declared formal parameter list different from definition */
 #pragma warning(disable : 4211) /* nonstandard extension used: redefined extern to static */
+#endif
 
-#include "pthread.h" /* pthreads-win32 library (https://github.com/tidesdb/tidesdb/issues/241) */
+#if defined(__MINGW32__) || defined(__MINGW64__)
+/* mingw provides POSIX-like headers */
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <dirent.h>
 
-#define ftruncate _chsize /* Windows uses _chsize(fd, size) for file truncation */
+/* mingw mkdir only takes one argument, create a wrapper for POSIX compatibility */
+#define mkdir(path, mode) _mkdir(path)
+#else
+/* msvc needs pthreads-win32 library */
+#include "pthread.h"
+#endif
 
-/* access flags are normally defined in unistd.h, which unavailable under
- * windows.
+#if defined(_MSC_VER)
+/* CRITICAL: Define missing POSIX types */
+#ifndef _OFF_T_DEFINED
+#define _OFF_T_DEFINED
+typedef __int64 off_t;
+#endif
+
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+typedef __int64 ssize_t;
+#endif
+
+#ifndef _MODE_T_DEFINED
+#define _MODE_T_DEFINED
+typedef int mode_t;
+#endif
+
+/* CRITICAL FIX: Windows file operations MUST use binary mode */
+#define ftruncate _chsize
+
+/* CRITICAL: Wrap open() to always use O_BINARY on Windows */
+static inline int _tidesdb_open_wrapper(const char *path, int flags, mode_t mode) {
+    /* Always add O_BINARY for binary file safety on Windows */
+    return _open(path, flags | _O_BINARY, mode);
+}
+#define open(path, flags, mode) _tidesdb_open_wrapper(path, flags, mode)
+
+/* C11 atomics support */
+#if defined(__MINGW32__) || defined(__GNUC__)
+/* MinGW and GCC have proper C11 stdatomic.h support */
+#include <stdatomic.h>
+#elif _MSC_VER < 1930
+/* MSVC < 2022 doesn't have stdatomic.h - use Windows Interlocked functions */
+/* Use volatile to prevent compiler reordering */
+typedef volatile LONG atomic_int;
+typedef volatile LONGLONG atomic_size_t;
+typedef volatile LONGLONG atomic_uint64_t;
+#define _Atomic(T) volatile T
+
+/* CRITICAL FIX: Atomic operations MUST use Windows Interlocked functions */
+
+/* Atomic store - MUST be truly atomic */
+#ifdef _WIN64
+/* 64-bit atomic store */
+#define atomic_store_explicit(ptr, val, order) do { \
+    if (sizeof(*(ptr)) == sizeof(void*)) { \
+        InterlockedExchangePointer((PVOID volatile*)(ptr), (PVOID)(uintptr_t)(val)); \
+    } else if (sizeof(*(ptr)) == 8) { \
+        InterlockedExchange64((LONGLONG volatile*)(ptr), (LONGLONG)(uintptr_t)(val)); \
+    } else if (sizeof(*(ptr)) == 4) { \
+        InterlockedExchange((LONG volatile*)(ptr), (LONG)(uintptr_t)(val)); \
+    } else { \
+        *(ptr) = (val); \
+    } \
+} while(0)
+#else
+/* 32-bit atomic store */
+#define atomic_store_explicit(ptr, val, order) do { \
+    if (sizeof(*(ptr)) == sizeof(void*)) { \
+        InterlockedExchangePointer((PVOID volatile*)(ptr), (PVOID)(uintptr_t)(val)); \
+    } else if (sizeof(*(ptr)) == 4) { \
+        InterlockedExchange((LONG volatile*)(ptr), (LONG)(uintptr_t)(val)); \
+    } else { \
+        *(ptr) = (val); \
+    } \
+} while(0)
+#endif
+
+/* Atomic load - MUST be truly atomic */
+static inline void* _atomic_load_ptr(volatile void* const* ptr) {
+    return (void*)InterlockedCompareExchangePointer((PVOID volatile*)ptr, NULL, NULL);
+}
+
+#ifdef _WIN64
+static inline LONGLONG _atomic_load_i64(volatile LONGLONG* ptr) {
+    return InterlockedCompareExchange64((LONGLONG volatile*)ptr, 0, 0);
+}
+#endif
+
+static inline LONG _atomic_load_i32(volatile LONG* ptr) {
+    return InterlockedCompareExchange((LONG volatile*)ptr, 0, 0);
+}
+
+static inline unsigned char _atomic_load_u8(volatile unsigned char* ptr) {
+    return *ptr;  /* byte reads are atomic on x86/x64 */
+}
+
+#ifdef _WIN64
+#define atomic_load_explicit(ptr, order) \
+    (sizeof(*(ptr)) == sizeof(void*) ? \
+        _atomic_load_ptr((volatile void* const*)(ptr)) : \
+     sizeof(*(ptr)) == 8 ? \
+        (void*)(uintptr_t)_atomic_load_i64((volatile LONGLONG*)(ptr)) : \
+     sizeof(*(ptr)) == 4 ? \
+        (void*)(uintptr_t)_atomic_load_i32((volatile LONG*)(ptr)) : \
+        (void*)(uintptr_t)_atomic_load_u8((volatile unsigned char*)(ptr)))
+#else
+#define atomic_load_explicit(ptr, order) \
+    (sizeof(*(ptr)) == sizeof(void*) ? \
+        _atomic_load_ptr((volatile void* const*)(ptr)) : \
+     sizeof(*(ptr)) == 4 ? \
+        (void*)(uintptr_t)_atomic_load_i32((volatile LONG*)(ptr)) : \
+        (void*)(uintptr_t)_atomic_load_u8((volatile unsigned char*)(ptr)))
+#endif
+
+/* Atomic exchange */
+#ifdef _WIN64
+#define atomic_exchange_explicit(ptr, val, order) \
+    (sizeof(*(ptr)) == sizeof(void*) ? \
+        InterlockedExchangePointer((PVOID volatile*)(ptr), (PVOID)(uintptr_t)(val)) : \
+     sizeof(*(ptr)) == 8 ? \
+        (void*)(uintptr_t)InterlockedExchange64((LONGLONG volatile*)(ptr), (LONGLONG)(uintptr_t)(val)) : \
+        (void*)(uintptr_t)InterlockedExchange((LONG volatile*)(ptr), (LONG)(uintptr_t)(val)))
+#else
+#define atomic_exchange_explicit(ptr, val, order) \
+    (sizeof(*(ptr)) == sizeof(void*) ? \
+        InterlockedExchangePointer((PVOID volatile*)(ptr), (PVOID)(uintptr_t)(val)) : \
+        (void*)(uintptr_t)InterlockedExchange((LONG volatile*)(ptr), (LONG)(uintptr_t)(val)))
+#endif
+
+#ifdef _WIN64
+#define atomic_fetch_add(ptr, val) InterlockedExchangeAdd64((LONGLONG volatile*)(ptr), (LONGLONG)(val))
+#else
+#define atomic_fetch_add(ptr, val) InterlockedExchangeAdd((LONG volatile*)(ptr), (LONG)(val))
+#endif
+
+#define atomic_store(ptr, val) atomic_store_explicit(ptr, val, memory_order_seq_cst)
+#define atomic_load(ptr) atomic_load_explicit(ptr, memory_order_seq_cst)
+#define memory_order_relaxed 0
+#define memory_order_acquire 1
+#define memory_order_release 2
+#define memory_order_seq_cst 3
+#endif /* _MSC_VER < 1930 */
+
+/* access flags are normally defined in unistd.h, which unavailable under MSVC
  *
  * instead, define the flags as documented at
  * https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/access-waccess */
+#ifndef F_OK
 #define F_OK 00
+#endif
+#ifndef W_OK
 #define W_OK 02
+#endif
+#ifndef R_OK
 #define R_OK 04
+#endif
+#endif
 
 /* fcntl.h flags for Windows - use _O_* equivalents */
 #ifndef O_RDWR
@@ -66,12 +220,12 @@
 #define O_BINARY _O_BINARY
 #endif
 
-typedef int64_t ssize_t; /* ssize_t is not defined in Windows */
-typedef int mode_t;      /* mode_t is not defined in Windows */
-
+#ifndef M_LN2
 #define M_LN2 0.69314718055994530942 /* log_e 2 */
+#endif
 
-/* clock_gettime support for Windows */
+#if defined(_MSC_VER)
+/* clock_gettime support for MSVC */
 #define CLOCK_REALTIME 0
 
 struct timezone
@@ -102,7 +256,7 @@ static inline int mkdir(const char *path, mode_t mode)
 
 static inline DIR *opendir(const char *name)
 {
-    DIR *dir = malloc(sizeof(DIR));
+    DIR *dir = (DIR *)malloc(sizeof(DIR));
     if (dir == NULL)
     {
         errno = ENOMEM;
@@ -151,7 +305,7 @@ static inline int closedir(DIR *dir)
     return 0;
 }
 
-/* semaphore functions for Windows */
+/* semaphore functions for MSVC */
 typedef struct
 {
     HANDLE handle;
@@ -191,7 +345,9 @@ static inline int sem_post(sem_t *sem)
 }
 
 /* file operations macros for cross-platform compatibility */
+#ifndef S_ISDIR
 #define S_ISDIR(m)           (((m)&S_IFMT) == S_IFDIR)
+#endif
 #define sleep(seconds)       Sleep((seconds)*1000)
 #define usleep(microseconds) Sleep((microseconds) / 1000) /* usleep for Windows */
 #define access               _access
@@ -208,77 +364,49 @@ static inline int fsync(int fd)
     return FlushFileBuffers(h) ? 0 : -1;
 }
 
-/* fdatasync for Windows, same as fsync (Windows doesn't distinguish) */
+/* fdatasync for MSVC, same as fsync (Windows doesn't distinguish) */
 static inline int fdatasync(int fd)
 {
     return fsync(fd);
 }
 
-/* clock_gettime for Windows */
+/* clock_gettime for MSVC */
 static inline int clock_gettime(int clk_id, struct timespec *tp)
 {
-    (void)clk_id; /* unused */
+    (void)clk_id;
     FILETIME ft;
-    unsigned __int64 tmpres = 0;
+    ULARGE_INTEGER ui;
 
     GetSystemTimeAsFileTime(&ft);
+    ui.LowPart = ft.dwLowDateTime;
+    ui.HighPart = ft.dwHighDateTime;
 
-    tmpres |= ft.dwHighDateTime;
-    tmpres <<= 32;
-    tmpres |= ft.dwLowDateTime;
-
-    /* convert to microseconds */
-    tmpres /= 10;
-
-    /* convert file time to unix epoch */
-    tmpres -= 11644473600000000ULL;
-
-    tp->tv_sec = (long)(tmpres / 1000000UL);
-    tp->tv_nsec = (long)((tmpres % 1000000UL) * 1000);
+    /* convert 100-nanosecond intervals to seconds and nanoseconds */
+    tp->tv_sec = (long)((ui.QuadPart - 116444736000000000ULL) / 10000000ULL);
+    tp->tv_nsec = (long)((ui.QuadPart % 10000000ULL) * 100);
 
     return 0;
 }
 
-/* gettimeofday function for win */
+/* gettimeofday for MSVC */
 static inline int gettimeofday(struct timeval *tp, struct timezone *tzp)
 {
+    (void)tzp;
     FILETIME ft;
-    unsigned __int64 tmpres = 0;
-    static int tzflag;
+    ULARGE_INTEGER ui;
 
-    if (NULL != tp)
-    {
-        GetSystemTimeAsFileTime(&ft);
+    GetSystemTimeAsFileTime(&ft);
+    ui.LowPart = ft.dwLowDateTime;
+    ui.HighPart = ft.dwHighDateTime;
 
-        tmpres |= ft.dwHighDateTime;
-        tmpres <<= 32;
-        tmpres |= ft.dwLowDateTime;
-
-        /* convert into microseconds */
-        tmpres /= 10;
-
-        /* converting file time to unix epoch */
-        tmpres -= 11644473600000000ULL;
-
-        tp->tv_sec = (long)(tmpres / 1000000UL);
-        tp->tv_usec = (long)(tmpres % 1000000UL);
-    }
-
-    if (NULL != tzp)
-    {
-        if (!tzflag)
-        {
-            _tzset();
-            tzflag++;
-        }
-        tzp->tz_minuteswest = _timezone / 60;
-        tzp->tz_dsttime = _daylight;
-    }
+    /* convert to microseconds */
+    tp->tv_sec = (long)((ui.QuadPart - 116444736000000000ULL) / 10000000ULL);
+    tp->tv_usec = (long)((ui.QuadPart % 10000000ULL) / 10);
 
     return 0;
 }
 
-/* pread and pwrite for Windows */
+/* pread/pwrite for MSVC */
 static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
@@ -294,7 +422,7 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
 
-    /* Create event for synchronous operation */
+    /* create event for synchronous operation */
     overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (overlapped.hEvent == NULL)
     {
@@ -310,7 +438,7 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
         DWORD err = GetLastError();
         if (err == ERROR_IO_PENDING)
         {
-            /* Wait for async operation to complete */
+            /* wait for async operation to complete */
             if (!GetOverlappedResult(h, &overlapped, &bytes_read, TRUE))
             {
                 CloseHandle(overlapped.hEvent);
@@ -345,7 +473,7 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
 
-    /* Create event for synchronous operation */
+    /* create event for synchronous operation */
     overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (overlapped.hEvent == NULL)
     {
@@ -361,7 +489,7 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
         DWORD err = GetLastError();
         if (err == ERROR_IO_PENDING)
         {
-            /* Wait for async operation to complete */
+            /* wait for async operation to complete */
             if (!GetOverlappedResult(h, &overlapped, &bytes_written, TRUE))
             {
                 CloseHandle(overlapped.hEvent);
@@ -380,6 +508,126 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     CloseHandle(overlapped.hEvent);
     return (ssize_t)bytes_written;
 }
+#endif /* _MSC_VER */
+
+#if defined(__MINGW32__) || defined(__MINGW64__)
+/* mingw provides semaphore.h for POSIX semaphores */
+#include <semaphore.h>
+
+/* mingw doesn't provide pread/pwrite/fdatasync, so we implement them */
+static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    OVERLAPPED overlapped = {0};
+    LARGE_INTEGER li;
+    li.QuadPart = offset;
+    overlapped.Offset = li.LowPart;
+    overlapped.OffsetHigh = li.HighPart;
+
+    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (overlapped.hEvent == NULL)
+    {
+        errno = GetLastError();
+        return -1;
+    }
+
+    DWORD bytes_read;
+    BOOL result = ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped);
+
+    if (!result)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING)
+        {
+            if (!GetOverlappedResult(h, &overlapped, &bytes_read, TRUE))
+            {
+                CloseHandle(overlapped.hEvent);
+                errno = GetLastError();
+                return -1;
+            }
+        }
+        else
+        {
+            CloseHandle(overlapped.hEvent);
+            errno = err;
+            return -1;
+        }
+    }
+
+    CloseHandle(overlapped.hEvent);
+    return (ssize_t)bytes_read;
+}
+
+static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    OVERLAPPED overlapped = {0};
+    LARGE_INTEGER li;
+    li.QuadPart = offset;
+    overlapped.Offset = li.LowPart;
+    overlapped.OffsetHigh = li.HighPart;
+
+    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (overlapped.hEvent == NULL)
+    {
+        errno = GetLastError();
+        return -1;
+    }
+
+    DWORD bytes_written;
+    BOOL result = WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped);
+
+    if (!result)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING)
+        {
+            if (!GetOverlappedResult(h, &overlapped, &bytes_written, TRUE))
+            {
+                CloseHandle(overlapped.hEvent);
+                errno = GetLastError();
+                return -1;
+            }
+        }
+        else
+        {
+            CloseHandle(overlapped.hEvent);
+            errno = err;
+            return -1;
+        }
+    }
+
+    CloseHandle(overlapped.hEvent);
+    return (ssize_t)bytes_written;
+}
+
+static inline int fsync(int fd)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return -1;
+    }
+    return FlushFileBuffers(h) ? 0 : -1;
+}
+
+static inline int fdatasync(int fd)
+{
+    return fsync(fd);
+}
+#endif /* __MINGW32__ || __MINGW64__ */
 
 #elif defined(__APPLE__)
 #include <dirent.h>

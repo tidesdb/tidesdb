@@ -46,14 +46,12 @@ void test_block_manager_open()
 
 void test_block_manager_block_create()
 {
-    /* we setup a new block */
     uint64_t size = 10;
     char data[10] = "testdata";
     block_manager_block_t *block = block_manager_block_create(size, data);
     ASSERT_TRUE(block != NULL);
     ASSERT_EQ(block->size, size);
 
-    /* we verify that the data is copied correctly */
     ASSERT_EQ(memcmp(block->data, data, size), 0);
     (void)block_manager_block_free(block);
 
@@ -62,7 +60,6 @@ void test_block_manager_block_create()
 
 void test_block_manager_block_write()
 {
-    /* we set up a new block manager */
     block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
@@ -77,10 +74,8 @@ void test_block_manager_block_write()
 
     (void)block_manager_block_free(block);
 
-    /* we close the block manager */
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
-    /* we remove the file */
     (void)remove("test.db");
 
     printf(GREEN "test_block_manager_block_write passed\n" RESET);
@@ -88,7 +83,6 @@ void test_block_manager_block_write()
 
 void test_block_manager_block_write_close_reopen_read()
 {
-    /* we set up a new block manager */
     block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
@@ -103,13 +97,10 @@ void test_block_manager_block_write_close_reopen_read()
 
     (void)block_manager_block_free(block);
 
-    /* we close the block manager */
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
-    /* we reopen the block manager */
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
-    /* we use a cursor to read the block from the file */
     block_manager_cursor_t *cursor;
     if (block_manager_cursor_init(&cursor, bm) != 0)
     {
@@ -120,7 +111,6 @@ void test_block_manager_block_write_close_reopen_read()
     block = block_manager_cursor_read(cursor);
     ASSERT_TRUE(block != NULL);
 
-    /* we verify that the block was read correctly */
     ASSERT_EQ(block->size, size);
     ASSERT_EQ(memcmp(block->data, data, size), 0);
 

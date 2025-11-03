@@ -160,7 +160,8 @@ static int mkdir_p(const char *path)
 static void get_cf_path(const tidesdb_t *db, const char *cf_name, char *path)
 {
     /* TDB_MAX_PATH_LENGTH (1024) is sufficient for db_path + PATH_SEPARATOR + cf_name */
-    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", db->config.db_path, cf_name);
+    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", db->config.db_path,
+                   cf_name);
 }
 
 /* internal helper to get wal path */
@@ -288,8 +289,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             if (strstr(entry->d_name, TDB_TEMP_EXT) != NULL)
             {
                 char temp_file_path[TDB_MAX_PATH_LENGTH];
-                (void)snprintf(temp_file_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", config->db_path,
-                               entry->d_name);
+                (void)snprintf(temp_file_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s",
+                               config->db_path, entry->d_name);
                 TDB_DEBUG_LOG("Cleaning up incomplete temp file: %s", temp_file_path);
                 unlink(temp_file_path);
             }
@@ -310,8 +311,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 #ifdef _WIN32
             /* on windows, check if it's a directory using stat */
             char entry_path[TDB_MAX_PATH_LENGTH];
-            (void)snprintf(entry_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", config->db_path,
-                           entry->d_name);
+            (void)snprintf(entry_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s",
+                           config->db_path, entry->d_name);
             struct stat st;
             if (stat(entry_path, &st) == 0 && S_ISDIR(st.st_mode))
 #else
@@ -415,7 +416,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         {
             TDB_DEBUG_LOG("Column family %s already exists", name);
             pthread_rwlock_unlock(&db->db_lock);
-            return 0; 
+            return 0;
         }
     }
 
@@ -647,7 +648,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     }
 
     tidesdb_column_family_t *cf = db->column_families[found];
-    int cleanup_error = 0;  /* Track errors but continue cleanup */
+    int cleanup_error = 0; /* Track errors but continue cleanup */
 
     /* stop background compaction thread if running */
     if (cf->config.enable_background_compaction)
@@ -693,8 +694,8 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     char config_path[TDB_MAX_PATH_LENGTH];
     char cf_path[TDB_MAX_PATH_LENGTH];
     get_cf_path(db, name, cf_path);
-    snprintf(config_path, sizeof(config_path), "%s" PATH_SEPARATOR "%s%s",
-             cf_path, name, TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
+    snprintf(config_path, sizeof(config_path), "%s" PATH_SEPARATOR "%s%s", cf_path, name,
+             TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
     if (unlink(config_path) == -1 && errno != ENOENT)
     {
         cleanup_error = TDB_ERR_IO;
@@ -709,7 +710,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     /* delete directory (should now be empty) */
     if (rmdir(cf_path) == -1)
     {
-        if (errno != ENOENT)  /* dir might already be gone */
+        if (errno != ENOENT) /* dir might already be gone */
         {
             cleanup_error = TDB_ERR_IO;
         }
@@ -2584,7 +2585,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
 
         pthread_rwlock_unlock(&cf->cf_lock);
-
 
         tidesdb_check_and_flush(cf);
     }

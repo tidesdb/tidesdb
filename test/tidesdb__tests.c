@@ -96,7 +96,6 @@ static void test_basic_txn_put_get(void)
     const char *key = "test_key";
     const char *value = "test_value";
 
-    /* write transaction */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
     ASSERT_EQ(tidesdb_txn_put(txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value,
@@ -105,7 +104,6 @@ static void test_basic_txn_put_get(void)
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    /* read transaction */
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
 
@@ -148,7 +146,6 @@ static void test_multiple_operations(void)
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    /* verify all entries */
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
 
@@ -184,7 +181,6 @@ static void test_delete(void)
     const char *key = "delete_me";
     const char *value = "some_value";
 
-    /* insert */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
     ASSERT_EQ(tidesdb_txn_put(txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value,
@@ -193,7 +189,6 @@ static void test_delete(void)
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    /* verify exists */
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
     uint8_t *retrieved = NULL;
@@ -204,14 +199,12 @@ static void test_delete(void)
     free(retrieved);
     tidesdb_txn_free(read_txn);
 
-    /* delete */
     txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
     ASSERT_EQ(tidesdb_txn_delete(txn, "data", (uint8_t *)key, strlen(key)), 0);
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    /* verify deleted */
     read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
     ASSERT_NE(
@@ -241,7 +234,6 @@ static void test_transaction_commit(void)
 
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
 
-    /* verify */
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
 
@@ -278,7 +270,6 @@ static void test_transaction_rollback(void)
 
     ASSERT_EQ(tidesdb_txn_rollback(txn), 0);
 
-    /* verify not committed */
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
     uint8_t *retrieved = NULL;
@@ -300,7 +291,6 @@ static void test_iterator_forward(void)
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
     ASSERT_EQ(tidesdb_create_column_family(db, "data", &cf_config), 0);
 
-    /* insert data */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -615,7 +605,6 @@ static void test_iterator_backward(void)
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
     ASSERT_EQ(tidesdb_create_column_family(db, "data", &cf_config), 0);
 
-    /* insert data */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -2345,8 +2334,8 @@ static void test_drop_column_family_cleanup(void)
         char key[32], value[64];
         snprintf(key, sizeof(key), "key_%d", i);
         snprintf(value, sizeof(value), "value_%d", i);
-        ASSERT_EQ(tidesdb_txn_put(txn, "cleanup_cf", (uint8_t *)key, strlen(key),
-                                  (uint8_t *)value, strlen(value), -1),
+        ASSERT_EQ(tidesdb_txn_put(txn, "cleanup_cf", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  strlen(value), -1),
                   0);
     }
 

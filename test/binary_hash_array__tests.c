@@ -29,25 +29,21 @@ void test_binary_hash_array_compare()
 {
     binary_hash_array_entry_t entry1, entry2;
 
-    /* we test equal entries */
     memset(entry1.key, 0x01, sizeof(entry1.key));
     memset(entry2.key, 0x01, sizeof(entry2.key));
 
     ASSERT_TRUE(binary_hash_array_compare(&entry1, &entry2) == 0);
 
-    /* we test entry1 < entry2 */
     memset(entry1.key, 0x01, sizeof(entry1.key));
     memset(entry2.key, 0x02, sizeof(entry2.key));
 
     ASSERT_TRUE(binary_hash_array_compare(&entry1, &entry2) < 0);
 
-    /* we test entry1 > entry2 */
     memset(entry1.key, 0x02, sizeof(entry1.key));
     memset(entry2.key, 0x01, sizeof(entry2.key));
 
     ASSERT_TRUE(binary_hash_array_compare(&entry1, &entry2) > 0);
 
-    /* test NULL handling */
     ASSERT_TRUE(binary_hash_array_compare(NULL, &entry2) < 0);
     ASSERT_TRUE(binary_hash_array_compare(&entry1, NULL) > 0);
     ASSERT_TRUE(binary_hash_array_compare(NULL, NULL) == 0);
@@ -74,7 +70,6 @@ void test_binary_hash_array_add_and_contains()
     ASSERT_TRUE(binary_hash_array_add(bha, key, sizeof(key), 42) == 0); /* should return 0 */
 
     size_t serialized_size;
-    /* we serialize the entries to sort them */
     uint8_t *serialized_data = binary_hash_array_serialize(bha, &serialized_size);
     binary_hash_array_t *sorted_bha = binary_hash_array_deserialize(serialized_data);
     ASSERT_TRUE(binary_hash_array_contains(sorted_bha, key, sizeof(key)) == 42);
@@ -107,7 +102,6 @@ void test_binary_hash_array_edge_cases()
     ASSERT_TRUE(deserialized_empty != NULL);
     ASSERT_EQ(deserialized_empty->size, 0);
 
-    /* we try to search in empty array */
     uint8_t test_key[] = "test";
     ASSERT_TRUE(binary_hash_array_contains(empty_bha, test_key, sizeof(test_key)) == -1);
 
@@ -140,7 +134,6 @@ void test_binary_hash_array_duplicate_keys()
 
     uint8_t key[] = "duplicate_key";
 
-    /* add the same key twice with different values */
     ASSERT_TRUE(binary_hash_array_add(bha, key, sizeof(key), 42) == 0);
     ASSERT_TRUE(binary_hash_array_add(bha, key, sizeof(key), 84) == 0);
 
@@ -168,11 +161,9 @@ void test_binary_hash_array_resize()
     ASSERT_TRUE(bha != NULL);
     ASSERT_EQ(bha->capacity, 10);
 
-    /* we test manual resize */
     ASSERT_TRUE(binary_hash_array_resize(bha, 20) == 0);
     ASSERT_EQ(bha->capacity, 20);
 
-    /* we test automatic resize by filling beyond capacity */
     for (int i = 0; i < 15; i++)
     {
         char key[32];
@@ -211,7 +202,6 @@ void benchmark_binary_hash_array()
 
     (void)binary_hash_array_free(bha);
 
-    /* we print the size of the serialized sorted binary hash array */
     printf(BOLDWHITE "Sorted binary hash array size: %f MB\n" RESET,
            (float)serialized_size / 1000000);
 

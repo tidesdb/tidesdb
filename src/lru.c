@@ -48,7 +48,7 @@ static lru_entry_t *lru_find_entry(lru_cache_t *cache, const char *key)
 /* move entry to head (most recently used) */
 static void lru_move_to_head(lru_cache_t *cache, lru_entry_t *entry)
 {
-    if (entry == cache->head) return; 
+    if (entry == cache->head) return;
 
     if (entry->prev) entry->prev->next = entry->next;
     if (entry->next) entry->next->prev = entry->prev;
@@ -138,7 +138,6 @@ static void lru_free_entry(lru_cache_t *cache, lru_entry_t *entry)
 
     if (entry->evict_cb) entry->evict_cb(entry->key, entry->value, entry->user_data);
 
-
     free(entry->key);
     free(entry);
 
@@ -182,7 +181,6 @@ int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_ca
     if (cache == NULL || key == NULL) return -1;
 
     pthread_mutex_lock(&cache->lock);
-
 
     lru_entry_t *existing = lru_find_entry(cache, key);
     if (existing != NULL)

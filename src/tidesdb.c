@@ -637,15 +637,22 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     {
         char wal_path[TDB_MAX_PATH_LENGTH];
         get_wal_path(cf, wal_path);
-        block_manager_close(cf->wal);
+        
+        /* evict from cache first (closes the file handle,bm) */
+        if (db->block_manager_cache)
+        {
+            lru_cache_remove(db->block_manager_cache, wal_path);
+        }
+        
+        cf->wal = NULL;
+        
         if (unlink(wal_path) == -1 && errno != ENOENT)
         {
-            /*  might not exist, that's okay */
             cleanup_error = TDB_ERR_IO;
         }
     }
 
-    /* delete sstables - release refs (will free when no iterators using them) */
+    /* delete sstables - evict from cache and delete files */
     for (int i = 0; i < cf->num_sstables; i++)
     {
         if (cf->sstables[i])
@@ -653,9 +660,15 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
             char path[TDB_MAX_PATH_LENGTH];
             get_sstable_path(cf, cf->sstables[i]->id, path);
 
+            /* evict from cache first (closes the file handle) */
+            if (db->block_manager_cache)
+            {
+                lru_cache_remove(db->block_manager_cache, path);
+            }
+
             tidesdb_sstable_free(cf->sstables[i]);
 
-            /* now delete the file */
+            /* now delete the file (handle is closed) */
             if (unlink(path) == -1 && errno != ENOENT)
             {
                 cleanup_error = TDB_ERR_IO;

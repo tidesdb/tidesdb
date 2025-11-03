@@ -690,9 +690,9 @@ TidesDB v1 features automatic background compaction with optional parallel execu
 ```c
 tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 cf_config.enable_background_compaction = 1;          /* Enable background compaction */
-cf_config.background_compaction_interval = 1000000;  /* Check every 1000000 microseconds (1 second) */
-cf_config.max_sstables_before_compaction = 512;      /* Trigger at 512 SSTables (default) */
-cf_config.compaction_threads = 4;                    /* Use 4 threads for parallel compaction */
+cf_config.background_compaction_interval = TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL;  /* Check every 1000000 microseconds (1 second) */
+cf_config.max_sstables_before_compaction = TDB_DEFAULT_MAX_SSTABLES;      /* Trigger at 128 SSTables (default) */
+cf_config.compaction_threads = TDB_DEFAULT_COMPACTION_THREADS;                    /* Use 4 threads for parallel compaction */
 
 tidesdb_create_column_family(db, "my_cf", &cf_config);
 /* Background thread automatically compacts when threshold is reached */

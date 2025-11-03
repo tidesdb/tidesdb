@@ -181,8 +181,8 @@ lru_cache_t *lru_cache_new(size_t capacity)
     return cache;
 }
 
-int lru_cache_put(lru_cache_t *cache, const char *key, void *value,
-                  lru_evict_callback_t evict_cb, void *user_data)
+int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_callback_t evict_cb,
+                  void *user_data)
 {
     if (cache == NULL || key == NULL) return -1;
 
@@ -300,8 +300,7 @@ void lru_cache_clear(lru_cache_t *cache)
         lru_entry_t *next = current->next;
 
         /* call eviction callback if set */
-        if (current->evict_cb)
-            current->evict_cb(current->key, current->value, current->user_data);
+        if (current->evict_cb) current->evict_cb(current->key, current->value, current->user_data);
 
         free(current->key);
         free(current);
@@ -339,7 +338,7 @@ void lru_cache_destroy(lru_cache_t *cache)
     while (current != NULL)
     {
         lru_entry_t *next = current->next;
-        
+
         /* free entry WITHOUT calling eviction callback */
         free(current->key);
         free(current);

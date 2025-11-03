@@ -27,22 +27,22 @@
 #include <sys/stat.h>
 
 #ifdef _WIN32
+#include <direct.h> /* for _rmdir */
 #include <windows.h>
-#include <direct.h>  /* for _rmdir */
 #else
-#include <unistd.h>  /* for rmdir */
+#include <unistd.h> /* for rmdir */
 #endif
 
 /* dirent.h MSVC needs compat.h, MinGW has it natively */
 #if defined(_MSC_VER)
-#include "../src/compat.h"  /* MSVC dirent implementation */
+#include "../src/compat.h" /* MSVC dirent implementation */
 #else
 #include <dirent.h>
 #endif
 
 #include "test_macros.h"
 
-#define TEST_DB_PATH    "./test_tidesdb"
+#define TEST_DB_PATH "./test_tidesdb"
 
 /* ensure assertions work in both Debug and Release builds */
 #undef NDEBUG

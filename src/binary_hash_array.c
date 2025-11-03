@@ -87,7 +87,7 @@ static void merge_entries(binary_hash_array_entry_t *arr, size_t left, size_t mi
 }
 
 static void merge_sort_entries(binary_hash_array_entry_t *arr, size_t left, size_t right,
-                                binary_hash_array_entry_t *temp)
+                               binary_hash_array_entry_t *temp)
 {
     if (left < right)
     {

@@ -32,8 +32,9 @@
 #define BLOCK_MANAGER_VERSION            1
 #define BLOCK_MANAGER_SHA1_DIGEST_LENGTH 20
 #define BLOCK_MANAGER_HEADER_SIZE        12 /* 3 + 1 + 4 + 4 (padding) */
-#define BLOCK_MANAGER_BLOCK_HEADER_SIZE  (sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + sizeof(uint64_t))
-#define MAX_INLINE_BLOCK_SIZE            (32 * 1024) /* 32KB inline, larger blocks use overflow */
+#define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
+    (sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + sizeof(uint64_t))
+#define MAX_INLINE_BLOCK_SIZE (32 * 1024) /* 32KB inline, larger blocks use overflow */
 
 /* sync mode enum for block manager and tidesdb */
 typedef enum

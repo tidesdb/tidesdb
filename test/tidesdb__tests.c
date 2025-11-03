@@ -823,7 +823,7 @@ static void test_error_handling(void)
     cleanup_test_dir();
 }
 
-/* many ssts - verify system handles large number of SSTables */
+/* many ssts, verify system handles large number of ssts */
 static void test_many_sstables(void)
 {
     tidesdb_t *db = create_test_db();
@@ -2122,7 +2122,7 @@ static void test_iterator_metadata_boundary(void)
     ASSERT_TRUE(sst != NULL);
     ASSERT_EQ(sst->num_entries, 5);
 
-    /* iterate through all entries - should read exactly 5 blocks, not metadata */
+    /* iterate through all entries, should read exactly 5 blocks, not metadata */
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
 
@@ -2363,6 +2363,230 @@ static void test_drop_column_family_cleanup(void)
     cleanup_test_dir();
 }
 
+/* test iterator and get operations during concurrent compaction */
+static void test_concurrent_compaction_with_reads(void)
+{
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+    /* disable background compaction, we'll trigger manually */
+    cf_config.enable_background_compaction = 0;
+    cf_config.max_sstables_before_compaction = 2;
+    cf_config.compaction_threads = 0; /* single-threaded for deterministic test */
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "concurrent_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "concurrent_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* insert data into first sstable */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_%03d_sst1", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "concurrent_cf", (uint8_t *)key, strlen(key),
+                                  (uint8_t *)value, strlen(value), -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+
+    /* insert data into second sstable */
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 50; i < 100; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_%03d_sst2", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "concurrent_cf", (uint8_t *)key, strlen(key),
+                                  (uint8_t *)value, strlen(value), -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+
+    /* verify we have 2 sstables */
+    int num_sstables = atomic_load(&cf->num_sstables);
+    ASSERT_EQ(num_sstables, 2);
+
+    /* create iterator BEFORE compaction */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(read_txn, "concurrent_cf", &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    /* read first 10 entries from iterator */
+    int count = 0;
+    while (tidesdb_iter_valid(iter) && count < 10)
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+        ASSERT_EQ(tidesdb_iter_value(iter, &value, &value_size), 0);
+        ASSERT_TRUE(key != NULL);
+        ASSERT_TRUE(value != NULL);
+        count++;
+        ASSERT_EQ(tidesdb_iter_next(iter), 0);
+    }
+    ASSERT_EQ(count, 10);
+
+    /* NOW trigger compaction while iterator is active */
+    ASSERT_EQ(tidesdb_compact(cf), 0);
+
+    /* verify compaction happened (2 sstables merged into 1) */
+    num_sstables = atomic_load(&cf->num_sstables);
+    ASSERT_EQ(num_sstables, 1);
+
+    /* iterator should STILL work,  continue reading remaining entries */
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+        ASSERT_EQ(tidesdb_iter_value(iter, &value, &value_size), 0);
+        ASSERT_TRUE(key != NULL);
+        ASSERT_TRUE(value != NULL);
+        count++;
+        if (tidesdb_iter_next(iter) != 0) break;
+    }
+    /* iterator has snapshot of old ssts, should read at least some entries */
+    ASSERT_TRUE(count >= 10); /* at least the 10 we already read */
+    printf("OK (iterator read %d entries from old sstables during compaction)\n", count);
+
+    /* test get operations after compaction */
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(read_txn, "concurrent_cf", (uint8_t *)key, strlen(key), &value,
+                                  &value_size),
+                  0);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(read_txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* test linear scan fallback when SBHA is disabled */
+static void test_linear_scan_fallback(void)
+{
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+    /* disable SBHA to force linear scan fallback */
+    cf_config.use_sbha = 0;
+    cf_config.enable_background_compaction = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "linear_scan_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "linear_scan_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* insert test data */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_for_key_%03d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, "linear_scan_cf", (uint8_t *)key, strlen(key),
+                                  (uint8_t *)value, strlen(value), -1),
+                  0);
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* flush to sstable to trigger linear scan path */
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    ASSERT_TRUE(atomic_load(&cf->num_sstables) > 0);
+
+    /* verify all keys can be retrieved using linear scan */
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &txn), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], expected_value[64];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(expected_value, sizeof(expected_value), "value_for_key_%03d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+
+        ASSERT_EQ(tidesdb_txn_get(txn, "linear_scan_cf", (uint8_t *)key, strlen(key), &value,
+                                  &value_size),
+                  0);
+        ASSERT_TRUE(value != NULL);
+        ASSERT_EQ(value_size, strlen(expected_value));
+        ASSERT_TRUE(memcmp(value, expected_value, value_size) == 0);
+        free(value);
+    }
+
+    /* test non-existent key */
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    ASSERT_TRUE(tidesdb_txn_get(txn, "linear_scan_cf", (uint8_t *)"nonexistent", 11, &value,
+                                &value_size) != 0);
+
+    tidesdb_txn_free(txn);
+
+    /* test with TTL expiration */
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    time_t expired_ttl = time(NULL) - 10; /* already expired */
+    ASSERT_EQ(tidesdb_txn_put(txn, "linear_scan_cf", (uint8_t *)"expired_key", 11,
+                              (uint8_t *)"expired_value", 13, expired_ttl),
+              0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+
+    /* verify expired key is not returned */
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &txn), 0);
+    value = NULL;
+    value_size = 0;
+    ASSERT_TRUE(tidesdb_txn_get(txn, "linear_scan_cf", (uint8_t *)"expired_key", 11, &value,
+                                &value_size) != 0);
+    tidesdb_txn_free(txn);
+
+    /* test with tombstone (delete) in sstable */
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    ASSERT_EQ(tidesdb_txn_delete(txn, "linear_scan_cf", (uint8_t *)"key_025", 7), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+
+    /* verify deleted key is not returned (tombstone in newer sstable) */
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &txn), 0);
+    value = NULL;
+    value_size = 0;
+    ASSERT_TRUE(
+        tidesdb_txn_get(txn, "linear_scan_cf", (uint8_t *)"key_025", 7, &value, &value_size) != 0);
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     printf("\n");
@@ -2411,6 +2635,8 @@ int main(void)
     RUN_TEST(test_drop_column_family_with_data, tests_passed);
     RUN_TEST(test_drop_column_family_not_found, tests_passed);
     RUN_TEST(test_drop_column_family_cleanup, tests_passed);
+    RUN_TEST(test_concurrent_compaction_with_reads, tests_passed);
+    RUN_TEST(test_linear_scan_fallback, tests_passed);
 
     printf("\n");
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

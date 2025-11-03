@@ -311,6 +311,7 @@ tidesdb_column_family_config_t cf_config = {
     .compress_algo = COMPRESS_LZ4,              /* use LZ4 */
     .bloom_filter_fp_rate = 0.01,               /* 1% false positive rate */
     .enable_background_compaction = 1,          /* enable background compaction */
+    .background_compaction_interval = 1000000,  /* check every 1000000 microseconds (1 second) */
     .use_sbha = 1,                              /* use sorted binary hash array */
     .sync_mode = TDB_SYNC_BACKGROUND,           /* background fsync */
     .sync_interval = 1000,                      /* fsync every 1000ms (1 second) */
@@ -596,6 +597,43 @@ tidesdb_iter_free(iter);
 tidesdb_txn_free(txn);
 ```
 
+**Iterator Compaction Resilience**
+
+TidesDB iterators automatically handle compaction that occurs during iteration:
+
+- **Automatic Snapshot Refresh** - When an iterator detects that compaction has occurred (SSTable count changed), it automatically refreshes its internal snapshot with the new compacted SSTables
+- **Seamless Continuation** - The iterator continues traversing data from the new SSTables without requiring manual intervention
+- **No Blocking** - Compaction doesn't wait for iterators, and iterators don't block compaction
+- **Read Lock Protection** - Each iteration operation holds a read lock, preventing SSTables from being freed during access
+
+```c
+tidesdb_iter_t *iter = NULL;
+tidesdb_iter_new(txn, "my_cf", &iter);
+tidesdb_iter_seek_to_first(iter);
+
+while (tidesdb_iter_valid(iter))
+{
+    /* If compaction occurs here, iterator automatically refreshes */
+    /* and continues reading from the new compacted SSTables */
+    
+    uint8_t *key = NULL, *value = NULL;
+    size_t key_size = 0, value_size = 0;
+    
+    tidesdb_iter_key(iter, &key, &key_size);
+    tidesdb_iter_value(iter, &value, &value_size);
+    
+    /* Process data */
+    
+    free(key);
+    free(value);
+    tidesdb_iter_next(iter);  /* Detects and handles compaction if it occurred */
+}
+
+tidesdb_iter_free(iter);
+```
+
+This design ensures iterators remain valid and functional even during active compaction, providing a robust and concurrent iteration experience.
+
 ### Custom Comparators
 Register custom key comparison functions for specialized sorting.
 
@@ -651,13 +689,20 @@ TidesDB v1 features automatic background compaction with optional parallel execu
 
 ```c
 tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-cf_config.enable_background_compaction = 1;       /* Enable background compaction */
-cf_config.max_sstables_before_compaction = 512;   /* Trigger at 512 SSTables (default) */
-cf_config.compaction_threads = 4;                 /* Use 4 threads for parallel compaction */
+cf_config.enable_background_compaction = 1;          /* Enable background compaction */
+cf_config.background_compaction_interval = 1000000;  /* Check every 1000000 microseconds (1 second) */
+cf_config.max_sstables_before_compaction = 512;      /* Trigger at 512 SSTables (default) */
+cf_config.compaction_threads = 4;                    /* Use 4 threads for parallel compaction */
 
 tidesdb_create_column_family(db, "my_cf", &cf_config);
 /* Background thread automatically compacts when threshold is reached */
 ```
+
+**Configuration Options**
+- `enable_background_compaction` - Enable/disable automatic background compaction (default: enabled)
+- `background_compaction_interval` - Interval in microseconds between compaction checks (default: 1000000 = 1 second)
+- `max_sstables_before_compaction` - SSTable count threshold to trigger compaction (default: 512, minimum: 2)
+- `compaction_threads` - Number of threads for parallel compaction (default: 4, set to 0 for single-threaded)
 
 **Parallel Compaction**
 - Set `compaction_threads > 0` to enable parallel compaction

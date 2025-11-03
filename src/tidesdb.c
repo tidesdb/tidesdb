@@ -159,8 +159,9 @@ static int mkdir_p(const char *path)
 /* internal helper to get column family directory path */
 static void get_cf_path(const tidesdb_t *db, const char *cf_name, char *path)
 {
-    /* TDB_MAX_PATH_LENGTH (1024) is sufficient for db_path + "/" + cf_name */
-    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s/%s", db->config.db_path, cf_name);
+    /* TDB_MAX_PATH_LENGTH (1024) is sufficient for db_path + PATH_SEPARATOR + cf_name */
+    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", db->config.db_path,
+                   cf_name);
 }
 
 /* internal helper to get wal path */
@@ -168,7 +169,7 @@ static void get_wal_path(const tidesdb_column_family_t *cf, char *path)
 {
     char cf_path[TDB_MAX_PATH_LENGTH];
     get_cf_path(cf->db, cf->name, cf_path);
-    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s/wal%s", cf_path, TDB_WAL_EXT);
+    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "wal%s", cf_path, TDB_WAL_EXT);
 }
 
 /* internal helper to get sstable path */
@@ -176,7 +177,7 @@ static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable
 {
     char cf_path[TDB_MAX_PATH_LENGTH];
     get_cf_path(cf->db, cf->name, cf_path);
-    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s/sstable_%llu%s", cf_path,
+    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "sstable_%llu%s", cf_path,
                    (unsigned long long)sstable_id, TDB_SSTABLE_EXT);
 }
 
@@ -288,8 +289,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             if (strstr(entry->d_name, TDB_TEMP_EXT) != NULL)
             {
                 char temp_file_path[TDB_MAX_PATH_LENGTH];
-                (void)snprintf(temp_file_path, TDB_MAX_PATH_LENGTH, "%s/%s", config->db_path,
-                               entry->d_name);
+                (void)snprintf(temp_file_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s",
+                               config->db_path, entry->d_name);
                 TDB_DEBUG_LOG("Cleaning up incomplete temp file: %s", temp_file_path);
                 unlink(temp_file_path);
             }
@@ -310,8 +311,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 #ifdef _WIN32
             /* on windows, check if it's a directory using stat */
             char entry_path[TDB_MAX_PATH_LENGTH];
-            (void)snprintf(entry_path, TDB_MAX_PATH_LENGTH, "%s/%s", config->db_path,
-                           entry->d_name);
+            (void)snprintf(entry_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s",
+                           config->db_path, entry->d_name);
             struct stat st;
             if (stat(entry_path, &st) == 0 && S_ISDIR(st.st_mode))
 #else
@@ -415,7 +416,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         {
             TDB_DEBUG_LOG("Column family %s already exists", name);
             pthread_rwlock_unlock(&db->db_lock);
-            return 0; /* already exists */
+            return 0;
         }
     }
 
@@ -647,6 +648,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     }
 
     tidesdb_column_family_t *cf = db->column_families[found];
+    int cleanup_error = 0; /* Track errors but continue cleanup */
 
     /* stop background compaction thread if running */
     if (cf->config.enable_background_compaction)
@@ -654,14 +656,22 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         atomic_store(&cf->compaction_stop, 1);
         if (pthread_join(cf->compaction_thread, NULL) != 0)
         {
-            return TDB_ERR_THREAD;
+            cleanup_error = TDB_ERR_THREAD;
+            /* continue with cleanup anyway */
         }
     }
 
-    /* close and delete WAL */
+    /* close and DELETE WAL file */
     if (cf->wal)
     {
+        char wal_path[TDB_MAX_PATH_LENGTH];
+        get_wal_path(cf, wal_path);
         block_manager_close(cf->wal);
+        if (unlink(wal_path) == -1 && errno != ENOENT)
+        {
+            /*  might not exist, that's okay */
+            cleanup_error = TDB_ERR_IO;
+        }
     }
 
     /* delete sstables */
@@ -671,11 +681,25 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         {
             char path[TDB_MAX_PATH_LENGTH];
             get_sstable_path(cf, cf->sstables[i]->id, path);
-            unlink(path);
+            if (unlink(path) == -1 && errno != ENOENT)
+            {
+                cleanup_error = TDB_ERR_IO;
+            }
             tidesdb_sstable_free(cf->sstables[i]);
         }
     }
     free(cf->sstables);
+
+    /* delete column family config file (.cfc) */
+    char config_path[TDB_MAX_PATH_LENGTH];
+    char cf_path[TDB_MAX_PATH_LENGTH];
+    get_cf_path(db, name, cf_path);
+    snprintf(config_path, sizeof(config_path), "%s" PATH_SEPARATOR "%s%s", cf_path, name,
+             TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
+    if (unlink(config_path) == -1 && errno != ENOENT)
+    {
+        cleanup_error = TDB_ERR_IO;
+    }
 
     /* free memtable */
     if (cf->memtable)
@@ -683,12 +707,13 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         skip_list_free(cf->memtable);
     }
 
-    /* delete directory */
-    char cf_path[TDB_MAX_PATH_LENGTH];
-    get_cf_path(db, name, cf_path);
+    /* delete directory (should now be empty) */
     if (rmdir(cf_path) == -1)
     {
-        return TDB_ERR_IO;
+        if (errno != ENOENT) /* dir might already be gone */
+        {
+            cleanup_error = TDB_ERR_IO;
+        }
     }
 
     pthread_rwlock_destroy(&cf->cf_lock);
@@ -704,7 +729,9 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     db->num_cfs--;
 
     pthread_rwlock_unlock(&db->db_lock);
-    return 0;
+
+    /* return any error that occurred during cleanup */
+    return cleanup_error;
 }
 
 tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *name)
@@ -2308,7 +2335,7 @@ int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn)
     (*txn)->num_ops = 0;
     (*txn)->op_capacity = 0;
     (*txn)->committed = 0;
-    (*txn)->snapshot_version = 0; /* will be set on first read */
+    (*txn)->snapshot_version = 0;
     (*txn)->read_only = 0;
 
     return 0;
@@ -2551,7 +2578,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 pthread_rwlock_unlock(&cf->cf_lock);
                 return -1;
             }
-            /* now mark it as deleted */
             if (skip_list_delete(cf->memtable, op->key, op->key_size) != 0)
             {
                 /* if delete fails, the put succeeded so we have a valid entry continue */
@@ -2560,7 +2586,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         pthread_rwlock_unlock(&cf->cf_lock);
 
-        /* check if flush is needed */
         tidesdb_check_and_flush(cf);
     }
 

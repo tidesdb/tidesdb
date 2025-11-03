@@ -245,7 +245,6 @@ void test_skip_list_cursor_prev()
 
 void benchmark_skip_list()
 {
-    /* random key-value pairs */
     skip_list_t *list = NULL;
     if (skip_list_new(&list, 12, 0.24f) == -1)
     {
@@ -255,7 +254,6 @@ void benchmark_skip_list()
     const size_t key_size = 16;
     const size_t value_size = 8;
 
-    /* allocate memory for keys and values */
     uint8_t **keys = malloc(BENCH_N * sizeof(uint8_t *));
     uint8_t **values = malloc(BENCH_N * sizeof(uint8_t *));
     if (keys == NULL || values == NULL)
@@ -282,13 +280,11 @@ void benchmark_skip_list()
         }
     }
 
-    /* generate random key-value pairs */
     for (size_t i = 0; i < BENCH_N; i++)
     {
         generate_random_key_value(keys[i], key_size, values[i], value_size);
     }
 
-    /* benchmark writing */
     clock_t start_write = clock();
     for (size_t i = 0; i < BENCH_N; i++)
     {
@@ -298,7 +294,6 @@ void benchmark_skip_list()
     double write_time = (double)(end_write - start_write) / CLOCKS_PER_SEC;
     printf(CYAN "Time taken to write %d entries: %f seconds\n" RESET, BENCH_N, write_time);
 
-    /* benchmark reading and verifying */
     clock_t start_read = clock();
     for (size_t i = 0; i < BENCH_N; i++)
     {
@@ -316,7 +311,6 @@ void benchmark_skip_list()
     double read_time = (double)(end_read - start_read) / CLOCKS_PER_SEC;
     printf(CYAN "Time taken to read and verify %d entries: %f seconds\n" RESET, BENCH_N, read_time);
 
-    /* free allocated memory */
     for (size_t i = 0; i < BENCH_N; i++)
     {
         free(keys[i]);
@@ -338,7 +332,7 @@ void test_skip_list_ttl()
     }
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
-    time_t ttl = 1; /* 1 second */
+    time_t ttl = 1;
 
     ASSERT_TRUE(skip_list_put(list, key, sizeof(key), value, sizeof(value), time(NULL) + ttl) == 0);
 
@@ -355,7 +349,6 @@ void test_skip_list_ttl()
     int result =
         skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size, &deleted);
 
-    /* check if the value is a tombstone */
     ASSERT_EQ(result, 0);
     ASSERT_EQ(deleted, 1);
 
@@ -366,7 +359,6 @@ void test_skip_list_ttl()
 
 void test_skip_list_cursor_functions()
 {
-    /* create a new skip list */
     skip_list_t *list = NULL;
     if (skip_list_new(&list, 12, 0.24f) == -1)
     {
@@ -375,11 +367,9 @@ void test_skip_list_cursor_functions()
     }
     ASSERT_TRUE(list != NULL);
 
-    /* initialize cursor */
     skip_list_cursor_t *cursor = skip_list_cursor_init(list);
     ASSERT_TRUE(cursor != NULL);
 
-    /* test cursor on empty list */
     ASSERT_TRUE(skip_list_cursor_has_next(cursor) == -1);
     ASSERT_TRUE(skip_list_cursor_has_prev(cursor) == -1);
     ASSERT_TRUE(skip_list_cursor_goto_first(cursor) == -1);
@@ -387,7 +377,6 @@ void test_skip_list_cursor_functions()
 
     (void)skip_list_cursor_free(cursor);
 
-    /* add entries */
     uint8_t key1[] = {1};
     uint8_t value1[] = {10};
     ASSERT_TRUE(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
@@ -400,11 +389,9 @@ void test_skip_list_cursor_functions()
     uint8_t value3[] = {30};
     ASSERT_TRUE(skip_list_put(list, key3, sizeof(key3), value3, sizeof(value3), -1) == 0);
 
-    /* reinitialize cursor */
     cursor = skip_list_cursor_init(list);
     ASSERT_TRUE(cursor != NULL);
 
-    /* test cursor functionality */
     ASSERT_TRUE(skip_list_cursor_goto_first(cursor) == 0);
     ASSERT_TRUE(skip_list_cursor_has_next(cursor) == 1);
     ASSERT_TRUE(skip_list_cursor_has_prev(cursor) == 0);
@@ -416,7 +403,6 @@ void test_skip_list_cursor_functions()
     time_t ttl;
     uint8_t deleted;
 
-    /* check first entry */
     ASSERT_TRUE(
         skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted) == 0);
     ASSERT_EQ(key_size, sizeof(key1));
@@ -432,7 +418,6 @@ void test_skip_list_cursor_functions()
     ASSERT_TRUE(skip_list_cursor_has_next(cursor) == 0);
     ASSERT_TRUE(skip_list_cursor_has_prev(cursor) == 1);
 
-    /* check last entry */
     ASSERT_TRUE(skip_list_cursor_goto_last(cursor) == 0);
     ASSERT_TRUE(skip_list_cursor_has_next(cursor) == 0);
     ASSERT_TRUE(skip_list_cursor_has_prev(cursor) == 1);
@@ -444,14 +429,12 @@ void test_skip_list_cursor_functions()
     ASSERT_EQ(value_size, sizeof(value3));
     ASSERT_EQ(memcmp(value, value3, value_size), 0);
 
-    /* clean upp */
     (void)skip_list_cursor_free(cursor);
     ASSERT_TRUE(skip_list_free(list) == 0);
 }
 
 void test_skip_list_min_max_key()
 {
-    /* create a new skip list */
     skip_list_t *list = NULL;
     if (skip_list_new(&list, 12, 0.24f) == -1)
     {
@@ -460,7 +443,6 @@ void test_skip_list_min_max_key()
     }
     ASSERT_TRUE(list != NULL);
 
-    /* test on empty list */
     uint8_t *min_key = NULL;
     size_t min_key_size;
     uint8_t *max_key = NULL;
@@ -469,7 +451,6 @@ void test_skip_list_min_max_key()
     ASSERT_TRUE(skip_list_get_min_key(list, &min_key, &min_key_size) == -1);
     ASSERT_TRUE(skip_list_get_max_key(list, &max_key, &max_key_size) == -1);
 
-    /* add entries in non-sequential order to test sorting */
     uint8_t key2[] = {2};
     uint8_t value2[] = {20};
     ASSERT_TRUE(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
@@ -482,49 +463,42 @@ void test_skip_list_min_max_key()
     uint8_t value3[] = {30};
     ASSERT_TRUE(skip_list_put(list, key3, sizeof(key3), value3, sizeof(value3), -1) == 0);
 
-    /* test min key */
     ASSERT_TRUE(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);
     ASSERT_TRUE(min_key != NULL);
     ASSERT_EQ(min_key_size, sizeof(key1));
     ASSERT_EQ(memcmp(min_key, key1, min_key_size), 0);
     free(min_key);
 
-    /* test max key */
     ASSERT_TRUE(skip_list_get_max_key(list, &max_key, &max_key_size) == 0);
     ASSERT_TRUE(max_key != NULL);
     ASSERT_EQ(max_key_size, sizeof(key3));
     ASSERT_EQ(memcmp(max_key, key3, max_key_size), 0);
     free(max_key);
 
-    /* test with TTL */
     uint8_t key0[] = {0};
     uint8_t value0[] = {5};
-    time_t ttl = 1; /* 1 second */
+    time_t ttl = 1;
     ASSERT_TRUE(skip_list_put(list, key0, sizeof(key0), value0, sizeof(value0), time(NULL) + ttl) ==
                 0);
 
-    /* verify key0 is now the min key */
     ASSERT_TRUE(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);
     ASSERT_TRUE(min_key != NULL);
     ASSERT_EQ(min_key_size, sizeof(key0));
     ASSERT_EQ(memcmp(min_key, key0, min_key_size), 0);
     free(min_key);
 
-    /* wait for TTL to expire */
 #ifdef _WIN32
     Sleep((ttl + 1) * 1000);
 #else
     sleep(ttl + 1);
 #endif
 
-    /* should still be able to get min key (now key1 again) after key0 expired */
     ASSERT_TRUE(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);
     ASSERT_TRUE(min_key != NULL);
     ASSERT_EQ(min_key_size, sizeof(key1));
     ASSERT_EQ(memcmp(min_key, key1, min_key_size), 0);
     free(min_key);
 
-    /* clean up */
     ASSERT_TRUE(skip_list_free(list) == 0);
     printf(GREEN "test_skip_list_min_max_key passed\n" RESET);
 }

@@ -48,7 +48,6 @@ static void free_evict_callback(const char *key, void *value, void *user_data)
     if (value) free(value);
 }
 
-/* test basic cache creation and destruction */
 static void test_lru_cache_new_free(void)
 {
     lru_cache_t *cache = lru_cache_new(10);
@@ -58,7 +57,6 @@ static void test_lru_cache_new_free(void)
     lru_cache_free(cache);
 }
 
-/* test basic put and get operations */
 static void test_lru_cache_put_get(void)
 {
     lru_cache_t *cache = lru_cache_new(5);
@@ -86,14 +84,12 @@ static void test_lru_cache_put_get(void)
     ASSERT_TRUE(retrieved3 != NULL);
     ASSERT_EQ(*retrieved3, 300);
 
-    /* test non-existent key */
     void *not_found = lru_cache_get(cache, "nonexistent");
     ASSERT_TRUE(not_found == NULL);
 
     lru_cache_free(cache);
 }
 
-/* test LRU eviction policy */
 static void test_lru_cache_eviction(void)
 {
     eviction_count = 0;
@@ -129,7 +125,6 @@ static void test_lru_cache_eviction(void)
     lru_cache_free(cache);
 }
 
-/* test that get() updates LRU order */
 static void test_lru_cache_get_updates_order(void)
 {
     eviction_count = 0;
@@ -159,7 +154,6 @@ static void test_lru_cache_get_updates_order(void)
     lru_cache_free(cache);
 }
 
-/* test updating existing key */
 static void test_lru_cache_update(void)
 {
     lru_cache_t *cache = lru_cache_new(5);
@@ -186,7 +180,6 @@ static void test_lru_cache_update(void)
     lru_cache_free(cache);
 }
 
-/* test remove operation */
 static void test_lru_cache_remove(void)
 {
     eviction_count = 0;
@@ -220,7 +213,6 @@ static void test_lru_cache_remove(void)
     lru_cache_free(cache);
 }
 
-/* test clear operation */
 static void test_lru_cache_clear(void)
 {
     eviction_count = 0;
@@ -249,7 +241,6 @@ static void test_lru_cache_clear(void)
     lru_cache_free(cache);
 }
 
-/* test with allocated memory and free callback */
 static void test_lru_cache_with_malloc(void)
 {
     lru_cache_t *cache = lru_cache_new(3);
@@ -364,7 +355,6 @@ static void test_lru_cache_concurrent(void)
 #undef OPS_PER_THREAD
 }
 
-/* test edge cases */
 static void test_lru_cache_edge_cases(void)
 {
     /* capacity of 1 */
@@ -395,7 +385,6 @@ static void test_lru_cache_edge_cases(void)
     lru_cache_free(cache2);
 }
 
-/* test foreach functionality */
 static int foreach_callback(const char *key, void *value, void *user_data)
 {
     int *count = (int *)user_data;
@@ -426,19 +415,16 @@ static void test_lru_cache_foreach(void)
     ASSERT_EQ(lru_cache_put(cache, "key2", &v2, NULL, NULL), 0);
     ASSERT_EQ(lru_cache_put(cache, "key3", &v3, NULL, NULL), 0);
 
-    /* test full iteration */
     int count = 0;
     size_t visited = lru_cache_foreach(cache, foreach_callback, &count);
     ASSERT_EQ(visited, 3);
     ASSERT_EQ(count, 3);
 
-    /* test early stop */
     count = 0;
     visited = lru_cache_foreach(cache, foreach_stop_callback, &count);
     ASSERT_EQ(visited, 2);
     ASSERT_EQ(count, 2);
 
-    /* test with NULL callback */
     visited = lru_cache_foreach(cache, NULL, NULL);
     ASSERT_EQ(visited, 0);
 

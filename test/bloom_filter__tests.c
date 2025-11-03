@@ -84,18 +84,15 @@ void test_bloom_filter_serialize_deserialize()
     bloom_filter_t *deserialized_bf = bloom_filter_deserialize(serialized_data);
     ASSERT_TRUE(deserialized_bf != NULL);
 
-    /* we verify same properties */
     ASSERT_EQ(deserialized_bf->m, bf->m);
     ASSERT_EQ(deserialized_bf->h, bf->h);
 
-    /* we verify contains the same keys */
     for (int i = 0; i < 5; i++)
     {
         ASSERT_EQ(bloom_filter_contains(deserialized_bf, (const uint8_t *)keys[i], strlen(keys[i])),
                   1);
     }
 
-    /* we check a key that should not be present */
     ASSERT_EQ(bloom_filter_contains(deserialized_bf, (const uint8_t *)"nonexistent", 10), 0);
 
     free(serialized_data);
@@ -107,12 +104,11 @@ void test_bloom_filter_serialize_deserialize()
 
 void test_false_positive_rate()
 {
-    double p = 0.01; /** false positive rate of 1% */
+    double p = 0.01;
     int n = 10000;
     bloom_filter_t *bf;
     (void)bloom_filter_new(&bf, p, n);
 
-    /* we write n elements */
     for (int i = 0; i < n; i++)
     {
         char key[20];

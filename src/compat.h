@@ -27,6 +27,12 @@
 #include <string.h>
 
 #ifdef _WIN32
+#define PATH_SEPARATOR "\\"
+#else
+#define PATH_SEPARATOR "/"
+#endif
+
+#ifdef _WIN32
 #include <direct.h>
 #include <fcntl.h>
 #include <io.h>
@@ -35,7 +41,7 @@
 
 /* mingw provides most POSIX compatibility, so only apply msvc-specific fixes */
 #if defined(_MSC_VER)
-#pragma warning(disable : 4996) /* disable deprecated warning for Windows */
+#pragma warning(disable : 4996) /* disable deprecated warning for windows */
 #pragma warning(disable : 4029) /* declared formal parameter list different from definition */
 #pragma warning(disable : 4211) /* nonstandard extension used: redefined extern to static */
 #endif
@@ -55,7 +61,6 @@
 #endif
 
 #if defined(_MSC_VER)
-/* CRITICAL: Define missing POSIX types */
 #ifndef _OFF_T_DEFINED
 #define _OFF_T_DEFINED
 typedef __int64 off_t;
@@ -71,41 +76,32 @@ typedef __int64 ssize_t;
 typedef int mode_t;
 #endif
 
-/* CRITICAL FIX: Windows file operations MUST use binary mode and 64-bit support */
-/* Use _chsize_s for 64-bit file size support instead of _chsize (32-bit only) */
 static inline int ftruncate(int fd, off_t length)
 {
     return _chsize_s(fd, length);
 }
 
-/* CRITICAL: Wrap open() to always use O_BINARY on Windows */
 static inline int _tidesdb_open_wrapper_3(const char *path, int flags, mode_t mode)
 {
-    /* Always add O_BINARY for binary file safety on Windows */
     return _open(path, flags | _O_BINARY, mode);
 }
 static inline int _tidesdb_open_wrapper_2(const char *path, int flags)
 {
-    /* Always add O_BINARY for binary file safety on Windows */
     return _open(path, flags | _O_BINARY, 0);
 }
 #define open(...) _tidesdb_open_wrapper_3(__VA_ARGS__)
 
 /* C11 atomics support */
 #if defined(__MINGW32__) || defined(__GNUC__)
-/* MinGW and GCC have proper C11 stdatomic.h support */
+/* mingw and GCC have proper C11 stdatomic.h support */
 #include <stdatomic.h>
 #elif _MSC_VER < 1930
 /* MSVC < 2022 doesn't have stdatomic.h - use Windows Interlocked functions */
-/* Use volatile to prevent compiler reordering */
 typedef volatile LONG atomic_int;
 typedef volatile LONGLONG atomic_size_t;
 typedef volatile LONGLONG atomic_uint64_t;
 #define _Atomic(T) volatile T
 
-/* CRITICAL FIX: Atomic operations MUST use Windows Interlocked functions */
-
-/* Atomic store - MUST be truly atomic */
 #ifdef _WIN64
 /* 64-bit atomic store */
 #define atomic_store_explicit(ptr, val, order)                                             \
@@ -129,7 +125,6 @@ typedef volatile LONGLONG atomic_uint64_t;
         }                                                                                  \
     } while (0)
 #else
-/* 32-bit atomic store */
 #define atomic_store_explicit(ptr, val, order)                                            \
     do                                                                                    \
     {                                                                                     \
@@ -148,7 +143,6 @@ typedef volatile LONGLONG atomic_uint64_t;
     } while (0)
 #endif
 
-/* Atomic load - MUST be truly atomic */
 static inline void *_atomic_load_ptr(volatile void *const *ptr)
 {
     return (void *)InterlockedCompareExchangePointer((PVOID volatile *)ptr, NULL, NULL);
@@ -230,7 +224,6 @@ static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
 #endif
 #endif
 
-/* fcntl.h flags for Windows - use _O_* equivalents */
 #ifndef O_RDWR
 #define O_RDWR _O_RDWR
 #endif
@@ -252,7 +245,6 @@ static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
 #endif
 
 #if defined(_MSC_VER)
-/* clock_gettime support for MSVC */
 #define CLOCK_REALTIME 0
 
 struct timezone
@@ -273,8 +265,6 @@ typedef struct
     struct dirent dirent;
 } DIR;
 
-/* https://github.com/tidesdb/tidesdb/issues/241#:~:text=if%20(mkdir(directory)%20%3D%3D%20%2D1)%20//%20%2C%200777%20and%20if%20(mkdir(cf_path)%20%3D%3D%20%2D1)%20//%20%2C%200777%20i%20get%20the%20following%3A
- */
 static inline int mkdir(const char *path, mode_t mode)
 {
     (void)mode; /* unused on Windows */
@@ -332,7 +322,6 @@ static inline int closedir(DIR *dir)
     return 0;
 }
 
-/* semaphore functions for MSVC */
 typedef struct
 {
     HANDLE handle;
@@ -340,7 +329,7 @@ typedef struct
 
 static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
 {
-    (void)pshared; /* unused on Windows */
+    (void)pshared;
     sem->handle = CreateSemaphore(NULL, value, LONG_MAX, NULL);
     if (sem->handle == NULL)
     {
@@ -440,8 +429,6 @@ static inline int gettimeofday(struct timeval *tp, struct timezone *tzp)
 }
 
 /* pread/pwrite for MSVC using OVERLAPPED
- * Key insight: OVERLAPPED offset works even for synchronous I/O!
- * No FILE_FLAG_OVERLAPPED needed - the offset is always respected.
  */
 static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
@@ -465,13 +452,12 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     li.QuadPart = offset;
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
-    overlapped.hEvent = NULL; /* Must be NULL for synchronous files */
+    overlapped.hEvent = NULL;
 
     DWORD bytes_read = 0;
     if (!ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped))
     {
         DWORD err = GetLastError();
-        /* For synchronous files, ERROR_IO_PENDING shouldn't happen, but check anyway */
         if (err != ERROR_IO_PENDING)
         {
             errno = err;
@@ -504,13 +490,13 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     li.QuadPart = offset;
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
-    overlapped.hEvent = NULL; /* Must be NULL for synchronous files */
+    overlapped.hEvent = NULL;
 
     DWORD bytes_written = 0;
     if (!WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped))
     {
         DWORD err = GetLastError();
-        /* For synchronous files, ERROR_IO_PENDING shouldn't happen, but check anyway */
+
         if (err != ERROR_IO_PENDING)
         {
             errno = err;

@@ -25,14 +25,14 @@ int binary_hash_array_compare(const void *a, const void *b)
     {
         if (!b)
         {
-            return 0; /* both are NULL */
+            return 0;
         }
-        return -1; /* a is NULL */
+        return -1;
     }
 
     if (!b)
     {
-        return 1; /* b is NULL */
+        return 1;
     }
 
     binary_hash_array_entry_t *ae = (binary_hash_array_entry_t *)a;
@@ -247,13 +247,11 @@ int64_t binary_hash_array_contains(binary_hash_array_t *bha, uint8_t *key, size_
 
         if (cmp_result < 0)
         {
-            /* target is smaller, search in the left half */
-            if (mid == 0) break; /* must prevent underflow */
+            if (mid == 0) break;
             high = mid - 1;
         }
         else
         {
-            /* target is larger, search in the right half */
             low = mid + 1;
         }
     }

@@ -26,6 +26,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "../src/compat.h" /* for PATH_SEPARATOR and platform compatibility */
+
 #ifdef _WIN32
 #include <direct.h> /* for _rmdir */
 #include <windows.h>
@@ -33,10 +35,8 @@
 #include <unistd.h> /* for rmdir */
 #endif
 
-/* dirent.h MSVC needs compat.h, MinGW has it natively */
-#if defined(_MSC_VER)
-#include "../src/compat.h" /* MSVC dirent implementation */
-#else
+/* dirent.h - MinGW has it natively, MSVC uses compat.h implementation */
+#if !defined(_MSC_VER)
 #include <dirent.h>
 #endif
 

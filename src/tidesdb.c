@@ -2853,14 +2853,13 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
     {
         if (iter->sstable_cursors[i])
         {
-            /* position at last KV block, not absolute last block (which would be metadata) */
+            /* position AFTER last KV block so prev() will read the last block */
             tidesdb_sstable_t *sst = iter->sstables[i];
             if (sst && sst->num_entries > 0)
             {
-                /* goto the block at position num_entries 1 (0-indexed) */
-                block_manager_cursor_goto(iter->sstable_cursors[i],
-                                          (uint64_t)(sst->num_entries - 1));
-                iter->sstable_blocks_read[i] = sst->num_entries - 1;
+                /* goto one past the last block */
+                block_manager_cursor_goto(iter->sstable_cursors[i], (uint64_t)(sst->num_entries));
+                iter->sstable_blocks_read[i] = sst->num_entries;
             }
             else
             {
@@ -2869,6 +2868,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
         }
     }
 
+    /* Now call prev() to position at the actual last item */
     return tidesdb_iter_prev(iter);
 }
 
@@ -3171,9 +3171,11 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         }
     }
 
-    if (iter->memtable_cursor && skip_list_cursor_has_prev(iter->memtable_cursor))
+    if (iter->memtable_cursor)
     {
-        if (skip_list_cursor_prev(iter->memtable_cursor) == 0)
+        /* check if we have a valid current position to read */
+        if (iter->memtable_cursor->current != NULL &&
+            iter->memtable_cursor->current != iter->memtable_cursor->list->header)
         {
             uint8_t *k = NULL, *v = NULL;
             size_t k_size = 0, v_size = 0;
@@ -3183,20 +3185,31 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
             if (skip_list_cursor_get(iter->memtable_cursor, &k, &k_size, &v, &v_size, &ttl,
                                      &deleted) == 0)
             {
-                max_key = malloc(k_size);
-                if (max_key)
+                int is_expired = (ttl > 0 && time(NULL) > ttl);
+                if (!is_expired)
                 {
-                    memcpy(max_key, k, k_size);
-                    max_key_size = k_size;
-                    max_value = malloc(v_size);
-                    if (max_value)
+                    max_key = malloc(k_size);
+                    if (max_key)
                     {
-                        memcpy(max_value, v, v_size);
-                        max_value_size = v_size;
-                        max_deleted = deleted;
+                        memcpy(max_key, k, k_size);
+                        max_key_size = k_size;
+                        max_value = malloc(v_size);
+                        if (max_value)
+                        {
+                            memcpy(max_value, v, v_size);
+                            max_value_size = v_size;
+                            max_deleted = deleted;
+                        }
                     }
                 }
             }
+        }
+
+        /* move backward for next iteration (may fail if at beginning) */
+        if (skip_list_cursor_prev(iter->memtable_cursor) != 0)
+        {
+            /* no more items, set cursor to NULL so we don't read again */
+            iter->memtable_cursor->current = NULL;
         }
     }
 

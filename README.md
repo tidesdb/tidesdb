@@ -39,6 +39,14 @@ Using cmake to build the shared library.
 rm -rf build && cmake -S . -B build
 cmake --build build
 cmake --install build
+
+# Production build
+rm -rf build && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIDESDB_WITH_SANITIZER=OFF -DTIDESDB_BUILD_TESTS=OFF
+cmake --build build --config Release
+sudo cmake --install build
+
+# On linux run ldconfig to update the shared library cache
+ldconfig
 ```
 
 ### Windows

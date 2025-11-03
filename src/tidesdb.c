@@ -672,13 +672,6 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         {
             char path[TDB_MAX_PATH_LENGTH];
             get_sstable_path(cf, cf->sstables[i]->id, path);
-            
-            /* remove block manager from cache before deleting file */
-            if (cf->db->block_manager_cache)
-            {
-                lru_cache_remove(cf->db->block_manager_cache, path);
-            }
-            
             unlink(path);
             tidesdb_sstable_free(cf->sstables[i]);
         }
@@ -1362,13 +1355,6 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         get_sstable_path(cf, sst1->id, path1);
         get_sstable_path(cf, sst2->id, path2);
         
-        /* remove block managers from cache before deleting files */
-        if (cf->db->block_manager_cache)
-        {
-            lru_cache_remove(cf->db->block_manager_cache, path1);
-            lru_cache_remove(cf->db->block_manager_cache, path2);
-        }
-        
         unlink(path1);
         unlink(path2);
 
@@ -1773,13 +1759,6 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
             char path2[TDB_MAX_PATH_LENGTH];
             get_sstable_path(cf, sst1->id, path1);
             get_sstable_path(cf, sst2->id, path2);
-
-            /* remove block managers from cache before deleting files */
-            if (cf->db->block_manager_cache)
-            {
-                lru_cache_remove(cf->db->block_manager_cache, path1);
-                lru_cache_remove(cf->db->block_manager_cache, path2);
-            }
 
             tidesdb_sstable_free(sst1);
             tidesdb_sstable_free(sst2);

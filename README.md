@@ -32,6 +32,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Sorted Binary Hash Array (SBHA)** - Fast SSTable lookups. Direct key-to-block offset mapping without full SSTable scans.
 - [x] **Tombstones** - Efficient deletion through tombstone markers. Removed during compaction.
 - [x] **Streamlined Serialization** - Compact binary format with versioning and bit-packed flags.
+- [x] **LRU File Handle Cache** - Configurable LRU cache for open file handles. Limits system resources while maintaining performance. Set `max_open_file_handles` to control cache size (0 = disabled).
 
 ## Building
 Using cmake to build the shared library.
@@ -83,16 +84,20 @@ Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
 # Configure with MSVC
 cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
 
-# Build
-cmake --build build
+# Build (Debug or Release)
+cmake --build build --config Debug
+# or
+cmake --build build --config Release
 
 # Run tests
 cd build
 ctest -C Debug --verbose
+# or
+ctest -C Release --verbose
 
 ```
 
-**Note** MSVC requires Visual Studio 2019 16.8 or later for C11 atomics support (`/experimental:c11atomics`).
+**Note** MSVC requires Visual Studio 2019 16.8 or later for C11 atomics support (`/experimental:c11atomics`). Both Debug and Release builds are fully supported.
 
 ## Requirements
 You need cmake and a C compiler.

@@ -32,10 +32,12 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Sorted Binary Hash Array (SBHA)** - Fast SSTable lookups. Direct key-to-block offset mapping without full SSTable scans.
 - [x] **Tombstones** - Efficient deletion through tombstone markers. Removed during compaction.
 - [x] **Streamlined Serialization** - Compact binary format with versioning and bit-packed flags.
+- [x] **LRU File Handle Cache** - Configurable LRU cache for open file handles. Limits system resources while maintaining performance. Set `max_open_file_handles` to control cache size (0 = disabled).
 
 ## Building
 Using cmake to build the shared library.
-### Unix
+
+### Unix (Linux/macOS)
 ```bash
 rm -rf build && cmake -S . -B build
 cmake --build build
@@ -43,11 +45,59 @@ cmake --install build
 ```
 
 ### Windows
-```bash
-rmdir /s /q build && cmake -S . -B build
+
+#### Option 1 MinGW-w64 (Recommended for Windows)
+MinGW-w64 provides a GCC-based toolchain with better C11 support and POSIX compatibility.
+
+**Prerequisites**
+- Install [MinGW-w64](https://www.mingw-w64.org/)
+- Install [CMake](https://cmake.org/download/)
+- Install [vcpkg](https://vcpkg.io/en/getting-started.html) for dependencies
+
+**Build Steps**
+```powershell
+# Clean previous build
+Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+
+# Configure with MinGW
+cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=gcc -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+
+# Build
 cmake --build build
-cmake --install build
+
+# Run tests
+cd build
+ctest --verbose  # or use --output-on-failure to only show failures
 ```
+
+#### Option 2 MSVC (Visual Studio)
+**Prerequisites**
+- Install [Visual Studio 2019 or later](https://visualstudio.microsoft.com/) with C++ development tools
+- Install [CMake](https://cmake.org/download/)
+- Install [vcpkg](https://vcpkg.io/en/getting-started.html) for dependencies
+
+**Build Steps**
+```powershell
+# Clean previous build
+Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+
+# Configure with MSVC
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+
+# Build (Debug or Release)
+cmake --build build --config Debug
+# or
+cmake --build build --config Release
+
+# Run tests
+cd build
+ctest -C Debug --verbose
+# or
+ctest -C Release --verbose
+
+```
+
+**Note** MSVC requires Visual Studio 2019 16.8 or later for C11 atomics support (`/experimental:c11atomics`). Both Debug and Release builds are fully supported.
 
 ## Requirements
 You need cmake and a C compiler.

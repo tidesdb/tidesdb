@@ -49,6 +49,66 @@ void binary_hash_array_hash_key(const uint8_t *key, size_t key_len, uint8_t *has
     memcpy(hash, &hash_value, sizeof(hash_value)); /* copy the hash value into the hash */
 }
 
+/* stable merge sort implementation for binary hash array entries */
+static void merge_entries(binary_hash_array_entry_t *arr, size_t left, size_t mid, size_t right,
+                          binary_hash_array_entry_t *temp)
+{
+    size_t i = left;
+    size_t j = mid + 1;
+    size_t k = left;
+
+    while (i <= mid && j <= right)
+    {
+        int cmp = memcmp(arr[i].key, arr[j].key, 16);
+        if (cmp <= 0)
+        {
+            memcpy(&temp[k++], &arr[i++], sizeof(binary_hash_array_entry_t));
+        }
+        else
+        {
+            memcpy(&temp[k++], &arr[j++], sizeof(binary_hash_array_entry_t));
+        }
+    }
+
+    while (i <= mid)
+    {
+        memcpy(&temp[k++], &arr[i++], sizeof(binary_hash_array_entry_t));
+    }
+
+    while (j <= right)
+    {
+        memcpy(&temp[k++], &arr[j++], sizeof(binary_hash_array_entry_t));
+    }
+
+    for (i = left; i <= right; i++)
+    {
+        memcpy(&arr[i], &temp[i], sizeof(binary_hash_array_entry_t));
+    }
+}
+
+static void merge_sort_entries(binary_hash_array_entry_t *arr, size_t left, size_t right,
+                                binary_hash_array_entry_t *temp)
+{
+    if (left < right)
+    {
+        size_t mid = left + (right - left) / 2;
+        merge_sort_entries(arr, left, mid, temp);
+        merge_sort_entries(arr, mid + 1, right, temp);
+        merge_entries(arr, left, mid, right, temp);
+    }
+}
+
+static void stable_sort_entries(binary_hash_array_entry_t *entries, size_t count)
+{
+    if (count <= 1) return;
+
+    binary_hash_array_entry_t *temp = malloc(count * sizeof(binary_hash_array_entry_t));
+    if (!temp) return; /* allocation failed, skip sorting */
+
+    merge_sort_entries(entries, 0, count - 1, temp);
+    free(temp);
+}
+
 binary_hash_array_t *binary_hash_array_new(size_t initial_capacity)
 {
     binary_hash_array_t *bha = malloc(sizeof(binary_hash_array_t));
@@ -104,7 +164,7 @@ int binary_hash_array_add(binary_hash_array_t *bha, uint8_t *key, size_t key_len
 
 uint8_t *binary_hash_array_serialize(binary_hash_array_t *bha, size_t *out_size)
 {
-    qsort(bha->entries, bha->size, sizeof(binary_hash_array_entry_t), binary_hash_array_compare);
+    stable_sort_entries(bha->entries, bha->size);
 
     *out_size = sizeof(size_t) + bha->size * sizeof(binary_hash_array_entry_t);
     uint8_t *buffer = malloc(*out_size);

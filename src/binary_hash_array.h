@@ -39,11 +39,13 @@
  * @param key the key of the entry. Is fixed at 16 bytes and is a hash of the original key
  * @param value the value of the entry. Is fixed at 8 bytes
  */
+#pragma pack(push, 1)
 typedef struct
 {
     uint8_t key[16];
     int64_t value;
 } binary_hash_array_entry_t;
+#pragma pack(pop)
 
 /**
  * binary_hash_array_t

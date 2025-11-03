@@ -20,18 +20,23 @@
 #define __TIDESDB_H__
 
 #include <errno.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+/* C11 atomics - skip_list.h provides the implementation for MSVC < 2022 */
+#if !defined(_MSC_VER) || _MSC_VER >= 1930
+#include <stdatomic.h>
+#endif
+
 #include "binary_hash_array.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "compat.h" /* cross-platform compatibility (dirent, pthread, unistd, sys/stat) */
 #include "compress.h"
+#include "lru.h"
 #include "skip_list.h"
 
 /* follow your passion, be obsessed, don't worry too much. */
@@ -161,11 +166,15 @@ typedef struct tidesdb_iter_t tidesdb_iter_t;
  * configuration for tidesdb instance
  * @param db_path path to the database directory
  * @param enable_debug_logging enable debug logging
+ * @param max_open_file_handles maximum number of open file handles (block managers) to cache
+ *        0 = disabled (no caching, unlimited open files)
+ *        > 0 = cache up to N open files, auto-close LRU when full
  */
 typedef struct
 {
     char db_path[TDB_MAX_PATH_LENGTH];
     int enable_debug_logging;
+    int max_open_file_handles;
 } tidesdb_config_t;
 
 /*
@@ -277,6 +286,7 @@ struct tidesdb_column_family_t
  * @param num_cfs number of column families
  * @param cf_capacity capacity of column families array
  * @param db_lock global database lock
+ * @param block_manager_cache LRU cache for open block managers (file handles)
  */
 struct tidesdb_t
 {
@@ -285,6 +295,7 @@ struct tidesdb_t
     int num_cfs;
     int cf_capacity;
     pthread_rwlock_t db_lock;
+    lru_cache_t *block_manager_cache;
 };
 
 /*

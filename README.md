@@ -9,9 +9,6 @@ It is not a full-featured database, but rather a library that can be used to bui
 
 [![Linux Build Status](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml/badge.svg)](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml)
 
-> [!CAUTION]
-> master is in active development. TidesDB 1 is the projected stable first MAJOR release. We are in the beta development stages.
-
 ## Features
 - [x] **ACID Transactions** - Atomic, consistent, isolated, and durable. Transactions support multiple operations across column families.
 - [x] **Optimized Concurrency** - Writers don't block readers, readers don't block readers. Column families use reader-writer locks allowing multiple concurrent readers. Only writers block other writers on the same column family.

@@ -329,6 +329,36 @@ void lru_cache_free(lru_cache_t *cache)
     free(cache);
 }
 
+void lru_cache_destroy(lru_cache_t *cache)
+{
+    if (cache == NULL) return;
+
+    pthread_mutex_lock(&cache->lock);
+
+    lru_entry_t *current = cache->head;
+    while (current != NULL)
+    {
+        lru_entry_t *next = current->next;
+        
+        /* free entry WITHOUT calling eviction callback */
+        free(current->key);
+        free(current);
+        current = next;
+    }
+
+    /* clear hash table */
+    memset(cache->table, 0, cache->table_size * sizeof(lru_entry_t *));
+
+    cache->head = NULL;
+    cache->tail = NULL;
+    cache->size = 0;
+
+    pthread_mutex_unlock(&cache->lock);
+    pthread_mutex_destroy(&cache->lock);
+    free(cache->table);
+    free(cache);
+}
+
 size_t lru_cache_size(lru_cache_t *cache)
 {
     if (cache == NULL) return 0;

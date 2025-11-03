@@ -1325,8 +1325,11 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
             free(index_data);
         }
 
-        /* close block manager before rename */
-        block_manager_close(merged->block_manager);
+        /* remove temp file's block manager from cache and close it before rename */
+        if (cf->db->block_manager_cache)
+        {
+            lru_cache_remove(cf->db->block_manager_cache, temp_path);
+        }
         merged->block_manager = NULL;
 
         /* rename temp file to final name (atomic operation) */
@@ -1648,7 +1651,12 @@ static void *tidesdb_compaction_worker(void *arg)
         free(index_data);
     }
 
-    block_manager_close(merged->block_manager);
+    /* remove temp file's block manager from cache and close it before rename */
+    if (cf->db->block_manager_cache)
+    {
+        lru_cache_remove(cf->db->block_manager_cache, temp_path);
+    }
+    merged->block_manager = NULL;
 
     /* rename temp to final */
     if (rename(temp_path, new_path) == 0)

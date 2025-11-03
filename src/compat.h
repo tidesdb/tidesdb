@@ -71,15 +71,22 @@ typedef __int64 ssize_t;
 typedef int mode_t;
 #endif
 
-/* CRITICAL FIX: Windows file operations MUST use binary mode */
-#define ftruncate _chsize
+/* CRITICAL FIX: Windows file operations MUST use binary mode and 64-bit support */
+/* Use _chsize_s for 64-bit file size support instead of _chsize (32-bit only) */
+static inline int ftruncate(int fd, off_t length) {
+    return _chsize_s(fd, length);
+}
 
 /* CRITICAL: Wrap open() to always use O_BINARY on Windows */
-static inline int _tidesdb_open_wrapper(const char *path, int flags, mode_t mode) {
+static inline int _tidesdb_open_wrapper_3(const char *path, int flags, mode_t mode) {
     /* Always add O_BINARY for binary file safety on Windows */
     return _open(path, flags | _O_BINARY, mode);
 }
-#define open(path, flags, mode) _tidesdb_open_wrapper(path, flags, mode)
+static inline int _tidesdb_open_wrapper_2(const char *path, int flags) {
+    /* Always add O_BINARY for binary file safety on Windows */
+    return _open(path, flags | _O_BINARY, 0);
+}
+#define open(...) _tidesdb_open_wrapper_3(__VA_ARGS__)
 
 /* C11 atomics support */
 #if defined(__MINGW32__) || defined(__GNUC__)
@@ -359,9 +366,15 @@ static inline int fsync(int fd)
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE)
     {
+        errno = EBADF;
         return -1;
     }
-    return FlushFileBuffers(h) ? 0 : -1;
+    if (!FlushFileBuffers(h))
+    {
+        errno = GetLastError();
+        return -1;
+    }
+    return 0;
 }
 
 /* fdatasync for MSVC, same as fsync (Windows doesn't distinguish) */
@@ -406,9 +419,18 @@ static inline int gettimeofday(struct timeval *tp, struct timezone *tzp)
     return 0;
 }
 
-/* pread/pwrite for MSVC */
+/* pread/pwrite for MSVC using OVERLAPPED
+ * Key insight: OVERLAPPED offset works even for synchronous I/O!
+ * No FILE_FLAG_OVERLAPPED needed - the offset is always respected.
+ */
 static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
+    if (!buf || count == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE)
     {
@@ -416,50 +438,38 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
         return -1;
     }
 
-    OVERLAPPED overlapped = {0};
+    OVERLAPPED overlapped;
+    ZeroMemory(&overlapped, sizeof(OVERLAPPED));
+    
     LARGE_INTEGER li;
     li.QuadPart = offset;
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
+    overlapped.hEvent = NULL;  /* Must be NULL for synchronous files */
 
-    /* create event for synchronous operation */
-    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (overlapped.hEvent == NULL)
-    {
-        errno = GetLastError();
-        return -1;
-    }
-
-    DWORD bytes_read;
-    BOOL result = ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped);
-
-    if (!result)
+    DWORD bytes_read = 0;
+    if (!ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped))
     {
         DWORD err = GetLastError();
-        if (err == ERROR_IO_PENDING)
+        /* For synchronous files, ERROR_IO_PENDING shouldn't happen, but check anyway */
+        if (err != ERROR_IO_PENDING)
         {
-            /* wait for async operation to complete */
-            if (!GetOverlappedResult(h, &overlapped, &bytes_read, TRUE))
-            {
-                CloseHandle(overlapped.hEvent);
-                errno = GetLastError();
-                return -1;
-            }
-        }
-        else
-        {
-            CloseHandle(overlapped.hEvent);
             errno = err;
             return -1;
         }
     }
 
-    CloseHandle(overlapped.hEvent);
     return (ssize_t)bytes_read;
 }
 
 static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 {
+    if (!buf || count == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE)
     {
@@ -467,45 +477,27 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
         return -1;
     }
 
-    OVERLAPPED overlapped = {0};
+    OVERLAPPED overlapped;
+    ZeroMemory(&overlapped, sizeof(OVERLAPPED));
+    
     LARGE_INTEGER li;
     li.QuadPart = offset;
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
+    overlapped.hEvent = NULL;  /* Must be NULL for synchronous files */
 
-    /* create event for synchronous operation */
-    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (overlapped.hEvent == NULL)
-    {
-        errno = GetLastError();
-        return -1;
-    }
-
-    DWORD bytes_written;
-    BOOL result = WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped);
-
-    if (!result)
+    DWORD bytes_written = 0;
+    if (!WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped))
     {
         DWORD err = GetLastError();
-        if (err == ERROR_IO_PENDING)
+        /* For synchronous files, ERROR_IO_PENDING shouldn't happen, but check anyway */
+        if (err != ERROR_IO_PENDING)
         {
-            /* wait for async operation to complete */
-            if (!GetOverlappedResult(h, &overlapped, &bytes_written, TRUE))
-            {
-                CloseHandle(overlapped.hEvent);
-                errno = GetLastError();
-                return -1;
-            }
-        }
-        else
-        {
-            CloseHandle(overlapped.hEvent);
             errno = err;
             return -1;
         }
     }
 
-    CloseHandle(overlapped.hEvent);
     return (ssize_t)bytes_written;
 }
 #endif /* _MSC_VER */

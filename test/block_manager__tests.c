@@ -32,7 +32,7 @@ static int tests_failed = 0;
 
 void test_block_manager_open()
 {
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) == 0);
     ASSERT_TRUE(bm != NULL);
     ASSERT_NE(bm->fd, 0);
@@ -63,7 +63,7 @@ void test_block_manager_block_create()
 void test_block_manager_block_write()
 {
     /* we set up a new block manager */
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     /* we set up a new block */
@@ -89,7 +89,7 @@ void test_block_manager_block_write()
 void test_block_manager_block_write_close_reopen_read()
 {
     /* we set up a new block manager */
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     /* we set up a new block */
@@ -139,7 +139,7 @@ void test_block_manager_block_write_close_reopen_read()
 void test_block_manager_truncate()
 {
     /* we set up a new block manager */
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     /* we set up a new block */
@@ -189,7 +189,7 @@ void test_block_manager_cursor()
     /* we create a block manager, write a few blocks and verify forward and backward iteration */
 
     /* we set up a new block manager */
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     for (int i = 0; i < 3; i++)
@@ -317,7 +317,7 @@ void test_block_manager_cursor()
 
 void test_block_manager_count_blocks()
 {
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     for (int i = 0; i < 3; i++)
@@ -344,7 +344,7 @@ void test_block_manager_count_blocks()
 
 void test_block_manager_cursor_goto_first()
 {
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     for (int i = 0; i < 3; i++)
@@ -383,7 +383,7 @@ void test_block_manager_cursor_goto_first()
 
 void test_block_manager_cursor_goto_last()
 {
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     for (int i = 0; i < 3; i++)
@@ -423,7 +423,7 @@ void test_block_manager_cursor_goto_last()
 
 void test_block_manager_cursor_has_next()
 {
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     for (int i = 0; i < 3; i++)
@@ -464,7 +464,7 @@ void test_block_manager_cursor_has_next()
 
 void test_block_manager_cursor_has_prev()
 {
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     for (int i = 0; i < 3; i++)
@@ -505,7 +505,7 @@ void test_block_manager_cursor_has_prev()
 
 void test_block_manager_cursor_position_checks()
 {
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     /* we write 3 blocks */
@@ -556,7 +556,7 @@ void test_block_manager_cursor_position_checks()
 
 void test_block_manager_get_size()
 {
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     uint64_t initial_size;
@@ -596,7 +596,7 @@ void test_block_manager_get_size()
 
 void test_block_manager_seek_and_goto()
 {
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", TDB_SYNC_NONE, 0) != 0) return;
 
     /* we write 3 blocks */
@@ -663,7 +663,7 @@ void test_block_manager_seek_and_goto()
 /** multithreaded tests */
 /* shared block manager
  * for all threads **/
-block_manager_t *bm;
+block_manager_t *bm = NULL;
 
 /* mutex for thread-safe block manager operations */
 pthread_mutex_t bm_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -868,7 +868,7 @@ void test_block_manager_validate_last_block()
     printf("Testing block manager validation of last block...\n");
 
     /* first, create a block manager and write some valid blocks */
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, "validate_test.db", TDB_SYNC_NONE, 0) == 0);
 
     /* we write 3 valid blocks */
@@ -964,7 +964,7 @@ void test_block_manager_validation_edge_cases()
 {
     printf("Testing block manager validation edge cases...\n");
 
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
 
     /* 1 opening a fresh empty database */
     (void)remove("empty_test.db");
@@ -1001,7 +1001,7 @@ void test_block_manager_open_safety()
 {
     printf("Testing block manager open with very long path...\n");
 
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
 
     /* we create a path name that would exceed the buffer */
     char long_path[1024] = "test_";
@@ -1043,7 +1043,7 @@ void benchmark_block_manager()
 {
     printf(BOLDWHITE "Running block manager benchmark...\n" RESET);
 
-    block_manager_t *bm;
+    block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, "benchmark.db", TDB_SYNC_NONE, 0) == 0);
 
     uint8_t **block_data = malloc(NUM_BLOCKS * sizeof(uint8_t *));

@@ -33,7 +33,7 @@
 #include <unistd.h>  /* for rmdir */
 #endif
 
-/* dirent.h - MSVC needs compat.h, MinGW has it natively */
+/* dirent.h MSVC needs compat.h, MinGW has it natively */
 #if defined(_MSC_VER)
 #include "../src/compat.h"  /* MSVC dirent implementation */
 #else
@@ -43,6 +43,11 @@
 #include "test_macros.h"
 
 #define TEST_DB_PATH    "./test_tidesdb"
+
+/* ensure assertions work in both Debug and Release builds */
+#undef NDEBUG
+#include <assert.h>
+
 #define ASSERT_EQ(a, b) assert((a) == (b))
 #define ASSERT_NE(a, b) assert((a) != (b))
 #define ASSERT_TRUE(a)  assert(a)

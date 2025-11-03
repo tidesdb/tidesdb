@@ -114,9 +114,12 @@ static int get_file_size(int fd, uint64_t *size)
 int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode,
                        int fsync_interval)
 {
-    *bm = NULL;  /* Initialize to NULL in case of early failure */
-    *bm = malloc(sizeof(block_manager_t));
-    if (!(*bm)) return -1;
+    block_manager_t *new_bm = malloc(sizeof(block_manager_t));
+    if (!new_bm)
+    {
+        *bm = NULL;
+        return -1;
+    }
 
     int file_exists = access(file_path, F_OK) == 0;
 
@@ -124,35 +127,38 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
     int flags = O_RDWR | O_CREAT;
     mode_t mode = 0644;
 
-    (*bm)->fd = open(file_path, flags, mode);
-    if ((*bm)->fd == -1)
+    new_bm->fd = open(file_path, flags, mode);
+    if (new_bm->fd == -1)
     {
-        free(*bm);
+        free(new_bm);
+        *bm = NULL;
         return -1;
     }
 
-    strncpy((*bm)->file_path, file_path, MAX_FILE_PATH_LENGTH - 1);
-    (*bm)->file_path[MAX_FILE_PATH_LENGTH - 1] = '\0';
+    strncpy(new_bm->file_path, file_path, MAX_FILE_PATH_LENGTH - 1);
+    new_bm->file_path[MAX_FILE_PATH_LENGTH - 1] = '\0';
 
     /* set sync mode and interval */
-    (*bm)->sync_mode = sync_mode;
-    (*bm)->fsync_interval = fsync_interval;
+    new_bm->sync_mode = sync_mode;
+    new_bm->fsync_interval = fsync_interval;
 
-    (*bm)->stop_fsync_thread = 0;
+    new_bm->stop_fsync_thread = 0;
 
     /* initialize write mutex for thread safety on writes only */
-    if (pthread_mutex_init(&(*bm)->write_mutex, NULL) != 0)
+    if (pthread_mutex_init(&new_bm->write_mutex, NULL) != 0)
     {
-        close((*bm)->fd);
-        free(*bm);
+        close(new_bm->fd);
+        free(new_bm);
+        *bm = NULL;
         return -1;
     }
 
-    if (pthread_cond_init(&(*bm)->fsync_cond, NULL) != 0)
+    if (pthread_cond_init(&new_bm->fsync_cond, NULL) != 0)
     {
-        pthread_mutex_destroy(&(*bm)->write_mutex);
-        close((*bm)->fd);
-        free(*bm);
+        pthread_mutex_destroy(&new_bm->write_mutex);
+        close(new_bm->fd);
+        free(new_bm);
+        *bm = NULL;
         return -1;
     }
 
@@ -160,40 +166,44 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
     if (file_exists)
     {
         /* read existing header */
-        if (read_header((*bm)->fd, &(*bm)->block_size) != 0)
+        if (read_header(new_bm->fd, &new_bm->block_size) != 0)
         {
-            pthread_mutex_destroy(&(*bm)->write_mutex);
-            close((*bm)->fd);
-            free(*bm);
+            pthread_mutex_destroy(&new_bm->write_mutex);
+            close(new_bm->fd);
+            free(new_bm);
+            *bm = NULL;
             return -1;
         }
 
         /* validate last block */
-        int validation_result = block_manager_validate_last_block(*bm);
+        int validation_result = block_manager_validate_last_block(new_bm);
         if (validation_result != 0)
         {
-            pthread_mutex_destroy(&(*bm)->write_mutex);
-            close((*bm)->fd);
-            free(*bm);
+            pthread_mutex_destroy(&new_bm->write_mutex);
+            close(new_bm->fd);
+            free(new_bm);
+            *bm = NULL;
             return -1;
         }
     }
     else
     {
         /* new file, write header */
-        (*bm)->block_size = MAX_INLINE_BLOCK_SIZE;
-        if (write_header((*bm)->fd, (*bm)->block_size) != 0)
+        new_bm->block_size = MAX_INLINE_BLOCK_SIZE;
+        if (write_header(new_bm->fd, new_bm->block_size) != 0)
         {
-            pthread_mutex_destroy(&(*bm)->write_mutex);
-            close((*bm)->fd);
-            free(*bm);
+            pthread_mutex_destroy(&new_bm->write_mutex);
+            close(new_bm->fd);
+            free(new_bm);
+            *bm = NULL;
             return -1;
         }
-        if (fdatasync((*bm)->fd) != 0)
+        if (fdatasync(new_bm->fd) != 0)
         {
-            pthread_mutex_destroy(&(*bm)->write_mutex);
-            close((*bm)->fd);
-            free(*bm);
+            pthread_mutex_destroy(&new_bm->write_mutex);
+            close(new_bm->fd);
+            free(new_bm);
+            *bm = NULL;
             return -1;
         }
     }
@@ -201,16 +211,19 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
     /* create and start the fsync thread only for background sync */
     if (sync_mode == TDB_SYNC_BACKGROUND)
     {
-        if (pthread_create(&(*bm)->fsync_thread, NULL, block_manager_fsync_thread, *bm) != 0)
+        if (pthread_create(&new_bm->fsync_thread, NULL, block_manager_fsync_thread, new_bm) != 0)
         {
-            pthread_mutex_destroy(&(*bm)->write_mutex);
-            pthread_cond_destroy(&(*bm)->fsync_cond);
-            close((*bm)->fd);
-            free(*bm);
+            pthread_mutex_destroy(&new_bm->write_mutex);
+            pthread_cond_destroy(&new_bm->fsync_cond);
+            close(new_bm->fd);
+            free(new_bm);
+            *bm = NULL;
             return -1;
         }
     }
 
+    /* Only set the output pointer after everything succeeds */
+    *bm = new_bm;
     return 0;
 }
 

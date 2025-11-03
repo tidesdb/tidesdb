@@ -26,7 +26,7 @@
 #include <string.h>
 #include <time.h>
 
-/* C11 atomics - skip_list.h provides the implementation for MSVC < 2022 */
+/* C11 atomics skip_list.h provides the implementation for MSVC < 2022 */
 #if !defined(_MSC_VER) || _MSC_VER >= 1930
 #include <stdatomic.h>
 #endif
@@ -34,7 +34,7 @@
 #include "binary_hash_array.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
-#include "compat.h" /* cross-platform compatibility (dirent, pthread, unistd, sys/stat) */
+#include "compat.h"
 #include "compress.h"
 #include "lru.h"
 #include "skip_list.h"
@@ -53,27 +53,30 @@ extern int _tidesdb_debug_enabled;
         }                                                                           \
     } while (0)
 
-#define TDB_MAX_CF_NAME_LENGTH          256
-#define TDB_MAX_PATH_LENGTH             1024
-#define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE (64 * 1024 * 1024) /* 64MB */
-#define TDB_DEFAULT_MAX_SSTABLES        512
-#define TDB_DEFAULT_COMPACTION_THREADS  4 /* default number of threads for parallel compaction */
+#define TDB_MAX_CF_NAME_LENGTH                     256
+#define TDB_MAX_PATH_LENGTH                        1024
+#define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE            (64 * 1024 * 1024)
+#define TDB_DEFAULT_MAX_SSTABLES                   128
+#define TDB_DEFAULT_COMPACTION_THREADS             4
+#define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000000
+#define TDB_DEFAULT_MAX_OPEN_FILE_HANDLES          1024
+#define TDB_DEFAULT_SKIPLIST_LEVELS                12
+#define TDB_DEFAULT_SKIPLIST_PROBABILITY           0.25
+#define TDB_DEFAULT_BLOOM_FILTER_FP_RATE           0.01
 
-/* file extensions */
-#define TDB_WAL_EXT                       ".wal" /* extension for the write-ahead log file */
-#define TDB_SSTABLE_EXT                   ".sst" /* extension for the SSTable file */
-#define TDB_COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc" /* configuration file for the column family */
-#define TDB_TEMP_EXT                      ".tmp" /* extension for temporary files, names */
+#define TDB_WAL_EXT                       ".wal"
+#define TDB_SSTABLE_EXT                   ".sst"
+#define TDB_COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"
+#define TDB_TEMP_EXT                      ".tmp"
 
-/* serialization format */
-#define TDB_KV_FORMAT_VERSION 1 /* current key-value serialization format version */
+#define TDB_KV_FORMAT_VERSION 1
 
 /*
  * tidesdb_kv_pair_header_t
  * header for serialized key-value pairs
- * streamlined format: [header][key][value]
+ * streamlined format [header][key][value]
  * @param version format version
- * @param flags bit flags (bit 0: tombstone/deleted)
+ * @param flags bit flags (bit 0 tombstone/deleted)
  * @param key_size size of key in bytes
  * @param value_size size of value in bytes
  * @param ttl time-to-live (expiration time)
@@ -82,30 +85,29 @@ extern int _tidesdb_debug_enabled;
 #pragma pack(push, 1)
 typedef struct
 {
-    uint8_t version;     /* format version */
-    uint8_t flags;       /* bit 0 = tombstone (1=deleted, 0=active) */
-    uint32_t key_size;   /* key size */
-    uint32_t value_size; /* value size */
-    int64_t ttl;         /* time-to-live */
+    uint8_t version;
+    uint8_t flags;
+    uint32_t key_size;
+    uint32_t value_size;
+    int64_t ttl;
 } tidesdb_kv_pair_header_t;
 #pragma pack(pop)
 #else
 typedef struct __attribute__((packed))
 {
-    uint8_t version;     /* format version */
-    uint8_t flags;       /* bit 0 = tombstone (1=deleted, 0=active) */
-    uint32_t key_size;   /* key size */
-    uint32_t value_size; /* value size */
-    int64_t ttl;         /* time-to-live */
+    uint8_t version;
+    uint8_t flags;
+    uint32_t key_size;
+    uint32_t value_size;
+    int64_t ttl;
 } tidesdb_kv_pair_header_t;
 #endif
 
-#define TDB_KV_FLAG_TOMBSTONE 0x01 /* bit flag for tombstone/deleted entry */
+#define TDB_KV_FLAG_TOMBSTONE 0x01
 
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATORS     32
 
-/* built-in comparator functions */
 extern int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                        size_t key2_size, void *ctx);
 extern int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
@@ -132,34 +134,33 @@ int tidesdb_register_comparator(const char *name, skip_list_comparator_fn compar
 skip_list_comparator_fn tidesdb_get_comparator(const char *name);
 
 /* error codes */
-#define TDB_SUCCESS                  0   /* operation successful */
-#define TDB_ERROR                    -1  /* generic error */
-#define TDB_ERR_MEMORY               -2  /* memory allocation failed */
-#define TDB_ERR_INVALID_ARGS         -3  /* invalid arguments */
-#define TDB_ERR_IO                   -4  /* I/O error */
-#define TDB_ERR_NOT_FOUND            -5  /* key not found */
-#define TDB_ERR_EXISTS               -6  /* already exists */
-#define TDB_ERR_CORRUPT              -7  /* data corruption detected */
-#define TDB_ERR_LOCK                 -8  /* lock acquisition failed */
-#define TDB_ERR_TXN_COMMITTED        -9  /* transaction already committed */
-#define TDB_ERR_TXN_ABORTED          -10 /* transaction aborted */
-#define TDB_ERR_READONLY             -11 /* read-only transaction */
-#define TDB_ERR_FULL                 -12 /* database or resource full */
-#define TDB_ERR_INVALID_NAME         -13 /* invalid name (too long or empty) */
-#define TDB_ERR_COMPARATOR_NOT_FOUND -14 /* comparator not found in registry */
-#define TDB_ERR_MAX_COMPARATORS      -15 /* maximum number of comparators reached */
-#define TDB_ERR_INVALID_CF           -16 /* invalid column family */
-#define TDB_ERR_THREAD               -17 /* thread creation or operation failed */
-#define TDB_ERR_CHECKSUM             -18 /* checksum verification failed */
+#define TDB_SUCCESS                  0
+#define TDB_ERROR                    -1
+#define TDB_ERR_MEMORY               -2
+#define TDB_ERR_INVALID_ARGS         -3
+#define TDB_ERR_IO                   -4
+#define TDB_ERR_NOT_FOUND            -5
+#define TDB_ERR_EXISTS               -6
+#define TDB_ERR_CORRUPT              -7
+#define TDB_ERR_LOCK                 -8
+#define TDB_ERR_TXN_COMMITTED        -9
+#define TDB_ERR_TXN_ABORTED          -10
+#define TDB_ERR_READONLY             -11
+#define TDB_ERR_FULL                 -12
+#define TDB_ERR_INVALID_NAME         -13
+#define TDB_ERR_COMPARATOR_NOT_FOUND -14
+#define TDB_ERR_MAX_COMPARATORS      -15
+#define TDB_ERR_INVALID_CF           -16
+#define TDB_ERR_THREAD               -17
+#define TDB_ERR_CHECKSUM             -18
+#define TDB_ERR_KEY_DELETED          -19
+#define TDB_ERR_KEY_EXPIRED          -20
 
-/* forward declarations */
 typedef struct tidesdb_t tidesdb_t;
 typedef struct tidesdb_column_family_t tidesdb_column_family_t;
 typedef struct tidesdb_sstable_t tidesdb_sstable_t;
 typedef struct tidesdb_txn_t tidesdb_txn_t;
 typedef struct tidesdb_iter_t tidesdb_iter_t;
-
-/* tidesdb_sync_mode_t is defined in block_manager.h */
 
 /*
  * tidesdb_config_t
@@ -190,6 +191,8 @@ typedef struct
  * @param compress_algo compression algorithm to use
  * @param bloom_filter_fp_rate bloom filter false positive rate
  * @param enable_background_compaction enable automatic background compaction
+ * @param background_compaction_interval interval in microseconds between compaction checks (default
+ * 1000000 = 1 second)
  * @param use_sbha use sorted binary hash array for direct key lookups
  * @param sync_mode sync mode for this column family
  * @param sync_interval interval in milliseconds for background sync (if sync_mode is
@@ -207,10 +210,11 @@ typedef struct
     compress_type compress_algo;
     double bloom_filter_fp_rate;
     int enable_background_compaction;
+    int background_compaction_interval;
     int use_sbha;
     tidesdb_sync_mode_t sync_mode;
     int sync_interval;
-    const char *comparator_name; /* name of registered comparator (NULL = "memcmp") */
+    const char *comparator_name;
 } tidesdb_column_family_config_t;
 
 /*
@@ -219,7 +223,7 @@ typedef struct
  * @param id unique identifier for this sstable
  * @param cf pointer to parent column family
  * @param block_manager block manager for this sstable
- * @param index binary hash array index (key hash -> block offset)
+ * @param index binary hash array index (key hash = block offset)
  * @param bloom_filter bloom filter for membership testing
  * @param min_key minimum key in this sstable
  * @param max_key maximum key in this sstable
@@ -262,13 +266,13 @@ struct tidesdb_sstable_t
 struct tidesdb_column_family_t
 {
     char name[TDB_MAX_CF_NAME_LENGTH];
-    char comparator_name[TDB_MAX_COMPARATOR_NAME]; /* name of comparator used */
+    char comparator_name[TDB_MAX_COMPARATOR_NAME];
     tidesdb_t *db;
     skip_list_t *memtable;
     block_manager_t *wal;
     tidesdb_sstable_t **sstables;
     _Atomic(int) num_sstables;
-    int sstable_array_capacity; /* internal allocated array size */
+    int sstable_array_capacity;
     _Atomic(uint64_t) next_sstable_id;
     pthread_rwlock_t cf_lock;
     pthread_mutex_t flush_lock;
@@ -374,9 +378,9 @@ struct tidesdb_iter_t
     tidesdb_column_family_t *cf;
     skip_list_cursor_t *memtable_cursor;
     block_manager_cursor_t **sstable_cursors;
-    tidesdb_sstable_t **sstables; /* snapshot of sstable pointers to avoid race conditions */
+    tidesdb_sstable_t **sstables;
     int num_sstable_cursors;
-    int *sstable_blocks_read; /* tracks blocks read per sstable to avoid reading metadata blocks */
+    int *sstable_blocks_read;
     uint8_t *current_key;
     uint8_t *current_value;
     size_t current_key_size;

@@ -96,7 +96,7 @@ static inline int remove_directory_recursive(const char *path)
             continue;
         }
 
-        snprintf(filepath, sizeof(filepath), "%s/%s", path, entry->d_name);
+        snprintf(filepath, sizeof(filepath), "%s" PATH_SEPARATOR "%s", path, entry->d_name);
 
         struct stat statbuf;
         if (stat(filepath, &statbuf) != 0)

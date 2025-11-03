@@ -2247,6 +2247,133 @@ static void test_sstable_num_entries_accuracy(void)
     cleanup_test_dir();
 }
 
+/* test basic column family drop */
+static void test_drop_column_family_basic(void)
+{
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+    /* create a column family */
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* drop the column family */
+    ASSERT_EQ(tidesdb_drop_column_family(db, "test_cf"), 0);
+
+    /* verify it no longer exists */
+    cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf == NULL);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* test dropping column family with data */
+static void test_drop_column_family_with_data(void)
+{
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+    /* create column family and add data */
+    ASSERT_EQ(tidesdb_create_column_family(db, "data_cf", &cf_config), 0);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(value, sizeof(value), "value_%d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "data_cf", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  strlen(value), -1),
+                  0);
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* flush to create sstables */
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "data_cf");
+    ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+
+    /* verify sstables were created */
+    int num_sstables = atomic_load(&cf->num_sstables);
+    ASSERT_TRUE(num_sstables > 0);
+
+    /* drop the column family */
+    ASSERT_EQ(tidesdb_drop_column_family(db, "data_cf"), 0);
+
+    /* verify it no longer exists */
+    cf = tidesdb_get_column_family(db, "data_cf");
+    ASSERT_TRUE(cf == NULL);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* test dropping non-existent column family */
+static void test_drop_column_family_not_found(void)
+{
+    tidesdb_t *db = create_test_db();
+
+    /* try to drop non-existent column family */
+    int result = tidesdb_drop_column_family(db, "nonexistent_cf");
+    ASSERT_EQ(result, TDB_ERR_NOT_FOUND);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* test dropping column family with WAL and sstables */
+static void test_drop_column_family_cleanup(void)
+{
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+    /* create column family */
+    ASSERT_EQ(tidesdb_create_column_family(db, "cleanup_cf", &cf_config), 0);
+
+    /* add data to create WAL entries */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(value, sizeof(value), "value_%d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "cleanup_cf", (uint8_t *)key, strlen(key),
+                                  (uint8_t *)value, strlen(value), -1),
+                  0);
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* flush to create sstables */
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cleanup_cf");
+    ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+
+    /* verify files exist before drop */
+    char cf_path[TDB_MAX_PATH_LENGTH];
+    snprintf(cf_path, sizeof(cf_path), "%s" PATH_SEPARATOR "cleanup_cf", TEST_DB_PATH);
+    struct stat st;
+    ASSERT_EQ(stat(cf_path, &st), 0); /* directory should exist */
+
+    /* drop the column family */
+    ASSERT_EQ(tidesdb_drop_column_family(db, "cleanup_cf"), 0);
+
+    /* verify directory is removed */
+    ASSERT_TRUE(stat(cf_path, &st) == -1); /* directory should not exist */
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     printf("\n");
@@ -2291,6 +2418,10 @@ int main(void)
     RUN_TEST(test_true_concurrency, tests_passed);
     RUN_TEST(test_iterator_metadata_boundary, tests_passed);
     RUN_TEST(test_sstable_num_entries_accuracy, tests_passed);
+    RUN_TEST(test_drop_column_family_basic, tests_passed);
+    RUN_TEST(test_drop_column_family_with_data, tests_passed);
+    RUN_TEST(test_drop_column_family_not_found, tests_passed);
+    RUN_TEST(test_drop_column_family_cleanup, tests_passed);
 
     printf("\n");
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

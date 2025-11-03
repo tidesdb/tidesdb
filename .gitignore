@@ -23,3 +23,4 @@ build
 .vscode
 vcpkg_installed
 .vs
+test_tidesdb

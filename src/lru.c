@@ -24,16 +24,16 @@
 #include "../external/xxhash.h"
 
 /* hash function for string keys using xxhash */
-static size_t _lru_hash(const char *key, size_t table_size)
+static size_t lru_hash(const char *key, size_t table_size)
 {
     XXH64_hash_t hash = XXH64(key, strlen(key), 0);
     return (size_t)(hash % table_size);
 }
 
 /* find entry in hash table */
-static lru_entry_t *_lru_find_entry(lru_cache_t *cache, const char *key)
+static lru_entry_t *lru_find_entry(lru_cache_t *cache, const char *key)
 {
-    size_t index = _lru_hash(key, cache->table_size);
+    size_t index = lru_hash(key, cache->table_size);
     lru_entry_t *entry = cache->table[index];
 
     while (entry != NULL)
@@ -46,11 +46,10 @@ static lru_entry_t *_lru_find_entry(lru_cache_t *cache, const char *key)
 }
 
 /* move entry to head (most recently used) */
-static void _lru_move_to_head(lru_cache_t *cache, lru_entry_t *entry)
+static void lru_move_to_head(lru_cache_t *cache, lru_entry_t *entry)
 {
-    if (entry == cache->head) return; /* already at head */
+    if (entry == cache->head) return; 
 
-    /* remove from current position */
     if (entry->prev) entry->prev->next = entry->next;
     if (entry->next) entry->next->prev = entry->prev;
     if (entry == cache->tail) cache->tail = entry->prev;
@@ -66,9 +65,9 @@ static void _lru_move_to_head(lru_cache_t *cache, lru_entry_t *entry)
 }
 
 /* remove entry from hash table */
-static void _lru_remove_from_table(lru_cache_t *cache, lru_entry_t *entry)
+static void lru_remove_from_table(lru_cache_t *cache, lru_entry_t *entry)
 {
-    size_t index = _lru_hash(entry->key, cache->table_size);
+    size_t index = lru_hash(entry->key, cache->table_size);
     lru_entry_t *current = cache->table[index];
     lru_entry_t *prev = NULL;
 
@@ -88,15 +87,15 @@ static void _lru_remove_from_table(lru_cache_t *cache, lru_entry_t *entry)
 }
 
 /* add entry to hash table */
-static void _lru_add_to_table(lru_cache_t *cache, lru_entry_t *entry)
+static void lru_add_to_table(lru_cache_t *cache, lru_entry_t *entry)
 {
-    size_t index = _lru_hash(entry->key, cache->table_size);
+    size_t index = lru_hash(entry->key, cache->table_size);
     entry->hash_next = cache->table[index];
     cache->table[index] = entry;
 }
 
 /* evict least recently used entry */
-static void _lru_evict_lru(lru_cache_t *cache)
+static void lru_evict_lru(lru_cache_t *cache)
 {
     if (cache->tail == NULL) return;
 
@@ -110,8 +109,7 @@ static void _lru_evict_lru(lru_cache_t *cache)
 
     cache->tail = lru->prev;
 
-    /* remove from hash table */
-    _lru_remove_from_table(cache, lru);
+    lru_remove_from_table(cache, lru);
 
     /* call eviction callback if set */
     if (lru->evict_cb) lru->evict_cb(lru->key, lru->value, lru->user_data);
@@ -124,9 +122,8 @@ static void _lru_evict_lru(lru_cache_t *cache)
 }
 
 /* free an entry and call its eviction callback */
-static void _lru_free_entry(lru_cache_t *cache, lru_entry_t *entry)
+static void lru_free_entry(lru_cache_t *cache, lru_entry_t *entry)
 {
-    /* remove from doubly linked list */
     if (entry->prev)
         entry->prev->next = entry->next;
     else
@@ -137,13 +134,11 @@ static void _lru_free_entry(lru_cache_t *cache, lru_entry_t *entry)
     else
         cache->tail = entry->prev;
 
-    /* remove from hash table */
-    _lru_remove_from_table(cache, entry);
+    lru_remove_from_table(cache, entry);
 
-    /* call eviction callback if set */
     if (entry->evict_cb) entry->evict_cb(entry->key, entry->value, entry->user_data);
 
-    /* free entry */
+
     free(entry->key);
     free(entry);
 
@@ -188,21 +183,20 @@ int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_ca
 
     pthread_mutex_lock(&cache->lock);
 
-    /* check if key already exists */
-    lru_entry_t *existing = _lru_find_entry(cache, key);
+
+    lru_entry_t *existing = lru_find_entry(cache, key);
     if (existing != NULL)
     {
-        /* update existing entry */
         existing->value = value;
         existing->evict_cb = evict_cb;
         existing->user_data = user_data;
-        _lru_move_to_head(cache, existing);
+        lru_move_to_head(cache, existing);
         pthread_mutex_unlock(&cache->lock);
         return 0;
     }
 
     /* evict if at capacity */
-    if (cache->size >= cache->capacity) _lru_evict_lru(cache);
+    if (cache->size >= cache->capacity) lru_evict_lru(cache);
 
     /* create new entry */
     lru_entry_t *entry = (lru_entry_t *)malloc(sizeof(lru_entry_t));
@@ -239,7 +233,7 @@ int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_ca
     if (cache->tail == NULL) cache->tail = entry;
 
     /* add to hash table */
-    _lru_add_to_table(cache, entry);
+    lru_add_to_table(cache, entry);
 
     cache->size++;
 
@@ -253,7 +247,7 @@ void *lru_cache_get(lru_cache_t *cache, const char *key)
 
     pthread_mutex_lock(&cache->lock);
 
-    lru_entry_t *entry = _lru_find_entry(cache, key);
+    lru_entry_t *entry = lru_find_entry(cache, key);
     if (entry == NULL)
     {
         pthread_mutex_unlock(&cache->lock);
@@ -261,7 +255,7 @@ void *lru_cache_get(lru_cache_t *cache, const char *key)
     }
 
     /* move to head (mark as recently used) */
-    _lru_move_to_head(cache, entry);
+    lru_move_to_head(cache, entry);
 
     void *value = entry->value;
     pthread_mutex_unlock(&cache->lock);
@@ -275,14 +269,14 @@ int lru_cache_remove(lru_cache_t *cache, const char *key)
 
     pthread_mutex_lock(&cache->lock);
 
-    lru_entry_t *entry = _lru_find_entry(cache, key);
+    lru_entry_t *entry = lru_find_entry(cache, key);
     if (entry == NULL)
     {
         pthread_mutex_unlock(&cache->lock);
         return -1;
     }
 
-    _lru_free_entry(cache, entry);
+    lru_free_entry(cache, entry);
 
     pthread_mutex_unlock(&cache->lock);
     return 0;

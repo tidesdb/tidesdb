@@ -195,8 +195,7 @@ static void block_manager_evict_cb(const char *key, void *value, void *user_data
 
 /* get or open block manager from cache */
 static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path,
-                                                   tidesdb_sync_mode_t sync_mode,
-                                                   int sync_interval)
+                                                 tidesdb_sync_mode_t sync_mode, int sync_interval)
 {
     if (!db || !path || !db->block_manager_cache) return NULL;
 
@@ -256,10 +255,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     /* initialize block manager cache
      * If max_open_file_handles is 0, use a large default (1000) to avoid leaks
      * while still providing reasonable resource limits */
-    size_t cache_capacity = (*db)->config.max_open_file_handles > 0 
-                           ? (size_t)(*db)->config.max_open_file_handles 
-                           : 1000;
-    
+    size_t cache_capacity = (*db)->config.max_open_file_handles > 0
+                                ? (size_t)(*db)->config.max_open_file_handles
+                                : 1000;
+
     (*db)->block_manager_cache = lru_cache_new(cache_capacity);
     if (!(*db)->block_manager_cache)
     {
@@ -860,7 +859,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
     /* open block manager via cache */
     sst->block_manager = get_cached_block_manager(cf->db, sstable_path, cf->config.sync_mode,
-                                                    cf->config.sync_interval);
+                                                  cf->config.sync_interval);
     if (!sst->block_manager)
     {
         free(sst);
@@ -1116,7 +1115,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         merged->num_entries = 0;
 
         merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode,
-                                                          cf->config.sync_interval);
+                                                         cf->config.sync_interval);
         if (!merged->block_manager)
         {
             free(merged);
@@ -1338,7 +1337,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
             TDB_DEBUG_LOG("Successfully renamed %s to %s", temp_path, new_path);
             /* reopen with final path via cache */
             merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode,
-                                                              cf->config.sync_interval);
+                                                             cf->config.sync_interval);
             if (!merged->block_manager)
             {
                 TDB_DEBUG_LOG("Failed to reopen merged sstable after rename");
@@ -1357,7 +1356,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         char path1[TDB_MAX_PATH_LENGTH], path2[TDB_MAX_PATH_LENGTH];
         get_sstable_path(cf, sst1->id, path1);
         get_sstable_path(cf, sst2->id, path2);
-        
+
         unlink(path1);
         unlink(path2);
 
@@ -1430,8 +1429,8 @@ static void *tidesdb_compaction_worker(void *arg)
     merged->max_key = NULL;
     merged->num_entries = 0;
 
-    merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode,
-                                                      cf->config.sync_interval);
+    merged->block_manager =
+        get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode, cf->config.sync_interval);
     if (!merged->block_manager)
     {
         free(merged);
@@ -1662,7 +1661,7 @@ static void *tidesdb_compaction_worker(void *arg)
     if (rename(temp_path, new_path) == 0)
     {
         merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode,
-                                                          cf->config.sync_interval);
+                                                         cf->config.sync_interval);
         if (merged->block_manager)
         {
             *job->result = merged;
@@ -1874,8 +1873,8 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
     sst->bloom_filter = NULL;
     sst->index = NULL;
 
-    sst->block_manager = get_cached_block_manager(cf->db, path, cf->config.sync_mode,
-                                                    cf->config.sync_interval);
+    sst->block_manager =
+        get_cached_block_manager(cf->db, path, cf->config.sync_mode, cf->config.sync_interval);
     if (!sst->block_manager)
     {
         free(sst);
@@ -2260,7 +2259,7 @@ static int tidesdb_recover_wal(tidesdb_column_family_t *cf)
 
     /* read first entry */
     block_manager_block_t *block = block_manager_cursor_read(cursor);
-    
+
     while (block != NULL)
     {
         if (block->data)
@@ -2281,15 +2280,15 @@ static int tidesdb_recover_wal(tidesdb_column_family_t *cf)
                               (time_t)header.ttl);
             }
         }
-        
+
         block_manager_block_free(block);
-        
+
         /* advance to next entry */
         if (block_manager_cursor_next(cursor) != 0)
         {
             break; /* no more entries */
         }
-        
+
         block = block_manager_cursor_read(cursor);
     }
 

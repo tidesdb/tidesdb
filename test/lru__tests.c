@@ -325,7 +325,7 @@ static void test_lru_cache_concurrent(void)
     lru_cache_t *cache = lru_cache_new(100);
     ASSERT_TRUE(cache != NULL);
 
-#define NUM_THREADS 4
+#define NUM_THREADS    4
 #define OPS_PER_THREAD 100
 
     pthread_t threads[NUM_THREADS];

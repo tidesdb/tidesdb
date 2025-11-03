@@ -21,10 +21,10 @@
 
 /* compat header for multi-platform support (Windows, POSIX, posix includes macOS) */
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -42,10 +42,10 @@
 
 #if defined(__MINGW32__) || defined(__MINGW64__)
 /* mingw provides POSIX-like headers */
-#include <pthread.h>
-#include <unistd.h>
-#include <sys/time.h>
 #include <dirent.h>
+#include <pthread.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 /* mingw mkdir only takes one argument, create a wrapper for POSIX compatibility */
 #define mkdir(path, mode) _mkdir(path)
@@ -73,16 +73,19 @@ typedef int mode_t;
 
 /* CRITICAL FIX: Windows file operations MUST use binary mode and 64-bit support */
 /* Use _chsize_s for 64-bit file size support instead of _chsize (32-bit only) */
-static inline int ftruncate(int fd, off_t length) {
+static inline int ftruncate(int fd, off_t length)
+{
     return _chsize_s(fd, length);
 }
 
 /* CRITICAL: Wrap open() to always use O_BINARY on Windows */
-static inline int _tidesdb_open_wrapper_3(const char *path, int flags, mode_t mode) {
+static inline int _tidesdb_open_wrapper_3(const char *path, int flags, mode_t mode)
+{
     /* Always add O_BINARY for binary file safety on Windows */
     return _open(path, flags | _O_BINARY, mode);
 }
-static inline int _tidesdb_open_wrapper_2(const char *path, int flags) {
+static inline int _tidesdb_open_wrapper_2(const char *path, int flags)
+{
     /* Always add O_BINARY for binary file safety on Windows */
     return _open(path, flags | _O_BINARY, 0);
 }
@@ -105,94 +108,111 @@ typedef volatile LONGLONG atomic_uint64_t;
 /* Atomic store - MUST be truly atomic */
 #ifdef _WIN64
 /* 64-bit atomic store */
-#define atomic_store_explicit(ptr, val, order) do { \
-    if (sizeof(*(ptr)) == sizeof(void*)) { \
-        InterlockedExchangePointer((PVOID volatile*)(ptr), (PVOID)(uintptr_t)(val)); \
-    } else if (sizeof(*(ptr)) == 8) { \
-        InterlockedExchange64((LONGLONG volatile*)(ptr), (LONGLONG)(uintptr_t)(val)); \
-    } else if (sizeof(*(ptr)) == 4) { \
-        InterlockedExchange((LONG volatile*)(ptr), (LONG)(uintptr_t)(val)); \
-    } else { \
-        *(ptr) = (val); \
-    } \
-} while(0)
+#define atomic_store_explicit(ptr, val, order)                                             \
+    do                                                                                     \
+    {                                                                                      \
+        if (sizeof(*(ptr)) == sizeof(void *))                                              \
+        {                                                                                  \
+            InterlockedExchangePointer((PVOID volatile *)(ptr), (PVOID)(uintptr_t)(val));  \
+        }                                                                                  \
+        else if (sizeof(*(ptr)) == 8)                                                      \
+        {                                                                                  \
+            InterlockedExchange64((LONGLONG volatile *)(ptr), (LONGLONG)(uintptr_t)(val)); \
+        }                                                                                  \
+        else if (sizeof(*(ptr)) == 4)                                                      \
+        {                                                                                  \
+            InterlockedExchange((LONG volatile *)(ptr), (LONG)(uintptr_t)(val));           \
+        }                                                                                  \
+        else                                                                               \
+        {                                                                                  \
+            *(ptr) = (val);                                                                \
+        }                                                                                  \
+    } while (0)
 #else
 /* 32-bit atomic store */
-#define atomic_store_explicit(ptr, val, order) do { \
-    if (sizeof(*(ptr)) == sizeof(void*)) { \
-        InterlockedExchangePointer((PVOID volatile*)(ptr), (PVOID)(uintptr_t)(val)); \
-    } else if (sizeof(*(ptr)) == 4) { \
-        InterlockedExchange((LONG volatile*)(ptr), (LONG)(uintptr_t)(val)); \
-    } else { \
-        *(ptr) = (val); \
-    } \
-} while(0)
+#define atomic_store_explicit(ptr, val, order)                                            \
+    do                                                                                    \
+    {                                                                                     \
+        if (sizeof(*(ptr)) == sizeof(void *))                                             \
+        {                                                                                 \
+            InterlockedExchangePointer((PVOID volatile *)(ptr), (PVOID)(uintptr_t)(val)); \
+        }                                                                                 \
+        else if (sizeof(*(ptr)) == 4)                                                     \
+        {                                                                                 \
+            InterlockedExchange((LONG volatile *)(ptr), (LONG)(uintptr_t)(val));          \
+        }                                                                                 \
+        else                                                                              \
+        {                                                                                 \
+            *(ptr) = (val);                                                               \
+        }                                                                                 \
+    } while (0)
 #endif
 
 /* Atomic load - MUST be truly atomic */
-static inline void* _atomic_load_ptr(volatile void* const* ptr) {
-    return (void*)InterlockedCompareExchangePointer((PVOID volatile*)ptr, NULL, NULL);
+static inline void *_atomic_load_ptr(volatile void *const *ptr)
+{
+    return (void *)InterlockedCompareExchangePointer((PVOID volatile *)ptr, NULL, NULL);
 }
 
 #ifdef _WIN64
-static inline LONGLONG _atomic_load_i64(volatile LONGLONG* ptr) {
-    return InterlockedCompareExchange64((LONGLONG volatile*)ptr, 0, 0);
+static inline LONGLONG _atomic_load_i64(volatile LONGLONG *ptr)
+{
+    return InterlockedCompareExchange64((LONGLONG volatile *)ptr, 0, 0);
 }
 #endif
 
-static inline LONG _atomic_load_i32(volatile LONG* ptr) {
-    return InterlockedCompareExchange((LONG volatile*)ptr, 0, 0);
+static inline LONG _atomic_load_i32(volatile LONG *ptr)
+{
+    return InterlockedCompareExchange((LONG volatile *)ptr, 0, 0);
 }
 
-static inline unsigned char _atomic_load_u8(volatile unsigned char* ptr) {
-    return *ptr;  /* byte reads are atomic on x86/x64 */
+static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
+{
+    return *ptr; /* byte reads are atomic on x86/x64 */
 }
 
 #ifdef _WIN64
-#define atomic_load_explicit(ptr, order) \
-    (sizeof(*(ptr)) == sizeof(void*) ? \
-        _atomic_load_ptr((volatile void* const*)(ptr)) : \
-     sizeof(*(ptr)) == 8 ? \
-        (void*)(uintptr_t)_atomic_load_i64((volatile LONGLONG*)(ptr)) : \
-     sizeof(*(ptr)) == 4 ? \
-        (void*)(uintptr_t)_atomic_load_i32((volatile LONG*)(ptr)) : \
-        (void*)(uintptr_t)_atomic_load_u8((volatile unsigned char*)(ptr)))
+#define atomic_load_explicit(ptr, order)                                                     \
+    (sizeof(*(ptr)) == sizeof(void *) ? _atomic_load_ptr((volatile void *const *)(ptr))      \
+     : sizeof(*(ptr)) == 8 ? (void *)(uintptr_t)_atomic_load_i64((volatile LONGLONG *)(ptr)) \
+     : sizeof(*(ptr)) == 4 ? (void *)(uintptr_t)_atomic_load_i32((volatile LONG *)(ptr))     \
+                           : (void *)(uintptr_t)_atomic_load_u8((volatile unsigned char *)(ptr)))
 #else
-#define atomic_load_explicit(ptr, order) \
-    (sizeof(*(ptr)) == sizeof(void*) ? \
-        _atomic_load_ptr((volatile void* const*)(ptr)) : \
-     sizeof(*(ptr)) == 4 ? \
-        (void*)(uintptr_t)_atomic_load_i32((volatile LONG*)(ptr)) : \
-        (void*)(uintptr_t)_atomic_load_u8((volatile unsigned char*)(ptr)))
+#define atomic_load_explicit(ptr, order)                                                            \
+    (sizeof(*(ptr)) == sizeof(void *) ? _atomic_load_ptr((volatile void *const *)(ptr))             \
+     : sizeof(*(ptr)) == 4            ? (void *)(uintptr_t)_atomic_load_i32((volatile LONG *)(ptr)) \
+                           : (void *)(uintptr_t)_atomic_load_u8((volatile unsigned char *)(ptr)))
 #endif
 
 /* Atomic exchange */
 #ifdef _WIN64
-#define atomic_exchange_explicit(ptr, val, order) \
-    (sizeof(*(ptr)) == sizeof(void*) ? \
-        InterlockedExchangePointer((PVOID volatile*)(ptr), (PVOID)(uintptr_t)(val)) : \
-     sizeof(*(ptr)) == 8 ? \
-        (void*)(uintptr_t)InterlockedExchange64((LONGLONG volatile*)(ptr), (LONGLONG)(uintptr_t)(val)) : \
-        (void*)(uintptr_t)InterlockedExchange((LONG volatile*)(ptr), (LONG)(uintptr_t)(val)))
+#define atomic_exchange_explicit(ptr, val, order)                                       \
+    (sizeof(*(ptr)) == sizeof(void *)                                                   \
+         ? InterlockedExchangePointer((PVOID volatile *)(ptr), (PVOID)(uintptr_t)(val)) \
+     : sizeof(*(ptr)) == 8                                                              \
+         ? (void *)(uintptr_t)InterlockedExchange64((LONGLONG volatile *)(ptr),         \
+                                                    (LONGLONG)(uintptr_t)(val))         \
+         : (void *)(uintptr_t)InterlockedExchange((LONG volatile *)(ptr), (LONG)(uintptr_t)(val)))
 #else
-#define atomic_exchange_explicit(ptr, val, order) \
-    (sizeof(*(ptr)) == sizeof(void*) ? \
-        InterlockedExchangePointer((PVOID volatile*)(ptr), (PVOID)(uintptr_t)(val)) : \
-        (void*)(uintptr_t)InterlockedExchange((LONG volatile*)(ptr), (LONG)(uintptr_t)(val)))
+#define atomic_exchange_explicit(ptr, val, order)                                       \
+    (sizeof(*(ptr)) == sizeof(void *)                                                   \
+         ? InterlockedExchangePointer((PVOID volatile *)(ptr), (PVOID)(uintptr_t)(val)) \
+         : (void *)(uintptr_t)InterlockedExchange((LONG volatile *)(ptr), (LONG)(uintptr_t)(val)))
 #endif
 
 #ifdef _WIN64
-#define atomic_fetch_add(ptr, val) InterlockedExchangeAdd64((LONGLONG volatile*)(ptr), (LONGLONG)(val))
+#define atomic_fetch_add(ptr, val) \
+    InterlockedExchangeAdd64((LONGLONG volatile *)(ptr), (LONGLONG)(val))
 #else
-#define atomic_fetch_add(ptr, val) InterlockedExchangeAdd((LONG volatile*)(ptr), (LONG)(val))
+#define atomic_fetch_add(ptr, val) InterlockedExchangeAdd((LONG volatile *)(ptr), (LONG)(val))
 #endif
 
 #define atomic_store(ptr, val) atomic_store_explicit(ptr, val, memory_order_seq_cst)
-#define atomic_load(ptr) atomic_load_explicit(ptr, memory_order_seq_cst)
-#define memory_order_relaxed 0
-#define memory_order_acquire 1
-#define memory_order_release 2
-#define memory_order_seq_cst 3
+#define atomic_load(ptr)       atomic_load_explicit(ptr, memory_order_seq_cst)
+#define memory_order_relaxed   0
+#define memory_order_acquire   1
+#define memory_order_release   2
+#define memory_order_seq_cst   3
 #endif /* _MSC_VER < 1930 */
 
 /* access flags are normally defined in unistd.h, which unavailable under MSVC
@@ -353,7 +373,7 @@ static inline int sem_post(sem_t *sem)
 
 /* file operations macros for cross-platform compatibility */
 #ifndef S_ISDIR
-#define S_ISDIR(m)           (((m)&S_IFMT) == S_IFDIR)
+#define S_ISDIR(m) (((m)&S_IFMT) == S_IFDIR)
 #endif
 #define sleep(seconds)       Sleep((seconds)*1000)
 #define usleep(microseconds) Sleep((microseconds) / 1000) /* usleep for Windows */
@@ -440,12 +460,12 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 
     OVERLAPPED overlapped;
     ZeroMemory(&overlapped, sizeof(OVERLAPPED));
-    
+
     LARGE_INTEGER li;
     li.QuadPart = offset;
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
-    overlapped.hEvent = NULL;  /* Must be NULL for synchronous files */
+    overlapped.hEvent = NULL; /* Must be NULL for synchronous files */
 
     DWORD bytes_read = 0;
     if (!ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped))
@@ -479,12 +499,12 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
 
     OVERLAPPED overlapped;
     ZeroMemory(&overlapped, sizeof(OVERLAPPED));
-    
+
     LARGE_INTEGER li;
     li.QuadPart = offset;
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
-    overlapped.hEvent = NULL;  /* Must be NULL for synchronous files */
+    overlapped.hEvent = NULL; /* Must be NULL for synchronous files */
 
     DWORD bytes_written = 0;
     if (!WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped))

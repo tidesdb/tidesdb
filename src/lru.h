@@ -42,13 +42,13 @@ typedef void (*lru_evict_callback_t)(const char *key, void *value, void *user_da
  */
 struct lru_entry_t
 {
-    char *key;                         /* key string (owned by entry) */
-    void *value;                       /* value pointer (not owned, managed by callback) */
-    void *user_data;                   /* optional user data for callback */
-    lru_evict_callback_t evict_cb;     /* eviction callback for this entry */
-    lru_entry_t *prev;                 /* previous entry in doubly linked list */
-    lru_entry_t *next;                 /* next entry in doubly linked list */
-    lru_entry_t *hash_next;            /* next entry in hash table chain */
+    char *key;                     /* key string (owned by entry) */
+    void *value;                   /* value pointer (not owned, managed by callback) */
+    void *user_data;               /* optional user data for callback */
+    lru_evict_callback_t evict_cb; /* eviction callback for this entry */
+    lru_entry_t *prev;             /* previous entry in doubly linked list */
+    lru_entry_t *next;             /* next entry in doubly linked list */
+    lru_entry_t *hash_next;        /* next entry in hash table chain */
 };
 
 /*
@@ -57,13 +57,13 @@ struct lru_entry_t
  */
 struct lru_cache_t
 {
-    size_t capacity;        /* maximum number of entries */
-    size_t size;            /* current number of entries */
-    lru_entry_t *head;      /* most recently used entry */
-    lru_entry_t *tail;      /* least recently used entry */
-    lru_entry_t **table;    /* hash table for O(1) lookups */
-    size_t table_size;      /* hash table size */
-    pthread_mutex_t lock;   /* mutex for thread safety */
+    size_t capacity;      /* maximum number of entries */
+    size_t size;          /* current number of entries */
+    lru_entry_t *head;    /* most recently used entry */
+    lru_entry_t *tail;    /* least recently used entry */
+    lru_entry_t **table;  /* hash table for O(1) lookups */
+    size_t table_size;    /* hash table size */
+    pthread_mutex_t lock; /* mutex for thread safety */
 };
 
 /*
@@ -85,8 +85,8 @@ lru_cache_t *lru_cache_new(size_t capacity);
  * @param user_data optional user data to pass to the callback (can be NULL)
  * @return 0 on success, -1 on failure
  */
-int lru_cache_put(lru_cache_t *cache, const char *key, void *value,
-                  lru_evict_callback_t evict_cb, void *user_data);
+int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_callback_t evict_cb,
+                  void *user_data);
 
 /*
  * lru_cache_get

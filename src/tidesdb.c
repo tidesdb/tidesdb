@@ -189,8 +189,7 @@ static void block_manager_evict_cb(const char *key, void *value, void *user_data
     if (bm)
     {
         TDB_DEBUG_LOG("Evicting block manager from cache: %s", key);
-        block_manager_close(bm);
-        free(bm);
+        block_manager_close(bm); /* block_manager_close already frees bm */
     }
 }
 
@@ -199,20 +198,7 @@ static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path
                                                    tidesdb_sync_mode_t sync_mode,
                                                    int sync_interval)
 {
-    if (!db || !path) return NULL;
-
-    /* if caching is disabled, open directly without caching */
-    if (!db->block_manager_cache)
-    {
-        block_manager_t *bm = malloc(sizeof(block_manager_t));
-        if (!bm) return NULL;
-        if (block_manager_open(&bm, path, sync_mode, sync_interval) == -1)
-        {
-            free(bm);
-            return NULL;
-        }
-        return bm;
-    }
+    if (!db || !path || !db->block_manager_cache) return NULL;
 
     /* check cache first */
     block_manager_t *bm = (block_manager_t *)lru_cache_get(db->block_manager_cache, path);
@@ -224,12 +210,11 @@ static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path
 
     /* cache miss - open and add to cache */
     TDB_DEBUG_LOG("Block manager cache miss: %s", path);
-    bm = malloc(sizeof(block_manager_t));
-    if (!bm) return NULL;
+    bm = NULL;
 
     if (block_manager_open(&bm, path, sync_mode, sync_interval) == -1)
     {
-        free(bm);
+        /* block_manager_open sets bm to NULL on failure */
         return NULL;
     }
 
@@ -237,8 +222,7 @@ static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path
     if (lru_cache_put(db->block_manager_cache, path, bm, block_manager_evict_cb, NULL) == -1)
     {
         /* cache full or error - close and return NULL */
-        block_manager_close(bm);
-        free(bm);
+        block_manager_close(bm); /* block_manager_close already frees bm */
         return NULL;
     }
 
@@ -269,23 +253,21 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_LOCK;
     }
 
-    /* initialize block manager cache if enabled (max_open_file_handles > 0) */
-    if ((*db)->config.max_open_file_handles > 0)
+    /* initialize block manager cache
+     * If max_open_file_handles is 0, use a large default (1000) to avoid leaks
+     * while still providing reasonable resource limits */
+    size_t cache_capacity = (*db)->config.max_open_file_handles > 0 
+                           ? (size_t)(*db)->config.max_open_file_handles 
+                           : 1000;
+    
+    (*db)->block_manager_cache = lru_cache_new(cache_capacity);
+    if (!(*db)->block_manager_cache)
     {
-        (*db)->block_manager_cache = lru_cache_new((*db)->config.max_open_file_handles);
-        if (!(*db)->block_manager_cache)
-        {
-            pthread_rwlock_destroy(&(*db)->db_lock);
-            free(*db);
-            return TDB_ERR_MEMORY;
-        }
-        TDB_DEBUG_LOG("Block manager cache initialized with capacity: %d",
-                      (*db)->config.max_open_file_handles);
+        pthread_rwlock_destroy(&(*db)->db_lock);
+        free(*db);
+        return TDB_ERR_MEMORY;
     }
-    else
-    {
-        TDB_DEBUG_LOG("Block manager caching disabled (max_open_file_handles = 0)");
-    }
+    TDB_DEBUG_LOG("Block manager cache initialized with capacity: %d", (int)cache_capacity);
 
     /* create database directory */
     if (mkdir_p(config->db_path) == -1)
@@ -402,7 +384,8 @@ int tidesdb_close(tidesdb_t *db)
 
     free(db->column_families);
 
-    /* free block manager cache (this will close all cached block managers) */
+    /* close all cached block managers before destroying cache
+     * We use lru_cache_free which calls eviction callbacks to properly close them */
     if (db->block_manager_cache)
     {
         TDB_DEBUG_LOG("Freeing block manager cache");
@@ -1342,8 +1325,11 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
             free(index_data);
         }
 
-        /* close block manager before rename */
-        block_manager_close(merged->block_manager);
+        /* remove temp file's block manager from cache and close it before rename */
+        if (cf->db->block_manager_cache)
+        {
+            lru_cache_remove(cf->db->block_manager_cache, temp_path);
+        }
         merged->block_manager = NULL;
 
         /* rename temp file to final name (atomic operation) */
@@ -1371,6 +1357,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         char path1[TDB_MAX_PATH_LENGTH], path2[TDB_MAX_PATH_LENGTH];
         get_sstable_path(cf, sst1->id, path1);
         get_sstable_path(cf, sst2->id, path2);
+        
         unlink(path1);
         unlink(path2);
 
@@ -1664,7 +1651,12 @@ static void *tidesdb_compaction_worker(void *arg)
         free(index_data);
     }
 
-    block_manager_close(merged->block_manager);
+    /* remove temp file's block manager from cache and close it before rename */
+    if (cf->db->block_manager_cache)
+    {
+        lru_cache_remove(cf->db->block_manager_cache, temp_path);
+    }
+    merged->block_manager = NULL;
 
     /* rename temp to final */
     if (rename(temp_path, new_path) == 0)
@@ -2149,10 +2141,11 @@ static void tidesdb_sstable_free(tidesdb_sstable_t *sstable)
 {
     if (!sstable) return;
 
-    if (sstable->block_manager)
-    {
-        block_manager_close(sstable->block_manager);
-    }
+    /* NOTE: We don't close block_manager here because it's managed by the LRU cache.
+     * The cache will close block managers when:
+     * - They are evicted (LRU)
+     * - tidesdb_close() frees the cache
+     */
 
     if (sstable->index)
     {

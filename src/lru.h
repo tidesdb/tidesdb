@@ -115,10 +115,18 @@ void lru_cache_clear(lru_cache_t *cache);
 
 /*
  * lru_cache_free
- * frees the cache and all its entries, calling eviction callbacks
+ * frees the cache and all its entries (calls eviction callbacks)
  * @param cache the LRU cache
  */
 void lru_cache_free(lru_cache_t *cache);
+
+/*
+ * lru_cache_destroy
+ * frees the cache without calling eviction callbacks
+ * use this when you want to clean up the cache but handle the values separately
+ * @param cache the LRU cache
+ */
+void lru_cache_destroy(lru_cache_t *cache);
 
 /*
  * lru_cache_size

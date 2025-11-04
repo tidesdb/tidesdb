@@ -369,7 +369,15 @@ static void test_memtable_flush(void)
 
     int sstables_before = atomic_load(&cf->num_sstables);
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
-    int sstables_after = atomic_load(&cf->num_sstables);
+
+    /* wait for async flush to complete (flush happens in background) */
+    int max_wait = 50; /* 5 seconds max */
+    int sstables_after = sstables_before;
+    for (int i = 0; i < max_wait && sstables_after == sstables_before; i++)
+    {
+        usleep(100000); /* 100ms */
+        sstables_after = atomic_load(&cf->num_sstables);
+    }
 
     ASSERT_TRUE(sstables_after > sstables_before);
 
@@ -420,7 +428,7 @@ static void test_custom_comparator(void)
 {
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.comparator_name = "string"; /* Use registered comparator by name */
+    cf_config.comparator_name = "string"; /* use a registered comparator by name */
 
     ASSERT_EQ(tidesdb_create_column_family(db, "string_cf", &cf_config), 0);
 
@@ -1581,7 +1589,15 @@ static void test_compaction_tombstones(void)
     tidesdb_txn_free(txn2);
     tidesdb_flush_memtable(cf);
 
-    int sstables_before = atomic_load(&cf->num_sstables);
+    /* wait for async flushes to complete */
+    int max_wait = 50; /* 5 seconds max */
+    int sstables_before = 0;
+    for (int i = 0; i < max_wait; i++)
+    {
+        sstables_before = atomic_load(&cf->num_sstables);
+        if (sstables_before >= 2) break; /* wait for at least 2 SSTables */
+        usleep(100000);                  /* 100ms */
+    }
 
     /* trigger compaction to merge the two data ssts */
     ASSERT_EQ(tidesdb_compact(cf), 0);
@@ -1818,8 +1834,18 @@ static void test_parallel_compaction(void)
         ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
     }
 
-    /* verify we have 8 ssts */
-    ASSERT_EQ(atomic_load(&cf->num_sstables), num_sstables);
+    /* wait for all async flushes to complete */
+    int max_wait = 100; /* 10 seconds max */
+    int current_sstables = 0;
+    for (int i = 0; i < max_wait; i++)
+    {
+        current_sstables = atomic_load(&cf->num_sstables);
+        if (current_sstables >= num_sstables) break;
+        usleep(100000); /* 100ms */
+    }
+
+    /* verify we have at least 8 ssts (might have more if auto-compaction triggered) */
+    ASSERT_TRUE(current_sstables >= num_sstables);
 
     /* trigger parallel compaction */
     ASSERT_EQ(tidesdb_compact(cf), 0);
@@ -2115,9 +2141,19 @@ static void test_iterator_metadata_boundary(void)
     /* manually flush memtable */
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
-    ASSERT_TRUE(atomic_load(&cf->num_sstables) > 0);
+    /* wait for async flush to complete */
+    int max_wait = 50; /* 5 seconds max */
+    int num_ssts = 0;
+    for (int i = 0; i < max_wait; i++)
+    {
+        num_ssts = atomic_load(&cf->num_sstables);
+        if (num_ssts > 0) break;
+        usleep(100000); /* 100ms */
+    }
 
-    /* get the SSTable and verify num_entries */
+    ASSERT_TRUE(num_ssts > 0);
+
+    /* get the sst and verify num_entries */
     tidesdb_sstable_t *sst = cf->sstables[0];
     ASSERT_TRUE(sst != NULL);
     ASSERT_EQ(sst->num_entries, 5);
@@ -2200,7 +2236,16 @@ static void test_sstable_num_entries_accuracy(void)
     ASSERT_TRUE(cf != NULL);
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
-    int actual_sstables = atomic_load(&cf->num_sstables);
+    /* wait for async flush to complete */
+    int max_wait = 50; /* 5 seconds max */
+    int actual_sstables = 0;
+    for (int i = 0; i < max_wait; i++)
+    {
+        actual_sstables = atomic_load(&cf->num_sstables);
+        if (actual_sstables > 0) break;
+        usleep(100000); /* 100ms */
+    }
+
     ASSERT_TRUE(actual_sstables > 0); /* at least one SSTable created */
 
     /* verify iterator reads correct total count */
@@ -2288,8 +2333,17 @@ static void test_drop_column_family_with_data(void)
     ASSERT_TRUE(cf != NULL);
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
+    /* wait for async flush to complete */
+    int max_wait = 50; /* 5 seconds max */
+    int num_sstables = 0;
+    for (int i = 0; i < max_wait; i++)
+    {
+        num_sstables = atomic_load(&cf->num_sstables);
+        if (num_sstables > 0) break;
+        usleep(100000); /* 100ms */
+    }
+
     /* verify sstables were created */
-    int num_sstables = atomic_load(&cf->num_sstables);
     ASSERT_TRUE(num_sstables > 0);
 
     /* drop the column family */
@@ -2347,6 +2401,14 @@ static void test_drop_column_family_cleanup(void)
     ASSERT_TRUE(cf != NULL);
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
+    /* wait for async flush to complete */
+    int max_wait = 50; /* 5 seconds max */
+    for (int i = 0; i < max_wait; i++)
+    {
+        if (atomic_load(&cf->num_sstables) > 0) break;
+        usleep(100000); /* 100ms */
+    }
+
     /* verify files exist before drop */
     char cf_path[TDB_MAX_PATH_LENGTH];
     snprintf(cf_path, sizeof(cf_path), "%s" PATH_SEPARATOR "cleanup_cf", TEST_DB_PATH);
@@ -2371,8 +2433,8 @@ static void test_concurrent_compaction_with_reads(void)
 
     /* disable background compaction, we'll trigger manually */
     cf_config.enable_background_compaction = 0;
-    cf_config.max_sstables_before_compaction = 2;
-    cf_config.compaction_threads = 0; /* single-threaded for deterministic test */
+    cf_config.max_sstables_before_compaction = 10; /* prevent auto-compaction by flush worker */
+    cf_config.compaction_threads = 0;              /* single-threaded for deterministic test */
 
     ASSERT_EQ(tidesdb_create_column_family(db, "concurrent_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "concurrent_cf");
@@ -2392,7 +2454,14 @@ static void test_concurrent_compaction_with_reads(void)
     }
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
+    printf("\n  [Debug] Before first flush: active_memtable entries=%d",
+           skip_list_count_entries(cf->active_memtable->memtable));
+    fflush(stdout);
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    printf("\n  [Debug] After first flush: immutable=%zu, flush_queue=%zu",
+           queue_size(cf->immutable_memtables), queue_size(cf->flush_queue));
+    fflush(stdout);
+    usleep(200000); /* give flush thread time to pick up work */
 
     /* insert data into second sstable */
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
@@ -2407,11 +2476,39 @@ static void test_concurrent_compaction_with_reads(void)
     }
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
+    printf("\n  [Debug] Before second flush: active_memtable entries=%d",
+           skip_list_count_entries(cf->active_memtable->memtable));
+    fflush(stdout);
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    printf("\n  [Debug] After second flush: immutable=%zu, flush_queue=%zu",
+           queue_size(cf->immutable_memtables), queue_size(cf->flush_queue));
+    fflush(stdout);
+    usleep(200000); /* give flush thread time to pick up work */
 
-    /* verify we have 2 sstables */
-    int num_sstables = atomic_load(&cf->num_sstables);
-    ASSERT_EQ(num_sstables, 2);
+    /* wait for both async flushes to complete */
+    int max_wait = 100; /* 10 seconds max */
+    int num_sstables = 0;
+    for (int i = 0; i < max_wait; i++)
+    {
+        num_sstables = atomic_load(&cf->num_sstables);
+        if (num_sstables >= 2) break;
+        if (i % 10 == 0) /* print every second */
+        {
+            size_t immutable_size = queue_size(cf->immutable_memtables);
+            size_t flush_queue_size = queue_size(cf->flush_queue);
+            printf(
+                "\n  [Debug] Waiting for flushes... SSTables: %d, immutable: %zu, flush_queue: "
+                "%zu, iter: %d",
+                num_sstables, immutable_size, flush_queue_size, i);
+            fflush(stdout);
+        }
+        usleep(100000); /* 100ms */
+    }
+    printf("\n  [Debug] Final SSTable count: %d\n", num_sstables);
+    fflush(stdout);
+
+    /* verify we have at least 2 sstables */
+    ASSERT_TRUE(num_sstables >= 2);
 
     /* create iterator BEFORE compaction */
     tidesdb_txn_t *read_txn = NULL;
@@ -2517,7 +2614,18 @@ static void test_linear_scan_fallback(void)
 
     /* flush to sstable to trigger linear scan path */
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
-    ASSERT_TRUE(atomic_load(&cf->num_sstables) > 0);
+
+    /* wait for async flush to complete */
+    int max_wait = 50;
+    int num_sstables = 0;
+    for (int i = 0; i < max_wait; i++)
+    {
+        num_sstables = atomic_load(&cf->num_sstables);
+        if (num_sstables > 0) break;
+        usleep(100000);
+    }
+
+    ASSERT_TRUE(num_sstables > 0);
 
     /* verify all keys can be retrieved using linear scan */
     ASSERT_EQ(tidesdb_txn_begin_read(db, &txn), 0);

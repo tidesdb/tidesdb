@@ -37,6 +37,7 @@
 #include "compat.h"
 #include "compress.h"
 #include "lru.h"
+#include "queue.h"
 #include "skip_list.h"
 
 /* follow your passion, be obsessed, don't worry too much. */
@@ -246,21 +247,41 @@ struct tidesdb_sstable_t
 };
 
 /*
+ * tidesdb_memtable_t
+ * represents a memtable instance with its own WAL
+ * @param memtable in-memory skip list
+ * @param wal write-ahead log block manager for this memtable
+ * @param id unique identifier (timestamp-based)
+ * @param created_at creation timestamp
+ */
+typedef struct
+{
+    skip_list_t *memtable;
+    block_manager_t *wal;
+    uint64_t id;
+    time_t created_at;
+} tidesdb_memtable_t;
+
+/*
  * tidesdb_column_family_t
  * represents a column family (logical keyspace)
  * @param name name of the column family
  * @param db pointer to parent tidesdb instance
- * @param memtable in-memory skip list
- * @param wal write-ahead log block manager
+ * @param active_memtable current active memtable for writes
+ * @param immutable_memtables queue of memtables being flushed
  * @param sstables array of sstable pointers
  * @param num_sstables current number of sstables
  * @param sstable_array_capacity allocated capacity of sstables array (internal, can grow)
  * @param next_sstable_id next sstable ID to assign
  * @param cf_lock reader-writer lock for this column family
  * @param flush_lock lock for flush operations
+ * @param flush_queue queue of memtables waiting to be flushed
+ * @param flush_thread background flush worker thread
+ * @param flush_stop flag to stop flush thread
  * @param compaction_lock lock for compaction operations
  * @param compaction_thread background compaction thread
  * @param compaction_stop flag to stop compaction thread
+ * @param next_memtable_id next memtable ID to assign
  * @param config configuration for this column family (config.sstable_capacity triggers compaction)
  */
 struct tidesdb_column_family_t
@@ -268,14 +289,18 @@ struct tidesdb_column_family_t
     char name[TDB_MAX_CF_NAME_LENGTH];
     char comparator_name[TDB_MAX_COMPARATOR_NAME];
     tidesdb_t *db;
-    skip_list_t *memtable;
-    block_manager_t *wal;
+    _Atomic(tidesdb_memtable_t *) active_memtable;
+    queue_t *immutable_memtables;
     tidesdb_sstable_t **sstables;
     _Atomic(int) num_sstables;
     int sstable_array_capacity;
     _Atomic(uint64_t) next_sstable_id;
+    _Atomic(uint64_t) next_memtable_id;
     pthread_rwlock_t cf_lock;
     pthread_mutex_t flush_lock;
+    queue_t *flush_queue;
+    pthread_t flush_thread;
+    _Atomic(int) flush_stop;
     pthread_mutex_t compaction_lock;
     pthread_t compaction_thread;
     _Atomic(int) compaction_stop;
@@ -377,6 +402,8 @@ struct tidesdb_iter_t
     tidesdb_txn_t *txn;
     tidesdb_column_family_t *cf;
     skip_list_cursor_t *memtable_cursor;
+    skip_list_cursor_t **immutable_memtable_cursors;
+    int num_immutable_cursors;
     block_manager_cursor_t **sstable_cursors;
     tidesdb_sstable_t **sstables;
     int num_sstable_cursors;
@@ -498,7 +525,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf);
 
 /*
  * tidesdb_compact_parallel
- * parallel compaction using multiple threads with semaphore-based work queue
+ * manual parallel compaction using multiple threads with semaphore-based work queue
  * each thread compacts a pair of SSTables concurrently
  * @param cf column family
  * @return 0 on success, -1 on failure

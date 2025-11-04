@@ -3158,7 +3158,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
                 for (size_t i = 0; i < num_immutable; i++)
                 {
                     tidesdb_memtable_t *imt =
-                        (tidesdb_memtable_t *)queue_peek(cf->immutable_memtables);
+                        (tidesdb_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
                     if (imt && imt->memtable)
                     {
                         (*iter)->immutable_memtable_cursors[i] =

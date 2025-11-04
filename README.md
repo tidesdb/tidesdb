@@ -11,24 +11,23 @@ It is not a full-featured database, but rather a library that can be used to bui
 
 ## Features
 - [x] **ACID Transactions** - Atomic, consistent, isolated, and durable. Transactions support multiple operations across column families.
-- [x] **Optimized Concurrency** - Writers don't block readers, readers don't block readers. Column families use reader-writer locks allowing multiple concurrent readers. Only writers block other writers on the same column family.
+- [x] **Optimized Concurrency** - Single writer, multiple readers. Writers don't block readers. Readers never block other readers.
 - [x] **Column Families** - Isolated key-value stores. Each column family has its own memtable, SSTables, and WAL.
 - [x] **Atomic Transactions** - Commit or rollback multiple operations atomically. Failed transactions automatically rollback.
 - [x] **Bidirectional Iterators** - Iterate forward and backward over key-value pairs with merge-sort across memtable and SSTables.
-- [x] **Write-Ahead Log (WAL)** - Durability through WAL. Automatic recovery on startup reconstructs memtable from WAL.
-- [x] **Background Compaction** - Automatic background compaction when SSTable count reaches threshold. Configurable compaction interval and capacity.
+- [x] **Write-Ahead Log (WAL)** - Durability through WAL. Automatic recovery on startup reconstructs memtables from WALs.
+- [x] **Background Compaction** - Automatic background compaction when SSTable count reaches configured max per column family.
 - [x] **Bloom Filters** - Reduce disk reads by checking key existence before reading SSTables. Configurable false positive rate.
 - [x] **Compression** - Snappy, LZ4, or ZSTD compression for SSTables and WAL entries. Configurable per column family.
 - [x] **TTL Support** - Time-to-live for key-value pairs. Expired entries automatically skipped during reads.
 - [x] **Custom Comparators** - Register custom key comparison functions. Built-in comparators `memcmp, string, numeric`.
 - [x] **Sync Modes** - Three sync modes `NONE (fastest), BACKGROUND (balanced), FULL (most durable)`.
 - [x] **Configurable** - Per-column-family configuration `memtable size, compaction settings, compression, bloom filters, sync mode`.
-- [x] **Simple API** - Clean, easy-to-use C API. Returns 0 on success, -1 on error.
-- [x] **Skip List Memtable** - Lock-free skip list for in-memory storage with configurable max level and probability.
+- [x] **Simple API** - Clean, easy-to-use C API. Returns 0 on success, -n on error.
+- [x] **Skip List Memtable** - COW and atomic skip list for in-memory storage with configurable max level and probability.
 - [x] **Cross-Platform** - Linux, macOS, and Windows support with platform abstraction layer.
 - [x] **Sorted Binary Hash Array (SBHA)** - Fast SSTable lookups. Direct key-to-block offset mapping without full SSTable scans.
 - [x] **Tombstones** - Efficient deletion through tombstone markers. Removed during compaction.
-- [x] **Streamlined Serialization** - Compact binary format with versioning and bit-packed flags.
 - [x] **LRU File Handle Cache** - Configurable LRU cache for open file handles. Limits system resources while maintaining performance. Set `max_open_file_handles` to control cache size (0 = disabled).
 
 ## Building

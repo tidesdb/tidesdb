@@ -54,14 +54,16 @@ typedef int (*skip_list_comparator_fn)(const uint8_t *key1, size_t key1_size, co
 
 /*
  * skip_list_node_t
- * the node structure for the skip list
+ * immutable node structure; once created, contents never change
+ * nodes are reference counted for safe memory reclamation
  * @param key the key for the node
  * @param key_size the key size
  * @param value the value for the node
  * @param value_size the value size
  * @param ttl an expiration time for the node (-1 if no expiration)
  * @param deleted flag indicating if the node is deleted (1 = deleted, 0 = valid)
- * @param forward the forward pointers for the node
+ * @param ref_count reference count for safe memory reclamation
+ * @param forward the forward pointers for the node (atomic for COW updates)
  */
 struct skip_list_node_t
 {
@@ -70,10 +72,11 @@ struct skip_list_node_t
     uint8_t *value;
     size_t value_size;
     time_t ttl;
-    _Atomic(uint8_t) deleted;
+    uint8_t deleted;
+    _Atomic(uint64_t) ref_count;
 #ifdef _MSC_VER
 #pragma warning(push)
-#pragma warning(disable : 4200) /* nonstandard extension: zero-sized array */
+#pragma warning(disable : 4200)
 #endif
     _Atomic(skip_list_node_t *) forward[];
 #ifdef _MSC_VER
@@ -83,44 +86,50 @@ struct skip_list_node_t
 
 /*
  * skip_list_t
- * the skip list structure
+ * the skip list structure using copy-on-write for lock-free reads
  * @param level the current level of the skip list
  * @param max_level the maximum level of the skip list
  * @param probability the probability of a node having a certain level
- * @param header the header node of the skip list
- * @param tail the tail node of the skip list
+ * @param header the header node of the skip list (atomic pointer)
+ * @param tail the tail node of the skip list (atomic pointer)
  * @param total_size the total size in bytes of kv pairs in the skip list
- * @param write_lock mutex for exclusive write access
+ * @param write_lock mutex for exclusive write access (only writers block writers)
  * @param version global version number (incremented on each write)
  * @param comparator custom key comparator function
  * @param comparator_ctx context pointer passed to comparator function
+ * @param epoch current epoch for memory reclamation
+ * @param retired_nodes list of nodes pending deletion
  */
 typedef struct skip_list_t
 {
     _Atomic(int) level;
     int max_level;
     float probability;
-    skip_list_node_t *header;
+    _Atomic(skip_list_node_t *) header;
     _Atomic(skip_list_node_t *) tail;
     _Atomic(size_t) total_size;
     pthread_mutex_t write_lock;
     _Atomic(uint64_t) version;
     skip_list_comparator_fn comparator;
     void *comparator_ctx;
+    _Atomic(uint64_t) epoch;
 } skip_list_t;
 
 /*
  * skip_list_cursor_t
  * the cursor structure for the skip list
+ * cursors hold references to nodes to prevent premature deallocation
  * @param list the skip list
- * @param current the current node
+ * @param current the current node (with reference held)
  * @param snapshot_version the version this cursor was created at (for consistency)
+ * @param local_epoch the epoch this cursor started in
  */
 typedef struct
 {
     skip_list_t *list;
     skip_list_node_t *current;
     uint64_t snapshot_version;
+    uint64_t local_epoch;
 } skip_list_cursor_t;
 
 /*** default comparator functions * * */
@@ -170,21 +179,37 @@ int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const ui
 
 /*
  * skip_list_create_node
- * create a new skip list node
+ * create a new skip list node (immutable after creation)
  * @param level the level of the node
  * @param key the key for the node
  * @param key_size the key size
  * @param value the value for the node
  * @param value_size the value size
  * @param ttl an expiration time for the node (optional)
+ * @param deleted whether this node represents a deletion
  * @return the new skip list node
  */
 skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t key_size,
-                                        const uint8_t *value, size_t value_size, time_t ttl);
+                                        const uint8_t *value, size_t value_size, time_t ttl,
+                                        uint8_t deleted);
+
+/*
+ * skip_list_retain_node
+ * increment reference count on a node
+ * @param node the node to retain
+ */
+void skip_list_retain_node(skip_list_node_t *node);
+
+/*
+ * skip_list_release_node
+ * decrement reference count and free if zero
+ * @param node the node to release
+ */
+void skip_list_release_node(skip_list_node_t *node);
 
 /*
  * skip_list_free_node
- * free's a skip list node
+ * free's a skip list node (internal use only)
  * @param node the node to free
  * @return 0 if the node was freed successfully, -1 otherwise
  */
@@ -245,7 +270,8 @@ int skip_list_compare_keys(skip_list_t *list, const uint8_t *key1, size_t key1_s
 /*
  * skip_list_put
  * put a new key-value pair into the skip list
- * exclusive write operation.. acquires write lock internally
+ * uses copy-on-write: creates new node, readers never blocked
+ * exclusive write operation (only blocks other writers)
  * @param list the skip list
  * @param key the key to put
  * @param key_size the key size
@@ -260,7 +286,8 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
 /*
  * skip_list_delete
  * mark a key as deleted in the skip list
- * exclusive write operation.. acquires write lock internally
+ * uses copy-on-write: creates tombstone node, readers never blocked
+ * exclusive write operation (only blocks other writers)
  * @param list the skip list
  * @param key the key to delete
  * @param key_size the key size
@@ -271,7 +298,7 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size);
 /*
  * skip_list_get
  * get a value from the skip list
- * lock-free read operation using atomic pointer reads
+ * lock-free read operation, never blocks or is blocked by writers
  * @param list the skip list
  * @param key the key to get
  * @param key_size the key size
@@ -287,6 +314,7 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
  * skip_list_cursor_init
  * initialize a new skip list cursor
  * creates a snapshot of the list at current version
+ * lock-free operation
  * @param list the skip list
  * @return the new skip list cursor
  */
@@ -295,7 +323,7 @@ skip_list_cursor_t *skip_list_cursor_init(skip_list_t *list);
 /*
  * skip_list_cursor_next
  * move the cursor to the next node
- * lock-free operation using atomic pointer reads
+ * lock-free operation, never blocked by writers
  * @param cursor the cursor
  * @return 0 if the cursor was moved successfully, -1 otherwise on error
  */
@@ -304,7 +332,7 @@ int skip_list_cursor_next(skip_list_cursor_t *cursor);
 /*
  * skip_list_cursor_prev
  * move the cursor to the previous node
- * lock-free operation using atomic pointer reads
+ * lock-free operation, never blocked by writers
  * @param cursor the cursor
  * @return 0 if the cursor was moved successfully, -1 otherwise on error
  */
@@ -335,7 +363,7 @@ void skip_list_cursor_free(skip_list_cursor_t *cursor);
 /*
  * skip_list_clear
  * clear the skip list
- * exclusive write operation.. acquires write lock internally
+ * exclusive write operation (only blocks other writers)
  * @param list the skip list
  * @return 0 if the skip list was cleared successfully, -1 otherwise on error
  */
@@ -352,8 +380,8 @@ skip_list_t *skip_list_copy(skip_list_t *list);
 
 /*
  * skip_list_check_and_update_ttl
- * checks if a node has expired and updates the value to TOMBSTONE
- * **NOTE** Only called from write operations or within write lock
+ * checks if a node has expired
+ * in COW model, expired nodes are treated as deleted during traversal
  * @param list the skip list
  * @param node the node to check
  * @return 0 if the node has not expired, 1 if the node has expired

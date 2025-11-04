@@ -30,15 +30,19 @@ static int tests_failed = 0;
 
 #define BENCH_N 1000000 /* number of entries to write and retrieve */
 
-// void test_skip_list_create_node()
-// {
-//     uint8_t key[] = "test_key";
-//     uint8_t value[] = "test_value";
-//     skip_list_node_t *node = skip_list_create_node(1, key, sizeof(key), value, sizeof(value),
-//     -1); ASSERT_TRUE(node != NULL); ASSERT_TRUE(memcmp(node->key, key, sizeof(key)) == 0);
-//     ASSERT_TRUE(memcmp(node->value, value, sizeof(value)) == 0);
-//     (void)skip_list_free_node(node);
-// }
+void test_skip_list_create_node()
+{
+    uint8_t key[] = "test_key";
+    uint8_t value[] = "test_value";
+    skip_list_node_t *node =
+        skip_list_create_node(1, key, sizeof(key), value, sizeof(value), -1, 0);
+    ASSERT_TRUE(node != NULL);
+    ASSERT_TRUE(memcmp(node->key, key, sizeof(key)) == 0);
+    ASSERT_TRUE(memcmp(node->value, value, sizeof(value)) == 0);
+    ASSERT_EQ(node->deleted, 0);
+    skip_list_release_node(node);
+    printf(GREEN "test_skip_list_create_node passed\n" RESET);
+}
 
 void test_skip_list_put_get()
 {
@@ -504,7 +508,7 @@ void test_skip_list_min_max_key()
 
 int main(void)
 {
-    // RUN_TEST(test_skip_list_create_node, tests_passed);
+    RUN_TEST(test_skip_list_create_node, tests_passed);
     RUN_TEST(test_skip_list_put_get, tests_passed);
     RUN_TEST(test_skip_list_destroy, tests_passed);
     RUN_TEST(test_skip_list_clear, tests_passed);

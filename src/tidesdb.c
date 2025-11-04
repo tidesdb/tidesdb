@@ -643,7 +643,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                             tidesdb_kv_pair_header_t header;
                             memcpy(&header, block->data, sizeof(tidesdb_kv_pair_header_t));
 
-                            uint8_t *key = block->data + sizeof(tidesdb_kv_pair_header_t);
+                            uint8_t *data_ptr = (uint8_t *)block->data;
+                            uint8_t *key = data_ptr + sizeof(tidesdb_kv_pair_header_t);
                             uint8_t *value = key + header.key_size;
 
                             if (header.flags & TDB_KV_FLAG_TOMBSTONE)

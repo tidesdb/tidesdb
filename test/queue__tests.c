@@ -238,14 +238,15 @@ void test_queue_threaded(void)
     queue_t *queue = queue_new();
     ASSERT_TRUE(queue != NULL);
 
-    const int num_producers = 3;
-    const int num_consumers = 2;
-    const int items_per_producer = 50;
-    const int expected_total = num_producers * items_per_producer;
+#define NUM_PRODUCERS      3
+#define NUM_CONSUMERS      2
+#define ITEMS_PER_PRODUCER 50
 
-    pthread_t producers[num_producers];
-    pthread_t consumers[num_consumers];
-    producer_args_t producer_args[num_producers];
+    const int expected_total = NUM_PRODUCERS * ITEMS_PER_PRODUCER;
+
+    pthread_t producers[NUM_PRODUCERS];
+    pthread_t consumers[NUM_CONSUMERS];
+    producer_args_t producer_args[NUM_PRODUCERS];
 
     int consumed_count = 0;
     pthread_mutex_t count_lock;
@@ -257,25 +258,25 @@ void test_queue_threaded(void)
     consumer_args.consumed_count = &consumed_count;
     consumer_args.count_lock = &count_lock;
 
-    for (int i = 0; i < num_consumers; i++)
+    for (int i = 0; i < NUM_CONSUMERS; i++)
     {
         pthread_create(&consumers[i], NULL, consumer_thread, &consumer_args);
     }
 
-    for (int i = 0; i < num_producers; i++)
+    for (int i = 0; i < NUM_PRODUCERS; i++)
     {
         producer_args[i].queue = queue;
-        producer_args[i].num_items = items_per_producer;
+        producer_args[i].num_items = ITEMS_PER_PRODUCER;
         producer_args[i].thread_id = i;
         pthread_create(&producers[i], NULL, producer_thread, &producer_args[i]);
     }
 
-    for (int i = 0; i < num_producers; i++)
+    for (int i = 0; i < NUM_PRODUCERS; i++)
     {
         pthread_join(producers[i], NULL);
     }
 
-    for (int i = 0; i < num_consumers; i++)
+    for (int i = 0; i < NUM_CONSUMERS; i++)
     {
         pthread_join(consumers[i], NULL);
     }

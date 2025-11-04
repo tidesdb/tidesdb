@@ -139,38 +139,6 @@ vcpkg install snappy
 vcpkg install openssl
 ```
 
-## Bindings
-Bindings are in the works in various languages.
-<ul>
-    <li><img src="artwork/cpp.png" width="16" style="float: left; margin-right: 10px;" /> <a href="https://github.com/tidesdb/tidesdb-cpp">tidesdb-cpp</a></li>
-    <li><img src="artwork/go.png" width="16" style="float: left; margin-right: 10px;" /> <a href="https://github.com/tidesdb/tidesdb-go">tidesdb-go</a></li>
-    <li><img src="artwork/java.png" width="16" style="float: left; margin-right: 10px;" /> <a href="https://github.com/tidesdb/tidesdb-java">tidesdb-java</a></li>
-    <li><img src="artwork/python.png" width="16" style="float: left; margin-right: 10px;" /> <a href="https://github.com/tidesdb/tidesdb-python">tidesdb-python</a></li>
-    <li><img src="artwork/rust.png" width="16" style="float: left; margin-right: 10px;" /> <a href="https://github.com/tidesdb/tidesdb-rust">tidesdb-rust</a></li>
-    <li><img src="artwork/lua.png" width="16" style="float: left; margin-right: 10px;" /> <a href="https://github.com/tidesdb/tidesdb-lua">tidesdb-lua</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-csharp">tidesdb-csharp</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-scala">tidesdb-scala</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-objective-c">tidesdb-objective-c</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-php">tidesdb-php</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-perl">tidesdb-perl</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-ruby">tidesdb-ruby</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-swift">tidesdb-swift</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-haskell">tidesdb-haskell</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-d">tidesdb-d</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-kotlin">tidesdb-kotlin</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-julia">tidesdb-julia</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-r">tidesdb-r</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-js">tidesdb-js</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-dart">tidesdb-dart</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-nim">tidesdb-nim</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-zig">tidesdb-zig</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-ocaml">tidesdb-ocaml</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-fsharp">tidesdb-fsharp</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-erlang">tidesdb-erlang</a></li>
-    <li><a href="https://github.com/tidesdb/tidesdb-elixir">tidesdb-elixir</a></li>
-
-</ul>
-
 ## Discord Community
 Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask questions, work on development, and discuss the future of TidesDB.
 

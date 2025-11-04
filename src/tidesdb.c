@@ -3146,6 +3146,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
     (*iter)->num_immutable_cursors = 0;
     if (cf->immutable_memtables)
     {
+        /* lock to prevent flush thread from dequeuing while we snapshot */
+        pthread_mutex_lock(&cf->flush_lock);
         size_t num_immutable = queue_size(cf->immutable_memtables);
         if (num_immutable > 0)
         {
@@ -3171,6 +3173,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
                 }
             }
         }
+        pthread_mutex_unlock(&cf->flush_lock);
     }
 
     /* snapshot sstables at creation time */

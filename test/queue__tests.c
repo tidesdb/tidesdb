@@ -354,7 +354,7 @@ void test_queue_large_volume(void)
         ASSERT_EQ(queue_enqueue(queue, data), 0);
     }
 
-    ASSERT_EQ(queue_size(queue), num_items);
+    ASSERT_EQ(queue_size(queue), (size_t)num_items);
 
     for (int i = 0; i < num_items; i++)
     {

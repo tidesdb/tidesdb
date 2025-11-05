@@ -153,12 +153,6 @@ static inline int tidesdb_sstable_release(tidesdb_sstable_t *sst)
     return new_count;
 }
 
-static inline int tidesdb_sstable_get_ref_count(tidesdb_sstable_t *sst)
-{
-    if (!sst) return 0;
-    return atomic_load(&sst->ref_count);
-}
-
 /* reference counting helpers for memtables */
 static inline void tidesdb_memtable_acquire(tidesdb_memtable_t *mt)
 {
@@ -647,12 +641,6 @@ static inline int tidesdb_memtable_release(tidesdb_memtable_t *mt)
     return old_count - 1; /* return new count */
 }
 
-static inline int tidesdb_memtable_get_ref_count(tidesdb_memtable_t *mt)
-{
-    if (!mt) return 0;
-    return atomic_load(&mt->ref_count);
-}
-
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
 {
     tidesdb_column_family_config_t config = {
@@ -690,13 +678,6 @@ static void get_cf_path(const tidesdb_t *db, const char *cf_name, char *path)
 {
     (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", db->config.db_path,
                    cf_name);
-}
-
-static void get_wal_path(const tidesdb_column_family_t *cf, char *path)
-{
-    char cf_path[TDB_MAX_PATH_LENGTH];
-    get_cf_path(cf->db, cf->name, cf_path);
-    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "wal%s", cf_path, TDB_WAL_EXT);
 }
 
 static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable_id, char *path)
@@ -862,17 +843,18 @@ int tidesdb_close(tidesdb_t *db)
         queue_enqueue(cf->flush_queue, dummy);
         pthread_join(cf->flush_thread, NULL);
 
-        /* flush any remaining immutable memtables */
+        /* flush and free any remaining memtables in immutable_memtables queue
+         * hold flush_lock to prevent race with tidesdb_rotate_memtable */
+        pthread_mutex_lock(&cf->flush_lock);
         tidesdb_memtable_t *mt;
         while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
         {
+            pthread_mutex_unlock(&cf->flush_lock);
             tidesdb_flush_memtable_to_sstable(cf, mt);
-
-            atomic_store(&mt->ref_count, 0);
-            if (mt->memtable) skip_list_free(mt->memtable);
-            if (mt->wal) block_manager_close(mt->wal);
-            free(mt);
+            tidesdb_memtable_free(mt);
+            pthread_mutex_lock(&cf->flush_lock);
         }
+        pthread_mutex_unlock(&cf->flush_lock);
 
         /* stop compaction thread */
         if (cf->config.enable_background_compaction)
@@ -884,15 +866,15 @@ int tidesdb_close(tidesdb_t *db)
         tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
         if (active_mt)
         {
+            /* close WAL before freeing */
             if (active_mt->wal)
             {
                 block_manager_close(active_mt->wal);
                 active_mt->wal = NULL;
             }
 
-            atomic_store(&active_mt->ref_count, 0);
-            if (active_mt->memtable) skip_list_free(active_mt->memtable);
-            free(active_mt);
+            /* use tidesdb_memtable_free for consistent cleanup */
+            tidesdb_memtable_free(active_mt);
         }
 
         if (cf->immutable_memtables) queue_free(cf->immutable_memtables);
@@ -1730,8 +1712,9 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
     }
 
     char wal_path[TDB_MAX_PATH_LENGTH];
-    snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR "wal_%lu.log",
-             cf->db->config.db_path, cf->name, mt->id);
+    snprintf(wal_path, sizeof(wal_path),
+             "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log", cf->db->config.db_path,
+             cf->name, mt->id);
 
     if (block_manager_open(&mt->wal, wal_path, cf->config.sync_mode, cf->config.sync_interval) ==
         -1)
@@ -1776,16 +1759,19 @@ static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
     tidesdb_memtable_t *new_memtable = tidesdb_memtable_new(cf);
     if (!new_memtable) return -1;
 
+    /* hold flush_lock during entire rotation to prevent race with tidesdb_close */
+    pthread_mutex_lock(&cf->flush_lock);
+
     tidesdb_memtable_t *old_memtable = atomic_exchange(&cf->active_memtable, new_memtable);
 
     /* enqueue old memtable for flushing */
     if (old_memtable)
     {
-        pthread_mutex_lock(&cf->flush_lock);
         queue_enqueue(cf->immutable_memtables, old_memtable);
         queue_enqueue(cf->flush_queue, old_memtable);
-        pthread_mutex_unlock(&cf->flush_lock);
     }
+
+    pthread_mutex_unlock(&cf->flush_lock);
 
     return 0;
 }
@@ -1794,7 +1780,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
 {
     if (!cf || !mt) return -1;
 
-    TDB_DEBUG_LOG("Flushing memtable %lu for column family: %s", mt->id, cf->name);
+    TDB_DEBUG_LOG("Flushing memtable %" PRIu64 " for column family: %s", mt->id, cf->name);
 
     if (skip_list_count_entries(mt->memtable) == 0)
     {
@@ -2030,7 +2016,22 @@ static void *tidesdb_flush_worker_thread(void *arg)
     {
         tidesdb_memtable_t *mt = (tidesdb_memtable_t *)queue_dequeue_wait(cf->flush_queue);
 
-        if (atomic_load(&cf->flush_stop)) break;
+        if (atomic_load(&cf->flush_stop))
+        {
+            /* if we dequeued a valid memtable before stopping, we need to handle it */
+            if (mt)
+            {
+                /* flush it to avoid data loss */
+                tidesdb_flush_memtable_to_sstable(cf, mt);
+
+                pthread_mutex_lock(&cf->flush_lock);
+                queue_dequeue(cf->immutable_memtables);
+                pthread_mutex_unlock(&cf->flush_lock);
+
+                tidesdb_memtable_free(mt);
+            }
+            break;
+        }
 
         if (mt)
         {

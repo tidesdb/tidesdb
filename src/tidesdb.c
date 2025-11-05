@@ -1414,12 +1414,15 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     /* OPTION 1: Force close WAL files regardless of ref_count */
     /* This ensures file handles are released even if iterators/txns still hold references */
     
-    /* force close active memtable WAL */
+    /* force close active memtable WAL (no lock needed - threads are stopped) */
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
-    if (active_mt && active_mt->wal)
+    if (active_mt)
     {
-        block_manager_close(active_mt->wal);
-        active_mt->wal = NULL;
+        if (active_mt->wal)
+        {
+            block_manager_close(active_mt->wal);
+            active_mt->wal = NULL;
+        }
     }
 
     /* force close immutable memtable WALs */
@@ -1459,7 +1462,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     /* free flush queue */
     if (cf->flush_queue) queue_free(cf->flush_queue);
 
-    /* first, close all SSTable file handles by evicting from cache */
+    /* force-free all SSTables (evict from cache and free structures) */
     for (int i = 0; i < cf->num_sstables; i++)
     {
         if (cf->sstables[i])
@@ -1473,7 +1476,12 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
                 lru_cache_remove(db->block_manager_cache, path);
             }
 
-            tidesdb_sstable_release(cf->sstables[i]);
+            /* force-free SSTable structure regardless of ref_count */
+            tidesdb_sstable_t *sst = cf->sstables[i];
+            if (sst->index) binary_hash_array_free(sst->index);
+            if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
+            pthread_mutex_destroy(&sst->ref_lock);
+            free(sst);
         }
     }
     free(cf->sstables);

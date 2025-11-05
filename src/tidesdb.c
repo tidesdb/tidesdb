@@ -3760,29 +3760,39 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
         size_t num_immutable = queue_size(cf->immutable_memtables);
         if (num_immutable > 0)
         {
-            (*iter)->num_immutable_cursors = (int)num_immutable;
             (*iter)->immutable_memtable_cursors =
                 malloc(num_immutable * sizeof(skip_list_cursor_t *));
             (*iter)->immutable_memtables = malloc(num_immutable * sizeof(tidesdb_memtable_t *));
-            if ((*iter)->immutable_memtable_cursors && (*iter)->immutable_memtables)
+            if (!(*iter)->immutable_memtable_cursors || !(*iter)->immutable_memtables)
             {
-                /* cursors for each immutable memtable */
-                for (size_t i = 0; i < num_immutable; i++)
+                if ((*iter)->immutable_memtable_cursors) free((*iter)->immutable_memtable_cursors);
+                if ((*iter)->immutable_memtables) free((*iter)->immutable_memtables);
+                pthread_mutex_unlock(&cf->flush_lock);
+                if ((*iter)->memtable_cursor) skip_list_cursor_free((*iter)->memtable_cursor);
+                tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
+                if (active_mt) tidesdb_memtable_release(active_mt);
+                free(*iter);
+                return TDB_ERR_MEMORY;
+            }
+            
+            (*iter)->num_immutable_cursors = (int)num_immutable;
+            
+            /* cursors for each immutable memtable */
+            for (size_t i = 0; i < num_immutable; i++)
+            {
+                tidesdb_memtable_t *imt =
+                    (tidesdb_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
+                if (imt && imt->memtable)
                 {
-                    tidesdb_memtable_t *imt =
-                        (tidesdb_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
-                    if (imt && imt->memtable)
-                    {
-                        tidesdb_memtable_acquire(imt);
-                        (*iter)->immutable_memtables[i] = imt;
-                        (*iter)->immutable_memtable_cursors[i] =
-                            skip_list_cursor_init(imt->memtable);
-                    }
-                    else
-                    {
-                        (*iter)->immutable_memtables[i] = NULL;
-                        (*iter)->immutable_memtable_cursors[i] = NULL;
-                    }
+                    tidesdb_memtable_acquire(imt);
+                    (*iter)->immutable_memtables[i] = imt;
+                    (*iter)->immutable_memtable_cursors[i] =
+                        skip_list_cursor_init(imt->memtable);
+                }
+                else
+                {
+                    (*iter)->immutable_memtables[i] = NULL;
+                    (*iter)->immutable_memtable_cursors[i] = NULL;
                 }
             }
         }

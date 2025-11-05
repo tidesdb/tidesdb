@@ -144,17 +144,9 @@ static inline int tidesdb_sstable_release(tidesdb_sstable_t *sst)
     int old_count = atomic_fetch_sub(&sst->ref_count, 1);
     int new_count = old_count - 1;
 
-    /* if ref_count dropped to 0, free the sstable */
+    /* if ref_count dropped to 0, free the sstable structure (but NOT the file) */
     if (new_count == 0)
     {
-        /* delete the sstable file */
-        if (sst->cf)
-        {
-            char path[TDB_MAX_PATH_LENGTH];
-            get_sstable_path(sst->cf, sst->id, path);
-            remove(path);
-        }
-        /* free the sstable structure */
         tidesdb_sstable_free(sst);
     }
 

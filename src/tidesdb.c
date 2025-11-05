@@ -870,7 +870,7 @@ int tidesdb_close(tidesdb_t *db)
 
             if (mt->memtable) skip_list_free(mt->memtable);
             if (mt->wal) block_manager_close(mt->wal);
-            pthread_mutex_destroy(&mt->ref_lock);
+            /* Skip mutex destroy during shutdown for macOS compatibility */
             free(mt);
         }
 
@@ -891,7 +891,7 @@ int tidesdb_close(tidesdb_t *db)
             }
 
             if (active_mt->memtable) skip_list_free(active_mt->memtable);
-            pthread_mutex_destroy(&active_mt->ref_lock);
+            /* Skip mutex destroy during shutdown for macOS compatibility */
             free(active_mt);
         }
 
@@ -916,7 +916,7 @@ int tidesdb_close(tidesdb_t *db)
                 if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
                 if (sst->min_key) free(sst->min_key);
                 if (sst->max_key) free(sst->max_key);
-                pthread_mutex_destroy(&sst->ref_lock);
+                /* Skip mutex destroy during shutdown for macOS compatibility */
                 free(sst);
             }
         }
@@ -1500,7 +1500,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
             if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
             if (sst->min_key) free(sst->min_key);
             if (sst->max_key) free(sst->max_key);
-            pthread_mutex_destroy(&sst->ref_lock);
+            /* Skip mutex destroy for macOS compatibility */
             free(sst);
         }
     }
@@ -2038,7 +2038,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
             if (mt->memtable) skip_list_free(mt->memtable);
             if (mt->wal) block_manager_close(mt->wal);
-            pthread_mutex_destroy(&mt->ref_lock);
+            /* Skip mutex destroy during shutdown for macOS compatibility */
             free(mt);
 
             int num_ssts = atomic_load(&cf->num_sstables);

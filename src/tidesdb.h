@@ -309,6 +309,7 @@ struct tidesdb_column_family_t
     pthread_mutex_t compaction_lock;
     pthread_t compaction_thread;
     _Atomic(int) compaction_stop;
+    _Atomic(int) is_dropping;  /* flag to prevent new operations during drop */
     tidesdb_column_family_config_t config;
 };
 

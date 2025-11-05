@@ -960,6 +960,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->next_memtable_id, 0);
     atomic_init(&cf->flush_stop, 0);
     atomic_init(&cf->compaction_stop, 0);
+    atomic_init(&cf->is_dropping, 0);
     cf->flush_queue = NULL;
     memset(&cf->cf_lock, 0, sizeof(pthread_rwlock_t));
     memset(&cf->flush_lock, 0, sizeof(pthread_mutex_t));
@@ -1385,8 +1386,13 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     tidesdb_column_family_t *cf = db->column_families[found];
     int cleanup_error = 0; /* track errors but continue cleanup */
 
+    /* OPTION 3: Mark CF as dropping to prevent new operations */
+    atomic_store(&cf->is_dropping, 1);
+
     /* stop flush thread */
     atomic_store(&cf->flush_stop, 1);
+    
+    /* wake up flush thread if waiting */
     tidesdb_memtable_t *dummy = NULL;
     queue_enqueue(cf->flush_queue, dummy);
     if (pthread_join(cf->flush_thread, NULL) != 0)
@@ -1405,14 +1411,41 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         }
     }
 
-    /* free active memtable (will close WAL) */
+    /* OPTION 1: Force close WAL files regardless of ref_count */
+    /* This ensures file handles are released even if iterators/txns still hold references */
+    
+    /* force close active memtable WAL */
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
+    if (active_mt && active_mt->wal)
+    {
+        block_manager_close(active_mt->wal);
+        active_mt->wal = NULL;
+    }
+
+    /* force close immutable memtable WALs */
+    if (cf->immutable_memtables)
+    {
+        pthread_mutex_lock(&cf->flush_lock);
+        size_t queue_len = queue_size(cf->immutable_memtables);
+        for (size_t i = 0; i < queue_len; i++)
+        {
+            tidesdb_memtable_t *mt = (tidesdb_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
+            if (mt && mt->wal)
+            {
+                block_manager_close(mt->wal);
+                mt->wal = NULL;
+            }
+        }
+        pthread_mutex_unlock(&cf->flush_lock);
+    }
+
+    /* NOW free memtables (WALs already closed, so tidesdb_memtable_free won't try to close them again) */
     if (active_mt)
     {
         tidesdb_memtable_free(active_mt);
     }
 
-    /* free immutable memtables (will close WALs) */
+    /* free immutable memtables */
     if (cf->immutable_memtables)
     {
         tidesdb_memtable_t *mt;
@@ -3706,6 +3739,9 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
 
     tidesdb_column_family_t *cf = tidesdb_get_column_family(txn->db, cf_name);
     if (!cf) return TDB_ERR_NOT_FOUND;
+    
+    /* check if CF is being dropped */
+    if (atomic_load(&cf->is_dropping)) return TDB_ERR_INVALID_CF;
 
     *iter = malloc(sizeof(tidesdb_iter_t));
     if (!*iter) return TDB_ERR_MEMORY;

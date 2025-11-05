@@ -3411,7 +3411,6 @@ int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn)
     (*txn)->num_ops = 0;
     (*txn)->op_capacity = 0;
     (*txn)->committed = 0;
-    (*txn)->snapshot_version = 0;
     (*txn)->read_only = 0;
 
     return 0;
@@ -3429,7 +3428,6 @@ int tidesdb_txn_begin_read(tidesdb_t *db, tidesdb_txn_t **txn)
     (*txn)->num_ops = 0;
     (*txn)->op_capacity = 0;
     (*txn)->committed = 0;
-    (*txn)->snapshot_version = 0;
     (*txn)->read_only = 1;
 
     return 0;

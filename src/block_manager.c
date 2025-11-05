@@ -23,7 +23,7 @@
 
 /* fcntl.h and sys/stat.h are included via compat.h in block_manager.h */
 
-/* file format:
+/* file format
  * [HEADER]
  * - magic (3 bytes) 0x544442 "TDB"
  * - version (1 byte) 1
@@ -33,9 +33,9 @@
  * - block_size (8 bytes)
  * - checksum (20 bytes) SHA1 of data
  * - data (variable size)
- * - overflow_offset (8 bytes): 0 if no overflow, otherwise offset to next overflow block
+ * - overflow_offset (8 bytes) 0 if no overflow, otherwise offset to next overflow block
  *
- * CONCURRENCY MODEL:
+ * CONCURRENCY MODEL
  * - Single file descriptor shared by all operations
  * - pread/pwrite for lock-free reads (readers don't block readers or writers)
  * - write_mutex only for serializing writes (writers block writers)
@@ -111,8 +111,7 @@ static int get_file_size(int fd, uint64_t *size)
     return 0;
 }
 
-int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode,
-                       int fsync_interval)
+int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode)
 {
     block_manager_t *new_bm = malloc(sizeof(block_manager_t));
     if (!new_bm)
@@ -138,24 +137,12 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
     strncpy(new_bm->file_path, file_path, MAX_FILE_PATH_LENGTH - 1);
     new_bm->file_path[MAX_FILE_PATH_LENGTH - 1] = '\0';
 
-    /* set sync mode and interval */
+    /* set sync mode */
     new_bm->sync_mode = sync_mode;
-    new_bm->fsync_interval = fsync_interval;
-
-    new_bm->stop_fsync_thread = 0;
 
     /* initialize write mutex for thread safety on writes only */
     if (pthread_mutex_init(&new_bm->write_mutex, NULL) != 0)
     {
-        close(new_bm->fd);
-        free(new_bm);
-        *bm = NULL;
-        return -1;
-    }
-
-    if (pthread_cond_init(&new_bm->fsync_cond, NULL) != 0)
-    {
-        pthread_mutex_destroy(&new_bm->write_mutex);
         close(new_bm->fd);
         free(new_bm);
         *bm = NULL;
@@ -208,20 +195,6 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
         }
     }
 
-    /* create and start the fsync thread only for background sync */
-    if (sync_mode == TDB_SYNC_BACKGROUND)
-    {
-        if (pthread_create(&new_bm->fsync_thread, NULL, block_manager_fsync_thread, new_bm) != 0)
-        {
-            pthread_mutex_destroy(&new_bm->write_mutex);
-            pthread_cond_destroy(&new_bm->fsync_cond);
-            close(new_bm->fd);
-            free(new_bm);
-            *bm = NULL;
-            return -1;
-        }
-    }
-
     /* Only set the output pointer after everything succeeds */
     *bm = new_bm;
     return 0;
@@ -229,28 +202,13 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
 
 int block_manager_close(block_manager_t *bm)
 {
-    /* signal the fsync thread to stop and wait for it (only if background sync) */
-    if (bm->sync_mode == TDB_SYNC_BACKGROUND)
-    {
-        bm->stop_fsync_thread = 1;
-
-        /* wake up the fsync thread if it's sleeping on the condition variable */
-        pthread_mutex_lock(&bm->write_mutex);
-        pthread_cond_signal(&bm->fsync_cond);
-        pthread_mutex_unlock(&bm->write_mutex);
-
-        /* wait for the fsync thread to finish */
-        if (pthread_join(bm->fsync_thread, NULL) != 0) return -1;
-    }
-
     /* flush the file to disk one final time */
     (void)fdatasync(bm->fd);
 
     /* close the file descriptor */
     if (close(bm->fd) != 0) return -1;
 
-    /* destroy synchronization primitives */
-    pthread_cond_destroy(&bm->fsync_cond);
+    /* destroy write mutex */
     pthread_mutex_destroy(&bm->write_mutex);
 
     /* free the block manager */
@@ -427,8 +385,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
             return -1;
         }
     }
-    /* TDB_SYNC_BACKGROUND fsync thread handles it */
-    /* TDB_SYNC_NONE no sync */
+    /* TDB_SYNC_NONE - no sync */
 
     (void)pthread_mutex_unlock(&bm->write_mutex);
     return offset;
@@ -763,51 +720,6 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
     }
 
     return -1;
-}
-
-void *block_manager_fsync_thread(void *arg)
-{
-    block_manager_t *bm = (block_manager_t *)arg;
-
-    struct timespec ts;
-
-    pthread_mutex_lock(&bm->write_mutex);
-
-    while (!bm->stop_fsync_thread)
-    {
-        /* calculate absolute timeout time from milliseconds */
-        clock_gettime(CLOCK_REALTIME, &ts);
-
-        /* convert milliseconds to seconds and nanoseconds */
-        long ms = bm->fsync_interval;
-        ts.tv_sec += ms / 1000;
-        ts.tv_nsec += (ms % 1000) * 1000000;
-
-        /* handle nanosecond overflow */
-        if (ts.tv_nsec >= 1000000000)
-        {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= 1000000000;
-        }
-
-        /* wait on condition variable with timeout */
-        int result = pthread_cond_timedwait(&bm->fsync_cond, &bm->write_mutex, &ts);
-
-        /* if we were signaled to stop, exit loop */
-        if (bm->stop_fsync_thread) break;
-
-        /* if timeout occurred (not spurious wakeup or signal), perform fdatasync */
-        if (result == ETIMEDOUT)
-        {
-            pthread_mutex_unlock(&bm->write_mutex);
-            (void)fdatasync(bm->fd);
-            pthread_mutex_lock(&bm->write_mutex);
-        }
-    }
-
-    pthread_mutex_unlock(&bm->write_mutex);
-
-    return NULL;
 }
 
 int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)

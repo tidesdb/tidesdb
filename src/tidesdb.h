@@ -64,11 +64,14 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_SKIPLIST_LEVELS                12
 #define TDB_DEFAULT_SKIPLIST_PROBABILITY           0.25
 #define TDB_DEFAULT_BLOOM_FILTER_FP_RATE           0.01
+#define TDB_DEFAULT_THREAD_POOL_SIZE               2 /* default per pool, tune based on workload */
 
-#define TDB_WAL_EXT                       ".wal"
+#define TDB_WAL_EXT                       ".log"
 #define TDB_SSTABLE_EXT                   ".sst"
 #define TDB_COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"
 #define TDB_TEMP_EXT                      ".tmp"
+#define TDB_WAL_PREFIX                    "wal_"
+#define TDB_SSTABLE_PREFIX                "sstable_"
 
 #define TDB_KV_FORMAT_VERSION 1
 
@@ -171,12 +174,16 @@ typedef struct tidesdb_iter_t tidesdb_iter_t;
  * @param max_open_file_handles maximum number of open file handles (block managers) to cache
  *        0 = disabled (no caching, unlimited open files)
  *        > 0 = cache up to N open files, auto-close LRU when full
+ * @param num_flush_threads number of threads in flush thread pool (default 2)
+ * @param num_compaction_threads number of threads in compaction thread pool (default 2)
  */
 typedef struct
 {
     char db_path[TDB_MAX_PATH_LENGTH];
     int enable_debug_logging;
     int max_open_file_handles;
+    int num_flush_threads;
+    int num_compaction_threads;
 } tidesdb_config_t;
 
 /*
@@ -195,9 +202,7 @@ typedef struct
  * @param background_compaction_interval interval in microseconds between compaction checks (default
  * 1000000 = 1 second)
  * @param use_sbha use sorted binary hash array for direct key lookups
- * @param sync_mode sync mode for this column family
- * @param sync_interval interval in milliseconds for background sync (if sync_mode is
- * TDB_SYNC_BACKGROUND)
+ * @param sync_mode sync mode for this column family (TDB_SYNC_NONE or TDB_SYNC_FULL)
  * @param comparator_name name of registered comparator (NULL = use default "memcmp")
  * during compaction/flush (default 1000 = 1ms)
  */
@@ -215,7 +220,6 @@ typedef struct
     int background_compaction_interval;
     int use_sbha;
     tidesdb_sync_mode_t sync_mode;
-    int sync_interval;
     const char *comparator_name;
 } tidesdb_column_family_config_t;
 
@@ -281,11 +285,7 @@ typedef struct
  * @param cf_lock reader-writer lock for this column family
  * @param flush_lock lock for flush operations
  * @param flush_queue queue of memtables waiting to be flushed
- * @param flush_thread background flush worker thread
- * @param flush_stop flag to stop flush thread
  * @param compaction_lock lock for compaction operations
- * @param compaction_thread background compaction thread
- * @param compaction_stop flag to stop compaction thread
  * @param next_memtable_id next memtable ID to assign
  * @param is_dropping flag indicating if the column family is being dropped
  * @param config configuration for this column family (config.sstable_capacity triggers compaction)
@@ -305,14 +305,13 @@ struct tidesdb_column_family_t
     pthread_rwlock_t cf_lock;
     pthread_mutex_t flush_lock;
     queue_t *flush_queue;
-    pthread_t flush_thread;
-    _Atomic(int) flush_stop;
     pthread_mutex_t compaction_lock;
-    pthread_t compaction_thread;
-    _Atomic(int) compaction_stop;
     _Atomic(int) is_dropping;
     tidesdb_column_family_config_t config;
 };
+
+/* forward declaration for thread pool */
+typedef struct tidesdb_thread_pool_t tidesdb_thread_pool_t;
 
 /*
  * tidesdb_t
@@ -323,6 +322,8 @@ struct tidesdb_column_family_t
  * @param cf_capacity capacity of column families array
  * @param db_lock global database lock
  * @param block_manager_cache LRU cache for open block managers (file handles)
+ * @param flush_pool thread pool for flush operations
+ * @param compaction_pool thread pool for compaction operations
  */
 struct tidesdb_t
 {
@@ -332,6 +333,8 @@ struct tidesdb_t
     int cf_capacity;
     pthread_rwlock_t db_lock;
     lru_cache_t *block_manager_cache;
+    tidesdb_thread_pool_t *flush_pool;
+    tidesdb_thread_pool_t *compaction_pool;
 };
 
 /*
@@ -543,6 +546,43 @@ typedef struct
  */
 int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
                                     tidesdb_column_family_stat_t **stats);
+
+/*
+ * tidesdb_column_family_update_config_t
+ * runtime-updatable configuration for column families
+ * only includes settings that can be safely changed without affecting existing data
+ * @param memtable_flush_size size threshold for memtable flush (bytes)
+ * @param max_sstables_before_compaction max sstables before triggering compaction
+ * @param compaction_threads number of threads to use for parallel compaction
+ * @param max_level maximum skip list level (for new memtables)
+ * @param probability skip list probability (for new memtables)
+ * @param bloom_filter_fp_rate bloom filter false positive rate (for new SSTables)
+ * @param enable_background_compaction enable automatic background compaction
+ * @param background_compaction_interval interval in microseconds between compaction checks
+ */
+typedef struct
+{
+    size_t memtable_flush_size;
+    int max_sstables_before_compaction;
+    int compaction_threads;
+    int max_level;
+    float probability;
+    double bloom_filter_fp_rate;
+    int enable_background_compaction;
+    int background_compaction_interval;
+} tidesdb_column_family_update_config_t;
+
+/*
+ * tidesdb_update_column_family_config
+ * updates runtime-safe configuration for a column family
+ * only affects new operations, does not modify existing data
+ * @param db tidesdb instance
+ * @param name column family name
+ * @param update_config new configuration values
+ * @return 0 on success, -1 on failure
+ */
+int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
+                                        const tidesdb_column_family_update_config_t *update_config);
 
 /*
  * tidesdb_flush_memtable

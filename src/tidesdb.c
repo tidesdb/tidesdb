@@ -116,11 +116,9 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
                                 tidesdb_sstable_t **sstable);
 static void tidesdb_sstable_free(tidesdb_sstable_t *sstable);
 static int tidesdb_check_and_flush(tidesdb_column_family_t *cf);
-static void *tidesdb_background_compaction_thread(void *arg);
 static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf);
 static void tidesdb_memtable_free(tidesdb_memtable_t *mt);
 static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf);
-static void *tidesdb_flush_worker_thread(void *arg);
 static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesdb_memtable_t *mt);
 static int compare_keys_with_cf(tidesdb_column_family_t *cf, const uint8_t *key1, size_t key1_size,
                                 const uint8_t *key2, size_t key2_size);
@@ -128,6 +126,179 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
                        size_t *key_size, uint8_t **value, size_t *value_size, uint8_t *deleted,
                        time_t *ttl);
 static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable_id, char *path);
+
+/* thread pool implementation */
+typedef enum
+{
+    TASK_FLUSH,
+    TASK_COMPACTION
+} task_type_t;
+
+typedef struct
+{
+    task_type_t type;
+    tidesdb_column_family_t *cf;
+    tidesdb_memtable_t *memtable; /* for flush tasks */
+} thread_pool_task_t;
+
+struct tidesdb_thread_pool_t
+{
+    pthread_t *threads;
+    int num_threads;
+    queue_t *task_queue;
+    _Atomic(int) shutdown;
+    pthread_mutex_t lock;
+};
+
+static void *thread_pool_worker(void *arg)
+{
+    tidesdb_thread_pool_t *pool = (tidesdb_thread_pool_t *)arg;
+
+    while (!atomic_load(&pool->shutdown))
+    {
+        thread_pool_task_t *task = (thread_pool_task_t *)queue_dequeue_wait(pool->task_queue);
+
+        if (atomic_load(&pool->shutdown))
+        {
+            if (task) free(task);
+            break;
+        }
+
+        if (!task) continue;
+
+        if (task->type == TASK_FLUSH && task->memtable)
+        {
+            tidesdb_flush_memtable_to_sstable(task->cf, task->memtable);
+
+            pthread_mutex_lock(&task->cf->flush_lock);
+            queue_dequeue(task->cf->immutable_memtables);
+            pthread_mutex_unlock(&task->cf->flush_lock);
+
+            tidesdb_memtable_free(task->memtable);
+
+            /* check if compaction is needed */
+            int num_ssts = atomic_load(&task->cf->num_sstables);
+            if (num_ssts >= 2 && num_ssts >= task->cf->config.max_sstables_before_compaction)
+            {
+                /* submit compaction task */
+                thread_pool_task_t *compact_task = malloc(sizeof(thread_pool_task_t));
+                if (compact_task)
+                {
+                    compact_task->type = TASK_COMPACTION;
+                    compact_task->cf = task->cf;
+                    compact_task->memtable = NULL;
+                    queue_enqueue(task->cf->db->compaction_pool->task_queue, compact_task);
+                }
+            }
+        }
+        else if (task->type == TASK_COMPACTION)
+        {
+            tidesdb_compact(task->cf);
+        }
+
+        free(task);
+    }
+
+    return NULL;
+}
+
+static tidesdb_thread_pool_t *thread_pool_create(int num_threads)
+{
+    if (num_threads <= 0) num_threads = 2;
+
+    tidesdb_thread_pool_t *pool = malloc(sizeof(tidesdb_thread_pool_t));
+    if (!pool) return NULL;
+
+    pool->threads = malloc(num_threads * sizeof(pthread_t));
+    if (!pool->threads)
+    {
+        free(pool);
+        return NULL;
+    }
+
+    pool->task_queue = queue_new();
+    if (!pool->task_queue)
+    {
+        free(pool->threads);
+        free(pool);
+        return NULL;
+    }
+
+    pool->num_threads = num_threads;
+    atomic_init(&pool->shutdown, 0);
+    pthread_mutex_init(&pool->lock, NULL);
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        if (pthread_create(&pool->threads[i], NULL, thread_pool_worker, pool) != 0)
+        {
+            /* cleanup on failure */
+            atomic_store(&pool->shutdown, 1);
+            for (int j = 0; j < i; j++)
+            {
+                queue_enqueue(pool->task_queue, NULL);
+            }
+            for (int j = 0; j < i; j++)
+            {
+                pthread_join(pool->threads[j], NULL);
+            }
+            queue_free(pool->task_queue);
+            pthread_mutex_destroy(&pool->lock);
+            free(pool->threads);
+            free(pool);
+            return NULL;
+        }
+    }
+
+    return pool;
+}
+
+static void thread_pool_destroy(tidesdb_thread_pool_t *pool)
+{
+    if (!pool) return;
+
+    atomic_store(&pool->shutdown, 1);
+
+    /* wake up all threads */
+    for (int i = 0; i < pool->num_threads; i++)
+    {
+        queue_enqueue(pool->task_queue, NULL);
+    }
+
+    /* wait for all threads to finish */
+    for (int i = 0; i < pool->num_threads; i++)
+    {
+        pthread_join(pool->threads[i], NULL);
+    }
+
+    /* drain remaining tasks */
+    thread_pool_task_t *task;
+    while ((task = (thread_pool_task_t *)queue_dequeue(pool->task_queue)) != NULL)
+    {
+        free(task);
+    }
+
+    queue_free(pool->task_queue);
+    pthread_mutex_destroy(&pool->lock);
+    free(pool->threads);
+    free(pool);
+}
+
+static int thread_pool_submit(tidesdb_thread_pool_t *pool, task_type_t type,
+                              tidesdb_column_family_t *cf, tidesdb_memtable_t *memtable)
+{
+    if (!pool || atomic_load(&pool->shutdown)) return -1;
+
+    thread_pool_task_t *task = malloc(sizeof(thread_pool_task_t));
+    if (!task) return -1;
+
+    task->type = type;
+    task->cf = cf;
+    task->memtable = memtable;
+
+    queue_enqueue(pool->task_queue, task);
+    return 0;
+}
 
 /* reference counting helpers for sstables */
 static inline void tidesdb_sstable_acquire(tidesdb_sstable_t *sst)
@@ -666,8 +837,7 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .enable_background_compaction = 1,
         .background_compaction_interval = TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL,
         .use_sbha = 1,
-        .sync_mode = TDB_SYNC_BACKGROUND,
-        .sync_interval = 1,
+        .sync_mode = TDB_SYNC_FULL,
         .comparator_name = NULL};
     return config;
 }
@@ -695,8 +865,46 @@ static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable
 {
     char cf_path[TDB_MAX_PATH_LENGTH];
     get_cf_path(cf->db, cf->name, cf_path);
-    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "sstable_%llu%s", cf_path,
-                   (unsigned long long)sstable_id, TDB_SSTABLE_EXT);
+    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR TDB_SSTABLE_PREFIX "%llu%s",
+                   cf_path, (unsigned long long)sstable_id, TDB_SSTABLE_EXT);
+}
+
+static void get_cf_config_path(const tidesdb_column_family_t *cf, char *path)
+{
+    char cf_path[TDB_MAX_PATH_LENGTH];
+    get_cf_path(cf->db, cf->name, cf_path);
+    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "config%s", cf_path,
+                   TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
+}
+
+static int save_cf_config(tidesdb_column_family_t *cf)
+{
+    char config_path[TDB_MAX_PATH_LENGTH];
+    get_cf_config_path(cf, config_path);
+
+    FILE *f = fopen(config_path, "wb");
+    if (!f) return -1;
+
+    /* write config struct to file */
+    size_t written = fwrite(&cf->config, sizeof(tidesdb_column_family_config_t), 1, f);
+    fclose(f);
+
+    return (written == 1) ? 0 : -1;
+}
+
+static int load_cf_config(tidesdb_column_family_t *cf)
+{
+    char config_path[TDB_MAX_PATH_LENGTH];
+    get_cf_config_path(cf, config_path);
+
+    FILE *f = fopen(config_path, "rb");
+    if (!f) return -1; /* config file doesn't exist, use defaults */
+
+    /* read config struct from file */
+    size_t read = fread(&cf->config, sizeof(tidesdb_column_family_config_t), 1, f);
+    fclose(f);
+
+    return (read == 1) ? 0 : -1;
 }
 
 static void block_manager_evict_cb(const char *key, void *value, void *user_data)
@@ -712,7 +920,7 @@ static void block_manager_evict_cb(const char *key, void *value, void *user_data
 }
 
 static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path,
-                                                 tidesdb_sync_mode_t sync_mode, int sync_interval)
+                                                 tidesdb_sync_mode_t sync_mode)
 {
     if (!db || !path || !db->block_manager_cache) return NULL;
 
@@ -726,7 +934,7 @@ static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path
     TDB_DEBUG_LOG("Block manager cache miss: %s", path);
     bm = NULL;
 
-    if (block_manager_open(&bm, path, sync_mode, sync_interval) == -1)
+    if (block_manager_open(&bm, path, sync_mode) == -1)
     {
         return NULL;
     }
@@ -756,6 +964,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->num_cfs = 0;
     (*db)->cf_capacity = 0;
     (*db)->block_manager_cache = NULL;
+    (*db)->flush_pool = NULL;
+    (*db)->compaction_pool = NULL;
 
     if (pthread_rwlock_init(&(*db)->db_lock, NULL) != 0)
     {
@@ -774,6 +984,34 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_MEMORY;
     }
     TDB_DEBUG_LOG("Block manager cache initialized with capacity: %d", (int)cache_capacity);
+
+    /* create thread pools */
+    int num_flush_threads = (*db)->config.num_flush_threads > 0 ? (*db)->config.num_flush_threads
+                                                                : TDB_DEFAULT_THREAD_POOL_SIZE;
+    int num_compaction_threads = (*db)->config.num_compaction_threads > 0
+                                     ? (*db)->config.num_compaction_threads
+                                     : TDB_DEFAULT_THREAD_POOL_SIZE;
+
+    (*db)->flush_pool = thread_pool_create(num_flush_threads);
+    if (!(*db)->flush_pool)
+    {
+        lru_cache_free((*db)->block_manager_cache);
+        pthread_rwlock_destroy(&(*db)->db_lock);
+        free(*db);
+        return TDB_ERR_THREAD;
+    }
+    TDB_DEBUG_LOG("Flush thread pool created with %d threads", num_flush_threads);
+
+    (*db)->compaction_pool = thread_pool_create(num_compaction_threads);
+    if (!(*db)->compaction_pool)
+    {
+        thread_pool_destroy((*db)->flush_pool);
+        lru_cache_free((*db)->block_manager_cache);
+        pthread_rwlock_destroy(&(*db)->db_lock);
+        free(*db);
+        return TDB_ERR_THREAD;
+    }
+    TDB_DEBUG_LOG("Compaction thread pool created with %d threads", num_compaction_threads);
 
     if (mkdir_p(config->db_path) == -1)
     {
@@ -840,19 +1078,24 @@ int tidesdb_close(tidesdb_t *db)
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
 
+    /* shutdown thread pools first to stop processing new tasks */
+    if (db->flush_pool)
+    {
+        thread_pool_destroy(db->flush_pool);
+        db->flush_pool = NULL;
+    }
+    if (db->compaction_pool)
+    {
+        thread_pool_destroy(db->compaction_pool);
+        db->compaction_pool = NULL;
+    }
+
     pthread_rwlock_wrlock(&db->db_lock);
 
     for (int i = 0; i < db->num_cfs; i++)
     {
         tidesdb_column_family_t *cf = db->column_families[i];
         if (!cf) continue;
-
-        atomic_store(&cf->flush_stop, 1);
-
-        /* wake up flush thread if waiting */
-        tidesdb_memtable_t *dummy = NULL;
-        queue_enqueue(cf->flush_queue, dummy);
-        pthread_join(cf->flush_thread, NULL);
 
         /* flush and free any remaining memtables in immutable_memtables queue
          * hold flush_lock to prevent race with tidesdb_rotate_memtable */
@@ -866,13 +1109,6 @@ int tidesdb_close(tidesdb_t *db)
             pthread_mutex_lock(&cf->flush_lock);
         }
         pthread_mutex_unlock(&cf->flush_lock);
-
-        /* stop compaction thread */
-        if (cf->config.enable_background_compaction)
-        {
-            atomic_store(&cf->compaction_stop, 1);
-            pthread_join(cf->compaction_thread, NULL);
-        }
 
         tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
         if (active_mt)
@@ -990,15 +1226,11 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     cf->sstable_array_capacity = 0;
     atomic_init(&cf->next_sstable_id, 0);
     atomic_init(&cf->next_memtable_id, 0);
-    atomic_init(&cf->flush_stop, 0);
-    atomic_init(&cf->compaction_stop, 0);
     atomic_init(&cf->is_dropping, 0);
     cf->flush_queue = NULL;
     memset(&cf->cf_lock, 0, sizeof(pthread_rwlock_t));
     memset(&cf->flush_lock, 0, sizeof(pthread_mutex_t));
-    memset(&cf->flush_thread, 0, sizeof(pthread_t));
     memset(&cf->compaction_lock, 0, sizeof(pthread_mutex_t));
-    memset(&cf->compaction_thread, 0, sizeof(pthread_t));
 
     if (config)
     {
@@ -1064,9 +1296,26 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         return TDB_ERR_IO;
     }
 
+    /* try to load existing config from .cfc file (recovery scenario) */
+    if (load_cf_config(cf) == 0)
+    {
+        TDB_DEBUG_LOG("Loaded existing config for column family: %s", name);
+    }
+    else
+    {
+        /* no existing config, save the provided/default config */
+        if (save_cf_config(cf) != 0)
+        {
+            TDB_DEBUG_LOG("Warning: Failed to save initial config for column family: %s", name);
+        }
+        else
+        {
+            TDB_DEBUG_LOG("Saved initial config for column family: %s", name);
+        }
+    }
+
     /* initialize memtable IDs */
     atomic_store(&cf->next_memtable_id, 0);
-    atomic_store(&cf->flush_stop, 0);
 
     /* create queues */
     cf->immutable_memtables = queue_new();
@@ -1118,13 +1367,13 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         struct dirent *entry;
         while ((entry = readdir(wal_dir)) != NULL)
         {
-            if (strstr(entry->d_name, "wal_") && strstr(entry->d_name, ".log"))
+            if (strstr(entry->d_name, TDB_WAL_PREFIX) && strstr(entry->d_name, TDB_WAL_EXT))
             {
                 /* parse WAL ID */
-                const char *id_start = entry->d_name + 4; /* skip "wal_" */
+                const char *id_start = entry->d_name + 4; /* skip TDB_WAL_PREFIX */
                 char *endptr;
                 uint64_t wal_id = strtoul(id_start, &endptr, 10);
-                if (endptr != id_start && strstr(endptr, ".log"))
+                if (endptr != id_start && strstr(endptr, TDB_WAL_EXT))
                 {
                     /* grow array if needed */
                     if (num_wal_files >= wal_capacity)
@@ -1197,8 +1446,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         }
 
         /* open WAL file directly (not cached) */
-        if (block_manager_open(&recovered_mt->wal, wal_files[i].path, cf->config.sync_mode,
-                               cf->config.sync_interval) == -1)
+        if (block_manager_open(&recovered_mt->wal, wal_files[i].path, cf->config.sync_mode) == -1)
         {
             skip_list_free(recovered_mt->memtable);
             free(recovered_mt);
@@ -1276,10 +1524,10 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         {
             if (strstr(entry->d_name, TDB_SSTABLE_EXT))
             {
-                const char *id_start = entry->d_name + 8; /* skip "sstable_" */
+                const char *id_start = entry->d_name + 8; /* skip TDB_SSTABLE_PREFIX */
                 char *endptr;
                 uint64_t sstable_id = strtoul(id_start, &endptr, 10);
-                if (endptr != id_start && strstr(endptr, ".sst"))
+                if (endptr != id_start && strstr(endptr, TDB_SSTABLE_EXT))
                 {
                     tidesdb_sstable_t *sst = NULL;
                     if (tidesdb_load_sstable(cf, sstable_id, &sst) == 0)
@@ -1325,46 +1573,38 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         closedir(dir);
     }
 
-    /* start flush worker thread */
-    if (pthread_create(&cf->flush_thread, NULL, tidesdb_flush_worker_thread, cf) != 0)
+    /* sort sstables by ID (oldest to newest) for correct read semantics */
+    if (atomic_load(&cf->num_sstables) > 1)
     {
-        tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
-        tidesdb_memtable_free(active_mt);
-        queue_free(cf->immutable_memtables);
-        queue_free(cf->flush_queue);
-        pthread_rwlock_destroy(&cf->cf_lock);
-        pthread_mutex_destroy(&cf->flush_lock);
-        pthread_mutex_destroy(&cf->compaction_lock);
-        free(cf);
-        return TDB_ERR_THREAD;
-    }
+        int num_ssts = atomic_load(&cf->num_sstables);
 
-    /* start background compaction thread if enabled */
-    if (cf->config.enable_background_compaction)
-    {
-        if (pthread_create(&cf->compaction_thread, NULL, tidesdb_background_compaction_thread,
-                           cf) != 0)
+        for (int i = 0; i < num_ssts - 1; i++)
         {
-            /* failed to create compaction thread; stop flush thread and cleanup */
-            cf->config.enable_background_compaction = 0;
-
-            atomic_store(&cf->flush_stop, 1);
-            tidesdb_memtable_t *dummy = NULL;
-            queue_enqueue(cf->flush_queue, dummy);
-            pthread_join(cf->flush_thread, NULL);
-
-            tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
-            if (active_mt) tidesdb_memtable_free(active_mt);
-            if (cf->immutable_memtables) queue_free(cf->immutable_memtables);
-            if (cf->flush_queue) queue_free(cf->flush_queue);
-
-            pthread_rwlock_destroy(&cf->cf_lock);
-            pthread_mutex_destroy(&cf->flush_lock);
-            pthread_mutex_destroy(&cf->compaction_lock);
-            free(cf);
-            return TDB_ERR_THREAD;
+            for (int j = 0; j < num_ssts - i - 1; j++)
+            {
+                if (cf->sstables[j]->id > cf->sstables[j + 1]->id)
+                {
+                    tidesdb_sstable_t *temp = cf->sstables[j];
+                    cf->sstables[j] = cf->sstables[j + 1];
+                    cf->sstables[j + 1] = temp;
+                }
+            }
         }
+        TDB_DEBUG_LOG("Sorted %d SSTables by ID for column family: %s", num_ssts, cf->name);
     }
+
+    /* submit any recovered memtables to flush pool */
+    pthread_mutex_lock(&cf->flush_lock);
+    tidesdb_memtable_t *recovered_mt;
+    while ((recovered_mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
+    {
+        /* also dequeue from flush_queue to keep queues in sync */
+        queue_dequeue(cf->flush_queue);
+        pthread_mutex_unlock(&cf->flush_lock);
+        thread_pool_submit(db->flush_pool, TASK_FLUSH, cf, recovered_mt);
+        pthread_mutex_lock(&cf->flush_lock);
+    }
+    pthread_mutex_unlock(&cf->flush_lock);
 
     /* re-acquire db_lock to add CF to database */
     pthread_rwlock_wrlock(&db->db_lock);
@@ -1378,18 +1618,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         if (!new_cfs)
         {
             /* cleanup on failure */
-            atomic_store(&cf->flush_stop, 1);
-            tidesdb_memtable_t *dummy = NULL;
-            queue_enqueue(cf->flush_queue, dummy);
-            pthread_join(cf->flush_thread, NULL);
-
-            /* stop compaction thread if running */
-            if (cf->config.enable_background_compaction)
-            {
-                atomic_store(&cf->compaction_stop, 1);
-                pthread_join(cf->compaction_thread, NULL);
-            }
-
             tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
             if (active_mt) tidesdb_memtable_free(active_mt);
             if (cf->immutable_memtables) queue_free(cf->immutable_memtables);
@@ -1455,27 +1683,17 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 
     atomic_store(&cf->is_dropping, 1);
 
-    /* stop flush thread */
-    atomic_store(&cf->flush_stop, 1);
-
-    /* wake up flush thread if waiting */
-    tidesdb_memtable_t *dummy = NULL;
-    queue_enqueue(cf->flush_queue, dummy);
-    if (pthread_join(cf->flush_thread, NULL) != 0)
+    /* flush any remaining memtables */
+    pthread_mutex_lock(&cf->flush_lock);
+    tidesdb_memtable_t *mt;
+    while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
     {
-        cleanup_error = TDB_ERR_THREAD;
+        pthread_mutex_unlock(&cf->flush_lock);
+        tidesdb_flush_memtable_to_sstable(cf, mt);
+        tidesdb_memtable_free(mt);
+        pthread_mutex_lock(&cf->flush_lock);
     }
-
-    /* stop background compaction thread if running */
-    if (cf->config.enable_background_compaction)
-    {
-        atomic_store(&cf->compaction_stop, 1);
-        if (pthread_join(cf->compaction_thread, NULL) != 0)
-        {
-            cleanup_error = TDB_ERR_THREAD;
-            /* continue with cleanup anyway */
-        }
-    }
+    pthread_mutex_unlock(&cf->flush_lock);
 
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt)
@@ -1774,8 +1992,7 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
              "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log", cf->db->config.db_path,
              cf->name, mt->id);
 
-    if (block_manager_open(&mt->wal, wal_path, cf->config.sync_mode, cf->config.sync_interval) ==
-        -1)
+    if (block_manager_open(&mt->wal, wal_path, cf->config.sync_mode) == -1)
     {
         skip_list_free(mt->memtable);
         pthread_mutex_destroy(&mt->ref_lock);
@@ -1807,11 +2024,14 @@ static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
 
     tidesdb_memtable_t *old_memtable = atomic_exchange(&cf->active_memtable, new_memtable);
 
-    /* enqueue old memtable for flushing */
+    /* submit old memtable for flushing to thread pool */
     if (old_memtable)
     {
         queue_enqueue(cf->immutable_memtables, old_memtable);
         queue_enqueue(cf->flush_queue, old_memtable);
+        pthread_mutex_unlock(&cf->flush_lock);
+        thread_pool_submit(cf->db->flush_pool, TASK_FLUSH, cf, old_memtable);
+        return 0;
     }
 
     pthread_mutex_unlock(&cf->flush_lock);
@@ -1847,8 +2067,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     atomic_store(&sst->ref_count, 1);
     pthread_mutex_init(&sst->ref_lock, NULL);
 
-    sst->block_manager = get_cached_block_manager(cf->db, sstable_path, cf->config.sync_mode,
-                                                  cf->config.sync_interval);
+    sst->block_manager = get_cached_block_manager(cf->db, sstable_path, cf->config.sync_mode);
     if (!sst->block_manager)
     {
         free(sst);
@@ -2051,50 +2270,87 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     return 0;
 }
 
-static void *tidesdb_flush_worker_thread(void *arg)
+int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
+                                        const tidesdb_column_family_update_config_t *update_config)
 {
-    tidesdb_column_family_t *cf = (tidesdb_column_family_t *)arg;
+    if (!db || !name || !update_config) return TDB_ERR_INVALID_ARGS;
 
-    while (!atomic_load(&cf->flush_stop))
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, name);
+    if (!cf) return TDB_ERR_NOT_FOUND;
+
+    /* validate configuration values */
+    if (update_config->memtable_flush_size == 0)
     {
-        tidesdb_memtable_t *mt = (tidesdb_memtable_t *)queue_dequeue_wait(cf->flush_queue);
-
-        if (atomic_load(&cf->flush_stop))
-        {
-            /* if we dequeued a valid memtable before stopping, we need to handle it */
-            if (mt)
-            {
-                /* flush it to avoid data loss */
-                tidesdb_flush_memtable_to_sstable(cf, mt);
-
-                pthread_mutex_lock(&cf->flush_lock);
-                queue_dequeue(cf->immutable_memtables);
-                pthread_mutex_unlock(&cf->flush_lock);
-
-                tidesdb_memtable_free(mt);
-            }
-            break;
-        }
-
-        if (mt)
-        {
-            tidesdb_flush_memtable_to_sstable(cf, mt);
-
-            pthread_mutex_lock(&cf->flush_lock);
-            queue_dequeue(cf->immutable_memtables);
-            pthread_mutex_unlock(&cf->flush_lock);
-
-            tidesdb_memtable_free(mt);
-
-            int num_ssts = atomic_load(&cf->num_sstables);
-            if (num_ssts >= 2 && num_ssts >= cf->config.max_sstables_before_compaction)
-            {
-                tidesdb_compact(cf);
-            }
-        }
+        return TDB_ERR_INVALID_ARGS;
     }
 
-    return NULL;
+    if (update_config->max_sstables_before_compaction < 2)
+    {
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    if (update_config->compaction_threads < 0)
+    {
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    if (update_config->max_level < 1)
+    {
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    if (update_config->probability <= 0.0f || update_config->probability >= 1.0f)
+    {
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    if (update_config->bloom_filter_fp_rate <= 0.0 || update_config->bloom_filter_fp_rate >= 1.0)
+    {
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    if (update_config->background_compaction_interval < 0)
+    {
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    /* acquire write lock to update configuration atomically */
+    pthread_rwlock_wrlock(&cf->cf_lock);
+
+    /* update runtime-safe configuration */
+    cf->config.memtable_flush_size = update_config->memtable_flush_size;
+    cf->config.max_sstables_before_compaction = update_config->max_sstables_before_compaction;
+    cf->config.compaction_threads = update_config->compaction_threads;
+    cf->config.max_level = update_config->max_level;
+    cf->config.probability = update_config->probability;
+    cf->config.bloom_filter_fp_rate = update_config->bloom_filter_fp_rate;
+    cf->config.enable_background_compaction = update_config->enable_background_compaction;
+    cf->config.background_compaction_interval = update_config->background_compaction_interval;
+
+    /* save updated config to disk */
+    int save_result = save_cf_config(cf);
+
+    pthread_rwlock_unlock(&cf->cf_lock);
+
+    if (save_result != 0)
+    {
+        TDB_DEBUG_LOG("Warning: Failed to save config file for column family: %s", cf->name);
+        return TDB_ERR_IO;
+    }
+
+    TDB_DEBUG_LOG("Updated configuration for column family: %s", cf->name);
+    TDB_DEBUG_LOG("  memtable_flush_size: %zu", cf->config.memtable_flush_size);
+    TDB_DEBUG_LOG("  max_sstables_before_compaction: %d",
+                  cf->config.max_sstables_before_compaction);
+    TDB_DEBUG_LOG("  compaction_threads: %d", cf->config.compaction_threads);
+    TDB_DEBUG_LOG("  max_level: %d", cf->config.max_level);
+    TDB_DEBUG_LOG("  probability: %.2f", cf->config.probability);
+    TDB_DEBUG_LOG("  bloom_filter_fp_rate: %.4f", cf->config.bloom_filter_fp_rate);
+    TDB_DEBUG_LOG("  enable_background_compaction: %d", cf->config.enable_background_compaction);
+    TDB_DEBUG_LOG("  background_compaction_interval: %d",
+                  cf->config.background_compaction_interval);
+
+    return 0;
 }
 
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
@@ -2194,8 +2450,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         atomic_store(&merged->ref_count, 1);
         pthread_mutex_init(&merged->ref_lock, NULL);
 
-        merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode,
-                                                         cf->config.sync_interval);
+        merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode);
         if (!merged->block_manager)
         {
             free(merged);
@@ -2416,8 +2671,8 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         {
             TDB_DEBUG_LOG("Successfully renamed %s to %s", temp_path, new_path);
             /* reopen with final path via cache */
-            merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode,
-                                                             cf->config.sync_interval);
+            merged->block_manager =
+                get_cached_block_manager(cf->db, new_path, cf->config.sync_mode);
             if (!merged->block_manager)
             {
                 TDB_DEBUG_LOG("Failed to reopen merged sstable after rename");
@@ -2527,8 +2782,7 @@ static void *tidesdb_compaction_worker(void *arg)
     atomic_store(&merged->ref_count, 1); /* initial reference */
     pthread_mutex_init(&merged->ref_lock, NULL);
 
-    merged->block_manager =
-        get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode, cf->config.sync_interval);
+    merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode);
     if (!merged->block_manager)
     {
         free(merged);
@@ -2758,8 +3012,7 @@ static void *tidesdb_compaction_worker(void *arg)
     /* rename temp to final */
     if (rename(temp_path, new_path) == 0)
     {
-        merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode,
-                                                         cf->config.sync_interval);
+        merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode);
         if (merged->block_manager)
         {
             *job->result = merged;
@@ -2899,24 +3152,6 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
     return 0;
 }
 
-static void *tidesdb_background_compaction_thread(void *arg)
-{
-    tidesdb_column_family_t *cf = (tidesdb_column_family_t *)arg;
-
-    while (!atomic_load(&cf->compaction_stop))
-    {
-        int num_ssts = atomic_load(&cf->num_sstables);
-        if (num_ssts >= 2 && num_ssts >= cf->config.max_sstables_before_compaction)
-        {
-            tidesdb_compact(cf);
-        }
-
-        usleep(cf->config.background_compaction_interval);
-    }
-
-    return NULL;
-}
-
 static int tidesdb_check_and_flush(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
@@ -2957,8 +3192,7 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
     atomic_store(&sst->ref_count, 1);
     pthread_mutex_init(&sst->ref_lock, NULL);
 
-    sst->block_manager =
-        get_cached_block_manager(cf->db, path, cf->config.sync_mode, cf->config.sync_interval);
+    sst->block_manager = get_cached_block_manager(cf->db, path, cf->config.sync_mode);
     if (!sst->block_manager)
     {
         free(sst);
@@ -3857,7 +4091,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
     (*iter)->txn = txn;
     (*iter)->cf = cf;
     (*iter)->memtable_cursor = NULL;
-    (*iter)->active_memtable = NULL; /* initialize to NULL */
+    (*iter)->active_memtable = NULL;
     (*iter)->immutable_memtable_cursors = NULL;
     (*iter)->immutable_memtables = NULL;
     (*iter)->num_immutable_cursors = 0;

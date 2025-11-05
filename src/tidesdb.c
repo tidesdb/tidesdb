@@ -843,16 +843,11 @@ int tidesdb_close(tidesdb_t *db)
         queue_enqueue(cf->flush_queue, dummy);
         pthread_join(cf->flush_thread, NULL);
 
-        /* flush any remaining immutable memtables */
         tidesdb_memtable_t *mt;
         while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
         {
             tidesdb_flush_memtable_to_sstable(cf, mt);
-
-            atomic_store(&mt->ref_count, 0);
-            if (mt->memtable) skip_list_free(mt->memtable);
-            if (mt->wal) block_manager_close(mt->wal);
-            free(mt);
+            tidesdb_memtable_free(mt);
         }
 
         /* stop compaction thread */
@@ -873,6 +868,7 @@ int tidesdb_close(tidesdb_t *db)
 
             atomic_store(&active_mt->ref_count, 0);
             if (active_mt->memtable) skip_list_free(active_mt->memtable);
+            pthread_mutex_destroy(&active_mt->ref_lock);
             free(active_mt);
         }
 

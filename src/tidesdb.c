@@ -871,7 +871,6 @@ int tidesdb_close(tidesdb_t *db)
             atomic_store(&mt->ref_count, 0);
             if (mt->memtable) skip_list_free(mt->memtable);
             if (mt->wal) block_manager_close(mt->wal);
-            /* Skip mutex destroy during shutdown for macOS compatibility */
             free(mt);
         }
 
@@ -891,10 +890,8 @@ int tidesdb_close(tidesdb_t *db)
                 active_mt->wal = NULL;
             }
 
-            /* Set ref_count to 0 before freeing to satisfy ASAN */
             atomic_store(&active_mt->ref_count, 0);
             if (active_mt->memtable) skip_list_free(active_mt->memtable);
-            /* Skip mutex destroy during shutdown for macOS compatibility */
             free(active_mt);
         }
 
@@ -914,12 +911,10 @@ int tidesdb_close(tidesdb_t *db)
                     lru_cache_remove(cf->db->block_manager_cache, sstable_path);
                 }
 
-                /* Free SSTable resources */
                 if (sst->index) binary_hash_array_free(sst->index);
                 if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
                 if (sst->min_key) free(sst->min_key);
                 if (sst->max_key) free(sst->max_key);
-                /* Skip mutex destroy during shutdown for macOS compatibility */
                 free(sst);
             }
         }
@@ -1473,7 +1468,6 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     {
         atomic_store(&active_mt->ref_count, 0);
         if (active_mt->memtable) skip_list_free(active_mt->memtable);
-        /* Skip mutex destroy for macOS compatibility */
         free(active_mt);
     }
 
@@ -1484,7 +1478,6 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         {
             atomic_store(&mt->ref_count, 0);
             if (mt->memtable) skip_list_free(mt->memtable);
-            /* Skip mutex destroy for macOS compatibility */
             free(mt);
         }
         queue_free(cf->immutable_memtables);
@@ -1547,7 +1540,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
                 }
                 else
                 {
-                    /* delete file (WAL, SSTable, config, temp, etc.) */
+                    /* delete file (wal, sst, config, temp, etc.) */
                     if (unlink(file_path) == -1 && errno != ENOENT)
                     {
                         cleanup_error = TDB_ERR_IO;
@@ -2047,8 +2040,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
             queue_dequeue(cf->immutable_memtables);
             pthread_mutex_unlock(&cf->flush_lock);
 
-            /* Use tidesdb_memtable_free which handles reference counting */
-            /* It will only free if ref_count reaches 0 after release */
             tidesdb_memtable_free(mt);
 
             int num_ssts = atomic_load(&cf->num_sstables);
@@ -2117,7 +2108,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
     tidesdb_sstable_t **merged_ssts = calloc((size_t)pairs_to_merge, sizeof(tidesdb_sstable_t *));
     if (!merged_ssts)
     {
-        /* release all acquired SSTable references before returning */
+        /* release all acquired sst references before returning */
         for (int i = 0; i < num_ssts; i++)
         {
             if (sst_snapshot[i])
@@ -3945,7 +3936,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
             (*iter)->sstable_blocks_read[i] = 0;
             if (cf->sstables[i] && cf->sstables[i]->block_manager)
             {
-                tidesdb_sstable_acquire(cf->sstables[i]); /* acquire reference */
+                tidesdb_sstable_acquire(cf->sstables[i]);
                 block_manager_cursor_init(&(*iter)->sstable_cursors[i],
                                           cf->sstables[i]->block_manager);
             }

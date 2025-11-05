@@ -368,13 +368,12 @@ typedef struct
 
 /*
  * tidesdb_txn_t
- * transaction handle with snapshot isolation
+ * transaction handle
  * @param db pointer to tidesdb instance
  * @param operations array of operations
  * @param num_ops number of operations
  * @param op_capacity capacity of operations array
  * @param committed whether transaction has been committed
- * @param snapshot_version snapshot version for reads
  * @param read_only whether this is a read-only transaction
  */
 struct tidesdb_txn_t
@@ -384,7 +383,6 @@ struct tidesdb_txn_t
     int num_ops;
     int op_capacity;
     int committed;
-    uint64_t snapshot_version;
     int read_only;
 };
 

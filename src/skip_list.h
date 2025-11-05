@@ -94,11 +94,8 @@ struct skip_list_node_t
  * @param tail the tail node of the skip list (atomic pointer)
  * @param total_size the total size in bytes of kv pairs in the skip list
  * @param write_lock mutex for exclusive write access (only writers block writers)
- * @param version global version number (incremented on each write)
  * @param comparator custom key comparator function
  * @param comparator_ctx context pointer passed to comparator function
- * @param epoch current epoch for memory reclamation
- * @param retired_nodes list of nodes pending deletion
  */
 typedef struct skip_list_t
 {
@@ -109,10 +106,8 @@ typedef struct skip_list_t
     _Atomic(skip_list_node_t *) tail;
     _Atomic(size_t) total_size;
     pthread_mutex_t write_lock;
-    _Atomic(uint64_t) version;
     skip_list_comparator_fn comparator;
     void *comparator_ctx;
-    _Atomic(uint64_t) epoch;
 } skip_list_t;
 
 /*
@@ -121,15 +116,11 @@ typedef struct skip_list_t
  * cursors hold references to nodes to prevent premature deallocation
  * @param list the skip list
  * @param current the current node (with reference held)
- * @param snapshot_version the version this cursor was created at (for consistency)
- * @param local_epoch the epoch this cursor started in
  */
 typedef struct
 {
     skip_list_t *list;
     skip_list_node_t *current;
-    uint64_t snapshot_version;
-    uint64_t local_epoch;
 } skip_list_cursor_t;
 
 /*** default comparator functions * * */

@@ -435,6 +435,7 @@ struct tidesdb_iter_t
     tidesdb_column_family_t *cf;
     skip_list_cursor_t *memtable_cursor;
     skip_list_cursor_t **immutable_memtable_cursors;
+    tidesdb_memtable_t **immutable_memtables;
     int num_immutable_cursors;
     block_manager_cursor_t **sstable_cursors;
     tidesdb_sstable_t **sstables;

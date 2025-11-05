@@ -1633,11 +1633,13 @@ int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
     {
         if (cf->sstables[i] && cf->sstables[i]->block_manager)
         {
+            tidesdb_sstable_acquire(cf->sstables[i]);
             uint64_t size = 0;
             if (block_manager_get_size(cf->sstables[i]->block_manager, &size) == 0)
             {
                 (*stats)->total_sstable_size += size;
             }
+            tidesdb_sstable_release(cf->sstables[i]);
         }
     }
 
@@ -2017,7 +2019,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         return 0; /* nothing to compact */
     }
 
-    /* copy sst pointers to work with outside lock */
+    /* copy sst pointers and acquire references */
     int pairs_to_merge = num_ssts / 2;
     tidesdb_sstable_t **sst_snapshot = malloc(num_ssts * sizeof(tidesdb_sstable_t *));
     if (!sst_snapshot)
@@ -2027,6 +2029,14 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         return -1;
     }
     memcpy(sst_snapshot, cf->sstables, num_ssts * sizeof(tidesdb_sstable_t *));
+    
+    for (int i = 0; i < num_ssts; i++)
+    {
+        if (sst_snapshot[i])
+        {
+            tidesdb_sstable_acquire(sst_snapshot[i]);
+        }
+    }
     pthread_rwlock_unlock(&cf->cf_lock);
 
     tidesdb_sstable_t **merged_ssts = calloc((size_t)pairs_to_merge, sizeof(tidesdb_sstable_t *));
@@ -2321,11 +2331,6 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         /* replace in array first to prevent new readers from acquiring references */
         cf->sstables[p * 2] = merged;
         cf->sstables[p * 2 + 1] = NULL;
-
-        /* release initial reference (from creation) */
-        /* sstables will be automatically freed when ref_count drops to 0 */
-        tidesdb_sstable_release(sst1);
-        tidesdb_sstable_release(sst2);
     }
 
     /* compact array to remove NULLs */
@@ -2341,6 +2346,15 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
 
     pthread_rwlock_unlock(&cf->cf_lock);
     pthread_mutex_unlock(&cf->compaction_lock);
+
+    /* release all snapshot references */
+    for (int i = 0; i < num_ssts; i++)
+    {
+        if (sst_snapshot[i])
+        {
+            tidesdb_sstable_release(sst_snapshot[i]);
+        }
+    }
 
     free(sst_snapshot);
     free(merged_ssts);
@@ -3274,29 +3288,31 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
         tidesdb_sstable_t *sst = cf->sstables[i];
         if (!sst) continue;
 
+        tidesdb_sstable_acquire(sst);
+        pthread_rwlock_unlock(&cf->cf_lock);
+
         uint8_t *sst_value = NULL;
         size_t sst_value_size = 0;
 
         int result = tidesdb_sstable_get(sst, key, key_size, &sst_value, &sst_value_size);
+        tidesdb_sstable_release(sst);
 
         if (result == 0)
         {
             *value = sst_value;
             *value_size = sst_value_size;
-            pthread_rwlock_unlock(&cf->cf_lock);
             return 0;
         }
         else if (result == TDB_ERR_NOT_FOUND)
         {
-            /* key found but deleted/expired; stop searching older sstables */
-            pthread_rwlock_unlock(&cf->cf_lock);
             return -1;
         }
-        /* if result is other error (eg -1 for truly not in this sstable), continue to next */
+        
+        pthread_rwlock_rdlock(&cf->cf_lock);
     }
 
     pthread_rwlock_unlock(&cf->cf_lock);
-    return -1; /* not found */
+    return -1;
 }
 
 int tidesdb_txn_begin(tidesdb_t *db, tidesdb_txn_t **txn)
@@ -3724,16 +3740,15 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
 
     /* create cursor for active memtable */
     (*iter)->memtable_cursor = NULL;
+    (*iter)->immutable_memtable_cursors = NULL;
+    (*iter)->immutable_memtables = NULL;
+    (*iter)->num_immutable_cursors = 0;
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt && active_mt->memtable)
     {
-        tidesdb_memtable_acquire(active_mt); /* acquire reference to prevent premature free */
+        tidesdb_memtable_acquire(active_mt);
         (*iter)->memtable_cursor = skip_list_cursor_init(active_mt->memtable);
     }
-
-    /* immutable memtables at creation time */
-    (*iter)->immutable_memtable_cursors = NULL;
-    (*iter)->num_immutable_cursors = 0;
     if (cf->immutable_memtables)
     {
         /* lock to prevent flush thread from dequeuing while we snapshot */
@@ -3744,7 +3759,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
             (*iter)->num_immutable_cursors = (int)num_immutable;
             (*iter)->immutable_memtable_cursors =
                 malloc(num_immutable * sizeof(skip_list_cursor_t *));
-            if ((*iter)->immutable_memtable_cursors)
+            (*iter)->immutable_memtables = malloc(num_immutable * sizeof(tidesdb_memtable_t *));
+            if ((*iter)->immutable_memtable_cursors && (*iter)->immutable_memtables)
             {
                 /* cursors for each immutable memtable */
                 for (size_t i = 0; i < num_immutable; i++)
@@ -3753,12 +3769,14 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
                         (tidesdb_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
                     if (imt && imt->memtable)
                     {
-                        tidesdb_memtable_acquire(imt); /* acquire reference to prevent premature free */
+                        tidesdb_memtable_acquire(imt);
+                        (*iter)->immutable_memtables[i] = imt;
                         (*iter)->immutable_memtable_cursors[i] =
                             skip_list_cursor_init(imt->memtable);
                     }
                     else
                     {
+                        (*iter)->immutable_memtables[i] = NULL;
                         (*iter)->immutable_memtable_cursors[i] = NULL;
                     }
                 }
@@ -4145,22 +4163,23 @@ void tidesdb_iter_free(tidesdb_iter_t *iter)
     /* release references on immutable memtables */
     if (iter->immutable_memtable_cursors)
     {
-        pthread_mutex_lock(&iter->cf->flush_lock);
         for (int i = 0; i < iter->num_immutable_cursors; i++)
         {
             if (iter->immutable_memtable_cursors[i])
             {
-                tidesdb_memtable_t *imt =
-                    (tidesdb_memtable_t *)queue_peek_at(iter->cf->immutable_memtables, i);
-                if (imt)
-                {
-                    tidesdb_memtable_release(imt);
-                }
                 skip_list_cursor_free(iter->immutable_memtable_cursors[i]);
             }
+            if (iter->immutable_memtables && iter->immutable_memtables[i])
+            {
+                tidesdb_memtable_release(iter->immutable_memtables[i]);
+            }
         }
-        pthread_mutex_unlock(&iter->cf->flush_lock);
         free(iter->immutable_memtable_cursors);
+    }
+    
+    if (iter->immutable_memtables)
+    {
+        free(iter->immutable_memtables);
     }
 
     /* release references on sstables */

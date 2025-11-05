@@ -21,7 +21,6 @@ It is not a full-featured database, but rather a library that can be used to bui
   - [Linux](#linux)
   - [MacOS](#macos)
   - [Windows](#windows-1)
-- [Discord Community](#discord-community)
 - [Include](#include)
 - [Error Codes](#error-codes)
 - [Usage](#usage)
@@ -37,17 +36,8 @@ It is not a full-featured database, but rather a library that can be used to bui
   - [Iterators](#iterators)
   - [Custom Comparators](#custom-comparators)
   - [Sync Modes](#sync-modes)
-- [Thread Pool Architecture](#thread-pool-architecture)
-- [Background Compaction](#background-compaction)
-- [Directory Structure and File Organization](#directory-structure-and-file-organization)
-  - [Database Directory Layout](#database-directory-layout)
-  - [File Naming Conventions](#file-naming-conventions)
-  - [WAL Rotation and Memtable Lifecycle](#wal-rotation-and-memtable-lifecycle)
-  - [Recovery Process](#recovery-process)
-  - [Directory Management](#directory-management)
-  - [Monitoring Disk Usage](#monitoring-disk-usage)
-  - [Best Practices](#best-practices)
-- [Concurrency Model](#concurrency-model)
+- [System Architecture](#system-architecture)
+- [Discord Community](#discord-community)
 - [License](#license)
 
 ## Features
@@ -178,9 +168,6 @@ vcpkg install lz4
 vcpkg install snappy
 vcpkg install openssl
 ```
-
-## Discord Community
-Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask questions, work on development, and discuss the future of TidesDB.
 
 ## Include
 ```c
@@ -423,66 +410,6 @@ if (tidesdb_get_column_family_stats(db, "my_cf", &stats) == 0)
 - Memtable size and entry count
 - Full configuration (compression, bloom filters, sync mode, etc.)
 
-### Updating column family configuration
-Update runtime-safe configuration settings without affecting existing data.
-
-```c
-tidesdb_column_family_update_config_t update_config = {
-    .memtable_flush_size = 128 * 1024 * 1024,   /* increase to 128MB */
-    .max_sstables_before_compaction = 256,      /* trigger at 256 SSTables */
-    .compaction_threads = 8,                    /* use 8 threads */
-    .max_level = 16,                            /* for new memtables */
-    .probability = 0.25f,                       /* for new memtables */
-    .bloom_filter_fp_rate = 0.001,              /* 0.1% FP rate for new SSTables */
-    .enable_background_compaction = 1,          /* enable background compaction */
-    .background_compaction_interval = 500000    /* check every 500ms */
-};
-
-if (tidesdb_update_column_family_config(db, "my_cf", &update_config) == 0)
-{
-    printf("Configuration updated successfully\n");
-}
-```
-
-**Updatable settings** (safe to change at runtime)
-- `memtable_flush_size` - Affects when new flushes trigger
-- `max_sstables_before_compaction` - Affects compaction trigger threshold
-- `compaction_threads` - Number of parallel compaction threads
-- `max_level` - Skip list level for **new** memtables only
-- `probability` - Skip list probability for **new** memtables only
-- `bloom_filter_fp_rate` - False positive rate for **new** SSTables only
-- `enable_background_compaction` - Enable/disable background compaction
-- `background_compaction_interval` - Compaction check interval
-
-**Non-updatable settings** (would corrupt existing data)
-- `compressed` - Cannot change compression on existing SSTables
-- `compress_algo` - Cannot change algorithm on existing SSTables
-- `use_sbha` - Cannot change index structure on existing SSTables
-- `sync_mode` - Cannot change durability mode on existing WALs
-- `comparator_name` - Cannot change sort order on existing data
-
-**Configuration persistence**
-```
-mydb/
-├── my_cf/
-│   ├── config.cfc          ← Configuration saved here
-│   ├── wal_0.log
-│   ├── sstable_0.sst
-│   └── sstable_1.sst
-```
-
-- **On CF creation** Initial config saved to `config.cfc`
-- **On database restart** Config loaded from `config.cfc` (if exists)
-- **On config update** Changes immediately saved to `config.cfc`
-- **If save fails** Returns `TDB_ERR_IO` error code
-
-**Important notes**
-- Changes apply immediately to new operations
-- Existing SSTables/memtables retain their original settings
-- New memtables use updated `max_level` and `probability`
-- New SSTables use updated `bloom_filter_fp_rate`
-- Thread-safe - uses write lock during update
-
 ### Transactions
 All operations in TidesDB v1 are done through transactions for ACID guarantees.
 
@@ -674,58 +601,6 @@ tidesdb_iter_free(iter);
 tidesdb_txn_free(txn);
 ```
 
-**Iterator Reference Counting and Compaction Safety**
-
-TidesDB uses atomic reference counting to ensure safe concurrent access between iterators and compaction
-
-- **Automatic Reference Counting** - When an iterator is created, it acquires references on all active SSTables, preventing them from being deleted
-- **Copy-on-Write (COW) Semantics** - Compaction creates new merged SSTables and immediately replaces old ones in the active array, but old SSTables remain in memory for active iterators
-- **Non-Blocking Compaction** - Compaction completes immediately without waiting for iterators to finish, ensuring high throughput
-- **Automatic Cleanup** - When an iterator is freed, it releases its references. SSTables with zero references are automatically deleted (both file and memory)
-- **Heap-Based Merge** - Iterators use a min-heap (forward) or max-heap (backward) to efficiently merge-sort entries from multiple sources
-
-**How it works**
-1. Iterator creation acquires references on all SSTables (increments `ref_count`)
-2. Compaction creates new merged SSTables and swaps them into the active array
-3. Compaction releases its reference on old SSTables (decrements `ref_count`)
-4. Old SSTables remain accessible to active iterators (ref_count > 0)
-5. When iterator is freed, it releases references (decrements `ref_count`)
-6. When `ref_count` drops to 0, the SSTable file is deleted and memory is freed
-
-```c
-tidesdb_iter_t *iter = NULL;
-tidesdb_iter_new(txn, "my_cf", &iter);  /* Acquires references on SSTables */
-tidesdb_iter_seek_to_first(iter);
-
-/* Compaction can occur here - new SSTables replace old ones */
-/* But iterator still has valid references to old SSTables */
-
-while (tidesdb_iter_valid(iter))
-{
-    uint8_t *key = NULL, *value = NULL;
-    size_t key_size = 0, value_size = 0;
-    
-    tidesdb_iter_key(iter, &key, &key_size);
-    tidesdb_iter_value(iter, &value, &value_size);
-    
-    /* Process data from snapshot */
-    
-    free(key);
-    free(value);
-    tidesdb_iter_next(iter);
-}
-
-tidesdb_iter_free(iter);  /* Releases references, triggers cleanup if ref_count == 0 */
-```
-
-**Benefits**
-- **True Snapshot Isolation** - Iterators see a consistent snapshot of data from creation time
-- **No Blocking** - Compaction and iteration proceed independently without waiting
-- **Automatic Resource Management** - No manual cleanup required, reference counting handles everything
-- **Safe Concurrent Access** - Multiple iterators and compaction can run simultaneously
-
-This design provides robust, lock-free iteration with automatic memory safety through reference counting.
-
 ### Custom Comparators
 Register custom key comparison functions for specialized sorting.
 
@@ -749,9 +624,9 @@ tidesdb_create_column_family(db, "sorted_cf", &cf_config);
 ```
 
 **Built-in comparators**
-- `"memcmp"` - Binary comparison (default)
-- `"string"` - Lexicographic string comparison
-- `"numeric"` - Numeric comparison for uint64_t keys
+- `"memcmp"` Binary comparison (default)
+- `"string"` Lexicographic string comparison
+- `"numeric"` Numeric comparison for uint64_t keys
 
 See `examples/custom_comparator.c` for more examples.
 
@@ -761,338 +636,20 @@ Control durability vs performance tradeoff.
 ```c
 tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
-/* TDB_SYNC_NONE - Fastest, least durable (OS handles flushing) */
+/* TDB_SYNC_NONE is fastest, least durable (OS handles flushing) */
 cf_config.sync_mode = TDB_SYNC_NONE;
 
-/* TDB_SYNC_FULL - Most durable (fsync on every write) */
+/* TDB_SYNC_FULL is most durable (fsync on every write) */
 cf_config.sync_mode = TDB_SYNC_FULL;
 
 tidesdb_create_column_family(db, "my_cf", &cf_config);
 ```
 
-> [!TIP]
-> For full system design/architecture explaination please go to [https://tidesdb.com](https://tidesdb.com). What is described here is minimal.
+## System Architecture & Further Reading
+You can find detailed documentation on the architecture, thread pool design, background compaction, directory structure, file organization, and concurrency model and more at the [TidesDB Website](https://tidesdb.com/getting-started/what-is-tidesdb/).
 
-
-## Thread Pool Architecture
-TidesDB uses shared thread pools at the database level for efficient resource management.
-**Shared Thread Pools**
-- **Flush Pool** - Handles memtable-to-SSTable flush operations
-- **Compaction Pool** - Handles SSTable compaction tasks
-- **Shared Across Column Families** - All column families use the same thread pools
-- **Configurable Size** - Set pool sizes via `num_flush_threads` and `num_compaction_threads`
-```c
-tidesdb_config_t config = {
- .db_path = "./mydb",
- .num_flush_threads = 4, /* 4 threads for flush operations */
- .num_compaction_threads = 4 /* 4 threads for compaction operations */
-};
-tidesdb_t *db = NULL;
-tidesdb_open(&config, &db);
-/* Creates 4 flush threads + 4 compaction threads = 8 total threads */
-/* All column families share these thread pools */
-```
-**Benefits**
-- **Resource Efficiency** - Fixed thread count regardless of column family count
-- **Scalability** - 1000 column families = still only 4-8 threads (vs 2000+ with per-CF threads)
-- **Auto-Compaction** - Flush workers automatically trigger compaction when needed
-- **Configurable** - Tune thread counts based on workload and CPU cores
-  **Default Configuration**
-- `num_flush_threads = 2` (default if not specified or set to 0)
-- `num_compaction_threads = 2` (default if not specified or set to 0)
-- Total: 4 threads for typical workloads
-  **Tuning Recommendations**
-- **Low write throughput** - Use defaults (2 + 2 = 4 threads)
-- **High write throughput** - Increase flush threads (4-8)
-- **Many column families** - Increase both pools (4 + 4 = 8 threads)
-- **CPU-bound compaction** - Match compaction threads to CPU cores
-- **I/O-bound flush** - More flush threads can overlap I/O operations
-
-## Background Compaction
-TidesDB v1 features automatic background compaction with optional parallel execution.
-
-**Automatic background compaction** runs when SSTable count reaches the configured threshold
-
-```c
-tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-cf_config.enable_background_compaction = 1;          /* Enable background compaction */
-cf_config.background_compaction_interval = TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL;  /* Check every 1000000 microseconds (1 second) */
-cf_config.max_sstables_before_compaction = TDB_DEFAULT_MAX_SSTABLES;      /* Trigger at 128 SSTables (default) */
-cf_config.compaction_threads = TDB_DEFAULT_COMPACTION_THREADS;                    /* Use 4 threads for parallel compaction */
-
-tidesdb_create_column_family(db, "my_cf", &cf_config);
-/* Background thread automatically compacts when threshold is reached */
-```
-
-**Configuration Options**
-- `enable_background_compaction` - Enable/disable automatic background compaction (default: enabled)
-- `background_compaction_interval` - Interval in microseconds between compaction checks (default: 1000000 = 1 second)
-- `max_sstables_before_compaction` - SSTable count threshold to trigger compaction (default: 512, minimum: 2)
-- `compaction_threads` - Number of threads for parallel compaction (default: 4, set to 0 for single-threaded)
-
-**Parallel Compaction**
-- Set `compaction_threads > 0` to enable parallel compaction
-- Uses semaphore-based thread pool for concurrent SSTable pair merging
-- Each thread compacts one pair of SSTables independently
-- Automatically limits threads to available CPU cores
-- Set `compaction_threads = 0` for single-threaded compaction (default 4 threads)
-
-**Manual compaction** can be triggered at any time (requires minimum 2 SSTables)
-
-```c
-tidesdb_compact(cf);  /* Automatically uses parallel compaction if compaction_threads > 0 */
-```
-
-**Benefits**
-- Removes tombstones and expired TTL entries
-- Merges duplicate keys (keeps latest version)
-- Reduces SSTable count
-- Background compaction runs in separate thread (non-blocking)
-- Parallel compaction significantly speeds up large compactions
-- Manual compaction requires minimum 2 SSTables to merge
-
-## Directory Structure and File Organization
-
-TidesDB organizes data on disk with a clear directory hierarchy. Understanding this structure is helpful for backup, monitoring, and debugging.
-
-### Database Directory Layout
-
-```
-mydb/
-├── my_cf/
-│   ├── config.cfc
-│   ├── wal_1.log
-│   ├── sstable_0.sst
-│   ├── sstable_1.sst
-│   └── sstable_2.sst
-├── users/
-│   ├── config.cfc
-│   ├── wal_0.log
-│   └── sstable_0.sst
-└── sessions/
-│   ├── config.cfc
-│   └── wal_0.log
-```
-
-### File Naming Conventions
-
-**Write-Ahead Log (WAL) Files**
-- **Format** `wal_<memtable_id>.log`
-- **Example** `wal_0.log`, `wal_1.log`, `wal_2.log`
-- **Purpose** Durability - records all writes before they're applied to memtable
-- **Lifecycle**
-  - Created when a new memtable is created (on database open or rotation)
-  - Each memtable has its own dedicated WAL file
-  - WAL ID matches the memtable ID (monotonically increasing counter)
-  - **Multiple WAL files can exist simultaneously** - one for active memtable, others for memtables in flush queue
-  - Deleted only after memtable is successfully flushed to SSTable AND freed
-  - Automatically recovered on database restart if flush didn't complete
-
-**SSTable Files**
-- **Format** `sstable_<sstable_id>.sst`
-- **Example** `sstable_0.sst`, `sstable_1.sst`, `sstable_2.sst`
-- **Purpose** Persistent storage of flushed memtables
-- **Lifecycle**
-  - Created when memtable is flushed (when size exceeds `memtable_flush_size`)
-  - SSTable ID is monotonically increasing per column family
-  - Merged during compaction (old SSTables deleted, new merged SSTable created)
-  - Contains sorted key-value pairs with bloom filter and index metadata
-
-### WAL Rotation and Memtable Lifecycle
-
-TidesDB uses a rotating WAL system tied to memtable rotation
-
-**1. Initial State**
-```
-Active Memtable (ID: 0) → wal_0.log
-```
-
-**2. Memtable Fills Up** (size >= `memtable_flush_size`)
-```
-Active Memtable (ID: 0) → wal_0.log  [FULL - triggers rotation]
-```
-
-**3. Rotation Occurs**
-```
-New Active Memtable (ID: 1) → wal_1.log  [new WAL created]
-Immutable Memtable (ID: 0) → wal_0.log  [queued for flush]
-```
-
-**4. Background Flush (Async)**
-```
-Active Memtable (ID: 1) → wal_1.log
-Flushing: Memtable (ID: 0) → sstable_0.sst  [writing to disk]
-wal_0.log  [still exists - flush in progress]
-```
-
-**5. Flush Complete**
-```
-Active Memtable (ID: 1) → wal_1.log
-SSTable: sstable_0.sst  [persisted]
-wal_0.log  [DELETED - memtable freed after flush]
-```
-
-**6. Next Rotation (Before Previous Flush Completes)**
-```
-New Active Memtable (ID: 2) → wal_2.log  [new active]
-Immutable Memtable (ID: 1) → wal_1.log  [queued for flush]
-Flushing: Memtable (ID: 0) → sstable_0.sst  [still flushing]
-wal_0.log  [still exists - flush not complete]
-```
-
-**7. After All Flushes Complete**
-```
-Active Memtable (ID: 2) → wal_2.log
-SSTable: sstable_0.sst
-SSTable: sstable_1.sst
-wal_0.log, wal_1.log  [DELETED - both flushes complete]
-```
-
-### Recovery Process
-
-On database startup, TidesDB automatically recovers from WAL files
-
-```c
-tidesdb_t *db = NULL;
-tidesdb_open(&config, &db);  /* Automatic WAL recovery */
-```
-
-**Recovery Steps**
-1. Scans column family directory for `wal_*.log` files
-2. Sorts WAL files by ID (oldest to newest)
-3. Replays each WAL file into a new memtable
-4. Reconstructs in-memory state from persisted WAL entries
-5. Continues normal operation with recovered data
-
-**What Gets Recovered**
-- All committed transactions that were written to WAL
-- Uncommitted transactions are discarded (not in WAL)
-- Memtables that were being flushed when crash occurred
-
-**Example Recovery Scenario**
-```
-Before Crash:
-  Active Memtable (ID: 2) → wal_2.log  [100 entries]
-  Flushing Memtable (ID: 1) → wal_1.log  [partially written to sstable_1.sst]
-  SSTable: sstable_0.sst
-
-After Recovery:
-  Recovered Memtable (ID: 1) from wal_1.log  [fully recovered]
-  Recovered Memtable (ID: 2) from wal_2.log  [fully recovered]
-  SSTable: sstable_0.sst
-  
-Next flush will create sstable_1.sst and sstable_2.sst
-```
-
-### Directory Management
-
-**Creating a column family**
-```c
-tidesdb_create_column_family(db, "my_cf", &cf_config);
-/* Creates mydb/my_cf/ directory with initial wal_0.log */
-```
-
-**Dropping a column family**
-```c
-tidesdb_drop_column_family(db, "my_cf");
-/* Deletes mydb/my_cf/ directory and all contents (WALs, SSTables) */
-```
-
-**Manual cleanup** (if needed)
-```bash
-# Backup before cleanup
-cp -r mydb mydb_backup
-
-# Remove specific column family
-rm -rf mydb/old_cf/
-
-# Clean up old database
-rm -rf mydb/
-```
-
-### Monitoring Disk Usage
-
-```bash
-# Check total database size
-du -sh mydb/
-
-# Check per-column-family size
-du -sh mydb/*/
-
-# Count WAL files (should be 1-2 per CF normally)
-find mydb/ -name "wal_*.log" | wc -l
-
-# Count SSTable files
-find mydb/ -name "sstable_*.sst" | wc -l
-
-# List largest SSTables
-find mydb/ -name "sstable_*.sst" -exec ls -lh {} \; | sort -k5 -hr | head -10
-```
-
-### Best Practices
-
-**Backup Strategy**
-```bash
-# Stop writes, flush all memtables, then backup
-# In your application
-tidesdb_flush_memtable(cf);  # Force flush before backup
-
-# Then backup
-tar -czf mydb_backup.tar.gz mydb/
-```
-
-**Disk Space Monitoring**
-- Monitor WAL file count - typically 1-3 per column family (1 active + 1-2 in flush queue)
-- Many WAL files (>5) may indicate flush backlog, slow I/O, or configuration issue
-- Monitor SSTable count - triggers compaction at `max_sstables_before_compaction`
-- Set appropriate `memtable_flush_size` based on write patterns and flush speed
-
-**Performance Tuning**
-- Larger `memtable_flush_size` = fewer, larger SSTables = less compaction
-- Smaller `memtable_flush_size` = more, smaller SSTables = more compaction
-- Adjust `max_sstables_before_compaction` based on read/write ratio
-- Use `enable_background_compaction` for automatic maintenance
-
-## Concurrency Model
-
-TidesDB is designed for high concurrency with minimal blocking
-
-**Reader-Writer Locks**
-- Each column family has a reader-writer lock
-- **Multiple readers can read concurrently** - no blocking between readers
-- **Writers don't block readers** - readers can access data while writes are in progress
-- **Writers block other writers** - only one writer per column family at a time
-
-**Transaction Isolation**
-- Read transactions (`tidesdb_txn_begin_read`) acquire read locks
-- Write transactions (`tidesdb_txn_begin`) acquire write locks on commit
-- Transactions are isolated; Changes not visible until commit
-
-**Optimal for**
-- Read-heavy workloads (unlimited concurrent readers)
-- Mixed read/write workloads (readers never wait for writers)
-- Multi-column-family applications (different CFs can be written concurrently)
-
-**Concurrent operations example**
-```c
-/* Thread 1 Reading */
-tidesdb_txn_t *read_txn;
-tidesdb_txn_begin_read(db, &read_txn);
-tidesdb_txn_get(read_txn, "my_cf", key, key_size, &value, &value_size);
-/* Can read while Thread 2 is writing */
-
-/* Thread 2 Writing */
-tidesdb_txn_t *write_txn;
-tidesdb_txn_begin(db, &write_txn);
-tidesdb_txn_put(write_txn, "my_cf", key, key_size, value, value_size, -1);
-tidesdb_txn_commit(write_txn);  /* Briefly blocks other writers only */
-
-/* Thread 3 Reading different CF */
-tidesdb_txn_t *other_txn;
-tidesdb_txn_begin_read(db, &other_txn);
-tidesdb_txn_get(other_txn, "other_cf", key, key_size, &value, &value_size);
-/* No blocking different column family */
-```
+## Discord Community
+Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask questions, work on development, and discuss the future of TidesDB.
 
 ## License
 Multiple

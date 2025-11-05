@@ -14,7 +14,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Optimized Concurrency** - Writers don't block readers. Readers never block other readers. Flush and compaction I/O happens outside locks with only brief blocking for metadata updates. Atomic memtable operations.
 - [x] **Column Families** - Isolated key-value stores. Each column family has its own memtable, SSTables, and WAL.
 - [x] **Atomic Transactions** - Commit or rollback multiple operations atomically. Failed transactions automatically rollback.
-- [x] **Bidirectional Iterators** - Iterate forward and backward over key-value pairs with merge-sort across memtable and SSTables.
+- [x] **Bidirectional Iterators** - Iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and SSTables. Reference counting prevents premature deletion during iteration.
 - [x] **Write-Ahead Log (WAL)** - Durability through WAL. Automatic recovery on startup reconstructs memtables from WALs.
 - [x] **Background Compaction** - Automatic background compaction when SSTable count reaches configured max per column family.
 - [x] **Bloom Filters** - Reduce disk reads by checking key existence before reading SSTables. Configurable false positive rate.
@@ -42,7 +42,7 @@ cmake --install build
 # Production build
 rm -rf build && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIDESDB_WITH_SANITIZER=OFF -DTIDESDB_BUILD_TESTS=OFF
 cmake --build build --config Release
-sudo cmake --install build
+cmake --install build
 
 # On linux run ldconfig to update the shared library cache
 ldconfig
@@ -572,44 +572,57 @@ tidesdb_iter_free(iter);
 tidesdb_txn_free(txn);
 ```
 
-**Iterator Compaction Resilience**
+**Iterator Reference Counting and Compaction Safety**
 
-TidesDB iterators automatically handle compaction that occurs during iteration
+TidesDB uses atomic reference counting to ensure safe concurrent access between iterators and compaction
 
-- **Automatic Snapshot Refresh** - When an iterator detects that compaction has occurred (SSTable count changed), it automatically refreshes its internal snapshot with the new compacted SSTables
-- **Seamless Continuation** - The iterator continues traversing data from the new SSTables without requiring manual intervention
-- **No Blocking** - Compaction doesn't wait for iterators, and iterators don't block compaction
-- **Read Lock Protection** - Each iteration operation holds a read lock, preventing SSTables from being freed during access
+- **Automatic Reference Counting** - When an iterator is created, it acquires references on all active SSTables, preventing them from being deleted
+- **Copy-on-Write (COW) Semantics** - Compaction creates new merged SSTables and immediately replaces old ones in the active array, but old SSTables remain in memory for active iterators
+- **Non-Blocking Compaction** - Compaction completes immediately without waiting for iterators to finish, ensuring high throughput
+- **Automatic Cleanup** - When an iterator is freed, it releases its references. SSTables with zero references are automatically deleted (both file and memory)
+- **Heap-Based Merge** - Iterators use a min-heap (forward) or max-heap (backward) to efficiently merge-sort entries from multiple sources
 
-Do note that background compactions may cause duplicates in your results if keys were merged. You may need to handle duplicates in your application logic.
+**How it works**
+1. Iterator creation acquires references on all SSTables (increments `ref_count`)
+2. Compaction creates new merged SSTables and swaps them into the active array
+3. Compaction releases its reference on old SSTables (decrements `ref_count`)
+4. Old SSTables remain accessible to active iterators (ref_count > 0)
+5. When iterator is freed, it releases references (decrements `ref_count`)
+6. When `ref_count` drops to 0, the SSTable file is deleted and memory is freed
 
 ```c
 tidesdb_iter_t *iter = NULL;
-tidesdb_iter_new(txn, "my_cf", &iter);
+tidesdb_iter_new(txn, "my_cf", &iter);  /* Acquires references on SSTables */
 tidesdb_iter_seek_to_first(iter);
+
+/* Compaction can occur here - new SSTables replace old ones */
+/* But iterator still has valid references to old SSTables */
 
 while (tidesdb_iter_valid(iter))
 {
-    /* If compaction occurs here, iterator automatically refreshes */
-    /* and continues reading from the new compacted SSTables */
-    
     uint8_t *key = NULL, *value = NULL;
     size_t key_size = 0, value_size = 0;
     
     tidesdb_iter_key(iter, &key, &key_size);
     tidesdb_iter_value(iter, &value, &value_size);
     
-    /* Process data */
+    /* Process data from snapshot */
     
     free(key);
     free(value);
-    tidesdb_iter_next(iter);  /* Detects and handles compaction if it occurred */
+    tidesdb_iter_next(iter);
 }
 
-tidesdb_iter_free(iter);
+tidesdb_iter_free(iter);  /* Releases references, triggers cleanup if ref_count == 0 */
 ```
 
-This design ensures iterators remain valid and functional even during active compaction, providing a robust and concurrent iteration experience.
+**Benefits**
+- **True Snapshot Isolation** - Iterators see a consistent snapshot of data from creation time
+- **No Blocking** - Compaction and iteration proceed independently without waiting
+- **Automatic Resource Management** - No manual cleanup required, reference counting handles everything
+- **Safe Concurrent Access** - Multiple iterators and compaction can run simultaneously
+
+This design provides robust, lock-free iteration with automatic memory safety through reference counting.
 
 ### Custom Comparators
 Register custom key comparison functions for specialized sorting.

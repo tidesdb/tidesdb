@@ -1405,44 +1405,20 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         }
     }
 
-    /* close active memtable WAL (but don't delete yet - directory scan will handle it) */
+    /* free active memtable (will close WAL) */
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt)
     {
-        /* close WAL by closing the block manager directly, bypassing ref_count */
-        if (active_mt->wal)
-        {
-            if (block_manager_close(active_mt->wal) != 0)
-            {
-                cleanup_error = TDB_ERR_IO;
-            }
-            active_mt->wal = NULL;
-        }
-        /* free the memtable structure (skip list, etc) but WAL is already closed */
-        if (active_mt->memtable) skip_list_free(active_mt->memtable);
-        pthread_mutex_destroy(&active_mt->ref_lock);
-        free(active_mt);
+        tidesdb_memtable_free(active_mt);
     }
 
-    /* close immutable memtables WALs (but don't delete yet - directory scan will handle it) */
+    /* free immutable memtables (will close WALs) */
     if (cf->immutable_memtables)
     {
         tidesdb_memtable_t *mt;
         while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
         {
-            /* close WAL directly */
-            if (mt->wal)
-            {
-                if (block_manager_close(mt->wal) != 0)
-                {
-                    cleanup_error = TDB_ERR_IO;
-                }
-                mt->wal = NULL;
-            }
-            /* free the memtable structure */
-            if (mt->memtable) skip_list_free(mt->memtable);
-            pthread_mutex_destroy(&mt->ref_lock);
-            free(mt);
+            tidesdb_memtable_free(mt);
         }
         queue_free(cf->immutable_memtables);
     }

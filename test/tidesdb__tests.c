@@ -2639,7 +2639,7 @@ static void test_concurrent_compaction_with_reads(void)
 }
 
 /* test linear scan fallback when SBHA is disabled */
-static void test_linear_scan_fallback(void)
+static int test_linear_scan_fallback(void)
 {
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();

@@ -868,6 +868,7 @@ int tidesdb_close(tidesdb_t *db)
         {
             tidesdb_flush_memtable_to_sstable(cf, mt);
 
+            atomic_store(&mt->ref_count, 0);
             if (mt->memtable) skip_list_free(mt->memtable);
             if (mt->wal) block_manager_close(mt->wal);
             /* Skip mutex destroy during shutdown for macOS compatibility */
@@ -890,6 +891,8 @@ int tidesdb_close(tidesdb_t *db)
                 active_mt->wal = NULL;
             }
 
+            /* Set ref_count to 0 before freeing to satisfy ASAN */
+            atomic_store(&active_mt->ref_count, 0);
             if (active_mt->memtable) skip_list_free(active_mt->memtable);
             /* Skip mutex destroy during shutdown for macOS compatibility */
             free(active_mt);
@@ -1176,6 +1179,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
         recovered_mt->id = wal_files[i].id;
         recovered_mt->created_at = time(NULL);
+        atomic_store(&recovered_mt->ref_count, 1); /* initial reference */
+        if (pthread_mutex_init(&recovered_mt->ref_lock, NULL) != 0)
+        {
+            free(recovered_mt);
+            continue;
+        }
 
         skip_list_comparator_fn cmp_fn = tidesdb_get_comparator(cf->comparator_name);
         if (skip_list_new_with_comparator(&recovered_mt->memtable, cf->config.max_level,
@@ -1462,8 +1471,9 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 
     if (active_mt)
     {
+        atomic_store(&active_mt->ref_count, 0);
         if (active_mt->memtable) skip_list_free(active_mt->memtable);
-        pthread_mutex_destroy(&active_mt->ref_lock);
+        /* Skip mutex destroy for macOS compatibility */
         free(active_mt);
     }
 
@@ -1472,8 +1482,9 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         tidesdb_memtable_t *mt;
         while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
         {
+            atomic_store(&mt->ref_count, 0);
             if (mt->memtable) skip_list_free(mt->memtable);
-            pthread_mutex_destroy(&mt->ref_lock);
+            /* Skip mutex destroy for macOS compatibility */
             free(mt);
         }
         queue_free(cf->immutable_memtables);
@@ -1500,7 +1511,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
             if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
             if (sst->min_key) free(sst->min_key);
             if (sst->max_key) free(sst->max_key);
-            /* Skip mutex destroy for macOS compatibility */
+            /* skip mutex destroy for macOS compatibility */
             free(sst);
         }
     }
@@ -2036,10 +2047,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
             queue_dequeue(cf->immutable_memtables);
             pthread_mutex_unlock(&cf->flush_lock);
 
-            if (mt->memtable) skip_list_free(mt->memtable);
-            if (mt->wal) block_manager_close(mt->wal);
-            /* Skip mutex destroy during shutdown for macOS compatibility */
-            free(mt);
+            /* Use tidesdb_memtable_free which handles reference counting */
+            /* It will only free if ref_count reaches 0 after release */
+            tidesdb_memtable_free(mt);
 
             int num_ssts = atomic_load(&cf->num_sstables);
             if (num_ssts >= 2 && num_ssts >= cf->config.max_sstables_before_compaction)

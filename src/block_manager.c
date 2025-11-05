@@ -1084,7 +1084,11 @@ int block_manager_validate_last_block(block_manager_t *bm)
     {
         /* truncate to header only */
         pthread_mutex_lock(&bm->write_mutex);
-        ftruncate(bm->fd, BLOCK_MANAGER_HEADER_SIZE);
+        if (ftruncate(bm->fd, BLOCK_MANAGER_HEADER_SIZE) == -1)
+        {
+            pthread_mutex_unlock(&bm->write_mutex);
+            return -1;
+        }
         lseek(bm->fd, 0, SEEK_SET);
         pthread_mutex_unlock(&bm->write_mutex);
         return (bm->fd != -1) ? 0 : -1;

@@ -199,6 +199,7 @@ typedef struct
  * @param sync_interval interval in milliseconds for background sync (if sync_mode is
  * TDB_SYNC_BACKGROUND)
  * @param comparator_name name of registered comparator (NULL = use default "memcmp")
+ * during compaction/flush (default 1000 = 1ms)
  */
 typedef struct
 {
@@ -244,6 +245,8 @@ struct tidesdb_sstable_t
     size_t min_key_size;
     size_t max_key_size;
     int num_entries;
+    _Atomic(int) ref_count;
+    pthread_mutex_t ref_lock;
 };
 
 /*
@@ -260,6 +263,8 @@ typedef struct
     block_manager_t *wal;
     uint64_t id;
     time_t created_at;
+    _Atomic(int) ref_count;
+    pthread_mutex_t ref_lock;
 } tidesdb_memtable_t;
 
 /*
@@ -382,6 +387,30 @@ struct tidesdb_txn_t
 };
 
 /*
+ * tidesdb_iter_entry_t
+ * represents a pending entry from one source (memtable/sstable)
+ * @param key key
+ * @param key_size key size
+ * @param value value
+ * @param value_size value size
+ * @param deleted whether this entry is deleted
+ * @param ttl time-to-live
+ * @param source_type source type (0=active memtable, 1=immutable memtable, 2=sstable)
+ * @param source_index index of immutable memtable or sstable
+ */
+typedef struct
+{
+    uint8_t *key;
+    size_t key_size;
+    uint8_t *value;
+    size_t value_size;
+    uint8_t deleted;
+    time_t ttl;
+    int source_type;
+    int source_index;
+} tidesdb_iter_entry_t;
+
+/*
  * tidesdb_iter_t
  * iterator for traversing key-value pairs (tied to transaction)
  * @param txn transaction this iterator belongs to
@@ -396,6 +425,9 @@ struct tidesdb_txn_t
  * @param current_deleted whether current entry is deleted
  * @param valid whether iterator is at a valid position
  * @param direction iteration direction (1 = forward, -1 = backward)
+ * @param heap array of pending entries from each source (min-heap)
+ * @param heap_size current number of entries in heap
+ * @param heap_capacity allocated capacity of heap
  */
 struct tidesdb_iter_t
 {
@@ -415,6 +447,9 @@ struct tidesdb_iter_t
     uint8_t current_deleted;
     int valid;
     int direction;
+    tidesdb_iter_entry_t *heap;
+    int heap_size;
+    int heap_capacity;
 };
 
 /*

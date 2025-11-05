@@ -905,12 +905,97 @@ static void test_many_sstables(void)
         count++;
         tidesdb_iter_next(iter);
     }
-    ASSERT_TRUE(count >= 50); /* at least 50 entries found */
+
+    /* with reference counting, all 200 entries should be accessible */
+    ASSERT_EQ(count, total_keys);
 
     tidesdb_iter_free(iter);
     tidesdb_txn_free(iter_txn);
 
-    printf("OK (verified %d entries across SSTables, inserted %d)\n", count, total_keys);
+    printf("OK (verified %d entries across SSTables)\n", count);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* backward iteration test */
+static void test_backward_iteration(void)
+{
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    cf_config.memtable_flush_size = 4096; /* small memtable to force many flushes */
+    cf_config.max_sstables_before_compaction = 200;
+    cf_config.enable_background_compaction = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "backward_test", &cf_config), 0);
+
+    printf("\n  [Verification] Testing backward iteration... ");
+    fflush(stdout);
+
+    /* insert data in batches */
+    int total_keys = 0;
+    for (int batch = 0; batch < 10; batch++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        for (int i = 0; i < 20; i++)
+        {
+            char key[64], value[256];
+            int key_num = batch * 20 + i;
+            snprintf(key, sizeof(key), "key_%05d", key_num);
+            snprintf(value, sizeof(value), "value_%05d_backward_test", key_num);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, "backward_test", (uint8_t *)key, strlen(key),
+                                      (uint8_t *)value, strlen(value), -1),
+                      0);
+            total_keys++;
+        }
+
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* test backward iteration */
+    tidesdb_txn_t *iter_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &iter_txn), 0);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(iter_txn, "backward_test", &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_last(iter), 0);
+
+    int count = 0;
+    int expected_key_num = total_keys - 1; /* should start at key_00199 */
+
+    while (tidesdb_iter_valid(iter) && count < 500)
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+
+        if (tidesdb_iter_key(iter, &key, &key_size) == 0)
+        {
+            char expected_key[64];
+            snprintf(expected_key, sizeof(expected_key), "key_%05d", expected_key_num);
+
+            /* verify keys are in descending order */
+            ASSERT_EQ(key_size, strlen(expected_key));
+            ASSERT_EQ(memcmp(key, expected_key, key_size), 0);
+
+            expected_key_num--;
+        }
+
+        count++;
+        tidesdb_iter_prev(iter);
+    }
+
+    /* verify we got all entries in reverse order */
+    ASSERT_EQ(count, total_keys);
+    ASSERT_EQ(expected_key_num, -1); /* should have gone through all keys */
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(iter_txn);
+
+    printf("OK (verified %d entries in reverse order)\n", count);
 
     tidesdb_close(db);
     cleanup_test_dir();
@@ -2454,13 +2539,7 @@ static void test_concurrent_compaction_with_reads(void)
     }
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
-    printf("\n  [Debug] Before first flush: active_memtable entries=%d",
-           skip_list_count_entries(cf->active_memtable->memtable));
-    fflush(stdout);
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
-    printf("\n  [Debug] After first flush: immutable=%zu, flush_queue=%zu",
-           queue_size(cf->immutable_memtables), queue_size(cf->flush_queue));
-    fflush(stdout);
     usleep(200000); /* give flush thread time to pick up work */
 
     /* insert data into second sstable */
@@ -2476,13 +2555,7 @@ static void test_concurrent_compaction_with_reads(void)
     }
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
-    printf("\n  [Debug] Before second flush: active_memtable entries=%d",
-           skip_list_count_entries(cf->active_memtable->memtable));
-    fflush(stdout);
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
-    printf("\n  [Debug] After second flush: immutable=%zu, flush_queue=%zu",
-           queue_size(cf->immutable_memtables), queue_size(cf->flush_queue));
-    fflush(stdout);
     usleep(200000); /* give flush thread time to pick up work */
 
     /* wait for both async flushes to complete */
@@ -2492,20 +2565,8 @@ static void test_concurrent_compaction_with_reads(void)
     {
         num_sstables = atomic_load(&cf->num_sstables);
         if (num_sstables >= 2) break;
-        if (i % 10 == 0) /* print every second */
-        {
-            size_t immutable_size = queue_size(cf->immutable_memtables);
-            size_t flush_queue_size = queue_size(cf->flush_queue);
-            printf(
-                "\n  [Debug] Waiting for flushes... SSTables: %d, immutable: %zu, flush_queue: "
-                "%zu, iter: %d",
-                num_sstables, immutable_size, flush_queue_size, i);
-            fflush(stdout);
-        }
         usleep(100000); /* 100ms */
     }
-    printf("\n  [Debug] Final SSTable count: %d\n", num_sstables);
-    fflush(stdout);
 
     /* verify we have at least 2 sstables */
     ASSERT_TRUE(num_sstables >= 2);
@@ -2721,6 +2782,7 @@ int main(void)
     RUN_TEST(test_concurrent_operations, tests_passed);
     RUN_TEST(test_error_handling, tests_passed);
     RUN_TEST(test_many_sstables, tests_passed);
+    RUN_TEST(test_backward_iteration, tests_passed);
     RUN_TEST(test_crash_recovery, tests_passed);
     RUN_TEST(test_background_compaction, tests_passed);
     RUN_TEST(test_update_patterns, tests_passed);

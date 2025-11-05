@@ -416,6 +416,7 @@ typedef struct
  * @param txn transaction this iterator belongs to
  * @param cf column family being iterated
  * @param memtable_cursor skip list cursor for memtable
+ * @param active_memtable reference to active memtable
  * @param sstable_cursors array of block manager cursors for sstables
  * @param num_sstable_cursors number of sstable cursors
  * @param current_key current key
@@ -434,7 +435,7 @@ struct tidesdb_iter_t
     tidesdb_txn_t *txn;
     tidesdb_column_family_t *cf;
     skip_list_cursor_t *memtable_cursor;
-    tidesdb_memtable_t *active_memtable; /* reference to active memtable */
+    tidesdb_memtable_t *active_memtable;
     skip_list_cursor_t **immutable_memtable_cursors;
     tidesdb_memtable_t **immutable_memtables;
     int num_immutable_cursors;

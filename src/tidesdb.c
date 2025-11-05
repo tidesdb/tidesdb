@@ -3103,29 +3103,28 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         pthread_join(threads[p], NULL);
     }
 
-    /* clean up old ssts and update array */
-    for (int p = 0; p < pairs_to_merge; p++)
-    {
-        if (!errors[p] && merged_sstables[p])
-        {
-            tidesdb_sstable_t *sst1 = cf->sstables[p * 2];
-            tidesdb_sstable_t *sst2 = cf->sstables[p * 2 + 1];
-
-            tidesdb_sstable_release(sst1);
-            tidesdb_sstable_release(sst2);
-        }
-    }
-
-    /* rebuild sstable array */
+    /* rebuild sstable array; must keep originals if merge failed */
     tidesdb_sstable_t **new_sstables =
-        malloc((size_t)(pairs_to_merge + (num_ssts % 2)) * sizeof(tidesdb_sstable_t *));
+        malloc((size_t)(num_ssts + pairs_to_merge) * sizeof(tidesdb_sstable_t *));
     int new_count = 0;
 
     for (int p = 0; p < pairs_to_merge; p++)
     {
         if (!errors[p] && merged_sstables[p])
         {
+            /* merge succeeded, now we can add merged sstable and release originals */
             new_sstables[new_count++] = merged_sstables[p];
+
+            tidesdb_sstable_t *sst1 = cf->sstables[p * 2];
+            tidesdb_sstable_t *sst2 = cf->sstables[p * 2 + 1];
+            tidesdb_sstable_release(sst1);
+            tidesdb_sstable_release(sst2);
+        }
+        else
+        {
+            /* merge failed, keep both original sstables. */
+            new_sstables[new_count++] = cf->sstables[p * 2];
+            new_sstables[new_count++] = cf->sstables[p * 2 + 1];
         }
     }
 

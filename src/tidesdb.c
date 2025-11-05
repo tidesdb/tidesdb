@@ -2030,7 +2030,22 @@ static void *tidesdb_flush_worker_thread(void *arg)
     {
         tidesdb_memtable_t *mt = (tidesdb_memtable_t *)queue_dequeue_wait(cf->flush_queue);
 
-        if (atomic_load(&cf->flush_stop)) break;
+        if (atomic_load(&cf->flush_stop))
+        {
+            /* if we dequeued a valid memtable before stopping, we need to handle it */
+            if (mt)
+            {
+                /* flush it to avoid data loss */
+                tidesdb_flush_memtable_to_sstable(cf, mt);
+
+                pthread_mutex_lock(&cf->flush_lock);
+                queue_dequeue(cf->immutable_memtables);
+                pthread_mutex_unlock(&cf->flush_lock);
+
+                tidesdb_memtable_free(mt);
+            }
+            break;
+        }
 
         if (mt)
         {

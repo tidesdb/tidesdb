@@ -1234,6 +1234,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
     if (wal_files) free(wal_files);
 
+    /* release db_lock before starting threads to avoid deadlock */
+    pthread_rwlock_unlock(&db->db_lock);
+
     /* load existing sstables */
     DIR *dir = opendir(cf_path);
     if (dir)
@@ -1294,7 +1297,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         pthread_mutex_destroy(&cf->flush_lock);
         pthread_mutex_destroy(&cf->compaction_lock);
         free(cf);
-        pthread_rwlock_unlock(&db->db_lock);
         return TDB_ERR_THREAD;
     }
 
@@ -1323,10 +1325,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             pthread_mutex_destroy(&cf->flush_lock);
             pthread_mutex_destroy(&cf->compaction_lock);
             free(cf);
-            pthread_rwlock_unlock(&db->db_lock);
             return TDB_ERR_THREAD;
         }
     }
+
+    /* re-acquire db_lock to add CF to database */
+    pthread_rwlock_wrlock(&db->db_lock);
 
     /* add to database */
     if (db->num_cfs >= db->cf_capacity)
@@ -1938,18 +1942,18 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
         int new_cap = cf->sstable_array_capacity == 0 ? 8 : cf->sstable_array_capacity * 2;
         tidesdb_sstable_t **new_ssts =
             realloc(cf->sstables, (size_t)new_cap * sizeof(tidesdb_sstable_t *));
-        if (new_ssts)
+        if (!new_ssts)
         {
-            cf->sstables = new_ssts;
-            cf->sstable_array_capacity = new_cap;
+            pthread_rwlock_unlock(&cf->cf_lock);
+            tidesdb_sstable_free(sst);
+            return -1;
         }
+        cf->sstables = new_ssts;
+        cf->sstable_array_capacity = new_cap;
     }
 
-    if (cf->num_sstables < cf->sstable_array_capacity)
-    {
-        cf->sstables[cf->num_sstables] = sst;
-        atomic_fetch_add(&cf->num_sstables, 1);
-    }
+    cf->sstables[cf->num_sstables] = sst;
+    atomic_fetch_add(&cf->num_sstables, 1);
 
     pthread_rwlock_unlock(&cf->cf_lock);
 

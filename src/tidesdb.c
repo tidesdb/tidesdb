@@ -638,7 +638,18 @@ static inline int tidesdb_memtable_release(tidesdb_memtable_t *mt)
 {
     if (!mt) return 0;
     int old_count = atomic_fetch_sub(&mt->ref_count, 1);
-    return old_count - 1; /* return new count */
+    int new_count = old_count - 1;
+
+    /* if ref_count reached 0, free the memtable */
+    if (new_count == 0)
+    {
+        if (mt->memtable) skip_list_free(mt->memtable);
+        if (mt->wal) block_manager_close(mt->wal);
+        pthread_mutex_destroy(&mt->ref_lock);
+        free(mt);
+    }
+
+    return new_count;
 }
 
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
@@ -878,9 +889,23 @@ int tidesdb_close(tidesdb_t *db)
         }
 
         if (cf->immutable_memtables) queue_free(cf->immutable_memtables);
-        if (cf->flush_queue) queue_free(cf->flush_queue);
 
-        for (int j = 0; j < cf->num_sstables; j++)
+        /* drain flush_queue before freeing it
+         * flush_queue and immutable_memtables contain the same memtable pointers.
+         * the memtables were already freed when draining immutable_memtables above,
+         * so we just drain flush_queue to remove dangling pointers and NULL sentinels */
+        if (cf->flush_queue)
+        {
+            void *item;
+            while ((item = queue_dequeue(cf->flush_queue)) != NULL)
+            {
+                /* don't free,already freed from immutable_memtables or is NULL sentinel */
+            }
+            queue_free(cf->flush_queue);
+        }
+
+        int num_ssts = atomic_load(&cf->num_sstables);
+        for (int j = 0; j < num_ssts; j++)
         {
             if (cf->sstables[j])
             {
@@ -1283,6 +1308,16 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                 atomic_store(&cf->next_sstable_id, sstable_id + 1);
                             }
                         }
+                        else
+                        {
+                            /* failed to grow array, free the loaded sstable */
+                            if (sst->index) binary_hash_array_free(sst->index);
+                            if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
+                            if (sst->min_key) free(sst->min_key);
+                            if (sst->max_key) free(sst->max_key);
+                            pthread_mutex_destroy(&sst->ref_lock);
+                            free(sst);
+                        }
                     }
                 }
             }
@@ -1348,10 +1383,33 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             queue_enqueue(cf->flush_queue, dummy);
             pthread_join(cf->flush_thread, NULL);
 
+            /* stop compaction thread if running */
+            if (cf->config.enable_background_compaction)
+            {
+                atomic_store(&cf->compaction_stop, 1);
+                pthread_join(cf->compaction_thread, NULL);
+            }
+
             tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
             if (active_mt) tidesdb_memtable_free(active_mt);
             if (cf->immutable_memtables) queue_free(cf->immutable_memtables);
             if (cf->flush_queue) queue_free(cf->flush_queue);
+
+            /* free any loaded sstables */
+            for (int i = 0; i < atomic_load(&cf->num_sstables); i++)
+            {
+                if (cf->sstables[i])
+                {
+                    tidesdb_sstable_t *sst = cf->sstables[i];
+                    if (sst->index) binary_hash_array_free(sst->index);
+                    if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
+                    if (sst->min_key) free(sst->min_key);
+                    if (sst->max_key) free(sst->max_key);
+                    pthread_mutex_destroy(&sst->ref_lock);
+                    free(sst);
+                }
+            }
+            free(cf->sstables);
 
             pthread_rwlock_destroy(&cf->cf_lock);
             pthread_mutex_destroy(&cf->flush_lock);
@@ -1732,24 +1790,9 @@ static void tidesdb_memtable_free(tidesdb_memtable_t *mt)
 {
     if (!mt) return;
 
-    /* decrement reference count and only free if it reaches 0 */
-    int ref_count = tidesdb_memtable_release(mt);
-    if (ref_count > 0)
-    {
-        /* still has references, don't free yet */
-        return;
-    }
-
-    if (ref_count < 0)
-    {
-        return;
-    }
-
-    /* ref_count is 0, safe to free */
-    if (mt->memtable) skip_list_free(mt->memtable);
-    if (mt->wal) block_manager_close(mt->wal);
-    pthread_mutex_destroy(&mt->ref_lock);
-    free(mt);
+    /* decrement reference count
+     * tidesdb_memtable_release will automatically free the memtable if ref_count reaches 0 */
+    (void)tidesdb_memtable_release(mt);
 }
 
 static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)

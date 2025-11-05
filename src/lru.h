@@ -39,31 +39,44 @@ typedef void (*lru_evict_callback_t)(const char *key, void *value, void *user_da
 /*
  * lru_entry_t
  * represents a single entry in the LRU cache
+ * @param key the key string (owned by entry)
+ * @param value the value pointer (not owned, managed by callback)
+ * @param user_data optional user data for callback
+ * @param evict_cb eviction callback for this entry
+ * @param prev previous entry in doubly linked list
+ * @param next next entry in doubly linked list
+ * @param hash_next next entry in hash table chain
  */
 struct lru_entry_t
 {
-    char *key;                     /* key string (owned by entry) */
-    void *value;                   /* value pointer (not owned, managed by callback) */
-    void *user_data;               /* optional user data for callback */
-    lru_evict_callback_t evict_cb; /* eviction callback for this entry */
-    lru_entry_t *prev;             /* previous entry in doubly linked list */
-    lru_entry_t *next;             /* next entry in doubly linked list */
-    lru_entry_t *hash_next;        /* next entry in hash table chain */
+    char *key;
+    void *value;
+    void *user_data;
+    lru_evict_callback_t evict_cb;
+    lru_entry_t *prev;
+    lru_entry_t *next;
+    lru_entry_t *hash_next;
 };
 
 /*
  * lru_cache_t
  * thread-safe LRU cache with configurable capacity
+ * @param capacity maximum number of entries
+ * @param size current number of entries
+ * @param head most recently used entry
+ * @param tail least recently used entry
+ * @param table hash table for O(1) lookups
+ * @param table_size hash table size
  */
 struct lru_cache_t
 {
-    size_t capacity;      /* maximum number of entries */
-    size_t size;          /* current number of entries */
-    lru_entry_t *head;    /* most recently used entry */
-    lru_entry_t *tail;    /* least recently used entry */
-    lru_entry_t **table;  /* hash table for O(1) lookups */
-    size_t table_size;    /* hash table size */
-    pthread_mutex_t lock; /* mutex for thread safety */
+    size_t capacity;
+    size_t size;
+    lru_entry_t *head;
+    lru_entry_t *tail;
+    lru_entry_t **table;
+    size_t table_size;
+    pthread_mutex_t lock;
 };
 
 /*

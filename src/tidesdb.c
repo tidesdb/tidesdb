@@ -1251,8 +1251,26 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         if (pthread_create(&cf->compaction_thread, NULL, tidesdb_background_compaction_thread,
                            cf) != 0)
         {
-            /* failed to create thread, but continue anyway */
+            /* failed to create compaction thread; stop flush thread and cleanup */
             cf->config.enable_background_compaction = 0;
+
+            /* stop flush thread */
+            atomic_store(&cf->flush_stop, 1);
+            tidesdb_memtable_t *dummy = NULL;
+            queue_enqueue(cf->flush_queue, dummy);
+            pthread_join(cf->flush_thread, NULL);
+
+            /* cleanup */
+            tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
+            if (active_mt) tidesdb_memtable_free(active_mt);
+            if (cf->immutable_memtables) queue_free(cf->immutable_memtables);
+            if (cf->flush_queue) queue_free(cf->flush_queue);
+
+            pthread_rwlock_destroy(&cf->cf_lock);
+            pthread_mutex_destroy(&cf->flush_lock);
+            pthread_mutex_destroy(&cf->compaction_lock);
+            free(cf);
+            pthread_rwlock_unlock(&db->db_lock);
             return TDB_ERR_THREAD;
         }
     }

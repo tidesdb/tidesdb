@@ -574,7 +574,7 @@ tidesdb_txn_free(txn);
 
 **Iterator Reference Counting and Compaction Safety**
 
-TidesDB uses atomic reference counting to ensure safe concurrent access between iterators and compaction:
+TidesDB uses atomic reference counting to ensure safe concurrent access between iterators and compaction
 
 - **Automatic Reference Counting** - When an iterator is created, it acquires references on all active SSTables, preventing them from being deleted
 - **Copy-on-Write (COW) Semantics** - Compaction creates new merged SSTables and immediately replaces old ones in the active array, but old SSTables remain in memory for active iterators

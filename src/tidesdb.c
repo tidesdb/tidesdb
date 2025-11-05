@@ -3281,6 +3281,15 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
 {
     if (!sstable || !key || !value || !value_size) return -1;
 
+    /* we check if key is within sst's min/max range */
+    if (sstable->min_key && sstable->max_key)
+    {
+        skip_list_comparator_fn cmp = tidesdb_get_comparator(sstable->cf->comparator_name);
+
+        if (cmp(key, key_size, sstable->min_key, sstable->min_key_size, NULL) < 0) return -1;
+        if (cmp(key, key_size, sstable->max_key, sstable->max_key_size, NULL) > 0) return -1;
+    }
+
     /* check bloom filter first */
     if (sstable->bloom_filter && !bloom_filter_contains(sstable->bloom_filter, key, key_size))
     {

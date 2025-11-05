@@ -1347,7 +1347,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             pthread_mutex_destroy(&cf->flush_lock);
             pthread_mutex_destroy(&cf->compaction_lock);
             free(cf);
-            pthread_rwlock_unlock(&db->db_lock);
+            /* db_lock already released at line 1230, don't unlock again */
             return TDB_ERR_MEMORY;
         }
         db->column_families = new_cfs;
@@ -1405,41 +1405,44 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         }
     }
 
-    /* cleanup active memtable and delete its WAL file */
+    /* close active memtable WAL (but don't delete yet - directory scan will handle it) */
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt)
     {
-        char wal_path[TDB_MAX_PATH_LENGTH];
-        snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR "wal_%lu.log",
-                 db->config.db_path, cf->name, active_mt->id);
-
-        tidesdb_memtable_free(active_mt); /* closes WAL */
-
-        /* delete WAL file */
-        if (unlink(wal_path) == -1 && errno != ENOENT)
+        /* close WAL by closing the block manager directly, bypassing ref_count */
+        if (active_mt->wal)
         {
-            cleanup_error = TDB_ERR_IO;
+            if (block_manager_close(active_mt->wal) != 0)
+            {
+                cleanup_error = TDB_ERR_IO;
+            }
+            active_mt->wal = NULL;
         }
+        /* free the memtable structure (skip list, etc) but WAL is already closed */
+        if (active_mt->memtable) skip_list_free(active_mt->memtable);
+        pthread_mutex_destroy(&active_mt->ref_lock);
+        free(active_mt);
     }
 
-    /* cleanup immutable memtables and delete their WAL files */
+    /* close immutable memtables WALs (but don't delete yet - directory scan will handle it) */
     if (cf->immutable_memtables)
     {
         tidesdb_memtable_t *mt;
         while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
         {
-            char wal_path[TDB_MAX_PATH_LENGTH];
-            snprintf(wal_path, sizeof(wal_path),
-                     "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR "wal_%lu.log", db->config.db_path,
-                     cf->name, mt->id);
-
-            tidesdb_memtable_free(mt); /* closes WAL */
-
-            /* delete WAL file */
-            if (unlink(wal_path) == -1 && errno != ENOENT)
+            /* close WAL directly */
+            if (mt->wal)
             {
-                cleanup_error = TDB_ERR_IO;
+                if (block_manager_close(mt->wal) != 0)
+                {
+                    cleanup_error = TDB_ERR_IO;
+                }
+                mt->wal = NULL;
             }
+            /* free the memtable structure */
+            if (mt->memtable) skip_list_free(mt->memtable);
+            pthread_mutex_destroy(&mt->ref_lock);
+            free(mt);
         }
         queue_free(cf->immutable_memtables);
     }
@@ -1447,30 +1450,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     /* free flush queue */
     if (cf->flush_queue) queue_free(cf->flush_queue);
 
-    /* scan directory and delete any remaining WAL files */
-    char cf_path[TDB_MAX_PATH_LENGTH];
-    get_cf_path(db, cf->name, cf_path);
-    DIR *wal_cleanup_dir = opendir(cf_path);
-    if (wal_cleanup_dir)
-    {
-        struct dirent *entry;
-        while ((entry = readdir(wal_cleanup_dir)) != NULL)
-        {
-            if (strstr(entry->d_name, "wal_") && strstr(entry->d_name, ".log"))
-            {
-                char wal_file_path[TDB_MAX_PATH_LENGTH];
-                snprintf(wal_file_path, sizeof(wal_file_path), "%s" PATH_SEPARATOR "%s", cf_path,
-                         entry->d_name);
-                /* delete orphaned WAL file */
-                if (unlink(wal_file_path) == -1 && errno != ENOENT)
-                {
-                    cleanup_error = TDB_ERR_IO;
-                }
-            }
-        }
-        closedir(wal_cleanup_dir);
-    }
-
+    /* first, close all SSTable file handles by evicting from cache */
     for (int i = 0; i < cf->num_sstables; i++)
     {
         if (cf->sstables[i])
@@ -1478,41 +1458,62 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
             char path[TDB_MAX_PATH_LENGTH];
             get_sstable_path(cf, cf->sstables[i]->id, path);
 
-            /* evict from cache first (closes the file handle) */
+            /* evict from cache (closes the file handle) */
             if (db->block_manager_cache)
             {
                 lru_cache_remove(db->block_manager_cache, path);
             }
 
             tidesdb_sstable_release(cf->sstables[i]);
-
-            /* now delete the file (handle is closed) */
-            if (unlink(path) == -1 && errno != ENOENT)
-            {
-                cleanup_error = TDB_ERR_IO;
-            }
         }
     }
     free(cf->sstables);
 
-    /* delete column family config file (.cfc) */
-    char config_path[TDB_MAX_PATH_LENGTH];
-    /* cf_path already declared above for WAL cleanup, reuse it */
-    get_cf_path(db, name, cf_path);
-    snprintf(config_path, sizeof(config_path), "%s" PATH_SEPARATOR "%s%s", cf_path, name,
-             TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
-    if (unlink(config_path) == -1 && errno != ENOENT)
+    /* now scan directory and delete ALL files and subdirectories (handles are closed) */
+    char cf_path[TDB_MAX_PATH_LENGTH];
+    get_cf_path(db, cf->name, cf_path);
+    DIR *cleanup_dir = opendir(cf_path);
+    if (cleanup_dir)
     {
-        cleanup_error = TDB_ERR_IO;
+        struct dirent *entry;
+        while ((entry = readdir(cleanup_dir)) != NULL)
+        {
+            /* skip . and .. */
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            {
+                continue;
+            }
+            
+            char file_path[TDB_MAX_PATH_LENGTH];
+            snprintf(file_path, sizeof(file_path), "%s" PATH_SEPARATOR "%s", cf_path,
+                     entry->d_name);
+            
+            /* check if it's a directory or file */
+            struct stat st;
+            if (stat(file_path, &st) == 0)
+            {
+                if (S_ISDIR(st.st_mode))
+                {
+                    /* recursively delete subdirectory (shouldn't normally exist) */
+                    rmdir(file_path); /* try to remove if empty */
+                }
+                else
+                {
+                    /* delete file (WAL, SSTable, config, temp, etc.) */
+                    if (unlink(file_path) == -1 && errno != ENOENT)
+                    {
+                        cleanup_error = TDB_ERR_IO;
+                    }
+                }
+            }
+        }
+        closedir(cleanup_dir);
     }
 
     /* delete directory (should now be empty) */
-    if (rmdir(cf_path) == -1)
+    if (rmdir(cf_path) == -1 && errno != ENOENT)
     {
-        if (errno != ENOENT) /* dir might already be gone */
-        {
-            cleanup_error = TDB_ERR_IO;
-        }
+        cleanup_error = TDB_ERR_IO;
     }
 
     pthread_rwlock_destroy(&cf->cf_lock);
@@ -1671,12 +1672,18 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
     mt->id = atomic_fetch_add(&cf->next_memtable_id, 1);
     mt->created_at = time(NULL);
     atomic_store(&mt->ref_count, 1); /* initial reference for active memtable */
-    pthread_mutex_init(&mt->ref_lock, NULL);
+    
+    if (pthread_mutex_init(&mt->ref_lock, NULL) != 0)
+    {
+        free(mt);
+        return NULL;
+    }
 
     skip_list_comparator_fn cmp_fn = tidesdb_get_comparator(cf->comparator_name);
     if (skip_list_new_with_comparator(&mt->memtable, cf->config.max_level, cf->config.probability,
                                       cmp_fn, NULL) == -1)
     {
+        pthread_mutex_destroy(&mt->ref_lock);
         free(mt);
         return NULL;
     }
@@ -1689,6 +1696,7 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
         -1)
     {
         skip_list_free(mt->memtable);
+        pthread_mutex_destroy(&mt->ref_lock);
         free(mt);
         return NULL;
     }
@@ -1705,6 +1713,11 @@ static void tidesdb_memtable_free(tidesdb_memtable_t *mt)
     if (ref_count > 0)
     {
         /* still has references, don't free yet */
+        return;
+    }
+    
+    if (ref_count < 0)
+    {
         return;
     }
 

@@ -878,21 +878,31 @@ int tidesdb_close(tidesdb_t *db)
             pthread_join(cf->compaction_thread, NULL);
         }
 
-        /* free active memtable (WAL will be closed in tidesdb_memtable_free) */
+        /* force close active memtable WAL and free */
         tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
         if (active_mt)
         {
+            if (active_mt->wal)
+            {
+                block_manager_close(active_mt->wal);
+                active_mt->wal = NULL;
+            }
             tidesdb_memtable_free(active_mt);
         }
 
         if (cf->immutable_memtables) queue_free(cf->immutable_memtables);
         if (cf->flush_queue) queue_free(cf->flush_queue);
 
+        /* force-free all SSTables */
         for (int j = 0; j < cf->num_sstables; j++)
         {
             if (cf->sstables[j])
             {
-                tidesdb_sstable_release(cf->sstables[j]);
+                tidesdb_sstable_t *sst = cf->sstables[j];
+                if (sst->index) binary_hash_array_free(sst->index);
+                if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
+                pthread_mutex_destroy(&sst->ref_lock);
+                free(sst);
             }
         }
         free(cf->sstables);

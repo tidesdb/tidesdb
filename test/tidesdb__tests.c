@@ -57,6 +57,7 @@ static tidesdb_column_family_config_t get_test_cf_config(void)
         .compress_algo = COMPRESS_LZ4,
         .bloom_filter_fp_rate = 0.01,
         .enable_background_compaction = 0, /* disable for deterministic testing */
+        .background_compaction_interval = 0, /* not used when background compaction disabled */
         .use_sbha = 1,                     /* enable SBHA */
         .sync_mode = TDB_SYNC_NONE,        /* no fsync for tests */
         .sync_interval = 0,                /* not used with SYNC_NONE */

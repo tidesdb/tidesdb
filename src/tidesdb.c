@@ -287,20 +287,24 @@ static int iter_refill_from_memtable(tidesdb_iter_t *iter)
             break;
 
         if (ttl > 0 && time(NULL) > ttl) continue;
+        if (deleted) continue; /* skip tombstones */
 
         tidesdb_iter_entry_t entry = {.key = malloc(k_size),
                                       .key_size = k_size,
-                                      .value = malloc(v_size),
+                                      .value = v_size > 0 ? malloc(v_size) : NULL,
                                       .value_size = v_size,
                                       .deleted = deleted,
                                       .ttl = ttl,
                                       .source_type = 0,
                                       .source_index = 0};
 
-        if (entry.key && entry.value)
+        if (entry.key && (v_size == 0 || entry.value))
         {
             memcpy(entry.key, k, k_size);
-            memcpy(entry.value, v, v_size);
+            if (v_size > 0 && entry.value)
+            {
+                memcpy(entry.value, v, v_size);
+            }
             return heap_push(iter, &entry);
         }
         else
@@ -332,20 +336,24 @@ static int iter_refill_from_immutable(tidesdb_iter_t *iter, int idx)
             break;
 
         if (ttl > 0 && time(NULL) > ttl) continue;
+        if (deleted) continue; /* skip tombstones */
 
         tidesdb_iter_entry_t entry = {.key = malloc(k_size),
                                       .key_size = k_size,
-                                      .value = malloc(v_size),
+                                      .value = v_size > 0 ? malloc(v_size) : NULL,
                                       .value_size = v_size,
                                       .deleted = deleted,
                                       .ttl = ttl,
                                       .source_type = 1,
                                       .source_index = idx};
 
-        if (entry.key && entry.value)
+        if (entry.key && (v_size == 0 || entry.value))
         {
             memcpy(entry.key, k, k_size);
-            memcpy(entry.value, v, v_size);
+            if (v_size > 0 && entry.value)
+            {
+                memcpy(entry.value, v, v_size);
+            }
             return heap_push(iter, &entry);
         }
         else
@@ -401,6 +409,13 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
             continue; /* skip expired */
         }
 
+        if (deleted)
+        {
+            free(k);
+            free(v);
+            continue; /* skip tombstones */
+        }
+
         tidesdb_iter_entry_t entry = {.key = k,
                                       .key_size = k_size,
                                       .value = v,
@@ -439,24 +454,34 @@ static int iter_refill_from_memtable_backward(tidesdb_iter_t *iter)
                 skip_list_cursor_prev(iter->memtable_cursor);
                 return 0;
             }
+            
+            if (deleted)
+            {
+                /* skip tombstones, move backward and return */
+                skip_list_cursor_prev(iter->memtable_cursor);
+                return 0;
+            }
 
             tidesdb_iter_entry_t entry = {.key = malloc(k_size),
                                           .key_size = k_size,
-                                          .value = malloc(v_size),
+                                          .value = v_size > 0 ? malloc(v_size) : NULL,
                                           .value_size = v_size,
                                           .deleted = deleted,
                                           .ttl = ttl,
                                           .source_type = 0,
                                           .source_index = 0};
 
-            if (entry.key && entry.value)
+            if (entry.key && (v_size == 0 || entry.value))
             {
                 memcpy(entry.key, k, k_size);
-                memcpy(entry.value, v, v_size);
+                if (v_size > 0 && entry.value)
+                {
+                    memcpy(entry.value, v, v_size);
+                }
                 /* move backward for next call */
                 skip_list_node_t *old_pos = iter->memtable_cursor->current;
                 skip_list_cursor_prev(iter->memtable_cursor);
-                /* if cursor didn't move, we're at the beginning - mark as exhausted */
+                /* if cursor didn't move, we're at the beginning; mark as exhausted */
                 if (iter->memtable_cursor->current == old_pos)
                 {
                     if (iter->memtable_cursor->current)
@@ -501,24 +526,34 @@ static int iter_refill_from_immutable_backward(tidesdb_iter_t *iter, int idx)
                 skip_list_cursor_prev(iter->immutable_memtable_cursors[idx]);
                 return 0;
             }
+            
+            if (deleted)
+            {
+                /* skip tombstones, move backward and return */
+                skip_list_cursor_prev(iter->immutable_memtable_cursors[idx]);
+                return 0;
+            }
 
             tidesdb_iter_entry_t entry = {.key = malloc(k_size),
                                           .key_size = k_size,
-                                          .value = malloc(v_size),
+                                          .value = v_size > 0 ? malloc(v_size) : NULL,
                                           .value_size = v_size,
                                           .deleted = deleted,
                                           .ttl = ttl,
                                           .source_type = 1,
                                           .source_index = idx};
 
-            if (entry.key && entry.value)
+            if (entry.key && (v_size == 0 || entry.value))
             {
                 memcpy(entry.key, k, k_size);
-                memcpy(entry.value, v, v_size);
+                if (v_size > 0 && entry.value)
+                {
+                    memcpy(entry.value, v, v_size);
+                }
                 /* move backward for next call */
                 skip_list_node_t *old_pos = iter->immutable_memtable_cursors[idx]->current;
                 skip_list_cursor_prev(iter->immutable_memtable_cursors[idx]);
-                /* if cursor didn't move, we're at the beginning - mark as exhausted */
+             
                 if (iter->immutable_memtable_cursors[idx]->current == old_pos)
                 {
                     if (iter->immutable_memtable_cursors[idx]->current)
@@ -590,6 +625,13 @@ static int iter_refill_from_sstable_backward(tidesdb_iter_t *iter, int idx)
             free(k);
             free(v);
             return 0; /* skip expired */
+        }
+        
+        if (deleted)
+        {
+            free(k);
+            free(v);
+            return 0; /* skip tombstones */
         }
 
         tidesdb_iter_entry_t entry = {.key = k,
@@ -821,8 +863,9 @@ int tidesdb_close(tidesdb_t *db)
         tidesdb_column_family_t *cf = db->column_families[i];
         if (!cf) continue;
 
-        /* stop flush thread */
+
         atomic_store(&cf->flush_stop, 1);
+        
         /* wake up flush thread if waiting */
         tidesdb_memtable_t *dummy = NULL;
         queue_enqueue(cf->flush_queue, dummy);
@@ -857,7 +900,7 @@ int tidesdb_close(tidesdb_t *db)
         {
             if (cf->sstables[j])
             {
-                tidesdb_sstable_free(cf->sstables[j]);
+                tidesdb_sstable_release(cf->sstables[j]);
             }
         }
         free(cf->sstables);
@@ -914,12 +957,23 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
     strncpy(cf->name, name, TDB_MAX_CF_NAME_LENGTH - 1);
     cf->name[TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
+    memset(cf->comparator_name, 0, TDB_MAX_COMPARATOR_NAME);
     cf->db = db;
+    atomic_init(&cf->active_memtable, NULL);
+    cf->immutable_memtables = NULL;
     cf->sstables = NULL;
-    atomic_store(&cf->num_sstables, 0);
+    atomic_init(&cf->num_sstables, 0);
     cf->sstable_array_capacity = 0;
-    atomic_store(&cf->next_sstable_id, 0);
-    atomic_store(&cf->compaction_stop, 0);
+    atomic_init(&cf->next_sstable_id, 0);
+    atomic_init(&cf->next_memtable_id, 0);
+    atomic_init(&cf->flush_stop, 0);
+    atomic_init(&cf->compaction_stop, 0);
+    cf->flush_queue = NULL;
+    memset(&cf->cf_lock, 0, sizeof(pthread_rwlock_t));
+    memset(&cf->flush_lock, 0, sizeof(pthread_mutex_t));
+    memset(&cf->flush_thread, 0, sizeof(pthread_t));
+    memset(&cf->compaction_lock, 0, sizeof(pthread_mutex_t));
+    memset(&cf->compaction_thread, 0, sizeof(pthread_t));
 
     if (config)
     {
@@ -1006,7 +1060,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
     /* create initial active memtable */
     tidesdb_memtable_t *initial_mt = tidesdb_memtable_new(cf);
-    atomic_store(&cf->active_memtable, initial_mt);
     if (!initial_mt)
     {
         queue_free(cf->immutable_memtables);
@@ -1018,11 +1071,11 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         pthread_rwlock_unlock(&db->db_lock);
         return TDB_ERR_MEMORY;
     }
+    atomic_store(&cf->active_memtable, initial_mt);
 
     /* init sstables array (grows dynamically) */
     cf->sstables = NULL;
     cf->sstable_array_capacity = 0;
-
     /* recover from WAL files if they exist */
     typedef struct
     {
@@ -1254,13 +1307,13 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             /* failed to create compaction thread; stop flush thread and cleanup */
             cf->config.enable_background_compaction = 0;
 
-            /* stop flush thread */
+    
             atomic_store(&cf->flush_stop, 1);
             tidesdb_memtable_t *dummy = NULL;
             queue_enqueue(cf->flush_queue, dummy);
             pthread_join(cf->flush_thread, NULL);
 
-            /* cleanup */
+    
             tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
             if (active_mt) tidesdb_memtable_free(active_mt);
             if (cf->immutable_memtables) queue_free(cf->immutable_memtables);
@@ -1435,7 +1488,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
                 lru_cache_remove(db->block_manager_cache, path);
             }
 
-            tidesdb_sstable_free(cf->sstables[i]);
+            tidesdb_sstable_release(cf->sstables[i]);
 
             /* now delete the file (handle is closed) */
             if (unlink(path) == -1 && errno != ENOENT)
@@ -1592,8 +1645,10 @@ int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt && active_mt->memtable)
     {
+        tidesdb_memtable_acquire(active_mt);
         (*stats)->memtable_size = (size_t)skip_list_get_size(active_mt->memtable);
         (*stats)->memtable_entries = skip_list_count_entries(active_mt->memtable);
+        tidesdb_memtable_release(active_mt);
     }
     else
     {
@@ -1647,6 +1702,15 @@ static void tidesdb_memtable_free(tidesdb_memtable_t *mt)
 {
     if (!mt) return;
 
+    /* decrement reference count and only free if it reaches 0 */
+    int ref_count = tidesdb_memtable_release(mt);
+    if (ref_count > 0)
+    {
+        /* still has references, don't free yet */
+        return;
+    }
+
+    /* ref_count is 0, safe to free */
     if (mt->memtable) skip_list_free(mt->memtable);
     if (mt->wal) block_manager_close(mt->wal);
     pthread_mutex_destroy(&mt->ref_lock);
@@ -1904,7 +1968,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
         {
             tidesdb_flush_memtable_to_sstable(cf, mt);
 
+            pthread_mutex_lock(&cf->flush_lock);
             queue_dequeue(cf->immutable_memtables);
+            pthread_mutex_unlock(&cf->flush_lock);
 
             tidesdb_memtable_free(mt);
 
@@ -1997,7 +2063,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         merged->min_key = NULL;
         merged->max_key = NULL;
         merged->num_entries = 0;
-        atomic_store(&merged->ref_count, 1); /* initial reference */
+        atomic_store(&merged->ref_count, 1); 
         pthread_mutex_init(&merged->ref_lock, NULL);
 
         merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode,
@@ -2603,8 +2669,7 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
     int num_threads = cf->config.compaction_threads;
     if (num_threads > pairs_to_merge) num_threads = pairs_to_merge;
 
-    /* init semaphore to limit concurrent threads */
-    sem_t semaphore = {0}; /* initialize to zero/NULL for all platforms */
+    sem_t semaphore = {0};
     if (sem_init(&semaphore, 0, (unsigned int)num_threads) != 0)
     {
         pthread_rwlock_unlock(&cf->cf_lock);
@@ -2660,8 +2725,6 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
             tidesdb_sstable_t *sst1 = cf->sstables[p * 2];
             tidesdb_sstable_t *sst2 = cf->sstables[p * 2 + 1];
 
-            /* release initial reference (from creation) */
-            /* sstables will be automatically freed when ref_count drops to 0 */
             tidesdb_sstable_release(sst1);
             tidesdb_sstable_release(sst2);
         }
@@ -2723,10 +2786,15 @@ static void *tidesdb_background_compaction_thread(void *arg)
 
 static int tidesdb_check_and_flush(tidesdb_column_family_t *cf)
 {
+    if (!cf) return TDB_ERR_INVALID_ARGS;
+    
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
-    if (!cf || !active_mt) return TDB_ERR_INVALID_ARGS;
-
+    if (!active_mt) return TDB_ERR_INVALID_ARGS;
+    
+    tidesdb_memtable_acquire(active_mt);
     size_t memtable_size = (size_t)skip_list_get_size(active_mt->memtable);
+    tidesdb_memtable_release(active_mt);
+    
     if (memtable_size >= cf->config.memtable_flush_size)
     {
         return tidesdb_rotate_memtable(cf);
@@ -2753,7 +2821,7 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
     sst->num_entries = 0;
     sst->bloom_filter = NULL;
     sst->index = NULL;
-    atomic_store(&sst->ref_count, 1); /* initial reference */
+    atomic_store(&sst->ref_count, 1);
     pthread_mutex_init(&sst->ref_lock, NULL);
 
     sst->block_manager =
@@ -3084,6 +3152,8 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt && active_mt->memtable)
     {
+        tidesdb_memtable_acquire(active_mt);
+        
         uint8_t *mem_value = NULL;
         size_t mem_value_size = 0;
         uint8_t deleted = 0;
@@ -3098,6 +3168,7 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
             {
                 /* key is tombstoned */
                 if (mem_value) free(mem_value);
+                tidesdb_memtable_release(active_mt);
                 return -1;
             }
 
@@ -3108,6 +3179,7 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
                 if (!*value)
                 {
                     if (mem_value) free(mem_value);
+                    tidesdb_memtable_release(active_mt);
                     return -1;
                 }
                 memcpy(*value, mem_value, mem_value_size);
@@ -3119,18 +3191,23 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
                 if (!*value)
                 {
                     if (mem_value) free(mem_value);
+                    tidesdb_memtable_release(active_mt);
                     return -1;
                 }
             }
 
             *value_size = mem_value_size;
             if (mem_value) free(mem_value);
+            tidesdb_memtable_release(active_mt);
             return 0;
         }
+        
+        tidesdb_memtable_release(active_mt);
     }
 
     if (cf->immutable_memtables)
     {
+        pthread_mutex_lock(&cf->flush_lock);
         size_t queue_sz = queue_size(cf->immutable_memtables);
         for (ssize_t i = (ssize_t)queue_sz - 1; i >= 0; i--)
         {
@@ -3138,12 +3215,17 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
                 (tidesdb_memtable_t *)queue_peek_at(cf->immutable_memtables, (size_t)i);
             if (imt && imt->memtable)
             {
+                tidesdb_memtable_acquire(imt); 
+                pthread_mutex_unlock(&cf->flush_lock); /* unlock while reading */
+                
                 uint8_t *mem_value = NULL;
                 size_t mem_value_size = 0;
                 uint8_t deleted = 0;
 
                 int result = skip_list_get(imt->memtable, key, key_size, &mem_value,
                                            &mem_value_size, &deleted);
+                tidesdb_memtable_release(imt);
+                
                 if (result == 0)
                 {
                     if (deleted)
@@ -3176,12 +3258,13 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
                     if (mem_value) free(mem_value);
                     return 0;
                 }
+                
+                pthread_mutex_lock(&cf->flush_lock); /* re-lock for next iteration */
             }
         }
+        pthread_mutex_unlock(&cf->flush_lock);
     }
 
-    /* key not in memtable, check sstables
-     * Acquire cf_lock here to prevent sstables array modification during iteration */
     pthread_rwlock_rdlock(&cf->cf_lock);
 
     /* check sstables from newest to oldest */
@@ -3387,8 +3470,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         if (op->type == TIDESDB_OP_PUT)
         {
             tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
+            if (!active_mt) return -1;
+            
+            tidesdb_memtable_acquire(active_mt);
 
-            if (active_mt && active_mt->wal)
+            if (active_mt->wal)
             {
                 tidesdb_kv_pair_header_t header = {.version = TDB_KV_FORMAT_VERSION,
                                                    .flags = 0,
@@ -3410,15 +3496,18 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                     block_manager_block_t *block = block_manager_block_create(wal_size, wal_data);
                     if (block)
                     {
-                        block_manager_block_write(cf->active_memtable->wal, block);
+                        block_manager_block_write(active_mt->wal, block);
                         block_manager_block_free(block);
                     }
                     free(wal_data);
                 }
             }
 
-            if (active_mt && skip_list_put(active_mt->memtable, op->key, op->key_size, op->value,
-                                           op->value_size, op->ttl) != 0)
+            int result = skip_list_put(active_mt->memtable, op->key, op->key_size, op->value,
+                                       op->value_size, op->ttl);
+            tidesdb_memtable_release(active_mt);
+            
+            if (result != 0)
             {
                 return -1;
             }
@@ -3426,8 +3515,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         else if (op->type == TIDESDB_OP_DELETE)
         {
             tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
+            if (!active_mt) return -1;
+            
+            tidesdb_memtable_acquire(active_mt); 
 
-            if (active_mt && active_mt->wal)
+            if (active_mt->wal)
             {
                 tidesdb_kv_pair_header_t header = {.version = TDB_KV_FORMAT_VERSION,
                                                    .flags = TDB_KV_FLAG_TOMBSTONE,
@@ -3455,15 +3547,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
 
             uint8_t empty_value = 0;
-            if (active_mt &&
-                skip_list_put(active_mt->memtable, op->key, op->key_size, &empty_value, 0, 0) != 0)
-            {
-                return -1;
-            }
-            if (active_mt && skip_list_delete(active_mt->memtable, op->key, op->key_size) != 0)
-            {
-                /* if delete fails, the put succeeded so we have a valid entry continue */
-            }
+            skip_list_put(active_mt->memtable, op->key, op->key_size, &empty_value, 0, 0);
+            skip_list_delete(active_mt->memtable, op->key, op->key_size);
+            /* if delete fails, the put succeeded so we have a valid entry, continue */
+            
+            tidesdb_memtable_release(active_mt);
         }
 
         tidesdb_check_and_flush(cf);
@@ -3597,7 +3685,10 @@ static int compare_keys_with_cf(tidesdb_column_family_t *cf, const uint8_t *key1
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt && active_mt->memtable)
     {
-        return skip_list_compare_keys(active_mt->memtable, key1, key1_size, key2, key2_size);
+        tidesdb_memtable_acquire(active_mt);
+        int result = skip_list_compare_keys(active_mt->memtable, key1, key1_size, key2, key2_size);
+        tidesdb_memtable_release(active_mt);
+        return result;
     }
     /* fallback to memcmp if no active memtable */
     size_t min_size = key1_size < key2_size ? key1_size : key2_size;
@@ -3636,6 +3727,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt && active_mt->memtable)
     {
+        tidesdb_memtable_acquire(active_mt); /* acquire reference to prevent premature free */
         (*iter)->memtable_cursor = skip_list_cursor_init(active_mt->memtable);
     }
 
@@ -3661,6 +3753,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
                         (tidesdb_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
                     if (imt && imt->memtable)
                     {
+                        tidesdb_memtable_acquire(imt); /* acquire reference to prevent premature free */
                         (*iter)->immutable_memtable_cursors[i] =
                             skip_list_cursor_init(imt->memtable);
                     }

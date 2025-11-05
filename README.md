@@ -9,6 +9,47 @@ It is not a full-featured database, but rather a library that can be used to bui
 
 [![Linux Build Status](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml/badge.svg)](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml)
 
+## Table of Contents
+- [Features](#features)
+- [Building](#building)
+  - [Unix (Linux/macOS)](#unix-linuxmacos)
+  - [Windows](#windows)
+    - [MinGW-w64](#option-1-mingw-w64-recommended-for-windows)
+    - [MSVC](#option-2-msvc-visual-studio)
+- [Requirements](#requirements)
+  - [Dependencies](#dependencies)
+  - [Linux](#linux)
+  - [MacOS](#macos)
+  - [Windows](#windows-1)
+- [Discord Community](#discord-community)
+- [Include](#include)
+- [Error Codes](#error-codes)
+- [Usage](#usage)
+  - [Opening a database](#opening-a-database)
+  - [Debug Logging](#debug-logging)
+  - [Creating a column family](#creating-a-column-family)
+  - [Dropping a column family](#dropping-a-column-family)
+  - [Getting a column family](#getting-a-column-family)
+  - [Listing column families](#listing-column-families)
+  - [Column family statistics](#column-family-statistics)
+  - [Updating column family configuration](#updating-column-family-configuration)
+  - [Transactions](#transactions)
+  - [Iterators](#iterators)
+  - [Custom Comparators](#custom-comparators)
+  - [Sync Modes](#sync-modes)
+- [Thread Pool Architecture](#thread-pool-architecture)
+- [Background Compaction](#background-compaction)
+- [Directory Structure and File Organization](#directory-structure-and-file-organization)
+  - [Database Directory Layout](#database-directory-layout)
+  - [File Naming Conventions](#file-naming-conventions)
+  - [WAL Rotation and Memtable Lifecycle](#wal-rotation-and-memtable-lifecycle)
+  - [Recovery Process](#recovery-process)
+  - [Directory Management](#directory-management)
+  - [Monitoring Disk Usage](#monitoring-disk-usage)
+  - [Best Practices](#best-practices)
+- [Concurrency Model](#concurrency-model)
+- [License](#license)
+
 ## Features
 - [x] **ACID Transactions** - Atomic, consistent, isolated (Read Committed), and durable. Transactions support multiple operations across column families. Writers are serialized per column family ensuring atomicity, while COW provides consistency for concurrent readers.
 - [x] **Optimized Concurrency** - Writers don't block readers. Readers never block other readers. Background operations wont affect active transactions.
@@ -20,7 +61,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] **Compression** - Snappy, LZ4, or ZSTD compression for SSTables and WAL entries. Configurable per column family.
 - [x] **TTL Support** - Time-to-live for key-value pairs. Expired entries automatically skipped during reads.
 - [x] **Custom Comparators** - Register custom key comparison functions. Built-in comparators `memcmp, string, numeric`.
-- [x] **Sync Modes** - Three sync modes `NONE (fastest), BACKGROUND (balanced), FULL (most durable)`.
+- [x] **Sync Modes** - Three sync modes `NONE (fastest), FULL (most durable, slowest)`.
 - [x] **Configurable** - Per-column-family configuration `memtable size, compaction settings, compression, bloom filters, sync mode`.
 - [x] **Simple API** - Clean, easy-to-use C API. Returns 0 on success, -n on error.
 - [x] **Skip List Memtable** - COW and atomic skip list for in-memory storage with configurable max level and probability.
@@ -49,7 +90,7 @@ ldconfig
 
 ### Windows
 
-#### Option 1 MinGW-w64 (Recommended for Windows)
+#### MinGW-w64 (Recommended for Windows)
 MinGW-w64 provides a GCC-based toolchain with better C11 support and POSIX compatibility.
 
 **Prerequisites**
@@ -73,7 +114,7 @@ cd build
 ctest --verbose  # or use --output-on-failure to only show failures
 ```
 
-#### Option 2 MSVC (Visual Studio)
+#### MSVC (Visual Studio)
 **Prerequisites**
 - Install [Visual Studio 2019 or later](https://visualstudio.microsoft.com/) with C++ development tools
 - Install [CMake](https://cmake.org/download/)
@@ -204,7 +245,9 @@ To open a database you pass a config struct and a pointer to the database.
 ```c
 tidesdb_config_t config = {
     .db_path = "./mydb",
-    .enable_debug_logging = 0  /* Optional enable debug logging */
+    .enable_debug_logging = 0,     /* Optional to enable debug logging */
+    .num_flush_threads = 2,        /* Optional to set flush thread pool size (default is 2) */
+    .num_compaction_threads = 2    /* Optional to set compaction thread pool size (default is 2) */
 };
 
 tidesdb_t *db = NULL;
@@ -288,8 +331,7 @@ tidesdb_column_family_config_t cf_config = {
     .enable_background_compaction = 1,          /* enable background compaction */
     .background_compaction_interval = 1000000,  /* check every 1000000 microseconds (1 second) */
     .use_sbha = 1,                              /* use sorted binary hash array */
-    .sync_mode = TDB_SYNC_BACKGROUND,           /* background fsync */
-    .sync_interval = 1000,                      /* fsync every 1000ms (1 second) */
+    .sync_mode = TDB_SYNC_FULL,                 /* sync on every write for maximum durability */
     .comparator_name = NULL                     /* NULL = use default "memcmp" */
 };
 
@@ -380,6 +422,66 @@ if (tidesdb_get_column_family_stats(db, "my_cf", &stats) == 0)
 - Number of SSTables and total size
 - Memtable size and entry count
 - Full configuration (compression, bloom filters, sync mode, etc.)
+
+### Updating column family configuration
+Update runtime-safe configuration settings without affecting existing data.
+
+```c
+tidesdb_column_family_update_config_t update_config = {
+    .memtable_flush_size = 128 * 1024 * 1024,   /* increase to 128MB */
+    .max_sstables_before_compaction = 256,      /* trigger at 256 SSTables */
+    .compaction_threads = 8,                    /* use 8 threads */
+    .max_level = 16,                            /* for new memtables */
+    .probability = 0.25f,                       /* for new memtables */
+    .bloom_filter_fp_rate = 0.001,              /* 0.1% FP rate for new SSTables */
+    .enable_background_compaction = 1,          /* enable background compaction */
+    .background_compaction_interval = 500000    /* check every 500ms */
+};
+
+if (tidesdb_update_column_family_config(db, "my_cf", &update_config) == 0)
+{
+    printf("Configuration updated successfully\n");
+}
+```
+
+**Updatable settings** (safe to change at runtime)
+- `memtable_flush_size` - Affects when new flushes trigger
+- `max_sstables_before_compaction` - Affects compaction trigger threshold
+- `compaction_threads` - Number of parallel compaction threads
+- `max_level` - Skip list level for **new** memtables only
+- `probability` - Skip list probability for **new** memtables only
+- `bloom_filter_fp_rate` - False positive rate for **new** SSTables only
+- `enable_background_compaction` - Enable/disable background compaction
+- `background_compaction_interval` - Compaction check interval
+
+**Non-updatable settings** (would corrupt existing data)
+- `compressed` - Cannot change compression on existing SSTables
+- `compress_algo` - Cannot change algorithm on existing SSTables
+- `use_sbha` - Cannot change index structure on existing SSTables
+- `sync_mode` - Cannot change durability mode on existing WALs
+- `comparator_name` - Cannot change sort order on existing data
+
+**Configuration persistence**
+```
+mydb/
+├── my_cf/
+│   ├── config.cfc          ← Configuration saved here
+│   ├── wal_0.log
+│   ├── sstable_0.sst
+│   └── sstable_1.sst
+```
+
+- **On CF creation**: Initial config saved to `config.cfc`
+- **On database restart**: Config loaded from `config.cfc` (if exists)
+- **On config update**: Changes immediately saved to `config.cfc`
+- **If save fails**: Returns `TDB_ERR_IO` error code
+
+**Important notes**
+- Changes apply immediately to new operations
+- Existing SSTables/memtables retain their original settings
+- New memtables use updated `max_level` and `probability`
+- New SSTables use updated `bloom_filter_fp_rate`
+- Thread-safe - uses write lock during update
 
 ### Transactions
 All operations in TidesDB v1 are done through transactions for ACID guarantees.
@@ -662,15 +764,45 @@ tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config(
 /* TDB_SYNC_NONE - Fastest, least durable (OS handles flushing) */
 cf_config.sync_mode = TDB_SYNC_NONE;
 
-/* TDB_SYNC_BACKGROUND - Balanced (fsync every N milliseconds in background) */
-cf_config.sync_mode = TDB_SYNC_BACKGROUND;
-cf_config.sync_interval = 1000;  /* fsync every 1000ms (1 second) */
-
 /* TDB_SYNC_FULL - Most durable (fsync on every write) */
 cf_config.sync_mode = TDB_SYNC_FULL;
 
 tidesdb_create_column_family(db, "my_cf", &cf_config);
 ```
+
+## Thread Pool Architecture
+TidesDB uses shared thread pools at the database level for efficient resource management.
+**Shared Thread Pools**
+- **Flush Pool** - Handles memtable-to-SSTable flush operations
+- **Compaction Pool** - Handles SSTable compaction tasks
+- **Shared Across Column Families** - All column families use the same thread pools
+- **Configurable Size** - Set pool sizes via `num_flush_threads` and `num_compaction_threads`
+```c
+tidesdb_config_t config = {
+ .db_path = "./mydb",
+ .num_flush_threads = 4, /* 4 threads for flush operations */
+ .num_compaction_threads = 4 /* 4 threads for compaction operations */
+};
+tidesdb_t *db = NULL;
+tidesdb_open(&config, &db);
+/* Creates 4 flush threads + 4 compaction threads = 8 total threads */
+/* All column families share these thread pools */
+```
+**Benefits**
+- **Resource Efficiency** - Fixed thread count regardless of column family count
+- **Scalability** - 1000 column families = still only 4-8 threads (vs 2000+ with per-CF threads)
+- **Auto-Compaction** - Flush workers automatically trigger compaction when needed
+- **Configurable** - Tune thread counts based on workload and CPU cores
+**Default Configuration**
+- `num_flush_threads = 2` (default if not specified or set to 0)
+- `num_compaction_threads = 2` (default if not specified or set to 0)
+- Total: 4 threads for typical workloads
+**Tuning Recommendations**
+- **Low write throughput** - Use defaults (2 + 2 = 4 threads)
+- **High write throughput** - Increase flush threads (4-8)
+- **Many column families** - Increase both pools (4 + 4 = 8 threads)
+- **CPU-bound compaction** - Match compaction threads to CPU cores
+- **I/O-bound flush** - More flush threads can overlap I/O operations
 
 ## Background Compaction
 TidesDB v1 features automatic background compaction with optional parallel execution.

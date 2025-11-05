@@ -60,7 +60,6 @@ static tidesdb_column_family_config_t get_test_cf_config(void)
         .background_compaction_interval = 0, /* not used when background compaction disabled */
         .use_sbha = 1,                       /* enable SBHA */
         .sync_mode = TDB_SYNC_NONE,          /* no fsync for tests */
-        .sync_interval = 0,                  /* not used with SYNC_NONE */
         .comparator_name = NULL              /* use default memcmp */
     };
     return config;
@@ -488,19 +487,12 @@ static void test_sync_modes(void)
     cf_config.sync_mode = TDB_SYNC_FULL;
     ASSERT_EQ(tidesdb_create_column_family(db, "full_sync", &cf_config), 0);
 
-    /* test TDB_SYNC_BACKGROUND */
-    cf_config.sync_mode = TDB_SYNC_BACKGROUND;
-    cf_config.sync_interval = 500; /* 500ms */
-    ASSERT_EQ(tidesdb_create_column_family(db, "bg_sync", &cf_config), 0);
-
     /* write to each CF */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
     ASSERT_EQ(tidesdb_txn_put(txn, "no_sync", (uint8_t *)"key1", 4, (uint8_t *)"val1", 4, -1), 0);
     ASSERT_EQ(tidesdb_txn_put(txn, "full_sync", (uint8_t *)"key2", 4, (uint8_t *)"val2", 4, -1), 0);
-    ASSERT_EQ(tidesdb_txn_put(txn, "bg_sync", (uint8_t *)"key3", 4, (uint8_t *)"val3", 4, -1), 0);
-
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
@@ -2647,7 +2639,7 @@ static void test_concurrent_compaction_with_reads(void)
 }
 
 /* test linear scan fallback when SBHA is disabled */
-static void test_linear_scan_fallback(void)
+static int test_linear_scan_fallback(void)
 {
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
@@ -2759,6 +2751,151 @@ static void test_linear_scan_fallback(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
+
+    return 1;
+}
+
+static int test_column_family_config_persistence(void)
+{
+    printf("Testing column family config persistence and updates...\n");
+
+    cleanup_test_dir();
+
+    tidesdb_config_t db_config = {.db_path = TEST_DB_PATH};
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&db_config, &db), 0);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.memtable_flush_size = 32 * 1024 * 1024;
+    cf_config.max_sstables_before_compaction = 64;
+    cf_config.compaction_threads = 2;
+    cf_config.max_level = 10;
+    cf_config.probability = 0.5f;
+    cf_config.bloom_filter_fp_rate = 0.02;
+    cf_config.enable_background_compaction = 0;
+    cf_config.background_compaction_interval = 2000000;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+
+    /* verify initial config was saved */
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(cf->config.memtable_flush_size, 32 * 1024 * 1024);
+    ASSERT_EQ(cf->config.max_sstables_before_compaction, 64);
+    ASSERT_EQ(cf->config.compaction_threads, 2);
+    ASSERT_EQ(cf->config.max_level, 10);
+    ASSERT_TRUE(cf->config.probability > 0.49f && cf->config.probability < 0.51f);
+    ASSERT_TRUE(cf->config.bloom_filter_fp_rate > 0.019 && cf->config.bloom_filter_fp_rate < 0.021);
+    ASSERT_EQ(cf->config.enable_background_compaction, 0);
+    ASSERT_EQ(cf->config.background_compaction_interval, 2000000);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&db_config, &db), 0);
+
+    /* verify config was loaded from disk */
+    cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(cf->config.memtable_flush_size, 32 * 1024 * 1024);
+    ASSERT_EQ(cf->config.max_sstables_before_compaction, 64);
+    ASSERT_EQ(cf->config.compaction_threads, 2);
+    ASSERT_EQ(cf->config.max_level, 10);
+    ASSERT_TRUE(cf->config.probability > 0.49f && cf->config.probability < 0.51f);
+    ASSERT_TRUE(cf->config.bloom_filter_fp_rate > 0.019 && cf->config.bloom_filter_fp_rate < 0.021);
+    ASSERT_EQ(cf->config.enable_background_compaction, 0);
+    ASSERT_EQ(cf->config.background_compaction_interval, 2000000);
+
+    /* update configuration */
+    tidesdb_column_family_update_config_t update_config = {
+        .memtable_flush_size = 128 * 1024 * 1024, /* 128MB */
+        .max_sstables_before_compaction = 256,
+        .compaction_threads = 8,
+        .max_level = 16,
+        .probability = 0.25f,
+        .bloom_filter_fp_rate = 0.001,
+        .enable_background_compaction = 1,
+        .background_compaction_interval = 500000};
+
+    ASSERT_EQ(tidesdb_update_column_family_config(db, "test_cf", &update_config), 0);
+
+    /* verify updated config in memory */
+    cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(cf->config.memtable_flush_size, 128 * 1024 * 1024);
+    ASSERT_EQ(cf->config.max_sstables_before_compaction, 256);
+    ASSERT_EQ(cf->config.compaction_threads, 8);
+    ASSERT_EQ(cf->config.max_level, 16);
+    ASSERT_TRUE(cf->config.probability > 0.24f && cf->config.probability < 0.26f);
+    ASSERT_TRUE(cf->config.bloom_filter_fp_rate > 0.0009 &&
+                cf->config.bloom_filter_fp_rate < 0.0011);
+    ASSERT_EQ(cf->config.enable_background_compaction, 1);
+    ASSERT_EQ(cf->config.background_compaction_interval, 500000);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&db_config, &db), 0);
+
+    /* verify updated config was persisted */
+    cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+    ASSERT_EQ(cf->config.memtable_flush_size, 128 * 1024 * 1024);
+    ASSERT_EQ(cf->config.max_sstables_before_compaction, 256);
+    ASSERT_EQ(cf->config.compaction_threads, 8);
+    ASSERT_EQ(cf->config.max_level, 16);
+    ASSERT_TRUE(cf->config.probability > 0.24f && cf->config.probability < 0.26f);
+    ASSERT_TRUE(cf->config.bloom_filter_fp_rate > 0.0009 &&
+                cf->config.bloom_filter_fp_rate < 0.0011);
+    ASSERT_EQ(cf->config.enable_background_compaction, 1);
+    ASSERT_EQ(cf->config.background_compaction_interval, 500000);
+
+    /* invalid memtable_flush_size */
+    tidesdb_column_family_update_config_t invalid_config = update_config;
+    invalid_config.memtable_flush_size = 0;
+    ASSERT_EQ(tidesdb_update_column_family_config(db, "test_cf", &invalid_config),
+              TDB_ERR_INVALID_ARGS);
+
+    /* invalid max_sstables_before_compaction */
+    invalid_config = update_config;
+    invalid_config.max_sstables_before_compaction = 1; /* must be >= 2 */
+    ASSERT_EQ(tidesdb_update_column_family_config(db, "test_cf", &invalid_config),
+              TDB_ERR_INVALID_ARGS);
+
+    /* invalid compaction_threads */
+    invalid_config = update_config;
+    invalid_config.compaction_threads = -1;
+    ASSERT_EQ(tidesdb_update_column_family_config(db, "test_cf", &invalid_config),
+              TDB_ERR_INVALID_ARGS);
+
+    /* invalid probability */
+    invalid_config = update_config;
+    invalid_config.probability = 0.0f; /* must be > 0 and < 1 */
+    ASSERT_EQ(tidesdb_update_column_family_config(db, "test_cf", &invalid_config),
+              TDB_ERR_INVALID_ARGS);
+
+    invalid_config.probability = 1.0f;
+    ASSERT_EQ(tidesdb_update_column_family_config(db, "test_cf", &invalid_config),
+              TDB_ERR_INVALID_ARGS);
+
+    /* invalid bloom_filter_fp_rate */
+    invalid_config = update_config;
+    invalid_config.bloom_filter_fp_rate = 0.0; /* must be > 0 and < 1 */
+    ASSERT_EQ(tidesdb_update_column_family_config(db, "test_cf", &invalid_config),
+              TDB_ERR_INVALID_ARGS);
+
+    invalid_config.bloom_filter_fp_rate = 1.0;
+    ASSERT_EQ(tidesdb_update_column_family_config(db, "test_cf", &invalid_config),
+              TDB_ERR_INVALID_ARGS);
+
+    /* test update on non-existent column family */
+    ASSERT_EQ(tidesdb_update_column_family_config(db, "nonexistent", &update_config),
+              TDB_ERR_NOT_FOUND);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+
+    return 1;
 }
 
 int main(void)
@@ -2769,6 +2906,7 @@ int main(void)
     printf(BLUE "=======================================\n\n" RESET);
     RUN_TEST(test_basic_open_close, tests_passed);
     RUN_TEST(test_column_family_creation, tests_passed);
+    RUN_TEST(test_column_family_config_persistence, tests_passed);
     RUN_TEST(test_basic_txn_put_get, tests_passed);
     RUN_TEST(test_multiple_operations, tests_passed);
     RUN_TEST(test_delete, tests_passed);
@@ -2794,7 +2932,6 @@ int main(void)
     RUN_TEST(test_delete_patterns, tests_passed);
     RUN_TEST(test_list_column_families, tests_passed);
     RUN_TEST(test_column_family_stats, tests_passed);
-
     RUN_TEST(test_mixed_workload, tests_passed);
     RUN_TEST(test_overflow_blocks, tests_passed);
     RUN_TEST(test_empty_key_value, tests_passed);

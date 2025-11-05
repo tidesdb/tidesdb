@@ -39,9 +39,9 @@
 /* sync mode enum for block manager and tidesdb */
 typedef enum
 {
-    TDB_SYNC_NONE,       /* no sync - fastest, least durable */
-    TDB_SYNC_FULL,       /* full sync on every write - slowest, most durable */
-    TDB_SYNC_BACKGROUND, /* background sync with interval - balanced */
+    TDB_SYNC_NONE, /* no fsync/fdatasync - fastest, least durable */
+    TDB_SYNC_FULL, /* full fsync/fdatasync on every write to a block manager - slowest, most durable
+                    */
 } tidesdb_sync_mode_t;
 
 /**
@@ -50,9 +50,7 @@ typedef enum
  * used for block managers in TidesDB
  * @param fd the file descriptor the block manager is managing
  * @param file_path the path of the file
- * @param fsync_thread the fsync thread
- * @param fsync_interval the fsync interval in milliseconds
- * @param stop_fsync_thread flag to stop fsync thread
+ * @param sync_mode sync mode for this block manager
  * @param write_mutex mutex for write operations only
  * @param block_size the default block size for this block manager
  */
@@ -60,12 +58,8 @@ typedef struct
 {
     int fd;
     char file_path[MAX_FILE_PATH_LENGTH];
-    pthread_t fsync_thread;
-    int fsync_interval;
-    int stop_fsync_thread;
     tidesdb_sync_mode_t sync_mode;
     pthread_mutex_t write_mutex;
-    pthread_cond_t fsync_cond;
     uint32_t block_size;
 } block_manager_t;
 
@@ -102,12 +96,10 @@ typedef struct
  * opens a block manager
  * @param bm the block manager to open
  * @param file_path the path of the file
- * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL, TDB_SYNC_BACKGROUND)
- * @param fsync_interval the fsync interval in milliseconds (only used for TDB_SYNC_BACKGROUND)
+ * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL)
  * @return 0 if successful, -1 if not
  */
-int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode,
-                       int fsync_interval);
+int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode);
 
 /**
  * block_manager_close

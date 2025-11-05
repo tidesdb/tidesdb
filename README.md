@@ -471,10 +471,10 @@ mydb/
 │   └── sstable_1.sst
 ```
 
-- **On CF creation**: Initial config saved to `config.cfc`
-- **On database restart**: Config loaded from `config.cfc` (if exists)
-- **On config update**: Changes immediately saved to `config.cfc`
-- **If save fails**: Returns `TDB_ERR_IO` error code
+- **On CF creation** Initial config saved to `config.cfc`
+- **On database restart** Config loaded from `config.cfc` (if exists)
+- **On config update** Changes immediately saved to `config.cfc`
+- **If save fails** Returns `TDB_ERR_IO` error code
 
 **Important notes**
 - Changes apply immediately to new operations
@@ -770,6 +770,10 @@ cf_config.sync_mode = TDB_SYNC_FULL;
 tidesdb_create_column_family(db, "my_cf", &cf_config);
 ```
 
+> [!TIP]
+> For full system design/architecture explaination please go to [https://tidesdb.com](https://tidesdb.com). What is described here is minimal.
+
+
 ## Thread Pool Architecture
 TidesDB uses shared thread pools at the database level for efficient resource management.
 **Shared Thread Pools**
@@ -793,11 +797,11 @@ tidesdb_open(&config, &db);
 - **Scalability** - 1000 column families = still only 4-8 threads (vs 2000+ with per-CF threads)
 - **Auto-Compaction** - Flush workers automatically trigger compaction when needed
 - **Configurable** - Tune thread counts based on workload and CPU cores
-**Default Configuration**
+  **Default Configuration**
 - `num_flush_threads = 2` (default if not specified or set to 0)
 - `num_compaction_threads = 2` (default if not specified or set to 0)
 - Total: 4 threads for typical workloads
-**Tuning Recommendations**
+  **Tuning Recommendations**
 - **Low write throughput** - Use defaults (2 + 2 = 4 threads)
 - **High write throughput** - Increase flush threads (4-8)
 - **Many column families** - Increase both pools (4 + 4 = 8 threads)
@@ -856,15 +860,18 @@ TidesDB organizes data on disk with a clear directory hierarchy. Understanding t
 ```
 mydb/
 ├── my_cf/
+│   ├── config.cfc
 │   ├── wal_1.log
 │   ├── sstable_0.sst
 │   ├── sstable_1.sst
 │   └── sstable_2.sst
 ├── users/
+│   ├── config.cfc
 │   ├── wal_0.log
 │   └── sstable_0.sst
 └── sessions/
-    └── wal_0.log
+│   ├── config.cfc
+│   └── wal_0.log
 ```
 
 ### File Naming Conventions
@@ -1059,14 +1066,14 @@ TidesDB is designed for high concurrency with minimal blocking
 **Transaction Isolation**
 - Read transactions (`tidesdb_txn_begin_read`) acquire read locks
 - Write transactions (`tidesdb_txn_begin`) acquire write locks on commit
-- Transactions are isolated - changes not visible until commit
+- Transactions are isolated; Changes not visible until commit
 
 **Optimal for**
 - Read-heavy workloads (unlimited concurrent readers)
 - Mixed read/write workloads (readers never wait for writers)
 - Multi-column-family applications (different CFs can be written concurrently)
 
-**Example - Concurrent Operations**
+**Concurrent operations example**
 ```c
 /* Thread 1 Reading */
 tidesdb_txn_t *read_txn;

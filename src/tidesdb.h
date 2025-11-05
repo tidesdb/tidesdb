@@ -287,6 +287,7 @@ typedef struct
  * @param compaction_thread background compaction thread
  * @param compaction_stop flag to stop compaction thread
  * @param next_memtable_id next memtable ID to assign
+ * @param is_dropping flag indicating if the column family is being dropped
  * @param config configuration for this column family (config.sstable_capacity triggers compaction)
  */
 struct tidesdb_column_family_t
@@ -309,7 +310,7 @@ struct tidesdb_column_family_t
     pthread_mutex_t compaction_lock;
     pthread_t compaction_thread;
     _Atomic(int) compaction_stop;
-    _Atomic(int) is_dropping;  /* flag to prevent new operations during drop */
+    _Atomic(int) is_dropping;
     tidesdb_column_family_config_t config;
 };
 
@@ -367,13 +368,12 @@ typedef struct
 
 /*
  * tidesdb_txn_t
- * transaction handle with snapshot isolation
+ * transaction handle
  * @param db pointer to tidesdb instance
  * @param operations array of operations
  * @param num_ops number of operations
  * @param op_capacity capacity of operations array
  * @param committed whether transaction has been committed
- * @param snapshot_version snapshot version for reads
  * @param read_only whether this is a read-only transaction
  */
 struct tidesdb_txn_t
@@ -383,7 +383,6 @@ struct tidesdb_txn_t
     int num_ops;
     int op_capacity;
     int committed;
-    uint64_t snapshot_version;
     int read_only;
 };
 
@@ -435,6 +434,7 @@ struct tidesdb_iter_t
     tidesdb_txn_t *txn;
     tidesdb_column_family_t *cf;
     skip_list_cursor_t *memtable_cursor;
+    tidesdb_memtable_t *active_memtable; /* reference to active memtable */
     skip_list_cursor_t **immutable_memtable_cursors;
     tidesdb_memtable_t **immutable_memtables;
     int num_immutable_cursors;

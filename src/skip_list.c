@@ -179,8 +179,6 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
     (*list)->max_level = max_level;
     (*list)->probability = probability;
     atomic_store_explicit(&(*list)->total_size, 0, memory_order_relaxed);
-    atomic_store_explicit(&(*list)->version, 0, memory_order_relaxed);
-    atomic_store_explicit(&(*list)->epoch, 0, memory_order_relaxed);
     (*list)->comparator = comparator;
     (*list)->comparator_ctx = comparator_ctx;
 
@@ -372,13 +370,6 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
         size_t new_total = old_total - x->value_size + value_size;
         atomic_store_explicit(&list->total_size, new_total, memory_order_relaxed);
 
-        /* increment version and epoch */
-        uint64_t old_version = atomic_load_explicit(&list->version, memory_order_relaxed);
-        atomic_store_explicit(&list->version, old_version + 1, memory_order_release);
-
-        uint64_t old_epoch = atomic_load_explicit(&list->epoch, memory_order_relaxed);
-        atomic_store_explicit(&list->epoch, old_epoch + 1, memory_order_release);
-
         /* old node will be freed when all references are released */
         skip_list_release_node(x);
 
@@ -434,13 +425,6 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
 
     size_t new_total = atomic_load_explicit(&list->total_size, memory_order_relaxed);
     atomic_store_explicit(&list->total_size, new_total + value_size, memory_order_relaxed);
-
-    /* increment version and epoch */
-    uint64_t old_version = atomic_load_explicit(&list->version, memory_order_relaxed);
-    atomic_store_explicit(&list->version, old_version + 1, memory_order_release);
-
-    uint64_t old_epoch = atomic_load_explicit(&list->epoch, memory_order_relaxed);
-    atomic_store_explicit(&list->epoch, old_epoch + 1, memory_order_release);
 
     free(update);
     pthread_mutex_unlock(&list->write_lock);
@@ -598,13 +582,6 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size)
     size_t old_total = atomic_load_explicit(&list->total_size, memory_order_relaxed);
     atomic_store_explicit(&list->total_size, old_total - x->value_size, memory_order_relaxed);
 
-    /* increment version and epoch */
-    uint64_t old_version = atomic_load_explicit(&list->version, memory_order_relaxed);
-    atomic_store_explicit(&list->version, old_version + 1, memory_order_release);
-
-    uint64_t old_epoch = atomic_load_explicit(&list->epoch, memory_order_relaxed);
-    atomic_store_explicit(&list->epoch, old_epoch + 1, memory_order_release);
-
     /* release reference to old node (will be freed when all readers done) */
     skip_list_release_node(x);
 
@@ -663,8 +640,6 @@ skip_list_cursor_t *skip_list_cursor_init(skip_list_t *list)
     if (cursor == NULL) return NULL;
 
     cursor->list = list;
-    cursor->snapshot_version = atomic_load_explicit(&list->version, memory_order_acquire);
-    cursor->local_epoch = atomic_load_explicit(&list->epoch, memory_order_acquire);
 
     skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
     cursor->current = atomic_load_explicit(&header->forward[0], memory_order_acquire);
@@ -829,13 +804,6 @@ int skip_list_clear(skip_list_t *list)
     atomic_store_explicit(&list->tail, header, memory_order_release);
     atomic_store_explicit(&list->level, 1, memory_order_relaxed);
     atomic_store_explicit(&list->total_size, 0, memory_order_relaxed);
-
-    /* increment version and epoch */
-    uint64_t old_version = atomic_load_explicit(&list->version, memory_order_relaxed);
-    atomic_store_explicit(&list->version, old_version + 1, memory_order_release);
-
-    uint64_t old_epoch = atomic_load_explicit(&list->epoch, memory_order_relaxed);
-    atomic_store_explicit(&list->epoch, old_epoch + 1, memory_order_release);
 
     pthread_mutex_unlock(&list->write_lock);
     return 0;
@@ -1004,8 +972,6 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
     }
 
     (*cursor)->list = list;
-    (*cursor)->snapshot_version = atomic_load_explicit(&list->version, memory_order_acquire);
-    (*cursor)->local_epoch = atomic_load_explicit(&list->epoch, memory_order_acquire);
 
     /* if list is empty (tail is header) */
     skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
@@ -1132,16 +1098,6 @@ int skip_list_compact(skip_list_t *list)
         current_level--;
     }
     atomic_store_explicit(&list->level, current_level, memory_order_release);
-
-    /* increment version and epoch */
-    if (removed_count > 0)
-    {
-        uint64_t old_version = atomic_load_explicit(&list->version, memory_order_relaxed);
-        atomic_store_explicit(&list->version, old_version + 1, memory_order_release);
-
-        uint64_t old_epoch = atomic_load_explicit(&list->epoch, memory_order_relaxed);
-        atomic_store_explicit(&list->epoch, old_epoch + 1, memory_order_release);
-    }
 
     pthread_mutex_unlock(&list->write_lock);
     return removed_count;

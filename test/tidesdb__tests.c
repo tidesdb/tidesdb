@@ -56,12 +56,12 @@ static tidesdb_column_family_config_t get_test_cf_config(void)
         .compressed = 1,
         .compress_algo = COMPRESS_LZ4,
         .bloom_filter_fp_rate = 0.01,
-        .enable_background_compaction = 0, /* disable for deterministic testing */
+        .enable_background_compaction = 0,   /* disable for deterministic testing */
         .background_compaction_interval = 0, /* not used when background compaction disabled */
-        .use_sbha = 1,                     /* enable SBHA */
-        .sync_mode = TDB_SYNC_NONE,        /* no fsync for tests */
-        .sync_interval = 0,                /* not used with SYNC_NONE */
-        .comparator_name = NULL            /* use default memcmp */
+        .use_sbha = 1,                       /* enable SBHA */
+        .sync_mode = TDB_SYNC_NONE,          /* no fsync for tests */
+        .sync_interval = 0,                  /* not used with SYNC_NONE */
+        .comparator_name = NULL              /* use default memcmp */
     };
     return config;
 }
@@ -850,7 +850,7 @@ static void test_many_sstables(void)
     printf("\n  [Verification] Creating many SSTables... ");
     fflush(stdout);
 
-    /* insert data in batches to create many SSTables */
+    /* insert data in batches to create many sstables */
     int total_keys = 0;
     for (int batch = 0; batch < 10; batch++)
     {
@@ -1101,7 +1101,7 @@ static void test_background_compaction(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
     cf_config.memtable_flush_size = 8192;
-    cf_config.max_sstables_before_compaction = 5; /* compact at 5 SSTables */
+    cf_config.max_sstables_before_compaction = 5; /* compact at 5 sstables */
     cf_config.enable_background_compaction = 1;   /* enable background compaction */
 
     ASSERT_EQ(tidesdb_create_column_family(db, "bg_compact", &cf_config), 0);
@@ -1322,7 +1322,9 @@ static void test_list_column_families(void)
     char **names = NULL;
     int count = 0;
     ASSERT_EQ(tidesdb_list_column_families(db, &names, &count), 0);
-    ASSERT_TRUE(count >= 3); /* at least the 3 we created (may have more if cleanup from previous test failed) */
+    ASSERT_TRUE(
+        count >=
+        3); /* at least the 3 we created (may have more if cleanup from previous test failed) */
     ASSERT_TRUE(names != NULL);
 
     /* verify our 3 CFs are present */
@@ -1684,7 +1686,7 @@ static void test_compaction_tombstones(void)
     for (int i = 0; i < max_wait; i++)
     {
         sstables_before = atomic_load(&cf->num_sstables);
-        if (sstables_before >= 2) break; /* wait for at least 2 SSTables */
+        if (sstables_before >= 2) break; /* wait for at least 2 sstables */
         usleep(100000);                  /* 100ms */
     }
 
@@ -1969,7 +1971,7 @@ static void test_parallel_compaction(void)
         }
     }
 
-    ASSERT_EQ(found_count, num_sstables * 10); /* all 80 keys should be found */
+    ASSERT_EQ(found_count, num_sstables * 10);
 
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
@@ -2206,7 +2208,7 @@ static void test_iterator_metadata_boundary(void)
 
     ASSERT_EQ(tidesdb_create_column_family(db, "boundary_test", &cf_config), 0);
 
-    /* insert exactly 5 entries to create 1 SSTable with 5 KV blocks + metadata */
+    /* insert exactly 5 entries to create 1 sstable with 5 KV blocks + metadata */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -2283,7 +2285,7 @@ static void test_iterator_metadata_boundary(void)
     cleanup_test_dir();
 }
 
-/* regression test verify num_entries is correctly set in SSTables */
+/* regression test verify num_entries is correctly set in sstables */
 static void test_sstable_num_entries_accuracy(void)
 {
     printf("\n  [Regression] Testing SSTable num_entries accuracy... ");
@@ -2320,7 +2322,7 @@ static void test_sstable_num_entries_accuracy(void)
         tidesdb_txn_free(txn);
     }
 
-    /* force memtable flush to create SSTables */
+    /* force memtable flush to create sstables */
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "entries_test");
     ASSERT_TRUE(cf != NULL);
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
@@ -2335,7 +2337,7 @@ static void test_sstable_num_entries_accuracy(void)
         usleep(100000); /* 100ms */
     }
 
-    ASSERT_TRUE(actual_sstables > 0); /* at least one SSTable created */
+    ASSERT_TRUE(actual_sstables > 0); /* at least one sstable created */
 
     /* verify iterator reads correct total count */
     tidesdb_txn_t *read_txn = NULL;
@@ -2491,9 +2493,8 @@ static void test_drop_column_family_cleanup(void)
     /* flush to create sstables */
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cleanup_cf");
     ASSERT_TRUE(cf != NULL);
-   //ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    // ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
- 
     /* verify files exist before drop */
     char cf_path[TDB_MAX_PATH_LENGTH];
     snprintf(cf_path, sizeof(cf_path), "%s" PATH_SEPARATOR "cleanup_cf", TEST_DB_PATH);
@@ -2790,9 +2791,10 @@ int main(void)
     RUN_TEST(test_crash_recovery, tests_passed);
     RUN_TEST(test_background_compaction, tests_passed);
     RUN_TEST(test_update_patterns, tests_passed);
-   RUN_TEST(test_delete_patterns, tests_passed);
+    RUN_TEST(test_delete_patterns, tests_passed);
     RUN_TEST(test_list_column_families, tests_passed);
     RUN_TEST(test_column_family_stats, tests_passed);
+
     RUN_TEST(test_mixed_workload, tests_passed);
     RUN_TEST(test_overflow_blocks, tests_passed);
     RUN_TEST(test_empty_key_value, tests_passed);
@@ -2806,9 +2808,9 @@ int main(void)
     RUN_TEST(test_iterator_metadata_boundary, tests_passed);
     RUN_TEST(test_sstable_num_entries_accuracy, tests_passed);
     RUN_TEST(test_drop_column_family_basic, tests_passed);
-   RUN_TEST(test_drop_column_family_with_data, tests_passed);
+    RUN_TEST(test_drop_column_family_with_data, tests_passed);
     RUN_TEST(test_drop_column_family_not_found, tests_passed);
-   RUN_TEST(test_drop_column_family_cleanup, tests_passed);
+    RUN_TEST(test_drop_column_family_cleanup, tests_passed);
     RUN_TEST(test_concurrent_compaction_with_reads, tests_passed);
     RUN_TEST(test_linear_scan_fallback, tests_passed);
 

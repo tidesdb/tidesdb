@@ -2604,7 +2604,7 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
     if (num_threads > pairs_to_merge) num_threads = pairs_to_merge;
 
     /* init semaphore to limit concurrent threads */
-    sem_t semaphore;
+    sem_t semaphore = {0}; /* initialize to zero/NULL for all platforms */
     if (sem_init(&semaphore, 0, (unsigned int)num_threads) != 0)
     {
         pthread_rwlock_unlock(&cf->cf_lock);

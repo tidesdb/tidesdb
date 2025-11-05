@@ -901,6 +901,8 @@ int tidesdb_close(tidesdb_t *db)
                 tidesdb_sstable_t *sst = cf->sstables[j];
                 if (sst->index) binary_hash_array_free(sst->index);
                 if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
+                if (sst->min_key) free(sst->min_key);
+                if (sst->max_key) free(sst->max_key);
                 pthread_mutex_destroy(&sst->ref_lock);
                 free(sst);
             }
@@ -1490,6 +1492,8 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
             tidesdb_sstable_t *sst = cf->sstables[i];
             if (sst->index) binary_hash_array_free(sst->index);
             if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
+            if (sst->min_key) free(sst->min_key);
+            if (sst->max_key) free(sst->max_key);
             pthread_mutex_destroy(&sst->ref_lock);
             free(sst);
         }

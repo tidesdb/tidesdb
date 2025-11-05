@@ -112,7 +112,7 @@ void test_false_positive_rate()
     for (int i = 0; i < n; i++)
     {
         char key[20];
-        sprintf(key, "inserted_key_%d", i);
+        snprintf(key, sizeof(key), "inserted_key_%d", i);
         (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
     }
 
@@ -122,7 +122,7 @@ void test_false_positive_rate()
     for (int i = 0; i < m; i++)
     {
         char key[20];
-        sprintf(key, "test_key_%d", i + n); /** different from inserted keys */
+        snprintf(key, sizeof(key), "test_key_%d", i + n); /** different from inserted keys */
         if (bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)))
         {
             false_positives++;
@@ -177,7 +177,7 @@ void benchmark_bloom_filter()
     for (int i = 0; i < 1000000; i++)
     {
         char key[20];
-        sprintf(key, "key_%d", i);
+        snprintf(key, sizeof(key), "key_%d", i);
         (void)bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
     }
     clock_t end_add = clock();
@@ -197,7 +197,7 @@ void benchmark_bloom_filter()
     for (int i = 0; i < 1000000; i++)
     {
         char key[20];
-        sprintf(key, "key_%d", i);
+        snprintf(key, sizeof(key), "key_%d", i);
         ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)key, strlen(key)), 1);
     }
     clock_t end_check = clock();

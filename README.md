@@ -10,8 +10,8 @@ It is not a full-featured database, but rather a library that can be used to bui
 [![Linux Build Status](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml/badge.svg)](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml)
 
 ## Features
-- [x] **ACID Transactions** - Atomic, consistent, isolated (Read Committed), and durable. Transactions support multiple operations across column families. Writers are serialized per column family ensuring atomicity, while COW skip list provides consistency for concurrent readers.
-- [x] **Optimized Concurrency** - Writers don't block readers. Readers never block other readers. Flush and compaction I/O happens outside locks with only brief blocking for metadata updates, readers will always see consistent data as background operations wont affect active transactions.
+- [x] **ACID Transactions** - Atomic, consistent, isolated (Read Committed), and durable. Transactions support multiple operations across column families. Writers are serialized per column family ensuring atomicity, while COW provides consistency for concurrent readers.
+- [x] **Optimized Concurrency** - Writers don't block readers. Readers never block other readers. Background operations wont affect active transactions.
 - [x] **Column Families** - Isolated key-value stores. Each column family has its own memtable, SSTables, and WAL.
 - [x] **Bidirectional Iterators** - Iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and SSTables. Reference counting prevents premature deletion during iteration.
 - [x] **Write-Ahead Log (WAL)** - Durability through WAL. Automatic recovery on startup reconstructs memtables from WALs.
@@ -94,6 +94,7 @@ cmake --build build --config Release
 
 # Run tests
 cd build
+
 ctest -C Debug --verbose
 # or
 ctest -C Release --verbose
@@ -713,6 +714,205 @@ tidesdb_compact(cf);  /* Automatically uses parallel compaction if compaction_th
 - Background compaction runs in separate thread (non-blocking)
 - Parallel compaction significantly speeds up large compactions
 - Manual compaction requires minimum 2 SSTables to merge
+
+## Directory Structure and File Organization
+
+TidesDB organizes data on disk with a clear directory hierarchy. Understanding this structure is helpful for backup, monitoring, and debugging.
+
+### Database Directory Layout
+
+```
+mydb/
+├── my_cf/
+│   ├── wal_1.log
+│   ├── sstable_0.sst
+│   ├── sstable_1.sst
+│   └── sstable_2.sst
+├── users/
+│   ├── wal_0.log
+│   └── sstable_0.sst
+└── sessions/
+    └── wal_0.log
+```
+
+### File Naming Conventions
+
+**Write-Ahead Log (WAL) Files**
+- **Format** `wal_<memtable_id>.log`
+- **Example** `wal_0.log`, `wal_1.log`, `wal_2.log`
+- **Purpose** Durability - records all writes before they're applied to memtable
+- **Lifecycle**
+  - Created when a new memtable is created (on database open or rotation)
+  - Each memtable has its own dedicated WAL file
+  - WAL ID matches the memtable ID (monotonically increasing counter)
+  - **Multiple WAL files can exist simultaneously** - one for active memtable, others for memtables in flush queue
+  - Deleted only after memtable is successfully flushed to SSTable AND freed
+  - Automatically recovered on database restart if flush didn't complete
+
+**SSTable Files**
+- **Format** `sstable_<sstable_id>.sst`
+- **Example** `sstable_0.sst`, `sstable_1.sst`, `sstable_2.sst`
+- **Purpose** Persistent storage of flushed memtables
+- **Lifecycle**
+  - Created when memtable is flushed (when size exceeds `memtable_flush_size`)
+  - SSTable ID is monotonically increasing per column family
+  - Merged during compaction (old SSTables deleted, new merged SSTable created)
+  - Contains sorted key-value pairs with bloom filter and index metadata
+
+### WAL Rotation and Memtable Lifecycle
+
+TidesDB uses a rotating WAL system tied to memtable rotation
+
+**1. Initial State**
+```
+Active Memtable (ID: 0) → wal_0.log
+```
+
+**2. Memtable Fills Up** (size >= `memtable_flush_size`)
+```
+Active Memtable (ID: 0) → wal_0.log  [FULL - triggers rotation]
+```
+
+**3. Rotation Occurs**
+```
+New Active Memtable (ID: 1) → wal_1.log  [new WAL created]
+Immutable Memtable (ID: 0) → wal_0.log  [queued for flush]
+```
+
+**4. Background Flush (Async)**
+```
+Active Memtable (ID: 1) → wal_1.log
+Flushing: Memtable (ID: 0) → sstable_0.sst  [writing to disk]
+wal_0.log  [still exists - flush in progress]
+```
+
+**5. Flush Complete**
+```
+Active Memtable (ID: 1) → wal_1.log
+SSTable: sstable_0.sst  [persisted]
+wal_0.log  [DELETED - memtable freed after flush]
+```
+
+**6. Next Rotation (Before Previous Flush Completes)**
+```
+New Active Memtable (ID: 2) → wal_2.log  [new active]
+Immutable Memtable (ID: 1) → wal_1.log  [queued for flush]
+Flushing: Memtable (ID: 0) → sstable_0.sst  [still flushing]
+wal_0.log  [still exists - flush not complete]
+```
+
+**7. After All Flushes Complete**
+```
+Active Memtable (ID: 2) → wal_2.log
+SSTable: sstable_0.sst
+SSTable: sstable_1.sst
+wal_0.log, wal_1.log  [DELETED - both flushes complete]
+```
+
+### Recovery Process
+
+On database startup, TidesDB automatically recovers from WAL files
+
+```c
+tidesdb_t *db = NULL;
+tidesdb_open(&config, &db);  /* Automatic WAL recovery */
+```
+
+**Recovery Steps**
+1. Scans column family directory for `wal_*.log` files
+2. Sorts WAL files by ID (oldest to newest)
+3. Replays each WAL file into a new memtable
+4. Reconstructs in-memory state from persisted WAL entries
+5. Continues normal operation with recovered data
+
+**What Gets Recovered**
+- All committed transactions that were written to WAL
+- Uncommitted transactions are discarded (not in WAL)
+- Memtables that were being flushed when crash occurred
+
+**Example Recovery Scenario**
+```
+Before Crash:
+  Active Memtable (ID: 2) → wal_2.log  [100 entries]
+  Flushing Memtable (ID: 1) → wal_1.log  [partially written to sstable_1.sst]
+  SSTable: sstable_0.sst
+
+After Recovery:
+  Recovered Memtable (ID: 1) from wal_1.log  [fully recovered]
+  Recovered Memtable (ID: 2) from wal_2.log  [fully recovered]
+  SSTable: sstable_0.sst
+  
+Next flush will create sstable_1.sst and sstable_2.sst
+```
+
+### Directory Management
+
+**Creating a column family**
+```c
+tidesdb_create_column_family(db, "my_cf", &cf_config);
+/* Creates mydb/my_cf/ directory with initial wal_0.log */
+```
+
+**Dropping a column family**
+```c
+tidesdb_drop_column_family(db, "my_cf");
+/* Deletes mydb/my_cf/ directory and all contents (WALs, SSTables) */
+```
+
+**Manual cleanup** (if needed)
+```bash
+# Backup before cleanup
+cp -r mydb mydb_backup
+
+# Remove specific column family
+rm -rf mydb/old_cf/
+
+# Clean up old database
+rm -rf mydb/
+```
+
+### Monitoring Disk Usage
+
+```bash
+# Check total database size
+du -sh mydb/
+
+# Check per-column-family size
+du -sh mydb/*/
+
+# Count WAL files (should be 1-2 per CF normally)
+find mydb/ -name "wal_*.log" | wc -l
+
+# Count SSTable files
+find mydb/ -name "sstable_*.sst" | wc -l
+
+# List largest SSTables
+find mydb/ -name "sstable_*.sst" -exec ls -lh {} \; | sort -k5 -hr | head -10
+```
+
+### Best Practices
+
+**Backup Strategy**
+```bash
+# Stop writes, flush all memtables, then backup
+# In your application
+tidesdb_flush_memtable(cf);  # Force flush before backup
+
+# Then backup
+tar -czf mydb_backup.tar.gz mydb/
+```
+
+**Disk Space Monitoring**
+- Monitor WAL file count - typically 1-3 per column family (1 active + 1-2 in flush queue)
+- Many WAL files (>5) may indicate flush backlog, slow I/O, or configuration issue
+- Monitor SSTable count - triggers compaction at `max_sstables_before_compaction`
+- Set appropriate `memtable_flush_size` based on write patterns and flush speed
+
+**Performance Tuning**
+- Larger `memtable_flush_size` = fewer, larger SSTables = less compaction
+- Smaller `memtable_flush_size` = more, smaller SSTables = more compaction
+- Adjust `max_sstables_before_compaction` based on read/write ratio
+- Use `enable_background_compaction` for automatic maintenance
 
 ## Concurrency Model
 

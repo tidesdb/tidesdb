@@ -153,12 +153,6 @@ static inline int tidesdb_sstable_release(tidesdb_sstable_t *sst)
     return new_count;
 }
 
-static inline int tidesdb_sstable_get_ref_count(tidesdb_sstable_t *sst)
-{
-    if (!sst) return 0;
-    return atomic_load(&sst->ref_count);
-}
-
 /* reference counting helpers for memtables */
 static inline void tidesdb_memtable_acquire(tidesdb_memtable_t *mt)
 {
@@ -647,12 +641,6 @@ static inline int tidesdb_memtable_release(tidesdb_memtable_t *mt)
     return old_count - 1; /* return new count */
 }
 
-static inline int tidesdb_memtable_get_ref_count(tidesdb_memtable_t *mt)
-{
-    if (!mt) return 0;
-    return atomic_load(&mt->ref_count);
-}
-
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
 {
     tidesdb_column_family_config_t config = {
@@ -690,13 +678,6 @@ static void get_cf_path(const tidesdb_t *db, const char *cf_name, char *path)
 {
     (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", db->config.db_path,
                    cf_name);
-}
-
-static void get_wal_path(const tidesdb_column_family_t *cf, char *path)
-{
-    char cf_path[TDB_MAX_PATH_LENGTH];
-    get_cf_path(cf->db, cf->name, cf_path);
-    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "wal%s", cf_path, TDB_WAL_EXT);
 }
 
 static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable_id, char *path)
@@ -1730,8 +1711,9 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
     }
 
     char wal_path[TDB_MAX_PATH_LENGTH];
-    snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR "wal_%lu.log",
-             cf->db->config.db_path, cf->name, mt->id);
+    snprintf(wal_path, sizeof(wal_path),
+             "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log", cf->db->config.db_path,
+             cf->name, mt->id);
 
     if (block_manager_open(&mt->wal, wal_path, cf->config.sync_mode, cf->config.sync_interval) ==
         -1)
@@ -1794,7 +1776,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
 {
     if (!cf || !mt) return -1;
 
-    TDB_DEBUG_LOG("Flushing memtable %lu for column family: %s", mt->id, cf->name);
+    TDB_DEBUG_LOG("Flushing memtable %" PRIu64 " for column family: %s", mt->id, cf->name);
 
     if (skip_list_count_entries(mt->memtable) == 0)
     {

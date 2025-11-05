@@ -1051,7 +1051,7 @@ void benchmark_block_manager()
         }
 
         /* we add identifier at the end of each block for verification */
-        sprintf((char *)(block_data[i] + BLOCK_SIZE - 20), "block_%d", i);
+        snprintf((char *)(block_data[i] + BLOCK_SIZE - 20), 20, "block_%d", i);
     }
 
     printf(BOLDWHITE "Benchmark 1: Sequential Write Performance\n" RESET);
@@ -1104,7 +1104,7 @@ void benchmark_block_manager()
     {
         /* we verify block identifier */
         char expected_id[20];
-        sprintf(expected_id, "block_%d", blocks_read);
+        snprintf(expected_id, sizeof(expected_id), "block_%d", blocks_read);
 
         ASSERT_TRUE(
             memcmp((char *)block->data + BLOCK_SIZE - 20, expected_id, strlen(expected_id)) == 0);

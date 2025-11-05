@@ -12,7 +12,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 ## Features
 - [x] **ACID Transactions** - Atomic, consistent, isolated (Read Committed), and durable. Transactions support multiple operations across column families. Writers are serialized per column family ensuring atomicity, while COW provides consistency for concurrent readers.
 - [x] **Optimized Concurrency** - Writers don't block readers. Readers never block other readers. Background operations wont affect active transactions.
-- [x] **Column Families** - Isolated key-value stores. Each column family has its own memtable, SSTables, and WAL.
+- [x] **Column Families** - Isolated key-value stores. Each column family has its own memtable, SSTables, and WALs.
 - [x] **Bidirectional Iterators** - Iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and SSTables. Reference counting prevents premature deletion during iteration.
 - [x] **Write-Ahead Log (WAL)** - Durability through WAL. Automatic recovery on startup reconstructs memtables from WALs.
 - [x] **Background Compaction** - Automatic background compaction when SSTable count reaches configured max per column family.

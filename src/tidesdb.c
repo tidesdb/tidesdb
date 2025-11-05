@@ -843,12 +843,18 @@ int tidesdb_close(tidesdb_t *db)
         queue_enqueue(cf->flush_queue, dummy);
         pthread_join(cf->flush_thread, NULL);
 
+        /* flush and free any remaining memtables in immutable_memtables queue
+         * hold flush_lock to prevent race with tidesdb_rotate_memtable */
+        pthread_mutex_lock(&cf->flush_lock);
         tidesdb_memtable_t *mt;
         while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
         {
+            pthread_mutex_unlock(&cf->flush_lock);
             tidesdb_flush_memtable_to_sstable(cf, mt);
             tidesdb_memtable_free(mt);
+            pthread_mutex_lock(&cf->flush_lock);
         }
+        pthread_mutex_unlock(&cf->flush_lock);
 
         /* stop compaction thread */
         if (cf->config.enable_background_compaction)
@@ -860,16 +866,15 @@ int tidesdb_close(tidesdb_t *db)
         tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
         if (active_mt)
         {
+            /* close WAL before freeing */
             if (active_mt->wal)
             {
                 block_manager_close(active_mt->wal);
                 active_mt->wal = NULL;
             }
 
-            atomic_store(&active_mt->ref_count, 0);
-            if (active_mt->memtable) skip_list_free(active_mt->memtable);
-            pthread_mutex_destroy(&active_mt->ref_lock);
-            free(active_mt);
+            /* use tidesdb_memtable_free for consistent cleanup */
+            tidesdb_memtable_free(active_mt);
         }
 
         if (cf->immutable_memtables) queue_free(cf->immutable_memtables);
@@ -1754,16 +1759,19 @@ static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
     tidesdb_memtable_t *new_memtable = tidesdb_memtable_new(cf);
     if (!new_memtable) return -1;
 
+    /* hold flush_lock during entire rotation to prevent race with tidesdb_close */
+    pthread_mutex_lock(&cf->flush_lock);
+
     tidesdb_memtable_t *old_memtable = atomic_exchange(&cf->active_memtable, new_memtable);
 
     /* enqueue old memtable for flushing */
     if (old_memtable)
     {
-        pthread_mutex_lock(&cf->flush_lock);
         queue_enqueue(cf->immutable_memtables, old_memtable);
         queue_enqueue(cf->flush_queue, old_memtable);
-        pthread_mutex_unlock(&cf->flush_lock);
     }
+
+    pthread_mutex_unlock(&cf->flush_lock);
 
     return 0;
 }

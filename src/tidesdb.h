@@ -453,6 +453,8 @@ struct tidesdb_iter_t
     tidesdb_iter_entry_t *heap;
     int heap_size;
     int heap_capacity;
+    uint8_t *last_seek_key;    /* last key we sought to (for sequential seek optimization) */
+    size_t last_seek_key_size; /* size of last seek key */
 };
 
 /*

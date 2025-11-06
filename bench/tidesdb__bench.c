@@ -18,11 +18,10 @@
  */
 #include "../src/compat.h"
 #include "../src/tidesdb.h"
-#include "../test/test_macros.h"
 #include "../test/test_utils.h"
 
 #define NUM_OPERATIONS 1000000
-#define NUM_SEEK_OPS   10000
+#define NUM_SEEK_OPS   1000
 #define KEY_SIZE       16
 #define VALUE_SIZE     100
 #define CF_NAME        "benchmark_cf"
@@ -232,13 +231,8 @@ void *thread_iter_seek(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
 
-    printf(YELLOW "[Thread %d] Starting seek benchmark (range %d-%d)\n" RESET, data->thread_id,
-           data->start, data->end);
-    fflush(stdout);
-
     tidesdb_txn_t *txn = NULL;
-    printf(YELLOW "[Thread %d] Beginning read transaction...\n" RESET, data->thread_id);
-    fflush(stdout);
+
     if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
     {
         printf(BOLDRED "[Thread %d] Failed to begin transaction\n" RESET, data->thread_id);
@@ -246,27 +240,23 @@ void *thread_iter_seek(void *arg)
     }
 
     tidesdb_iter_t *iter = NULL;
-    printf(YELLOW "[Thread %d] Creating iterator...\n" RESET, data->thread_id);
-    fflush(stdout);
+
     if (tidesdb_iter_new(txn, CF_NAME, &iter) != 0)
     {
         printf(BOLDRED "[Thread %d] Failed to create iterator\n" RESET, data->thread_id);
         tidesdb_txn_free(txn);
         return NULL;
     }
-    printf(YELLOW "[Thread %d] Iterator created successfully\n" RESET, data->thread_id);
-    fflush(stdout);
 
-    for (int i = data->start; i < data->end; i++)
+    /* seed random number generator with thread id for different sequences per thread */
+    srand(time(NULL) + data->thread_id);
+
+    int num_seeks = data->end - data->start;
+    for (int i = 0; i < num_seeks; i++)
     {
-        if (i % 1000 == 0)
-        {
-            printf(YELLOW "[Thread %d] Seek %d/%d\n" RESET, data->thread_id, i - data->start,
-                   data->end - data->start);
-            fflush(stdout);
-        }
-
-        tidesdb_iter_seek(iter, data->keys[i], data->key_sizes[i]);
+        /* random seek to an existing key */
+        int random_idx = data->start + (rand() % (data->end - data->start));
+        tidesdb_iter_seek(iter, data->keys[random_idx], data->key_sizes[random_idx]);
         if (tidesdb_iter_valid(iter))
         {
             uint8_t *key = NULL, *value = NULL;
@@ -276,14 +266,8 @@ void *thread_iter_seek(void *arg)
         }
     }
 
-    printf(YELLOW "[Thread %d] Freeing iterator...\n" RESET, data->thread_id);
-    fflush(stdout);
     tidesdb_iter_free(iter);
-    printf(YELLOW "[Thread %d] Freeing transaction...\n" RESET, data->thread_id);
-    fflush(stdout);
     tidesdb_txn_free(txn);
-    printf(YELLOW "[Thread %d] Complete\n" RESET, data->thread_id);
-    fflush(stdout);
 
     return NULL;
 }
@@ -388,7 +372,7 @@ int main()
     }
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.memtable_flush_size = (1024 * 1024) * 24;
+    cf_config.memtable_flush_size = TDB_DEFAULT_MEMTABLE_FLUSH_SIZE;
     cf_config.max_sstables_before_compaction = 128;
     cf_config.compaction_threads = 4;
     cf_config.compressed = 1;
@@ -502,8 +486,8 @@ int main()
     }
 
     end_time = get_time_ms();
-    printf(BOLDGREEN "Forward Iterator: %d threads in %.2f ms\n" RESET, NUM_THREADS,
-           end_time - start_time);
+    printf(BOLDGREEN "Forward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET, NUM_THREADS,
+           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
     printf(BOLDGREEN "\nBenchmarking Backward Iterator (full scan)...\n" RESET);
     start_time = get_time_ms();
@@ -519,8 +503,8 @@ int main()
     }
 
     end_time = get_time_ms();
-    printf(BOLDGREEN "Backward Iterator: %d threads in %.2f ms\n" RESET, NUM_THREADS,
-           end_time - start_time);
+    printf(BOLDGREEN "Backward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET, NUM_THREADS,
+           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
     printf(BOLDGREEN "\nBenchmarking Iterator Seek operations...\n" RESET);
 

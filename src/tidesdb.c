@@ -777,7 +777,12 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
         /* position at first block or advance to next */
         if (iter->sstable_blocks_read[idx] == 0)
         {
-            if (block_manager_cursor_goto_first(iter->sstable_cursors[idx]) != 0) break;
+            /* if cursor already positioned (e.g. by SBHA), don't reset it */
+            if (iter->sstable_cursors[idx]->current_pos == BLOCK_MANAGER_HEADER_SIZE)
+            {
+                if (block_manager_cursor_goto_first(iter->sstable_cursors[idx]) != 0) break;
+            }
+            /* else: cursor already positioned by SBHA, just read from current position */
         }
         else
         {
@@ -2051,6 +2056,10 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 
     atomic_store(&cf->is_dropping, 1);
 
+    /* wait for any ongoing compaction to complete */
+    pthread_mutex_lock(&cf->compaction_lock);
+    pthread_mutex_unlock(&cf->compaction_lock);
+
     /* flush any remaining memtables */
     pthread_mutex_lock(&cf->flush_lock);
     tidesdb_memtable_t *mt;
@@ -2660,6 +2669,15 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     atomic_fetch_add(&cf->num_sstables, 1);
 
     pthread_rwlock_unlock(&cf->cf_lock);
+
+    /* delete the WAL file after successful flush */
+    if (mt->wal)
+    {
+        char wal_path[TDB_MAX_PATH_LENGTH];
+        snprintf(wal_path, sizeof(wal_path), "%s/%s/%s%" PRIu64 "%s", cf->db->config.db_path,
+                 cf->name, TDB_WAL_PREFIX, mt->id, TDB_WAL_EXT);
+        remove(wal_path);
+    }
 
     return 0;
 }
@@ -3299,6 +3317,14 @@ static void *tidesdb_compaction_worker(void *arg)
 {
     compaction_job_t *job = (compaction_job_t *)arg;
     tidesdb_column_family_t *cf = job->cf;
+
+    /* check if CF is being dropped */
+    if (atomic_load(&cf->is_dropping))
+    {
+        *job->error = 1;
+        sem_post(job->semaphore);
+        return NULL;
+    }
     tidesdb_sstable_t *sst1 = job->sst1;
     tidesdb_sstable_t *sst2 = job->sst2;
 
@@ -3731,8 +3757,18 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
 
             tidesdb_sstable_t *sst1 = cf->sstables[p * 2];
             tidesdb_sstable_t *sst2 = cf->sstables[p * 2 + 1];
+
+            /* delete old SSTable files */
+            char sst1_path[TDB_MAX_PATH_LENGTH];
+            char sst2_path[TDB_MAX_PATH_LENGTH];
+            get_sstable_path(cf, sst1->id, sst1_path);
+            get_sstable_path(cf, sst2->id, sst2_path);
+
             tidesdb_sstable_release(sst1);
             tidesdb_sstable_release(sst2);
+
+            remove(sst1_path);
+            remove(sst2_path);
         }
         else
         {
@@ -3750,6 +3786,7 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
 
     free(cf->sstables);
     cf->sstables = new_sstables;
+    cf->sstable_array_capacity = num_ssts + pairs_to_merge; /* update capacity */
     atomic_store(&cf->num_sstables, new_count);
 
     free(jobs);
@@ -4845,6 +4882,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
     (*iter)->heap = NULL;
     (*iter)->heap_size = 0;
     (*iter)->heap_capacity = 0;
+    (*iter)->last_seek_key = NULL;
+    (*iter)->last_seek_key_size = 0;
 
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt && active_mt->memtable)
@@ -5126,12 +5165,19 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         }
     }
 
+    /* track which ssts were positioned by SBHA during this seek */
+    int *sbha_positioned = calloc(iter->num_sstable_cursors, sizeof(int));
+    if (!sbha_positioned) return TDB_ERR_MEMORY;
+
     /* position sstable cursors using min/max key */
     for (int i = 0; i < iter->num_sstable_cursors; i++)
     {
         if (iter->sstable_cursors[i] && iter->sstables[i])
         {
             tidesdb_sstable_t *sst = iter->sstables[i];
+
+            /* reset blocks_read for this seek */
+            iter->sstable_blocks_read[i] = 0;
 
             /* check if target key is within this sstable's range */
             if (sst->min_key && sst->max_key)
@@ -5143,24 +5189,48 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
 
                 if (cmp_max > 0)
                 {
-                    /* seek_key > max_key skip this entire SSTable */
+                    /* seek_key > max_key skip this entire sstable */
                     iter->sstable_blocks_read[i] = sst->num_entries;
                 }
                 else if (cmp_min < 0)
                 {
-                    /* seek_key < min_key: this sst's first key is already >= seek_key
-                     * start from beginning to include all keys */
+                    /* seek_key < min_key this ssts's first key is already >= seek_key
+                     * no need to scan, just position at first block for heap population */
                     iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
                     iter->sstable_cursors[i]->current_block_size = 0;
                     iter->sstable_blocks_read[i] = 0;
+                    /* will be added to heap by iter_refill_from_sstable below */
                 }
                 else
                 {
-                    /* seek_key is within [min_key, max_key] scan from beginning
-                     * the heap merge will naturally find the first key >= seek_key */
-                    iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
-                    iter->sstable_cursors[i]->current_block_size = 0;
-                    iter->sstable_blocks_read[i] = 0;
+                    /* seek_key is within [min_key, max_key]
+                     * try SBHA to jump directly to the key if it exists */
+                    int positioned_via_sbha = 0;
+                    if (sst->cf->config.use_sbha && sst->index)
+                    {
+                        int64_t exact_offset =
+                            binary_hash_array_contains(sst->index, (uint8_t *)key, key_size);
+                        if (exact_offset >= 0)
+                        {
+                            /* found exact key! position cursor at it */
+                            if (block_manager_cursor_goto(iter->sstable_cursors[i],
+                                                          (uint64_t)exact_offset) == 0)
+                            {
+                                positioned_via_sbha = 1;
+                                sbha_positioned[i] = 1; /* mark for refill section */
+                                iter->sstable_blocks_read[i] =
+                                    0; /* refill will read from current position */
+                            }
+                        }
+                    }
+
+                    if (!positioned_via_sbha)
+                    {
+                        /* SBHA didn't find it - position at beginning */
+                        iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
+                        iter->sstable_cursors[i]->current_block_size = 0;
+                        iter->sstable_blocks_read[i] = 0;
+                    }
                 }
             }
             else
@@ -5173,85 +5243,47 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         }
     }
 
-    /* populate heap with first entry >= key from each source
-     * for sstables, we need to scan forward until we find key >= seek_target */
+    /* populate heap with first entry >= key from each source */
     iter_refill_from_memtable(iter);
     for (int i = 0; i < iter->num_immutable_cursors; i++)
     {
         iter_refill_from_immutable(iter, i);
     }
 
-    /* try SBHA index first for exact match, then linear scan */
     for (int i = 0; i < iter->num_sstable_cursors; i++)
     {
         tidesdb_sstable_t *sst = iter->sstables[i];
         if (!sst || !iter->sstable_cursors[i]) continue;
 
+        /* skip if out of range */
         if (iter->sstable_blocks_read[i] >= sst->num_entries) continue;
 
-        int64_t exact_offset = -1;
-        uint8_t has_index = (sst->cf->config.use_sbha && sst->index);
-
-        if (has_index)
+        /* if seek_key <= min_key, first entry is already >= seek_key */
+        if (sst->min_key &&
+            compare_keys_with_cf(iter->cf, key, key_size, sst->min_key, sst->min_key_size) <= 0)
         {
-            exact_offset = binary_hash_array_contains(sst->index, (uint8_t *)key, key_size);
-
-            if (exact_offset >= 0)
-            {
-                /* found exact key in index! jump directly to it */
-                if (block_manager_cursor_goto(iter->sstable_cursors[i], (uint64_t)exact_offset) ==
-                    0)
-                {
-                    block_manager_block_t *block =
-                        block_manager_cursor_read(iter->sstable_cursors[i]);
-                    if (block)
-                    {
-                        uint8_t *k = NULL, *v = NULL;
-                        size_t k_size = 0, v_size = 0;
-                        uint8_t deleted = 0;
-                        time_t ttl = 0;
-
-                        if (parse_block(block, iter->cf, &k, &k_size, &v, &v_size, &deleted,
-                                        &ttl) == 0)
-                        {
-                            block_manager_block_free(block);
-
-                            if (!(ttl > 0 && time(NULL) > ttl) && !deleted)
-                            {
-                                tidesdb_iter_entry_t entry = {.key = k,
-                                                              .key_size = k_size,
-                                                              .value = v,
-                                                              .value_size = v_size,
-                                                              .deleted = deleted,
-                                                              .ttl = ttl,
-                                                              .source_type = 2,
-                                                              .source_index = i};
-                                heap_push(iter, &entry);
-                            }
-                            else
-                            {
-                                free(k);
-                                free(v);
-                            }
-                        }
-                        else
-                        {
-                            block_manager_block_free(block);
-                        }
-                    }
-                }
-            }
-            /* key not in index or deleted/expired; skip this sst entirely
-             * the heap merge will find the key from other sources if it exists */
+            iter_refill_from_sstable(iter, i);
             continue;
         }
 
-        /* we fallback to linear scan only if SBHA is disabled (no index) */
+        /* if SBHA positioned us, just refill; cursor is already at the right offset */
+        if (sbha_positioned[i])
+        {
+            iter_refill_from_sstable(iter, i);
+            continue;
+        }
+
+        /* scan from current position to find first key >= seek_key */
         while (iter->sstable_blocks_read[i] < sst->num_entries)
         {
             if (iter->sstable_blocks_read[i] == 0)
             {
-                if (block_manager_cursor_goto_first(iter->sstable_cursors[i]) != 0) break;
+                /* if cursor already positioned (e.g. by SBHA), don't reset it */
+                if (iter->sstable_cursors[i]->current_pos == BLOCK_MANAGER_HEADER_SIZE)
+                {
+                    if (block_manager_cursor_goto_first(iter->sstable_cursors[i]) != 0) break;
+                }
+                /* else the cursor already positioned by SBHA, just read from current position */
             }
             else
             {
@@ -5270,47 +5302,39 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
             int parse_result =
                 parse_block(block, iter->cf, &k, &k_size, &v, &v_size, &deleted, &ttl);
             block_manager_block_free(block);
-
             if (parse_result != 0) break;
 
             int cmp = compare_keys_with_cf(iter->cf, k, k_size, key, key_size);
-
             if (cmp >= 0)
             {
-                /* found key >= seek target, add to heap if not expired/deleted */
-                if (ttl > 0 && time(NULL) > ttl)
+                /* found first key >= seek target */
+                if (!(ttl > 0 && time(NULL) > ttl) && !deleted)
+                {
+                    tidesdb_iter_entry_t entry = {.key = k,
+                                                  .key_size = k_size,
+                                                  .value = v,
+                                                  .value_size = v_size,
+                                                  .deleted = deleted,
+                                                  .ttl = ttl,
+                                                  .source_type = 2,
+                                                  .source_index = i};
+                    heap_push(iter, &entry);
+                }
+                else
                 {
                     free(k);
                     free(v);
-                    continue;
                 }
-
-                if (deleted)
-                {
-                    free(k);
-                    free(v);
-                    continue;
-                }
-
-                tidesdb_iter_entry_t entry = {.key = k,
-                                              .key_size = k_size,
-                                              .value = v,
-                                              .value_size = v_size,
-                                              .deleted = deleted,
-                                              .ttl = ttl,
-                                              .source_type = 2,
-                                              .source_index = i};
-                heap_push(iter, &entry);
                 break;
             }
 
-            /* key < seek target, keep scanning */
             free(k);
             free(v);
         }
     }
 
     /* get first entry (heap is already populated) */
+    free(sbha_positioned);
     return tidesdb_iter_next(iter);
 }
 
@@ -5609,6 +5633,7 @@ void tidesdb_iter_free(tidesdb_iter_t *iter)
 
     if (iter->current_key) free(iter->current_key);
     if (iter->current_value) free(iter->current_value);
+    if (iter->last_seek_key) free(iter->last_seek_key);
     if (iter->memtable_cursor)
     {
         skip_list_cursor_free(iter->memtable_cursor);

@@ -91,6 +91,16 @@ extern int _tidesdb_debug_enabled;
  */
 #ifdef _MSC_VER
 #pragma pack(push, 1)
+/*
+ * tidesdb_kv_pair_header_t
+ * header for serialized key-value pairs
+ * streamlined format [header][key][value]
+ * @param version format version
+ * @param flags bit flags (bit 0 tombstone/deleted)
+ * @param key_size size of key in bytes
+ * @param value_size size of value in bytes
+ * @param ttl time-to-live (expiration time)
+ */
 typedef struct
 {
     uint8_t version;
@@ -101,6 +111,16 @@ typedef struct
 } tidesdb_kv_pair_header_t;
 #pragma pack(pop)
 #else
+/*
+ * tidesdb_kv_pair_header_t
+ * header for serialized key-value pairs
+ * streamlined format [header][key][value]
+ * @param version format version
+ * @param flags bit flags (bit 0 tombstone/deleted)
+ * @param key_size size of key in bytes
+ * @param value_size size of value in bytes
+ * @param ttl time-to-live (expiration time)
+ */
 typedef struct __attribute__((packed))
 {
     uint8_t version;

@@ -4604,40 +4604,40 @@ static void test_concurrent_readers_writers(void)
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
     ASSERT_EQ(tidesdb_create_column_family(db, "concurrent_cf", &cf_config), 0);
 
-    const int num_writers = 3;
-    const int num_readers = 3;
-    const int ops_per_thread = 20;
+#define NUM_WRITERS    3
+#define NUM_READERS    3
+#define OPS_PER_THREAD 20
 
-    pthread_t writers[num_writers];
-    pthread_t readers[num_readers];
-    thread_test_args_t writer_args[num_writers];
-    thread_test_args_t reader_args[num_readers];
+    pthread_t writers[NUM_WRITERS];
+    pthread_t readers[NUM_READERS];
+    thread_test_args_t writer_args[NUM_WRITERS];
+    thread_test_args_t reader_args[NUM_READERS];
     _Atomic(int) error_count = 0;
 
-    for (int i = 0; i < num_writers; i++)
+    for (int i = 0; i < NUM_WRITERS; i++)
     {
         writer_args[i].db = db;
         writer_args[i].thread_id = i;
-        writer_args[i].num_ops = ops_per_thread;
+        writer_args[i].num_ops = OPS_PER_THREAD;
         writer_args[i].error_count = &error_count;
         pthread_create(&writers[i], NULL, concurrent_writer_thread, &writer_args[i]);
     }
 
-    for (int i = 0; i < num_readers; i++)
+    for (int i = 0; i < NUM_READERS; i++)
     {
         reader_args[i].db = db;
         reader_args[i].thread_id = i;
-        reader_args[i].num_ops = ops_per_thread;
+        reader_args[i].num_ops = OPS_PER_THREAD;
         reader_args[i].error_count = &error_count;
         pthread_create(&readers[i], NULL, concurrent_reader_thread, &reader_args[i]);
     }
 
-    for (int i = 0; i < num_writers; i++)
+    for (int i = 0; i < NUM_WRITERS; i++)
     {
         pthread_join(writers[i], NULL);
     }
 
-    for (int i = 0; i < num_readers; i++)
+    for (int i = 0; i < NUM_READERS; i++)
     {
         pthread_join(readers[i], NULL);
     }
@@ -4648,6 +4648,10 @@ static void test_concurrent_readers_writers(void)
     tidesdb_close(db);
     cleanup_test_dir();
     printf("OK (errors: %d)\n", total_errors);
+
+#undef NUM_WRITERS
+#undef NUM_READERS
+#undef OPS_PER_THREAD
 }
 
 static void test_concurrent_flush_and_read(void)

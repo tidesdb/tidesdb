@@ -64,7 +64,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_SKIPLIST_LEVELS                12
 #define TDB_DEFAULT_SKIPLIST_PROBABILITY           0.25
 #define TDB_DEFAULT_BLOOM_FILTER_FP_RATE           0.01
-#define TDB_DEFAULT_THREAD_POOL_SIZE               2 /* default per pool, tune based on workload */
+#define TDB_DEFAULT_THREAD_POOL_SIZE               2
 
 #define TDB_WAL_EXT                       ".log"
 #define TDB_SSTABLE_EXT                   ".sst"
@@ -72,8 +72,8 @@ extern int _tidesdb_debug_enabled;
 #define TDB_TEMP_EXT                      ".tmp"
 #define TDB_WAL_PREFIX                    "wal_"
 #define TDB_SSTABLE_PREFIX                "sstable_"
-
-#define TDB_KV_FORMAT_VERSION 1
+#define TDB_CONFIG_FILE_NAME              "config"
+#define TDB_KV_FORMAT_VERSION             1
 
 /*
  * tidesdb_kv_pair_header_t
@@ -111,31 +111,6 @@ typedef struct __attribute__((packed))
 
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATORS     32
-
-extern int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
-                                       size_t key2_size, void *ctx);
-extern int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
-                                       size_t key2_size, void *ctx);
-extern int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
-                                        size_t key2_size, void *ctx);
-
-/*
- * tidesdb_register_comparator
- * register a custom comparator function with a name
- * must be called before creating column families that use this comparator
- * @param name unique name for the comparator
- * @param compare_fn the comparison function
- * @return 0 on success, -1 on failure
- */
-int tidesdb_register_comparator(const char *name, skip_list_comparator_fn compare_fn);
-
-/*
- * tidesdb_get_comparator
- * get a registered comparator by name
- * @param name name of the comparator
- * @return comparator function or NULL if not found
- */
-skip_list_comparator_fn tidesdb_get_comparator(const char *name);
 
 /* error codes */
 #define TDB_SUCCESS                  0
@@ -459,6 +434,53 @@ struct tidesdb_iter_t
 };
 
 /*
+ * tidesdb_column_family_stat_t
+ * statistics for a column family
+ * @param name column family name
+ * @param comparator_name comparator name
+ * @param num_sstables number of SSTables
+ * @param memtable_size size of memtable in bytes
+ * @param memtable_entries number of entries in memtable
+ * @param total_sstable_size total size of SSTables in bytes
+ * @param config column family configuration
+ */
+typedef struct
+{
+    char name[TDB_MAX_CF_NAME_LENGTH];
+    char comparator_name[TDB_MAX_COMPARATOR_NAME];
+    int num_sstables;
+    size_t memtable_size;
+    int memtable_entries;
+    size_t total_sstable_size;
+    tidesdb_column_family_config_t config;
+} tidesdb_column_family_stat_t;
+
+/*
+ * tidesdb_column_family_update_config_t
+ * runtime-updatable configuration for column families
+ * only includes settings that can be safely changed without affecting existing data
+ * @param memtable_flush_size size threshold for memtable flush (bytes)
+ * @param max_sstables_before_compaction max sstables before triggering compaction
+ * @param compaction_threads number of threads to use for parallel compaction
+ * @param max_level maximum skip list level (for new memtables)
+ * @param probability skip list probability (for new memtables)
+ * @param bloom_filter_fp_rate bloom filter false positive rate (for new SSTables)
+ * @param enable_background_compaction enable automatic background compaction
+ * @param background_compaction_interval interval in microseconds between compaction checks
+ */
+typedef struct
+{
+    size_t memtable_flush_size;
+    int max_sstables_before_compaction;
+    int compaction_threads;
+    int max_level;
+    float probability;
+    double bloom_filter_fp_rate;
+    int enable_background_compaction;
+    int background_compaction_interval;
+} tidesdb_column_family_update_config_t;
+
+/*
  * tidesdb_open
  * opens or creates a tidesdb instance
  * @param config database configuration
@@ -522,21 +544,6 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
 int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count);
 
 /*
- * tidesdb_column_family_stat_t
- * statistics for a column family
- */
-typedef struct
-{
-    char name[TDB_MAX_CF_NAME_LENGTH];
-    char comparator_name[TDB_MAX_COMPARATOR_NAME];
-    int num_sstables;
-    size_t memtable_size;
-    int memtable_entries;
-    size_t total_sstable_size;
-    tidesdb_column_family_config_t config;
-} tidesdb_column_family_stat_t;
-
-/*
  * tidesdb_get_column_family_stats
  * gets statistics for a column family
  * @param db tidesdb instance
@@ -546,31 +553,6 @@ typedef struct
  */
 int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
                                     tidesdb_column_family_stat_t **stats);
-
-/*
- * tidesdb_column_family_update_config_t
- * runtime-updatable configuration for column families
- * only includes settings that can be safely changed without affecting existing data
- * @param memtable_flush_size size threshold for memtable flush (bytes)
- * @param max_sstables_before_compaction max sstables before triggering compaction
- * @param compaction_threads number of threads to use for parallel compaction
- * @param max_level maximum skip list level (for new memtables)
- * @param probability skip list probability (for new memtables)
- * @param bloom_filter_fp_rate bloom filter false positive rate (for new SSTables)
- * @param enable_background_compaction enable automatic background compaction
- * @param background_compaction_interval interval in microseconds between compaction checks
- */
-typedef struct
-{
-    size_t memtable_flush_size;
-    int max_sstables_before_compaction;
-    int compaction_threads;
-    int max_level;
-    float probability;
-    double bloom_filter_fp_rate;
-    int enable_background_compaction;
-    int background_compaction_interval;
-} tidesdb_column_family_update_config_t;
 
 /*
  * tidesdb_update_column_family_config
@@ -768,5 +750,62 @@ int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size
  * @param iter iterator
  */
 void tidesdb_iter_free(tidesdb_iter_t *iter);
+
+/*
+ * skip_list_comparator_memcmp
+ * memcmp comparator for skip list
+ * @param key1 first key
+ * @param key1_size size of first key
+ * @param key2 second key
+ * @param key2_size size of second key
+ * @param ctx comparator context (not used)
+ * @return negative if key1 < key2, zero if equal, positive if key1 > key2
+ */
+extern int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                       size_t key2_size, void *ctx);
+
+/*
+ * skip_list_comparator_string
+ * string comparator for skip list
+ * @param key1 first key
+ * @param key1_size size of first key
+ * @param key2 second key
+ * @param key2_size size of second key
+ * @param ctx comparator context (not used)
+ * @return negative if key1 < key2, zero if equal, positive if key1 > key2
+ */
+extern int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                       size_t key2_size, void *ctx);
+
+/*
+ * skip_list_comparator_numeric
+ * numeric comparator for skip list
+ * @param key1 first key
+ * @param key1_size size of first key
+ * @param key2 second key
+ * @param key2_size size of second key
+ * @param ctx comparator context (not used)
+ * @return negative if key1 < key2, zero if equal, positive if key1 > key2
+ */
+extern int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                        size_t key2_size, void *ctx);
+
+/*
+ * tidesdb_register_comparator
+ * register a custom comparator function with a name
+ * must be called before creating column families that use this comparator
+ * @param name unique name for the comparator
+ * @param compare_fn the comparison function
+ * @return 0 on success, -1 on failure
+ */
+int tidesdb_register_comparator(const char *name, skip_list_comparator_fn compare_fn);
+
+/*
+ * tidesdb_get_comparator
+ * get a registered comparator by name
+ * @param name name of the comparator
+ * @return comparator function or NULL if not found
+ */
+skip_list_comparator_fn tidesdb_get_comparator(const char *name);
 
 #endif /* __TIDESDB_H__ */

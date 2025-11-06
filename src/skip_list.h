@@ -35,8 +35,9 @@ typedef atomic_size_t atomic_size_t;
 typedef atomic_uint_fast64_t atomic_uint64_t;
 #endif
 
-typedef struct skip_list_node_t skip_list_node_t; /* forward declaration */
-typedef struct skip_list_t skip_list_t;           /* forward declaration */
+/* forward declarations */
+typedef struct skip_list_node_t skip_list_node_t;
+typedef struct skip_list_t skip_list_t;
 
 /* comparator function type for custom key comparison
  * @param key1 the first key

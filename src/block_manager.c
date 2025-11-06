@@ -42,13 +42,26 @@
  * - Readers NEVER block - they can read while writes happen
  */
 
-/* internal helper to compute SHA1 checksum */
+/*
+ * compute_sha1
+ * compute SHA1 checksum
+ * @param data the data to compute the checksum for
+ * @param size the size of the data
+ * @param digest the digest to store the result in
+ */
 static void compute_sha1(const void *data, size_t size, unsigned char *digest)
 {
     SHA1((const unsigned char *)data, size, digest);
 }
 
-/* internal helper to verify SHA1 checksum */
+/*
+ * verify_sha1
+ * verify SHA1 checksum
+ * @param data the data to verify the checksum for
+ * @param size the size of the data
+ * @param expected_digest the expected digest
+ * @return 0 if the checksum matches, -1 otherwise
+ */
 static int verify_sha1(const void *data, size_t size, const unsigned char *expected_digest)
 {
     unsigned char computed_digest[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
@@ -56,7 +69,13 @@ static int verify_sha1(const void *data, size_t size, const unsigned char *expec
     return memcmp(computed_digest, expected_digest, BLOCK_MANAGER_SHA1_DIGEST_LENGTH) == 0 ? 0 : -1;
 }
 
-/* internal helper to write file header using pwrite */
+/*
+ * write_header
+ * write file header using pwrite
+ * @param fd the file descriptor to write to
+ * @param block_size the block size to write
+ * @return 0 if successful, -1 otherwise
+ */
 static int write_header(int fd, uint32_t block_size)
 {
     unsigned char header[BLOCK_MANAGER_HEADER_SIZE];
@@ -75,7 +94,13 @@ static int write_header(int fd, uint32_t block_size)
     return (written == BLOCK_MANAGER_HEADER_SIZE) ? 0 : -1;
 }
 
-/* internal helper to read and validate file header using pread */
+/*
+ * read_header
+ * read and validate file header using pread
+ * @param fd the file descriptor to read from
+ * @param block_size the block size to read
+ * @return 0 if successful, -1 otherwise
+ */
 static int read_header(int fd, uint32_t *block_size)
 {
     unsigned char header[BLOCK_MANAGER_HEADER_SIZE];
@@ -102,7 +127,13 @@ static int read_header(int fd, uint32_t *block_size)
     return 0;
 }
 
-/* internal helper to get file size */
+/*
+ * get_file_size
+ * get file size using fstat
+ * @param fd the file descriptor to get the size of
+ * @param size the size to store the result in
+ * @return 0 if successful, -1 otherwise
+ */
 static int get_file_size(int fd, uint64_t *size)
 {
     struct stat st;

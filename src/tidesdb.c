@@ -28,7 +28,11 @@
 /* global debug logging flag */
 int _tidesdb_debug_enabled = 0;
 
-/* comparator registry */
+/*
+ * comparator_entry_t
+ * @param name comparator name
+ * @param compare_fn comparator function
+ */
 typedef struct
 {
     char name[TDB_MAX_COMPARATOR_NAME];
@@ -111,36 +115,136 @@ skip_list_comparator_fn tidesdb_get_comparator(const char *name)
     return NULL;
 }
 
-/* forward declarations for static functions */
+/*
+ * tidesdb_load_sstable
+ * loads an sstable from disk
+ * @param cf column family
+ * @param sstable_id sstable identifier
+ * @param sstable pointer to store loaded sstable
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id,
                                 tidesdb_sstable_t **sstable);
+
+/*
+ * tidesdb_sstable_free
+ * frees an sstable
+ * @param sstable sstable to free
+ */
 static void tidesdb_sstable_free(tidesdb_sstable_t *sstable);
+
+/*
+ * tidesdb_check_and_flush
+ * checks if memtable needs to be flushed
+ * @param cf column family
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_check_and_flush(tidesdb_column_family_t *cf);
+
+/*
+ * tidesdb_memtable_new
+ * creates a new memtable
+ * @param cf column family
+ * @return pointer to new memtable, NULL on failure
+ */
 static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf);
+
+/*
+ * tidesdb_memtable_free
+ * frees a memtable
+ * @param mt memtable to free
+ */
 static void tidesdb_memtable_free(tidesdb_memtable_t *mt);
+
+/*
+ * tidesdb_rotate_memtable
+ * rotates the memtable
+ * @param cf column family
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf);
+
+/*
+ * tidesdb_flush_memtable_to_sstable
+ * flushes the memtable to an sstable
+ * @param cf column family
+ * @param mt memtable to flush
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesdb_memtable_t *mt);
+
+/*
+ * compare_keys_with_cf
+ * compares two keys using the column family's comparator
+ * @param cf column family
+ * @param key1 first key
+ * @param key1_size size of first key
+ * @param key2 second key
+ * @param key2_size size of second key
+ * @return negative if key1 < key2, zero if equal, positive if key1 > key2
+ */
 static int compare_keys_with_cf(tidesdb_column_family_t *cf, const uint8_t *key1, size_t key1_size,
                                 const uint8_t *key2, size_t key2_size);
+
+/*
+ * parse_block
+ * parses a block from the block manager
+ * @param block block to parse
+ * @param cf column family
+ * @param key pointer to store parsed key
+ * @param key_size pointer to store parsed key size
+ * @param value pointer to store parsed value
+ * @param value_size pointer to store parsed value size
+ * @param deleted pointer to store deleted flag
+ * @param ttl pointer to store TTL
+ * @return 0 on success, -1 on failure
+ */
 static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf, uint8_t **key,
                        size_t *key_size, uint8_t **value, size_t *value_size, uint8_t *deleted,
                        time_t *ttl);
+
+/*
+ * get_sstable_path
+ * gets the path to an sstable
+ * @param cf column family
+ * @param sstable_id sstable identifier
+ * @param path buffer to store path
+ */
 static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable_id, char *path);
 
-/* thread pool implementation */
+/*
+ * thread_pool_task_t
+ * @param type task type (flush or compaction)
+ * @param cf column family
+ * @param memtable memtable (for flush tasks)
+ */
 typedef enum
 {
     TASK_FLUSH,
     TASK_COMPACTION
 } task_type_t;
 
+/*
+ * thread_pool_task_t
+ * @param type task type (flush or compaction)
+ * @param cf column family
+ * @param memtable memtable (for flush tasks)
+ */
 typedef struct
 {
     task_type_t type;
     tidesdb_column_family_t *cf;
-    tidesdb_memtable_t *memtable; /* for flush tasks */
+    tidesdb_memtable_t *memtable;
 } thread_pool_task_t;
 
+/*
+ * tidesdb_thread_pool_t
+ * @param threads array of threads
+ * @param num_threads number of threads
+ * @param task_queue queue of tasks
+ * @param shutdown shutdown flag
+ * @param lock mutex lock
+ */
 struct tidesdb_thread_pool_t
 {
     pthread_t *threads;
@@ -150,6 +254,11 @@ struct tidesdb_thread_pool_t
     pthread_mutex_t lock;
 };
 
+/*
+ * thread_pool_worker
+ * worker thread for thread pool
+ * @param arg thread pool
+ */
 static void *thread_pool_worker(void *arg)
 {
     tidesdb_thread_pool_t *pool = (tidesdb_thread_pool_t *)arg;
@@ -202,6 +311,12 @@ static void *thread_pool_worker(void *arg)
     return NULL;
 }
 
+/*
+ * thread_pool_create
+ * creates a thread pool
+ * @param num_threads number of threads
+ * @return thread pool on success, NULL on failure
+ */
 static tidesdb_thread_pool_t *thread_pool_create(int num_threads)
 {
     if (num_threads <= 0) num_threads = 2;
@@ -253,6 +368,11 @@ static tidesdb_thread_pool_t *thread_pool_create(int num_threads)
     return pool;
 }
 
+/*
+ * thread_pool_destroy
+ * destroys a thread pool
+ * @param pool thread pool
+ */
 static void thread_pool_destroy(tidesdb_thread_pool_t *pool)
 {
     if (!pool) return;
@@ -284,6 +404,15 @@ static void thread_pool_destroy(tidesdb_thread_pool_t *pool)
     free(pool);
 }
 
+/*
+ * thread_pool_submit
+ * submits a task to the thread pool
+ * @param pool thread pool
+ * @param type task type
+ * @param cf column family
+ * @param memtable memtable
+ * @return 0 on success, -1 on failure
+ */
 static int thread_pool_submit(tidesdb_thread_pool_t *pool, task_type_t type,
                               tidesdb_column_family_t *cf, tidesdb_memtable_t *memtable)
 {
@@ -300,7 +429,11 @@ static int thread_pool_submit(tidesdb_thread_pool_t *pool, task_type_t type,
     return 0;
 }
 
-/* reference counting helpers for sstables */
+/*
+ * tidesdb_sstable_acquire
+ * acquires a reference to an sstable
+ * @param sst sstable
+ */
 static inline void tidesdb_sstable_acquire(tidesdb_sstable_t *sst)
 {
     if (sst)
@@ -309,6 +442,11 @@ static inline void tidesdb_sstable_acquire(tidesdb_sstable_t *sst)
     }
 }
 
+/*
+ * tidesdb_sstable_release
+ * releases a reference to an sstable
+ * @param sst sstable
+ */
 static inline int tidesdb_sstable_release(tidesdb_sstable_t *sst)
 {
     if (!sst) return 0;
@@ -324,7 +462,11 @@ static inline int tidesdb_sstable_release(tidesdb_sstable_t *sst)
     return new_count;
 }
 
-/* reference counting helpers for memtables */
+/*
+ * tidesdb_memtable_acquire
+ * acquires a reference to a memtable
+ * @param mt memtable
+ */
 static inline void tidesdb_memtable_acquire(tidesdb_memtable_t *mt)
 {
     if (mt)
@@ -333,7 +475,13 @@ static inline void tidesdb_memtable_acquire(tidesdb_memtable_t *mt)
     }
 }
 
-/* heap helper functions for iterator merge */
+/*
+ * heap_swap
+ * swaps two entries in the heap
+ * @param heap heap array
+ * @param i index of first entry
+ * @param j index of second entry
+ */
 static void heap_swap(tidesdb_iter_entry_t *heap, int i, int j)
 {
     tidesdb_iter_entry_t temp = heap[i];
@@ -341,6 +489,12 @@ static void heap_swap(tidesdb_iter_entry_t *heap, int i, int j)
     heap[j] = temp;
 }
 
+/*
+ * heap_sift_down
+ * sifts an entry down the heap
+ * @param iter iterator
+ * @param idx index of entry to sift
+ */
 static void heap_sift_down(tidesdb_iter_t *iter, int idx)
 {
     int size = iter->heap_size;
@@ -375,6 +529,12 @@ static void heap_sift_down(tidesdb_iter_t *iter, int idx)
     }
 }
 
+/*
+ * heap_sift_up
+ * sifts an entry up the heap
+ * @param iter iterator
+ * @param idx index of entry to sift
+ */
 static void heap_sift_up(tidesdb_iter_t *iter, int idx)
 {
     int forward = (iter->direction > 0);
@@ -391,6 +551,13 @@ static void heap_sift_up(tidesdb_iter_t *iter, int idx)
     }
 }
 
+/*
+ * heap_push
+ * pushes an entry into the heap
+ * @param iter iterator
+ * @param entry entry to push
+ * @return 0 on success, -1 on failure
+ */
 static int heap_push(tidesdb_iter_t *iter, tidesdb_iter_entry_t *entry)
 {
     if (iter->heap_size >= iter->heap_capacity)
@@ -409,6 +576,13 @@ static int heap_push(tidesdb_iter_t *iter, tidesdb_iter_entry_t *entry)
     return 0;
 }
 
+/*
+ * heap_pop
+ * pops an entry from the heap
+ * @param iter iterator
+ * @param entry buffer to store entry
+ * @return 0 on success, -1 on failure
+ */
 static int heap_pop(tidesdb_iter_t *iter, tidesdb_iter_entry_t *entry)
 {
     if (iter->heap_size == 0) return -1;
@@ -425,7 +599,12 @@ static int heap_pop(tidesdb_iter_t *iter, tidesdb_iter_entry_t *entry)
     return 0;
 }
 
-/* helper to read next entry from active memtable and add to heap */
+/*
+ * iter_refill_from_memtable
+ * refills iterator from active memtable
+ * @param iter iterator
+ * @return 0 on success, -1 on failure
+ */
 static int iter_refill_from_memtable(tidesdb_iter_t *iter)
 {
     if (!iter->memtable_cursor) return 0;
@@ -474,7 +653,13 @@ static int iter_refill_from_memtable(tidesdb_iter_t *iter)
     return 0;
 }
 
-/* helper to read next entry from immutable memtable and add to heap */
+/*
+ * iter_refill_from_immutable
+ * refills iterator from immutable memtable
+ * @param iter iterator
+ * @param idx immutable memtable index
+ * @return 0 on success, -1 on failure
+ */
 static int iter_refill_from_immutable(tidesdb_iter_t *iter, int idx)
 {
     if (idx >= iter->num_immutable_cursors || !iter->immutable_memtable_cursors[idx]) return 0;
@@ -523,7 +708,13 @@ static int iter_refill_from_immutable(tidesdb_iter_t *iter, int idx)
     return 0;
 }
 
-/* helper to read next entry from sstable and add to heap */
+/*
+ * iter_refill_from_sstable
+ * refills iterator from sstable
+ * @param iter iterator
+ * @param idx sstable index
+ * @return 0 on success, -1 on failure
+ */
 static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
 {
     if (idx >= iter->num_sstable_cursors || !iter->sstable_cursors[idx]) return 0;
@@ -587,7 +778,12 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
     return 0;
 }
 
-/* helper to read previous entry from active memtable (for backward iteration) */
+/*
+ * iter_refill_from_memtable_backward
+ * refills iterator from active memtable backward
+ * @param iter iterator
+ * @return 0 on success, -1 on failure
+ */
 static int iter_refill_from_memtable_backward(tidesdb_iter_t *iter)
 {
     if (!iter->memtable_cursor) return 0;
@@ -658,7 +854,13 @@ static int iter_refill_from_memtable_backward(tidesdb_iter_t *iter)
     return 0;
 }
 
-/* helper to read previous entry from immutable memtable (for backward iteration) */
+/*
+ * iter_refill_from_immutable_backward
+ * refills iterator from immutable memtable backward
+ * @param iter iterator
+ * @param idx immutable memtable index
+ * @return 0 on success, -1 on failure
+ */
 static int iter_refill_from_immutable_backward(tidesdb_iter_t *iter, int idx)
 {
     if (idx >= iter->num_immutable_cursors || !iter->immutable_memtable_cursors[idx]) return 0;
@@ -730,7 +932,13 @@ static int iter_refill_from_immutable_backward(tidesdb_iter_t *iter, int idx)
     return 0;
 }
 
-/* helper to read previous entry from sstable (for backward iteration) */
+/*
+ * iter_refill_from_sstable_backward
+ * refills iterator from sstable backward
+ * @param iter iterator
+ * @param idx sstable index
+ * @return 0 on success, -1 on failure
+ */
 static int iter_refill_from_sstable_backward(tidesdb_iter_t *iter, int idx)
 {
     if (idx >= iter->num_sstable_cursors || !iter->sstable_cursors[idx])
@@ -805,6 +1013,12 @@ static int iter_refill_from_sstable_backward(tidesdb_iter_t *iter, int idx)
     return 0;
 }
 
+/*
+ * tidesdb_memtable_release
+ * releases a reference to a memtable
+ * @param mt memtable to release
+ * @return new reference count
+ */
 static inline int tidesdb_memtable_release(tidesdb_memtable_t *mt)
 {
     if (!mt) return 0;
@@ -842,6 +1056,12 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
     return config;
 }
 
+/*
+ * mkdir_p
+ * creates directory if it doesn't exist
+ * @param path path to directory
+ * @return 0 on success, -1 on failure
+ */
 static int mkdir_p(const char *path)
 {
     struct stat st;
@@ -861,6 +1081,13 @@ static void get_cf_path(const tidesdb_t *db, const char *cf_name, char *path)
                    cf_name);
 }
 
+/*
+ * get_sstable_path
+ * gets sstable file path
+ * @param cf column family
+ * @param sstable_id sstable identifier
+ * @param path buffer to store path
+ */
 static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable_id, char *path)
 {
     char cf_path[TDB_MAX_PATH_LENGTH];
@@ -869,14 +1096,26 @@ static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable
                    cf_path, (unsigned long long)sstable_id, TDB_SSTABLE_EXT);
 }
 
+/*
+ * get_cf_config_path
+ * gets column family config file path
+ * @param cf column family
+ * @param path buffer to store path
+ */
 static void get_cf_config_path(const tidesdb_column_family_t *cf, char *path)
 {
     char cf_path[TDB_MAX_PATH_LENGTH];
     get_cf_path(cf->db, cf->name, cf_path);
-    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "config%s", cf_path,
-                   TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
+    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR TDB_CONFIG_FILE_NAME "%s",
+                   cf_path, TDB_COLUMN_FAMILY_CONFIG_FILE_EXT);
 }
 
+/*
+ * save_cf_config
+ * saves column family config to file
+ * @param cf column family
+ * @return 0 on success, -1 on failure
+ */
 static int save_cf_config(tidesdb_column_family_t *cf)
 {
     char config_path[TDB_MAX_PATH_LENGTH];
@@ -892,6 +1131,12 @@ static int save_cf_config(tidesdb_column_family_t *cf)
     return (written == 1) ? 0 : -1;
 }
 
+/*
+ * load_cf_config
+ * loads column family config from file
+ * @param cf column family
+ * @return 0 on success, -1 on failure
+ */
 static int load_cf_config(tidesdb_column_family_t *cf)
 {
     char config_path[TDB_MAX_PATH_LENGTH];
@@ -907,6 +1152,13 @@ static int load_cf_config(tidesdb_column_family_t *cf)
     return (read == 1) ? 0 : -1;
 }
 
+/*
+ * block_manager_evict_cb
+ * callback for evicting block managers from cache
+ * @param key key for block manager
+ * @param value block manager
+ * @param user_data user data (not used)
+ */
 static void block_manager_evict_cb(const char *key, void *value, void *user_data)
 {
     (void)key;
@@ -919,6 +1171,14 @@ static void block_manager_evict_cb(const char *key, void *value, void *user_data
     }
 }
 
+/*
+ * get_cached_block_manager
+ * gets a block manager from the cache
+ * @param db tidesdb instance
+ * @param path path to block manager
+ * @param sync_mode sync mode for block manager
+ * @return block manager on success, NULL on failure
+ */
 static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path,
                                                  tidesdb_sync_mode_t sync_mode)
 {
@@ -1370,7 +1630,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             if (strstr(entry->d_name, TDB_WAL_PREFIX) && strstr(entry->d_name, TDB_WAL_EXT))
             {
                 /* parse WAL ID */
-                const char *id_start = entry->d_name + 4; /* skip TDB_WAL_PREFIX */
+                const char *id_start = entry->d_name + strlen(TDB_WAL_PREFIX);
                 char *endptr;
                 uint64_t wal_id = strtoul(id_start, &endptr, 10);
                 if (endptr != id_start && strstr(endptr, TDB_WAL_EXT))
@@ -1524,7 +1784,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         {
             if (strstr(entry->d_name, TDB_SSTABLE_EXT))
             {
-                const char *id_start = entry->d_name + 8; /* skip TDB_SSTABLE_PREFIX */
+                const char *id_start = entry->d_name + strlen(TDB_SSTABLE_PREFIX);
                 char *endptr;
                 uint64_t sstable_id = strtoul(id_start, &endptr, 10);
                 if (endptr != id_start && strstr(endptr, TDB_SSTABLE_EXT))
@@ -1961,6 +2221,12 @@ int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
     return 0;
 }
 
+/*
+ * tidesdb_memtable_new
+ * creates a new memtable
+ * @param cf column family
+ * @return new memtable on success, NULL on failure
+ */
 static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
 {
     if (!cf) return NULL;
@@ -1989,8 +2255,8 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
 
     char wal_path[TDB_MAX_PATH_LENGTH];
     snprintf(wal_path, sizeof(wal_path),
-             "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log", cf->db->config.db_path,
-             cf->name, mt->id);
+             "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR TDB_WAL_PREFIX "%" PRIu64 TDB_WAL_EXT,
+             cf->db->config.db_path, cf->name, mt->id);
 
     if (block_manager_open(&mt->wal, wal_path, cf->config.sync_mode) == -1)
     {
@@ -2003,6 +2269,11 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
     return mt;
 }
 
+/*
+ * tidesdb_memtable_free
+ * frees a memtable
+ * @param mt memtable to free
+ */
 static void tidesdb_memtable_free(tidesdb_memtable_t *mt)
 {
     if (!mt) return;
@@ -2012,6 +2283,12 @@ static void tidesdb_memtable_free(tidesdb_memtable_t *mt)
     (void)tidesdb_memtable_release(mt);
 }
 
+/*
+ * tidesdb_rotate_memtable
+ * rotates the active memtable to a new one
+ * @param cf column family
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
 {
     if (!cf) return -1;
@@ -2039,6 +2316,13 @@ static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
     return 0;
 }
 
+/*
+ * tidesdb_flush_memtable_to_sstable
+ * flushes a memtable to an sstable
+ * @param cf column family
+ * @param mt memtable to flush
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesdb_memtable_t *mt)
 {
     if (!cf || !mt) return -1;
@@ -2736,7 +3020,15 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
     return 0;
 }
 
-/* parallel compaction structures */
+/*
+ * compaction_job_t
+ * @param cf column family
+ * @param sst1 first sstable
+ * @param sst2 second sstable
+ * @param result pointer to store merged sstable
+ * @param semaphore semaphore for thread synchronization
+ * @param error pointer to store error code
+ */
 typedef struct
 {
     tidesdb_column_family_t *cf;
@@ -2747,7 +3039,11 @@ typedef struct
     int *error;
 } compaction_job_t;
 
-/* worker thread function for parallel compaction */
+/*
+ * tidesdb_compaction_worker
+ * worker thread function for parallel compaction
+ * @param arg pointer to compaction job
+ */
 static void *tidesdb_compaction_worker(void *arg)
 {
     compaction_job_t *job = (compaction_job_t *)arg;
@@ -3094,7 +3390,13 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         jobs[p].semaphore = &semaphore;
         jobs[p].error = &errors[p];
 
-        pthread_create(&threads[p], NULL, tidesdb_compaction_worker, &jobs[p]);
+        if (pthread_create(&threads[p], NULL, tidesdb_compaction_worker, &jobs[p]) != 0)
+        {
+            /* thread creation failed, mark as error and release semaphore */
+            errors[p] = 1;
+            sem_post(&semaphore);
+            TDB_DEBUG_LOG("Failed to create compaction thread for pair %d", p);
+        }
     }
 
     /* wait for all threads to complete */
@@ -3170,6 +3472,14 @@ static int tidesdb_check_and_flush(tidesdb_column_family_t *cf)
     return 0;
 }
 
+/*
+ * tidesdb_load_sstable
+ * loads an sstable from disk
+ * @param cf column family
+ * @param sstable_id ID of sstable to load
+ * @param sstable pointer to store loaded sstable
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id,
                                 tidesdb_sstable_t **sstable)
 {
@@ -3275,6 +3585,16 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
     return 0;
 }
 
+/*
+ * tidesdb_sstable_get
+ * gets a value from an sstable
+ * @param sstable sstable to get value from
+ * @param key key to get value for
+ * @param key_size size of key
+ * @param value pointer to store value
+ * @param value_size pointer to store value size
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, size_t key_size,
                                uint8_t **value, size_t *value_size)
 {
@@ -3497,6 +3817,11 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
     return 0;
 }
 
+/*
+ * tidesdb_sstable_free
+ * frees an sstable
+ * @param sstable sstable to free
+ */
 static void tidesdb_sstable_free(tidesdb_sstable_t *sstable)
 {
     if (!sstable) return;
@@ -3527,6 +3852,17 @@ static void tidesdb_sstable_free(tidesdb_sstable_t *sstable)
     free(sstable);
 }
 
+/*
+ * tidesdb_txn_get_internal
+ * internal implementation of get operation
+ * @param txn transaction
+ * @param cf column family
+ * @param key key to get
+ * @param key_size size of key
+ * @param value pointer to store value
+ * @param value_size pointer to store value size
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
                                     const uint8_t *key, size_t key_size, uint8_t **value,
                                     size_t *value_size)
@@ -3969,7 +4305,19 @@ void tidesdb_txn_free(tidesdb_txn_t *txn)
     free(txn);
 }
 
-/* helper to parse a block and extract key/value */
+/*
+ * parse_block
+ * parses a block from the block manager
+ * @param block block to parse
+ * @param cf column family
+ * @param key pointer to store parsed key
+ * @param key_size pointer to store parsed key size
+ * @param value pointer to store parsed value
+ * @param value_size pointer to store parsed value size
+ * @param deleted pointer to store deleted flag
+ * @param ttl pointer to store TTL
+ * @return 0 on success, -1 on failure
+ */
 static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf, uint8_t **key,
                        size_t *key_size, uint8_t **value, size_t *value_size, uint8_t *deleted,
                        time_t *ttl)
@@ -4061,7 +4409,16 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
     return 0;
 }
 
-/* helper to compare keys for merge iteration using column family's comparator */
+/*
+ * compare_keys_with_cf
+ * compares two keys using the column family's comparator
+ * @param cf column family
+ * @param key1 first key
+ * @param key1_size size of first key
+ * @param key2 second key
+ * @param key2_size size of second key
+ * @return negative if key1 < key2, zero if equal, positive if key1 > key2
+ */
 static int compare_keys_with_cf(tidesdb_column_family_t *cf, const uint8_t *key1, size_t key1_size,
                                 const uint8_t *key2, size_t key2_size)
 {

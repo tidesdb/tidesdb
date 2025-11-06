@@ -4747,10 +4747,21 @@ static int sstable_binary_search_block(tidesdb_sstable_t *sst, tidesdb_column_fa
         block_manager_cursor_t *cursor = NULL;
         if (block_manager_cursor_init(&cursor, sst->block_manager) != 0) return -1;
 
-        if (block_manager_cursor_goto(cursor, (uint64_t)mid) != 0)
+        /* navigate to block mid by going to first and calling next() mid times */
+        if (block_manager_cursor_goto_first(cursor) != 0)
         {
             block_manager_cursor_free(cursor);
             return -1;
+        }
+
+        /* skip to block mid */
+        for (int i = 0; i < mid; i++)
+        {
+            if (block_manager_cursor_next(cursor) != 0)
+            {
+                block_manager_cursor_free(cursor);
+                return -1;
+            }
         }
 
         block_manager_block_t *block = block_manager_cursor_read(cursor);
@@ -5130,6 +5141,18 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
     iter->direction = 1;
     iter->valid = 0;
 
+    /* free current key/value if they exist */
+    if (iter->current_key)
+    {
+        free(iter->current_key);
+        iter->current_key = NULL;
+    }
+    if (iter->current_value)
+    {
+        free(iter->current_value);
+        iter->current_value = NULL;
+    }
+
     /* clear existing heap */
     if (iter->heap)
     {
@@ -5191,16 +5214,28 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                     if (sstable_binary_search_block(sst, iter->cf, key, key_size, &block_idx) == 0)
                     {
                         /* position cursor at the found block */
-                        if (block_idx > 0)
+                        if (block_manager_cursor_goto_first(iter->sstable_cursors[i]) == 0)
                         {
-                            /* position before the target block so refill can read it */
-                            block_manager_cursor_goto(iter->sstable_cursors[i],
-                                                      (uint64_t)(block_idx - 1));
-                            iter->sstable_blocks_read[i] = block_idx - 1;
+                            /* skip to block_idx, 1 so refill's next() will read block_idx */
+                            int target_block = block_idx > 0 ? block_idx - 1 : 0;
+                            for (int j = 0; j < target_block; j++)
+                            {
+                                if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0)
+                                {
+                                    /* failed to navigate, fall back to start */
+                                    iter->sstable_cursors[i]->current_pos =
+                                        BLOCK_MANAGER_HEADER_SIZE;
+                                    iter->sstable_cursors[i]->current_block_size = 0;
+                                    iter->sstable_blocks_read[i] = 0;
+                                    break;
+                                }
+                            }
+                            /* cursor is now at target_block, set blocks_read to match */
+                            iter->sstable_blocks_read[i] = target_block;
                         }
                         else
                         {
-                            /* target is at or before first block */
+                            /* goto_first failed, start from beginning */
                             iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
                             iter->sstable_cursors[i]->current_block_size = 0;
                             iter->sstable_blocks_read[i] = 0;
@@ -5246,6 +5281,18 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
 
     iter->direction = -1;
     iter->valid = 0;
+
+    /* free current key/value if they exist */
+    if (iter->current_key)
+    {
+        free(iter->current_key);
+        iter->current_key = NULL;
+    }
+    if (iter->current_value)
+    {
+        free(iter->current_value);
+        iter->current_value = NULL;
+    }
 
     /* clear existing heap */
     if (iter->heap)

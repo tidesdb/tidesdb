@@ -712,4 +712,84 @@ typedef pthread_mutex_t crit_section_t;
 typedef pthread_rwlock_t rwlock_t;
 #endif
 
+/*
+ * get_available_memory
+ * gets available system memory in bytes
+ * @return available memory in bytes, or 0 on failure
+ */
+static inline size_t get_available_memory(void)
+{
+#ifdef _WIN32
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status))
+    {
+        return (size_t)status.ullAvailPhys;
+    }
+    return 0;
+#elif defined(__APPLE__)
+    vm_size_t page_size;
+    mach_port_t mach_port;
+    mach_msg_type_number_t count;
+    vm_statistics64_data_t vm_stats;
+
+    mach_port = mach_host_self();
+    count = sizeof(vm_stats) / sizeof(natural_t);
+    if (host_page_size(mach_port, &page_size) == KERN_SUCCESS &&
+        host_statistics64(mach_port, HOST_VM_INFO, (host_info64_t)&vm_stats, &count) ==
+            KERN_SUCCESS)
+    {
+        return (size_t)(vm_stats.free_count * page_size);
+    }
+    return 0;
+#else
+    /* Linux and other POSIX systems */
+    struct sysinfo si;
+    if (sysinfo(&si) == 0)
+    {
+        return (size_t)si.freeram * (size_t)si.mem_unit;
+    }
+    return 0;
+#endif
+}
+
+/*
+ * get_total_memory
+ * gets total system memory in bytes
+ * @return total memory in bytes, or 0 on failure
+ */
+static inline size_t get_total_memory(void)
+{
+#ifdef _WIN32
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status))
+    {
+        return (size_t)status.ullTotalPhys;
+    }
+    return 0;
+#elif defined(__APPLE__)
+    int mib[2];
+    int64_t physical_memory;
+    size_t length;
+
+    mib[0] = CTL_HW;
+    mib[1] = HW_MEMSIZE;
+    length = sizeof(int64_t);
+    if (sysctl(mib, 2, &physical_memory, &length, NULL, 0) == 0)
+    {
+        return (size_t)physical_memory;
+    }
+    return 0;
+#else
+    /* Linux and other POSIX systems */
+    struct sysinfo si;
+    if (sysinfo(&si) == 0)
+    {
+        return (size_t)si.totalram * (size_t)si.mem_unit;
+    }
+    return 0;
+#endif
+}
+
 #endif /* __COMPAT_H__ */

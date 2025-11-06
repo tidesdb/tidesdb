@@ -30,7 +30,6 @@
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-/* helper to create test database */
 static tidesdb_t *create_test_db(void)
 {
     cleanup_test_dir();
@@ -44,7 +43,6 @@ static tidesdb_t *create_test_db(void)
     return db;
 }
 
-/* helper to get test column family config */
 static tidesdb_column_family_config_t get_test_cf_config(void)
 {
     tidesdb_column_family_config_t config = {
@@ -65,7 +63,6 @@ static tidesdb_column_family_config_t get_test_cf_config(void)
     return config;
 }
 
-/* basic database open and close */
 static void test_basic_open_close(void)
 {
     tidesdb_t *db = create_test_db();
@@ -73,7 +70,6 @@ static void test_basic_open_close(void)
     cleanup_test_dir();
 }
 
-/* column family creation */
 static void test_column_family_creation(void)
 {
     tidesdb_t *db = create_test_db();
@@ -89,7 +85,6 @@ static void test_column_family_creation(void)
     cleanup_test_dir();
 }
 
-/* basic txn PUT and GET */
 static void test_basic_txn_put_get(void)
 {
     tidesdb_t *db = create_test_db();
@@ -125,7 +120,6 @@ static void test_basic_txn_put_get(void)
     cleanup_test_dir();
 }
 
-/* multiple PUT/GET operations */
 static void test_multiple_operations(void)
 {
     tidesdb_t *db = create_test_db();
@@ -174,7 +168,6 @@ static void test_multiple_operations(void)
     cleanup_test_dir();
 }
 
-/* DELETE operation */
 static void test_delete(void)
 {
     tidesdb_t *db = create_test_db();
@@ -219,7 +212,6 @@ static void test_delete(void)
     cleanup_test_dir();
 }
 
-/* transaction commit */
 static void test_transaction_commit(void)
 {
     tidesdb_t *db = create_test_db();
@@ -258,7 +250,6 @@ static void test_transaction_commit(void)
     cleanup_test_dir();
 }
 
-/* transaction rollback */
 static void test_transaction_rollback(void)
 {
     tidesdb_t *db = create_test_db();
@@ -287,7 +278,6 @@ static void test_transaction_rollback(void)
     cleanup_test_dir();
 }
 
-/* forward iterator */
 static void test_iterator_forward(void)
 {
     tidesdb_t *db = create_test_db();
@@ -342,7 +332,6 @@ static void test_iterator_forward(void)
     cleanup_test_dir();
 }
 
-/* memtable flush */
 static void test_memtable_flush(void)
 {
     tidesdb_t *db = create_test_db();
@@ -388,7 +377,6 @@ static void test_memtable_flush(void)
     cleanup_test_dir();
 }
 
-/* multiple column families */
 static void test_multiple_column_families(void)
 {
     tidesdb_t *db = create_test_db();
@@ -426,7 +414,6 @@ static void test_multiple_column_families(void)
     cleanup_test_dir();
 }
 
-/* custom comparator */
 static void test_custom_comparator(void)
 {
     tidesdb_t *db = create_test_db();
@@ -473,7 +460,6 @@ static void test_custom_comparator(void)
     cleanup_test_dir();
 }
 
-/* sync modes */
 static void test_sync_modes(void)
 {
     tidesdb_t *db = create_test_db();
@@ -500,7 +486,6 @@ static void test_sync_modes(void)
     cleanup_test_dir();
 }
 
-/* compaction triggers */
 static void test_compaction_trigger(void)
 {
     tidesdb_t *db = create_test_db();
@@ -546,7 +531,6 @@ static void test_compaction_trigger(void)
     cleanup_test_dir();
 }
 
-/* TTL expiration */
 static void test_ttl_expiration(void)
 {
     tidesdb_t *db = create_test_db();
@@ -602,7 +586,6 @@ static void test_ttl_expiration(void)
     cleanup_test_dir();
 }
 
-/* iterator backward */
 static void test_iterator_backward(void)
 {
     tidesdb_t *db = create_test_db();
@@ -649,7 +632,6 @@ static void test_iterator_backward(void)
     cleanup_test_dir();
 }
 
-/* database reopen and recovery */
 static void test_database_reopen(void)
 {
     /* create and populate database */
@@ -707,7 +689,6 @@ static void test_database_reopen(void)
     cleanup_test_dir();
 }
 
-/* large value handling */
 static void test_large_values(void)
 {
     tidesdb_t *db = create_test_db();
@@ -748,7 +729,6 @@ static void test_large_values(void)
     cleanup_test_dir();
 }
 
-/* concurrent column families */
 static void test_concurrent_operations(void)
 {
     tidesdb_t *db = create_test_db();
@@ -801,7 +781,6 @@ static void test_concurrent_operations(void)
     cleanup_test_dir();
 }
 
-/* error handling */
 static void test_error_handling(void)
 {
     tidesdb_t *db = create_test_db();
@@ -827,7 +806,6 @@ static void test_error_handling(void)
     cleanup_test_dir();
 }
 
-/* many ssts, verify system handles large number of ssts */
 static void test_many_sstables(void)
 {
     tidesdb_t *db = create_test_db();
@@ -914,7 +892,6 @@ static void test_many_sstables(void)
     cleanup_test_dir();
 }
 
-/* backward iteration test */
 static void test_backward_iteration(void)
 {
     tidesdb_t *db = create_test_db();
@@ -997,7 +974,6 @@ static void test_backward_iteration(void)
     cleanup_test_dir();
 }
 
-/* crash recovery, verify WAL recovery works */
 static void test_crash_recovery(void)
 {
     printf("\n  [Reliability] Testing crash recovery... ");
@@ -1087,7 +1063,6 @@ static void test_crash_recovery(void)
     cleanup_test_dir();
 }
 
-/* background compaction */
 static void test_background_compaction(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1146,7 +1121,6 @@ static void test_background_compaction(void)
     cleanup_test_dir();
 }
 
-/* update and overwrite patterns */
 static void test_update_patterns(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1222,7 +1196,6 @@ static void test_update_patterns(void)
     cleanup_test_dir();
 }
 
-/* delete and tombstone handling */
 static void test_delete_patterns(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1299,7 +1272,6 @@ static void test_delete_patterns(void)
     cleanup_test_dir();
 }
 
-/* list column families */
 static void test_list_column_families(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1340,7 +1312,6 @@ static void test_list_column_families(void)
     cleanup_test_dir();
 }
 
-/* get column family stats */
 static void test_column_family_stats(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1387,7 +1358,6 @@ static void test_column_family_stats(void)
     cleanup_test_dir();
 }
 
-/* mixed workload */
 static void test_mixed_workload(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1481,7 +1451,6 @@ static void test_mixed_workload(void)
     cleanup_test_dir();
 }
 
-/* large values requiring overflow blocks */
 static void test_overflow_blocks(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1529,7 +1498,6 @@ static void test_overflow_blocks(void)
     cleanup_test_dir();
 }
 
-/* empty key and value handling */
 static void test_empty_key_value(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1568,7 +1536,6 @@ static void test_empty_key_value(void)
     cleanup_test_dir();
 }
 
-/* read-your-own-writes within transaction */
 static void test_read_your_own_writes(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1623,7 +1590,6 @@ static void test_read_your_own_writes(void)
     cleanup_test_dir();
 }
 
-/* compaction with all tombstones */
 static void test_compaction_tombstones(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1724,7 +1690,6 @@ static void test_compaction_tombstones(void)
     cleanup_test_dir();
 }
 
-/* iterator with expired TTL entries */
 static void test_iterator_expired_ttl(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1807,7 +1772,6 @@ static void test_iterator_expired_ttl(void)
     cleanup_test_dir();
 }
 
-/* WAL recovery with uncommitted data */
 static void test_wal_uncommitted_recovery(void)
 {
     printf("\n  [WAL Recovery] Testing recovery with uncommitted data... ");
@@ -1877,7 +1841,6 @@ static void test_wal_uncommitted_recovery(void)
     cleanup_test_dir();
 }
 
-/* parallel compaction with multiple threads */
 static void test_parallel_compaction(void)
 {
     tidesdb_t *db = create_test_db();
@@ -1972,7 +1935,6 @@ static void test_parallel_compaction(void)
            found_count);
 }
 
-/* test compaction deduplication with overlapping keys */
 static void test_compaction_deduplication(void)
 {
     tidesdb_t *db = create_test_db();
@@ -2111,7 +2073,6 @@ static void test_compaction_deduplication(void)
     printf("OK (verified deduplication: 20 entries -> 15 unique keys)\n");
 }
 
-/* maximum key size handling */
 static void test_max_key_size(void)
 {
     tidesdb_t *db = create_test_db();
@@ -2325,7 +2286,6 @@ static void test_true_concurrency(void)
     cleanup_test_dir();
 }
 
-/* regression test verify iterator stops at num_entries and doesn't read metadata blocks */
 static void test_iterator_metadata_boundary(void)
 {
     printf("\n  [Regression] Testing iterator metadata boundary... ");
@@ -2416,7 +2376,6 @@ static void test_iterator_metadata_boundary(void)
     cleanup_test_dir();
 }
 
-/* regression test verify num_entries is correctly set in sstables */
 static void test_sstable_num_entries_accuracy(void)
 {
     printf("\n  [Regression] Testing SSTable num_entries accuracy... ");
@@ -2503,7 +2462,6 @@ static void test_sstable_num_entries_accuracy(void)
     cleanup_test_dir();
 }
 
-/* test basic column family drop */
 static void test_drop_column_family_basic(void)
 {
     tidesdb_t *db = create_test_db();
@@ -2582,7 +2540,6 @@ static void test_drop_column_family_with_data(void)
     cleanup_test_dir();
 }
 
-/* test dropping non-existent column family */
 static void test_drop_column_family_not_found(void)
 {
     tidesdb_t *db = create_test_db();
@@ -2595,7 +2552,6 @@ static void test_drop_column_family_not_found(void)
     cleanup_test_dir();
 }
 
-/* test dropping column family with WAL and sstables */
 static void test_drop_column_family_cleanup(void)
 {
     tidesdb_t *db = create_test_db();
@@ -2646,7 +2602,6 @@ static void test_drop_column_family_cleanup(void)
     cleanup_test_dir();
 }
 
-/* test iterator and get operations during concurrent compaction */
 static void test_concurrent_compaction_with_reads(void)
 {
     tidesdb_t *db = create_test_db();
@@ -2777,7 +2732,6 @@ static void test_concurrent_compaction_with_reads(void)
     cleanup_test_dir();
 }
 
-/* test linear scan fallback when SBHA is disabled */
 static int test_linear_scan_fallback(void)
 {
     tidesdb_t *db = create_test_db();
@@ -3037,6 +2991,140 @@ static int test_column_family_config_persistence(void)
     return 1;
 }
 
+static void test_memory_safety(void)
+{
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "memory_test", &cf_config), 0);
+
+    /* verify memory info was captured at startup */
+    ASSERT_TRUE(db->total_memory > 0 || db->total_memory == SIZE_MAX);
+    ASSERT_TRUE(db->available_memory > 0 || db->available_memory == SIZE_MAX);
+
+    /* test normal sized key/value should succeed */
+    tidesdb_txn_t *txn1 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
+
+    const char *normal_key = "normal_key";
+    const char *normal_value = "normal_value";
+    int result = tidesdb_txn_put(txn1, "memory_test", (uint8_t *)normal_key, strlen(normal_key),
+                                 (uint8_t *)normal_value, strlen(normal_value), -1);
+    ASSERT_EQ(result, 0);
+
+    ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
+    tidesdb_txn_free(txn1);
+
+    /* test extremely large key/value should fail with TDB_ERR_MEMORY_LIMIT */
+    /* only test if we successfully detected memory (not SIZE_MAX fallback) */
+    if (db->available_memory != SIZE_MAX && db->available_memory > 0)
+    {
+        tidesdb_txn_t *txn2 = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+
+        /* calculate a size that exceeds 10% of available memory */
+        size_t max_allowed = (size_t)(db->available_memory * 0.10);
+        /* account for overhead (50%) and header */
+        size_t excessive_size =
+            (max_allowed * 2) / 3; /* ensures total with overhead exceeds limit */
+
+        uint8_t *large_key = malloc(excessive_size);
+        uint8_t *large_value = malloc(excessive_size);
+        ASSERT_TRUE(large_key != NULL);
+        ASSERT_TRUE(large_value != NULL);
+
+        memset(large_key, 'K', excessive_size);
+        memset(large_value, 'V', excessive_size);
+
+        result = tidesdb_txn_put(txn2, "memory_test", large_key, excessive_size, large_value,
+                                 excessive_size, -1);
+
+        /* should fail with memory limit error */
+        ASSERT_EQ(result, TDB_ERR_MEMORY_LIMIT);
+
+        free(large_key);
+        free(large_value);
+        tidesdb_txn_free(txn2);
+    }
+
+    /* test verify normal operations still work after memory limit rejection */
+    tidesdb_txn_t *txn3 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn3), 0);
+
+    const char *key3 = "key_after_limit";
+    const char *value3 = "value_after_limit";
+    result = tidesdb_txn_put(txn3, "memory_test", (uint8_t *)key3, strlen(key3), (uint8_t *)value3,
+                             strlen(value3), -1);
+    ASSERT_EQ(result, 0);
+
+    ASSERT_EQ(tidesdb_txn_commit(txn3), 0);
+    tidesdb_txn_free(txn3);
+
+    /* test verify we can read the normal values we wrote */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, "memory_test", (uint8_t *)normal_key, strlen(normal_key),
+                              &value, &value_size),
+              0);
+    ASSERT_TRUE(value_size == strlen(normal_value));
+    ASSERT_TRUE(memcmp(value, normal_value, value_size) == 0);
+    free(value);
+
+    value = NULL;
+    value_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, "memory_test", (uint8_t *)key3, strlen(key3), &value,
+                              &value_size),
+              0);
+    ASSERT_TRUE(value_size == strlen(value3));
+    ASSERT_TRUE(memcmp(value, value3, value_size) == 0);
+    free(value);
+
+    tidesdb_txn_free(read_txn);
+
+    /* test test with moderately large but acceptable values */
+    tidesdb_txn_t *txn4 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn4), 0);
+
+    /* 1 MB key and value should be acceptable on most systems */
+    size_t moderate_size = 1024 * 1024; /* 1 MB */
+    uint8_t *moderate_key = malloc(moderate_size);
+    uint8_t *moderate_value = malloc(moderate_size);
+    ASSERT_TRUE(moderate_key != NULL);
+    ASSERT_TRUE(moderate_value != NULL);
+
+    memset(moderate_key, 'M', moderate_size);
+    memset(moderate_value, 'N', moderate_size);
+
+    result = tidesdb_txn_put(txn4, "memory_test", moderate_key, moderate_size, moderate_value,
+                             moderate_size, -1);
+
+    /* this should succeed unless we're on a very memory-constrained system */
+    if (db->available_memory != SIZE_MAX && db->available_memory > 100 * 1024 * 1024)
+    {
+        /* only assert success if we have > 100MB available */
+        ASSERT_EQ(result, 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn4), 0);
+    }
+    else
+    {
+        /* on constrained systems, either result is acceptable */
+        ASSERT_TRUE(result == 0 || result == TDB_ERR_MEMORY_LIMIT);
+        if (result == 0)
+        {
+            ASSERT_EQ(tidesdb_txn_commit(txn4), 0);
+        }
+    }
+
+    free(moderate_key);
+    free(moderate_value);
+    tidesdb_txn_free(txn4);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     printf("\n");
@@ -3091,6 +3179,7 @@ int main(void)
     RUN_TEST(test_drop_column_family_cleanup, tests_passed);
     RUN_TEST(test_concurrent_compaction_with_reads, tests_passed);
     RUN_TEST(test_linear_scan_fallback, tests_passed);
+    RUN_TEST(test_memory_safety, tests_passed);
 
     printf("\n");
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

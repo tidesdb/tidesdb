@@ -75,66 +75,109 @@
         printf("=======================================\n");          \
     } while (0)
 
-/* recursive directory removal - cross-platform */
-static inline int remove_directory_recursive(const char *path)
+/*
+ * remove_directory
+ * @param path path to directory to remove
+ * @return 0 on success, -1 on failure
+ */
+static inline int remove_directory(const char *path)
 {
-    DIR *dir = opendir(path);
-    if (!dir)
-    {
-        return 0; /* dir doesn't exist, nothing to do */
-    }
-
-    struct dirent *entry;
-    char filepath[1024];
+    char *dir_stack[64];
+    int stack_top = 0;
     int result = 0;
 
-    while ((entry = readdir(dir)) != NULL)
+    /* push initial directory */
+    dir_stack[stack_top] = strdup(path);
+    if (!dir_stack[stack_top]) return -1;
+    stack_top++;
+
+    /* process directories in post-order (children before parents) */
+    while (stack_top > 0)
     {
-        /* skip . and .. */
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+        /* peek at top directory */
+        char *current_path = dir_stack[stack_top - 1];
+        DIR *dir = opendir(current_path);
+
+        if (!dir)
+        {
+            /* directory doesn't exist or can't be opened, pop and continue */
+            free(dir_stack[--stack_top]);
+            continue;
+        }
+
+        struct dirent *entry;
+        int has_subdirs = 0;
+
+        /* scan for subdirectories and files */
+        while ((entry = readdir(dir)) != NULL)
+        {
+            /* skip . and .. */
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            {
+                continue;
+            }
+
+            char filepath[1024];
+            snprintf(filepath, sizeof(filepath), "%s" PATH_SEPARATOR "%s", current_path,
+                     entry->d_name);
+
+            struct stat statbuf;
+            if (stat(filepath, &statbuf) != 0)
+            {
+                continue;
+            }
+
+            if (S_ISDIR(statbuf.st_mode))
+            {
+                /* push subdirectory onto stack if space available */
+                if (stack_top < 64)
+                {
+                    dir_stack[stack_top] = strdup(filepath);
+                    if (dir_stack[stack_top])
+                    {
+                        stack_top++;
+                        has_subdirs = 1;
+                    }
+                }
+            }
+            else
+            {
+                /* remove file immediately */
+                if (remove(filepath) != 0)
+                {
+                    result = -1;
+                }
+            }
+        }
+
+        closedir(dir);
+
+        /* if we found subdirectories, process them first */
+        if (has_subdirs)
         {
             continue;
         }
 
-        snprintf(filepath, sizeof(filepath), "%s" PATH_SEPARATOR "%s", path, entry->d_name);
-
-        struct stat statbuf;
-        if (stat(filepath, &statbuf) != 0)
+        /* no subdirectories, remove this directory and pop from stack */
+#ifdef _WIN32
+        if (_rmdir(current_path) != 0)
+#else
+        if (rmdir(current_path) != 0)
+#endif
         {
-            continue;
+            result = -1;
         }
 
-        if (S_ISDIR(statbuf.st_mode))
-        {
-            /* recursively remove subdirectory */
-            result = remove_directory_recursive(filepath);
-            if (result != 0)
-            {
-                closedir(dir);
-                return result;
-            }
-        }
-        else
-        {
-            /* remove file */
-            if (remove(filepath) != 0)
-            {
-                result = -1;
-            }
-        }
+        free(dir_stack[--stack_top]);
     }
 
-    closedir(dir);
-
-    /* remove the now-empty directory */
-#ifdef _WIN32
-    return _rmdir(path);
-#else
-    return rmdir(path);
-#endif
+    return result;
 }
 
-/* helper to clean test directory */
+/*
+ * cleanup_test_dir
+ * @brief cleanup test directory
+ */
 static inline void cleanup_test_dir(void)
 {
 #ifdef _WIN32
@@ -142,12 +185,12 @@ static inline void cleanup_test_dir(void)
     Sleep(200);
 #endif
 
-    /* try to remove directory, retry if it fails (Windows file locking) */
+    /* try to remove directory, retry if it fails (windows file locking) */
     for (int attempt = 0; attempt < 3; attempt++)
     {
-        if (remove_directory_recursive(TEST_DB_PATH) == 0)
+        if (remove_directory(TEST_DB_PATH) == 0)
         {
-            break; /* Success */
+            break; /* success */
         }
 
 #ifdef _WIN32
@@ -156,7 +199,10 @@ static inline void cleanup_test_dir(void)
     }
 }
 
-/* generate random key-value pairs for testing */
+/*
+ * generate_random_key_value
+ * @brief generate random key-value pairs for testing
+ */
 static inline void generate_random_key_value(uint8_t *key, size_t key_size, uint8_t *value,
                                              size_t value_size)
 {

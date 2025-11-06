@@ -149,16 +149,13 @@ typedef struct __attribute__((packed))
 #define TDB_ERR_TXN_COMMITTED        -9
 #define TDB_ERR_TXN_ABORTED          -10
 #define TDB_ERR_READONLY             -11
-#define TDB_ERR_FULL                 -12
-#define TDB_ERR_INVALID_NAME         -13
-#define TDB_ERR_COMPARATOR_NOT_FOUND -14
-#define TDB_ERR_MAX_COMPARATORS      -15
-#define TDB_ERR_INVALID_CF           -16
-#define TDB_ERR_THREAD               -17
-#define TDB_ERR_CHECKSUM             -18
-#define TDB_ERR_KEY_DELETED          -19
-#define TDB_ERR_KEY_EXPIRED          -20
-#define TDB_ERR_MEMORY_LIMIT         -21
+#define TDB_ERR_INVALID_NAME         -12
+#define TDB_ERR_COMPARATOR_NOT_FOUND -13
+#define TDB_ERR_MAX_COMPARATORS      -14
+#define TDB_ERR_INVALID_CF           -15
+#define TDB_ERR_THREAD               -16
+#define TDB_ERR_CHECKSUM             -17
+#define TDB_ERR_MEMORY_LIMIT         -18
 
 typedef struct tidesdb_t tidesdb_t;
 typedef struct tidesdb_column_family_t tidesdb_column_family_t;

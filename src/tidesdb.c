@@ -3880,12 +3880,13 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
 /*
  * tidesdb_sstable_get
  * gets a value from an sstable
- * @param sstable sstable to get value from
- * @param key key to get value for
+ * @param sstable sstable to get from
+ * @param key key to get
  * @param key_size size of key
  * @param value pointer to store value
  * @param value_size pointer to store value size
- * @return 0 on success, -1 on failure
+ * @return 0 on success, TDB_ERR_CORRUPT if data is corrupted, TDB_ERR_NOT_FOUND if key not found or
+ * expired, -1 on other failures
  */
 static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, size_t key_size,
                                uint8_t **value, size_t *value_size)
@@ -4025,7 +4026,7 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
     if (!block || !block->data)
     {
         if (block) block_manager_block_free(block);
-        return -1;
+        return TDB_ERR_CORRUPT; /* checksum verification failed or block corrupted */
     }
 
     /* decompress if needed */
@@ -4301,6 +4302,11 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
             *value_size = sst_value_size;
             return 0;
         }
+        else if (result == TDB_ERR_CORRUPT)
+        {
+            /* data corruption detected, propagate error */
+            return TDB_ERR_CORRUPT;
+        }
         else if (result == TDB_ERR_NOT_FOUND)
         {
             return -1;
@@ -4391,7 +4397,8 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
                     const uint8_t *value, size_t value_size, time_t ttl)
 {
     if (!txn || !cf_name || !key || !value) return TDB_ERR_INVALID_ARGS;
-    if (txn->committed) return TDB_ERR_TXN_COMMITTED;
+    if (txn->committed == 1) return TDB_ERR_TXN_COMMITTED;
+    if (txn->committed == -1) return TDB_ERR_TXN_ABORTED;
     if (txn->read_only) return TDB_ERR_READONLY;
 
     /* validate key/value sizes against memory limits */
@@ -4438,7 +4445,8 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
 int tidesdb_txn_delete(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key, size_t key_size)
 {
     if (!txn || !cf_name || !key) return TDB_ERR_INVALID_ARGS;
-    if (txn->committed) return TDB_ERR_TXN_COMMITTED;
+    if (txn->committed == 1) return TDB_ERR_TXN_COMMITTED;
+    if (txn->committed != 0) return TDB_ERR_TXN_ABORTED;
     if (txn->read_only) return TDB_ERR_READONLY;
 
     if (txn->num_ops >= txn->op_capacity)
@@ -4472,7 +4480,8 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *k
 int tidesdb_txn_commit(tidesdb_txn_t *txn)
 {
     if (!txn) return TDB_ERR_INVALID_ARGS;
-    if (txn->committed) return TDB_ERR_TXN_COMMITTED;
+    if (txn->committed == 1) return TDB_ERR_TXN_COMMITTED;
+    if (txn->committed == -1) return TDB_ERR_TXN_ABORTED;
     if (txn->read_only)
     {
         txn->committed = 1;
@@ -4582,7 +4591,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
 int tidesdb_txn_rollback(tidesdb_txn_t *txn)
 {
-    if (!txn) return -1;
+    if (!txn) return TDB_ERR_INVALID_ARGS;
+    if (txn->committed == 1) return TDB_ERR_TXN_COMMITTED;
+    if (txn->committed == -1) return TDB_ERR_TXN_ABORTED;
 
     /* mark as rolled back, operations won't be committed */
     txn->committed = -1;
@@ -4654,14 +4665,14 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
     if (header.version != TDB_KV_FORMAT_VERSION)
     {
         if (data != block->data) free(data);
-        return -1;
+        return TDB_ERR_CORRUPT; /* invalid format version indicates corruption */
     }
 
     /* verify we have enough data for key and value */
     if (data_size < sizeof(tidesdb_kv_pair_header_t) + header.key_size + header.value_size)
     {
         if (data != block->data) free(data);
-        return -1;
+        return TDB_ERR_CORRUPT; /* truncated data indicates corruption */
     }
 
     /* extract key */

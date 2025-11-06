@@ -515,7 +515,6 @@ void test_skip_list_cursor_seek()
         return;
     }
 
-    /* insert keys: key_00, key_10, key_20, ..., key_90 */
     for (int i = 0; i <= 90; i += 10)
     {
         char key[16];
@@ -579,7 +578,6 @@ void test_skip_list_cursor_seek_for_prev()
         return;
     }
 
-    /* insert keys: key_00, key_10, key_20, ..., key_90 */
     for (int i = 0; i <= 90; i += 10)
     {
         char key[16];
@@ -590,14 +588,12 @@ void test_skip_list_cursor_seek_for_prev()
                                   strlen(value), -1) == 0);
     }
 
-    /* test seek_for_prev to exact key */
     skip_list_cursor_t *cursor = skip_list_cursor_init(list);
     ASSERT_TRUE(cursor != NULL);
 
     const char *seek_key = "key_50";
     ASSERT_EQ(skip_list_cursor_seek_for_prev(cursor, (uint8_t *)seek_key, strlen(seek_key)), 0);
 
-    /* cursor should be positioned AT key_50 */
     uint8_t *key = NULL;
     size_t key_size = 0;
     uint8_t *value = NULL;

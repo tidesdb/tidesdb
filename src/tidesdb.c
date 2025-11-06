@@ -1590,6 +1590,26 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         cf->config = tidesdb_default_column_family_config();
     }
 
+    /* validate config parameters */
+    if (cf->config.memtable_flush_size == 0)
+    {
+        free(cf);
+        pthread_rwlock_unlock(&db->db_lock);
+        return TDB_ERR_INVALID_ARGS;
+    }
+    if (cf->config.max_sstables_before_compaction < 2)
+    {
+        free(cf);
+        pthread_rwlock_unlock(&db->db_lock);
+        return TDB_ERR_INVALID_ARGS;
+    }
+    if (cf->config.bloom_filter_fp_rate <= 0.0 || cf->config.bloom_filter_fp_rate > 1.0)
+    {
+        free(cf);
+        pthread_rwlock_unlock(&db->db_lock);
+        return TDB_ERR_INVALID_ARGS;
+    }
+
     /* lookup comparator by name */
     const char *cmp_name = cf->config.comparator_name ? cf->config.comparator_name : "memcmp";
     skip_list_comparator_fn cmp_fn = tidesdb_get_comparator(cmp_name);
@@ -4357,6 +4377,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
                     uint8_t **value, size_t *value_size)
 {
     if (!txn || !cf_name || !key || !value || !value_size) return TDB_ERR_INVALID_ARGS;
+    if (key_size == 0) return TDB_ERR_INVALID_ARGS; /* keys must have non-zero length */
 
     tidesdb_column_family_t *cf = tidesdb_get_column_family(txn->db, cf_name);
     if (!cf) return TDB_ERR_NOT_FOUND;
@@ -4397,6 +4418,7 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
                     const uint8_t *value, size_t value_size, time_t ttl)
 {
     if (!txn || !cf_name || !key || !value) return TDB_ERR_INVALID_ARGS;
+    if (key_size == 0) return TDB_ERR_INVALID_ARGS; /* keys must have non-zero length */
     if (txn->committed == 1) return TDB_ERR_TXN_COMMITTED;
     if (txn->committed == -1) return TDB_ERR_TXN_ABORTED;
     if (txn->read_only) return TDB_ERR_READONLY;
@@ -4445,6 +4467,7 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
 int tidesdb_txn_delete(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key, size_t key_size)
 {
     if (!txn || !cf_name || !key) return TDB_ERR_INVALID_ARGS;
+    if (key_size == 0) return TDB_ERR_INVALID_ARGS; /* keys must have non-zero length */
     if (txn->committed == 1) return TDB_ERR_TXN_COMMITTED;
     if (txn->committed != 0) return TDB_ERR_TXN_ABORTED;
     if (txn->read_only) return TDB_ERR_READONLY;

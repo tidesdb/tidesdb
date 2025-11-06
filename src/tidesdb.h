@@ -725,6 +725,26 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter);
 int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter);
 
 /*
+ * tidesdb_iter_seek
+ * positions iterator at first key >= target key
+ * @param iter iterator
+ * @param key target key to seek to
+ * @param key_size size of target key
+ * @return 0 on success, -1 on failure
+ */
+int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size);
+
+/*
+ * tidesdb_iter_seek_for_prev
+ * positions iterator at last key <= target key
+ * @param iter iterator
+ * @param key target key to seek to
+ * @param key_size size of target key
+ * @return 0 on success, -1 on failure
+ */
+int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size);
+
+/*
  * tidesdb_iter_next
  * moves iterator to next key
  * @param iter iterator
@@ -770,8 +790,8 @@ int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size
 
 /*
  * tidesdb_iter_free
- * frees iterator resources
- * @param iter iterator
+ * frees an iterator
+ * @param iter iterator to free
  */
 void tidesdb_iter_free(tidesdb_iter_t *iter);
 

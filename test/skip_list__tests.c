@@ -506,6 +506,127 @@ void test_skip_list_min_max_key()
     printf(GREEN "test_skip_list_min_max_key passed\n" RESET);
 }
 
+void test_skip_list_cursor_seek()
+{
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
+
+    /* insert keys: key_00, key_10, key_20, ..., key_90 */
+    for (int i = 0; i <= 90; i += 10)
+    {
+        char key[16];
+        char value[16];
+        snprintf(key, sizeof(key), "key_%02d", i);
+        snprintf(value, sizeof(value), "value_%02d", i);
+        ASSERT_TRUE(skip_list_put(list, (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  strlen(value), -1) == 0);
+    }
+
+    /* test seek to exact key */
+    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    ASSERT_TRUE(cursor != NULL);
+
+    const char *seek_key = "key_50";
+    ASSERT_EQ(skip_list_cursor_seek(cursor, (uint8_t *)seek_key, strlen(seek_key)), 0);
+
+    /* cursor should be positioned BEFORE key_50, so next() should return key_50 */
+    ASSERT_TRUE(skip_list_cursor_has_next(cursor));
+    ASSERT_EQ(skip_list_cursor_next(cursor), 0);
+
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    time_t ttl = 0;
+    uint8_t deleted = 0;
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(memcmp(key, "key_50", strlen("key_50")), 0);
+
+    /* test seek to non-existent key (should find next key) */
+    const char *seek_key2 = "key_55";
+    ASSERT_EQ(skip_list_cursor_seek(cursor, (uint8_t *)seek_key2, strlen(seek_key2)), 0);
+    ASSERT_TRUE(skip_list_cursor_has_next(cursor));
+    ASSERT_EQ(skip_list_cursor_next(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(memcmp(key, "key_60", strlen("key_60")), 0);
+
+    /* test seek to key before all keys */
+    const char *seek_key3 = "key_";
+    ASSERT_EQ(skip_list_cursor_seek(cursor, (uint8_t *)seek_key3, strlen(seek_key3)), 0);
+    ASSERT_TRUE(skip_list_cursor_has_next(cursor));
+    ASSERT_EQ(skip_list_cursor_next(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(memcmp(key, "key_00", strlen("key_00")), 0);
+
+    skip_list_cursor_free(cursor);
+    ASSERT_TRUE(skip_list_free(list) == 0);
+    printf(GREEN "test_skip_list_cursor_seek passed\n" RESET);
+}
+
+void test_skip_list_cursor_seek_for_prev()
+{
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
+
+    /* insert keys: key_00, key_10, key_20, ..., key_90 */
+    for (int i = 0; i <= 90; i += 10)
+    {
+        char key[16];
+        char value[16];
+        snprintf(key, sizeof(key), "key_%02d", i);
+        snprintf(value, sizeof(value), "value_%02d", i);
+        ASSERT_TRUE(skip_list_put(list, (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  strlen(value), -1) == 0);
+    }
+
+    /* test seek_for_prev to exact key */
+    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    ASSERT_TRUE(cursor != NULL);
+
+    const char *seek_key = "key_50";
+    ASSERT_EQ(skip_list_cursor_seek_for_prev(cursor, (uint8_t *)seek_key, strlen(seek_key)), 0);
+
+    /* cursor should be positioned AT key_50 */
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    time_t ttl = 0;
+    uint8_t deleted = 0;
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(memcmp(key, "key_50", strlen("key_50")), 0);
+
+    /* test seek_for_prev to non-existent key (should find previous key) */
+    const char *seek_key2 = "key_55";
+    ASSERT_EQ(skip_list_cursor_seek_for_prev(cursor, (uint8_t *)seek_key2, strlen(seek_key2)), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(memcmp(key, "key_50", strlen("key_50")), 0);
+
+    /* test seek_for_prev to key after all keys */
+    const char *seek_key3 = "key_99";
+    ASSERT_EQ(skip_list_cursor_seek_for_prev(cursor, (uint8_t *)seek_key3, strlen(seek_key3)), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(memcmp(key, "key_90", strlen("key_90")), 0);
+
+    skip_list_cursor_free(cursor);
+    ASSERT_TRUE(skip_list_free(list) == 0);
+    printf(GREEN "test_skip_list_cursor_seek_for_prev passed\n" RESET);
+}
+
 int main(void)
 {
     RUN_TEST(test_skip_list_create_node, tests_passed);
@@ -521,6 +642,8 @@ int main(void)
     RUN_TEST(test_skip_list_cursor_prev, tests_passed);
     RUN_TEST(test_skip_list_cursor_functions, tests_passed);
     RUN_TEST(test_skip_list_ttl, tests_passed);
+    RUN_TEST(test_skip_list_cursor_seek, tests_passed);
+    RUN_TEST(test_skip_list_cursor_seek_for_prev, tests_passed);
     RUN_TEST(benchmark_skip_list, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

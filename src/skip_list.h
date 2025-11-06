@@ -476,4 +476,26 @@ int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size);
  */
 int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list);
 
+/*
+ * skip_list_cursor_seek
+ * positions cursor at the first node with key >= target key
+ * lock-free operation, never blocked by writers
+ * @param cursor the cursor to position
+ * @param key the target key to seek to
+ * @param key_size the size of the target key
+ * @return 0 if positioned successfully, -1 if key not found or cursor at end
+ */
+int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size);
+
+/*
+ * skip_list_cursor_seek_for_prev
+ * positions cursor at the first node with key <= target key
+ * lock-free operation, never blocked by writers
+ * @param cursor the cursor to position
+ * @param key the target key to seek to
+ * @param key_size the size of the target key
+ * @return 0 if positioned successfully, -1 if key not found or cursor at start
+ */
+int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size);
+
 #endif /* __SKIP_LIST_H__ */

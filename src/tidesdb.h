@@ -281,7 +281,6 @@ typedef struct
  * @param next_sstable_id next sstable ID to assign
  * @param cf_lock reader-writer lock for this column family
  * @param flush_lock lock for flush operations
- * @param flush_queue queue of memtables waiting to be flushed
  * @param compaction_lock lock for compaction operations
  * @param next_memtable_id next memtable ID to assign
  * @param is_dropping flag indicating if the column family is being dropped
@@ -301,7 +300,6 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) next_memtable_id;
     pthread_rwlock_t cf_lock;
     pthread_mutex_t flush_lock;
-    queue_t *flush_queue;
     pthread_mutex_t compaction_lock;
     _Atomic(int) is_dropping;
     tidesdb_column_family_config_t config;

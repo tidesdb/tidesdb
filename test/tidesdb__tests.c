@@ -4066,16 +4066,16 @@ static void test_cf_name_limits(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
 
+    /* test name that's too long (should fail) */
     char long_name[TDB_MAX_CF_NAME_LENGTH + 10];
     memset(long_name, 'a', sizeof(long_name) - 1);
     long_name[sizeof(long_name) - 1] = '\0';
-
     ASSERT_NE(tidesdb_create_column_family(db, long_name, &cf_config), 0);
 
+    /* test name that's at safe maximum length (should succeed) */
     char max_name[TDB_MAX_CF_NAME_LENGTH];
-    memset(max_name, 'b', TDB_MAX_CF_NAME_LENGTH - 1);
-    max_name[TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
-
+    memset(max_name, 'b', TDB_MAX_CF_NAME_LENGTH - 2); /* leave room for null terminator */
+    max_name[TDB_MAX_CF_NAME_LENGTH - 2] = '\0';
     ASSERT_EQ(tidesdb_create_column_family(db, max_name, &cf_config), 0);
 
     tidesdb_close(db);

@@ -4823,22 +4823,6 @@ static int sstable_binary_search_block(tidesdb_sstable_t *sst, tidesdb_column_fa
 }
 
 /*
- * key_has_prefix
- * checks if a key starts with a given prefix
- * @param key the key to check
- * @param key_size size of the key
- * @param prefix the prefix to match
- * @param prefix_size size of the prefix
- * @return 1 if key has prefix, 0 otherwise
- */
-static int key_has_prefix(const uint8_t *key, size_t key_size, const uint8_t *prefix,
-                          size_t prefix_size)
-{
-    if (!key || !prefix || key_size < prefix_size) return 0;
-    return memcmp(key, prefix, prefix_size) == 0;
-}
-
-/*
  * compare_keys_with_cf
  * compares two keys using the column family's comparator
  * @param cf column family

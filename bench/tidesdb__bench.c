@@ -16,26 +16,27 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "../src/compat.h"
 #include "../src/tidesdb.h"
-#include "../test/test_macros.h"
+#include "../test/test_utils.h"
 
 #define NUM_OPERATIONS 1000000
-#define KEY_SIZE       64
-#define VALUE_SIZE     156
+#define NUM_SEEK_OPS   1000
+#define KEY_SIZE       16
+#define VALUE_SIZE     100
 #define CF_NAME        "benchmark_cf"
 #define NUM_THREADS    2
 #define BENCH_DB_PATH  "benchmark_db"
 
-/* helper to clean benchmark directory */
-static inline void cleanup_benchmark_dir(void)
-{
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", BENCH_DB_PATH);
-    system(cmd);
-}
-
 /*
- * thread_data_t struct is used to pass data to the thread functions
+ * thread_data_t
+ * data structure for passing to threads
+ * @param tdb pointer to tidesdb instance
+ * @param keys array of keys
+ * @param values array of values
+ * @param key_sizes array of key sizes
+ * @param value_sizes array of value sizes
+ * @param start start index
  */
 typedef struct
 {
@@ -46,19 +47,17 @@ typedef struct
     size_t *value_sizes;
     int start;
     int end;
+    int thread_id;
 } thread_data_t;
 
 void generate_random_string(uint8_t *buffer, size_t size)
 {
     const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-
-    /*  we fill buffer with random characters from charset (leaving room for null terminator) */
     for (size_t i = 0; i < size - 1; i++)
     {
         buffer[i] = (uint8_t)charset[rand() % (int)(sizeof(charset) - 1)];
     }
 
-    /* ensure null termination */
     buffer[size - 1] = '\0';
 }
 
@@ -158,16 +157,129 @@ void *thread_delete(void *arg)
     return NULL;
 }
 
+void *thread_iter_forward(void *arg)
+{
+    thread_data_t *data = (thread_data_t *)arg;
+    int count = 0;
+
+    tidesdb_txn_t *txn = NULL;
+    if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
+    {
+        printf(BOLDRED "Failed to begin read transaction\n" RESET);
+        return NULL;
+    }
+
+    tidesdb_iter_t *iter = NULL;
+    if (tidesdb_iter_new(txn, CF_NAME, &iter) != 0)
+    {
+        printf(BOLDRED "Failed to create iterator\n" RESET);
+        tidesdb_txn_free(txn);
+        return NULL;
+    }
+
+    if (tidesdb_iter_seek_to_first(iter) == 0)
+    {
+        while (tidesdb_iter_valid(iter))
+        {
+            count++;
+            if (tidesdb_iter_next(iter) != 0) break;
+        }
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    return NULL;
+}
+
+void *thread_iter_backward(void *arg)
+{
+    thread_data_t *data = (thread_data_t *)arg;
+    int count = 0;
+
+    tidesdb_txn_t *txn = NULL;
+    if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
+    {
+        printf(BOLDRED "Failed to begin read transaction\n" RESET);
+        return NULL;
+    }
+
+    tidesdb_iter_t *iter = NULL;
+    if (tidesdb_iter_new(txn, CF_NAME, &iter) != 0)
+    {
+        printf(BOLDRED "Failed to create iterator\n" RESET);
+        tidesdb_txn_free(txn);
+        return NULL;
+    }
+
+    if (tidesdb_iter_seek_to_last(iter) == 0)
+    {
+        while (tidesdb_iter_valid(iter))
+        {
+            count++;
+            if (tidesdb_iter_prev(iter) != 0) break;
+        }
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    return NULL;
+}
+
+void *thread_iter_seek(void *arg)
+{
+    thread_data_t *data = (thread_data_t *)arg;
+
+    tidesdb_txn_t *txn = NULL;
+
+    if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
+    {
+        printf(BOLDRED "[Thread %d] Failed to begin transaction\n" RESET, data->thread_id);
+        return NULL;
+    }
+
+    tidesdb_iter_t *iter = NULL;
+
+    if (tidesdb_iter_new(txn, CF_NAME, &iter) != 0)
+    {
+        printf(BOLDRED "[Thread %d] Failed to create iterator\n" RESET, data->thread_id);
+        tidesdb_txn_free(txn);
+        return NULL;
+    }
+
+    /* seed random number generator with thread id for different sequences per thread */
+    srand(time(NULL) + data->thread_id);
+
+    int num_seeks = data->end - data->start;
+    for (int i = 0; i < num_seeks; i++)
+    {
+        /* random seek to an existing key */
+        int random_idx = data->start + (rand() % (data->end - data->start));
+        tidesdb_iter_seek(iter, data->keys[random_idx], data->key_sizes[random_idx]);
+        if (tidesdb_iter_valid(iter))
+        {
+            uint8_t *key = NULL, *value = NULL;
+            size_t key_size = 0, value_size = 0;
+            tidesdb_iter_key(iter, &key, &key_size);
+            tidesdb_iter_value(iter, &value, &value_size);
+        }
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    return NULL;
+}
+
 int main()
 {
-    cleanup_benchmark_dir();
+    remove_directory(BENCH_DB_PATH);
     tidesdb_t *tdb = NULL;
     double start_time, end_time;
 
-    /* we seed random number generator */
     srand((unsigned int)time(NULL));
 
-    /* we allocate arrays for keys and values */
     uint8_t **keys = malloc(NUM_OPERATIONS * sizeof(uint8_t *));
     if (keys == NULL)
     {
@@ -202,10 +314,8 @@ int main()
         return 1;
     }
 
-    /* we generate random keys and values */
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {
-        /* we allocate and generate key */
         keys[i] = malloc(KEY_SIZE);
         if (keys[i] == NULL)
         {
@@ -224,7 +334,6 @@ int main()
         generate_random_string(keys[i], KEY_SIZE);
         key_sizes[i] = KEY_SIZE - 1;
 
-        /* we allocate and generate value */
         values[i] = malloc(VALUE_SIZE);
         if (values[i] == NULL)
         {
@@ -245,7 +354,7 @@ int main()
         value_sizes[i] = VALUE_SIZE - 1;
     }
 
-    tidesdb_config_t config = {.db_path = "benchmark_db", .enable_debug_logging = 0};
+    tidesdb_config_t config = {.db_path = BENCH_DB_PATH, .enable_debug_logging = 0};
     if (tidesdb_open(&config, &tdb) != 0)
     {
         printf(BOLDRED "Failed to open database\n" RESET);
@@ -263,18 +372,18 @@ int main()
     }
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.memtable_flush_size = (1024 * 1024) * 64; /* 64MB */
-    cf_config.max_sstables_before_compaction = 512;
-    cf_config.compaction_threads = 4; /* Enable parallel compaction */
+    cf_config.memtable_flush_size = TDB_DEFAULT_MEMTABLE_FLUSH_SIZE;
+    cf_config.max_sstables_before_compaction = 128;
+    cf_config.compaction_threads = 4;
     cf_config.compressed = 1;
     cf_config.compress_algo = COMPRESS_LZ4;
     cf_config.enable_background_compaction = 1;
+    cf_config.sync_mode = TDB_SYNC_NONE;
 
     if (tidesdb_create_column_family(tdb, CF_NAME, &cf_config) != 0)
     {
         printf(BOLDRED "Failed to create column family\n" RESET);
 
-        /* we free allocated memory */
         for (int i = 0; i < NUM_OPERATIONS; i++)
         {
             free(keys[i]);
@@ -288,7 +397,6 @@ int main()
         return 1;
     }
 
-    /* setup thread data */
     pthread_t threads[NUM_THREADS];
     thread_data_t thread_data[NUM_THREADS];
 
@@ -354,6 +462,75 @@ int main()
     printf(BOLDGREEN "Delete: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, NUM_OPERATIONS,
            end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
+    printf(BOLDGREEN "\nRe-populating data for iterator benchmarks...\n" RESET);
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_create(&threads[i], NULL, thread_put, &thread_data[i]);
+    }
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_join(threads[i], NULL);
+    }
+
+    printf(BOLDGREEN "\nBenchmarking Forward Iterator (full scan)...\n" RESET);
+    start_time = get_time_ms();
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_create(&threads[i], NULL, thread_iter_forward, &thread_data[i]);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_join(threads[i], NULL);
+    }
+
+    end_time = get_time_ms();
+    printf(BOLDGREEN "Forward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET, NUM_THREADS,
+           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
+
+    printf(BOLDGREEN "\nBenchmarking Backward Iterator (full scan)...\n" RESET);
+    start_time = get_time_ms();
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_create(&threads[i], NULL, thread_iter_backward, &thread_data[i]);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_join(threads[i], NULL);
+    }
+
+    end_time = get_time_ms();
+    printf(BOLDGREEN "Backward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET, NUM_THREADS,
+           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
+
+    printf(BOLDGREEN "\nBenchmarking Iterator Seek operations...\n" RESET);
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        thread_data[i].start = i * (NUM_SEEK_OPS / NUM_THREADS);
+        thread_data[i].end = (i + 1) * (NUM_SEEK_OPS / NUM_THREADS);
+        thread_data[i].thread_id = i;
+    }
+
+    start_time = get_time_ms();
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_create(&threads[i], NULL, thread_iter_seek, &thread_data[i]);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        (void)pthread_join(threads[i], NULL);
+    }
+
+    end_time = get_time_ms();
+    printf(BOLDGREEN "Iterator Seek: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, NUM_SEEK_OPS,
+           end_time - start_time, (NUM_SEEK_OPS / (end_time - start_time)) * 1000);
+
     if (tidesdb_drop_column_family(tdb, CF_NAME) != 0)
     {
         printf(BOLDRED "Failed to drop column family\n" RESET);
@@ -361,7 +538,6 @@ int main()
 
     tidesdb_close(tdb);
 
-    /* we free allocated memory */
     for (int i = 0; i < NUM_OPERATIONS; i++)
     {
         free(keys[i]);
@@ -372,7 +548,7 @@ int main()
     free(key_sizes);
     free(value_sizes);
 
-    cleanup_benchmark_dir();
+    remove_directory(BENCH_DB_PATH);
 
     printf(MAGENTA "\nCleanup completed\n" RESET);
     return 0;

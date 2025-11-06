@@ -1814,9 +1814,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             continue;
         }
 
-        skip_list_comparator_fn cmp_fn = tidesdb_get_comparator(cf->comparator_name);
+        skip_list_comparator_fn recovered_cmp_fn = tidesdb_get_comparator(cf->comparator_name);
         if (skip_list_new_with_comparator(&recovered_mt->memtable, cf->config.max_level,
-                                          cf->config.probability, cmp_fn, NULL) == -1)
+                                          cf->config.probability, recovered_cmp_fn, NULL) == -1)
         {
             free(recovered_mt);
             continue;
@@ -2529,18 +2529,18 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
                     sst->max_key_size = k_size;
                 }
 
-                tidesdb_kv_pair_header_t header = {.version = TDB_KV_FORMAT_VERSION,
-                                                   .flags = deleted ? TDB_KV_FLAG_TOMBSTONE : 0,
-                                                   .key_size = (uint32_t)k_size,
-                                                   .value_size = (uint32_t)v_size,
-                                                   .ttl = (int64_t)ttl};
+                tidesdb_kv_pair_header_t kv_header = {.version = TDB_KV_FORMAT_VERSION,
+                                                      .flags = deleted ? TDB_KV_FLAG_TOMBSTONE : 0,
+                                                      .key_size = (uint32_t)k_size,
+                                                      .value_size = (uint32_t)v_size,
+                                                      .ttl = (int64_t)ttl};
 
                 size_t block_size = sizeof(tidesdb_kv_pair_header_t) + k_size + v_size;
                 uint8_t *block_data = malloc(block_size);
                 if (block_data)
                 {
                     uint8_t *ptr = block_data;
-                    memcpy(ptr, &header, sizeof(tidesdb_kv_pair_header_t));
+                    memcpy(ptr, &kv_header, sizeof(tidesdb_kv_pair_header_t));
                     ptr += sizeof(tidesdb_kv_pair_header_t);
                     memcpy(ptr, k, k_size);
                     ptr += k_size;

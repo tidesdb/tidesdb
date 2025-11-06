@@ -4720,6 +4720,120 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
 }
 
 /*
+ * sstable_binary_search_block
+ * performs binary search on SSTable blocks to find the block containing or after target key
+ * @param sst SSTable to search
+ * @param cf column family
+ * @param key target key
+ * @param key_size target key size
+ * @param block_index pointer to store the found block index
+ * @return 0 on success, -1 on failure
+ */
+static int sstable_binary_search_block(tidesdb_sstable_t *sst, tidesdb_column_family_t *cf,
+                                       const uint8_t *key, size_t key_size, int *block_index)
+{
+    if (!sst || !cf || !key || !block_index || sst->num_entries == 0) return -1;
+
+    int left = 0;
+    int right = sst->num_entries - 1;
+    int result = -1;
+
+    /* binary search for the first block >= target key */
+    while (left <= right)
+    {
+        int mid = left + (right - left) / 2;
+
+        /* read the block at mid position */
+        block_manager_cursor_t *cursor = NULL;
+        if (block_manager_cursor_init(&cursor, sst->block_manager) != 0) return -1;
+
+        /* navigate to block mid by going to first and calling next() mid times */
+        if (block_manager_cursor_goto_first(cursor) != 0)
+        {
+            block_manager_cursor_free(cursor);
+            return -1;
+        }
+
+        /* skip to block mid */
+        for (int i = 0; i < mid; i++)
+        {
+            if (block_manager_cursor_next(cursor) != 0)
+            {
+                block_manager_cursor_free(cursor);
+                return -1;
+            }
+        }
+
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        block_manager_cursor_free(cursor);
+
+        if (!block) return -1;
+
+        /* parse the block to get its key */
+        uint8_t *block_key = NULL;
+        size_t block_key_size = 0;
+        uint8_t *block_value = NULL;
+        size_t block_value_size = 0;
+        uint8_t deleted = 0;
+        time_t ttl = 0;
+
+        int parse_result = parse_block(block, cf, &block_key, &block_key_size, &block_value,
+                                       &block_value_size, &deleted, &ttl);
+        block_manager_block_free(block);
+
+        if (parse_result != 0)
+        {
+            if (block_key) free(block_key);
+            if (block_value) free(block_value);
+            return -1;
+        }
+
+        /* compare with target key */
+        tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
+        int cmp = 0;
+        if (active_mt && active_mt->memtable)
+        {
+            tidesdb_memtable_acquire(active_mt);
+            cmp = skip_list_compare_keys(active_mt->memtable, block_key, block_key_size, key,
+                                         key_size);
+            tidesdb_memtable_release(active_mt);
+        }
+        else
+        {
+            /* fallback to memcmp */
+            size_t min_size = block_key_size < key_size ? block_key_size : key_size;
+            cmp = memcmp(block_key, key, min_size);
+            if (cmp == 0)
+            {
+                if (block_key_size < key_size)
+                    cmp = -1;
+                else if (block_key_size > key_size)
+                    cmp = 1;
+            }
+        }
+
+        free(block_key);
+        free(block_value);
+
+        if (cmp < 0)
+        {
+            /* block key < target, search right half */
+            left = mid + 1;
+        }
+        else
+        {
+            /* block key >= target, this could be our answer */
+            result = mid;
+            right = mid - 1;
+        }
+    }
+
+    /* if result is still -1, target is greater than all keys, start from left */
+    *block_index = (result == -1) ? left : result;
+    return 0;
+}
+
+/*
  * compare_keys_with_cf
  * compares two keys using the column family's comparator
  * @param cf column family
@@ -5013,6 +5127,246 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
             else
             {
                 block_manager_cursor_goto_last(iter->sstable_cursors[i]);
+            }
+        }
+    }
+
+    return tidesdb_iter_prev(iter);
+}
+
+int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
+{
+    if (!iter || !key) return TDB_ERR_INVALID_ARGS;
+
+    iter->direction = 1;
+    iter->valid = 0;
+
+    /* free current key/value if they exist */
+    if (iter->current_key)
+    {
+        free(iter->current_key);
+        iter->current_key = NULL;
+    }
+    if (iter->current_value)
+    {
+        free(iter->current_value);
+        iter->current_value = NULL;
+    }
+
+    /* clear existing heap */
+    if (iter->heap)
+    {
+        for (int i = 0; i < iter->heap_size; i++)
+        {
+            if (iter->heap[i].key) free(iter->heap[i].key);
+            if (iter->heap[i].value) free(iter->heap[i].value);
+        }
+        iter->heap_size = 0;
+    }
+
+    /* position memtable cursor at or after target key */
+    if (iter->memtable_cursor)
+    {
+        skip_list_cursor_seek(iter->memtable_cursor, key, key_size);
+    }
+
+    /* position immutable memtable cursors at or after target key */
+    for (int i = 0; i < iter->num_immutable_cursors; i++)
+    {
+        if (iter->immutable_memtable_cursors[i])
+        {
+            skip_list_cursor_seek(iter->immutable_memtable_cursors[i], key, key_size);
+        }
+    }
+
+    /* position sstable cursors using min/max key optimization */
+    for (int i = 0; i < iter->num_sstable_cursors; i++)
+    {
+        if (iter->sstable_cursors[i] && iter->sstables[i])
+        {
+            tidesdb_sstable_t *sst = iter->sstables[i];
+
+            /* check if target key is within this sstable's range */
+            if (sst->min_key && sst->max_key)
+            {
+                int cmp_min =
+                    compare_keys_with_cf(iter->cf, key, key_size, sst->min_key, sst->min_key_size);
+                int cmp_max =
+                    compare_keys_with_cf(iter->cf, key, key_size, sst->max_key, sst->max_key_size);
+
+                /* if key < min_key, start from beginning */
+                if (cmp_min < 0)
+                {
+                    iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
+                    iter->sstable_cursors[i]->current_block_size = 0;
+                    iter->sstable_blocks_read[i] = 0;
+                }
+                /* if key > max_key, skip this sstable entirely */
+                else if (cmp_max > 0)
+                {
+                    /* position past the end */
+                    iter->sstable_blocks_read[i] = sst->num_entries;
+                }
+                /* key is within range, use binary search to find starting block */
+                else
+                {
+                    int block_idx = 0;
+                    if (sstable_binary_search_block(sst, iter->cf, key, key_size, &block_idx) == 0)
+                    {
+                        /* position cursor at the found block */
+                        if (block_manager_cursor_goto_first(iter->sstable_cursors[i]) == 0)
+                        {
+                            /* skip to block_idx, 1 so refill's next() will read block_idx */
+                            int target_block = block_idx > 0 ? block_idx - 1 : 0;
+                            for (int j = 0; j < target_block; j++)
+                            {
+                                if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0)
+                                {
+                                    /* failed to navigate, fall back to start */
+                                    iter->sstable_cursors[i]->current_pos =
+                                        BLOCK_MANAGER_HEADER_SIZE;
+                                    iter->sstable_cursors[i]->current_block_size = 0;
+                                    iter->sstable_blocks_read[i] = 0;
+                                    break;
+                                }
+                            }
+                            /* cursor is now at target_block, set blocks_read to match */
+                            iter->sstable_blocks_read[i] = target_block;
+                        }
+                        else
+                        {
+                            /* goto_first failed, start from beginning */
+                            iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
+                            iter->sstable_cursors[i]->current_block_size = 0;
+                            iter->sstable_blocks_read[i] = 0;
+                        }
+                    }
+                    else
+                    {
+                        /* binary search failed, fall back to linear scan */
+                        iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
+                        iter->sstable_cursors[i]->current_block_size = 0;
+                        iter->sstable_blocks_read[i] = 0;
+                    }
+                }
+            }
+            else
+            {
+                /* no min/max key info, start from beginning */
+                iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
+                iter->sstable_cursors[i]->current_block_size = 0;
+                iter->sstable_blocks_read[i] = 0;
+            }
+        }
+    }
+
+    /* populate heap with first entry >= key from each source */
+    iter_refill_from_memtable(iter);
+    for (int i = 0; i < iter->num_immutable_cursors; i++)
+    {
+        iter_refill_from_immutable(iter, i);
+    }
+    for (int i = 0; i < iter->num_sstable_cursors; i++)
+    {
+        iter_refill_from_sstable(iter, i);
+    }
+
+    /* get first entry (heap is already populated) */
+    return tidesdb_iter_next(iter);
+}
+
+int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
+{
+    if (!iter || !key) return TDB_ERR_INVALID_ARGS;
+
+    iter->direction = -1;
+    iter->valid = 0;
+
+    /* free current key/value if they exist */
+    if (iter->current_key)
+    {
+        free(iter->current_key);
+        iter->current_key = NULL;
+    }
+    if (iter->current_value)
+    {
+        free(iter->current_value);
+        iter->current_value = NULL;
+    }
+
+    /* clear existing heap */
+    if (iter->heap)
+    {
+        for (int i = 0; i < iter->heap_size; i++)
+        {
+            if (iter->heap[i].key) free(iter->heap[i].key);
+            if (iter->heap[i].value) free(iter->heap[i].value);
+        }
+        iter->heap_size = 0;
+    }
+
+    /* position memtable cursor at or before target key */
+    if (iter->memtable_cursor)
+    {
+        skip_list_cursor_seek_for_prev(iter->memtable_cursor, key, key_size);
+    }
+
+    /* position immutable memtable cursors at or before target key */
+    for (int i = 0; i < iter->num_immutable_cursors; i++)
+    {
+        if (iter->immutable_memtable_cursors[i])
+        {
+            skip_list_cursor_seek_for_prev(iter->immutable_memtable_cursors[i], key, key_size);
+        }
+    }
+
+    /* position sstable cursors using min/max key optimization */
+    for (int i = 0; i < iter->num_sstable_cursors; i++)
+    {
+        if (iter->sstable_cursors[i] && iter->sstables[i])
+        {
+            tidesdb_sstable_t *sst = iter->sstables[i];
+
+            /* check if target key is within this sstable's range */
+            if (sst->min_key && sst->max_key)
+            {
+                int cmp_min =
+                    compare_keys_with_cf(iter->cf, key, key_size, sst->min_key, sst->min_key_size);
+                int cmp_max =
+                    compare_keys_with_cf(iter->cf, key, key_size, sst->max_key, sst->max_key_size);
+
+                /* if key < min_key, skip this sstable entirely */
+                if (cmp_min < 0)
+                {
+                    /* position before the start */
+                    iter->sstable_blocks_read[i] = 0;
+                    iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
+                    iter->sstable_cursors[i]->current_block_size = 0;
+                }
+                /* if key > max_key, start from end */
+                else if (cmp_max > 0)
+                {
+                    block_manager_cursor_goto(iter->sstable_cursors[i],
+                                              (uint64_t)(sst->num_entries));
+                    iter->sstable_blocks_read[i] = sst->num_entries;
+                }
+                /* key is within range, start from end and scan backward (could optimize) */
+                else
+                {
+                    block_manager_cursor_goto(iter->sstable_cursors[i],
+                                              (uint64_t)(sst->num_entries));
+                    iter->sstable_blocks_read[i] = sst->num_entries;
+                }
+            }
+            else
+            {
+                /* no min/max key info, start from end */
+                if (sst->num_entries > 0)
+                {
+                    block_manager_cursor_goto(iter->sstable_cursors[i],
+                                              (uint64_t)(sst->num_entries));
+                    iter->sstable_blocks_read[i] = sst->num_entries;
+                }
             }
         }
     }

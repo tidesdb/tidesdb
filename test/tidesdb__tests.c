@@ -2991,6 +2991,418 @@ static int test_column_family_config_persistence(void)
     return 1;
 }
 
+static void test_iterator_seek(void)
+{
+    printf("Testing iterator seek functionality...");
+    fflush(stdout);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "seek_cf", &cf_config), 0);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    /* insert keys key_000, key_010, key_020, ..., key_100 */
+    for (int i = 0; i <= 100; i += 10)
+    {
+        char key[32];
+        char value[32];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "seek_cf", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  strlen(value), -1),
+                  0);
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* test seek to exact key */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(read_txn, "seek_cf", &iter), 0);
+
+    const char *seek_key = "key_050";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key, strlen(seek_key)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(key_size, strlen("key_050"));
+    ASSERT_EQ(memcmp(key, "key_050", key_size), 0);
+
+    /* test seek to non-existent key (should find next key) */
+    const char *seek_key2 = "key_055";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key2, strlen(seek_key2)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(key_size, strlen("key_060"));
+    ASSERT_EQ(memcmp(key, "key_060", key_size), 0);
+
+    /* test seek to key before all keys */
+    const char *seek_key3 = "key_";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key3, strlen(seek_key3)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(key_size, strlen("key_000"));
+    ASSERT_EQ(memcmp(key, "key_000", key_size), 0);
+
+    /* test seek to key after all keys */
+    const char *seek_key4 = "key_999";
+    tidesdb_iter_seek(iter, (uint8_t *)seek_key4, strlen(seek_key4));
+    ASSERT_FALSE(tidesdb_iter_valid(iter));
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(read_txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+
+    printf("OK\n");
+}
+
+static void test_iterator_seek_range(void)
+{
+    printf("Testing iterator seek with range queries...");
+    fflush(stdout);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "range_cf", &cf_config), 0);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    /* insert 100 keys */
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32];
+        char value[32];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "range_cf", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  strlen(value), -1),
+                  0);
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* test range query seek to key_025 and iterate to key_075 */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(read_txn, "range_cf", &iter), 0);
+
+    const char *start_key = "key_025";
+    const char *end_key = "key_075";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)start_key, strlen(start_key)), 0);
+
+    int count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+
+        /* check if we've passed the end key */
+        if (memcmp(key, end_key, strlen(end_key)) > 0) break;
+
+        count++;
+        if (tidesdb_iter_next(iter) != 0) break;
+    }
+
+    /* should have read keys from 025 to 075 inclusive (51 keys) */
+    ASSERT_EQ(count, 51);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(read_txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+
+    printf("OK\n");
+}
+
+static void test_iterator_seek_prefix(void)
+{
+    printf("Testing iterator seek with prefix scan...");
+    fflush(stdout);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "prefix_cf", &cf_config), 0);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    /* insert keys with different prefixes */
+    const char *prefixes[] = {"user:", "post:", "comment:"};
+    for (int p = 0; p < 3; p++)
+    {
+        for (int i = 0; i < 20; i++)
+        {
+            char key[64];
+            char value[64];
+            snprintf(key, sizeof(key), "%s%03d", prefixes[p], i);
+            snprintf(value, sizeof(value), "value_%s%03d", prefixes[p], i);
+            ASSERT_EQ(tidesdb_txn_put(txn, "prefix_cf", (uint8_t *)key, strlen(key),
+                                      (uint8_t *)value, strlen(value), -1),
+                      0);
+        }
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* test prefix scan for "post:" */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(read_txn, "prefix_cf", &iter), 0);
+
+    const char *prefix = "post:";
+    size_t prefix_len = strlen(prefix);
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)prefix, prefix_len), 0);
+
+    int count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+
+        /* check if key still has the prefix */
+        if (key_size < prefix_len || memcmp(key, prefix, prefix_len) != 0) break;
+
+        count++;
+        if (tidesdb_iter_next(iter) != 0) break;
+    }
+
+    /* should have found all 20 "post:" keys */
+    ASSERT_EQ(count, 20);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(read_txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+
+    printf("OK\n");
+}
+
+static void test_iterator_seek_large_sstable(void)
+{
+    printf("Testing iterator seek with binary search on large SSTable...");
+    fflush(stdout);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    cf_config.memtable_flush_size = 4096;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "large_cf", &cf_config), 0);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 1000; i++)
+    {
+        char key[32];
+        char value[32];
+        snprintf(key, sizeof(key), "key_%05d", i);
+        snprintf(value, sizeof(value), "value_%05d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "large_cf", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  strlen(value), -1),
+                  0);
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "large_cf");
+    ASSERT_TRUE(cf != NULL);
+    /* flush memtable to create sst */
+    tidesdb_flush_memtable(cf);
+
+    sleep(2);
+
+    /* test binary search by seeking to middle of sst */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(read_txn, "large_cf", &iter), 0);
+
+    const char *seek_key = "key_00500";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key, strlen(seek_key)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    printf("Found key: %.*s\n", (int)key_size, key);
+    ASSERT_EQ(memcmp(key, "key_00500", strlen("key_00500")), 0);
+
+    /* seek to key near end; binary search should skip most blocks */
+    const char *seek_key2 = "key_00950";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key2, strlen(seek_key2)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(memcmp(key, "key_00950", strlen("key_00950")), 0);
+
+    /* verify we can iterate from there */
+    int count = 0;
+    while (tidesdb_iter_valid(iter) && count < 50)
+    {
+        count++;
+        if (tidesdb_iter_next(iter) != 0) break;
+    }
+    ASSERT_EQ(count, 50); /* should read 50 keys from 950 to 999 */
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(read_txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+
+    printf("OK\n");
+}
+
+static void test_iterator_seek_multi_source(void)
+{
+    printf("Testing iterator seek across multiple sources...");
+    fflush(stdout);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    cf_config.memtable_flush_size = 2048;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "multi_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "multi_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* create data in multiple batches to generate multiple sstables */
+    for (int batch = 0; batch < 5; batch++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        /* insert 100 keys per batch */
+        for (int i = 0; i < 100; i++)
+        {
+            char key[32];
+            char value[32];
+            int key_num = batch * 100 + i;
+            snprintf(key, sizeof(key), "key_%05d", key_num);
+            snprintf(value, sizeof(value), "value_%05d", key_num);
+            ASSERT_EQ(tidesdb_txn_put(txn, "multi_cf", (uint8_t *)key, strlen(key),
+                                      (uint8_t *)value, strlen(value), -1),
+                      0);
+        }
+
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        /* flush to create sst */
+        tidesdb_flush_memtable(cf);
+    }
+
+    /* add more data to active memtable (not flushed) */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 20; i++)
+    {
+        char key[32];
+        char value[32];
+        snprintf(key, sizeof(key), "key_%05d", 500 + i);
+        snprintf(value, sizeof(value), "value_%05d", 500 + i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "multi_cf", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  strlen(value), -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* now we have 5 ssts (0-499) + active memtable (500-519) */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(read_txn, "multi_cf", &iter), 0);
+
+    /* test seek to key in first sst */
+    const char *seek_key1 = "key_00050";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key1, strlen(seek_key1)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(memcmp(key, "key_00050", strlen("key_00050")), 0);
+
+    /* test seek to key in middle sstable */
+    const char *seek_key2 = "key_00250";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key2, strlen(seek_key2)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(memcmp(key, "key_00250", strlen("key_00250")), 0);
+
+    /* test seek to key in last sstable */
+    const char *seek_key3 = "key_00450";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key3, strlen(seek_key3)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(memcmp(key, "key_00450", strlen("key_00450")), 0);
+
+    /* test seek to key in active memtable */
+    const char *seek_key4 = "key_00510";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key4, strlen(seek_key4)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(memcmp(key, "key_00510", strlen("key_00510")), 0);
+
+    /* test seek to non-existent key (should find next) */
+    /* key_001555 doesnt exist, should find key_00156 */
+    const char *seek_key5 = "key_001555";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key5, strlen(seek_key5)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(memcmp(key, "key_00156", strlen("key_00156")), 0);
+
+    /* test seek to beginning */
+    const char *seek_key6 = "key_00000";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key6, strlen(seek_key6)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(memcmp(key, "key_00000", strlen("key_00000")), 0);
+
+    /* test seek past end */
+    const char *seek_key7 = "key_99999";
+    tidesdb_iter_seek(iter, (uint8_t *)seek_key7, strlen(seek_key7));
+    /* iterator should be invalid when seeking past end */
+    ASSERT_FALSE(tidesdb_iter_valid(iter));
+
+    /* test range scan across sources */
+    const char *range_start = "key_00095";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)range_start, strlen(range_start)), 0);
+    int count = 0;
+    while (tidesdb_iter_valid(iter) && count < 10)
+    {
+        count++;
+        if (tidesdb_iter_next(iter) != 0) break;
+    }
+    ASSERT_EQ(count, 10); /* should read 10 keys (95-104) */
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(read_txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+
+    printf("OK\n");
+}
+
 static void test_memory_safety(void)
 {
     tidesdb_t *db = create_test_db();
@@ -3179,6 +3591,11 @@ int main(void)
     RUN_TEST(test_drop_column_family_cleanup, tests_passed);
     RUN_TEST(test_concurrent_compaction_with_reads, tests_passed);
     RUN_TEST(test_linear_scan_fallback, tests_passed);
+    RUN_TEST(test_iterator_seek, tests_passed);
+    RUN_TEST(test_iterator_seek_range, tests_passed);
+    RUN_TEST(test_iterator_seek_prefix, tests_passed);
+    RUN_TEST(test_iterator_seek_large_sstable, tests_passed);
+    RUN_TEST(test_iterator_seek_multi_source, tests_passed);
     RUN_TEST(test_memory_safety, tests_passed);
 
     printf("\n");

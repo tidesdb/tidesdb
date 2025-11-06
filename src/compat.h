@@ -387,7 +387,7 @@ static inline int fsync(int fd)
     return 0;
 }
 
-/* fdatasync for MSVC, same as fsync (Windows doesn't distinguish) */
+/* fdatasync for MSVC, same as fsync (windows doesn't distinguish) */
 static inline int fdatasync(int fd)
 {
     return fsync(fd);
@@ -640,9 +640,9 @@ static inline int fdatasync(int fd)
 #include <unistd.h>
 
 /* pread and pwrite are available natively on macOS via unistd.h */
-/* no additional implementation needed - using system pread/pwrite */
+/* no additional implementation needed using system pread/pwrite */
 
-/* fdatasync for macOS - use F_FULLFSYNC for proper data sync */
+/* fdatasync for macOS, use F_FULLFSYNC for proper data sync */
 static inline int fdatasync(int fd)
 {
 #ifdef F_FULLFSYNC
@@ -703,7 +703,7 @@ static inline int sem_post(sem_t *sem)
 #include <unistd.h>
 
 /* pread, pwrite, and fdatasync are available natively on POSIX systems via unistd.h */
-/* no additional implementation needed - using system pread/pwrite/fdatasync */
+/* no additional implementation needed using system pread/pwrite/fdatasync */
 
 typedef pthread_t thread_t;
 typedef pthread_mutex_t mutex_t;
@@ -743,7 +743,7 @@ static inline size_t get_available_memory(void)
     }
     return 0;
 #else
-    /* Linux and other POSIX systems */
+    /* linux and other POSIX systems */
     struct sysinfo si;
     if (sysinfo(&si) == 0)
     {

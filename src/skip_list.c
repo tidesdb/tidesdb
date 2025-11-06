@@ -991,114 +991,58 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
     return 0;
 }
 
-int skip_list_compact(skip_list_t *list)
+int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size)
 {
-    if (list == NULL) return -1;
+    if (cursor == NULL || cursor->list == NULL || key == NULL) return -1;
 
-    /* only writers can compact (blocks other writers) */
-    pthread_mutex_lock(&list->write_lock);
+    skip_list_t *list = cursor->list;
 
-    int removed_count = 0;
     skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
+    skip_list_node_t *x = header;
     int current_level = atomic_load_explicit(&list->level, memory_order_acquire);
 
-    /* collect all tombstone nodes first */
-    typedef struct tombstone_entry
+    for (int i = current_level - 1; i >= 0; i--)
     {
-        skip_list_node_t *node;
-        struct tombstone_entry *next;
-    } tombstone_entry;
-
-    tombstone_entry *tombstone_list = NULL;
-
-    skip_list_node_t *current = atomic_load_explicit(&header->forward[0], memory_order_acquire);
-    while (current != NULL)
-    {
-        if (current->deleted)
+        skip_list_node_t *next = atomic_load_explicit(&x->forward[i], memory_order_acquire);
+        while (next && skip_list_compare_keys(list, next->key, next->key_size, key, key_size) < 0)
         {
-            tombstone_entry *entry = (tombstone_entry *)malloc(sizeof(tombstone_entry));
-            if (entry != NULL)
-            {
-                entry->node = current;
-                entry->next = tombstone_list;
-                tombstone_list = entry;
-                removed_count++;
-            }
+            x = next;
+            next = atomic_load_explicit(&x->forward[i], memory_order_acquire);
         }
-        current = atomic_load_explicit(&current->forward[0], memory_order_acquire);
     }
 
-    /* now physically remove each tombstone */
-    while (tombstone_list != NULL)
+    skip_list_retain_node(x);
+    if (cursor->current) skip_list_release_node(cursor->current);
+
+    cursor->current = x;
+    return 0;
+}
+
+int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size)
+{
+    if (cursor == NULL || cursor->list == NULL || key == NULL) return -1;
+
+    skip_list_t *list = cursor->list;
+
+    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
+    skip_list_node_t *x = header;
+    int current_level = atomic_load_explicit(&list->level, memory_order_acquire);
+
+    for (int i = current_level - 1; i >= 0; i--)
     {
-        skip_list_node_t *tombstone = tombstone_list->node;
-        tombstone_entry *next_entry = tombstone_list->next;
-        free(tombstone_list);
-        tombstone_list = next_entry;
-
-        /* find update pointers for this tombstone */
-        skip_list_node_t **update =
-            (skip_list_node_t **)malloc((size_t)list->max_level * sizeof(skip_list_node_t *));
-        if (update == NULL) continue;
-
-        skip_list_node_t *x = header;
-        for (int i = current_level - 1; i >= 0; i--)
+        skip_list_node_t *next = atomic_load_explicit(&x->forward[i], memory_order_acquire);
+        while (next && skip_list_compare_keys(list, next->key, next->key_size, key, key_size) <= 0)
         {
-            skip_list_node_t *next = atomic_load_explicit(&x->forward[i], memory_order_acquire);
-            while (next && next != tombstone &&
-                   skip_list_compare_keys(list, next->key, next->key_size, tombstone->key,
-                                          tombstone->key_size) < 0)
-            {
-                x = next;
-                next = atomic_load_explicit(&x->forward[i], memory_order_acquire);
-            }
-            update[i] = x;
+            x = next;
+            next = atomic_load_explicit(&x->forward[i], memory_order_acquire);
         }
-
-        /* unlink tombstone at all levels */
-        for (int i = 0; i < current_level; i++)
-        {
-            skip_list_node_t *next =
-                atomic_load_explicit(&update[i]->forward[i], memory_order_acquire);
-            if (next == tombstone)
-            {
-                skip_list_node_t *tombstone_next =
-                    atomic_load_explicit(&tombstone->forward[i], memory_order_acquire);
-                atomic_store_explicit(&update[i]->forward[i], tombstone_next, memory_order_release);
-
-                if (tombstone_next != NULL)
-                {
-                    atomic_store_explicit(&BACKWARD_PTR(tombstone_next, i, list->max_level),
-                                          update[i], memory_order_release);
-                }
-            }
-        }
-
-        /* update tail if tombstone was the tail */
-        skip_list_node_t *tail = atomic_load_explicit(&list->tail, memory_order_acquire);
-        if (tail == tombstone)
-        {
-            skip_list_node_t *new_tail = atomic_load_explicit(
-                &BACKWARD_PTR(tombstone, 0, list->max_level), memory_order_acquire);
-            atomic_store_explicit(&list->tail, new_tail, memory_order_release);
-        }
-
-        /* release reference to tombstone */
-        skip_list_release_node(tombstone);
-
-        free(update);
     }
 
-    /* update level if necessary */
-    while (current_level > 1)
-    {
-        skip_list_node_t *next =
-            atomic_load_explicit(&header->forward[current_level - 1], memory_order_acquire);
-        if (next != NULL) break;
-        current_level--;
-    }
-    atomic_store_explicit(&list->level, current_level, memory_order_release);
+    if (x == header) return -1;
 
-    pthread_mutex_unlock(&list->write_lock);
-    return removed_count;
+    skip_list_retain_node(x);
+    if (cursor->current) skip_list_release_node(cursor->current);
+
+    cursor->current = x;
+    return 0;
 }

@@ -23,14 +23,26 @@
 
 #include "../external/xxhash.h"
 
-/* hash function for string keys using xxhash */
+/*
+ * lru_hash
+ * hash function for string keys using xxhash
+ * @param key the key to hash
+ * @param table_size the size of the hash table
+ * @return the hash value
+ */
 static size_t lru_hash(const char *key, size_t table_size)
 {
     XXH64_hash_t hash = XXH64(key, strlen(key), 0);
     return (size_t)(hash % table_size);
 }
 
-/* find entry in hash table */
+/*
+ * lru_find_entry
+ * find entry in hash table
+ * @param cache the cache to search in
+ * @param key the key to search for
+ * @return the entry if found, NULL otherwise
+ */
 static lru_entry_t *lru_find_entry(lru_cache_t *cache, const char *key)
 {
     size_t index = lru_hash(key, cache->table_size);
@@ -45,7 +57,12 @@ static lru_entry_t *lru_find_entry(lru_cache_t *cache, const char *key)
     return NULL;
 }
 
-/* move entry to head (most recently used) */
+/*
+ * lru_move_to_head
+ * move entry to head (most recently used)
+ * @param cache the cache to move the entry to
+ * @param entry the entry to move
+ */
 static void lru_move_to_head(lru_cache_t *cache, lru_entry_t *entry)
 {
     if (entry == cache->head) return;
@@ -64,7 +81,12 @@ static void lru_move_to_head(lru_cache_t *cache, lru_entry_t *entry)
     if (cache->tail == NULL) cache->tail = entry;
 }
 
-/* remove entry from hash table */
+/*
+ * lru_remove_from_table
+ * remove entry from hash table
+ * @param cache the cache to remove the entry from
+ * @param entry the entry to remove
+ */
 static void lru_remove_from_table(lru_cache_t *cache, lru_entry_t *entry)
 {
     size_t index = lru_hash(entry->key, cache->table_size);
@@ -86,7 +108,12 @@ static void lru_remove_from_table(lru_cache_t *cache, lru_entry_t *entry)
     }
 }
 
-/* add entry to hash table */
+/*
+ * lru_add_to_table
+ * add entry to hash table
+ * @param cache the cache to add the entry to
+ * @param entry the entry to add
+ */
 static void lru_add_to_table(lru_cache_t *cache, lru_entry_t *entry)
 {
     size_t index = lru_hash(entry->key, cache->table_size);
@@ -94,7 +121,11 @@ static void lru_add_to_table(lru_cache_t *cache, lru_entry_t *entry)
     cache->table[index] = entry;
 }
 
-/* evict least recently used entry */
+/*
+ * lru_evict_lru
+ * evict least recently used entry
+ * @param cache the cache to evict from
+ */
 static void lru_evict_lru(lru_cache_t *cache)
 {
     if (cache->tail == NULL) return;
@@ -121,7 +152,12 @@ static void lru_evict_lru(lru_cache_t *cache)
     cache->size--;
 }
 
-/* free an entry and call its eviction callback */
+/*
+ * lru_free_entry
+ * free an entry and call its eviction callback
+ * @param cache the cache to free the entry from
+ * @param entry the entry to free
+ */
 static void lru_free_entry(lru_cache_t *cache, lru_entry_t *entry)
 {
     if (entry->prev)

@@ -1986,7 +1986,7 @@ static void test_compaction_deduplication(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "dedup_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* create first SSTable with initial values */
+    /* create first sstable with initial values */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     for (int i = 0; i < 10; i++)
@@ -2005,7 +2005,7 @@ static void test_compaction_deduplication(void)
     /* wait for flush to complete */
     usleep(200000); /* 200ms */
 
-    /* create second SSTable with overlapping keys (keys 5-14) */
+    /* create second sstable with overlapping keys (keys 5-14) */
     tidesdb_txn_t *txn2 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
     for (int i = 5; i < 15; i++)
@@ -2035,12 +2035,12 @@ static void test_compaction_deduplication(void)
     int num_ssts_after = atomic_load(&cf->num_sstables);
     ASSERT_EQ(num_ssts_after, 1);
 
-    /* verify deduplication: keys 0-4 should have old values, keys 5-9 should have new values,
+    /* verify deduplication keys 0-4 should have old values, keys 5-9 should have new values,
      * keys 10-14 should have new values */
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
 
-    /* keys 0-4: should have old values (only in first SSTable) */
+    /* keys 0-4 should have old values (only in first SSTable) */
     for (int i = 0; i < 5; i++)
     {
         char key[32], expected_value[64];
@@ -2057,7 +2057,7 @@ static void test_compaction_deduplication(void)
         free(value);
     }
 
-    /* keys 5-9: should have NEW values (overlapping, newer SSTable wins) */
+    /* keys 5-9 should have NEW values (overlapping, newer SSTable wins) */
     for (int i = 5; i < 10; i++)
     {
         char key[32], expected_value[64];
@@ -2074,7 +2074,7 @@ static void test_compaction_deduplication(void)
         free(value);
     }
 
-    /* keys 10-14: should have new values (only in second SSTable) */
+    /* keys 10-14 should have new values (only in second SSTable) */
     for (int i = 10; i < 15; i++)
     {
         char key[32], expected_value[64];

@@ -2746,7 +2746,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         merged->index =
             binary_hash_array_new((size_t)sst1->num_entries + (size_t)sst2->num_entries);
 
-        /* merge entries from both sstables using cursors with proper key comparison */
+        /* merge entries from both sstables using cursors with key comparison */
         block_manager_cursor_t *cursor1 = NULL;
         block_manager_cursor_t *cursor2 = NULL;
         block_manager_cursor_init(&cursor1, sst1->block_manager);
@@ -3012,7 +3012,6 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
             }
         }
 
-        /* cleanup any remaining peek blocks and decompressed data */
         if (decompressed1) free(decompressed1);
         if (decompressed2) free(decompressed2);
         if (peek1) block_manager_block_free(peek1);

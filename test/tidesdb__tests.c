@@ -3037,6 +3037,141 @@ static int test_column_family_config_persistence(void)
     return 1;
 }
 
+/* test memory safety validation */
+static void test_memory_safety(void)
+{
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "memory_test", &cf_config), 0);
+
+    /* verify memory info was captured at startup */
+    ASSERT_TRUE(db->total_memory > 0 || db->total_memory == SIZE_MAX);
+    ASSERT_TRUE(db->available_memory > 0 || db->available_memory == SIZE_MAX);
+
+    /* test normal sized key/value should succeed */
+    tidesdb_txn_t *txn1 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
+
+    const char *normal_key = "normal_key";
+    const char *normal_value = "normal_value";
+    int result = tidesdb_txn_put(txn1, "memory_test", (uint8_t *)normal_key, strlen(normal_key),
+                                 (uint8_t *)normal_value, strlen(normal_value), -1);
+    ASSERT_EQ(result, 0);
+
+    ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
+    tidesdb_txn_free(txn1);
+
+    /* test extremely large key/value should fail with TDB_ERR_MEMORY_LIMIT */
+    /* only test if we successfully detected memory (not SIZE_MAX fallback) */
+    if (db->available_memory != SIZE_MAX && db->available_memory > 0)
+    {
+        tidesdb_txn_t *txn2 = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+
+        /* calculate a size that exceeds 10% of available memory */
+        size_t max_allowed = (size_t)(db->available_memory * 0.10);
+        /* account for overhead (50%) and header */
+        size_t excessive_size =
+            (max_allowed * 2) / 3; /* ensures total with overhead exceeds limit */
+
+        uint8_t *large_key = malloc(excessive_size);
+        uint8_t *large_value = malloc(excessive_size);
+        ASSERT_TRUE(large_key != NULL);
+        ASSERT_TRUE(large_value != NULL);
+
+        memset(large_key, 'K', excessive_size);
+        memset(large_value, 'V', excessive_size);
+
+        result = tidesdb_txn_put(txn2, "memory_test", large_key, excessive_size, large_value,
+                                 excessive_size, -1);
+
+        /* should fail with memory limit error */
+        ASSERT_EQ(result, TDB_ERR_MEMORY_LIMIT);
+
+        free(large_key);
+        free(large_value);
+        tidesdb_txn_free(txn2);
+    }
+
+    /* test verify normal operations still work after memory limit rejection */
+    tidesdb_txn_t *txn3 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn3), 0);
+
+    const char *key3 = "key_after_limit";
+    const char *value3 = "value_after_limit";
+    result = tidesdb_txn_put(txn3, "memory_test", (uint8_t *)key3, strlen(key3), (uint8_t *)value3,
+                             strlen(value3), -1);
+    ASSERT_EQ(result, 0);
+
+    ASSERT_EQ(tidesdb_txn_commit(txn3), 0);
+    tidesdb_txn_free(txn3);
+
+    /* test verify we can read the normal values we wrote */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, "memory_test", (uint8_t *)normal_key, strlen(normal_key),
+                              &value, &value_size),
+              0);
+    ASSERT_TRUE(value_size == strlen(normal_value));
+    ASSERT_TRUE(memcmp(value, normal_value, value_size) == 0);
+    free(value);
+
+    value = NULL;
+    value_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, "memory_test", (uint8_t *)key3, strlen(key3), &value,
+                              &value_size),
+              0);
+    ASSERT_TRUE(value_size == strlen(value3));
+    ASSERT_TRUE(memcmp(value, value3, value_size) == 0);
+    free(value);
+
+    tidesdb_txn_free(read_txn);
+
+    /* test test with moderately large but acceptable values */
+    tidesdb_txn_t *txn4 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn4), 0);
+
+    /* 1 MB key and value should be acceptable on most systems */
+    size_t moderate_size = 1024 * 1024; /* 1 MB */
+    uint8_t *moderate_key = malloc(moderate_size);
+    uint8_t *moderate_value = malloc(moderate_size);
+    ASSERT_TRUE(moderate_key != NULL);
+    ASSERT_TRUE(moderate_value != NULL);
+
+    memset(moderate_key, 'M', moderate_size);
+    memset(moderate_value, 'N', moderate_size);
+
+    result = tidesdb_txn_put(txn4, "memory_test", moderate_key, moderate_size, moderate_value,
+                             moderate_size, -1);
+
+    /* this should succeed unless we're on a very memory-constrained system */
+    if (db->available_memory != SIZE_MAX && db->available_memory > 100 * 1024 * 1024)
+    {
+        /* only assert success if we have > 100MB available */
+        ASSERT_EQ(result, 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn4), 0);
+    }
+    else
+    {
+        /* on constrained systems, either result is acceptable */
+        ASSERT_TRUE(result == 0 || result == TDB_ERR_MEMORY_LIMIT);
+        if (result == 0)
+        {
+            ASSERT_EQ(tidesdb_txn_commit(txn4), 0);
+        }
+    }
+
+    free(moderate_key);
+    free(moderate_value);
+    tidesdb_txn_free(txn4);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     printf("\n");
@@ -3091,6 +3226,7 @@ int main(void)
     RUN_TEST(test_drop_column_family_cleanup, tests_passed);
     RUN_TEST(test_concurrent_compaction_with_reads, tests_passed);
     RUN_TEST(test_linear_scan_fallback, tests_passed);
+    RUN_TEST(test_memory_safety, tests_passed);
 
     printf("\n");
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

@@ -231,6 +231,16 @@ static int peek_next_block_for_merge(block_manager_cursor_t *cursor, int *blocks
                                      uint8_t **decompressed_ptr, tidesdb_column_family_t *cf);
 
 /*
+ * tidesdb_validate_kv_size
+ * validates that key and value sizes are within memory limits
+ * @param db tidesdb instance
+ * @param key_size size of key
+ * @param value_size size of value
+ * @return 0 on success, TDB_ERR_MEMORY_LIMIT if sizes exceed limits
+ */
+static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t value_size);
+
+/*
  * thread_pool_task_t
  * @param type task type (flush or compaction)
  * @param cf column family
@@ -1093,6 +1103,50 @@ static int mkdir_p(const char *path)
     return 0;
 }
 
+/*
+ * tidesdb_validate_kv_size
+ * validates that key and value sizes are within memory limits
+ * @param db tidesdb instance
+ * @param key_size size of key
+ * @param value_size size of value
+ * @return 0 on success, TDB_ERR_MEMORY_LIMIT if sizes exceed limits
+ */
+static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t value_size)
+{
+    if (!db) return TDB_ERR_INVALID_ARGS;
+
+    /* calculate total size needed (key + value + header + overhead) */
+    size_t total_size = key_size + value_size + sizeof(tidesdb_kv_pair_header_t);
+
+    /* add estimated overhead for skip list node, bloom filter, index, etc. */
+    size_t estimated_overhead = total_size / 2; /* conservative 50% overhead estimate */
+    size_t total_with_overhead = total_size + estimated_overhead;
+
+    /* check against maximum allowed per operation (percentage of available memory) */
+    size_t max_allowed = (size_t)(db->available_memory * TDB_MAX_KEY_VALUE_MEMORY_PERCENT);
+
+    if (total_with_overhead > max_allowed)
+    {
+        TDB_DEBUG_LOG(
+            "Key/value size (%zu bytes) with overhead (%zu bytes total) exceeds memory limit "
+            "(%zu bytes, %.1f%% of %zu bytes available)",
+            total_size, total_with_overhead, max_allowed, TDB_MAX_KEY_VALUE_MEMORY_PERCENT * 100.0,
+            db->available_memory);
+        return TDB_ERR_MEMORY_LIMIT;
+    }
+
+    /* check if we have minimum required free memory */
+    size_t current_available = get_available_memory();
+    if (current_available > 0 && current_available < TDB_MIN_AVAILABLE_MEMORY)
+    {
+        TDB_DEBUG_LOG("Available memory (%zu bytes) below minimum threshold (%d bytes)",
+                      current_available, TDB_MIN_AVAILABLE_MEMORY);
+        return TDB_ERR_MEMORY_LIMIT;
+    }
+
+    return 0;
+}
+
 static void get_cf_path(const tidesdb_t *db, const char *cf_name, char *path)
 {
     (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", db->config.db_path,
@@ -1244,6 +1298,23 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->block_manager_cache = NULL;
     (*db)->flush_pool = NULL;
     (*db)->compaction_pool = NULL;
+
+    /* capture system memory at startup */
+    (*db)->total_memory = get_total_memory();
+    (*db)->available_memory = get_available_memory();
+
+    if ((*db)->total_memory > 0)
+    {
+        TDB_DEBUG_LOG("System memory: total=%zu MB, available=%zu MB",
+                      (*db)->total_memory / (1024 * 1024), (*db)->available_memory / (1024 * 1024));
+    }
+    else
+    {
+        TDB_DEBUG_LOG("Warning: Could not determine system memory, memory checks disabled");
+        /* set to large value to effectively disable checks if we can't determine memory */
+        (*db)->total_memory = SIZE_MAX;
+        (*db)->available_memory = SIZE_MAX;
+    }
 
     if (pthread_rwlock_init(&(*db)->db_lock, NULL) != 0)
     {
@@ -3147,6 +3218,30 @@ static int peek_next_block_for_merge(block_manager_cursor_t *cursor, int *blocks
 
     tidesdb_kv_pair_header_t header;
     memcpy(&header, data, sizeof(tidesdb_kv_pair_header_t));
+
+    /* validate key/value sizes to protect against corrupted data */
+    int validation_result = tidesdb_validate_kv_size(cf->db, header.key_size, header.value_size);
+    if (validation_result != 0)
+    {
+        TDB_DEBUG_LOG("Skipping corrupted block during compaction: key_size=%u, value_size=%u",
+                      header.key_size, header.value_size);
+        if (*decompressed_ptr) free(*decompressed_ptr);
+        block_manager_block_free(*peek_block);
+        *peek_block = NULL;
+        return 0;
+    }
+
+    /* verify we have enough data for the key */
+    if (data_size < sizeof(tidesdb_kv_pair_header_t) + header.key_size)
+    {
+        TDB_DEBUG_LOG("Block data size (%zu) insufficient for key size (%u)", data_size,
+                      header.key_size);
+        if (*decompressed_ptr) free(*decompressed_ptr);
+        block_manager_block_free(*peek_block);
+        *peek_block = NULL;
+        return 0;
+    }
+
     *peek_key = data + sizeof(tidesdb_kv_pair_header_t);
     *peek_key_size = header.key_size;
 
@@ -4298,6 +4393,13 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
     if (!txn || !cf_name || !key || !value) return TDB_ERR_INVALID_ARGS;
     if (txn->committed) return TDB_ERR_TXN_COMMITTED;
     if (txn->read_only) return TDB_ERR_READONLY;
+
+    /* validate key/value sizes against memory limits */
+    int validation_result = tidesdb_validate_kv_size(txn->db, key_size, value_size);
+    if (validation_result != 0)
+    {
+        return validation_result;
+    }
 
     if (txn->num_ops >= txn->op_capacity)
     {

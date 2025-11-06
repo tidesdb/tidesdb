@@ -66,6 +66,10 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_BLOOM_FILTER_FP_RATE           0.01
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
 
+/* memory safety thresholds */
+#define TDB_MAX_KEY_VALUE_MEMORY_PERCENT 0.10 /* max 10% of available memory per operation */
+#define TDB_MIN_AVAILABLE_MEMORY         (100 * 1024 * 1024) /* require at least 100MB free */
+
 #define TDB_WAL_EXT                       ".log"
 #define TDB_SSTABLE_EXT                   ".sst"
 #define TDB_COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"
@@ -134,6 +138,7 @@ typedef struct __attribute__((packed))
 #define TDB_ERR_CHECKSUM             -18
 #define TDB_ERR_KEY_DELETED          -19
 #define TDB_ERR_KEY_EXPIRED          -20
+#define TDB_ERR_MEMORY_LIMIT         -21
 
 typedef struct tidesdb_t tidesdb_t;
 typedef struct tidesdb_column_family_t tidesdb_column_family_t;
@@ -310,6 +315,8 @@ struct tidesdb_t
     lru_cache_t *block_manager_cache;
     tidesdb_thread_pool_t *flush_pool;
     tidesdb_thread_pool_t *compaction_pool;
+    size_t total_memory;     /* total system memory at startup */
+    size_t available_memory; /* available memory at startup */
 };
 
 /*

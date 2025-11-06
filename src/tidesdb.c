@@ -2746,7 +2746,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         merged->index =
             binary_hash_array_new((size_t)sst1->num_entries + (size_t)sst2->num_entries);
 
-        /* merge entries from both sstables using cursors */
+        /* merge entries from both sstables using cursors with proper key comparison */
         block_manager_cursor_t *cursor1 = NULL;
         block_manager_cursor_t *cursor2 = NULL;
         block_manager_cursor_init(&cursor1, sst1->block_manager);
@@ -2755,44 +2755,143 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         if (cursor1) block_manager_cursor_goto_first(cursor1);
         if (cursor2) block_manager_cursor_goto_first(cursor2);
 
-        int has1 = cursor1 ? block_manager_cursor_has_next(cursor1) : 0;
-        int has2 = cursor2 ? block_manager_cursor_has_next(cursor2) : 0;
-
         /* track blocks read to avoid reading metadata blocks */
         int blocks_read1 = 0;
         int blocks_read2 = 0;
 
+        /* peek buffers for key comparison */
+        block_manager_block_t *peek1 = NULL;
+        block_manager_block_t *peek2 = NULL;
+        uint8_t *key1 = NULL, *key2 = NULL;
+        size_t key1_size = 0, key2_size = 0;
+
+        /* helper to read and extract key from next block */
+        uint8_t *decompressed1 = NULL; /* track decompressed data for cleanup */
+        uint8_t *decompressed2 = NULL;
+        auto int peek_next_block(block_manager_cursor_t * cursor, int *blocks_read, int max_blocks,
+                                 block_manager_block_t **peek_block, uint8_t **peek_key,
+                                 size_t *peek_key_size, uint8_t **decompressed_ptr)
+        {
+            if (*blocks_read >= max_blocks) return 0;
+            if (!block_manager_cursor_has_next(cursor)) return 0;
+
+            *peek_block = block_manager_cursor_read(cursor);
+            if (!*peek_block || !(*peek_block)->data) return 0;
+
+            uint8_t *data = (*peek_block)->data;
+            size_t data_size = (*peek_block)->size;
+
+            /* decompress if needed for key extraction */
+            if (cf->config.compressed)
+            {
+                size_t decompressed_size = 0;
+                uint8_t *decompressed =
+                    decompress_data(data, data_size, &decompressed_size, cf->config.compress_algo);
+                if (decompressed)
+                {
+                    data = decompressed;
+                    data_size = decompressed_size;
+                    *decompressed_ptr = decompressed; /* track for cleanup */
+                }
+                else
+                {
+                    *decompressed_ptr = NULL;
+                }
+            }
+            else
+            {
+                *decompressed_ptr = NULL;
+            }
+
+            if (data_size < sizeof(tidesdb_kv_pair_header_t))
+            {
+                if (*decompressed_ptr) free(*decompressed_ptr);
+                block_manager_block_free(*peek_block);
+                *peek_block = NULL;
+                return 0;
+            }
+
+            tidesdb_kv_pair_header_t header;
+            memcpy(&header, data, sizeof(tidesdb_kv_pair_header_t));
+            *peek_key = data + sizeof(tidesdb_kv_pair_header_t);
+            *peek_key_size = header.key_size;
+
+            block_manager_cursor_next(cursor);
+            (*blocks_read)++;
+            return 1;
+        };
+
+        /* initial peek from both cursors */
+        int has1 = peek_next_block(cursor1, &blocks_read1, sst1->num_entries, &peek1, &key1,
+                                   &key1_size, &decompressed1);
+        int has2 = peek_next_block(cursor2, &blocks_read2, sst2->num_entries, &peek2, &key2,
+                                   &key2_size, &decompressed2);
+
+        skip_list_comparator_fn comparator = tidesdb_get_comparator(cf->comparator_name);
+
         while (has1 || has2)
         {
             block_manager_block_t *block = NULL;
-            /* use cursor1 unless only cursor2 has data */
-            int use1 = !(has2 && !has1);
+            int use1 = 0;
 
-            if (use1 && has1)
+            if (has1 && has2)
             {
-                /* check if we've read all KV blocks from sst1 */
-                if (blocks_read1 >= sst1->num_entries)
+                /* compare keys to decide which to use */
+                int cmp = comparator(key1, key1_size, key2, key2_size, NULL);
+                if (cmp < 0)
                 {
-                    has1 = 0;
-                    continue;
+                    /* key1 < key2, use sst1 */
+                    use1 = 1;
                 }
-                block = block_manager_cursor_read(cursor1);
-                blocks_read1++;
-                block_manager_cursor_next(cursor1);
-                has1 = block_manager_cursor_has_next(cursor1) && (blocks_read1 < sst1->num_entries);
+                else if (cmp > 0)
+                {
+                    /* key1 > key2, use sst2 */
+                    use1 = 0;
+                }
+                else
+                {
+                    /* keys are equal, prefer sst2 (newer), skip sst1 */
+                    if (decompressed1) free(decompressed1);
+                    block_manager_block_free(peek1);
+                    peek1 = NULL;
+                    decompressed1 = NULL;
+                    has1 = peek_next_block(cursor1, &blocks_read1, sst1->num_entries, &peek1, &key1,
+                                           &key1_size, &decompressed1);
+                    use1 = 0; /* use sst2 */
+                }
             }
-            else if (has2)
+            else if (has1)
             {
-                /* check if we've read all KV blocks from sst2 */
-                if (blocks_read2 >= sst2->num_entries)
+                use1 = 1;
+            }
+            else
+            {
+                use1 = 0;
+            }
+
+            if (use1)
+            {
+                block = peek1;
+                peek1 = NULL;
+                if (decompressed1)
                 {
-                    has2 = 0;
-                    continue;
+                    free(decompressed1);
+                    decompressed1 = NULL;
                 }
-                block = block_manager_cursor_read(cursor2);
-                blocks_read2++;
-                block_manager_cursor_next(cursor2);
-                has2 = block_manager_cursor_has_next(cursor2) && (blocks_read2 < sst2->num_entries);
+                has1 = peek_next_block(cursor1, &blocks_read1, sst1->num_entries, &peek1, &key1,
+                                       &key1_size, &decompressed1);
+            }
+            else
+            {
+                block = peek2;
+                peek2 = NULL;
+                if (decompressed2)
+                {
+                    free(decompressed2);
+                    decompressed2 = NULL;
+                }
+                has2 = peek_next_block(cursor2, &blocks_read2, sst2->num_entries, &peek2, &key2,
+                                       &key2_size, &decompressed2);
             }
 
             if (block && block->data)
@@ -2912,6 +3011,12 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
                 block_manager_block_free(block);
             }
         }
+
+        /* cleanup any remaining peek blocks and decompressed data */
+        if (decompressed1) free(decompressed1);
+        if (decompressed2) free(decompressed2);
+        if (peek1) block_manager_block_free(peek1);
+        if (peek2) block_manager_block_free(peek2);
 
         if (cursor1) block_manager_cursor_free(cursor1);
         if (cursor2) block_manager_cursor_free(cursor2);
@@ -3091,7 +3196,7 @@ static void *tidesdb_compaction_worker(void *arg)
                      sst1->num_entries + sst2->num_entries);
     merged->index = binary_hash_array_new((size_t)sst1->num_entries + (size_t)sst2->num_entries);
 
-    /* merge entries from both sstables */
+    /* merge entries from both sstables with proper key comparison */
     block_manager_cursor_t *cursor1 = NULL;
     block_manager_cursor_t *cursor2 = NULL;
     block_manager_cursor_init(&cursor1, sst1->block_manager);
@@ -3100,44 +3205,143 @@ static void *tidesdb_compaction_worker(void *arg)
     if (cursor1) block_manager_cursor_goto_first(cursor1);
     if (cursor2) block_manager_cursor_goto_first(cursor2);
 
-    int has1 = cursor1 ? block_manager_cursor_has_next(cursor1) : 0;
-    int has2 = cursor2 ? block_manager_cursor_has_next(cursor2) : 0;
-
     /* track blocks read to avoid reading metadata blocks */
     int blocks_read1 = 0;
     int blocks_read2 = 0;
 
+    /* peek buffers for key comparison */
+    block_manager_block_t *peek1 = NULL;
+    block_manager_block_t *peek2 = NULL;
+    uint8_t *key1 = NULL, *key2 = NULL;
+    size_t key1_size = 0, key2_size = 0;
+
+    /* helper to read and extract key from next block */
+    uint8_t *decompressed1 = NULL; /* track decompressed data for cleanup */
+    uint8_t *decompressed2 = NULL;
+    auto int peek_next_block(block_manager_cursor_t * cursor, int *blocks_read, int max_blocks,
+                             block_manager_block_t **peek_block, uint8_t **peek_key,
+                             size_t *peek_key_size, uint8_t **decompressed_ptr)
+    {
+        if (*blocks_read >= max_blocks) return 0;
+        if (!block_manager_cursor_has_next(cursor)) return 0;
+
+        *peek_block = block_manager_cursor_read(cursor);
+        if (!*peek_block || !(*peek_block)->data) return 0;
+
+        uint8_t *data = (*peek_block)->data;
+        size_t data_size = (*peek_block)->size;
+
+        /* decompress if needed for key extraction */
+        if (cf->config.compressed)
+        {
+            size_t decompressed_size = 0;
+            uint8_t *decompressed =
+                decompress_data(data, data_size, &decompressed_size, cf->config.compress_algo);
+            if (decompressed)
+            {
+                data = decompressed;
+                data_size = decompressed_size;
+                *decompressed_ptr = decompressed; /* track for cleanup */
+            }
+            else
+            {
+                *decompressed_ptr = NULL;
+            }
+        }
+        else
+        {
+            *decompressed_ptr = NULL;
+        }
+
+        if (data_size < sizeof(tidesdb_kv_pair_header_t))
+        {
+            if (*decompressed_ptr) free(*decompressed_ptr);
+            block_manager_block_free(*peek_block);
+            *peek_block = NULL;
+            return 0;
+        }
+
+        tidesdb_kv_pair_header_t header;
+        memcpy(&header, data, sizeof(tidesdb_kv_pair_header_t));
+        *peek_key = data + sizeof(tidesdb_kv_pair_header_t);
+        *peek_key_size = header.key_size;
+
+        block_manager_cursor_next(cursor);
+        (*blocks_read)++;
+        return 1;
+    };
+
+    /* initial peek from both cursors */
+    int has1 = peek_next_block(cursor1, &blocks_read1, sst1->num_entries, &peek1, &key1, &key1_size,
+                               &decompressed1);
+    int has2 = peek_next_block(cursor2, &blocks_read2, sst2->num_entries, &peek2, &key2, &key2_size,
+                               &decompressed2);
+
+    skip_list_comparator_fn comparator = tidesdb_get_comparator(cf->comparator_name);
+
     while (has1 || has2)
     {
         block_manager_block_t *block = NULL;
-        /* use cursor1 unless only cursor2 has data */
-        int use1 = !(has2 && !has1);
+        int use1 = 0;
 
-        if (use1 && has1)
+        if (has1 && has2)
         {
-            /* check if we've read all KV blocks from sst1 */
-            if (blocks_read1 >= sst1->num_entries)
+            /* compare keys to decide which to use */
+            int cmp = comparator(key1, key1_size, key2, key2_size, NULL);
+            if (cmp < 0)
             {
-                has1 = 0;
-                continue;
+                /* key1 < key2, use sst1 */
+                use1 = 1;
             }
-            block = block_manager_cursor_read(cursor1);
-            blocks_read1++;
-            block_manager_cursor_next(cursor1);
-            has1 = block_manager_cursor_has_next(cursor1) && (blocks_read1 < sst1->num_entries);
+            else if (cmp > 0)
+            {
+                /* key1 > key2, use sst2 */
+                use1 = 0;
+            }
+            else
+            {
+                /* keys are equal, prefer sst2 (newer), skip sst1 */
+                if (decompressed1) free(decompressed1);
+                block_manager_block_free(peek1);
+                peek1 = NULL;
+                decompressed1 = NULL;
+                has1 = peek_next_block(cursor1, &blocks_read1, sst1->num_entries, &peek1, &key1,
+                                       &key1_size, &decompressed1);
+                use1 = 0; /* use sst2 */
+            }
         }
-        else if (has2)
+        else if (has1)
         {
-            /* check if we've read all KV blocks from sst2 */
-            if (blocks_read2 >= sst2->num_entries)
+            use1 = 1;
+        }
+        else
+        {
+            use1 = 0;
+        }
+
+        if (use1)
+        {
+            block = peek1;
+            peek1 = NULL;
+            if (decompressed1)
             {
-                has2 = 0;
-                continue;
+                free(decompressed1);
+                decompressed1 = NULL;
             }
-            block = block_manager_cursor_read(cursor2);
-            blocks_read2++;
-            block_manager_cursor_next(cursor2);
-            has2 = block_manager_cursor_has_next(cursor2) && (blocks_read2 < sst2->num_entries);
+            has1 = peek_next_block(cursor1, &blocks_read1, sst1->num_entries, &peek1, &key1,
+                                   &key1_size, &decompressed1);
+        }
+        else
+        {
+            block = peek2;
+            peek2 = NULL;
+            if (decompressed2)
+            {
+                free(decompressed2);
+                decompressed2 = NULL;
+            }
+            has2 = peek_next_block(cursor2, &blocks_read2, sst2->num_entries, &peek2, &key2,
+                                   &key2_size, &decompressed2);
         }
 
         if (block && block->data)
@@ -3231,6 +3435,12 @@ static void *tidesdb_compaction_worker(void *arg)
             block_manager_block_free(block);
         }
     }
+
+    /* cleanup any remaining peek blocks and decompressed data */
+    if (decompressed1) free(decompressed1);
+    if (decompressed2) free(decompressed2);
+    if (peek1) block_manager_block_free(peek1);
+    if (peek2) block_manager_block_free(peek2);
 
     if (cursor1) block_manager_cursor_free(cursor1);
     if (cursor2) block_manager_cursor_free(cursor2);
@@ -3365,13 +3575,15 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
     tidesdb_sstable_t **merged_sstables =
         calloc((size_t)pairs_to_merge, sizeof(tidesdb_sstable_t *));
     int *errors = calloc((size_t)pairs_to_merge, sizeof(int));
+    int *thread_created = calloc((size_t)pairs_to_merge, sizeof(int)); /* track created threads */
 
-    if (!jobs || !threads || !merged_sstables || !errors)
+    if (!jobs || !threads || !merged_sstables || !errors || !thread_created)
     {
         free(jobs);
         free(threads);
         free(merged_sstables);
         free(errors);
+        free(thread_created);
         sem_destroy(&semaphore);
         pthread_rwlock_unlock(&cf->cf_lock);
         pthread_mutex_unlock(&cf->compaction_lock);
@@ -3394,15 +3606,23 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         {
             /* thread creation failed, mark as error and release semaphore */
             errors[p] = 1;
+            thread_created[p] = 0;
             sem_post(&semaphore);
             TDB_DEBUG_LOG("Failed to create compaction thread for pair %d", p);
+        }
+        else
+        {
+            thread_created[p] = 1;
         }
     }
 
     /* wait for all threads to complete */
     for (int p = 0; p < pairs_to_merge; p++)
     {
-        pthread_join(threads[p], NULL);
+        if (thread_created[p])
+        {
+            pthread_join(threads[p], NULL);
+        }
     }
 
     /* rebuild sstable array; must keep originals if merge failed */
@@ -3444,6 +3664,7 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
     free(threads);
     free(merged_sstables);
     free(errors);
+    free(thread_created);
     sem_destroy(&semaphore);
 
     pthread_rwlock_unlock(&cf->cf_lock);

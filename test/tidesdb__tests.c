@@ -1972,6 +1972,145 @@ static void test_parallel_compaction(void)
            found_count);
 }
 
+/* test compaction deduplication with overlapping keys */
+static void test_compaction_deduplication(void)
+{
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    cf_config.compaction_threads = 0; /* single-threaded for deterministic behavior */
+    ASSERT_EQ(tidesdb_create_column_family(db, "dedup_cf", &cf_config), 0);
+
+    printf("\n  [Compaction] Testing deduplication with overlapping keys... ");
+    fflush(stdout);
+
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "dedup_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* create first SSTable with initial values */
+    tidesdb_txn_t *txn1 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
+    for (int i = 0; i < 10; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(value, sizeof(value), "old_value_%d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn1, "dedup_cf", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  strlen(value), -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
+    tidesdb_txn_free(txn1);
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+
+    /* wait for flush to complete */
+    usleep(200000); /* 200ms */
+
+    /* create second SSTable with overlapping keys (keys 5-14) */
+    tidesdb_txn_t *txn2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+    for (int i = 5; i < 15; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(value, sizeof(value), "new_value_%d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn2, "dedup_cf", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  strlen(value), -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn2), 0);
+    tidesdb_txn_free(txn2);
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+
+    /* wait for flush to complete */
+    usleep(200000); /* 200ms */
+
+    /* verify we have 2 SSTables */
+    int num_ssts_before = atomic_load(&cf->num_sstables);
+    ASSERT_EQ(num_ssts_before, 2);
+
+    /* trigger compaction */
+    ASSERT_EQ(tidesdb_compact(cf), 0);
+
+    /* after compaction, should have 1 SSTable */
+    int num_ssts_after = atomic_load(&cf->num_sstables);
+    ASSERT_EQ(num_ssts_after, 1);
+
+    /* verify deduplication: keys 0-4 should have old values, keys 5-9 should have new values,
+     * keys 10-14 should have new values */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+
+    /* keys 0-4: should have old values (only in first SSTable) */
+    for (int i = 0; i < 5; i++)
+    {
+        char key[32], expected_value[64];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(expected_value, sizeof(expected_value), "old_value_%d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(read_txn, "dedup_cf", (uint8_t *)key, strlen(key), &value, &value_size),
+            0);
+        ASSERT_TRUE(value_size == strlen(expected_value));
+        ASSERT_TRUE(memcmp(value, expected_value, value_size) == 0);
+        free(value);
+    }
+
+    /* keys 5-9: should have NEW values (overlapping, newer SSTable wins) */
+    for (int i = 5; i < 10; i++)
+    {
+        char key[32], expected_value[64];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(expected_value, sizeof(expected_value), "new_value_%d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(read_txn, "dedup_cf", (uint8_t *)key, strlen(key), &value, &value_size),
+            0);
+        ASSERT_TRUE(value_size == strlen(expected_value));
+        ASSERT_TRUE(memcmp(value, expected_value, value_size) == 0);
+        free(value);
+    }
+
+    /* keys 10-14: should have new values (only in second SSTable) */
+    for (int i = 10; i < 15; i++)
+    {
+        char key[32], expected_value[64];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(expected_value, sizeof(expected_value), "new_value_%d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(read_txn, "dedup_cf", (uint8_t *)key, strlen(key), &value, &value_size),
+            0);
+        ASSERT_TRUE(value_size == strlen(expected_value));
+        ASSERT_TRUE(memcmp(value, expected_value, value_size) == 0);
+        free(value);
+    }
+
+    /* verify total unique keys is 15 (not 20) */
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(read_txn, "dedup_cf", &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    int count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        count++;
+        tidesdb_iter_next(iter);
+    }
+    ASSERT_EQ(count, 15); /* should be 15 unique keys, not 20 */
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(read_txn);
+    tidesdb_close(db);
+
+    printf("OK (verified deduplication: 20 entries -> 15 unique keys)\n");
+}
+
 /* maximum key size handling */
 static void test_max_key_size(void)
 {
@@ -2922,6 +3061,7 @@ int main(void)
     RUN_TEST(test_iterator_backward, tests_passed);
     RUN_TEST(test_database_reopen, tests_passed);
     RUN_TEST(test_large_values, tests_passed);
+    RUN_TEST(test_compaction_deduplication, tests_passed);
     RUN_TEST(test_concurrent_operations, tests_passed);
     RUN_TEST(test_error_handling, tests_passed);
     RUN_TEST(test_many_sstables, tests_passed);
@@ -2939,6 +3079,7 @@ int main(void)
     RUN_TEST(test_compaction_tombstones, tests_passed);
     RUN_TEST(test_iterator_expired_ttl, tests_passed);
     RUN_TEST(test_wal_uncommitted_recovery, tests_passed);
+    RUN_TEST(test_compaction_deduplication, tests_passed);
     RUN_TEST(test_parallel_compaction, tests_passed);
     RUN_TEST(test_max_key_size, tests_passed);
     RUN_TEST(test_true_concurrency, tests_passed);

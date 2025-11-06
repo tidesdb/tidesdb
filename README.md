@@ -10,24 +10,24 @@ It is not a full-featured database, but rather a library that can be used to bui
 [![Linux Build Status](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml/badge.svg)](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml)
 
 ## Features
-- [x] ACID transactions that are atomic, consistent, isolated (read committed), and durable. Transactions support multiple operations across column families. Writers are serialized per column family ensuring atomicity, while COW provides consistency for concurrent readers.
-- [x] Writers don't block readers. Readers never block other readers. Background operations will not affect active transactions.
-- [x] Isolated key-value stores. Each column family has its own configuration, memtables, sstables, and write ahead logs.
-- [x] Bidirectional iterators that allow you to iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and sstables. Reference counting prevents premature deletion during iteration.
-- [x] Durability through WAL (write ahead log). Automatic recovery on startup reconstructs memtables from WALs.
-- [x] Optional automatic background compaction when sstable count reaches configured max per column family. You can also trigger manual compactions through the API, parallelized or not.
-- [x] Optional bloom filters to reduce disk reads by checking key existence before reading sstables. Configurable false positive rate.
-- [x] Optional compression via Snappy, LZ4, or ZSTD for sstables and WAL entries. Configurable per column family.
-- [x] Optional TTL (time-to-live) for key-value pairs. Expired entries automatically skipped during reads.
-- [x] Optional custom comparators. You can register custom key comparison functions. Built-in comparators include memcmp, string, numeric.
-- [x] Two sync modes NONE (fastest), FULL (most durable, slowest).
-- [x] Per-column-family configuration includes memtable size, compaction settings, compression, bloom filters, sync mode, and more.
-- [x] Clean, easy-to-use C API. Returns 0 on success, -n on error.
-- [x] Cross-platform support for Linux, macOS, and Windows with platform abstraction layer.
-- [x] Optional use of sorted binary hash array (SBHA). Allows for fast sstable lookups. Direct key-to-block offset mapping without full sstable scans.
-- [x] Efficient deletion through tombstone markers. Removed during compactions.
-- [x] Configurable LRU cache for open file handles. Limits system resources while maintaining performance. Set `max_open_file_handles` to control cache size (0 = disabled).
-- [x] Storage engine thread pools for background flush and compaction with configurable thread counts.
+- ACID transactions that are atomic, consistent, isolated, and durable. Transactions support multiple operations across column families with read committed isolation. Writers are serialized per column family to ensure atomicity, while copy-on-write (COW) provides consistency for concurrent readers.
+- Writers don't block readers. Readers never block other readers. Background operations will not affect active transactions.
+- Isolated key-value stores. Each column family has its own configuration, memtables, sstables, and write ahead logs.
+- Bidirectional iterators that allow you to iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and sstables. Reference counting prevents premature deletion during iteration.
+- Durability through WAL (write ahead log). Automatic recovery on startup reconstructs memtables from WALs.
+- Optional automatic background compaction when sstable count reaches configured max per column family. You can also trigger manual compactions through the API, parallelized or not.
+- Optional bloom filters to reduce disk reads by checking key existence before reading sstables. Configurable false positive rate.
+- Optional compression via Snappy, LZ4, or ZSTD for sstables and WAL entries. Configurable per column family.
+- Optional TTL (time-to-live) for key-value pairs. Expired entries automatically skipped during reads.
+- Optional custom comparators. You can register custom key comparison functions. Built-in comparators include memcmp, string, numeric.
+- Two sync modes NONE (fastest), FULL (most durable, slowest).
+- Per-column-family configuration includes memtable size, compaction settings, compression, bloom filters, sync mode, and more.
+- Clean, easy-to-use C API. Returns 0 on success, -n on error.
+- Cross-platform support for Linux, macOS, and Windows with platform abstraction layer.
+- Optional use of sorted binary hash array (SBHA). Allows for fast sstable lookups. Direct key-to-block offset mapping without full sstable scans.
+- Efficient deletion through tombstone markers. Removed during compactions.
+- Configurable LRU cache for open file handles. Limits system resources while maintaining performance. Set `max_open_file_handles` to control cache size (0 = disabled).
+- Storage engine thread pools for background flush and compaction with configurable thread counts.
 
 ## Getting Started
 To learn more about TidesDB, check out [What is TidesDB?](https://tidesdb.com/getting-started/what-is-tidesdb/).

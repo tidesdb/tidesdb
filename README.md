@@ -25,9 +25,10 @@ It is not a full-featured database, but rather a library that can be used to bui
 - [x] Clean, easy-to-use C API. Returns 0 on success, -n on error.
 - [x] Cross-platform support for Linux, macOS, and Windows with platform abstraction layer.
 - [x] Optional use of sorted binary hash array (SBHA). Allows for fast sstable lookups. Direct key-to-block offset mapping without full sstable scans.
-- [x] Efficient deletion through tombstone markers. Removed during compaction.
+- [x] Efficient deletion through tombstone markers. Removed during compactions.
 - [x] Configurable LRU cache for open file handles. Limits system resources while maintaining performance. Set `max_open_file_handles` to control cache size (0 = disabled).
 - [x] Storage engine thread pools for background flush and compaction with configurable thread counts.
+
 ## Getting Started
 To learn more about TidesDB, check out [What is TidesDB?](https://tidesdb.com/getting-started/what-is-tidesdb/).
 

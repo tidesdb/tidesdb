@@ -1,25 +1,8 @@
-## cmake build instructions unix
-# rm -rf build && cmake -S . -B build
-# cmake --build build
-# cmake --install build
-
-## cmake build instructions windows
-# rmdir /s /q build && cmake -S . -B build
-# cmake --build build
-# cmake --install build
-
-## or 
-# Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
-# cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
-# cmake --build build
-# Set-Location build
-# ctest --output-on-failure
-
 cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 1.0.0) # TidesDB v1.0.0
+set(PROJECT_VERSION 1.5.0)
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)

@@ -33,6 +33,15 @@
 #define PATH_SEPARATOR "/"
 #endif
 
+/* cross-platform atomic alignment */
+#if defined(_MSC_VER)
+#define ATOMIC_ALIGN(n) __declspec(align(n))
+#elif defined(__GNUC__) || defined(__clang__)
+#define ATOMIC_ALIGN(n) __attribute__((aligned(n)))
+#else
+#define ATOMIC_ALIGN(n)
+#endif
+
 /* cross-platform unused attribute for static functions */
 #if defined(__GNUC__) || defined(__clang__)
 #define UNUSED __attribute__((unused))

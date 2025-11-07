@@ -23,7 +23,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Two sync modes NONE (fastest), FULL (most durable, slowest).
 - Per-column-family configuration includes memtable size, compaction settings, compression, bloom filters, sync mode, and more.
 - Clean, easy-to-use C API. Returns 0 on success, -n on error.
-- Cross-platform support for Linux, macOS, and Windows with platform abstraction layer.
+- Cross-platform support for 64bit Linux, macOS, and Windows with platform abstraction layer.
 - Optional use of sorted binary hash array (SBHA). Allows for fast sstable lookups. Direct key-to-block offset mapping without full sstable scans.
 - Efficient deletion through tombstone markers. Removed during compactions.
 - Configurable LRU cache for open file handles. Limits system resources while maintaining performance. Set `max_open_file_handles` to control cache size (0 = disabled).

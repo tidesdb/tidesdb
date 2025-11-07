@@ -14,15 +14,33 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            name: Linux
+            name: Linux x64
+            arch: x64
+          - os: ubuntu-latest
+            name: Linux x86
+            arch: x86
           - os: macos-latest
-            name: macOS
+            name: macOS x64
+            arch: x64
+          - os: macos-latest
+            name: macOS x86
+            arch: x86
           - os: windows-latest
-            name: Windows MSVC
+            name: Windows MSVC x64
             compiler: msvc
+            arch: x64
           - os: windows-latest
-            name: Windows MinGW
+            name: Windows MSVC x86
+            compiler: msvc
+            arch: x86
+          - os: windows-latest
+            name: Windows MinGW x64
             compiler: mingw
+            arch: x64
+          - os: windows-latest
+            name: Windows MinGW x86
+            compiler: mingw
+            arch: x86
 
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
@@ -34,20 +52,30 @@ jobs:
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo dpkg --add-architecture i386
           sudo apt update
-          sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev libssl-dev
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev libssl-dev
+          else
+            sudo apt install -y libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 libssl-dev:i386
+          fi
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install zstd lz4 snappy openssl
+          # macOS supports building universal binaries, but true 32-bit may need extra flags
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
           git pull
-          .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows openssl:x64-windows pthreads:x64-windows
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows openssl:x64-windows pthreads:x64-windows
+          else
+            .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows openssl:x86-windows pthreads:x86-windows
+          fi
 
       - name: Install MinGW
         if: matrix.compiler == 'mingw'
@@ -56,16 +84,25 @@ jobs:
       - name: Configure CMake (Windows MSVC)
         if: matrix.compiler == 'msvc'
         run: |
-          cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -S . -B build -A ${{ matrix.arch }} -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Configure CMake (Windows MinGW)
         if: matrix.compiler == 'mingw'
         run: |
-          cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=gcc -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=gcc -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          else
+            cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=i686-w64-mingw32-gcc -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          fi
 
       - name: Configure CMake (Linux/macOS)
         if: runner.os != 'Windows'
-        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON
+        run: |
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON
+          else
+            cmake -S . -B build -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DTIDESDB_BUILD_TESTS=ON
+          fi
 
       - name: Build
         run: cmake --build build --config Release
@@ -74,4 +111,3 @@ jobs:
         run: |
           cd build
           ctest --output-on-failure --build-config Release
-

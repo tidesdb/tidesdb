@@ -36,14 +36,14 @@ jobs:
             name: Windows MSVC x86
             compiler: msvc
             arch: x86
-          # Windows MSYS2 (MinGW-w64)
+          # Windows MinGW
           - os: windows-latest
-            name: Windows MSYS2 MinGW x64
-            compiler: msys2
+            name: Windows MinGW x64
+            compiler: mingw
             arch: x64
           - os: windows-latest
-            name: Windows MSYS2 MinGW x86
-            compiler: msys2
+            name: Windows MinGW x86
+            compiler: mingw
             arch: x86
 
     runs-on: ${{ matrix.os }}
@@ -91,30 +91,32 @@ jobs:
           git pull
           .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows openssl:x86-windows pthreads:x86-windows
 
-      # MSYS2 setup for MinGW builds
-      - name: Setup MSYS2 (MinGW)
-        if: matrix.compiler == 'msys2'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: ${{ matrix.arch == 'x64' && 'MINGW64' || 'MINGW32' }}
-          update: true
-          install: >-
-            base-devel
-            mingw-w64-${{ matrix.arch == 'x64' && 'x86_64' || 'i686' }}-toolchain
-            mingw-w64-${{ matrix.arch == 'x64' && 'x86_64' || 'i686' }}-cmake
-            mingw-w64-${{ matrix.arch == 'x64' && 'x86_64' || 'i686' }}-openssl
-            mingw-w64-${{ matrix.arch == 'x64' && 'x86_64' || 'i686' }}-snappy
-            mingw-w64-${{ matrix.arch == 'x64' && 'x86_64' || 'i686' }}-lz4
-            mingw-w64-${{ matrix.arch == 'x64' && 'x86_64' || 'i686' }}-zstd
-            mingw-w64-${{ matrix.arch == 'x64' && 'x86_64' || 'i686' }}-pkg-config
+      - name: Install MinGW
+        if: matrix.compiler == 'mingw'
+        shell: pwsh
+        run: |
+          choco install mingw -y
+          # Find the MinGW installation directory
+          $mingwBase = "C:\ProgramData\chocolatey\lib\mingw\tools\install"
+          if ("${{ matrix.arch }}" -eq "x86") {
+              # Add mingw32/bin to PATH for 32-bit builds
+              $mingwBin = Join-Path $mingwBase "mingw32\bin"
+              echo "$mingwBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              echo "Added $mingwBin to PATH"
+          } else {
+              # Add mingw64/bin to PATH for 64-bit builds  
+              $mingwBin = Join-Path $mingwBase "mingw64\bin"
+              echo "$mingwBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              echo "Added $mingwBin to PATH"
+          }
 
-      # Configure CMake (Linux/macOS x64)
+      # Configure CMake for Linux/macOS x64
       - name: Configure CMake (Linux/macOS x64)
         if: runner.os != 'Windows' && matrix.arch == 'x64'
         shell: bash
         run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON
 
-      # Configure CMake (Linux/macOS x86)
+      # Configure CMake for Linux/macOS x86
       - name: Configure CMake (Linux/macOS x86)
         if: runner.os != 'Windows' && matrix.arch == 'x86'
         shell: bash
@@ -128,30 +130,47 @@ jobs:
             -DCMAKE_MODULE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
             -DTIDESDB_BUILD_TESTS=ON
 
-      # Configure CMake (Windows MSVC)
-      - name: Configure CMake (Windows MSVC)
-        if: matrix.compiler == 'msvc'
+      # Configure CMake (Windows MSVC x64)
+      - name: Configure CMake (Windows MSVC x64)
+        if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
         shell: pwsh
         run: |
-          $arch = if ("${{ matrix.arch }}" -eq "x64") { "x64" } else { "Win32" }
-          cmake -S . -B build -A $arch -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -S . -B build -A x64 -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
-      # Configure and build (MSYS2)
-      - name: Configure and Build (MSYS2 MinGW)
-        if: matrix.compiler == 'msys2'
-        shell: msys2 {0}
+      # Configure CMake (Windows MSVC x86)
+      - name: Configure CMake (Windows MSVC x86)
+        if: matrix.compiler == 'msvc' && matrix.arch == 'x86'
+        shell: pwsh
         run: |
-          cmake -S . -B build -G "MinGW Makefiles" -DTIDESDB_BUILD_TESTS=ON
-          cmake --build build --config Release
+          cmake -S . -B build -A Win32 -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
-      # Build (for non-MSYS2)
+      # Configure CMake (Windows MinGW)
+      - name: Configure CMake (Windows MinGW)
+        if: matrix.compiler == 'mingw'
+        shell: pwsh
+        run: |
+          $mingwBase = "C:\ProgramData\chocolatey\lib\mingw\tools\install"
+          if (${{ matrix.arch }} -eq "x86") {
+           $cc = Join-Path $mingwBase "mingw32\bin\i686-w64-mingw32-gcc.exe"
+           $cxx = Join-Path $mingwBase "mingw32\bin\i686-w64-mingw32-g++.exe"
+          } else {
+           $cc = Join-Path $mingwBase "mingw64\bin\x86_64-w64-mingw32-gcc.exe"
+           $cxx = Join-Path $mingwBase "mingw64\bin\x86_64-w64-mingw32-g++.exe"
+          }
+          
+          cmake -S . -B build -G "MinGW Makefiles" `
+          -DCMAKE_C_COMPILER=$cc `
+          -DCMAKE_CXX_COMPILER=$cxx `
+          -DTIDESDB_BUILD_TESTS=ON `
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          
+          
+          # Build
       - name: Build
-        if: matrix.compiler != 'msys2'
         run: cmake --build build --config Release
 
       # Run tests
       - name: Run tests
-        shell: bash
         run: |
           cd build
           ctest --output-on-failure --build-config Release

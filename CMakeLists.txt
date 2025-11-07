@@ -13,6 +13,12 @@ if(MINGW)
     add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)
 endif()
 
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    if(NOT CMAKE_C_COMPILER_VERSION VERSION_LESS 11.0)
+        add_compile_options(-Wno-psabi)
+    endif()
+endif()
+
 # for development, we want to enable all warnings and sanitizers
 if(TIDESDB_WITH_SANITIZER)
     if(MSVC)

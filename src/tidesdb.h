@@ -285,13 +285,6 @@ typedef struct
     pthread_mutex_t ref_lock;
 } tidesdb_memtable_t;
 
-/* suppress GCC 11.1+ atomic alignment ABI note on x86 linux */
-#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11 && defined(__linux__) && \
-    (defined(__i386__) || defined(__x86_64__))
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpsabi"
-#endif
-
 /*
  * tidesdb_column_family_t
  * represents a column family (logical keyspace)
@@ -328,11 +321,6 @@ struct tidesdb_column_family_t
     _Atomic(int) is_dropping;
     tidesdb_column_family_config_t config;
 };
-
-#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11 && defined(__linux__) && \
-    (defined(__i386__) || defined(__x86_64__))
-#pragma GCC diagnostic pop
-#endif
 
 /* forward declaration for thread pool */
 typedef struct tidesdb_thread_pool_t tidesdb_thread_pool_t;

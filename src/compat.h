@@ -34,11 +34,15 @@
 #endif
 
 #if defined(__MINGW32__) || defined(__MINGW64__)
-#define TDB_SIZE_FMT "%llu"
-#define TDB_U64_FMT  "%I64u"
+#define TDB_SIZE_FMT     "%llu"  /* size_t promoted to unsigned long long */
+#define TDB_U64_FMT      "%I64u" /* uint64_t */
+#define TDB_SIZE_CAST(x) ((unsigned long long)(x))
+#define TDB_U64_CAST(x)  ((unsigned long long)(x))
 #else
-#define TDB_SIZE_FMT "%zu"
-#define TDB_U64_FMT  "%llu"
+#define TDB_SIZE_FMT     "%zu" /* native size_t */
+#define TDB_U64_FMT      "%llu"
+#define TDB_SIZE_CAST(x) ((size_t)(x))
+#define TDB_U64_CAST(x)  ((unsigned long long)(x))
 #endif
 
 /* cross-platform atomic alignment */

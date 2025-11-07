@@ -2091,7 +2091,7 @@ static void test_max_key_size(void)
     }
 
     printf("OK (handled keys up to " TDB_SIZE_FMT " bytes)\n",
-           (unsigned long long)key_sizes[successful - 1]);
+           TDB_SIZE_CAST(key_sizes[successful - 1]));
 
     tidesdb_close(db);
     cleanup_test_dir();

@@ -1153,7 +1153,7 @@ static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t
     if (total_size > max_allowed)
     {
         TDB_DEBUG_LOG("Key/value size (" TDB_SIZE_FMT " bytes) exceeds memory limit " TDB_SIZE_FMT,
-                      (unsigned long long)total_size, (unsigned long long)max_allowed);
+                      TDB_SIZE_CAST(total_size), TDB_SIZE_CAST(max_allowed));
         return TDB_ERR_MEMORY_LIMIT;
     }
 
@@ -1179,7 +1179,7 @@ static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable
     get_cf_path(cf->db, cf->name, cf_path);
     (void)snprintf(path, TDB_MAX_PATH_LENGTH,
                    "%s" PATH_SEPARATOR TDB_SSTABLE_PREFIX TDB_U64_FMT "%s", cf_path,
-                   (unsigned long long)sstable_id, TDB_SSTABLE_EXT);
+                   TDB_U64_CAST(sstable_id), TDB_SSTABLE_EXT);
 }
 
 /*
@@ -1318,8 +1318,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     if ((*db)->total_memory > 0)
     {
         TDB_DEBUG_LOG("System memory: total=" TDB_SIZE_FMT " MB, available=" TDB_SIZE_FMT " MB",
-                      (unsigned long long)((*db)->total_memory / (1024 * 1024)),
-                      (unsigned long long)((*db)->available_memory / (1024 * 1024)));
+                      TDB_SIZE_CAST((*db)->total_memory / (1024 * 1024)),
+                      TDB_SIZE_CAST((*db)->available_memory / (1024 * 1024)));
     }
     else
     {
@@ -2822,7 +2822,7 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
 
     TDB_DEBUG_LOG("Updated configuration for column family: %s", cf->name);
     TDB_DEBUG_LOG("  memtable_flush_size: " TDB_SIZE_FMT,
-                  (unsigned long long)cf->config.memtable_flush_size);
+                  TDB_SIZE_CAST(cf->config.memtable_flush_size));
     TDB_DEBUG_LOG("  max_sstables_before_compaction: %d",
                   cf->config.max_sstables_before_compaction);
     TDB_DEBUG_LOG("  compaction_threads: %d", cf->config.compaction_threads);
@@ -3416,7 +3416,7 @@ static int peek_next_block_for_merge(block_manager_cursor_t *cursor, int *blocks
     if (data_size < sizeof(tidesdb_kv_pair_header_t) + header.key_size)
     {
         TDB_DEBUG_LOG("Block data size (" TDB_SIZE_FMT ") insufficient for key size (%u)",
-                      (unsigned long long)data_size, header.key_size);
+                      TDB_SIZE_CAST(data_size), header.key_size);
         if (*decompressed_ptr) free(*decompressed_ptr);
         block_manager_block_free(*peek_block);
         *peek_block = NULL;

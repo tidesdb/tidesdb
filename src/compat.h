@@ -19,13 +19,6 @@
 #ifndef __COMPAT_H__
 #define __COMPAT_H__
 
-/* enable mingw ANSI stdio to support C99 format specifiers like %llu, %zu */
-#if defined(__MINGW32__) || defined(__MINGW64__)
-#ifndef __USE_MINGW_ANSI_STDIO
-#define __USE_MINGW_ANSI_STDIO 1
-#endif
-#endif
-
 /* compat header for multi-platform support (Windows, POSIX, posix includes macOS) */
 #include <errno.h>
 #include <inttypes.h>
@@ -33,6 +26,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11 && defined(__linux__) && \
+(defined(__i386__) || defined(__x86_64__))
+#pragma GCC diagnostic ignored "-Wpsabi"
+#endif
 
 #ifdef _WIN32
 #define PATH_SEPARATOR "\\"
@@ -68,10 +66,6 @@
 #define UNUSED
 #endif
 
-#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11 && defined(__linux__) && \
-    (defined(__i386__) || defined(__x86_64__))
-#pragma GCC diagnostic ignored "-Wpsabi"
-#endif
 
 #ifdef _WIN32
 #include <direct.h>

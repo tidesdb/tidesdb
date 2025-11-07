@@ -9,6 +9,10 @@ option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 
+if(MINGW)
+    add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)
+endif()
+
 # for development, we want to enable all warnings and sanitizers
 if(TIDESDB_WITH_SANITIZER)
     if(MSVC)

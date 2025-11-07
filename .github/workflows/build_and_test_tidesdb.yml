@@ -143,7 +143,9 @@ jobs:
           if ("${{ matrix.arch }}" -eq "x86") {
               cd $env:VCPKG_INSTALLATION_ROOT
               .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows openssl:x86-windows pthreads:x86-windows
-          
+
+              cd $env:GITHUB_WORKSPACE
+
               Write-Host "Configuring for 32-bit MinGW build..."
               cmake -S . -B build -G "MinGW Makefiles" `
                 -DCMAKE_C_FLAGS="-m32" `
@@ -152,9 +154,12 @@ jobs:
                 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
                 -DVCPKG_TARGET_TRIPLET=x86-windows
           } else {
+
               cd $env:VCPKG_INSTALLATION_ROOT
               .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows openssl:x64-windows pthreads:x64-windows
-          
+
+              cd $env:GITHUB_WORKSPACE
+
               Write-Host "Configuring for 64-bit MinGW build..."
               cmake -S . -B build -G "MinGW Makefiles" `
                 -DTIDESDB_BUILD_TESTS=ON `

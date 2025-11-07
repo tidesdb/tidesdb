@@ -45,13 +45,14 @@
 /* debug logging macro */
 extern int _tidesdb_debug_enabled;
 #if defined(_MSC_VER)
-#define TDB_DEBUG_LOG(fmt, ...)                                                                   \
-    do                                                                                            \
-    {                                                                                             \
-        if (_tidesdb_debug_enabled)                                                               \
-        {                                                                                         \
-            fprintf(stderr, "[TidesDB DEBUG] %s:%d: " fmt "\n", __FILE__, __LINE__, __VA_ARGS__); \
-        }                                                                                         \
+#define TDB_DEBUG_LOG(fmt, ...)                                                     \
+    do                                                                              \
+    {                                                                               \
+        if (_tidesdb_debug_enabled)                                                 \
+        {                                                                           \
+            fprintf(stderr, "[TidesDB DEBUG] %s:%d: " fmt "\n", __FILE__, __LINE__, \
+                    ##__VA_ARGS__);                                                 \
+        }                                                                           \
     } while (0)
 #else
 #define TDB_DEBUG_LOG(fmt, ...)                                                     \

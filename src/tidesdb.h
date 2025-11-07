@@ -44,6 +44,16 @@
 
 /* debug logging macro */
 extern int _tidesdb_debug_enabled;
+#if defined(_MSC_VER)
+#define TDB_DEBUG_LOG(fmt, ...)                                                                   \
+    do                                                                                            \
+    {                                                                                             \
+        if (_tidesdb_debug_enabled)                                                               \
+        {                                                                                         \
+            fprintf(stderr, "[TidesDB DEBUG] %s:%d: " fmt "\n", __FILE__, __LINE__, __VA_ARGS__); \
+        }                                                                                         \
+    } while (0)
+#else
 #define TDB_DEBUG_LOG(fmt, ...)                                                     \
     do                                                                              \
     {                                                                               \
@@ -53,6 +63,7 @@ extern int _tidesdb_debug_enabled;
                     ##__VA_ARGS__);                                                 \
         }                                                                           \
     } while (0)
+#endif
 
 /* defaults */
 #define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE            (64 * 1024 * 1024)

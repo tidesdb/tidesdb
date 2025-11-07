@@ -1152,8 +1152,8 @@ static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t
 
     if (total_size > max_allowed)
     {
-        TDB_DEBUG_LOG("Key/value size (%zu bytes) exceeds memory limit %zu", total_size,
-                      max_allowed);
+        TDB_DEBUG_LOG("Key/value size (" TDB_SIZE_FMT " bytes) exceeds memory limit " TDB_SIZE_FMT,
+                      (unsigned long long)total_size, (unsigned long long)max_allowed);
         return TDB_ERR_MEMORY_LIMIT;
     }
 
@@ -1177,8 +1177,9 @@ static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable
 {
     char cf_path[TDB_MAX_PATH_LENGTH];
     get_cf_path(cf->db, cf->name, cf_path);
-    (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR TDB_SSTABLE_PREFIX "%llu%s",
-                   cf_path, (unsigned long long)sstable_id, TDB_SSTABLE_EXT);
+    (void)snprintf(path, TDB_MAX_PATH_LENGTH,
+                   "%s" PATH_SEPARATOR TDB_SSTABLE_PREFIX TDB_U64_FMT "%s", cf_path,
+                   (unsigned long long)sstable_id, TDB_SSTABLE_EXT);
 }
 
 /*
@@ -1316,8 +1317,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     if ((*db)->total_memory > 0)
     {
-        TDB_DEBUG_LOG("System memory: total=%zu MB, available=%zu MB",
-                      (*db)->total_memory / (1024 * 1024), (*db)->available_memory / (1024 * 1024));
+        TDB_DEBUG_LOG("System memory: total=" TDB_SIZE_FMT " MB, available=" TDB_SIZE_FMT " MB",
+                      (unsigned long long)((*db)->total_memory / (1024 * 1024)),
+                      (unsigned long long)((*db)->available_memory / (1024 * 1024)));
     }
     else
     {
@@ -2819,7 +2821,8 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
     }
 
     TDB_DEBUG_LOG("Updated configuration for column family: %s", cf->name);
-    TDB_DEBUG_LOG("  memtable_flush_size: %zu", cf->config.memtable_flush_size);
+    TDB_DEBUG_LOG("  memtable_flush_size: " TDB_SIZE_FMT,
+                  (unsigned long long)cf->config.memtable_flush_size);
     TDB_DEBUG_LOG("  max_sstables_before_compaction: %d",
                   cf->config.max_sstables_before_compaction);
     TDB_DEBUG_LOG("  compaction_threads: %d", cf->config.compaction_threads);
@@ -2913,7 +2916,8 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         get_sstable_path(cf, new_id, new_path);
         (void)snprintf(temp_path, TDB_MAX_PATH_LENGTH, "%s%s", new_path, TDB_TEMP_EXT);
 
-        TDB_DEBUG_LOG("Compacting sstables %llu and %llu into %llu (temp: %s)",
+        TDB_DEBUG_LOG("Compacting sstables " TDB_U64_FMT " and " TDB_U64_FMT " into " TDB_U64_FMT
+                      " (temp: %s)",
                       (unsigned long long)sst1->id, (unsigned long long)sst2->id,
                       (unsigned long long)new_id, temp_path);
 
@@ -3411,8 +3415,8 @@ static int peek_next_block_for_merge(block_manager_cursor_t *cursor, int *blocks
     /* verify we have enough data for the key */
     if (data_size < sizeof(tidesdb_kv_pair_header_t) + header.key_size)
     {
-        TDB_DEBUG_LOG("Block data size (%zu) insufficient for key size (%u)", data_size,
-                      header.key_size);
+        TDB_DEBUG_LOG("Block data size (" TDB_SIZE_FMT ") insufficient for key size (%u)",
+                      (unsigned long long)data_size, header.key_size);
         if (*decompressed_ptr) free(*decompressed_ptr);
         block_manager_block_free(*peek_block);
         *peek_block = NULL;
@@ -3485,9 +3489,9 @@ static void *tidesdb_compaction_worker(void *arg)
     get_sstable_path(cf, new_id, new_path);
     (void)snprintf(temp_path, TDB_MAX_PATH_LENGTH, "%s%s", new_path, TDB_TEMP_EXT);
 
-    TDB_DEBUG_LOG("[Thread] Compacting sstables %llu and %llu into %llu",
-                  (unsigned long long)sst1->id, (unsigned long long)sst2->id,
-                  (unsigned long long)new_id);
+    TDB_DEBUG_LOG(
+        "[Thread] Compacting sstables " TDB_U64_FMT " and " TDB_U64_FMT " into " TDB_U64_FMT,
+        (unsigned long long)sst1->id, (unsigned long long)sst2->id, (unsigned long long)new_id);
 
     tidesdb_sstable_t *merged = malloc(sizeof(tidesdb_sstable_t));
     if (!merged)

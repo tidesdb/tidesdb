@@ -33,6 +33,14 @@
 #define PATH_SEPARATOR "/"
 #endif
 
+#if defined(__MINGW32__) || defined(__MINGW64__)
+#define TDB_SIZE_FMT "%llu"
+#define TDB_U64_FMT  "%I64u"
+#else
+#define TDB_SIZE_FMT "%zu"
+#define TDB_U64_FMT  "%llu"
+#endif
+
 /* cross-platform atomic alignment */
 #if defined(_MSC_VER)
 #define ATOMIC_ALIGN(n) __declspec(align(n))

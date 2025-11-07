@@ -1075,19 +1075,24 @@ static int iter_refill_from_sstable_backward(tidesdb_iter_t *iter, int idx)
 static inline int tidesdb_memtable_release(tidesdb_memtable_t *mt)
 {
     if (!mt) return 0;
+
     int old_count = atomic_fetch_sub(&mt->ref_count, 1);
     int new_count = old_count - 1;
 
-    /* if ref_count reached 0, free the memtable */
-    if (new_count == 0)
+    if (old_count == 1)
     {
-        if (mt->memtable) skip_list_free(mt->memtable);
-        if (mt->wal) block_manager_close(mt->wal);
-        pthread_mutex_destroy(&mt->ref_lock);
-        free(mt);
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&mt->ref_count, &expected, -1))
+        {
+            if (mt->memtable) skip_list_free(mt->memtable);
+            if (mt->wal) block_manager_close(mt->wal);
+            pthread_mutex_destroy(&mt->ref_lock);
+            free(mt);
+            return 0;
+        }
     }
 
-    return new_count;
+    return new_count > 0 ? new_count : 0;
 }
 
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
@@ -1143,7 +1148,6 @@ static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t
     /* calculate total size needed (key + value + header + overhead) */
     size_t total_size = key_size + value_size + sizeof(tidesdb_kv_pair_header_t);
 
-    /* check against maximum allowed per operation (percentage of available memory) */
     size_t max_allowed = (size_t)(db->available_memory);
 
     if (total_size > max_allowed)

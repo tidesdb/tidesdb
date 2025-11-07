@@ -28,7 +28,7 @@
 #include <string.h>
 
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11 && defined(__linux__) && \
-(defined(__i386__) || defined(__x86_64__))
+    (defined(__i386__) || defined(__x86_64__))
 #pragma GCC diagnostic ignored "-Wpsabi"
 #endif
 
@@ -65,7 +65,6 @@
 #else
 #define UNUSED
 #endif
-
 
 #ifdef _WIN32
 #include <direct.h>

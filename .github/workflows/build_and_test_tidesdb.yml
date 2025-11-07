@@ -88,16 +88,16 @@ jobs:
         if: matrix.compiler == 'mingw'
         shell: pwsh
         run: |
-          choco install mingw --version=8.1.0 -y
-          $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
+          if ("${{ matrix.arch }}" -eq "x86") {
+              choco install mingw --version=8.1.0 --forcex86 -y
+              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
+          } else {
+              choco install mingw --version=8.1.0 -y
+              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
+          }
           echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           $env:PATH = "$mingwPath;$env:PATH"
           gcc --version
-
-      - name: Configure CMake (Linux/macOS x64)
-        if: runner.os != 'Windows' && matrix.arch == 'x64'
-        shell: bash
-        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON
 
       - name: Configure CMake (Linux/macOS x86)
         if: runner.os != 'Windows' && matrix.arch == 'x86'

@@ -27,11 +27,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11 && defined(__linux__) && \
-    (defined(__i386__) || defined(__x86_64__))
-#pragma GCC diagnostic ignored "-Wpsabi"
-#endif
-
 #ifdef _WIN32
 #define PATH_SEPARATOR "\\"
 #else

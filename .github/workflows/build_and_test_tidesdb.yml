@@ -99,6 +99,11 @@ jobs:
           $env:PATH = "$mingwPath;$env:PATH"
           gcc --version
 
+      - name: Configure CMake (Linux/macOS x64)
+        if: runner.os != 'Windows' && matrix.arch == 'x64'
+        shell: bash
+        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON
+
       - name: Configure CMake (Linux/macOS x86)
         if: runner.os != 'Windows' && matrix.arch == 'x86'
         shell: bash

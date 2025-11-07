@@ -1323,8 +1323,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->block_manager_cache = NULL;
     (*db)->flush_pool = NULL;
     (*db)->compaction_pool = NULL;
-
-    /* capture system memory at startup */
     (*db)->total_memory = get_total_memory();
     (*db)->available_memory = get_available_memory();
 
@@ -1422,16 +1420,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         while ((entry = readdir(dir)) != NULL)
         {
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-
-#ifdef _WIN32
-            char entry_path[TDB_MAX_PATH_LENGTH];
-            (void)snprintf(entry_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s",
-                           config->db_path, entry->d_name);
-            struct stat st;
-            if (stat(entry_path, &st) == 0 && S_ISDIR(st.st_mode))
-#else
-            if (entry->d_type == DT_DIR)
-#endif
             {
                 tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
                 if (tidesdb_create_column_family(*db, entry->d_name, &cf_config) == -1)

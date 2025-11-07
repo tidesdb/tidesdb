@@ -60,10 +60,10 @@ jobs:
           sudo dpkg --add-architecture i386
           sudo apt update
           if [ "${{ matrix.arch }}" = "x64" ]; then
-            sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev libssl-dev build-essential cmake
+            sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev libssl-dev build-essential cmake pkg-config
           else
             sudo apt install -y gcc-multilib g++-multilib libc6-dev-i386 \
-              libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 libssl-dev:i386 build-essential cmake
+              libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 libssl-dev:i386 build-essential cmake pkg-config
           fi
 
       # macOS dependencies
@@ -116,8 +116,14 @@ jobs:
           if [ "${{ matrix.arch }}" = "x64" ]; then
             cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON
           else
-            cmake -S . -B build -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DTIDESDB_BUILD_TESTS=ON
-          fi
+            export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
+            cmake -S . -B build \
+              -DCMAKE_C_FLAGS="-m32" \
+              -DCMAKE_CXX_FLAGS="-m32" \
+              -DCMAKE_EXE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+              -DCMAKE_SHARED_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+              -DCMAKE_MODULE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+              -DTIDESDB_BUILD_TESTS=ON
 
       # Build
       - name: Build

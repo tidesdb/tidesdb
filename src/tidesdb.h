@@ -54,8 +54,7 @@ extern int _tidesdb_debug_enabled;
         }                                                                           \
     } while (0)
 
-#define TDB_MAX_CF_NAME_LENGTH                     256
-#define TDB_MAX_PATH_LENGTH                        1024
+/* defaults */
 #define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_MAX_SSTABLES                   128
 #define TDB_DEFAULT_COMPACTION_THREADS             4
@@ -67,9 +66,17 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
 
 /* memory safety thresholds */
-#define TDB_MAX_KEY_VALUE_MEMORY_PERCENT 0.10 /* max 10% of available memory per operation */
-#define TDB_MIN_AVAILABLE_MEMORY         (100 * 1024 * 1024) /* require at least 100MB free */
+#define TDB_MAX_KEY_VALUE_MEMORY_PERCENT 0.05
+#define TDB_MIN_AVAILABLE_MEMORY         (1024 * 1024 * 1024)
 
+
+/* maximums */
+#define TDB_MAX_CF_NAME_LENGTH                     256
+#define TDB_MAX_PATH_LENGTH                        1024
+#define TDB_MAX_COMPARATOR_NAME 64
+#define TDB_MAX_COMPARATORS     32
+
+/* extensions, prefixes, and file names */
 #define TDB_WAL_EXT                       ".log"
 #define TDB_SSTABLE_EXT                   ".sst"
 #define TDB_COLUMN_FAMILY_CONFIG_FILE_EXT ".cfc"
@@ -77,7 +84,39 @@ extern int _tidesdb_debug_enabled;
 #define TDB_WAL_PREFIX                    "wal_"
 #define TDB_SSTABLE_PREFIX                "sstable_"
 #define TDB_CONFIG_FILE_NAME              "config"
+
+/* used for key value pair headers on disk */
 #define TDB_KV_FORMAT_VERSION             1
+
+/* flags for key-value pair header */
+#define TDB_KV_FLAG_TOMBSTONE 0x01
+
+/* error codes */
+#define TDB_SUCCESS                  0
+#define TDB_ERROR                    -1
+#define TDB_ERR_MEMORY               -2
+#define TDB_ERR_INVALID_ARGS         -3
+#define TDB_ERR_IO                   -4
+#define TDB_ERR_NOT_FOUND            -5
+#define TDB_ERR_EXISTS               -6
+#define TDB_ERR_CORRUPT              -7
+#define TDB_ERR_LOCK                 -8
+#define TDB_ERR_TXN_COMMITTED        -9
+#define TDB_ERR_TXN_ABORTED          -10
+#define TDB_ERR_READONLY             -11
+#define TDB_ERR_INVALID_NAME         -12
+#define TDB_ERR_COMPARATOR_NOT_FOUND -13
+#define TDB_ERR_MAX_COMPARATORS      -14
+#define TDB_ERR_INVALID_CF           -15
+#define TDB_ERR_THREAD               -16
+#define TDB_ERR_CHECKSUM             -17
+#define TDB_ERR_MEMORY_LIMIT         -18
+
+typedef struct tidesdb_t tidesdb_t;
+typedef struct tidesdb_column_family_t tidesdb_column_family_t;
+typedef struct tidesdb_sstable_t tidesdb_sstable_t;
+typedef struct tidesdb_txn_t tidesdb_txn_t;
+typedef struct tidesdb_iter_t tidesdb_iter_t;
 
 /*
  * tidesdb_kv_pair_header_t
@@ -130,38 +169,6 @@ typedef struct __attribute__((packed))
     int64_t ttl;
 } tidesdb_kv_pair_header_t;
 #endif
-
-#define TDB_KV_FLAG_TOMBSTONE 0x01
-
-#define TDB_MAX_COMPARATOR_NAME 64
-#define TDB_MAX_COMPARATORS     32
-
-/* error codes */
-#define TDB_SUCCESS                  0
-#define TDB_ERROR                    -1
-#define TDB_ERR_MEMORY               -2
-#define TDB_ERR_INVALID_ARGS         -3
-#define TDB_ERR_IO                   -4
-#define TDB_ERR_NOT_FOUND            -5
-#define TDB_ERR_EXISTS               -6
-#define TDB_ERR_CORRUPT              -7
-#define TDB_ERR_LOCK                 -8
-#define TDB_ERR_TXN_COMMITTED        -9
-#define TDB_ERR_TXN_ABORTED          -10
-#define TDB_ERR_READONLY             -11
-#define TDB_ERR_INVALID_NAME         -12
-#define TDB_ERR_COMPARATOR_NOT_FOUND -13
-#define TDB_ERR_MAX_COMPARATORS      -14
-#define TDB_ERR_INVALID_CF           -15
-#define TDB_ERR_THREAD               -16
-#define TDB_ERR_CHECKSUM             -17
-#define TDB_ERR_MEMORY_LIMIT         -18
-
-typedef struct tidesdb_t tidesdb_t;
-typedef struct tidesdb_column_family_t tidesdb_column_family_t;
-typedef struct tidesdb_sstable_t tidesdb_sstable_t;
-typedef struct tidesdb_txn_t tidesdb_txn_t;
-typedef struct tidesdb_iter_t tidesdb_iter_t;
 
 /*
  * tidesdb_config_t

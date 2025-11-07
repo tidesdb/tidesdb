@@ -33,6 +33,27 @@
 #define PATH_SEPARATOR "/"
 #endif
 
+#if defined(__MINGW32__) || defined(__MINGW64__)
+#define TDB_SIZE_FMT     "%llu" /* size_t promoted to unsigned long long */
+#define TDB_U64_FMT      "%llu" /* uint64_t - use C99 with ANSI stdio */
+#define TDB_SIZE_CAST(x) ((unsigned long long)(x))
+#define TDB_U64_CAST(x)  ((unsigned long long)(x))
+#else
+#define TDB_SIZE_FMT     "%zu" /* native size_t */
+#define TDB_U64_FMT      "%llu"
+#define TDB_SIZE_CAST(x) ((size_t)(x))
+#define TDB_U64_CAST(x)  ((unsigned long long)(x))
+#endif
+
+/* cross-platform atomic alignment */
+#if defined(_MSC_VER)
+#define ATOMIC_ALIGN(n) __declspec(align(n))
+#elif defined(__GNUC__) || defined(__clang__)
+#define ATOMIC_ALIGN(n) __attribute__((aligned(n)))
+#else
+#define ATOMIC_ALIGN(n)
+#endif
+
 /* cross-platform unused attribute for static functions */
 #if defined(__GNUC__) || defined(__clang__)
 #define UNUSED __attribute__((unused))

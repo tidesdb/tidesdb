@@ -13,7 +13,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - ACID transactions that are atomic, consistent, isolated, and durable. Transactions support multiple operations across column families with read committed isolation. Writers are serialized per column family to ensure atomicity, while copy-on-write (COW) provides consistency for concurrent readers.
 - Writers don't block readers. Readers never block other readers. Background operations will not affect active transactions.
 - Isolated key-value stores. Each column family has its own configuration, memtables, sstables, and write ahead logs.
-- Bidirectional iterators that allow you to iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and sstables. Efficient seek operations with O(log n) skip list positioning and binary search in sstables enable fast range queries and prefix scans. Reference counting prevents premature deletion during iteration.
+- Bidirectional iterators that allow you to iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and sstables. Effective seek operations with O(log n) skip list positioning and SBHA positioning(if enabled) in sstables. Reference counting prevents premature deletion during iteration.
 - Durability through WAL (write ahead log). Automatic recovery on startup reconstructs memtables from WALs.
 - Optional automatic background compaction when sstable count reaches configured max per column family. You can also trigger manual compactions through the API, parallelized or not.
 - Optional bloom filters to reduce disk reads by checking key existence before reading sstables. Configurable false positive rate.
@@ -23,7 +23,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Two sync modes NONE (fastest), FULL (most durable, slowest).
 - Per-column-family configuration includes memtable size, compaction settings, compression, bloom filters, sync mode, and more.
 - Clean, easy-to-use C API. Returns 0 on success, -n on error.
-- Cross-platform support for Linux, macOS, and Windows with platform abstraction layer.
+- Cross-platform support for 32bit and 64bit Linux, macOS, and Windows with platform abstraction layer.
 - Optional use of sorted binary hash array (SBHA). Allows for fast sstable lookups. Direct key-to-block offset mapping without full sstable scans.
 - Efficient deletion through tombstone markers. Removed during compactions.
 - Configurable LRU cache for open file handles. Limits system resources while maintaining performance. Set `max_open_file_handles` to control cache size (0 = disabled).

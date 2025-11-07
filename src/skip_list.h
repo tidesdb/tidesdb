@@ -18,8 +18,6 @@
  */
 #ifndef __SKIP_LIST_H__
 #define __SKIP_LIST_H__
-
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,7 +72,7 @@ struct skip_list_node_t
     size_t value_size;
     time_t ttl;
     uint8_t deleted;
-    _Atomic(uint64_t) ref_count;
+    ATOMIC_ALIGN(8) _Atomic(uint64_t) ref_count;
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4200)

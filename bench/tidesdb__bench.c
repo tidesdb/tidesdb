@@ -159,8 +159,6 @@ void *thread_delete(void *arg)
 void *thread_iter_forward(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
-    int count = 0;
-
     tidesdb_txn_t *txn = NULL;
     if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
     {
@@ -180,7 +178,6 @@ void *thread_iter_forward(void *arg)
     {
         while (tidesdb_iter_valid(iter))
         {
-            count++;
             if (tidesdb_iter_next(iter) != 0) break;
         }
     }
@@ -194,7 +191,6 @@ void *thread_iter_forward(void *arg)
 void *thread_iter_backward(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
-    int count = 0;
 
     tidesdb_txn_t *txn = NULL;
     if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
@@ -215,7 +211,6 @@ void *thread_iter_backward(void *arg)
     {
         while (tidesdb_iter_valid(iter))
         {
-            count++;
             if (tidesdb_iter_prev(iter) != 0) break;
         }
     }

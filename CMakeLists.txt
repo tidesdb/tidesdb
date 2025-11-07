@@ -1,30 +1,23 @@
-## cmake build instructions unix
-# rm -rf build && cmake -S . -B build
-# cmake --build build
-# cmake --install build
-
-## cmake build instructions windows
-# rmdir /s /q build && cmake -S . -B build
-# cmake --build build
-# cmake --install build
-
-## or 
-# Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
-# cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
-# cmake --build build
-# Set-Location build
-# ctest --output-on-failure
-
 cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 1.0.0) # TidesDB v1.0.0
+set(PROJECT_VERSION 1.5.0)
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
+
+if(MINGW)
+    add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)
+endif()
+
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    if(NOT CMAKE_C_COMPILER_VERSION VERSION_LESS 11.0)
+        add_compile_options(-Wno-psabi)
+    endif()
+endif()
 
 # for development, we want to enable all warnings and sanitizers
 if(TIDESDB_WITH_SANITIZER)
@@ -167,20 +160,28 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)
     if(WIN32)
-        # get the DLL directories from vcpkg
-        if(DEFINED PThreads4W_DLL_DIR)
-            file(GLOB VCPKG_DLLS 
-                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/x64-windows/bin/*.dll"
-                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/x64-windows/debug/bin/*.dll"
-            )
-            
+        # determine vcpkg triplet based on target architecture
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            set(VCPKG_TARGET_TRIPLET "x64-windows")
+        else()
+            set(VCPKG_TARGET_TRIPLET "x86-windows")
+        endif()
+
+        # get DLLs from the correct vcpkg directory
+        file(GLOB VCPKG_DLLS
+                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll"
+                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin/*.dll"
+        )
+
+        # only proceed if we found DLLs
+        if(VCPKG_DLLS)
             # copy DLLs to build directory after building tests
             foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests binary_hash_array_tests lru_tests queue_tests tidesdb_tests tidesdb_bench)
                 add_custom_command(TARGET ${test_target} POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${VCPKG_DLLS}
-                    $<TARGET_FILE_DIR:${test_target}>
-                    COMMENT "Copying DLLs to ${test_target} directory"
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        ${VCPKG_DLLS}
+                        $<TARGET_FILE_DIR:${test_target}>
+                        COMMENT "Copying DLLs to ${test_target} directory"
                 )
             endforeach()
         endif()

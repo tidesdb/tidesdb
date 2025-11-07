@@ -1152,7 +1152,7 @@ static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t
 
     if (total_size > max_allowed)
     {
-        TDB_DEBUG_LOG("Key/value size (%zu bytes) exceeds memory limit %lu", total_size,
+        TDB_DEBUG_LOG("Key/value size (%zu bytes) exceeds memory limit %zu", total_size,
                       max_allowed);
         return TDB_ERR_MEMORY_LIMIT;
     }

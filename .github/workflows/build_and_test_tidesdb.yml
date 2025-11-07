@@ -91,25 +91,20 @@ jobs:
           git pull
           .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows openssl:x86-windows pthreads:x86-windows
 
-      # Install MinGW and set up PATH correctly
-      - name: Install MinGW
+      # Install MinGW and set up PATH
+      - name: Install and setup MinGW
         if: matrix.compiler == 'mingw'
         shell: pwsh
         run: |
           choco install mingw -y
-          # Find the MinGW installation directory
           $mingwBase = "C:\ProgramData\chocolatey\lib\mingw\tools\install"
           if ("${{ matrix.arch }}" -eq "x86") {
-              # Add mingw32/bin to PATH for 32-bit builds
               $mingwBin = Join-Path $mingwBase "mingw32\bin"
-              echo "$mingwBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-              echo "Added $mingwBin to PATH"
           } else {
-              # Add mingw64/bin to PATH for 64-bit builds  
               $mingwBin = Join-Path $mingwBase "mingw64\bin"
-              echo "$mingwBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-              echo "Added $mingwBin to PATH"
           }
+          echo "$mingwBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "Added $mingwBin to PATH for future steps"
 
       # Configure CMake for Linux/macOS x64
       - name: Configure CMake (Linux/macOS x64)
@@ -145,16 +140,18 @@ jobs:
         run: |
           cmake -S . -B build -A Win32 -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
-      # Configure CMake (Windows MinGW) - Now with correct PATH, just use gcc
+      # Configure CMake (Windows MinGW)
       - name: Configure CMake (Windows MinGW)
         if: matrix.compiler == 'mingw'
         shell: pwsh
         run: |
-          # Since we set PATH correctly, both i686-w64-mingw32-gcc and gcc should work
-          # But let's use the explicit compiler name to be sure
           if ("${{ matrix.arch }}" -eq "x86") {
+              Write-Host "Checking for i686-w64-mingw32-gcc..."
+              & i686-w64-mingw32-gcc --version
               cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=i686-w64-mingw32-gcc -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           } else {
+              Write-Host "Checking for x86_64-w64-mingw32-gcc..."
+              & x86_64-w64-mingw32-gcc --version
               cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           }
 

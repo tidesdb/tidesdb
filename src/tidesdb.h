@@ -69,10 +69,9 @@ extern int _tidesdb_debug_enabled;
 #define TDB_MAX_KEY_VALUE_MEMORY_PERCENT 0.05
 #define TDB_MIN_AVAILABLE_MEMORY         (1024 * 1024 * 1024)
 
-
 /* maximums */
-#define TDB_MAX_CF_NAME_LENGTH                     256
-#define TDB_MAX_PATH_LENGTH                        1024
+#define TDB_MAX_CF_NAME_LENGTH  256
+#define TDB_MAX_PATH_LENGTH     1024
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATORS     32
 
@@ -86,7 +85,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_CONFIG_FILE_NAME              "config"
 
 /* used for key value pair headers on disk */
-#define TDB_KV_FORMAT_VERSION             1
+#define TDB_KV_FORMAT_VERSION 1
 
 /* flags for key-value pair header */
 #define TDB_KV_FLAG_TOMBSTONE 0x01

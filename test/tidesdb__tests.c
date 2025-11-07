@@ -45,19 +45,20 @@ static tidesdb_t *create_test_db(void)
 
 static tidesdb_column_family_config_t get_test_cf_config(void)
 {
-    tidesdb_column_family_config_t config = {.memtable_flush_size = 1024 * 1024,
-                                             .max_sstables_before_compaction = 512,
-                                             .compaction_threads = 0,
-                                             .max_level = 8,
-                                             .probability = 0.25,
-                                             .compressed = 1,
-                                             .compress_algo = COMPRESS_LZ4,
-                                             .bloom_filter_fp_rate = 0.01,
-                                             .enable_background_compaction = 0,
-                                             .background_compaction_interval = 0,
-                                             .use_sbha = 1,
-                                             .sync_mode = TDB_SYNC_NONE,
-                                             .comparator_name = NULL};
+    tidesdb_column_family_config_t config = {
+        .memtable_flush_size = 1024 * 1024,
+        .max_sstables_before_compaction = 512,
+        .compaction_threads = 1,
+        .max_level = 8,
+        .probability = 0.25,
+        .compressed = 1,
+        .compress_algo = COMPRESS_LZ4,
+        .bloom_filter_fp_rate = 0.01,
+        .enable_background_compaction = 1,
+        .background_compaction_interval = TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL,
+        .use_sbha = 1,
+        .sync_mode = TDB_SYNC_NONE,
+        .comparator_name = NULL};
     return config;
 }
 
@@ -1028,7 +1029,6 @@ static void test_crash_recovery(void)
         tidesdb_close(db);
     }
 
-    printf("OK\n");
     cleanup_test_dir();
 }
 
@@ -1083,8 +1083,6 @@ static void test_background_compaction(void)
     }
 
     tidesdb_txn_free(read_txn);
-
-    printf("OK\n");
 
     tidesdb_close(db);
     cleanup_test_dir();
@@ -3017,8 +3015,6 @@ static void test_iterator_seek(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-
-    printf("OK\n");
 }
 
 static void test_iterator_seek_range(void)
@@ -3079,8 +3075,6 @@ static void test_iterator_seek_range(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-
-    printf("OK\n");
 }
 
 static void test_iterator_seek_prefix(void)
@@ -3145,13 +3139,11 @@ static void test_iterator_seek_prefix(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-
-    printf("OK\n");
 }
 
 static void test_iterator_seek_large_sstable(void)
 {
-    printf("Testing iterator seek with binary search on large SSTable...");
+    printf("Testing iterator seek on large SSTable...");
     fflush(stdout);
 
     tidesdb_t *db = create_test_db();
@@ -3199,7 +3191,6 @@ static void test_iterator_seek_large_sstable(void)
     printf("Found key: %.*s\n", (int)key_size, key);
     ASSERT_EQ(memcmp(key, "key_00500", strlen("key_00500")), 0);
 
-    /* seek to key near end; binary search should skip most blocks */
     const char *seek_key2 = "key_00950";
     ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key2, strlen(seek_key2)), 0);
     ASSERT_TRUE(tidesdb_iter_valid(iter));
@@ -3220,8 +3211,6 @@ static void test_iterator_seek_large_sstable(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-
-    printf("OK\n");
 }
 
 static void test_iterator_seek_multi_source(void)
@@ -3342,8 +3331,6 @@ static void test_iterator_seek_multi_source(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-
-    printf("OK\n");
 }
 
 static void test_memory_safety(void)
@@ -3515,7 +3502,6 @@ static void test_txn_write_write_serialization(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_txn_read_your_own_deletes(void)
@@ -3547,7 +3533,6 @@ static void test_txn_read_your_own_deletes(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_txn_rollback_no_side_effects(void)
@@ -3589,7 +3574,6 @@ static void test_txn_rollback_no_side_effects(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_iterator_empty_column_family(void)
@@ -3621,7 +3605,6 @@ static void test_iterator_empty_column_family(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_iterator_single_entry(void)
@@ -3668,7 +3651,6 @@ static void test_iterator_single_entry(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_iterator_all_expired_ttl(void)
@@ -3712,7 +3694,6 @@ static void test_iterator_all_expired_ttl(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_iterator_all_tombstones(void)
@@ -3764,7 +3745,6 @@ static void test_iterator_all_tombstones(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_iterator_seek_to_deleted_key(void)
@@ -3812,7 +3792,6 @@ static void test_iterator_seek_to_deleted_key(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_iterator_direction_changes(void)
@@ -3867,7 +3846,6 @@ static void test_iterator_direction_changes(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_compaction_single_sstable(void)
@@ -3908,7 +3886,6 @@ static void test_compaction_single_sstable(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_compaction_all_expired(void)
@@ -3965,7 +3942,6 @@ static void test_compaction_all_expired(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_compaction_duplicate_keys(void)
@@ -4000,7 +3976,13 @@ static void test_compaction_duplicate_keys(void)
         usleep(200000);
     }
 
+    int num_ssts_before = atomic_load(&cf->num_sstables);
+    ASSERT_TRUE(num_ssts_before >= 3);
+
     ASSERT_EQ(tidesdb_compact(cf), 0);
+
+    int num_ssts_after = atomic_load(&cf->num_sstables);
+    ASSERT_TRUE(num_ssts_after < num_ssts_before);
 
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
@@ -4021,7 +4003,6 @@ static void test_compaction_duplicate_keys(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_cf_independent_operations(void)
@@ -4055,7 +4036,6 @@ static void test_cf_independent_operations(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_cf_name_limits(void)
@@ -4080,7 +4060,6 @@ static void test_cf_name_limits(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_bloom_filter_disabled(void)
@@ -4126,7 +4105,6 @@ static void test_bloom_filter_disabled(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_sbha_disabled(void)
@@ -4171,7 +4149,6 @@ static void test_sbha_disabled(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_compression_snappy(void)
@@ -4223,7 +4200,6 @@ static void test_compression_snappy(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_compression_zstd(void)
@@ -4275,7 +4251,6 @@ static void test_compression_zstd(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_compression_none(void)
@@ -4321,7 +4296,6 @@ static void test_compression_none(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_comparator_string(void)
@@ -4361,7 +4335,6 @@ static void test_comparator_string(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_comparator_numeric(void)
@@ -4406,7 +4379,6 @@ static void test_comparator_numeric(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_wal_recovery_after_reopen(void)
@@ -4465,7 +4437,6 @@ static void test_wal_recovery_after_reopen(void)
     }
 
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_wal_with_multiple_memtables(void)
@@ -4516,7 +4487,6 @@ static void test_wal_with_multiple_memtables(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 /*
@@ -4702,7 +4672,6 @@ static void test_concurrent_flush_and_read(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_no_deadlock_multiple_cfs(void)
@@ -4738,7 +4707,6 @@ static void test_no_deadlock_multiple_cfs(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_invalid_column_family_operations(void)
@@ -4773,7 +4741,6 @@ static void test_invalid_column_family_operations(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_null_pointer_handling(void)
@@ -4794,7 +4761,6 @@ static void test_null_pointer_handling(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_zero_length_keys_values(void)
@@ -4830,7 +4796,6 @@ static void test_zero_length_keys_values(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_invalid_ttl_values(void)
@@ -4870,7 +4835,6 @@ static void test_invalid_ttl_values(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_transaction_after_close(void)
@@ -4891,7 +4855,6 @@ static void test_transaction_after_close(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_iterator_invalid_operations(void)
@@ -4927,7 +4890,6 @@ static void test_iterator_invalid_operations(void)
     tidesdb_txn_free(read_txn);
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_config_validation(void)
@@ -4969,7 +4931,6 @@ static void test_config_validation(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_large_batch_operations(void)
@@ -5012,7 +4973,6 @@ static void test_large_batch_operations(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 static void test_special_characters_in_keys(void)
@@ -5054,7 +5014,6 @@ static void test_special_characters_in_keys(void)
 
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("OK\n");
 }
 
 int main(void)

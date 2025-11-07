@@ -2766,7 +2766,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
-    if (cf->config.compaction_threads > 0)
+    if (cf->config.compaction_threads >= 2)
     {
         return tidesdb_compact_parallel(cf);
     }
@@ -4460,7 +4460,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, const char *cf_name, const uint8_t *key,
                 {
                     return TDB_ERR_NOT_FOUND;
                 }
-                else if (op->type == TIDESDB_OP_PUT)
+                if (op->type == TIDESDB_OP_PUT)
                 {
                     *value = malloc(op->value_size);
                     if (*value)

@@ -69,6 +69,7 @@ jobs:
       # macOS dependencies
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
+        shell: bash
         run: |
           brew install zstd lz4 snappy openssl
 
@@ -112,6 +113,7 @@ jobs:
       # Configure CMake (Linux/macOS)
       - name: Configure CMake (Linux/macOS)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
           if [ "${{ matrix.arch }}" = "x64" ]; then
             cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON

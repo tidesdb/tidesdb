@@ -167,20 +167,28 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)
     if(WIN32)
-        # get the DLL directories from vcpkg
-        if(DEFINED PThreads4W_DLL_DIR)
-            file(GLOB VCPKG_DLLS 
-                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/x64-windows/bin/*.dll"
-                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/x64-windows/debug/bin/*.dll"
-            )
-            
+        # determine vcpkg triplet based on target architecture
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            set(VCPKG_TARGET_TRIPLET "x64-windows")
+        else()
+            set(VCPKG_TARGET_TRIPLET "x86-windows")
+        endif()
+
+        # get DLLs from the correct vcpkg directory
+        file(GLOB VCPKG_DLLS
+                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll"
+                "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin/*.dll"
+        )
+
+        # only proceed if we found DLLs
+        if(VCPKG_DLLS)
             # copy DLLs to build directory after building tests
             foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests binary_hash_array_tests lru_tests queue_tests tidesdb_tests tidesdb_bench)
                 add_custom_command(TARGET ${test_target} POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${VCPKG_DLLS}
-                    $<TARGET_FILE_DIR:${test_target}>
-                    COMMENT "Copying DLLs to ${test_target} directory"
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        ${VCPKG_DLLS}
+                        $<TARGET_FILE_DIR:${test_target}>
+                        COMMENT "Copying DLLs to ${test_target} directory"
                 )
             endforeach()
         endif()

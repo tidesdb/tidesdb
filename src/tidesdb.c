@@ -1143,29 +1143,13 @@ static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t
     /* calculate total size needed (key + value + header + overhead) */
     size_t total_size = key_size + value_size + sizeof(tidesdb_kv_pair_header_t);
 
-    /* add estimated overhead for skip list node, bloom filter, index, etc. */
-    size_t estimated_overhead = total_size / 2; /* conservative 50% overhead estimate */
-    size_t total_with_overhead = total_size + estimated_overhead;
-
     /* check against maximum allowed per operation (percentage of available memory) */
-    size_t max_allowed = (size_t)(db->available_memory * TDB_MAX_KEY_VALUE_MEMORY_PERCENT);
+    size_t max_allowed = (size_t)(db->available_memory);
 
-    if (total_with_overhead > max_allowed)
+    if (total_size > max_allowed)
     {
-        TDB_DEBUG_LOG(
-            "Key/value size (%zu bytes) with overhead (%zu bytes total) exceeds memory limit "
-            "(%zu bytes, %.1f%% of %zu bytes available)",
-            total_size, total_with_overhead, max_allowed, TDB_MAX_KEY_VALUE_MEMORY_PERCENT * 100.0,
-            db->available_memory);
-        return TDB_ERR_MEMORY_LIMIT;
-    }
-
-    /* check if we have minimum required free memory */
-    size_t current_available = get_available_memory();
-    if (current_available > 0 && current_available < TDB_MIN_AVAILABLE_MEMORY)
-    {
-        TDB_DEBUG_LOG("Available memory (%zu bytes) below minimum threshold (%d bytes)",
-                      current_available, TDB_MIN_AVAILABLE_MEMORY);
+        TDB_DEBUG_LOG("Key/value size (%zu bytes) exceeds memory limit %lu", total_size,
+                      max_allowed);
         return TDB_ERR_MEMORY_LIMIT;
     }
 

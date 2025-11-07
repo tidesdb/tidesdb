@@ -192,7 +192,6 @@ void *thread_iter_backward(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
 
-
     tidesdb_txn_t *txn = NULL;
     if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
     {

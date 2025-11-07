@@ -65,10 +65,6 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_BLOOM_FILTER_FP_RATE           0.01
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
 
-/* memory safety thresholds */
-#define TDB_MAX_KEY_VALUE_MEMORY_PERCENT 0.10
-#define TDB_MIN_AVAILABLE_MEMORY         (512 * 1024 * 1024)
-
 /* maximums */
 #define TDB_MAX_CF_NAME_LENGTH  256
 #define TDB_MAX_PATH_LENGTH     1024

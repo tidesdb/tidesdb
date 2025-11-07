@@ -13,7 +13,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - ACID transactions that are atomic, consistent, isolated, and durable. Transactions support multiple operations across column families with read committed isolation. Writers are serialized per column family to ensure atomicity, while copy-on-write (COW) provides consistency for concurrent readers.
 - Writers don't block readers. Readers never block other readers. Background operations will not affect active transactions.
 - Isolated key-value stores. Each column family has its own configuration, memtables, sstables, and write ahead logs.
-- Bidirectional iterators that allow you to iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and sstables. Efficient seek operations with O(log n) skip list positioning and binary search in sstables enable fast range queries and prefix scans. Reference counting prevents premature deletion during iteration.
+- Bidirectional iterators that allow you to iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and sstables. Efficient seek operations with O(log n) skip list positioning and SBHA positioning(if enabled) in sstables enable seek iteration. Reference counting prevents premature deletion during iteration.
 - Durability through WAL (write ahead log). Automatic recovery on startup reconstructs memtables from WALs.
 - Optional automatic background compaction when sstable count reaches configured max per column family. You can also trigger manual compactions through the API, parallelized or not.
 - Optional bloom filters to reduce disk reads by checking key existence before reading sstables. Configurable false positive rate.

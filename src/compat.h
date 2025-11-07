@@ -33,6 +33,13 @@
 #define PATH_SEPARATOR "/"
 #endif
 
+/* cross-platform unused attribute for static functions */
+#if defined(__GNUC__) || defined(__clang__)
+#define UNUSED __attribute__((unused))
+#else
+#define UNUSED
+#endif
+
 #ifdef _WIN32
 #include <direct.h>
 #include <fcntl.h>

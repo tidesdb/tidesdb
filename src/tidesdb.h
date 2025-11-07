@@ -66,7 +66,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
 
 /* memory safety thresholds */
-#define TDB_MAX_KEY_VALUE_MEMORY_PERCENT 0.25
+#define TDB_MAX_KEY_VALUE_MEMORY_PERCENT 0.10
 #define TDB_MIN_AVAILABLE_MEMORY         (512 * 1024 * 1024)
 
 /* maximums */

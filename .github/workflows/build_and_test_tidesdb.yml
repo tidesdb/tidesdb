@@ -150,19 +150,22 @@ jobs:
         shell: pwsh
         run: |
           $mingwBase = "C:\ProgramData\chocolatey\lib\mingw\tools\install"
-          if (${{ matrix.arch }} -eq "x86") {
-           $cc = Join-Path $mingwBase "mingw32\bin\i686-w64-mingw32-gcc.exe"
-           $cxx = Join-Path $mingwBase "mingw32\bin\i686-w64-mingw32-g++.exe"
+          $arch = "${{ matrix.arch }}"
+
+          if ($arch -eq "x86") {
+              $cc = Join-Path $mingwBase "mingw32\bin\i686-w64-mingw32-gcc.exe"
+              $cxx = Join-Path $mingwBase "mingw32\bin\i686-w64-mingw32-g++.exe"
           } else {
-           $cc = Join-Path $mingwBase "mingw64\bin\x86_64-w64-mingw32-gcc.exe"
-           $cxx = Join-Path $mingwBase "mingw64\bin\x86_64-w64-mingw32-g++.exe"
+              $cc = Join-Path $mingwBase "mingw64\bin\x86_64-w64-mingw32-gcc.exe"
+              $cxx = Join-Path $mingwBase "mingw64\bin\x86_64-w64-mingw32-g++.exe"
           }
-          
+
           cmake -S . -B build -G "MinGW Makefiles" `
-          -DCMAKE_C_COMPILER=$cc `
-          -DCMAKE_CXX_COMPILER=$cxx `
-          -DTIDESDB_BUILD_TESTS=ON `
-          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+            -DCMAKE_C_COMPILER=$cc `
+            -DCMAKE_CXX_COMPILER=$cxx `
+            -DTIDESDB_BUILD_TESTS=ON `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          
           
           
           # Build

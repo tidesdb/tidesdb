@@ -2741,8 +2741,9 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
         mt->wal = NULL;
 
         char wal_path[TDB_MAX_PATH_LENGTH];
-        snprintf(wal_path, sizeof(wal_path), "%s/%s/%s%" PRIu64 "%s", cf->db->config.db_path,
-                 cf->name, TDB_WAL_PREFIX, mt->id, TDB_WAL_EXT);
+        snprintf(wal_path, sizeof(wal_path),
+                 "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR TDB_WAL_PREFIX "%" PRIu64 TDB_WAL_EXT,
+                 cf->db->config.db_path, cf->name, mt->id);
         remove(wal_path);
     }
 

@@ -2090,12 +2090,12 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         size_t queue_len = queue_size(cf->immutable_memtables);
         for (size_t i = 0; i < queue_len; i++)
         {
-            tidesdb_memtable_t *mt =
+            tidesdb_memtable_t *peek_mt =
                 (tidesdb_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
-            if (mt && mt->wal)
+            if (peek_mt && peek_mt->wal)
             {
-                block_manager_close(mt->wal);
-                mt->wal = NULL;
+                block_manager_close(peek_mt->wal);
+                peek_mt->wal = NULL;
             }
         }
         pthread_mutex_unlock(&cf->flush_lock);
@@ -2110,12 +2110,12 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 
     if (cf->immutable_memtables)
     {
-        tidesdb_memtable_t *mt;
-        while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
+        tidesdb_memtable_t *cleanup_mt;
+        while ((cleanup_mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
         {
-            atomic_store(&mt->ref_count, 0);
-            if (mt->memtable) skip_list_free(mt->memtable);
-            free(mt);
+            atomic_store(&cleanup_mt->ref_count, 0);
+            if (cleanup_mt->memtable) skip_list_free(cleanup_mt->memtable);
+            free(cleanup_mt);
         }
         queue_free(cf->immutable_memtables);
     }

@@ -13,18 +13,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux
           - os: ubuntu-latest
             name: Linux x64
             arch: x64
           - os: ubuntu-latest
             name: Linux x86
             arch: x86
+          # macOS
           - os: macos-latest
             name: macOS x64
             arch: x64
           - os: macos-latest
             name: macOS x86
             arch: x86
+          # Windows MSVC
           - os: windows-latest
             name: Windows MSVC x64
             compiler: msvc
@@ -33,6 +36,7 @@ jobs:
             name: Windows MSVC x86
             compiler: msvc
             arch: x86
+          # Windows MinGW
           - os: windows-latest
             name: Windows MinGW x64
             compiler: mingw
@@ -46,55 +50,66 @@ jobs:
     name: ${{ matrix.name }}
 
     steps:
-      - name: Checkout tidesdb repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Linux dependencies
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo dpkg --add-architecture i386
           sudo apt update
           if [ "${{ matrix.arch }}" = "x64" ]; then
-            sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev libssl-dev
+            sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev libssl-dev build-essential cmake
           else
-            sudo apt install -y libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 libssl-dev:i386
+            sudo apt install -y gcc-multilib g++-multilib libc6-dev-i386 \
+              libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 libssl-dev:i386 build-essential cmake
           fi
 
+      # macOS dependencies
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install zstd lz4 snappy openssl
-          # macOS supports building universal binaries, but true 32-bit may need extra flags
 
+      # Windows dependencies
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
           git pull
-          if [ "${{ matrix.arch }}" = "x64" ]; then
-            .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows openssl:x64-windows pthreads:x64-windows
-          else
-            .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows openssl:x86-windows pthreads:x86-windows
-          fi
+          if ("${{ matrix.arch }}" -eq "x64") {
+              .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows openssl:x64-windows pthreads:x64-windows
+          } else {
+              .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows openssl:x86-windows pthreads:x86-windows
+          }
 
+      # Install MinGW on Windows
       - name: Install MinGW
         if: matrix.compiler == 'mingw'
+        shell: pwsh
         run: choco install mingw -y
 
+      # Configure CMake (Windows MSVC)
       - name: Configure CMake (Windows MSVC)
         if: matrix.compiler == 'msvc'
+        shell: pwsh
         run: |
           cmake -S . -B build -A ${{ matrix.arch }} -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
+      # Configure CMake (Windows MinGW)
       - name: Configure CMake (Windows MinGW)
         if: matrix.compiler == 'mingw'
+        shell: pwsh
         run: |
-          if [ "${{ matrix.arch }}" = "x64" ]; then
-            cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=gcc -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-          else
-            cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=i686-w64-mingw32-gcc -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-          fi
+          if ("${{ matrix.arch }}" -eq "x64") {
+              cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=gcc -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          } else {
+              cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=i686-w64-mingw32-gcc -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          }
 
+      # Configure CMake (Linux/macOS)
       - name: Configure CMake (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
@@ -104,9 +119,11 @@ jobs:
             cmake -S . -B build -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DTIDESDB_BUILD_TESTS=ON
           fi
 
+      # Build
       - name: Build
         run: cmake --build build --config Release
 
+      # Run tests
       - name: Run tests
         run: |
           cd build

@@ -71,6 +71,9 @@ extern int _tidesdb_debug_enabled;
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATORS     32
 
+/* if a key-value exceeds this percentage users system memory we throw an error */
+#define TDB_MEMORY_PERCENTAGE 60
+
 /* extensions, prefixes, and file names */
 #define TDB_WAL_EXT                       ".log"
 #define TDB_SSTABLE_EXT                   ".sst"

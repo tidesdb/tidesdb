@@ -1811,6 +1811,8 @@ static void test_parallel_compaction(void)
 {
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    cf_config.enable_background_compaction = 0;
+
     cf_config.compaction_threads = 4; /* enable parallel compaction with 4 threads */
     ASSERT_EQ(tidesdb_create_column_family(db, "parallel_cf", &cf_config), 0);
 
@@ -1855,6 +1857,8 @@ static void test_parallel_compaction(void)
         if (current_sstables >= num_sstables) break;
         usleep(100000); /* 100ms */
     }
+
+    printf("sstables %d created, proceeding to compaction...\n", current_sstables);
 
     /* verify we have at least 8 ssts (might have more if auto-compaction triggered) */
     ASSERT_TRUE(current_sstables >= num_sstables);
@@ -3348,7 +3352,7 @@ static void test_memory_safety(void)
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
     /* allocate key+value that exceeds available memory */
-    size_t excessive_size = db->available_memory / 2 + 1;
+    size_t excessive_size = (size_t)((db->available_memory * TDB_MEMORY_PERCENTAGE / 100) / 2) + 1;
     uint8_t *large_key = malloc(excessive_size);
     uint8_t *large_value = malloc(excessive_size);
     ASSERT_TRUE(large_key != NULL);

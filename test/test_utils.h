@@ -178,7 +178,7 @@ static inline int remove_directory(const char *path)
  * cleanup_test_dir
  * @brief cleanup test directory
  */
-__attribute__((unused)) static void cleanup_test_dir(void)
+static inline void cleanup_test_dir(void)
 {
 #ifdef _WIN32
     /* wait for file handles to be released */

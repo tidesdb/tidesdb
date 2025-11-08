@@ -5079,8 +5079,6 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, const char *cf_name, tidesdb_iter_t **i
     (*iter)->heap = NULL;
     (*iter)->heap_size = 0;
     (*iter)->heap_capacity = 0;
-    (*iter)->last_seek_key = NULL;
-    (*iter)->last_seek_key_size = 0;
 
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt && active_mt->memtable)
@@ -5961,7 +5959,6 @@ void tidesdb_iter_free(tidesdb_iter_t *iter)
 
     if (iter->current_key) free(iter->current_key);
     if (iter->current_value) free(iter->current_value);
-    if (iter->last_seek_key) free(iter->last_seek_key);
     if (iter->memtable_cursor)
     {
         skip_list_cursor_free(iter->memtable_cursor);

@@ -42,7 +42,6 @@
 
 /* follow your passion, be obsessed, don't worry too much. */
 
-/* debug logging macro */
 extern int _tidesdb_debug_enabled;
 #if defined(_MSC_VER)
 #define TDB_DEBUG_LOG(fmt, ...)                                                     \
@@ -97,6 +96,8 @@ extern int _tidesdb_debug_enabled;
 
 /* used for key value pair headers on disk */
 #define TDB_KV_FORMAT_VERSION 1
+
+#define TDB_SST_META_MAGIC 0x5353544D /* "SSTM" */
 
 /* flags for key-value pair header */
 #define TDB_KV_FLAG_TOMBSTONE 0x01
@@ -336,6 +337,8 @@ typedef struct tidesdb_thread_pool_t tidesdb_thread_pool_t;
  * @param block_manager_cache LRU cache for open block managers (file handles)
  * @param flush_pool thread pool for flush operations
  * @param compaction_pool thread pool for compaction operations
+ * @param total_memory total system memory at startup
+ * @param available_memory available memory at startup
  */
 struct tidesdb_t
 {
@@ -347,8 +350,8 @@ struct tidesdb_t
     lru_cache_t *block_manager_cache;
     tidesdb_thread_pool_t *flush_pool;
     tidesdb_thread_pool_t *compaction_pool;
-    size_t total_memory;     /* total system memory at startup */
-    size_t available_memory; /* available memory at startup */
+    size_t total_memory;
+    size_t available_memory;
 };
 
 /*

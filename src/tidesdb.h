@@ -97,7 +97,8 @@ extern int _tidesdb_debug_enabled;
 /* used for key value pair headers on disk */
 #define TDB_KV_FORMAT_VERSION 1
 
-#define TDB_SST_META_MAGIC 0x5353544D /* "SSTM" */
+/* "SSTM" sstable meta magic number */
+#define TDB_SST_META_MAGIC 0x5353544D
 
 /* flags for key-value pair header */
 #define TDB_KV_FLAG_TOMBSTONE 0x01

@@ -61,6 +61,15 @@
 #define UNUSED
 #endif
 
+/* cross-platform thread ID for unique file naming */
+#if defined(_WIN32)
+#include <windows.h>
+#define TDB_THREAD_ID() ((unsigned long)GetCurrentThreadId())
+#else
+#include <pthread.h>
+#define TDB_THREAD_ID() ((unsigned long)pthread_self())
+#endif
+
 #ifdef _WIN32
 #include <direct.h>
 #include <fcntl.h>

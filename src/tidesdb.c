@@ -3581,10 +3581,10 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         {
             uint64_t sst_id = sst_snapshot[i]->id;
             int ref_count_before = atomic_load(&sst_snapshot[i]->ref_count);
-            TDB_DEBUG_LOG("Releasing snapshot SSTable %lu, ref_count before release: %d", sst_id,
-                          ref_count_before);
+            TDB_DEBUG_LOG("Releasing snapshot SSTable %" PRIu64 ", ref_count before release: %d",
+                          sst_id, ref_count_before);
             int remaining_refs = tidesdb_sstable_release(sst_snapshot[i]);
-            TDB_DEBUG_LOG("Snapshot SSTable %lu released, remaining refs: %d", sst_id,
+            TDB_DEBUG_LOG("Snapshot SSTable %" PRIu64 " released, remaining refs: %d", sst_id,
                           remaining_refs);
         }
     }

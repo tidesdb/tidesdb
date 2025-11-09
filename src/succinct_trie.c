@@ -25,8 +25,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "block_manager.h"
-
 #define BIT_SET(bm, i) ((bm)[(i) >> 3] |= (1u << ((i)&7)))
 #define BIT_GET(bm, i) (((bm)[(i) >> 3] >> ((i)&7)) & 1u)
 
@@ -136,7 +134,7 @@ succinct_trie_builder_t *succinct_trie_builder_new(const char *temp_dir,
     const char *dir = temp_dir ? temp_dir : "/succinct_trie";
     char path[512];
     /* use both PID and thread ID to make filenames unique per thread */
-    unsigned long tid = (unsigned long)pthread_self();
+    unsigned long tid = TDB_THREAD_ID();
     snprintf(path, sizeof(path), "%s/trie_labels_%d_%lu", dir, getpid(), tid);
     if (block_manager_open((block_manager_t **)&builder->labels_bm, path, TDB_SYNC_NONE) != 0)
     {

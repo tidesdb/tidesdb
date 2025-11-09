@@ -22,6 +22,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "block_manager.h"
+#include "compat.h"
+
 /*
  * succinct_trie_comparator_fn
  * comparator function type for custom key comparison

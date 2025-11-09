@@ -38,6 +38,8 @@ typedef struct queue_node_t
  * @param head pointer to first node
  * @param tail pointer to last node
  * @param size current number of elements
+ * @param shutdown has queue been shutdown?
+ * @param waiter_count number of threads currently waiting in queue_dequeue_wait
  * @param lock mutex for thread safety
  * @param not_empty condition variable signaled when queue becomes non-empty
  */
@@ -46,6 +48,8 @@ typedef struct
     queue_node_t *head;
     queue_node_t *tail;
     size_t size;
+    int shutdown;
+    int waiter_count;
     pthread_mutex_t lock;
     pthread_cond_t not_empty;
 } queue_t;
@@ -78,7 +82,7 @@ void *queue_dequeue(queue_t *queue);
  * queue_dequeue_wait
  * remove and return item from front of queue, blocking until available
  * @param queue the queue
- * @return pointer to dequeued data, NULL on error
+ * @return pointer to dequeued data, NULL if queue is destroyed or on error
  */
 void *queue_dequeue_wait(queue_t *queue);
 

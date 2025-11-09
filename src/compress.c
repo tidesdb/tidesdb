@@ -18,7 +18,8 @@
  */
 #include "compress.h"
 
-uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size, compress_type type)
+uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
+                       compression_algorithm type)
 {
     uint8_t *compressed_data = NULL;
 
@@ -72,7 +73,7 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
 }
 
 uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_size,
-                         compress_type type)
+                         compression_algorithm type)
 {
     uint8_t *decompressed_data = NULL;
 

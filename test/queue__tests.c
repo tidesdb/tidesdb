@@ -516,6 +516,72 @@ void test_queue_peek_at(void)
     printf(GREEN "test_queue_peek_at passed\n" RESET);
 }
 
+typedef struct
+{
+    queue_t *queue;
+    int *thread_started;
+    pthread_mutex_t *start_lock;
+} wait_thread_args_t;
+
+static void *wait_and_expect_null_thread(void *arg)
+{
+    wait_thread_args_t *args = (wait_thread_args_t *)arg;
+
+    /* signal that thread has started */
+    pthread_mutex_lock(args->start_lock);
+    *args->thread_started = 1;
+    pthread_mutex_unlock(args->start_lock);
+
+    /* this should return NULL when queue is freed */
+    void *data = queue_dequeue_wait(args->queue);
+
+    /* we expect NULL because queue was freed while waiting */
+    ASSERT_TRUE(data == NULL);
+
+    return NULL;
+}
+
+void test_queue_free_with_waiting_threads(void)
+{
+    queue_t *queue = queue_new();
+    ASSERT_TRUE(queue != NULL);
+
+    int thread_started = 0;
+    pthread_mutex_t start_lock;
+    pthread_mutex_init(&start_lock, NULL);
+
+    wait_thread_args_t args = {
+        .queue = queue, .thread_started = &thread_started, .start_lock = &start_lock};
+
+    pthread_t waiter;
+    pthread_create(&waiter, NULL, wait_and_expect_null_thread, &args);
+
+    /* wait for thread to start and begin waiting */
+    while (1)
+    {
+        pthread_mutex_lock(&start_lock);
+        if (thread_started)
+        {
+            pthread_mutex_unlock(&start_lock);
+            break;
+        }
+        pthread_mutex_unlock(&start_lock);
+        usleep(1000);
+    }
+
+    /* give thread time to enter wait state */
+    usleep(50000);
+
+    /* free the queue - this should wake up the waiting thread */
+    queue_free(queue);
+
+    /* thread should exit cleanly */
+    pthread_join(waiter, NULL);
+
+    pthread_mutex_destroy(&start_lock);
+    printf(GREEN "test_queue_free_with_waiting_threads passed\n" RESET);
+}
+
 int main(void)
 {
     RUN_TEST(test_queue_new, tests_passed);
@@ -532,6 +598,7 @@ int main(void)
     RUN_TEST(test_queue_foreach_cleanup, tests_passed);
     RUN_TEST(test_queue_null_handling, tests_passed);
     RUN_TEST(test_queue_peek_at, tests_passed);
+    RUN_TEST(test_queue_free_with_waiting_threads, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

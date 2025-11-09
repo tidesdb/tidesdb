@@ -31,7 +31,7 @@ typedef enum
     COMPRESS_SNAPPY,
     COMPRESS_LZ4,
     COMPRESS_ZSTD
-} compress_type;
+} compression_algorithm;
 
 /*
  * compress_data
@@ -43,7 +43,7 @@ typedef enum
  * @return the compressed data
  */
 uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
-                       compress_type type);
+                       compression_algorithm type);
 
 /*
  * decompress_data
@@ -55,6 +55,6 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
  * @return the decompressed data
  */
 uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_size,
-                         compress_type type);
+                         compression_algorithm type);
 
 #endif /* __COMPRESS_H__ */

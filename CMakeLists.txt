@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 1.5.1)
+set(PROJECT_VERSION 2.0.0)
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
@@ -55,9 +55,9 @@ include_directories(external) # for external libraries linking internally
 
 # build as STATIC on Windows to avoid DLL export/import complexity in tests
 if(WIN32)
-    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/binary_hash_array.c src/lru.c src/queue.c external/xxhash.c)
+    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c external/xxhash.c)
 else()
-    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/binary_hash_array.c src/lru.c src/queue.c external/xxhash.c)
+    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c external/xxhash.c)
 endif()
 
 target_include_directories(tidesdb PRIVATE src)
@@ -137,14 +137,14 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(skip_list_tests test/skip_list__tests.c)
     add_executable(compress_tests test/compress__tests.c)
     add_executable(bloom_filter_tests test/bloom_filter__tests.c)
-    add_executable(binary_hash_array_tests test/binary_hash_array__tests.c)
     add_executable(lru_tests test/lru__tests.c)
     add_executable(queue_tests test/queue__tests.c)
+    add_executable(succinct_trie_tests test/succinct_trie__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
     add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests binary_hash_array_tests lru_tests queue_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests lru_tests queue_tests succinct_trie_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -153,9 +153,9 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME skip_list_tests COMMAND skip_list_tests)
     add_test(NAME compress_tests COMMAND compress_tests)
     add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
-    add_test(NAME binary_hash_array_tests COMMAND binary_hash_array_tests)
     add_test(NAME lru_tests COMMAND lru_tests)
     add_test(NAME queue_tests COMMAND queue_tests)
+    add_test(NAME succinct_trie_tests COMMAND succinct_trie_tests)
     add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)
@@ -176,7 +176,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         # only proceed if we found DLLs
         if(VCPKG_DLLS)
             # copy DLLs to build directory after building tests
-            foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests binary_hash_array_tests lru_tests queue_tests tidesdb_tests tidesdb_bench)
+            foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests lru_tests queue_tests tidesdb_tests tidesdb_bench)
                 add_custom_command(TARGET ${test_target} POST_BUILD
                         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                         ${VCPKG_DLLS}

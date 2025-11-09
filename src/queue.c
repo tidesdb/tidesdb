@@ -18,6 +18,8 @@
  */
 #include "queue.h"
 
+#include "compat.h"
+
 queue_t *queue_new(void)
 {
     queue_t *queue = (queue_t *)malloc(sizeof(queue_t));
@@ -26,6 +28,8 @@ queue_t *queue_new(void)
     queue->head = NULL;
     queue->tail = NULL;
     queue->size = 0;
+    queue->shutdown = 0;
+    queue->waiter_count = 0;
 
     if (pthread_mutex_init(&queue->lock, NULL) != 0)
     {
@@ -115,10 +119,25 @@ void *queue_dequeue_wait(queue_t *queue)
 
     pthread_mutex_lock(&queue->lock);
 
-    /* wait until queue is not empty */
-    while (queue->head == NULL)
+    /* increment waiter count before waiting */
+    queue->waiter_count++;
+
+    /* wait until queue is not empty or shutdown */
+    while (queue->head == NULL && !queue->shutdown)
     {
         pthread_cond_wait(&queue->not_empty, &queue->lock);
+    }
+
+    /* decrement waiter count after waking up */
+    queue->waiter_count--;
+
+    /* if shutdown and no data, signal and return NULL */
+    if (queue->shutdown && queue->head == NULL)
+    {
+        /* signal in case queue_free is waiting for waiter_count to reach 0 */
+        pthread_cond_broadcast(&queue->not_empty);
+        pthread_mutex_unlock(&queue->lock);
+        return NULL;
     }
 
     queue_node_t *node = queue->head;
@@ -297,7 +316,33 @@ void queue_free(queue_t *queue)
 {
     if (queue == NULL) return;
 
-    queue_clear(queue);
+    pthread_mutex_lock(&queue->lock);
+
+    /* set shutdown flag and wake all waiting threads */
+    queue->shutdown = 1;
+    pthread_cond_broadcast(&queue->not_empty);
+
+    /* clear the queue while holding the lock */
+    queue_node_t *current = queue->head;
+    while (current != NULL)
+    {
+        queue_node_t *next = current->next;
+        free(current);
+        current = next;
+    }
+
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->size = 0;
+
+    /* wait for all waiting threads to exit */
+    while (queue->waiter_count > 0)
+    {
+        /* threads will decrement waiter_count and broadcast when they wake */
+        pthread_cond_wait(&queue->not_empty, &queue->lock);
+    }
+
+    pthread_mutex_unlock(&queue->lock);
 
     pthread_mutex_destroy(&queue->lock);
     pthread_cond_destroy(&queue->not_empty);
@@ -326,6 +371,9 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     queue->head = NULL;
     queue->tail = NULL;
     queue->size = 0;
+
+    queue->shutdown = 1;
+    pthread_cond_broadcast(&queue->not_empty);
 
     pthread_mutex_unlock(&queue->lock);
 

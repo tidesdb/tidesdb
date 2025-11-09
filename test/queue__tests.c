@@ -16,12 +16,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef _WIN32
-#include <unistd.h>
-#else
-#include <windows.h>
-#endif
-
+#include "../src/compat.h"
 #include "../src/queue.h"
 #include "test_utils.h"
 
@@ -220,7 +215,7 @@ static void *consumer_thread(void *arg)
         }
         pthread_mutex_unlock(args->count_lock);
 
-        int *data = (int *)queue_dequeue_timeout(args->queue, 100);
+        int *data = (int *)queue_dequeue(args->queue);
         if (data != NULL)
         {
             pthread_mutex_lock(args->count_lock);
@@ -319,25 +314,6 @@ void test_queue_dequeue_wait(void)
 
     queue_free(queue);
     printf(GREEN "test_queue_dequeue_wait passed\n" RESET);
-}
-
-void test_queue_dequeue_timeout(void)
-{
-    queue_t *queue = queue_new();
-    ASSERT_TRUE(queue != NULL);
-
-    void *result = queue_dequeue_timeout(queue, 100);
-    ASSERT_TRUE(result == NULL);
-
-    int data = 42;
-    queue_enqueue(queue, &data);
-
-    int *result2 = (int *)queue_dequeue_timeout(queue, 100);
-    ASSERT_TRUE(result2 != NULL);
-    ASSERT_EQ(*result2, 42);
-
-    queue_free(queue);
-    printf(GREEN "test_queue_dequeue_timeout passed\n" RESET);
 }
 
 void test_queue_large_volume(void)
@@ -590,7 +566,6 @@ int main(void)
     RUN_TEST(test_queue_clear, tests_passed);
     RUN_TEST(test_queue_with_strings, tests_passed);
     RUN_TEST(test_queue_free_with_data, tests_passed);
-    RUN_TEST(test_queue_dequeue_timeout, tests_passed);
     RUN_TEST(test_queue_dequeue_wait, tests_passed);
     RUN_TEST(test_queue_threaded, tests_passed);
     RUN_TEST(test_queue_large_volume, tests_passed);

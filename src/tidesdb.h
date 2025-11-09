@@ -310,6 +310,7 @@ typedef struct
  * @param compaction_lock lock for compaction operations
  * @param next_memtable_id next memtable ID to assign
  * @param is_dropping flag indicating if the column family is being dropped
+ * @param active_operations count of background tasks currently executing
  * @param config configuration for this column family (config.sstable_capacity triggers compaction)
  */
 struct tidesdb_column_family_t
@@ -328,7 +329,7 @@ struct tidesdb_column_family_t
     pthread_mutex_t flush_lock;
     pthread_mutex_t compaction_lock;
     _Atomic(int) is_dropping;
-    _Atomic(int) active_operations; /* count of background tasks currently executing */
+    _Atomic(int) active_operations;
     tidesdb_column_family_config_t config;
 };
 

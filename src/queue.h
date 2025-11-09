@@ -87,15 +87,6 @@ void *queue_dequeue(queue_t *queue);
 void *queue_dequeue_wait(queue_t *queue);
 
 /*
- * queue_dequeue_timeout
- * remove and return item from front of queue, blocking with timeout
- * @param queue the queue
- * @param timeout_ms timeout in milliseconds
- * @return pointer to dequeued data, NULL if timeout or error
- */
-void *queue_dequeue_timeout(queue_t *queue, int timeout_ms);
-
-/*
  * queue_peek
  * view item at front of queue without removing it
  * @param queue the queue

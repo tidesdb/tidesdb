@@ -19,14 +19,6 @@
 #include "../src/tidesdb.h"
 #include "../test/test_utils.h"
 
-#define NUM_OPERATIONS 10
-#define NUM_SEEK_OPS   10
-#define KEY_SIZE       16
-#define VALUE_SIZE     100
-#define CF_NAME        "benchmark_cf"
-#define NUM_THREADS    2
-#define BENCH_DB_PATH  "benchmark_db"
-
 /*
  * thread_data_t
  * data structure for passing to threads
@@ -48,6 +40,62 @@ typedef struct
     int end;
     int thread_id;
 } thread_data_t;
+
+/*
+ * generate_sequential_key
+ * generates a sequential key based on index
+ * format: key_<16-digit-padded-number>
+ */
+void generate_sequential_key(uint8_t *buffer, size_t size, int index)
+{
+    snprintf((char *)buffer, size, "key_%016d", index);
+}
+
+/*
+ * generate_random_key
+ * generates a random alphanumeric key
+ */
+void generate_random_key(uint8_t *buffer, size_t size)
+{
+    const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (size_t i = 0; i < size - 1; i++)
+    {
+        buffer[i] = (uint8_t)charset[rand() % (int)(sizeof(charset) - 1)];
+    }
+    buffer[size - 1] = '\0';
+}
+
+/*
+ * zipfian_next
+ * generates a zipfian-distributed number (80/20 rule)
+ * 80% of accesses go to 20% of keys
+ */
+int zipfian_next(int max_value)
+{
+    double random = (double)rand() / RAND_MAX;
+
+    /* simple zipfian approximation */
+    if (random < 0.8)
+    {
+        /* 80% of accesses go to first 20% of keys */
+        return rand() % (max_value / 5);
+    }
+    else
+    {
+        /* 20% of accesses go to remaining 80% of keys */
+        return (max_value / 5) + (rand() % (max_value - max_value / 5));
+    }
+}
+
+/*
+ * generate_zipfian_key
+ * generates a key following zipfian distribution
+ */
+void generate_zipfian_key(uint8_t *buffer, size_t size, int max_index)
+{
+    int index = zipfian_next(max_index);
+    snprintf((char *)buffer, size, "key_%016d", index);
+}
 
 void generate_random_string(uint8_t *buffer, size_t size)
 {
@@ -80,7 +128,7 @@ void *thread_put(void *arg)
             continue;
         }
 
-        if (tidesdb_txn_put(txn, CF_NAME, data->keys[i], data->key_sizes[i], data->values[i],
+        if (tidesdb_txn_put(txn, BENCH_CF_NAME, data->keys[i], data->key_sizes[i], data->values[i],
                             data->value_sizes[i], -1) != 0)
         {
             printf(BOLDRED "Put operation failed\n" RESET);
@@ -114,7 +162,7 @@ void *thread_get(void *arg)
         uint8_t *value_out = NULL;
         size_t value_len = 0;
 
-        if (tidesdb_txn_get(txn, CF_NAME, data->keys[i], data->key_sizes[i], &value_out,
+        if (tidesdb_txn_get(txn, BENCH_CF_NAME, data->keys[i], data->key_sizes[i], &value_out,
                             &value_len) == 0)
         {
             free(value_out);
@@ -139,7 +187,7 @@ void *thread_delete(void *arg)
             continue;
         }
 
-        if (tidesdb_txn_delete(txn, CF_NAME, data->keys[i], data->key_sizes[i]) != 0)
+        if (tidesdb_txn_delete(txn, BENCH_CF_NAME, data->keys[i], data->key_sizes[i]) != 0)
         {
             printf(BOLDRED "Delete operation failed\n" RESET);
             tidesdb_txn_free(txn);
@@ -167,7 +215,7 @@ void *thread_iter_forward(void *arg)
     }
 
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, CF_NAME, &iter) != 0)
+    if (tidesdb_iter_new(txn, BENCH_CF_NAME, &iter) != 0)
     {
         printf(BOLDRED "Failed to create iterator\n" RESET);
         tidesdb_txn_free(txn);
@@ -200,7 +248,7 @@ void *thread_iter_backward(void *arg)
     }
 
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, CF_NAME, &iter) != 0)
+    if (tidesdb_iter_new(txn, BENCH_CF_NAME, &iter) != 0)
     {
         printf(BOLDRED "Failed to create iterator\n" RESET);
         tidesdb_txn_free(txn);
@@ -241,7 +289,7 @@ void *thread_iter_seek(void *arg)
     {
         /* create a new iterator for each seek (more realistic benchmark) */
         tidesdb_iter_t *iter = NULL;
-        if (tidesdb_iter_new(txn, CF_NAME, &iter) != 0)
+        if (tidesdb_iter_new(txn, BENCH_CF_NAME, &iter) != 0)
         {
             continue;
         }
@@ -272,14 +320,28 @@ int main()
 
     srand((unsigned int)time(NULL));
 
-    uint8_t **keys = malloc(NUM_OPERATIONS * sizeof(uint8_t *));
+    /* print benchmark configuration */
+    printf(BOLDCYAN "\n=== TidesDB Benchmark Configuration ===\n" RESET);
+    printf("Operations: %d\n", BENCH_NUM_OPERATIONS);
+    printf("Seek Operations: %d\n", BENCH_NUM_SEEK_OPS);
+    printf("Key Size: %d bytes\n", BENCH_KEY_SIZE);
+    printf("Value Size: %d bytes\n", BENCH_VALUE_SIZE);
+    printf("Threads: %d\n", BENCH_NUM_THREADS);
+    printf("Debug Logging: %s\n", BENCH_DEBUG ? "enabled" : "disabled");
+    printf("Key Pattern: %s\n", BENCH_KEY_PATTERN);
+    printf("Compression: %s\n", BENCH_ENABLE_COMPRESSION ? "enabled" : "disabled");
+    printf("Bloom Filter: %s\n", BENCH_ENABLE_BLOOM_FILTER ? "enabled" : "disabled");
+    printf("Block Indexes: %s\n", BENCH_ENABLE_BLOCK_INDEXES ? "enabled" : "disabled");
+    printf("======================================\n\n" RESET);
+
+    uint8_t **keys = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t *));
     if (keys == NULL)
     {
         printf(BOLDRED "Failed to allocate memory for keys array\n" RESET);
         return 1;
     }
 
-    uint8_t **values = malloc(NUM_OPERATIONS * sizeof(uint8_t *));
+    uint8_t **values = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t *));
     if (values == NULL)
     {
         printf(BOLDRED "Failed to allocate memory for values array\n" RESET);
@@ -287,7 +349,7 @@ int main()
         return 1;
     }
 
-    size_t *key_sizes = malloc(NUM_OPERATIONS * sizeof(size_t));
+    size_t *key_sizes = malloc(BENCH_NUM_OPERATIONS * sizeof(size_t));
     if (key_sizes == NULL)
     {
         printf(BOLDRED "Failed to allocate memory for key sizes array\n" RESET);
@@ -296,7 +358,7 @@ int main()
         return 1;
     }
 
-    size_t *value_sizes = malloc(NUM_OPERATIONS * sizeof(size_t));
+    size_t *value_sizes = malloc(BENCH_NUM_OPERATIONS * sizeof(size_t));
     if (value_sizes == NULL)
     {
         printf(BOLDRED "Failed to allocate memory for value sizes array\n" RESET);
@@ -306,9 +368,9 @@ int main()
         return 1;
     }
 
-    for (int i = 0; i < NUM_OPERATIONS; i++)
+    for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
     {
-        keys[i] = malloc(KEY_SIZE);
+        keys[i] = malloc(BENCH_KEY_SIZE);
         if (keys[i] == NULL)
         {
             printf(BOLDRED "Failed to allocate memory for key %d\n" RESET, i);
@@ -323,10 +385,23 @@ int main()
             free(value_sizes);
             return 1;
         }
-        generate_random_string(keys[i], KEY_SIZE);
-        key_sizes[i] = KEY_SIZE - 1;
 
-        values[i] = malloc(VALUE_SIZE);
+        /* generate key based on selected pattern */
+        if (strcmp(BENCH_KEY_PATTERN, "sequential") == 0)
+        {
+            generate_sequential_key(keys[i], BENCH_KEY_SIZE, i);
+        }
+        else if (strcmp(BENCH_KEY_PATTERN, "zipfian") == 0)
+        {
+            generate_zipfian_key(keys[i], BENCH_KEY_SIZE, BENCH_NUM_OPERATIONS);
+        }
+        else /* default to random */
+        {
+            generate_random_key(keys[i], BENCH_KEY_SIZE);
+        }
+        key_sizes[i] = strlen((char *)keys[i]);
+
+        values[i] = malloc(BENCH_VALUE_SIZE);
         if (values[i] == NULL)
         {
             printf(BOLDRED "Failed to allocate memory for value %d\n" RESET, i);
@@ -342,16 +417,16 @@ int main()
             free(value_sizes);
             return 1;
         }
-        generate_random_string(values[i], VALUE_SIZE);
-        value_sizes[i] = VALUE_SIZE - 1;
+        generate_random_string(values[i], BENCH_VALUE_SIZE);
+        value_sizes[i] = BENCH_VALUE_SIZE - 1;
     }
 
-    tidesdb_config_t config = {.db_path = BENCH_DB_PATH, .enable_debug_logging = 1};
+    tidesdb_config_t config = {.db_path = BENCH_DB_PATH, .enable_debug_logging = BENCH_DEBUG};
     if (tidesdb_open(&config, &tdb) != 0)
     {
         printf(BOLDRED "Failed to open database\n" RESET);
 
-        for (int i = 0; i < NUM_OPERATIONS; i++)
+        for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
         {
             free(keys[i]);
             free(values[i]);
@@ -364,20 +439,26 @@ int main()
     }
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.memtable_flush_size = (KEY_SIZE + VALUE_SIZE) * 4;
-    cf_config.max_sstables_before_compaction = 128;
-    cf_config.compaction_threads = 4;
-    cf_config.enable_compression = 1;
-    cf_config.compression_algorithm = COMPRESS_LZ4;
-    cf_config.enable_background_compaction = 1;
-    cf_config.sync_mode = TDB_SYNC_NONE;
-    cf_config.enable_block_indexes = 1;
+    cf_config.memtable_flush_size = BENCH_MEMTABLE_FLUSH_SIZE;
+    cf_config.max_sstables_before_compaction = BENCH_MAX_SSTABLES_BEFORE_COMPACTION;
+    cf_config.compaction_threads = BENCH_COMPACTION_THREADS;
+    cf_config.sl_max_level = BENCH_SL_MAX_LEVEL;
+    cf_config.sl_probability = BENCH_SL_PROBABILITY;
+    cf_config.enable_compression = BENCH_ENABLE_COMPRESSION;
+    cf_config.compression_algorithm = BENCH_COMPRESSION_ALGORITHM;
+    cf_config.enable_bloom_filter = BENCH_ENABLE_BLOOM_FILTER;
+    cf_config.bloom_filter_fp_rate = BENCH_BLOOM_FILTER_FP_RATE;
+    cf_config.enable_background_compaction = BENCH_ENABLE_BACKGROUND_COMPACTION;
+    cf_config.background_compaction_interval = BENCH_BACKGROUND_COMPACTION_INTERVAL;
+    cf_config.enable_block_indexes = BENCH_ENABLE_BLOCK_INDEXES;
+    cf_config.sync_mode = BENCH_SYNC_MODE;
+    cf_config.comparator_name = BENCH_COMPARATOR_NAME;
 
-    if (tidesdb_create_column_family(tdb, CF_NAME, &cf_config) != 0)
+    if (tidesdb_create_column_family(tdb, BENCH_CF_NAME, &cf_config) != 0)
     {
         printf(BOLDRED "Failed to create column family\n" RESET);
 
-        for (int i = 0; i < NUM_OPERATIONS; i++)
+        for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
         {
             free(keys[i]);
             free(values[i]);
@@ -390,77 +471,78 @@ int main()
         return 1;
     }
 
-    pthread_t threads[NUM_THREADS];
-    thread_data_t thread_data[NUM_THREADS];
+    pthread_t threads[BENCH_NUM_THREADS];
+    thread_data_t thread_data[BENCH_NUM_THREADS];
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         thread_data[i].tdb = tdb;
         thread_data[i].keys = keys;
         thread_data[i].values = values;
         thread_data[i].key_sizes = key_sizes;
         thread_data[i].value_sizes = value_sizes;
-        thread_data[i].start = i * (NUM_OPERATIONS / NUM_THREADS);
-        thread_data[i].end = (i + 1) * (NUM_OPERATIONS / NUM_THREADS);
+        thread_data[i].start = i * (BENCH_NUM_OPERATIONS / BENCH_NUM_THREADS);
+        thread_data[i].end = (i + 1) * (BENCH_NUM_OPERATIONS / BENCH_NUM_THREADS);
     }
 
     printf(BOLDGREEN "\nBenchmarking Put operations...\n" RESET);
     start_time = get_time_ms();
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_create(&threads[i], NULL, thread_put, &thread_data[i]);
     }
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_join(threads[i], NULL);
     }
 
     end_time = get_time_ms();
-    printf(BOLDGREEN "Put: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, NUM_OPERATIONS,
-           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
+    printf(BOLDGREEN "Put: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, BENCH_NUM_OPERATIONS,
+           end_time - start_time, (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
     printf(BOLDGREEN "\nBenchmarking Get operations...\n" RESET);
     start_time = get_time_ms();
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_create(&threads[i], NULL, thread_get, &thread_data[i]);
     }
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_join(threads[i], NULL);
     }
 
     end_time = get_time_ms();
-    printf(BOLDGREEN "Get: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, NUM_OPERATIONS,
-           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
+    printf(BOLDGREEN "Get: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, BENCH_NUM_OPERATIONS,
+           end_time - start_time, (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
     printf(BOLDGREEN "\nBenchmarking Delete operations...\n" RESET);
     start_time = get_time_ms();
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_create(&threads[i], NULL, thread_delete, &thread_data[i]);
     }
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_join(threads[i], NULL);
     }
 
     end_time = get_time_ms();
-    printf(BOLDGREEN "Delete: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, NUM_OPERATIONS,
-           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
+    printf(BOLDGREEN "Delete: %d operations in %.2f ms (%.2f ops/sec)\n" RESET,
+           BENCH_NUM_OPERATIONS, end_time - start_time,
+           (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
     printf(BOLDGREEN "\nRe-populating data for iterator benchmarks...\n" RESET);
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_create(&threads[i], NULL, thread_put, &thread_data[i]);
     }
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_join(threads[i], NULL);
     }
@@ -468,70 +550,73 @@ int main()
     printf(BOLDGREEN "\nBenchmarking Forward Iterator (full scan)...\n" RESET);
     start_time = get_time_ms();
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_create(&threads[i], NULL, thread_iter_forward, &thread_data[i]);
     }
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_join(threads[i], NULL);
     }
 
     end_time = get_time_ms();
-    printf(BOLDGREEN "Forward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET, NUM_THREADS,
-           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
+    printf(BOLDGREEN "Forward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET,
+           BENCH_NUM_THREADS, end_time - start_time,
+           (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
     printf(BOLDGREEN "\nBenchmarking Backward Iterator (full scan)...\n" RESET);
     start_time = get_time_ms();
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_create(&threads[i], NULL, thread_iter_backward, &thread_data[i]);
     }
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_join(threads[i], NULL);
     }
 
     end_time = get_time_ms();
-    printf(BOLDGREEN "Backward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET, NUM_THREADS,
-           end_time - start_time, (NUM_OPERATIONS / (end_time - start_time)) * 1000);
+    printf(BOLDGREEN "Backward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET,
+           BENCH_NUM_THREADS, end_time - start_time,
+           (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
     printf(BOLDGREEN "\nBenchmarking Iterator Seek operations...\n" RESET);
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
-        thread_data[i].start = i * (NUM_SEEK_OPS / NUM_THREADS);
-        thread_data[i].end = (i + 1) * (NUM_SEEK_OPS / NUM_THREADS);
+        thread_data[i].start = i * (BENCH_NUM_SEEK_OPS / BENCH_NUM_THREADS);
+        thread_data[i].end = (i + 1) * (BENCH_NUM_SEEK_OPS / BENCH_NUM_THREADS);
         thread_data[i].thread_id = i;
     }
 
     start_time = get_time_ms();
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_create(&threads[i], NULL, thread_iter_seek, &thread_data[i]);
     }
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         (void)pthread_join(threads[i], NULL);
     }
 
     end_time = get_time_ms();
-    printf(BOLDGREEN "Iterator Seek: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, NUM_SEEK_OPS,
-           end_time - start_time, (NUM_SEEK_OPS / (end_time - start_time)) * 1000);
+    printf(BOLDGREEN "Iterator Seek: %d operations in %.2f ms (%.2f ops/sec)\n" RESET,
+           BENCH_NUM_SEEK_OPS, end_time - start_time,
+           (BENCH_NUM_SEEK_OPS / (end_time - start_time)) * 1000);
 
-    if (tidesdb_drop_column_family(tdb, CF_NAME) != 0)
+    if (tidesdb_drop_column_family(tdb, BENCH_CF_NAME) != 0)
     {
         printf(BOLDRED "Failed to drop column family\n" RESET);
     }
 
     tidesdb_close(tdb);
 
-    for (int i = 0; i < NUM_OPERATIONS; i++)
+    for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
     {
         free(keys[i]);
         free(values[i]);

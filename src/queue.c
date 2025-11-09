@@ -131,61 +131,17 @@ void *queue_dequeue_wait(queue_t *queue)
     /* decrement waiter count after waking up */
     queue->waiter_count--;
 
-    /* if shutdown and no data, signal and return NULL */
+    /* always broadcast when waiter_count changes to wake queue_free if waiting */
+    if (queue->waiter_count == 0)
+    {
+        pthread_cond_broadcast(&queue->not_empty);
+    }
+
+    /* if shutdown and no data, return NULL */
     if (queue->shutdown && queue->head == NULL)
     {
-        /* signal in case queue_free is waiting for waiter_count to reach 0 */
-        pthread_cond_broadcast(&queue->not_empty);
         pthread_mutex_unlock(&queue->lock);
         return NULL;
-    }
-
-    queue_node_t *node = queue->head;
-    void *data = node->data;
-
-    queue->head = node->next;
-    if (queue->head == NULL)
-    {
-        queue->tail = NULL;
-    }
-
-    queue->size--;
-
-    pthread_mutex_unlock(&queue->lock);
-
-    free(node);
-    return data;
-}
-
-void *queue_dequeue_timeout(queue_t *queue, int timeout_ms)
-{
-    if (queue == NULL) return NULL;
-
-    pthread_mutex_lock(&queue->lock);
-
-    if (queue->head == NULL)
-    {
-        /* calculate absolute timeout */
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-
-        ts.tv_sec += timeout_ms / 1000;
-        ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
-
-        /* handle nanosecond overflow */
-        if (ts.tv_nsec >= 1000000000L)
-        {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= 1000000000L;
-        }
-
-        /* wait with timeout */
-        int result = pthread_cond_timedwait(&queue->not_empty, &queue->lock, &ts);
-        if (result == ETIMEDOUT || queue->head == NULL)
-        {
-            pthread_mutex_unlock(&queue->lock);
-            return NULL;
-        }
     }
 
     queue_node_t *node = queue->head;
@@ -335,11 +291,29 @@ void queue_free(queue_t *queue)
     queue->tail = NULL;
     queue->size = 0;
 
-    /* wait for all waiting threads to exit */
+    /* wait for all waiting threads to exit with timeout to prevent deadlock */
     while (queue->waiter_count > 0)
     {
-        /* threads will decrement waiter_count and broadcast when they wake */
-        pthread_cond_wait(&queue->not_empty, &queue->lock);
+        /* broadcast to wake any waiting threads */
+        pthread_cond_broadcast(&queue->not_empty);
+
+        /* use timed wait to prevent indefinite blocking */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 10000000; /* 10ms timeout */
+        if (ts.tv_nsec >= 1000000000)
+        {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000;
+        }
+
+        pthread_cond_timedwait(&queue->not_empty, &queue->lock, &ts);
+
+        /* if waiter_count hasn't changed, broadcast again */
+        if (queue->waiter_count > 0)
+        {
+            pthread_cond_broadcast(&queue->not_empty);
+        }
     }
 
     pthread_mutex_unlock(&queue->lock);

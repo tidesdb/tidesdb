@@ -336,8 +336,40 @@ static void *thread_pool_worker(void *arg)
 
         if (!task) continue;
 
+        /* check if column family is being dropped before executing task */
+        if (atomic_load(&task->cf->is_dropping))
+        {
+            /* column family is being dropped, skip task and cleanup */
+            if (task->type == TASK_FLUSH && task->memtable)
+            {
+                tidesdb_memtable_free(task->memtable);
+            }
+            free(task);
+            continue;
+        }
+
         if (task->type == TASK_FLUSH && task->memtable)
         {
+            /* check is_dropping BEFORE incrementing to avoid race */
+            if (atomic_load(&task->cf->is_dropping))
+            {
+                tidesdb_memtable_free(task->memtable);
+                free(task);
+                continue;
+            }
+
+            /* increment active operations counter */
+            atomic_fetch_add(&task->cf->active_operations, 1);
+
+            /* double-check is_dropping after incrementing */
+            if (atomic_load(&task->cf->is_dropping))
+            {
+                atomic_fetch_sub(&task->cf->active_operations, 1);
+                tidesdb_memtable_free(task->memtable);
+                free(task);
+                continue;
+            }
+
             tidesdb_flush_memtable_to_sstable(task->cf, task->memtable);
 
             /* check if column family is being dropped before accessing queue */
@@ -351,6 +383,9 @@ static void *thread_pool_worker(void *arg)
                 /* release the immutable_memtables queue reference */
                 if (dequeued_mt) tidesdb_memtable_release(dequeued_mt);
             }
+
+            /* decrement active operations counter */
+            atomic_fetch_sub(&task->cf->active_operations, 1);
 
             /* release the task reference */
             tidesdb_memtable_free(task->memtable);
@@ -372,7 +407,28 @@ static void *thread_pool_worker(void *arg)
         }
         else if (task->type == TASK_COMPACTION)
         {
+            /* check is_dropping BEFORE incrementing to avoid race */
+            if (atomic_load(&task->cf->is_dropping))
+            {
+                free(task);
+                continue;
+            }
+
+            /* increment active operations counter */
+            atomic_fetch_add(&task->cf->active_operations, 1);
+
+            /* double-check is_dropping after incrementing */
+            if (atomic_load(&task->cf->is_dropping))
+            {
+                atomic_fetch_sub(&task->cf->active_operations, 1);
+                free(task);
+                continue;
+            }
+
             tidesdb_compact(task->cf);
+
+            /* decrement active operations counter */
+            atomic_fetch_sub(&task->cf->active_operations, 1);
         }
 
         free(task);
@@ -1581,18 +1637,24 @@ int tidesdb_close(tidesdb_t *db)
         tidesdb_column_family_t *cf = db->column_families[i];
         if (!cf) continue;
 
-        /* flush and free any remaining memtables in immutable_memtables queue
-         * hold flush_lock to prevent race with tidesdb_rotate_memtable */
+        /* clear immutable memtables queue without flushing
+         * background flush threads have been stopped, just release references
+         * WAL will handle recovery on next open if needed */
         pthread_mutex_lock(&cf->flush_lock);
         tidesdb_memtable_t *mt;
         while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
         {
-            pthread_mutex_unlock(&cf->flush_lock);
-            tidesdb_flush_memtable_to_sstable(cf, mt);
-            /* release queue reference, then release creation reference */
+            /* memtable has ref_count=2 -- one from queue_enqueue, one from task
+             * if task never ran (because we're closing), we need to release both */
+            if (mt->wal)
+            {
+                block_manager_close(mt->wal);
+                mt->wal = NULL;
+            }
+            /* release queue reference */
             tidesdb_memtable_release(mt);
+            /* release creation reference and free */
             tidesdb_memtable_free(mt);
-            pthread_mutex_lock(&cf->flush_lock);
         }
         pthread_mutex_unlock(&cf->flush_lock);
 
@@ -1697,6 +1759,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->next_sstable_id, 0);
     atomic_init(&cf->next_memtable_id, 0);
     atomic_init(&cf->is_dropping, 0);
+    atomic_init(&cf->active_operations, 0);
     memset(&cf->cf_lock, 0, sizeof(pthread_rwlock_t));
     memset(&cf->flush_lock, 0, sizeof(pthread_mutex_t));
     memset(&cf->compaction_lock, 0, sizeof(pthread_mutex_t));
@@ -2162,21 +2225,31 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     tidesdb_column_family_t *cf = db->column_families[found];
     int cleanup_error = 0; /* track errors but continue cleanup */
 
+    /* set dropping flag to stop new background operations */
     atomic_store(&cf->is_dropping, 1);
 
-    /* wait for any ongoing compaction to complete */
-    pthread_mutex_lock(&cf->compaction_lock);
-    pthread_mutex_unlock(&cf->compaction_lock);
+    /* wait for all active background operations to complete
+     * operations check is_dropping and will decrement counter before exiting */
+    while (atomic_load(&cf->active_operations) > 0)
+    {
+        /* spin-wait -- operations should complete quickly once they see is_dropping */
+        sched_yield(); /* yield CPU to let other threads run */
+    }
 
+    /* clear immutable memtables queue without flushing
+     * WAL will handle recovery on next open if needed */
     pthread_mutex_lock(&cf->flush_lock);
     tidesdb_memtable_t *mt;
     while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
     {
-        pthread_mutex_unlock(&cf->flush_lock);
-        tidesdb_flush_memtable_to_sstable(cf, mt);
-        /* release the creation reference */
-        tidesdb_memtable_release(mt);
-        pthread_mutex_lock(&cf->flush_lock);
+        /* close WAL and free memtable without flushing */
+        if (mt->wal)
+        {
+            block_manager_close(mt->wal);
+            mt->wal = NULL;
+        }
+        /* tidesdb_memtable_free calls tidesdb_memtable_release internally */
+        tidesdb_memtable_free(mt);
     }
     pthread_mutex_unlock(&cf->flush_lock);
 

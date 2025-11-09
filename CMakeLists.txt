@@ -133,6 +133,79 @@ install(FILES external/xxhash.h DESTINATION include/tidesdb)
 if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     enable_testing()
 
+    # benchmark configuration variables (can be overridden at build time with -D flags)
+    if(NOT DEFINED BENCH_NUM_OPERATIONS)
+        set(BENCH_NUM_OPERATIONS 10)
+    endif()
+    if(NOT DEFINED BENCH_NUM_SEEK_OPS)
+        set(BENCH_NUM_SEEK_OPS 10)
+    endif()
+    if(NOT DEFINED BENCH_KEY_SIZE)
+        set(BENCH_KEY_SIZE 16)
+    endif()
+    if(NOT DEFINED BENCH_VALUE_SIZE)
+        set(BENCH_VALUE_SIZE 100)
+    endif()
+    if(NOT DEFINED BENCH_CF_NAME)
+        set(BENCH_CF_NAME "benchmark_cf")
+    endif()
+    if(NOT DEFINED BENCH_NUM_THREADS)
+        set(BENCH_NUM_THREADS 2)
+    endif()
+    if(NOT DEFINED BENCH_DEBUG)
+        set(BENCH_DEBUG 0)
+    endif()
+    if(NOT DEFINED BENCH_DB_PATH)
+        set(BENCH_DB_PATH "benchmark_db")
+    endif()
+    if(NOT DEFINED BENCH_KEY_PATTERN)
+        set(BENCH_KEY_PATTERN "random")
+    endif()
+
+    # column family configuration variables for benchmark
+    if(NOT DEFINED BENCH_MEMTABLE_FLUSH_SIZE)
+        set(BENCH_MEMTABLE_FLUSH_SIZE 67108864)
+    endif()
+    if(NOT DEFINED BENCH_MAX_SSTABLES_BEFORE_COMPACTION)
+        set(BENCH_MAX_SSTABLES_BEFORE_COMPACTION 128)
+    endif()
+    if(NOT DEFINED BENCH_COMPACTION_THREADS)
+        set(BENCH_COMPACTION_THREADS 4)
+    endif()
+    if(NOT DEFINED BENCH_SL_MAX_LEVEL)
+        set(BENCH_SL_MAX_LEVEL 12)
+    endif()
+    if(NOT DEFINED BENCH_SL_PROBABILITY)
+        set(BENCH_SL_PROBABILITY 0.25)
+    endif()
+    if(NOT DEFINED BENCH_ENABLE_COMPRESSION)
+        set(BENCH_ENABLE_COMPRESSION 1)
+    endif()
+    if(NOT DEFINED BENCH_COMPRESSION_ALGORITHM)
+        set(BENCH_COMPRESSION_ALGORITHM COMPRESS_LZ4)
+    endif()
+    if(NOT DEFINED BENCH_ENABLE_BLOOM_FILTER)
+        set(BENCH_ENABLE_BLOOM_FILTER 1)
+    endif()
+    if(NOT DEFINED BENCH_BLOOM_FILTER_FP_RATE)
+        set(BENCH_BLOOM_FILTER_FP_RATE 0.01)
+    endif()
+    if(NOT DEFINED BENCH_ENABLE_BACKGROUND_COMPACTION)
+        set(BENCH_ENABLE_BACKGROUND_COMPACTION 1)
+    endif()
+    if(NOT DEFINED BENCH_BACKGROUND_COMPACTION_INTERVAL)
+        set(BENCH_BACKGROUND_COMPACTION_INTERVAL 1000000)
+    endif()
+    if(NOT DEFINED BENCH_ENABLE_BLOCK_INDEXES)
+        set(BENCH_ENABLE_BLOCK_INDEXES 1)
+    endif()
+    if(NOT DEFINED BENCH_SYNC_MODE)
+        set(BENCH_SYNC_MODE TDB_SYNC_NONE)
+    endif()
+    if(NOT DEFINED BENCH_COMPARATOR_NAME)
+        set(BENCH_COMPARATOR_NAME "memcmp")
+    endif()
+
     add_executable(block_manager_tests test/block_manager__tests.c)
     add_executable(skip_list_tests test/skip_list__tests.c)
     add_executable(compress_tests test/compress__tests.c)
@@ -142,6 +215,33 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(succinct_trie_tests test/succinct_trie__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
     add_executable(tidesdb_bench bench/tidesdb__bench.c)
+
+    # pass benchmark configuration as compile definitions
+    target_compile_definitions(tidesdb_bench PRIVATE
+        BENCH_NUM_OPERATIONS=${BENCH_NUM_OPERATIONS}
+        BENCH_NUM_SEEK_OPS=${BENCH_NUM_SEEK_OPS}
+        BENCH_KEY_SIZE=${BENCH_KEY_SIZE}
+        BENCH_VALUE_SIZE=${BENCH_VALUE_SIZE}
+        BENCH_CF_NAME=\"${BENCH_CF_NAME}\"
+        BENCH_NUM_THREADS=${BENCH_NUM_THREADS}
+        BENCH_DEBUG=${BENCH_DEBUG}
+        BENCH_DB_PATH=\"${BENCH_DB_PATH}\"
+        BENCH_KEY_PATTERN=\"${BENCH_KEY_PATTERN}\"
+        BENCH_MEMTABLE_FLUSH_SIZE=${BENCH_MEMTABLE_FLUSH_SIZE}
+        BENCH_MAX_SSTABLES_BEFORE_COMPACTION=${BENCH_MAX_SSTABLES_BEFORE_COMPACTION}
+        BENCH_COMPACTION_THREADS=${BENCH_COMPACTION_THREADS}
+        BENCH_SL_MAX_LEVEL=${BENCH_SL_MAX_LEVEL}
+        BENCH_SL_PROBABILITY=${BENCH_SL_PROBABILITY}
+        BENCH_ENABLE_COMPRESSION=${BENCH_ENABLE_COMPRESSION}
+        BENCH_COMPRESSION_ALGORITHM=${BENCH_COMPRESSION_ALGORITHM}
+        BENCH_ENABLE_BLOOM_FILTER=${BENCH_ENABLE_BLOOM_FILTER}
+        BENCH_BLOOM_FILTER_FP_RATE=${BENCH_BLOOM_FILTER_FP_RATE}
+        BENCH_ENABLE_BACKGROUND_COMPACTION=${BENCH_ENABLE_BACKGROUND_COMPACTION}
+        BENCH_BACKGROUND_COMPACTION_INTERVAL=${BENCH_BACKGROUND_COMPACTION_INTERVAL}
+        BENCH_ENABLE_BLOCK_INDEXES=${BENCH_ENABLE_BLOCK_INDEXES}
+        BENCH_SYNC_MODE=${BENCH_SYNC_MODE}
+        BENCH_COMPARATOR_NAME=\"${BENCH_COMPARATOR_NAME}\"
+    )
 
     # add include and link directories for test executables
     foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests lru_tests queue_tests succinct_trie_tests tidesdb_tests tidesdb_bench)

@@ -19,13 +19,14 @@
 #include "../src/tidesdb.h"
 #include "../test/test_utils.h"
 
-#define NUM_OPERATIONS 10
-#define NUM_SEEK_OPS   10
-#define KEY_SIZE       16
-#define VALUE_SIZE     100
-#define CF_NAME        "benchmark_cf"
-#define NUM_THREADS    2
-#define BENCH_DB_PATH  "benchmark_db"
+/* convenience macros for cleaner code */
+#define NUM_OPERATIONS BENCH_NUM_OPERATIONS
+#define NUM_SEEK_OPS   BENCH_NUM_SEEK_OPS
+#define KEY_SIZE       BENCH_KEY_SIZE
+#define VALUE_SIZE     BENCH_VALUE_SIZE
+#define CF_NAME        BENCH_CF_NAME
+#define NUM_THREADS    BENCH_NUM_THREADS
+#define DEBUG          BENCH_DEBUG
 
 /*
  * thread_data_t
@@ -48,6 +49,62 @@ typedef struct
     int end;
     int thread_id;
 } thread_data_t;
+
+/*
+ * generate_sequential_key
+ * generates a sequential key based on index
+ * format: key_<16-digit-padded-number>
+ */
+void generate_sequential_key(uint8_t *buffer, size_t size, int index)
+{
+    snprintf((char *)buffer, size, "key_%016d", index);
+}
+
+/*
+ * generate_random_key
+ * generates a random alphanumeric key
+ */
+void generate_random_key(uint8_t *buffer, size_t size)
+{
+    const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (size_t i = 0; i < size - 1; i++)
+    {
+        buffer[i] = (uint8_t)charset[rand() % (int)(sizeof(charset) - 1)];
+    }
+    buffer[size - 1] = '\0';
+}
+
+/*
+ * zipfian_next
+ * generates a zipfian-distributed number (80/20 rule)
+ * 80% of accesses go to 20% of keys
+ */
+int zipfian_next(int max_value)
+{
+    double random = (double)rand() / RAND_MAX;
+
+    /* simple zipfian approximation */
+    if (random < 0.8)
+    {
+        /* 80% of accesses go to first 20% of keys */
+        return rand() % (max_value / 5);
+    }
+    else
+    {
+        /* 20% of accesses go to remaining 80% of keys */
+        return (max_value / 5) + (rand() % (max_value - max_value / 5));
+    }
+}
+
+/*
+ * generate_zipfian_key
+ * generates a key following zipfian distribution
+ */
+void generate_zipfian_key(uint8_t *buffer, size_t size, int max_index)
+{
+    int index = zipfian_next(max_index);
+    snprintf((char *)buffer, size, "key_%016d", index);
+}
 
 void generate_random_string(uint8_t *buffer, size_t size)
 {
@@ -272,6 +329,20 @@ int main()
 
     srand((unsigned int)time(NULL));
 
+    /* print benchmark configuration */
+    printf(BOLDCYAN "\n=== TidesDB Benchmark Configuration ===\n" RESET);
+    printf("Operations: %d\n", NUM_OPERATIONS);
+    printf("Seek Operations: %d\n", NUM_SEEK_OPS);
+    printf("Key Size: %d bytes\n", KEY_SIZE);
+    printf("Value Size: %d bytes\n", VALUE_SIZE);
+    printf("Threads: %d\n", NUM_THREADS);
+    printf("Debug Logging: %s\n", DEBUG ? "enabled" : "disabled");
+    printf("Key Pattern: %s\n", BENCH_KEY_PATTERN);
+    printf("Compression: %s\n", BENCH_ENABLE_COMPRESSION ? "enabled" : "disabled");
+    printf("Bloom Filter: %s\n", BENCH_ENABLE_BLOOM_FILTER ? "enabled" : "disabled");
+    printf("Block Indexes: %s\n", BENCH_ENABLE_BLOCK_INDEXES ? "enabled" : "disabled");
+    printf("======================================\n\n" RESET);
+
     uint8_t **keys = malloc(NUM_OPERATIONS * sizeof(uint8_t *));
     if (keys == NULL)
     {
@@ -323,8 +394,21 @@ int main()
             free(value_sizes);
             return 1;
         }
-        generate_random_string(keys[i], KEY_SIZE);
-        key_sizes[i] = KEY_SIZE - 1;
+
+        /* generate key based on selected pattern */
+        if (strcmp(BENCH_KEY_PATTERN, "sequential") == 0)
+        {
+            generate_sequential_key(keys[i], KEY_SIZE, i);
+        }
+        else if (strcmp(BENCH_KEY_PATTERN, "zipfian") == 0)
+        {
+            generate_zipfian_key(keys[i], KEY_SIZE, NUM_OPERATIONS);
+        }
+        else /* default to random */
+        {
+            generate_random_key(keys[i], KEY_SIZE);
+        }
+        key_sizes[i] = strlen((char *)keys[i]);
 
         values[i] = malloc(VALUE_SIZE);
         if (values[i] == NULL)
@@ -346,7 +430,7 @@ int main()
         value_sizes[i] = VALUE_SIZE - 1;
     }
 
-    tidesdb_config_t config = {.db_path = BENCH_DB_PATH, .enable_debug_logging = 1};
+    tidesdb_config_t config = {.db_path = BENCH_DB_PATH, .enable_debug_logging = DEBUG};
     if (tidesdb_open(&config, &tdb) != 0)
     {
         printf(BOLDRED "Failed to open database\n" RESET);
@@ -364,14 +448,20 @@ int main()
     }
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.memtable_flush_size = (KEY_SIZE + VALUE_SIZE) * 4;
-    cf_config.max_sstables_before_compaction = 128;
-    cf_config.compaction_threads = 4;
-    cf_config.enable_compression = 1;
-    cf_config.compression_algorithm = COMPRESS_LZ4;
-    cf_config.enable_background_compaction = 1;
-    cf_config.sync_mode = TDB_SYNC_NONE;
-    cf_config.enable_block_indexes = 1;
+    cf_config.memtable_flush_size = BENCH_MEMTABLE_FLUSH_SIZE;
+    cf_config.max_sstables_before_compaction = BENCH_MAX_SSTABLES_BEFORE_COMPACTION;
+    cf_config.compaction_threads = BENCH_COMPACTION_THREADS;
+    cf_config.sl_max_level = BENCH_SL_MAX_LEVEL;
+    cf_config.sl_probability = BENCH_SL_PROBABILITY;
+    cf_config.enable_compression = BENCH_ENABLE_COMPRESSION;
+    cf_config.compression_algorithm = BENCH_COMPRESSION_ALGORITHM;
+    cf_config.enable_bloom_filter = BENCH_ENABLE_BLOOM_FILTER;
+    cf_config.bloom_filter_fp_rate = BENCH_BLOOM_FILTER_FP_RATE;
+    cf_config.enable_background_compaction = BENCH_ENABLE_BACKGROUND_COMPACTION;
+    cf_config.background_compaction_interval = BENCH_BACKGROUND_COMPACTION_INTERVAL;
+    cf_config.enable_block_indexes = BENCH_ENABLE_BLOCK_INDEXES;
+    cf_config.sync_mode = BENCH_SYNC_MODE;
+    cf_config.comparator_name = BENCH_COMPARATOR_NAME;
 
     if (tidesdb_create_column_family(tdb, CF_NAME, &cf_config) != 0)
     {

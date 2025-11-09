@@ -154,7 +154,7 @@ void test_disk_streaming_large_dataset()
 void test_disk_streaming_common_prefix()
 {
     /* test keys with long common prefixes */
-    succinct_trie_builder_t *builder = succinct_trie_builder_new("/tmp", NULL, NULL);
+    succinct_trie_builder_t *builder = succinct_trie_builder_new(NULL, NULL, NULL);
     ASSERT_TRUE(builder != NULL);
 
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"commonprefix_a", 14, 1), 0);
@@ -182,7 +182,7 @@ void test_disk_streaming_common_prefix()
 void test_disk_streaming_single_entry()
 {
     /* single entry */
-    succinct_trie_builder_t *builder = succinct_trie_builder_new("/tmp", NULL, NULL);
+    succinct_trie_builder_t *builder = succinct_trie_builder_new(NULL, NULL, NULL);
     ASSERT_TRUE(builder != NULL);
 
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"single", 6, 42), 0);
@@ -201,7 +201,7 @@ void test_disk_streaming_single_entry()
 void test_disk_streaming_serialization()
 {
     /* test that disk-streaming trie can be serialized/deserialized */
-    succinct_trie_builder_t *builder = succinct_trie_builder_new("/tmp", NULL, NULL);
+    succinct_trie_builder_t *builder = succinct_trie_builder_new(NULL, NULL, NULL);
     ASSERT_TRUE(builder != NULL);
 
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"alpha", 5, 10), 0);
@@ -249,7 +249,7 @@ void benchmark_succinct_trie()
 
     clock_t start = clock();
     succinct_trie_builder_t *builder =
-        succinct_trie_builder_new("/tmp", succinct_trie_comparator_string, NULL);
+        succinct_trie_builder_new(NULL, succinct_trie_comparator_string, NULL);
     ASSERT_TRUE(builder != NULL);
 
     /* add keys in sorted order (streaming mode requires sorted input) */
@@ -301,7 +301,7 @@ void benchmark_disk_streaming_vs_memory()
 
     /* benchmark disk streaming */
     clock_t start = clock();
-    succinct_trie_builder_t *disk_builder = succinct_trie_builder_new("/tmp", NULL, NULL);
+    succinct_trie_builder_t *disk_builder = succinct_trie_builder_new(NULL, NULL, NULL);
     ASSERT_TRUE(disk_builder != NULL);
 
     for (int i = 0; i < N; i++)
@@ -317,7 +317,7 @@ void benchmark_disk_streaming_vs_memory()
 
     /* benchmark memory streaming */
     start = clock();
-    succinct_trie_builder_t *mem_builder = succinct_trie_builder_new("/tmp", NULL, NULL);
+    succinct_trie_builder_t *mem_builder = succinct_trie_builder_new(NULL, NULL, NULL);
     ASSERT_TRUE(mem_builder != NULL);
 
     for (int i = 0; i < N; i++)

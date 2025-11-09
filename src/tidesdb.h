@@ -39,6 +39,7 @@
 #include "lru.h"
 #include "queue.h"
 #include "skip_list.h"
+#include "succinct_trie.h"
 
 /* follow your passion, be obsessed, don't worry too much. */
 
@@ -99,6 +100,9 @@ extern int _tidesdb_debug_enabled;
 
 /* "SSTM" sstable meta magic number */
 #define TDB_SST_META_MAGIC 0x5353544D
+
+/* 1MB */
+#define SUCCINCT_TRIE_INITIAL_BUFFER_SIZE (1024 * 1024)
 
 /* flags for key-value pair header */
 #define TDB_KV_FLAG_TOMBSTONE 0x01
@@ -209,15 +213,18 @@ typedef struct
  * @param max_sstables_before_compaction max sstables before triggering compaction (background or
  * manual)
  * @param compaction_threads number of threads to use for parallel compaction (0 = single-threaded)
- * @param max_level maximum skip list level
- * @param probability skip list probability
- * @param compressed whether to compress sstables
- * @param compress_algo compression algorithm to use
- * @param bloom_filter_fp_rate bloom filter false positive rate
+ * @param sl_max_level maximum skip list level
+ * @param sl_probability skip list probability
+ * @param enable_compression whether or not to enable compression
+ * @param compression_algorithm compression algorithm to use if compression is enabled for column
+ * family
+ * @param enable_bloom_filter whether to use bloom filters for this column family
+ * @param bloom_filter_fp_rate bloom filter false positive rate (only used if enable_bloom_filter is
+ * true)
  * @param enable_background_compaction enable automatic background compaction
  * @param background_compaction_interval interval in microseconds between compaction checks (default
  * 1000000 = 1 second)
- * @param use_sbha use sorted binary hash array for direct key lookups
+ * @param enable_block_indexes use succinct trie for block offset indexing (faster key lookups)
  * @param sync_mode sync mode for this column family (TDB_SYNC_NONE or TDB_SYNC_FULL)
  * @param comparator_name name of registered comparator (NULL = use default "memcmp")
  * during compaction/flush (default 1000 = 1ms)
@@ -227,14 +234,15 @@ typedef struct
     size_t memtable_flush_size;
     int max_sstables_before_compaction;
     int compaction_threads;
-    int max_level;
-    float probability;
-    int compressed;
-    compress_type compress_algo;
+    int sl_max_level;
+    float sl_probability;
+    int enable_compression;
+    compression_algorithm compression_algorithm;
+    int enable_bloom_filter;
     double bloom_filter_fp_rate;
     int enable_background_compaction;
     int background_compaction_interval;
-    int use_sbha;
+    int enable_block_indexes;
     tidesdb_sync_mode_t sync_mode;
     const char *comparator_name;
 } tidesdb_column_family_config_t;
@@ -245,7 +253,7 @@ typedef struct
  * @param id unique identifier for this sstable
  * @param cf pointer to parent column family
  * @param block_manager block manager for this sstable
- * @param index binary hash array index (key hash = block offset)
+ * @param index succinct trie index (key -> block offset)
  * @param bloom_filter bloom filter for membership testing
  * @param min_key minimum key in this sstable
  * @param max_key maximum key in this sstable
@@ -258,7 +266,7 @@ struct tidesdb_sstable_t
     uint64_t id;
     tidesdb_column_family_t *cf;
     block_manager_t *block_manager;
-    binary_hash_array_t *index;
+    succinct_trie_t *index;
     bloom_filter_t *bloom_filter;
     uint8_t *min_key;
     uint8_t *max_key;
@@ -507,6 +515,7 @@ typedef struct
  * @param compaction_threads number of threads to use for parallel compaction
  * @param max_level maximum skip list level (for new memtables)
  * @param probability skip list probability (for new memtables)
+ * @param enable_bloom_filter whether to use bloom filters (for new SSTables)
  * @param bloom_filter_fp_rate bloom filter false positive rate (for new SSTables)
  * @param enable_background_compaction enable automatic background compaction
  * @param background_compaction_interval interval in microseconds between compaction checks
@@ -518,6 +527,7 @@ typedef struct
     int compaction_threads;
     int max_level;
     float probability;
+    int enable_bloom_filter;
     double bloom_filter_fp_rate;
     int enable_background_compaction;
     int background_compaction_interval;

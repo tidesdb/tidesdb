@@ -26,6 +26,7 @@ queue_t *queue_new(void)
     queue->head = NULL;
     queue->tail = NULL;
     queue->size = 0;
+    queue->shutdown = 0;
 
     if (pthread_mutex_init(&queue->lock, NULL) != 0)
     {
@@ -115,10 +116,17 @@ void *queue_dequeue_wait(queue_t *queue)
 
     pthread_mutex_lock(&queue->lock);
 
-    /* wait until queue is not empty */
-    while (queue->head == NULL)
+    /* wait until queue is not empty or shutdown */
+    while (queue->head == NULL && !queue->shutdown)
     {
         pthread_cond_wait(&queue->not_empty, &queue->lock);
+    }
+
+    /* if shutdown and no data, return NULL */
+    if (queue->shutdown && queue->head == NULL)
+    {
+        pthread_mutex_unlock(&queue->lock);
+        return NULL;
     }
 
     queue_node_t *node = queue->head;
@@ -297,6 +305,11 @@ void queue_free(queue_t *queue)
 {
     if (queue == NULL) return;
 
+    pthread_mutex_lock(&queue->lock);
+    queue->shutdown = 1;
+    pthread_cond_broadcast(&queue->not_empty);
+    pthread_mutex_unlock(&queue->lock);
+
     queue_clear(queue);
 
     pthread_mutex_destroy(&queue->lock);
@@ -326,6 +339,9 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     queue->head = NULL;
     queue->tail = NULL;
     queue->size = 0;
+
+    queue->shutdown = 1;
+    pthread_cond_broadcast(&queue->not_empty);
 
     pthread_mutex_unlock(&queue->lock);
 

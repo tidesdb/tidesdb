@@ -19,8 +19,8 @@
 #include "../src/tidesdb.h"
 #include "../test/test_utils.h"
 
-#define NUM_OPERATIONS 1000000
-#define NUM_SEEK_OPS   1000
+#define NUM_OPERATIONS 10
+#define NUM_SEEK_OPS   10
 #define KEY_SIZE       16
 #define VALUE_SIZE     100
 #define CF_NAME        "benchmark_cf"
@@ -233,21 +233,19 @@ void *thread_iter_seek(void *arg)
         return NULL;
     }
 
-    tidesdb_iter_t *iter = NULL;
-
-    if (tidesdb_iter_new(txn, CF_NAME, &iter) != 0)
-    {
-        printf(BOLDRED "[Thread %d] Failed to create iterator\n" RESET, data->thread_id);
-        tidesdb_txn_free(txn);
-        return NULL;
-    }
-
     /* seed random number generator with thread id for different sequences per thread */
     srand(time(NULL) + data->thread_id);
 
     int num_seeks = data->end - data->start;
     for (int i = 0; i < num_seeks; i++)
     {
+        /* create a new iterator for each seek (more realistic benchmark) */
+        tidesdb_iter_t *iter = NULL;
+        if (tidesdb_iter_new(txn, CF_NAME, &iter) != 0)
+        {
+            continue;
+        }
+
         /* random seek to an existing key */
         int random_idx = data->start + (rand() % (data->end - data->start));
         tidesdb_iter_seek(iter, data->keys[random_idx], data->key_sizes[random_idx]);
@@ -258,9 +256,9 @@ void *thread_iter_seek(void *arg)
             tidesdb_iter_key(iter, &key, &key_size);
             tidesdb_iter_value(iter, &value, &value_size);
         }
-    }
 
-    tidesdb_iter_free(iter);
+        tidesdb_iter_free(iter);
+    }
     tidesdb_txn_free(txn);
 
     return NULL;
@@ -348,7 +346,7 @@ int main()
         value_sizes[i] = VALUE_SIZE - 1;
     }
 
-    tidesdb_config_t config = {.db_path = BENCH_DB_PATH, .enable_debug_logging = 0};
+    tidesdb_config_t config = {.db_path = BENCH_DB_PATH, .enable_debug_logging = 1};
     if (tidesdb_open(&config, &tdb) != 0)
     {
         printf(BOLDRED "Failed to open database\n" RESET);
@@ -366,13 +364,14 @@ int main()
     }
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.memtable_flush_size = TDB_DEFAULT_MEMTABLE_FLUSH_SIZE;
+    cf_config.memtable_flush_size = (KEY_SIZE + VALUE_SIZE) * 4;
     cf_config.max_sstables_before_compaction = 128;
     cf_config.compaction_threads = 4;
-    cf_config.compressed = 1;
-    cf_config.compress_algo = COMPRESS_LZ4;
+    cf_config.enable_compression = 1;
+    cf_config.compression_algorithm = COMPRESS_LZ4;
     cf_config.enable_background_compaction = 1;
     cf_config.sync_mode = TDB_SYNC_NONE;
+    cf_config.enable_block_indexes = 1;
 
     if (tidesdb_create_column_family(tdb, CF_NAME, &cf_config) != 0)
     {

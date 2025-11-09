@@ -49,14 +49,15 @@ static tidesdb_column_family_config_t get_test_cf_config(void)
         .memtable_flush_size = 1024 * 1024,
         .max_sstables_before_compaction = 512,
         .compaction_threads = 1,
-        .max_level = 8,
-        .probability = 0.25,
-        .compressed = 1,
-        .compress_algo = COMPRESS_LZ4,
+        .sl_max_level = 8,
+        .sl_probability = 0.25,
+        .enable_compression = 1,
+        .compression_algorithm = COMPRESS_LZ4,
+        .enable_bloom_filter = 1,
         .bloom_filter_fp_rate = 0.01,
         .enable_background_compaction = 1,
         .background_compaction_interval = TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL,
-        .use_sbha = 1,
+        .enable_block_indexes = 1,
         .sync_mode = TDB_SYNC_NONE,
         .comparator_name = NULL};
     return config;
@@ -1316,8 +1317,8 @@ static void test_column_family_stats(void)
     ASSERT_TRUE(strcmp(stats->comparator_name, "memcmp") == 0);
 
     /* verify config was copied */
-    ASSERT_TRUE(stats->config.compressed == cf_config.compressed);
-    ASSERT_TRUE(stats->config.compress_algo == cf_config.compress_algo);
+    ASSERT_TRUE(stats->config.enable_compression == cf_config.enable_compression);
+    ASSERT_TRUE(stats->config.compression_algorithm == cf_config.compression_algorithm);
 
     free(stats);
 
@@ -2264,8 +2265,8 @@ static void test_iterator_metadata_boundary(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
     cf_config.memtable_flush_size = 2048; /* small to force flush */
-    cf_config.compressed = 1;
-    cf_config.compress_algo = COMPRESS_LZ4;
+    cf_config.enable_compression = 1;
+    cf_config.compression_algorithm = COMPRESS_LZ4;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "boundary_test", &cf_config), 0);
 
@@ -2354,7 +2355,7 @@ static void test_sstable_num_entries_accuracy(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
     cf_config.memtable_flush_size = 1024;
-    cf_config.compressed = 1;
+    cf_config.enable_compression = 1;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "entries_test", &cf_config), 0);
 
@@ -2703,8 +2704,8 @@ static int test_linear_scan_fallback(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
 
-    /* disable SBHA to force linear scan fallback */
-    cf_config.use_sbha = 0;
+    /* disable block indexes to force linear scan fallback */
+    cf_config.enable_block_indexes = 0;
     cf_config.enable_background_compaction = 0;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "linear_scan_cf", &cf_config), 0);
@@ -2825,8 +2826,8 @@ static int test_column_family_config_persistence(void)
     cf_config.memtable_flush_size = 32 * 1024 * 1024;
     cf_config.max_sstables_before_compaction = 64;
     cf_config.compaction_threads = 2;
-    cf_config.max_level = 10;
-    cf_config.probability = 0.5f;
+    cf_config.sl_max_level = 10;
+    cf_config.sl_probability = 0.5f;
     cf_config.bloom_filter_fp_rate = 0.02;
     cf_config.enable_background_compaction = 0;
     cf_config.background_compaction_interval = 2000000;
@@ -2839,8 +2840,8 @@ static int test_column_family_config_persistence(void)
     ASSERT_EQ(cf->config.memtable_flush_size, 32 * 1024 * 1024);
     ASSERT_EQ(cf->config.max_sstables_before_compaction, 64);
     ASSERT_EQ(cf->config.compaction_threads, 2);
-    ASSERT_EQ(cf->config.max_level, 10);
-    ASSERT_TRUE(cf->config.probability > 0.49f && cf->config.probability < 0.51f);
+    ASSERT_EQ(cf->config.sl_max_level, 10);
+    ASSERT_TRUE(cf->config.sl_probability > 0.49f && cf->config.sl_probability < 0.51f);
     ASSERT_TRUE(cf->config.bloom_filter_fp_rate > 0.019 && cf->config.bloom_filter_fp_rate < 0.021);
     ASSERT_EQ(cf->config.enable_background_compaction, 0);
     ASSERT_EQ(cf->config.background_compaction_interval, 2000000);
@@ -2856,8 +2857,8 @@ static int test_column_family_config_persistence(void)
     ASSERT_EQ(cf->config.memtable_flush_size, 32 * 1024 * 1024);
     ASSERT_EQ(cf->config.max_sstables_before_compaction, 64);
     ASSERT_EQ(cf->config.compaction_threads, 2);
-    ASSERT_EQ(cf->config.max_level, 10);
-    ASSERT_TRUE(cf->config.probability > 0.49f && cf->config.probability < 0.51f);
+    ASSERT_EQ(cf->config.sl_max_level, 10);
+    ASSERT_TRUE(cf->config.sl_probability > 0.49f && cf->config.sl_probability < 0.51f);
     ASSERT_TRUE(cf->config.bloom_filter_fp_rate > 0.019 && cf->config.bloom_filter_fp_rate < 0.021);
     ASSERT_EQ(cf->config.enable_background_compaction, 0);
     ASSERT_EQ(cf->config.background_compaction_interval, 2000000);
@@ -2869,6 +2870,7 @@ static int test_column_family_config_persistence(void)
         .compaction_threads = 8,
         .max_level = 16,
         .probability = 0.25f,
+        .enable_bloom_filter = 1,
         .bloom_filter_fp_rate = 0.001,
         .enable_background_compaction = 1,
         .background_compaction_interval = 500000};
@@ -2881,8 +2883,8 @@ static int test_column_family_config_persistence(void)
     ASSERT_EQ(cf->config.memtable_flush_size, 128 * 1024 * 1024);
     ASSERT_EQ(cf->config.max_sstables_before_compaction, 256);
     ASSERT_EQ(cf->config.compaction_threads, 8);
-    ASSERT_EQ(cf->config.max_level, 16);
-    ASSERT_TRUE(cf->config.probability > 0.24f && cf->config.probability < 0.26f);
+    ASSERT_EQ(cf->config.sl_max_level, 16);
+    ASSERT_TRUE(cf->config.sl_probability > 0.24f && cf->config.sl_probability < 0.26f);
     ASSERT_TRUE(cf->config.bloom_filter_fp_rate > 0.0009 &&
                 cf->config.bloom_filter_fp_rate < 0.0011);
     ASSERT_EQ(cf->config.enable_background_compaction, 1);
@@ -2899,8 +2901,8 @@ static int test_column_family_config_persistence(void)
     ASSERT_EQ(cf->config.memtable_flush_size, 128 * 1024 * 1024);
     ASSERT_EQ(cf->config.max_sstables_before_compaction, 256);
     ASSERT_EQ(cf->config.compaction_threads, 8);
-    ASSERT_EQ(cf->config.max_level, 16);
-    ASSERT_TRUE(cf->config.probability > 0.24f && cf->config.probability < 0.26f);
+    ASSERT_EQ(cf->config.sl_max_level, 16);
+    ASSERT_TRUE(cf->config.sl_probability > 0.24f && cf->config.sl_probability < 0.26f);
     ASSERT_TRUE(cf->config.bloom_filter_fp_rate > 0.0009 &&
                 cf->config.bloom_filter_fp_rate < 0.0011);
     ASSERT_EQ(cf->config.enable_background_compaction, 1);
@@ -4023,7 +4025,7 @@ static void test_sbha_disabled(void)
 
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.use_sbha = 0;
+    cf_config.enable_block_indexes = 0;
     cf_config.memtable_flush_size = 2048;
     ASSERT_EQ(tidesdb_create_column_family(db, "no_sbha_cf", &cf_config), 0);
 
@@ -4067,8 +4069,8 @@ static void test_compression_snappy(void)
 
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.compressed = 1;
-    cf_config.compress_algo = COMPRESS_SNAPPY;
+    cf_config.enable_compression = 1;
+    cf_config.compression_algorithm = COMPRESS_SNAPPY;
     cf_config.memtable_flush_size = 2048;
     ASSERT_EQ(tidesdb_create_column_family(db, "snappy_cf", &cf_config), 0);
 
@@ -4118,8 +4120,8 @@ static void test_compression_zstd(void)
 
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.compressed = 1;
-    cf_config.compress_algo = COMPRESS_ZSTD;
+    cf_config.enable_compression = 1;
+    cf_config.compression_algorithm = COMPRESS_ZSTD;
     cf_config.memtable_flush_size = 2048;
     ASSERT_EQ(tidesdb_create_column_family(db, "zstd_cf", &cf_config), 0);
 
@@ -4169,7 +4171,7 @@ static void test_compression_none(void)
 
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.compressed = 0;
+    cf_config.enable_compression = 0;
     cf_config.memtable_flush_size = 2048;
     ASSERT_EQ(tidesdb_create_column_family(db, "no_compress_cf", &cf_config), 0);
 

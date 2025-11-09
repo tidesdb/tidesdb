@@ -31,7 +31,6 @@
 #include <stdatomic.h>
 #endif
 
-#include "binary_hash_array.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "compat.h"

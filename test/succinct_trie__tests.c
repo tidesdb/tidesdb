@@ -64,7 +64,7 @@ void test_disk_streaming_basic()
 void test_disk_streaming_prefix_queries()
 {
     /* test prefix queries with disk streaming */
-    succinct_trie_builder_t *builder = succinct_trie_builder_new("/tmp", NULL, NULL);
+    succinct_trie_builder_t *builder = succinct_trie_builder_new(NULL, NULL, NULL);
     ASSERT_TRUE(builder != NULL);
 
     /* add keys with common prefixes (must be in sorted order) */
@@ -95,7 +95,7 @@ void test_disk_streaming_prefix_queries()
 void test_disk_streaming_sorted_order_validation()
 {
     /* test that unsorted keys are rejected */
-    succinct_trie_builder_t *builder = succinct_trie_builder_new("/tmp", NULL, NULL);
+    succinct_trie_builder_t *builder = succinct_trie_builder_new(NULL, NULL, NULL);
     ASSERT_TRUE(builder != NULL);
 
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"apple", 5, 1), 0);
@@ -112,7 +112,7 @@ void test_disk_streaming_large_dataset()
 {
     /* test with larger dataset to verify memory efficiency */
     const int N = 10000;
-    succinct_trie_builder_t *builder = succinct_trie_builder_new("/tmp", NULL, NULL);
+    succinct_trie_builder_t *builder = succinct_trie_builder_new(NULL, NULL, NULL);
     ASSERT_TRUE(builder != NULL);
 
     clock_t start = clock();

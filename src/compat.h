@@ -70,6 +70,15 @@
 #define TDB_THREAD_ID() ((unsigned long)pthread_self())
 #endif
 
+/* cross-platform process ID */
+#if defined(_WIN32)
+#include <process.h>
+#define TDB_GETPID() _getpid()
+#else
+#include <unistd.h>
+#define TDB_GETPID() getpid()
+#endif
+
 #ifdef _WIN32
 #include <direct.h>
 #include <fcntl.h>

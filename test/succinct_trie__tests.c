@@ -27,7 +27,8 @@ static int tests_failed = 0;
 
 void test_disk_streaming_basic()
 {
-    succinct_trie_builder_t *builder = succinct_trie_builder_new("/tmp", NULL, NULL);
+    /* use NULL to let builder choose platform-appropriate temp directory */
+    succinct_trie_builder_t *builder = succinct_trie_builder_new(NULL, NULL, NULL);
     ASSERT_TRUE(builder != NULL);
 
     /* add sorted keys */

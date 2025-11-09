@@ -29,6 +29,7 @@ queue_t *queue_new(void)
     queue->tail = NULL;
     queue->size = 0;
     queue->shutdown = 0;
+    queue->waiter_count = 0;
 
     if (pthread_mutex_init(&queue->lock, NULL) != 0)
     {
@@ -118,15 +119,23 @@ void *queue_dequeue_wait(queue_t *queue)
 
     pthread_mutex_lock(&queue->lock);
 
+    /* increment waiter count before waiting */
+    queue->waiter_count++;
+
     /* wait until queue is not empty or shutdown */
     while (queue->head == NULL && !queue->shutdown)
     {
         pthread_cond_wait(&queue->not_empty, &queue->lock);
     }
 
-    /* if shutdown and no data, return NULL */
+    /* decrement waiter count after waking up */
+    queue->waiter_count--;
+
+    /* if shutdown and no data, signal and return NULL */
     if (queue->shutdown && queue->head == NULL)
     {
+        /* signal in case queue_free is waiting for waiter_count to reach 0 */
+        pthread_cond_broadcast(&queue->not_empty);
         pthread_mutex_unlock(&queue->lock);
         return NULL;
     }
@@ -326,12 +335,14 @@ void queue_free(queue_t *queue)
     queue->tail = NULL;
     queue->size = 0;
 
-    pthread_mutex_unlock(&queue->lock);
+    /* wait for all waiting threads to exit */
+    while (queue->waiter_count > 0)
+    {
+        /* threads will decrement waiter_count and broadcast when they wake */
+        pthread_cond_wait(&queue->not_empty, &queue->lock);
+    }
 
-    /* small delay to allow waiting threads to exit their wait */
-    /* this is a workaround for the race where threads may still be in pthread_cond_wait */
-    struct timespec ts = {0, 1000000}; /* 1ms */
-    nanosleep(&ts, NULL);
+    pthread_mutex_unlock(&queue->lock);
 
     pthread_mutex_destroy(&queue->lock);
     pthread_cond_destroy(&queue->not_empty);

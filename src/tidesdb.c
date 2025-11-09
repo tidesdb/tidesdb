@@ -521,13 +521,6 @@ static inline int tidesdb_sstable_release(tidesdb_sstable_t *sst)
 {
     if (!sst) return 0;
 
-    /* check for corrupted pointer patterns (common in memory debugging tools) */
-    if ((uintptr_t)sst == 0xbebebebebebebebe || (uintptr_t)sst == 0xdeadbeefdeadbeef ||
-        (uintptr_t)sst < 0x1000) /* very low addresses are likely invalid */
-    {
-        return 0;
-    }
-
     int old_count = atomic_fetch_sub(&sst->ref_count, 1);
     int new_count = old_count - 1;
 

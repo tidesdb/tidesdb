@@ -18,6 +18,8 @@
  */
 #include "queue.h"
 
+#include "compat.h"
+
 queue_t *queue_new(void)
 {
     queue_t *queue = (queue_t *)malloc(sizeof(queue_t));
@@ -306,11 +308,30 @@ void queue_free(queue_t *queue)
     if (queue == NULL) return;
 
     pthread_mutex_lock(&queue->lock);
+
+    /* set shutdown flag and wake all waiting threads */
     queue->shutdown = 1;
     pthread_cond_broadcast(&queue->not_empty);
+
+    /* clear the queue while holding the lock */
+    queue_node_t *current = queue->head;
+    while (current != NULL)
+    {
+        queue_node_t *next = current->next;
+        free(current);
+        current = next;
+    }
+
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->size = 0;
+
     pthread_mutex_unlock(&queue->lock);
 
-    queue_clear(queue);
+    /* small delay to allow waiting threads to exit their wait */
+    /* this is a workaround for the race where threads may still be in pthread_cond_wait */
+    struct timespec ts = {0, 1000000}; /* 1ms */
+    nanosleep(&ts, NULL);
 
     pthread_mutex_destroy(&queue->lock);
     pthread_cond_destroy(&queue->not_empty);

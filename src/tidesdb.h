@@ -26,11 +26,6 @@
 #include <string.h>
 #include <time.h>
 
-/* C11 atomics skip_list.h provides the implementation for MSVC < 2022 */
-#if !defined(_MSC_VER) || _MSC_VER >= 1930
-#include <stdatomic.h>
-#endif
-
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "compat.h"

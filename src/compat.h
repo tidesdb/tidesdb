@@ -33,6 +33,12 @@
 #define PATH_SEPARATOR "/"
 #endif
 
+#if !defined(_MSC_VER) || _MSC_VER >= 1930
+#include <stdatomic.h>
+typedef atomic_size_t atomic_size_t;
+typedef atomic_uint_fast64_t atomic_uint64_t;
+#endif
+
 #if defined(__MINGW32__) || defined(__MINGW64__)
 #define TDB_SIZE_FMT     "%llu" /* size_t promoted to unsigned long long */
 #define TDB_U64_FMT      "%llu" /* uint64_t - use C99 with ANSI stdio */

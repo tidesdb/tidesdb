@@ -847,7 +847,7 @@ static inline size_t get_total_memory(void)
 }
 
 /* method to get modified time of a file */
-inline time_t get_file_mod_time(const char *path)
+static inline time_t get_file_mod_time(const char *path)
 {
     struct stat file_stat;
 

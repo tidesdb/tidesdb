@@ -56,7 +56,7 @@ static tidesdb_column_family_config_t get_test_cf_config(void)
         .background_compaction_interval = TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL,
         .enable_block_indexes = 1,
         .sync_mode = TDB_SYNC_NONE,
-        .comparator_name = NULL};
+        .comparator_name = {0}};
     return config;
 }
 
@@ -410,7 +410,8 @@ static void test_custom_comparator(void)
 {
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.comparator_name = "string";
+    strncpy(cf_config.comparator_name, "string", TDB_MAX_COMPARATOR_NAME - 1);
+    cf_config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
 
     ASSERT_EQ(tidesdb_create_column_family(db, "string_cf", &cf_config), 0);
 
@@ -2546,7 +2547,7 @@ static void test_drop_column_family_cleanup(void)
     /* flush to create sstables */
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cleanup_cf");
     ASSERT_TRUE(cf != NULL);
-    // ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
     /* verify files exist before drop */
     char cf_path[TDB_MAX_PATH_LENGTH];
@@ -4343,7 +4344,8 @@ static void test_comparator_string(void)
 
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.comparator_name = "string";
+    strncpy(cf_config.comparator_name, "string", TDB_MAX_COMPARATOR_NAME - 1);
+    cf_config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
     ASSERT_EQ(tidesdb_create_column_family(db, "string_cf", &cf_config), 0);
 
     tidesdb_txn_t *txn = NULL;
@@ -4382,7 +4384,8 @@ static void test_comparator_numeric(void)
 
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.comparator_name = "numeric";
+    strncpy(cf_config.comparator_name, "numeric", TDB_MAX_COMPARATOR_NAME - 1);
+    cf_config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
     ASSERT_EQ(tidesdb_create_column_family(db, "numeric_cf", &cf_config), 0);
 
     tidesdb_txn_t *txn = NULL;

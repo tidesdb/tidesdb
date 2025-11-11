@@ -691,7 +691,7 @@ void *writer_thread(void *arg)
 
         (void)block_manager_block_free(block);
 
-        usleep((unsigned int)(rand() % 10000));  // NOLINT(cert-msc30-c,cert-msc50-cpp)
+        usleep((unsigned int)(rand() % 10000)); /* NOLINT(cert-msc30-c,cert-msc50-cpp) */
     }
 
     return NULL;
@@ -780,7 +780,7 @@ void *reader_thread(void *arg)
         (void)pthread_mutex_unlock(&bm_mutex);
 
         /* we sleep a short random time to simulate variable processing time */
-        usleep(rand() % 5000);  // 0-5ms
+        usleep(rand() % 5000); /* 0-5ms */
     }
 
     return NULL;
@@ -788,7 +788,7 @@ void *reader_thread(void *arg)
 
 void test_block_manager_concurrent_rw()
 {
-    srand((unsigned int)time(NULL));  // NOLINT(cert-msc51-cpp) -- acceptable for test code
+    srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) -- acceptable for test code */
 
     /* we initialize the block manager */
     ASSERT_TRUE(block_manager_open(&bm, "concurrent_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
@@ -1047,7 +1047,7 @@ void benchmark_block_manager()
         /* we fill with random data + sequential identifier */
         for (int j = 0; j < BLOCK_SIZE - 20; j++)
         {
-            block_data[i][j] = (uint8_t)(rand() % 256);  // NOLINT(cert-msc30-c,cert-msc50-cpp)
+            block_data[i][j] = (uint8_t)(rand() % 256); /* NOLINT(cert-msc30-c,cert-msc50-cpp) */
         }
 
         /* we add identifier at the end of each block for verification */
@@ -1137,8 +1137,8 @@ void benchmark_block_manager()
     /* we shuffle the offsets array to randomize access */
     for (int i = 0; i < NUM_BLOCKS; i++)
     {
-        int j =
-            rand() % NUM_BLOCKS;  // NOLINT(cert-msc30-c,cert-msc50-cpp) -- acceptable for test code
+        int j = rand() %
+                NUM_BLOCKS; /* NOLINT(cert-msc30-c,cert-msc50-cpp) -- acceptable for test code */
         long temp = block_offsets[i];
         block_offsets[i] = block_offsets[j];
         block_offsets[j] = temp;
@@ -1746,7 +1746,9 @@ void benchmark_block_manager_with_cache()
         ASSERT_TRUE(block != NULL);
 
         /* count potential cache hits (blocks that might still be in cache) */
-        uint32_t cache_threshold = NUM_BLOCKS - (cache_size / BLOCK_SIZE);
+        uint32_t blocks_in_cache = cache_size / bm->block_size;
+        uint32_t cache_threshold =
+            (blocks_in_cache >= NUM_BLOCKS) ? 0 : (NUM_BLOCKS - blocks_in_cache);
         if ((uint32_t)i >= cache_threshold)
         {
             cache_hits_expected++;
@@ -1764,17 +1766,18 @@ void benchmark_block_manager_with_cache()
            time_spent_read_random);
     printf("Cached random read throughput: %.2f blocks/second\n",
            NUM_BLOCKS / time_spent_read_random);
-    printf("Cached random read throughput: %.2f MB/second\n" RESET,
+    printf("Cached random read throughput: %.2f MB/second\n",
            (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_read_random * 1024 * 1024));
-
     printf("Estimated cache hits: %d/%d (%.1f%%)\n" RESET, cache_hits_expected, NUM_BLOCKS,
            (float)cache_hits_expected / NUM_BLOCKS * 100);
 
     printf(BOLDWHITE "Cached Benchmark 4: Repeated Access Pattern (cache hit test)\n" RESET);
 
     /* testt reading the same subset of blocks multiple times */
-    int subset_size = cache_size / bm->block_size / 2; /* half of what fits in cache */
+    uint32_t blocks_that_fit = cache_size / bm->block_size;
+    int subset_size = (int)(blocks_that_fit / 2);
     if (subset_size > NUM_BLOCKS) subset_size = NUM_BLOCKS;
+    if (subset_size <= 0) subset_size = 1;
 
     clock_t start_repeated = clock();
 
@@ -1841,7 +1844,7 @@ int main(void)
     RUN_TEST(test_block_manager_cache_concurrent, tests_passed);
     RUN_TEST(test_block_manager_concurrent_rw, tests_passed);
 
-    srand((unsigned int)time(NULL));  // NOLINT(cert-msc51-cpp) -- acceptable for test code
+    srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) -- acceptable for test code */
     RUN_TEST(benchmark_block_manager, tests_passed);
     RUN_TEST(benchmark_block_manager_with_cache, tests_passed);
 

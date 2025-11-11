@@ -26,6 +26,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "../external/ini.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "compat.h"
@@ -246,7 +247,7 @@ typedef struct
     int background_compaction_interval;
     int enable_block_indexes;
     tidesdb_sync_mode_t sync_mode;
-    const char *comparator_name;
+    char comparator_name[TDB_MAX_COMPARATOR_NAME];
     int block_manager_cache_size;
 } tidesdb_column_family_config_t;
 

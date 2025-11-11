@@ -452,7 +452,8 @@ int main()
     cf_config.background_compaction_interval = BENCH_BACKGROUND_COMPACTION_INTERVAL;
     cf_config.enable_block_indexes = BENCH_ENABLE_BLOCK_INDEXES;
     cf_config.sync_mode = BENCH_SYNC_MODE;
-    cf_config.comparator_name = BENCH_COMPARATOR_NAME;
+    strncpy(cf_config.comparator_name, BENCH_COMPARATOR_NAME, TDB_MAX_COMPARATOR_NAME - 1);
+    cf_config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
 
     if (tidesdb_create_column_family(tdb, BENCH_CF_NAME, &cf_config) != 0)
     {

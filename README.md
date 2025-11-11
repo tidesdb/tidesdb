@@ -48,6 +48,7 @@ Mozilla Public License Version 2.0 (TidesDB)
 BSD 3 Clause (Snappy)
 BSD 2 (LZ4)
 BSD 2 (xxHash - Yann Collet)
+BSD 2 (inih - Ben Hoyt)
 BSD (Zstandard)
 Apache 2.0 (OpenSSL 3.0+) / OpenSSL License (OpenSSL 1.x)
 ```

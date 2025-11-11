@@ -55,9 +55,9 @@ include_directories(external) # for external libraries linking internally
 
 # build as STATIC on Windows to avoid DLL export/import complexity in tests
 if(WIN32)
-    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c external/xxhash.c)
+    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c external/xxhash.c external/ini.c)
 else()
-    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c external/xxhash.c)
+    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c external/xxhash.c external/ini.c)
 endif()
 
 target_include_directories(tidesdb PRIVATE src)

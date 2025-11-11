@@ -64,7 +64,7 @@ extern int _tidesdb_debug_enabled;
 /* defaults */
 #define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_MAX_SSTABLES                   128
-#define TDB_DEFAULT_COMPACTION_THREADS             4
+#define TDB_DEFAULT_COMPACTION_THREADS             2
 #define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000000
 #define TDB_DEFAULT_MAX_OPEN_FILE_HANDLES          1024
 #define TDB_DEFAULT_SKIPLIST_LEVELS                12
@@ -73,7 +73,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
 
 /* limits */
-#define TDB_MAX_CF_NAME_LENGTH  64
+#define TDB_MAX_CF_NAME_LENGTH  128
 #define TDB_MAX_PATH_LENGTH     1024
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATORS     32

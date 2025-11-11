@@ -244,6 +244,8 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         BENCH_ENABLE_BLOCK_INDEXES=${BENCH_ENABLE_BLOCK_INDEXES}
         BENCH_SYNC_MODE=${BENCH_SYNC_MODE}
         BENCH_COMPARATOR_NAME=\"${BENCH_COMPARATOR_NAME}\"
+        BENCH_COLUMN_FAMILY_BLOCK_CACHE=${BENCH_COLUMN_FAMILY_BLOCK_CACHE}
+
     )
 
     # add include and link directories for test executables

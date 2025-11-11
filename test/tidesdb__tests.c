@@ -5137,7 +5137,8 @@ static void test_sstable_reference_counting(void)
             char key[32], value[32];
             snprintf(key, sizeof(key), "key_%03d", i + (sst * 50));
             snprintf(value, sizeof(value), "value_%d", i);
-            tidesdb_txn_put(txn, "data", key, strlen(key), value, strlen(value), -1);
+            tidesdb_txn_put(txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                            strlen(value), -1);
         }
         tidesdb_txn_commit(txn);
         tidesdb_txn_free(txn);
@@ -5229,7 +5230,8 @@ static void test_block_cache_eviction_under_pressure(void)
             snprintf(key, sizeof(key), "sst%d_key%d", sst, i);
             uint8_t *value;
             size_t value_size;
-            ASSERT_EQ(tidesdb_txn_get(txn, "data", key, strlen(key), &value, &value_size), 0);
+            ASSERT_EQ(
+                tidesdb_txn_get(txn, "data", (uint8_t *)key, strlen(key), &value, &value_size), 0);
             ASSERT_EQ(value_size, 1024);
             free(value);
         }
@@ -5254,7 +5256,7 @@ static void test_wal_corruption_detection(void)
 
         tidesdb_txn_t *txn;
         tidesdb_txn_begin(db, &txn);
-        tidesdb_txn_put(txn, "data", "key1", 4, "value1", 6, -1);
+        tidesdb_txn_put(txn, "data", (uint8_t *)"key1", 4, (uint8_t *)"value1", 6, -1);
         tidesdb_txn_commit(txn);
         tidesdb_txn_free(txn);
 
@@ -5367,7 +5369,8 @@ static void test_parallel_compaction_race(void)
             char key[32], value[32];
             snprintf(key, sizeof(key), "sst%d_key%d", i, j);
             snprintf(value, sizeof(value), "value_%d", j);
-            tidesdb_txn_put(txn, "data", key, strlen(key), value, strlen(value), -1);
+            tidesdb_txn_put(txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                            strlen(value), -1);
         }
         tidesdb_txn_commit(txn);
         tidesdb_txn_free(txn);
@@ -5388,7 +5391,7 @@ static void test_parallel_compaction_race(void)
         snprintf(key, sizeof(key), "sst%d_key%d", rand() % 16, rand() % 100);
         uint8_t *value;
         size_t value_size;
-        tidesdb_txn_get(txn, "data", key, strlen(key), &value, &value_size);
+        tidesdb_txn_get(txn, "data", (uint8_t *)key, strlen(key), &value, &value_size);
         if (value) free(value);
         tidesdb_txn_free(txn);
         usleep(10000);

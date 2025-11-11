@@ -322,16 +322,30 @@ int main()
 
     /* print benchmark configuration */
     printf(BOLDCYAN "\n=== TidesDB Benchmark Configuration ===\n" RESET);
-    printf("Operations: %d\n", BENCH_NUM_OPERATIONS);
-    printf("Seek Operations: %d\n", BENCH_NUM_SEEK_OPS);
-    printf("Key Size: %d bytes\n", BENCH_KEY_SIZE);
-    printf("Value Size: %d bytes\n", BENCH_VALUE_SIZE);
-    printf("Threads: %d\n", BENCH_NUM_THREADS);
-    printf("Debug Logging: %s\n", BENCH_DEBUG ? "enabled" : "disabled");
-    printf("Key Pattern: %s\n", BENCH_KEY_PATTERN);
-    printf("Compression: %s\n", BENCH_ENABLE_COMPRESSION ? "enabled" : "disabled");
-    printf("Bloom Filter: %s\n", BENCH_ENABLE_BLOOM_FILTER ? "enabled" : "disabled");
-    printf("Block Indexes: %s\n", BENCH_ENABLE_BLOCK_INDEXES ? "enabled" : "disabled");
+    printf(BOLDWHITE "Workload Settings:\n" RESET);
+    printf("  Operations: %d\n", BENCH_NUM_OPERATIONS);
+    printf("  Seek Operations: %d\n", BENCH_NUM_SEEK_OPS);
+    printf("  Key Size: %d bytes\n", BENCH_KEY_SIZE);
+    printf("  Value Size: %d bytes\n", BENCH_VALUE_SIZE);
+    printf("  Threads: %d\n", BENCH_NUM_THREADS);
+    printf("  Key Pattern: %s\n", BENCH_KEY_PATTERN);
+    printf("  Debug Logging: %s\n", BENCH_DEBUG ? "enabled" : "disabled");
+    printf("\n" BOLDWHITE "Column Family Configuration:\n" RESET);
+    printf("  Memtable Flush Size: %zu bytes (%.2f MB)\n", (size_t)BENCH_MEMTABLE_FLUSH_SIZE,
+           (double)BENCH_MEMTABLE_FLUSH_SIZE / (1024.0 * 1024.0));
+    printf("  Max SSTables Before Compaction: %d\n", BENCH_MAX_SSTABLES_BEFORE_COMPACTION);
+    printf("  Compaction Threads: %d\n", BENCH_COMPACTION_THREADS);
+    printf("  Skip List Max Level: %d\n", BENCH_SL_MAX_LEVEL);
+    printf("  Skip List Probability: %.2f\n", BENCH_SL_PROBABILITY);
+    printf("  Compression: %s\n", BENCH_ENABLE_COMPRESSION ? "enabled" : "disabled");
+    printf("  Bloom Filter: %s\n", BENCH_ENABLE_BLOOM_FILTER ? "enabled" : "disabled");
+    printf("  Bloom Filter FP Rate: %.4f\n", BENCH_BLOOM_FILTER_FP_RATE);
+    printf("  Block Indexes: %s\n", BENCH_ENABLE_BLOCK_INDEXES ? "enabled" : "disabled");
+    printf("  Background Compaction: %s\n",
+           BENCH_ENABLE_BACKGROUND_COMPACTION ? "enabled" : "disabled");
+    printf("  Background Compaction Interval: %d\n", BENCH_BACKGROUND_COMPACTION_INTERVAL);
+    printf("  Block Manager Cache Size: %d\n", BENCH_COLUMN_FAMILY_BLOCK_CACHE);
+    printf("  Comparator: %s\n", BENCH_COMPARATOR_NAME);
     printf("======================================\n\n" RESET);
 
     uint8_t **keys = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t *));

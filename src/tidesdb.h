@@ -525,6 +525,7 @@ typedef struct
  * @param bloom_filter_fp_rate bloom filter false positive rate (for new SSTables)
  * @param enable_background_compaction enable automatic background compaction
  * @param background_compaction_interval interval in microseconds between compaction checks
+ * @param block_manager_cache_size if column family block managers will cache most recent blocks
  */
 typedef struct
 {
@@ -537,6 +538,7 @@ typedef struct
     double bloom_filter_fp_rate;
     int enable_background_compaction;
     int background_compaction_interval;
+    int block_manager_cache_size;
 } tidesdb_column_family_update_config_t;
 
 /*

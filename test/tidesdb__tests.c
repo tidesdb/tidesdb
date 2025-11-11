@@ -3482,15 +3482,18 @@ static void test_memory_safety(void)
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
-    /* allocate key+value that exceeds available memory */
-    size_t excessive_size = (size_t)((db->available_memory * TDB_MEMORY_PERCENTAGE / 100) / 2) + 1;
+    /* allocate key+value that exceeds available memory
+     * we need key_size + value_size + sizeof(header) > (available * 60% / 100)
+     * so we make each half slightly larger to guarantee exceeding the limit */
+    size_t max_allowed = (size_t)(db->available_memory * TDB_MEMORY_PERCENTAGE / 100);
+    size_t excessive_size = (max_allowed / 2) + 1024; /* add 1KB buffer to ensure we exceed */
     uint8_t *large_key = malloc(excessive_size);
     uint8_t *large_value = malloc(excessive_size);
 
     /* on 32-bit systems, malloc may fail for large allocations */
     if (large_key == NULL || large_value == NULL)
     {
-        /* malloc failed - this is expected on 32-bit systems with limited address space */
+        /* malloc failed -- this is expected on 32-bit systems with limited address space */
         if (large_key) free(large_key);
         if (large_value) free(large_value);
         tidesdb_txn_free(txn);

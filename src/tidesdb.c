@@ -1977,7 +1977,11 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         if (!recovered_mt) continue;
 
         recovered_mt->id = wal_files[i].id;
-        recovered_mt->created_at = time(NULL);
+
+        char mt_path[TDB_MAX_PATH_LENGTH];
+        snprintf(mt_path, sizeof(mt_path), "%s" PATH_SEPARATOR "%s", cf_path, wal_files[i].path);
+
+        recovered_mt->created_at = get_file_mod_time(mt_path);
         atomic_store(&recovered_mt->ref_count, 1); /* initial reference */
         if (pthread_mutex_init(&recovered_mt->ref_lock, NULL) != 0)
         {

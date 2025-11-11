@@ -92,6 +92,8 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #include <sys/stat.h>
 #include <windows.h>
 
+#define stat _stat
+
 /* mingw provides most POSIX compatibility, so only apply msvc-specific fixes */
 #if defined(_MSC_VER)
 #pragma warning(disable : 4996) /* disable deprecated warning for windows */
@@ -842,6 +844,19 @@ static inline size_t get_total_memory(void)
     }
     return 0;
 #endif
+}
+
+/* method to get modified time of a file */
+inline time_t get_file_mod_time(const char *path)
+{
+    struct stat file_stat;
+
+    if (stat(path, &file_stat) != 0)
+    {
+        return -1;
+    }
+
+    return file_stat.st_mtime;
 }
 
 #endif /* __COMPAT_H__ */

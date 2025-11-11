@@ -4538,13 +4538,61 @@ static int tidesdb_check_and_flush(tidesdb_column_family_t *cf)
 
     tidesdb_memtable_acquire(active_mt);
     size_t memtable_size = (size_t)skip_list_get_size(active_mt->memtable);
+    size_t wal_size = 0;
+    if (active_mt->wal)
+    {
+        uint64_t size;
+        if (block_manager_get_size(active_mt->wal, &size) == 0)
+        {
+            wal_size = (size_t)size;
+        }
+    }
     tidesdb_memtable_release(active_mt);
 
-    if (memtable_size >= cf->config.memtable_flush_size)
+    /* early check without lock -- flush if either memtable or WAL exceeds threshold */
+    if (memtable_size < cf->config.memtable_flush_size && wal_size < cf->config.memtable_flush_size)
     {
+        return 0;
+    }
+
+    /* size exceeded, acquire lock and check again to prevent race */
+    pthread_mutex_lock(&cf->flush_lock);
+
+    /* re-check size after acquiring lock (memtable might have been rotated by another thread) */
+    active_mt = atomic_load(&cf->active_memtable);
+    if (!active_mt)
+    {
+        pthread_mutex_unlock(&cf->flush_lock);
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    tidesdb_memtable_acquire(active_mt);
+    memtable_size = (size_t)skip_list_get_size(active_mt->memtable);
+    wal_size = 0;
+    if (active_mt->wal)
+    {
+        uint64_t size;
+        if (block_manager_get_size(active_mt->wal, &size) == 0)
+        {
+            wal_size = (size_t)size;
+        }
+    }
+    tidesdb_memtable_release(active_mt);
+
+    /* flush if EITHER memtable OR WAL exceeds threshold */
+    if (memtable_size >= cf->config.memtable_flush_size ||
+        wal_size >= cf->config.memtable_flush_size)
+    {
+        /* release lock before calling rotate, as it acquires the same lock internally */
+        pthread_mutex_unlock(&cf->flush_lock);
+
+        TDB_DEBUG_LOG(
+            "Triggering memtable rotation for CF '%s' (memtable: %zu, WAL: %zu, threshold: %zu)",
+            cf->name, memtable_size, wal_size, cf->config.memtable_flush_size);
         return tidesdb_rotate_memtable(cf);
     }
 
+    pthread_mutex_unlock(&cf->flush_lock);
     return 0;
 }
 
@@ -5325,6 +5373,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         if (op->type == TIDESDB_OP_PUT)
         {
+            /* check if memtable needs flushing BEFORE writing to prevent unbounded growth */
+            tidesdb_check_and_flush(cf);
+
             tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
             if (!active_mt) return -1;
 
@@ -5367,12 +5418,12 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             {
                 return -1;
             }
-
-            /* check if memtable needs flushing after this operation */
-            tidesdb_check_and_flush(cf);
         }
         else if (op->type == TIDESDB_OP_DELETE)
         {
+            /* check if memtable needs flushing BEFORE writing */
+            tidesdb_check_and_flush(cf);
+
             tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
             if (!active_mt) return -1;
 
@@ -5408,15 +5459,10 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             uint8_t empty_value = 0;
             skip_list_put(active_mt->memtable, op->key, op->key_size, &empty_value, 0, 0);
             skip_list_delete(active_mt->memtable, op->key, op->key_size);
-
-            /* check if memtable needs flushing after this operation */
-            tidesdb_check_and_flush(cf);
             /* if delete fails, the put succeeded so we have a valid entry, continue */
 
             tidesdb_memtable_release(active_mt);
         }
-
-        tidesdb_check_and_flush(cf);
     }
 
     txn->committed = 1;

@@ -10,7 +10,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 [![Linux Build Status](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml/badge.svg)](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml)
 
 ## Features
-- ACID transactions that are atomic, consistent, isolated, and durable. Transactions support multiple operations across column families with read committed isolation. Writers are serialized per column family to ensure atomicity, while copy-on-write (COW) provides consistency for concurrent readers.
+- ACID transactions that are atomic, consistent, isolated, and durable. Transactions support multiple operations across column families. Point reads use READ COMMITTED isolation (see latest committed data), while iterators use snapshot isolation (consistent point-in-time view via reference counting). Writers are serialized per column family to ensure atomicity, while copy-on-write (COW) provides consistency for concurrent readers.
 - Writers don't block readers. Readers never block other readers. Background operations will not affect active transactions.
 - Isolated key-value stores. Each column family has its own configuration, memtables, sstables, and write ahead logs.
 - Bidirectional iterators that allow you to iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and sstables. Effective seek operations with O(log n) skip list positioning and succinct trie block index positioning (if enabled) in sstables. Reference counting prevents premature deletion during iteration.

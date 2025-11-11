@@ -24,14 +24,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "compat.h" /* provides atomic operations for MSVC < 2022 */
-
-/* C11 atomics provided by compat.h for MSVC < 2022, stdatomic.h otherwise */
-#if !defined(_MSC_VER) || _MSC_VER >= 1930
-#include <stdatomic.h>
-typedef atomic_size_t atomic_size_t;
-typedef atomic_uint_fast64_t atomic_uint64_t;
-#endif
+#include "compat.h"
 
 /* forward declarations */
 typedef struct skip_list_node_t skip_list_node_t;

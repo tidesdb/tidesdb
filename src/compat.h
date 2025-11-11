@@ -33,9 +33,40 @@
 #define PATH_SEPARATOR "/"
 #endif
 
+/* https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/stat-functions?view=msvc-170
+ * https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fstat-fstat32-fstat64-fstati64-fstat32i64-fstat64i32?view=msvc-170
+ * to handle the compiler differences
+ */
+#if defined(_WIN32)
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#if defined(_MSC_VER)
+#define STAT_STRUCT _stat64
+#define STAT_FUNC   _stat64
+#define FSTAT_FUNC  _fstat64
+#else
+#define STAT_STRUCT stat
+#define STAT_FUNC   stat
+#define FSTAT_FUNC  fstat
+#endif
+
+#else /* posix */
+#include <sys/stat.h>
+#define STAT_STRUCT stat
+#define STAT_FUNC   stat
+#define FSTAT_FUNC  fstat
+#endif
+
+#if !defined(_MSC_VER) || _MSC_VER >= 1930
+#include <stdatomic.h>
+typedef atomic_size_t atomic_size_t;
+typedef atomic_uint_fast64_t atomic_uint64_t;
+#endif
+
 #if defined(__MINGW32__) || defined(__MINGW64__)
 #define TDB_SIZE_FMT     "%llu" /* size_t promoted to unsigned long long */
-#define TDB_U64_FMT      "%llu" /* uint64_t - use C99 with ANSI stdio */
+#define TDB_U64_FMT      "%llu" /* uint64_t -- use C99 with ANSI stdio */
 #define TDB_SIZE_CAST(x) ((unsigned long long)(x))
 #define TDB_U64_CAST(x)  ((unsigned long long)(x))
 #else
@@ -86,7 +117,6 @@
 #include <sys/stat.h>
 #include <windows.h>
 
-/* mingw provides most POSIX compatibility, so only apply msvc-specific fixes */
 #if defined(_MSC_VER)
 #pragma warning(disable : 4996) /* disable deprecated warning for windows */
 #pragma warning(disable : 4029) /* declared formal parameter list different from definition */
@@ -836,6 +866,19 @@ static inline size_t get_total_memory(void)
     }
     return 0;
 #endif
+}
+
+/* method to get modified time of a file */
+static inline time_t get_file_mod_time(const char *path)
+{
+    struct STAT_STRUCT file_stat;
+
+    if (STAT_FUNC(path, &file_stat) != 0)
+    {
+        return -1;
+    }
+
+    return (time_t)file_stat.st_mtime;
 }
 
 #endif /* __COMPAT_H__ */

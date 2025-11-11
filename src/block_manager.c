@@ -21,8 +21,6 @@
 #include <openssl/sha.h>
 #include <time.h>
 
-/* fcntl.h and sys/stat.h are included via compat.h in block_manager.h */
-
 /* file format
  * [HEADER]
  * - magic (3 bytes) 0x544442 "TDB"
@@ -136,8 +134,8 @@ static int read_header(int fd, uint32_t *block_size)
  */
 static int get_file_size(int fd, uint64_t *size)
 {
-    struct stat st;
-    if (fstat(fd, &st) != 0) return -1;
+    struct STAT_STRUCT st;
+    if (FSTAT_FUNC(fd, &st) != 0) return -1;
     *size = (uint64_t)st.st_size;
     return 0;
 }

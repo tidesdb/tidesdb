@@ -1077,9 +1077,16 @@ void benchmark_block_manager()
 
     printf(CYAN "Writing %d blocks (%d bytes each) took %.3f seconds\n", NUM_BLOCKS, BLOCK_SIZE,
            time_spent_write);
-    printf("Write throughput: %.2f blocks/second\n", NUM_BLOCKS / time_spent_write);
-    printf("Write throughput: %.2f MB/second\n" RESET,
-           (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_write * 1024 * 1024));
+    if (time_spent_write > 0.0)
+    {
+        printf("Write throughput: %.2f blocks/second\n", NUM_BLOCKS / time_spent_write);
+        printf("Write throughput: %.2f MB/second\n" RESET,
+               (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_write * 1024 * 1024));
+    }
+    else
+    {
+        printf("Write throughput: N/A (completed too fast to measure)\n" RESET);
+    }
 
     uint64_t file_size;
     ASSERT_TRUE(block_manager_get_size(bm, &file_size) == 0);
@@ -1126,9 +1133,17 @@ void benchmark_block_manager()
 
     printf(CYAN "Sequentially reading %d blocks took %.3f seconds\n", NUM_BLOCKS,
            time_spent_read_seq);
-    printf("Sequential read throughput: %.2f blocks/second\n", NUM_BLOCKS / time_spent_read_seq);
-    printf("Sequential read throughput: %.2f MB/second\n" RESET,
-           (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_read_seq * 1024 * 1024));
+    if (time_spent_read_seq > 0.0)
+    {
+        printf("Sequential read throughput: %.2f blocks/second\n",
+               NUM_BLOCKS / time_spent_read_seq);
+        printf("Sequential read throughput: %.2f MB/second\n" RESET,
+               (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_read_seq * 1024 * 1024));
+    }
+    else
+    {
+        printf("Sequential read throughput: N/A (completed too fast to measure)\n" RESET);
+    }
 
     printf(BOLDWHITE "Benchmark 3: Random Read Performance\n" RESET);
 
@@ -1166,9 +1181,16 @@ void benchmark_block_manager()
 
     printf(CYAN "Randomly reading %d blocks took %.3f seconds\n", NUM_BLOCKS,
            time_spent_read_random);
-    printf("Random read throughput: %.2f blocks/second\n", NUM_BLOCKS / time_spent_read_random);
-    printf("Random read throughput: %.2f MB/second\n" RESET,
-           (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_read_random * 1024 * 1024));
+    if (time_spent_read_random > 0.0)
+    {
+        printf("Random read throughput: %.2f blocks/second\n", NUM_BLOCKS / time_spent_read_random);
+        printf("Random read throughput: %.2f MB/second\n" RESET,
+               (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_read_random * 1024 * 1024));
+    }
+    else
+    {
+        printf("Random read throughput: N/A (completed too fast to measure)\n" RESET);
+    }
 
     printf(BOLDWHITE "Benchmark 4: Block Count Performance\n" RESET);
 
@@ -1669,9 +1691,16 @@ void benchmark_block_manager_with_cache()
 
     printf(CYAN "Writing %d blocks (%d bytes each) with cache took %.3f seconds\n", NUM_BLOCKS,
            BLOCK_SIZE, time_spent_write);
-    printf("Cached write throughput: %.2f blocks/second\n", NUM_BLOCKS / time_spent_write);
-    printf("Cached write throughput: %.2f MB/second\n" RESET,
-           (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_write * 1024 * 1024));
+    if (time_spent_write > 0.0)
+    {
+        printf("Cached write throughput: %.2f blocks/second\n", NUM_BLOCKS / time_spent_write);
+        printf("Cached write throughput: %.2f MB/second\n" RESET,
+               (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_write * 1024 * 1024));
+    }
+    else
+    {
+        printf("Cached write throughput: N/A (completed too fast to measure)\n" RESET);
+    }
 
     printf("Final cache usage: %u / %u bytes (%.1f%%)\n", bm->block_manager_cache->current_size,
            bm->block_manager_cache->max_size,
@@ -1715,10 +1744,17 @@ void benchmark_block_manager_with_cache()
 
     printf(CYAN "Sequentially reading %d blocks with cache took %.3f seconds\n", NUM_BLOCKS,
            time_spent_read_seq);
-    printf("Cached sequential read throughput: %.2f blocks/second\n",
-           NUM_BLOCKS / time_spent_read_seq);
-    printf("Cached sequential read throughput: %.2f MB/second\n" RESET,
-           (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_read_seq * 1024 * 1024));
+    if (time_spent_read_seq > 0.0)
+    {
+        printf("Cached sequential read throughput: %.2f blocks/second\n",
+               NUM_BLOCKS / time_spent_read_seq);
+        printf("Cached sequential read throughput: %.2f MB/second\n" RESET,
+               (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_read_seq * 1024 * 1024));
+    }
+    else
+    {
+        printf("Cached sequential read throughput: N/A (completed too fast to measure)\n" RESET);
+    }
 
     printf(BOLDWHITE "Cached Benchmark 3: Random Read Performance (cache behavior test)\n" RESET);
 
@@ -1764,10 +1800,17 @@ void benchmark_block_manager_with_cache()
 
     printf(CYAN "Randomly reading %d blocks with cache took %.3f seconds\n", NUM_BLOCKS,
            time_spent_read_random);
-    printf("Cached random read throughput: %.2f blocks/second\n",
-           NUM_BLOCKS / time_spent_read_random);
-    printf("Cached random read throughput: %.2f MB/second\n",
-           (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_read_random * 1024 * 1024));
+    if (time_spent_read_random > 0.0)
+    {
+        printf("Cached random read throughput: %.2f blocks/second\n",
+               NUM_BLOCKS / time_spent_read_random);
+        printf("Cached random read throughput: %.2f MB/second\n",
+               (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_read_random * 1024 * 1024));
+    }
+    else
+    {
+        printf("Cached random read throughput: N/A (completed too fast to measure)\n");
+    }
     printf("Estimated cache hits: %d/%d (%.1f%%)\n" RESET, cache_hits_expected, NUM_BLOCKS,
            (float)cache_hits_expected / NUM_BLOCKS * 100);
 
@@ -1802,10 +1845,17 @@ void benchmark_block_manager_with_cache()
 
     printf(CYAN "Reading %d blocks 3 times (cache hit test) took %.3f seconds\n", subset_size,
            time_spent_repeated);
-    printf("Repeated access throughput: %.2f blocks/second\n",
-           (subset_size * 3) / time_spent_repeated);
-    printf("Repeated access throughput: %.2f MB/second\n" RESET,
-           (subset_size * 3 * BLOCK_SIZE) / (time_spent_repeated * 1024 * 1024));
+    if (time_spent_repeated > 0.0)
+    {
+        printf("Repeated access throughput: %.2f blocks/second\n",
+               (subset_size * 3) / time_spent_repeated);
+        printf("Repeated access throughput: %.2f MB/second\n" RESET,
+               (subset_size * 3 * BLOCK_SIZE) / (time_spent_repeated * 1024 * 1024));
+    }
+    else
+    {
+        printf("Repeated access throughput: N/A (completed too fast to measure)\n" RESET);
+    }
 
     for (int i = 0; i < NUM_BLOCKS; i++)
     {

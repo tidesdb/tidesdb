@@ -1217,7 +1217,7 @@ void test_block_manager_lru_cache()
         snprintf(data, sizeof(data), "cached_block_%d_", i);
 
         /* fill rest with pattern */
-        for (int j = strlen(data); j < 299; j++)
+        for (int j = (int)strlen(data); j < 299; j++)
         {
             data[j] = 'A' + (i % 26);
         }
@@ -1253,7 +1253,7 @@ void test_block_manager_lru_cache()
     /* verify content */
     char expected[300];
     snprintf(expected, sizeof(expected), "cached_block_4_");
-    for (int j = strlen(expected); j < 299; j++)
+    for (int j = (int)strlen(expected); j < 299; j++)
     {
         expected[j] = 'A' + (4 % 26);
     }
@@ -1272,7 +1272,7 @@ void test_block_manager_lru_cache()
 
         /* verify content matches what we wrote */
         snprintf(expected, sizeof(expected), "cached_block_%d_", i);
-        for (int j = strlen(expected); j < 299; j++)
+        for (int j = (int)strlen(expected); j < 299; j++)
         {
             expected[j] = 'A' + (i % 26);
         }

@@ -80,6 +80,8 @@ extern int _tidesdb_debug_enabled;
 
 /* if a key-value exceeds this percentage users system memory we throw an error */
 #define TDB_MEMORY_PERCENTAGE 60
+/* minimum allowed size for a single key-value pair (1MB), regardless of available memory */
+#define TDB_MIN_KEY_VALUE_SIZE (1024 * 1024)
 
 /* extensions, prefixes, and file names */
 #define TDB_WAL_EXT                       ".log"

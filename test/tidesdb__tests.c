@@ -5508,6 +5508,92 @@ static void test_memtable_flush_size_enforcement(void)
     cleanup_test_dir();
 }
 
+static void test_default_comparator_persistence(void)
+{
+    printf("Testing default comparator name persistence...");
+    fflush(stdout);
+
+    /* create CF without specifying comparator (should default to memcmp) */
+    {
+        tidesdb_t *db = create_test_db();
+        tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+        /* explicitly clear comparator_name to test default */
+        memset(cf_config.comparator_name, 0, TDB_MAX_COMPARATOR_NAME);
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "default_cmp_cf", &cf_config), 0);
+
+        /* verify comparator is set to memcmp */
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "default_cmp_cf");
+        ASSERT_TRUE(cf != NULL);
+        ASSERT_TRUE(strcmp(cf->comparator_name, "memcmp") == 0);
+
+        /* write some data */
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        ASSERT_EQ(tidesdb_txn_put(txn, "default_cmp_cf", (uint8_t *)"key1", 4, (uint8_t *)"value1",
+                                  6, -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+
+    /* verify config file has comparator_name=memcmp */
+    {
+        char config_path[512];
+        snprintf(config_path, sizeof(config_path), "%s/default_cmp_cf/config.cfc", TEST_DB_PATH);
+
+        FILE *f = fopen(config_path, "r");
+        ASSERT_TRUE(f != NULL);
+
+        char line[256];
+        int found_comparator = 0;
+        while (fgets(line, sizeof(line), f))
+        {
+            if (strncmp(line, "comparator_name=", 16) == 0)
+            {
+                /* verify it's not empty and equals memcmp */
+                ASSERT_TRUE(strstr(line, "comparator_name=memcmp") != NULL);
+                found_comparator = 1;
+                break;
+            }
+        }
+        fclose(f);
+
+        ASSERT_TRUE(found_comparator);
+    }
+
+    /* reopen and verify comparator is still memcmp */
+    {
+        tidesdb_config_t config = {.db_path = TEST_DB_PATH};
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "default_cmp_cf");
+        ASSERT_TRUE(cf != NULL);
+        ASSERT_TRUE(strcmp(cf->comparator_name, "memcmp") == 0);
+
+        /* verify data is still accessible */
+        tidesdb_txn_t *read_txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(read_txn, "default_cmp_cf", (uint8_t *)"key1", 4, &value, &value_size),
+            0);
+        ASSERT_TRUE(memcmp(value, "value1", 6) == 0);
+        free(value);
+
+        tidesdb_txn_free(read_txn);
+        tidesdb_close(db);
+    }
+
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     printf("\n");
@@ -5611,6 +5697,7 @@ int main(void)
     RUN_TEST(test_drop_cf_with_active_iterators, tests_passed);
     RUN_TEST(test_parallel_compaction_race, tests_passed);
     RUN_TEST(test_memtable_flush_size_enforcement, tests_passed);
+    RUN_TEST(test_default_comparator_persistence, tests_passed);
 
     printf("\n");
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

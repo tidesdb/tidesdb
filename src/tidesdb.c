@@ -1911,11 +1911,16 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         return TDB_ERR_COMPARATOR_NOT_FOUND;
     }
 
-    /* save comparator name to both cf and config (so it persists correctly) */
+    /* save comparator name to cf */
     strncpy(cf->comparator_name, cmp_name, TDB_MAX_COMPARATOR_NAME - 1);
     cf->comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
-    strncpy(cf->config.comparator_name, cmp_name, TDB_MAX_COMPARATOR_NAME - 1);
-    cf->config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
+
+    /* if config had empty comparator_name, save the resolved default to config */
+    if (cf->config.comparator_name[0] == '\0')
+    {
+        strncpy(cf->config.comparator_name, cmp_name, TDB_MAX_COMPARATOR_NAME - 1);
+        cf->config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
+    }
 
     TDB_DEBUG_LOG("Column family '%s' using comparator '%s'", name, cf->comparator_name);
 
@@ -5362,6 +5367,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             {
                 return -1;
             }
+
+            /* check if memtable needs flushing after this operation */
+            tidesdb_check_and_flush(cf);
         }
         else if (op->type == TIDESDB_OP_DELETE)
         {
@@ -5400,6 +5408,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             uint8_t empty_value = 0;
             skip_list_put(active_mt->memtable, op->key, op->key_size, &empty_value, 0, 0);
             skip_list_delete(active_mt->memtable, op->key, op->key_size);
+
+            /* check if memtable needs flushing after this operation */
+            tidesdb_check_and_flush(cf);
             /* if delete fails, the put succeeded so we have a valid entry, continue */
 
             tidesdb_memtable_release(active_mt);

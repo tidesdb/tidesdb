@@ -1911,9 +1911,11 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         return TDB_ERR_COMPARATOR_NOT_FOUND;
     }
 
-    /* save comparator name */
+    /* save comparator name to both cf and config (so it persists correctly) */
     strncpy(cf->comparator_name, cmp_name, TDB_MAX_COMPARATOR_NAME - 1);
     cf->comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
+    strncpy(cf->config.comparator_name, cmp_name, TDB_MAX_COMPARATOR_NAME - 1);
+    cf->config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
 
     TDB_DEBUG_LOG("Column family '%s' using comparator '%s'", name, cf->comparator_name);
 

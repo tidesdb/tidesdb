@@ -365,9 +365,9 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
             atomic_store_explicit(&list->tail, new_node, memory_order_release);
         }
 
-        /* update size */
+        /* update size (track both key and value sizes) */
         size_t old_total = atomic_load_explicit(&list->total_size, memory_order_relaxed);
-        size_t new_total = old_total - x->value_size + value_size;
+        size_t new_total = old_total - (x->key_size + x->value_size) + (key_size + value_size);
         atomic_store_explicit(&list->total_size, new_total, memory_order_relaxed);
 
         /* old node will be freed when all references are released */
@@ -424,7 +424,8 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
     }
 
     size_t new_total = atomic_load_explicit(&list->total_size, memory_order_relaxed);
-    atomic_store_explicit(&list->total_size, new_total + value_size, memory_order_relaxed);
+    atomic_store_explicit(&list->total_size, new_total + key_size + value_size,
+                          memory_order_relaxed);
 
     free(update);
     pthread_mutex_unlock(&list->write_lock);
@@ -578,9 +579,10 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size)
         atomic_store_explicit(&list->tail, tombstone, memory_order_release);
     }
 
-    /* update size (subtract deleted value size) */
+    /* update size (subtract deleted key and value sizes) */
     size_t old_total = atomic_load_explicit(&list->total_size, memory_order_relaxed);
-    atomic_store_explicit(&list->total_size, old_total - x->value_size, memory_order_relaxed);
+    atomic_store_explicit(&list->total_size, old_total - (x->key_size + x->value_size),
+                          memory_order_relaxed);
 
     /* release reference to old node (will be freed when all readers done) */
     skip_list_release_node(x);

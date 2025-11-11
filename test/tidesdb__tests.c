@@ -3484,9 +3484,10 @@ static void test_memory_safety(void)
 
     /* allocate key+value that exceeds available memory
      * we need key_size + value_size + sizeof(header) > (available * 60% / 100)
-     * so we make each half slightly larger to guarantee exceeding the limit */
+     * header is small (48 bytes), so we add 1MB buffer to guarantee exceeding the limit */
     size_t max_allowed = (size_t)(db->available_memory * TDB_MEMORY_PERCENTAGE / 100);
-    size_t excessive_size = (max_allowed / 2) + 1024; /* add 1KB buffer to ensure we exceed */
+    size_t excessive_size =
+        (max_allowed / 2) + (1024 * 1024); /* add 1MB buffer to ensure we exceed */
     uint8_t *large_key = malloc(excessive_size);
     uint8_t *large_value = malloc(excessive_size);
 
@@ -5421,6 +5422,178 @@ static void test_parallel_compaction_race(void)
     cleanup_test_dir();
 }
 
+static void test_memtable_flush_size_enforcement(void)
+{
+    printf("Testing memtable_flush_size enforcement with multiple WAL files...");
+    fflush(stdout);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+    /* set small memtable flush size to force multiple rotations */
+    cf_config.memtable_flush_size = 64 * 1024; /* 64 KB */
+    cf_config.enable_background_compaction = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "flush_test", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "flush_test");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write enough data to exceed memtable_flush_size multiple times */
+    int num_writes = 200;
+    size_t key_size = 32;
+    size_t value_size = 1024; /* 1 KB values */
+    size_t expected_data_per_write = key_size + value_size;
+    size_t total_data = num_writes * expected_data_per_write;
+
+    /* we expect at least (total_data / memtable_flush_size) memtable rotations */
+    int expected_min_rotations = (int)(total_data / cf_config.memtable_flush_size);
+
+    printf("\n  Writing %d entries (%zu bytes each, %zu total)\n", num_writes,
+           expected_data_per_write, total_data);
+    printf("  Memtable flush size: %zu bytes\n", cf_config.memtable_flush_size);
+    printf("  Expected minimum rotations: %d\n", expected_min_rotations);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < num_writes; i++)
+    {
+        char key[64], value[1024];
+        snprintf(key, sizeof(key), "flush_test_key_%05d", i);
+        memset(value, 'X', sizeof(value));
+        snprintf(value, 50, "flush_test_value_%05d", i); /* add identifiable prefix */
+
+        ASSERT_EQ(tidesdb_txn_put(txn, "flush_test", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                  value_size, -1),
+                  0);
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* give time for flushes to complete */
+    sleep(2);
+
+    /* verify data is still accessible */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+
+    for (int i = 0; i < num_writes; i += 20) /* sample every 20th entry */
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "flush_test_key_%05d", i);
+
+        uint8_t *retrieved_value = NULL;
+        size_t retrieved_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(read_txn, "flush_test", (uint8_t *)key, strlen(key),
+                                  &retrieved_value, &retrieved_size),
+                  0);
+        ASSERT_TRUE(retrieved_value != NULL);
+        ASSERT_EQ(retrieved_size, value_size);
+        free(retrieved_value);
+    }
+
+    tidesdb_txn_free(read_txn);
+
+    /* check that we have multiple SSTables (indicating multiple flushes) */
+    int num_sstables = atomic_load(&cf->num_sstables);
+    printf("  Created %d SSTables\n", num_sstables);
+
+    /* we should have at least 2 sstables if memtable_flush_size is working */
+    ASSERT_TRUE(num_sstables >= 2);
+
+    printf("OK (memtable_flush_size properly enforced)\n");
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_default_comparator_persistence(void)
+{
+    printf("Testing default comparator name persistence...");
+    fflush(stdout);
+
+    /* create CF without specifying comparator (should default to memcmp) */
+    {
+        tidesdb_t *db = create_test_db();
+        tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+        /* explicitly clear comparator_name to test default */
+        memset(cf_config.comparator_name, 0, TDB_MAX_COMPARATOR_NAME);
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "default_cmp_cf", &cf_config), 0);
+
+        /* verify comparator is set to memcmp */
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "default_cmp_cf");
+        ASSERT_TRUE(cf != NULL);
+        ASSERT_TRUE(strcmp(cf->comparator_name, "memcmp") == 0);
+
+        /* write some data */
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        ASSERT_EQ(tidesdb_txn_put(txn, "default_cmp_cf", (uint8_t *)"key1", 4, (uint8_t *)"value1",
+                                  6, -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+
+    /* verify config file has comparator_name=memcmp */
+    {
+        char config_path[512];
+        snprintf(config_path, sizeof(config_path), "%s/default_cmp_cf/config.cfc", TEST_DB_PATH);
+
+        FILE *f = fopen(config_path, "r");
+        ASSERT_TRUE(f != NULL);
+
+        char line[256];
+        int found_comparator = 0;
+        while (fgets(line, sizeof(line), f))
+        {
+            if (strncmp(line, "comparator_name=", 16) == 0)
+            {
+                /* verify it's not empty and equals memcmp */
+                ASSERT_TRUE(strstr(line, "comparator_name=memcmp") != NULL);
+                found_comparator = 1;
+                break;
+            }
+        }
+        fclose(f);
+
+        ASSERT_TRUE(found_comparator);
+    }
+
+    /* reopen and verify comparator is still memcmp */
+    {
+        tidesdb_config_t config = {.db_path = TEST_DB_PATH};
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "default_cmp_cf");
+        ASSERT_TRUE(cf != NULL);
+        ASSERT_TRUE(strcmp(cf->comparator_name, "memcmp") == 0);
+
+        /* verify data is still accessible */
+        tidesdb_txn_t *read_txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(read_txn, "default_cmp_cf", (uint8_t *)"key1", 4, &value, &value_size),
+            0);
+        ASSERT_TRUE(memcmp(value, "value1", 6) == 0);
+        free(value);
+
+        tidesdb_txn_free(read_txn);
+        tidesdb_close(db);
+    }
+
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     printf("\n");
@@ -5523,6 +5696,8 @@ int main(void)
     RUN_TEST(test_wal_corruption_detection, tests_passed);
     RUN_TEST(test_drop_cf_with_active_iterators, tests_passed);
     RUN_TEST(test_parallel_compaction_race, tests_passed);
+    RUN_TEST(test_memtable_flush_size_enforcement, tests_passed);
+    RUN_TEST(test_default_comparator_persistence, tests_passed);
 
     printf("\n");
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

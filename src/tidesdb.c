@@ -378,7 +378,13 @@ static void *thread_pool_worker(void *arg)
                 pthread_mutex_lock(&task->cf->flush_lock);
                 tidesdb_memtable_t *dequeued_mt =
                     (tidesdb_memtable_t *)queue_dequeue(task->cf->immutable_memtables);
+                size_t remaining_immutable = queue_size(task->cf->immutable_memtables);
                 pthread_mutex_unlock(&task->cf->flush_lock);
+
+                TDB_DEBUG_LOG("Flush completed for column family: %s (memtable id: " TDB_U64_FMT
+                              ", remaining immutable: %zu)",
+                              task->cf->name, (unsigned long long)task->memtable->id,
+                              remaining_immutable);
 
                 /* release the immutable_memtables queue reference */
                 if (dequeued_mt) tidesdb_memtable_release(dequeued_mt);
@@ -401,6 +407,10 @@ static void *thread_pool_worker(void *arg)
                     compact_task->type = TASK_COMPACTION;
                     compact_task->cf = task->cf;
                     compact_task->memtable = NULL;
+                    TDB_DEBUG_LOG(
+                        "Submitting compaction task for column family: %s (sstables: %d, "
+                        "threshold: %d)",
+                        task->cf->name, num_ssts, task->cf->config.max_sstables_before_compaction);
                     queue_enqueue(task->cf->db->compaction_pool->task_queue, compact_task);
                 }
             }
@@ -1248,8 +1258,7 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
 
     /* allocate buffer to hold all keys (needed because decompressed blocks are freed immediately)
      */
-    size_t keys_buffer_capacity =
-        SUCCINCT_TRIE_INITIAL_BUFFER_SIZE; /* start at SUCCINCT_TRIE_INITIAL_BUFFER_SIZE */
+    size_t keys_buffer_capacity = SUCCINCT_TRIE_INITIAL_BUFFER_SIZE;
     size_t keys_buffer_used = 0;
     uint8_t *keys_buffer = malloc(keys_buffer_capacity);
     if (!keys_buffer)
@@ -2104,6 +2113,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         }
 
         /* recover entries from WAL into memtable */
+        int entries_recovered = 0;
         block_manager_cursor_t *cursor = NULL;
         if (block_manager_cursor_init(&cursor, recovered_mt->wal) == 0)
         {
@@ -2137,6 +2147,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                 skip_list_put(recovered_mt->memtable, key, header.key_size, value,
                                               header.value_size, (time_t)header.ttl);
                             }
+                            entries_recovered++;
                         }
                         block_manager_block_free(block);
                     }
@@ -2144,6 +2155,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             }
             block_manager_cursor_free(cursor);
         }
+
+        TDB_DEBUG_LOG("WAL recovery for column family: %s (wal id: " TDB_U64_FMT ", entries: %d)",
+                      cf->name, (unsigned long long)wal_files[i].id, entries_recovered);
 
         /* if this is the newest WAL, make it active; otherwise add to immutable queue */
         if (i == num_wal_files - 1)
@@ -2158,6 +2172,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             /* older, add to immutable queue for flushing */
             queue_enqueue(cf->immutable_memtables, recovered_mt);
         }
+    }
+
+    if (num_wal_files > 0)
+    {
+        TDB_DEBUG_LOG("WAL recovery completed for column family: %s (%d WAL files processed)",
+                      cf->name, num_wal_files);
     }
 
     if (wal_files) free(wal_files);
@@ -2241,6 +2261,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         }
         TDB_DEBUG_LOG("Sorted %d SSTables by ID for column family: %s", num_ssts, cf->name);
     }
+
+    TDB_DEBUG_LOG("SSTable recovery completed for column family: %s (%d sstables loaded)", cf->name,
+                  atomic_load(&cf->num_sstables));
 
     /* submit any recovered memtables to flush pool */
     pthread_mutex_lock(&cf->flush_lock);
@@ -2690,6 +2713,8 @@ static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
 {
     if (!cf) return -1;
 
+    TDB_DEBUG_LOG("Rotating memtable for column family: %s", cf->name);
+
     tidesdb_memtable_t *new_memtable = tidesdb_memtable_new(cf);
     if (!new_memtable) return -1;
 
@@ -2709,6 +2734,15 @@ static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
             pthread_mutex_unlock(&cf->flush_lock);
             return -1;
         }
+
+        size_t immutable_count = queue_size(cf->immutable_memtables);
+        TDB_DEBUG_LOG("Memtable rotated for column family: %s (old id: " TDB_U64_FMT
+                      ", new id: " TDB_U64_FMT ", immutable queue size: %zu)",
+                      cf->name, (unsigned long long)old_memtable->id,
+                      (unsigned long long)new_memtable->id, immutable_count);
+
+        TDB_DEBUG_LOG("Submitting flush task for column family: %s (memtable id: " TDB_U64_FMT ")",
+                      cf->name, (unsigned long long)old_memtable->id);
 
         int submit_result = thread_pool_submit(cf->db->flush_pool, TASK_FLUSH, cf, old_memtable);
 
@@ -3774,6 +3808,10 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
 
     free(sst_snapshot);
     free(merged_ssts);
+
+    TDB_DEBUG_LOG(
+        "Compaction completed for column family: %s (merged %d pairs, final sstables: %d)",
+        cf->name, pairs_to_merge, atomic_load(&cf->num_sstables));
 
     return 0;
 }

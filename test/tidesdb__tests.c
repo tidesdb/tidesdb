@@ -5211,7 +5211,8 @@ static void test_block_cache_eviction_under_pressure(void)
             char key[32], value[1024];
             snprintf(key, sizeof(key), "sst%d_key%d", sst, i);
             memset(value, 'X', sizeof(value));
-            tidesdb_txn_put(txn, "data", key, strlen(key), value, sizeof(value), -1);
+            tidesdb_txn_put(txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                            sizeof(value), -1);
         }
         tidesdb_txn_commit(txn);
         tidesdb_txn_free(txn);
@@ -5305,7 +5306,8 @@ static void test_drop_cf_with_active_iterators(void)
         char key[32], value[32];
         snprintf(key, sizeof(key), "key_%d", i);
         snprintf(value, sizeof(value), "value_%d", i);
-        tidesdb_txn_put(txn, "data", key, strlen(key), value, strlen(value), -1);
+        tidesdb_txn_put(txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value, strlen(value),
+                        -1);
     }
     tidesdb_txn_commit(txn);
     tidesdb_txn_free(txn);

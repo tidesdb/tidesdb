@@ -4391,7 +4391,7 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
                   cf->name, atomic_load(&cf->num_sstables), cf->config.compaction_threads);
 
     pthread_mutex_lock(&cf->compaction_lock);
-    pthread_rwlock_wrlock(&cf->cf_lock);
+    pthread_rwlock_rdlock(&cf->cf_lock);
 
     int num_ssts = atomic_load(&cf->num_sstables);
     if (num_ssts < 2)
@@ -4434,6 +4434,16 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         return -1;
     }
 
+    /* acquire references to all sstables while holding read lock */
+    for (int p = 0; p < pairs_to_merge; p++)
+    {
+        tidesdb_sstable_acquire(cf->sstables[p * 2]);
+        tidesdb_sstable_acquire(cf->sstables[p * 2 + 1]);
+    }
+
+    /* release read lock -- compaction can proceed without blocking reads */
+    pthread_rwlock_unlock(&cf->cf_lock);
+
     /* launch worker threads for each pair */
     for (int p = 0; p < pairs_to_merge; p++)
     {
@@ -4468,6 +4478,9 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
             pthread_join(threads[p], NULL);
         }
     }
+
+    /* re-acquire write lock only for the swap operation */
+    pthread_rwlock_wrlock(&cf->cf_lock);
 
     /* rebuild sstable array; must keep originals if merge failed */
     tidesdb_sstable_t **new_sstables =
@@ -4504,7 +4517,7 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         }
     }
 
-    /* add odd sst if exists */
+    /* add odd sstable if exists */
     if (num_ssts % 2 == 1)
     {
         new_sstables[new_count++] = cf->sstables[num_ssts - 1];

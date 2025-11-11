@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 2.0.1)
+set(PROJECT_VERSION 2.1.0)
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
@@ -55,9 +55,9 @@ include_directories(external) # for external libraries linking internally
 
 # build as STATIC on Windows to avoid DLL export/import complexity in tests
 if(WIN32)
-    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c external/xxhash.c)
+    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c external/xxhash.c external/ini.c)
 else()
-    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c external/xxhash.c)
+    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c external/xxhash.c external/ini.c)
 endif()
 
 target_include_directories(tidesdb PRIVATE src)
@@ -205,6 +205,9 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_COMPARATOR_NAME)
         set(BENCH_COMPARATOR_NAME "memcmp")
     endif()
+    if (NOT DEFINED BENCH_COLUMN_FAMILY_BLOCK_CACHE)
+        set(BENCH_COLUMN_FAMILY_BLOCK_CACHE 0)
+    endif()
 
     add_executable(block_manager_tests test/block_manager__tests.c)
     add_executable(skip_list_tests test/skip_list__tests.c)
@@ -241,6 +244,8 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         BENCH_ENABLE_BLOCK_INDEXES=${BENCH_ENABLE_BLOCK_INDEXES}
         BENCH_SYNC_MODE=${BENCH_SYNC_MODE}
         BENCH_COMPARATOR_NAME=\"${BENCH_COMPARATOR_NAME}\"
+        BENCH_COLUMN_FAMILY_BLOCK_CACHE=${BENCH_COLUMN_FAMILY_BLOCK_CACHE}
+
     )
 
     # add include and link directories for test executables

@@ -1176,7 +1176,7 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .background_compaction_interval = TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL,
         .enable_block_indexes = 1,
         .sync_mode = TDB_SYNC_FULL,
-        .comparator_name = NULL};
+        .comparator_name = {0}};
     return config;
 }
 
@@ -1372,6 +1372,81 @@ static void get_sstable_path(const tidesdb_column_family_t *cf, uint64_t sstable
 }
 
 /*
+ * config_handler
+ * INI parser handler for column family config
+ */
+static int config_handler(void *user, const char *section, const char *name, const char *value)
+{
+    tidesdb_column_family_config_t *config = (tidesdb_column_family_config_t *)user;
+
+    if (strcmp(section, "column_family") == 0)
+    {
+        if (strcmp(name, "memtable_flush_size") == 0)
+        {
+            config->memtable_flush_size = (size_t)strtoull(value, NULL, 10);
+        }
+        else if (strcmp(name, "max_sstables_before_compaction") == 0)
+        {
+            config->max_sstables_before_compaction = atoi(value);
+        }
+        else if (strcmp(name, "compaction_threads") == 0)
+        {
+            config->compaction_threads = atoi(value);
+        }
+        else if (strcmp(name, "sl_max_level") == 0)
+        {
+            config->sl_max_level = atoi(value);
+        }
+        else if (strcmp(name, "sl_probability") == 0)
+        {
+            config->sl_probability = (float)atof(value);
+        }
+        else if (strcmp(name, "enable_compression") == 0)
+        {
+            config->enable_compression = atoi(value);
+        }
+        else if (strcmp(name, "compression_algorithm") == 0)
+        {
+            config->compression_algorithm = atoi(value);
+        }
+        else if (strcmp(name, "enable_bloom_filter") == 0)
+        {
+            config->enable_bloom_filter = atoi(value);
+        }
+        else if (strcmp(name, "bloom_filter_fp_rate") == 0)
+        {
+            config->bloom_filter_fp_rate = atof(value);
+        }
+        else if (strcmp(name, "enable_background_compaction") == 0)
+        {
+            config->enable_background_compaction = atoi(value);
+        }
+        else if (strcmp(name, "background_compaction_interval") == 0)
+        {
+            config->background_compaction_interval = atoi(value);
+        }
+        else if (strcmp(name, "enable_block_indexes") == 0)
+        {
+            config->enable_block_indexes = atoi(value);
+        }
+        else if (strcmp(name, "sync_mode") == 0)
+        {
+            config->sync_mode = (tidesdb_sync_mode_t)atoi(value);
+        }
+        else if (strcmp(name, "comparator_name") == 0)
+        {
+            strncpy(config->comparator_name, value, TDB_MAX_COMPARATOR_NAME - 1);
+            config->comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
+        }
+        else if (strcmp(name, "block_manager_cache_size") == 0)
+        {
+            config->block_manager_cache_size = atoi(value);
+        }
+    }
+    return 1;
+}
+
+/*
  * get_cf_config_path
  * gets column family config file path
  * @param cf column family
@@ -1396,14 +1471,29 @@ static int save_cf_config(tidesdb_column_family_t *cf)
     char config_path[TDB_MAX_PATH_LENGTH];
     get_cf_config_path(cf, config_path);
 
-    FILE *f = fopen(config_path, "wb");
+    FILE *f = fopen(config_path, "w");
     if (!f) return -1;
 
-    /* write config struct to file */
-    size_t written = fwrite(&cf->config, sizeof(tidesdb_column_family_config_t), 1, f);
-    fclose(f);
+    fprintf(f, "[column_family]\n");
+    fprintf(f, "memtable_flush_size=%zu\n", cf->config.memtable_flush_size);
+    fprintf(f, "max_sstables_before_compaction=%d\n", cf->config.max_sstables_before_compaction);
+    fprintf(f, "compaction_threads=%d\n", cf->config.compaction_threads);
+    fprintf(f, "sl_max_level=%d\n", cf->config.sl_max_level);
+    fprintf(f, "sl_probability=%f\n", cf->config.sl_probability);
+    fprintf(f, "enable_compression=%d\n", cf->config.enable_compression);
+    fprintf(f, "compression_algorithm=%d\n", cf->config.compression_algorithm);
+    fprintf(f, "enable_bloom_filter=%d\n", cf->config.enable_bloom_filter);
+    fprintf(f, "bloom_filter_fp_rate=%f\n", cf->config.bloom_filter_fp_rate);
+    fprintf(f, "enable_background_compaction=%d\n", cf->config.enable_background_compaction);
+    fprintf(f, "background_compaction_interval=%d\n", cf->config.background_compaction_interval);
+    fprintf(f, "enable_block_indexes=%d\n", cf->config.enable_block_indexes);
+    fprintf(f, "sync_mode=%d\n", cf->config.sync_mode);
+    fprintf(f, "comparator_name=%s\n",
+            cf->config.comparator_name[0] ? cf->config.comparator_name : "");
+    fprintf(f, "block_manager_cache_size=%d\n", cf->config.block_manager_cache_size);
 
-    return (written == 1) ? 0 : -1;
+    fclose(f);
+    return 0;
 }
 
 /*
@@ -1417,14 +1507,13 @@ static int load_cf_config(tidesdb_column_family_t *cf)
     char config_path[TDB_MAX_PATH_LENGTH];
     get_cf_config_path(cf, config_path);
 
-    FILE *f = fopen(config_path, "rb");
-    if (!f) return -1; /* config file doesn't exist, use defaults */
+    /* parse ini config file */
+    if (ini_parse(config_path, config_handler, &cf->config) < 0)
+    {
+        return -1; /* file doesn't exist or parse error, use defaults */
+    }
 
-    /* read config struct from file */
-    size_t read = fread(&cf->config, sizeof(tidesdb_column_family_config_t), 1, f);
-    fclose(f);
-
-    return (read == 1) ? 0 : -1;
+    return 0;
 }
 
 /*
@@ -1455,7 +1544,7 @@ static void block_manager_evict_cb(const char *key, void *value, void *user_data
  * @return block manager on success, NULL on failure
  */
 static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path,
-                                                 tidesdb_sync_mode_t sync_mode)
+                                                 tidesdb_sync_mode_t sync_mode, uint32_t cache_size)
 {
     if (!db || !path || !db->block_manager_cache) return NULL;
 
@@ -1469,7 +1558,8 @@ static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path
     TDB_DEBUG_LOG("Block manager cache miss: %s", path);
     bm = NULL;
 
-    if (block_manager_open(&bm, path, sync_mode) == -1)
+    if (block_manager_open_with_cache(&bm, path, convert_sync_mode((int)sync_mode), cache_size) ==
+        -1)
     {
         return NULL;
     }
@@ -1795,7 +1885,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
 
     /* lookup comparator by name */
-    const char *cmp_name = cf->config.comparator_name ? cf->config.comparator_name : "memcmp";
+    const char *cmp_name = cf->config.comparator_name[0] ? cf->config.comparator_name : "memcmp";
     skip_list_comparator_fn cmp_fn = tidesdb_get_comparator(cmp_name);
 
     if (!cmp_fn)
@@ -1997,8 +2087,10 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             continue;
         }
 
-        /* open WAL file directly (not cached) */
-        if (block_manager_open(&recovered_mt->wal, wal_files[i].path, cf->config.sync_mode) == -1)
+        /* open WAL file directly (not cached by engine) */
+        if (block_manager_open_with_cache(&recovered_mt->wal, wal_files[i].path,
+                                          convert_sync_mode((int)cf->config.sync_mode),
+                                          cf->config.block_manager_cache_size) == -1)
         {
             skip_list_free(recovered_mt->memtable);
             free(recovered_mt);
@@ -2284,6 +2376,8 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         pthread_mutex_unlock(&cf->flush_lock);
     }
 
+    pthread_mutex_destroy(&cf->compaction_lock);
+
     if (active_mt)
     {
         /* release the active memtable reference properly */
@@ -2553,7 +2647,9 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
              "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR TDB_WAL_PREFIX "%" PRIu64 TDB_WAL_EXT,
              cf->db->config.db_path, cf->name, mt->id);
 
-    if (block_manager_open(&mt->wal, wal_path, cf->config.sync_mode) == -1)
+    if (block_manager_open_with_cache(&mt->wal, wal_path,
+                                      convert_sync_mode((int)cf->config.sync_mode),
+                                      cf->config.block_manager_cache_size) == -1)
     {
         skip_list_free(mt->memtable);
         pthread_mutex_destroy(&mt->ref_lock);
@@ -2681,7 +2777,8 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     atomic_store(&sst->ref_count, 1);
     pthread_mutex_init(&sst->ref_lock, NULL);
 
-    sst->block_manager = get_cached_block_manager(cf->db, sstable_path, cf->config.sync_mode);
+    sst->block_manager = get_cached_block_manager(cf->db, sstable_path, cf->config.sync_mode,
+                                                  cf->config.block_manager_cache_size);
     if (!sst->block_manager)
     {
         pthread_mutex_destroy(&sst->ref_lock);
@@ -3105,6 +3202,7 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
     cf->config.bloom_filter_fp_rate = update_config->bloom_filter_fp_rate;
     cf->config.enable_background_compaction = update_config->enable_background_compaction;
     cf->config.background_compaction_interval = update_config->background_compaction_interval;
+    cf->config.block_manager_cache_size = update_config->block_manager_cache_size;
 
     int save_result = save_cf_config(cf);
 
@@ -3128,6 +3226,7 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
     TDB_DEBUG_LOG("  enable_background_compaction: %d", cf->config.enable_background_compaction);
     TDB_DEBUG_LOG("  background_compaction_interval: %d",
                   cf->config.background_compaction_interval);
+    TDB_DEBUG_LOG("  block_manager_cache_size: %d", cf->config.block_manager_cache_size);
 
     return 0;
 }
@@ -3231,7 +3330,8 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         atomic_store(&merged->ref_count, 1);
         pthread_mutex_init(&merged->ref_lock, NULL);
 
-        merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode);
+        merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode,
+                                                         cf->config.block_manager_cache_size);
         if (!merged->block_manager)
         {
             free(merged);
@@ -3525,8 +3625,8 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         {
             TDB_DEBUG_LOG("Successfully renamed %s to %s", temp_path, new_path);
             /* reopen with final path via cache */
-            merged->block_manager =
-                get_cached_block_manager(cf->db, new_path, cf->config.sync_mode);
+            merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode,
+                                                             cf->config.block_manager_cache_size);
             if (!merged->block_manager)
             {
                 TDB_DEBUG_LOG("Failed to reopen merged sstable after rename");
@@ -3844,7 +3944,8 @@ static void *tidesdb_compaction_worker(void *arg)
     atomic_store(&merged->ref_count, 1);
     pthread_mutex_init(&merged->ref_lock, NULL);
 
-    merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode);
+    merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode,
+                                                     cf->config.block_manager_cache_size);
     if (!merged->block_manager)
     {
         pthread_mutex_destroy(&merged->ref_lock);
@@ -4184,7 +4285,8 @@ static void *tidesdb_compaction_worker(void *arg)
     /* rename temp to final */
     if (rename(temp_path, new_path) == 0)
     {
-        merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode);
+        merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode,
+                                                         cf->config.block_manager_cache_size);
         if (merged->block_manager)
         {
             *job->result = merged;
@@ -4400,7 +4502,8 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
     atomic_store(&sst->ref_count, 1);
     pthread_mutex_init(&sst->ref_lock, NULL);
 
-    sst->block_manager = get_cached_block_manager(cf->db, path, cf->config.sync_mode);
+    sst->block_manager = get_cached_block_manager(cf->db, path, cf->config.sync_mode,
+                                                  cf->config.block_manager_cache_size);
     if (!sst->block_manager)
     {
         free(sst);

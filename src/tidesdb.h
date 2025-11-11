@@ -26,6 +26,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "../external/ini.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "compat.h"
@@ -63,7 +64,7 @@ extern int _tidesdb_debug_enabled;
 /* defaults */
 #define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_MAX_SSTABLES                   128
-#define TDB_DEFAULT_COMPACTION_THREADS             4
+#define TDB_DEFAULT_COMPACTION_THREADS             2
 #define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000000
 #define TDB_DEFAULT_MAX_OPEN_FILE_HANDLES          1024
 #define TDB_DEFAULT_SKIPLIST_LEVELS                12
@@ -72,7 +73,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
 
 /* limits */
-#define TDB_MAX_CF_NAME_LENGTH  256
+#define TDB_MAX_CF_NAME_LENGTH  128
 #define TDB_MAX_PATH_LENGTH     1024
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATORS     32
@@ -120,6 +121,13 @@ extern int _tidesdb_debug_enabled;
 #define TDB_ERR_THREAD               -16
 #define TDB_ERR_CHECKSUM             -17
 #define TDB_ERR_MEMORY_LIMIT         -18
+
+typedef enum
+{
+    TDB_SYNC_NONE, /* no fsync/fdatasync - fastest, least durable */
+    TDB_SYNC_FULL, /* full fsync/fdatasync on every write to a block manager - slowest, most durable
+                    */
+} tidesdb_sync_mode_t;
 
 typedef struct tidesdb_t tidesdb_t;
 typedef struct tidesdb_column_family_t tidesdb_column_family_t;
@@ -221,6 +229,8 @@ typedef struct
  * @param sync_mode sync mode for this column family (TDB_SYNC_NONE or TDB_SYNC_FULL)
  * @param comparator_name name of registered comparator (NULL = use default "memcmp")
  * during compaction/flush (default 1000 = 1ms)
+ * @param block_manager_cache_size if you want block managers to use an LRU cache for blocks set to
+ * > 0
  */
 typedef struct
 {
@@ -237,7 +247,8 @@ typedef struct
     int background_compaction_interval;
     int enable_block_indexes;
     tidesdb_sync_mode_t sync_mode;
-    const char *comparator_name;
+    char comparator_name[TDB_MAX_COMPARATOR_NAME];
+    int block_manager_cache_size;
 } tidesdb_column_family_config_t;
 
 /*
@@ -515,6 +526,7 @@ typedef struct
  * @param bloom_filter_fp_rate bloom filter false positive rate (for new SSTables)
  * @param enable_background_compaction enable automatic background compaction
  * @param background_compaction_interval interval in microseconds between compaction checks
+ * @param block_manager_cache_size if column family block managers will cache most recent blocks
  */
 typedef struct
 {
@@ -527,6 +539,7 @@ typedef struct
     double bloom_filter_fp_rate;
     int enable_background_compaction;
     int background_compaction_interval;
+    int block_manager_cache_size;
 } tidesdb_column_family_update_config_t;
 
 /*

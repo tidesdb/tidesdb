@@ -149,14 +149,16 @@ succinct_trie_builder_t *succinct_trie_builder_new(const char *temp_dir,
     /* use both PID and thread ID to make filenames unique per thread */
     unsigned long tid = TDB_THREAD_ID();
     snprintf(path, sizeof(path), "%s/trie_labels_%d_%lu", dir, TDB_GETPID(), tid);
-    if (block_manager_open((block_manager_t **)&builder->labels_bm, path, TDB_SYNC_NONE) != 0)
+    if (block_manager_open((block_manager_t **)&builder->labels_bm, path,
+                           BLOCK_MANAGER_SYNC_NONE) != 0)
     {
         free(builder);
         return NULL;
     }
 
     snprintf(path, sizeof(path), "%s/trie_parents_%d_%lu", dir, TDB_GETPID(), tid);
-    if (block_manager_open((block_manager_t **)&builder->parents_bm, path, TDB_SYNC_NONE) != 0)
+    if (block_manager_open((block_manager_t **)&builder->parents_bm, path,
+                           BLOCK_MANAGER_SYNC_NONE) != 0)
     {
         block_manager_close((block_manager_t *)builder->labels_bm);
         free(builder);
@@ -164,7 +166,8 @@ succinct_trie_builder_t *succinct_trie_builder_new(const char *temp_dir,
     }
 
     snprintf(path, sizeof(path), "%s/trie_child_ids_%d_%lu", dir, TDB_GETPID(), tid);
-    if (block_manager_open((block_manager_t **)&builder->child_ids_bm, path, TDB_SYNC_NONE) != 0)
+    if (block_manager_open((block_manager_t **)&builder->child_ids_bm, path,
+                           BLOCK_MANAGER_SYNC_NONE) != 0)
     {
         block_manager_close((block_manager_t *)builder->parents_bm);
         block_manager_close((block_manager_t *)builder->labels_bm);
@@ -173,7 +176,8 @@ succinct_trie_builder_t *succinct_trie_builder_new(const char *temp_dir,
     }
 
     snprintf(path, sizeof(path), "%s/trie_term_%d_%lu", dir, TDB_GETPID(), tid);
-    if (block_manager_open((block_manager_t **)&builder->term_bm, path, TDB_SYNC_NONE) != 0)
+    if (block_manager_open((block_manager_t **)&builder->term_bm, path, BLOCK_MANAGER_SYNC_NONE) !=
+        0)
     {
         block_manager_close((block_manager_t *)builder->child_ids_bm);
         block_manager_close((block_manager_t *)builder->parents_bm);
@@ -183,7 +187,8 @@ succinct_trie_builder_t *succinct_trie_builder_new(const char *temp_dir,
     }
 
     snprintf(path, sizeof(path), "%s/trie_vals_%d_%lu", dir, TDB_GETPID(), tid);
-    if (block_manager_open((block_manager_t **)&builder->vals_bm, path, TDB_SYNC_NONE) != 0)
+    if (block_manager_open((block_manager_t **)&builder->vals_bm, path, BLOCK_MANAGER_SYNC_NONE) !=
+        0)
     {
         block_manager_close((block_manager_t *)builder->term_bm);
         block_manager_close((block_manager_t *)builder->child_ids_bm);

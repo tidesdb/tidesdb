@@ -318,4 +318,15 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
  */
 int block_manager_validate_last_block(block_manager_t *bm);
 
+/**
+ * convert_sync_mode
+ * converts TidesDB sync mode enum values to block manager sync mode enum values
+ * This function provides compatibility between the public TidesDB API (which uses
+ * TDB_SYNC_NONE/TDB_SYNC_FULL) and the internal block manager API (which uses
+ * BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_TDB_SYNC_FULL)
+ * @param tdb_sync_mode the TidesDB sync mode (TDB_SYNC_NONE=0, TDB_SYNC_FULL=1)
+ * @return the corresponding block manager sync mode enum value
+ */
+block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode);
+
 #endif /* __BLOCK_MANAGER_H__ */

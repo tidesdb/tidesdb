@@ -1300,7 +1300,7 @@ void test_block_manager_lru_cache()
 
     ASSERT_TRUE(block_manager_open(&bm, "cache_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
     ASSERT_TRUE(bm != NULL);
-    ASSERT_TRUE(bm->block_manager_cache == NULL); /* No cache should be allocated */
+    ASSERT_TRUE(bm->block_manager_cache == NULL); /* no cache should be allocated */
 
     uint64_t size = 100;
     char data[100] = "no_cache_block";
@@ -1598,7 +1598,7 @@ void test_block_manager_cache_concurrent()
 
     (void)block_manager_cursor_free(reader_cursor);
 
-    /* Verify cache is still within limits */
+    /* verify cache is still within limits */
     ASSERT_TRUE(bm->block_manager_cache->current_size <= bm->block_manager_cache->max_size);
     printf("Final cache size: %u / %u\n", bm->block_manager_cache->current_size,
            bm->block_manager_cache->max_size);
@@ -1655,7 +1655,6 @@ void benchmark_block_manager_with_cache()
 
         (void)block_manager_block_free(block);
 
-        /* Print cache stats every 10000 blocks */
         if (i % 10000 == 0 && i > 0)
         {
             printf("Wrote %d blocks, cache usage: %u / %u bytes (%.1f%%)\n", i,
@@ -1747,7 +1746,8 @@ void benchmark_block_manager_with_cache()
         ASSERT_TRUE(block != NULL);
 
         /* count potential cache hits (blocks that might still be in cache) */
-        if (i >= NUM_BLOCKS - (cache_size / BLOCK_SIZE))
+        uint32_t cache_threshold = NUM_BLOCKS - (cache_size / BLOCK_SIZE);
+        if ((uint32_t)i >= cache_threshold)
         {
             cache_hits_expected++;
         }
@@ -1767,10 +1767,13 @@ void benchmark_block_manager_with_cache()
     printf("Cached random read throughput: %.2f MB/second\n" RESET,
            (NUM_BLOCKS * BLOCK_SIZE) / (time_spent_read_random * 1024 * 1024));
 
+    printf("Estimated cache hits: %d/%d (%.1f%%)\n" RESET, cache_hits_expected, NUM_BLOCKS,
+           (float)cache_hits_expected / NUM_BLOCKS * 100);
+
     printf(BOLDWHITE "Cached Benchmark 4: Repeated Access Pattern (cache hit test)\n" RESET);
 
     /* testt reading the same subset of blocks multiple times */
-    int subset_size = cache_size / BLOCK_SIZE / 2; /* half of what fits in cache */
+    int subset_size = cache_size / bm->block_size / 2; /* half of what fits in cache */
     if (subset_size > NUM_BLOCKS) subset_size = NUM_BLOCKS;
 
     clock_t start_repeated = clock();

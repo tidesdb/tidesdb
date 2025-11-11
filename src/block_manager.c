@@ -49,6 +49,7 @@
  */
 static void cached_block_evict_callback(const char *key, void *value, void *user_data)
 {
+    (void)key;
     block_manager_block_t *block = (block_manager_block_t *)value;
     block_manager_cache_t *cache = (block_manager_cache_t *)user_data;
 
@@ -67,7 +68,7 @@ static void cached_block_evict_callback(const char *key, void *value, void *user
  */
 static void block_offset_to_key(int64_t offset, char *key_buffer)
 {
-    snprintf(key_buffer, 32, "%ld", offset);
+    snprintf(key_buffer, 32, "%" PRId64, offset);
 }
 
 /*
@@ -1304,7 +1305,7 @@ done_scanning:
  * @param tdb_sync_mode the tidesdb sync mode
  * @return the corresponding block manager sync mode
  */
-static block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode)
+block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode)
 {
     switch (tdb_sync_mode)
     {

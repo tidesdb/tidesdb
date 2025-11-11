@@ -1469,7 +1469,8 @@ static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path
     TDB_DEBUG_LOG("Block manager cache miss: %s", path);
     bm = NULL;
 
-    if (block_manager_open_with_cache(&bm, path, sync_mode, cache_size) == -1)
+    if (block_manager_open_with_cache(&bm, path, convert_sync_mode((int)sync_mode), cache_size) ==
+        -1)
     {
         return NULL;
     }
@@ -1999,7 +2000,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
         /* open WAL file directly (not cached by engine) */
         if (block_manager_open_with_cache(&recovered_mt->wal, wal_files[i].path,
-                                          cf->config.sync_mode,
+                                          convert_sync_mode((int)cf->config.sync_mode),
                                           cf->config.block_manager_cache_size) == -1)
         {
             skip_list_free(recovered_mt->memtable);
@@ -2555,7 +2556,8 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
              "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR TDB_WAL_PREFIX "%" PRIu64 TDB_WAL_EXT,
              cf->db->config.db_path, cf->name, mt->id);
 
-    if (block_manager_open_with_cache(&mt->wal, wal_path, cf->config.sync_mode,
+    if (block_manager_open_with_cache(&mt->wal, wal_path,
+                                      convert_sync_mode((int)cf->config.sync_mode),
                                       cf->config.block_manager_cache_size) == -1)
     {
         skip_list_free(mt->memtable);

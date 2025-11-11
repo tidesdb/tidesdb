@@ -2653,6 +2653,14 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
     if (!mt) return NULL;
 
     mt->id = atomic_fetch_add(&cf->next_memtable_id, 1);
+    /* check for overflow. safe because WALs are deleted after flush; old ids are expired */
+    if (mt->id == UINT64_MAX)
+    {
+        TDB_DEBUG_LOG("Memtable ID overflow for CF '%s', resetting to 0", cf->name);
+        atomic_store(&cf->next_memtable_id, 0);
+        mt->id = 0;
+    }
+
     mt->created_at = time(NULL);
     atomic_store(&mt->ref_count, 1); /* initial reference for active memtable */
 
@@ -3349,6 +3357,15 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
 
         /* create new merged sstable with temp extension */
         uint64_t new_id = atomic_fetch_add(&cf->next_sstable_id, 1);
+        /* just in case we check for overflow. this is safe because column families have a max
+         * sstable count; old ids are expired */
+        if (new_id == UINT64_MAX)
+        {
+            TDB_DEBUG_LOG("SSTable ID overflow for CF '%s', resetting to 0", cf->name);
+            atomic_store(&cf->next_sstable_id, 0);
+            new_id = 0;
+        }
+
         char new_path[TDB_MAX_PATH_LENGTH];
         char temp_path[TDB_MAX_PATH_LENGTH];
         get_sstable_path(cf, new_id, new_path);
@@ -3960,6 +3977,13 @@ static void *tidesdb_compaction_worker(void *arg)
     job->acquired_refs = 1;
 
     uint64_t new_id = atomic_fetch_add(&cf->next_sstable_id, 1);
+    if (new_id == UINT64_MAX)
+    {
+        TDB_DEBUG_LOG("SSTable ID overflow for CF '%s', resetting to 0", cf->name);
+        atomic_store(&cf->next_sstable_id, 0);
+        new_id = 0;
+    }
+
     char new_path[TDB_MAX_PATH_LENGTH];
     char temp_path[TDB_MAX_PATH_LENGTH];
     get_sstable_path(cf, new_id, new_path);

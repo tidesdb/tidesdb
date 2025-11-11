@@ -16,8 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef SUCCINCT_TRIE_H
-#define SUCCINCT_TRIE_H
+#ifndef __SUCCINCT_TRIE_H__
+#define __SUCCINCT_TRIE_H__
 
 #include <stddef.h>
 #include <stdint.h>
@@ -234,4 +234,4 @@ succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size
  */
 size_t succinct_trie_get_size(const succinct_trie_t *trie);
 
-#endif /* SUCCINCT_TRIE_H */
+#endif /* __SUCCINCT_TRIE_H__ */

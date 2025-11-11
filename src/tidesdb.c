@@ -1455,7 +1455,7 @@ static void block_manager_evict_cb(const char *key, void *value, void *user_data
  * @return block manager on success, NULL on failure
  */
 static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path,
-                                                 tidesdb_sync_mode_t sync_mode)
+                                                 tidesdb_sync_mode_t sync_mode, uint32_t cache_size)
 {
     if (!db || !path || !db->block_manager_cache) return NULL;
 
@@ -1469,7 +1469,7 @@ static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path
     TDB_DEBUG_LOG("Block manager cache miss: %s", path);
     bm = NULL;
 
-    if (block_manager_open(&bm, path, sync_mode) == -1)
+    if (block_manager_open_with_cache(&bm, path, sync_mode, cache_size) == -1)
     {
         return NULL;
     }
@@ -1997,8 +1997,10 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             continue;
         }
 
-        /* open WAL file directly (not cached) */
-        if (block_manager_open(&recovered_mt->wal, wal_files[i].path, cf->config.sync_mode) == -1)
+        /* open WAL file directly (not cached by engine) */
+        if (block_manager_open_with_cache(&recovered_mt->wal, wal_files[i].path,
+                                          cf->config.sync_mode,
+                                          cf->config.block_manager_cache_size) == -1)
         {
             skip_list_free(recovered_mt->memtable);
             free(recovered_mt);
@@ -2553,7 +2555,8 @@ static tidesdb_memtable_t *tidesdb_memtable_new(tidesdb_column_family_t *cf)
              "%s" PATH_SEPARATOR "%s" PATH_SEPARATOR TDB_WAL_PREFIX "%" PRIu64 TDB_WAL_EXT,
              cf->db->config.db_path, cf->name, mt->id);
 
-    if (block_manager_open(&mt->wal, wal_path, cf->config.sync_mode) == -1)
+    if (block_manager_open_with_cache(&mt->wal, wal_path, cf->config.sync_mode,
+                                      cf->config.block_manager_cache_size) == -1)
     {
         skip_list_free(mt->memtable);
         pthread_mutex_destroy(&mt->ref_lock);
@@ -2681,7 +2684,8 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     atomic_store(&sst->ref_count, 1);
     pthread_mutex_init(&sst->ref_lock, NULL);
 
-    sst->block_manager = get_cached_block_manager(cf->db, sstable_path, cf->config.sync_mode);
+    sst->block_manager = get_cached_block_manager(cf->db, sstable_path, cf->config.sync_mode,
+                                                  cf->config.block_manager_cache_size);
     if (!sst->block_manager)
     {
         pthread_mutex_destroy(&sst->ref_lock);
@@ -3231,7 +3235,8 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         atomic_store(&merged->ref_count, 1);
         pthread_mutex_init(&merged->ref_lock, NULL);
 
-        merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode);
+        merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode,
+                                                         cf->config.block_manager_cache_size);
         if (!merged->block_manager)
         {
             free(merged);
@@ -3525,8 +3530,8 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         {
             TDB_DEBUG_LOG("Successfully renamed %s to %s", temp_path, new_path);
             /* reopen with final path via cache */
-            merged->block_manager =
-                get_cached_block_manager(cf->db, new_path, cf->config.sync_mode);
+            merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode,
+                                                             cf->config.block_manager_cache_size);
             if (!merged->block_manager)
             {
                 TDB_DEBUG_LOG("Failed to reopen merged sstable after rename");
@@ -3844,7 +3849,8 @@ static void *tidesdb_compaction_worker(void *arg)
     atomic_store(&merged->ref_count, 1);
     pthread_mutex_init(&merged->ref_lock, NULL);
 
-    merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode);
+    merged->block_manager = get_cached_block_manager(cf->db, temp_path, cf->config.sync_mode,
+                                                     cf->config.block_manager_cache_size);
     if (!merged->block_manager)
     {
         pthread_mutex_destroy(&merged->ref_lock);
@@ -4184,7 +4190,8 @@ static void *tidesdb_compaction_worker(void *arg)
     /* rename temp to final */
     if (rename(temp_path, new_path) == 0)
     {
-        merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode);
+        merged->block_manager = get_cached_block_manager(cf->db, new_path, cf->config.sync_mode,
+                                                         cf->config.block_manager_cache_size);
         if (merged->block_manager)
         {
             *job->result = merged;
@@ -4400,7 +4407,8 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
     atomic_store(&sst->ref_count, 1);
     pthread_mutex_init(&sst->ref_lock, NULL);
 
-    sst->block_manager = get_cached_block_manager(cf->db, path, cf->config.sync_mode);
+    sst->block_manager = get_cached_block_manager(cf->db, path, cf->config.sync_mode,
+                                                  cf->config.block_manager_cache_size);
     if (!sst->block_manager)
     {
         free(sst);

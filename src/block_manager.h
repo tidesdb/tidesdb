@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "compat.h"
+#include "lru.h"
 
 /* more time equals more results, but remember to take breaks to refresh your mind. */
 
@@ -34,15 +35,22 @@
 #define BLOCK_MANAGER_HEADER_SIZE        12 /* 3 + 1 + 4 + 4 (padding) */
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
     (sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + sizeof(uint64_t))
-#define MAX_INLINE_BLOCK_SIZE (32 * 1024) /* 32KB inline, larger blocks use overflow */
+#define MAX_INLINE_BLOCK_SIZE     (32 * 1024) /* 32KB inline, larger blocks are overflowed */
+#define MIN_CACHE_ENTRIES         10
+#define MAX_REASONABLE_BLOCK_SIZE 10ULL << 30
 
-/* sync mode enum for block manager and tidesdb */
 typedef enum
 {
-    TDB_SYNC_NONE, /* no fsync/fdatasync - fastest, least durable */
-    TDB_SYNC_FULL, /* full fsync/fdatasync on every write to a block manager - slowest, most durable
-                    */
-} tidesdb_sync_mode_t;
+    BLOCK_MANAGER_SYNC_NONE,
+    BLOCK_MANAGER_SYNC_FULL,
+} block_manager_sync_mode_t;
+
+typedef struct
+{
+    uint32_t max_size;
+    uint32_t current_size;
+    lru_cache_t *lru_cache;
+} block_manager_cache_t;
 
 /**
  * block_manager_t
@@ -53,14 +61,16 @@ typedef enum
  * @param sync_mode sync mode for this block manager
  * @param write_mutex mutex for write operations only
  * @param block_size the default block size for this block manager
+ * @param cache_size size of lru cache of blocks in bytes
  */
 typedef struct
 {
     int fd;
     char file_path[MAX_FILE_PATH_LENGTH];
-    tidesdb_sync_mode_t sync_mode;
+    block_manager_sync_mode_t sync_mode;
     pthread_mutex_t write_mutex;
     uint32_t block_size;
+    block_manager_cache_t *block_manager_cache;
 } block_manager_t;
 
 /**
@@ -93,13 +103,26 @@ typedef struct
 
 /**
  * block_manager_open
- * opens a block manager
+ * opens a block manager (no cache)
  * @param bm the block manager to open
  * @param file_path the path of the file
  * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL)
  * @return 0 if successful, -1 if not
  */
-int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode);
+int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode);
+
+/**
+ * block_manager_open_with_cache
+ * opens a block manager with LRU cache support for blocks, if you provide cache_size of 0, will
+ * open with no caching.
+ * @param bm the block manager to open
+ * @param file_path the path of the file
+ * @param sync_mode the sync mode
+ * @param cache_size size of block manager lru block cache in bytes
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_open_with_cache(block_manager_t **bm, const char *file_path,
+                                  block_manager_sync_mode_t sync_mode, uint32_t cache_size);
 
 /**
  * block_manager_close

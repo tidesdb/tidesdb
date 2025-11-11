@@ -37,8 +37,38 @@
  * - Single file descriptor shared by all operations
  * - pread/pwrite for lock-free reads (readers don't block readers or writers)
  * - write_mutex only for serializing writes (writers block writers)
- * - Readers NEVER block - they can read while writes happen
+ * - Readers NEVER block -- they can read while writes happen
  */
+
+/*
+ * cached_block_evict_callback
+ * callback function called when a cached block is evicted from LRU cache
+ * @param key the cache key (block offset as string)
+ * @param value the cached block
+ * @param user_data the block manager cache structure
+ */
+static void cached_block_evict_callback(const char *key, void *value, void *user_data)
+{
+    block_manager_block_t *block = (block_manager_block_t *)value;
+    block_manager_cache_t *cache = (block_manager_cache_t *)user_data;
+
+    if (block && cache)
+    {
+        cache->current_size -= (uint32_t)block->size;
+        block_manager_block_free(block);
+    }
+}
+
+/*
+ * block_offset_to_key
+ * converts a block offset to a string key for caching
+ * @param offset the block offset
+ * @param key_buffer buffer to store the key (must be at least 32 bytes)
+ */
+static void block_offset_to_key(int64_t offset, char *key_buffer)
+{
+    snprintf(key_buffer, 32, "%ld", offset);
+}
 
 /*
  * compute_sha1
@@ -140,7 +170,8 @@ static int get_file_size(int fd, uint64_t *size)
     return 0;
 }
 
-int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync_mode_t sync_mode)
+static int block_manager_open_internal(block_manager_t **bm, const char *file_path,
+                                       block_manager_sync_mode_t sync_mode, uint32_t cache_size)
 {
     block_manager_t *new_bm = malloc(sizeof(block_manager_t));
     if (!new_bm)
@@ -151,7 +182,6 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
 
     int file_exists = access(file_path, F_OK) == 0;
 
-    /* open with O_RDWR for read/write, O_CREAT to create if needed */
     int flags = O_RDWR | O_CREAT;
     mode_t mode = 0644;
 
@@ -166,16 +196,47 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
     strncpy(new_bm->file_path, file_path, MAX_FILE_PATH_LENGTH - 1);
     new_bm->file_path[MAX_FILE_PATH_LENGTH - 1] = '\0';
 
-    /* set sync mode */
     new_bm->sync_mode = sync_mode;
 
-    /* initialize write mutex for thread safety on writes only */
     if (pthread_mutex_init(&new_bm->write_mutex, NULL) != 0)
     {
         close(new_bm->fd);
         free(new_bm);
         *bm = NULL;
         return -1;
+    }
+
+    /* initialize block cache if cache_size > 0 */
+    new_bm->block_manager_cache = NULL;
+    if (cache_size > 0)
+    {
+        new_bm->block_manager_cache = malloc(sizeof(block_manager_cache_t));
+        if (!new_bm->block_manager_cache)
+        {
+            pthread_mutex_destroy(&new_bm->write_mutex);
+            close(new_bm->fd);
+            free(new_bm);
+            *bm = NULL;
+            return -1;
+        }
+
+        new_bm->block_manager_cache->max_size = cache_size;
+        new_bm->block_manager_cache->current_size = 0;
+
+        /* create LRU cache with reasonable number of entries based on cache size */
+        size_t max_entries = cache_size / new_bm->block_size;
+        if (max_entries < MIN_CACHE_ENTRIES) max_entries = MIN_CACHE_ENTRIES; /* minimum entries */
+
+        new_bm->block_manager_cache->lru_cache = lru_cache_new(max_entries);
+        if (!new_bm->block_manager_cache->lru_cache)
+        {
+            free(new_bm->block_manager_cache);
+            pthread_mutex_destroy(&new_bm->write_mutex);
+            close(new_bm->fd);
+            free(new_bm);
+            *bm = NULL;
+            return -1;
+        }
     }
 
     /* handle file header */
@@ -224,7 +285,6 @@ int block_manager_open(block_manager_t **bm, const char *file_path, tidesdb_sync
         }
     }
 
-    /* Only set the output pointer after everything succeeds */
     *bm = new_bm;
     return 0;
 }
@@ -234,13 +294,20 @@ int block_manager_close(block_manager_t *bm)
     /* flush the file to disk one final time */
     (void)fdatasync(bm->fd);
 
-    /* close the file descriptor */
     if (close(bm->fd) != 0) return -1;
 
-    /* destroy write mutex */
+    /* cleanup cache if it exists */
+    if (bm->block_manager_cache)
+    {
+        if (bm->block_manager_cache->lru_cache)
+        {
+            lru_cache_free(bm->block_manager_cache->lru_cache);
+        }
+        free(bm->block_manager_cache);
+    }
+
     pthread_mutex_destroy(&bm->write_mutex);
 
-    /* free the block manager */
     free(bm);
     bm = NULL;
 
@@ -405,7 +472,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     }
 
     /* perform sync based on sync_mode */
-    if (bm->sync_mode == TDB_SYNC_FULL)
+    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
     {
         /* full sync on every write */
         if (fdatasync(bm->fd) != 0)
@@ -414,7 +481,37 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
             return -1;
         }
     }
-    /* TDB_SYNC_NONE - no sync */
+    /* BLOCK_MANAGER_SYNC_NONE -- no sync */
+
+    /* cache the written block if caching is enabled */
+    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    {
+        /* check if we have space in cache */
+        if (bm->block_manager_cache->current_size + block->size <=
+            bm->block_manager_cache->max_size)
+        {
+            /* create a copy of the block for caching */
+            block_manager_block_t *cached_block =
+                block_manager_block_create(block->size, block->data);
+            if (cached_block)
+            {
+                char cache_key[32];
+                block_offset_to_key(offset, cache_key);
+
+                /* add to cache */
+                if (lru_cache_put(bm->block_manager_cache->lru_cache, cache_key, cached_block,
+                                  cached_block_evict_callback, bm->block_manager_cache) == 0)
+                {
+                    bm->block_manager_cache->current_size += (uint32_t)block->size;
+                }
+                else
+                {
+                    /* failed to cache, free the copy */
+                    block_manager_block_free(cached_block);
+                }
+            }
+        }
+    }
 
     (void)pthread_mutex_unlock(&bm->write_mutex);
     return offset;
@@ -438,7 +535,7 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
     (*cursor) = malloc(sizeof(block_manager_cursor_t));
     if (!(*cursor)) return -1;
 
-    /* set the block manager of the cursor - shares same fd, no extra file handles */
+    /* set the block manager of the cursor -- shares same fd, no extra file handles */
     (*cursor)->bm = bm;
 
     /* initialize to position after header */
@@ -541,17 +638,42 @@ int block_manager_cursor_has_prev(block_manager_cursor_t *cursor)
     return (cursor->current_pos > BLOCK_MANAGER_HEADER_SIZE) ? 1 : 0;
 }
 
-block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
+/*
+ * block_manager_read_block_at_offset
+ * reads a block at a specific offset, checking cache first
+ * @param bm the block manager
+ * @param offset the offset to read from
+ * @return the block if successful, NULL otherwise
+ */
+static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t *bm,
+                                                                 uint64_t offset)
 {
-    if (!cursor) return NULL;
+    if (!bm) return NULL;
+
+    /* check cache first if caching is enabled */
+    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    {
+        char cache_key[32];
+        block_offset_to_key((int64_t)offset, cache_key);
+
+        block_manager_block_t *cached_block =
+            (block_manager_block_t *)lru_cache_get(bm->block_manager_cache->lru_cache, cache_key);
+
+        if (cached_block)
+        {
+            /* return a copy of the cached block */
+            return block_manager_block_create(cached_block->size, cached_block->data);
+        }
+    }
+
+    /* not in cache, read from disk */
+    block_manager_block_t *block = NULL;
 
     /* read block size using pread */
     uint64_t block_size;
-    if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (off_t)cursor->current_pos) !=
-        sizeof(uint64_t))
+    if (pread(bm->fd, &block_size, sizeof(uint64_t), (off_t)offset) != sizeof(uint64_t))
         return NULL;
 
-    const uint64_t MAX_REASONABLE_BLOCK_SIZE = 1ULL << 30; /* 1GB */
     if (block_size == 0 || block_size > MAX_REASONABLE_BLOCK_SIZE)
     {
         return NULL;
@@ -559,13 +681,13 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 
     /* read checksum using pread */
     unsigned char checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
-    off_t checksum_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t);
-    if (pread(cursor->bm->fd, checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH, (off_t)checksum_pos) !=
+    off_t checksum_pos = (off_t)offset + (off_t)sizeof(uint64_t);
+    if (pread(bm->fd, checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH, (off_t)checksum_pos) !=
         BLOCK_MANAGER_SHA1_DIGEST_LENGTH)
         return NULL;
 
     /* allocate block */
-    block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
+    block = malloc(sizeof(block_manager_block_t));
     if (!block) return NULL;
 
     block->size = block_size;
@@ -577,12 +699,11 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
     }
 
     /* read inline data using pread */
-    uint64_t inline_size =
-        block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
-    off_t data_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) +
-                     (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
+    uint64_t inline_size = block_size <= bm->block_size ? block_size : bm->block_size;
+    off_t data_pos =
+        (off_t)offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
 
-    if (pread(cursor->bm->fd, block->data, inline_size, (off_t)data_pos) != (ssize_t)inline_size)
+    if (pread(bm->fd, block->data, inline_size, (off_t)data_pos) != (ssize_t)inline_size)
     {
         free(block->data);
         free(block);
@@ -592,7 +713,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
     /* read overflow offset using pread */
     off_t overflow_offset_pos = data_pos + (off_t)inline_size;
     uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
+    if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
         sizeof(uint64_t))
     {
         free(block->data);
@@ -606,7 +727,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
     {
         /* read chunk size using pread */
         uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
+        if (pread(bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
             sizeof(uint64_t))
         {
             free(block->data);
@@ -615,8 +736,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
         }
 
         /* validate chunk_size to prevent corrupted data from causing overflow or OOM */
-        if (chunk_size == 0 || chunk_size > cursor->bm->block_size ||
-            data_offset + chunk_size > block_size)
+        if (chunk_size == 0 || chunk_size > bm->block_size || data_offset + chunk_size > block_size)
         {
             free(block->data);
             free(block);
@@ -626,7 +746,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
         /* read chunk checksum using pread */
         unsigned char chunk_checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
         off_t chunk_checksum_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t);
-        if (pread(cursor->bm->fd, chunk_checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH,
+        if (pread(bm->fd, chunk_checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH,
                   (off_t)chunk_checksum_pos) != BLOCK_MANAGER_SHA1_DIGEST_LENGTH)
         {
             free(block->data);
@@ -636,7 +756,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 
         /* read chunk data using pread */
         off_t chunk_data_pos = chunk_checksum_pos + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
-        if (pread(cursor->bm->fd, (unsigned char *)block->data + data_offset, chunk_size,
+        if (pread(bm->fd, (unsigned char *)block->data + data_offset, chunk_size,
                   (off_t)chunk_data_pos) != (ssize_t)chunk_size)
         {
             free(block->data);
@@ -655,7 +775,7 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
 
         /* read next overflow offset using pread */
         off_t next_overflow_pos = chunk_data_pos + (off_t)chunk_size;
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
+        if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
             sizeof(uint64_t))
         {
             free(block->data);
@@ -674,14 +794,48 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
         return NULL;
     }
 
+    /* cache the block if caching is enabled and we have space */
+    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    {
+        if (bm->block_manager_cache->current_size + block->size <=
+            bm->block_manager_cache->max_size)
+        {
+            /* create a copy for caching */
+            block_manager_block_t *cached_block =
+                block_manager_block_create(block->size, block->data);
+            if (cached_block)
+            {
+                char cache_key[32];
+                block_offset_to_key((int64_t)offset, cache_key);
+
+                if (lru_cache_put(bm->block_manager_cache->lru_cache, cache_key, cached_block,
+                                  cached_block_evict_callback, bm->block_manager_cache) == 0)
+                {
+                    bm->block_manager_cache->current_size += (uint32_t)block->size;
+                }
+                else
+                {
+                    block_manager_block_free(cached_block);
+                }
+            }
+        }
+    }
+
     return block;
+}
+
+block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
+{
+    if (!cursor) return NULL;
+
+    return block_manager_read_block_at_offset(cursor->bm, cursor->current_pos);
 }
 
 void block_manager_cursor_free(block_manager_cursor_t *cursor)
 {
     if (cursor)
     {
-        /* no file descriptor to close - we share bm->fd */
+        /* no file descriptor to close -- we share bm->fd */
         free(cursor);
         cursor = NULL;
     }
@@ -784,6 +938,13 @@ int block_manager_truncate(block_manager_t *bm)
     if (!bm) return -1;
 
     pthread_mutex_lock(&bm->write_mutex);
+
+    /* clear cache if it exists */
+    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    {
+        lru_cache_clear(bm->block_manager_cache->lru_cache);
+        bm->block_manager_cache->current_size = 0;
+    }
 
     if (ftruncate(bm->fd, 0) != 0)
     {
@@ -1135,4 +1296,34 @@ done_scanning:
     }
 
     return 0;
+}
+
+/*
+ * convert_sync_mode
+ * converts tidesdb sync mode to block manager sync mode
+ * @param tdb_sync_mode the tidesdb sync mode
+ * @return the corresponding block manager sync mode
+ */
+static block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode)
+{
+    switch (tdb_sync_mode)
+    {
+        case 0: /* TDB_SYNC_NONE */
+            return BLOCK_MANAGER_SYNC_NONE;
+        case 1: /* TDB_SYNC_FULL */
+            return BLOCK_MANAGER_SYNC_FULL;
+        default:
+            return BLOCK_MANAGER_SYNC_NONE;
+    }
+}
+
+int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode)
+{
+    return block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode), 0);
+}
+
+int block_manager_open_with_cache(block_manager_t **bm, const char *file_path,
+                                  block_manager_sync_mode_t sync_mode, uint32_t cache_size)
+{
+    return block_manager_open_internal(bm, file_path, sync_mode, cache_size);
 }

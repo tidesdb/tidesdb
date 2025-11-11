@@ -16,12 +16,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef LRU_H
-#define LRU_H
+#ifndef __LRU_H__
+#define __LRU_H__
 
-#include <pthread.h>
-#include <stddef.h>
-#include <stdint.h>
+#include "compat.h"
 
 /* forward declarations */
 typedef struct lru_cache_t lru_cache_t;

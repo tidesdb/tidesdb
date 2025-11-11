@@ -20,10 +20,9 @@
 #define __COMPRESS_H__
 #include <lz4.h>
 #include <snappy-c.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
 #include <zstd.h>
+
+#include "compat.h"
 
 /* snappy, lz4, zstd supported to use for compression purposes */
 typedef enum

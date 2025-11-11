@@ -18,9 +18,6 @@
  */
 #include "lru.h"
 
-#include <stdlib.h>
-#include <string.h>
-
 #include "../external/xxhash.h"
 
 /*

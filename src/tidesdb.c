@@ -1211,10 +1211,16 @@ static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
 
-    /* calculate total size needed (key + value + header + overhead) */
     size_t total_size = key_size + value_size + sizeof(tidesdb_kv_pair_header_t);
 
     size_t max_allowed = (size_t)(db->available_memory * TDB_MEMORY_PERCENTAGE / 100);
+
+    /* ensure minimum of TDB_MIN_KEY_VALUE_SIZE for single key-value pair, even on low-memory
+     * systems */
+    if (max_allowed < TDB_MIN_KEY_VALUE_SIZE)
+    {
+        max_allowed = TDB_MIN_KEY_VALUE_SIZE;
+    }
 
     if (total_size > max_allowed)
     {

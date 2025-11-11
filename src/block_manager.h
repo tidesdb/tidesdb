@@ -18,11 +18,6 @@
  */
 #ifndef __BLOCK_MANAGER_H__
 #define __BLOCK_MANAGER_H__
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
 #include "compat.h"
 #include "lru.h"
 

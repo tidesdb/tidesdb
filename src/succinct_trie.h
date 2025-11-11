@@ -19,9 +19,6 @@
 #ifndef __SUCCINCT_TRIE_H__
 #define __SUCCINCT_TRIE_H__
 
-#include <stddef.h>
-#include <stdint.h>
-
 #include "block_manager.h"
 #include "compat.h"
 

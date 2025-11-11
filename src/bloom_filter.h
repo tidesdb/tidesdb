@@ -18,7 +18,6 @@
  */
 #ifndef __BLOOM_FILTER_H__
 #define __BLOOM_FILTER_H__
-#include <stdint.h>
 #include <tgmath.h>
 
 #include "compat.h"

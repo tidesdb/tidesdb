@@ -18,12 +18,6 @@
  */
 #ifndef __SKIP_LIST_H__
 #define __SKIP_LIST_H__
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
 #include "compat.h"
 
 /* forward declarations */

@@ -19,7 +19,6 @@
 #include "block_manager.h"
 
 #include <openssl/sha.h>
-#include <time.h>
 
 /* file format
  * [HEADER]
@@ -207,38 +206,8 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         return -1;
     }
 
-    /* initialize block cache if cache_size > 0 */
+    /* initialize cache pointer to NULL, will be set up after block_size is known */
     new_bm->block_manager_cache = NULL;
-    if (cache_size > 0)
-    {
-        new_bm->block_manager_cache = malloc(sizeof(block_manager_cache_t));
-        if (!new_bm->block_manager_cache)
-        {
-            pthread_mutex_destroy(&new_bm->write_mutex);
-            close(new_bm->fd);
-            free(new_bm);
-            *bm = NULL;
-            return -1;
-        }
-
-        new_bm->block_manager_cache->max_size = cache_size;
-        new_bm->block_manager_cache->current_size = 0;
-
-        /* create LRU cache with reasonable number of entries based on cache size */
-        size_t max_entries = cache_size / new_bm->block_size;
-        if (max_entries < MIN_CACHE_ENTRIES) max_entries = MIN_CACHE_ENTRIES; /* minimum entries */
-
-        new_bm->block_manager_cache->lru_cache = lru_cache_new(max_entries);
-        if (!new_bm->block_manager_cache->lru_cache)
-        {
-            free(new_bm->block_manager_cache);
-            pthread_mutex_destroy(&new_bm->write_mutex);
-            close(new_bm->fd);
-            free(new_bm);
-            *bm = NULL;
-            return -1;
-        }
-    }
 
     /* handle file header */
     if (file_exists)
@@ -278,6 +247,38 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         }
         if (fdatasync(new_bm->fd) != 0)
         {
+            pthread_mutex_destroy(&new_bm->write_mutex);
+            close(new_bm->fd);
+            free(new_bm);
+            *bm = NULL;
+            return -1;
+        }
+    }
+
+    /* initialize block cache after block_size is set */
+    if (cache_size > 0)
+    {
+        new_bm->block_manager_cache = malloc(sizeof(block_manager_cache_t));
+        if (!new_bm->block_manager_cache)
+        {
+            pthread_mutex_destroy(&new_bm->write_mutex);
+            close(new_bm->fd);
+            free(new_bm);
+            *bm = NULL;
+            return -1;
+        }
+
+        new_bm->block_manager_cache->max_size = cache_size;
+        new_bm->block_manager_cache->current_size = 0;
+
+        /* create LRU cache with reasonable number of entries based on cache size */
+        size_t max_entries = cache_size / new_bm->block_size;
+        if (max_entries < MIN_CACHE_ENTRIES) max_entries = MIN_CACHE_ENTRIES; /* minimum entries */
+
+        new_bm->block_manager_cache->lru_cache = lru_cache_new(max_entries);
+        if (!new_bm->block_manager_cache->lru_cache)
+        {
+            free(new_bm->block_manager_cache);
             pthread_mutex_destroy(&new_bm->write_mutex);
             close(new_bm->fd);
             free(new_bm);

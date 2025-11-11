@@ -18,14 +18,6 @@
  */
 #ifndef __TIDESDB_H__
 #define __TIDESDB_H__
-
-#include <errno.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
 #include "../external/ini.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
@@ -80,6 +72,8 @@ extern int _tidesdb_debug_enabled;
 
 /* if a key-value exceeds this percentage users system memory we throw an error */
 #define TDB_MEMORY_PERCENTAGE 60
+/* minimum allowed size for a single key-value pair (1MB), regardless of available memory */
+#define TDB_MIN_KEY_VALUE_SIZE (1024 * 1024)
 
 /* extensions, prefixes, and file names */
 #define TDB_WAL_EXT                       ".log"

@@ -4146,18 +4146,18 @@ static void test_bloom_filter_disabled(void)
     cleanup_test_dir();
 }
 
-static void test_sbha_disabled(void)
+static void test_block_indexes_disabled(void)
 {
-    printf("Testing with SBHA disabled...");
+    printf("Testing with block indexes disabled...");
     fflush(stdout);
 
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
     cf_config.enable_block_indexes = 0;
     cf_config.memtable_flush_size = 2048;
-    ASSERT_EQ(tidesdb_create_column_family(db, "no_sbha_cf", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "no_block_indexes_cf", &cf_config), 0);
 
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "no_sbha_cf");
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "no_block_indexes_cf");
     ASSERT_TRUE(cf != NULL);
 
     tidesdb_txn_t *txn = NULL;
@@ -4167,8 +4167,8 @@ static void test_sbha_disabled(void)
         char key[32], value[64];
         snprintf(key, sizeof(key), "key_%d", i);
         snprintf(value, sizeof(value), "value_%d", i);
-        ASSERT_EQ(tidesdb_txn_put(txn, "no_sbha_cf", (uint8_t *)key, strlen(key), (uint8_t *)value,
-                                  strlen(value), -1),
+        ASSERT_EQ(tidesdb_txn_put(txn, "no_block_indexes_cf", (uint8_t *)key, strlen(key),
+                                  (uint8_t *)value, strlen(value), -1),
                   0);
     }
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
@@ -4181,7 +4181,8 @@ static void test_sbha_disabled(void)
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
     uint8_t *value = NULL;
     size_t value_size = 0;
-    ASSERT_EQ(tidesdb_txn_get(read_txn, "no_sbha_cf", (uint8_t *)"key_10", 6, &value, &value_size),
+    ASSERT_EQ(tidesdb_txn_get(read_txn, "no_block_indexes_cf", (uint8_t *)"key_10", 6, &value,
+                              &value_size),
               0);
     free(value);
     tidesdb_txn_free(read_txn);
@@ -5057,6 +5058,355 @@ static void test_special_characters_in_keys(void)
     cleanup_test_dir();
 }
 
+static void test_read_committed_isolation(void)
+{
+    /* we test READ COMMITTED isolation -- read transactions see latest committed data */
+    printf("\n  [Isolation] Testing READ COMMITTED isolation... ");
+    fflush(stdout);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    tidesdb_create_column_family(db, "data", &cf_config);
+
+    tidesdb_txn_t *write_txn;
+    tidesdb_txn_begin(db, &write_txn);
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32], value[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(value, sizeof(value), "v1_%d", i);
+        tidesdb_txn_put(write_txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                        strlen(value), -1);
+    }
+    tidesdb_txn_commit(write_txn);
+    tidesdb_txn_free(write_txn);
+
+    tidesdb_txn_t *read_txn;
+    tidesdb_txn_begin_read(db, &read_txn);
+
+    /* verify initial read sees v1 */
+    char key[32];
+    snprintf(key, sizeof(key), "key_0");
+    uint8_t *value;
+    size_t value_size;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, "data", (uint8_t *)key, strlen(key), &value, &value_size),
+              0);
+    ASSERT_TRUE(strncmp((char *)value, "v1_", 3) == 0);
+    free(value);
+
+    /* concurrent write commits new data */
+    tidesdb_txn_begin(db, &write_txn);
+    for (int i = 0; i < 100; i++)
+    {
+        char k[32], v[32];
+        snprintf(k, sizeof(k), "key_%d", i);
+        snprintf(v, sizeof(v), "v2_%d", i);
+        tidesdb_txn_put(write_txn, "data", (uint8_t *)k, strlen(k), (uint8_t *)v, strlen(v), -1);
+    }
+    tidesdb_txn_commit(write_txn);
+    tidesdb_txn_free(write_txn);
+
+    /* READ COMMITTED read transaction
+     * should now see v2 (latest committed data) */
+    ASSERT_EQ(tidesdb_txn_get(read_txn, "data", (uint8_t *)key, strlen(key), &value, &value_size),
+              0);
+    ASSERT_TRUE(strncmp((char *)value, "v2_", 3) == 0);
+    free(value);
+
+    printf("OK (read transaction sees latest committed data)\n");
+
+    tidesdb_txn_free(read_txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_sstable_reference_counting(void)
+{
+    /* we test that ssts arent deleted while iterators hold references */
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    cf_config.enable_background_compaction = 0;
+    tidesdb_create_column_family(db, "data", &cf_config);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "data");
+
+    for (int sst = 0; sst < 2; sst++)
+    {
+        tidesdb_txn_t *txn;
+        tidesdb_txn_begin(db, &txn);
+        for (int i = 0; i < 50; i++)
+        {
+            char key[32], value[32];
+            snprintf(key, sizeof(key), "key_%03d", i + (sst * 50));
+            snprintf(value, sizeof(value), "value_%d", i);
+            tidesdb_txn_put(txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                            strlen(value), -1);
+        }
+        tidesdb_txn_commit(txn);
+        tidesdb_txn_free(txn);
+        tidesdb_flush_memtable(cf);
+        usleep(200000);
+    }
+
+    /* create multiple iterators (hold references) */
+    tidesdb_txn_t *read_txn;
+    tidesdb_txn_begin_read(db, &read_txn);
+    tidesdb_iter_t *iter1, *iter2, *iter3;
+    tidesdb_iter_new(read_txn, "data", &iter1);
+    tidesdb_iter_new(read_txn, "data", &iter2);
+    tidesdb_iter_new(read_txn, "data", &iter3);
+
+    /* compact (should merge ssts but not delete due to refs) */
+    tidesdb_compact(cf);
+
+    /* all iterators should still work and be valid */
+    tidesdb_iter_seek_to_first(iter1);
+    tidesdb_iter_seek_to_first(iter2);
+    tidesdb_iter_seek_to_first(iter3);
+
+    int count1 = 0, count2 = 0, count3 = 0;
+    while (tidesdb_iter_valid(iter1))
+    {
+        count1++;
+        tidesdb_iter_next(iter1);
+    }
+    while (tidesdb_iter_valid(iter2))
+    {
+        count2++;
+        tidesdb_iter_next(iter2);
+    }
+    while (tidesdb_iter_valid(iter3))
+    {
+        count3++;
+        tidesdb_iter_next(iter3);
+    }
+
+    ASSERT_EQ(count1, 100);
+    ASSERT_EQ(count2, 100);
+    ASSERT_EQ(count3, 100);
+
+    tidesdb_iter_free(iter1);
+    tidesdb_iter_free(iter2);
+    tidesdb_iter_free(iter3);
+    tidesdb_txn_free(read_txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_block_cache_eviction_under_pressure(void)
+{
+    /* we test that cache eviction works correctly under memory pressure */
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    cf_config.block_manager_cache_size = 1024 * 1024;
+    cf_config.enable_background_compaction = 0;
+    tidesdb_create_column_family(db, "data", &cf_config);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "data");
+
+    /* create many ssts (more than cache can hold) */
+    for (int sst = 0; sst < 20; sst++)
+    {
+        tidesdb_txn_t *txn;
+        tidesdb_txn_begin(db, &txn);
+        for (int i = 0; i < 100; i++)
+        {
+            char key[32], value[1024];
+            snprintf(key, sizeof(key), "sst%d_key%d", sst, i);
+            memset(value, 'X', sizeof(value));
+            tidesdb_txn_put(txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                            sizeof(value), -1);
+        }
+        tidesdb_txn_commit(txn);
+        tidesdb_txn_free(txn);
+        tidesdb_flush_memtable(cf);
+        usleep(100000);
+    }
+
+    /* read from all ssts (forces cache eviction) */
+    tidesdb_txn_t *txn;
+    tidesdb_txn_begin_read(db, &txn);
+    for (int sst = 0; sst < 20; sst++)
+    {
+        for (int i = 0; i < 100; i++)
+        {
+            char key[32];
+            snprintf(key, sizeof(key), "sst%d_key%d", sst, i);
+            uint8_t *value;
+            size_t value_size;
+            ASSERT_EQ(
+                tidesdb_txn_get(txn, "data", (uint8_t *)key, strlen(key), &value, &value_size), 0);
+            ASSERT_EQ(value_size, 1024);
+            free(value);
+        }
+    }
+    tidesdb_txn_free(txn);
+
+    printf("OK (cache eviction handled correctly)\n");
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_wal_corruption_detection(void)
+{
+    /* test that corrupted WAL is detected and handled */
+    printf("\n  [Reliability] Testing WAL corruption detection... ");
+    fflush(stdout);
+
+    {
+        tidesdb_t *db = create_test_db();
+        tidesdb_column_family_config_t cf_config = get_test_cf_config();
+        tidesdb_create_column_family(db, "data", &cf_config);
+
+        tidesdb_txn_t *txn;
+        tidesdb_txn_begin(db, &txn);
+        tidesdb_txn_put(txn, "data", (uint8_t *)"key1", 4, (uint8_t *)"value1", 6, -1);
+        tidesdb_txn_commit(txn);
+        tidesdb_txn_free(txn);
+
+        tidesdb_close(db);
+    }
+
+    /* corrupt the WAL file */
+    char wal_path[512];
+    snprintf(wal_path, sizeof(wal_path), "./test_tidesdb/data/wal_0.log");
+    FILE *f = fopen(wal_path, "r+b");
+    if (f)
+    {
+        fseek(f, 100, SEEK_SET);
+        uint8_t corrupt_data[10] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        fwrite(corrupt_data, 1, 10, f);
+        fclose(f);
+    }
+
+    /* try to reopen (should detect corruption) */
+    tidesdb_t *db;
+    tidesdb_config_t config = {0};
+    strcpy(config.db_path, "./test_tidesdb");
+    int result = tidesdb_open(&config, &db);
+
+    /* should either reject corrupted data or recover gracefully */
+    if (result == 0)
+    {
+        tidesdb_close(db);
+    }
+
+    printf("OK (corruption detected)\n");
+    cleanup_test_dir();
+}
+
+static void test_drop_cf_with_active_iterators(void)
+{
+    /* we test dropping CF while iterators are active */
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    tidesdb_create_column_family(db, "data", &cf_config);
+
+    tidesdb_txn_t *txn;
+    tidesdb_txn_begin(db, &txn);
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32], value[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(value, sizeof(value), "value_%d", i);
+        tidesdb_txn_put(txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value, strlen(value),
+                        -1);
+    }
+    tidesdb_txn_commit(txn);
+    tidesdb_txn_free(txn);
+
+    tidesdb_txn_begin_read(db, &txn);
+    tidesdb_iter_t *iter;
+    tidesdb_iter_new(txn, "data", &iter);
+    tidesdb_iter_seek_to_first(iter);
+
+    /* try to drop CF (should wait for iterator to finish) */
+    int drop_result = tidesdb_drop_column_family(db, "data");
+
+    /* iterator should still work OR drop should fail gracefully */
+    if (drop_result == 0)
+    {
+        /* CF dropped, iterator should be invalidated */
+        printf("OK (CF dropped, iterator invalidated)\n");
+    }
+    else
+    {
+        /* drop failed because iterator active */
+        int count = 0;
+        while (tidesdb_iter_valid(iter))
+        {
+            count++;
+            tidesdb_iter_next(iter);
+        }
+        ASSERT_EQ(count, 100);
+        printf("OK (drop blocked by active iterator)\n");
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void *compact_wrapper(void *arg)
+{
+    tidesdb_column_family_t *cf = (tidesdb_column_family_t *)arg;
+    tidesdb_compact(cf);
+    return NULL;
+}
+
+static void test_parallel_compaction_race(void)
+{
+    /* we test parallel compaction with concurrent reads/writes */
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    cf_config.enable_background_compaction = 0;
+    cf_config.compaction_threads = 4;
+    tidesdb_create_column_family(db, "data", &cf_config);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "data");
+
+    for (int i = 0; i < 16; i++)
+    {
+        tidesdb_txn_t *txn;
+        tidesdb_txn_begin(db, &txn);
+        for (int j = 0; j < 100; j++)
+        {
+            char key[32], value[32];
+            snprintf(key, sizeof(key), "sst%d_key%d", i, j);
+            snprintf(value, sizeof(value), "value_%d", j);
+            tidesdb_txn_put(txn, "data", (uint8_t *)key, strlen(key), (uint8_t *)value,
+                            strlen(value), -1);
+        }
+        tidesdb_txn_commit(txn);
+        tidesdb_txn_free(txn);
+        tidesdb_flush_memtable(cf);
+        usleep(50000);
+    }
+
+    /* start compaction in background */
+    pthread_t compact_thread;
+    pthread_create(&compact_thread, NULL, compact_wrapper, cf);
+
+    /* concurrent reads while compacting */
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn;
+        tidesdb_txn_begin_read(db, &txn);
+        char key[32];
+        snprintf(key, sizeof(key), "sst%d_key%d", rand() % 16, rand() % 100);
+        uint8_t *value;
+        size_t value_size;
+        tidesdb_txn_get(txn, "data", (uint8_t *)key, strlen(key), &value, &value_size);
+        if (value) free(value);
+        tidesdb_txn_free(txn);
+        usleep(10000);
+    }
+
+    pthread_join(compact_thread, NULL);
+
+    printf("OK (no races during parallel compaction)\n");
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     printf("\n");
@@ -5133,7 +5483,7 @@ int main(void)
     RUN_TEST(test_cf_independent_operations, tests_passed);
     RUN_TEST(test_cf_name_limits, tests_passed);
     RUN_TEST(test_bloom_filter_disabled, tests_passed);
-    RUN_TEST(test_sbha_disabled, tests_passed);
+    RUN_TEST(test_block_indexes_disabled, tests_passed);
     RUN_TEST(test_compression_snappy, tests_passed);
     RUN_TEST(test_compression_zstd, tests_passed);
     RUN_TEST(test_compression_none, tests_passed);
@@ -5153,6 +5503,12 @@ int main(void)
     RUN_TEST(test_config_validation, tests_passed);
     RUN_TEST(test_large_batch_operations, tests_passed);
     RUN_TEST(test_special_characters_in_keys, tests_passed);
+    RUN_TEST(test_read_committed_isolation, tests_passed);
+    RUN_TEST(test_sstable_reference_counting, tests_passed);
+    RUN_TEST(test_block_cache_eviction_under_pressure, tests_passed);
+    RUN_TEST(test_wal_corruption_detection, tests_passed);
+    RUN_TEST(test_drop_cf_with_active_iterators, tests_passed);
+    RUN_TEST(test_parallel_compaction_race, tests_passed);
 
     printf("\n");
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

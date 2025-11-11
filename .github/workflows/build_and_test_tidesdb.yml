@@ -105,13 +105,16 @@ jobs:
         run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON
 
       - name: Configure CMake (Linux/macOS x86)
-        if: runner.os == 'macOS' && matrix.arch == 'x86'
+        if: runner.os != 'Windows' && matrix.arch == 'x86'
         shell: bash
         run: |
+          export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
           cmake -S . -B build \
             -DCMAKE_C_FLAGS="-m32" \
-            -DCMAKE_OSX_ARCHITECTURES=i386 \
             -DCMAKE_CXX_FLAGS="-m32" \
+            -DCMAKE_EXE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
             -DTIDESDB_BUILD_TESTS=ON
 
       - name: Configure CMake (Windows MSVC x64)

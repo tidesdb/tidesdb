@@ -205,6 +205,9 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_COMPARATOR_NAME)
         set(BENCH_COMPARATOR_NAME "memcmp")
     endif()
+    if (NOT DEFINED BENCH_COLUMN_FAMILY_BLOCK_CACHE)
+        set(BENCH_COLUMN_FAMILY_BLOCK_CACHE 0)
+    endif()
 
     add_executable(block_manager_tests test/block_manager__tests.c)
     add_executable(skip_list_tests test/skip_list__tests.c)

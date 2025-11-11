@@ -76,7 +76,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_MAX_CF_NAME_LENGTH  64
 #define TDB_MAX_PATH_LENGTH     1024
 #define TDB_MAX_COMPARATOR_NAME 64
-#define TDB_MAX_COMPARATORS     128
+#define TDB_MAX_COMPARATORS     32
 
 /* if a key-value exceeds this percentage users system memory we throw an error */
 #define TDB_MEMORY_PERCENTAGE 60

@@ -21,7 +21,6 @@
 #include <string.h>
 #include <sys/stat.h>
 
-
 #include "../src/tidesdb.h"
 #include "test_utils.h"
 

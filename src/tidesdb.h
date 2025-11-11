@@ -71,7 +71,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_BLOOM_FILTER_FP_RATE           0.01
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
 
-/* maximums */
+/* limits */
 #define TDB_MAX_CF_NAME_LENGTH  256
 #define TDB_MAX_PATH_LENGTH     1024
 #define TDB_MAX_COMPARATOR_NAME 64
@@ -95,7 +95,6 @@ extern int _tidesdb_debug_enabled;
 /* "SSTM" sstable meta magic number */
 #define TDB_SST_META_MAGIC 0x5353544D
 
-/* 1MB */
 #define SUCCINCT_TRIE_INITIAL_BUFFER_SIZE (1024 * 1024)
 
 /* flags for key-value pair header */

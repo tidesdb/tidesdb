@@ -42,11 +42,10 @@
 #include <sys/types.h>
 
 #if defined(_MSC_VER)
-/* for MSVC we gotta use _stat64 for 64-bit time_t */
 #define STAT_STRUCT _stat64
 #define STAT_FUNC   _stat64
 #define FSTAT_FUNC  _fstat64
-#else /* mainly mingw */
+#else
 #define STAT_STRUCT stat
 #define STAT_FUNC   stat
 #define FSTAT_FUNC  fstat

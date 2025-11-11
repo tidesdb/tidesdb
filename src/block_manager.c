@@ -134,7 +134,7 @@ static int read_header(int fd, uint32_t *block_size)
  */
 static int get_file_size(int fd, uint64_t *size)
 {
-    struct stat st;
+    struct STAT_STRUCT st;
     if (FSTAT_FUNC(fd, &st) != 0) return -1;
     *size = (uint64_t)st.st_size;
     return 0;

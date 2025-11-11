@@ -33,7 +33,9 @@ It is not a full-featured database, but rather a library that can be used to bui
 ## Getting Started
 To learn more about TidesDB, check out [What is TidesDB?](https://tidesdb.com/getting-started/what-is-tidesdb/).
 
-For usage documentation, see the [TidesDB C Reference](https://tidesdb.com/reference/c/).
+For building and benchmarking instructions [Building & Benchmarking TidesDB](https://tidesdb.com/reference/building/)
+
+For C usage documentation, see the [TidesDB C Reference](https://tidesdb.com/reference/c/).
 
 ## Discord Community
 Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask questions, work on development, and discuss the future of TidesDB.

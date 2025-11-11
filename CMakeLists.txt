@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 2.1.1)
+set(PROJECT_VERSION 2.1.2)
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
@@ -128,7 +128,7 @@ install(TARGETS tidesdb
         ARCHIVE DESTINATION lib)
 
 install(DIRECTORY src/ DESTINATION include/tidesdb FILES_MATCHING PATTERN "*.h")
-install(FILES external/xxhash.h DESTINATION include/tidesdb)
+install(FILES external/ini.h external/xxhash.h DESTINATION include/tidesdb)
 
 if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     enable_testing()

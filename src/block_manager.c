@@ -19,7 +19,6 @@
 #include "block_manager.h"
 
 #include <openssl/sha.h>
-#include <time.h>
 
 /* file format
  * [HEADER]

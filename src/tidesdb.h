@@ -18,14 +18,6 @@
  */
 #ifndef __TIDESDB_H__
 #define __TIDESDB_H__
-
-#include <errno.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
 #include "../external/ini.h"
 #include "block_manager.h"
 #include "bloom_filter.h"

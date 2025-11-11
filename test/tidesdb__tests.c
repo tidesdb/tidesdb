@@ -4146,18 +4146,18 @@ static void test_bloom_filter_disabled(void)
     cleanup_test_dir();
 }
 
-static void test_sbha_disabled(void)
+static void test_block_indexes_disabled(void)
 {
-    printf("Testing with SBHA disabled...");
+    printf("Testing with block indexes disabled...");
     fflush(stdout);
 
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
     cf_config.enable_block_indexes = 0;
     cf_config.memtable_flush_size = 2048;
-    ASSERT_EQ(tidesdb_create_column_family(db, "no_sbha_cf", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "no_block_indexes_cf", &cf_config), 0);
 
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "no_sbha_cf");
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "no_block_indexes_cf");
     ASSERT_TRUE(cf != NULL);
 
     tidesdb_txn_t *txn = NULL;
@@ -4167,8 +4167,8 @@ static void test_sbha_disabled(void)
         char key[32], value[64];
         snprintf(key, sizeof(key), "key_%d", i);
         snprintf(value, sizeof(value), "value_%d", i);
-        ASSERT_EQ(tidesdb_txn_put(txn, "no_sbha_cf", (uint8_t *)key, strlen(key), (uint8_t *)value,
-                                  strlen(value), -1),
+        ASSERT_EQ(tidesdb_txn_put(txn, "no_block_indexes_cf", (uint8_t *)key, strlen(key),
+                                  (uint8_t *)value, strlen(value), -1),
                   0);
     }
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
@@ -4181,7 +4181,8 @@ static void test_sbha_disabled(void)
     ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
     uint8_t *value = NULL;
     size_t value_size = 0;
-    ASSERT_EQ(tidesdb_txn_get(read_txn, "no_sbha_cf", (uint8_t *)"key_10", 6, &value, &value_size),
+    ASSERT_EQ(tidesdb_txn_get(read_txn, "no_block_indexes_cf", (uint8_t *)"key_10", 6, &value,
+                              &value_size),
               0);
     free(value);
     tidesdb_txn_free(read_txn);
@@ -5482,7 +5483,7 @@ int main(void)
     RUN_TEST(test_cf_independent_operations, tests_passed);
     RUN_TEST(test_cf_name_limits, tests_passed);
     RUN_TEST(test_bloom_filter_disabled, tests_passed);
-    RUN_TEST(test_sbha_disabled, tests_passed);
+    RUN_TEST(test_block_indexes_disabled, tests_passed);
     RUN_TEST(test_compression_snappy, tests_passed);
     RUN_TEST(test_compression_zstd, tests_passed);
     RUN_TEST(test_compression_none, tests_passed);

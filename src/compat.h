@@ -447,6 +447,16 @@ static inline int sem_post(sem_t *sem)
 #define ftell                _ftelli64
 #define fseek                _fseeki64
 
+/* fopen wrapper for windows */
+static inline FILE *tdb_fopen(const char *filename, const char *mode)
+{
+    FILE *fp = NULL;
+    errno_t err = fopen_s(&fp, filename, mode);
+    if (err != 0) return NULL;
+    return fp;
+}
+#define fopen tdb_fopen
+
 static inline int fsync(int fd)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);

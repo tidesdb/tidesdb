@@ -4549,50 +4549,16 @@ static int tidesdb_check_and_flush(tidesdb_column_family_t *cf)
     }
     tidesdb_memtable_release(active_mt);
 
-    /* early check without lock -- flush if either memtable or WAL exceeds threshold */
-    if (memtable_size < cf->config.memtable_flush_size && wal_size < cf->config.memtable_flush_size)
-    {
-        return 0;
-    }
-
-    /* size exceeded, acquire lock and check again to prevent race */
-    pthread_mutex_lock(&cf->flush_lock);
-
-    /* re-check size after acquiring lock (memtable might have been rotated by another thread) */
-    active_mt = atomic_load(&cf->active_memtable);
-    if (!active_mt)
-    {
-        pthread_mutex_unlock(&cf->flush_lock);
-        return TDB_ERR_INVALID_ARGS;
-    }
-
-    tidesdb_memtable_acquire(active_mt);
-    memtable_size = (size_t)skip_list_get_size(active_mt->memtable);
-    wal_size = 0;
-    if (active_mt->wal)
-    {
-        uint64_t size;
-        if (block_manager_get_size(active_mt->wal, &size) == 0)
-        {
-            wal_size = (size_t)size;
-        }
-    }
-    tidesdb_memtable_release(active_mt);
-
     /* flush if EITHER memtable OR WAL exceeds threshold */
     if (memtable_size >= cf->config.memtable_flush_size ||
         wal_size >= cf->config.memtable_flush_size)
     {
-        /* release lock before calling rotate, as it acquires the same lock internally */
-        pthread_mutex_unlock(&cf->flush_lock);
-
         TDB_DEBUG_LOG(
             "Triggering memtable rotation for CF '%s' (memtable: %zu, WAL: %zu, threshold: %zu)",
             cf->name, memtable_size, wal_size, cf->config.memtable_flush_size);
         return tidesdb_rotate_memtable(cf);
     }
 
-    pthread_mutex_unlock(&cf->flush_lock);
     return 0;
 }
 

@@ -128,7 +128,7 @@ install(TARGETS tidesdb
         ARCHIVE DESTINATION lib)
 
 install(DIRECTORY src/ DESTINATION include/tidesdb FILES_MATCHING PATTERN "*.h")
-install(FILES external/xxhash.h DESTINATION include/tidesdb)
+install(FILES external/ini.h external/xxhash.h DESTINATION include/tidesdb)
 
 if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     enable_testing()

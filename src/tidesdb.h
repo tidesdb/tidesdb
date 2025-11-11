@@ -18,11 +18,11 @@
  */
 #ifndef __TIDESDB_H__
 #define __TIDESDB_H__
-#include "../external/ini.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "compat.h"
 #include "compress.h"
+#include "ini.h"
 #include "lru.h"
 #include "queue.h"
 #include "skip_list.h"

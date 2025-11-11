@@ -18,7 +18,7 @@
  */
 #include "lru.h"
 
-#include "../external/xxhash.h"
+#include "xxhash.h"
 
 /*
  * lru_hash

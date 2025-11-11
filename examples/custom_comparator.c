@@ -1,11 +1,6 @@
 /*
  * demonstrates how to create and register a custom comparator
  * that can be used with TidesDB column families.
- *
- * to use
- * 1. add this file to your tidesdb directory
- * 2. include it in your build
- * 3. register the comparator before creating column families
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -18,7 +13,8 @@
 int reverse_comparator(const uint8_t *key1, size_t key1_size, const uint8_t *key2, size_t key2_size,
                        void *ctx)
 {
-    (void)ctx; /* unused */
+    (void)ctx; /* not entirely used on the core TidesDB system but on internal data structures that
+                  can be included and used. */
 
     /* compare using memcmp but reverse the result */
     size_t min_size = key1_size < key2_size ? key1_size : key2_size;
@@ -91,7 +87,7 @@ int timestamp_comparator(const uint8_t *key1, size_t key1_size, const uint8_t *k
 }
 
 /*
- * example ****
+ * example
  *
  * #include "tidesdb.h"
  *
@@ -113,7 +109,8 @@ int timestamp_comparator(const uint8_t *key1, size_t key1_size, const uint8_t *k
  *
  *     // create column family with custom comparator
  *     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
- *     cf_config.comparator_name = "reverse";  // Use your registered comparator
+ *     strncpy(cf_config.comparator_name, "reverse", TDB_MAX_COMPARATOR_NAME - 1);
+ *     cf_config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
  *     tidesdb_create_column_family(db, "my_cf", &cf_config);
  *
  *     // on reopen, just register the comparators again before opening

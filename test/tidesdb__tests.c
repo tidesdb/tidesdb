@@ -2696,6 +2696,136 @@ static void test_concurrent_compaction_with_reads(void)
     cleanup_test_dir();
 }
 
+static void test_concurrent_compaction_lru_enabled_with_reads(void)
+{
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+
+    /* disable background compaction, we'll trigger manually */
+    cf_config.enable_background_compaction = 0;
+    cf_config.max_sstables_before_compaction = 10;
+    cf_config.compaction_threads = 0;
+    cf_config.block_manager_cache_size = (1024 * 1024) * 10;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "concurrent_block_cache_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "concurrent_block_cache_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* insert data into first sstable */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_%03d_sst1", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "concurrent_block_cache_cf", (uint8_t *)key, strlen(key),
+                                  (uint8_t *)value, strlen(value), -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    usleep(200000); /* give flush thread time to pick up work */
+
+    /* insert data into second sstable */
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 50; i < 100; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_%03d_sst2", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, "concurrent_block_cache_cf", (uint8_t *)key, strlen(key),
+                                  (uint8_t *)value, strlen(value), -1),
+                  0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    usleep(200000); /* give flush thread time to pick up work */
+
+    /* wait for both async flushes to complete */
+    int max_wait = 100; /* 10 seconds max */
+    int num_sstables = 0;
+    for (int i = 0; i < max_wait; i++)
+    {
+        num_sstables = atomic_load(&cf->num_sstables);
+        if (num_sstables >= 2) break;
+        usleep(100000); /* 100ms */
+    }
+
+    /* verify we have at least 2 sstables */
+    ASSERT_TRUE(num_sstables >= 2);
+
+    /* create iterator BEFORE compaction */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_read(db, &read_txn), 0);
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(read_txn, "concurrent_block_cache_cf", &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    /* read first 10 entries from iterator */
+    int count = 0;
+    while (tidesdb_iter_valid(iter) && count < 10)
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+        ASSERT_EQ(tidesdb_iter_value(iter, &value, &value_size), 0);
+        ASSERT_TRUE(key != NULL);
+        ASSERT_TRUE(value != NULL);
+        count++;
+        ASSERT_EQ(tidesdb_iter_next(iter), 0);
+    }
+    ASSERT_EQ(count, 10);
+
+    /* NOW trigger compaction while iterator is active */
+    ASSERT_EQ(tidesdb_compact(cf), 0);
+
+    /* verify compaction happened (2 sstables merged into 1) */
+    num_sstables = atomic_load(&cf->num_sstables);
+    ASSERT_EQ(num_sstables, 1);
+
+    /* iterator should STILL work,  continue reading remaining entries */
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+        ASSERT_EQ(tidesdb_iter_value(iter, &value, &value_size), 0);
+        ASSERT_TRUE(key != NULL);
+        ASSERT_TRUE(value != NULL);
+        count++;
+        if (tidesdb_iter_next(iter) != 0) break;
+    }
+    /* iterator has snapshot of old ssts, should read at least some entries */
+    ASSERT_TRUE(count >= 10);
+    printf("OK (iterator read %d entries from old sstables during compaction)\n", count);
+
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(read_txn, "concurrent_block_cache_cf", (uint8_t *)key,
+                                  strlen(key), &value, &value_size),
+                  0);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(read_txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static int test_linear_scan_fallback(void)
 {
     tidesdb_t *db = create_test_db();
@@ -4977,6 +5107,7 @@ int main(void)
     RUN_TEST(test_drop_column_family_not_found, tests_passed);
     RUN_TEST(test_drop_column_family_cleanup, tests_passed);
     RUN_TEST(test_concurrent_compaction_with_reads, tests_passed);
+    RUN_TEST(test_concurrent_compaction_lru_enabled_with_reads, tests_passed);
     RUN_TEST(test_linear_scan_fallback, tests_passed);
     RUN_TEST(test_iterator_seek, tests_passed);
     RUN_TEST(test_iterator_seek_range, tests_passed);

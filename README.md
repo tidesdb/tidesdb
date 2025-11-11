@@ -20,6 +20,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Optional compression via Snappy, LZ4, or ZSTD for sstables and WAL entries. Configurable per column family.
 - Optional TTL (time-to-live) for key-value pairs. Expired entries automatically skipped during reads.
 - Optional custom comparators. You can register custom key comparison functions. Built-in comparators include memcmp, string, numeric.
+- You can enable column families to utilize block caching (most recent blocks).
 - Two sync modes NONE (fastest), FULL (most durable, slowest).
 - Per-column-family configuration includes memtable size, compaction settings, compression, bloom filters, sync mode, and more.
 - Clean, easy-to-use C API. Returns 0 on success, -n on error.

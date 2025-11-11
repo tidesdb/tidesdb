@@ -3484,9 +3484,10 @@ static void test_memory_safety(void)
 
     /* allocate key+value that exceeds available memory
      * we need key_size + value_size + sizeof(header) > (available * 60% / 100)
-     * so we make each half slightly larger to guarantee exceeding the limit */
+     * header is small (48 bytes), so we add 1MB buffer to guarantee exceeding the limit */
     size_t max_allowed = (size_t)(db->available_memory * TDB_MEMORY_PERCENTAGE / 100);
-    size_t excessive_size = (max_allowed / 2) + 1024; /* add 1KB buffer to ensure we exceed */
+    size_t excessive_size =
+        (max_allowed / 2) + (1024 * 1024); /* add 1MB buffer to ensure we exceed */
     uint8_t *large_key = malloc(excessive_size);
     uint8_t *large_value = malloc(excessive_size);
 

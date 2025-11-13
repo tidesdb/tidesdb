@@ -1046,8 +1046,13 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
         /* ensure we don't read beyond num_entries */
         if (iter->sstable_blocks_read[idx] > num_entries)
         {
+            TDB_DEBUG_LOG("[ITER_REFILL] SSTable %d: blocks_read=%d > num_entries=%d, breaking",
+                          idx, iter->sstable_blocks_read[idx], num_entries);
             break;
         }
+
+        TDB_DEBUG_LOG("[ITER_REFILL] SSTable %d: about to read block (blocks_read=%d, num_entries=%d)",
+                      idx, iter->sstable_blocks_read[idx], num_entries);
 
         block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[idx]);
         if (!block) break;

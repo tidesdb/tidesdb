@@ -6610,8 +6610,8 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 }
                 block_manager_block_free(block);
             }
-            /* Set blocks_read to target so subsequent iter_next calls work correctly */
-            iter->sstable_blocks_read[i] = target_block;
+            /* Set blocks_read to target + 1 since we've already read block target_block */
+            iter->sstable_blocks_read[i] = target_block + 1;
             continue;
         }
 
@@ -6864,8 +6864,8 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                 }
                 block_manager_block_free(block);
             }
-            /* Set blocks_read to target for subsequent operations */
-            iter->sstable_blocks_read[i] = target_block;
+            /* Set blocks_read to target + 1 since we've already read block target_block */
+            iter->sstable_blocks_read[i] = target_block + 1;
             continue;
         }
 

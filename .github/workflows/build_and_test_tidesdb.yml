@@ -289,7 +289,24 @@ jobs:
           path: build/portable_test_db/
           retention-days: 1
 
-      - name: Download and verify portable database (all platforms)
+      - name: Wait for portable database artifact (all platforms except Linux x64)
+        if: runner.os != 'Linux' || matrix.arch != 'x64'
+        shell: bash
+        run: |
+          echo "Waiting for Linux x64 to create portable database artifact..."
+          for i in {1..60}; do
+            if gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts --jq '.artifacts[] | select(.name=="portable-test-database") | .name' 2>/dev/null | grep -q "portable-test-database"; then
+              echo "Artifact found!"
+              break
+            fi
+            echo "Attempt $i/60: Artifact not ready yet, waiting 10 seconds..."
+            sleep 10
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
+        continue-on-error: true
+
+      - name: Download portable database artifact
         if: runner.os != 'Linux' || matrix.arch != 'x64'
         uses: actions/download-artifact@v4
         with:

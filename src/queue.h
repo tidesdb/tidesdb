@@ -34,24 +34,30 @@ typedef struct queue_node_t
 
 /*
  * queue_t
- * thread-safe FIFO queue implementation
+ * thread-safe FIFO queue implementation with node pooling
  * @param head pointer to first node
  * @param tail pointer to last node
- * @param size current number of elements
+ * @param size current number of elements (atomic for lock-free reads)
  * @param shutdown has queue been shutdown?
  * @param waiter_count number of threads currently waiting in queue_dequeue_wait
  * @param lock mutex for thread safety
  * @param not_empty condition variable signaled when queue becomes non-empty
+ * @param node_pool free list of reusable nodes for performance
+ * @param pool_size current size of node pool
+ * @param max_pool_size maximum nodes to keep in pool
  */
 typedef struct
 {
     queue_node_t *head;
     queue_node_t *tail;
-    size_t size;
+    _Atomic(size_t) size;
     int shutdown;
     int waiter_count;
     pthread_mutex_t lock;
     pthread_cond_t not_empty;
+    queue_node_t *node_pool;
+    size_t pool_size;
+    size_t max_pool_size;
 } queue_t;
 
 /*

@@ -364,14 +364,12 @@ void test_queue_foreach(void)
     queue_t *queue = queue_new();
     ASSERT_TRUE(queue != NULL);
 
-    /* test empty queue */
     foreach_context_t ctx = {0, 0};
     int result = queue_foreach(queue, sum_callback, &ctx);
     ASSERT_EQ(result, 0);
     ASSERT_EQ(ctx.count, 0);
     ASSERT_EQ(ctx.sum, 0);
 
-    /* add items */
     int data1 = 10, data2 = 20, data3 = 30, data4 = 40;
     queue_enqueue(queue, &data1);
     queue_enqueue(queue, &data2);
@@ -410,7 +408,6 @@ static void cleanup_callback(void *data, void *context)
     cleanup_item_t *item = (cleanup_item_t *)data;
     int *cleanup_count = (int *)context;
 
-    /* simulate cleanup operation */
     if (item->name) free(item->name);
     free(item);
     (*cleanup_count)++;
@@ -446,9 +443,8 @@ void test_queue_foreach_cleanup(void)
 
 void test_queue_null_handling(void)
 {
-    /* test null queue - should return error codes */
     ASSERT_EQ(queue_size(NULL), 0);
-    ASSERT_EQ(queue_is_empty(NULL), -1); /* -1 = error */
+    ASSERT_EQ(queue_is_empty(NULL), -1);
     ASSERT_EQ(queue_peek(NULL), NULL);
     ASSERT_EQ(queue_dequeue(NULL), NULL);
     queue_clear(NULL); /* should not crash */
@@ -465,7 +461,6 @@ void test_queue_peek_at(void)
     ASSERT_EQ(queue_peek_at(queue, 0), NULL);
     ASSERT_EQ(queue_peek_at(queue, 10), NULL);
 
-    /* add items */
     int data1 = 10, data2 = 20, data3 = 30, data4 = 40;
     queue_enqueue(queue, &data1);
     queue_enqueue(queue, &data2);
@@ -532,7 +527,6 @@ void test_queue_free_with_waiting_threads(void)
     pthread_t waiter;
     pthread_create(&waiter, NULL, wait_and_expect_null_thread, &args);
 
-    /* wait for thread to start and begin waiting */
     while (1)
     {
         pthread_mutex_lock(&start_lock);
@@ -545,13 +539,8 @@ void test_queue_free_with_waiting_threads(void)
         usleep(1000);
     }
 
-    /* give thread time to enter wait state */
-    usleep(50000);
-
-    /* free the queue - this should wake up the waiting thread */
     queue_free(queue);
 
-    /* thread should exit cleanly */
     pthread_join(waiter, NULL);
 
     pthread_mutex_destroy(&start_lock);

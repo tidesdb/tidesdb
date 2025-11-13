@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 2.1.3)
+set(PROJECT_VERSION 3.0.0)
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
@@ -62,9 +62,6 @@ endif()
 
 target_include_directories(tidesdb PRIVATE src)
 
-# find OpenSSL for SHA1 checksums
-find_package(OpenSSL REQUIRED)
-
 # find compression libraries (use CONFIG mode on Windows with vcpkg)
 if(WIN32)
     find_package(zstd CONFIG REQUIRED)
@@ -84,7 +81,6 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
             zstd        # zstandard compression
             snappy      # snappy compression
             pthread     # pthread library
-            OpenSSL::Crypto  # openssl for SHA1
     )
 elseif(APPLE)
     # for intel macs, homebrew typically installs in /usr/local
@@ -97,7 +93,6 @@ elseif(APPLE)
             zstd        # zstandard compression
             snappy      # snappy compression
             pthread     # pthread library
-            OpenSSL::Crypto  # openssl for SHA1
     )
 elseif(WIN32)
     # for windows, link against compression libraries and pthreads
@@ -106,7 +101,6 @@ elseif(WIN32)
             Snappy::snappy
             lz4::lz4
             PThreads4W::PThreads4W
-            OpenSSL::Crypto
     )
 else()
     # for linux and other unix systems
@@ -115,7 +109,6 @@ else()
             snappy
             lz4
             pthread
-            OpenSSL::Crypto
     )
     find_library(MATH_LIBRARY m)
     if(MATH_LIBRARY)
@@ -153,7 +146,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_NUM_THREADS 2)
     endif()
     if(NOT DEFINED BENCH_DEBUG)
-        set(BENCH_DEBUG 0)
+        set(BENCH_DEBUG 1)
     endif()
     if(NOT DEFINED BENCH_DB_PATH)
         set(BENCH_DB_PATH "benchmark_db")

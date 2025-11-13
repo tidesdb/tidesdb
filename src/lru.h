@@ -38,6 +38,7 @@ typedef void (*lru_evict_callback_t)(const char *key, void *value, void *user_da
  * lru_entry_t
  * represents a single entry in the LRU cache
  * @param key the key string (owned by entry)
+ * @param key_len the length of the key (pre-computed)
  * @param value the value pointer (not owned, managed by callback)
  * @param user_data optional user data for callback
  * @param evict_cb eviction callback for this entry
@@ -48,6 +49,7 @@ typedef void (*lru_evict_callback_t)(const char *key, void *value, void *user_da
 struct lru_entry_t
 {
     char *key;
+    size_t key_len;
     void *value;
     void *user_data;
     lru_evict_callback_t evict_cb;
@@ -65,6 +67,7 @@ struct lru_entry_t
  * @param tail least recently used entry
  * @param table hash table for O(1) lookups
  * @param table_size hash table size
+ * @param lock mutex for thread safety
  */
 struct lru_cache_t
 {

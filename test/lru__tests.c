@@ -16,11 +16,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <pthread.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
 #include "../src/lru.h"
 #include "test_utils.h"
 
@@ -195,7 +190,6 @@ static void test_lru_cache_remove(void)
 
     ASSERT_EQ(lru_cache_size(cache), 3);
 
-    /* remove key2 */
     ASSERT_EQ(lru_cache_remove(cache, "key2"), 0);
     ASSERT_EQ(lru_cache_size(cache), 2);
     ASSERT_EQ(eviction_count, 1); /* callback should be called */
@@ -246,7 +240,6 @@ static void test_lru_cache_with_malloc(void)
     lru_cache_t *cache = lru_cache_new(3);
     ASSERT_TRUE(cache != NULL);
 
-    /* allocate memory for values */
     int *v1 = (int *)malloc(sizeof(int));
     int *v2 = (int *)malloc(sizeof(int));
     int *v3 = (int *)malloc(sizeof(int));
@@ -269,7 +262,6 @@ static void test_lru_cache_with_malloc(void)
     lru_cache_free(cache); /* should free remaining allocated memory */
 }
 
-/* test concurrent access */
 typedef struct
 {
     lru_cache_t *cache;
@@ -322,7 +314,6 @@ static void test_lru_cache_concurrent(void)
     pthread_t threads[NUM_THREADS];
     thread_arg_t args[NUM_THREADS];
 
-    /* spawn writer threads */
     for (int i = 0; i < NUM_THREADS / 2; i++)
     {
         args[i].cache = cache;
@@ -331,7 +322,6 @@ static void test_lru_cache_concurrent(void)
         pthread_create(&threads[i], NULL, concurrent_put_thread, &args[i]);
     }
 
-    /* spawn reader threads */
     for (int i = NUM_THREADS / 2; i < NUM_THREADS; i++)
     {
         args[i].cache = cache;
@@ -340,7 +330,6 @@ static void test_lru_cache_concurrent(void)
         pthread_create(&threads[i], NULL, concurrent_get_thread, &args[i]);
     }
 
-    /* wait for all threads */
     for (int i = 0; i < NUM_THREADS; i++)
     {
         pthread_join(threads[i], NULL);
@@ -357,7 +346,6 @@ static void test_lru_cache_concurrent(void)
 
 static void test_lru_cache_edge_cases(void)
 {
-    /* capacity of 1 */
     lru_cache_t *cache1 = lru_cache_new(1);
     ASSERT_TRUE(cache1 != NULL);
 

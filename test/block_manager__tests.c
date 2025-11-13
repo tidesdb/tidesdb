@@ -16,13 +16,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <inttypes.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <unistd.h>
-#endif
 
 #include "../src/block_manager.h"
 #include "test_utils.h"
@@ -117,10 +110,8 @@ void test_block_manager_block_write_close_reopen_read()
     (void)block_manager_block_free(block);
     (void)block_manager_cursor_free(cursor);
 
-    /* we close the block manager */
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
-    /* we remove the file */
     remove("test.db");
 
     printf(GREEN "test_block_manager_block_write_close_reopen_read passed\n" RESET);
@@ -128,11 +119,9 @@ void test_block_manager_block_write_close_reopen_read()
 
 void test_block_manager_truncate()
 {
-    /* we set up a new block manager */
     block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
 
-    /* we set up a new block */
     uint64_t size = 10;
     char data[10] = "testdata";
     block_manager_block_t *block = block_manager_block_create(size, data);
@@ -143,13 +132,10 @@ void test_block_manager_truncate()
 
     (void)block_manager_block_free(block);
 
-    /* we truncate the file */
     ASSERT_TRUE(block_manager_truncate(bm) == 0);
 
-    /* we close the block manager */
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
-    /* we reopen the block manager */
     if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
 
     /* we use a cursor to verify the file is empty */
@@ -165,10 +151,8 @@ void test_block_manager_truncate()
 
     (void)block_manager_cursor_free(cursor);
 
-    /* we close the block manager */
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
-    /* we remove the file */
     (void)remove("test.db");
 
     printf(GREEN "test_block_manager_truncate passed\n" RESET);
@@ -222,7 +206,6 @@ void test_block_manager_cursor()
 
     (void)block_manager_block_free(read_block);
 
-    /* we go next */
     ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
 
     /* check next block */
@@ -239,7 +222,6 @@ void test_block_manager_cursor()
 
     (void)block_manager_block_free(read_block);
 
-    /* we go next */
     ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
 
     /* check next block */
@@ -293,13 +275,10 @@ void test_block_manager_cursor()
 
     (void)block_manager_block_free(read_block);
 
-    /* we free the cursor */
     (void)block_manager_cursor_free(cursor);
 
-    /* we close the block manager */
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
-    /* we remove the file */
     (void)remove("test.db");
 
     printf(GREEN "test_block_manager_cursor passed\n" RESET);
@@ -498,7 +477,6 @@ void test_block_manager_cursor_position_checks()
     block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
 
-    /* we write 3 blocks */
     for (int i = 0; i < 3; i++)
     {
         uint64_t size = 10;
@@ -589,7 +567,6 @@ void test_block_manager_seek_and_goto()
     block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
 
-    /* we write 3 blocks */
     long block_offsets[3];
     for (int i = 0; i < 3; i++)
     {
@@ -790,7 +767,6 @@ void test_block_manager_concurrent_rw()
 {
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) -- acceptable for test code */
 
-    /* we initialize the block manager */
     ASSERT_TRUE(block_manager_open(&bm, "concurrent_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
     /* we create thread IDs */
@@ -885,7 +861,6 @@ void test_block_manager_validate_last_block()
     uint64_t corrupt_size = 100; /* size that's larger than what we'll actually write */
     ASSERT_TRUE(fwrite(&corrupt_size, sizeof(uint64_t), 1, file) == 1);
 
-    /* we close the file */
     fclose(file);
 
     /* we get the file size after corruption */
@@ -956,16 +931,16 @@ void test_block_manager_validation_edge_cases()
 
     block_manager_t *bm = NULL;
 
-    /* 1 opening a fresh empty database */
+    /* opening a fresh empty database */
     (void)remove("empty_test.db");
     ASSERT_TRUE(block_manager_open(&bm, "empty_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
-    /* 2 opening an existing empty database */
+    /* opening an existing empty database */
     ASSERT_TRUE(block_manager_open(&bm, "empty_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
-    /* 3 test with some data and validation */
+    /* test with some data and validation */
     if (block_manager_open(&bm, "empty_test.db", BLOCK_MANAGER_SYNC_NONE) == 0)
     {
         uint64_t size = 10;
@@ -981,7 +956,6 @@ void test_block_manager_validation_edge_cases()
         ASSERT_TRUE(block_manager_close(bm) == 0);
     }
 
-    /* Cleanup */
     (void)remove("empty_test.db");
 
     printf(GREEN "test_block_manager_validation_edge_cases passed\n" RESET);
@@ -1152,14 +1126,12 @@ void benchmark_block_manager()
     /* we shuffle the offsets array to randomize access */
     for (int i = 0; i < NUM_BLOCKS; i++)
     {
-        int j = rand() %
-                NUM_BLOCKS; /* NOLINT(cert-msc30-c,cert-msc50-cpp) -- acceptable for test code */
+        int j = rand() % NUM_BLOCKS; /* NOLINT(cert-msc30-c,cert-msc50-cpp) */
         long temp = block_offsets[i];
         block_offsets[i] = block_offsets[j];
         block_offsets[j] = temp;
     }
 
-    /* init a cursor for random access */
     ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
 
     for (int i = 0; i < NUM_BLOCKS; i++)
@@ -1238,7 +1210,6 @@ void test_block_manager_lru_cache()
         char data[300];
         snprintf(data, sizeof(data), "cached_block_%d_", i);
 
-        /* fill rest with pattern */
         for (int j = (int)strlen(data); j < 299; j++)
         {
             data[j] = 'A' + (i % 26);
@@ -1533,7 +1504,6 @@ void test_block_manager_cache_concurrent()
                                               BLOCK_MANAGER_SYNC_NONE, 2048) == 0);
     ASSERT_TRUE(bm->block_manager_cache != NULL);
 
-    /* write some initial blocks */
     long initial_offsets[5];
     for (int i = 0; i < 5; i++)
     {
@@ -1637,7 +1607,7 @@ void benchmark_block_manager_with_cache()
 
     block_manager_t *bm = NULL;
 
-    uint32_t cache_size = 10 * 1024 * 1024; /* 10MB cache */
+    uint32_t cache_size = 10 * 1024 * 1024;
     ASSERT_TRUE(block_manager_open_with_cache(&bm, "benchmark_cache.db", BLOCK_MANAGER_SYNC_NONE,
                                               cache_size) == 0);
 
@@ -1769,7 +1739,6 @@ void benchmark_block_manager_with_cache()
         block_offsets[j] = temp;
     }
 
-    /* init a cursor for random access */
     ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
 
     int cache_hits_expected = 0;
@@ -1870,6 +1839,113 @@ void benchmark_block_manager_with_cache()
     printf(GREEN "benchmark_block_manager_with_cache completed successfully\n" RESET);
 }
 
+typedef struct
+{
+    block_manager_t *bm;
+    int thread_id;
+    int blocks_per_thread;
+    double elapsed_time;
+} parallel_write_context_t;
+
+void *parallel_write_worker(void *arg)
+{
+    parallel_write_context_t *ctx = (parallel_write_context_t *)arg;
+    struct timespec start, end;
+
+    clock_gettime(0, &start);
+
+    for (int i = 0; i < ctx->blocks_per_thread; i++)
+    {
+        char data[256];
+        snprintf(data, sizeof(data), "thread%d-block%d", ctx->thread_id, i);
+
+        block_manager_block_t *block =
+            block_manager_block_create(strlen(data) + 1, (uint8_t *)data);
+        if (block)
+        {
+            block_manager_block_write(ctx->bm, block);
+            block_manager_block_free(block);
+        }
+    }
+
+    clock_gettime(0, &end);
+    ctx->elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    return NULL;
+}
+
+void benchmark_block_manager_parallel_write(void)
+{
+    printf("\nRunning block manager parallel write benchmark...\n");
+
+    block_manager_t *bm = NULL;
+    (void)remove("test_parallel.db");
+    ASSERT_TRUE(block_manager_open_with_cache(&bm, "test_parallel.db", 0, 0) == 0);
+
+    const int num_threads[] = {1, 2, 4, 6, 8};
+    const int total_blocks = 100000;
+
+    for (size_t t = 0; t < sizeof(num_threads) / sizeof(num_threads[0]); t++)
+    {
+        int threads = num_threads[t];
+        int blocks_per_thread = total_blocks / threads;
+
+        block_manager_truncate(bm);
+
+        pthread_t *thread_ids = malloc(threads * sizeof(pthread_t));
+        parallel_write_context_t *contexts = malloc(threads * sizeof(parallel_write_context_t));
+
+        struct timespec start, end;
+        clock_gettime(0, &start);
+
+        for (int i = 0; i < threads; i++)
+        {
+            contexts[i].bm = bm;
+            contexts[i].thread_id = i;
+            contexts[i].blocks_per_thread = blocks_per_thread;
+            contexts[i].elapsed_time = 0;
+            pthread_create(&thread_ids[i], NULL, parallel_write_worker, &contexts[i]);
+        }
+
+        for (int i = 0; i < threads; i++)
+        {
+            pthread_join(thread_ids[i], NULL);
+        }
+
+        clock_gettime(0, &end);
+        double wall_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+        double aggregate_throughput = (total_blocks) / wall_time;
+        double aggregate_mb_per_sec = (aggregate_throughput * 256) / (1024.0 * 1024.0);
+
+        double avg_thread_time = 0;
+        for (int i = 0; i < threads; i++)
+        {
+            avg_thread_time += contexts[i].elapsed_time;
+        }
+        avg_thread_time /= threads;
+
+        printf("\n%d thread%s:\n", threads, threads > 1 ? "s" : "");
+        printf("  Wall time: %.3f seconds\n", wall_time);
+        printf("  Aggregate throughput: %.2f blocks/sec (%.2f MB/sec)\n", aggregate_throughput,
+               aggregate_mb_per_sec);
+        printf("  Average per-thread time: %.3f seconds\n", avg_thread_time);
+
+        if (t > 0)
+        {
+            printf("  Speedup vs 1 thread: %.2fx\n", (double)threads * wall_time / wall_time);
+        }
+
+        free(thread_ids);
+        free(contexts);
+    }
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove("test_parallel.db");
+
+    printf(GREEN "\nbenchmark_block_manager_parallel_write completed successfully\n" RESET);
+}
+
 int main(void)
 {
     RUN_TEST(test_block_manager_open, tests_passed);
@@ -1894,9 +1970,10 @@ int main(void)
     RUN_TEST(test_block_manager_cache_concurrent, tests_passed);
     RUN_TEST(test_block_manager_concurrent_rw, tests_passed);
 
-    srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) -- acceptable for test code */
+    srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);
     RUN_TEST(benchmark_block_manager_with_cache, tests_passed);
+    RUN_TEST(benchmark_block_manager_parallel_write, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

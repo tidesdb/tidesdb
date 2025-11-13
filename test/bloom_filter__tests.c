@@ -184,7 +184,6 @@ void benchmark_bloom_filter()
     double time_spent_add = (double)(end_add - start_add) / CLOCKS_PER_SEC;
     printf(CYAN "Adding 1,000,000 elements took %f seconds\n" RESET, time_spent_add);
 
-    /* serializing and deserializing the bloom filter */
     size_t serialized_bf_size = 0;
     uint8_t *serialized_bf = bloom_filter_serialize(bf, &serialized_bf_size);
     ASSERT_TRUE(serialized_bf != NULL);

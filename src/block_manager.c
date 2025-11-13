@@ -18,24 +18,25 @@
  */
 #include "block_manager.h"
 
-#include <openssl/sha.h>
+#include "xxhash.h"
 
 /* file format
  * [HEADER]
  * - magic (3 bytes) 0x544442 "TDB"
- * - version (1 byte) 1
+ * - version (1 byte) 3
  * - block_size (4 bytes) default block size
  * - padding (4 bytes) reserved
  * [BLOCKS]
  * - block_size (8 bytes)
- * - checksum (20 bytes) SHA1 of data
+ * - checksum (8 bytes) xxHash64 of data
  * - data (variable size)
  * - overflow_offset (8 bytes) 0 if no overflow, otherwise offset to next overflow block
  *
  * CONCURRENCY MODEL
  * - Single file descriptor shared by all operations
  * - pread/pwrite for lock-free reads (readers don't block readers or writers)
- * - write_mutex only for serializing writes (writers block writers)
+ * - Atomic offset allocation for lock-free writes
+ * - Writers don't block writers - concurrent writes to different offsets
  * - Readers NEVER block -- they can read while writes happen
  */
 
@@ -67,34 +68,33 @@ static void cached_block_evict_callback(const char *key, void *value, void *user
  */
 static void block_offset_to_key(int64_t offset, char *key_buffer)
 {
-    snprintf(key_buffer, 32, "%" PRId64, offset);
+    snprintf(key_buffer, BLOCK_MANAGER_CACHE_KEY_SIZE, "%" PRId64, offset);
 }
 
 /*
- * compute_sha1
- * compute SHA1 checksum
+ * compute_checksum
+ * compute xxHash64 checksum
  * @param data the data to compute the checksum for
  * @param size the size of the data
- * @param digest the digest to store the result in
+ * @return the 64-bit checksum
  */
-static void compute_sha1(const void *data, size_t size, unsigned char *digest)
+static inline uint64_t compute_checksum(const void *data, size_t size)
 {
-    SHA1((const unsigned char *)data, size, digest);
+    return XXH64(data, size, 0);
 }
 
 /*
- * verify_sha1
- * verify SHA1 checksum
+ * verify_checksum
+ * verify xxHash64 checksum
  * @param data the data to verify the checksum for
  * @param size the size of the data
- * @param expected_digest the expected digest
+ * @param expected_checksum the expected checksum
  * @return 0 if the checksum matches, -1 otherwise
  */
-static int verify_sha1(const void *data, size_t size, const unsigned char *expected_digest)
+static inline int verify_checksum(const void *data, size_t size, uint64_t expected_checksum)
 {
-    unsigned char computed_digest[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
-    compute_sha1(data, size, computed_digest);
-    return memcmp(computed_digest, expected_digest, BLOCK_MANAGER_SHA1_DIGEST_LENGTH) == 0 ? 0 : -1;
+    uint64_t computed = compute_checksum(data, size);
+    return (computed == expected_checksum) ? 0 : -1;
 }
 
 /*
@@ -111,13 +111,14 @@ static int write_header(int fd, uint32_t block_size)
     uint8_t version = BLOCK_MANAGER_VERSION;
     uint32_t padding = 0;
 
-    /* build header buffer */
-    memcpy(header, &magic, 3);
-    memcpy(header + 3, &version, sizeof(uint8_t));
-    memcpy(header + 4, &block_size, sizeof(uint32_t));
-    memcpy(header + 8, &padding, sizeof(uint32_t));
+    memcpy(header, &magic, BLOCK_MANAGER_MAGIC_SIZE);
+    memcpy(header + BLOCK_MANAGER_MAGIC_SIZE, &version, BLOCK_MANAGER_VERSION_SIZE);
+    memcpy(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE, &block_size,
+           BLOCK_MANAGER_BLOCK_SIZE_SIZE);
+    memcpy(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE +
+               BLOCK_MANAGER_BLOCK_SIZE_SIZE,
+           &padding, BLOCK_MANAGER_PADDING_SIZE);
 
-    /* write atomically at offset 0 */
     ssize_t written = pwrite(fd, header, BLOCK_MANAGER_HEADER_SIZE, 0);
     return (written == BLOCK_MANAGER_HEADER_SIZE) ? 0 : -1;
 }
@@ -133,24 +134,21 @@ static int read_header(int fd, uint32_t *block_size)
 {
     unsigned char header[BLOCK_MANAGER_HEADER_SIZE];
 
-    /* read header atomically */
     ssize_t nread = pread(fd, header, BLOCK_MANAGER_HEADER_SIZE, 0);
     if (nread != BLOCK_MANAGER_HEADER_SIZE) return -1;
 
-    /* extract and validate magic */
     uint32_t magic;
-    memcpy(&magic, header, 3);
-    magic &= 0xFFFFFF; /* mask to 3 bytes */
+    memcpy(&magic, header, BLOCK_MANAGER_MAGIC_SIZE);
+    magic &= BLOCK_MANAGER_MAGIC_MASK;
 
     if (magic != BLOCK_MANAGER_MAGIC) return -1;
 
-    /* extract and validate version */
     uint8_t version;
-    memcpy(&version, header + 3, sizeof(uint8_t));
+    memcpy(&version, header + BLOCK_MANAGER_MAGIC_SIZE, BLOCK_MANAGER_VERSION_SIZE);
     if (version != BLOCK_MANAGER_VERSION) return -1;
 
-    /* extract block size */
-    memcpy(block_size, header + 4, sizeof(uint32_t));
+    memcpy(block_size, header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE,
+           BLOCK_MANAGER_BLOCK_SIZE_SIZE);
 
     return 0;
 }
@@ -170,6 +168,14 @@ static int get_file_size(int fd, uint64_t *size)
     return 0;
 }
 
+/*
+ * block_manager_open_internal
+ * opens a block manager (no cache)
+ * @param bm the block manager to open
+ * @param file_path the path of the file
+ * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL)
+ * @return 0 if successful, -1 if not
+ */
 static int block_manager_open_internal(block_manager_t **bm, const char *file_path,
                                        block_manager_sync_mode_t sync_mode, uint32_t cache_size)
 {
@@ -183,7 +189,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     int file_exists = access(file_path, F_OK) == 0;
 
     int flags = O_RDWR | O_CREAT;
-    mode_t mode = 0644;
+    mode_t mode = BLOCK_MANAGER_FILE_MODE;
 
     new_bm->fd = open(file_path, flags, mode);
     if (new_bm->fd == -1)
@@ -198,35 +204,21 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
 
     new_bm->sync_mode = sync_mode;
 
-    if (pthread_mutex_init(&new_bm->write_mutex, NULL) != 0)
-    {
-        close(new_bm->fd);
-        free(new_bm);
-        *bm = NULL;
-        return -1;
-    }
-
-    /* initialize cache pointer to NULL, will be set up after block_size is known */
     new_bm->block_manager_cache = NULL;
 
-    /* handle file header */
     if (file_exists)
     {
-        /* read existing header */
         if (read_header(new_bm->fd, &new_bm->block_size) != 0)
         {
-            pthread_mutex_destroy(&new_bm->write_mutex);
             close(new_bm->fd);
             free(new_bm);
             *bm = NULL;
             return -1;
         }
 
-        /* validate last block */
         int validation_result = block_manager_validate_last_block(new_bm);
         if (validation_result != 0)
         {
-            pthread_mutex_destroy(&new_bm->write_mutex);
             close(new_bm->fd);
             free(new_bm);
             *bm = NULL;
@@ -235,33 +227,43 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     }
     else
     {
-        /* new file, write header */
         new_bm->block_size = MAX_INLINE_BLOCK_SIZE;
         if (write_header(new_bm->fd, new_bm->block_size) != 0)
         {
-            pthread_mutex_destroy(&new_bm->write_mutex);
             close(new_bm->fd);
             free(new_bm);
             *bm = NULL;
             return -1;
         }
-        if (fdatasync(new_bm->fd) != 0)
+        if (new_bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
         {
-            pthread_mutex_destroy(&new_bm->write_mutex);
-            close(new_bm->fd);
-            free(new_bm);
-            *bm = NULL;
-            return -1;
+            if (fdatasync(new_bm->fd) != 0)
+            {
+                close(new_bm->fd);
+                free(new_bm);
+                *bm = NULL;
+                return -1;
+            }
         }
     }
 
-    /* initialize block cache after block_size is set */
+    uint64_t file_size = 0;
+    if (get_file_size(new_bm->fd, &file_size) == 0)
+    {
+        new_bm->current_file_size = file_size;
+    }
+    else
+    {
+        /* If we can't get size, use lseek to get current position (end of file) */
+        off_t pos = lseek(new_bm->fd, 0, SEEK_END);
+        new_bm->current_file_size = (pos >= 0) ? (uint64_t)pos : 0;
+    }
+
     if (cache_size > 0)
     {
         new_bm->block_manager_cache = malloc(sizeof(block_manager_cache_t));
         if (!new_bm->block_manager_cache)
         {
-            pthread_mutex_destroy(&new_bm->write_mutex);
             close(new_bm->fd);
             free(new_bm);
             *bm = NULL;
@@ -271,15 +273,13 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         new_bm->block_manager_cache->max_size = cache_size;
         new_bm->block_manager_cache->current_size = 0;
 
-        /* create LRU cache with reasonable number of entries based on cache size */
         size_t max_entries = cache_size / new_bm->block_size;
-        if (max_entries < MIN_CACHE_ENTRIES) max_entries = MIN_CACHE_ENTRIES; /* minimum entries */
+        if (max_entries < MIN_CACHE_ENTRIES) max_entries = MIN_CACHE_ENTRIES;
 
         new_bm->block_manager_cache->lru_cache = lru_cache_new(max_entries);
         if (!new_bm->block_manager_cache->lru_cache)
         {
             free(new_bm->block_manager_cache);
-            pthread_mutex_destroy(&new_bm->write_mutex);
             close(new_bm->fd);
             free(new_bm);
             *bm = NULL;
@@ -293,12 +293,13 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
 
 int block_manager_close(block_manager_t *bm)
 {
-    /* flush the file to disk one final time */
-    (void)fdatasync(bm->fd);
+    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+    {
+        (void)fdatasync(bm->fd);
+    }
 
     if (close(bm->fd) != 0) return -1;
 
-    /* cleanup cache if it exists */
     if (bm->block_manager_cache)
     {
         if (bm->block_manager_cache->lru_cache)
@@ -307,8 +308,6 @@ int block_manager_close(block_manager_t *bm)
         }
         free(bm->block_manager_cache);
     }
-
-    pthread_mutex_destroy(&bm->write_mutex);
 
     free(bm);
     bm = NULL;
@@ -335,106 +334,121 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
     return block;
 }
 
+block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, void *data)
+{
+    block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
+    if (!block) return NULL;
+
+    block->size = size;
+    block->data = data;
+
+    return block;
+}
+
 int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
 {
-    if (!bm || !block || !block->data) return -1;
-
-    (void)pthread_mutex_lock(&bm->write_mutex);
-
-    /* get current file size for append position */
-    uint64_t file_size;
-    if (get_file_size(bm->fd, &file_size) != 0)
-    {
-        (void)pthread_mutex_unlock(&bm->write_mutex);
-        return -1;
-    }
-
-    int64_t offset = (int64_t)file_size;
-
-    /* compute SHA1 checksum */
-    unsigned char checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
-    compute_sha1(block->data, block->size, checksum);
-
-    /* determine if we need overflow blocks */
     uint64_t inline_size = block->size <= bm->block_size ? block->size : bm->block_size;
     uint64_t remaining = block->size > bm->block_size ? block->size - bm->block_size : 0;
 
-    /* build main block in memory buffer for atomic write */
-    size_t main_block_total_size =
-        sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + inline_size + sizeof(uint64_t);
-    unsigned char *main_block_buffer = malloc(main_block_total_size);
-    if (!main_block_buffer)
+    size_t main_block_total_size = BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH +
+                                   inline_size + BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE;
+
+    uint64_t total_bytes_needed = main_block_total_size;
+    uint64_t temp_remaining = remaining;
+    while (temp_remaining > 0)
     {
-        (void)pthread_mutex_unlock(&bm->write_mutex);
-        return -1;
+        uint64_t chunk = temp_remaining <= bm->block_size ? temp_remaining : bm->block_size;
+        total_bytes_needed += BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH +
+                              chunk + BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE;
+        temp_remaining -= chunk;
+    }
+
+    int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_bytes_needed);
+
+    uint64_t checksum = compute_checksum(block->data, block->size);
+
+    unsigned char stack_buffer[MAX_INLINE_BLOCK_SIZE + BLOCK_MANAGER_STACK_BUFFER_OVERHEAD];
+    unsigned char *main_block_buffer;
+    int use_stack = (main_block_total_size <= sizeof(stack_buffer));
+
+    if (use_stack)
+    {
+        main_block_buffer = stack_buffer;
+    }
+    else
+    {
+        main_block_buffer = malloc(main_block_total_size);
+        if (!main_block_buffer)
+        {
+            return -1;
+        }
     }
 
     size_t buf_offset = 0;
 
-    /* write block size */
-    memcpy(main_block_buffer + buf_offset, &block->size, sizeof(uint64_t));
-    buf_offset += sizeof(uint64_t);
+    memcpy(main_block_buffer + buf_offset, &block->size, BLOCK_MANAGER_SIZE_FIELD_SIZE);
+    buf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
 
-    /* write checksum */
-    memcpy(main_block_buffer + buf_offset, checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH);
-    buf_offset += BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
+    memcpy(main_block_buffer + buf_offset, &checksum, BLOCK_MANAGER_CHECKSUM_LENGTH);
+    buf_offset += BLOCK_MANAGER_CHECKSUM_LENGTH;
 
-    /* write inline data */
     memcpy(main_block_buffer + buf_offset, block->data, inline_size);
     buf_offset += inline_size;
 
-    /* placeholder for overflow offset */
     uint64_t overflow_offset = 0;
-    memcpy(main_block_buffer + buf_offset, &overflow_offset, sizeof(uint64_t));
+    memcpy(main_block_buffer + buf_offset, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
 
-    /* write main block atomically using pwrite */
     ssize_t written = pwrite(bm->fd, main_block_buffer, main_block_total_size, offset);
-    free(main_block_buffer);
+    if (!use_stack) free(main_block_buffer);
 
     if (written != (ssize_t)main_block_total_size)
     {
-        (void)pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
-    /* handle overflow if needed */
     if (remaining > 0)
     {
-        uint64_t overflow_link_pos =
-            (uint64_t)offset + sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + inline_size;
+        uint64_t overflow_link_pos = (uint64_t)offset + BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                     BLOCK_MANAGER_CHECKSUM_LENGTH + inline_size;
         uint64_t data_offset = inline_size;
         uint64_t current_write_pos = (uint64_t)offset + main_block_total_size;
 
         while (remaining > 0)
         {
-            /* determine chunk size */
             uint64_t chunk_size = remaining <= bm->block_size ? remaining : bm->block_size;
 
-            /* compute checksum for this chunk */
-            unsigned char chunk_checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
-            compute_sha1((unsigned char *)block->data + data_offset, chunk_size, chunk_checksum);
+            uint64_t chunk_checksum =
+                compute_checksum((unsigned char *)block->data + data_offset, chunk_size);
 
-            /* build overflow block buffer */
-            size_t overflow_block_size =
-                sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + chunk_size + sizeof(uint64_t);
-            unsigned char *overflow_buffer = malloc(overflow_block_size);
-            if (!overflow_buffer)
+            size_t overflow_block_size = BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                         BLOCK_MANAGER_CHECKSUM_LENGTH + chunk_size +
+                                         BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE;
+
+            unsigned char overflow_stack[MAX_INLINE_BLOCK_SIZE + 64];
+            unsigned char *overflow_buffer;
+            int use_overflow_stack = (overflow_block_size <= sizeof(overflow_stack));
+
+            if (use_overflow_stack)
             {
-                (void)pthread_mutex_unlock(&bm->write_mutex);
-                return -1;
+                overflow_buffer = overflow_stack;
+            }
+            else
+            {
+                overflow_buffer = malloc(overflow_block_size);
+                if (!overflow_buffer)
+                {
+                    return -1;
+                }
             }
 
             size_t obuf_offset = 0;
 
-            /* write chunk size */
-            memcpy(overflow_buffer + obuf_offset, &chunk_size, sizeof(uint64_t));
-            obuf_offset += sizeof(uint64_t);
+            memcpy(overflow_buffer + obuf_offset, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE);
+            obuf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
 
-            /* write chunk checksum */
-            memcpy(overflow_buffer + obuf_offset, chunk_checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH);
-            obuf_offset += BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
+            memcpy(overflow_buffer + obuf_offset, &chunk_checksum, BLOCK_MANAGER_CHECKSUM_LENGTH);
+            obuf_offset += BLOCK_MANAGER_CHECKSUM_LENGTH;
 
-            /* write chunk data */
             memcpy(overflow_buffer + obuf_offset, (unsigned char *)block->data + data_offset,
                    chunk_size);
             obuf_offset += chunk_size;
@@ -442,65 +456,54 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
             /* next overflow offset (0 if last) */
             uint64_t next_overflow =
                 (remaining - chunk_size > 0) ? (current_write_pos + overflow_block_size) : 0;
-            memcpy(overflow_buffer + obuf_offset, &next_overflow, sizeof(uint64_t));
+            memcpy(overflow_buffer + obuf_offset, &next_overflow,
+                   BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
 
-            /* update previous overflow link to point to this block using pwrite */
-            if (pwrite(bm->fd, &current_write_pos, sizeof(uint64_t), (off_t)overflow_link_pos) !=
-                sizeof(uint64_t))
+            if (pwrite(bm->fd, &current_write_pos, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+                       (off_t)overflow_link_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             {
-                free(overflow_buffer);
-                (void)pthread_mutex_unlock(&bm->write_mutex);
+                if (!use_overflow_stack) free(overflow_buffer);
                 return -1;
             }
 
-            /* write overflow block atomically using pwrite */
             if (pwrite(bm->fd, overflow_buffer, overflow_block_size, (off_t)current_write_pos) !=
                 (ssize_t)overflow_block_size)
             {
-                free(overflow_buffer);
-                (void)pthread_mutex_unlock(&bm->write_mutex);
+                if (!use_overflow_stack) free(overflow_buffer);
                 return -1;
             }
 
-            free(overflow_buffer);
+            if (!use_overflow_stack) free(overflow_buffer);
 
             /* update for next iteration */
-            overflow_link_pos = current_write_pos + sizeof(uint64_t) +
-                                BLOCK_MANAGER_SHA1_DIGEST_LENGTH + chunk_size;
+            overflow_link_pos = current_write_pos + BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                BLOCK_MANAGER_CHECKSUM_LENGTH + chunk_size;
             data_offset += chunk_size;
             remaining -= chunk_size;
             current_write_pos += overflow_block_size;
         }
     }
 
-    /* perform sync based on sync_mode */
     if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
     {
-        /* full sync on every write */
         if (fdatasync(bm->fd) != 0)
         {
-            (void)pthread_mutex_unlock(&bm->write_mutex);
             return -1;
         }
     }
-    /* BLOCK_MANAGER_SYNC_NONE -- no sync */
 
-    /* cache the written block if caching is enabled */
     if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
     {
-        /* check if we have space in cache */
         if (bm->block_manager_cache->current_size + block->size <=
             bm->block_manager_cache->max_size)
         {
-            /* create a copy of the block for caching */
             block_manager_block_t *cached_block =
                 block_manager_block_create(block->size, block->data);
             if (cached_block)
             {
-                char cache_key[32];
+                char cache_key[BLOCK_MANAGER_CACHE_KEY_SIZE];
                 block_offset_to_key(offset, cache_key);
 
-                /* add to cache */
                 if (lru_cache_put(bm->block_manager_cache->lru_cache, cache_key, cached_block,
                                   cached_block_evict_callback, bm->block_manager_cache) == 0)
                 {
@@ -508,14 +511,12 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
                 }
                 else
                 {
-                    /* failed to cache, free the copy */
                     block_manager_block_free(cached_block);
                 }
             }
         }
     }
 
-    (void)pthread_mutex_unlock(&bm->write_mutex);
     return offset;
 }
 
@@ -533,16 +534,18 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
 {
     if (!bm) return -1;
 
-    /* allocate memory for the new cursor */
     (*cursor) = malloc(sizeof(block_manager_cursor_t));
     if (!(*cursor)) return -1;
 
-    /* set the block manager of the cursor -- shares same fd, no extra file handles */
     (*cursor)->bm = bm;
 
     /* initialize to position after header */
     (*cursor)->current_pos = BLOCK_MANAGER_HEADER_SIZE;
     (*cursor)->current_block_size = 0;
+
+#ifdef __linux__
+    posix_fadvise(bm->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
 
     return 0;
 }
@@ -550,61 +553,56 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
 int block_manager_cursor_next(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
-
-    /* read block size at current position using pread */
     uint64_t block_size;
-    ssize_t nread =
-        pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (off_t)cursor->current_pos);
-    if (nread != sizeof(uint64_t))
+    ssize_t nread = pread(cursor->bm->fd, &block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                          (off_t)cursor->current_pos);
+    if (nread != BLOCK_MANAGER_SIZE_FIELD_SIZE)
     {
         if (nread == 0) return 1; /* EOF */
         return -1;
     }
 
-    /* calculate inline size */
     uint64_t inline_size =
         block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
 
-    /* calculate overflow offset position */
-    off_t overflow_offset_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) +
-                                (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+    off_t overflow_offset_pos = (off_t)cursor->current_pos + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
 
-    /* read overflow offset using pread */
     uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
-        sizeof(uint64_t))
+    if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+              (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
         return -1;
 
     /* if no overflow, next block starts immediately after this one */
     if (overflow_offset == 0)
     {
-        cursor->current_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+        cursor->current_pos =
+            (uint64_t)(overflow_offset_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
         cursor->current_block_size = block_size;
         return 0;
     }
 
     /* skip overflow chain to find end */
-    uint64_t last_overflow_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+    uint64_t last_overflow_pos =
+        (uint64_t)(overflow_offset_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
     while (overflow_offset != 0)
     {
         off_t chunk_offset = (off_t)overflow_offset;
 
-        /* read chunk size using pread */
         uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)chunk_offset) !=
-            sizeof(uint64_t))
+        if (pread(cursor->bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                  (off_t)chunk_offset) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
             return -1;
 
-        /* calculate next overflow offset position */
-        off_t next_overflow_pos = chunk_offset + (off_t)sizeof(uint64_t) +
-                                  (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
+        off_t next_overflow_pos = chunk_offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                  (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
 
-        /* read next overflow offset using pread */
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
-            sizeof(uint64_t))
+        if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+                  (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             return -1;
 
-        last_overflow_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
+        last_overflow_pos =
+            (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
     }
 
     /* update cursor position to after last overflow block */
@@ -622,7 +620,6 @@ int block_manager_cursor_has_next(block_manager_cursor_t *cursor)
     uint64_t saved_cursor_pos = cursor->current_pos;
     uint64_t saved_block_size = cursor->current_block_size;
 
-    /* try to move to next */
     int result = block_manager_cursor_next(cursor);
 
     /* restore cursor state */
@@ -652,7 +649,6 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 {
     if (!bm) return NULL;
 
-    /* check cache first if caching is enabled */
     if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
     {
         char cache_key[32];
@@ -671,9 +667,9 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     /* not in cache, read from disk */
     block_manager_block_t *block = NULL;
 
-    /* read block size using pread */
     uint64_t block_size;
-    if (pread(bm->fd, &block_size, sizeof(uint64_t), (off_t)offset) != sizeof(uint64_t))
+    if (pread(bm->fd, &block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=
+        BLOCK_MANAGER_SIZE_FIELD_SIZE)
         return NULL;
 
     if (block_size == 0 || block_size > MAX_REASONABLE_BLOCK_SIZE)
@@ -681,14 +677,12 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         return NULL;
     }
 
-    /* read checksum using pread */
-    unsigned char checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
-    off_t checksum_pos = (off_t)offset + (off_t)sizeof(uint64_t);
-    if (pread(bm->fd, checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH, (off_t)checksum_pos) !=
-        BLOCK_MANAGER_SHA1_DIGEST_LENGTH)
+    uint64_t checksum;
+    off_t checksum_pos = (off_t)offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE;
+    if (pread(bm->fd, &checksum, BLOCK_MANAGER_CHECKSUM_LENGTH, (off_t)checksum_pos) !=
+        BLOCK_MANAGER_CHECKSUM_LENGTH)
         return NULL;
 
-    /* allocate block */
     block = malloc(sizeof(block_manager_block_t));
     if (!block) return NULL;
 
@@ -700,10 +694,9 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         return NULL;
     }
 
-    /* read inline data using pread */
     uint64_t inline_size = block_size <= bm->block_size ? block_size : bm->block_size;
     off_t data_pos =
-        (off_t)offset + (off_t)sizeof(uint64_t) + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
+        (off_t)offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE + (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH;
 
     if (pread(bm->fd, block->data, inline_size, (off_t)data_pos) != (ssize_t)inline_size)
     {
@@ -712,32 +705,28 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         return NULL;
     }
 
-    /* read overflow offset using pread */
     off_t overflow_offset_pos = data_pos + (off_t)inline_size;
     uint64_t overflow_offset;
-    if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
-        sizeof(uint64_t))
+    if (pread(bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+              (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
     {
         free(block->data);
         free(block);
         return NULL;
     }
 
-    /* read overflow blocks using pread */
     uint64_t data_offset = inline_size;
     while (overflow_offset != 0)
     {
-        /* read chunk size using pread */
         uint64_t chunk_size;
-        if (pread(bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
-            sizeof(uint64_t))
+        if (pread(bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)overflow_offset) !=
+            BLOCK_MANAGER_SIZE_FIELD_SIZE)
         {
             free(block->data);
             free(block);
             return NULL;
         }
 
-        /* validate chunk_size to prevent corrupted data from causing overflow or OOM */
         if (chunk_size == 0 || chunk_size > bm->block_size || data_offset + chunk_size > block_size)
         {
             free(block->data);
@@ -745,19 +734,17 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
             return NULL;
         }
 
-        /* read chunk checksum using pread */
-        unsigned char chunk_checksum[BLOCK_MANAGER_SHA1_DIGEST_LENGTH];
-        off_t chunk_checksum_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t);
-        if (pread(bm->fd, chunk_checksum, BLOCK_MANAGER_SHA1_DIGEST_LENGTH,
-                  (off_t)chunk_checksum_pos) != BLOCK_MANAGER_SHA1_DIGEST_LENGTH)
+        uint64_t chunk_checksum;
+        off_t chunk_checksum_pos = (off_t)overflow_offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE;
+        if (pread(bm->fd, &chunk_checksum, BLOCK_MANAGER_CHECKSUM_LENGTH,
+                  (off_t)chunk_checksum_pos) != BLOCK_MANAGER_CHECKSUM_LENGTH)
         {
             free(block->data);
             free(block);
             return NULL;
         }
 
-        /* read chunk data using pread */
-        off_t chunk_data_pos = chunk_checksum_pos + (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH;
+        off_t chunk_data_pos = chunk_checksum_pos + (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH;
         if (pread(bm->fd, (unsigned char *)block->data + data_offset, chunk_size,
                   (off_t)chunk_data_pos) != (ssize_t)chunk_size)
         {
@@ -766,19 +753,17 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
             return NULL;
         }
 
-        /* verify chunk checksum */
-        if (verify_sha1((unsigned char *)block->data + data_offset, chunk_size, chunk_checksum) !=
-            0)
+        if (verify_checksum((unsigned char *)block->data + data_offset, chunk_size,
+                            chunk_checksum) != 0)
         {
             free(block->data);
             free(block);
             return NULL;
         }
 
-        /* read next overflow offset using pread */
         off_t next_overflow_pos = chunk_data_pos + (off_t)chunk_size;
-        if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
-            sizeof(uint64_t))
+        if (pread(bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+                  (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
         {
             free(block->data);
             free(block);
@@ -789,7 +774,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     }
 
     /* verify main block checksum */
-    if (verify_sha1(block->data, block_size, checksum) != 0)
+    if (verify_checksum(block->data, block_size, checksum) != 0)
     {
         free(block->data);
         free(block);
@@ -837,7 +822,6 @@ void block_manager_cursor_free(block_manager_cursor_t *cursor)
 {
     if (cursor)
     {
-        /* no file descriptor to close -- we share bm->fd */
         free(cursor);
         cursor = NULL;
     }
@@ -850,47 +834,43 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
     /* can't go back from first block */
     if (cursor->current_pos <= BLOCK_MANAGER_HEADER_SIZE) return -1;
 
-    /* scan from beginning using pread to find previous block */
     uint64_t scan_pos = BLOCK_MANAGER_HEADER_SIZE;
 
     while (scan_pos < cursor->current_pos)
     {
-        /* read block size using pread */
         uint64_t block_size;
-        if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (off_t)scan_pos) !=
-            sizeof(uint64_t))
+        if (pread(cursor->bm->fd, &block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)scan_pos) !=
+            BLOCK_MANAGER_SIZE_FIELD_SIZE)
             return -1;
 
-        /* calculate inline size */
         uint64_t inline_size =
             block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
 
-        /* read overflow offset using pread */
-        off_t overflow_offset_pos = (off_t)scan_pos + (off_t)sizeof(uint64_t) +
-                                    (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+        off_t overflow_offset_pos = (off_t)scan_pos + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                    (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
         uint64_t overflow_offset;
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
-            sizeof(uint64_t))
+        if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+                  (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             return -1;
 
-        /* calculate next block position */
-        uint64_t next_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+        uint64_t next_pos =
+            (uint64_t)(overflow_offset_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
 
-        /* skip overflow chain using pread */
         while (overflow_offset != 0)
         {
             uint64_t chunk_size;
-            if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
-                sizeof(uint64_t))
+            if (pread(cursor->bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                      (off_t)overflow_offset) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
                 return -1;
 
-            off_t next_overflow_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t) +
-                                      (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
-            if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t),
-                      (off_t)next_overflow_pos) != sizeof(uint64_t))
+            off_t next_overflow_pos = (off_t)overflow_offset +
+                                      (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                      (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
+            if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+                      (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
                 return -1;
 
-            next_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
+            next_pos = (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
         }
 
         /* check if next block is our current position */
@@ -921,7 +901,6 @@ int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    /* position to first block position (before any data) */
     if (block_manager_cursor_goto_first(cursor) != 0) return -1;
 
     /* move forward until we hit EOF (no more blocks to read) */
@@ -939,9 +918,6 @@ int block_manager_truncate(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    pthread_mutex_lock(&bm->write_mutex);
-
-    /* clear cache if it exists */
     if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
     {
         lru_cache_clear(bm->block_manager_cache->lru_cache);
@@ -950,37 +926,34 @@ int block_manager_truncate(block_manager_t *bm)
 
     if (ftruncate(bm->fd, 0) != 0)
     {
-        pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
     if (close(bm->fd) != 0)
     {
-        pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
     bm->fd = open(bm->file_path, O_RDWR | O_CREAT, 0644);
     if (bm->fd == -1)
     {
-        pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
     /* write new header */
     if (write_header(bm->fd, bm->block_size) != 0)
     {
-        pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
     if (fdatasync(bm->fd) != 0)
     {
-        pthread_mutex_unlock(&bm->write_mutex);
         return -1;
     }
 
-    pthread_mutex_unlock(&bm->write_mutex);
+    /* reset cached file size to header size */
+    atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
+
     return 0;
 }
 
@@ -997,44 +970,43 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor)
     /* if at first block, not at second */
     if (cursor->current_pos == BLOCK_MANAGER_HEADER_SIZE) return 0;
 
-    /* read first block size using pread */
     uint64_t first_block_size;
-    if (pread(cursor->bm->fd, &first_block_size, sizeof(uint64_t),
-              (off_t)BLOCK_MANAGER_HEADER_SIZE) != sizeof(uint64_t))
+    if (pread(cursor->bm->fd, &first_block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+              (off_t)BLOCK_MANAGER_HEADER_SIZE) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
         return -1;
 
-    /* calculate inline size */
     uint64_t inline_size =
         first_block_size <= cursor->bm->block_size ? first_block_size : cursor->bm->block_size;
 
     /* calculate overflow offset position */
-    off_t overflow_offset_pos = (off_t)BLOCK_MANAGER_HEADER_SIZE + (off_t)sizeof(uint64_t) +
-                                (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+    off_t overflow_offset_pos = (off_t)BLOCK_MANAGER_HEADER_SIZE +
+                                (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
 
-    /* read overflow offset using pread */
     uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
-        sizeof(uint64_t))
+    if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+              (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
         return -1;
 
     /* calculate second block position */
-    uint64_t second_block_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+    uint64_t second_block_pos =
+        (uint64_t)(overflow_offset_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
 
-    /* skip overflow chain if present using pread */
     while (overflow_offset != 0)
     {
         uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
-            sizeof(uint64_t))
+        if (pread(cursor->bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                  (off_t)overflow_offset) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
             return -1;
 
-        off_t next_overflow_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t) +
-                                  (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
-            sizeof(uint64_t))
+        off_t next_overflow_pos = (off_t)overflow_offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                  (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
+        if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+                  (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             return -1;
 
-        second_block_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
+        second_block_pos =
+            (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
     }
 
     return (cursor->current_pos == second_block_pos) ? 1 : 0;
@@ -1044,61 +1016,53 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    /* read current block size using pread */
     uint64_t block_size;
-    if (pread(cursor->bm->fd, &block_size, sizeof(uint64_t), (off_t)cursor->current_pos) !=
-        sizeof(uint64_t))
+    if (pread(cursor->bm->fd, &block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+              (off_t)cursor->current_pos) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
         return -1;
 
-    /* calculate inline size */
     uint64_t inline_size =
         block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
 
-    /* calculate overflow offset position */
-    off_t overflow_offset_pos = (off_t)cursor->current_pos + (off_t)sizeof(uint64_t) +
-                                (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+    off_t overflow_offset_pos = (off_t)cursor->current_pos + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
 
-    /* read overflow offset using pread */
     uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
-        sizeof(uint64_t))
+    if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+              (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
         return -1;
 
-    /* calculate position after current block */
-    uint64_t after_current_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+    uint64_t after_current_pos =
+        (uint64_t)(overflow_offset_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
 
-    /* skip overflow chain using pread */
     while (overflow_offset != 0)
     {
         uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
-            sizeof(uint64_t))
+        if (pread(cursor->bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                  (off_t)overflow_offset) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
             return -1;
 
-        off_t next_overflow_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t) +
-                                  (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
-        if (pread(cursor->bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
-            sizeof(uint64_t))
+        off_t next_overflow_pos = (off_t)overflow_offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                  (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
+        if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+                  (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             return -1;
 
-        after_current_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
+        after_current_pos =
+            (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
     }
 
-    /* try to read next block using pread */
     uint64_t next_block_size;
-    ssize_t read_result =
-        pread(cursor->bm->fd, &next_block_size, sizeof(uint64_t), (off_t)after_current_pos);
+    ssize_t read_result = pread(cursor->bm->fd, &next_block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                                (off_t)after_current_pos);
 
-    return (read_result != sizeof(uint64_t)) ? 1 : 0;
+    return (read_result != BLOCK_MANAGER_SIZE_FIELD_SIZE) ? 1 : 0;
 }
 
 int block_manager_get_size(block_manager_t *bm, uint64_t *size)
 {
     if (!bm || !size) return -1;
-
-    struct stat st;
-    if (stat(bm->file_path, &st) != 0) return -1;
-    *size = (uint64_t)st.st_size;
+    *size = bm->current_file_size;
     return 0;
 }
 
@@ -1134,17 +1098,14 @@ int block_manager_count_blocks(block_manager_t *bm)
 
     if (block_manager_cursor_init(&cursor, bm) != 0) return -1;
 
-    /* position at first block */
     block_manager_cursor_goto_first(cursor);
 
-    /* check if there are any blocks */
     if (block_manager_cursor_has_next(cursor) > 0)
     {
         /* move to first block and count it */
         block_manager_cursor_next(cursor);
         count++;
 
-        /* count remaining blocks */
         while (block_manager_cursor_next(cursor) == 0)
         {
             count++;
@@ -1159,21 +1120,17 @@ int block_manager_validate_last_block(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    /* get file size using pread-compatible approach */
     uint64_t file_size;
     if (get_file_size(bm->fd, &file_size) != 0) return -1;
 
     /* if file is empty, write header */
     if (file_size == 0)
     {
-        pthread_mutex_lock(&bm->write_mutex);
         if (write_header(bm->fd, bm->block_size) != 0)
         {
-            pthread_mutex_unlock(&bm->write_mutex);
             return -1;
         }
         fdatasync(bm->fd);
-        pthread_mutex_unlock(&bm->write_mutex);
         return 0;
     }
 
@@ -1183,55 +1140,48 @@ int block_manager_validate_last_block(block_manager_t *bm)
     }
 
     /* ensure we have at least header + one block header */
-    if (file_size < BLOCK_MANAGER_HEADER_SIZE + sizeof(uint64_t) +
-                        BLOCK_MANAGER_SHA1_DIGEST_LENGTH + sizeof(uint64_t))
+    if (file_size < BLOCK_MANAGER_HEADER_SIZE + BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                        BLOCK_MANAGER_CHECKSUM_LENGTH + BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
     {
         /* truncate to header only */
-        pthread_mutex_lock(&bm->write_mutex);
         if (ftruncate(bm->fd, BLOCK_MANAGER_HEADER_SIZE) == -1)
         {
-            pthread_mutex_unlock(&bm->write_mutex);
             return -1;
         }
         lseek(bm->fd, 0, SEEK_SET);
-        pthread_mutex_unlock(&bm->write_mutex);
         return (bm->fd != -1) ? 0 : -1;
     }
 
-    /* scan through blocks to find last complete one using pread */
     uint64_t valid_size = BLOCK_MANAGER_HEADER_SIZE;
     uint64_t scan_pos = BLOCK_MANAGER_HEADER_SIZE;
 
     while (scan_pos < file_size)
     {
-        /* try to read block size using pread */
         uint64_t block_size;
-        if (pread(bm->fd, &block_size, sizeof(uint64_t), (off_t)scan_pos) != sizeof(uint64_t))
+        if (pread(bm->fd, &block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)scan_pos) !=
+            BLOCK_MANAGER_SIZE_FIELD_SIZE)
             break;
 
-        /* calculate inline size */
         uint64_t inline_size = block_size <= bm->block_size ? block_size : bm->block_size;
 
-        /* check if we have complete inline block */
-        if (scan_pos + sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + inline_size +
-                sizeof(uint64_t) >
+        if (scan_pos + BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH + inline_size +
+                BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE >
             file_size)
         {
             valid_size = scan_pos;
             break;
         }
 
-        /* read overflow offset using pread */
-        off_t overflow_offset_pos = (off_t)scan_pos + (off_t)sizeof(uint64_t) +
-                                    (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)inline_size;
+        off_t overflow_offset_pos = (off_t)scan_pos + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                    (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
         uint64_t overflow_offset;
-        if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)overflow_offset_pos) !=
-            sizeof(uint64_t))
+        if (pread(bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+                  (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             break;
 
-        uint64_t next_pos = (uint64_t)(overflow_offset_pos + (off_t)sizeof(uint64_t));
+        uint64_t next_pos =
+            (uint64_t)(overflow_offset_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
 
-        /* validate overflow chain using pread */
         while (overflow_offset != 0)
         {
             if (overflow_offset >= file_size)
@@ -1241,48 +1191,43 @@ int block_manager_validate_last_block(block_manager_t *bm)
             }
 
             uint64_t chunk_size;
-            if (pread(bm->fd, &chunk_size, sizeof(uint64_t), (off_t)overflow_offset) !=
-                sizeof(uint64_t))
+            if (pread(bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)overflow_offset) !=
+                BLOCK_MANAGER_SIZE_FIELD_SIZE)
             {
                 valid_size = scan_pos;
                 goto done_scanning;
             }
 
-            /* check if complete overflow block exists */
-            if (overflow_offset + sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + chunk_size +
-                    sizeof(uint64_t) >
+            if (overflow_offset + BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH +
+                    chunk_size + BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE >
                 file_size)
             {
                 valid_size = scan_pos;
                 goto done_scanning;
             }
 
-            off_t next_overflow_pos = (off_t)overflow_offset + (off_t)sizeof(uint64_t) +
-                                      (off_t)BLOCK_MANAGER_SHA1_DIGEST_LENGTH + (off_t)chunk_size;
-            if (pread(bm->fd, &overflow_offset, sizeof(uint64_t), (off_t)next_overflow_pos) !=
-                sizeof(uint64_t))
+            off_t next_overflow_pos = (off_t)overflow_offset +
+                                      (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                      (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
+            if (pread(bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+                      (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             {
                 valid_size = scan_pos;
                 goto done_scanning;
             }
 
-            next_pos = (uint64_t)(next_overflow_pos + (off_t)sizeof(uint64_t));
+            next_pos = (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
         }
 
-        /* this block and its overflow chain are complete */
         valid_size = next_pos;
         scan_pos = next_pos;
     }
 
 done_scanning:
-    /* truncate if needed */
     if (valid_size != file_size)
     {
-        pthread_mutex_lock(&bm->write_mutex);
-
         if (ftruncate(bm->fd, (long)valid_size) != 0)
         {
-            pthread_mutex_unlock(&bm->write_mutex);
             return -1;
         }
 
@@ -1290,11 +1235,8 @@ done_scanning:
         bm->fd = open(bm->file_path, O_RDWR | O_CREAT, 0644);
         if (bm->fd == -1)
         {
-            pthread_mutex_unlock(&bm->write_mutex);
             return -1;
         }
-
-        pthread_mutex_unlock(&bm->write_mutex);
     }
 
     return 0;

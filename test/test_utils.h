@@ -20,26 +20,8 @@
 #define TEST_UTILS_H
 
 #include <assert.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
 
 #include "../src/compat.h" /* for PATH_SEPARATOR and platform compatibility */
-
-#ifdef _WIN32
-#include <direct.h> /* for _rmdir */
-#include <windows.h>
-#else
-#include <unistd.h> /* for rmdir */
-#endif
-
-/* dirent.h - MinGW has it natively, MSVC uses compat.h implementation */
-#if !defined(_MSC_VER)
-#include <dirent.h>
-#endif
-
 #include "test_macros.h"
 
 #define TEST_DB_PATH "./test_tidesdb"

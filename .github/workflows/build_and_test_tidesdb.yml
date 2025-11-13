@@ -244,22 +244,25 @@ jobs:
                   return 1;
               }
               
-              /* Write diverse test data */
+              /* Write first 50 keys */
+              printf("Writing keys 0-49...\n");
               for (int i = 0; i < 50; i++) {
                   char key[64], value[128];
                   snprintf(key, sizeof(key), "test_key_%d", i);
-                  snprintf(value, sizeof(value), "test_value_%d_with_data_0x%08X", i, i * 12345);
+                  snprintf(value, sizeof(value), "test_value_%d", i);
                   tidesdb_txn_put(txn, (uint8_t*)key, strlen(key), 
                                  (uint8_t*)value, strlen(value), -1);
               }
-              
               tidesdb_txn_commit(txn);
               tidesdb_txn_free(txn);
               
-              /* Force flush to create SSTables */
+              /* Flush to create first SSTable */
+              printf("Flushing first batch...\n");
               tidesdb_flush_memtable(cf);
+              sleep(1); /* Wait for flush to complete */
               
-              /* Add more data and compact */
+              /* Write second 50 keys */
+              printf("Writing keys 50-99...\n");
               if (tidesdb_txn_begin(db, cf, &txn) != 0) {
                   fprintf(stderr, "Failed to begin second transaction\n");
                   tidesdb_close(db);
@@ -268,16 +271,22 @@ jobs:
               for (int i = 50; i < 100; i++) {
                   char key[64], value[128];
                   snprintf(key, sizeof(key), "test_key_%d", i);
-                  snprintf(value, sizeof(value), "test_value_%d_compacted", i);
+                  snprintf(value, sizeof(value), "test_value_%d", i);
                   tidesdb_txn_put(txn, (uint8_t*)key, strlen(key), 
                                  (uint8_t*)value, strlen(value), -1);
               }
               tidesdb_txn_commit(txn);
               tidesdb_txn_free(txn);
-              tidesdb_flush_memtable(cf);
               
-              /* Trigger compaction */
+              /* Flush to create second SSTable */
+              printf("Flushing second batch...\n");
+              tidesdb_flush_memtable(cf);
+              sleep(1); /* Wait for flush to complete */
+              
+              /* Compact to merge into single SSTable */
+              printf("Compacting...\n");
               tidesdb_compact(cf);
+              sleep(1); /* Wait for compaction to complete */
               
               printf("✓ Created portable database with 100 keys\n");
               printf("✓ Database includes WAL, SSTables, bloom filters, and indexes\n");
@@ -454,12 +463,7 @@ jobs:
               for (int i = 0; i < 100; i++) {
                   char key[64], expected[128];
                   snprintf(key, sizeof(key), "test_key_%d", i);
-                  
-                  if (i < 50) {
-                      snprintf(expected, sizeof(expected), "test_value_%d_with_data_0x%08X", i, i * 12345);
-                  } else {
-                      snprintf(expected, sizeof(expected), "test_value_%d_compacted", i);
-                  }
+                  snprintf(expected, sizeof(expected), "test_value_%d", i);
                   
                   uint8_t *value = NULL;
                   size_t value_size = 0;

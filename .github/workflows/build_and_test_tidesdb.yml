@@ -215,7 +215,7 @@ jobs:
                   .num_compaction_threads = 1
               };
               
-              if (tidesdb_open(&db, &cfg) != 0) {
+              if (tidesdb_open(&cfg, &db) != 0) {
                   fprintf(stderr, "Failed to open database\n");
                   return 1;
               }

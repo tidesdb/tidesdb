@@ -1037,9 +1037,9 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
         {
             if (block_manager_cursor_next(iter->sstable_cursors[idx]) != 0) break;
         }
-        iter->sstable_blocks_read[idx]++;
 
-        /* check after increment to prevent reading metadata blocks */
+        /* increment and check BEFORE reading to prevent reading metadata blocks */
+        iter->sstable_blocks_read[idx]++;
         if (iter->sstable_blocks_read[idx] > sst->num_entries) break;
 
         block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[idx]);

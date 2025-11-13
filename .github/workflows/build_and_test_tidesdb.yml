@@ -311,7 +311,6 @@ jobs:
           path: build/portable_test_db/
           retention-days: 1
 
-  # Verify database on all platforms and architectures
   verify-portable-database:
     needs: create-portable-database
     strategy:
@@ -418,7 +417,8 @@ jobs:
           cmake -S . -B build \
             -DCMAKE_C_FLAGS="-m32" \
             -DCMAKE_EXE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu"
+            -DCMAKE_SHARED_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu"
 
       - name: Configure CMake (macOS x86)
         if: runner.os == 'macOS' && matrix.arch == 'x86'
@@ -426,7 +426,8 @@ jobs:
           cmake -S . -B build \
             -DCMAKE_C_FLAGS="-m32" \
             -DCMAKE_EXE_LINKER_FLAGS="-m32" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-m32"
+            -DCMAKE_SHARED_LINKER_FLAGS="-m32" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-m32"
 
       - name: Configure CMake (Windows MSVC x64)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
@@ -572,49 +573,68 @@ jobs:
           EOF
           
           if [ "$RUNNER_OS" == "Windows" ]; then
-            # Windows: Just add verify test to existing build (same as main CI)
-            # The build directory already has tidesdb library and all dependencies configured
+            # on windows just add verify test to existing build (same as main CI)
+            # the build directory already has tidesdb library and all dependencies configured
             
-            # Add verify executable to CMakeLists.txt
+            # move source file to root and add to CMakeLists.txt
+            mv verify_portable_db.c ../
+            cd ..
+            
+            # add verify executable to root CMakeLists.txt
             cat >> CMakeLists.txt << 'CMAKEEOF'
           
-          # Portability verification test
+          # portability verification test
           add_executable(verify_portable_db_test verify_portable_db.c)
           target_link_libraries(verify_portable_db_test PRIVATE tidesdb)
           target_include_directories(verify_portable_db_test PRIVATE external)
           CMAKEEOF
             
-            # Reconfigure to pick up the new executable
-            cd ..
-            if [ "${{ matrix.compiler }}" == "mingw" ]; then
-              cmake build
-            else
-              cmake build
-            fi
+            # reconf to pick up the new executable
+            cmake build
             
-            # Build just the verify test
-            cmake --build build --target verify_portable_db_test --config Release
-            
-            # Run it
-            cd build
+            # Build the verify test
             if [ "${{ matrix.compiler }}" == "mingw" ]; then
+              # minqw build all (makefiles don't support --target well)
+              cmake --build build
+              cd build
               ./verify_portable_db_test.exe
             else
-              ./Release/verify_portable_db_test.exe
+              # msvc build specific target with rel config
+              cmake --build build --target verify_portable_db_test --config Release
+              cd build/Release
+              ./verify_portable_db_test.exe
             fi
           else
             if [ "$RUNNER_OS" == "macOS" ]; then
               # macOS needs homebrew library paths
-              gcc -o verify_portable_db verify_portable_db.c \
-                -I../src -I../external \
-                -I/opt/homebrew/include -I/usr/local/include \
-                -L. -L/opt/homebrew/lib -L/usr/local/lib \
-                -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-              DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_portable_db
+              if [ "${{ matrix.arch }}" == "x86" ]; then
+                gcc -m32 -o verify_portable_db verify_portable_db.c \
+                  -I../src -I../external \
+                  -I/opt/homebrew/include -I/usr/local/include \
+                  -L. -L/opt/homebrew/lib -L/usr/local/lib \
+                  -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+                DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_portable_db
+              else
+                gcc -o verify_portable_db verify_portable_db.c \
+                  -I../src -I../external \
+                  -I/opt/homebrew/include -I/usr/local/include \
+                  -L. -L/opt/homebrew/lib -L/usr/local/lib \
+                  -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+                DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_portable_db
+              fi
             else
-              gcc -o verify_portable_db verify_portable_db.c \
-                -I../src -I../external \
-                -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-              LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./verify_portable_db
+              # linux
+              if [ "${{ matrix.arch }}" == "x86" ]; then
+                gcc -m32 -o verify_portable_db verify_portable_db.c \
+                  -I../src -I../external \
+                  -L. -L/usr/lib/i386-linux-gnu \
+                  -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+                LD_LIBRARY_PATH=.:/usr/lib/i386-linux-gnu ./verify_portable_db
+              else
+                gcc -o verify_portable_db verify_portable_db.c \
+                  -I../src -I../external \
+                  -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+                LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./verify_portable_db
+              fi
             fi
           fi

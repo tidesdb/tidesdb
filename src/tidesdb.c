@@ -2519,8 +2519,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     TDB_DEBUG_LOG("SSTable recovery completed for column family: %s (%d sstables loaded)", cf->name,
                   atomic_load(&cf->num_sstables));
 
-    /* submit any recovered memtables to flush pool */
+    /* submit any recovered memtables to flush pool and wait for completion */
     pthread_mutex_lock(&cf->flush_lock);
+    int num_recovered_to_flush = queue_size(cf->immutable_memtables);
     tidesdb_memtable_t *recovered_mt;
     while ((recovered_mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
     {
@@ -2529,6 +2530,37 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         pthread_mutex_lock(&cf->flush_lock);
     }
     pthread_mutex_unlock(&cf->flush_lock);
+
+    /* wait for all recovered memtable flushes to complete
+     * this ensures data is immediately queryable after tidesdb_open returns */
+    if (num_recovered_to_flush > 0)
+    {
+        TDB_DEBUG_LOG(
+            "Waiting for %d recovered memtable flush(es) to complete for column family: %s",
+            num_recovered_to_flush, cf->name);
+
+        /* poll until all flushes complete (immutable queue becomes empty and stays empty)
+         * we check twice with a small delay to ensure flushes have actually completed */
+        int stable_count = 0;
+        while (stable_count < 2)
+        {
+            usleep(100000); /* 100ms */
+            pthread_mutex_lock(&cf->flush_lock);
+            int current_size = queue_size(cf->immutable_memtables);
+            pthread_mutex_unlock(&cf->flush_lock);
+
+            if (current_size == 0)
+            {
+                stable_count++;
+            }
+            else
+            {
+                stable_count = 0; /* reset if queue is not empty */
+            }
+        }
+
+        TDB_DEBUG_LOG("All recovered memtable flushes completed for column family: %s", cf->name);
+    }
 
     /* re-acquire db_lock to add CF to database */
     pthread_rwlock_wrlock(&db->db_lock);

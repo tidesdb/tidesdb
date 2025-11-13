@@ -307,6 +307,7 @@ jobs:
         continue-on-error: true
 
       - name: Download portable database artifact
+        id: download-artifact
         if: runner.os != 'Linux' || matrix.arch != 'x64'
         uses: actions/download-artifact@v4
         with:

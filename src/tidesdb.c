@@ -1054,8 +1054,10 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
         /* handle blocks_read increment */
         if (iter->sstable_blocks_read[idx] == -1)
         {
-            /* first read from index-positioned cursor */
-            iter->sstable_blocks_read[idx] = 1;
+            /* first read from index-positioned cursor
+             * We don't know our absolute position in the SSTable, so we cannot safely
+             * continue sequential reading. Set to num_entries to stop after this read. */
+            iter->sstable_blocks_read[idx] = num_entries;
         }
         else
         {
@@ -6510,31 +6512,19 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                         if (succinct_trie_prefix_get(sst->index, (uint8_t *)key, key_size,
                                                      &exact_offset) == 0)
                         {
-                            /* found offset from index, but we need to validate it's within bounds
-                             * by checking if we can actually read a valid block there */
+                            TDB_DEBUG_LOG("Block index for SSTable %d (id=%llu, entries=%d) returned offset=%ld for key=%.*s",
+                                          i, (unsigned long long)sst->id, atomic_load(&sst->num_entries),
+                                          exact_offset, (int)key_size, (char*)key);
+                            /* found offset from index, position cursor there */
                             if (block_manager_cursor_goto(iter->sstable_cursors[i],
                                                           (uint64_t)exact_offset) == 0)
                             {
-                                /* Try to read the block to validate it's not beyond num_entries */
-                                block_manager_block_t *test_block =
-                                    block_manager_cursor_read(iter->sstable_cursors[i]);
-                                if (test_block)
-                                {
-                                    /* Valid block - reposition cursor back to this offset for later
-                                     * read */
-                                    block_manager_block_free(test_block);
-                                    if (block_manager_cursor_goto(iter->sstable_cursors[i],
-                                                                  (uint64_t)exact_offset) == 0)
-                                    {
-                                        positioned_via_index = 1;
-                                        index_positioned[i] = 1; /* mark for refill section */
-                                        /* Set blocks_read to -1 to indicate cursor was positioned
-                                         * via index. This tells iter_refill_from_sstable to skip
-                                         * boundary checks on first read. */
-                                        iter->sstable_blocks_read[i] = -1;
-                                    }
-                                }
-                                /* If block read failed, fall through to linear scan */
+                                positioned_via_index = 1;
+                                index_positioned[i] = 1; /* mark for refill section */
+                                /* Set blocks_read to -1 to indicate cursor was positioned
+                                 * via index. This tells iter_refill_from_sstable to read one
+                                 * block then stop (we don't know our absolute position). */
+                                iter->sstable_blocks_read[i] = -1;
                             }
                         }
                     }

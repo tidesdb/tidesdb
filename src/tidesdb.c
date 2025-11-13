@@ -25,8 +25,6 @@
 
 #include "tidesdb.h"
 
-#include <dirent.h>
-
 /*
  * encode_uint32_le
  * encodes a uint32_t value in little-endian format
@@ -1470,7 +1468,6 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
     int blocks_read = 0;
     while (blocks_read < sst->num_entries && block_manager_cursor_has_next(cursor))
     {
-        uint64_t current_offset = cursor->current_pos;
         block_manager_block_t *block = block_manager_cursor_read(cursor);
         if (!block) break;
 
@@ -3211,7 +3208,8 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
                         /* Store block number (entries_written) in the index, not file offset.
                          * This allows us to know exactly which block we're at after an index seek,
                          * enabling proper bounds checking to prevent reading metadata blocks. */
-                        succinct_trie_builder_add(index_builder, k, k_size, (int64_t)entries_written);
+                        succinct_trie_builder_add(index_builder, k, k_size,
+                                                  (int64_t)entries_written);
                     }
                     /* don't increment num_entries yet - use local counter */
                     entries_written++;
@@ -5081,7 +5079,7 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
         block_manager_cursor_free(cursor);
         return -1;
     }
-    
+
     /* advance to the target block number */
     for (int64_t b = 0; b < block_num; b++)
     {
@@ -6510,9 +6508,11 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                         if (succinct_trie_prefix_get(sst->index, (uint8_t *)key, key_size,
                                                      &block_num) == 0)
                         {
-                            TDB_DEBUG_LOG("Block index for SSTable %d (id=%llu, entries=%d) returned block_num=%ld for key=%.*s",
-                                          i, (unsigned long long)sst->id, atomic_load(&sst->num_entries),
-                                          block_num, (int)key_size, (char*)key);
+                            TDB_DEBUG_LOG(
+                                "Block index for SSTable %d (id=%llu, entries=%d) returned "
+                                "block_num=%ld for key=%.*s",
+                                i, (unsigned long long)sst->id, atomic_load(&sst->num_entries),
+                                block_num, (int)key_size, (char *)key);
                             /* Index now returns block number (0-indexed), not file offset.
                              * Set blocks_read to this number so we can track position correctly. */
                             positioned_via_index = 1;
@@ -6569,16 +6569,16 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         if (index_positioned[i])
         {
             int target_block = iter->sstable_blocks_read[i];
-            
+
             /* Position cursor at first block */
             if (block_manager_cursor_goto_first(iter->sstable_cursors[i]) != 0) continue;
-            
+
             /* Advance cursor to target block */
             for (int b = 0; b < target_block; b++)
             {
                 if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0) break;
             }
-            
+
             /* Read the block directly without calling iter_refill (which would advance again) */
             block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[i]);
             if (block)
@@ -6824,16 +6824,16 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         if (index_positioned[i])
         {
             int target_block = iter->sstable_blocks_read[i];
-            
+
             /* Position cursor at first block */
             if (block_manager_cursor_goto_first(iter->sstable_cursors[i]) != 0) continue;
-            
+
             /* Advance cursor to target block */
             for (int b = 0; b < target_block; b++)
             {
                 if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0) break;
             }
-            
+
             /* Read the block directly */
             block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[i]);
             if (block)
@@ -6855,7 +6855,8 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                                                       .ttl = ttl,
                                                       .source_type = 2,
                                                       .source_index = i};
-                        heap_push(iter, &entry);                    }
+                        heap_push(iter, &entry);
+                    }
                     else
                     {
                         free(k);

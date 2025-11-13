@@ -17,8 +17,6 @@
  * limitations under the License.
  */
 
-#include <stdbool.h>
-
 #include "../src/succinct_trie.h"
 #include "test_utils.h"
 

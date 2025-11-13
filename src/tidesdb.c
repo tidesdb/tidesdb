@@ -1031,9 +1031,11 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
         /* position at first block or advance to next */
         if (iter->sstable_blocks_read[idx] == -1)
         {
-            /* cursor already positioned by block index, just read from current position */
-            /* set blocks_read to 0 so next iteration will advance normally */
-            iter->sstable_blocks_read[idx] = 0;
+            /* cursor already positioned by block index, just read from current position
+             * We'll read this ONE block, then stop reading from this SSTable since we
+             * don't know which block number we're actually at. Setting to num_entries-1
+             * means after incrementing below, we'll be at num_entries and stop. */
+            iter->sstable_blocks_read[idx] = num_entries - 1;
         }
         else if (iter->sstable_blocks_read[idx] == 0)
         {

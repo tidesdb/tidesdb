@@ -548,9 +548,8 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
     (*cursor)->current_pos = BLOCK_MANAGER_HEADER_SIZE;
     (*cursor)->current_block_size = 0;
 
-#ifdef __linux__
-    posix_fadvise(bm->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-#endif
+    /* hint to OS that we'll be reading sequentially */
+    set_file_sequential_hint(bm->fd);
 
     return 0;
 }

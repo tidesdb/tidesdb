@@ -192,7 +192,7 @@ static inline int ftruncate(int fd, off_t length)
  */
 static inline int _tidesdb_open_wrapper_3(const char *path, int flags, mode_t mode)
 {
-    return _open(path, flags | _O_BINARY, mode);
+    return _open(path, flags | _O_BINARY | _O_SEQUENTIAL, mode);
 }
 
 /* open for windows */
@@ -448,6 +448,9 @@ static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
 #endif
 #ifndef O_BINARY
 #define O_BINARY _O_BINARY
+#endif
+#ifndef O_SEQUENTIAL
+#define O_SEQUENTIAL _O_SEQUENTIAL
 #endif
 
 #ifndef M_LN2
@@ -1245,6 +1248,28 @@ static inline uint64_t decode_uint64_le_compat(const uint8_t *buf)
     return ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
            ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
            ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
+}
+
+/*
+ * set_file_sequential_hint
+ * hints to the OS that file access will be sequential for read-ahead optimization
+ * @param fd the file descriptor
+ * @return 0 on success, -1 on failure (non-critical, can be ignored)
+ */
+static inline int set_file_sequential_hint(int fd)
+{
+#ifdef __linux__
+    return posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#elif defined(__APPLE__)
+    return fcntl(fd, F_RDAHEAD, 1);
+#elif defined(_WIN32)
+    /* _O_SEQUENTIAL flag set at open time via compat.h wrapper */
+    (void)fd; /* unused on Windows */
+    return 0;
+#else
+    (void)fd; /* unused on other platforms */
+    return 0;
+#endif
 }
 
 #endif /* __COMPAT_H__ */

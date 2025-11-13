@@ -24,16 +24,18 @@
 
 /**
  * bloom_filter_t
- * bloom filter struct
- * @param bitset the bloom filter bitset
- * @param m the size of the bloom filter bitset
+ * bloom filter struct (optimized with packed bits)
+ * @param bitset the bloom filter bitset (packed in uint64_t words)
+ * @param m the size of the bloom filter in bits
  * @param h the number of hash functions
+ * @param size_in_words number of uint64_t words in bitset
  */
 typedef struct
 {
-    int8_t *bitset;
+    uint64_t *bitset;
     int m;
     int h;
+    int size_in_words;
 } bloom_filter_t;
 
 /**

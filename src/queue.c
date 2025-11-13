@@ -20,6 +20,44 @@
 
 #include "compat.h"
 
+/* node pool configuration */
+#define QUEUE_MAX_POOL_SIZE 64
+
+static inline queue_node_t *queue_alloc_node(queue_t *queue)
+{
+    queue_node_t *node = NULL;
+
+    if (queue->node_pool)
+    {
+        node = queue->node_pool;
+        queue->node_pool = node->next;
+        queue->pool_size--;
+    }
+    else
+    {
+        node = (queue_node_t *)malloc(sizeof(queue_node_t));
+    }
+
+    return node;
+}
+
+/* return node to pool or free */
+static inline void queue_free_node(queue_t *queue, queue_node_t *node)
+{
+    if (queue->pool_size < queue->max_pool_size)
+    {
+        /* return to pool */
+        node->next = queue->node_pool;
+        queue->node_pool = node;
+        queue->pool_size++;
+    }
+    else
+    {
+        /* pool full, actually free */
+        free(node);
+    }
+}
+
 queue_t *queue_new(void)
 {
     queue_t *queue = (queue_t *)malloc(sizeof(queue_t));
@@ -27,9 +65,12 @@ queue_t *queue_new(void)
 
     queue->head = NULL;
     queue->tail = NULL;
-    queue->size = 0;
+    atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
     queue->shutdown = 0;
     queue->waiter_count = 0;
+    queue->node_pool = NULL;
+    queue->pool_size = 0;
+    queue->max_pool_size = QUEUE_MAX_POOL_SIZE;
 
     if (pthread_mutex_init(&queue->lock, NULL) != 0)
     {
@@ -51,17 +92,21 @@ int queue_enqueue(queue_t *queue, void *data)
 {
     if (queue == NULL) return -1;
 
-    queue_node_t *node = (queue_node_t *)malloc(sizeof(queue_node_t));
-    if (node == NULL) return -1;
+    pthread_mutex_lock(&queue->lock);
+
+    /* allocate from pool (must be inside lock) */
+    queue_node_t *node = queue_alloc_node(queue);
+    if (node == NULL)
+    {
+        pthread_mutex_unlock(&queue->lock);
+        return -1;
+    }
 
     node->data = data;
     node->next = NULL;
 
-    pthread_mutex_lock(&queue->lock);
-
     if (queue->tail == NULL)
     {
-        /* queue is empty */
         queue->head = node;
         queue->tail = node;
     }
@@ -72,7 +117,7 @@ int queue_enqueue(queue_t *queue, void *data)
         queue->tail = node;
     }
 
-    queue->size++;
+    atomic_fetch_add_explicit(&queue->size, 1, memory_order_relaxed);
 
     /* signal waiting threads that queue is not empty */
     pthread_cond_signal(&queue->not_empty);
@@ -105,11 +150,13 @@ void *queue_dequeue(queue_t *queue)
         queue->tail = NULL;
     }
 
-    queue->size--;
+    atomic_fetch_sub_explicit(&queue->size, 1, memory_order_relaxed);
+
+    /* return node to pool */
+    queue_free_node(queue, node);
 
     pthread_mutex_unlock(&queue->lock);
 
-    free(node);
     return data;
 }
 
@@ -153,11 +200,13 @@ void *queue_dequeue_wait(queue_t *queue)
         queue->tail = NULL;
     }
 
-    queue->size--;
+    atomic_fetch_sub_explicit(&queue->size, 1, memory_order_relaxed);
+
+    /* return node to pool */
+    queue_free_node(queue, node);
 
     pthread_mutex_unlock(&queue->lock);
 
-    free(node);
     return data;
 }
 
@@ -182,22 +231,14 @@ size_t queue_size(queue_t *queue)
 {
     if (queue == NULL) return 0;
 
-    pthread_mutex_lock(&queue->lock);
-    size_t size = queue->size;
-    pthread_mutex_unlock(&queue->lock);
-
-    return size;
+    return atomic_load_explicit(&queue->size, memory_order_relaxed);
 }
 
 int queue_is_empty(queue_t *queue)
 {
     if (queue == NULL) return -1;
 
-    pthread_mutex_lock(&queue->lock);
-    int empty = (queue->head == NULL) ? 1 : 0;
-    pthread_mutex_unlock(&queue->lock);
-
-    return empty;
+    return (atomic_load_explicit(&queue->size, memory_order_relaxed) == 0) ? 1 : 0;
 }
 
 int queue_clear(queue_t *queue)
@@ -210,13 +251,13 @@ int queue_clear(queue_t *queue)
     while (current != NULL)
     {
         queue_node_t *next = current->next;
-        free(current);
+        queue_free_node(queue, current); /* return to pool */
         current = next;
     }
 
     queue->head = NULL;
     queue->tail = NULL;
-    queue->size = 0;
+    atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
     pthread_mutex_unlock(&queue->lock);
 
@@ -287,9 +328,18 @@ void queue_free(queue_t *queue)
         current = next;
     }
 
+    current = queue->node_pool;
+    while (current != NULL)
+    {
+        queue_node_t *next = current->next;
+        free(current);
+        current = next;
+    }
+
     queue->head = NULL;
     queue->tail = NULL;
-    queue->size = 0;
+    queue->node_pool = NULL;
+    atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
     /* wait for all waiting threads to exit with timeout to prevent deadlock */
     while (queue->waiter_count > 0)

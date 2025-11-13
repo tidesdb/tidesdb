@@ -153,7 +153,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_NUM_THREADS 2)
     endif()
     if(NOT DEFINED BENCH_DEBUG)
-        set(BENCH_DEBUG 0)
+        set(BENCH_DEBUG 1)
     endif()
     if(NOT DEFINED BENCH_DB_PATH)
         set(BENCH_DB_PATH "benchmark_db")

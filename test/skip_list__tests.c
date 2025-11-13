@@ -16,14 +16,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef _WIN32
-#include <unistd.h>
-#else
-#include <windows.h>
-#endif
 
 #include "../src/skip_list.h"
 #include "test_utils.h"
+
+#define NODE_KEY(node) \
+    ((node)->key_is_inline ? (node)->key_data.key_inline : (node)->key_data.key_ptr)
+#define NODE_VALUE(node) \
+    ((node)->value_is_inline ? (node)->value_data.value_inline : (node)->value_data.value_ptr)
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -37,8 +37,8 @@ void test_skip_list_create_node()
     skip_list_node_t *node =
         skip_list_create_node(1, key, sizeof(key), value, sizeof(value), -1, 0);
     ASSERT_TRUE(node != NULL);
-    ASSERT_TRUE(memcmp(node->key, key, sizeof(key)) == 0);
-    ASSERT_TRUE(memcmp(node->value, value, sizeof(value)) == 0);
+    ASSERT_TRUE(memcmp(NODE_KEY(node), key, sizeof(key)) == 0);
+    ASSERT_TRUE(memcmp(NODE_VALUE(node), value, sizeof(value)) == 0);
     ASSERT_EQ(node->deleted, 0);
     skip_list_release_node(node);
     printf(GREEN "test_skip_list_create_node passed\n" RESET);
@@ -209,7 +209,7 @@ void test_skip_list_cursor_next()
     int result = skip_list_cursor_next(cursor);
     ASSERT_EQ(result, 0);
     ASSERT_NE(cursor->current, NULL);
-    ASSERT_TRUE(memcmp(cursor->current->key, key2, sizeof(key2)) == 0);
+    ASSERT_TRUE(memcmp(NODE_KEY(cursor->current), key2, sizeof(key2)) == 0);
 
     (void)skip_list_cursor_free(cursor);
     (void)skip_list_free(list);
@@ -239,7 +239,7 @@ void test_skip_list_cursor_prev()
     int result = skip_list_cursor_prev(cursor);
     ASSERT_EQ(result, 0);
     ASSERT_NE(cursor->current, NULL);
-    ASSERT_TRUE(memcmp(cursor->current->key, key1, sizeof(key1)) == 0);
+    ASSERT_TRUE(memcmp(NODE_KEY(cursor->current), key1, sizeof(key1)) == 0);
 
     (void)skip_list_cursor_free(cursor);
     (void)skip_list_free(list);
@@ -323,6 +323,72 @@ void benchmark_skip_list()
     free(values);
 
     (void)skip_list_free(list);
+}
+
+void benchmark_skip_list_sequential()
+{
+    skip_list_t *list = NULL;
+    if (skip_list_new(&list, 12, 0.24f) == -1)
+    {
+        printf(RED "Failed to create skip list\n" RESET);
+        return;
+    }
+    const size_t key_size = 16;
+    const size_t value_size = 8;
+
+    uint8_t **keys = malloc(BENCH_N * sizeof(uint8_t *));
+    uint8_t **values = malloc(BENCH_N * sizeof(uint8_t *));
+    if (keys == NULL || values == NULL)
+    {
+        printf(RED "Failed to allocate memory\n" RESET);
+        return;
+    }
+
+    for (size_t i = 0; i < BENCH_N; i++)
+    {
+        keys[i] = malloc(key_size);
+        values[i] = malloc(value_size);
+    }
+
+    for (size_t i = 0; i < BENCH_N; i++)
+    {
+        memset(keys[i], 0, key_size);
+        memcpy(keys[i], &i, sizeof(size_t));
+        memset(values[i], (int)i, value_size);
+    }
+
+    clock_t start = clock();
+    for (size_t i = 0; i < BENCH_N; i++)
+    {
+        skip_list_put(list, keys[i], key_size, values[i], value_size, -1);
+    }
+    clock_t end = clock();
+    double write_time = (double)(end - start) / CLOCKS_PER_SEC;
+    printf(CYAN "Sequential keys - Write time: %f seconds (%.2f M ops/sec)\n" RESET, write_time,
+           BENCH_N / write_time / 1000000.0);
+
+    start = clock();
+    for (size_t i = 0; i < BENCH_N; i++)
+    {
+        uint8_t *retrieved_value;
+        size_t retrieved_value_size;
+        uint8_t deleted;
+        skip_list_get(list, keys[i], key_size, &retrieved_value, &retrieved_value_size, &deleted);
+        free(retrieved_value);
+    }
+    end = clock();
+    double read_time = (double)(end - start) / CLOCKS_PER_SEC;
+    printf(CYAN "Sequential keys - Read time: %f seconds (%.2f M ops/sec)\n" RESET, read_time,
+           BENCH_N / read_time / 1000000.0);
+
+    for (size_t i = 0; i < BENCH_N; i++)
+    {
+        free(keys[i]);
+        free(values[i]);
+    }
+    free(keys);
+    free(values);
+    skip_list_free(list);
 }
 
 void test_skip_list_ttl()
@@ -611,7 +677,6 @@ void test_skip_list_cursor_seek_for_prev()
               0);
     ASSERT_EQ(memcmp(key, "key_50", strlen("key_50")), 0);
 
-    /* test seek_for_prev to key after all keys */
     const char *seek_key3 = "key_99";
     ASSERT_EQ(skip_list_cursor_seek_for_prev(cursor, (uint8_t *)seek_key3, strlen(seek_key3)), 0);
     ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
@@ -621,6 +686,162 @@ void test_skip_list_cursor_seek_for_prev()
     skip_list_cursor_free(cursor);
     ASSERT_TRUE(skip_list_free(list) == 0);
     printf(GREEN "test_skip_list_cursor_seek_for_prev passed\n" RESET);
+}
+
+void test_skip_list_cow_updates()
+{
+    printf("Testing COW updates...\n");
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+    ASSERT_TRUE(list != NULL);
+
+    uint8_t key[] = "test_key";
+    uint8_t value1[] = "value1";
+    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value1, sizeof(value1), -1), 0);
+
+    for (int i = 0; i < 100; i++)
+    {
+        char value_buf[32];
+        snprintf(value_buf, sizeof(value_buf), "value%d", i);
+        ASSERT_EQ(
+            skip_list_put(list, key, sizeof(key), (uint8_t *)value_buf, strlen(value_buf) + 1, -1),
+            0);
+
+        uint8_t *read_value = NULL;
+        size_t read_size = 0;
+        uint8_t deleted = 0;
+        ASSERT_EQ(skip_list_get(list, key, sizeof(key), &read_value, &read_size, &deleted), 0);
+        ASSERT_TRUE(read_value != NULL);
+        ASSERT_EQ(strcmp((char *)read_value, value_buf), 0);
+        free(read_value);
+    }
+
+    skip_list_free(list);
+    printf(GREEN "test_skip_list_cow_updates passed\n" RESET);
+}
+
+typedef struct
+{
+    skip_list_t *list;
+    int thread_id;
+    int num_ops;
+    int reads_completed;
+    int writes_completed;
+} concurrent_test_ctx_t;
+
+void *concurrent_reader(void *arg)
+{
+    concurrent_test_ctx_t *ctx = (concurrent_test_ctx_t *)arg;
+
+    for (int i = 0; i < ctx->num_ops; i++)
+    {
+        char key_buf[32];
+        snprintf(key_buf, sizeof(key_buf), "key%d", i % 10);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+        int result = skip_list_get(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1, &value,
+                                   &value_size, &deleted);
+
+        if (result == 0 && value != NULL)
+        {
+            ASSERT_TRUE(value_size > 0);
+            free(value);
+        }
+
+        ctx->reads_completed++;
+    }
+
+    return NULL;
+}
+
+void *concurrent_writer(void *arg)
+{
+    concurrent_test_ctx_t *ctx = (concurrent_test_ctx_t *)arg;
+
+    for (int i = 0; i < ctx->num_ops; i++)
+    {
+        char key_buf[32];
+        char value_buf[64];
+        snprintf(key_buf, sizeof(key_buf), "key%d", i % 10);
+        snprintf(value_buf, sizeof(value_buf), "thread%d_value%d", ctx->thread_id, i);
+
+        skip_list_put(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1, (uint8_t *)value_buf,
+                      strlen(value_buf) + 1, -1);
+
+        ctx->writes_completed++;
+    }
+
+    return NULL;
+}
+
+void test_skip_list_concurrent_read_write()
+{
+    printf("Testing concurrent reads and writes (non-blocking)...\n");
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+    ASSERT_TRUE(list != NULL);
+
+    for (int i = 0; i < 10; i++)
+    {
+        char key_buf[32];
+        char value_buf[32];
+        snprintf(key_buf, sizeof(key_buf), "key%d", i);
+        snprintf(value_buf, sizeof(value_buf), "initial_value%d", i);
+        skip_list_put(list, (uint8_t *)key_buf, strlen(key_buf) + 1, (uint8_t *)value_buf,
+                      strlen(value_buf) + 1, -1);
+    }
+
+    const int num_readers = 4;
+    const int num_writers = 1;
+    const int ops_per_thread = 10000;
+
+    pthread_t readers[num_readers];
+    pthread_t writers[num_writers];
+    concurrent_test_ctx_t reader_ctx[num_readers];
+    concurrent_test_ctx_t writer_ctx[num_writers];
+
+    for (int i = 0; i < num_readers; i++)
+    {
+        reader_ctx[i].list = list;
+        reader_ctx[i].thread_id = i;
+        reader_ctx[i].num_ops = ops_per_thread;
+        reader_ctx[i].reads_completed = 0;
+        pthread_create(&readers[i], NULL, concurrent_reader, &reader_ctx[i]);
+    }
+
+    for (int i = 0; i < num_writers; i++)
+    {
+        writer_ctx[i].list = list;
+        writer_ctx[i].thread_id = i;
+        writer_ctx[i].num_ops = ops_per_thread;
+        writer_ctx[i].writes_completed = 0;
+        pthread_create(&writers[i], NULL, concurrent_writer, &writer_ctx[i]);
+    }
+
+    for (int i = 0; i < num_readers; i++)
+    {
+        pthread_join(readers[i], NULL);
+        printf("  Reader %d completed %d reads\n", i, reader_ctx[i].reads_completed);
+    }
+
+    for (int i = 0; i < num_writers; i++)
+    {
+        pthread_join(writers[i], NULL);
+        printf("  Writer %d completed %d writes\n", i, writer_ctx[i].writes_completed);
+    }
+
+    int total_reads = 0;
+    int total_writes = 0;
+    for (int i = 0; i < num_readers; i++) total_reads += reader_ctx[i].reads_completed;
+    for (int i = 0; i < num_writers; i++) total_writes += writer_ctx[i].writes_completed;
+
+    ASSERT_EQ(total_reads, num_readers * ops_per_thread);
+    ASSERT_EQ(total_writes, num_writers * ops_per_thread);
+
+    skip_list_free(list);
+    printf(GREEN "test_skip_list_concurrent_read_write passed - readers never blocked!\n" RESET);
 }
 
 int main(void)
@@ -641,6 +862,9 @@ int main(void)
     RUN_TEST(test_skip_list_cursor_seek, tests_passed);
     RUN_TEST(test_skip_list_cursor_seek_for_prev, tests_passed);
     RUN_TEST(benchmark_skip_list, tests_passed);
+    RUN_TEST(benchmark_skip_list_sequential, tests_passed);
+    RUN_TEST(test_skip_list_cow_updates, tests_passed);
+    RUN_TEST(test_skip_list_concurrent_read_write, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

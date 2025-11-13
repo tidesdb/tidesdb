@@ -65,12 +65,12 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #endif
 
 #if defined(__MINGW32__) || defined(__MINGW64__)
-#define TDB_SIZE_FMT     "%llu" /* size_t promoted to unsigned long long */
-#define TDB_U64_FMT      "%llu" /* uint64_t -- use C99 with ANSI stdio */
+#define TDB_SIZE_FMT     "%llu"
+#define TDB_U64_FMT      "%llu"
 #define TDB_SIZE_CAST(x) ((unsigned long long)(x))
 #define TDB_U64_CAST(x)  ((unsigned long long)(x))
 #else
-#define TDB_SIZE_FMT     "%zu" /* native size_t */
+#define TDB_SIZE_FMT     "%zu"
 #define TDB_U64_FMT      "%llu"
 #define TDB_SIZE_CAST(x) ((size_t)(x))
 #define TDB_U64_CAST(x)  ((unsigned long long)(x))
@@ -90,6 +90,23 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #define UNUSED __attribute__((unused))
 #else
 #define UNUSED
+#endif
+
+/* cross-platform prefetch hints for cache optimization */
+#if defined(__GNUC__) || defined(__clang__)
+/* __builtin_prefetch(addr, rw, locality)
+ * rw: 0 = read, 1 = write
+ * locality: 0 = no temporal locality, 3 = high temporal locality */
+#define PREFETCH_READ(addr)  __builtin_prefetch((addr), 0, 3)
+#define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 3)
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#define PREFETCH_READ(addr)  _mm_prefetch((const char *)(addr), _MM_HINT_T0)
+#define PREFETCH_WRITE(addr) _mm_prefetch((const char *)(addr), _MM_HINT_T0)
+#else
+/* No prefetch support - define as no-op */
+#define PREFETCH_READ(addr)  ((void)0)
+#define PREFETCH_WRITE(addr) ((void)0)
 #endif
 
 /* cross-platform thread ID for unique file naming */
@@ -344,7 +361,7 @@ typedef struct
 
 static inline int mkdir(const char *path, mode_t mode)
 {
-    (void)mode; /* unused on Windows */
+    (void)mode; /* unused on windows */
     return _mkdir(path);
 }
 

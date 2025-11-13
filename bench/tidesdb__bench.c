@@ -32,6 +32,7 @@
 typedef struct
 {
     tidesdb_t *tdb;
+    tidesdb_column_family_t *cf;
     uint8_t **keys;
     uint8_t **values;
     size_t *key_sizes;
@@ -119,16 +120,25 @@ void *thread_put(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
 
+    printf("[TRACE] Thread %d starting, range %d-%d\n", data->thread_id, data->start, data->end);
+    fflush(stdout);
+
     for (int i = data->start; i < data->end; i++)
     {
+        printf("[TRACE] Thread %d: operation %d\n", data->thread_id, i);
+        fflush(stdout);
+
         tidesdb_txn_t *txn = NULL;
-        if (tidesdb_txn_begin(data->tdb, &txn) != 0)
+        if (tidesdb_txn_begin(data->tdb, data->cf, &txn) != 0)
         {
             printf(BOLDRED "Failed to begin transaction\n" RESET);
             continue;
         }
 
-        if (tidesdb_txn_put(txn, BENCH_CF_NAME, data->keys[i], data->key_sizes[i], data->values[i],
+        printf("[TRACE] Thread %d: txn_put %d\n", data->thread_id, i);
+        fflush(stdout);
+
+        if (tidesdb_txn_put(txn, data->keys[i], data->key_sizes[i], data->values[i],
                             data->value_sizes[i], -1) != 0)
         {
             printf(BOLDRED "Put operation failed\n" RESET);
@@ -136,12 +146,22 @@ void *thread_put(void *arg)
             continue;
         }
 
+        printf("[TRACE] Thread %d: txn_commit %d\n", data->thread_id, i);
+        fflush(stdout);
+
         if (tidesdb_txn_commit(txn) != 0)
         {
             printf(BOLDRED "Failed to commit transaction\n" RESET);
         }
+
+        printf("[TRACE] Thread %d: txn_free %d\n", data->thread_id, i);
+        fflush(stdout);
+
         tidesdb_txn_free(txn);
     }
+
+    printf("[TRACE] Thread %d finished\n", data->thread_id);
+    fflush(stdout);
 
     return NULL;
 }
@@ -153,7 +173,7 @@ void *thread_get(void *arg)
     for (int i = data->start; i < data->end; i++)
     {
         tidesdb_txn_t *txn = NULL;
-        if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
+        if (tidesdb_txn_begin_read(data->tdb, data->cf, &txn) != 0)
         {
             printf(BOLDRED "Failed to begin read transaction\n" RESET);
             continue;
@@ -162,8 +182,7 @@ void *thread_get(void *arg)
         uint8_t *value_out = NULL;
         size_t value_len = 0;
 
-        if (tidesdb_txn_get(txn, BENCH_CF_NAME, data->keys[i], data->key_sizes[i], &value_out,
-                            &value_len) == 0)
+        if (tidesdb_txn_get(txn, data->keys[i], data->key_sizes[i], &value_out, &value_len) == 0)
         {
             free(value_out);
         }
@@ -181,13 +200,13 @@ void *thread_delete(void *arg)
     for (int i = data->start; i < data->end; i++)
     {
         tidesdb_txn_t *txn = NULL;
-        if (tidesdb_txn_begin(data->tdb, &txn) != 0)
+        if (tidesdb_txn_begin(data->tdb, data->cf, &txn) != 0)
         {
             printf(BOLDRED "Failed to begin transaction\n" RESET);
             continue;
         }
 
-        if (tidesdb_txn_delete(txn, BENCH_CF_NAME, data->keys[i], data->key_sizes[i]) != 0)
+        if (tidesdb_txn_delete(txn, data->keys[i], data->key_sizes[i]) != 0)
         {
             printf(BOLDRED "Delete operation failed\n" RESET);
             tidesdb_txn_free(txn);
@@ -208,14 +227,14 @@ void *thread_iter_forward(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
+    if (tidesdb_txn_begin_read(data->tdb, data->cf, &txn) != 0)
     {
         printf(BOLDRED "Failed to begin read transaction\n" RESET);
         return NULL;
     }
 
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, BENCH_CF_NAME, &iter) != 0)
+    if (tidesdb_iter_new(txn, &iter) != 0)
     {
         printf(BOLDRED "Failed to create iterator\n" RESET);
         tidesdb_txn_free(txn);
@@ -241,14 +260,14 @@ void *thread_iter_backward(void *arg)
     thread_data_t *data = (thread_data_t *)arg;
 
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
+    if (tidesdb_txn_begin_read(data->tdb, data->cf, &txn) != 0)
     {
         printf(BOLDRED "Failed to begin read transaction\n" RESET);
         return NULL;
     }
 
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, BENCH_CF_NAME, &iter) != 0)
+    if (tidesdb_iter_new(txn, &iter) != 0)
     {
         printf(BOLDRED "Failed to create iterator\n" RESET);
         tidesdb_txn_free(txn);
@@ -275,7 +294,7 @@ void *thread_iter_seek(void *arg)
 
     tidesdb_txn_t *txn = NULL;
 
-    if (tidesdb_txn_begin_read(data->tdb, &txn) != 0)
+    if (tidesdb_txn_begin_read(data->tdb, data->cf, &txn) != 0)
     {
         printf(BOLDRED "[Thread %d] Failed to begin transaction\n" RESET, data->thread_id);
         return NULL;
@@ -289,7 +308,7 @@ void *thread_iter_seek(void *arg)
     {
         /* create a new iterator for each seek (more realistic benchmark) */
         tidesdb_iter_t *iter = NULL;
-        if (tidesdb_iter_new(txn, BENCH_CF_NAME, &iter) != 0)
+        if (tidesdb_iter_new(txn, &iter) != 0)
         {
             continue;
         }
@@ -329,7 +348,11 @@ int main()
     printf("  Value Size: %d bytes\n", BENCH_VALUE_SIZE);
     printf("  Threads: %d\n", BENCH_NUM_THREADS);
     printf("  Key Pattern: %s\n", BENCH_KEY_PATTERN);
-    printf("  Debug Logging: %s\n", BENCH_DEBUG ? "enabled" : "disabled");
+#ifdef TDB_DEBUG
+    printf("  Debug Logging: %s\n", "enabled");
+#else
+    printf("  Debug Logging: %s\n", "disabled");
+#endif
     printf("\n" BOLDWHITE "Column Family Configuration:\n" RESET);
     printf("  Memtable Flush Size: %zu bytes (%.2f MB)\n", (size_t)BENCH_MEMTABLE_FLUSH_SIZE,
            (double)BENCH_MEMTABLE_FLUSH_SIZE / (1024.0 * 1024.0));
@@ -487,12 +510,31 @@ int main()
         return 1;
     }
 
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(tdb, BENCH_CF_NAME);
+    if (cf == NULL)
+    {
+        printf(BOLDRED "Failed to get column family\n" RESET);
+
+        for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
+        {
+            free(keys[i]);
+            free(values[i]);
+        }
+        free(keys);
+        free(values);
+        free(key_sizes);
+        free(value_sizes);
+        tidesdb_close(tdb);
+        return 1;
+    }
+
     pthread_t threads[BENCH_NUM_THREADS];
     thread_data_t thread_data[BENCH_NUM_THREADS];
 
     for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         thread_data[i].tdb = tdb;
+        thread_data[i].cf = cf;
         thread_data[i].keys = keys;
         thread_data[i].values = values;
         thread_data[i].key_sizes = key_sizes;

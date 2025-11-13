@@ -23,6 +23,10 @@
 /* forward declarations */
 typedef struct skip_list_node_t skip_list_node_t;
 typedef struct skip_list_t skip_list_t;
+typedef struct skip_list_arena_t skip_list_arena_t;
+
+/* inline threshold -- keys/values smaller than this are stored inline */
+#define SKIP_LIST_INLINE_THRESHOLD 24
 
 /* comparator function type for custom key comparison
  * @param key1 the first key
@@ -35,31 +39,65 @@ typedef struct skip_list_t skip_list_t;
 typedef int (*skip_list_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                        size_t key2_size, void *ctx);
 
+/*
+ * skip_list_arena_t
+ * memory pool for efficient node allocation
+ * reduces malloc overhead and improves cache locality
+ * @param buffer the memory buffer
+ * @param capacity total capacity of the buffer
+ * @param offset current allocation offset (atomic for thread-safety)
+ * @param next pointer to next arena in chain
+ */
+struct skip_list_arena_t
+{
+    uint8_t *buffer;
+    size_t capacity;
+    _Atomic(size_t) offset;
+    skip_list_arena_t *next;
+};
+
 /* macro to access backward pointers at a specific level */
-#define BACKWARD_PTR(node, level, max_level) (node->forward[max_level + level])
+#define BACKWARD_PTR(node, lvl, max_level) (node->forward[(node)->level + (lvl)])
 
 /*
  * skip_list_node_t
  * immutable node structure; once created, contents never change
  * nodes are reference counted for safe memory reclamation
- * @param key the key for the node
+ * optimized with inline storage for small keys/values
  * @param key_size the key size
- * @param value the value for the node
  * @param value_size the value size
  * @param ttl an expiration time for the node (-1 if no expiration)
  * @param deleted flag indicating if the node is deleted (1 = deleted, 0 = valid)
+ * @param key_is_inline flag indicating if key is stored inline (1) or as pointer (0)
+ * @param value_is_inline flag indicating if value is stored inline (1) or as pointer (0)
+ * @param arena_allocated flag indicating if node was allocated from arena (1) or malloc (0)
+ * @param level actual level of this node (for backward pointer calculation)
  * @param ref_count reference count for safe memory reclamation
+ * @param key_data union for inline or pointer storage of key
+ * @param value_data union for inline or pointer storage of value
  * @param forward the forward pointers for the node (atomic for COW updates)
  */
 struct skip_list_node_t
 {
-    uint8_t *key;
     size_t key_size;
-    uint8_t *value;
     size_t value_size;
     time_t ttl;
     uint8_t deleted;
+    uint8_t key_is_inline;
+    uint8_t value_is_inline;
+    uint8_t arena_allocated; /* 1 if allocated from arena, 0 if from malloc */
+    int level;               /* actual level of this node (for backward pointer calculation) */
     ATOMIC_ALIGN(8) _Atomic(uint64_t) ref_count;
+    union
+    {
+        uint8_t *key_ptr;
+        uint8_t key_inline[SKIP_LIST_INLINE_THRESHOLD];
+    } key_data;
+    union
+    {
+        uint8_t *value_ptr;
+        uint8_t value_inline[SKIP_LIST_INLINE_THRESHOLD];
+    } value_data;
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4200)
@@ -79,10 +117,21 @@ struct skip_list_node_t
  * @param header the header node of the skip list (atomic pointer)
  * @param tail the tail node of the skip list (atomic pointer)
  * @param total_size the total size in bytes of kv pairs in the skip list
- * @param write_lock mutex for exclusive write access (only writers block writers)
+ * @param global_epoch current epoch for RCU memory reclamation
+ * @param retired_head list of retired nodes awaiting reclamation
+ * @param retired_lock mutex protecting retired nodes list
  * @param comparator custom key comparator function
  * @param comparator_ctx context pointer passed to comparator function
+ * @param arena memory pool for efficient node allocation
  */
+/* retired node for epoch-based RCU */
+typedef struct retired_node_t
+{
+    skip_list_node_t *node;
+    uint64_t retire_epoch;
+    struct retired_node_t *next;
+} retired_node_t;
+
 typedef struct skip_list_t
 {
     _Atomic(int) level;
@@ -91,9 +140,15 @@ typedef struct skip_list_t
     _Atomic(skip_list_node_t *) header;
     _Atomic(skip_list_node_t *) tail;
     _Atomic(size_t) total_size;
-    pthread_mutex_t write_lock;
     skip_list_comparator_fn comparator;
     void *comparator_ctx;
+    skip_list_arena_t *arena;
+
+    /* epoch-based RCU for safe memory reclamation */
+    /* uses time-based grace period: nodes retired at epoch N are freed at epoch N+10 */
+    _Atomic(uint64_t) global_epoch; /* current epoch */
+    retired_node_t *retired_head;   /* list of retired nodes */
+    pthread_mutex_t retired_lock;   /* protects retired list */
 } skip_list_t;
 
 /*
@@ -234,7 +289,7 @@ int skip_list_random_level(skip_list_t *list);
 /*
  * skip_list_compare_keys
  * compares two keys using the skip list's comparator
- * @param list the skip list (contains the comparator)
+ * @param list the skip list
  * @param key1 the first key
  * @param key1_size the first key size
  * @param key2 the second key
@@ -358,7 +413,7 @@ skip_list_t *skip_list_copy(skip_list_t *list);
 /*
  * skip_list_check_and_update_ttl
  * checks if a node has expired
- * in COW model, expired nodes are treated as deleted during traversal
+ * in copy-on-write model, expired nodes are treated as deleted during traversal
  * @param list the skip list
  * @param node the node to check
  * @return 0 if the node has not expired, 1 if the node has expired
@@ -435,8 +490,8 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor);
  * skip_list_get_min_key
  * lock-free read operation
  * @param list the skip list
- * @param key Pointer to store the key (will be allocated)
- * @param key_size Pointer to store the key size
+ * @param key pointer to store the key (will be allocated)
+ * @param key_size pointer to store the key size
  * @return 0 on success, -1 on failure
  */
 int skip_list_get_min_key(skip_list_t *list, uint8_t **key, size_t *key_size);

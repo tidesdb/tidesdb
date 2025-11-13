@@ -23,14 +23,44 @@
 
 /* more time equals more results, but remember to take breaks to refresh your mind. */
 
-#define MAX_FILE_PATH_LENGTH             1024 /* max file path length for block manager file(s) */
-#define BLOCK_MANAGER_MAGIC              0x544442 /* TDB in hex */
-#define BLOCK_MANAGER_VERSION            1
-#define BLOCK_MANAGER_SHA1_DIGEST_LENGTH 20
-#define BLOCK_MANAGER_HEADER_SIZE        12 /* 3 + 1 + 4 + 4 (padding) */
-#define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
-    (sizeof(uint64_t) + BLOCK_MANAGER_SHA1_DIGEST_LENGTH + sizeof(uint64_t))
-#define MAX_INLINE_BLOCK_SIZE     (32 * 1024) /* 32KB inline, larger blocks are overflowed */
+#define MAX_FILE_PATH_LENGTH     1024     /* max file path length for block manager file(s) */
+#define BLOCK_MANAGER_MAGIC      0x544442 /* TDB in hex */
+#define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF /* 3-byte mask for magic number validation */
+#define BLOCK_MANAGER_VERSION    3
+
+/* header field sizes */
+/* magic number size in bytes */
+#define BLOCK_MANAGER_MAGIC_SIZE 3
+/* version field size in bytes */
+#define BLOCK_MANAGER_VERSION_SIZE 1
+/* block_size field size in bytes */
+#define BLOCK_MANAGER_BLOCK_SIZE_SIZE 4
+/* padding field size in bytes */
+#define BLOCK_MANAGER_PADDING_SIZE 4
+/* total: 3 + 1 + 4 + 4 */
+
+#define BLOCK_MANAGER_HEADER_SIZE 12
+
+/* block field sizes */
+/* block size field (uint64_t) */
+#define BLOCK_MANAGER_SIZE_FIELD_SIZE 8
+/* xxHash64 = 8 bytes */
+#define BLOCK_MANAGER_CHECKSUM_LENGTH 8
+
+/* overflow offset field (uint64_t) */
+#define BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE 8
+#define BLOCK_MANAGER_BLOCK_HEADER_SIZE                              \
+    (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH + \
+     BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
+/* 32KB inline, larger blocks are overflowed */
+#define MAX_INLINE_BLOCK_SIZE (32 * 1024)
+/* extra bytes for headers in stack buffers */
+#define BLOCK_MANAGER_STACK_BUFFER_OVERHEAD 64
+/* size of cache key buffer for offset-to-string conversion */
+#define BLOCK_MANAGER_CACHE_KEY_SIZE 32
+
+/* default file permissions (rw-r--r--) */
+#define BLOCK_MANAGER_FILE_MODE   0644
 #define MIN_CACHE_ENTRIES         10
 #define MAX_REASONABLE_BLOCK_SIZE 10ULL << 30
 
@@ -40,6 +70,14 @@ typedef enum
     BLOCK_MANAGER_SYNC_FULL,
 } block_manager_sync_mode_t;
 
+/**
+ * block_manager_cache_t
+ * block manager cache struct
+ * used for block manager caching
+ * @param max_size max size of cache in bytes
+ * @param current_size current size of cache in bytes
+ * @param lru_cache the LRU cache
+ */
 typedef struct
 {
     uint32_t max_size;
@@ -54,17 +92,18 @@ typedef struct
  * @param fd the file descriptor the block manager is managing
  * @param file_path the path of the file
  * @param sync_mode sync mode for this block manager
- * @param write_mutex mutex for write operations only
  * @param block_size the default block size for this block manager
  * @param cache_size size of lru cache of blocks in bytes
+ * @param current_file_size track file size in memory to avoid syscalls
+ * @param block_manager_cache the block manager cache
  */
 typedef struct
 {
     int fd;
     char file_path[MAX_FILE_PATH_LENGTH];
     block_manager_sync_mode_t sync_mode;
-    pthread_mutex_t write_mutex;
     uint32_t block_size;
+    uint64_t current_file_size;
     block_manager_cache_t *block_manager_cache;
 } block_manager_t;
 
@@ -137,8 +176,16 @@ int block_manager_close(block_manager_t *bm);
 block_manager_block_t *block_manager_block_create(uint64_t size, void *data);
 
 /**
+ * block_manager_block_create_from_buffer
+ * creates a new block taking ownership of buffer (no copy)
+ * @param size the size of the data in block
+ * @param data the data buffer (will be freed with block)
+ * @return a new block
+ */
+block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, void *data);
+
+/**
  * block_manager_block_write
- * writes a block to a file
  * @param bm the block manager to write the block to
  * @param block the block to write
  * @return block offset if successful, -1 if not

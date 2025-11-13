@@ -100,19 +100,12 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
         case COMPRESS_LZ4:
         case COMPRESS_ZSTD:
         {
-            /* validate we have at least sizeof(size_t) bytes for the header */
             if (data_size < sizeof(size_t))
             {
                 return NULL;
             }
 
             memcpy(decompressed_size, data, sizeof(size_t));
-
-            const size_t MAX_DECOMPRESSED_SIZE = 1ULL << 30; /* 1GB */
-            if (*decompressed_size == 0 || *decompressed_size > MAX_DECOMPRESSED_SIZE)
-            {
-                return NULL;
-            }
 
             decompressed_data = malloc(*decompressed_size);
             if (!decompressed_data) return NULL;

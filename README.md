@@ -2,18 +2,26 @@
     <h1 align="left"><img width="128" src="artwork/tidesdb-logo-v0.1.png"></h1>
 </div>
 
-TidesDB is a fast and efficient key value storage engine library written in C.
-The underlying data structure is based on a log-structured merge-tree (LSM-tree).
+TidesDB is a fast and efficient key value storage engine library written in C. The underlying data structure is based on a log-structured merge-tree (LSM-tree).
 
 It is not a full-featured database, but rather a library that can be used to build a database atop of or used as a standalone key-value/column store.
 
 [![Linux Build Status](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml/badge.svg)](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml)
 
 ## Features
-- ACID transactions that are atomic, consistent, isolated, and durable. Transactions support multiple operations across column families. Point reads use READ COMMITTED isolation (see latest committed data), while iterators use snapshot isolation (consistent point-in-time view via reference counting). Writers are serialized per column family to ensure atomicity, while copy-on-write (COW) provides consistency for concurrent readers.
-- Writers don't block readers. Readers never block other readers. Background operations will not affect active transactions.
+- Lock-free skip list memtables with atomic operations and RCU (Read-Copy-Update) memory management for exceptional read performance
+- True lock-free reads - readers never acquire locks, never block, and scale linearly with CPU cores
+- Single-writer serialization per column family using lightweight mutex, ensuring write atomicity without complex locking
+- RCU-based memory reclamation with epoch-based garbage collection prevents use-after-free while maintaining lock-free reads
+- Atomic pointer operations with acquire/release memory ordering for correct synchronization without locks
+- Writers don't block readers. Readers never block other readers or writers. Background operations don't affect active transactions.
+- ACID transactions that are atomic, consistent, isolated, and durable. Transactions support multiple operations across column families.
+- Point reads use READ COMMITTED isolation (see latest committed data), while iterators use snapshot isolation (consistent point-in-time view via reference counting).
+- Mark-and-insert update strategy for lock-free consistency - updates mark old nodes as deleted and insert new nodes atomically.
 - Isolated key-value stores. Each column family has its own configuration, memtables, sstables, and write ahead logs.
-- Bidirectional iterators that allow you to iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and sstables. Effective seek operations with O(log n) skip list positioning and succinct trie block index positioning (if enabled) in sstables. Reference counting prevents premature deletion during iteration.
+- Bidirectional iterators that allow you to iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and sstables.
+- Lock-free iteration with reference counting prevents premature deletion during iteration without blocking writers.
+- Effective seek operations with O(log n) skip list positioning and succinct trie block index positioning (if enabled) in sstables.
 - Durability through WAL (write ahead log). Automatic recovery on startup reconstructs memtables from WALs.
 - Optional automatic background compaction when sstable count reaches configured max per column family. You can also trigger manual compactions through the API, parallelized or not.
 - Optional bloom filters to reduce disk reads by checking key existence before reading sstables. Configurable false positive rate.
@@ -29,6 +37,8 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Efficient deletion through tombstone markers. Removed during compactions.
 - Configurable LRU cache for open file handles. Limits system resources while maintaining performance. Set `max_open_file_handles` to control cache size (0 = disabled).
 - Storage engine thread pools for background flush and compaction with configurable thread counts.
+- Arena-based memory allocation for skip list nodes reduces malloc overhead and improves cache locality.
+- Inline storage optimization for small keys/values (≤24 bytes) eliminates pointer indirection and improves performance.
 
 ## Getting Started
 To learn more about TidesDB, check out [What is TidesDB?](https://tidesdb.com/getting-started/what-is-tidesdb/).

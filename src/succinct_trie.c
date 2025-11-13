@@ -30,6 +30,27 @@
 #define BIT_SET(bm, i) ((bm)[(i) >> 3] |= (1u << ((i)&7)))
 #define BIT_GET(bm, i) (((bm)[(i) >> 3] >> ((i)&7)) & 1u)
 
+/* cross-platform popcount */
+#if defined(__GNUC__) || defined(__clang__)
+#define POPCOUNT64(x) __builtin_popcountll(x)
+#define POPCOUNT32(x) __builtin_popcount(x)
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#define POPCOUNT64(x) __popcnt64(x)
+#define POPCOUNT32(x) __popcnt(x)
+#else
+/* fallback popcount */
+static inline int popcount64_fallback(uint64_t x)
+{
+    x = x - ((x >> 1) & 0x5555555555555555ULL);
+    x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
+    return (int)((x * 0x0101010101010101ULL) >> 56);
+}
+#define POPCOUNT64(x) popcount64_fallback(x)
+#define POPCOUNT32(x) popcount64_fallback(x)
+#endif
+
 /* built-in comparator functions */
 int succinct_trie_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                     size_t key2_size, void *ctx)
@@ -76,22 +97,47 @@ static size_t compute_lcp(const uint8_t *k1, size_t len1, const uint8_t *k2, siz
 
 /*
  * rank1
- * count 1s up to position i (exclusive)
+ * count 1s up to position i (exclusive) - optimized with popcount
  * @param bm the bitvector
  * @param i the position
  * @return the number of 1s up to position i (exclusive)
  */
 static uint32_t rank1(const uint8_t *bm, uint32_t i)
 {
+    if (i == 0) return 0;
+
     uint32_t cnt = 0;
-    for (uint32_t j = 0; j < i; j++)
-        if (BIT_GET(bm, j)) cnt++;
+    uint32_t full_bytes = i / 8;
+    uint32_t remaining_bits = i % 8;
+
+    /* process full 64-bit words */
+    uint32_t full_words = full_bytes / 8;
+    const uint64_t *words = (const uint64_t *)bm;
+    for (uint32_t w = 0; w < full_words; w++)
+    {
+        cnt += POPCOUNT64(words[w]);
+    }
+
+    /* process remaining full bytes */
+    uint32_t byte_offset = full_words * 8;
+    for (uint32_t b = byte_offset; b < full_bytes; b++)
+    {
+        cnt += POPCOUNT32(bm[b]);
+    }
+
+    /* process remaining bits in last byte */
+    if (remaining_bits > 0)
+    {
+        uint8_t mask = (1u << remaining_bits) - 1;
+        cnt += POPCOUNT32(bm[full_bytes] & mask);
+    }
+
     return cnt;
 }
 
 /*
  * select0
- * find position of k-th 0 (1-indexed)
+ * find position of k-th 0 (1-indexed) - optimized with word-level scanning
  * @param bm the bitvector
  * @param max_bits the maximum number of bits
  * @param k the k-th 0 to find
@@ -100,15 +146,36 @@ static uint32_t rank1(const uint8_t *bm, uint32_t i)
 static uint32_t select0(const uint8_t *bm, uint32_t max_bits, uint32_t k)
 {
     if (k == 0) return max_bits;
+
     uint32_t cnt = 0;
-    for (uint32_t i = 0; i < max_bits; i++)
+    uint32_t max_bytes = (max_bits + 7) / 8;
+
+    /* scan bytes */
+    for (uint32_t byte_idx = 0; byte_idx < max_bytes; byte_idx++)
     {
-        if (!BIT_GET(bm, i))
+        uint8_t byte_val = bm[byte_idx];
+        uint32_t zeros_in_byte = 8 - POPCOUNT32(byte_val);
+
+        /* check if k-th zero is in this byte */
+        if (cnt + zeros_in_byte >= k)
         {
-            cnt++;
-            if (cnt == k) return i;
+            /* scan bits in this byte */
+            uint32_t bit_offset = byte_idx * 8;
+            for (uint32_t bit = 0; bit < 8 && bit_offset + bit < max_bits; bit++)
+            {
+                if (!(byte_val & (1u << bit)))
+                {
+                    cnt++;
+                    if (cnt == k) return bit_offset + bit;
+                }
+            }
+        }
+        else
+        {
+            cnt += zeros_in_byte;
         }
     }
+
     return max_bits;
 }
 
@@ -281,7 +348,7 @@ int succinct_trie_builder_add(succinct_trie_builder_t *builder, const uint8_t *k
     /* create new nodes for the suffix after LCP */
     for (size_t i = lcp; i < key_len; i++)
     {
-        /* reisze path stack if needed */
+        /* resize path stack if needed */
         if (i >= builder->path_capacity)
         {
             size_t new_cap = builder->path_capacity * 2;
@@ -604,7 +671,6 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
     }
 
     free(queue);
-    /* dont free node_id_to_louds yet -- we need it to reorder terminal bits */
     free(labels);
     free(parents);
     free(child_ids);
@@ -711,7 +777,6 @@ void succinct_trie_builder_free(succinct_trie_builder_t *builder)
 {
     if (!builder) return;
 
-    /* close and delete block managers */
     if (builder->labels_bm)
     {
         block_manager_t *bm = (block_manager_t *)builder->labels_bm;
@@ -866,13 +931,32 @@ uint8_t *succinct_trie_serialize(const succinct_trie_t *trie, size_t *out_size)
     if (!buffer) return NULL;
     uint8_t *ptr = buffer;
 
-    memcpy(ptr, &trie->louds_bits, sizeof(uint32_t));
+    /* write louds_bits - little-endian */
+    ptr[0] = (uint8_t)(trie->louds_bits & 0xFF);
+    ptr[1] = (uint8_t)((trie->louds_bits >> 8) & 0xFF);
+    ptr[2] = (uint8_t)((trie->louds_bits >> 16) & 0xFF);
+    ptr[3] = (uint8_t)((trie->louds_bits >> 24) & 0xFF);
     ptr += sizeof(uint32_t);
-    memcpy(ptr, &trie->n_edges, sizeof(uint32_t));
+
+    /* write n_edges - little-endian */
+    ptr[0] = (uint8_t)(trie->n_edges & 0xFF);
+    ptr[1] = (uint8_t)((trie->n_edges >> 8) & 0xFF);
+    ptr[2] = (uint8_t)((trie->n_edges >> 16) & 0xFF);
+    ptr[3] = (uint8_t)((trie->n_edges >> 24) & 0xFF);
     ptr += sizeof(uint32_t);
-    memcpy(ptr, &trie->n_nodes, sizeof(uint32_t));
+
+    /* write n_nodes - little-endian */
+    ptr[0] = (uint8_t)(trie->n_nodes & 0xFF);
+    ptr[1] = (uint8_t)((trie->n_nodes >> 8) & 0xFF);
+    ptr[2] = (uint8_t)((trie->n_nodes >> 16) & 0xFF);
+    ptr[3] = (uint8_t)((trie->n_nodes >> 24) & 0xFF);
     ptr += sizeof(uint32_t);
-    memcpy(ptr, &trie->n_vals, sizeof(uint32_t));
+
+    /* write n_vals - little-endian */
+    ptr[0] = (uint8_t)(trie->n_vals & 0xFF);
+    ptr[1] = (uint8_t)((trie->n_vals >> 8) & 0xFF);
+    ptr[2] = (uint8_t)((trie->n_vals >> 16) & 0xFF);
+    ptr[3] = (uint8_t)((trie->n_vals >> 24) & 0xFF);
     ptr += sizeof(uint32_t);
 
     memcpy(ptr, trie->louds, louds_bytes);
@@ -882,8 +966,17 @@ uint8_t *succinct_trie_serialize(const succinct_trie_t *trie, size_t *out_size)
     {
         memcpy(ptr, trie->labels, trie->n_edges);
         ptr += trie->n_edges;
-        memcpy(ptr, trie->edge_child, trie->n_edges * sizeof(uint32_t));
-        ptr += trie->n_edges * sizeof(uint32_t);
+
+        /* write edge_child array - little-endian */
+        for (uint32_t i = 0; i < trie->n_edges; i++)
+        {
+            uint32_t val = trie->edge_child[i];
+            ptr[0] = (uint8_t)(val & 0xFF);
+            ptr[1] = (uint8_t)((val >> 8) & 0xFF);
+            ptr[2] = (uint8_t)((val >> 16) & 0xFF);
+            ptr[3] = (uint8_t)((val >> 24) & 0xFF);
+            ptr += sizeof(uint32_t);
+        }
     }
 
     memcpy(ptr, trie->term, term_bytes);
@@ -891,7 +984,21 @@ uint8_t *succinct_trie_serialize(const succinct_trie_t *trie, size_t *out_size)
 
     if (trie->n_vals > 0)
     {
-        memcpy(ptr, trie->vals, trie->n_vals * sizeof(int64_t));
+        /* write vals array - little-endian */
+        for (uint32_t i = 0; i < trie->n_vals; i++)
+        {
+            int64_t val = trie->vals[i];
+            uint64_t uval = (uint64_t)val;
+            ptr[0] = (uint8_t)(uval & 0xFF);
+            ptr[1] = (uint8_t)((uval >> 8) & 0xFF);
+            ptr[2] = (uint8_t)((uval >> 16) & 0xFF);
+            ptr[3] = (uint8_t)((uval >> 24) & 0xFF);
+            ptr[4] = (uint8_t)((uval >> 32) & 0xFF);
+            ptr[5] = (uint8_t)((uval >> 40) & 0xFF);
+            ptr[6] = (uint8_t)((uval >> 48) & 0xFF);
+            ptr[7] = (uint8_t)((uval >> 56) & 0xFF);
+            ptr += sizeof(int64_t);
+        }
     }
 
     return buffer;
@@ -905,13 +1012,24 @@ succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size
     succinct_trie_t *trie = calloc(1, sizeof(succinct_trie_t));
     if (!trie) return NULL;
 
-    memcpy(&trie->louds_bits, ptr, sizeof(uint32_t));
+    /* read louds_bits - little-endian */
+    trie->louds_bits = ((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
+                       ((uint32_t)ptr[3] << 24);
     ptr += sizeof(uint32_t);
-    memcpy(&trie->n_edges, ptr, sizeof(uint32_t));
+
+    /* read n_edges - little-endian */
+    trie->n_edges = ((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
+                    ((uint32_t)ptr[3] << 24);
     ptr += sizeof(uint32_t);
-    memcpy(&trie->n_nodes, ptr, sizeof(uint32_t));
+
+    /* read n_nodes - little-endian */
+    trie->n_nodes = ((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
+                    ((uint32_t)ptr[3] << 24);
     ptr += sizeof(uint32_t);
-    memcpy(&trie->n_vals, ptr, sizeof(uint32_t));
+
+    /* read n_vals - little-endian */
+    trie->n_vals = ((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
+                   ((uint32_t)ptr[3] << 24);
     ptr += sizeof(uint32_t);
 
     uint32_t louds_bytes = (trie->louds_bits + 7) / 8;
@@ -946,8 +1064,14 @@ succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size
             free(trie);
             return NULL;
         }
-        memcpy(trie->edge_child, ptr, trie->n_edges * sizeof(uint32_t));
-        ptr += trie->n_edges * sizeof(uint32_t);
+
+        /* read edge_child array - little-endian */
+        for (uint32_t i = 0; i < trie->n_edges; i++)
+        {
+            trie->edge_child[i] = ((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) |
+                                  ((uint32_t)ptr[2] << 16) | ((uint32_t)ptr[3] << 24);
+            ptr += sizeof(uint32_t);
+        }
     }
     else
     {
@@ -977,7 +1101,17 @@ succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size
             free(trie);
             return NULL;
         }
-        memcpy(trie->vals, ptr, trie->n_vals * sizeof(int64_t));
+
+        /* read vals array - little-endian */
+        for (uint32_t i = 0; i < trie->n_vals; i++)
+        {
+            uint64_t uval = ((uint64_t)ptr[0]) | ((uint64_t)ptr[1] << 8) |
+                            ((uint64_t)ptr[2] << 16) | ((uint64_t)ptr[3] << 24) |
+                            ((uint64_t)ptr[4] << 32) | ((uint64_t)ptr[5] << 40) |
+                            ((uint64_t)ptr[6] << 48) | ((uint64_t)ptr[7] << 56);
+            trie->vals[i] = (int64_t)uval;
+            ptr += sizeof(int64_t);
+        }
     }
     else
     {

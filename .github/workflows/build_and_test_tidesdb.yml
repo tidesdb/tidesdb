@@ -180,10 +180,9 @@ jobs:
           cd build
           ctest --output-on-failure --build-config Release
 
-  # Create portable test database on Linux
   create-portable-database:
     runs-on: ubuntu-latest
-    name: Create Portable Test Database
+    name: Portability
     
     steps:
       - name: Checkout
@@ -196,7 +195,7 @@ jobs:
 
       - name: Build TidesDB
         run: |
-          cmake -S . -B build
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release
 
       - name: Create test database with WAL and SSTables
@@ -351,7 +350,7 @@ jobs:
 
       - name: Configure CMake (Linux/macOS)
         if: runner.os != 'Windows'
-        run: cmake -S . -B build
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Configure CMake (Windows MSVC)
         if: matrix.compiler == 'msvc'

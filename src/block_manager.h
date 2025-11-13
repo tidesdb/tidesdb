@@ -103,7 +103,7 @@ typedef struct
     char file_path[MAX_FILE_PATH_LENGTH];
     block_manager_sync_mode_t sync_mode;
     uint32_t block_size;
-    uint64_t current_file_size;
+    _Atomic uint64_t current_file_size;
     block_manager_cache_t *block_manager_cache;
 } block_manager_t;
 

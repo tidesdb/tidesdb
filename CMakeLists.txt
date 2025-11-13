@@ -4,6 +4,9 @@ project(tidesdb C)
 set(CMAKE_C_STANDARD 11)
 set(PROJECT_VERSION 3.0.0)
 
+# Define version as compile definition
+add_compile_definitions(TIDESDB_VERSION="${PROJECT_VERSION}")
+
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
@@ -128,10 +131,10 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # benchmark configuration variables (can be overridden at build time with -D flags)
     if(NOT DEFINED BENCH_NUM_OPERATIONS)
-        set(BENCH_NUM_OPERATIONS 10)
+        set(BENCH_NUM_OPERATIONS 100000)
     endif()
     if(NOT DEFINED BENCH_NUM_SEEK_OPS)
-        set(BENCH_NUM_SEEK_OPS 10)
+        set(BENCH_NUM_SEEK_OPS 100000)
     endif()
     if(NOT DEFINED BENCH_KEY_SIZE)
         set(BENCH_KEY_SIZE 16)
@@ -157,7 +160,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # column family configuration variables for benchmark
     if(NOT DEFINED BENCH_MEMTABLE_FLUSH_SIZE)
-        set(BENCH_MEMTABLE_FLUSH_SIZE 67108864)
+        set(BENCH_MEMTABLE_FLUSH_SIZE 67108864/4)
     endif()
     if(NOT DEFINED BENCH_MAX_SSTABLES_BEFORE_COMPACTION)
         set(BENCH_MAX_SSTABLES_BEFORE_COMPACTION 128)

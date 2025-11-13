@@ -4,8 +4,10 @@ project(tidesdb C)
 set(CMAKE_C_STANDARD 11)
 set(PROJECT_VERSION 3.0.0)
 
-# Define version as compile definition
-add_compile_definitions(TIDESDB_VERSION="${PROJECT_VERSION}")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h"
+)
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
@@ -125,6 +127,7 @@ install(TARGETS tidesdb
 
 install(DIRECTORY src/ DESTINATION include/tidesdb FILES_MATCHING PATTERN "*.h")
 install(FILES external/ini.h external/xxhash.h DESTINATION include/tidesdb)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h" DESTINATION include/tidesdb)
 
 if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     enable_testing()

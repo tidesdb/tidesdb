@@ -1,0 +1,6 @@
+#ifndef TIDESDB_VERSION_H
+#define TIDESDB_VERSION_H
+
+#define TIDESDB_VERSION "@PROJECT_VERSION@"
+
+#endif

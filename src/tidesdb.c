@@ -6554,6 +6554,10 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
             {
                 if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0) break;
             }
+
+            /* check again after advancing cursor to prevent reading metadata blocks */
+            if (iter->sstable_blocks_read[i] >= sst->num_entries) break;
+
             iter->sstable_blocks_read[i]++;
 
             block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[i]);
@@ -6766,6 +6770,10 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
             {
                 if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0) break;
             }
+
+            /* check again after advancing cursor to prevent reading metadata blocks */
+            if (iter->sstable_blocks_read[i] >= sst->num_entries) break;
+
             iter->sstable_blocks_read[i]++;
 
             block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[i]);

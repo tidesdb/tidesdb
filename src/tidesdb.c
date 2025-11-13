@@ -2521,7 +2521,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
     /* submit any recovered memtables to flush pool and wait for completion */
     pthread_mutex_lock(&cf->flush_lock);
-    int num_recovered_to_flush = queue_size(cf->immutable_memtables);
+    int num_recovered_to_flush = (int)queue_size(cf->immutable_memtables);
     tidesdb_memtable_t *recovered_mt;
     while ((recovered_mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
     {
@@ -2546,7 +2546,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         {
             usleep(100000); /* 100ms */
             pthread_mutex_lock(&cf->flush_lock);
-            int current_size = queue_size(cf->immutable_memtables);
+            int current_size = (int)queue_size(cf->immutable_memtables);
             pthread_mutex_unlock(&cf->flush_lock);
 
             if (current_size == 0)

@@ -504,13 +504,23 @@ jobs:
           EOF
           
           if [ "$RUNNER_OS" == "Windows" ]; then
+            # Create a standalone build directory for the verify test
+            mkdir -p verify_test
+            cd verify_test
+            
+            # Copy the source file
+            cp ../verify_portable_db.c .
+            
             # Create CMakeLists.txt for the verify test
-            cat > CMakeLists_verify.txt << 'CMAKEEOF'
+            cat > CMakeLists.txt << 'CMAKEEOF'
           cmake_minimum_required(VERSION 3.10)
           project(verify_portable_db C)
           
+          # Find the tidesdb library from parent build directory
+          link_directories(${CMAKE_CURRENT_SOURCE_DIR}/../Release ${CMAKE_CURRENT_SOURCE_DIR}/..)
+          
           add_executable(verify_portable_db verify_portable_db.c)
-          target_include_directories(verify_portable_db PRIVATE ../src ../external)
+          target_include_directories(verify_portable_db PRIVATE ../../src ../../external)
           target_link_libraries(verify_portable_db PRIVATE tidesdb)
           CMAKEEOF
             
@@ -518,17 +528,21 @@ jobs:
             if [ "${{ matrix.compiler }}" == "mingw" ]; then
               cmake -S . -B verify_build -G "MinGW Makefiles" \
                 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
-                -DVCPKG_TARGET_TRIPLET=x64-windows \
-                -DCMAKE_PREFIX_PATH="$(pwd)"
+                -DVCPKG_TARGET_TRIPLET=x64-windows
               cmake --build verify_build
+              # Copy DLLs to verify_build directory
+              cp ../Release/*.dll verify_build/ 2>/dev/null || true
+              cp ../*.dll verify_build/ 2>/dev/null || true
               ./verify_build/verify_portable_db.exe
             else
               cmake -S . -B verify_build -A x64 \
-                -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
-                -DCMAKE_PREFIX_PATH="$(pwd)"
+                -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
               cmake --build verify_build --config Release
+              # Copy DLLs to verify_build/Release directory
+              cp ../Release/*.dll verify_build/Release/ 2>/dev/null || true
               ./verify_build/Release/verify_portable_db.exe
             fi
+            cd ..
           else
             if [ "$RUNNER_OS" == "macOS" ]; then
               # macOS needs homebrew library paths

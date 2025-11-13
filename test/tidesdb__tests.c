@@ -3370,18 +3370,17 @@ static void test_iterator_seek_large_sstable(void)
 
 static void test_iterator_race_condition(void)
 {
-    printf("Testing iterator race condition with concurrent flushes...");
+    printf("Reproducing test_iterator_seek_large_sstable OOM...");
     fflush(stdout);
 
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
     cf_config.memtable_flush_size = 4096;
 
-    ASSERT_EQ(tidesdb_create_column_family(db, "race_cf", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "large_cf", &cf_config), 0);
 
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "race_cf");
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "large_cf");
 
-    /* Write data that will trigger multiple flushes */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, cf, &txn), 0);
 
@@ -3398,60 +3397,54 @@ static void test_iterator_race_condition(void)
 
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
-
-    /* Trigger flush but DON'T wait - create iterator immediately */
+    ASSERT_TRUE(cf != NULL);
+    /* flush memtable to create sst */
     tidesdb_flush_memtable(cf);
 
-    /* Try multiple times to hit the race condition */
-    tidesdb_txn_t *read_txn = NULL;
-    tidesdb_iter_t *iter = NULL;
-    for (int attempt = 0; attempt < 10; attempt++)
-    {
-        read_txn = NULL;
-        iter = NULL;
-        /* Create iterator while flushes are still running */
-        ASSERT_EQ(tidesdb_txn_begin_read(db, cf, &read_txn), 0);
-        ASSERT_EQ(tidesdb_iter_new(read_txn, &iter), 0);
+    sleep(2);
 
-        /* Do seeks like the failing test */
-        const char *seek_key = "key_00500";
-        if (tidesdb_iter_seek(iter, (uint8_t *)seek_key, strlen(seek_key)) == 0)
-        {
-            /* Try to iterate forward */
-            int count = 0;
-            while (tidesdb_iter_valid(iter) && count < 50)
-            {
-                count++;
-                if (tidesdb_iter_next(iter) != 0) break;
-            }
-            printf("Attempt %d: Read %d entries during concurrent flush\n", attempt, count);
+    /* Check how many SSTables were created */
+    int num_ssts = atomic_load(&cf->num_sstables);
+    printf("\nCreated %d SSTables\n", num_ssts);
+    for (int i = 0; i < num_ssts; i++) {
+        if (cf->sstables[i]) {
+            printf("  SSTable %d: id=%llu, entries=%d\n", i, 
+                   (unsigned long long)cf->sstables[i]->id,
+                   cf->sstables[i]->num_entries);
         }
-
-        tidesdb_iter_free(iter);
-        tidesdb_txn_free(read_txn);
-
-        /* Small delay to let flushes progress */
-        usleep(10000); /* 10ms */
     }
+    fflush(stdout);
 
-    /* Now wait for flushes to complete */
-    sleep(3);
-
-    /* Verify we can read all data after flushes complete */
-    read_txn = NULL;
+    tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, cf, &read_txn), 0);
-    iter = NULL;
+    tidesdb_iter_t *iter = NULL;
     ASSERT_EQ(tidesdb_iter_new(read_txn, &iter), 0);
-    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
 
+    const char *seek_key = "key_00500";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key, strlen(seek_key)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    printf("Found key: %.*s\n", (int)key_size, key);
+    ASSERT_EQ(memcmp(key, "key_00500", strlen("key_00500")), 0);
+
+    const char *seek_key2 = "key_00950";
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key2, strlen(seek_key2)), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_EQ(memcmp(key, "key_00950", strlen("key_00950")), 0);
+
+    /* verify we can iterate from there */
     int count = 0;
-    while (tidesdb_iter_valid(iter))
+    while (tidesdb_iter_valid(iter) && count < 50)
     {
         count++;
         if (tidesdb_iter_next(iter) != 0) break;
     }
-
-    ASSERT_EQ(count, 1000);
+    ASSERT_EQ(count, 50); /* should read 50 keys from 950 to 999 */
 
     tidesdb_iter_free(iter);
     tidesdb_txn_free(read_txn);

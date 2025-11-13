@@ -1020,22 +1020,23 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
     tidesdb_sstable_t *sst = iter->sstables[idx];
     int num_entries = atomic_load(&sst->num_entries);
     /* skip boundary check if blocks_read is -1 (positioned via block index) */
-    if (iter->sstable_blocks_read[idx] >= num_entries && iter->sstable_blocks_read[idx] != -1) return 0;
+    if (iter->sstable_blocks_read[idx] >= num_entries && iter->sstable_blocks_read[idx] != -1)
+        return 0;
 
     while (block_manager_cursor_has_next(iter->sstable_cursors[idx]))
     {
         /* check BEFORE positioning to prevent reading past num_entries */
         /* skip check if blocks_read is -1 (positioned via block index) */
-        if (iter->sstable_blocks_read[idx] >= num_entries && iter->sstable_blocks_read[idx] != -1) break;
+        if (iter->sstable_blocks_read[idx] >= num_entries && iter->sstable_blocks_read[idx] != -1)
+            break;
 
         /* position at first block or advance to next */
         if (iter->sstable_blocks_read[idx] == -1)
         {
             /* cursor already positioned by block index, just read from current position
-             * We'll read this ONE block, then stop reading from this SSTable since we
-             * don't know which block number we're actually at. Setting to num_entries-1
-             * means after incrementing below, we'll be at num_entries and stop. */
-            iter->sstable_blocks_read[idx] = num_entries - 1;
+             * don't advance cursor -- it's already at the right position.
+             * After reading this block, we'll set blocks_read to 1 and continue normally. */
+            /* don't modify blocks_read here -- we'll set it after the read */
         }
         else if (iter->sstable_blocks_read[idx] == 0)
         {
@@ -1050,7 +1051,16 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
             if (block_manager_cursor_next(iter->sstable_cursors[idx]) != 0) break;
         }
 
-        iter->sstable_blocks_read[idx]++;
+        /* handle blocks_read increment */
+        if (iter->sstable_blocks_read[idx] == -1)
+        {
+            /* first read from index-positioned cursor */
+            iter->sstable_blocks_read[idx] = 1;
+        }
+        else
+        {
+            iter->sstable_blocks_read[idx]++;
+        }
 
         /* ensure we don't read beyond num_entries */
         if (iter->sstable_blocks_read[idx] > num_entries)
@@ -6506,18 +6516,21 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                                                           (uint64_t)exact_offset) == 0)
                             {
                                 /* Try to read the block to validate it's not beyond num_entries */
-                                block_manager_block_t *test_block = block_manager_cursor_read(iter->sstable_cursors[i]);
+                                block_manager_block_t *test_block =
+                                    block_manager_cursor_read(iter->sstable_cursors[i]);
                                 if (test_block)
                                 {
-                                    /* Valid block - reposition cursor back to this offset for later read */
+                                    /* Valid block - reposition cursor back to this offset for later
+                                     * read */
                                     block_manager_block_free(test_block);
                                     if (block_manager_cursor_goto(iter->sstable_cursors[i],
                                                                   (uint64_t)exact_offset) == 0)
                                     {
                                         positioned_via_index = 1;
                                         index_positioned[i] = 1; /* mark for refill section */
-                                        /* Set blocks_read to -1 to indicate cursor was positioned via index.
-                                         * This tells iter_refill_from_sstable to skip boundary checks on first read. */
+                                        /* Set blocks_read to -1 to indicate cursor was positioned
+                                         * via index. This tells iter_refill_from_sstable to skip
+                                         * boundary checks on first read. */
                                         iter->sstable_blocks_read[i] = -1;
                                     }
                                 }

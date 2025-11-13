@@ -68,6 +68,24 @@ jobs:
         shell: bash
         run: brew install zstd lz4 snappy
 
+      - name: Setup vcpkg binary cache (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg_cache"
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE
+          echo "VCPKG_DEFAULT_BINARY_CACHE=$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Cache vcpkg packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: vcpkg-${{ matrix.compiler }}-${{ matrix.arch }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-${{ matrix.compiler }}-${{ matrix.arch }}-
+            vcpkg-${{ matrix.compiler }}-
+
       - name: Install dependencies (Windows MSVC x64)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
         shell: pwsh
@@ -179,3 +197,287 @@ jobs:
         run: |
           cd build
           ctest --output-on-failure --build-config Release
+
+  create-portable-db:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    name: Create Portable Database (x64 Linux)
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev build-essential cmake
+      
+      - name: Build TidesDB
+        run: |
+          cmake -S . -B build
+          cmake --build build --config Release
+      
+      - name: Create test database
+        run: |
+          cd build
+          cat > create_db.c << 'EOF'
+          #include "../src/tidesdb.h"
+          #include <stdio.h>
+          #include <string.h>
+          #include <unistd.h>
+          
+          int main() {
+              tidesdb_t *db;
+              tidesdb_config_t cfg = {.db_path = "./testdb", .num_flush_threads = 1, .num_compaction_threads = 1};
+              if (tidesdb_open(&cfg, &db) != 0) return 1;
+              
+              tidesdb_column_family_config_t cf_cfg = tidesdb_default_column_family_config();
+              cf_cfg.memtable_flush_size = 1024;
+              cf_cfg.enable_bloom_filter = 1;
+              cf_cfg.enable_block_indexes = 1;
+              if (tidesdb_create_column_family(db, "test_cf", &cf_cfg) != 0) return 1;
+              
+              tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+              tidesdb_txn_t *txn;
+              if (tidesdb_txn_begin(db, cf, &txn) != 0) return 1;
+              
+              for (int i = 0; i < 100; i++) {
+                  char key[64], value[128];
+                  snprintf(key, sizeof(key), "key_%d", i);
+                  snprintf(value, sizeof(value), "value_%d", i);
+                  tidesdb_txn_put(txn, (uint8_t*)key, strlen(key), (uint8_t*)value, strlen(value), -1);
+              }
+              tidesdb_txn_commit(txn);
+              tidesdb_txn_free(txn);
+              tidesdb_flush_memtable(cf);
+              sleep(1);
+              tidesdb_compact(cf);
+              sleep(1);
+              tidesdb_close(db);
+              printf("Database created with 100 keys\n");
+              return 0;
+          }
+          EOF
+          gcc -o create_db create_db.c -I../src -I../external -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+          LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./create_db
+      
+      - name: Upload database
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-db
+          path: build/testdb/
+          retention-days: 1
+
+  verify-portable-db:
+    runs-on: ${{ matrix.os }}
+    needs: create-portable-db
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows MSVC x64
+            compiler: msvc
+            arch: x64
+          - os: windows-latest
+            name: Windows MSVC x86
+            compiler: msvc
+            arch: x86
+          - os: windows-latest
+            name: Windows MinGW x64
+            compiler: mingw
+            arch: x64
+          - os: windows-latest
+            name: Windows MinGW x86
+            compiler: mingw
+            arch: x86
+          - os: macos-latest
+            name: macOS x64
+            arch: x64
+          - os: macos-latest
+            name: macOS x86
+            arch: x86
+          - os: ubuntu-latest
+            name: Linux x86
+            arch: x86
+    
+    name: Verify portability on ${{ matrix.name }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Download database
+        uses: actions/download-artifact@v4
+        with:
+          name: portable-db
+          path: testdb
+      
+      - name: Install dependencies (Linux x86)
+        if: runner.os == 'Linux' && matrix.arch == 'x86'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt update
+          sudo apt install -y gcc-multilib g++-multilib libc6-dev-i386 \
+            libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 build-essential cmake pkg-config
+      
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install zstd lz4 snappy
+      
+      - name: Setup vcpkg binary cache (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg_cache"
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE
+          echo "VCPKG_DEFAULT_BINARY_CACHE=$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Cache vcpkg packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: vcpkg-verify-${{ matrix.compiler }}-${{ matrix.arch }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-verify-${{ matrix.compiler }}-${{ matrix.arch }}-
+            vcpkg-${{ matrix.compiler }}-${{ matrix.arch }}-
+      
+      - name: Install dependencies (Windows MSVC x64)
+        if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
+      
+      - name: Install dependencies (Windows MSVC x86)
+        if: matrix.compiler == 'msvc' && matrix.arch == 'x86'
+        shell: pwsh
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
+      
+      - name: Install dependencies (Windows MinGW)
+        if: matrix.compiler == 'mingw'
+        shell: pwsh
+        run: |
+          if ("${{ matrix.arch }}" -eq "x86") {
+              choco install mingw --version=8.1.0 --forcex86 -y
+              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
+              cd $env:VCPKG_INSTALLATION_ROOT
+              .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
+          } else {
+              choco install mingw --version=8.1.0 -y
+              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
+              cd $env:VCPKG_INSTALLATION_ROOT
+              .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
+          }
+          echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      
+      - name: Build TidesDB
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            if [ "${{ matrix.compiler }}" == "mingw" ]; then
+              if [ "${{ matrix.arch }}" == "x86" ]; then
+                cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_FLAGS="-m32" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x86-windows
+              else
+                cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+              fi
+            else
+              if [ "${{ matrix.arch }}" == "x86" ]; then
+                cmake -S . -B build -A Win32 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+              else
+                cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+              fi
+            fi
+          elif [ "$RUNNER_OS" == "Linux" ]; then
+            export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
+            cmake -S . -B build \
+              -DCMAKE_C_FLAGS="-m32" \
+              -DCMAKE_EXE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+              -DCMAKE_SHARED_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+              -DCMAKE_MODULE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+              -DTIDESDB_WITH_SANITIZER=OFF
+          else
+            cmake -S . -B build
+          fi
+          cmake --build build --config Release
+      
+      - name: Verify database
+        shell: bash
+        run: |
+          cd build
+          cat > verify_db.c << 'EOF'
+          #include "../src/tidesdb.h"
+          #include <stdio.h>
+          #include <string.h>
+          
+          int main() {
+              tidesdb_t *db;
+              tidesdb_config_t cfg = {.db_path = "../testdb", .num_flush_threads = 1, .num_compaction_threads = 1, .wait_for_wal_recovery = 1};
+              if (tidesdb_open(&cfg, &db) != 0) { fprintf(stderr, "Failed to open\n"); return 1; }
+              
+              tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+              if (!cf) { fprintf(stderr, "CF not found\n"); return 1; }
+              
+              tidesdb_txn_t *txn;
+              if (tidesdb_txn_begin_read(db, cf, &txn) != 0) return 1;
+              
+              for (int i = 0; i < 100; i++) {
+                  char key[64], expected[128];
+                  snprintf(key, sizeof(key), "key_%d", i);
+                  snprintf(expected, sizeof(expected), "value_%d", i);
+                  uint8_t *value = NULL;
+                  size_t value_size = 0;
+                  if (tidesdb_txn_get(txn, (uint8_t*)key, strlen(key), &value, &value_size) != 0) {
+                      fprintf(stderr, "Key not found: %s\n", key);
+                      return 1;
+                  }
+                  if (value_size != strlen(expected) || memcmp(value, expected, value_size) != 0) {
+                      fprintf(stderr, "Value mismatch\n");
+                      return 1;
+                  }
+                  free(value);
+              }
+              tidesdb_txn_free(txn);
+              tidesdb_close(db);
+              printf("All 100 keys verified successfully!\n");
+              return 0;
+          }
+          EOF
+          
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            # Move verify source to root and update CMakeLists
+            mv verify_db.c ../
+            # Fix path for MSVC which runs from build/Release/
+            if [ "${{ matrix.compiler }}" == "msvc" ]; then
+              sed -i 's|\.\./testdb|../../testdb|g' ../verify_db.c
+            fi
+            cat >> ../CMakeLists.txt << 'CMAKEEOF'
+          
+          add_executable(verify_db verify_db.c)
+          target_link_libraries(verify_db PRIVATE tidesdb)
+          target_include_directories(verify_db PRIVATE external)
+          CMAKEEOF
+            # Reconfigure and build from build directory
+            cd ..
+            cmake build
+            cd build
+            cmake --build . --config Release
+            if [ "${{ matrix.compiler }}" == "mingw" ]; then
+              ./verify_db.exe
+            else
+              cd Release
+              ./verify_db.exe
+            fi
+          elif [ "$RUNNER_OS" == "Linux" ]; then
+            gcc -m32 -o verify_db verify_db.c \
+              -I../src -I../external \
+              -L. -L/usr/lib/i386-linux-gnu \
+              -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+            LD_LIBRARY_PATH=.:/usr/lib/i386-linux-gnu ./verify_db
+          else
+            gcc -o verify_db verify_db.c -I../src -I../external -I/opt/homebrew/include -I/usr/local/include -L. -L/opt/homebrew/lib -L/usr/local/lib -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+            DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_db
+          fi

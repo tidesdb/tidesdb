@@ -84,6 +84,37 @@ static inline int64_t decode_int64_le(const uint8_t *buf)
     return (int64_t)uval;
 }
 
+/*
+ * encode_uint64_le
+ * encodes a uint64_t value in little-endian format
+ * @param buf buffer to store encoded value
+ * @param val value to encode
+ */
+static inline void encode_uint64_le(uint8_t *buf, uint64_t val)
+{
+    buf[0] = (uint8_t)(val & 0xFF);
+    buf[1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[2] = (uint8_t)((val >> 16) & 0xFF);
+    buf[3] = (uint8_t)((val >> 24) & 0xFF);
+    buf[4] = (uint8_t)((val >> 32) & 0xFF);
+    buf[5] = (uint8_t)((val >> 40) & 0xFF);
+    buf[6] = (uint8_t)((val >> 48) & 0xFF);
+    buf[7] = (uint8_t)((val >> 56) & 0xFF);
+}
+
+/*
+ * decode_uint64_le
+ * decodes a uint64_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline uint64_t decode_uint64_le(const uint8_t *buf)
+{
+    return ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
+           ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
+           ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
+}
+
 #define TDB_KV_HEADER_SIZE 18 /* 1 + 1 + 4 + 4 + 8 = 18 bytes */
 
 /*
@@ -2100,14 +2131,18 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
 
     /* save comparator name to cf */
-    strncpy(cf->comparator_name, cmp_name, TDB_MAX_COMPARATOR_NAME - 1);
-    cf->comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
+    size_t cmp_len = strlen(cmp_name);
+    if (cmp_len >= TDB_MAX_COMPARATOR_NAME) cmp_len = TDB_MAX_COMPARATOR_NAME - 1;
+    memcpy(cf->comparator_name, cmp_name, cmp_len);
+    cf->comparator_name[cmp_len] = '\0';
 
     /* if config had empty comparator_name, save the resolved default to config */
     if (cf->config.comparator_name[0] == '\0')
     {
-        strncpy(cf->config.comparator_name, cmp_name, TDB_MAX_COMPARATOR_NAME - 1);
-        cf->config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
+        size_t cfg_cmp_len = strlen(cmp_name);
+        if (cfg_cmp_len >= TDB_MAX_COMPARATOR_NAME) cfg_cmp_len = TDB_MAX_COMPARATOR_NAME - 1;
+        memcpy(cf->config.comparator_name, cmp_name, cfg_cmp_len);
+        cf->config.comparator_name[cfg_cmp_len] = '\0';
     }
 
     TDB_DEBUG_LOG("Column family '%s' using comparator '%s'", name, cf->comparator_name);
@@ -2488,8 +2523,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     TDB_DEBUG_LOG("SSTable recovery completed for column family: %s (%d sstables loaded)", cf->name,
                   atomic_load(&cf->num_sstables));
 
-    /* submit any recovered memtables to flush pool */
+    /* submit any recovered memtables to flush pool and wait for completion */
     pthread_mutex_lock(&cf->flush_lock);
+    int num_recovered_to_flush = (int)queue_size(cf->immutable_memtables);
     tidesdb_memtable_t *recovered_mt;
     while ((recovered_mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
     {
@@ -2498,6 +2534,37 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         pthread_mutex_lock(&cf->flush_lock);
     }
     pthread_mutex_unlock(&cf->flush_lock);
+
+    /* wait for all recovered memtable flushes to complete
+     * this ensures data is immediately queryable after tidesdb_open returns */
+    if (num_recovered_to_flush > 0)
+    {
+        TDB_DEBUG_LOG(
+            "Waiting for %d recovered memtable flush(es) to complete for column family: %s",
+            num_recovered_to_flush, cf->name);
+
+        /* poll until all flushes complete (immutable queue becomes empty and stays empty)
+         * we check twice with a small delay to ensure flushes have actually completed */
+        int stable_count = 0;
+        while (stable_count < 2)
+        {
+            usleep(100000); /* 100ms */
+            pthread_mutex_lock(&cf->flush_lock);
+            int current_size = (int)queue_size(cf->immutable_memtables);
+            pthread_mutex_unlock(&cf->flush_lock);
+
+            if (current_size == 0)
+            {
+                stable_count++;
+            }
+            else
+            {
+                stable_count = 0; /* reset if queue is not empty */
+            }
+        }
+
+        TDB_DEBUG_LOG("All recovered memtable flushes completed for column family: %s", cf->name);
+    }
 
     /* re-acquire db_lock to add CF to database */
     pthread_rwlock_wrlock(&db->db_lock);
@@ -2783,8 +2850,10 @@ int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
             pthread_rwlock_unlock(&db->db_lock);
             return TDB_ERR_MEMORY;
         }
-        strncpy((*names)[i], db->column_families[i]->name, TDB_MAX_CF_NAME_LENGTH - 1);
-        (*names)[i][TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
+        size_t name_len = strlen(db->column_families[i]->name);
+        if (name_len >= TDB_MAX_CF_NAME_LENGTH) name_len = TDB_MAX_CF_NAME_LENGTH - 1;
+        memcpy((*names)[i], db->column_families[i]->name, name_len);
+        (*names)[i][name_len] = '\0';
     }
 
     pthread_rwlock_unlock(&db->db_lock);
@@ -2805,11 +2874,15 @@ int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
     pthread_rwlock_rdlock(&cf->cf_lock);
 
     /* copy basic info */
-    strncpy((*stats)->name, cf->name, TDB_MAX_CF_NAME_LENGTH - 1);
-    (*stats)->name[TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
+    size_t stats_name_len = strlen(cf->name);
+    if (stats_name_len >= TDB_MAX_CF_NAME_LENGTH) stats_name_len = TDB_MAX_CF_NAME_LENGTH - 1;
+    memcpy((*stats)->name, cf->name, stats_name_len);
+    (*stats)->name[stats_name_len] = '\0';
 
-    strncpy((*stats)->comparator_name, cf->comparator_name, TDB_MAX_COMPARATOR_NAME - 1);
-    (*stats)->comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
+    size_t stats_cmp_len = strlen(cf->comparator_name);
+    if (stats_cmp_len >= TDB_MAX_COMPARATOR_NAME) stats_cmp_len = TDB_MAX_COMPARATOR_NAME - 1;
+    memcpy((*stats)->comparator_name, cf->comparator_name, stats_cmp_len);
+    (*stats)->comparator_name[stats_cmp_len] = '\0';
     (*stats)->num_sstables = atomic_load(&cf->num_sstables);
 
     /* calc total ssts size */
@@ -3331,18 +3404,18 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
         if (metadata)
         {
             uint8_t *ptr = metadata;
-            memcpy(ptr, &magic, sizeof(uint32_t));
+            encode_uint32_le(ptr, magic);
             ptr += sizeof(uint32_t);
             uint64_t num_entries_u64 = (uint64_t)sst->num_entries;
-            memcpy(ptr, &num_entries_u64, sizeof(uint64_t));
+            encode_uint64_le(ptr, num_entries_u64);
             ptr += sizeof(uint64_t);
             uint32_t min_size = (uint32_t)sst->min_key_size;
-            memcpy(ptr, &min_size, sizeof(uint32_t));
+            encode_uint32_le(ptr, min_size);
             ptr += sizeof(uint32_t);
             memcpy(ptr, sst->min_key, sst->min_key_size);
             ptr += sst->min_key_size;
             uint32_t max_size = (uint32_t)sst->max_key_size;
-            memcpy(ptr, &max_size, sizeof(uint32_t));
+            encode_uint32_le(ptr, max_size);
             ptr += sizeof(uint32_t);
             memcpy(ptr, sst->max_key, sst->max_key_size);
 
@@ -3877,7 +3950,43 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
             TDB_DEBUG_LOG("Failed to build index for merged SSTable");
         }
 
-        /* write metadata */
+        /* write metadata (magic number, entry count, min/max keys) */
+        if (merged->min_key && merged->max_key)
+        {
+            uint32_t magic = TDB_SST_META_MAGIC;
+            size_t metadata_size = sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t) +
+                                   merged->min_key_size + sizeof(uint32_t) + merged->max_key_size;
+            uint8_t *metadata = malloc(metadata_size);
+            if (metadata)
+            {
+                uint8_t *ptr = metadata;
+                encode_uint32_le(ptr, magic);
+                ptr += sizeof(uint32_t);
+                uint64_t num_entries = (uint64_t)merged->num_entries;
+                encode_uint64_le(ptr, num_entries);
+                ptr += sizeof(uint64_t);
+                uint32_t min_size = (uint32_t)merged->min_key_size;
+                encode_uint32_le(ptr, min_size);
+                ptr += sizeof(uint32_t);
+                memcpy(ptr, merged->min_key, merged->min_key_size);
+                ptr += merged->min_key_size;
+                uint32_t max_size = (uint32_t)merged->max_key_size;
+                encode_uint32_le(ptr, max_size);
+                ptr += sizeof(uint32_t);
+                memcpy(ptr, merged->max_key, merged->max_key_size);
+
+                block_manager_block_t *metadata_block =
+                    block_manager_block_create(metadata_size, metadata);
+                if (metadata_block)
+                {
+                    block_manager_block_write(merged->block_manager, metadata_block);
+                    block_manager_block_free(metadata_block);
+                }
+                free(metadata);
+            }
+        }
+
+        /* write bloom filter */
         if (merged->bloom_filter)
         {
             size_t bloom_size = 0;
@@ -4533,18 +4642,18 @@ static void *tidesdb_compaction_worker(void *arg)
         if (metadata)
         {
             uint8_t *ptr = metadata;
-            memcpy(ptr, &magic, sizeof(uint32_t));
+            encode_uint32_le(ptr, magic);
             ptr += sizeof(uint32_t);
             uint64_t num_entries = (uint64_t)merged->num_entries;
-            memcpy(ptr, &num_entries, sizeof(uint64_t));
+            encode_uint64_le(ptr, num_entries);
             ptr += sizeof(uint64_t);
             uint32_t min_size = (uint32_t)merged->min_key_size;
-            memcpy(ptr, &min_size, sizeof(uint32_t));
+            encode_uint32_le(ptr, min_size);
             ptr += sizeof(uint32_t);
             memcpy(ptr, merged->min_key, merged->min_key_size);
             ptr += merged->min_key_size;
             uint32_t max_size = (uint32_t)merged->max_key_size;
-            memcpy(ptr, &max_size, sizeof(uint32_t));
+            encode_uint32_le(ptr, max_size);
             ptr += sizeof(uint32_t);
             memcpy(ptr, merged->max_key, merged->max_key_size);
 
@@ -4876,17 +4985,14 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
             metadata_block->size >= sizeof(uint32_t) + sizeof(uint64_t) + 2 * sizeof(uint32_t))
         {
             uint8_t *ptr = metadata_block->data;
-            uint32_t magic;
-            memcpy(&magic, ptr, sizeof(uint32_t));
+            uint32_t magic = decode_uint32_le(ptr);
 
             if (magic == TDB_SST_META_MAGIC)
             {
                 ptr += sizeof(uint32_t);
-                uint64_t num_entries;
-                memcpy(&num_entries, ptr, sizeof(uint64_t));
+                uint64_t num_entries = decode_uint64_le(ptr);
                 ptr += sizeof(uint64_t);
-                uint32_t min_key_size;
-                memcpy(&min_key_size, ptr, sizeof(uint32_t));
+                uint32_t min_key_size = decode_uint32_le(ptr);
                 ptr += sizeof(uint32_t);
 
                 sst->num_entries = (int)num_entries;
@@ -4897,8 +5003,7 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
                     sst->min_key_size = min_key_size;
                 }
                 ptr += min_key_size;
-                uint32_t max_key_size;
-                memcpy(&max_key_size, ptr, sizeof(uint32_t));
+                uint32_t max_key_size = decode_uint32_le(ptr);
                 ptr += sizeof(uint32_t);
                 sst->max_key = malloc(max_key_size);
                 if (sst->max_key)
@@ -5471,8 +5576,8 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
             }
             else if (result == TDB_ERR_NOT_FOUND)
             {
-                free(sst_snapshot);
-                return -1;
+                /* Key not in this SSTable, continue to next one */
+                continue;
             }
             /* else continue to next sstable */
         }
@@ -5589,8 +5694,10 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size, con
 
     tidesdb_operation_t *op = &txn->operations[txn->num_ops];
     op->type = TIDESDB_OP_PUT;
-    strncpy(op->cf_name, cf->name, TDB_MAX_CF_NAME_LENGTH - 1);
-    op->cf_name[TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
+    size_t put_cf_len = strlen(cf->name);
+    if (put_cf_len >= TDB_MAX_CF_NAME_LENGTH) put_cf_len = TDB_MAX_CF_NAME_LENGTH - 1;
+    memcpy(op->cf_name, cf->name, put_cf_len);
+    op->cf_name[put_cf_len] = '\0';
 
     op->key = malloc(key_size);
     if (!op->key) return TDB_ERR_MEMORY;
@@ -5634,8 +5741,10 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size)
 
     tidesdb_operation_t *op = &txn->operations[txn->num_ops];
     op->type = TIDESDB_OP_DELETE;
-    strncpy(op->cf_name, cf->name, TDB_MAX_CF_NAME_LENGTH - 1);
-    op->cf_name[TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
+    size_t del_cf_len = strlen(cf->name);
+    if (del_cf_len >= TDB_MAX_CF_NAME_LENGTH) del_cf_len = TDB_MAX_CF_NAME_LENGTH - 1;
+    memcpy(op->cf_name, cf->name, del_cf_len);
+    op->cf_name[del_cf_len] = '\0';
 
     /* allocate and copy key */
     op->key = malloc(key_size);

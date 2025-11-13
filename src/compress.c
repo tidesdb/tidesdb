@@ -41,18 +41,19 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
         {
             *compressed_size = (type == COMPRESS_LZ4) ? (size_t)LZ4_compressBound((int)data_size)
                                                       : ZSTD_compressBound(data_size);
-            size_t total_size = *compressed_size + sizeof(size_t);
+            size_t total_size = *compressed_size + sizeof(uint64_t);
             compressed_data = malloc(total_size);
             if (!compressed_data) return NULL;
 
-            memcpy(compressed_data, &data_size, sizeof(size_t));
+            /* store original size as uint64_t for cross-architecture portability */
+            encode_uint64_le_compat(compressed_data, (uint64_t)data_size);
 
             size_t actual_size =
                 (type == COMPRESS_LZ4)
                     ? (size_t)LZ4_compress_default((const char *)data,
-                                                   (char *)(compressed_data + sizeof(size_t)),
+                                                   (char *)(compressed_data + sizeof(uint64_t)),
                                                    (int)data_size, (int)*compressed_size)
-                    : ZSTD_compress(compressed_data + sizeof(size_t), *compressed_size, data,
+                    : ZSTD_compress(compressed_data + sizeof(uint64_t), *compressed_size, data,
                                     data_size, 1);
 
             if (actual_size <= 0 || (type == COMPRESS_ZSTD && ZSTD_isError(actual_size)))
@@ -61,7 +62,7 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
                 return NULL;
             }
 
-            *compressed_size = actual_size + sizeof(size_t);
+            *compressed_size = actual_size + sizeof(uint64_t);
             break;
         }
 
@@ -100,12 +101,14 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
         case COMPRESS_LZ4:
         case COMPRESS_ZSTD:
         {
-            if (data_size < sizeof(size_t))
+            if (data_size < sizeof(uint64_t))
             {
                 return NULL;
             }
 
-            memcpy(decompressed_size, data, sizeof(size_t));
+            /* decode original size from uint64_t for cross-architecture portability */
+            uint64_t original_size = decode_uint64_le_compat(data);
+            *decompressed_size = (size_t)original_size;
 
             decompressed_data = malloc(*decompressed_size);
             if (!decompressed_data) return NULL;
@@ -113,10 +116,10 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
             size_t actual_size =
                 (type == COMPRESS_LZ4)
                     ? (size_t)LZ4_decompress_safe(
-                          (const char *)(data + sizeof(size_t)), (char *)decompressed_data,
-                          (int)(data_size - sizeof(size_t)), (int)*decompressed_size)
-                    : ZSTD_decompress(decompressed_data, *decompressed_size, data + sizeof(size_t),
-                                      data_size - sizeof(size_t));
+                          (const char *)(data + sizeof(uint64_t)), (char *)decompressed_data,
+                          (int)(data_size - sizeof(uint64_t)), (int)*decompressed_size)
+                    : ZSTD_decompress(decompressed_data, *decompressed_size,
+                                      data + sizeof(uint64_t), data_size - sizeof(uint64_t));
 
             if ((type == COMPRESS_ZSTD && ZSTD_isError(actual_size)) ||
                 (type == COMPRESS_LZ4 && actual_size <= 0))

@@ -63,6 +63,8 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_SKIPLIST_PROBABILITY           0.25
 #define TDB_DEFAULT_BLOOM_FILTER_FP_RATE           0.01
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
+#define TDB_DEFAULT_WAL_RECOVERY_POLL_INTERVAL_MS  100
+#define TDB_DEFAULT_WAIT_FOR_WAL_RECOVERY          0 /* false: fast startup by default */
 
 /* limits */
 #define TDB_MAX_CF_NAME_LENGTH  128
@@ -191,6 +193,10 @@ typedef struct __attribute__((packed))
  *        > 0 = cache up to N open files, auto-close LRU when full
  * @param num_flush_threads number of threads in flush thread pool (default 2)
  * @param num_compaction_threads number of threads in compaction thread pool (default 2)
+ * @param wait_for_wal_recovery if true, tidesdb_open blocks until all WAL recovery flushes complete
+ *        (default: false for fast startup, set true for guaranteed data availability)
+ * @param wal_recovery_poll_interval_ms polling interval in milliseconds when waiting for WAL
+ * recovery (default: 100ms, only used if wait_for_wal_recovery is true)
  */
 typedef struct
 {
@@ -199,6 +205,8 @@ typedef struct
     int max_open_file_handles;
     int num_flush_threads;
     int num_compaction_threads;
+    int wait_for_wal_recovery;
+    int wal_recovery_poll_interval_ms;
 } tidesdb_config_t;
 
 /*

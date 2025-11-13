@@ -386,8 +386,10 @@ int succinct_trie_builder_add(succinct_trie_builder_t *builder, const uint8_t *k
         }
         block_manager_block_free(block);
 
-        /* write parent ID */
-        block = block_manager_block_create(sizeof(uint32_t), &parent_id);
+        /* write parent ID (little-endian) */
+        uint8_t parent_buf[4];
+        encode_uint32_le_compat(parent_buf, parent_id);
+        block = block_manager_block_create(sizeof(uint32_t), parent_buf);
         if (!block) return -1;
         if (block_manager_block_write((block_manager_t *)builder->parents_bm, block) < 0)
         {
@@ -396,8 +398,10 @@ int succinct_trie_builder_add(succinct_trie_builder_t *builder, const uint8_t *k
         }
         block_manager_block_free(block);
 
-        /* write child node ID */
-        block = block_manager_block_create(sizeof(uint32_t), &child_node_id);
+        /* write child node ID (little-endian) */
+        uint8_t child_buf[4];
+        encode_uint32_le_compat(child_buf, child_node_id);
+        block = block_manager_block_create(sizeof(uint32_t), child_buf);
         if (!block) return -1;
         if (block_manager_block_write((block_manager_t *)builder->child_ids_bm, block) < 0)
         {
@@ -417,9 +421,12 @@ int succinct_trie_builder_add(succinct_trie_builder_t *builder, const uint8_t *k
         block_manager_block_free(block);
 
         /* write value if terminal */
-        if (is_terminal)
+        if (is_terminal && value != -1)
         {
-            block = block_manager_block_create(sizeof(int64_t), &value);
+            /* write value (little-endian) */
+            uint8_t val_buf[8];
+            encode_uint64_le_compat(val_buf, (uint64_t)value);
+            block = block_manager_block_create(sizeof(int64_t), val_buf);
             if (!block) return -1;
             if (block_manager_block_write((block_manager_t *)builder->vals_bm, block) < 0)
             {
@@ -507,7 +514,7 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
             block_manager_block_t *block = block_manager_cursor_read(cursor);
             if (block)
             {
-                parents[idx++] = *(uint32_t *)block->data;
+                parents[idx++] = decode_uint32_le_compat((uint8_t *)block->data);
                 block_manager_block_free(block);
             }
             block_manager_cursor_next(cursor);
@@ -524,7 +531,7 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
             block_manager_block_t *block = block_manager_cursor_read(cursor);
             if (block)
             {
-                child_ids[idx++] = *(uint32_t *)block->data;
+                child_ids[idx++] = decode_uint32_le_compat((uint8_t *)block->data);
                 block_manager_block_free(block);
             }
             block_manager_cursor_next(cursor);
@@ -752,7 +759,7 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
             block_manager_block_t *block = block_manager_cursor_read(cursor);
             if (block)
             {
-                temp_vals[idx++] = *(int64_t *)block->data;
+                temp_vals[idx++] = (int64_t)decode_uint64_le_compat((uint8_t *)block->data);
                 block_manager_block_free(block);
             }
             block_manager_cursor_next(cursor);

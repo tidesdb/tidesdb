@@ -448,11 +448,11 @@ jobs:
             mv verify_db.c ../
             cd ..
             cat >> CMakeLists.txt << 'CMAKEEOF'
-
-add_executable(verify_db verify_db.c)
-target_link_libraries(verify_db PRIVATE tidesdb)
-target_include_directories(verify_db PRIVATE external)
-CMAKEEOF
+          
+          add_executable(verify_db verify_db.c)
+          target_link_libraries(verify_db PRIVATE tidesdb)
+          target_include_directories(verify_db PRIVATE external)
+          CMAKEEOF
             cmake build
             cmake --build build --config Release
             if [ "${{ matrix.compiler }}" == "mingw" ]; then

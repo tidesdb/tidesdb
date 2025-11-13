@@ -3205,7 +3205,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
                     {
                         succinct_trie_builder_add(index_builder, k, k_size, offset);
                     }
-                    atomic_fetch_add(&sst->num_entries, 1);
+                    /* don't increment num_entries yet - use local counter */
                     entries_written++;
                 }
                 else
@@ -3340,6 +3340,9 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
             free(metadata);
         }
     }
+
+    /* atomically store final num_entries now that all blocks and metadata are written */
+    atomic_store(&sst->num_entries, entries_written);
 
     pthread_rwlock_wrlock(&cf->cf_lock);
 

@@ -276,7 +276,7 @@ jobs:
           gcc -o create_portable_db create_portable_db.c \
             -I../src -I../external \
             -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-          LD_LIBRARY_PATH=. ./create_portable_db
+          LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./create_portable_db
           
           echo "Database files created:"
           find portable_test_db -type f -ls
@@ -483,6 +483,6 @@ jobs:
             if [ "$RUNNER_OS" == "macOS" ]; then
               DYLD_LIBRARY_PATH=. ./verify_portable_db
             else
-              LD_LIBRARY_PATH=. ./verify_portable_db
+              LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./verify_portable_db
             fi
           fi

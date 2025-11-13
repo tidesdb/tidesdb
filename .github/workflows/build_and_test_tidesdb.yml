@@ -294,6 +294,9 @@ jobs:
           - os: macos-latest
             name: macOS x64
             arch: x64
+          - os: macos-latest
+            name: macOS x86
+            arch: x86
           - os: ubuntu-latest
             name: Linux x86
             arch: x86
@@ -445,20 +448,24 @@ jobs:
           EOF
           
           if [ "$RUNNER_OS" == "Windows" ]; then
+            # Move verify source to root and update CMakeLists
             mv verify_db.c ../
-            cd ..
-            cat >> CMakeLists.txt << 'CMAKEEOF'
+            cat >> ../CMakeLists.txt << 'CMAKEEOF'
           
           add_executable(verify_db verify_db.c)
           target_link_libraries(verify_db PRIVATE tidesdb)
           target_include_directories(verify_db PRIVATE external)
           CMAKEEOF
+            # Reconfigure and build from build directory
+            cd ..
             cmake build
-            cmake --build build --config Release
+            cd build
+            cmake --build . --config Release
             if [ "${{ matrix.compiler }}" == "mingw" ]; then
-              ./build/verify_db.exe
+              ./verify_db.exe
             else
-              ./build/Release/verify_db.exe
+              cd Release
+              ./verify_db.exe
             fi
           elif [ "$RUNNER_OS" == "Linux" ]; then
             gcc -m32 -o verify_db verify_db.c \

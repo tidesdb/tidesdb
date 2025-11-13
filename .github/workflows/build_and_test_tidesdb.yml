@@ -53,7 +53,7 @@ jobs:
         if: runner.os == 'Linux' && matrix.arch == 'x64'
         run: |
           sudo apt update
-          sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev libssl-dev build-essential cmake pkg-config
+          sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev build-essential cmake pkg-config
 
       - name: Install dependencies (Linux x86)
         if: runner.os == 'Linux' && matrix.arch == 'x86'
@@ -61,12 +61,12 @@ jobs:
           sudo dpkg --add-architecture i386
           sudo apt update
           sudo apt install -y gcc-multilib g++-multilib libc6-dev-i386 \
-            libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 libssl-dev:i386 build-essential cmake pkg-config
+            libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 build-essential cmake pkg-config
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         shell: bash
-        run: brew install zstd lz4 snappy openssl
+        run: brew install zstd lz4 snappy
 
       - name: Install dependencies (Windows MSVC x64)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
@@ -74,7 +74,7 @@ jobs:
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
           git pull
-          .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows openssl:x64-windows pthreads:x64-windows
+          .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
 
       - name: Install dependencies (Windows MSVC x86)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x86'
@@ -82,7 +82,7 @@ jobs:
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
           git pull
-          .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows openssl:x86-windows pthreads:x86-windows
+          .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
 
       - name: Install and setup MinGW
         if: matrix.compiler == 'mingw'
@@ -147,7 +147,7 @@ jobs:
         run: |
           if ("${{ matrix.arch }}" -eq "x86") {
               cd $env:VCPKG_INSTALLATION_ROOT
-              .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows openssl:x86-windows pthreads:x86-windows
+              .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
 
               cd $env:GITHUB_WORKSPACE
 
@@ -161,7 +161,7 @@ jobs:
           } else {
 
               cd $env:VCPKG_INSTALLATION_ROOT
-              .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows openssl:x64-windows pthreads:x64-windows
+              .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
 
               cd $env:GITHUB_WORKSPACE
 

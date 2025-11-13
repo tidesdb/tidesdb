@@ -696,7 +696,6 @@ static void test_large_values(void)
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    /* retrieve and verify */
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, cf, &read_txn), 0);
 
@@ -810,10 +809,9 @@ static void test_many_sstables(void)
 {
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.memtable_flush_size = 4096; /* small memtable to force many flushes */
-    cf_config.max_sstables_before_compaction =
-        200; /* high threshold to prevent compaction during test */
-    cf_config.enable_background_compaction = 0; /* disable for deterministic testing */
+    cf_config.memtable_flush_size = 4096;
+    cf_config.max_sstables_before_compaction = 200;
+    cf_config.enable_background_compaction = 0;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "many_sst", &cf_config), 0);
 
@@ -822,7 +820,6 @@ static void test_many_sstables(void)
     printf("\n  [Verification] Creating many SSTables... ");
     fflush(stdout);
 
-    /* insert data in batches to create many sstables */
     int total_keys = 0;
     for (int batch = 0; batch < 10; batch++)
     {
@@ -847,7 +844,6 @@ static void test_many_sstables(void)
         tidesdb_txn_free(txn);
     }
 
-    /* verify all data is accessible across many ssts */
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, cf, &read_txn), 0);
 
@@ -896,7 +892,7 @@ static void test_backward_iteration(void)
 {
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.memtable_flush_size = 4096; /* small memtable to force many flushes */
+    cf_config.memtable_flush_size = 4096;
     cf_config.max_sstables_before_compaction = 200;
     cf_config.enable_background_compaction = 0;
 
@@ -980,7 +976,7 @@ static void test_crash_recovery(void)
     printf("\n  [Reliability] Testing crash recovery... ");
     fflush(stdout);
 
-    /* 1 write data and close normally */
+    /* write data and close normally */
     {
         tidesdb_t *db = create_test_db();
         tidesdb_column_family_config_t cf_config = get_test_cf_config();
@@ -1016,7 +1012,7 @@ static void test_crash_recovery(void)
         ASSERT_EQ(tidesdb_close(db), 0);
     }
 
-    /* 2 reopen and verify all data recovered */
+    /* reopen and verify all data recovered */
     {
         tidesdb_config_t config = {.db_path = TEST_DB_PATH};
         tidesdb_t *db = NULL;
@@ -1066,8 +1062,8 @@ static void test_background_compaction(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
     cf_config.memtable_flush_size = 8192;
-    cf_config.max_sstables_before_compaction = 5; /* compact at 5 sstables */
-    cf_config.enable_background_compaction = 1;   /* enable background compaction */
+    cf_config.max_sstables_before_compaction = 5;
+    cf_config.enable_background_compaction = 1;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "bg_compact", &cf_config), 0);
 
@@ -1076,7 +1072,6 @@ static void test_background_compaction(void)
     printf("\n  [Background] Testing background compaction... ");
     fflush(stdout);
 
-    /* insert data to trigger background compaction */
     for (int i = 0; i < 100; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -1204,7 +1199,6 @@ static void test_delete_patterns(void)
     printf("\n  [Reliability] Testing delete patterns... ");
     fflush(stdout);
 
-    /* insert data */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, cf, &txn1), 0);
 
@@ -1273,7 +1267,6 @@ static void test_list_column_families(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
 
-    /* create multiple column families */
     ASSERT_EQ(tidesdb_create_column_family(db, "cf1", &cf_config), 0);
     ASSERT_EQ(tidesdb_create_column_family(db, "cf2", &cf_config), 0);
     ASSERT_EQ(tidesdb_create_column_family(db, "cf3", &cf_config), 0);
@@ -1297,7 +1290,6 @@ static void test_list_column_families(void)
     }
     ASSERT_TRUE(found_cf1 && found_cf2 && found_cf3);
 
-    /* free names */
     for (int i = 0; i < count; i++)
     {
         free(names[i]);
@@ -1317,7 +1309,6 @@ static void test_column_family_stats(void)
 
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "stats_cf");
 
-    /* add some data */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, cf, &txn), 0);
 
@@ -1335,18 +1326,15 @@ static void test_column_family_stats(void)
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    /* get stats */
     tidesdb_column_family_stat_t *stats = NULL;
     ASSERT_EQ(tidesdb_get_column_family_stats(db, "stats_cf", &stats), 0);
     ASSERT_TRUE(stats != NULL);
 
-    /* verify stats */
     ASSERT_TRUE(strcmp(stats->name, "stats_cf") == 0);
     ASSERT_TRUE(stats->memtable_entries >= 10);
     ASSERT_TRUE(stats->memtable_size > 0);
     ASSERT_TRUE(strcmp(stats->comparator_name, "memcmp") == 0);
 
-    /* verify config was copied */
     ASSERT_TRUE(stats->config.enable_compression == cf_config.enable_compression);
     ASSERT_TRUE(stats->config.compression_algorithm == cf_config.compression_algorithm);
 
@@ -1370,7 +1358,6 @@ static void test_mixed_workload(void)
     printf("\n  [Verification] Testing mixed workload (put/get/delete/iterate)... ");
     fflush(stdout);
 
-    /* mixed operations */
     for (int round = 0; round < 10; round++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -1442,7 +1429,6 @@ static void test_mixed_workload(void)
 
     printf("OK (processed %d entries)\n", count);
 
-    /* give background compaction time to finish */
     sleep(1);
 
     tidesdb_close(db);
@@ -1546,7 +1532,6 @@ static void test_read_your_own_writes(void)
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, cf, &txn), 0);
 
-    /* write key */
     ASSERT_EQ(tidesdb_txn_put(txn, (uint8_t *)"uncommitted_key", 15, (uint8_t *)"uncommitted_value",
                               17, -1),
               0);
@@ -1569,7 +1554,6 @@ static void test_read_your_own_writes(void)
     ASSERT_TRUE(memcmp(value, "updated_value", 13) == 0);
     free(value);
 
-    /* delete key */
     ASSERT_EQ(tidesdb_txn_delete(txn, (uint8_t *)"uncommitted_key", 15), 0);
 
     /* read after delete, should not find it */
@@ -1589,7 +1573,7 @@ static void test_compaction_tombstones(void)
 {
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.memtable_flush_size = 1024 * 1024; /* large enough to avoid auto-flush */
+    cf_config.memtable_flush_size = 1024 * 1024;
     cf_config.max_sstables_before_compaction = 3;
     cf_config.enable_background_compaction = 0;
 
@@ -1890,7 +1874,6 @@ static void test_parallel_compaction(void)
     /* verify we have at least 8 ssts (might have more if auto-compaction triggered) */
     ASSERT_TRUE(current_sstables >= num_sstables);
 
-    /* trigger parallel compaction */
     ASSERT_EQ(tidesdb_compact(cf), 0);
 
     /* after compaction, should have 4 ssts (8 pairs merged into 4) */
@@ -1961,7 +1944,7 @@ static void test_compaction_deduplication(void)
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
     /* wait for flush to complete */
-    usleep(200000); /* 200ms */
+    usleep(200000);
 
     /* create second sstable with overlapping keys (keys 5-14) */
     tidesdb_txn_t *txn2 = NULL;
@@ -1980,7 +1963,7 @@ static void test_compaction_deduplication(void)
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
     /* wait for flush to complete */
-    usleep(200000); /* 200ms */
+    usleep(200000);
 
     /* verify we have 2 sstables */
     int num_ssts_before = atomic_load(&cf->num_sstables);
@@ -2311,14 +2294,14 @@ static void test_iterator_metadata_boundary(void)
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    /* force flush to create SSTable */
+    /* force flush to create sstable */
     ASSERT_TRUE(cf != NULL);
 
     /* manually flush memtable */
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
     /* wait for async flush to complete */
-    int max_wait = 50; /* 5 seconds max */
+    int max_wait = 50;
     int num_ssts = 0;
     for (int i = 0; i < max_wait; i++)
     {

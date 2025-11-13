@@ -10,14 +10,14 @@ It is not a full-featured database, but rather a library that can be used to bui
 
 ## Features
 - Lock-free skip list memtables with atomic operations and RCU (Read-Copy-Update) memory management for exceptional read performance
-- True lock-free reads - readers never acquire locks, never block, and scale linearly with CPU cores
+- Readers never acquire locks, never block, and scale linearly with CPU cores
 - Single-writer serialization per column family using lightweight mutex, ensuring write atomicity without complex locking
 - RCU-based memory reclamation with epoch-based garbage collection prevents use-after-free while maintaining lock-free reads
 - Atomic pointer operations with acquire/release memory ordering for correct synchronization without locks
 - Writers don't block readers. Readers never block other readers or writers. Background operations don't affect active transactions.
 - ACID transactions that are atomic, consistent, isolated, and durable. Transactions support multiple operations across column families.
 - Point reads use READ COMMITTED isolation (see latest committed data), while iterators use snapshot isolation (consistent point-in-time view via reference counting).
-- Mark-and-insert update strategy for lock-free consistency - updates mark old nodes as deleted and insert new nodes atomically.
+- Mark-and-insert update strategy for lock-free consistency; Updates mark old nodes as deleted and insert new nodes atomically.
 - Isolated key-value stores. Each column family has its own configuration, memtables, sstables, and write ahead logs.
 - Bidirectional iterators that allow you to iterate forward and backward over key-value pairs with heap-based merge-sort across memtable and sstables.
 - Lock-free iteration with reference counting prevents premature deletion during iteration without blocking writers.

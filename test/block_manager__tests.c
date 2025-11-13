@@ -1868,7 +1868,7 @@ void *parallel_write_worker(void *arg)
         }
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &end);
+    clock_gettime(0, &end);
     ctx->elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
     return NULL;
@@ -1912,7 +1912,7 @@ void benchmark_block_manager_parallel_write(void)
             pthread_join(thread_ids[i], NULL);
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &end);
+        clock_gettime(0, &end);
         double wall_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
         double aggregate_throughput = (total_blocks) / wall_time;

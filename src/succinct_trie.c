@@ -36,7 +36,12 @@
 #define POPCOUNT32(x) __builtin_popcount(x)
 #elif defined(_MSC_VER)
 #include <intrin.h>
+#if defined(_M_X64) || defined(_M_AMD64)
 #define POPCOUNT64(x) __popcnt64(x)
+#else
+/* x86 doesn't have __popcnt64, use two __popcnt calls */
+#define POPCOUNT64(x) (__popcnt((uint32_t)(x)) + __popcnt((uint32_t)((x) >> 32)))
+#endif
 #define POPCOUNT32(x) __popcnt(x)
 #else
 /* fallback popcount */

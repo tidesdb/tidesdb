@@ -544,8 +544,8 @@ typedef struct
     size_t memtable_flush_size;
     int max_sstables_before_compaction;
     int compaction_threads;
-    int max_level;
-    float probability;
+    int sl_max_level;
+    float sl_probability;
     int enable_bloom_filter;
     double bloom_filter_fp_rate;
     int enable_background_compaction;

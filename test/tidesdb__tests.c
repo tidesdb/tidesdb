@@ -2993,8 +2993,8 @@ static int test_column_family_config_persistence(void)
         .memtable_flush_size = 128 * 1024 * 1024,
         .max_sstables_before_compaction = 256,
         .compaction_threads = 8,
-        .max_level = 16,
-        .probability = 0.25f,
+        .sl_max_level = 16,
+        .sl_probability = 0.25f,
         .enable_bloom_filter = 1,
         .bloom_filter_fp_rate = 0.001,
         .enable_background_compaction = 1,
@@ -3053,11 +3053,11 @@ static int test_column_family_config_persistence(void)
 
     /* invalid probability */
     invalid_config = update_config;
-    invalid_config.probability = 0.0f; /* must be > 0 and < 1 */
+    invalid_config.sl_probability = 0.0f; /* must be > 0 and < 1 */
     ASSERT_EQ(tidesdb_update_column_family_config(db, "test_cf", &invalid_config),
               TDB_ERR_INVALID_ARGS);
 
-    invalid_config.probability = 1.0f;
+    invalid_config.sl_probability = 1.0f;
     ASSERT_EQ(tidesdb_update_column_family_config(db, "test_cf", &invalid_config),
               TDB_ERR_INVALID_ARGS);
 

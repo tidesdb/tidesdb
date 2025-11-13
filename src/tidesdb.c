@@ -3448,12 +3448,12 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
         return TDB_ERR_INVALID_ARGS;
     }
 
-    if (update_config->max_level < 1)
+    if (update_config->sl_max_level < 1)
     {
         return TDB_ERR_INVALID_ARGS;
     }
 
-    if (update_config->probability <= 0.0f || update_config->probability >= 1.0f)
+    if (update_config->sl_probability <= 0.0f || update_config->sl_probability >= 1.0f)
     {
         return TDB_ERR_INVALID_ARGS;
     }
@@ -3476,8 +3476,8 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
     cf->config.memtable_flush_size = update_config->memtable_flush_size;
     cf->config.max_sstables_before_compaction = update_config->max_sstables_before_compaction;
     cf->config.compaction_threads = update_config->compaction_threads;
-    cf->config.sl_max_level = update_config->max_level;
-    cf->config.sl_probability = update_config->probability;
+    cf->config.sl_max_level = update_config->sl_max_level;
+    cf->config.sl_probability = update_config->sl_probability;
     cf->config.enable_bloom_filter = update_config->enable_bloom_filter;
     cf->config.bloom_filter_fp_rate = update_config->bloom_filter_fp_rate;
     cf->config.enable_background_compaction = update_config->enable_background_compaction;

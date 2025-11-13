@@ -1018,12 +1018,13 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
 
     /* stop reading after num_entries to avoid reading metadata blocks */
     tidesdb_sstable_t *sst = iter->sstables[idx];
-    if (iter->sstable_blocks_read[idx] >= sst->num_entries) return 0;
+    int num_entries = atomic_load(&sst->num_entries);
+    if (iter->sstable_blocks_read[idx] >= num_entries) return 0;
 
     while (block_manager_cursor_has_next(iter->sstable_cursors[idx]))
     {
         /* check BEFORE positioning to prevent reading past num_entries */
-        if (iter->sstable_blocks_read[idx] >= sst->num_entries) break;
+        if (iter->sstable_blocks_read[idx] >= num_entries) break;
 
         /* position at first block or advance to next */
         if (iter->sstable_blocks_read[idx] == 0)
@@ -1043,7 +1044,7 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
         iter->sstable_blocks_read[idx]++;
 
         /* ensure we don't read beyond num_entries */
-        if (iter->sstable_blocks_read[idx] > atomic_load(&sst->num_entries))
+        if (iter->sstable_blocks_read[idx] > num_entries)
         {
             break;
         }
@@ -1258,17 +1259,18 @@ static int iter_refill_from_sstable_backward(tidesdb_iter_t *iter, int idx)
 
     if (block_manager_cursor_has_prev(iter->sstable_cursors[idx]))
     {
+        int num_entries = atomic_load(&sst->num_entries);
         /* position at last block or move to previous */
-        if (sst && iter->sstable_blocks_read[idx] == sst->num_entries)
+        if (sst && iter->sstable_blocks_read[idx] == num_entries)
         {
             /* first read after seek_to_last, go to last KV block (0-indexed) */
 
             if (block_manager_cursor_goto(iter->sstable_cursors[idx],
-                                          (uint64_t)(sst->num_entries - 1)) != 0)
+                                          (uint64_t)(num_entries - 1)) != 0)
             {
                 return 0;
             }
-            iter->sstable_blocks_read[idx] = sst->num_entries - 1;
+            iter->sstable_blocks_read[idx] = num_entries - 1;
         }
         else
         {
@@ -6379,10 +6381,11 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
         if (iter->sstable_cursors[i])
         {
             tidesdb_sstable_t *sst = iter->sstables[i];
-            if (sst && sst->num_entries > 0)
+            int num_entries = atomic_load(&sst->num_entries);
+            if (sst && num_entries > 0)
             {
-                block_manager_cursor_goto(iter->sstable_cursors[i], (uint64_t)(sst->num_entries));
-                iter->sstable_blocks_read[i] = sst->num_entries;
+                block_manager_cursor_goto(iter->sstable_cursors[i], (uint64_t)(num_entries));
+                iter->sstable_blocks_read[i] = num_entries;
             }
             else
             {
@@ -6463,7 +6466,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 if (cmp_max > 0)
                 {
                     /* seek_key > max_key skip this entire sstable */
-                    iter->sstable_blocks_read[i] = sst->num_entries;
+                    iter->sstable_blocks_read[i] = atomic_load(&sst->num_entries);
                 }
                 else if (cmp_min < 0)
                 {
@@ -6528,8 +6531,10 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         tidesdb_sstable_t *sst = iter->sstables[i];
         if (!sst || !iter->sstable_cursors[i]) continue;
 
+        int num_entries = atomic_load(&sst->num_entries);
+
         /* skip if out of range */
-        if (iter->sstable_blocks_read[i] >= sst->num_entries) continue;
+        if (iter->sstable_blocks_read[i] >= num_entries) continue;
 
         /* if seek_key <= min_key, first entry is already >= seek_key */
         if (sst->min_key &&
@@ -6547,7 +6552,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         }
 
         /* scan from current position to find first key >= seek_key */
-        while (iter->sstable_blocks_read[i] < sst->num_entries)
+        while (iter->sstable_blocks_read[i] < num_entries)
         {
             if (iter->sstable_blocks_read[i] == 0)
             {
@@ -6687,7 +6692,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                 if (cmp_min < 0)
                 {
                     /* no keys <= target in this sstable */
-                    iter->sstable_blocks_read[i] = sst->num_entries;
+                    iter->sstable_blocks_read[i] = atomic_load(&sst->num_entries);
                     continue;
                 }
                 /* if key > max_key, position at end (all keys <= target) */ if (cmp_max > 0)
@@ -6750,8 +6755,10 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         tidesdb_sstable_t *sst = iter->sstables[i];
         if (!sst) continue;
 
+        int num_entries = atomic_load(&sst->num_entries);
+
         /* skip if already exhausted */
-        if (iter->sstable_blocks_read[i] >= sst->num_entries) continue;
+        if (iter->sstable_blocks_read[i] >= num_entries) continue;
 
         /* if block index positioned us at exact match, just refill */
         if (index_positioned[i])
@@ -6769,7 +6776,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         time_t last_valid_ttl = 0;
         int found_any = 0;
 
-        while (iter->sstable_blocks_read[i] < sst->num_entries)
+        while (iter->sstable_blocks_read[i] < num_entries)
         {
             if (iter->sstable_blocks_read[i] == 0)
             {

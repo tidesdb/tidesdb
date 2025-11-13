@@ -45,7 +45,6 @@
 #define BLOCK_MANAGER_PADDING_SIZE 4
 /* total: 3 + 1 + 4 + 4 */
 
-/
 #define BLOCK_MANAGER_HEADER_SIZE 12
 
 /* block field sizes */
@@ -71,10 +70,11 @@
 #define MIN_CACHE_ENTRIES         10
 #define MAX_REASONABLE_BLOCK_SIZE 10ULL << 30
 
-    typedef enum {
-        BLOCK_MANAGER_SYNC_NONE,
-        BLOCK_MANAGER_SYNC_FULL,
-    } block_manager_sync_mode_t;
+typedef enum
+{
+    BLOCK_MANAGER_SYNC_NONE,
+    BLOCK_MANAGER_SYNC_FULL,
+} block_manager_sync_mode_t;
 
 /**
  * block_manager_cache_t

@@ -359,8 +359,6 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
     uint64_t checksum = compute_checksum(block->data, block->size);
 
-    uint64_t bytes_written = 0;
-
     unsigned char stack_buffer[MAX_INLINE_BLOCK_SIZE + BLOCK_MANAGER_STACK_BUFFER_OVERHEAD];
     unsigned char *main_block_buffer;
     int use_stack = (main_block_total_size <= sizeof(stack_buffer));
@@ -399,8 +397,6 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     {
         return -1;
     }
-
-    bytes_written += main_block_total_size;
 
     if (remaining > 0)
     {
@@ -470,8 +466,6 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
             }
 
             if (!use_overflow_stack) free(overflow_buffer);
-
-            bytes_written += overflow_block_size;
 
             /* update for next iteration */
             overflow_link_pos = current_write_pos + BLOCK_MANAGER_SIZE_FIELD_SIZE +

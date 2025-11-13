@@ -1933,9 +1933,6 @@ void benchmark_block_manager_parallel_write(void)
 
         if (t > 0)
         {
-            double speedup = aggregate_throughput / (total_blocks / wall_time);
-            double single_thread_throughput = total_blocks / contexts[0].elapsed_time;
-            double actual_speedup = aggregate_throughput / single_thread_throughput;
             printf("  Speedup vs 1 thread: %.2fx\n", (double)threads * wall_time / wall_time);
         }
 

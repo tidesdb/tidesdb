@@ -407,11 +407,6 @@ static void reclaim_old_nodes(skip_list_t *list)
     pthread_mutex_unlock(&list->retired_lock);
 }
 
-static inline void advance_epoch(skip_list_t *list)
-{
-    atomic_fetch_add(&list->global_epoch, 1);
-}
-
 int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const uint8_t *value,
                   size_t value_size, time_t ttl)
 {

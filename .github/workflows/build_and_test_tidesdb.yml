@@ -231,8 +231,18 @@ jobs:
               }
               
               tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+              if (!cf) {
+                  fprintf(stderr, "Failed to get column family\n");
+                  tidesdb_close(db);
+                  return 1;
+              }
+              
               tidesdb_txn_t *txn;
-              tidesdb_txn_begin(db, cf, &txn);
+              if (tidesdb_txn_begin(db, cf, &txn) != 0) {
+                  fprintf(stderr, "Failed to begin transaction\n");
+                  tidesdb_close(db);
+                  return 1;
+              }
               
               /* Write diverse test data */
               for (int i = 0; i < 50; i++) {
@@ -250,7 +260,11 @@ jobs:
               tidesdb_flush_memtable(cf);
               
               /* Add more data and compact */
-              tidesdb_txn_begin(db, cf, &txn);
+              if (tidesdb_txn_begin(db, cf, &txn) != 0) {
+                  fprintf(stderr, "Failed to begin second transaction\n");
+                  tidesdb_close(db);
+                  return 1;
+              }
               for (int i = 50; i < 100; i++) {
                   char key[64], value[128];
                   snprintf(key, sizeof(key), "test_key_%d", i);
@@ -397,13 +411,28 @@ jobs:
               }
               printf("✓ Database opened successfully\n");
               
-              tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
-              if (!cf) {
-                  fprintf(stderr, "FAIL: Could not get column family\n");
+              /* List column families to verify they were loaded */
+              char **cf_names = NULL;
+              int cf_count = 0;
+              if (tidesdb_list_column_families(db, &cf_names, &cf_count) != 0) {
+                  fprintf(stderr, "FAIL: Could not list column families\n");
                   tidesdb_close(db);
                   return 1;
               }
-              printf("✓ Column family retrieved\n");
+              printf("✓ Found %d column families\n", cf_count);
+              for (int i = 0; i < cf_count; i++) {
+                  printf("  - %s\n", cf_names[i]);
+                  free(cf_names[i]);
+              }
+              free(cf_names);
+              
+              tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+              if (!cf) {
+                  fprintf(stderr, "FAIL: Could not get column family 'test_cf'\n");
+                  tidesdb_close(db);
+                  return 1;
+              }
+              printf("✓ Column family 'test_cf' retrieved\n");
               
               tidesdb_txn_t *txn;
               if (tidesdb_txn_begin_read(db, cf, &txn) != 0) {

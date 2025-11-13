@@ -5534,8 +5534,8 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
             }
             else if (result == TDB_ERR_NOT_FOUND)
             {
-                free(sst_snapshot);
-                return -1;
+                /* Key not in this SSTable, continue to next one */
+                continue;
             }
             /* else continue to next sstable */
         }

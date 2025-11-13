@@ -438,6 +438,10 @@ jobs:
               }
               printf("✓ Column family 'test_cf' retrieved\n");
               
+              /* Give background flush threads time to complete WAL recovery flushes */
+              printf("Waiting for background operations to complete...\n");
+              sleep(2);
+              
               tidesdb_txn_t *txn;
               if (tidesdb_txn_begin_read(db, cf, &txn) != 0) {
                   fprintf(stderr, "FAIL: Could not begin transaction\n");

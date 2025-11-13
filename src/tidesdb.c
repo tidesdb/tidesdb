@@ -1046,13 +1046,8 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
         /* ensure we don't read beyond num_entries */
         if (iter->sstable_blocks_read[idx] > num_entries)
         {
-            TDB_DEBUG_LOG("[ITER_REFILL] SSTable %d: blocks_read=%d > num_entries=%d, breaking",
-                          idx, iter->sstable_blocks_read[idx], num_entries);
             break;
         }
-
-        TDB_DEBUG_LOG("[ITER_REFILL] SSTable %d: about to read block (blocks_read=%d, num_entries=%d)",
-                      idx, iter->sstable_blocks_read[idx], num_entries);
 
         block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[idx]);
         if (!block) break;
@@ -6503,7 +6498,8 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                                 positioned_via_index = 1;
                                 index_positioned[i] = 1; /* mark for refill section */
                                 /* don't reset blocks_read to 0! We don't know which block we're at.
-                                 * set to num_entries-1 so we only read one block from this position. */
+                                 * set to num_entries-1 so we only read one block from this
+                                 * position. */
                                 int num_entries = atomic_load(&sst->num_entries);
                                 iter->sstable_blocks_read[i] = num_entries - 1;
                             }

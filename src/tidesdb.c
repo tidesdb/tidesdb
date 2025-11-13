@@ -1020,9 +1020,11 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
     tidesdb_sstable_t *sst = iter->sstables[idx];
     if (iter->sstable_blocks_read[idx] >= sst->num_entries) return 0;
 
-    while (block_manager_cursor_has_next(iter->sstable_cursors[idx]) &&
-           iter->sstable_blocks_read[idx] < sst->num_entries)
+    while (block_manager_cursor_has_next(iter->sstable_cursors[idx]))
     {
+        /* check BEFORE positioning to prevent reading past num_entries */
+        if (iter->sstable_blocks_read[idx] >= sst->num_entries) break;
+
         /* position at first block or advance to next */
         if (iter->sstable_blocks_read[idx] == 0)
         {
@@ -1038,9 +1040,7 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
             if (block_manager_cursor_next(iter->sstable_cursors[idx]) != 0) break;
         }
 
-        /* increment and check BEFORE reading to prevent reading metadata blocks */
         iter->sstable_blocks_read[idx]++;
-        if (iter->sstable_blocks_read[idx] > sst->num_entries) break;
 
         block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[idx]);
         if (!block) break;

@@ -470,9 +470,6 @@ typedef struct
  * @param heap array of pending entries from each source (min-heap)
  * @param heap_size current number of entries in heap
  * @param heap_capacity allocated capacity of heap
- * @param entries_from_memtable count of entries from active memtable
- * @param entries_from_immutable count of entries from immutable memtables
- * @param entries_from_sstables count of entries from sstables
  */
 struct tidesdb_iter_t
 {
@@ -497,9 +494,6 @@ struct tidesdb_iter_t
     tidesdb_iter_entry_t *heap;
     int heap_size;
     int heap_capacity;
-    int entries_from_memtable;
-    int entries_from_immutable;
-    int entries_from_sstables;
 };
 
 /*

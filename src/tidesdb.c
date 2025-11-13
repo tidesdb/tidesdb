@@ -3265,7 +3265,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     /* build the succinct trie from the builder */
     if (index_builder)
     {
-        TDB_DEBUG_LOG("Building succinct trie index for SSTable (entries: %d)", sst->num_entries);
+        TDB_DEBUG_LOG("Building succinct trie index for SSTable (entries: %d)", entries_written);
         sst->index = succinct_trie_builder_build(index_builder);
         /* builder is freed by build function */
         index_builder = NULL;
@@ -6107,9 +6107,6 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
     (*iter)->heap = NULL;
     (*iter)->heap_size = 0;
     (*iter)->heap_capacity = 0;
-    (*iter)->entries_from_memtable = 0;
-    (*iter)->entries_from_immutable = 0;
-    (*iter)->entries_from_sstables = 0;
 
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt && active_mt->memtable)
@@ -6161,10 +6158,6 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
                 {
                     tidesdb_memtable_acquire(imt);
                     (*iter)->immutable_memtables[i] = imt;
-                    size_t mt_size = imt->memtable ? atomic_load(&imt->memtable->total_size) : 0;
-                    TDB_DEBUG_LOG("Iterator captured immutable memtable %zu: id=" TDB_U64_FMT
-                                  ", size=%zu bytes",
-                                  i, (unsigned long long)imt->id, mt_size);
                 }
                 else
                 {
@@ -6998,20 +6991,6 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         return -1;
     }
 
-    /* track which source this entry came from */
-    if (entry.source_type == 0)
-    {
-        iter->entries_from_memtable++;
-    }
-    else if (entry.source_type == 1)
-    {
-        iter->entries_from_immutable++;
-    }
-    else if (entry.source_type == 2)
-    {
-        iter->entries_from_sstables++;
-    }
-
     /* refill heap from the source that produced this entry */
     if (entry.source_type == 0)
     {
@@ -7180,11 +7159,6 @@ int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size
 void tidesdb_iter_free(tidesdb_iter_t *iter)
 {
     if (!iter) return;
-
-    TDB_DEBUG_LOG(
-        "Iterator stats: entries from memtable=%d, immutable=%d, sstables=%d, total=%d",
-        iter->entries_from_memtable, iter->entries_from_immutable, iter->entries_from_sstables,
-        iter->entries_from_memtable + iter->entries_from_immutable + iter->entries_from_sstables);
 
     if (iter->current_key) free(iter->current_key);
     if (iter->current_value) free(iter->current_value);

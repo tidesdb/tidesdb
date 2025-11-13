@@ -616,8 +616,10 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size)
         return -1;
     }
 
-    /* copy pointers from old node at levels >= tombstone's level */
-    for (int i = level; i < list->max_level; i++)
+    /* copy pointers from old node at levels >= tombstone's level
+     * only copy up to x->level since that's how many forward pointers x has */
+    int copy_limit = (x->level < list->max_level) ? x->level : list->max_level;
+    for (int i = level; i < copy_limit; i++)
     {
         skip_list_node_t *next = atomic_load_explicit(&x->forward[i], memory_order_acquire);
         atomic_store_explicit(&tombstone->forward[i], next, memory_order_relaxed);

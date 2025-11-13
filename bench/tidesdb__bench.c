@@ -120,23 +120,13 @@ void *thread_put(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
 
-    printf("[TRACE] Thread %d starting, range %d-%d\n", data->thread_id, data->start, data->end);
-    fflush(stdout);
-
     for (int i = data->start; i < data->end; i++)
     {
-        printf("[TRACE] Thread %d: operation %d\n", data->thread_id, i);
-        fflush(stdout);
-
         tidesdb_txn_t *txn = NULL;
         if (tidesdb_txn_begin(data->tdb, data->cf, &txn) != 0)
         {
-            printf(BOLDRED "Failed to begin transaction\n" RESET);
             continue;
         }
-
-        printf("[TRACE] Thread %d: txn_put %d\n", data->thread_id, i);
-        fflush(stdout);
 
         if (tidesdb_txn_put(txn, data->keys[i], data->key_sizes[i], data->values[i],
                             data->value_sizes[i], -1) != 0)
@@ -146,22 +136,13 @@ void *thread_put(void *arg)
             continue;
         }
 
-        printf("[TRACE] Thread %d: txn_commit %d\n", data->thread_id, i);
-        fflush(stdout);
-
         if (tidesdb_txn_commit(txn) != 0)
         {
             printf(BOLDRED "Failed to commit transaction\n" RESET);
         }
 
-        printf("[TRACE] Thread %d: txn_free %d\n", data->thread_id, i);
-        fflush(stdout);
-
         tidesdb_txn_free(txn);
     }
-
-    printf("[TRACE] Thread %d finished\n", data->thread_id);
-    fflush(stdout);
 
     return NULL;
 }

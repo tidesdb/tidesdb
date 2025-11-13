@@ -414,7 +414,9 @@ jobs:
                   .db_path = "../portable_test_db",
                   .num_flush_threads = 1,
                   .num_compaction_threads = 1,
-                  .enable_debug_logging = 1
+                  .enable_debug_logging = 1,
+                  .wait_for_wal_recovery = 1,
+                  .wal_recovery_poll_interval_ms = 100
               };
               
               printf("\nOpening database created on Linux x64...\n");

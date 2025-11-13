@@ -1031,14 +1031,7 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
             break;
 
         /* position at first block or advance to next */
-        if (iter->sstable_blocks_read[idx] == -1)
-        {
-            /* cursor already positioned by block index, just read from current position
-             * don't advance cursor -- it's already at the right position.
-             * After reading this block, we'll set blocks_read to 1 and continue normally. */
-            /* don't modify blocks_read here -- we'll set it after the read */
-        }
-        else if (iter->sstable_blocks_read[idx] == 0)
+        if (iter->sstable_blocks_read[idx] == 0)
         {
             /* first read, position at first block */
             if (iter->sstable_cursors[idx]->current_pos == BLOCK_MANAGER_HEADER_SIZE)
@@ -1051,18 +1044,8 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
             if (block_manager_cursor_next(iter->sstable_cursors[idx]) != 0) break;
         }
 
-        /* handle blocks_read increment */
-        if (iter->sstable_blocks_read[idx] == -1)
-        {
-            /* first read from index-positioned cursor
-             * We don't know our absolute position in the SSTable, so we cannot safely
-             * continue sequential reading. Set to num_entries to stop after this read. */
-            iter->sstable_blocks_read[idx] = num_entries;
-        }
-        else
-        {
-            iter->sstable_blocks_read[idx]++;
-        }
+        /* increment blocks_read */
+        iter->sstable_blocks_read[idx]++;
 
         /* ensure we don't read beyond num_entries */
         if (iter->sstable_blocks_read[idx] > num_entries)
@@ -3224,6 +3207,9 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
                     }
                     if (index_builder)
                     {
+                        /* Store both offset AND block number in the index.
+                         * We store offset for positioning, but we need block number for bounds checking.
+                         * For now, store offset - we'll track block number separately. */
                         succinct_trie_builder_add(index_builder, k, k_size, offset);
                     }
                     /* don't increment num_entries yet - use local counter */
@@ -6508,23 +6494,17 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                     int positioned_via_index = 0;
                     if (sst->cf->config.enable_block_indexes && sst->index)
                     {
-                        int64_t exact_offset = -1;
+                        int64_t offset = -1;
                         if (succinct_trie_prefix_get(sst->index, (uint8_t *)key, key_size,
-                                                     &exact_offset) == 0)
+                                                     &offset) == 0)
                         {
                             TDB_DEBUG_LOG("Block index for SSTable %d (id=%llu, entries=%d) returned offset=%ld for key=%.*s",
                                           i, (unsigned long long)sst->id, atomic_load(&sst->num_entries),
-                                          exact_offset, (int)key_size, (char*)key);
-                            /* found offset from index, position cursor there */
+                                          offset, (int)key_size, (char*)key);
                             if (block_manager_cursor_goto(iter->sstable_cursors[i],
-                                                          (uint64_t)exact_offset) == 0)
+                                                          (uint64_t)offset) == 0)
                             {
                                 positioned_via_index = 1;
-                                index_positioned[i] = 1; /* mark for refill section */
-                                /* Set blocks_read to -1 to indicate cursor was positioned
-                                 * via index. This tells iter_refill_from_sstable to read one
-                                 * block then stop (we don't know our absolute position). */
-                                iter->sstable_blocks_read[i] = -1;
                             }
                         }
                     }

@@ -2131,14 +2131,18 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
 
     /* save comparator name to cf */
-    strncpy(cf->comparator_name, cmp_name, TDB_MAX_COMPARATOR_NAME - 1);
-    cf->comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
+    size_t cmp_len = strlen(cmp_name);
+    if (cmp_len >= TDB_MAX_COMPARATOR_NAME) cmp_len = TDB_MAX_COMPARATOR_NAME - 1;
+    memcpy(cf->comparator_name, cmp_name, cmp_len);
+    cf->comparator_name[cmp_len] = '\0';
 
     /* if config had empty comparator_name, save the resolved default to config */
     if (cf->config.comparator_name[0] == '\0')
     {
-        strncpy(cf->config.comparator_name, cmp_name, TDB_MAX_COMPARATOR_NAME - 1);
-        cf->config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
+        size_t cfg_cmp_len = strlen(cmp_name);
+        if (cfg_cmp_len >= TDB_MAX_COMPARATOR_NAME) cfg_cmp_len = TDB_MAX_COMPARATOR_NAME - 1;
+        memcpy(cf->config.comparator_name, cmp_name, cfg_cmp_len);
+        cf->config.comparator_name[cfg_cmp_len] = '\0';
     }
 
     TDB_DEBUG_LOG("Column family '%s' using comparator '%s'", name, cf->comparator_name);
@@ -2846,8 +2850,10 @@ int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
             pthread_rwlock_unlock(&db->db_lock);
             return TDB_ERR_MEMORY;
         }
-        strncpy((*names)[i], db->column_families[i]->name, TDB_MAX_CF_NAME_LENGTH - 1);
-        (*names)[i][TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
+        size_t name_len = strlen(db->column_families[i]->name);
+        if (name_len >= TDB_MAX_CF_NAME_LENGTH) name_len = TDB_MAX_CF_NAME_LENGTH - 1;
+        memcpy((*names)[i], db->column_families[i]->name, name_len);
+        (*names)[i][name_len] = '\0';
     }
 
     pthread_rwlock_unlock(&db->db_lock);
@@ -2868,11 +2874,15 @@ int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
     pthread_rwlock_rdlock(&cf->cf_lock);
 
     /* copy basic info */
-    strncpy((*stats)->name, cf->name, TDB_MAX_CF_NAME_LENGTH - 1);
-    (*stats)->name[TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
+    size_t stats_name_len = strlen(cf->name);
+    if (stats_name_len >= TDB_MAX_CF_NAME_LENGTH) stats_name_len = TDB_MAX_CF_NAME_LENGTH - 1;
+    memcpy((*stats)->name, cf->name, stats_name_len);
+    (*stats)->name[stats_name_len] = '\0';
 
-    strncpy((*stats)->comparator_name, cf->comparator_name, TDB_MAX_COMPARATOR_NAME - 1);
-    (*stats)->comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
+    size_t stats_cmp_len = strlen(cf->comparator_name);
+    if (stats_cmp_len >= TDB_MAX_COMPARATOR_NAME) stats_cmp_len = TDB_MAX_COMPARATOR_NAME - 1;
+    memcpy((*stats)->comparator_name, cf->comparator_name, stats_cmp_len);
+    (*stats)->comparator_name[stats_cmp_len] = '\0';
     (*stats)->num_sstables = atomic_load(&cf->num_sstables);
 
     /* calc total ssts size */
@@ -5684,8 +5694,10 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size, con
 
     tidesdb_operation_t *op = &txn->operations[txn->num_ops];
     op->type = TIDESDB_OP_PUT;
-    strncpy(op->cf_name, cf->name, TDB_MAX_CF_NAME_LENGTH - 1);
-    op->cf_name[TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
+    size_t put_cf_len = strlen(cf->name);
+    if (put_cf_len >= TDB_MAX_CF_NAME_LENGTH) put_cf_len = TDB_MAX_CF_NAME_LENGTH - 1;
+    memcpy(op->cf_name, cf->name, put_cf_len);
+    op->cf_name[put_cf_len] = '\0';
 
     op->key = malloc(key_size);
     if (!op->key) return TDB_ERR_MEMORY;
@@ -5729,8 +5741,10 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size)
 
     tidesdb_operation_t *op = &txn->operations[txn->num_ops];
     op->type = TIDESDB_OP_DELETE;
-    strncpy(op->cf_name, cf->name, TDB_MAX_CF_NAME_LENGTH - 1);
-    op->cf_name[TDB_MAX_CF_NAME_LENGTH - 1] = '\0';
+    size_t del_cf_len = strlen(cf->name);
+    if (del_cf_len >= TDB_MAX_CF_NAME_LENGTH) del_cf_len = TDB_MAX_CF_NAME_LENGTH - 1;
+    memcpy(op->cf_name, cf->name, del_cf_len);
+    op->cf_name[del_cf_len] = '\0';
 
     /* allocate and copy key */
     op->key = malloc(key_size);

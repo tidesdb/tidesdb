@@ -68,6 +68,24 @@ jobs:
         shell: bash
         run: brew install zstd lz4 snappy
 
+      - name: Setup vcpkg binary cache (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg_cache"
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE
+          echo "VCPKG_DEFAULT_BINARY_CACHE=$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Cache vcpkg packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: vcpkg-${{ matrix.compiler }}-${{ matrix.arch }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-${{ matrix.compiler }}-${{ matrix.arch }}-
+            vcpkg-${{ matrix.compiler }}-
+
       - name: Install dependencies (Windows MSVC x64)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
         shell: pwsh
@@ -241,7 +259,7 @@ jobs:
           }
           EOF
           gcc -o create_db create_db.c -I../src -I../external -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-          LD_LIBRARY_PATH=. ./create_db
+          LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./create_db
       
       - name: Upload database
         uses: actions/upload-artifact@v4

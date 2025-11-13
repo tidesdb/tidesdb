@@ -6107,9 +6107,6 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
     (*iter)->heap = NULL;
     (*iter)->heap_size = 0;
     (*iter)->heap_capacity = 0;
-    (*iter)->entries_from_memtable = 0;
-    (*iter)->entries_from_immutable = 0;
-    (*iter)->entries_from_sstables = 0;
 
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt && active_mt->memtable)
@@ -6992,20 +6989,6 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
     {
         iter->valid = 0;
         return -1;
-    }
-
-    /* track which source this entry came from */
-    if (entry.source_type == 0)
-    {
-        iter->entries_from_memtable++;
-    }
-    else if (entry.source_type == 1)
-    {
-        iter->entries_from_immutable++;
-    }
-    else if (entry.source_type == 2)
-    {
-        iter->entries_from_sstables++;
     }
 
     /* refill heap from the source that produced this entry */

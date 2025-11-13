@@ -6502,8 +6502,10 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                             {
                                 positioned_via_index = 1;
                                 index_positioned[i] = 1; /* mark for refill section */
-                                iter->sstable_blocks_read[i] =
-                                    0; /* refill will read from current position */
+                                /* don't reset blocks_read to 0! We don't know which block we're at.
+                                 * set to num_entries-1 so we only read one block from this position. */
+                                int num_entries = atomic_load(&sst->num_entries);
+                                iter->sstable_blocks_read[i] = num_entries - 1;
                             }
                         }
                     }

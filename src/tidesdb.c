@@ -84,6 +84,37 @@ static inline int64_t decode_int64_le(const uint8_t *buf)
     return (int64_t)uval;
 }
 
+/*
+ * encode_uint64_le
+ * encodes a uint64_t value in little-endian format
+ * @param buf buffer to store encoded value
+ * @param val value to encode
+ */
+static inline void encode_uint64_le(uint8_t *buf, uint64_t val)
+{
+    buf[0] = (uint8_t)(val & 0xFF);
+    buf[1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[2] = (uint8_t)((val >> 16) & 0xFF);
+    buf[3] = (uint8_t)((val >> 24) & 0xFF);
+    buf[4] = (uint8_t)((val >> 32) & 0xFF);
+    buf[5] = (uint8_t)((val >> 40) & 0xFF);
+    buf[6] = (uint8_t)((val >> 48) & 0xFF);
+    buf[7] = (uint8_t)((val >> 56) & 0xFF);
+}
+
+/*
+ * decode_uint64_le
+ * decodes a uint64_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline uint64_t decode_uint64_le(const uint8_t *buf)
+{
+    return ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
+           ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
+           ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
+}
+
 #define TDB_KV_HEADER_SIZE 18 /* 1 + 1 + 4 + 4 + 8 = 18 bytes */
 
 /*
@@ -4533,18 +4564,18 @@ static void *tidesdb_compaction_worker(void *arg)
         if (metadata)
         {
             uint8_t *ptr = metadata;
-            memcpy(ptr, &magic, sizeof(uint32_t));
+            encode_uint32_le(ptr, magic);
             ptr += sizeof(uint32_t);
             uint64_t num_entries = (uint64_t)merged->num_entries;
-            memcpy(ptr, &num_entries, sizeof(uint64_t));
+            encode_uint64_le(ptr, num_entries);
             ptr += sizeof(uint64_t);
             uint32_t min_size = (uint32_t)merged->min_key_size;
-            memcpy(ptr, &min_size, sizeof(uint32_t));
+            encode_uint32_le(ptr, min_size);
             ptr += sizeof(uint32_t);
             memcpy(ptr, merged->min_key, merged->min_key_size);
             ptr += merged->min_key_size;
             uint32_t max_size = (uint32_t)merged->max_key_size;
-            memcpy(ptr, &max_size, sizeof(uint32_t));
+            encode_uint32_le(ptr, max_size);
             ptr += sizeof(uint32_t);
             memcpy(ptr, merged->max_key, merged->max_key_size);
 
@@ -4876,17 +4907,14 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
             metadata_block->size >= sizeof(uint32_t) + sizeof(uint64_t) + 2 * sizeof(uint32_t))
         {
             uint8_t *ptr = metadata_block->data;
-            uint32_t magic;
-            memcpy(&magic, ptr, sizeof(uint32_t));
+            uint32_t magic = decode_uint32_le(ptr);
 
             if (magic == TDB_SST_META_MAGIC)
             {
                 ptr += sizeof(uint32_t);
-                uint64_t num_entries;
-                memcpy(&num_entries, ptr, sizeof(uint64_t));
+                uint64_t num_entries = decode_uint64_le(ptr);
                 ptr += sizeof(uint64_t);
-                uint32_t min_key_size;
-                memcpy(&min_key_size, ptr, sizeof(uint32_t));
+                uint32_t min_key_size = decode_uint32_le(ptr);
                 ptr += sizeof(uint32_t);
 
                 sst->num_entries = (int)num_entries;
@@ -4897,8 +4925,7 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
                     sst->min_key_size = min_key_size;
                 }
                 ptr += min_key_size;
-                uint32_t max_key_size;
-                memcpy(&max_key_size, ptr, sizeof(uint32_t));
+                uint32_t max_key_size = decode_uint32_le(ptr);
                 ptr += sizeof(uint32_t);
                 sst->max_key = malloc(max_key_size);
                 if (sst->max_key)

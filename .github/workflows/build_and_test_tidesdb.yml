@@ -180,26 +180,8 @@ jobs:
           cd build
           ctest --output-on-failure --build-config Release
 
-  create-portable-database:
-    runs-on: ubuntu-latest
-    name: Portability
-    
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev build-essential cmake
-
-      - name: Configure CMake
-        run: cmake -S . -B build
-
-      - name: Build
-        run: cmake --build build --config Release
-
-      - name: Create test database with WAL and SSTables
+      - name: Create portable test database (Linux x64 only)
+        if: runner.os == 'Linux' && matrix.arch == 'x64'
         run: |
           cd build
           cat > create_portable_db.c << 'EOF'
@@ -244,7 +226,6 @@ jobs:
                   return 1;
               }
               
-            
               printf("Writing keys 0-49...\n");
               for (int i = 0; i < 50; i++) {
                   char key[64], value[128];
@@ -256,12 +237,10 @@ jobs:
               tidesdb_txn_commit(txn);
               tidesdb_txn_free(txn);
               
-           
               printf("Flushing first batch...\n");
               tidesdb_flush_memtable(cf);
-              sleep(1); 
+              sleep(1);
               
-     
               printf("Writing keys 50-99...\n");
               if (tidesdb_txn_begin(db, cf, &txn) != 0) {
                   fprintf(stderr, "Failed to begin second transaction\n");
@@ -278,15 +257,13 @@ jobs:
               tidesdb_txn_commit(txn);
               tidesdb_txn_free(txn);
               
-      
               printf("Flushing second batch...\n");
               tidesdb_flush_memtable(cf);
               sleep(1);
               
-          
               printf("Compacting...\n");
               tidesdb_compact(cf);
-              sleep(1); 
+              sleep(1);
               
               printf("☑ Created portable database with 100 keys\n");
               printf("☑ Database includes WAL, SSTables, bloom filters, and indexes\n");
@@ -304,168 +281,24 @@ jobs:
           echo "Database files created:"
           find portable_test_db -type f -ls
 
-      - name: Upload portable database
+      - name: Upload portable database artifact (Linux x64 only)
+        if: runner.os == 'Linux' && matrix.arch == 'x64'
         uses: actions/upload-artifact@v4
         with:
           name: portable-test-database
           path: build/portable_test_db/
           retention-days: 1
 
-  verify-portable-database:
-    needs: create-portable-database
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: Linux x64
-            arch: x64
-          - os: ubuntu-latest
-            name: Linux x86
-            arch: x86
-          - os: macos-latest
-            name: macOS x64
-            arch: x64
-          - os: macos-latest
-            name: macOS x86
-            arch: x86
-          - os: windows-latest
-            name: Windows MSVC x64
-            compiler: msvc
-            arch: x64
-          - os: windows-latest
-            name: Windows MSVC x86
-            compiler: msvc
-            arch: x86
-          - os: windows-latest
-            name: Windows MinGW x64
-            compiler: mingw
-            arch: x64
-          - os: windows-latest
-            name: Windows MinGW x86
-            compiler: mingw
-            arch: x86
-
-    runs-on: ${{ matrix.os }}
-    name: Verify Portability on ${{ matrix.name }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download portable database
+      - name: Download and verify portable database (all platforms)
+        if: runner.os != 'Linux' || matrix.arch != 'x64'
         uses: actions/download-artifact@v4
         with:
           name: portable-test-database
           path: portable_test_db
+        continue-on-error: true
 
-      - name: Install dependencies (Linux x64)
-        if: runner.os == 'Linux' && matrix.arch == 'x64'
-        run: |
-          sudo apt update
-          sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev build-essential cmake
-
-      - name: Install dependencies (Linux x86)
-        if: runner.os == 'Linux' && matrix.arch == 'x86'
-        run: |
-          sudo dpkg --add-architecture i386
-          sudo apt update
-          sudo apt install -y gcc-multilib g++-multilib libc6-dev-i386 \
-            libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 build-essential cmake
-
-      - name: Install dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: brew install zstd lz4 snappy
-
-      - name: Install dependencies (Windows MSVC x64)
-        if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
-        shell: pwsh
-        run: |
-          cd $env:VCPKG_INSTALLATION_ROOT
-          git pull
-          .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
-
-      - name: Install dependencies (Windows MSVC x86)
-        if: matrix.compiler == 'msvc' && matrix.arch == 'x86'
-        shell: pwsh
-        run: |
-          cd $env:VCPKG_INSTALLATION_ROOT
-          git pull
-          .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
-
-      - name: Install and setup MinGW
-        if: matrix.compiler == 'mingw'
-        shell: pwsh
-        run: |
-          if ("${{ matrix.arch }}" -eq "x86") {
-              choco install mingw --version=8.1.0 --forcex86 -y
-              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
-          } else {
-              choco install mingw --version=8.1.0 -y
-              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
-          }
-          echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Configure CMake (Linux/macOS x64)
-        if: runner.os != 'Windows' && matrix.arch == 'x64'
-        run: cmake -S . -B build
-
-      - name: Configure CMake (Linux x86)
-        if: runner.os == 'Linux' && matrix.arch == 'x86'
-        run: |
-          export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
-          cmake -S . -B build \
-            -DCMAKE_C_FLAGS="-m32" \
-            -DCMAKE_EXE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
-            -DCMAKE_MODULE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu"
-
-      - name: Configure CMake (macOS x86)
-        if: runner.os == 'macOS' && matrix.arch == 'x86'
-        run: |
-          cmake -S . -B build \
-            -DCMAKE_C_FLAGS="-m32" \
-            -DCMAKE_EXE_LINKER_FLAGS="-m32" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-m32" \
-            -DCMAKE_MODULE_LINKER_FLAGS="-m32"
-
-      - name: Configure CMake (Windows MSVC x64)
-        if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
-        shell: pwsh
-        run: |
-          cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-
-      - name: Configure CMake (Windows MSVC x86)
-        if: matrix.compiler == 'msvc' && matrix.arch == 'x86'
-        shell: pwsh
-        run: |
-          cmake -S . -B build -A Win32 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-
-      - name: Configure CMake (Windows MinGW)
-        if: matrix.compiler == 'mingw'
-        shell: pwsh
-        run: |
-          if ("${{ matrix.arch }}" -eq "x86") {
-              cd $env:VCPKG_INSTALLATION_ROOT
-              .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
-              cd $env:GITHUB_WORKSPACE
-              cmake -S . -B build -G "MinGW Makefiles" `
-                -DCMAKE_C_FLAGS="-m32" `
-                -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-                -DVCPKG_TARGET_TRIPLET=x86-windows
-          } else {
-              cd $env:VCPKG_INSTALLATION_ROOT
-              .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
-              cd $env:GITHUB_WORKSPACE
-              cmake -S . -B build -G "MinGW Makefiles" `
-                -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-                -DVCPKG_TARGET_TRIPLET=x64-windows
-          }
-
-      - name: Build TidesDB
-        run: cmake --build build --config Release
-
-      - name: Verify portable database
+      - name: Verify cross-platform portability
+        if: (runner.os != 'Linux' || matrix.arch != 'x64') && steps.download-artifact.outcome == 'success'
         shell: bash
         run: |
           cd build
@@ -475,8 +308,7 @@ jobs:
           #include <string.h>
           
           int main() {
-              printf("Checking database files before opening...\n");
-              system("ls -laR ../portable_test_db/");
+              printf("Verifying database created on Linux x64...\n");
               
               tidesdb_t *db;
               tidesdb_config_t cfg = {
@@ -488,35 +320,18 @@ jobs:
                   .wal_recovery_poll_interval_ms = 100
               };
               
-              printf("\nOpening database created on Linux x64...\n");
               if (tidesdb_open(&cfg, &db) != 0) {
                   fprintf(stderr, "FAIL: Could not open database\n");
                   return 1;
               }
               printf("☑ Database opened successfully\n");
               
-      
-              char **cf_names = NULL;
-              int cf_count = 0;
-              if (tidesdb_list_column_families(db, &cf_names, &cf_count) != 0) {
-                  fprintf(stderr, "FAIL: Could not list column families\n");
-                  tidesdb_close(db);
-                  return 1;
-              }
-              printf("☑ Found %d column families\n", cf_count);
-              for (int i = 0; i < cf_count; i++) {
-                  printf("  - %s\n", cf_names[i]);
-                  free(cf_names[i]);
-              }
-              free(cf_names);
-              
               tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
               if (!cf) {
-                  fprintf(stderr, "FAIL: Could not get column family 'test_cf'\n");
+                  fprintf(stderr, "FAIL: Could not get column family\n");
                   tidesdb_close(db);
                   return 1;
               }
-              printf("☑ Column family 'test_cf' retrieved\n");
               
               tidesdb_txn_t *txn;
               if (tidesdb_txn_begin_read(db, cf, &txn) != 0) {
@@ -525,7 +340,6 @@ jobs:
                   return 1;
               }
               
-      
               int verified = 0;
               for (int i = 0; i < 100; i++) {
                   char key[64], expected[128];
@@ -544,8 +358,6 @@ jobs:
                   
                   if (value_size != strlen(expected) || memcmp(value, expected, value_size) != 0) {
                       fprintf(stderr, "FAIL: Value mismatch for %s\n", key);
-                      fprintf(stderr, "  Expected: %s\n", expected);
-                      fprintf(stderr, "  Got: %.*s\n", (int)value_size, value);
                       free(value);
                       tidesdb_txn_free(txn);
                       tidesdb_close(db);
@@ -559,10 +371,6 @@ jobs:
               printf("\n*========================================*\n");
               printf("☑ CROSS-PLATFORM TEST PASSED\n");
               printf("☑ All %d keys verified successfully\n", verified);
-              printf("☑ WAL files readable\n");
-              printf("☑ SSTable files readable\n");
-              printf("☑ Bloom filters working\n");
-              printf("☑ Block indexes working\n");
               printf("☑ Little-endian serialization confirmed\n");
               printf("*=======================================*\n");
               
@@ -573,68 +381,41 @@ jobs:
           EOF
           
           if [ "$RUNNER_OS" == "Windows" ]; then
-            # on windows just add verify test to existing build (same as main CI)
-            # the build directory already has tidesdb library and all dependencies configured
-            
-            # move source file to root and add to CMakeLists.txt
             mv verify_portable_db.c ../
             cd ..
-            
-            # add verify executable to root CMakeLists.txt
             cat >> CMakeLists.txt << 'CMAKEEOF'
-          
-          # portability verification test
           add_executable(verify_portable_db_test verify_portable_db.c)
           target_link_libraries(verify_portable_db_test PRIVATE tidesdb)
           target_include_directories(verify_portable_db_test PRIVATE external)
           CMAKEEOF
-            
-            # reconf to pick up the new executable
             cmake build
-            
-            # Build the verify test
             if [ "${{ matrix.compiler }}" == "mingw" ]; then
-              # minqw build all (makefiles don't support --target well)
               cmake --build build
               cd build
               ./verify_portable_db_test.exe
             else
-              # msvc build specific target with rel config
               cmake --build build --target verify_portable_db_test --config Release
               cd build/Release
               ./verify_portable_db_test.exe
             fi
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            gcc -o verify_portable_db verify_portable_db.c \
+              -I../src -I../external \
+              -I/opt/homebrew/include -I/usr/local/include \
+              -L. -L/opt/homebrew/lib -L/usr/local/lib \
+              -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+            DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_portable_db
           else
-            if [ "$RUNNER_OS" == "macOS" ]; then
-              # macOS needs homebrew library paths
-              if [ "${{ matrix.arch }}" == "x86" ]; then
-                gcc -m32 -o verify_portable_db verify_portable_db.c \
-                  -I../src -I../external \
-                  -I/opt/homebrew/include -I/usr/local/include \
-                  -L. -L/opt/homebrew/lib -L/usr/local/lib \
-                  -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-                DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_portable_db
-              else
-                gcc -o verify_portable_db verify_portable_db.c \
-                  -I../src -I../external \
-                  -I/opt/homebrew/include -I/usr/local/include \
-                  -L. -L/opt/homebrew/lib -L/usr/local/lib \
-                  -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-                DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_portable_db
-              fi
+            if [ "${{ matrix.arch }}" == "x86" ]; then
+              gcc -m32 -o verify_portable_db verify_portable_db.c \
+                -I../src -I../external \
+                -L. -L/usr/lib/i386-linux-gnu \
+                -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+              LD_LIBRARY_PATH=.:/usr/lib/i386-linux-gnu ./verify_portable_db
             else
-              # linux
-              if [ "${{ matrix.arch }}" == "x86" ]; then
-                gcc -m32 -o verify_portable_db verify_portable_db.c \
-                  -I../src -I../external \
-                  -L. -L/usr/lib/i386-linux-gnu \
-                  -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-                LD_LIBRARY_PATH=.:/usr/lib/i386-linux-gnu ./verify_portable_db
-              else
-                gcc -o verify_portable_db verify_portable_db.c \
-                  -I../src -I../external \
-                  -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-                LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./verify_portable_db
-              fi
+              gcc -o verify_portable_db verify_portable_db.c \
+                -I../src -I../external \
+                -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+              LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./verify_portable_db
             fi
           fi

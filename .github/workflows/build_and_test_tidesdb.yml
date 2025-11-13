@@ -274,7 +274,7 @@ jobs:
           EOF
           
           gcc -o create_portable_db create_portable_db.c \
-            -I../src -I../external/inih -I../external/xxHash -I../external/snappy \
+            -I../src -I../external \
             -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
           LD_LIBRARY_PATH=. ./create_portable_db
           
@@ -467,18 +467,18 @@ jobs:
           if [ "$RUNNER_OS" == "Windows" ]; then
             if [ "${{ matrix.compiler }}" == "mingw" ]; then
               gcc -o verify_portable_db verify_portable_db.c \
-                -I../src -I../external/inih -I../external/xxHash -I../external/snappy \
+                -I../src -I../external \
                 -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
               ./verify_portable_db.exe
             else
               # MSVC build
-              cl.exe /I../src /I../external/inih /I../external/xxHash /I../external/snappy \
+              cl.exe /I../src /I../external \
                 verify_portable_db.c /link /LIBPATH:Release tidesdb.lib
               ./verify_portable_db.exe
             fi
           else
             gcc -o verify_portable_db verify_portable_db.c \
-              -I../src -I../external/inih -I../external/xxHash -I../external/snappy \
+              -I../src -I../external \
               -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
             if [ "$RUNNER_OS" == "macOS" ]; then
               DYLD_LIBRARY_PATH=. ./verify_portable_db

@@ -193,10 +193,11 @@ jobs:
           sudo apt update
           sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev build-essential cmake
 
-      - name: Build TidesDB
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release
+      - name: Configure CMake
+        run: cmake -S . -B build
+
+      - name: Build
+        run: cmake --build build --config Release
 
       - name: Create test database with WAL and SSTables
         run: |
@@ -350,7 +351,7 @@ jobs:
 
       - name: Configure CMake (Linux/macOS)
         if: runner.os != 'Windows'
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build
 
       - name: Configure CMake (Windows MSVC)
         if: matrix.compiler == 'msvc'

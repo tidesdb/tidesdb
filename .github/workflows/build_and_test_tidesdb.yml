@@ -450,6 +450,10 @@ jobs:
           if [ "$RUNNER_OS" == "Windows" ]; then
             # Move verify source to root and update CMakeLists
             mv verify_db.c ../
+            # Fix path for MSVC which runs from build/Release/
+            if [ "${{ matrix.compiler }}" == "msvc" ]; then
+              sed -i 's|\.\./testdb|../../testdb|g' ../verify_db.c
+            fi
             cat >> ../CMakeLists.txt << 'CMAKEEOF'
           
           add_executable(verify_db verify_db.c)

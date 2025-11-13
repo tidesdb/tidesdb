@@ -2924,6 +2924,15 @@ static int test_linear_scan_fallback(void)
 
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
+    /* wait for async flush to complete */
+    int prev_sstables = num_sstables;
+    for (int i = 0; i < max_wait; i++)
+    {
+        num_sstables = atomic_load(&cf->num_sstables);
+        if (num_sstables > prev_sstables) break;
+        usleep(100000);
+    }
+
     /* verify deleted key is not returned (tombstone in newer sstable) */
     ASSERT_EQ(tidesdb_txn_begin_read(db, cf, &txn), 0);
     value = NULL;

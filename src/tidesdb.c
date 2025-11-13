@@ -1019,22 +1019,29 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
     /* stop reading after num_entries to avoid reading metadata blocks */
     tidesdb_sstable_t *sst = iter->sstables[idx];
     int num_entries = atomic_load(&sst->num_entries);
-    if (iter->sstable_blocks_read[idx] >= num_entries) return 0;
+    /* skip boundary check if blocks_read is -1 (positioned via block index) */
+    if (iter->sstable_blocks_read[idx] >= num_entries && iter->sstable_blocks_read[idx] != -1) return 0;
 
     while (block_manager_cursor_has_next(iter->sstable_cursors[idx]))
     {
         /* check BEFORE positioning to prevent reading past num_entries */
-        if (iter->sstable_blocks_read[idx] >= num_entries) break;
+        /* skip check if blocks_read is -1 (positioned via block index) */
+        if (iter->sstable_blocks_read[idx] >= num_entries && iter->sstable_blocks_read[idx] != -1) break;
 
         /* position at first block or advance to next */
-        if (iter->sstable_blocks_read[idx] == 0)
+        if (iter->sstable_blocks_read[idx] == -1)
         {
-            /* if cursor already positioned (e.g. by block index), don't reset it */
+            /* cursor already positioned by block index, just read from current position */
+            /* set blocks_read to 0 so next iteration will advance normally */
+            iter->sstable_blocks_read[idx] = 0;
+        }
+        else if (iter->sstable_blocks_read[idx] == 0)
+        {
+            /* first read, position at first block */
             if (iter->sstable_cursors[idx]->current_pos == BLOCK_MANAGER_HEADER_SIZE)
             {
                 if (block_manager_cursor_goto_first(iter->sstable_cursors[idx]) != 0) break;
             }
-            /* cursor is already positioned by block index, just read from current position */
         }
         else
         {
@@ -6497,11 +6504,9 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                             {
                                 positioned_via_index = 1;
                                 index_positioned[i] = 1; /* mark for refill section */
-                                /* don't reset blocks_read to 0! We don't know which block we're at.
-                                 * set to num_entries-1 so we only read one block from this
-                                 * position. */
-                                int num_entries = atomic_load(&sst->num_entries);
-                                iter->sstable_blocks_read[i] = num_entries - 1;
+                                /* Set blocks_read to -1 to indicate cursor was positioned via index.
+                                 * This tells iter_refill_from_sstable to skip boundary checks. */
+                                iter->sstable_blocks_read[i] = -1;
                             }
                         }
                     }

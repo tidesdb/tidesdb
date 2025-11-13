@@ -118,8 +118,8 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
                     ? (size_t)LZ4_decompress_safe(
                           (const char *)(data + sizeof(uint64_t)), (char *)decompressed_data,
                           (int)(data_size - sizeof(uint64_t)), (int)*decompressed_size)
-                    : ZSTD_decompress(decompressed_data, *decompressed_size, data + sizeof(uint64_t),
-                                      data_size - sizeof(uint64_t));
+                    : ZSTD_decompress(decompressed_data, *decompressed_size,
+                                      data + sizeof(uint64_t), data_size - sizeof(uint64_t));
 
             if ((type == COMPRESS_ZSTD && ZSTD_isError(actual_size)) ||
                 (type == COMPRESS_LZ4 && actual_size <= 0))

@@ -477,12 +477,18 @@ jobs:
               ./verify_portable_db.exe
             fi
           else
-            gcc -o verify_portable_db verify_portable_db.c \
-              -I../src -I../external \
-              -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
             if [ "$RUNNER_OS" == "macOS" ]; then
-              DYLD_LIBRARY_PATH=. ./verify_portable_db
+              # macOS needs homebrew library paths
+              gcc -o verify_portable_db verify_portable_db.c \
+                -I../src -I../external \
+                -I/opt/homebrew/include -I/usr/local/include \
+                -L. -L/opt/homebrew/lib -L/usr/local/lib \
+                -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+              DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_portable_db
             else
+              gcc -o verify_portable_db verify_portable_db.c \
+                -I../src -I../external \
+                -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
               LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./verify_portable_db
             fi
           fi

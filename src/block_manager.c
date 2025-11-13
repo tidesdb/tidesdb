@@ -111,13 +111,15 @@ static int write_header(int fd, uint32_t block_size)
     uint8_t version = BLOCK_MANAGER_VERSION;
     uint32_t padding = 0;
 
-    memcpy(header, &magic, BLOCK_MANAGER_MAGIC_SIZE);
-    memcpy(header + BLOCK_MANAGER_MAGIC_SIZE, &version, BLOCK_MANAGER_VERSION_SIZE);
-    memcpy(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE, &block_size,
-           BLOCK_MANAGER_BLOCK_SIZE_SIZE);
-    memcpy(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE +
-               BLOCK_MANAGER_BLOCK_SIZE_SIZE,
-           &padding, BLOCK_MANAGER_PADDING_SIZE);
+    /* use little-endian encoding for cross-platform compatibility */
+    /* magic is 3 bytes, encode as little-endian uint32 and take first 3 bytes */
+    encode_uint32_le_compat(header, magic);
+    header[BLOCK_MANAGER_MAGIC_SIZE] = version;
+    encode_uint32_le_compat(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE,
+                            block_size);
+    encode_uint32_le_compat(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE +
+                                BLOCK_MANAGER_BLOCK_SIZE_SIZE,
+                            padding);
 
     ssize_t written = pwrite(fd, header, BLOCK_MANAGER_HEADER_SIZE, 0);
     return (written == BLOCK_MANAGER_HEADER_SIZE) ? 0 : -1;
@@ -386,17 +388,18 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
     size_t buf_offset = 0;
 
-    memcpy(main_block_buffer + buf_offset, &block->size, BLOCK_MANAGER_SIZE_FIELD_SIZE);
+    /* use little-endian encoding for cross-platform compatibility */
+    encode_uint64_le_compat(main_block_buffer + buf_offset, block->size);
     buf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
 
-    memcpy(main_block_buffer + buf_offset, &checksum, BLOCK_MANAGER_CHECKSUM_LENGTH);
+    encode_uint64_le_compat(main_block_buffer + buf_offset, checksum);
     buf_offset += BLOCK_MANAGER_CHECKSUM_LENGTH;
 
     memcpy(main_block_buffer + buf_offset, block->data, inline_size);
     buf_offset += inline_size;
 
     uint64_t overflow_offset = 0;
-    memcpy(main_block_buffer + buf_offset, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
+    encode_uint64_le_compat(main_block_buffer + buf_offset, overflow_offset);
 
     ssize_t written = pwrite(bm->fd, main_block_buffer, main_block_total_size, offset);
     if (!use_stack) free(main_block_buffer);
@@ -443,10 +446,10 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
             size_t obuf_offset = 0;
 
-            memcpy(overflow_buffer + obuf_offset, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE);
+            encode_uint64_le_compat(overflow_buffer + obuf_offset, chunk_size);
             obuf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
 
-            memcpy(overflow_buffer + obuf_offset, &chunk_checksum, BLOCK_MANAGER_CHECKSUM_LENGTH);
+            encode_uint64_le_compat(overflow_buffer + obuf_offset, chunk_checksum);
             obuf_offset += BLOCK_MANAGER_CHECKSUM_LENGTH;
 
             memcpy(overflow_buffer + obuf_offset, (unsigned char *)block->data + data_offset,
@@ -456,10 +459,12 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
             /* next overflow offset (0 if last) */
             uint64_t next_overflow =
                 (remaining - chunk_size > 0) ? (current_write_pos + overflow_block_size) : 0;
-            memcpy(overflow_buffer + obuf_offset, &next_overflow,
-                   BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
+            encode_uint64_le_compat(overflow_buffer + obuf_offset, next_overflow);
 
-            if (pwrite(bm->fd, &current_write_pos, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+            /* write overflow link pointer */
+            unsigned char link_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+            encode_uint64_le_compat(link_buf, current_write_pos);
+            if (pwrite(bm->fd, link_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
                        (off_t)overflow_link_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             {
                 if (!use_overflow_stack) free(overflow_buffer);
@@ -553,14 +558,15 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
 int block_manager_cursor_next(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
-    uint64_t block_size;
-    ssize_t nread = pread(cursor->bm->fd, &block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
-                          (off_t)cursor->current_pos);
+    unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+    ssize_t nread =
+        pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)cursor->current_pos);
     if (nread != BLOCK_MANAGER_SIZE_FIELD_SIZE)
     {
         if (nread == 0) return 1; /* EOF */
         return -1;
     }
+    uint64_t block_size = decode_uint64_le_compat(size_buf);
 
     uint64_t inline_size =
         block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
@@ -568,10 +574,11 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
     off_t overflow_offset_pos = (off_t)cursor->current_pos + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                 (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
 
-    uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+    unsigned char overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+    if (pread(cursor->bm->fd, overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
               (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
         return -1;
+    uint64_t overflow_offset = decode_uint64_le_compat(overflow_buf);
 
     /* if no overflow, next block starts immediately after this one */
     if (overflow_offset == 0)
@@ -589,17 +596,20 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
     {
         off_t chunk_offset = (off_t)overflow_offset;
 
-        uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+        unsigned char chunk_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+        if (pread(cursor->bm->fd, chunk_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
                   (off_t)chunk_offset) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
             return -1;
+        uint64_t chunk_size = decode_uint64_le_compat(chunk_size_buf);
 
         off_t next_overflow_pos = chunk_offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                   (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
 
-        if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+        unsigned char next_overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+        if (pread(cursor->bm->fd, next_overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
                   (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             return -1;
+        overflow_offset = decode_uint64_le_compat(next_overflow_buf);
 
         last_overflow_pos =
             (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
@@ -667,21 +677,22 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     /* not in cache, read from disk */
     block_manager_block_t *block = NULL;
 
-    uint64_t block_size;
-    if (pread(bm->fd, &block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=
+    /* read block size with little-endian decoding */
+    unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+    if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=
         BLOCK_MANAGER_SIZE_FIELD_SIZE)
         return NULL;
+    uint64_t block_size = decode_uint64_le_compat(size_buf);
 
-    if (block_size == 0 || block_size > MAX_REASONABLE_BLOCK_SIZE)
-    {
-        return NULL;
-    }
+    if (block_size == 0 || block_size > MAX_REASONABLE_BLOCK_SIZE) return NULL;
 
-    uint64_t checksum;
+    /* read checksum with little-endian decoding */
+    unsigned char checksum_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
     off_t checksum_pos = (off_t)offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE;
-    if (pread(bm->fd, &checksum, BLOCK_MANAGER_CHECKSUM_LENGTH, (off_t)checksum_pos) !=
+    if (pread(bm->fd, checksum_buf, BLOCK_MANAGER_CHECKSUM_LENGTH, (off_t)checksum_pos) !=
         BLOCK_MANAGER_CHECKSUM_LENGTH)
         return NULL;
+    uint64_t checksum = decode_uint64_le_compat(checksum_buf);
 
     block = malloc(sizeof(block_manager_block_t));
     if (!block) return NULL;
@@ -706,43 +717,46 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     }
 
     off_t overflow_offset_pos = data_pos + (off_t)inline_size;
-    uint64_t overflow_offset;
-    if (pread(bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+    unsigned char overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+    if (pread(bm->fd, overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
               (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
     {
         free(block->data);
         free(block);
         return NULL;
     }
+    uint64_t overflow_offset = decode_uint64_le_compat(overflow_buf);
 
     uint64_t data_offset = inline_size;
     while (overflow_offset != 0)
     {
-        uint64_t chunk_size;
-        if (pread(bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)overflow_offset) !=
+        unsigned char chunk_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+        if (pread(bm->fd, chunk_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)overflow_offset) !=
             BLOCK_MANAGER_SIZE_FIELD_SIZE)
         {
             free(block->data);
             free(block);
             return NULL;
         }
+        uint64_t chunk_size = decode_uint64_le_compat(chunk_size_buf);
 
-        if (chunk_size == 0 || chunk_size > bm->block_size || data_offset + chunk_size > block_size)
+        if (chunk_size == 0 || chunk_size > MAX_REASONABLE_BLOCK_SIZE)
         {
             free(block->data);
             free(block);
             return NULL;
         }
 
-        uint64_t chunk_checksum;
+        unsigned char chunk_checksum_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
         off_t chunk_checksum_pos = (off_t)overflow_offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE;
-        if (pread(bm->fd, &chunk_checksum, BLOCK_MANAGER_CHECKSUM_LENGTH,
+        if (pread(bm->fd, chunk_checksum_buf, BLOCK_MANAGER_CHECKSUM_LENGTH,
                   (off_t)chunk_checksum_pos) != BLOCK_MANAGER_CHECKSUM_LENGTH)
         {
             free(block->data);
             free(block);
             return NULL;
         }
+        uint64_t chunk_checksum = decode_uint64_le_compat(chunk_checksum_buf);
 
         off_t chunk_data_pos = chunk_checksum_pos + (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH;
         if (pread(bm->fd, (unsigned char *)block->data + data_offset, chunk_size,
@@ -762,13 +776,15 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         }
 
         off_t next_overflow_pos = chunk_data_pos + (off_t)chunk_size;
-        if (pread(bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+        unsigned char next_overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+        if (pread(bm->fd, next_overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
                   (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
         {
             free(block->data);
             free(block);
             return NULL;
         }
+        overflow_offset = decode_uint64_le_compat(next_overflow_buf);
 
         data_offset += chunk_size;
     }
@@ -838,37 +854,42 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
 
     while (scan_pos < cursor->current_pos)
     {
-        uint64_t block_size;
-        if (pread(cursor->bm->fd, &block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)scan_pos) !=
+        unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+        if (pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)scan_pos) !=
             BLOCK_MANAGER_SIZE_FIELD_SIZE)
             return -1;
+        uint64_t block_size = decode_uint64_le_compat(size_buf);
 
         uint64_t inline_size =
             block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
 
         off_t overflow_offset_pos = (off_t)scan_pos + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                     (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
-        uint64_t overflow_offset;
-        if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+        unsigned char overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+        if (pread(cursor->bm->fd, overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
                   (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             return -1;
+        uint64_t overflow_offset = decode_uint64_le_compat(overflow_buf);
 
         uint64_t next_pos =
             (uint64_t)(overflow_offset_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
 
         while (overflow_offset != 0)
         {
-            uint64_t chunk_size;
-            if (pread(cursor->bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+            unsigned char chunk_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+            if (pread(cursor->bm->fd, chunk_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
                       (off_t)overflow_offset) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
                 return -1;
+            uint64_t chunk_size = decode_uint64_le_compat(chunk_size_buf);
 
             off_t next_overflow_pos = (off_t)overflow_offset +
                                       (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                       (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
-            if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+            unsigned char next_overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+            if (pread(cursor->bm->fd, next_overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
                       (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
                 return -1;
+            overflow_offset = decode_uint64_le_compat(next_overflow_buf);
 
             next_pos = (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
         }
@@ -1016,10 +1037,11 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    uint64_t block_size;
-    if (pread(cursor->bm->fd, &block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+    unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+    if (pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
               (off_t)cursor->current_pos) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
         return -1;
+    uint64_t block_size = decode_uint64_le_compat(size_buf);
 
     uint64_t inline_size =
         block_size <= cursor->bm->block_size ? block_size : cursor->bm->block_size;
@@ -1027,33 +1049,37 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
     off_t overflow_offset_pos = (off_t)cursor->current_pos + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                 (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
 
-    uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+    unsigned char overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+    if (pread(cursor->bm->fd, overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
               (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
         return -1;
+    uint64_t overflow_offset = decode_uint64_le_compat(overflow_buf);
 
     uint64_t after_current_pos =
         (uint64_t)(overflow_offset_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
 
     while (overflow_offset != 0)
     {
-        uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+        unsigned char chunk_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+        if (pread(cursor->bm->fd, chunk_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
                   (off_t)overflow_offset) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
             return -1;
+        uint64_t chunk_size = decode_uint64_le_compat(chunk_size_buf);
 
         off_t next_overflow_pos = (off_t)overflow_offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                   (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
-        if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+        unsigned char next_overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+        if (pread(cursor->bm->fd, next_overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
                   (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             return -1;
+        overflow_offset = decode_uint64_le_compat(next_overflow_buf);
 
         after_current_pos =
             (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
     }
 
-    uint64_t next_block_size;
-    ssize_t read_result = pread(cursor->bm->fd, &next_block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+    unsigned char next_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+    ssize_t read_result = pread(cursor->bm->fd, next_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
                                 (off_t)after_current_pos);
 
     return (read_result != BLOCK_MANAGER_SIZE_FIELD_SIZE) ? 1 : 0;
@@ -1157,10 +1183,11 @@ int block_manager_validate_last_block(block_manager_t *bm)
 
     while (scan_pos < file_size)
     {
-        uint64_t block_size;
-        if (pread(bm->fd, &block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)scan_pos) !=
+        unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+        if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)scan_pos) !=
             BLOCK_MANAGER_SIZE_FIELD_SIZE)
             break;
+        uint64_t block_size = decode_uint64_le_compat(size_buf);
 
         uint64_t inline_size = block_size <= bm->block_size ? block_size : bm->block_size;
 
@@ -1174,10 +1201,11 @@ int block_manager_validate_last_block(block_manager_t *bm)
 
         off_t overflow_offset_pos = (off_t)scan_pos + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                     (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
-        uint64_t overflow_offset;
-        if (pread(bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+        unsigned char overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+        if (pread(bm->fd, overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
                   (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             break;
+        uint64_t overflow_offset = decode_uint64_le_compat(overflow_buf);
 
         uint64_t next_pos =
             (uint64_t)(overflow_offset_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
@@ -1190,13 +1218,14 @@ int block_manager_validate_last_block(block_manager_t *bm)
                 goto done_scanning;
             }
 
-            uint64_t chunk_size;
-            if (pread(bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)overflow_offset) !=
-                BLOCK_MANAGER_SIZE_FIELD_SIZE)
+            unsigned char chunk_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+            if (pread(bm->fd, chunk_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                      (off_t)overflow_offset) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
             {
                 valid_size = scan_pos;
                 goto done_scanning;
             }
+            uint64_t chunk_size = decode_uint64_le_compat(chunk_size_buf);
 
             if (overflow_offset + BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH +
                     chunk_size + BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE >
@@ -1209,12 +1238,14 @@ int block_manager_validate_last_block(block_manager_t *bm)
             off_t next_overflow_pos = (off_t)overflow_offset +
                                       (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                       (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
-            if (pread(bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+            unsigned char next_overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+            if (pread(bm->fd, next_overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
                       (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             {
                 valid_size = scan_pos;
                 goto done_scanning;
             }
+            overflow_offset = decode_uint64_le_compat(next_overflow_buf);
 
             next_pos = (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
         }

@@ -1188,4 +1188,63 @@ static inline time_t get_file_mod_time(const char *path)
     return (time_t)file_stat.st_mtime;
 }
 
+/* cross-platform little-endian serialization functions */
+
+/*
+ * encode_uint32_le_compat
+ * encodes a uint32_t value in little-endian format
+ * @param buf buffer to store encoded value
+ * @param val value to encode
+ */
+static inline void encode_uint32_le_compat(uint8_t *buf, uint32_t val)
+{
+    buf[0] = (uint8_t)(val & 0xFF);
+    buf[1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[2] = (uint8_t)((val >> 16) & 0xFF);
+    buf[3] = (uint8_t)((val >> 24) & 0xFF);
+}
+
+/*
+ * decode_uint32_le_compat
+ * decodes a uint32_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline uint32_t decode_uint32_le_compat(const uint8_t *buf)
+{
+    return ((uint32_t)buf[0]) | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) |
+           ((uint32_t)buf[3] << 24);
+}
+
+/*
+ * encode_uint64_le_compat
+ * encodes a uint64_t value in little-endian format
+ * @param buf buffer to store encoded value
+ * @param val value to encode
+ */
+static inline void encode_uint64_le_compat(uint8_t *buf, uint64_t val)
+{
+    buf[0] = (uint8_t)(val & 0xFF);
+    buf[1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[2] = (uint8_t)((val >> 16) & 0xFF);
+    buf[3] = (uint8_t)((val >> 24) & 0xFF);
+    buf[4] = (uint8_t)((val >> 32) & 0xFF);
+    buf[5] = (uint8_t)((val >> 40) & 0xFF);
+    buf[6] = (uint8_t)((val >> 48) & 0xFF);
+    buf[7] = (uint8_t)((val >> 56) & 0xFF);
+}
+
+/*
+ * decode_uint64_le_compat
+ * decodes a uint64_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline uint64_t decode_uint64_le_compat(const uint8_t *buf)
+{
+    return ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
+           ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
+           ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
+}
+
 #endif /* __COMPAT_H__ */

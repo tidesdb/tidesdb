@@ -3362,18 +3362,18 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
         if (metadata)
         {
             uint8_t *ptr = metadata;
-            memcpy(ptr, &magic, sizeof(uint32_t));
+            encode_uint32_le(ptr, magic);
             ptr += sizeof(uint32_t);
             uint64_t num_entries_u64 = (uint64_t)sst->num_entries;
-            memcpy(ptr, &num_entries_u64, sizeof(uint64_t));
+            encode_uint64_le(ptr, num_entries_u64);
             ptr += sizeof(uint64_t);
             uint32_t min_size = (uint32_t)sst->min_key_size;
-            memcpy(ptr, &min_size, sizeof(uint32_t));
+            encode_uint32_le(ptr, min_size);
             ptr += sizeof(uint32_t);
             memcpy(ptr, sst->min_key, sst->min_key_size);
             ptr += sst->min_key_size;
             uint32_t max_size = (uint32_t)sst->max_key_size;
-            memcpy(ptr, &max_size, sizeof(uint32_t));
+            encode_uint32_le(ptr, max_size);
             ptr += sizeof(uint32_t);
             memcpy(ptr, sst->max_key, sst->max_key_size);
 
@@ -3908,7 +3908,43 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
             TDB_DEBUG_LOG("Failed to build index for merged SSTable");
         }
 
-        /* write metadata */
+        /* write metadata (magic number, entry count, min/max keys) */
+        if (merged->min_key && merged->max_key)
+        {
+            uint32_t magic = TDB_SST_META_MAGIC;
+            size_t metadata_size = sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t) +
+                                   merged->min_key_size + sizeof(uint32_t) + merged->max_key_size;
+            uint8_t *metadata = malloc(metadata_size);
+            if (metadata)
+            {
+                uint8_t *ptr = metadata;
+                encode_uint32_le(ptr, magic);
+                ptr += sizeof(uint32_t);
+                uint64_t num_entries = (uint64_t)merged->num_entries;
+                encode_uint64_le(ptr, num_entries);
+                ptr += sizeof(uint64_t);
+                uint32_t min_size = (uint32_t)merged->min_key_size;
+                encode_uint32_le(ptr, min_size);
+                ptr += sizeof(uint32_t);
+                memcpy(ptr, merged->min_key, merged->min_key_size);
+                ptr += merged->min_key_size;
+                uint32_t max_size = (uint32_t)merged->max_key_size;
+                encode_uint32_le(ptr, max_size);
+                ptr += sizeof(uint32_t);
+                memcpy(ptr, merged->max_key, merged->max_key_size);
+
+                block_manager_block_t *metadata_block =
+                    block_manager_block_create(metadata_size, metadata);
+                if (metadata_block)
+                {
+                    block_manager_block_write(merged->block_manager, metadata_block);
+                    block_manager_block_free(metadata_block);
+                }
+                free(metadata);
+            }
+        }
+
+        /* write bloom filter */
         if (merged->bloom_filter)
         {
             size_t bloom_size = 0;

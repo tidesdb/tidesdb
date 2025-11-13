@@ -258,6 +258,8 @@ typedef struct
  * @param min_key_size size of minimum key
  * @param max_key_size size of maximum key
  * @param num_entries number of entries in this sstable
+ * @param ref_count reference count
+ * @param ref_lock lock for reference counting
  */
 struct tidesdb_sstable_t
 {
@@ -282,6 +284,8 @@ struct tidesdb_sstable_t
  * @param wal write-ahead log block manager for this memtable
  * @param id unique identifier (timestamp-based)
  * @param created_at creation timestamp
+ * @param ref_count reference count
+ * @param ref_lock lock for reference counting
  */
 typedef struct
 {
@@ -442,16 +446,20 @@ typedef struct
     int source_type;
     int source_index;
 } tidesdb_iter_entry_t;
-
 /*
  * tidesdb_iter_t
  * iterator for traversing key-value pairs (tied to transaction)
  * @param txn transaction this iterator belongs to
  * @param cf column family being iterated
- * @param memtable_cursor skip list cursor for memtable
+ * @param memtable_cursor skip list cursor for active memtable
  * @param active_memtable reference to active memtable
+ * @param immutable_memtable_cursors array of skip list cursors for immutable memtables
+ * @param immutable_memtables array of immutable memtable references
+ * @param num_immutable_cursors number of immutable memtable cursors
  * @param sstable_cursors array of block manager cursors for sstables
+ * @param sstables array of sstable references
  * @param num_sstable_cursors number of sstable cursors
+ * @param sstable_blocks_read array tracking blocks read per sstable
  * @param current_key current key
  * @param current_value current value
  * @param current_key_size current key size
@@ -462,6 +470,9 @@ typedef struct
  * @param heap array of pending entries from each source (min-heap)
  * @param heap_size current number of entries in heap
  * @param heap_capacity allocated capacity of heap
+ * @param entries_from_memtable count of entries from active memtable
+ * @param entries_from_immutable count of entries from immutable memtables
+ * @param entries_from_sstables count of entries from sstables
  */
 struct tidesdb_iter_t
 {

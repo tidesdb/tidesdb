@@ -40,6 +40,10 @@
 #define POPCOUNT32(x) __popcnt(x)
 #else
 /* fallback popcount */
+/*
+ * popcount64_fallback
+ * @param x the 64-bit integer to count 1s in
+ */
 static inline int popcount64_fallback(uint64_t x)
 {
     x = x - ((x >> 1) & 0x5555555555555555ULL);
@@ -827,6 +831,13 @@ void succinct_trie_builder_free(succinct_trie_builder_t *builder)
     free(builder);
 }
 
+/*
+ * find_first_terminal
+ * @param trie the succinct trie
+ * @param node the node to find the first terminal for
+ * @param value pointer to store the value
+ * @return 0 on success, -1 on failure
+ */
 static int find_first_terminal(const succinct_trie_t *trie, uint32_t node, int64_t *value)
 {
     if (!trie || node == 0 || node > trie->n_nodes) return -1;

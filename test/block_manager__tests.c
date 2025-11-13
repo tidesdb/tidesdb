@@ -1852,7 +1852,7 @@ void *parallel_write_worker(void *arg)
     parallel_write_context_t *ctx = (parallel_write_context_t *)arg;
     struct timespec start, end;
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    clock_gettime(0, &start);
 
     for (int i = 0; i < ctx->blocks_per_thread; i++)
     {
@@ -1896,7 +1896,7 @@ void benchmark_block_manager_parallel_write(void)
         parallel_write_context_t *contexts = malloc(threads * sizeof(parallel_write_context_t));
 
         struct timespec start, end;
-        clock_gettime(CLOCK_MONOTONIC, &start);
+        clock_gettime(0, &start);
 
         for (int i = 0; i < threads; i++)
         {

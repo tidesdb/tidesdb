@@ -23,6 +23,11 @@
 /* node pool configuration */
 #define QUEUE_MAX_POOL_SIZE 64
 
+/*
+ * queue_alloc_node
+ * @param queue the queue to allocate the node from
+ * @return the allocated node, or NULL on failure
+ */
 static inline queue_node_t *queue_alloc_node(queue_t *queue)
 {
     queue_node_t *node = NULL;
@@ -41,7 +46,11 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
     return node;
 }
 
-/* return node to pool or free */
+/*
+ * queue_free_node
+ * @param queue the queue to return the node to
+ * @param node the node to return
+ */
 static inline void queue_free_node(queue_t *queue, queue_node_t *node)
 {
     if (queue->pool_size < queue->max_pool_size)

@@ -67,6 +67,7 @@ struct lru_entry_t
  * @param tail least recently used entry
  * @param table hash table for O(1) lookups
  * @param table_size hash table size
+ * @param lock mutex for thread safety
  */
 struct lru_cache_t
 {

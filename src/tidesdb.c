@@ -1422,6 +1422,13 @@ static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t
     return 0;
 }
 
+/*
+ * tidesdb_build_sstable_index
+ * builds index for sstable
+ * @param sst sstable to build index for
+ * @param cf column family
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_family_t *cf)
 {
     if (!sst || !cf || !sst->block_manager) return -1;
@@ -1522,7 +1529,6 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
             memcpy(key_ptr, key_src, key_size);
             keys_buffer_used += key_size;
 
-            /* Store block number (blocks_read) instead of file offset */
             succinct_trie_builder_add(builder, key_ptr, key_size, (int64_t)blocks_read);
         }
 
@@ -1545,6 +1551,13 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
     return sst->index ? 0 : -1;
 }
 
+/*
+ * get_cf_path
+ * gets column family directory path
+ * @param db tidesdb instance
+ * @param cf_name column family name
+ * @param path buffer to store path
+ */
 static void get_cf_path(const tidesdb_t *db, const char *cf_name, char *path)
 {
     (void)snprintf(path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", db->config.db_path,
@@ -3115,7 +3128,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
 
     while (skip_list_cursor_has_next(cursor))
     {
-        /* check if database is shutting down - abort flush early */
+        /* check if database is shutting down -- abort flush early */
         if (cf->db->flush_pool && atomic_load(&cf->db->flush_pool->shutdown))
         {
             TDB_DEBUG_LOG("Shutdown detected, aborting flush");
@@ -3205,13 +3218,10 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
                     }
                     if (index_builder)
                     {
-                        /* Store block number (entries_written) in the index, not file offset.
-                         * This allows us to know exactly which block we're at after an index seek,
-                         * enabling proper bounds checking to prevent reading metadata blocks. */
                         succinct_trie_builder_add(index_builder, k, k_size,
                                                   (int64_t)entries_written);
                     }
-                    /* don't increment num_entries yet - use local counter */
+                    /* don't increment num_entries yet -- use local counter */
                     entries_written++;
                 }
                 else
@@ -4777,6 +4787,12 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
     return 0;
 }
 
+/*
+ * tidesdb_check_and_flush
+ * checks if memtable or WAL exceeds flush threshold and flushes if necessary
+ * @param cf column family to check
+ * @return 0 on success, -1 on failure
+ */
 static int tidesdb_check_and_flush(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
@@ -6510,11 +6526,10 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                         {
                             TDB_DEBUG_LOG(
                                 "Block index for SSTable %d (id=%llu, entries=%d) returned "
-                                "block_num=%ld for key=%.*s",
+                                "block_num=%" PRId64 " for key=%.*s",
                                 i, (unsigned long long)sst->id, atomic_load(&sst->num_entries),
                                 block_num, (int)key_size, (char *)key);
-                            /* Index now returns block number (0-indexed), not file offset.
-                             * Set blocks_read to this number so we can track position correctly. */
+
                             positioned_via_index = 1;
                             index_positioned[i] = 1;
                             iter->sstable_blocks_read[i] = (int)block_num;
@@ -6570,16 +6585,14 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         {
             int target_block = iter->sstable_blocks_read[i];
 
-            /* Position cursor at first block */
             if (block_manager_cursor_goto_first(iter->sstable_cursors[i]) != 0) continue;
 
-            /* Advance cursor to target block */
             for (int b = 0; b < target_block; b++)
             {
                 if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0) break;
             }
 
-            /* Read the block directly without calling iter_refill (which would advance again) */
+            /* read the block directly without calling iter_refill (which would advance again) */
             block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[i]);
             if (block)
             {
@@ -6825,16 +6838,16 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         {
             int target_block = iter->sstable_blocks_read[i];
 
-            /* Position cursor at first block */
+            /* position cursor at first block */
             if (block_manager_cursor_goto_first(iter->sstable_cursors[i]) != 0) continue;
 
-            /* Advance cursor to target block */
+            /* advance cursor to target block */
             for (int b = 0; b < target_block; b++)
             {
                 if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0) break;
             }
 
-            /* Read the block directly */
+            /* read the block directly */
             block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[i]);
             if (block)
             {
@@ -6865,7 +6878,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                 }
                 block_manager_block_free(block);
             }
-            /* Set blocks_read to target + 1 since we've already read block target_block */
+            /* set blocks_read to target + 1 since we've already read block target_block */
             iter->sstable_blocks_read[i] = target_block + 1;
             continue;
         }

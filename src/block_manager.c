@@ -168,6 +168,14 @@ static int get_file_size(int fd, uint64_t *size)
     return 0;
 }
 
+/*
+ * block_manager_open_internal
+ * opens a block manager (no cache)
+ * @param bm the block manager to open
+ * @param file_path the path of the file
+ * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL)
+ * @return 0 if successful, -1 if not
+ */
 static int block_manager_open_internal(block_manager_t **bm, const char *file_path,
                                        block_manager_sync_mode_t sync_mode, uint32_t cache_size)
 {

@@ -66,6 +66,11 @@ int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const ui
     return 0;
 }
 
+/*
+ * skip_list_arena_create
+ * @param capacity the capacity of the arena
+ * @return the created arena, or NULL on failure
+ */
 static skip_list_arena_t *skip_list_arena_create(size_t capacity)
 {
     skip_list_arena_t *arena = (skip_list_arena_t *)malloc(sizeof(skip_list_arena_t));
@@ -85,6 +90,12 @@ static skip_list_arena_t *skip_list_arena_create(size_t capacity)
     return arena;
 }
 
+/*
+ * skip_list_arena_alloc
+ * @param arena_ptr the pointer to the arena to allocate from
+ * @param size the size to allocate
+ * @return the allocated memory, or NULL on failure
+ */
 static void *skip_list_arena_alloc(skip_list_arena_t **arena_ptr, size_t size)
 {
     if (!arena_ptr || !*arena_ptr) return NULL;
@@ -110,6 +121,10 @@ static void *skip_list_arena_alloc(skip_list_arena_t **arena_ptr, size_t size)
     return new_arena->buffer;
 }
 
+/*
+ * skip_list_arena_free_all
+ * @param arena the arena to free
+ */
 static void skip_list_arena_free_all(skip_list_arena_t *arena)
 {
     while (arena)
@@ -308,8 +323,17 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
     return 0;
 }
 
+/*
+ * skip_list_random_level
+ * @param list the skip list
+ * @return the random level
+ */
 static _Thread_local uint32_t tls_rng_state = 0;
 
+/*
+ * fast_rand32
+ * @return a random 32-bit integer
+ */
 static inline uint32_t fast_rand32(void)
 {
     if (tls_rng_state == 0)
@@ -353,6 +377,11 @@ int skip_list_compare_keys(skip_list_t *list, const uint8_t *key1, size_t key1_s
     return list->comparator(key1, key1_size, key2, key2_size, list->comparator_ctx);
 }
 
+/*
+ * retire_node
+ * @param list the skip list
+ * @param node the node to retire
+ */
 static void retire_node(skip_list_t *list, skip_list_node_t *node)
 {
     uint64_t current_epoch = atomic_load(&list->global_epoch);
@@ -372,6 +401,10 @@ static void retire_node(skip_list_t *list, skip_list_node_t *node)
     pthread_mutex_unlock(&list->retired_lock);
 }
 
+/*
+ * reclaim_old_nodes
+ * @param list the skip list
+ */
 static void reclaim_old_nodes(skip_list_t *list)
 {
     uint64_t current_epoch = atomic_load(&list->global_epoch);

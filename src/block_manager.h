@@ -23,10 +23,16 @@
 
 /* more time equals more results, but remember to take breaks to refresh your mind. */
 
-#define MAX_FILE_PATH_LENGTH     1024     /* max file path length for block manager file(s) */
-#define BLOCK_MANAGER_MAGIC      0x544442 /* TDB in hex */
-#define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF /* 3-byte mask for magic number validation */
-#define BLOCK_MANAGER_VERSION    3
+/* max file path length for block manager file(s) */
+#define MAX_FILE_PATH_LENGTH 1024
+
+/* TDB in hex */
+#define BLOCK_MANAGER_MAGIC 0x544442
+/* 3-byte mask for magic number validation */
+#define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF
+
+/* block manager version */
+#define BLOCK_MANAGER_VERSION 3
 
 /* header field sizes */
 /* magic number size in bytes */
@@ -39,6 +45,7 @@
 #define BLOCK_MANAGER_PADDING_SIZE 4
 /* total: 3 + 1 + 4 + 4 */
 
+/
 #define BLOCK_MANAGER_HEADER_SIZE 12
 
 /* block field sizes */
@@ -64,11 +71,10 @@
 #define MIN_CACHE_ENTRIES         10
 #define MAX_REASONABLE_BLOCK_SIZE 10ULL << 30
 
-typedef enum
-{
-    BLOCK_MANAGER_SYNC_NONE,
-    BLOCK_MANAGER_SYNC_FULL,
-} block_manager_sync_mode_t;
+    typedef enum {
+        BLOCK_MANAGER_SYNC_NONE,
+        BLOCK_MANAGER_SYNC_FULL,
+    } block_manager_sync_mode_t;
 
 /**
  * block_manager_cache_t
@@ -331,7 +337,7 @@ int block_manager_escalate_fsync(block_manager_t *bm);
  * block_manager_cursor_at_last
  * checks if the cursor is at the last block
  * @param cursor the cursor to check
- * @return 1 if the cursor is at the last block, 0 if not.  Can return -1 if error
+ * @return 1 if the cursor is at the last block, 0 if not.  can return -1 if error
  */
 int block_manager_cursor_at_last(block_manager_cursor_t *cursor);
 
@@ -339,7 +345,7 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor);
  * block_manager_cursor_at_first
  * checks if the cursor is at the first block
  * @param cursor the cursor to check
- * @return 1 if the cursor is at the first block, 0 if not.  Can return -1 if error
+ * @return 1 if the cursor is at the first block, 0 if not.  can return -1 if error
  */
 int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
 
@@ -347,7 +353,7 @@ int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
  * block_manager_cursor_at_second
  * checks if the cursor is at the second block from start
  * @param cursor the cursor to check
- * @return 1 if the cursor is at the second block, 0 if not.  Can return -1 if error
+ * @return 1 if the cursor is at the second block, 0 if not.  can return -1 if error
  */
 int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
 

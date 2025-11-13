@@ -797,10 +797,10 @@ void test_skip_list_concurrent_read_write()
     const int num_writers = 1;
     const int ops_per_thread = 10000;
 
-    pthread_t readers[num_readers];
-    pthread_t writers[num_writers];
-    concurrent_test_ctx_t reader_ctx[num_readers];
-    concurrent_test_ctx_t writer_ctx[num_writers];
+    pthread_t *readers = malloc(num_readers * sizeof(pthread_t));
+    pthread_t *writers = malloc(num_writers * sizeof(pthread_t));
+    concurrent_test_ctx_t *reader_ctx = malloc(num_readers * sizeof(concurrent_test_ctx_t));
+    concurrent_test_ctx_t *writer_ctx = malloc(num_writers * sizeof(concurrent_test_ctx_t));
 
     for (int i = 0; i < num_readers; i++)
     {
@@ -839,6 +839,11 @@ void test_skip_list_concurrent_read_write()
 
     ASSERT_EQ(total_reads, num_readers * ops_per_thread);
     ASSERT_EQ(total_writes, num_writers * ops_per_thread);
+
+    free(readers);
+    free(writers);
+    free(reader_ctx);
+    free(writer_ctx);
 
     skip_list_free(list);
     printf(GREEN "test_skip_list_concurrent_read_write passed - readers never blocked!\n" RESET);

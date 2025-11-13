@@ -104,7 +104,7 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #define PREFETCH_READ(addr)  _mm_prefetch((const char *)(addr), _MM_HINT_T0)
 #define PREFETCH_WRITE(addr) _mm_prefetch((const char *)(addr), _MM_HINT_T0)
 #else
-/* No prefetch support - define as no-op */
+/* no prefetch support - define as no-op */
 #define PREFETCH_READ(addr)  ((void)0)
 #define PREFETCH_WRITE(addr) ((void)0)
 #endif
@@ -170,15 +170,38 @@ typedef __int64 ssize_t;
 typedef int mode_t;
 #endif
 
+/* ftruncate for windows */
+/*
+ * ftruncate
+ * @param fd the file descriptor to truncate
+ * @param length the new length of the file
+ * @return 0 on success, -1 on failure
+ */
 static inline int ftruncate(int fd, off_t length)
 {
     return _chsize_s(fd, length);
 }
 
+/* open for windows */
+/*
+ * open
+ * @param path the path to open
+ * @param flags the flags to use
+ * @param mode the mode to use (only used if O_CREAT is set)
+ * @return the file descriptor on success, -1 on failure
+ */
 static inline int _tidesdb_open_wrapper_3(const char *path, int flags, mode_t mode)
 {
     return _open(path, flags | _O_BINARY, mode);
 }
+
+/* open for windows */
+/*
+ * open
+ * @param path the path to open
+ * @param flags the flags to use
+ * @return the file descriptor on success, -1 on failure
+ */
 static inline int _tidesdb_open_wrapper_2(const char *path, int flags)
 {
     return _open(path, flags | _O_BINARY, 0);
@@ -198,6 +221,12 @@ typedef volatile LONGLONG atomic_uint64_t;
 
 #ifdef _WIN64
 /* 64-bit atomic store */
+/*
+ * atomic_store_explicit
+ * @param ptr the pointer to store the value at
+ * @param val the value to store
+ * @param order the memory order (unused)
+ */
 #define atomic_store_explicit(ptr, val, order)                                             \
     do                                                                                     \
     {                                                                                      \
@@ -219,6 +248,13 @@ typedef volatile LONGLONG atomic_uint64_t;
         }                                                                                  \
     } while (0)
 #else
+/* 32-bit atomic store */
+/*
+ * atomic_store_explicit
+ * @param ptr the pointer to store the value at
+ * @param val the value to store
+ * @param order the memory order (unused)
+ */
 #define atomic_store_explicit(ptr, val, order)                                            \
     do                                                                                    \
     {                                                                                     \
@@ -237,43 +273,89 @@ typedef volatile LONGLONG atomic_uint64_t;
     } while (0)
 #endif
 
+/* atomic load */
+/*
+ * _atomic_load_ptr
+ * @param ptr the pointer to load the value from
+ * @return the value loaded from the pointer
+ */
 static inline void *_atomic_load_ptr(volatile void *const *ptr)
 {
     return (void *)InterlockedCompareExchangePointer((PVOID volatile *)ptr, NULL, NULL);
 }
 
 #ifdef _WIN64
+/* atomic load */
+/*
+ * _atomic_load_i64
+ * @param ptr the pointer to load the value from
+ * @return the value loaded from the pointer
+ */
 static inline LONGLONG _atomic_load_i64(volatile LONGLONG *ptr)
 {
     return InterlockedCompareExchange64((LONGLONG volatile *)ptr, 0, 0);
 }
 #endif
 
+/* atomic load */
+/*
+ * _atomic_load_i32
+ * @param ptr the pointer to load the value from
+ * @return the value loaded from the pointer
+ */
 static inline LONG _atomic_load_i32(volatile LONG *ptr)
 {
     return InterlockedCompareExchange((LONG volatile *)ptr, 0, 0);
 }
 
+/* atomic load */
+/*
+ * _atomic_load_u8
+ * @param ptr the pointer to load the value from
+ * @return the value loaded from the pointer
+ */
 static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
 {
     return *ptr; /* byte reads are atomic on x86/x64 */
 }
 
 #ifdef _WIN64
+/* atomic load */
+/*
+ * atomic_load_explicit
+ * @param ptr the pointer to load the value from
+ * @param order the memory order (unused)
+ * @return the value loaded from the pointer
+ */
 #define atomic_load_explicit(ptr, order)                                                     \
     (sizeof(*(ptr)) == sizeof(void *) ? _atomic_load_ptr((volatile void *const *)(ptr))      \
      : sizeof(*(ptr)) == 8 ? (void *)(uintptr_t)_atomic_load_i64((volatile LONGLONG *)(ptr)) \
      : sizeof(*(ptr)) == 4 ? (void *)(uintptr_t)_atomic_load_i32((volatile LONG *)(ptr))     \
                            : (void *)(uintptr_t)_atomic_load_u8((volatile unsigned char *)(ptr)))
 #else
+/* atomic load */
+/*
+ * atomic_load_explicit
+ * @param ptr the pointer to load the value from
+ * @param order the memory order (unused)
+ * @return the value loaded from the pointer
+ */
 #define atomic_load_explicit(ptr, order)                                                            \
     (sizeof(*(ptr)) == sizeof(void *) ? _atomic_load_ptr((volatile void *const *)(ptr))             \
      : sizeof(*(ptr)) == 4            ? (void *)(uintptr_t)_atomic_load_i32((volatile LONG *)(ptr)) \
                            : (void *)(uintptr_t)_atomic_load_u8((volatile unsigned char *)(ptr)))
 #endif
 
-/* Atomic exchange */
+/* atomic exchange */
 #ifdef _WIN64
+/* atomic exchange */
+/*
+ * atomic_exchange_explicit
+ * @param ptr the pointer to exchange the value at
+ * @param val the value to exchange
+ * @param order the memory order (unused)
+ * @return the value exchanged from the pointer
+ */
 #define atomic_exchange_explicit(ptr, val, order)                                       \
     (sizeof(*(ptr)) == sizeof(void *)                                                   \
          ? InterlockedExchangePointer((PVOID volatile *)(ptr), (PVOID)(uintptr_t)(val)) \
@@ -282,6 +364,14 @@ static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
                                                     (LONGLONG)(uintptr_t)(val))         \
          : (void *)(uintptr_t)InterlockedExchange((LONG volatile *)(ptr), (LONG)(uintptr_t)(val)))
 #else
+/* atomic exchange */
+/*
+ * atomic_exchange_explicit
+ * @param ptr the pointer to exchange the value at
+ * @param val the value to exchange
+ * @param order the memory order (unused)
+ * @return the value exchanged from the pointer
+ */
 #define atomic_exchange_explicit(ptr, val, order)                                       \
     (sizeof(*(ptr)) == sizeof(void *)                                                   \
          ? InterlockedExchangePointer((PVOID volatile *)(ptr), (PVOID)(uintptr_t)(val)) \
@@ -289,13 +379,39 @@ static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
 #endif
 
 #ifdef _WIN64
+/* atomic fetch add */
+/*
+ * atomic_fetch_add
+ * @param ptr the pointer to add the value to
+ * @param val the value to add
+ * @return the value before the addition
+ */
 #define atomic_fetch_add(ptr, val) \
     InterlockedExchangeAdd64((LONGLONG volatile *)(ptr), (LONGLONG)(val))
 #else
+/* atomic fetch add */
+/*
+ * atomic_fetch_add
+ * @param ptr the pointer to add the value to
+ * @param val the value to add
+ * @return the value before the addition
+ */
 #define atomic_fetch_add(ptr, val) InterlockedExchangeAdd((LONG volatile *)(ptr), (LONG)(val))
 #endif
 
+/* atomic store */
+/*
+ * atomic_store
+ * @param ptr the pointer to store the value at
+ * @param val the value to store
+ */
 #define atomic_store(ptr, val) atomic_store_explicit(ptr, val, memory_order_seq_cst)
+/* atomic load */
+/*
+ * atomic_load
+ * @param ptr the pointer to load the value from
+ * @return the value loaded from the pointer
+ */
 #define atomic_load(ptr)       atomic_load_explicit(ptr, memory_order_seq_cst)
 #define memory_order_relaxed   0
 #define memory_order_acquire   1
@@ -359,12 +475,25 @@ typedef struct
     struct dirent dirent;
 } DIR;
 
+/* mkdir */
+/*
+ * mkdir
+ * @param path the path to create the directory at
+ * @param mode the mode to create the directory with (unused on windows)
+ * @return 0 on success, -1 on failure
+ */
 static inline int mkdir(const char *path, mode_t mode)
 {
     (void)mode; /* unused on windows */
     return _mkdir(path);
 }
 
+/* opendir */
+/*
+ * opendir
+ * @param name the name of the directory to open
+ * @return a pointer to the directory stream, or NULL on failure
+ */
 static inline DIR *opendir(const char *name)
 {
     DIR *dir = (DIR *)malloc(sizeof(DIR));
@@ -384,6 +513,12 @@ static inline DIR *opendir(const char *name)
     return dir;
 }
 
+/* readdir */
+/*
+ * readdir
+ * @param dir the directory stream to read from
+ * @return a pointer to the next directory entry, or NULL on failure
+ */
 static inline struct dirent *readdir(DIR *dir)
 {
     if (dir == NULL || dir->hFind == INVALID_HANDLE_VALUE)
@@ -402,6 +537,12 @@ static inline struct dirent *readdir(DIR *dir)
     return &dir->dirent;
 }
 
+/* closedir */
+/*
+ * closedir
+ * @param dir the directory stream to close
+ * @return 0 on success, -1 on failure
+ */
 static inline int closedir(DIR *dir)
 {
     if (dir == NULL)
@@ -421,6 +562,14 @@ typedef struct
     HANDLE handle;
 } sem_t;
 
+/* sem_init */
+/*
+ * sem_init
+ * @param sem the semaphore to initialize
+ * @param pshared whether the semaphore is shared between processes (unused on windows)
+ * @param value the initial value of the semaphore
+ * @return 0 on success, -1 on failure
+ */
 static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
 {
     (void)pshared;
@@ -433,6 +582,12 @@ static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
     return 0;
 }
 
+/* sem_destroy */
+/*
+ * sem_destroy
+ * @param sem the semaphore to destroy
+ * @return 0 on success, -1 on failure
+ */
 static inline int sem_destroy(sem_t *sem)
 {
     if (sem->handle != NULL)
@@ -443,12 +598,24 @@ static inline int sem_destroy(sem_t *sem)
     return 0;
 }
 
+/* sem_wait */
+/*
+ * sem_wait
+ * @param sem the semaphore to wait on
+ * @return 0 on success, -1 on failure
+ */
 static inline int sem_wait(sem_t *sem)
 {
     DWORD result = WaitForSingleObject(sem->handle, INFINITE);
     return (result == WAIT_OBJECT_0) ? 0 : -1;
 }
 
+/* sem_post */
+/*
+ * sem_post
+ * @param sem the semaphore to post
+ * @return 0 on success, -1 on failure
+ */
 static inline int sem_post(sem_t *sem)
 {
     return ReleaseSemaphore(sem->handle, 1, NULL) ? 0 : -1;
@@ -465,6 +632,12 @@ static inline int sem_post(sem_t *sem)
 #define fseek                _fseeki64
 
 /* fopen wrapper for windows */
+/*
+ * tdb_fopen
+ * @param filename the filename to open
+ * @param mode the mode to open the file in
+ * @return a pointer to the opened file, or NULL on failure
+ */
 static inline FILE *tdb_fopen(const char *filename, const char *mode)
 {
     FILE *fp = NULL;
@@ -474,6 +647,12 @@ static inline FILE *tdb_fopen(const char *filename, const char *mode)
 }
 #define fopen tdb_fopen
 
+/* fsync for windows */
+/*
+ * fsync
+ * @param fd the file descriptor to sync
+ * @return 0 on success, -1 on failure
+ */
 static inline int fsync(int fd)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
@@ -491,12 +670,23 @@ static inline int fsync(int fd)
 }
 
 /* fdatasync for MSVC, same as fsync (windows doesn't distinguish) */
+/*
+ * fdatasync
+ * @param fd the file descriptor to sync
+ * @return 0 on success, -1 on failure
+ */
 static inline int fdatasync(int fd)
 {
     return fsync(fd);
 }
 
 /* clock_gettime for MSVC */
+/*
+ * clock_gettime
+ * @param clk_id the clock ID (unused)
+ * @param tp the timespec struct to fill
+ * @return 0 on success, -1 on failure
+ */
 static inline int clock_gettime(int clk_id, struct timespec *tp)
 {
     (void)clk_id;
@@ -515,6 +705,12 @@ static inline int clock_gettime(int clk_id, struct timespec *tp)
 }
 
 /* gettimeofday for MSVC */
+/*
+ * gettimeofday
+ * @param tp the timeval struct to fill
+ * @param tzp the timezone struct (unused)
+ * @return 0 on success, -1 on failure
+ */
 static inline int gettimeofday(struct timeval *tp, struct timezone *tzp)
 {
     (void)tzp;
@@ -533,6 +729,15 @@ static inline int gettimeofday(struct timeval *tp, struct timezone *tzp)
 }
 
 /* pread/pwrite for MSVC using OVERLAPPED
+ */
+/*
+ * pread
+ * reads data from a file descriptor at a specific offset
+ * @param fd the file descriptor to read from
+ * @param buf the buffer to read into
+ * @param count the number of bytes to read
+ * @param offset the offset to read from
+ * @return the number of bytes read, or -1 on error
  */
 static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
@@ -572,6 +777,15 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     return (ssize_t)bytes_read;
 }
 
+/*
+ * pwrite
+ * writes data to a file descriptor at a specific offset
+ * @param fd the file descriptor to write to
+ * @param buf the buffer to write from
+ * @param count the number of bytes to write
+ * @param offset the offset to write at
+ * @return the number of bytes written, or -1 on error
+ */
 static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 {
     if (!buf || count == 0)
@@ -617,6 +831,15 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
 #include <semaphore.h>
 
 /* mingw doesn't provide pread/pwrite/fdatasync, so we implement them */
+/*
+ * pread
+ * reads data from a file descriptor at a specific offset
+ * @param fd the file descriptor to read from
+ * @param buf the buffer to read into
+ * @param count the number of bytes to read
+ * @param offset the offset to read from
+ * @return the number of bytes read, or -1 on error
+ */
 static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
@@ -666,6 +889,15 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     return (ssize_t)bytes_read;
 }
 
+/*
+ * pwrite
+ * writes data to a file descriptor at a specific offset
+ * @param fd the file descriptor to write to
+ * @param buf the buffer to write from
+ * @param count the number of bytes to write
+ * @param offset the offset to write at
+ * @return the number of bytes written, or -1 on error
+ */
 static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
@@ -715,6 +947,12 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     return (ssize_t)bytes_written;
 }
 
+/*
+ * fsync
+ * synchronizes file data to disk
+ * @param fd the file descriptor to synchronize
+ * @return 0 if successful, -1 otherwise
+ */
 static inline int fsync(int fd)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
@@ -725,6 +963,12 @@ static inline int fsync(int fd)
     return FlushFileBuffers(h) ? 0 : -1;
 }
 
+/*
+ * fdatasync
+ * synchronizes file data to disk
+ * @param fd the file descriptor to synchronize
+ * @return 0 if successful, -1 otherwise
+ */
 static inline int fdatasync(int fd)
 {
     return fsync(fd);
@@ -745,7 +989,12 @@ static inline int fdatasync(int fd)
 /* pread and pwrite are available natively on macOS via unistd.h */
 /* no additional implementation needed using system pread/pwrite */
 
-/* fdatasync for macOS, use F_FULLFSYNC for proper data sync */
+/*
+ * fdatasync
+ * synchronizes file data to disk
+ * @param fd the file descriptor to synchronize
+ * @return 0 if successful, -1 otherwise
+ */
 static inline int fdatasync(int fd)
 {
 #ifdef F_FULLFSYNC
@@ -767,6 +1016,14 @@ static inline int fdatasync(int fd)
  * use dispatch_semaphore instead */
 typedef dispatch_semaphore_t sem_t;
 
+/*
+ * sem_init
+ * initializes a semaphore
+ * @param sem the semaphore to initialize
+ * @param pshared whether the semaphore is shared between processes
+ * @param value the initial value of the semaphore
+ * @return 0 if successful, -1 otherwise
+ */
 static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
 {
     (void)pshared; /* unused on macOS */
@@ -774,6 +1031,12 @@ static inline int sem_init(sem_t *sem, int pshared, unsigned int value)
     return (*sem == NULL) ? -1 : 0;
 }
 
+/*
+ * sem_destroy
+ * destroys a semaphore
+ * @param sem the semaphore to destroy
+ * @return 0 if successful, -1 otherwise
+ */
 static inline int sem_destroy(sem_t *sem)
 {
     if (*sem)
@@ -784,11 +1047,23 @@ static inline int sem_destroy(sem_t *sem)
     return 0;
 }
 
+/*
+ * sem_wait
+ * waits on a semaphore
+ * @param sem the semaphore to wait on
+ * @return 0 if successful, -1 otherwise
+ */
 static inline int sem_wait(sem_t *sem)
 {
     return (dispatch_semaphore_wait(*sem, DISPATCH_TIME_FOREVER) == 0) ? 0 : -1;
 }
 
+/*
+ * sem_post
+ * posts a semaphore
+ * @param sem the semaphore to post
+ * @return 0 if successful, -1 otherwise
+ */
 static inline int sem_post(sem_t *sem)
 {
     dispatch_semaphore_signal(*sem);
@@ -885,7 +1160,7 @@ static inline size_t get_total_memory(void)
     }
     return 0;
 #else
-    /* Linux and other POSIX systems */
+    /* linux and other POSIX systems */
     struct sysinfo si;
     if (sysinfo(&si) == 0)
     {
@@ -895,7 +1170,12 @@ static inline size_t get_total_memory(void)
 #endif
 }
 
-/* method to get modified time of a file */
+/*
+ * get_file_mod_time
+ * gets the modified time of a file
+ * @param path the path of the file
+ * @return the modified time of the file, or -1 on failure
+ */
 static inline time_t get_file_mod_time(const char *path)
 {
     struct STAT_STRUCT file_stat;

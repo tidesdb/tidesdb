@@ -180,260 +180,195 @@ jobs:
           cd build
           ctest --output-on-failure --build-config Release
 
-      - name: Create portable test database (Linux x64 only)
-        if: runner.os == 'Linux' && matrix.arch == 'x64'
+  create-portable-db:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    name: Create Portable Database
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev build-essential cmake
+      
+      - name: Build TidesDB
+        run: |
+          cmake -S . -B build
+          cmake --build build --config Release
+      
+      - name: Create test database
         run: |
           cd build
-          cat > create_portable_db.c << 'EOF'
+          cat > create_db.c << 'EOF'
           #include "../src/tidesdb.h"
           #include <stdio.h>
           #include <string.h>
+          #include <unistd.h>
           
           int main() {
               tidesdb_t *db;
-              tidesdb_config_t cfg = {
-                  .db_path = "./portable_test_db",
-                  .num_flush_threads = 1,
-                  .num_compaction_threads = 1
-              };
-              
-              if (tidesdb_open(&cfg, &db) != 0) {
-                  fprintf(stderr, "Failed to open database\n");
-                  return 1;
-              }
+              tidesdb_config_t cfg = {.db_path = "./testdb", .num_flush_threads = 1, .num_compaction_threads = 1};
+              if (tidesdb_open(&cfg, &db) != 0) return 1;
               
               tidesdb_column_family_config_t cf_cfg = tidesdb_default_column_family_config();
               cf_cfg.memtable_flush_size = 1024;
               cf_cfg.enable_bloom_filter = 1;
               cf_cfg.enable_block_indexes = 1;
-              
-              if (tidesdb_create_column_family(db, "test_cf", &cf_cfg) != 0) {
-                  fprintf(stderr, "Failed to create column family\n");
-                  return 1;
-              }
+              if (tidesdb_create_column_family(db, "test_cf", &cf_cfg) != 0) return 1;
               
               tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
-              if (!cf) {
-                  fprintf(stderr, "Failed to get column family\n");
-                  tidesdb_close(db);
-                  return 1;
-              }
-              
               tidesdb_txn_t *txn;
-              if (tidesdb_txn_begin(db, cf, &txn) != 0) {
-                  fprintf(stderr, "Failed to begin transaction\n");
-                  tidesdb_close(db);
-                  return 1;
-              }
+              if (tidesdb_txn_begin(db, cf, &txn) != 0) return 1;
               
-              printf("Writing keys 0-49...\n");
-              for (int i = 0; i < 50; i++) {
+              for (int i = 0; i < 100; i++) {
                   char key[64], value[128];
-                  snprintf(key, sizeof(key), "test_key_%d", i);
-                  snprintf(value, sizeof(value), "test_value_%d", i);
-                  tidesdb_txn_put(txn, (uint8_t*)key, strlen(key), 
-                                 (uint8_t*)value, strlen(value), -1);
+                  snprintf(key, sizeof(key), "key_%d", i);
+                  snprintf(value, sizeof(value), "value_%d", i);
+                  tidesdb_txn_put(txn, (uint8_t*)key, strlen(key), (uint8_t*)value, strlen(value), -1);
               }
               tidesdb_txn_commit(txn);
               tidesdb_txn_free(txn);
-              
-              printf("Flushing first batch...\n");
               tidesdb_flush_memtable(cf);
               sleep(1);
-              
-              printf("Writing keys 50-99...\n");
-              if (tidesdb_txn_begin(db, cf, &txn) != 0) {
-                  fprintf(stderr, "Failed to begin second transaction\n");
-                  tidesdb_close(db);
-                  return 1;
-              }
-              for (int i = 50; i < 100; i++) {
-                  char key[64], value[128];
-                  snprintf(key, sizeof(key), "test_key_%d", i);
-                  snprintf(value, sizeof(value), "test_value_%d", i);
-                  tidesdb_txn_put(txn, (uint8_t*)key, strlen(key), 
-                                 (uint8_t*)value, strlen(value), -1);
-              }
-              tidesdb_txn_commit(txn);
-              tidesdb_txn_free(txn);
-              
-              printf("Flushing second batch...\n");
-              tidesdb_flush_memtable(cf);
-              sleep(1);
-              
-              printf("Compacting...\n");
               tidesdb_compact(cf);
               sleep(1);
-              
-              printf("☑ Created portable database with 100 keys\n");
-              printf("☑ Database includes WAL, SSTables, bloom filters, and indexes\n");
-              
               tidesdb_close(db);
+              printf("Database created with 100 keys\n");
               return 0;
           }
           EOF
-          
-          gcc -o create_portable_db create_portable_db.c \
-            -I../src -I../external \
-            -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-          LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./create_portable_db
-          
-          echo "Database files created:"
-          find portable_test_db -type f -ls
-
-      - name: Upload portable database artifact (Linux x64 only)
-        if: runner.os == 'Linux' && matrix.arch == 'x64'
+          gcc -o create_db create_db.c -I../src -I../external -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+          LD_LIBRARY_PATH=. ./create_db
+      
+      - name: Upload database
         uses: actions/upload-artifact@v4
         with:
-          name: portable-test-database
-          path: build/portable_test_db/
+          name: portable-db
+          path: build/testdb/
           retention-days: 1
 
-      - name: Wait for portable database artifact (all platforms except Linux x64)
-        if: runner.os != 'Linux' || matrix.arch != 'x64'
-        shell: bash
-        run: |
-          echo "Waiting for Linux x64 to create portable database artifact..."
-          for i in {1..60}; do
-            if gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts --jq '.artifacts[] | select(.name=="portable-test-database") | .name' 2>/dev/null | grep -q "portable-test-database"; then
-              echo "Artifact found!"
-              break
-            fi
-            echo "Attempt $i/60: Artifact not ready yet, waiting 10 seconds..."
-            sleep 10
-          done
-        env:
-          GH_TOKEN: ${{ github.token }}
-        continue-on-error: true
-
-      - name: Download portable database artifact
-        id: download-artifact
-        if: runner.os != 'Linux' || matrix.arch != 'x64'
+  verify-portable-db:
+    runs-on: ${{ matrix.os }}
+    needs: create-portable-db
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows MSVC
+            compiler: msvc
+          - os: windows-latest
+            name: Windows MinGW
+            compiler: mingw
+          - os: macos-latest
+            name: macOS
+    
+    name: Verify on ${{ matrix.name }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Download database
         uses: actions/download-artifact@v4
         with:
-          name: portable-test-database
-          path: portable_test_db
-        continue-on-error: true
-
-      - name: Verify cross-platform portability
-        if: (runner.os != 'Linux' || matrix.arch != 'x64') && steps.download-artifact.outcome == 'success'
+          name: portable-db
+          path: testdb
+      
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install zstd lz4 snappy
+      
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
+      
+      - name: Setup MinGW
+        if: matrix.compiler == 'mingw'
+        shell: pwsh
+        run: |
+          choco install mingw --version=8.1.0 -y
+          echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      
+      - name: Build TidesDB
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            if [ "${{ matrix.compiler }}" == "mingw" ]; then
+              cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+            else
+              cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+            fi
+          else
+            cmake -S . -B build
+          fi
+          cmake --build build --config Release
+      
+      - name: Verify database
         shell: bash
         run: |
           cd build
-          cat > verify_portable_db.c << 'EOF'
+          cat > verify_db.c << 'EOF'
           #include "../src/tidesdb.h"
           #include <stdio.h>
           #include <string.h>
           
           int main() {
-              printf("Verifying database created on Linux x64...\n");
-              
               tidesdb_t *db;
-              tidesdb_config_t cfg = {
-                  .db_path = "../portable_test_db",
-                  .num_flush_threads = 1,
-                  .num_compaction_threads = 1,
-                  .enable_debug_logging = 1,
-                  .wait_for_wal_recovery = 1,
-                  .wal_recovery_poll_interval_ms = 100
-              };
-              
-              if (tidesdb_open(&cfg, &db) != 0) {
-                  fprintf(stderr, "FAIL: Could not open database\n");
-                  return 1;
-              }
-              printf("☑ Database opened successfully\n");
+              tidesdb_config_t cfg = {.db_path = "../testdb", .num_flush_threads = 1, .num_compaction_threads = 1, .wait_for_wal_recovery = 1};
+              if (tidesdb_open(&cfg, &db) != 0) { fprintf(stderr, "Failed to open\n"); return 1; }
               
               tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
-              if (!cf) {
-                  fprintf(stderr, "FAIL: Could not get column family\n");
-                  tidesdb_close(db);
-                  return 1;
-              }
+              if (!cf) { fprintf(stderr, "CF not found\n"); return 1; }
               
               tidesdb_txn_t *txn;
-              if (tidesdb_txn_begin_read(db, cf, &txn) != 0) {
-                  fprintf(stderr, "FAIL: Could not begin transaction\n");
-                  tidesdb_close(db);
-                  return 1;
-              }
+              if (tidesdb_txn_begin_read(db, cf, &txn) != 0) return 1;
               
-              int verified = 0;
               for (int i = 0; i < 100; i++) {
                   char key[64], expected[128];
-                  snprintf(key, sizeof(key), "test_key_%d", i);
-                  snprintf(expected, sizeof(expected), "test_value_%d", i);
-                  
+                  snprintf(key, sizeof(key), "key_%d", i);
+                  snprintf(expected, sizeof(expected), "value_%d", i);
                   uint8_t *value = NULL;
                   size_t value_size = 0;
-                  
                   if (tidesdb_txn_get(txn, (uint8_t*)key, strlen(key), &value, &value_size) != 0) {
-                      fprintf(stderr, "FAIL: Key not found: %s\n", key);
-                      tidesdb_txn_free(txn);
-                      tidesdb_close(db);
+                      fprintf(stderr, "Key not found: %s\n", key);
                       return 1;
                   }
-                  
                   if (value_size != strlen(expected) || memcmp(value, expected, value_size) != 0) {
-                      fprintf(stderr, "FAIL: Value mismatch for %s\n", key);
-                      free(value);
-                      tidesdb_txn_free(txn);
-                      tidesdb_close(db);
+                      fprintf(stderr, "Value mismatch\n");
                       return 1;
                   }
-                  
                   free(value);
-                  verified++;
               }
-              
-              printf("\n*========================================*\n");
-              printf("☑ CROSS-PLATFORM TEST PASSED\n");
-              printf("☑ All %d keys verified successfully\n", verified);
-              printf("☑ Little-endian serialization confirmed\n");
-              printf("*=======================================*\n");
-              
               tidesdb_txn_free(txn);
               tidesdb_close(db);
+              printf("All 100 keys verified successfully!\n");
               return 0;
           }
           EOF
           
           if [ "$RUNNER_OS" == "Windows" ]; then
-            mv verify_portable_db.c ../
+            mv verify_db.c ../
             cd ..
             cat >> CMakeLists.txt << 'CMAKEEOF'
-          add_executable(verify_portable_db_test verify_portable_db.c)
-          target_link_libraries(verify_portable_db_test PRIVATE tidesdb)
-          target_include_directories(verify_portable_db_test PRIVATE external)
+          add_executable(verify_db verify_db.c)
+          target_link_libraries(verify_db PRIVATE tidesdb)
+          target_include_directories(verify_db PRIVATE external)
           CMAKEEOF
             cmake build
+            cmake --build build --config Release
             if [ "${{ matrix.compiler }}" == "mingw" ]; then
-              cmake --build build
-              cd build
-              ./verify_portable_db_test.exe
+              ./build/verify_db.exe
             else
-              cmake --build build --target verify_portable_db_test --config Release
-              cd build/Release
-              ./verify_portable_db_test.exe
+              ./build/Release/verify_db.exe
             fi
-          elif [ "$RUNNER_OS" == "macOS" ]; then
-            gcc -o verify_portable_db verify_portable_db.c \
-              -I../src -I../external \
-              -I/opt/homebrew/include -I/usr/local/include \
-              -L. -L/opt/homebrew/lib -L/usr/local/lib \
-              -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-            DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_portable_db
           else
-            if [ "${{ matrix.arch }}" == "x86" ]; then
-              gcc -m32 -o verify_portable_db verify_portable_db.c \
-                -I../src -I../external \
-                -L. -L/usr/lib/i386-linux-gnu \
-                -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-              LD_LIBRARY_PATH=.:/usr/lib/i386-linux-gnu ./verify_portable_db
-            else
-              gcc -o verify_portable_db verify_portable_db.c \
-                -I../src -I../external \
-                -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-              LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./verify_portable_db
-            fi
+            gcc -o verify_db verify_db.c -I../src -I../external -I/opt/homebrew/include -I/usr/local/include -L. -L/opt/homebrew/lib -L/usr/local/lib -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+            DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_db
           fi

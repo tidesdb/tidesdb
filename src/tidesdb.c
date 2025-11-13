@@ -1042,6 +1042,12 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
 
         iter->sstable_blocks_read[idx]++;
 
+        /* ensure we don't read beyond num_entries */
+        if (iter->sstable_blocks_read[idx] > atomic_load(&sst->num_entries))
+        {
+            break;
+        }
+
         block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[idx]);
         if (!block) break;
 
@@ -3197,7 +3203,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
                     {
                         succinct_trie_builder_add(index_builder, k, k_size, offset);
                     }
-                    sst->num_entries++;
+                    atomic_fetch_add(&sst->num_entries, 1);
                     entries_written++;
                 }
                 else

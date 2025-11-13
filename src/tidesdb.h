@@ -270,7 +270,7 @@ struct tidesdb_sstable_t
     uint8_t *max_key;
     size_t min_key_size;
     size_t max_key_size;
-    int num_entries;
+    _Atomic int num_entries;
     _Atomic(int) ref_count;
     pthread_mutex_t ref_lock;
 };

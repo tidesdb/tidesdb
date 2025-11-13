@@ -391,7 +391,7 @@ jobs:
               };
               
               printf("Opening database created on Linux x64...\n");
-              if (tidesdb_open(&db, &cfg) != 0) {
+              if (tidesdb_open(&cfg, &db) != 0) {
                   fprintf(stderr, "FAIL: Could not open database\n");
                   return 1;
               }

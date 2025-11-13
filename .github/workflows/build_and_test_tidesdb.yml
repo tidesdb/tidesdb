@@ -397,14 +397,18 @@ jobs:
           #include <string.h>
           
           int main() {
+              printf("Checking database files before opening...\n");
+              system("ls -laR ../portable_test_db/");
+              
               tidesdb_t *db;
               tidesdb_config_t cfg = {
                   .db_path = "../portable_test_db",
                   .num_flush_threads = 1,
-                  .num_compaction_threads = 1
+                  .num_compaction_threads = 1,
+                  .enable_debug_logging = 1
               };
               
-              printf("Opening database created on Linux x64...\n");
+              printf("\nOpening database created on Linux x64...\n");
               if (tidesdb_open(&cfg, &db) != 0) {
                   fprintf(stderr, "FAIL: Could not open database\n");
                   return 1;

@@ -195,8 +195,8 @@ typedef struct __attribute__((packed))
  * @param num_compaction_threads number of threads in compaction thread pool (default 2)
  * @param wait_for_wal_recovery if true, tidesdb_open blocks until all WAL recovery flushes complete
  *        (default: false for fast startup, set true for guaranteed data availability)
- * @param wal_recovery_poll_interval_ms polling interval in milliseconds when waiting for WAL recovery
- *        (default: 100ms, only used if wait_for_wal_recovery is true)
+ * @param wal_recovery_poll_interval_ms polling interval in milliseconds when waiting for WAL
+ * recovery (default: 100ms, only used if wait_for_wal_recovery is true)
  */
 typedef struct
 {

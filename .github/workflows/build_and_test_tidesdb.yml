@@ -504,16 +504,30 @@ jobs:
           EOF
           
           if [ "$RUNNER_OS" == "Windows" ]; then
+            # Create CMakeLists.txt for the verify test
+            cat > CMakeLists_verify.txt << 'CMAKEEOF'
+          cmake_minimum_required(VERSION 3.10)
+          project(verify_portable_db C)
+          
+          add_executable(verify_portable_db verify_portable_db.c)
+          target_include_directories(verify_portable_db PRIVATE ../src ../external)
+          target_link_libraries(verify_portable_db PRIVATE tidesdb)
+          CMAKEEOF
+            
+            # Use CMake to build (handles vcpkg and MSVC automatically)
             if [ "${{ matrix.compiler }}" == "mingw" ]; then
-              gcc -o verify_portable_db verify_portable_db.c \
-                -I../src -I../external \
-                -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-              ./verify_portable_db.exe
+              cmake -S . -B verify_build -G "MinGW Makefiles" \
+                -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+                -DVCPKG_TARGET_TRIPLET=x64-windows \
+                -DCMAKE_PREFIX_PATH="$(pwd)"
+              cmake --build verify_build
+              ./verify_build/verify_portable_db.exe
             else
-              # MSVC build
-              cl.exe /I../src /I../external \
-                verify_portable_db.c /link /LIBPATH:Release tidesdb.lib
-              ./verify_portable_db.exe
+              cmake -S . -B verify_build -A x64 \
+                -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+                -DCMAKE_PREFIX_PATH="$(pwd)"
+              cmake --build verify_build --config Release
+              ./verify_build/Release/verify_portable_db.exe
             fi
           else
             if [ "$RUNNER_OS" == "macOS" ]; then

@@ -201,7 +201,7 @@ jobs:
   create-portable-db:
     runs-on: ubuntu-latest
     needs: build-and-test
-    name: Create Portable Database
+    name: Create Portable Database (x64 Linux)
     
     steps:
       - name: Checkout
@@ -276,15 +276,29 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            name: Windows MSVC
+            name: Windows MSVC x64
             compiler: msvc
+            arch: x64
           - os: windows-latest
-            name: Windows MinGW
+            name: Windows MSVC x86
+            compiler: msvc
+            arch: x86
+          - os: windows-latest
+            name: Windows MinGW x64
             compiler: mingw
+            arch: x64
+          - os: windows-latest
+            name: Windows MinGW x86
+            compiler: mingw
+            arch: x86
           - os: macos-latest
-            name: macOS
+            name: macOS x64
+            arch: x64
+          - os: ubuntu-latest
+            name: Linux x86
+            arch: x86
     
-    name: Verify on ${{ matrix.name }}
+    name: Verify portability on ${{ matrix.name }}
     
     steps:
       - name: Checkout
@@ -296,33 +310,92 @@ jobs:
           name: portable-db
           path: testdb
       
+      - name: Install dependencies (Linux x86)
+        if: runner.os == 'Linux' && matrix.arch == 'x86'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt update
+          sudo apt install -y gcc-multilib g++-multilib libc6-dev-i386 \
+            libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 build-essential cmake pkg-config
+      
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install zstd lz4 snappy
       
-      - name: Install dependencies (Windows)
+      - name: Setup vcpkg binary cache (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg_cache"
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE
+          echo "VCPKG_DEFAULT_BINARY_CACHE=$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Cache vcpkg packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: vcpkg-verify-${{ matrix.compiler }}-${{ matrix.arch }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-verify-${{ matrix.compiler }}-${{ matrix.arch }}-
+            vcpkg-${{ matrix.compiler }}-${{ matrix.arch }}-
+      
+      - name: Install dependencies (Windows MSVC x64)
+        if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
         shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
           .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
       
-      - name: Setup MinGW
+      - name: Install dependencies (Windows MSVC x86)
+        if: matrix.compiler == 'msvc' && matrix.arch == 'x86'
+        shell: pwsh
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
+      
+      - name: Install dependencies (Windows MinGW)
         if: matrix.compiler == 'mingw'
         shell: pwsh
         run: |
-          choco install mingw --version=8.1.0 -y
-          echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          if ("${{ matrix.arch }}" -eq "x86") {
+              choco install mingw --version=8.1.0 --forcex86 -y
+              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
+              cd $env:VCPKG_INSTALLATION_ROOT
+              .\vcpkg.exe install zstd:x86-windows snappy:x86-windows lz4:x86-windows pthreads:x86-windows
+          } else {
+              choco install mingw --version=8.1.0 -y
+              $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
+              cd $env:VCPKG_INSTALLATION_ROOT
+              .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
+          }
+          echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       
       - name: Build TidesDB
         shell: bash
         run: |
           if [ "$RUNNER_OS" == "Windows" ]; then
             if [ "${{ matrix.compiler }}" == "mingw" ]; then
-              cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+              if [ "${{ matrix.arch }}" == "x86" ]; then
+                cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_FLAGS="-m32" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x86-windows
+              else
+                cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+              fi
             else
-              cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+              if [ "${{ matrix.arch }}" == "x86" ]; then
+                cmake -S . -B build -A Win32 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+              else
+                cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+              fi
             fi
+          elif [ "$RUNNER_OS" == "Linux" ]; then
+            export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
+            cmake -S . -B build \
+              -DCMAKE_C_FLAGS="-m32" \
+              -DCMAKE_EXE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+              -DCMAKE_SHARED_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+              -DCMAKE_MODULE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
+              -DTIDESDB_WITH_SANITIZER=OFF
           else
             cmake -S . -B build
           fi
@@ -375,10 +448,11 @@ jobs:
             mv verify_db.c ../
             cd ..
             cat >> CMakeLists.txt << 'CMAKEEOF'
-          add_executable(verify_db verify_db.c)
-          target_link_libraries(verify_db PRIVATE tidesdb)
-          target_include_directories(verify_db PRIVATE external)
-          CMAKEEOF
+
+add_executable(verify_db verify_db.c)
+target_link_libraries(verify_db PRIVATE tidesdb)
+target_include_directories(verify_db PRIVATE external)
+CMAKEEOF
             cmake build
             cmake --build build --config Release
             if [ "${{ matrix.compiler }}" == "mingw" ]; then
@@ -386,6 +460,12 @@ jobs:
             else
               ./build/Release/verify_db.exe
             fi
+          elif [ "$RUNNER_OS" == "Linux" ]; then
+            gcc -m32 -o verify_db verify_db.c \
+              -I../src -I../external \
+              -L. -L/usr/lib/i386-linux-gnu \
+              -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+            LD_LIBRARY_PATH=.:/usr/lib/i386-linux-gnu ./verify_db
           else
             gcc -o verify_db verify_db.c -I../src -I../external -I/opt/homebrew/include -I/usr/local/include -L. -L/opt/homebrew/lib -L/usr/local/lib -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
             DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_db

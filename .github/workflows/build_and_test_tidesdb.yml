@@ -504,45 +504,36 @@ jobs:
           EOF
           
           if [ "$RUNNER_OS" == "Windows" ]; then
-            # Create a standalone build directory for the verify test
-            mkdir -p verify_test
-            cd verify_test
+            # Windows: Just add verify test to existing build (same as main CI)
+            # The build directory already has tidesdb library and all dependencies configured
             
-            # Copy the source file
-            cp ../verify_portable_db.c .
-            
-            # Create CMakeLists.txt for the verify test
-            cat > CMakeLists.txt << 'CMAKEEOF'
-          cmake_minimum_required(VERSION 3.10)
-          project(verify_portable_db C)
+            # Add verify executable to CMakeLists.txt
+            cat >> CMakeLists.txt << 'CMAKEEOF'
           
-          # Find the tidesdb library from parent build directory
-          link_directories(${CMAKE_CURRENT_SOURCE_DIR}/../Release ${CMAKE_CURRENT_SOURCE_DIR}/..)
-          
-          add_executable(verify_portable_db verify_portable_db.c)
-          target_include_directories(verify_portable_db PRIVATE ../../src ../../external)
-          target_link_libraries(verify_portable_db PRIVATE tidesdb)
+          # Portability verification test
+          add_executable(verify_portable_db_test verify_portable_db.c)
+          target_link_libraries(verify_portable_db_test PRIVATE tidesdb)
+          target_include_directories(verify_portable_db_test PRIVATE external)
           CMAKEEOF
             
-            # Use CMake to build (handles vcpkg and MSVC automatically)
-            if [ "${{ matrix.compiler }}" == "mingw" ]; then
-              cmake -S . -B verify_build -G "MinGW Makefiles" \
-                -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
-                -DVCPKG_TARGET_TRIPLET=x64-windows
-              cmake --build verify_build
-              # Copy DLLs to verify_build directory
-              cp ../Release/*.dll verify_build/ 2>/dev/null || true
-              cp ../*.dll verify_build/ 2>/dev/null || true
-              ./verify_build/verify_portable_db.exe
-            else
-              cmake -S . -B verify_build -A x64 \
-                -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-              cmake --build verify_build --config Release
-              # Copy DLLs to verify_build/Release directory
-              cp ../Release/*.dll verify_build/Release/ 2>/dev/null || true
-              ./verify_build/Release/verify_portable_db.exe
-            fi
+            # Reconfigure to pick up the new executable
             cd ..
+            if [ "${{ matrix.compiler }}" == "mingw" ]; then
+              cmake build
+            else
+              cmake build
+            fi
+            
+            # Build just the verify test
+            cmake --build build --target verify_portable_db_test --config Release
+            
+            # Run it
+            cd build
+            if [ "${{ matrix.compiler }}" == "mingw" ]; then
+              ./verify_portable_db_test.exe
+            else
+              ./Release/verify_portable_db_test.exe
+            fi
           else
             if [ "$RUNNER_OS" == "macOS" ]; then
               # macOS needs homebrew library paths

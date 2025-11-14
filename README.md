@@ -23,9 +23,9 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Memory optimizations include arena-based allocation for skip list nodes and inline storage for small keys/values (≤24 bytes) to reduce malloc overhead and pointer indirection.
 - Two-tier caching system with block-level LRU cache for frequently accessed data and configurable file handle cache to limit open file descriptors.
 - Shared thread pools for background flush and compaction operations with configurable thread counts at the database level.
-- Two sync modes: TDB_SYNC_NONE for maximum performance (OS-managed flushing) and TDB_SYNC_FULL for maximum durability (fsync on every write).
+- Two sync modes: `TDB_SYNC_NONE` for maximum performance (OS-managed flushing) and `TDB_SYNC_FULL` for maximum durability (fsync on every write).
 - Cross-platform support for Linux, macOS, and Windows on both 32-bit and 64-bit architectures with platform abstraction layer.
-- Full file portability with little-endian serialization throughout—database files can be copied between any platform (x86, ARM, RISC-V) and architecture (32-bit, 64-bit, little-endian, big-endian) without conversion.
+- Full file portability with explicit little-endian serialization throughout—database files can be copied between any platform (x86, ARM, RISC-V) and architecture (32-bit, 64-bit) without conversion.
 - Clean C API that returns 0 on success and negative error codes on failure for straightforward error handling.
 
 ## Getting Started
@@ -39,7 +39,7 @@ For C usage documentation, see the [TidesDB C Reference](https://tidesdb.com/ref
 Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask questions, work on development, and discuss the future of TidesDB.
 
 ## License
-Multiple
+Multiple licenses apply to TidesDB. The primary license is the Mozilla Public License Version 2.0 (TidesDB), while additional licenses apply to the dependencies used in the project.
 
 ```
 Mozilla Public License Version 2.0 (TidesDB)
@@ -50,5 +50,4 @@ BSD 2 (LZ4)
 BSD 2 (xxHash - Yann Collet)
 BSD 2 (inih - Ben Hoyt)
 BSD (Zstandard)
-Apache 2.0 (OpenSSL 3.0+) / OpenSSL License (OpenSSL 1.x)
 ```

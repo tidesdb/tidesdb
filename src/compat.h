@@ -24,6 +24,12 @@
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+
+/* fallback for SIZE_MAX, just in case */
+#ifndef SIZE_MAX
+#define SIZE_MAX ((size_t)-1)
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,6 +37,22 @@
 #define PATH_SEPARATOR "\\"
 #else
 #define PATH_SEPARATOR "/"
+#endif
+
+/* cross-platform strdup abstraction */
+#if defined(_MSC_VER)
+#define tdb_strdup(s) _strdup(s)
+#else
+#define tdb_strdup(s) strdup(s)
+#endif
+
+/* cross-platform localtime abstraction */
+#if defined(_WIN32)
+/* (MSVC and MinGW) use localtime_s with reversed parameter order */
+#define tdb_localtime(timer, result) localtime_s((result), (timer))
+#else
+/* POSIX uses localtime_r */
+#define tdb_localtime(timer, result) localtime_r((timer), (result))
 #endif
 
 /* https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/stat-functions?view=msvc-170
@@ -1235,6 +1257,108 @@ static inline void encode_uint64_le_compat(uint8_t *buf, uint64_t val)
     buf[5] = (uint8_t)((val >> 40) & 0xFF);
     buf[6] = (uint8_t)((val >> 48) & 0xFF);
     buf[7] = (uint8_t)((val >> 56) & 0xFF);
+}
+
+/*
+ * encode_uint32_le
+ * encodes a uint32_t value in little-endian format
+ * @param buf buffer to store encoded value
+ * @param val value to encode
+ */
+static inline void encode_uint32_le(uint8_t *buf, uint32_t val)
+{
+    buf[0] = (uint8_t)(val & 0xFF);
+    buf[1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[2] = (uint8_t)((val >> 16) & 0xFF);
+    buf[3] = (uint8_t)((val >> 24) & 0xFF);
+}
+
+/*
+ * decode_uint32_le
+ * decodes a uint32_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline uint32_t decode_uint32_le(const uint8_t *buf)
+{
+    return ((uint32_t)buf[0]) | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) |
+           ((uint32_t)buf[3] << 24);
+}
+
+/*
+ * encode_int64_le
+ * encodes an int64_t value in little-endian format
+ * @param buf buffer to store encoded value
+ * @param val value to encode
+ */
+static inline void encode_int64_le(uint8_t *buf, int64_t val)
+{
+    uint64_t uval = (uint64_t)val;
+    buf[0] = (uint8_t)(uval & 0xFF);
+    buf[1] = (uint8_t)((uval >> 8) & 0xFF);
+    buf[2] = (uint8_t)((uval >> 16) & 0xFF);
+    buf[3] = (uint8_t)((uval >> 24) & 0xFF);
+    buf[4] = (uint8_t)((uval >> 32) & 0xFF);
+    buf[5] = (uint8_t)((uval >> 40) & 0xFF);
+    buf[6] = (uint8_t)((uval >> 48) & 0xFF);
+    buf[7] = (uint8_t)((uval >> 56) & 0xFF);
+}
+
+/*
+ * decode_int64_le
+ * decodes an int64_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline int64_t decode_int64_le(const uint8_t *buf)
+{
+    uint64_t uval = ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
+                    ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
+                    ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
+    return (int64_t)uval;
+}
+
+/*
+ * encode_uint64_le
+ * encodes a uint64_t value in little-endian format
+ * @param buf buffer to store encoded value
+ * @param val value to encode
+ */
+static inline void encode_uint64_le(uint8_t *buf, uint64_t val)
+{
+    buf[0] = (uint8_t)(val & 0xFF);
+    buf[1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[2] = (uint8_t)((val >> 16) & 0xFF);
+    buf[3] = (uint8_t)((val >> 24) & 0xFF);
+    buf[4] = (uint8_t)((val >> 32) & 0xFF);
+    buf[5] = (uint8_t)((val >> 40) & 0xFF);
+    buf[6] = (uint8_t)((val >> 48) & 0xFF);
+    buf[7] = (uint8_t)((val >> 56) & 0xFF);
+}
+
+/*
+ * decode_uint64_le
+ * decodes a uint64_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline uint64_t decode_uint64_le(const uint8_t *buf)
+{
+    return ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
+           ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
+           ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
+}
+
+/*
+ * decode_fixed_32
+ * decodes a uint32_t value in little-endian format
+ * @param data buffer containing encoded value
+ * @return decoded value
+ */
+static inline uint32_t decode_fixed_32(const char *data)
+{
+    return ((uint32_t)(uint8_t)data[0]) | ((uint32_t)(uint8_t)data[1] << 8) |
+           ((uint32_t)(uint8_t)data[2] << 16) | ((uint32_t)(uint8_t)data[3] << 24);
 }
 
 /*

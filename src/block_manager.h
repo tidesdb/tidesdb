@@ -43,7 +43,6 @@
 #define BLOCK_MANAGER_BLOCK_SIZE_SIZE 4
 /* padding field size in bytes */
 #define BLOCK_MANAGER_PADDING_SIZE 4
-/* total: 3 + 1 + 4 + 4 */
 
 #define BLOCK_MANAGER_HEADER_SIZE 12
 
@@ -68,7 +67,7 @@
 /* default file permissions (rw-r--r--) */
 #define BLOCK_MANAGER_FILE_MODE   0644
 #define MIN_CACHE_ENTRIES         10
-#define MAX_REASONABLE_BLOCK_SIZE 10ULL << 30
+#define MAX_REASONABLE_BLOCK_SIZE (10ULL * 1024 * 1024 * 1024)
 
 typedef enum
 {

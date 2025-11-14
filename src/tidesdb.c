@@ -26,98 +26,6 @@
 #include "tidesdb.h"
 
 /*
- * encode_uint32_le
- * encodes a uint32_t value in little-endian format
- * @param buf buffer to store encoded value
- * @param val value to encode
- */
-static inline void encode_uint32_le(uint8_t *buf, uint32_t val)
-{
-    buf[0] = (uint8_t)(val & 0xFF);
-    buf[1] = (uint8_t)((val >> 8) & 0xFF);
-    buf[2] = (uint8_t)((val >> 16) & 0xFF);
-    buf[3] = (uint8_t)((val >> 24) & 0xFF);
-}
-
-/*
- * decode_uint32_le
- * decodes a uint32_t value in little-endian format
- * @param buf buffer containing encoded value
- * @return decoded value
- */
-static inline uint32_t decode_uint32_le(const uint8_t *buf)
-{
-    return ((uint32_t)buf[0]) | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) |
-           ((uint32_t)buf[3] << 24);
-}
-
-/*
- * encode_int64_le
- * encodes an int64_t value in little-endian format
- * @param buf buffer to store encoded value
- * @param val value to encode
- */
-static inline void encode_int64_le(uint8_t *buf, int64_t val)
-{
-    uint64_t uval = (uint64_t)val;
-    buf[0] = (uint8_t)(uval & 0xFF);
-    buf[1] = (uint8_t)((uval >> 8) & 0xFF);
-    buf[2] = (uint8_t)((uval >> 16) & 0xFF);
-    buf[3] = (uint8_t)((uval >> 24) & 0xFF);
-    buf[4] = (uint8_t)((uval >> 32) & 0xFF);
-    buf[5] = (uint8_t)((uval >> 40) & 0xFF);
-    buf[6] = (uint8_t)((uval >> 48) & 0xFF);
-    buf[7] = (uint8_t)((uval >> 56) & 0xFF);
-}
-
-/*
- * decode_int64_le
- * decodes an int64_t value in little-endian format
- * @param buf buffer containing encoded value
- * @return decoded value
- */
-static inline int64_t decode_int64_le(const uint8_t *buf)
-{
-    uint64_t uval = ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
-                    ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
-                    ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
-    return (int64_t)uval;
-}
-
-/*
- * encode_uint64_le
- * encodes a uint64_t value in little-endian format
- * @param buf buffer to store encoded value
- * @param val value to encode
- */
-static inline void encode_uint64_le(uint8_t *buf, uint64_t val)
-{
-    buf[0] = (uint8_t)(val & 0xFF);
-    buf[1] = (uint8_t)((val >> 8) & 0xFF);
-    buf[2] = (uint8_t)((val >> 16) & 0xFF);
-    buf[3] = (uint8_t)((val >> 24) & 0xFF);
-    buf[4] = (uint8_t)((val >> 32) & 0xFF);
-    buf[5] = (uint8_t)((val >> 40) & 0xFF);
-    buf[6] = (uint8_t)((val >> 48) & 0xFF);
-    buf[7] = (uint8_t)((val >> 56) & 0xFF);
-}
-
-/*
- * decode_uint64_le
- * decodes a uint64_t value in little-endian format
- * @param buf buffer containing encoded value
- * @return decoded value
- */
-static inline uint64_t decode_uint64_le(const uint8_t *buf)
-{
-    return ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
-           ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
-           ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
-}
-
-#define TDB_KV_HEADER_SIZE 18 /* 1 + 1 + 4 + 4 + 8 = 18 bytes */
-
-/*
  * serialize_kv_header
  * serializes a key-value header to a buffer
  * @param buf buffer to store serialized header
@@ -1432,6 +1340,13 @@ static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
 
+    /* check for integer overflow */
+    if (key_size > SIZE_MAX - value_size - TDB_KV_HEADER_SIZE)
+    {
+        TDB_DEBUG_LOG("Key/value size overflow detected");
+        return TDB_ERR_MEMORY_LIMIT;
+    }
+
     size_t total_size = key_size + value_size + TDB_KV_HEADER_SIZE;
 
     size_t max_allowed = (size_t)(db->available_memory * TDB_MEMORY_PERCENTAGE / 100);
@@ -1464,6 +1379,9 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
 {
     if (!sst || !cf || !sst->block_manager) return -1;
     if (!cf->config.enable_block_indexes) return 0;
+
+    TDB_DEBUG_LOG("Building succinct trie index for SSTable " TDB_U64_FMT " (%d entries)",
+                  (unsigned long long)sst->id, sst->num_entries);
 
     /* use streaming builder for reduced allocation overhead */
     /* sstable keys are already sorted, perfect for streaming mode */
@@ -1578,6 +1496,11 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
 
     /* now safe to free the keys buffer */
     free(keys_buffer);
+
+    if (sst->index)
+    {
+        TDB_DEBUG_LOG("Succinct trie index built successfully");
+    }
 
     return sst->index ? 0 : -1;
 }
@@ -2048,6 +1971,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config)
 {
     if (!db || !name) return TDB_ERR_INVALID_ARGS;
+    if (name[0] == '\0') return TDB_ERR_INVALID_NAME; /* empty name not allowed */
     if (strlen(name) >= TDB_MAX_CF_NAME_LENGTH) return TDB_ERR_INVALID_NAME;
 
     TDB_DEBUG_LOG("Creating column family: %s", name);
@@ -3582,6 +3506,9 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
     TDB_DEBUG_LOG("  background_compaction_interval: %d",
                   cf->config.background_compaction_interval);
     TDB_DEBUG_LOG("  block_manager_cache_size: %d", cf->config.block_manager_cache_size);
+    TDB_DEBUG_LOG("  enable_bloom_filter: %d", cf->config.enable_bloom_filter);
+    TDB_DEBUG_LOG("  bloom_filter_fp_rate: %.4f", cf->config.bloom_filter_fp_rate);
+    TDB_DEBUG_LOG("  sync_mode: %d", cf->config.sync_mode);
 
     return 0;
 }
@@ -3713,13 +3640,20 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         merged->bloom_filter = NULL;
         if (cf->config.enable_bloom_filter)
         {
+            TDB_DEBUG_LOG("Creating bloom filter (entries: %d, fp_rate: %f)",
+                          sst1->num_entries + sst2->num_entries, cf->config.bloom_filter_fp_rate);
             bloom_filter_new(&merged->bloom_filter, cf->config.bloom_filter_fp_rate,
                              sst1->num_entries + sst2->num_entries);
+            if (merged->bloom_filter)
+            {
+                TDB_DEBUG_LOG("Bloom filter created successfully");
+            }
         }
 
         merged->index = NULL; /* will be built after merging in second pass */
 
         /* merge entries from both sstables using cursors with key comparison */
+        TDB_DEBUG_LOG("Creating block manager cursors for compaction merge");
         block_manager_cursor_t *cursor1 = NULL;
         block_manager_cursor_t *cursor2 = NULL;
         block_manager_cursor_init(&cursor1, sst1->block_manager);
@@ -6347,9 +6281,6 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
             if (cf->sstables[i])
             {
                 tidesdb_sstable_acquire(cf->sstables[i]);
-                TDB_DEBUG_LOG("Iterator captured sstable %d: id=" TDB_U64_FMT ", entries=%d", i,
-                              (unsigned long long)cf->sstables[i]->id,
-                              cf->sstables[i]->num_entries);
             }
         }
     }
@@ -6461,11 +6392,6 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter)
         }
     }
 
-    /* populate heap with first entry from each source */
-    TDB_DEBUG_LOG("Iterator sources: memtable=%d, immutable=%d, sstables=%d",
-                  iter->memtable_cursor ? 1 : 0, iter->num_immutable_cursors,
-                  iter->num_sstable_cursors);
-
     iter_refill_from_memtable(iter);
     for (int i = 0; i < iter->num_immutable_cursors; i++)
     {
@@ -6475,8 +6401,6 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter)
     {
         iter_refill_from_sstable(iter, i);
     }
-
-    TDB_DEBUG_LOG("Initial heap size after refill: %d", iter->heap_size);
 
     /* get first entry (heap is already populated) */
     return tidesdb_iter_next(iter);
@@ -6540,6 +6464,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
 int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
 {
     if (!iter || !key) return TDB_ERR_INVALID_ARGS;
+    if (key_size == 0) return TDB_ERR_INVALID_ARGS; /* keys must have non-zero length */
 
     iter->direction = 1;
     iter->valid = 0;
@@ -6628,12 +6553,6 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                         if (succinct_trie_prefix_get(sst->index, (uint8_t *)key, key_size,
                                                      &block_num) == 0)
                         {
-                            TDB_DEBUG_LOG(
-                                "Block index for SSTable %d (id=%llu, entries=%d) returned "
-                                "block_num=%" PRId64 " for key=%.*s",
-                                i, (unsigned long long)sst->id, atomic_load(&sst->num_entries),
-                                block_num, (int)key_size, (char *)key);
-
                             positioned_via_index = 1;
                             index_positioned[i] = 1;
                             iter->sstable_blocks_read[i] = (int)block_num;
@@ -6805,6 +6724,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
 int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
 {
     if (!iter || !key) return TDB_ERR_INVALID_ARGS;
+    if (key_size == 0) return TDB_ERR_INVALID_ARGS;
 
     iter->direction = -1;
     iter->valid = 0;

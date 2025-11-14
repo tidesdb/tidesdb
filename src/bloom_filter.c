@@ -27,6 +27,11 @@
 
 int bloom_filter_new(bloom_filter_t **bf, double p, int n)
 {
+    if (p <= 0.0 || p >= 1.0 || n <= 0)
+    {
+        return -1;
+    }
+
     *bf = malloc(sizeof(bloom_filter_t));
     if (*bf == NULL)
     {
@@ -165,21 +170,21 @@ uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
 
     uint8_t *ptr = buffer;
 
-    /* write the size of the bitset (m) - little-endian */
+    /* write the size of the bitset (m)  */
     ptr[0] = (uint8_t)(bf->m & 0xFF);
     ptr[1] = (uint8_t)((bf->m >> 8) & 0xFF);
     ptr[2] = (uint8_t)((bf->m >> 16) & 0xFF);
     ptr[3] = (uint8_t)((bf->m >> 24) & 0xFF);
     ptr += sizeof(int32_t);
 
-    /* write the number of hash functions (h) - little-endian */
+    /* write the number of hash functions (h) */
     ptr[0] = (uint8_t)(bf->h & 0xFF);
     ptr[1] = (uint8_t)((bf->h >> 8) & 0xFF);
     ptr[2] = (uint8_t)((bf->h >> 16) & 0xFF);
     ptr[3] = (uint8_t)((bf->h >> 24) & 0xFF);
     ptr += sizeof(int32_t);
 
-    /* write the packed bitset - little-endian */
+    /* write the packed bitset */
     for (int i = 0; i < bf->size_in_words; i++)
     {
         uint64_t word = bf->bitset[i];
@@ -201,19 +206,37 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
 {
     const uint8_t *ptr = data;
 
-    /* read the size of the bitset (m) - little-endian */
-    int32_t m = ((int32_t)ptr[0]) | ((int32_t)ptr[1] << 8) | ((int32_t)ptr[2] << 16) |
-                ((int32_t)ptr[3] << 24);
+    /* read the size of the bitset (m) */
+    int32_t m = (int32_t)(((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
+                          ((uint32_t)ptr[3] << 24));
     ptr += sizeof(int32_t);
 
-    /* read the number of hash functions (h) - little-endian */
-    int32_t h = ((int32_t)ptr[0]) | ((int32_t)ptr[1] << 8) | ((int32_t)ptr[2] << 16) |
-                ((int32_t)ptr[3] << 24);
+    /* read the number of hash functions (h)*/
+    int32_t h = (int32_t)(((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
+                          ((uint32_t)ptr[3] << 24));
     ptr += sizeof(int32_t);
+
+    /* validate deserialized values */
+    if (m <= 0 || h <= 0)
+    {
+        return NULL;
+    }
+
+    /* check for potential integer overflow in size calculation */
+    if (m > INT32_MAX - BF_BITS_PER_WORD)
+    {
+        return NULL;
+    }
 
     int size_in_words = (m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
 
-    /* read the packed bitset - little-endian */
+    /* sanity check result */
+    if (size_in_words <= 0)
+    {
+        return NULL;
+    }
+
+    /* read the packed bitset */
     uint64_t *bitset = malloc((size_t)size_in_words * sizeof(uint64_t));
     if (bitset == NULL)
     {
@@ -253,10 +276,4 @@ void bloom_filter_free(bloom_filter_t *bf)
     free(bf->bitset);
     free(bf);
     bf = NULL;
-}
-
-uint32_t decode_fixed_32(const char *data)
-{
-    return ((uint32_t)(uint8_t)data[0]) | ((uint32_t)(uint8_t)data[1] << 8) |
-           ((uint32_t)(uint8_t)data[2] << 16) | ((uint32_t)(uint8_t)data[3] << 24);
 }

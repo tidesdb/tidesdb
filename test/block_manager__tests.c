@@ -1874,6 +1874,113 @@ void *parallel_write_worker(void *arg)
     return NULL;
 }
 
+void test_block_manager_sync_modes()
+{
+    printf("testing block manager sync modes...\n");
+
+    /* test SYNC_NONE */
+    block_manager_t *bm_none = NULL;
+    ASSERT_EQ(block_manager_open(&bm_none, "test_sync_none.db", BLOCK_MANAGER_SYNC_NONE), 0);
+
+    block_manager_block_t *block = block_manager_block_create(10, (uint8_t *)"test_data");
+    ASSERT_TRUE(block != NULL);
+    int64_t offset = block_manager_block_write(bm_none, block);
+    ASSERT_TRUE(offset != -1);
+
+    block_manager_block_free(block);
+    block_manager_close(bm_none);
+    remove("test_sync_none.db");
+
+    /* test SYNC_FULL */
+    block_manager_t *bm_full = NULL;
+    ASSERT_EQ(block_manager_open(&bm_full, "test_sync_full.db", BLOCK_MANAGER_SYNC_FULL), 0);
+
+    block = block_manager_block_create(10, (uint8_t *)"test_data");
+    ASSERT_TRUE(block != NULL);
+    offset = block_manager_block_write(bm_full, block);
+    ASSERT_TRUE(offset != -1);
+
+    block_manager_block_free(block);
+    block_manager_close(bm_full);
+    remove("test_sync_full.db");
+
+    printf(GREEN "test_block_manager_sync_modes passed\n" RESET);
+}
+
+void test_block_manager_overflow_blocks()
+{
+    printf("testing block manager overflow blocks (>32KB)...\n");
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, "test_overflow.db", BLOCK_MANAGER_SYNC_NONE), 0);
+
+    /* create block larger than MAX_INLINE_BLOCK_SIZE (32KB) */
+    uint64_t large_size = 64 * 1024; /* 64KB */
+    uint8_t *large_data = malloc(large_size);
+    memset(large_data, 'X', large_size);
+
+    block_manager_block_t *block = block_manager_block_create(large_size, large_data);
+    ASSERT_TRUE(block != NULL);
+    int64_t offset = block_manager_block_write(bm, block);
+    ASSERT_TRUE(offset != -1);
+
+    /* read it back using cursor */
+    block_manager_cursor_t *cursor;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)offset) == 0);
+
+    block_manager_block_t *read_block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(read_block != NULL);
+    ASSERT_EQ(read_block->size, large_size);
+    ASSERT_EQ(memcmp(read_block->data, large_data, large_size), 0);
+
+    block_manager_block_free(read_block);
+    block_manager_cursor_free(cursor);
+    free(large_data);
+    block_manager_block_free(block);
+    block_manager_close(bm);
+    remove("test_overflow.db");
+
+    printf(GREEN "test_block_manager_overflow_blocks passed\n" RESET);
+}
+
+void test_block_manager_empty_block()
+{
+    printf("testing block manager empty block...\n");
+
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, "test_empty.db", BLOCK_MANAGER_SYNC_NONE), 0);
+
+    /* create empty block (size 0) */
+    block_manager_block_t *block = block_manager_block_create(0, NULL);
+    ASSERT_TRUE(block != NULL);
+    int64_t offset = block_manager_block_write(bm, block);
+
+    if (offset != -1)
+    {
+        block_manager_cursor_t *cursor;
+        if (block_manager_cursor_init(&cursor, bm) == 0)
+        {
+            if (block_manager_cursor_goto(cursor, (uint64_t)offset) == 0)
+            {
+                block_manager_block_t *read_block = block_manager_cursor_read(cursor);
+                if (read_block != NULL)
+                {
+                    ASSERT_EQ(read_block->size, 0);
+                    block_manager_block_free(read_block);
+                }
+            }
+            block_manager_cursor_free(cursor);
+        }
+    }
+
+    block_manager_block_free(block);
+    block_manager_close(bm);
+    remove("test_empty.db");
+
+    printf(GREEN "test_block_manager_empty_block passed\n" RESET);
+}
+
 void benchmark_block_manager_parallel_write(void)
 {
     printf("\nRunning block manager parallel write benchmark...\n");
@@ -1969,6 +2076,9 @@ int main(void)
     RUN_TEST(test_block_manager_lru_cache_edge_cases, tests_passed);
     RUN_TEST(test_block_manager_cache_concurrent, tests_passed);
     RUN_TEST(test_block_manager_concurrent_rw, tests_passed);
+    RUN_TEST(test_block_manager_sync_modes, tests_passed);
+    RUN_TEST(test_block_manager_overflow_blocks, tests_passed);
+    RUN_TEST(test_block_manager_empty_block, tests_passed);
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);

@@ -109,12 +109,4 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data);
  */
 void bloom_filter_free(bloom_filter_t *bf);
 
-/**
- * decode_fixed_32
- * decode a fixed 32-bit integer
- * @param data the data to decode
- * @return the decoded 32-bit integer
- */
-uint32_t decode_fixed_32(const char *data);
-
 #endif /* __BLOOM_FILTER_H__ */

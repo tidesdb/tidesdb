@@ -332,7 +332,11 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
         return NULL;
     }
 
-    memcpy(block->data, data, size);
+    /* only copy if size > 0 and data is not NULL */
+    if (size > 0 && data != NULL)
+    {
+        memcpy(block->data, data, size);
+    }
     return block;
 }
 

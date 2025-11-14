@@ -25,7 +25,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Shared thread pools for background flush and compaction operations with configurable thread counts at the database level.
 - Two sync modes: `TDB_SYNC_NONE` for maximum performance (OS-managed flushing) and `TDB_SYNC_FULL` for maximum durability (fsync on every write).
 - Cross-platform support for Linux, macOS, and Windows on both 32-bit and 64-bit architectures with platform abstraction layer.
-- Full file portability with explicit little-endian serialization throughout—database files can be copied between any platform (x86, ARM, RISC-V) and architecture (32-bit, 64-bit) without conversion.
+- Full file portability with explicit little-endian serialization throughout; database files can be copied between any platform (x86, ARM, RISC-V) and architecture (32-bit, 64-bit) without conversion.
 - Clean C API that returns 0 on success and negative error codes on failure for straightforward error handling.
 
 ## Getting Started

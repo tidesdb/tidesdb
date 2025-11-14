@@ -443,6 +443,9 @@ static void reclaim_old_nodes(skip_list_t *list)
 int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const uint8_t *value,
                   size_t value_size, time_t ttl)
 {
+    if (!list || !key || !value) return -1;
+    if (key_size == 0) return -1;
+
     skip_list_node_t *update[64];
 
     int current_level = atomic_load_explicit(&list->level, memory_order_relaxed);
@@ -703,6 +706,9 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size)
 int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
                   size_t *value_size, uint8_t *deleted)
 {
+    if (!list || !key || !value || !value_size) return -1;
+    if (key_size == 0) return -1;
+
     /* periodically reclaim old nodes (safe here since we hold references) */
     static _Thread_local int read_count = 0;
     if (++read_count >= 100)

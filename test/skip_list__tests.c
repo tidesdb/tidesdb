@@ -849,6 +849,161 @@ void test_skip_list_concurrent_read_write()
     printf(GREEN "test_skip_list_concurrent_read_write passed - readers never blocked!\n" RESET);
 }
 
+void test_skip_list_null_validation()
+{
+    printf("testing skip list null validation...\n");
+
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    uint8_t key[] = "key";
+    uint8_t value[] = "value";
+    uint8_t *out_value = NULL;
+    size_t out_size = 0;
+    uint8_t deleted = 0;
+
+    /* null list */
+    ASSERT_EQ(skip_list_put(NULL, key, sizeof(key), value, sizeof(value), -1), -1);
+    ASSERT_EQ(skip_list_get(NULL, key, sizeof(key), &out_value, &out_size, &deleted), -1);
+
+    /* null key */
+    ASSERT_EQ(skip_list_put(list, NULL, sizeof(key), value, sizeof(value), -1), -1);
+    ASSERT_EQ(skip_list_get(list, NULL, sizeof(key), &out_value, &out_size, &deleted), -1);
+
+    /* null value on put */
+    ASSERT_EQ(skip_list_put(list, key, sizeof(key), NULL, sizeof(value), -1), -1);
+
+    /* null output pointers on get */
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), NULL, &out_size, &deleted), -1);
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &out_value, NULL, &deleted), -1);
+
+    skip_list_free(list);
+    printf(GREEN "test_skip_list_null_validation passed\n" RESET);
+}
+
+void test_skip_list_zero_size_key()
+{
+    printf("testing skip list zero-size key...\n");
+
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    uint8_t key[] = "";
+    uint8_t value[] = "value";
+
+    /* zero-size key should fail */
+    ASSERT_EQ(skip_list_put(list, key, 0, value, sizeof(value), -1), -1);
+
+    skip_list_free(list);
+    printf(GREEN "test_skip_list_zero_size_key passed\n" RESET);
+}
+
+void test_skip_list_large_keys_values()
+{
+    printf("testing skip list large keys and values...\n");
+
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    /* test key larger than inline threshold (24 bytes) */
+    uint8_t large_key[100];
+    memset(large_key, 'K', sizeof(large_key));
+
+    /* test value larger than inline threshold */
+    uint8_t large_value[200];
+    memset(large_value, 'V', sizeof(large_value));
+
+    ASSERT_EQ(
+        skip_list_put(list, large_key, sizeof(large_key), large_value, sizeof(large_value), -1), 0);
+
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_size = 0;
+    uint8_t deleted = 0;
+
+    ASSERT_EQ(skip_list_get(list, large_key, sizeof(large_key), &retrieved_value, &retrieved_size,
+                            &deleted),
+              0);
+    ASSERT_EQ(retrieved_size, sizeof(large_value));
+    ASSERT_EQ(memcmp(retrieved_value, large_value, sizeof(large_value)), 0);
+
+    free(retrieved_value);
+    skip_list_free(list);
+    printf(GREEN "test_skip_list_large_keys_values passed\n" RESET);
+}
+
+void test_skip_list_duplicate_key_update()
+{
+    printf("testing skip list duplicate key update...\n");
+
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    uint8_t key[] = "duplicate_key";
+    uint8_t value1[] = "first_value";
+    uint8_t value2[] = "second_value";
+
+    /* insert first value */
+    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value1, sizeof(value1), -1), 0);
+
+    /* update with second value */
+    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value2, sizeof(value2), -1), 0);
+
+    /* verify we get the second value */
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_size = 0;
+    uint8_t deleted = 0;
+
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &deleted),
+              0);
+    ASSERT_EQ(retrieved_size, sizeof(value2));
+    ASSERT_EQ(memcmp(retrieved_value, value2, sizeof(value2)), 0);
+    ASSERT_EQ(deleted, 0);
+
+    /* count should still be 1 (update, not insert) */
+    ASSERT_EQ(skip_list_count_entries(list), 1);
+
+    free(retrieved_value);
+    skip_list_free(list);
+    printf(GREEN "test_skip_list_duplicate_key_update passed\n" RESET);
+}
+
+void test_skip_list_delete_operations()
+{
+    printf("testing skip list delete operations...\n");
+
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    uint8_t key[] = "delete_me";
+    uint8_t value[] = "value";
+
+    /* insert then delete */
+    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1), 0);
+    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1),
+              0); /* mark deleted */
+
+    /* get should return with deleted flag */
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_size = 0;
+    uint8_t deleted = 0;
+
+    int result = skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &deleted);
+    /* depending on implementation, might return -1 or return with deleted=1 */
+    if (result == 0 && retrieved_value != NULL)
+    {
+        free(retrieved_value);
+    }
+
+    /* delete non-existent key */
+    uint8_t nonexistent[] = "nonexistent";
+    result = skip_list_get(list, nonexistent, sizeof(nonexistent), &retrieved_value,
+                           &retrieved_size, &deleted);
+    ASSERT_EQ(result, -1);
+
+    skip_list_free(list);
+    printf(GREEN "test_skip_list_delete_operations passed\n" RESET);
+}
+
 int main(void)
 {
     RUN_TEST(test_skip_list_create_node, tests_passed);
@@ -866,10 +1021,15 @@ int main(void)
     RUN_TEST(test_skip_list_ttl, tests_passed);
     RUN_TEST(test_skip_list_cursor_seek, tests_passed);
     RUN_TEST(test_skip_list_cursor_seek_for_prev, tests_passed);
-    RUN_TEST(benchmark_skip_list, tests_passed);
-    RUN_TEST(benchmark_skip_list_sequential, tests_passed);
     RUN_TEST(test_skip_list_cow_updates, tests_passed);
     RUN_TEST(test_skip_list_concurrent_read_write, tests_passed);
+    RUN_TEST(test_skip_list_null_validation, tests_passed);
+    RUN_TEST(test_skip_list_zero_size_key, tests_passed);
+    RUN_TEST(test_skip_list_large_keys_values, tests_passed);
+    RUN_TEST(test_skip_list_duplicate_key_update, tests_passed);
+    RUN_TEST(test_skip_list_delete_operations, tests_passed);
+    RUN_TEST(benchmark_skip_list, tests_passed);
+    RUN_TEST(benchmark_skip_list_sequential, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

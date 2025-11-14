@@ -18,15 +18,6 @@
  */
 #include "succinct_trie.h"
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include "block_manager.h"
-#include "compat.h"
-
 #define BIT_SET(bm, i) ((bm)[(i) >> 3] |= (1u << ((i)&7)))
 #define BIT_GET(bm, i) (((bm)[(i) >> 3] >> ((i)&7)) & 1u)
 
@@ -904,7 +895,7 @@ int succinct_trie_prefix_get(const succinct_trie_t *trie, const uint8_t *prefix,
         {
             return -1;
         }
-        bool found = false;
+        int found = 0;
 
         while (pos < trie->louds_bits && BIT_GET(trie->louds, pos))
         {
@@ -913,7 +904,7 @@ int succinct_trie_prefix_get(const succinct_trie_t *trie, const uint8_t *prefix,
             if (edge_idx < trie->n_edges && trie->labels[edge_idx] == prefix[depth])
             {
                 node = trie->edge_child[edge_idx];
-                found = true;
+                found = 1;
                 break;
             }
             pos++;

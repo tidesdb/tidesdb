@@ -547,6 +547,151 @@ void test_queue_free_with_waiting_threads(void)
     printf(GREEN "test_queue_free_with_waiting_threads passed\n" RESET);
 }
 
+void test_queue_node_pool()
+{
+    queue_t *queue = queue_new();
+
+    /* add and remove many items to populate node pool */
+    for (int i = 0; i < 100; i++)
+    {
+        int *val = malloc(sizeof(int));
+        *val = i;
+        queue_enqueue(queue, val);
+    }
+
+    /* dequeue all, should populate node pool */
+    for (int i = 0; i < 100; i++)
+    {
+        int *val = (int *)queue_dequeue(queue);
+        ASSERT_TRUE(val != NULL);
+        ASSERT_EQ(*val, i);
+        free(val);
+    }
+
+    ASSERT_EQ(queue_size(queue), 0);
+
+    /* re-enqueue, should reuse nodes from pool */
+    for (int i = 0; i < 50; i++)
+    {
+        int *val = malloc(sizeof(int));
+        *val = i * 2;
+        queue_enqueue(queue, val);
+    }
+
+    ASSERT_EQ(queue_size(queue), 50);
+
+    queue_free_with_data(queue, free);
+    printf(GREEN "test_queue_node_pool passed\n" RESET);
+}
+
+void *multi_waiter_thread(void *arg)
+{
+    queue_t *queue = (queue_t *)arg;
+    void *data = queue_dequeue_wait(queue);
+    return data;
+}
+
+void test_queue_multiple_waiters()
+{
+    queue_t *queue = queue_new();
+
+    /* start 5 waiting threads */
+    pthread_t waiters[5];
+    for (int i = 0; i < 5; i++)
+    {
+        pthread_create(&waiters[i], NULL, multi_waiter_thread, queue);
+    }
+
+    usleep(100000); /* Let threads start waiting */
+
+    /* enqueue 5 items, each waiter should get one */
+    int values[5] = {10, 20, 30, 40, 50};
+    for (int i = 0; i < 5; i++)
+    {
+        queue_enqueue(queue, &values[i]);
+        usleep(10000);
+    }
+
+    /* wait for all threads */
+    for (int i = 0; i < 5; i++)
+    {
+        void *result;
+        pthread_join(waiters[i], &result);
+        ASSERT_TRUE(result != NULL);
+    }
+
+    ASSERT_EQ(queue_size(queue), 0);
+    queue_free(queue);
+    printf(GREEN "test_queue_multiple_waiters passed\n" RESET);
+}
+
+void test_queue_enqueue_null_data()
+{
+    queue_t *queue = queue_new();
+
+    /* not allowed!!!! */
+    ASSERT_EQ(queue_enqueue(queue, NULL), 0);
+    ASSERT_EQ(queue_size(queue), 1);
+
+    void *data = queue_dequeue(queue);
+    ASSERT_EQ(data, NULL); /* NULL is valid data */
+
+    queue_free(queue);
+    printf(GREEN "test_queue_enqueue_null_data passed\n" RESET);
+}
+
+void test_queue_is_empty()
+{
+    queue_t *queue = queue_new();
+
+    ASSERT_EQ(queue_is_empty(queue), 1);
+
+    int v = 1;
+    queue_enqueue(queue, &v);
+    ASSERT_EQ(queue_is_empty(queue), 0);
+
+    queue_dequeue(queue);
+    ASSERT_EQ(queue_is_empty(queue), 1);
+
+    queue_free(queue);
+    printf(GREEN "test_queue_is_empty passed\n" RESET);
+}
+
+void test_queue_peek_at_boundary()
+{
+    queue_t *queue = queue_new();
+
+    int values[10];
+    for (int i = 0; i < 10; i++)
+    {
+        values[i] = i * 10;
+        queue_enqueue(queue, &values[i]);
+    }
+
+    /* test boundaries */
+    ASSERT_EQ(*(int *)queue_peek_at(queue, 0), 0);  /* first */
+    ASSERT_EQ(*(int *)queue_peek_at(queue, 9), 90); /* last */
+    ASSERT_EQ(queue_peek_at(queue, 10), NULL);      /* out of bounds */
+    ASSERT_EQ(queue_peek_at(queue, 100), NULL);     /* way out of bounds */
+
+    queue_free(queue);
+    printf(GREEN "test_queue_peek_at_boundary passed\n" RESET);
+}
+
+void test_queue_foreach_empty()
+{
+    queue_t *queue = queue_new();
+
+    foreach_context_t ctx = {0, 0};
+    int result = queue_foreach(queue, sum_callback, &ctx);
+    ASSERT_EQ(result, 0);
+    ASSERT_EQ(ctx.count, 0);
+    ASSERT_EQ(ctx.sum, 0);
+
+    queue_free(queue);
+    printf(GREEN "test_queue_foreach_empty passed\n" RESET);
+}
+
 int main(void)
 {
     RUN_TEST(test_queue_new, tests_passed);

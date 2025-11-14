@@ -4829,7 +4829,6 @@ static void test_invalid_column_family_operations(void)
     free(value);
     tidesdb_txn_free(txn);
 
-    /* test creating another CF with same name (may succeed or fail depending on implementation) */
     int result = tidesdb_create_column_family(db, "valid_cf", &cf_config);
     /* we don't assert the result, just ensure it doesn't crash */
     (void)result;
@@ -5739,10 +5738,6 @@ static void test_default_comparator_persistence(void)
 
 int main(void)
 {
-    printf("\n");
-    printf(BLUE "=======================================\n" RESET);
-    printf(WHITE "   TIDESDB TESTS                 \n" RESET);
-    printf(BLUE "=======================================\n\n" RESET);
     RUN_TEST(test_basic_open_close, tests_passed);
     RUN_TEST(test_column_family_creation, tests_passed);
     RUN_TEST(test_column_family_config_persistence, tests_passed);
@@ -5843,7 +5838,6 @@ int main(void)
     RUN_TEST(test_default_comparator_persistence, tests_passed);
     RUN_TEST(test_iterator_all_sources, tests_passed);
 
-    printf("\n");
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 
     return tests_failed > 0 ? 1 : 0;

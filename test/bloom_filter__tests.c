@@ -168,6 +168,174 @@ void test_boundary_conditions()
     printf(GREEN "test_boundary_conditions passed\n" RESET);
 }
 
+void test_bloom_filter_edge_cases()
+{
+    bloom_filter_t *bf;
+
+    /* empty key */
+    bloom_filter_new(&bf, 0.01, 100);
+    bloom_filter_add(bf, (uint8_t *)"", 0);
+    ASSERT_EQ(bloom_filter_contains(bf, (uint8_t *)"", 0), 1);
+
+    /* fairly large key */
+    uint8_t large_key[10000];
+    memset(large_key, 'A', sizeof(large_key));
+    bloom_filter_add(bf, large_key, sizeof(large_key));
+    ASSERT_EQ(bloom_filter_contains(bf, large_key, sizeof(large_key)), 1);
+
+    bloom_filter_free(bf);
+
+    printf(GREEN "test_bloom_filter_edge_cases passed\n" RESET);
+}
+
+void test_bloom_filter_boundary_values()
+{
+    bloom_filter_t *bf;
+
+    /* min n (1 element) */
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 1), 0);
+    bloom_filter_add(bf, (uint8_t *)"key", 3);
+    ASSERT_EQ(bloom_filter_contains(bf, (uint8_t *)"key", 3), 1);
+    bloom_filter_free(bf);
+
+    /* very high false positive rate (0.99) */
+    ASSERT_EQ(bloom_filter_new(&bf, 0.99, 100), 0);
+    bloom_filter_free(bf);
+
+    /** very low false positive rate (0.0001) */
+    ASSERT_EQ(bloom_filter_new(&bf, 0.0001, 100), 0);
+    bloom_filter_free(bf);
+
+    printf(GREEN "test_bloom_filter_boundary_values passed\n" RESET);
+}
+
+void test_bloom_filter_serialize_empty()
+{
+    bloom_filter_t *bf;
+    bloom_filter_new(&bf, 0.01, 100);
+
+    /* attempt to serialize without adding any keys */
+    size_t size;
+    uint8_t *data = bloom_filter_serialize(bf, &size);
+    ASSERT_TRUE(data != NULL);
+
+    /* deserialize and verify it's still empty */
+    bloom_filter_t *bf2 = bloom_filter_deserialize(data);
+    ASSERT_TRUE(bf2 != NULL);
+    ASSERT_EQ(bloom_filter_contains(bf2, (uint8_t *)"anything", 8), 0);
+
+    free(data);
+    bloom_filter_free(bf);
+    bloom_filter_free(bf2);
+
+    printf(GREEN "test_bloom_filter_serialize_empty passed\n" RESET);
+}
+
+void test_bloom_filter_duplicate_keys()
+{
+    bloom_filter_t *bf;
+    bloom_filter_new(&bf, 0.01, 100);
+
+    /* we add the same key many times, we are testing to see if key still found */
+    for (int i = 0; i < 10; i++)
+    {
+        bloom_filter_add(bf, (uint8_t *)"duplicate", 9);
+    }
+
+    ASSERT_EQ(bloom_filter_contains(bf, (uint8_t *)"duplicate", 9), 1);
+
+    bloom_filter_free(bf);
+
+    printf(GREEN "test_bloom_filter_duplicate_keys passed\n" RESET);
+}
+
+void test_bloom_filter_invalid_inputs()
+{
+    bloom_filter_t *bf;
+
+    /** invalid p values */
+    ASSERT_EQ(bloom_filter_new(&bf, 0.0, 100), -1);  /** p = 0 */
+    ASSERT_EQ(bloom_filter_new(&bf, 1.0, 100), -1);  /** p = 1 */
+    ASSERT_EQ(bloom_filter_new(&bf, -0.5, 100), -1); /** negative p */
+    ASSERT_EQ(bloom_filter_new(&bf, 1.5, 100), -1);  /**  p > 1 */
+
+    /* invalid n*/
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 0), -1);   /* n = 0 */
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, -10), -1); /* negative n */
+
+    printf(GREEN "test_bloom_filter_invalid_inputs passed\n" RESET);
+}
+
+void test_bloom_filter_hash_distribution()
+{
+    bloom_filter_t *bf;
+    bloom_filter_new(&bf, 0.01, 1000);
+
+    /* we add keys with similar patterns to test hash distribution */
+    for (int i = 0; i < 100; i++)
+    {
+        char key[20];
+        snprintf(key, sizeof(key), "key_%d", i);
+        bloom_filter_add(bf, (uint8_t *)key, strlen(key));
+    }
+
+    /* all should be found is the expectation */
+    for (int i = 0; i < 100; i++)
+    {
+        char key[20];
+        snprintf(key, sizeof(key), "key_%d", i);
+        ASSERT_EQ(bloom_filter_contains(bf, (uint8_t *)key, strlen(key)), 1);
+    }
+
+    bloom_filter_free(bf);
+
+    printf(GREEN "test_bloom_filter_hash_distribution passed\n" RESET);
+}
+
+void test_bloom_filter_deserialize_corrupted()
+{
+    bloom_filter_t *bf;
+    bloom_filter_new(&bf, 0.01, 100);
+    bloom_filter_add(bf, (uint8_t *)"test", 4);
+
+    size_t size;
+    uint8_t *data = bloom_filter_serialize(bf, &size);
+
+    /* corrupt it!! */
+    data[0] = 0xFF;
+    data[1] = 0xFF;
+    data[2] = 0xFF;
+    data[3] = 0xFF;
+
+    bloom_filter_t *bf2 = bloom_filter_deserialize(data);
+
+    free(data);
+    bloom_filter_free(bf);
+    if (bf2) bloom_filter_free(bf2);
+
+    printf(GREEN "test_bloom_filter_deserialize_corrupted passed\n" RESET);
+}
+
+void test_bloom_filter_binary_keys()
+{
+    bloom_filter_t *bf;
+    bloom_filter_new(&bf, 0.01, 100);
+
+    /* binary keys with null bytes */
+    uint8_t binary_key[] = {0x00, 0xFF, 0x00, 0xAA, 0x55};
+    bloom_filter_add(bf, binary_key, sizeof(binary_key));
+    ASSERT_EQ(bloom_filter_contains(bf, binary_key, sizeof(binary_key)), 1);
+
+    bloom_filter_free(bf);
+    printf(GREEN "test_bloom_filter_binary_keys passed\n" RESET);
+}
+
+void test_bloom_filter_free_null()
+{
+    bloom_filter_free(NULL);
+    printf(GREEN "test_bloom_filter_free_null passed\n" RESET);
+}
+
 void benchmark_bloom_filter()
 {
     bloom_filter_t *bf;
@@ -213,6 +381,15 @@ int main(void)
     RUN_TEST(test_bloom_filter_serialize_deserialize, tests_passed);
     RUN_TEST(test_false_positive_rate, tests_passed);
     RUN_TEST(test_boundary_conditions, tests_passed);
+    RUN_TEST(test_bloom_filter_edge_cases, tests_passed);
+    RUN_TEST(test_bloom_filter_boundary_values, tests_passed);
+    RUN_TEST(test_bloom_filter_serialize_empty, tests_passed);
+    RUN_TEST(test_bloom_filter_duplicate_keys, tests_passed);
+    RUN_TEST(test_bloom_filter_invalid_inputs, tests_passed);
+    RUN_TEST(test_bloom_filter_hash_distribution, tests_passed);
+    RUN_TEST(test_bloom_filter_deserialize_corrupted, tests_passed);
+    RUN_TEST(test_bloom_filter_binary_keys, tests_passed);
+    RUN_TEST(test_bloom_filter_free_null, tests_passed);
     RUN_TEST(benchmark_bloom_filter, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

@@ -419,13 +419,112 @@ static void test_lru_cache_foreach(void)
     lru_cache_free(cache);
 }
 
+void test_lru_cache_destroy_vs_free()
+{
+    /* test destroy (no callbacks) vs free (with callbacks) */
+    eviction_count = 0;
+
+    lru_cache_t *cache1 = lru_cache_new(3);
+    int v1 = 1, v2 = 2;
+    lru_cache_put(cache1, "key1", &v1, test_evict_callback, NULL);
+    lru_cache_put(cache1, "key2", &v2, test_evict_callback, NULL);
+
+    /* destroy should NOT call callbacks */
+    lru_cache_destroy(cache1);
+    ASSERT_EQ(eviction_count, 0);
+
+    /* free SHOULD call callbacks */
+    eviction_count = 0;
+    lru_cache_t *cache2 = lru_cache_new(3);
+    lru_cache_put(cache2, "key1", &v1, test_evict_callback, NULL);
+    lru_cache_put(cache2, "key2", &v2, test_evict_callback, NULL);
+    lru_cache_free(cache2);
+    ASSERT_EQ(eviction_count, 2);
+
+    printf(GREEN "test_lru_cache_destroy_vs_free passed\n" RESET);
+}
+
+void test_lru_cache_zero_capacity()
+{
+    lru_cache_t *cache = lru_cache_new(0);
+    if (cache)
+    {
+        ASSERT_EQ(lru_cache_capacity(cache), 0);
+        int v = 1;
+        /* should fail to add */
+        ASSERT_EQ(lru_cache_put(cache, "key", &v, NULL, NULL), -1);
+        lru_cache_free(cache);
+    }
+    printf(GREEN "test_lru_cache_zero_capacity passed\n" RESET);
+}
+
+void test_lru_cache_long_keys()
+{
+    lru_cache_t *cache = lru_cache_new(5);
+
+    /* fairly long key (1KB) */
+    char long_key[1024];
+    memset(long_key, 'A', sizeof(long_key) - 1);
+    long_key[sizeof(long_key) - 1] = '\0';
+
+    int v = 123;
+    ASSERT_EQ(lru_cache_put(cache, long_key, &v, NULL, NULL), 0);
+    ASSERT_TRUE(lru_cache_get(cache, long_key) == &v);
+
+    lru_cache_free(cache);
+    printf(GREEN "test_lru_cache_long_keys passed\n" RESET);
+}
+
+void test_lru_cache_empty_key()
+{
+    lru_cache_t *cache = lru_cache_new(5);
+
+    int v = 1;
+    ASSERT_EQ(lru_cache_put(cache, "", &v, NULL, NULL), 0);
+    ASSERT_TRUE(lru_cache_get(cache, "") == &v);
+
+    lru_cache_free(cache);
+    printf(GREEN "test_lru_cache_empty_key passed\n" RESET);
+}
+
+void test_lru_cache_hash_collisions()
+{
+    lru_cache_t *cache = lru_cache_new(100);
+
+    /* add many keys to test hash collision handling */
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        int *v = malloc(sizeof(int));
+        *v = i;
+        ASSERT_EQ(lru_cache_put(cache, key, v, free_evict_callback, NULL), 0);
+    }
+
+    /* verify all are retrievable */
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        int *v = (int *)lru_cache_get(cache, key);
+        ASSERT_TRUE(v != NULL);
+        ASSERT_EQ(*v, i);
+    }
+
+    lru_cache_free(cache);
+    printf(GREEN "test_lru_cache_hash_collisions passed\n" RESET);
+}
+
+void test_lru_cache_free_null()
+{
+    lru_cache_free(NULL);
+    lru_cache_destroy(NULL);
+    lru_cache_clear(NULL);
+    printf(GREEN "test_lru_cache_free_null passed\n" RESET);
+}
+
 int main(void)
 {
-    printf("\n");
-    printf(BLUE "=======================================\n" RESET);
-    printf(WHITE "   LRU CACHE TESTS\n" RESET);
-    printf(BLUE "=======================================\n\n" RESET);
-
     RUN_TEST(test_lru_cache_new_free, tests_passed);
     RUN_TEST(test_lru_cache_put_get, tests_passed);
     RUN_TEST(test_lru_cache_eviction, tests_passed);
@@ -437,8 +536,12 @@ int main(void)
     RUN_TEST(test_lru_cache_foreach, tests_passed);
     RUN_TEST(test_lru_cache_concurrent, tests_passed);
     RUN_TEST(test_lru_cache_edge_cases, tests_passed);
-
-    printf("\n");
+    RUN_TEST(test_lru_cache_destroy_vs_free, tests_passed);
+    RUN_TEST(test_lru_cache_zero_capacity, tests_passed);
+    RUN_TEST(test_lru_cache_long_keys, tests_passed);
+    RUN_TEST(test_lru_cache_empty_key, tests_passed);
+    RUN_TEST(test_lru_cache_hash_collisions, tests_passed);
+    RUN_TEST(test_lru_cache_free_null, tests_passed);
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 
     return 0;

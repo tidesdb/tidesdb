@@ -234,12 +234,8 @@ int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_ca
         return -1;
     }
 
-    /* use _strdup on MSVC, strdup on others */
-#ifdef _MSC_VER
-    entry->key = _strdup(key);
-#else
-    entry->key = strdup(key);
-#endif
+    entry->key = tdb_strdup(key);
+
     if (entry->key == NULL)
     {
         free(entry);

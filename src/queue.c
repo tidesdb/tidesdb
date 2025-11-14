@@ -350,33 +350,12 @@ void queue_free(queue_t *queue)
     queue->node_pool = NULL;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
-    /* wait for all waiting threads to exit with timeout to prevent deadlock */
     while (queue->waiter_count > 0)
     {
-        /* broadcast to wake any waiting threads */
-        pthread_cond_broadcast(&queue->not_empty);
-
-        /* use timed wait to prevent indefinite blocking */
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 10000000; /* 10ms timeout */
-        if (ts.tv_nsec >= 1000000000)
-        {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= 1000000000;
-        }
-
-        pthread_cond_timedwait(&queue->not_empty, &queue->lock, &ts);
-
-        /* if waiter_count hasn't changed, broadcast again */
-        if (queue->waiter_count > 0)
-        {
-            pthread_cond_broadcast(&queue->not_empty);
-        }
+        pthread_cond_wait(&queue->not_empty, &queue->lock);
     }
 
     pthread_mutex_unlock(&queue->lock);
-
     pthread_mutex_destroy(&queue->lock);
     pthread_cond_destroy(&queue->not_empty);
 

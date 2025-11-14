@@ -32,24 +32,36 @@
 
 extern int _tidesdb_debug_enabled;
 #if defined(_MSC_VER)
-#define TDB_DEBUG_LOG(fmt, ...)                                                     \
-    do                                                                              \
-    {                                                                               \
-        if (_tidesdb_debug_enabled)                                                 \
-        {                                                                           \
-            fprintf(stderr, "[TidesDB DEBUG] %s:%d: " fmt "\n", __FILE__, __LINE__, \
-                    ##__VA_ARGS__);                                                 \
-        }                                                                           \
+#define TDB_DEBUG_LOG(fmt, ...)                                                               \
+    do                                                                                        \
+    {                                                                                         \
+        if (_tidesdb_debug_enabled)                                                           \
+        {                                                                                     \
+            struct timespec _ts;                                                              \
+            timespec_get(&_ts, TIME_UTC);                                                     \
+            time_t _sec = _ts.tv_sec;                                                         \
+            struct tm _tm;                                                                    \
+            localtime_s(&_tm, &_sec);                                                         \
+            fprintf(stderr, "[%02d:%02d:%02d.%03ld] [TidesDB] %s:%d: " fmt "\n", _tm.tm_hour, \
+                    _tm.tm_min, _tm.tm_sec, _ts.tv_nsec / 1000000L, __FILE__, __LINE__,       \
+                    ##__VA_ARGS__);                                                           \
+        }                                                                                     \
     } while (0)
 #else
-#define TDB_DEBUG_LOG(fmt, ...)                                                     \
-    do                                                                              \
-    {                                                                               \
-        if (_tidesdb_debug_enabled)                                                 \
-        {                                                                           \
-            fprintf(stderr, "[TidesDB DEBUG] %s:%d: " fmt "\n", __FILE__, __LINE__, \
-                    ##__VA_ARGS__);                                                 \
-        }                                                                           \
+#define TDB_DEBUG_LOG(fmt, ...)                                                               \
+    do                                                                                        \
+    {                                                                                         \
+        if (_tidesdb_debug_enabled)                                                           \
+        {                                                                                     \
+            struct timespec _ts;                                                              \
+            clock_gettime(CLOCK_REALTIME, &_ts);                                              \
+            time_t _sec = _ts.tv_sec;                                                         \
+            struct tm _tm;                                                                    \
+            localtime_r(&_sec, &_tm);                                                         \
+            fprintf(stderr, "[%02d:%02d:%02d.%03ld] [TidesDB] %s:%d: " fmt "\n", _tm.tm_hour, \
+                    _tm.tm_min, _tm.tm_sec, _ts.tv_nsec / 1000000L, __FILE__, __LINE__,       \
+                    ##__VA_ARGS__);                                                           \
+        }                                                                                     \
     } while (0)
 #endif
 
@@ -64,7 +76,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_BLOOM_FILTER_FP_RATE           0.01
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
 #define TDB_DEFAULT_WAL_RECOVERY_POLL_INTERVAL_MS  100
-#define TDB_DEFAULT_WAIT_FOR_WAL_RECOVERY          0 /* false: fast startup by default */
+#define TDB_DEFAULT_WAIT_FOR_WAL_RECOVERY          0
 
 /* limits */
 #define TDB_MAX_CF_NAME_LENGTH  128
@@ -74,6 +86,7 @@ extern int _tidesdb_debug_enabled;
 
 /* if a key-value exceeds this percentage users system memory we throw an error */
 #define TDB_MEMORY_PERCENTAGE 60
+
 /* minimum allowed size for a single key-value pair (1MB), regardless of available memory */
 #define TDB_MIN_KEY_VALUE_SIZE (1024 * 1024)
 
@@ -88,6 +101,8 @@ extern int _tidesdb_debug_enabled;
 
 /* used for key value pair headers on disk */
 #define TDB_KV_FORMAT_VERSION 1
+
+#define TDB_KV_HEADER_SIZE 18
 
 /* "SSTM" sstable meta magic number */
 #define TDB_SST_META_MAGIC 0x5353544D

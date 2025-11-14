@@ -46,6 +46,15 @@
 #define tdb_strdup(s) strdup(s)
 #endif
 
+/* cross-platform localtime abstraction */
+#if defined(_WIN32)
+/* (MSVC and MinGW) use localtime_s with reversed parameter order */
+#define tdb_localtime(timer, result) localtime_s((result), (timer))
+#else
+/* POSIX uses localtime_r */
+#define tdb_localtime(timer, result) localtime_r((timer), (result))
+#endif
+
 /* https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/stat-functions?view=msvc-170
  * https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fstat-fstat32-fstat64-fstati64-fstat32i64-fstat64i32?view=msvc-170
  * to handle the compiler differences

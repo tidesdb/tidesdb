@@ -41,7 +41,7 @@ extern int _tidesdb_debug_enabled;
             timespec_get(&_ts, TIME_UTC);                                                     \
             time_t _sec = _ts.tv_sec;                                                         \
             struct tm _tm;                                                                    \
-            localtime_s(&_tm, &_sec);                                                         \
+            tdb_localtime(&_sec, &_tm);                                                       \
             fprintf(stderr, "[%02d:%02d:%02d.%03ld] [TidesDB] %s:%d: " fmt "\n", _tm.tm_hour, \
                     _tm.tm_min, _tm.tm_sec, _ts.tv_nsec / 1000000L, __FILE__, __LINE__,       \
                     ##__VA_ARGS__);                                                           \
@@ -57,7 +57,7 @@ extern int _tidesdb_debug_enabled;
             clock_gettime(CLOCK_REALTIME, &_ts);                                              \
             time_t _sec = _ts.tv_sec;                                                         \
             struct tm _tm;                                                                    \
-            localtime_r(&_sec, &_tm);                                                         \
+            tdb_localtime(&_sec, &_tm);                                                       \
             fprintf(stderr, "[%02d:%02d:%02d.%03ld] [TidesDB] %s:%d: " fmt "\n", _tm.tm_hour, \
                     _tm.tm_min, _tm.tm_sec, _ts.tv_nsec / 1000000L, __FILE__, __LINE__,       \
                     ##__VA_ARGS__);                                                           \

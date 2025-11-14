@@ -3556,6 +3556,7 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
     cf->config.enable_background_compaction = update_config->enable_background_compaction;
     cf->config.background_compaction_interval = update_config->background_compaction_interval;
     cf->config.block_manager_cache_size = update_config->block_manager_cache_size;
+    cf->config.sync_mode = update_config->sync_mode;
 
     int save_result = save_cf_config(cf);
 
@@ -3577,6 +3578,7 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
     TDB_DEBUG_LOG("  probability: %.2f", cf->config.sl_probability);
     TDB_DEBUG_LOG("  bloom_filter_fp_rate: %.4f", cf->config.bloom_filter_fp_rate);
     TDB_DEBUG_LOG("  enable_background_compaction: %d", cf->config.enable_background_compaction);
+    TDB_DEBUG_LOG("  sync_mode: %d", cf->config.sync_mode);
     TDB_DEBUG_LOG("  background_compaction_interval: %d",
                   cf->config.background_compaction_interval);
     TDB_DEBUG_LOG("  block_manager_cache_size: %d", cf->config.block_manager_cache_size);

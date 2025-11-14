@@ -540,6 +540,7 @@ typedef struct
  * @param enable_background_compaction enable automatic background compaction
  * @param background_compaction_interval interval in microseconds between compaction checks
  * @param block_manager_cache_size if column family block managers will cache most recent blocks
+ * @param sync_mode synchronization mode for new WAL and SSTable files
  */
 typedef struct
 {
@@ -553,6 +554,7 @@ typedef struct
     int enable_background_compaction;
     int background_compaction_interval;
     int block_manager_cache_size;
+    tidesdb_sync_mode_t sync_mode;
 } tidesdb_column_family_update_config_t;
 
 /*

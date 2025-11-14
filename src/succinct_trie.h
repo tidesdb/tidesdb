@@ -20,7 +20,6 @@
 #define __SUCCINCT_TRIE_H__
 
 #include "block_manager.h"
-#include "compat.h"
 
 /*
  * succinct_trie_comparator_fn

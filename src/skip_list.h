@@ -63,19 +63,20 @@ struct skip_list_arena_t
  * skip_list_node_t
  * immutable node structure; once created, contents never change
  * nodes are reference counted for safe memory reclamation
- * optimized with inline storage for small keys/values
- * @param key_size the key size
- * @param value_size the value size
- * @param ttl an expiration time for the node (-1 if no expiration)
- * @param deleted flag indicating if the node is deleted (1 = deleted, 0 = valid)
- * @param key_is_inline flag indicating if key is stored inline (1) or as pointer (0)
- * @param value_is_inline flag indicating if value is stored inline (1) or as pointer (0)
- * @param arena_allocated flag indicating if node was allocated from arena (1) or malloc (0)
- * @param level actual level of this node (for backward pointer calculation)
- * @param ref_count reference count for safe memory reclamation
- * @param key_data union for inline or pointer storage of key
- * @param value_data union for inline or pointer storage of value
- * @param forward the forward pointers for the node (atomic for COW updates)
+ * optimized with inline storage for small keys/values (<24 bytes stored inline)
+ * @param key_size size of the key in bytes
+ * @param value_size size of the value in bytes
+ * @param ttl expiration timestamp in seconds since epoch (-1 for no expiration)
+ * @param deleted tombstone flag (1 = logically deleted, 0 = active)
+ * @param key_is_inline 1 if key stored in key_inline array, 0 if in key_ptr
+ * @param value_is_inline 1 if value stored in value_inline array, 0 if in value_ptr
+ * @param arena_allocated 1 if allocated from arena pool, 0 if from malloc
+ * @param level actual level of this node (used for backward pointer calculation)
+ * @param ref_count atomic reference count for RCU-based memory reclamation
+ * @param key_data union containing either key_ptr (heap) or key_inline (stack) storage
+ * @param value_data union containing either value_ptr (heap) or value_inline (stack) storage
+ * @param forward flexible array of atomic forward pointers (size = level + max_level for backward
+ * ptrs)
  */
 struct skip_list_node_t
 {
@@ -85,8 +86,8 @@ struct skip_list_node_t
     uint8_t deleted;
     uint8_t key_is_inline;
     uint8_t value_is_inline;
-    uint8_t arena_allocated; /* 1 if allocated from arena, 0 if from malloc */
-    int level;               /* actual level of this node (for backward pointer calculation) */
+    uint8_t arena_allocated;
+    int level;
     ATOMIC_ALIGN(8) _Atomic(uint64_t) ref_count;
     union
     {
@@ -109,22 +110,13 @@ struct skip_list_node_t
 };
 
 /*
- * skip_list_t
- * the skip list structure using copy-on-write for lock-free reads
- * @param level the current level of the skip list
- * @param max_level the maximum level of the skip list
- * @param probability the probability of a node having a certain level
- * @param header the header node of the skip list (atomic pointer)
- * @param tail the tail node of the skip list (atomic pointer)
- * @param total_size the total size in bytes of kv pairs in the skip list
- * @param global_epoch current epoch for RCU memory reclamation
- * @param retired_head list of retired nodes awaiting reclamation
- * @param retired_lock mutex protecting retired nodes list
- * @param comparator custom key comparator function
- * @param comparator_ctx context pointer passed to comparator function
- * @param arena memory pool for efficient node allocation
+ * retired_node_t
+ * wrapper for nodes pending deletion in RCU grace period
+ * nodes are retired when replaced by COW updates and freed after grace period
+ * @param node pointer to the skip list node awaiting reclamation
+ * @param retire_epoch epoch when this node was retired (freed at retire_epoch + 10)
+ * @param next pointer to next retired node in linked list
  */
-/* retired node for epoch-based RCU */
 typedef struct retired_node_t
 {
     skip_list_node_t *node;
@@ -132,6 +124,23 @@ typedef struct retired_node_t
     struct retired_node_t *next;
 } retired_node_t;
 
+/*
+ * skip_list_t
+ * lock-free skip list using copy-on-write for concurrent reads and serialized writes
+ * implements RCU-based memory reclamation with epoch-based garbage collection
+ * @param level atomic current maximum level in use (grows dynamically)
+ * @param max_level maximum allowed level (typically 12)
+ * @param probability probability for level promotion (typically 0.25)
+ * @param header atomic pointer to sentinel header node (never deleted)
+ * @param tail atomic pointer to sentinel tail node (never deleted)
+ * @param total_size atomic total bytes of all key-value pairs (excludes metadata)
+ * @param comparator function pointer for custom key comparison (default: memcmp)
+ * @param comparator_ctx optional context passed to comparator function
+ * @param arena memory pool for efficient node allocation (reduces malloc overhead)
+ * @param global_epoch atomic monotonic counter for RCU grace period tracking
+ * @param retired_head linked list head of nodes awaiting reclamation
+ * @param retired_lock mutex protecting retired_head list modifications
+ */
 typedef struct skip_list_t
 {
     _Atomic(int) level;
@@ -143,12 +152,11 @@ typedef struct skip_list_t
     skip_list_comparator_fn comparator;
     void *comparator_ctx;
     skip_list_arena_t *arena;
-
     /* epoch-based RCU for safe memory reclamation */
-    /* uses time-based grace period: nodes retired at epoch N are freed at epoch N+10 */
-    _Atomic(uint64_t) global_epoch; /* current epoch */
-    retired_node_t *retired_head;   /* list of retired nodes */
-    pthread_mutex_t retired_lock;   /* protects retired list */
+    /* uses time-based grace period; nodes retired at epoch N are freed at epoch N+10 */
+    _Atomic(uint64_t) global_epoch;
+    retired_node_t *retired_head;
+    pthread_mutex_t retired_lock;
 } skip_list_t;
 
 /*

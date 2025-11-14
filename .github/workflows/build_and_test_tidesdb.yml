@@ -201,7 +201,7 @@ jobs:
   create-portable-db:
     runs-on: ubuntu-latest
     needs: build-and-test
-    name: Create Portable Database (x64 Linux)
+    name: Create Portable Test Database (x64 Linux)
     
     steps:
       - name: Checkout
@@ -301,7 +301,7 @@ jobs:
             name: Linux x86
             arch: x86
     
-    name: Verify portability on ${{ matrix.name }}
+    name: Test portability on ${{ matrix.name }}
     
     steps:
       - name: Checkout
@@ -448,9 +448,7 @@ jobs:
           EOF
           
           if [ "$RUNNER_OS" == "Windows" ]; then
-            # Move verify source to root and update CMakeLists
             mv verify_db.c ../
-            # Fix path for MSVC which runs from build/Release/
             if [ "${{ matrix.compiler }}" == "msvc" ]; then
               sed -i 's|\.\./testdb|../../testdb|g' ../verify_db.c
             fi

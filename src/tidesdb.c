@@ -6060,6 +6060,17 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
     uint8_t *data = block->data;
     size_t data_size = block->size;
 
+    /* detect metadata blocks (bloom filter, index, or meta) */
+    if (data_size >= sizeof(uint32_t))
+    {
+        uint32_t potential_magic = decode_uint32_le(data);
+        if (potential_magic == TDB_SST_META_MAGIC)
+        {
+            /* this is a metadata block, not a KV block */
+            return -1;
+        }
+    }
+
     if (cf->config.enable_compression)
     {
         size_t decompressed_size = 0;
@@ -6074,6 +6085,21 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
     }
 
     /* parse format [header][key][value] */
+    if (data_size < TDB_KV_HEADER_SIZE)
+    {
+        if (data != block->data) free(data);
+        return -1;
+    }
+
+    /* validate this looks like a KV block by checking header */
+    uint8_t check_version = data[0];
+    if (check_version != TDB_KV_FORMAT_VERSION)
+    {
+        /* not a valid KV block - likely a bloom filter or index block */
+        if (data != block->data) free(data);
+        return -1;
+    }
+
     if (data_size < TDB_KV_HEADER_SIZE)
     {
         if (data != block->data) free(data);

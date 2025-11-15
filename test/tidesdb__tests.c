@@ -1927,7 +1927,7 @@ static void test_compaction_deduplication(void)
     /* trigger compaction */
     ASSERT_EQ(tidesdb_compact(cf), 0);
 
-    /* after compaction, should have 1 SSTable */
+    /* after compaction, should have 1 sstable */
     int num_ssts_after = atomic_load(&cf->num_sstables);
     ASSERT_EQ(num_ssts_after, 1);
 
@@ -1936,7 +1936,7 @@ static void test_compaction_deduplication(void)
     tidesdb_txn_t *read_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_read(db, cf, &read_txn), 0);
 
-    /* keys 0-4 should have old values (only in first SSTable) */
+    /* keys 0-4 should have old values (only in first sstable) */
     for (int i = 0; i < 5; i++)
     {
         char key[32], expected_value[64];
@@ -1966,7 +1966,7 @@ static void test_compaction_deduplication(void)
         free(value);
     }
 
-    /* keys 10-14 should have new values (only in second SSTable) */
+    /* keys 10-14 should have new values (only in second sstable) */
     for (int i = 10; i < 15; i++)
     {
         char key[32], expected_value[64];
@@ -5245,8 +5245,8 @@ static void test_parallel_compaction_race(void)
         tidesdb_txn_begin_read(db, cf, &txn);
         char key[32];
         snprintf(key, sizeof(key), "sst%d_key%d", rand() % 16, rand() % 100);
-        uint8_t *value;
-        size_t value_size;
+        uint8_t *value = NULL;
+        size_t value_size = 0;
         tidesdb_txn_get(txn, (uint8_t *)key, strlen(key), &value, &value_size);
         if (value) free(value);
         tidesdb_txn_free(txn);
@@ -5709,11 +5709,11 @@ static void test_prefix_seek_multi_source(void)
 {
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = get_test_cf_config();
-    cf_config.memtable_flush_size = 512; /* small threshold to create multiple SSTables */
+    cf_config.memtable_flush_size = 512; /* small threshold to create multiple sstables */
     ASSERT_EQ(tidesdb_create_column_family(db, "prefix_seek_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "prefix_seek_cf");
 
-    /* insert keys with different prefixes across multiple batches to create SSTables */
+    /* insert keys with different prefixes across multiple batches to create sstables */
     /* batch 1 user_* keys (will become sst 0) */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, cf, &txn), 0);

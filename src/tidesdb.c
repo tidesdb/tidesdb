@@ -656,13 +656,23 @@ static int thread_pool_submit(tidesdb_thread_pool_t *pool, task_type_t type,
  * tidesdb_sstable_acquire
  * acquires a reference to an sstable
  * @param sst sstable
+ * @return 1 if acquired successfully, 0 if sstable is being freed
  */
-static inline void tidesdb_sstable_acquire(tidesdb_sstable_t *sst)
+static inline int tidesdb_sstable_acquire(tidesdb_sstable_t *sst)
 {
-    if (sst)
+    if (!sst) return 0;
+
+    /* atomically increment ref_count only if it's positive */
+    int old_count = atomic_load(&sst->ref_count);
+    while (old_count > 0)
     {
-        atomic_fetch_add(&sst->ref_count, 1);
+        if (atomic_compare_exchange_weak(&sst->ref_count, &old_count, old_count + 1))
+        {
+            return 1; /* successfully acquired */
+        }
+        /* CAS failed, old_count was updated, retry */
     }
+    return 0; /* sstable is being freed (ref_count <= 0) */
 }
 
 /*
@@ -2786,11 +2796,14 @@ int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
 
     /* calc total ssts size */
     (*stats)->total_sstable_size = 0;
-    for (int i = 0; i < (*stats)->num_sstables; i++)
+    for (int i = 0; i < cf->num_sstables; i++)
     {
         if (cf->sstables[i] && cf->sstables[i]->block_manager)
         {
-            tidesdb_sstable_acquire(cf->sstables[i]);
+            if (!tidesdb_sstable_acquire(cf->sstables[i]))
+            {
+                continue; /* sstable being freed, skip */
+            }
             uint64_t size = 0;
             if (block_manager_get_size(cf->sstables[i]->block_manager, &size) == 0)
             {
@@ -3541,7 +3554,10 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
     {
         if (sst_snapshot[i])
         {
-            tidesdb_sstable_acquire(sst_snapshot[i]);
+            if (!tidesdb_sstable_acquire(sst_snapshot[i]))
+            {
+                sst_snapshot[i] = NULL; /* sstable being freed, skip */
+            }
         }
     }
     pthread_rwlock_unlock(&cf->cf_lock);
@@ -6352,7 +6368,10 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
             (*iter)->sstables[i] = cf->sstables[i];
             if (cf->sstables[i])
             {
-                tidesdb_sstable_acquire(cf->sstables[i]);
+                if (!tidesdb_sstable_acquire(cf->sstables[i]))
+                {
+                    (*iter)->sstables[i] = NULL; /* sstable being freed, skip */
+                }
             }
         }
     }

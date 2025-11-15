@@ -440,8 +440,6 @@ void test_lru_cache_destroy_vs_free()
     lru_cache_put(cache2, "key2", &v2, test_evict_callback, NULL);
     lru_cache_free(cache2);
     ASSERT_EQ(eviction_count, 2);
-
-    printf(GREEN "test_lru_cache_destroy_vs_free passed\n" RESET);
 }
 
 void test_lru_cache_zero_capacity()
@@ -455,7 +453,6 @@ void test_lru_cache_zero_capacity()
         ASSERT_EQ(lru_cache_put(cache, "key", &v, NULL, NULL), -1);
         lru_cache_free(cache);
     }
-    printf(GREEN "test_lru_cache_zero_capacity passed\n" RESET);
 }
 
 void test_lru_cache_long_keys()
@@ -472,7 +469,6 @@ void test_lru_cache_long_keys()
     ASSERT_TRUE(lru_cache_get(cache, long_key) == &v);
 
     lru_cache_free(cache);
-    printf(GREEN "test_lru_cache_long_keys passed\n" RESET);
 }
 
 void test_lru_cache_empty_key()
@@ -484,7 +480,6 @@ void test_lru_cache_empty_key()
     ASSERT_TRUE(lru_cache_get(cache, "") == &v);
 
     lru_cache_free(cache);
-    printf(GREEN "test_lru_cache_empty_key passed\n" RESET);
 }
 
 void test_lru_cache_hash_collisions()
@@ -512,7 +507,6 @@ void test_lru_cache_hash_collisions()
     }
 
     lru_cache_free(cache);
-    printf(GREEN "test_lru_cache_hash_collisions passed\n" RESET);
 }
 
 void test_lru_cache_free_null()
@@ -520,7 +514,6 @@ void test_lru_cache_free_null()
     lru_cache_free(NULL);
     lru_cache_destroy(NULL);
     lru_cache_clear(NULL);
-    printf(GREEN "test_lru_cache_free_null passed\n" RESET);
 }
 
 int main(void)

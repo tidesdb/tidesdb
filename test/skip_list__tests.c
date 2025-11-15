@@ -41,7 +41,6 @@ void test_skip_list_create_node()
     ASSERT_TRUE(memcmp(NODE_VALUE(node), value, sizeof(value)) == 0);
     ASSERT_EQ(node->deleted, 0);
     skip_list_release_node(node);
-    printf(GREEN "test_skip_list_create_node passed\n" RESET);
 }
 
 void test_skip_list_put_get()
@@ -66,7 +65,6 @@ void test_skip_list_put_get()
 
     free(retrieved_value);
     skip_list_free(list);
-    printf(GREEN "test_skip_list_put_get passed\n" RESET);
 }
 
 void test_skip_list_destroy()
@@ -79,7 +77,6 @@ void test_skip_list_destroy()
     }
     int result = skip_list_free(list);
     ASSERT_EQ(result, 0);
-    printf(GREEN "test_skip_list_destroy passed\n" RESET);
 }
 
 void test_skip_list_clear()
@@ -97,7 +94,6 @@ void test_skip_list_clear()
     ASSERT_EQ(result, 0);
     ASSERT_TRUE(skip_list_count_entries(list) == 0);
     (void)skip_list_free(list);
-    printf(GREEN "test_skip_list_clear passed\n" RESET);
 }
 
 void test_skip_list_count_entries()
@@ -116,7 +112,6 @@ void test_skip_list_count_entries()
     ASSERT_TRUE(skip_list_count_entries(list) == 1);
 
     (void)skip_list_free(list);
-    printf(GREEN "test_skip_list_count_entries passed\n" RESET);
 }
 
 void test_skip_list_get_size()
@@ -135,7 +130,6 @@ void test_skip_list_get_size()
     ASSERT_TRUE(skip_list_get_size(list) > 0);
 
     (void)skip_list_free(list);
-    printf(GREEN "test_skip_list_get_size passed\n" RESET);
 }
 
 void test_skip_list_copy()
@@ -166,7 +160,6 @@ void test_skip_list_copy()
     free(retrieved_value);
     (void)skip_list_free(copy);
     (void)skip_list_free(list);
-    printf(GREEN "test_skip_list_copy passed\n" RESET);
 }
 
 void test_skip_list_cursor_init()
@@ -184,7 +177,6 @@ void test_skip_list_cursor_init()
 
     (void)skip_list_cursor_free(cursor);
     ASSERT_TRUE(skip_list_free(list) == 0);
-    printf(GREEN "test_skip_list_cursor_init passed\n" RESET);
 }
 
 void test_skip_list_cursor_next()
@@ -213,7 +205,6 @@ void test_skip_list_cursor_next()
 
     (void)skip_list_cursor_free(cursor);
     (void)skip_list_free(list);
-    printf(GREEN "test_skip_list_cursor_next passed\n" RESET);
 }
 
 void test_skip_list_cursor_prev()
@@ -243,7 +234,6 @@ void test_skip_list_cursor_prev()
 
     (void)skip_list_cursor_free(cursor);
     (void)skip_list_free(list);
-    printf(GREEN "test_skip_list_cursor_prev passed\n" RESET);
 }
 
 void benchmark_skip_list()
@@ -423,7 +413,6 @@ void test_skip_list_ttl()
 
     free(retrieved_value);
     (void)skip_list_free(list);
-    printf(GREEN "test_skip_list_ttl passed\n" RESET);
 }
 
 void test_skip_list_cursor_functions()
@@ -569,7 +558,6 @@ void test_skip_list_min_max_key()
     free(min_key);
 
     ASSERT_TRUE(skip_list_free(list) == 0);
-    printf(GREEN "test_skip_list_min_max_key passed\n" RESET);
 }
 
 void test_skip_list_cursor_seek()
@@ -632,7 +620,6 @@ void test_skip_list_cursor_seek()
 
     skip_list_cursor_free(cursor);
     ASSERT_TRUE(skip_list_free(list) == 0);
-    printf(GREEN "test_skip_list_cursor_seek passed\n" RESET);
 }
 
 void test_skip_list_cursor_seek_for_prev()
@@ -685,12 +672,10 @@ void test_skip_list_cursor_seek_for_prev()
 
     skip_list_cursor_free(cursor);
     ASSERT_TRUE(skip_list_free(list) == 0);
-    printf(GREEN "test_skip_list_cursor_seek_for_prev passed\n" RESET);
 }
 
 void test_skip_list_cow_updates()
 {
-    printf("Testing COW updates...\n");
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
     ASSERT_TRUE(list != NULL);
@@ -717,7 +702,6 @@ void test_skip_list_cow_updates()
     }
 
     skip_list_free(list);
-    printf(GREEN "test_skip_list_cow_updates passed\n" RESET);
 }
 
 typedef struct
@@ -778,7 +762,6 @@ void *concurrent_writer(void *arg)
 
 void test_skip_list_concurrent_read_write()
 {
-    printf("Testing concurrent reads and writes (non-blocking)...\n");
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
     ASSERT_TRUE(list != NULL);
@@ -846,13 +829,10 @@ void test_skip_list_concurrent_read_write()
     free(writer_ctx);
 
     skip_list_free(list);
-    printf(GREEN "test_skip_list_concurrent_read_write passed - readers never blocked!\n" RESET);
 }
 
 void test_skip_list_null_validation()
 {
-    printf("testing skip list null validation...\n");
-
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
 
@@ -878,13 +858,10 @@ void test_skip_list_null_validation()
     ASSERT_EQ(skip_list_get(list, key, sizeof(key), &out_value, NULL, &deleted), -1);
 
     skip_list_free(list);
-    printf(GREEN "test_skip_list_null_validation passed\n" RESET);
 }
 
 void test_skip_list_zero_size_key()
 {
-    printf("testing skip list zero-size key...\n");
-
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
 
@@ -895,13 +872,10 @@ void test_skip_list_zero_size_key()
     ASSERT_EQ(skip_list_put(list, key, 0, value, sizeof(value), -1), -1);
 
     skip_list_free(list);
-    printf(GREEN "test_skip_list_zero_size_key passed\n" RESET);
 }
 
 void test_skip_list_large_keys_values()
 {
-    printf("testing skip list large keys and values...\n");
-
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
 
@@ -928,13 +902,10 @@ void test_skip_list_large_keys_values()
 
     free(retrieved_value);
     skip_list_free(list);
-    printf(GREEN "test_skip_list_large_keys_values passed\n" RESET);
 }
 
 void test_skip_list_duplicate_key_update()
 {
-    printf("testing skip list duplicate key update...\n");
-
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
 
@@ -964,13 +935,10 @@ void test_skip_list_duplicate_key_update()
 
     free(retrieved_value);
     skip_list_free(list);
-    printf(GREEN "test_skip_list_duplicate_key_update passed\n" RESET);
 }
 
 void test_skip_list_delete_operations()
 {
-    printf("testing skip list delete operations...\n");
-
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
 
@@ -1001,7 +969,6 @@ void test_skip_list_delete_operations()
     ASSERT_EQ(result, -1);
 
     skip_list_free(list);
-    printf(GREEN "test_skip_list_delete_operations passed\n" RESET);
 }
 
 int main(void)

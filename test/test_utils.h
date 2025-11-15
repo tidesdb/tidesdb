@@ -24,6 +24,12 @@
 #include "../src/compat.h" /* for PATH_SEPARATOR and platform compatibility */
 #include "test_macros.h"
 
+/* disable format-truncation warnings for test utilities. all path buffers use 1024 bytes */
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
+
 #define TEST_DB_PATH "./test_tidesdb"
 
 /* ensure assertions work in both Debug and Release builds */
@@ -173,5 +179,9 @@ static inline void generate_random_key_value(uint8_t *key, size_t key_size, uint
         value[i] = (uint8_t)charset[rand() % (int)charset_size];
     }
 }
+
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
 
 #endif /* TEST_UTILS_H */

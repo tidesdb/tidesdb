@@ -30,7 +30,6 @@ void test_queue_new(void)
     ASSERT_EQ(queue_size(queue), 0);
     ASSERT_EQ(queue_is_empty(queue), 1);
     queue_free(queue);
-    printf(GREEN "test_queue_new passed\n" RESET);
 }
 
 void test_queue_enqueue_dequeue(void)
@@ -72,7 +71,6 @@ void test_queue_enqueue_dequeue(void)
     ASSERT_TRUE(result4 == NULL);
 
     queue_free(queue);
-    printf(GREEN "test_queue_enqueue_dequeue passed\n" RESET);
 }
 
 void test_queue_peek(void)
@@ -103,7 +101,6 @@ void test_queue_peek(void)
     ASSERT_EQ(*peek3, 100);
 
     queue_free(queue);
-    printf(GREEN "test_queue_peek passed\n" RESET);
 }
 
 void test_queue_clear(void)
@@ -122,7 +119,6 @@ void test_queue_clear(void)
     ASSERT_EQ(queue_is_empty(queue), 1);
 
     queue_free(queue);
-    printf(GREEN "test_queue_clear passed\n" RESET);
 }
 
 void test_queue_with_strings(void)
@@ -151,7 +147,6 @@ void test_queue_with_strings(void)
     free(result3);
 
     queue_free(queue);
-    printf(GREEN "test_queue_with_strings passed\n" RESET);
 }
 
 void test_queue_free_with_data(void)
@@ -168,7 +163,6 @@ void test_queue_free_with_data(void)
     queue_enqueue(queue, str3);
 
     queue_free_with_data(queue, free);
-    printf(GREEN "test_queue_free_with_data passed\n" RESET);
 }
 
 typedef struct
@@ -281,7 +275,6 @@ void test_queue_threaded(void)
 
     pthread_mutex_destroy(&count_lock);
     queue_free(queue);
-    printf(GREEN "test_queue_threaded passed\n" RESET);
 }
 
 static void *blocking_consumer_thread(void *arg)
@@ -313,7 +306,6 @@ void test_queue_dequeue_wait(void)
     pthread_join(consumer, NULL);
 
     queue_free(queue);
-    printf(GREEN "test_queue_dequeue_wait passed\n" RESET);
 }
 
 void test_queue_large_volume(void)
@@ -342,7 +334,6 @@ void test_queue_large_volume(void)
 
     ASSERT_EQ(queue_is_empty(queue), 1);
     queue_free(queue);
-    printf(GREEN "test_queue_large_volume passed\n" RESET);
 }
 
 typedef struct
@@ -394,7 +385,6 @@ void test_queue_foreach(void)
     ASSERT_EQ(queue_foreach(NULL, sum_callback, &ctx), -1);
 
     queue_free(queue);
-    printf(GREEN "test_queue_foreach passed\n" RESET);
 }
 
 typedef struct cleanup_item_t
@@ -438,7 +428,6 @@ void test_queue_foreach_cleanup(void)
     /* clear the queue (items already freed by foreach) */
     queue_clear(queue);
     queue_free(queue);
-    printf(GREEN "test_queue_foreach_cleanup passed\n" RESET);
 }
 
 void test_queue_null_handling(void)
@@ -449,7 +438,6 @@ void test_queue_null_handling(void)
     ASSERT_EQ(queue_dequeue(NULL), NULL);
     queue_clear(NULL); /* should not crash */
     queue_free(NULL);  /* should not crash */
-    printf(GREEN "test_queue_null_handling passed\n" RESET);
 }
 
 void test_queue_peek_at(void)
@@ -484,7 +472,6 @@ void test_queue_peek_at(void)
     ASSERT_EQ(queue_peek_at(NULL, 0), NULL);
 
     queue_free(queue);
-    printf(GREEN "test_queue_peek_at passed\n" RESET);
 }
 
 typedef struct
@@ -544,7 +531,6 @@ void test_queue_free_with_waiting_threads(void)
     pthread_join(waiter, NULL);
 
     pthread_mutex_destroy(&start_lock);
-    printf(GREEN "test_queue_free_with_waiting_threads passed\n" RESET);
 }
 
 void test_queue_node_pool()
@@ -581,7 +567,6 @@ void test_queue_node_pool()
     ASSERT_EQ(queue_size(queue), 50);
 
     queue_free_with_data(queue, free);
-    printf(GREEN "test_queue_node_pool passed\n" RESET);
 }
 
 void *multi_waiter_thread(void *arg)
@@ -622,7 +607,6 @@ void test_queue_multiple_waiters()
 
     ASSERT_EQ(queue_size(queue), 0);
     queue_free(queue);
-    printf(GREEN "test_queue_multiple_waiters passed\n" RESET);
 }
 
 void test_queue_enqueue_null_data()
@@ -637,7 +621,6 @@ void test_queue_enqueue_null_data()
     ASSERT_EQ(data, NULL); /* NULL is valid data */
 
     queue_free(queue);
-    printf(GREEN "test_queue_enqueue_null_data passed\n" RESET);
 }
 
 void test_queue_is_empty()
@@ -654,7 +637,6 @@ void test_queue_is_empty()
     ASSERT_EQ(queue_is_empty(queue), 1);
 
     queue_free(queue);
-    printf(GREEN "test_queue_is_empty passed\n" RESET);
 }
 
 void test_queue_peek_at_boundary()
@@ -675,7 +657,6 @@ void test_queue_peek_at_boundary()
     ASSERT_EQ(queue_peek_at(queue, 100), NULL);     /* way out of bounds */
 
     queue_free(queue);
-    printf(GREEN "test_queue_peek_at_boundary passed\n" RESET);
 }
 
 void test_queue_foreach_empty()
@@ -689,7 +670,6 @@ void test_queue_foreach_empty()
     ASSERT_EQ(ctx.sum, 0);
 
     queue_free(queue);
-    printf(GREEN "test_queue_foreach_empty passed\n" RESET);
 }
 
 int main(void)

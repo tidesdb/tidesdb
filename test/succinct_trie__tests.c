@@ -56,7 +56,6 @@ void test_disk_streaming_basic()
     ASSERT_EQ(succinct_trie_prefix_get(trie, (uint8_t *)"fig", 3, &value), -1);
 
     succinct_trie_free(trie);
-    printf(GREEN "test_disk_streaming_basic passed\n" RESET);
 }
 
 void test_disk_streaming_prefix_queries()
@@ -87,7 +86,6 @@ void test_disk_streaming_prefix_queries()
     ASSERT_EQ(value, 4); /* should find "toast" */
 
     succinct_trie_free(trie);
-    printf(GREEN "test_disk_streaming_prefix_queries passed\n" RESET);
 }
 
 void test_disk_streaming_sorted_order_validation()
@@ -103,7 +101,6 @@ void test_disk_streaming_sorted_order_validation()
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"banana", 6, 2), -1);
 
     succinct_trie_builder_free(builder);
-    printf(GREEN "test_disk_streaming_sorted_order_validation passed\n" RESET);
 }
 
 void test_disk_streaming_large_dataset()
@@ -146,7 +143,6 @@ void test_disk_streaming_large_dataset()
     printf(YELLOW "Disk-streaming trie size: %.2f KB\n" RESET, trie_size / 1024.0);
 
     succinct_trie_free(trie);
-    printf(GREEN "test_disk_streaming_large_dataset passed\n" RESET);
 }
 
 void test_disk_streaming_common_prefix()
@@ -174,7 +170,6 @@ void test_disk_streaming_common_prefix()
     ASSERT_EQ(value, 1); /* should find first entry */
 
     succinct_trie_free(trie);
-    printf(GREEN "test_disk_streaming_common_prefix passed\n" RESET);
 }
 
 void test_disk_streaming_single_entry()
@@ -193,7 +188,6 @@ void test_disk_streaming_single_entry()
     ASSERT_EQ(value, 42);
 
     succinct_trie_free(trie);
-    printf(GREEN "test_disk_streaming_single_entry passed\n" RESET);
 }
 
 void test_disk_streaming_serialization()
@@ -229,7 +223,6 @@ void test_disk_streaming_serialization()
     free(serialized);
     succinct_trie_free(trie);
     succinct_trie_free(trie2);
-    printf(GREEN "test_disk_streaming_serialization passed\n" RESET);
 }
 
 void benchmark_succinct_trie()
@@ -281,8 +274,6 @@ void benchmark_succinct_trie()
     succinct_trie_free(trie);
     for (int i = 0; i < N; i++) free(keys[i]);
     free(keys);
-
-    printf(GREEN "benchmark_succinct_trie passed\n" RESET);
 }
 
 void test_succinct_trie_invalid_inputs()
@@ -311,8 +302,6 @@ void test_succinct_trie_invalid_inputs()
 
     /* succinct_trie_free with NULL */
     succinct_trie_free(NULL);
-
-    printf(GREEN "test_succinct_trie_invalid_inputs passed\n" RESET);
 }
 
 void test_succinct_trie_empty()
@@ -338,7 +327,6 @@ void test_succinct_trie_empty()
     free(data);
     succinct_trie_free(trie);
     succinct_trie_free(trie2);
-    printf(GREEN "test_succinct_trie_empty passed\n" RESET);
 }
 
 void test_succinct_trie_binary_keys()
@@ -362,7 +350,6 @@ void test_succinct_trie_binary_keys()
     ASSERT_EQ(val, 200);
 
     succinct_trie_free(trie);
-    printf(GREEN "test_succinct_trie_binary_keys passed\n" RESET);
 }
 
 void test_succinct_trie_duplicate_keys()
@@ -382,7 +369,6 @@ void test_succinct_trie_duplicate_keys()
     ASSERT_EQ(val, 100);
 
     succinct_trie_free(trie);
-    printf(GREEN "test_succinct_trie_duplicate_keys passed\n" RESET);
 }
 
 void test_succinct_trie_long_keys()
@@ -403,7 +389,6 @@ void test_succinct_trie_long_keys()
     ASSERT_EQ(val, 999);
 
     succinct_trie_free(trie);
-    printf(GREEN "test_succinct_trie_long_keys passed\n" RESET);
 }
 
 void test_succinct_trie_prefix_edge_cases()
@@ -428,7 +413,6 @@ void test_succinct_trie_prefix_edge_cases()
     ASSERT_EQ(val, 3);
 
     succinct_trie_free(trie);
-    printf(GREEN "test_succinct_trie_prefix_edge_cases passed\n" RESET);
 }
 
 void test_succinct_trie_deserialize_corrupted()
@@ -457,7 +441,6 @@ void test_succinct_trie_deserialize_corrupted()
     free(data);
     succinct_trie_free(trie);
     if (trie2) succinct_trie_free(trie2);
-    printf(GREEN "test_succinct_trie_deserialize_corrupted passed\n" RESET);
 }
 
 void benchmark_disk_streaming_vs_memory()
@@ -504,7 +487,7 @@ void benchmark_disk_streaming_vs_memory()
     end = clock();
     double mem_time = (double)(end - start) / CLOCKS_PER_SEC;
 
-    printf(CYAN "\n=== Performance Comparison (%d entries) ===\n" RESET, N);
+    printf(CYAN "\n*=== Performance Comparison (%d entries) ===*\n" RESET, N);
     printf(YELLOW "Disk streaming: %.3f seconds\n" RESET, disk_time);
     printf(YELLOW "Memory streaming: %.3f seconds\n" RESET, mem_time);
     printf(YELLOW "Disk/Memory ratio: %.2fx\n" RESET, disk_time / mem_time);
@@ -527,8 +510,6 @@ void benchmark_disk_streaming_vs_memory()
     succinct_trie_free(mem_trie);
     for (int i = 0; i < N; i++) free(keys[i]);
     free(keys);
-
-    printf(GREEN "benchmark_disk_streaming_vs_memory passed\n" RESET);
 }
 
 int main(void)

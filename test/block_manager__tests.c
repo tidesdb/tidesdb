@@ -34,7 +34,6 @@ void test_block_manager_open()
     (void)block_manager_close(bm);
 
     remove("test.db"); /* remove created file */
-    printf(GREEN "test_block_manager_open passed\n" RESET);
 }
 
 void test_block_manager_block_create()
@@ -47,8 +46,6 @@ void test_block_manager_block_create()
 
     ASSERT_EQ(memcmp(block->data, data, size), 0);
     (void)block_manager_block_free(block);
-
-    printf(GREEN "test_block_manager_block_create passed\n" RESET);
 }
 
 void test_block_manager_block_write()
@@ -70,8 +67,6 @@ void test_block_manager_block_write()
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_block_write passed\n" RESET);
 }
 
 void test_block_manager_block_write_close_reopen_read()
@@ -113,8 +108,6 @@ void test_block_manager_block_write_close_reopen_read()
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
     remove("test.db");
-
-    printf(GREEN "test_block_manager_block_write_close_reopen_read passed\n" RESET);
 }
 
 void test_block_manager_truncate()
@@ -154,8 +147,6 @@ void test_block_manager_truncate()
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_truncate passed\n" RESET);
 }
 
 void test_block_manager_cursor()
@@ -280,8 +271,6 @@ void test_block_manager_cursor()
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_cursor passed\n" RESET);
 }
 
 void test_block_manager_count_blocks()
@@ -307,8 +296,6 @@ void test_block_manager_count_blocks()
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_count_blocks passed\n" RESET);
 }
 
 void test_block_manager_cursor_goto_first()
@@ -346,8 +333,6 @@ void test_block_manager_cursor_goto_first()
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_cursor_goto_first passed\n" RESET);
 }
 
 void test_block_manager_cursor_goto_last()
@@ -386,8 +371,6 @@ void test_block_manager_cursor_goto_last()
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_cursor_goto_last passed\n" RESET);
 }
 
 void test_block_manager_cursor_has_next()
@@ -427,8 +410,6 @@ void test_block_manager_cursor_has_next()
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_cursor_has_next passed\n" RESET);
 }
 
 void test_block_manager_cursor_has_prev()
@@ -468,8 +449,6 @@ void test_block_manager_cursor_has_prev()
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_cursor_has_prev passed\n" RESET);
 }
 
 void test_block_manager_cursor_position_checks()
@@ -518,8 +497,6 @@ void test_block_manager_cursor_position_checks()
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_cursor_position_checks passed\n" RESET);
 }
 
 void test_block_manager_get_size()
@@ -558,8 +535,6 @@ void test_block_manager_get_size()
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_get_size passed\n" RESET);
 }
 
 void test_block_manager_seek_and_goto()
@@ -623,8 +598,6 @@ void test_block_manager_seek_and_goto()
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test.db");
-
-    printf(GREEN "test_block_manager_seek_and_goto passed\n" RESET);
 }
 
 /** multithreaded tests */
@@ -825,14 +798,10 @@ void test_block_manager_concurrent_rw()
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("concurrent_test.db");
-
-    printf(GREEN "test_block_manager_concurrent_rw passed\n" RESET);
 }
 
 void test_block_manager_validate_last_block()
 {
-    printf("Testing block manager validation of last block...\n");
-
     /* first, create a block manager and write some valid blocks */
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, "validate_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
@@ -921,14 +890,10 @@ void test_block_manager_validate_last_block()
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     remove("validate_test.db");
-
-    printf(GREEN "test_block_manager_validate_last_block passed\n" RESET);
 }
 
 void test_block_manager_validation_edge_cases()
 {
-    printf("Testing block manager validation edge cases...\n");
-
     block_manager_t *bm = NULL;
 
     /* opening a fresh empty database */
@@ -957,14 +922,10 @@ void test_block_manager_validation_edge_cases()
     }
 
     (void)remove("empty_test.db");
-
-    printf(GREEN "test_block_manager_validation_edge_cases passed\n" RESET);
 }
 
 void test_block_manager_open_safety()
 {
-    printf("Testing block manager open with very long path...\n");
-
     block_manager_t *bm = NULL;
 
     /* we create a path name that would exceed the buffer */
@@ -991,8 +952,6 @@ void test_block_manager_open_safety()
         ASSERT_TRUE(block_manager_close(bm) == 0);
         remove(long_path); /* try to remove, might fail */
     }
-
-    printf(GREEN "test_block_manager_open_safety passed\n" RESET);
 }
 
 /** benchmark tests */
@@ -1005,8 +964,6 @@ void test_block_manager_open_safety()
 
 void benchmark_block_manager()
 {
-    printf(BOLDWHITE "Running block manager benchmark...\n" RESET);
-
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, "benchmark.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
@@ -1184,14 +1141,10 @@ void benchmark_block_manager()
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("benchmark.db");
-
-    printf(GREEN "benchmark_block_manager completed successfully\n" RESET);
 }
 
 void test_block_manager_lru_cache()
 {
-    printf("Testing block manager LRU cache functionality...\n");
-
     block_manager_t *bm = NULL;
 
     ASSERT_TRUE(
@@ -1316,13 +1269,10 @@ void test_block_manager_lru_cache()
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
     (void)remove("cache_test.db");
-    printf(GREEN "test_block_manager_lru_cache passed\n" RESET);
 }
 
 void test_block_manager_lru_cache_edge_cases()
 {
-    printf("Testing block manager LRU cache edge cases...\n");
-
     block_manager_t *bm = NULL;
 
     /* zero  cache size (should work without caching) */
@@ -1491,14 +1441,10 @@ void test_block_manager_lru_cache_edge_cases()
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("edge_test.db");
-
-    printf(GREEN "test_block_manager_lru_cache_edge_cases passed\n" RESET);
 }
 
 void test_block_manager_cache_concurrent()
 {
-    printf("Testing block manager cache with concurrent access...\n");
-
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open_with_cache(&bm, "cache_concurrent_test.db",
                                               BLOCK_MANAGER_SYNC_NONE, 2048) == 0);
@@ -1597,14 +1543,10 @@ void test_block_manager_cache_concurrent()
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("cache_concurrent_test.db");
-
-    printf(GREEN "test_block_manager_cache_concurrent passed\n" RESET);
 }
 
 void benchmark_block_manager_with_cache()
 {
-    printf(BOLDWHITE "Running block manager benchmark with LRU cache...\n" RESET);
-
     block_manager_t *bm = NULL;
 
     uint32_t cache_size = 10 * 1024 * 1024;
@@ -1835,8 +1777,6 @@ void benchmark_block_manager_with_cache()
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("benchmark_cache.db");
-
-    printf(GREEN "benchmark_block_manager_with_cache completed successfully\n" RESET);
 }
 
 typedef struct
@@ -1876,8 +1816,6 @@ void *parallel_write_worker(void *arg)
 
 void test_block_manager_sync_modes()
 {
-    printf("testing block manager sync modes...\n");
-
     /* test SYNC_NONE */
     block_manager_t *bm_none = NULL;
     ASSERT_EQ(block_manager_open(&bm_none, "test_sync_none.db", BLOCK_MANAGER_SYNC_NONE), 0);
@@ -1903,14 +1841,10 @@ void test_block_manager_sync_modes()
     block_manager_block_free(block);
     block_manager_close(bm_full);
     remove("test_sync_full.db");
-
-    printf(GREEN "test_block_manager_sync_modes passed\n" RESET);
 }
 
 void test_block_manager_overflow_blocks()
 {
-    printf("testing block manager overflow blocks (>32KB)...\n");
-
     block_manager_t *bm = NULL;
     ASSERT_EQ(block_manager_open(&bm, "test_overflow.db", BLOCK_MANAGER_SYNC_NONE), 0);
 
@@ -1940,14 +1874,10 @@ void test_block_manager_overflow_blocks()
     block_manager_block_free(block);
     block_manager_close(bm);
     remove("test_overflow.db");
-
-    printf(GREEN "test_block_manager_overflow_blocks passed\n" RESET);
 }
 
 void test_block_manager_empty_block()
 {
-    printf("testing block manager empty block...\n");
-
     block_manager_t *bm = NULL;
     ASSERT_EQ(block_manager_open(&bm, "test_empty.db", BLOCK_MANAGER_SYNC_NONE), 0);
 
@@ -1977,14 +1907,10 @@ void test_block_manager_empty_block()
     block_manager_block_free(block);
     block_manager_close(bm);
     remove("test_empty.db");
-
-    printf(GREEN "test_block_manager_empty_block passed\n" RESET);
 }
 
 void benchmark_block_manager_parallel_write(void)
 {
-    printf("\nRunning block manager parallel write benchmark...\n");
-
     block_manager_t *bm = NULL;
     (void)remove("test_parallel.db");
     ASSERT_TRUE(block_manager_open_with_cache(&bm, "test_parallel.db", 0, 0) == 0);
@@ -2049,8 +1975,6 @@ void benchmark_block_manager_parallel_write(void)
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("test_parallel.db");
-
-    printf(GREEN "\nbenchmark_block_manager_parallel_write completed successfully\n" RESET);
 }
 
 int main(void)

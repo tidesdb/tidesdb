@@ -433,7 +433,6 @@ static void *thread_pool_worker(void *arg)
                 /* remove flushed memtables from front of queue if safe */
                 /* memtables may finish flushing out of order, so check from the front */
                 pthread_mutex_lock(&task->cf->flush_lock);
-                pthread_rwlock_wrlock(&task->cf->cf_lock);
 
                 size_t queue_size_before = queue_size(task->cf->immutable_memtables);
                 TDB_DEBUG_LOG("Queue has %zu immutable memtables before cleanup",
@@ -478,7 +477,6 @@ static void *thread_pool_worker(void *arg)
                 }
 
                 size_t remaining = queue_size(task->cf->immutable_memtables);
-                pthread_rwlock_unlock(&task->cf->cf_lock);
                 pthread_mutex_unlock(&task->cf->flush_lock);
 
                 TDB_DEBUG_LOG("Cleanup complete: cleaned=%d, remaining=%zu", cleaned_count,
@@ -1424,6 +1422,8 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
     int blocks_read = 0;
     while (blocks_read < sst->num_entries && block_manager_cursor_has_next(cursor))
     {
+        /* save current byte offset before reading */
+        uint64_t block_offset = cursor->current_pos;
         block_manager_block_t *block = block_manager_cursor_read(cursor);
         if (!block) break;
 
@@ -1478,7 +1478,8 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
             memcpy(key_ptr, key_src, key_size);
             keys_buffer_used += key_size;
 
-            succinct_trie_builder_add(builder, key_ptr, key_size, (int64_t)blocks_read);
+            /* store byte offset for O(1) direct positioning */
+            succinct_trie_builder_add(builder, key_ptr, key_size, (int64_t)block_offset);
         }
 
         /* free decompressed data immediately */
@@ -2944,12 +2945,13 @@ static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
 
     TDB_DEBUG_LOG("Rotating memtable for column family: %s", cf->name);
 
+    /* allocate new memtable BEFORE acquiring lock to reduce lock hold time */
     tidesdb_memtable_t *new_memtable = tidesdb_memtable_new(cf);
     if (!new_memtable) return -1;
 
     pthread_mutex_lock(&cf->flush_lock);
-    pthread_rwlock_wrlock(&cf->cf_lock); /* write lock to sync with readers */
 
+    /* atomic_exchange is already atomic, no lock needed for swap */
     tidesdb_memtable_t *old_memtable = atomic_exchange(&cf->active_memtable, new_memtable);
 
     if (old_memtable)
@@ -2961,7 +2963,6 @@ static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
             atomic_store(&cf->active_memtable, old_memtable);
             tidesdb_memtable_release(old_memtable);
             tidesdb_memtable_free(new_memtable);
-            pthread_rwlock_unlock(&cf->cf_lock);
             pthread_mutex_unlock(&cf->flush_lock);
             return -1;
         }
@@ -2994,17 +2995,14 @@ static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
                     queue_enqueue(cf->immutable_memtables, removed);
                 }
             }
-            pthread_rwlock_unlock(&cf->cf_lock);
             pthread_mutex_unlock(&cf->flush_lock);
             return -1;
         }
 
-        pthread_rwlock_unlock(&cf->cf_lock);
         pthread_mutex_unlock(&cf->flush_lock);
         return 0;
     }
 
-    pthread_rwlock_unlock(&cf->cf_lock);
     pthread_mutex_unlock(&cf->flush_lock);
     return 0;
 }
@@ -3228,8 +3226,8 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
                     }
                     if (index_builder)
                     {
-                        succinct_trie_builder_add(index_builder, k, k_size,
-                                                  (int64_t)entries_written);
+                        /* store byte offset for O(1) direct positioning */
+                        succinct_trie_builder_add(index_builder, k, k_size, (int64_t)offset);
                     }
                     /* don't increment num_entries yet -- use local counter */
                     entries_written++;
@@ -3370,7 +3368,9 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     /* atomically store final num_entries now that all blocks and metadata are written */
     atomic_store(&sst->num_entries, entries_written);
 
-    pthread_rwlock_wrlock(&cf->cf_lock);
+    /* use flush_lock instead of cf_lock write lock to avoid blocking readers
+     * flush_lock serializes flushes but doesn't block reads */
+    pthread_mutex_lock(&cf->flush_lock);
 
     if (cf->num_sstables >= cf->sstable_array_capacity)
     {
@@ -3379,7 +3379,6 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
             realloc(cf->sstables, (size_t)new_cap * sizeof(tidesdb_sstable_t *));
         if (!new_ssts)
         {
-            pthread_rwlock_unlock(&cf->cf_lock);
             pthread_mutex_unlock(&cf->flush_lock);
 
             if (cf->db->block_manager_cache)
@@ -3414,7 +3413,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     atomic_thread_fence(memory_order_release);
     atomic_fetch_add(&cf->num_sstables, 1);
 
-    pthread_rwlock_unlock(&cf->cf_lock);
+    pthread_mutex_unlock(&cf->flush_lock);
 
     TDB_DEBUG_LOG("Successfully added SSTable to column family: %s (new count: %d)", cf->name,
                   atomic_load(&cf->num_sstables));
@@ -3479,10 +3478,8 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
         return TDB_ERR_INVALID_ARGS;
     }
 
-    /* acquire write lock to update configuration atomically */
     pthread_rwlock_wrlock(&cf->cf_lock);
 
-    /* update runtime-safe configuration */
     cf->config.memtable_flush_size = update_config->memtable_flush_size;
     cf->config.max_sstables_before_compaction = update_config->max_sstables_before_compaction;
     cf->config.compaction_threads = update_config->compaction_threads;
@@ -4002,10 +3999,9 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         merged_ssts[p] = merged;
     }
 
-    /* re-acquire compaction lock before modifying sstable array */
+    /* re-acquire compaction lock before modifying sstable array
+     * compaction_lock serializes compactions without blocking readers */
     pthread_mutex_lock(&cf->compaction_lock);
-
-    pthread_rwlock_wrlock(&cf->cf_lock);
 
     /* check if array was modified during compaction */
     int current_num_ssts = atomic_load(&cf->num_sstables);
@@ -4104,7 +4100,6 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         atomic_store(&cf->num_sstables, new_count);
     }
 
-    pthread_rwlock_unlock(&cf->cf_lock);
     pthread_mutex_unlock(&cf->compaction_lock);
 
     /* release snapshot references */
@@ -4799,9 +4794,7 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         }
     }
 
-    /* re-acquire write lock only for the swap operation */
-    pthread_rwlock_wrlock(&cf->cf_lock);
-
+    /* compaction_lock already held from beginning of function */
     /* rebuild sstable array; must keep originals if merge failed */
     tidesdb_sstable_t **new_sstables =
         malloc((size_t)(num_ssts + pairs_to_merge) * sizeof(tidesdb_sstable_t *));
@@ -4814,8 +4807,9 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
             /* merge succeeded, now we can add merged sstable and release originals */
             new_sstables[new_count++] = merged_sstables[p];
 
-            tidesdb_sstable_t *sst1 = cf->sstables[p * 2];
-            tidesdb_sstable_t *sst2 = cf->sstables[p * 2 + 1];
+            /* use snapshot from jobs, not current cf->sstables which may have changed */
+            tidesdb_sstable_t *sst1 = jobs[p].sst1;
+            tidesdb_sstable_t *sst2 = jobs[p].sst2;
 
             /* delete old sstable files */
             char sst1_path[TDB_MAX_PATH_LENGTH];
@@ -4855,7 +4849,6 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
     free(thread_created);
     sem_destroy(&semaphore);
 
-    pthread_rwlock_unlock(&cf->cf_lock);
     pthread_mutex_unlock(&cf->compaction_lock);
 
     TDB_DEBUG_LOG("Parallel compaction complete: %d -> %d sstables", num_ssts, new_count);
@@ -5041,12 +5034,12 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
         return -1; /* definitely not in sstable */
     }
 
-    int64_t block_num = -1;
+    int64_t block_offset = -1;
 
     /* if block indexes are enabled, use succinct trie for direct lookup */
     if (sstable->cf->config.enable_block_indexes && sstable->index)
     {
-        if (succinct_trie_prefix_get(sstable->index, (uint8_t *)key, key_size, &block_num) != 0)
+        if (succinct_trie_prefix_get(sstable->index, (uint8_t *)key, key_size, &block_offset) != 0)
         {
             return -1; /* not found in index */
         }
@@ -5156,25 +5149,15 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
         return -1; /* not found */
     }
 
-    /* read block at block_num from block index */
+    /* read block at byte offset from block index */
     block_manager_cursor_t *cursor = NULL;
     if (block_manager_cursor_init(&cursor, sstable->block_manager) != 0) return -1;
 
-    /* position at first block, then advance to target block number */
-    if (block_manager_cursor_goto_first(cursor) != 0)
+    /* use direct byte offset positioning for O(1) access */
+    if (block_manager_cursor_goto(cursor, (uint64_t)block_offset) != 0)
     {
         block_manager_cursor_free(cursor);
         return -1;
-    }
-
-    /* advance to the target block number */
-    for (int64_t b = 0; b < block_num; b++)
-    {
-        if (block_manager_cursor_next(cursor) != 0)
-        {
-            block_manager_cursor_free(cursor);
-            return -1;
-        }
     }
 
     block_manager_block_t *block = block_manager_cursor_read(cursor);
@@ -5383,24 +5366,24 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
 
     if (cf->immutable_memtables)
     {
-        /* get count first without holding lock */
+        /* get count first without lock */
         pthread_rwlock_rdlock(&cf->cf_lock);
         num_immutable = queue_size(cf->immutable_memtables);
         pthread_rwlock_unlock(&cf->cf_lock);
 
         if (num_immutable > 0)
         {
-            /* allocate BEFORE acquiring lock */
+            /* allocate OUTSIDE lock to avoid heap contention under lock */
             immutable_snapshot = malloc(num_immutable * sizeof(tidesdb_memtable_t *));
             if (immutable_snapshot)
             {
                 /* now acquire lock and snapshot quickly */
                 pthread_rwlock_rdlock(&cf->cf_lock);
-                /* re-check count in case it changed */
-                size_t actual_immutable = queue_size(cf->immutable_memtables);
-                if (actual_immutable > num_immutable) actual_immutable = num_immutable;
+                size_t actual_count = queue_size(cf->immutable_memtables);
+                /* use smaller of the two to avoid overrun */
+                if (actual_count > num_immutable) actual_count = num_immutable;
 
-                for (size_t i = 0; i < actual_immutable; i++)
+                for (size_t i = 0; i < actual_count; i++)
                 {
                     tidesdb_memtable_t *imt =
                         (tidesdb_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
@@ -5414,7 +5397,7 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
                         immutable_snapshot[i] = NULL;
                     }
                 }
-                num_immutable = actual_immutable; /* update for loop below */
+                num_immutable = actual_count;
                 pthread_rwlock_unlock(&cf->cf_lock);
             }
         }
@@ -5486,19 +5469,23 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
         }
     }
 
-    /* snapshot sstables once -- we never re-acquire lock to avoid blocking */
-    pthread_rwlock_rdlock(&cf->cf_lock);
+    /* snapshot sstables -- allocate outside lock to avoid heap contention */
     int num_ssts = atomic_load(&cf->num_sstables);
 
     tidesdb_sstable_t **sst_snapshot = NULL;
     if (num_ssts > 0)
     {
+        /* allocate OUTSIDE lock */
         sst_snapshot = malloc((size_t)num_ssts * sizeof(tidesdb_sstable_t *));
         if (sst_snapshot)
         {
-            /* copy pointers and acquire references while holding lock
-             * this prevents sstables from being freed during compaction */
-            for (int i = 0; i < num_ssts; i++)
+            /* acquire lock only for copying pointers and incrementing refs */
+            pthread_rwlock_rdlock(&cf->cf_lock);
+            int actual_count = atomic_load(&cf->num_sstables);
+            /* use smaller count to avoid overrun */
+            if (actual_count > num_ssts) actual_count = num_ssts;
+
+            for (int i = 0; i < actual_count; i++)
             {
                 sst_snapshot[i] = cf->sstables[i];
                 if (sst_snapshot[i])
@@ -5506,9 +5493,10 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
                     tidesdb_sstable_acquire(sst_snapshot[i]);
                 }
             }
+            num_ssts = actual_count;
+            pthread_rwlock_unlock(&cf->cf_lock);
         }
     }
-    pthread_rwlock_unlock(&cf->cf_lock);
 
     /* now search sstables without holding any locks */
     if (sst_snapshot)
@@ -5819,6 +5807,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
         }
 
+        /* serialize writes with memtable_write_lock (doesn't block readers) */
         pthread_mutex_lock(&cf->memtable_write_lock);
 
         int result = 0;
@@ -5943,7 +5932,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         last_cf = cf;
     }
 
-    /* serialize writes to lock-free skip list */
+    /* serialize writes with memtable_write_lock (doesn't block readers) */
     if (last_cf)
     {
         pthread_mutex_lock(&last_cf->memtable_write_lock);
@@ -6612,13 +6601,15 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                     int positioned_via_index = 0;
                     if (sst->cf->config.enable_block_indexes && sst->index)
                     {
-                        int64_t block_num = -1;
+                        int64_t block_offset = -1;
                         if (succinct_trie_prefix_get(sst->index, (uint8_t *)key, key_size,
-                                                     &block_num) == 0)
+                                                     &block_offset) == 0)
                         {
                             positioned_via_index = 1;
                             index_positioned[i] = 1;
-                            iter->sstable_blocks_read[i] = (int)block_num;
+                            /* position cursor directly at byte offset */
+                            iter->sstable_cursors[i]->current_pos = (uint64_t)block_offset;
+                            iter->sstable_blocks_read[i] = -1; /* mark as positioned via index */
                         }
                     }
 
@@ -6658,27 +6649,10 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         /* skip if out of range */
         if (iter->sstable_blocks_read[i] >= num_entries) continue;
 
-        /* if seek_key <= min_key, first entry is already >= seek_key */
-        if (sst->min_key &&
-            compare_keys_with_cf(iter->cf, key, key_size, sst->min_key, sst->min_key_size) <= 0)
-        {
-            iter_refill_from_sstable(iter, i);
-            continue;
-        }
-
         /* if block index positioned us, read the block directly */
         if (index_positioned[i])
         {
-            int target_block = iter->sstable_blocks_read[i];
-
-            if (block_manager_cursor_goto_first(iter->sstable_cursors[i]) != 0) continue;
-
-            for (int b = 0; b < target_block; b++)
-            {
-                if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0) break;
-            }
-
-            /* read the block directly without calling iter_refill (which would advance again) */
+            /* cursor already positioned at byte offset, just read */
             block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[i]);
             if (block)
             {
@@ -6709,8 +6683,9 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 }
                 block_manager_block_free(block);
             }
-            /* Set blocks_read to target + 1 since we've already read block target_block */
-            iter->sstable_blocks_read[i] = target_block + 1;
+            /* cursor is still at the indexed block we just read */
+            /* set blocks_read = 1 so iter_refill will call cursor_next() to advance */
+            iter->sstable_blocks_read[i] = 1;
             continue;
         }
 
@@ -6872,14 +6847,15 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                     int positioned_via_index = 0;
                     if (sst->cf->config.enable_block_indexes && sst->index)
                     {
-                        int64_t block_num = -1;
+                        int64_t block_offset = -1;
                         if (succinct_trie_prefix_get(sst->index, (uint8_t *)key, key_size,
-                                                     &block_num) == 0)
+                                                     &block_offset) == 0)
                         {
-                            /* found exact key! set blocks_read to block number */
+                            /* found exact key! position cursor at byte offset */
                             positioned_via_index = 1;
                             index_positioned[i] = 1;
-                            iter->sstable_blocks_read[i] = (int)block_num;
+                            iter->sstable_cursors[i]->current_pos = (uint64_t)block_offset;
+                            iter->sstable_blocks_read[i] = -1; /* mark as positioned via index */
                         }
                     }
 
@@ -6923,18 +6899,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         /* if block index positioned us at exact match, read block directly */
         if (index_positioned[i])
         {
-            int target_block = iter->sstable_blocks_read[i];
-
-            /* position cursor at first block */
-            if (block_manager_cursor_goto_first(iter->sstable_cursors[i]) != 0) continue;
-
-            /* advance cursor to target block */
-            for (int b = 0; b < target_block; b++)
-            {
-                if (block_manager_cursor_next(iter->sstable_cursors[i]) != 0) break;
-            }
-
-            /* read the block directly */
+            /* cursor already positioned at byte offset, just read */
             block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[i]);
             if (block)
             {
@@ -6965,8 +6930,9 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                 }
                 block_manager_block_free(block);
             }
-            /* set blocks_read to target + 1 since we've already read block target_block */
-            iter->sstable_blocks_read[i] = target_block + 1;
+            /* cursor is still at the indexed block we just read */
+            /* set blocks_read = 1 so iter_refill will call cursor_next() to advance */
+            iter->sstable_blocks_read[i] = 1;
             continue;
         }
 

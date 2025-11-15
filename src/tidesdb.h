@@ -74,7 +74,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_SKIPLIST_PROBABILITY           0.25
 #define TDB_DEFAULT_BLOOM_FILTER_FP_RATE           0.01
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
-#define TDB_DEFAULT_WAL_RECOVERY_POLL_INTERVAL_MS  100
+#define TDB_DEFAULT_WAL_RECOVERY_POLL_INTERVAL_MS  100000
 #define TDB_DEFAULT_WAIT_FOR_WAL_RECOVERY          0
 
 /* limits */

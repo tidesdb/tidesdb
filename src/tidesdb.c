@@ -306,7 +306,7 @@ static int tidesdb_validate_kv_size(const tidesdb_t *db, size_t key_size, size_t
 
 /*
  * tidesdb_build_sstable_index
- * builds a succinct trie index for an existing SSTable by reading it sequentially
+ * builds a succinct trie index for an existing sstable by reading it sequentially
  * @param sst sstable to build index for
  * @param cf column family
  * @return 0 on success, -1 on failure
@@ -1748,6 +1748,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     if (!*db) return TDB_ERR_MEMORY;
 
     memcpy(&(*db)->config, config, sizeof(tidesdb_config_t));
+
+    /* apply defaults for unset config values */
+    if ((*db)->config.wal_recovery_poll_interval_ms <= 0)
+    {
+        (*db)->config.wal_recovery_poll_interval_ms = TDB_DEFAULT_WAL_RECOVERY_POLL_INTERVAL_MS;
+    }
+    /* wait_for_wal_recovery is a boolean flag, no default needed (0 = false is valid) */
     (*db)->column_families = NULL;
     (*db)->num_cfs = 0;
     (*db)->cf_capacity = 0;
@@ -1952,8 +1959,8 @@ int tidesdb_close(tidesdb_t *db)
 
     free(db->column_families);
 
-    /* close all cached block managers before destroying cache
-     * we use lru_cache_free which calls eviction callbacks to properly close them */
+    /* close all cached block managers AFTER freeing sstables
+     * sstable_free needs to access the cache to evict entries */
     if (db->block_manager_cache)
     {
         TDB_DEBUG_LOG("Freeing block manager cache");
@@ -2459,9 +2466,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
     pthread_mutex_unlock(&cf->flush_lock);
 
-    /* wait for all recovered memtable flushes to complete
+    /* wait for all recovered memtable flushes to complete if configured
      * this ensures data is immediately queryable after tidesdb_open returns */
-    if (num_recovered_to_flush > 0)
+    if (num_recovered_to_flush > 0 && db->config.wait_for_wal_recovery)
     {
         TDB_DEBUG_LOG(
             "Waiting for %d recovered memtable flush(es) to complete for column family: %s",
@@ -2472,7 +2479,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         int stable_count = 0;
         while (stable_count < 2)
         {
-            usleep(100000); /* 100ms */
+            usleep(db->config.wal_recovery_poll_interval_ms);
             pthread_mutex_lock(&cf->flush_lock);
             int current_size = (int)queue_size(cf->immutable_memtables);
             pthread_mutex_unlock(&cf->flush_lock);
@@ -2488,6 +2495,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         }
 
         TDB_DEBUG_LOG("All recovered memtable flushes completed for column family: %s", cf->name);
+    }
+    else if (num_recovered_to_flush > 0)
+    {
+        TDB_DEBUG_LOG(
+            "Submitted %d recovered memtable(s) for background flush (wait_for_wal_recovery=false)",
+            num_recovered_to_flush);
     }
 
     /* re-acquire db_lock to add CF to database */
@@ -3989,7 +4002,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         merged_ssts[p] = merged;
     }
 
-    /* re-acquire compaction lock before modifying SSTable array */
+    /* re-acquire compaction lock before modifying sstable array */
     pthread_mutex_lock(&cf->compaction_lock);
 
     pthread_rwlock_wrlock(&cf->cf_lock);
@@ -4563,7 +4576,7 @@ static void *tidesdb_compaction_worker(void *arg)
     /* this avoids keeping all decompressed data in memory during merge */
     if (tidesdb_build_sstable_index(merged, cf) != 0)
     {
-        /* index build failed, but SSTable is still valid -- continue without index */
+        /* index build failed, but sstable is still valid -- continue without index */
         TDB_DEBUG_LOG("Failed to build index for merged SSTable");
     }
 
@@ -5511,8 +5524,9 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
             {
                 if (!bloom_filter_contains(sst->bloom_filter, key, key_size))
                 {
-                    /* definitely not in this SSTable, release and continue */
+                    /* definitely not in this sstable, release and continue */
                     tidesdb_sstable_release(sst);
+                    sst_snapshot[i] = NULL; /* mark as released */
                     continue;
                 }
             }
@@ -5522,13 +5536,18 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
 
             int result = tidesdb_sstable_get(sst, key, key_size, &sst_value, &sst_value_size);
             tidesdb_sstable_release(sst);
+            sst_snapshot[i] = NULL; /* mark as released */
 
             if (result == 0)
             {
                 /* release remaining sstable references */
                 for (int j = i - 1; j >= 0; j--)
                 {
-                    if (sst_snapshot[j]) tidesdb_sstable_release(sst_snapshot[j]);
+                    if (sst_snapshot[j])
+                    {
+                        tidesdb_sstable_release(sst_snapshot[j]);
+                        sst_snapshot[j] = NULL;
+                    }
                 }
                 free(sst_snapshot);
                 *value = sst_value;
@@ -5540,14 +5559,18 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
                 /* release remaining sstable references */
                 for (int j = i - 1; j >= 0; j--)
                 {
-                    if (sst_snapshot[j]) tidesdb_sstable_release(sst_snapshot[j]);
+                    if (sst_snapshot[j])
+                    {
+                        tidesdb_sstable_release(sst_snapshot[j]);
+                        sst_snapshot[j] = NULL;
+                    }
                 }
                 free(sst_snapshot);
                 return TDB_ERR_CORRUPT;
             }
             else if (result == TDB_ERR_NOT_FOUND)
             {
-                /* Key not in this SSTable, continue to next one */
+                /* Key not in this sstable, continue to next one */
                 continue;
             }
             /* else continue to next sstable */

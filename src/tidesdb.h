@@ -280,6 +280,7 @@ typedef struct
  * @param min_key_size size of minimum key
  * @param max_key_size size of maximum key
  * @param num_entries number of entries in this sstable
+ * @param data_end_offset byte offset where KV data ends
  * @param ref_count reference count
  * @param ref_lock lock for reference counting
  */
@@ -295,6 +296,7 @@ struct tidesdb_sstable_t
     size_t min_key_size;
     size_t max_key_size;
     _Atomic int num_entries;
+    uint64_t data_end_offset;
     _Atomic(int) ref_count;
     pthread_mutex_t ref_lock;
 };
@@ -481,7 +483,6 @@ typedef struct
  * @param sstable_cursors array of block manager cursors for sstables
  * @param sstables array of sstable references
  * @param num_sstable_cursors number of sstable cursors
- * @param sstable_blocks_read array tracking blocks read per sstable
  * @param current_key current key
  * @param current_value current value
  * @param current_key_size current key size
@@ -505,7 +506,6 @@ struct tidesdb_iter_t
     block_manager_cursor_t **sstable_cursors;
     tidesdb_sstable_t **sstables;
     int num_sstable_cursors;
-    int *sstable_blocks_read;
     uint8_t *current_key;
     uint8_t *current_value;
     size_t current_key_size;

@@ -4267,8 +4267,7 @@ static void *tidesdb_compaction_worker(void *arg)
         return NULL;
     }
 
-    tidesdb_sstable_acquire(sst1);
-    tidesdb_sstable_acquire(sst2);
+    /* references already acquired by parent thread in tidesdb_compact_parallel */
     job->acquired_refs = 1;
 
     uint64_t new_id = atomic_fetch_add(&cf->next_sstable_id, 1);
@@ -4721,8 +4720,20 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         return -1;
     }
 
+    /* snapshot sstable pointers and acquire references while holding lock
+     * this prevents use-after-free if sstables are modified by another thread */
+    for (int p = 0; p < pairs_to_merge; p++)
+    {
+        jobs[p].sst1 = cf->sstables[p * 2];
+        jobs[p].sst2 = cf->sstables[p * 2 + 1];
+
+        /* acquire references immediately to prevent sstables from being freed */
+        if (jobs[p].sst1) tidesdb_sstable_acquire(jobs[p].sst1);
+        if (jobs[p].sst2) tidesdb_sstable_acquire(jobs[p].sst2);
+    }
+
     /* release read lock -- compaction can proceed without blocking reads
-     * worker threads will acquire their own references to sstables */
+     * we've already acquired references to all sstables we need */
     pthread_rwlock_unlock(&cf->cf_lock);
 
     /* launch worker threads for each pair */
@@ -4732,7 +4743,12 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         if (cf->db->compaction_pool && atomic_load(&cf->db->compaction_pool->shutdown))
         {
             TDB_DEBUG_LOG("Shutdown detected, aborting parallel compaction");
-            /* release semaphore for any waiting threads */
+            /* release references we acquired and semaphore for any waiting threads */
+            for (int i = p; i < pairs_to_merge; i++)
+            {
+                if (jobs[i].sst1) tidesdb_sstable_release(jobs[i].sst1);
+                if (jobs[i].sst2) tidesdb_sstable_release(jobs[i].sst2);
+            }
             sem_post(&semaphore);
             break;
         }
@@ -4740,17 +4756,18 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         sem_wait(&semaphore);
 
         jobs[p].cf = cf;
-        jobs[p].sst1 = cf->sstables[p * 2];
-        jobs[p].sst2 = cf->sstables[p * 2 + 1];
+        /* sst1 and sst2 already set and acquired above */
         jobs[p].result = &merged_sstables[p];
         jobs[p].semaphore = &semaphore;
         jobs[p].error = &errors[p];
 
         if (pthread_create(&threads[p], NULL, tidesdb_compaction_worker, &jobs[p]) != 0)
         {
-            /* thread creation failed, mark as error and release semaphore */
+            /* thread creation failed, mark as error, release references and semaphore */
             errors[p] = 1;
             thread_created[p] = 0;
+            if (jobs[p].sst1) tidesdb_sstable_release(jobs[p].sst1);
+            if (jobs[p].sst2) tidesdb_sstable_release(jobs[p].sst2);
             sem_post(&semaphore);
             TDB_DEBUG_LOG("Failed to create compaction thread for pair %d", p);
         }
@@ -5466,8 +5483,16 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
         sst_snapshot = malloc((size_t)num_ssts * sizeof(tidesdb_sstable_t *));
         if (sst_snapshot)
         {
-            /* copy pointers only -- don't acquire refs yet */
-            memcpy(sst_snapshot, cf->sstables, (size_t)num_ssts * sizeof(tidesdb_sstable_t *));
+            /* copy pointers and acquire references while holding lock
+             * this prevents sstables from being freed during compaction */
+            for (int i = 0; i < num_ssts; i++)
+            {
+                sst_snapshot[i] = cf->sstables[i];
+                if (sst_snapshot[i])
+                {
+                    tidesdb_sstable_acquire(sst_snapshot[i]);
+                }
+            }
         }
     }
     pthread_rwlock_unlock(&cf->cf_lock);
@@ -5480,17 +5505,17 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
             tidesdb_sstable_t *sst = sst_snapshot[i];
             if (!sst) continue;
 
-            /* quick bloom filter check -- no ref count needed */
+            /* reference already acquired while holding lock */
+            /* quick bloom filter check */
             if (sst->bloom_filter)
             {
                 if (!bloom_filter_contains(sst->bloom_filter, key, key_size))
                 {
-                    continue; /* definitely not in this SSTable */
+                    /* definitely not in this SSTable, release and continue */
+                    tidesdb_sstable_release(sst);
+                    continue;
                 }
             }
-
-            /* acquire ref only for sstables we'll actually read */
-            tidesdb_sstable_acquire(sst);
 
             uint8_t *sst_value = NULL;
             size_t sst_value_size = 0;
@@ -5500,6 +5525,11 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
 
             if (result == 0)
             {
+                /* release remaining sstable references */
+                for (int j = i - 1; j >= 0; j--)
+                {
+                    if (sst_snapshot[j]) tidesdb_sstable_release(sst_snapshot[j]);
+                }
                 free(sst_snapshot);
                 *value = sst_value;
                 *value_size = sst_value_size;
@@ -5507,6 +5537,11 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
             }
             else if (result == TDB_ERR_CORRUPT)
             {
+                /* release remaining sstable references */
+                for (int j = i - 1; j >= 0; j--)
+                {
+                    if (sst_snapshot[j]) tidesdb_sstable_release(sst_snapshot[j]);
+                }
                 free(sst_snapshot);
                 return TDB_ERR_CORRUPT;
             }
@@ -5518,6 +5553,11 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
             /* else continue to next sstable */
         }
 
+        /* release all remaining references */
+        for (int i = 0; i < num_ssts; i++)
+        {
+            if (sst_snapshot[i]) tidesdb_sstable_release(sst_snapshot[i]);
+        }
         free(sst_snapshot);
     }
     return -1;

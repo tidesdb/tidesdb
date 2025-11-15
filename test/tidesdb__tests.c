@@ -5245,8 +5245,8 @@ static void test_parallel_compaction_race(void)
         tidesdb_txn_begin_read(db, cf, &txn);
         char key[32];
         snprintf(key, sizeof(key), "sst%d_key%d", rand() % 16, rand() % 100);
-        uint8_t *value;
-        size_t value_size;
+        uint8_t *value = NULL;
+        size_t value_size = 0;
         tidesdb_txn_get(txn, (uint8_t *)key, strlen(key), &value, &value_size);
         if (value) free(value);
         tidesdb_txn_free(txn);

@@ -42,10 +42,10 @@ static inline void serialize_kv_header(uint8_t *buf, uint8_t version, uint8_t fl
 {
     buf[0] = version;
     buf[1] = flags;
-    memcpy(buf + 2, &key_size, sizeof(uint32_t));
-    memcpy(buf + 6, &value_size, sizeof(uint32_t));
-    memcpy(buf + 10, &ttl, sizeof(int64_t));
-    memcpy(buf + 18, &seq, sizeof(uint64_t));
+    encode_uint32_le(buf + 2, key_size);
+    encode_uint32_le(buf + 6, value_size);
+    encode_int64_le(buf + 10, ttl);
+    encode_uint64_le(buf + 18, seq);
 }
 
 /*
@@ -65,16 +65,12 @@ static inline void deserialize_kv_header(const uint8_t *buf, uint8_t *version, u
 {
     *version = buf[0];
     *flags = buf[1];
-    memcpy(key_size, buf + 2, sizeof(uint32_t));
-    memcpy(value_size, buf + 6, sizeof(uint32_t));
-    memcpy(ttl, buf + 10, sizeof(int64_t));
+    *key_size = decode_uint32_le(buf + 2);
+    *value_size = decode_uint32_le(buf + 6);
+    *ttl = decode_int64_le(buf + 10);
     if (seq && *version >= 2)
     {
-        memcpy(seq, buf + 18, sizeof(uint64_t));
-    }
-    else if (seq)
-    {
-        *seq = 0; /* v1 format doesn't have sequence numbers */
+        *seq = decode_uint64_le(buf + 18);
     }
 }
 
@@ -2464,10 +2460,10 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         if (entry_count > 0 && entries)
         {
             /* insertion sort (fine for recovery, happens once) */
-            for (int i = 1; i < entry_count; i++)
+            for (int sort_i = 1; sort_i < entry_count; sort_i++)
             {
-                wal_entry_t temp = entries[i];
-                int j = i - 1;
+                wal_entry_t temp = entries[sort_i];
+                int j = sort_i - 1;
                 while (j >= 0 && entries[j].seq > temp.seq)
                 {
                     entries[j + 1] = entries[j];
@@ -2479,9 +2475,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
         /* replay entries in sequence order */
         int entries_recovered = 0;
-        for (int i = 0; i < entry_count; i++)
+        for (int replay_i = 0; replay_i < entry_count; replay_i++)
         {
-            wal_entry_t *e = &entries[i];
+            wal_entry_t *e = &entries[replay_i];
 
             if (e->flags & TDB_KV_FLAG_TOMBSTONE)
             {
@@ -2638,9 +2634,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         while (stable_count < 2)
         {
             usleep(db->config.wal_recovery_poll_interval_ms);
-            pthread_mutex_lock(&cf->flush_lock);
+            /* queue is atomic for queue_size */
             int current_size = (int)queue_size(cf->immutable_memtables);
-            pthread_mutex_unlock(&cf->flush_lock);
 
             if (current_size == 0)
             {
@@ -3095,7 +3090,6 @@ static int tidesdb_rotate_memtable(tidesdb_column_family_t *cf)
 
     TDB_DEBUG_LOG("Rotating memtable for column family: %s", cf->name);
 
-    /* allocate new memtable before acquiring lock to reduce lock hold time */
     tidesdb_memtable_t *new_memtable = tidesdb_memtable_new(cf);
     if (!new_memtable) return -1;
 
@@ -5602,26 +5596,24 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
         sst_snapshot = malloc((size_t)num_ssts * sizeof(tidesdb_sstable_t *));
         if (sst_snapshot)
         {
-            pthread_mutex_lock(&cf->compaction_lock);
-
+            /* atomic load + ref counting prevents use-after-free */
             int actual_count = atomic_load(&cf->num_sstables);
             atomic_thread_fence(memory_order_acquire);
             if (actual_count > num_ssts) actual_count = num_ssts;
 
             for (int i = 0; i < actual_count; i++)
             {
-                sst_snapshot[i] = cf->sstables[i];
-                if (sst_snapshot[i])
+                tidesdb_sstable_t *sst = cf->sstables[i];
+                if (sst && tidesdb_sstable_acquire(sst))
                 {
-                    if (!tidesdb_sstable_acquire(sst_snapshot[i]))
-                    {
-                        sst_snapshot[i] = NULL; /* skip this sstable */
-                    }
+                    sst_snapshot[i] = sst;
+                }
+                else
+                {
+                    sst_snapshot[i] = NULL;
                 }
             }
             num_ssts = actual_count;
-
-            pthread_mutex_unlock(&cf->compaction_lock);
         }
     }
 
@@ -5952,7 +5944,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             block_manager_block_write(mt->wal, wal_block);
         }
 
-        /* skip list insert (already lock-free, uses atomic CAS) */
         int result = 0;
         if (op->type == TIDESDB_OP_PUT)
         {
@@ -6448,20 +6439,19 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
             return TDB_ERR_MEMORY;
         }
 
-        /* hold compaction_lock while snapshotting to prevent use-after-free */
-        pthread_mutex_lock(&cf->compaction_lock);
+        /* atomic load + ref counting prevents use-after-free */
         for (int i = 0; i < num_ssts; i++)
         {
-            (*iter)->sstables[i] = cf->sstables[i];
-            if (cf->sstables[i])
+            tidesdb_sstable_t *sst = cf->sstables[i];
+            if (sst && tidesdb_sstable_acquire(sst))
             {
-                if (!tidesdb_sstable_acquire(cf->sstables[i]))
-                {
-                    (*iter)->sstables[i] = NULL; /* sstable being freed, skip */
-                }
+                (*iter)->sstables[i] = sst;
+            }
+            else
+            {
+                (*iter)->sstables[i] = NULL;
             }
         }
-        pthread_mutex_unlock(&cf->compaction_lock);
     }
 
     /* now set up cursors without holding the lock */

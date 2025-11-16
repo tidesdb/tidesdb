@@ -9,23 +9,23 @@ It is not a full-featured database, but rather a library that can be used to bui
 [![Linux Build Status](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml/badge.svg)](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml)
 
 ## Features
-- Memtables utilize a lock-free skip list with RCU memory management, epoch-based garbage collection, and atomic operations. Readers never block and scale linearly with CPU cores, while writers use lightweight mutex serialization per column family
-- ACID transactions that are atomic, consistent, isolated, and durable across multiple column families. Point reads use READ COMMITTED isolation, iterators use snapshot isolation with reference counting.
+- Memtables utilize a lock-free skip list with atomic CAS operations, arena-based allocation, and reference counting. Reads are completely lock-free and scale linearly with CPU cores. Writes are also lock-free using atomic operations and sequence numbers for ordering.
+- ACID transactions that are atomic, consistent, isolated, and durable across multiple column families. Reads see the latest committed data, while iterators use snapshot isolation with reference counting to prevent premature deletion during concurrent operations.
 - Column families provide isolated key-value stores, each with independent configuration, memtables, SSTables, and write-ahead logs.
 - Bidirectional iterators support forward and backward traversal with heap-based merge-sort across memtables and SSTables. Lock-free iteration with reference counting prevents premature deletion during concurrent operations.
 - Efficient seek operations using O(log n) skip list positioning and optional succinct trie block indexes with LOUDS encoding for direct key-to-block mapping in SSTables.
-- Durability through write-ahead log (WAL) with automatic recovery on startup that reconstructs memtables from persisted logs.
-- Automatic background compaction when SSTable count reaches configured threshold, or manual parallel compaction via API. Compaction removes tombstones and expired TTL entries.
+- Durability through write-ahead log (WAL) with sequence numbers for ordering and automatic recovery on startup that reconstructs memtables from persisted logs.
+- Automatic background compaction when SSTable count reaches configured threshold, or manual parallel compaction via API. Compaction removes tombstones and expired TTL entries. Locks only serialize array modifications, not reads.
 - Optional bloom filters provide probabilistic key existence checks to reduce disk reads. Configurable false positive rate per column family.
 - Optional compression using Snappy, LZ4, or ZSTD for both SSTables and WAL entries. Configurable per column family.
 - TTL (time-to-live) support for key-value pairs with automatic expiration. Expired entries are skipped during reads and removed during compaction.
 - Custom comparators allow registration of user-defined key comparison functions. Built-in comparators include memcmp, string, and numeric.
-- Memory optimizations include arena-based allocation for skip list nodes and inline storage for small keys/values (≤24 bytes) to reduce malloc overhead and pointer indirection.
-- Two-tier caching system with block-level LRU cache for frequently accessed data and configurable file handle cache to limit open file descriptors.
+- Memory optimizations include arena-based allocation for skip list nodes with atomic chaining, inline storage for small keys/values (≤24 bytes), and lock-free node pooling to reduce malloc overhead.
+- Lock-free block manager cache with atomic LRU operations and configurable file handle cache to limit open file descriptors.
 - Shared thread pools for background flush and compaction operations with configurable thread counts at the database level.
 - Two sync modes: `TDB_SYNC_NONE` for maximum performance (OS-managed flushing) and `TDB_SYNC_FULL` for maximum durability (fsync on every write).
-- Cross-platform support for Linux, macOS, and Windows on both 32-bit and 64-bit architectures with platform abstraction layer.
-- Full file portability with explicit little-endian serialization throughout; database files can be copied between any platform (x86, ARM, RISC-V) and architecture (32-bit, 64-bit) without conversion.
+- Cross-platform support for Linux, macOS, and Windows on both 32-bit and 64-bit architectures with comprehensive platform abstraction layer.
+- Full file portability with explicit little-endian serialization throughout; database files can be copied between any platform (x86, ARM, RISC-V, PowerPC) and architecture (32-bit, 64-bit) without conversion.
 - Clean C API that returns 0 on success and negative error codes on failure for straightforward error handling.
 
 ## Getting Started

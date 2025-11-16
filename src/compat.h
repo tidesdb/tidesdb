@@ -439,7 +439,45 @@ static inline unsigned char _atomic_load_u8(volatile unsigned char *ptr)
 #define memory_order_acquire   1
 #define memory_order_release   2
 #define memory_order_seq_cst   3
+
+/* atomic compare exchange for pointers (MSVC compatibility) */
+/*
+ * atomic_compare_exchange_strong_ptr
+ * @param ptr pointer to atomic pointer
+ * @param expected pointer to expected value
+ * @param desired new value to store
+ * @return 1 if successful, 0 if failed
+ */
+static inline int atomic_compare_exchange_strong_ptr(void *volatile *ptr, void **expected,
+                                                     void *desired)
+{
+    void *old =
+        InterlockedCompareExchangePointer((PVOID volatile *)ptr, (PVOID)desired, (PVOID)*expected);
+    if (old == *expected)
+    {
+        return 1;
+    }
+    *expected = old;
+    return 0;
+}
+
 #endif /* _MSC_VER < 1930 */
+
+/* atomic compare exchange for pointers (GCC/Clang/modern MSVC with C11 atomics) */
+#if !defined(_MSC_VER) || _MSC_VER >= 1930
+/*
+ * atomic_compare_exchange_strong_ptr
+ * @param ptr pointer to atomic pointer
+ * @param expected pointer to expected value
+ * @param desired new value to store
+ * @return 1 if successful, 0 if failed
+ */
+static inline int atomic_compare_exchange_strong_ptr(_Atomic(void *) *ptr, void **expected,
+                                                     void *desired)
+{
+    return atomic_compare_exchange_strong(ptr, expected, desired);
+}
+#endif
 
 /* access flags are normally defined in unistd.h, which unavailable under MSVC
  *

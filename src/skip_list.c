@@ -141,8 +141,8 @@ static void *skip_list_arena_alloc(skip_list_arena_t **arena_ptr, size_t size)
             new_arena->next = arena;
 
             /* try to swap in the new arena */
-            if (!atomic_compare_exchange_strong_ptr((void *volatile *)arena_ptr, (void **)&expected,
-                                                    new_arena))
+            if (!atomic_compare_exchange_strong_ptr((_Atomic(void *) *)arena_ptr,
+                                                    (void **)&expected, new_arena))
             {
                 /* another thread already created a new arena, free ours */
                 free(new_arena->buffer);

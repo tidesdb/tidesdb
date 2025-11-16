@@ -463,6 +463,22 @@ static inline int atomic_compare_exchange_strong_ptr(void *volatile *ptr, void *
 
 #endif /* _MSC_VER < 1930 */
 
+/* atomic compare exchange for pointers (modern MSVC >= 2022 with C11 atomics) */
+#if defined(_MSC_VER) && _MSC_VER >= 1930
+/*
+ * atomic_compare_exchange_strong_ptr
+ * @param ptr pointer to atomic pointer
+ * @param expected pointer to expected value
+ * @param desired new value to store
+ * @return 1 if successful, 0 if failed
+ */
+static inline int atomic_compare_exchange_strong_ptr(_Atomic(void *) *ptr, void **expected,
+                                                     void *desired)
+{
+    return atomic_compare_exchange_strong(ptr, expected, desired);
+}
+#endif
+
 /* access flags are normally defined in unistd.h, which unavailable under MSVC
  *
  * instead, define the flags as documented at
@@ -1118,20 +1134,6 @@ static inline int sem_post(sem_t *sem)
     return 0;
 }
 
-/* atomic compare exchange for pointers (macOS with C11 atomics) */
-/*
- * atomic_compare_exchange_strong_ptr
- * @param ptr pointer to atomic pointer
- * @param expected pointer to expected value
- * @param desired new value to store
- * @return 1 if successful, 0 if failed
- */
-static inline int atomic_compare_exchange_strong_ptr(_Atomic(void *) *ptr, void **expected,
-                                                     void *desired)
-{
-    return atomic_compare_exchange_strong(ptr, expected, desired);
-}
-
 #else /* posix systems */
 #include <dirent.h>
 #include <fcntl.h>
@@ -1150,20 +1152,6 @@ typedef pthread_mutex_t mutex_t;
 typedef pthread_cond_t cond_t;
 typedef pthread_mutex_t crit_section_t;
 typedef pthread_rwlock_t rwlock_t;
-
-/* atomic compare exchange for pointers (POSIX/macOS with C11 atomics) */
-/*
- * atomic_compare_exchange_strong_ptr
- * @param ptr pointer to atomic pointer
- * @param expected pointer to expected value
- * @param desired new value to store
- * @return 1 if successful, 0 if failed
- */
-static inline int atomic_compare_exchange_strong_ptr(_Atomic(void *) *ptr, void **expected,
-                                                     void *desired)
-{
-    return atomic_compare_exchange_strong(ptr, expected, desired);
-}
 #endif
 
 /*

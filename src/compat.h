@@ -502,7 +502,8 @@ static inline int atomic_compare_exchange_strong_ptr(void *volatile *ptr, void *
 #endif
 
 #if defined(_MSC_VER)
-#define CLOCK_REALTIME 0
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
 
 struct timezone
 {
@@ -1115,6 +1116,20 @@ static inline int sem_post(sem_t *sem)
 {
     dispatch_semaphore_signal(*sem);
     return 0;
+}
+
+/* atomic compare exchange for pointers (macOS with C11 atomics) */
+/*
+ * atomic_compare_exchange_strong_ptr
+ * @param ptr pointer to atomic pointer
+ * @param expected pointer to expected value
+ * @param desired new value to store
+ * @return 1 if successful, 0 if failed
+ */
+static inline int atomic_compare_exchange_strong_ptr(_Atomic(void *) *ptr, void **expected,
+                                                     void *desired)
+{
+    return atomic_compare_exchange_strong(ptr, expected, desired);
 }
 
 #else /* posix systems */

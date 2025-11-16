@@ -13,7 +13,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - ACID transactions that are atomic, consistent, isolated, and durable across multiple column families. Point reads use READ COMMITTED isolation, iterators use snapshot isolation with reference counting.
 - Column families provide isolated key-value stores, each with independent configuration, memtables, SSTables, and write-ahead logs.
 - Bidirectional iterators support forward and backward traversal with heap-based merge-sort across memtables and SSTables. Lock-free iteration with reference counting prevents premature deletion during concurrent operations.
-- Efficient seek operations using O(log n) skip list positioning and optional succinct trie block indexes with LOUDS encoding for direct key-to-block-number mapping in SSTables.
+- Efficient seek operations using O(log n) skip list positioning and optional succinct trie block indexes with LOUDS encoding for direct key-to-block mapping in SSTables.
 - Durability through write-ahead log (WAL) with automatic recovery on startup that reconstructs memtables from persisted logs.
 - Automatic background compaction when SSTable count reaches configured threshold, or manual parallel compaction via API. Compaction removes tombstones and expired TTL entries.
 - Optional bloom filters provide probabilistic key existence checks to reduce disk reads. Configurable false positive rate per column family.

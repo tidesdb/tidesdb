@@ -73,6 +73,7 @@ queue_t *queue_new(void)
     if (queue == NULL) return NULL;
 
     queue->head = NULL;
+    atomic_store(&queue->atomic_head, NULL);
     queue->tail = NULL;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
     queue->shutdown = 0;
@@ -117,6 +118,7 @@ int queue_enqueue(queue_t *queue, void *data)
     if (queue->tail == NULL)
     {
         queue->head = node;
+        atomic_store_explicit(&queue->atomic_head, node, memory_order_release);
         queue->tail = node;
     }
     else
@@ -153,6 +155,7 @@ void *queue_dequeue(queue_t *queue)
     void *data = node->data;
 
     queue->head = node->next;
+    atomic_store_explicit(&queue->atomic_head, node->next, memory_order_release);
     if (queue->head == NULL)
     {
         /* queue is now empty */
@@ -204,6 +207,7 @@ void *queue_dequeue_wait(queue_t *queue)
     void *data = node->data;
 
     queue->head = node->next;
+    atomic_store_explicit(&queue->atomic_head, node->next, memory_order_release);
     if (queue->head == NULL)
     {
         queue->tail = NULL;
@@ -297,25 +301,24 @@ void *queue_peek_at(queue_t *queue, size_t index)
 {
     if (!queue) return NULL;
 
-    pthread_mutex_lock(&queue->lock);
-
-    if (index >= queue->size)
+    /* lock-free read using atomic_head - no lock needed!
+     * this is safe because:
+     * 1. nodes are never freed while in queue (only when dequeued)
+     * 2. atomic_head is updated with release semantics
+     * 3. we use acquire semantics to see all previous writes */
+    size_t size = atomic_load_explicit(&queue->size, memory_order_relaxed);
+    if (index >= size)
     {
-        pthread_mutex_unlock(&queue->lock);
         return NULL;
     }
 
-    queue_node_t *current = queue->head;
+    queue_node_t *current = atomic_load_explicit(&queue->atomic_head, memory_order_acquire);
     for (size_t i = 0; i < index && current; i++)
     {
         current = current->next;
     }
 
-    void *data = current ? current->data : NULL;
-
-    pthread_mutex_unlock(&queue->lock);
-
-    return data;
+    return current ? current->data : NULL;
 }
 
 void queue_free(queue_t *queue)

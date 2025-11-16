@@ -280,6 +280,7 @@ typedef struct
  * @param min_key_size size of minimum key
  * @param max_key_size size of maximum key
  * @param num_entries number of entries in this sstable
+ * @param data_end_offset byte offset where KV data ends
  * @param ref_count reference count
  * @param ref_lock lock for reference counting
  */
@@ -295,6 +296,7 @@ struct tidesdb_sstable_t
     size_t min_key_size;
     size_t max_key_size;
     _Atomic int num_entries;
+    uint64_t data_end_offset;
     _Atomic(int) ref_count;
     pthread_mutex_t ref_lock;
 };
@@ -316,6 +318,7 @@ typedef struct
     uint64_t id;
     time_t created_at;
     _Atomic(int) ref_count;
+    _Atomic(int) flushed; /* 1 if flushed to sstable, 0 otherwise */
     pthread_mutex_t ref_lock;
 } tidesdb_memtable_t;
 
@@ -481,12 +484,12 @@ typedef struct
  * @param sstable_cursors array of block manager cursors for sstables
  * @param sstables array of sstable references
  * @param num_sstable_cursors number of sstable cursors
- * @param sstable_blocks_read array tracking blocks read per sstable
  * @param current_key current key
  * @param current_value current value
  * @param current_key_size current key size
  * @param current_value_size current value size
  * @param current_deleted whether current entry is deleted
+ * @param current_source_type source type of current entry (0=memtable, 1=immutable, 2=sstable)
  * @param valid whether iterator is at a valid position
  * @param direction iteration direction (1 = forward, -1 = backward)
  * @param heap array of pending entries from each source (min-heap)
@@ -505,17 +508,20 @@ struct tidesdb_iter_t
     block_manager_cursor_t **sstable_cursors;
     tidesdb_sstable_t **sstables;
     int num_sstable_cursors;
-    int *sstable_blocks_read;
     uint8_t *current_key;
     uint8_t *current_value;
     size_t current_key_size;
     size_t current_value_size;
     uint8_t current_deleted;
+    int current_source_type;
     int valid;
     int direction;
     tidesdb_iter_entry_t *heap;
     int heap_size;
     int heap_capacity;
+    /* cached comparator to avoid atomic ops on every comparison */
+    int (*comparator)(const uint8_t *, size_t, const uint8_t *, size_t, void *);
+    void *comparator_ctx;
 };
 
 /*

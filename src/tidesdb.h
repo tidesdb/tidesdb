@@ -488,6 +488,7 @@ typedef struct
  * @param current_key_size current key size
  * @param current_value_size current value size
  * @param current_deleted whether current entry is deleted
+ * @param current_source_type source type of current entry (0=memtable, 1=immutable, 2=sstable)
  * @param valid whether iterator is at a valid position
  * @param direction iteration direction (1 = forward, -1 = backward)
  * @param heap array of pending entries from each source (min-heap)
@@ -511,6 +512,7 @@ struct tidesdb_iter_t
     size_t current_key_size;
     size_t current_value_size;
     uint8_t current_deleted;
+    int current_source_type;
     int valid;
     int direction;
     tidesdb_iter_entry_t *heap;

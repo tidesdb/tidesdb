@@ -723,6 +723,32 @@ static void heap_swap(tidesdb_iter_entry_t *heap, int i, int j)
 }
 
 /*
+ * compare_keys_iter
+ * fast key comparison using cached comparator from iterator
+ * @param iter iterator with cached comparator
+ * @param key1 first key
+ * @param key1_size size of first key
+ * @param key2 second key
+ * @param key2_size size of second key
+ * @return negative if key1 < key2, zero if equal, positive if key1 > key2
+ */
+static inline int compare_keys_iter(tidesdb_iter_t *iter, const uint8_t *key1, size_t key1_size,
+                                    const uint8_t *key2, size_t key2_size)
+{
+    if (iter->comparator)
+    {
+        return iter->comparator(key1, key1_size, key2, key2_size, iter->comparator_ctx);
+    }
+    /* fallback to memcmp */
+    size_t min_size = key1_size < key2_size ? key1_size : key2_size;
+    int cmp = memcmp(key1, key2, min_size);
+    if (cmp != 0) return cmp;
+    if (key1_size < key2_size) return -1;
+    if (key1_size > key2_size) return 1;
+    return 0;
+}
+
+/*
  * heap_sift_down
  * sifts an entry down the heap
  * @param iter iterator
@@ -741,25 +767,15 @@ static void heap_sift_down(tidesdb_iter_t *iter, int idx)
 
         if (left < size)
         {
-            const uint8_t *left_key = iter->heap[left].key;
-            const uint8_t *best_key = iter->heap[best].key;
-            size_t left_size = iter->heap[left].key_size;
-            size_t best_size = iter->heap[best].key_size;
-            size_t min_size = (left_size < best_size) ? left_size : best_size;
-            int cmp = memcmp(left_key, best_key, min_size);
-            if (cmp == 0) cmp = (left_size < best_size) ? -1 : (left_size > best_size) ? 1 : 0;
+            int cmp = compare_keys_iter(iter, iter->heap[left].key, iter->heap[left].key_size,
+                                        iter->heap[best].key, iter->heap[best].key_size);
             if (forward ? (cmp < 0) : (cmp > 0)) best = left;
         }
 
         if (right < size)
         {
-            const uint8_t *right_key = iter->heap[right].key;
-            const uint8_t *best_key = iter->heap[best].key;
-            size_t right_size = iter->heap[right].key_size;
-            size_t best_size = iter->heap[best].key_size;
-            size_t min_size = (right_size < best_size) ? right_size : best_size;
-            int cmp = memcmp(right_key, best_key, min_size);
-            if (cmp == 0) cmp = (right_size < best_size) ? -1 : (right_size > best_size) ? 1 : 0;
+            int cmp = compare_keys_iter(iter, iter->heap[right].key, iter->heap[right].key_size,
+                                        iter->heap[best].key, iter->heap[best].key_size);
             if (forward ? (cmp < 0) : (cmp > 0)) best = right;
         }
 
@@ -783,13 +799,8 @@ static void heap_sift_up(tidesdb_iter_t *iter, int idx)
     while (idx > 0)
     {
         int parent = (idx - 1) / 2;
-        const uint8_t *idx_key = iter->heap[idx].key;
-        const uint8_t *parent_key = iter->heap[parent].key;
-        size_t idx_size = iter->heap[idx].key_size;
-        size_t parent_size = iter->heap[parent].key_size;
-        size_t min_size = (idx_size < parent_size) ? idx_size : parent_size;
-        int cmp = memcmp(idx_key, parent_key, min_size);
-        if (cmp == 0) cmp = (idx_size < parent_size) ? -1 : (idx_size > parent_size) ? 1 : 0;
+        int cmp = compare_keys_iter(iter, iter->heap[idx].key, iter->heap[idx].key_size,
+                                    iter->heap[parent].key, iter->heap[parent].key_size);
         if (forward ? (cmp >= 0) : (cmp <= 0)) break;
 
         heap_swap(iter->heap, idx, parent);
@@ -849,9 +860,10 @@ static int heap_pop(tidesdb_iter_t *iter, tidesdb_iter_entry_t *entry)
  * iter_refill_from_memtable
  * refills iterator from active memtable
  * @param iter iterator
+ * @param current_time cached current time for ttl checks
  * @return 0 on success, -1 on failure
  */
-static int iter_refill_from_memtable(tidesdb_iter_t *iter)
+static int iter_refill_from_memtable(tidesdb_iter_t *iter, time_t current_time)
 {
     if (!iter->memtable_cursor) return 0;
 
@@ -868,21 +880,27 @@ static int iter_refill_from_memtable(tidesdb_iter_t *iter)
             0)
             break;
 
-        if (ttl > 0 && time(NULL) > ttl) continue;
+        if (ttl > 0 && current_time > ttl) continue;
         if (deleted) continue;
 
-        uint8_t *entry_key = malloc(k_size);
-        uint8_t *entry_value = v_size > 0 ? malloc(v_size) : NULL;
-
-        if (!entry_key || (v_size > 0 && !entry_value))
+        /* single allocation for key+value to reduce malloc overhead */
+        uint8_t *entry_key;
+        uint8_t *entry_value = NULL;
+        if (v_size > 0)
         {
-            if (entry_key) free(entry_key);
-            if (entry_value) free(entry_value);
-            return -1;
+            uint8_t *combined = malloc(k_size + v_size);
+            if (!combined) return -1;
+            entry_key = combined;
+            entry_value = combined + k_size;
+            memcpy(entry_key, k, k_size);
+            memcpy(entry_value, v, v_size);
         }
-
-        memcpy(entry_key, k, k_size);
-        if (v_size > 0) memcpy(entry_value, v, v_size);
+        else
+        {
+            entry_key = malloc(k_size);
+            if (!entry_key) return -1;
+            memcpy(entry_key, k, k_size);
+        }
 
         tidesdb_iter_entry_t entry = {.key = entry_key,
                                       .key_size = k_size,
@@ -903,9 +921,10 @@ static int iter_refill_from_memtable(tidesdb_iter_t *iter)
  * refills iterator from immutable memtable
  * @param iter iterator
  * @param idx immutable memtable index
+ * @param current_time cached current time for ttl checks
  * @return 0 on success, -1 on failure
  */
-static int iter_refill_from_immutable(tidesdb_iter_t *iter, int idx)
+static int iter_refill_from_immutable(tidesdb_iter_t *iter, int idx, time_t current_time)
 {
     if (idx >= iter->num_immutable_cursors || !iter->immutable_memtable_cursors[idx]) return 0;
 
@@ -922,30 +941,38 @@ static int iter_refill_from_immutable(tidesdb_iter_t *iter, int idx)
                                  &ttl, &deleted) != 0)
             break;
 
-        if (ttl > 0 && time(NULL) > ttl) continue;
+        if (ttl > 0 && current_time > ttl) continue;
         if (deleted) continue;
 
-        tidesdb_iter_entry_t entry = {.key = malloc(k_size),
+        /* single allocation for key+value to reduce malloc overhead */
+        uint8_t *entry_key;
+        uint8_t *entry_value = NULL;
+        if (v_size > 0)
+        {
+            uint8_t *combined = malloc(k_size + v_size);
+            if (!combined) return -1;
+            entry_key = combined;
+            entry_value = combined + k_size;
+            memcpy(entry_key, k, k_size);
+            memcpy(entry_value, v, v_size);
+        }
+        else
+        {
+            entry_key = malloc(k_size);
+            if (!entry_key) return -1;
+            memcpy(entry_key, k, k_size);
+        }
+
+        tidesdb_iter_entry_t entry = {.key = entry_key,
                                       .key_size = k_size,
-                                      .value = v_size > 0 ? malloc(v_size) : NULL,
+                                      .value = entry_value,
                                       .value_size = v_size,
                                       .deleted = deleted,
                                       .ttl = ttl,
                                       .source_type = 1,
                                       .source_index = idx};
 
-        if (entry.key && (v_size == 0 || entry.value))
-        {
-            memcpy(entry.key, k, k_size);
-            if (v_size > 0 && entry.value)
-            {
-                memcpy(entry.value, v, v_size);
-            }
-            return heap_push(iter, &entry);
-        }
-        if (entry.key) free(entry.key);
-        if (entry.value) free(entry.value);
-        return -1;
+        return heap_push(iter, &entry);
     }
     return 0;
 }
@@ -955,9 +982,10 @@ static int iter_refill_from_immutable(tidesdb_iter_t *iter, int idx)
  * refills iterator from sstable
  * @param iter iterator
  * @param idx sstable index
+ * @param current_time cached current time for ttl checks
  * @return 0 on success, -1 on failure
  */
-static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
+static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx, time_t current_time)
 {
     if (idx >= iter->num_sstable_cursors || !iter->sstable_cursors[idx]) return 0;
 
@@ -990,7 +1018,7 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
             break;
         }
 
-        if (ttl > 0 && time(NULL) > ttl)
+        if (ttl > 0 && current_time > ttl)
         {
             free(k);
             free(v);
@@ -1025,9 +1053,10 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx)
  * iter_refill_from_memtable_backward
  * refills iterator from active memtable backward
  * @param iter iterator
+ * @param current_time cached current time for ttl checks
  * @return 0 on success, -1 on failure
  */
-static int iter_refill_from_memtable_backward(tidesdb_iter_t *iter)
+static int iter_refill_from_memtable_backward(tidesdb_iter_t *iter, time_t current_time)
 {
     if (!iter->memtable_cursor) return 0;
 
@@ -1044,7 +1073,7 @@ static int iter_refill_from_memtable_backward(tidesdb_iter_t *iter)
         if (skip_list_cursor_get(iter->memtable_cursor, &k, &k_size, &v, &v_size, &ttl, &deleted) ==
             0)
         {
-            if (ttl > 0 && time(NULL) > ttl)
+            if (ttl > 0 && current_time > ttl)
             {
                 skip_list_cursor_prev(iter->memtable_cursor);
                 return 0;
@@ -1056,22 +1085,35 @@ static int iter_refill_from_memtable_backward(tidesdb_iter_t *iter)
                 return 0;
             }
 
-            tidesdb_iter_entry_t entry = {.key = malloc(k_size),
+            /* single allocation for key+value to reduce malloc overhead */
+            uint8_t *entry_key;
+            uint8_t *entry_value = NULL;
+            if (v_size > 0)
+            {
+                uint8_t *combined = malloc(k_size + v_size);
+                if (!combined) return -1;
+                entry_key = combined;
+                entry_value = combined + k_size;
+                memcpy(entry_key, k, k_size);
+                memcpy(entry_value, v, v_size);
+            }
+            else
+            {
+                entry_key = malloc(k_size);
+                if (!entry_key) return -1;
+                memcpy(entry_key, k, k_size);
+            }
+
+            tidesdb_iter_entry_t entry = {.key = entry_key,
                                           .key_size = k_size,
-                                          .value = v_size > 0 ? malloc(v_size) : NULL,
+                                          .value = entry_value,
                                           .value_size = v_size,
                                           .deleted = deleted,
                                           .ttl = ttl,
                                           .source_type = 0,
                                           .source_index = 0};
 
-            if (entry.key && (v_size == 0 || entry.value))
             {
-                memcpy(entry.key, k, k_size);
-                if (v_size > 0 && entry.value)
-                {
-                    memcpy(entry.value, v, v_size);
-                }
                 /* move backward for next call */
                 skip_list_node_t *old_pos = iter->memtable_cursor->current;
                 skip_list_cursor_prev(iter->memtable_cursor);
@@ -1085,9 +1127,6 @@ static int iter_refill_from_memtable_backward(tidesdb_iter_t *iter)
                 }
                 return heap_push(iter, &entry);
             }
-            if (entry.key) free(entry.key);
-            if (entry.value) free(entry.value);
-            return -1;
         }
     }
     return 0;
@@ -1098,9 +1137,10 @@ static int iter_refill_from_memtable_backward(tidesdb_iter_t *iter)
  * refills iterator from immutable memtable backward
  * @param iter iterator
  * @param idx immutable memtable index
+ * @param current_time cached current time for ttl checks
  * @return 0 on success, -1 on failure
  */
-static int iter_refill_from_immutable_backward(tidesdb_iter_t *iter, int idx)
+static int iter_refill_from_immutable_backward(tidesdb_iter_t *iter, int idx, time_t current_time)
 {
     if (idx >= iter->num_immutable_cursors || !iter->immutable_memtable_cursors[idx]) return 0;
 
@@ -1118,7 +1158,7 @@ static int iter_refill_from_immutable_backward(tidesdb_iter_t *iter, int idx)
         if (skip_list_cursor_get(iter->immutable_memtable_cursors[idx], &k, &k_size, &v, &v_size,
                                  &ttl, &deleted) == 0)
         {
-            if (ttl > 0 && time(NULL) > ttl)
+            if (ttl > 0 && current_time > ttl)
             {
                 /* skip expired, move backward and return */
                 skip_list_cursor_prev(iter->immutable_memtable_cursors[idx]);
@@ -1132,22 +1172,35 @@ static int iter_refill_from_immutable_backward(tidesdb_iter_t *iter, int idx)
                 return 0;
             }
 
-            tidesdb_iter_entry_t entry = {.key = malloc(k_size),
+            /* single allocation for key+value to reduce malloc overhead */
+            uint8_t *entry_key;
+            uint8_t *entry_value = NULL;
+            if (v_size > 0)
+            {
+                uint8_t *combined = malloc(k_size + v_size);
+                if (!combined) return -1;
+                entry_key = combined;
+                entry_value = combined + k_size;
+                memcpy(entry_key, k, k_size);
+                memcpy(entry_value, v, v_size);
+            }
+            else
+            {
+                entry_key = malloc(k_size);
+                if (!entry_key) return -1;
+                memcpy(entry_key, k, k_size);
+            }
+
+            tidesdb_iter_entry_t entry = {.key = entry_key,
                                           .key_size = k_size,
-                                          .value = v_size > 0 ? malloc(v_size) : NULL,
+                                          .value = entry_value,
                                           .value_size = v_size,
                                           .deleted = deleted,
                                           .ttl = ttl,
                                           .source_type = 1,
                                           .source_index = idx};
 
-            if (entry.key && (v_size == 0 || entry.value))
             {
-                memcpy(entry.key, k, k_size);
-                if (v_size > 0 && entry.value)
-                {
-                    memcpy(entry.value, v, v_size);
-                }
                 /* move backward for next call */
                 skip_list_node_t *old_pos = iter->immutable_memtable_cursors[idx]->current;
                 skip_list_cursor_prev(iter->immutable_memtable_cursors[idx]);
@@ -1160,9 +1213,6 @@ static int iter_refill_from_immutable_backward(tidesdb_iter_t *iter, int idx)
                 }
                 return heap_push(iter, &entry);
             }
-            if (entry.key) free(entry.key);
-            if (entry.value) free(entry.value);
-            return -1;
         }
     }
     return 0;
@@ -1173,9 +1223,10 @@ static int iter_refill_from_immutable_backward(tidesdb_iter_t *iter, int idx)
  * refills iterator from sstable backward
  * @param iter iterator
  * @param idx sstable index
+ * @param current_time cached current time for ttl checks
  * @return 0 on success, -1 on failure
  */
-static int iter_refill_from_sstable_backward(tidesdb_iter_t *iter, int idx)
+static int iter_refill_from_sstable_backward(tidesdb_iter_t *iter, int idx, time_t current_time)
 {
     if (idx >= iter->num_sstable_cursors || !iter->sstable_cursors[idx])
     {
@@ -1200,7 +1251,7 @@ static int iter_refill_from_sstable_backward(tidesdb_iter_t *iter, int idx)
 
         if (parse_result != 0) return 0;
 
-        if (ttl > 0 && time(NULL) > ttl)
+        if (ttl > 0 && current_time > ttl)
         {
             free(k);
             free(v);
@@ -3355,7 +3406,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     /* atomically store final num_entries now that all blocks and metadata are written */
     atomic_store(&sst->num_entries, entries_written);
 
-    pthread_mutex_lock(&cf->flush_lock);
+    pthread_rwlock_wrlock(&cf->cf_lock);
 
     if (cf->num_sstables >= cf->sstable_array_capacity)
     {
@@ -3364,7 +3415,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
             realloc(cf->sstables, (size_t)new_cap * sizeof(tidesdb_sstable_t *));
         if (!new_ssts)
         {
-            pthread_mutex_unlock(&cf->flush_lock);
+            pthread_rwlock_unlock(&cf->cf_lock);
 
             if (cf->db->block_manager_cache)
             {
@@ -3398,7 +3449,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     atomic_thread_fence(memory_order_release);
     atomic_fetch_add(&cf->num_sstables, 1);
 
-    pthread_mutex_unlock(&cf->flush_lock);
+    pthread_rwlock_unlock(&cf->cf_lock);
 
     TDB_DEBUG_LOG("Successfully added SSTable to column family: %s (new count: %d)", cf->name,
                   atomic_load(&cf->num_sstables));
@@ -6107,7 +6158,7 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
     uint8_t check_version = data[0];
     if (check_version != TDB_KV_FORMAT_VERSION)
     {
-        /* not a valid KV block - likely a bloom filter or index block */
+        /* not a valid KV block, likely a bloom filter or index block */
         if (data != block->data) free(data);
         return -1;
     }
@@ -6180,7 +6231,7 @@ static int parse_block(block_manager_block_t *block, tidesdb_column_family_t *cf
 
 /*
  * compare_keys_with_cf
- * compares two keys using the column family's comparator
+ * compares two keys using the column family's comparator (for non-iterator operations)
  * @param cf column family
  * @param key1 first key
  * @param key1_size size of first key
@@ -6241,12 +6292,17 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
     (*iter)->heap = NULL;
     (*iter)->heap_size = 0;
     (*iter)->heap_capacity = 0;
+    (*iter)->comparator = NULL;
+    (*iter)->comparator_ctx = NULL;
 
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
     if (active_mt && active_mt->memtable)
     {
         tidesdb_memtable_acquire(active_mt);
         (*iter)->active_memtable = active_mt; /* store the reference */
+        /* cache comparator to avoid atomic ops on every comparison */
+        (*iter)->comparator = active_mt->memtable->comparator;
+        (*iter)->comparator_ctx = active_mt->memtable->comparator_ctx;
         (*iter)->memtable_cursor = skip_list_cursor_init(active_mt->memtable);
         if (!(*iter)->memtable_cursor)
         {
@@ -6257,10 +6313,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
     }
     if (cf->immutable_memtables)
     {
-        /* acquire flush_lock first to prevent races with flush operations */
-        pthread_mutex_lock(&cf->flush_lock);
-
-        /* then acquire cf_lock and hold it for the entire snapshot operation */
+        /* acquire cf_lock for safe snapshot, no need for flush_lock since we're just reading */
         pthread_rwlock_rdlock(&cf->cf_lock);
         size_t num_immutable = queue_size(cf->immutable_memtables);
 
@@ -6272,7 +6325,6 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
             if (!(*iter)->immutable_memtable_cursors || !(*iter)->immutable_memtables)
             {
                 pthread_rwlock_unlock(&cf->cf_lock);
-                pthread_mutex_unlock(&cf->flush_lock);
                 if ((*iter)->immutable_memtable_cursors) free((*iter)->immutable_memtable_cursors);
                 if ((*iter)->immutable_memtables) free((*iter)->immutable_memtables);
                 if ((*iter)->memtable_cursor) skip_list_cursor_free((*iter)->memtable_cursor);
@@ -6299,9 +6351,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
                 }
             }
 
-            /* now we can release the locks -- we have references to all memtables */
+            /* now we can release the lock -- we have references to all memtables */
             pthread_rwlock_unlock(&cf->cf_lock);
-            pthread_mutex_unlock(&cf->flush_lock);
 
             /* create cursors without holding any locks */
             for (size_t i = 0; i < num_immutable; i++)
@@ -6320,7 +6371,6 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
         else
         {
             pthread_rwlock_unlock(&cf->cf_lock);
-            pthread_mutex_unlock(&cf->flush_lock);
         }
     }
 
@@ -6440,7 +6490,7 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter)
         for (int i = 0; i < iter->heap_size; i++)
         {
             if (iter->heap[i].key) free(iter->heap[i].key);
-            if (iter->heap[i].value) free(iter->heap[i].value);
+            /* value is part of the same allocation as key, don't free separately */
         }
         iter->heap_size = 0;
     }
@@ -6479,14 +6529,17 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter)
         }
     }
 
-    iter_refill_from_memtable(iter);
+    /* cache current time to avoid redundant syscalls */
+    time_t current_time = time(NULL);
+
+    iter_refill_from_memtable(iter, current_time);
     for (int i = 0; i < iter->num_immutable_cursors; i++)
     {
-        iter_refill_from_immutable(iter, i);
+        iter_refill_from_immutable(iter, i, current_time);
     }
     for (int i = 0; i < iter->num_sstable_cursors; i++)
     {
-        iter_refill_from_sstable(iter, i);
+        iter_refill_from_sstable(iter, i, current_time);
     }
 
     /* get first entry (heap is already populated) */
@@ -6506,7 +6559,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
         for (int i = 0; i < iter->heap_size; i++)
         {
             if (iter->heap[i].key) free(iter->heap[i].key);
-            if (iter->heap[i].value) free(iter->heap[i].value);
+            /* value is part of the same allocation as key, don't free separately */
         }
         iter->heap_size = 0;
     }
@@ -6554,10 +6607,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
     {
         free(iter->current_key);
         iter->current_key = NULL;
-    }
-    if (iter->current_value)
-    {
-        free(iter->current_value);
+        /* current_value is part of the same allocation, so don't free separately */
         iter->current_value = NULL;
     }
 
@@ -6567,7 +6617,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         for (int i = 0; i < iter->heap_size; i++)
         {
             if (iter->heap[i].key) free(iter->heap[i].key);
-            if (iter->heap[i].value) free(iter->heap[i].value);
+            /* value is part of the same allocation as key, don't free separately */
         }
         iter->heap_size = 0;
     }
@@ -6655,11 +6705,14 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         }
     }
 
+    /* cache current time to avoid redundant syscalls */
+    time_t current_time = time(NULL);
+
     /* populate heap with first entry >= key from each source */
-    iter_refill_from_memtable(iter);
+    iter_refill_from_memtable(iter, current_time);
     for (int i = 0; i < iter->num_immutable_cursors; i++)
     {
-        iter_refill_from_immutable(iter, i);
+        iter_refill_from_immutable(iter, i, current_time);
     }
 
     for (int i = 0; i < iter->num_sstable_cursors; i++)
@@ -6678,7 +6731,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
 
                 if (parse_block(block, iter->cf, &k, &k_size, &v, &v_size, &deleted, &ttl) == 0)
                 {
-                    if (!(ttl > 0 && time(NULL) > ttl) && !deleted)
+                    if (!(ttl > 0 && current_time > ttl) && !deleted)
                     {
                         tidesdb_iter_entry_t entry = {.key = k,
                                                       .key_size = k_size,
@@ -6736,7 +6789,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
             if (cmp >= 0)
             {
                 /* found first key >= seek target */
-                if (!(ttl > 0 && time(NULL) > ttl) && !deleted)
+                if (!(ttl > 0 && current_time > ttl) && !deleted)
                 {
                     tidesdb_iter_entry_t entry = {.key = k,
                                                   .key_size = k_size,
@@ -6783,10 +6836,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
     {
         free(iter->current_key);
         iter->current_key = NULL;
-    }
-    if (iter->current_value)
-    {
-        free(iter->current_value);
+        /* current_value is part of the same allocation, so don't free separately */
         iter->current_value = NULL;
     }
 
@@ -6796,7 +6846,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         for (int i = 0; i < iter->heap_size; i++)
         {
             if (iter->heap[i].key) free(iter->heap[i].key);
-            if (iter->heap[i].value) free(iter->heap[i].value);
+            /* value is part of the same allocation as key, don't free separately */
         }
         iter->heap_size = 0;
     }
@@ -6882,13 +6932,16 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         }
     }
 
+    /* cache current time to avoid redundant syscalls */
+    time_t current_time = time(NULL);
+
     /* refill from active memtable */
-    iter_refill_from_memtable_backward(iter);
+    iter_refill_from_memtable_backward(iter, current_time);
 
     /* refill from immutable memtables */
     for (int i = 0; i < iter->num_immutable_cursors; i++)
     {
-        iter_refill_from_immutable_backward(iter, i);
+        iter_refill_from_immutable_backward(iter, i, current_time);
     }
 
     /* for sstables scan to find last key <= seek_key */
@@ -6908,7 +6961,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
 
                 if (parse_block(block, iter->cf, &k, &k_size, &v, &v_size, &deleted, &ttl) == 0)
                 {
-                    if (!(ttl > 0 && time(NULL) > ttl) && !deleted)
+                    if (!(ttl > 0 && current_time > ttl) && !deleted)
                     {
                         tidesdb_iter_entry_t entry = {.key = k,
                                                       .key_size = k_size,
@@ -6991,7 +7044,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         /* add the last valid entry to heap if found */
         if (found_any)
         {
-            if (!(last_valid_ttl > 0 && time(NULL) > last_valid_ttl) && !last_valid_deleted)
+            if (!(last_valid_ttl > 0 && current_time > last_valid_ttl) && !last_valid_deleted)
             {
                 tidesdb_iter_entry_t entry = {.key = last_valid_key,
                                               .key_size = last_valid_key_size,
@@ -7026,10 +7079,7 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
     {
         free(iter->current_key);
         iter->current_key = NULL;
-    }
-    if (iter->current_value)
-    {
-        free(iter->current_value);
+        /* current_value is part of the same allocation, so don't free separately */
         iter->current_value = NULL;
     }
 
@@ -7041,25 +7091,28 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         return -1;
     }
 
+    /* cache current time to avoid redundant syscalls */
+    time_t current_time = time(NULL);
+
     /* refill heap from the source that produced this entry */
     if (entry.source_type == 0)
     {
-        iter_refill_from_memtable(iter);
+        iter_refill_from_memtable(iter, current_time);
     }
     else if (entry.source_type == 1)
     {
-        iter_refill_from_immutable(iter, entry.source_index);
+        iter_refill_from_immutable(iter, entry.source_index, current_time);
     }
     else if (entry.source_type == 2)
     {
-        iter_refill_from_sstable(iter, entry.source_index);
+        iter_refill_from_sstable(iter, entry.source_index, current_time);
     }
 
     /* skip duplicate keys from other sources (keep newest version) */
     while (iter->heap_size > 0)
     {
-        int cmp = compare_keys_with_cf(iter->cf, iter->heap[0].key, iter->heap[0].key_size,
-                                       entry.key, entry.key_size);
+        int cmp = compare_keys_iter(iter, iter->heap[0].key, iter->heap[0].key_size, entry.key,
+                                    entry.key_size);
         if (cmp != 0) break;
 
         tidesdb_iter_entry_t dup;
@@ -7067,19 +7120,20 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
 
         if (dup.source_type == 0)
         {
-            iter_refill_from_memtable(iter);
+            iter_refill_from_memtable(iter, current_time);
         }
         else if (dup.source_type == 1)
         {
-            iter_refill_from_immutable(iter, dup.source_index);
+            iter_refill_from_immutable(iter, dup.source_index, current_time);
         }
         else if (dup.source_type == 2)
         {
-            iter_refill_from_sstable(iter, dup.source_index);
+            iter_refill_from_sstable(iter, dup.source_index, current_time);
         }
 
+        /* free key (which also frees value if they were allocated together) */
         free(dup.key);
-        free(dup.value);
+        /* don't free dup.value separately, it's part of the same allocation as dup.key */
     }
 
     iter->current_key = entry.key;
@@ -7102,24 +7156,24 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
     {
         free(iter->current_key);
         iter->current_key = NULL;
-    }
-    if (iter->current_value)
-    {
-        free(iter->current_value);
+        /* current_value is part of the same allocation, so don't free separately */
         iter->current_value = NULL;
     }
+
+    /* cache current time to avoid redundant syscalls */
+    time_t current_time = time(NULL);
 
     /* if heap is empty, populate it (first call after seek_to_last) */
     if (iter->heap_size == 0)
     {
-        iter_refill_from_memtable_backward(iter);
+        iter_refill_from_memtable_backward(iter, current_time);
         for (int i = 0; i < iter->num_immutable_cursors; i++)
         {
-            iter_refill_from_immutable_backward(iter, i);
+            iter_refill_from_immutable_backward(iter, i, current_time);
         }
         for (int i = 0; i < iter->num_sstable_cursors; i++)
         {
-            iter_refill_from_sstable_backward(iter, i);
+            iter_refill_from_sstable_backward(iter, i, current_time);
         }
     }
 
@@ -7131,23 +7185,25 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         return -1;
     }
 
+    /* refill heap from the source that produced this entry */
     if (entry.source_type == 0)
     {
-        iter_refill_from_memtable_backward(iter);
+        iter_refill_from_memtable_backward(iter, current_time);
     }
     else if (entry.source_type == 1)
     {
-        iter_refill_from_immutable_backward(iter, entry.source_index);
+        iter_refill_from_immutable_backward(iter, entry.source_index, current_time);
     }
     else if (entry.source_type == 2)
     {
-        iter_refill_from_sstable_backward(iter, entry.source_index);
+        iter_refill_from_sstable_backward(iter, entry.source_index, current_time);
     }
 
+    /* skip duplicate keys from other sources (keep newest version) */
     while (iter->heap_size > 0)
     {
-        int cmp = compare_keys_with_cf(iter->cf, iter->heap[0].key, iter->heap[0].key_size,
-                                       entry.key, entry.key_size);
+        int cmp = compare_keys_iter(iter, iter->heap[0].key, iter->heap[0].key_size, entry.key,
+                                    entry.key_size);
         if (cmp != 0) break;
 
         tidesdb_iter_entry_t dup;
@@ -7155,19 +7211,20 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
 
         if (dup.source_type == 0)
         {
-            iter_refill_from_memtable_backward(iter);
+            iter_refill_from_memtable_backward(iter, current_time);
         }
         else if (dup.source_type == 1)
         {
-            iter_refill_from_immutable_backward(iter, dup.source_index);
+            iter_refill_from_immutable_backward(iter, dup.source_index, current_time);
         }
         else if (dup.source_type == 2)
         {
-            iter_refill_from_sstable_backward(iter, dup.source_index);
+            iter_refill_from_sstable_backward(iter, dup.source_index, current_time);
         }
 
+        /* free key (which also frees value if they were allocated together) */
         free(dup.key);
-        free(dup.value);
+        /* don't free dup.value separately, it's part of the same allocation as dup.key */
     }
 
     iter->current_key = entry.key;
@@ -7211,7 +7268,7 @@ void tidesdb_iter_free(tidesdb_iter_t *iter)
     if (!iter) return;
 
     if (iter->current_key) free(iter->current_key);
-    if (iter->current_value) free(iter->current_value);
+    /* current_value is part of the same allocation as current_key, so don't free separately */
     if (iter->memtable_cursor)
     {
         skip_list_cursor_free(iter->memtable_cursor);
@@ -7265,7 +7322,7 @@ void tidesdb_iter_free(tidesdb_iter_t *iter)
         for (int i = 0; i < iter->heap_size; i++)
         {
             if (iter->heap[i].key) free(iter->heap[i].key);
-            if (iter->heap[i].value) free(iter->heap[i].value);
+            /* value is part of the same allocation as key, don't free separately */
         }
         free(iter->heap);
     }

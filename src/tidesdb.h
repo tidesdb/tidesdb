@@ -516,6 +516,9 @@ struct tidesdb_iter_t
     tidesdb_iter_entry_t *heap;
     int heap_size;
     int heap_capacity;
+    /* cached comparator to avoid atomic ops on every comparison */
+    int (*comparator)(const uint8_t *, size_t, const uint8_t *, size_t, void *);
+    void *comparator_ctx;
 };
 
 /*

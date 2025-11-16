@@ -65,8 +65,9 @@ extern int _tidesdb_debug_enabled;
 #endif
 
 /* defaults */
-#define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE            (64 * 1024 * 1024)
-#define TDB_DEFAULT_MAX_SSTABLES                   128
+#define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE (64 * 1024 * 1024)
+#define TDB_DEFAULT_MAX_SSTABLES \
+    512 /* allow many SSTables before compaction to reduce write amplification */
 #define TDB_DEFAULT_COMPACTION_THREADS             2
 #define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000000
 #define TDB_DEFAULT_MAX_OPEN_FILE_HANDLES          1024
@@ -99,9 +100,10 @@ extern int _tidesdb_debug_enabled;
 #define TDB_CONFIG_FILE_NAME              "config"
 
 /* used for key value pair headers on disk */
-#define TDB_KV_FORMAT_VERSION 1
+#define TDB_KV_FORMAT_VERSION 4
 
-#define TDB_KV_HEADER_SIZE 18
+#define TDB_KV_HEADER_SIZE \
+    26 /* version(1) + flags(1) + key_size(4) + value_size(4) + ttl(8) + seq(8) */
 
 /* "SSTM" sstable meta magic number */
 #define TDB_SST_META_MAGIC 0x5353544D
@@ -135,7 +137,7 @@ extern int _tidesdb_debug_enabled;
 typedef enum
 {
     TDB_SYNC_NONE, /* no fsync/fdatasync - fastest, least durable */
-    TDB_SYNC_FULL, /* full fsync/fdatasync on every write to a block manager - slowest, most durable
+    TDB_SYNC_FULL, /* full fsync/fdatasync on every write to a block manager, slowest, most durable
                     */
 } tidesdb_sync_mode_t;
 
@@ -282,7 +284,6 @@ typedef struct
  * @param num_entries number of entries in this sstable
  * @param data_end_offset byte offset where KV data ends
  * @param ref_count reference count
- * @param ref_lock lock for reference counting
  */
 struct tidesdb_sstable_t
 {
@@ -298,7 +299,6 @@ struct tidesdb_sstable_t
     _Atomic int num_entries;
     uint64_t data_end_offset;
     _Atomic(int) ref_count;
-    pthread_mutex_t ref_lock;
 };
 
 /*
@@ -309,7 +309,7 @@ struct tidesdb_sstable_t
  * @param id unique identifier (timestamp-based)
  * @param created_at creation timestamp
  * @param ref_count reference count
- * @param ref_lock lock for reference counting
+ * @param flushed 1 if flushed to sstable, 0 otherwise
  */
 typedef struct
 {
@@ -318,8 +318,7 @@ typedef struct
     uint64_t id;
     time_t created_at;
     _Atomic(int) ref_count;
-    _Atomic(int) flushed; /* 1 if flushed to sstable, 0 otherwise */
-    pthread_mutex_t ref_lock;
+    _Atomic(int) flushed;
 } tidesdb_memtable_t;
 
 /*
@@ -338,6 +337,7 @@ typedef struct
  * @param compaction_lock lock for compaction operations
  * @param memtable_write_lock lock for memtable writes
  * @param next_memtable_id next memtable ID to assign
+ * @param next_wal_seq sequence number for lock-free WAL writes
  * @param is_dropping flag indicating if the column family is being dropped
  * @param active_operations count of background tasks currently executing
  * @param config configuration for this column family (config.sstable_capacity triggers compaction)
@@ -354,10 +354,10 @@ struct tidesdb_column_family_t
     int sstable_array_capacity;
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(uint64_t) next_memtable_id;
+    _Atomic(uint64_t) next_wal_seq;
     pthread_rwlock_t cf_lock;
     pthread_mutex_t flush_lock;
     pthread_mutex_t compaction_lock;
-    pthread_mutex_t memtable_write_lock;
     _Atomic(int) is_dropping;
     _Atomic(int) active_operations;
     tidesdb_column_family_config_t config;

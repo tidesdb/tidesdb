@@ -516,6 +516,293 @@ void test_lru_cache_free_null()
     lru_cache_clear(NULL);
 }
 
+#define BENCH_ITERATIONS 1000000
+#define BENCH_CACHE_SIZE 10000
+#define BENCH_THREADS    8
+
+typedef struct
+{
+    lru_cache_t *cache;
+    int thread_id;
+    int iterations;
+    double elapsed_time;
+} bench_thread_context_t;
+
+static void benchmark_lru_sequential(void)
+{
+    printf(BOLDWHITE "\nBenchmark 1: Sequential Write/Read Performance\n" RESET);
+
+    lru_cache_t *cache = lru_cache_new(BENCH_CACHE_SIZE);
+    ASSERT_TRUE(cache != NULL);
+
+    int *values = malloc(BENCH_ITERATIONS * sizeof(int));
+    for (int i = 0; i < BENCH_ITERATIONS; i++)
+    {
+        values[i] = i;
+    }
+
+    /* sequential writes */
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < BENCH_ITERATIONS; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        lru_cache_put(cache, key, &values[i], NULL, NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double write_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    printf("  Sequential writes: %.2f M ops/sec (%.3f seconds)\n",
+           BENCH_ITERATIONS / write_time / 1e6, write_time);
+
+    /* sequential reads (cache hits for last BENCH_CACHE_SIZE entries) */
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    int hits = 0;
+    for (int i = 0; i < BENCH_ITERATIONS; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        void *val = lru_cache_get(cache, key);
+        if (val != NULL) hits++;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double read_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    printf("  Sequential reads: %.2f M ops/sec (%.3f seconds)\n",
+           BENCH_ITERATIONS / read_time / 1e6, read_time);
+    printf("  Cache hit rate: %.1f%% (%d/%d)\n", (double)hits / BENCH_ITERATIONS * 100, hits,
+           BENCH_ITERATIONS);
+
+    free(values);
+    lru_cache_free(cache);
+}
+
+static void benchmark_lru_random_access(void)
+{
+    printf(BOLDWHITE "\nBenchmark 2: Random Access Performance\n" RESET);
+
+    lru_cache_t *cache = lru_cache_new(BENCH_CACHE_SIZE);
+    ASSERT_TRUE(cache != NULL);
+
+    int *values = malloc(BENCH_CACHE_SIZE * sizeof(int));
+
+    /* populate cache */
+    for (int i = 0; i < BENCH_CACHE_SIZE; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        values[i] = i;
+        lru_cache_put(cache, key, &values[i], NULL, NULL);
+    }
+
+    /* random reads */
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < BENCH_ITERATIONS; i++)
+    {
+        int idx = rand() % BENCH_CACHE_SIZE;
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", idx);
+        void *val = lru_cache_get(cache, key);
+        (void)val;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    printf("  Random reads: %.2f M ops/sec (%.3f seconds)\n", BENCH_ITERATIONS / time / 1e6, time);
+    printf("  Cache hit rate: 100%% (all keys in cache)\n");
+
+    free(values);
+    lru_cache_free(cache);
+}
+
+static void *concurrent_read_worker(void *arg)
+{
+    bench_thread_context_t *ctx = (bench_thread_context_t *)arg;
+    struct timespec start, end;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < ctx->iterations; i++)
+    {
+        int idx = (ctx->thread_id * 1000 + i) % BENCH_CACHE_SIZE;
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", idx);
+        void *val = lru_cache_get(ctx->cache, key);
+        (void)val;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    ctx->elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    return NULL;
+}
+
+static void benchmark_lru_concurrent_reads(void)
+{
+    printf(BOLDWHITE "\nBenchmark 3: Concurrent Read Performance (Lock-Free)\n" RESET);
+
+    lru_cache_t *cache = lru_cache_new(BENCH_CACHE_SIZE);
+    ASSERT_TRUE(cache != NULL);
+
+    int *values = malloc(BENCH_CACHE_SIZE * sizeof(int));
+
+    /* populate cache */
+    for (int i = 0; i < BENCH_CACHE_SIZE; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        values[i] = i;
+        lru_cache_put(cache, key, &values[i], NULL, NULL);
+    }
+
+    pthread_t threads[BENCH_THREADS];
+    bench_thread_context_t contexts[BENCH_THREADS];
+    int iterations_per_thread = BENCH_ITERATIONS / BENCH_THREADS;
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    /* spawn reader threads */
+    for (int i = 0; i < BENCH_THREADS; i++)
+    {
+        contexts[i].cache = cache;
+        contexts[i].thread_id = i;
+        contexts[i].iterations = iterations_per_thread;
+        contexts[i].elapsed_time = 0;
+        pthread_create(&threads[i], NULL, concurrent_read_worker, &contexts[i]);
+    }
+
+    /* wait for all threads */
+    for (int i = 0; i < BENCH_THREADS; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double wall_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    double total_thread_time = 0;
+    for (int i = 0; i < BENCH_THREADS; i++)
+    {
+        total_thread_time += contexts[i].elapsed_time;
+    }
+    double avg_thread_time = total_thread_time / BENCH_THREADS;
+
+    printf("  Threads: %d\n", BENCH_THREADS);
+    printf("  Wall time: %.3f seconds\n", wall_time);
+    printf("  Aggregate throughput: %.2f M ops/sec\n", BENCH_ITERATIONS / wall_time / 1e6);
+    printf("  Average thread time: %.3f seconds\n", avg_thread_time);
+    printf("  Speedup vs sequential: %.2fx\n", avg_thread_time / wall_time * BENCH_THREADS);
+    printf("  Per-thread throughput: %.2f M ops/sec\n",
+           iterations_per_thread / avg_thread_time / 1e6);
+
+    free(values);
+    lru_cache_free(cache);
+}
+
+static void *mixed_workload_worker(void *arg)
+{
+    bench_thread_context_t *ctx = (bench_thread_context_t *)arg;
+    struct timespec start, end;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < ctx->iterations; i++)
+    {
+        int idx = (ctx->thread_id * 1000 + i) % BENCH_CACHE_SIZE;
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", idx);
+
+        /* 80% reads, 20% writes */
+        if (i % 5 == 0)
+        {
+            /* write */
+            static int dummy = 0;
+            lru_cache_put(ctx->cache, key, &dummy, NULL, NULL);
+        }
+        else
+        {
+            /* read */
+            void *val = lru_cache_get(ctx->cache, key);
+            (void)val;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    ctx->elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    return NULL;
+}
+
+static void benchmark_lru_mixed_workload(void)
+{
+    printf(BOLDWHITE "\nBenchmark 4: Mixed Workload (80%% Read, 20%% Write)\n" RESET);
+
+    lru_cache_t *cache = lru_cache_new(BENCH_CACHE_SIZE);
+    ASSERT_TRUE(cache != NULL);
+
+    int *values = malloc(BENCH_CACHE_SIZE * sizeof(int));
+
+    /* populate cache */
+    for (int i = 0; i < BENCH_CACHE_SIZE; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        values[i] = i;
+        lru_cache_put(cache, key, &values[i], NULL, NULL);
+    }
+
+    pthread_t threads[BENCH_THREADS];
+    bench_thread_context_t contexts[BENCH_THREADS];
+    int iterations_per_thread = BENCH_ITERATIONS / BENCH_THREADS;
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    /* spawn worker threads */
+    for (int i = 0; i < BENCH_THREADS; i++)
+    {
+        contexts[i].cache = cache;
+        contexts[i].thread_id = i;
+        contexts[i].iterations = iterations_per_thread;
+        contexts[i].elapsed_time = 0;
+        pthread_create(&threads[i], NULL, mixed_workload_worker, &contexts[i]);
+    }
+
+    /* wait for all threads */
+    for (int i = 0; i < BENCH_THREADS; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double wall_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    double total_thread_time = 0;
+    for (int i = 0; i < BENCH_THREADS; i++)
+    {
+        total_thread_time += contexts[i].elapsed_time;
+    }
+    double avg_thread_time = total_thread_time / BENCH_THREADS;
+
+    printf("  Threads: %d\n", BENCH_THREADS);
+    printf("  Wall time: %.3f seconds\n", wall_time);
+    printf("  Aggregate throughput: %.2f M ops/sec\n", BENCH_ITERATIONS / wall_time / 1e6);
+    printf("  Average thread time: %.3f seconds\n", avg_thread_time);
+    printf("  Speedup vs sequential: %.2fx\n", avg_thread_time / wall_time * BENCH_THREADS);
+
+    free(values);
+    lru_cache_free(cache);
+}
+
 int main(void)
 {
     RUN_TEST(test_lru_cache_new_free, tests_passed);
@@ -535,6 +822,12 @@ int main(void)
     RUN_TEST(test_lru_cache_empty_key, tests_passed);
     RUN_TEST(test_lru_cache_hash_collisions, tests_passed);
     RUN_TEST(test_lru_cache_free_null, tests_passed);
+
+    benchmark_lru_sequential();
+    benchmark_lru_random_access();
+    benchmark_lru_concurrent_reads();
+    benchmark_lru_mixed_workload();
+
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 
     return 0;

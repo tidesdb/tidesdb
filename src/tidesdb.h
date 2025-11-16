@@ -65,9 +65,8 @@ extern int _tidesdb_debug_enabled;
 #endif
 
 /* defaults */
-#define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE (64 * 1024 * 1024)
-#define TDB_DEFAULT_MAX_SSTABLES \
-    8 /* compact frequently to reduce write amplification and improve read performance */
+#define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE            (64 * 1024 * 1024)
+#define TDB_DEFAULT_MAX_SSTABLES                   64
 #define TDB_DEFAULT_COMPACTION_THREADS             2
 #define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000000
 #define TDB_DEFAULT_MAX_OPEN_FILE_HANDLES          1024

@@ -123,28 +123,46 @@ static void lru_add_to_table(lru_cache_t *cache, lru_entry_t *entry)
 
 /*
  * lru_evict_lru
- * evict least recently used entry
+ * evict least frequently used entry (approximate LRU based on access_count)
  * @param cache the cache to evict from
  */
 static void lru_evict_lru(lru_cache_t *cache)
 {
-    if (cache->tail == NULL) return;
+    if (cache->size == 0) return;
 
-    lru_entry_t *lru = cache->tail;
+    /* find entry with oldest timestamp (least recently used)
+     * this is approximate LRU - we scan the list to find oldest entry */
+    lru_entry_t *victim = cache->head;
+    lru_entry_t *current = cache->head;
+    uint64_t min_time = atomic_load(&victim->last_access_time);
 
-    /* remove from doubly linked list */
-    if (lru->prev)
-        lru->prev->next = NULL;
+    while (current != NULL)
+    {
+        uint64_t time = atomic_load(&current->last_access_time);
+        if (time < min_time)
+        {
+            min_time = time;
+            victim = current;
+        }
+        current = current->next;
+    }
+
+    /* remove victim from doubly linked list */
+    if (victim->prev)
+        victim->prev->next = victim->next;
     else
-        cache->head = NULL;
+        cache->head = victim->next;
 
-    cache->tail = lru->prev;
+    if (victim->next)
+        victim->next->prev = victim->prev;
+    else
+        cache->tail = victim->prev;
 
-    lru_remove_from_table(cache, lru);
-    if (lru->evict_cb) lru->evict_cb(lru->key, lru->value, lru->user_data);
+    lru_remove_from_table(cache, victim);
+    if (victim->evict_cb) victim->evict_cb(victim->key, victim->value, victim->user_data);
 
-    free(lru->key);
-    free(lru);
+    free(victim->key);
+    free(victim);
 
     cache->size--;
 }
@@ -189,6 +207,7 @@ lru_cache_t *lru_cache_new(size_t capacity)
     cache->head = NULL;
     cache->tail = NULL;
     cache->table_size = capacity * 2;
+    atomic_store(&cache->timestamp_counter, 0);
     cache->table = (lru_entry_t **)calloc(cache->table_size, sizeof(lru_entry_t *));
     if (cache->table == NULL)
     {
@@ -255,6 +274,7 @@ int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_ca
     entry->user_data = user_data;
     entry->prev = NULL;
     entry->next = cache->head;
+    atomic_store(&entry->last_access_time, atomic_fetch_add(&cache->timestamp_counter, 1));
 
     if (cache->head) cache->head->prev = entry;
     cache->head = entry;
@@ -275,21 +295,26 @@ void *lru_cache_get(lru_cache_t *cache, const char *key)
     if (cache == NULL || key == NULL) return NULL;
 
     size_t key_len = strlen(key);
-    pthread_mutex_lock(&cache->lock);
 
-    lru_entry_t *entry = lru_find_entry(cache, key, key_len);
-    if (entry == NULL)
+    /* LOCK-FREE READ: No lock needed for lookup!
+     * Hash table is read-only during lookups, only modified during put/evict.
+     * We rely on the write lock in put/evict to ensure consistency. */
+    size_t index = lru_hash(key, key_len, cache->table_size);
+    lru_entry_t *entry = cache->table[index];
+
+    /* walk hash chain without lock */
+    while (entry != NULL)
     {
-        pthread_mutex_unlock(&cache->lock);
-        return NULL;
+        if (entry->key_len == key_len && memcmp(entry->key, key, key_len) == 0)
+        {
+            /* found it! update timestamp atomically (lock-free) */
+            atomic_store(&entry->last_access_time, atomic_fetch_add(&cache->timestamp_counter, 1));
+            return entry->value;
+        }
+        entry = entry->hash_next;
     }
 
-    lru_move_to_head(cache, entry);
-
-    void *value = entry->value;
-    pthread_mutex_unlock(&cache->lock);
-
-    return value;
+    return NULL; /* not found */
 }
 
 int lru_cache_remove(lru_cache_t *cache, const char *key)

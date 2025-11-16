@@ -56,6 +56,7 @@ struct lru_entry_t
     lru_entry_t *prev;
     lru_entry_t *next;
     lru_entry_t *hash_next;
+    _Atomic(uint64_t) last_access_time; /* lock-free timestamp for approximate LRU */
 };
 
 /*
@@ -67,7 +68,7 @@ struct lru_entry_t
  * @param tail least recently used entry
  * @param table hash table for O(1) lookups
  * @param table_size hash table size
- * @param lock mutex for thread safety
+ * @param lock mutex for write operations (reads are lock-free)
  */
 struct lru_cache_t
 {
@@ -78,6 +79,7 @@ struct lru_cache_t
     lru_entry_t **table;
     size_t table_size;
     pthread_mutex_t lock;
+    _Atomic(uint64_t) timestamp_counter; /* monotonic counter for approximate LRU */
 };
 
 /*

@@ -4953,28 +4953,21 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         malloc((size_t)(num_ssts + pairs_to_merge) * sizeof(tidesdb_sstable_t *));
     int new_count = 0;
 
+    /* track old sstables to release after array update */
+    tidesdb_sstable_t **old_sstables_to_release =
+        malloc((size_t)(pairs_to_merge * 2) * sizeof(tidesdb_sstable_t *));
+    int old_count = 0;
+
     for (int p = 0; p < pairs_to_merge; p++)
     {
         if (!errors[p] && merged_sstables[p])
         {
-            /* merge succeeded, now we can add merged sstable and release originals */
+            /* merge succeeded, add merged sstable to new array */
             new_sstables[new_count++] = merged_sstables[p];
 
-            /* use snapshot from jobs, not current cf->sstables which may have changed */
-            tidesdb_sstable_t *sst1 = jobs[p].sst1;
-            tidesdb_sstable_t *sst2 = jobs[p].sst2;
-
-            /* delete old sstable files */
-            char sst1_path[TDB_MAX_PATH_LENGTH];
-            char sst2_path[TDB_MAX_PATH_LENGTH];
-            get_sstable_path(cf, sst1->id, sst1_path);
-            get_sstable_path(cf, sst2->id, sst2_path);
-
-            tidesdb_sstable_release(sst1);
-            tidesdb_sstable_release(sst2);
-
-            remove(sst1_path);
-            remove(sst2_path);
+            /* track old sstables for release AFTER array update */
+            old_sstables_to_release[old_count++] = jobs[p].sst1;
+            old_sstables_to_release[old_count++] = jobs[p].sst2;
         }
         else
         {
@@ -4990,10 +4983,26 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         new_sstables[new_count++] = cf->sstables[num_ssts - 1];
     }
 
-    free(cf->sstables);
+    /* atomically update array, readers can no longer see old sstables */
+    tidesdb_sstable_t **old_array = cf->sstables;
     cf->sstables = new_sstables;
-    cf->sstable_array_capacity = num_ssts + pairs_to_merge; /* update capacity */
+    cf->sstable_array_capacity = num_ssts + pairs_to_merge;
     atomic_store(&cf->num_sstables, new_count);
+
+    for (int i = 0; i < old_count; i++)
+    {
+        tidesdb_sstable_t *old_sst = old_sstables_to_release[i];
+        if (old_sst)
+        {
+            char old_path[TDB_MAX_PATH_LENGTH];
+            get_sstable_path(cf, old_sst->id, old_path);
+            tidesdb_sstable_release(old_sst);
+            remove(old_path);
+        }
+    }
+
+    free(old_sstables_to_release);
+    free(old_array);
 
     free(jobs);
     free(threads);

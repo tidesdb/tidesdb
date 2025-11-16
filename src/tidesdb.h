@@ -318,6 +318,7 @@ typedef struct
     uint64_t id;
     time_t created_at;
     _Atomic(int) ref_count;
+    _Atomic(int) flushed; /* 1 if flushed to sstable, 0 otherwise */
     pthread_mutex_t ref_lock;
 } tidesdb_memtable_t;
 

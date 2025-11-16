@@ -35,7 +35,8 @@ typedef struct queue_node_t
 /*
  * queue_t
  * thread-safe FIFO queue implementation with node pooling
- * @param head pointer to first node
+ * @param head pointer to first node (protected by lock for writes)
+ * @param atomic_head pointer to first node (atomic for lock-free reads)
  * @param tail pointer to last node
  * @param size current number of elements (atomic for lock-free reads)
  * @param shutdown has queue been shutdown?
@@ -49,6 +50,7 @@ typedef struct queue_node_t
 typedef struct
 {
     queue_node_t *head;
+    _Atomic(queue_node_t *) atomic_head;
     queue_node_t *tail;
     _Atomic(size_t) size;
     int shutdown;

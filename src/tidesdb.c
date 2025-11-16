@@ -1065,7 +1065,7 @@ static int iter_refill_from_sstable(tidesdb_iter_t *iter, int idx, time_t curren
         time_t ttl = 0;
 
         int parse_result = parse_block(block, iter->cf, &k, &k_size, &v, &v_size, &deleted, &ttl);
-        block_manager_block_free(block);
+        block_manager_block_release(block);
 
         /* if parse fails (metadata block or corrupted), stop reading this sstable */
         if (parse_result != 0)
@@ -1310,7 +1310,7 @@ static int iter_refill_from_sstable_backward(tidesdb_iter_t *iter, int idx, time
         time_t ttl = 0;
 
         int parse_result = parse_block(block, iter->cf, &k, &k_size, &v, &v_size, &deleted, &ttl);
-        block_manager_block_free(block);
+        block_manager_block_release(block);
 
         if (parse_result != 0)
         {
@@ -1397,7 +1397,8 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .background_compaction_interval = TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL,
         .enable_block_indexes = 1,
         .sync_mode = TDB_SYNC_FULL,
-        .comparator_name = {0}};
+        .comparator_name = {0},
+        .block_manager_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE};
     return config;
 }
 
@@ -1558,7 +1559,7 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
                 if (!new_buffer)
                 {
                     if (decompressed) free(decompressed);
-                    block_manager_block_free(block);
+                    block_manager_block_release(block);
                     block_manager_cursor_free(cursor);
                     free(keys_buffer);
                     succinct_trie_builder_free(builder);
@@ -1579,7 +1580,7 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
 
         /* free decompressed data immediately */
         if (decompressed) free(decompressed);
-        block_manager_block_free(block);
+        block_manager_block_release(block);
 
         blocks_read++;
         if (block_manager_cursor_next(cursor) != 0) break;
@@ -2449,7 +2450,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                             offset += value_size;
                             entry_count++;
                         }
-                        block_manager_block_free(block);
+                        block_manager_block_release(block);
                     }
                 } while (block_manager_cursor_next(cursor) == 0);
             }
@@ -3374,7 +3375,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
                 {
                     write_successful = 0;
                 }
-                block_manager_block_free(block);
+                block_manager_block_release(block);
             }
             else
             {
@@ -3453,7 +3454,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
             if (bloom_block)
             {
                 block_manager_block_write(sst->block_manager, bloom_block);
-                block_manager_block_free(bloom_block);
+                block_manager_block_release(bloom_block);
             }
             free(bloom_data);
         }
@@ -3470,7 +3471,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
             if (index_block)
             {
                 block_manager_block_write(sst->block_manager, index_block);
-                block_manager_block_free(index_block);
+                block_manager_block_release(index_block);
             }
             free(index_data);
         }
@@ -3508,7 +3509,7 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
             if (metadata_block)
             {
                 block_manager_block_write(sst->block_manager, metadata_block);
-                block_manager_block_free(metadata_block);
+                block_manager_block_release(metadata_block);
             }
             free(metadata);
         }
@@ -3858,7 +3859,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
                 {
                     /* keys are equal, prefer sst2 (newer), skip sst1 */
                     if (decompressed1) free(decompressed1);
-                    block_manager_block_free(peek1);
+                    block_manager_block_release(peek1);
                     peek1 = NULL;
                     decompressed1 = NULL;
                     has1 = peek_next_block_for_merge(cursor1, &blocks_read1, sst1->num_entries,
@@ -3922,7 +3923,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
                 if (data_size < TDB_KV_HEADER_SIZE)
                 {
                     if (data != block->data) free(data);
-                    block_manager_block_free(block);
+                    block_manager_block_release(block);
                     continue;
                 }
 
@@ -3936,7 +3937,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
                 if (flags & TDB_KV_FLAG_TOMBSTONE)
                 {
                     if (data != block->data) free(data);
-                    block_manager_block_free(block);
+                    block_manager_block_release(block);
                     continue;
                 }
 
@@ -3944,7 +3945,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
                 if (ttl > 0 && time(NULL) > ttl)
                 {
                     if (data != block->data) free(data);
-                    block_manager_block_free(block);
+                    block_manager_block_release(block);
                     continue;
                 }
 
@@ -3956,7 +3957,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
                 if (!key_copy)
                 {
                     if (data != block->data) free(data);
-                    block_manager_block_free(block);
+                    block_manager_block_release(block);
                     continue;
                 }
                 memcpy(key_copy, key, k_size);
@@ -4013,20 +4014,20 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
                             merged->max_key_size = k_size;
                         }
                     }
-                    block_manager_block_free(new_block);
+                    block_manager_block_release(new_block);
                 }
 
                 free(key_copy);
                 if (final_data != data && final_data != block->data) free(final_data);
                 if (data && data != block->data) free(data);
-                block_manager_block_free(block);
+                block_manager_block_release(block);
             }
         }
 
         if (decompressed1) free(decompressed1);
         if (decompressed2) free(decompressed2);
-        if (peek1) block_manager_block_free(peek1);
-        if (peek2) block_manager_block_free(peek2);
+        if (peek1) block_manager_block_release(peek1);
+        if (peek2) block_manager_block_release(peek2);
 
         if (cursor1) block_manager_cursor_free(cursor1);
         if (cursor2) block_manager_cursor_free(cursor2);
@@ -4080,7 +4081,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
                 if (metadata_block)
                 {
                     block_manager_block_write(merged->block_manager, metadata_block);
-                    block_manager_block_free(metadata_block);
+                    block_manager_block_release(metadata_block);
                 }
                 free(metadata);
             }
@@ -4098,7 +4099,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
                 if (bloom_block)
                 {
                     block_manager_block_write(merged->block_manager, bloom_block);
-                    block_manager_block_free(bloom_block);
+                    block_manager_block_release(bloom_block);
                 }
                 free(bloom_data);
             }
@@ -4115,7 +4116,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
                 if (index_block)
                 {
                     block_manager_block_write(merged->block_manager, index_block);
-                    block_manager_block_free(index_block);
+                    block_manager_block_release(index_block);
                 }
                 free(index_data);
             }
@@ -4340,7 +4341,7 @@ static int peek_next_block_for_merge(block_manager_cursor_t *cursor, int *blocks
     if (data_size < sizeof(tidesdb_kv_pair_header_t))
     {
         if (*decompressed_ptr) free(*decompressed_ptr);
-        block_manager_block_free(*peek_block);
+        block_manager_block_release(*peek_block);
         *peek_block = NULL;
         return 0;
     }
@@ -4358,7 +4359,7 @@ static int peek_next_block_for_merge(block_manager_cursor_t *cursor, int *blocks
         TDB_DEBUG_LOG("Skipping corrupted block during compaction: key_size=%u, value_size=%u",
                       key_size, value_size);
         if (*decompressed_ptr) free(*decompressed_ptr);
-        block_manager_block_free(*peek_block);
+        block_manager_block_release(*peek_block);
         *peek_block = NULL;
         return 0;
     }
@@ -4369,7 +4370,7 @@ static int peek_next_block_for_merge(block_manager_cursor_t *cursor, int *blocks
         TDB_DEBUG_LOG("Block data size (" TDB_SIZE_FMT ") insufficient for key size (%u)",
                       TDB_SIZE_CAST(data_size), key_size);
         if (*decompressed_ptr) free(*decompressed_ptr);
-        block_manager_block_free(*peek_block);
+        block_manager_block_release(*peek_block);
         *peek_block = NULL;
         return 0;
     }
@@ -4557,7 +4558,7 @@ static void *tidesdb_compaction_worker(void *arg)
                 }
                 if (peek1)
                 {
-                    block_manager_block_free(peek1);
+                    block_manager_block_release(peek1);
                     peek1 = NULL;
                 }
                 has1 = peek_next_block_for_merge(cursor1, &blocks_read1, sst1->num_entries, &peek1,
@@ -4623,7 +4624,7 @@ static void *tidesdb_compaction_worker(void *arg)
                 if (is_deleted || is_expired)
                 {
                     if (data != block->data) free(data);
-                    block_manager_block_free(block);
+                    block_manager_block_release(block);
                     continue;
                 }
 
@@ -4673,7 +4674,7 @@ static void *tidesdb_compaction_worker(void *arg)
                             merged->max_key_size = key_size;
                         }
                     }
-                    block_manager_block_free(new_block);
+                    block_manager_block_release(new_block);
                 }
 
                 if (cf->config.enable_compression && final_data != data)
@@ -4686,14 +4687,14 @@ static void *tidesdb_compaction_worker(void *arg)
             {
                 free(data);
             }
-            block_manager_block_free(block);
+            block_manager_block_release(block);
         }
     }
 
     if (decompressed1) free(decompressed1);
     if (decompressed2) free(decompressed2);
-    if (peek1) block_manager_block_free(peek1);
-    if (peek2) block_manager_block_free(peek2);
+    if (peek1) block_manager_block_release(peek1);
+    if (peek2) block_manager_block_release(peek2);
     if (cursor1) block_manager_cursor_free(cursor1);
     if (cursor2) block_manager_cursor_free(cursor2);
 
@@ -4766,7 +4767,7 @@ static void *tidesdb_compaction_worker(void *arg)
             if (metadata_block)
             {
                 block_manager_block_write(merged->block_manager, metadata_block);
-                block_manager_block_free(metadata_block);
+                block_manager_block_release(metadata_block);
             }
             free(metadata);
         }
@@ -4783,7 +4784,7 @@ static void *tidesdb_compaction_worker(void *arg)
             if (bloom_block)
             {
                 block_manager_block_write(merged->block_manager, bloom_block);
-                block_manager_block_free(bloom_block);
+                block_manager_block_release(bloom_block);
             }
             free(bloom_data);
         }
@@ -4799,7 +4800,7 @@ static void *tidesdb_compaction_worker(void *arg)
             if (index_block)
             {
                 block_manager_block_write(merged->block_manager, index_block);
-                block_manager_block_free(index_block);
+                block_manager_block_release(index_block);
             }
             free(index_data);
         }
@@ -5136,7 +5137,7 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
                 has_metadata = 1;
             }
         }
-        if (metadata_block) block_manager_block_free(metadata_block);
+        if (metadata_block) block_manager_block_release(metadata_block);
 
         /* read index */
         if (has_metadata)
@@ -5147,7 +5148,7 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
         if (index_block && index_block->data)
         {
             sst->index = succinct_trie_deserialize(index_block->data, index_block->size);
-            block_manager_block_free(index_block);
+            block_manager_block_release(index_block);
         }
 
         /* read bloom filter */
@@ -5156,7 +5157,7 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
         if (bloom_block && bloom_block->data)
         {
             sst->bloom_filter = bloom_filter_deserialize(bloom_block->data);
-            block_manager_block_free(bloom_block);
+            block_manager_block_release(bloom_block);
         }
 
         block_manager_cursor_free(cursor);
@@ -5240,7 +5241,7 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
                 if (data_size < TDB_KV_HEADER_SIZE)
                 {
                     if (data != block->data) free(data);
-                    block_manager_block_free(block);
+                    block_manager_block_release(block);
                     continue;
                 }
 
@@ -5264,7 +5265,7 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
                     if (is_deleted || is_expired)
                     {
                         if (data != block->data) free(data);
-                        block_manager_block_free(block);
+                        block_manager_block_release(block);
                         block_manager_cursor_free(cursor);
                         return TDB_ERR_NOT_FOUND;
                     }
@@ -5275,7 +5276,7 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
                         if (!*value)
                         {
                             if (data != block->data) free(data);
-                            block_manager_block_free(block);
+                            block_manager_block_release(block);
                             block_manager_cursor_free(cursor);
                             return -1;
                         }
@@ -5288,13 +5289,13 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
                     *value_size = hdr_value_size;
 
                     if (data != block->data) free(data);
-                    block_manager_block_free(block);
+                    block_manager_block_release(block);
                     block_manager_cursor_free(cursor);
                     return 0;
                 }
 
                 if (data != block->data) free(data);
-                block_manager_block_free(block);
+                block_manager_block_release(block);
             }
             block_manager_cursor_next(cursor);
         }
@@ -5314,55 +5315,70 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
         return -1;
     }
 
-    block_manager_block_t *block = block_manager_cursor_read(cursor);
-    block_manager_cursor_free(cursor);
+    /* two-phase read for large values
+     * read only header + key to verify key match (avoids reading large values unnecessarily)
+     * if key matches, read full block to get value */
+    size_t header_key_size = TDB_KV_HEADER_SIZE + key_size + 256; /* header + key + buffer */
+    block_manager_block_t *header_block =
+        block_manager_cursor_read_partial(cursor, header_key_size);
 
-    if (!block || !block->data)
+    if (!header_block || !header_block->data)
     {
-        if (block) block_manager_block_free(block);
-        return TDB_ERR_CORRUPT; /* checksum verification failed or block corrupted */
+        if (header_block) block_manager_block_release(header_block);
+        block_manager_cursor_free(cursor);
+        return TDB_ERR_CORRUPT;
     }
 
-    /* decompress if needed */
-    uint8_t *data = block->data;
-    size_t data_size = block->size;
+    /* decompress header if needed (for compressed blocks) */
+    uint8_t *header_data = header_block->data;
+    size_t header_data_size = header_block->size;
+    uint8_t *decompressed_header = NULL;
 
-    if (sstable->cf->config.enable_compression)
+    if (sstable->cf->config.enable_compression && header_data_size >= TDB_KV_HEADER_SIZE)
     {
         size_t decompressed_size = 0;
-        uint8_t *decompressed = decompress_data(data, data_size, &decompressed_size,
-                                                sstable->cf->config.compression_algorithm);
-        if (decompressed)
+        decompressed_header = decompress_data(header_data, header_data_size, &decompressed_size,
+                                              sstable->cf->config.compression_algorithm);
+        if (decompressed_header)
         {
-            data = decompressed;
-            data_size = decompressed_size;
+            header_data = decompressed_header;
+            header_data_size = decompressed_size;
         }
     }
 
-    if (data_size < sizeof(tidesdb_kv_pair_header_t))
+    if (header_data_size < TDB_KV_HEADER_SIZE)
     {
-        if (data != block->data) free(data);
-        block_manager_block_free(block);
+        if (decompressed_header) free(decompressed_header);
+        block_manager_block_release(header_block);
+        block_manager_cursor_free(cursor);
         return -1;
     }
 
+    /* parse header */
     uint8_t hdr_version, hdr_flags;
     uint32_t hdr_key_size, hdr_value_size;
     int64_t hdr_ttl;
     uint64_t hdr_seq;
-    deserialize_kv_header(data, &hdr_version, &hdr_flags, &hdr_key_size, &hdr_value_size, &hdr_ttl,
-                          &hdr_seq);
+    deserialize_kv_header(header_data, &hdr_version, &hdr_flags, &hdr_key_size, &hdr_value_size,
+                          &hdr_ttl, &hdr_seq);
 
-    uint8_t *ptr = data + TDB_KV_HEADER_SIZE;
-    uint8_t *block_key = ptr;
-    ptr += hdr_key_size;
-    uint8_t *block_value = ptr;
+    /* verify we have enough data for key */
+    if (header_data_size < TDB_KV_HEADER_SIZE + hdr_key_size)
+    {
+        if (decompressed_header) free(decompressed_header);
+        block_manager_block_release(header_block);
+        block_manager_cursor_free(cursor);
+        return -1;
+    }
+
+    uint8_t *block_key = header_data + TDB_KV_HEADER_SIZE;
 
     /* verify key matches */
     if (key_size != hdr_key_size || memcmp(key, block_key, key_size) != 0)
     {
-        if (data != block->data) free(data);
-        block_manager_block_free(block);
+        if (decompressed_header) free(decompressed_header);
+        block_manager_block_release(header_block);
+        block_manager_cursor_free(cursor);
         return -1;
     }
 
@@ -5372,18 +5388,82 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
 
     if (is_deleted || is_expired)
     {
-        if (data != block->data) free(data);
-        block_manager_block_free(block);
+        if (decompressed_header) free(decompressed_header);
+        block_manager_block_release(header_block);
+        block_manager_cursor_free(cursor);
         return TDB_ERR_NOT_FOUND;
     }
 
+    /* read value, check if we already have it in the partial read */
+    size_t value_offset = TDB_KV_HEADER_SIZE + hdr_key_size;
+    uint8_t *block_value = NULL;
+    uint8_t *full_data = NULL;
+    block_manager_block_t *full_block = NULL;
+
+    if (header_data_size >= value_offset + hdr_value_size)
+    {
+        /* value is already in the partial read (small value optimization) */
+        block_value = header_data + value_offset;
+    }
+    else if (hdr_value_size > 0)
+    {
+        /* need to read full block for large value */
+        if (decompressed_header) free(decompressed_header);
+        block_manager_block_release(header_block);
+
+        /* reset cursor and read full block */
+        if (block_manager_cursor_goto(cursor, (uint64_t)block_offset) != 0)
+        {
+            block_manager_cursor_free(cursor);
+            return -1;
+        }
+
+        full_block = block_manager_cursor_read(cursor);
+        block_manager_cursor_free(cursor);
+
+        if (!full_block || !full_block->data)
+        {
+            if (full_block) block_manager_block_release(full_block);
+            return TDB_ERR_CORRUPT;
+        }
+
+        full_data = full_block->data;
+        size_t full_data_size = full_block->size;
+
+        /* decompress if needed */
+        if (sstable->cf->config.enable_compression)
+        {
+            size_t decompressed_size = 0;
+            uint8_t *decompressed = decompress_data(full_data, full_data_size, &decompressed_size,
+                                                    sstable->cf->config.compression_algorithm);
+            if (decompressed)
+            {
+                full_data = decompressed;
+                full_data_size = decompressed_size;
+            }
+        }
+
+        if (full_data_size < value_offset + hdr_value_size)
+        {
+            if (full_data != full_block->data) free(full_data);
+            block_manager_block_release(full_block);
+            return -1;
+        }
+
+        block_value = full_data + value_offset;
+    }
+
+    /* copy value to output */
     if (hdr_value_size > 0)
     {
         *value = malloc(hdr_value_size);
         if (!*value)
         {
-            if (data != block->data) free(data);
-            block_manager_block_free(block);
+            if (decompressed_header) free(decompressed_header);
+            if (full_data && full_data != full_block->data) free(full_data);
+            if (full_block) block_manager_block_release(full_block);
+            if (header_block) block_manager_block_release(header_block);
+            if (!full_block) block_manager_cursor_free(cursor);
             return -1;
         }
         memcpy(*value, block_value, hdr_value_size);
@@ -5394,8 +5474,13 @@ static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, s
     }
     *value_size = hdr_value_size;
 
-    if (data != block->data) free(data);
-    block_manager_block_free(block);
+    /* cleanup */
+    if (decompressed_header) free(decompressed_header);
+    if (full_data && full_data != full_block->data) free(full_data);
+    if (full_block) block_manager_block_release(full_block);
+    if (header_block) block_manager_block_release(header_block);
+    if (!full_block) block_manager_cursor_free(cursor);
+
     return 0;
 }
 
@@ -5965,7 +6050,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
 
         /* cleanup WAL block */
-        if (wal_block) block_manager_block_free(wal_block);
+        if (wal_block) block_manager_block_release(wal_block);
         if (heap_buffer) free(heap_buffer);
 
         tidesdb_memtable_release(mt);
@@ -6047,7 +6132,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 if (block)
                 {
                     block_manager_block_write(active_mt->wal, block);
-                    block_manager_block_free(block); /* this frees batch_wal too */
+                    block_manager_block_release(block); /* this frees batch_wal too */
                 }
                 else
                 {
@@ -6807,7 +6892,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                     if (k) free(k);
                     if (v) free(v);
                 }
-                block_manager_block_free(block);
+                block_manager_block_release(block);
             }
             continue;
         }
@@ -6835,7 +6920,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
 
             int parse_result =
                 parse_block(block, iter->cf, &k, &k_size, &v, &v_size, &deleted, &ttl);
-            block_manager_block_free(block);
+            block_manager_block_release(block);
             if (parse_result != 0)
             {
                 if (k) free(k);
@@ -7058,7 +7143,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                     if (k) free(k);
                     if (v) free(v);
                 }
-                block_manager_block_free(block);
+                block_manager_block_release(block);
             }
             continue;
         }
@@ -7091,7 +7176,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
 
             int parse_result =
                 parse_block(block, iter->cf, &k, &k_size, &v, &v_size, &deleted, &ttl);
-            block_manager_block_free(block);
+            block_manager_block_release(block);
             if (parse_result != 0)
             {
                 if (k) free(k);

@@ -217,6 +217,12 @@ int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_ca
     lru_entry_t *existing = lru_find_entry(cache, key, key_len);
     if (existing != NULL)
     {
+        /* call eviction callback on old value before replacing */
+        if (existing->evict_cb && existing->value)
+        {
+            existing->evict_cb(existing->key, existing->value, existing->user_data);
+        }
+
         existing->value = value;
         existing->evict_cb = evict_cb;
         existing->user_data = user_data;

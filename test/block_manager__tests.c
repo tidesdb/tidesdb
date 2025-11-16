@@ -102,7 +102,7 @@ void test_block_manager_block_write_close_reopen_read()
     ASSERT_EQ(block->size, size);
     ASSERT_EQ(memcmp(block->data, data, size), 0);
 
-    (void)block_manager_block_free(block);
+    (void)block_manager_block_release(block);
     (void)block_manager_cursor_free(cursor);
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
@@ -195,7 +195,7 @@ void test_block_manager_cursor()
     ASSERT_EQ(read_block->size, 10);
     ASSERT_EQ(memcmp(read_block->data, "testdata0", 10), 0);
 
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
 
@@ -211,7 +211,7 @@ void test_block_manager_cursor()
     ASSERT_EQ(read_block->size, 10);
     ASSERT_EQ(memcmp(read_block->data, "testdata1", 10), 0);
 
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
 
@@ -228,7 +228,7 @@ void test_block_manager_cursor()
     ASSERT_EQ(read_block->size, 10);
     ASSERT_EQ(memcmp(read_block->data, "testdata2", 10), 0);
 
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     /* we go back */
     ASSERT_TRUE(block_manager_cursor_prev(cursor) == 0);
@@ -246,7 +246,7 @@ void test_block_manager_cursor()
     ASSERT_EQ(read_block->size, 10);
     ASSERT_EQ(memcmp(read_block->data, "testdata1", 10), 0);
 
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     /* we go back */
     ASSERT_TRUE(block_manager_cursor_prev(cursor) == 0);
@@ -264,7 +264,7 @@ void test_block_manager_cursor()
     ASSERT_EQ(read_block->size, 10);
     ASSERT_EQ(memcmp(read_block->data, "testdata0", 10), 0);
 
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     (void)block_manager_cursor_free(cursor);
 
@@ -328,7 +328,7 @@ void test_block_manager_cursor_goto_first()
     block_manager_block_t *read_block = block_manager_cursor_read(cursor);
     ASSERT_TRUE(read_block != NULL);
     ASSERT_EQ(memcmp(read_block->data, "testdata0", 10), 0);
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
@@ -366,7 +366,7 @@ void test_block_manager_cursor_goto_last()
     ASSERT_TRUE(read_block != NULL);
 
     ASSERT_EQ(memcmp(read_block->data, "testdata2", 10), 0);
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
@@ -573,7 +573,7 @@ void test_block_manager_seek_and_goto()
     block_manager_block_t *read_block = block_manager_cursor_read(cursor);
     ASSERT_TRUE(read_block != NULL);
     ASSERT_EQ(memcmp(read_block->data, "testdata1", 10), 0);
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     /* go to third block using its offset */
     ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)block_offsets[2]) == 0);
@@ -582,7 +582,7 @@ void test_block_manager_seek_and_goto()
     read_block = block_manager_cursor_read(cursor);
     ASSERT_TRUE(read_block != NULL);
     ASSERT_EQ(memcmp(read_block->data, "testdata2", 10), 0);
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     /* now go to first block */
     ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)block_offsets[0]) == 0);
@@ -591,7 +591,7 @@ void test_block_manager_seek_and_goto()
     read_block = block_manager_cursor_read(cursor);
     ASSERT_TRUE(read_block != NULL);
     ASSERT_EQ(memcmp(read_block->data, "testdata0", 10), 0);
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     /* we free the cursor */
     (void)block_manager_cursor_free(cursor);
@@ -722,7 +722,7 @@ void *reader_thread(void *arg)
         {
             printf("Reader %d read: %.*s\n", thread_id, (int)read_block->size,
                    (char *)read_block->data);
-            (void)block_manager_block_free(read_block);
+            (void)block_manager_block_release(read_block);
             read_count++;
         }
 
@@ -790,7 +790,7 @@ void test_block_manager_concurrent_rw()
     while ((block = block_manager_cursor_read(cursor)) != NULL)
     {
         printf("Block %d: %.*s\n", block_index++, (int)block->size, (char *)block->data);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
         if (block_manager_cursor_next(cursor) != 0) break;
     }
 
@@ -870,7 +870,7 @@ void test_block_manager_validate_last_block()
         ASSERT_EQ(block->size, 10);
         ASSERT_EQ(memcmp(block->data, expected, 10), 0);
 
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
         block_count++;
 
         /* we move to the next block if not the last one */
@@ -1047,7 +1047,7 @@ void benchmark_block_manager()
         ASSERT_TRUE(
             memcmp((char *)block->data + BLOCK_SIZE - 20, expected_id, strlen(expected_id)) == 0);
 
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
         blocks_read++;
 
         if (block_manager_cursor_next(cursor) != 0 || blocks_read >= NUM_BLOCKS)
@@ -1100,7 +1100,7 @@ void benchmark_block_manager()
         ASSERT_TRUE(block != NULL);
 
         /* no need to verify the block content for this benchmark */
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     (void)block_manager_cursor_free(cursor);
@@ -1206,7 +1206,7 @@ void test_block_manager_lru_cache()
     expected[299] = '\0';
 
     ASSERT_EQ(memcmp(read_block->data, expected, 300), 0);
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
 
     /* read all blocks to test cache behavior */
     for (int i = 0; i < 5; i++)
@@ -1225,7 +1225,7 @@ void test_block_manager_lru_cache()
         expected[299] = '\0';
 
         ASSERT_EQ(memcmp(read_block->data, expected, 300), 0);
-        (void)block_manager_block_free(read_block);
+        (void)block_manager_block_release(read_block);
 
         printf("Successfully read block %d from offset %ld\n", i, block_offsets[i]);
     }
@@ -1264,7 +1264,7 @@ void test_block_manager_lru_cache()
     ASSERT_EQ(read_block->size, 100);
     ASSERT_EQ(memcmp(read_block->data, "no_cache_block", 14), 0);
 
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
@@ -1299,7 +1299,7 @@ void test_block_manager_lru_cache_edge_cases()
     ASSERT_TRUE(read_block != NULL);
     ASSERT_EQ(memcmp(read_block->data, "zero_cache_test", 15), 0);
 
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("edge_test.db");
@@ -1336,7 +1336,7 @@ void test_block_manager_lru_cache_edge_cases()
     ASSERT_TRUE(read_block != NULL);
     ASSERT_EQ(read_block->size, 200);
 
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("edge_test.db");
@@ -1385,7 +1385,7 @@ void test_block_manager_lru_cache_edge_cases()
         snprintf(expected, sizeof(expected), "eviction_test_block_%d", i);
         ASSERT_EQ(memcmp(read_block->data, expected, strlen(expected)), 0);
 
-        (void)block_manager_block_free(read_block);
+        (void)block_manager_block_release(read_block);
         printf("Successfully read eviction test block %d\n", i);
     }
 
@@ -1402,7 +1402,7 @@ void test_block_manager_lru_cache_edge_cases()
         read_block = block_manager_cursor_read(cursor);
         ASSERT_TRUE(read_block != NULL);
         ASSERT_EQ(read_block->size, 100);
-        (void)block_manager_block_free(read_block);
+        (void)block_manager_block_release(read_block);
         printf("Read same block iteration %d\n", i + 1);
     }
 
@@ -1437,7 +1437,7 @@ void test_block_manager_lru_cache_edge_cases()
     ASSERT_TRUE(read_block != NULL);
     ASSERT_EQ(memcmp(read_block->data, "sync_mode_test", 14), 0);
 
-    (void)block_manager_block_free(read_block);
+    (void)block_manager_block_release(read_block);
     (void)block_manager_cursor_free(cursor);
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("edge_test.db");
@@ -1494,7 +1494,7 @@ void test_block_manager_cache_concurrent()
             snprintf(expected, sizeof(expected), "concurrent_cache_block_%d_", block_idx);
             ASSERT_EQ(memcmp(read_block->data, expected, strlen(expected)), 0);
 
-            (void)block_manager_block_free(read_block);
+            (void)block_manager_block_release(read_block);
             printf("Cursor %d read block %d in round %d\n", cursor_id, block_idx, round);
         }
     }
@@ -1515,7 +1515,7 @@ void test_block_manager_cache_concurrent()
                     0);
         block_manager_block_t *read_block = block_manager_cursor_read(reader_cursor);
         ASSERT_TRUE(read_block != NULL);
-        (void)block_manager_block_free(read_block);
+        (void)block_manager_block_release(read_block);
 
         uint64_t size = 150;
         char data[150];
@@ -1639,7 +1639,7 @@ void benchmark_block_manager_with_cache()
         ASSERT_TRUE(
             memcmp((char *)block->data + BLOCK_SIZE - 20, expected_id, strlen(expected_id)) == 0);
 
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
         blocks_read++;
 
         if (block_manager_cursor_next(cursor) != 0 || blocks_read >= NUM_BLOCKS)
@@ -1701,7 +1701,7 @@ void benchmark_block_manager_with_cache()
             cache_hits_expected++;
         }
 
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     (void)block_manager_cursor_free(cursor);
@@ -1745,7 +1745,7 @@ void benchmark_block_manager_with_cache()
             ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)block_offsets[i]) == 0);
             block = block_manager_cursor_read(cursor);
             ASSERT_TRUE(block != NULL);
-            (void)block_manager_block_free(block);
+            (void)block_manager_block_release(block);
         }
     }
 

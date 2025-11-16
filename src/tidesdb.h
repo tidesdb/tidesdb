@@ -67,7 +67,7 @@ extern int _tidesdb_debug_enabled;
 /* defaults */
 #define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE (64 * 1024 * 1024)
 #define TDB_DEFAULT_MAX_SSTABLES \
-    512 /* allow many SSTables before compaction to reduce write amplification */
+    8 /* compact frequently to reduce write amplification and improve read performance */
 #define TDB_DEFAULT_COMPACTION_THREADS             2
 #define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000000
 #define TDB_DEFAULT_MAX_OPEN_FILE_HANDLES          1024
@@ -77,6 +77,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
 #define TDB_DEFAULT_WAL_RECOVERY_POLL_INTERVAL_MS  100000
 #define TDB_DEFAULT_WAIT_FOR_WAL_RECOVERY          0
+#define TDB_DEFAULT_BLOCK_CACHE_SIZE               (64 * 1024 * 1024) /* 64MB block cache */
 
 /* limits */
 #define TDB_MAX_CF_NAME_LENGTH  128

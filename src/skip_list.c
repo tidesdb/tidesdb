@@ -489,10 +489,7 @@ retry:
                 return 0;
             }
             /* CAS failed, another thread modified the list, free replacement and retry */
-            if (!NODE_IS_ARENA_ALLOC(replacement))
-            {
-                free(replacement);
-            }
+            skip_list_free_node(replacement);
             goto retry;
         }
     }

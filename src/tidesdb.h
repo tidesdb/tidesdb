@@ -214,7 +214,7 @@ typedef struct
  * @param compaction_threads number of threads to use for parallel compaction (0 = single-threaded)
  * @param sl_max_level maximum skip list level
  * @param sl_probability skip list probability
- * @param enable_compression whether or not to enable compression
+ * @param enable_compression whether or not to enable compression for sstables
  * @param compression_algorithm compression algorithm to use if compression is enabled for column
  * family
  * @param enable_bloom_filter whether to use bloom filters for this column family

@@ -32,7 +32,7 @@
 #define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF
 
 /* block manager version */
-#define BLOCK_MANAGER_VERSION 3
+#define BLOCK_MANAGER_VERSION 4
 
 /* header field sizes */
 /* magic number size in bytes */

@@ -622,7 +622,6 @@ static void thread_pool_destroy(tidesdb_thread_pool_t *pool)
         queue_enqueue(pool->task_queue, NULL);
     }
 
-    /* wait for all threads to finish */
     for (int i = 0; i < pool->num_threads; i++)
     {
         pthread_join(pool->threads[i], NULL);
@@ -983,7 +982,6 @@ static int iter_refill_from_immutable(tidesdb_iter_t *iter, int idx, time_t curr
                                  &ttl, &deleted) != 0)
             break;
 
-        /* skip list cursor already positioned at latest version of each key */
         if (ttl > 0 && current_time > ttl) continue;
         if (deleted) continue;
 
@@ -1290,7 +1288,6 @@ static int iter_refill_from_sstable_backward(tidesdb_iter_t *iter, int idx, time
 
     if (block_manager_cursor_has_prev(iter->sstable_cursors[idx]))
     {
-        /* move to previous block */
         if (block_manager_cursor_prev(iter->sstable_cursors[idx]) != 0) return 0;
 
         block_manager_block_t *block = block_manager_cursor_read(iter->sstable_cursors[idx]);
@@ -1486,7 +1483,6 @@ static int tidesdb_build_sstable_index(tidesdb_sstable_t *sst, tidesdb_column_fa
         return -1;
     }
 
-    /* create cursor to iterate through blocks in order */
     block_manager_cursor_t *cursor = NULL;
     if (block_manager_cursor_init(&cursor, sst->block_manager) != 0)
     {
@@ -1845,7 +1841,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     {
         (*db)->config.wal_recovery_poll_interval_ms = TDB_DEFAULT_WAL_RECOVERY_POLL_INTERVAL_MS;
     }
-    /* wait_for_wal_recovery is a boolean flag, no default needed (0 = false is valid) */
+
     (*db)->column_families = NULL;
     (*db)->num_cfs = 0;
     (*db)->cf_capacity = 0;
@@ -1990,18 +1986,17 @@ int tidesdb_close(tidesdb_t *db)
 
         /* clear immutable memtables queue without flushing
          * background flush threads have been stopped
-         * need to release both queue reference AND creation reference */
+         * need to release both queue reference and creation reference */
         pthread_mutex_lock(&cf->flush_lock);
         tidesdb_memtable_t *mt;
         while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
         {
-            /* close WAL if still open */
             if (mt->wal)
             {
                 block_manager_close(mt->wal);
                 mt->wal = NULL;
             }
-            /* release queue reference */
+
             int remaining_refs = tidesdb_memtable_release(mt);
             /* if memtable wasn't freed (ref_count > 0), release creation reference too
              * (normally done by flush task via tidesdb_memtable_free)
@@ -2050,8 +2045,6 @@ int tidesdb_close(tidesdb_t *db)
 
     free(db->column_families);
 
-    /* close all cached block managers after freeing sstables
-     * sstable_free needs to access the cache to evict entries */
     if (db->block_manager_cache)
     {
         TDB_DEBUG_LOG("Freeing block manager cache");
@@ -2223,7 +2216,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         }
     }
 
-    /* initialize memtable IDs and WAL sequence numbers */
     atomic_store(&cf->next_memtable_id, 0);
     atomic_store(&cf->next_wal_seq, 0);
 
@@ -2256,6 +2248,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     /* init sstables array (grows dynamically) */
     atomic_init(&cf->sstables, NULL);
     atomic_init(&cf->sstable_array_capacity, 0);
+
     /* recover from WAL files if they exist */
     typedef struct
     {
@@ -2653,7 +2646,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             num_recovered_to_flush);
     }
 
-    /* re-acquire db_lock to add CF to database */
     pthread_rwlock_wrlock(&db->db_lock);
 
     /* add to database */
@@ -3603,7 +3595,6 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, name);
     if (!cf) return TDB_ERR_NOT_FOUND;
 
-    /* validate configuration values */
     if (update_config->memtable_flush_size == 0)
     {
         return TDB_ERR_INVALID_ARGS;
@@ -4971,7 +4962,6 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf)
         }
     }
 
-    /* wait for all threads to complete */
     for (int p = 0; p < pairs_to_merge; p++)
     {
         if (thread_created[p])
@@ -6916,7 +6906,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                     /* mark cursor as exhausted by positioning past end */
                     continue;
                 }
-                else if (cmp_min < 0)
+                if (cmp_min < 0)
                 {
                     /* seek_key < min_key this ssts's first key is already >= seek_key
                      * no need to scan, just position at first block for heap population */

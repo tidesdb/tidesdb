@@ -5925,7 +5925,6 @@ static void test_compact_single_sstable(void)
 
     /* compaction with single sst should succeed but do nothing */
     int result = tidesdb_compact(cf);
-    /* implementation may return 0 (success/noop) or error */
     (void)result;
 
     int num_ssts_after = atomic_load(&cf->num_sstables);

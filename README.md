@@ -10,7 +10,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 
 ## Features
 - Memtables utilize a lock-free skip list with atomic CAS operations, arena-based allocation, and reference counting. Reads are completely lock-free and scale linearly with CPU cores. Writes are also lock-free using atomic operations and sequence numbers for ordering.
-- ACID transactions that are atomic, consistent, isolated, and durable across multiple column families. Reads see the latest committed data, while iterators use snapshot isolation with reference counting to prevent premature deletion during concurrent operations.
+- ACID transactions with read-committed isolation: writes are atomic and durable, reads always see the latest committed data. Transactions support read-your-own-writes semantics. Concurrent writes use last-write-wins conflict resolution via atomic CAS operations. Lock-free writes with sequence numbers ensure ordering. Iterators use snapshot isolation with reference counting to prevent premature deletion during concurrent operations.
 - Column families provide isolated key-value stores, each with independent configuration, memtables, SSTables, and write-ahead logs.
 - Bidirectional iterators support forward and backward traversal with heap-based merge-sort across memtables and SSTables. Lock-free iteration with reference counting prevents premature deletion during concurrent operations.
 - Efficient seek operations using O(log n) skip list positioning and optional succinct trie block indexes with LOUDS encoding for direct key-to-block mapping in SSTables.
@@ -20,7 +20,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Optional compression using Snappy, LZ4, or ZSTD for both SSTables and WAL entries. Configurable per column family.
 - TTL (time-to-live) support for key-value pairs with automatic expiration. Expired entries are skipped during reads and removed during compaction.
 - Custom comparators allow registration of user-defined key comparison functions. Built-in comparators include memcmp, string, and numeric.
-- Memory optimizations include arena-based allocation for skip list nodes with atomic chaining, inline storage for small keys/values (≤24 bytes), and lock-free node pooling to reduce malloc overhead.
+- Memory optimizations include arena-based allocation for skip list nodes with atomic chaining and inline storage for small keys/values (≤24 bytes) to reduce malloc overhead. Internal queue structures use node pooling for efficient reuse.
 - Block manager cache with FIFO operations and configurable file handle cache to limit open file descriptors.
 - Shared thread pools for background flush and compaction operations with configurable thread counts at the database level.
 - Two sync modes: `TDB_SYNC_NONE` for maximum performance (OS-managed flushing) and `TDB_SYNC_FULL` for maximum durability (fsync on every write).

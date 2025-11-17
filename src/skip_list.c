@@ -856,14 +856,8 @@ int skip_list_clear(skip_list_t *list)
 int skip_list_free(skip_list_t *list)
 {
     if (list == NULL) return -1;
-
-    /* clear the list (frees malloc'd nodes but not arena-allocated ones) */
     (void)skip_list_clear(list);
-
-    /* free all arenas (this frees all arena-allocated nodes including header) */
     if (list->arena) skip_list_arena_free_all(list->arena);
-
-    /* free the list structure itself */
     free(list);
     return 0;
 }

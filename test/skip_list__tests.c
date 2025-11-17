@@ -954,7 +954,6 @@ void test_skip_list_delete_existing_keys()
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
 
-    /* insert 100 keys */
     for (int i = 0; i < 100; i++)
     {
         char key[32], value[64];
@@ -1050,10 +1049,8 @@ void test_skip_list_delete_and_reinsert()
     uint8_t value1[] = "value1";
     uint8_t value2[] = "value2";
 
-    /* insert */
     ASSERT_EQ(skip_list_put(list, key, sizeof(key), value1, sizeof(value1), -1), 0);
 
-    /* delete */
     ASSERT_EQ(skip_list_delete(list, key, sizeof(key)), 0);
 
     /* verify deleted */

@@ -1,4 +1,4 @@
-/*
+/**
  *
  * Copyright (C) TidesDB
  *
@@ -327,7 +327,7 @@ typedef enum
     TASK_COMPACTION
 } task_type_t;
 
-/*
+/**
  * thread_pool_task_t
  * @param type task type (flush or compaction)
  * @param cf column family
@@ -340,7 +340,7 @@ typedef struct
     tidesdb_memtable_t *memtable;
 } thread_pool_task_t;
 
-/*
+/**
  * tidesdb_thread_pool_t
  * @param threads array of threads
  * @param num_threads number of threads
@@ -4409,7 +4409,7 @@ static int peek_next_block_for_merge(block_manager_cursor_t *cursor, int *blocks
     return 1;
 }
 
-/*
+/**
  * compaction_job_t
  * @param cf column family
  * @param sst1 first sstable

@@ -1,4 +1,4 @@
-/*
+/**
  *
  * Copyright (C) TidesDB
  *
@@ -17,11 +17,6 @@
  * limitations under the License.
  */
 #include "skip_list.h"
-
-#include <math.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
 
 int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                 size_t key2_size, void *ctx)

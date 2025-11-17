@@ -9,7 +9,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 [![Linux Build Status](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml/badge.svg)](https://github.com/tidesdb/tidesdb/actions/workflows/build_and_test_tidesdb.yml)
 
 ## Features
-- Memtables utilize a lock-free skip list with atomic CAS operations, arena-based allocation, and reference counting. Reads are completely lock-free and scale linearly with CPU cores. Writes are also lock-free using atomic operations and sequence numbers for ordering.
+- Memtables utilize a lock-free skip list with atomic CAS operations. Reads are completely lock-free and scale linearly with CPU cores. Writes are also lock-free using atomic operations and sequence numbers for ordering.
 - ACID transactions with read-committed isolation: writes are atomic and durable, reads always see the latest committed data. Transactions support read-your-own-writes semantics. Concurrent writes use last-write-wins conflict resolution via atomic CAS operations. Lock-free writes with sequence numbers ensure ordering. Iterators use snapshot isolation with reference counting to prevent premature deletion during concurrent operations.
 - Column families provide isolated key-value stores, each with independent configuration, memtables, SSTables, and write-ahead logs.
 - Bidirectional iterators support forward and backward traversal with heap-based merge-sort across memtables and SSTables. Lock-free iteration with reference counting prevents premature deletion during concurrent operations.

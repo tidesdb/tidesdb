@@ -3327,7 +3327,10 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
             ptr += TDB_KV_HEADER_SIZE;
             memcpy(ptr, k, k_size);
             ptr += k_size;
-            memcpy(ptr, v, v_size);
+            if (v_size > 0 && v != NULL)
+            {
+                memcpy(ptr, v, v_size);
+            }
 
             uint8_t *final_data = block_data;
             size_t final_size = block_size;

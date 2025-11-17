@@ -20,10 +20,11 @@
 #include "../src/skip_list.h"
 #include "test_utils.h"
 
-#define NODE_KEY(node) \
-    (NODE_KEY_IS_INLINE(node) ? (node)->key_data.key_inline : (node)->key_data.key_ptr)
-#define NODE_VALUE(node) \
-    (NODE_VALUE_IS_INLINE(node) ? (node)->value_data.value_inline : (node)->value_data.value_ptr)
+/* helper macros for accessing node data */
+#define NODE_KEY(node)   ((node)->key)
+#define NODE_VALUE(node) (atomic_load_explicit(&(node)->versions, memory_order_acquire)->value)
+#define NODE_IS_DELETED(node) \
+    (VERSION_IS_DELETED(atomic_load_explicit(&(node)->versions, memory_order_acquire)))
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -43,8 +44,8 @@ void test_skip_list_create_node()
     if (memcmp(NODE_VALUE(node), value, sizeof(value)) != 0) test_passed = 0;
     if (NODE_IS_DELETED(node)) test_passed = 0;
 
-    /* node was created without arena, so it's always malloc'd and must be freed */
-    free(node);
+    /* properly free node with all its allocations */
+    skip_list_free_node(node);
 
     ASSERT_TRUE(test_passed);
 }
@@ -1694,6 +1695,44 @@ void benchmark_skip_list_deletions()
     printf(GREEN "  Deletion benchmark complete!\n" RESET);
 }
 
+void test_skip_list_seek_for_prev_nonexistent()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    /* insert keys 020-029 like in the failing test */
+    for (int i = 20; i < 30; i++)
+    {
+        char key[32], value[32];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_%03d", i);
+        ASSERT_EQ(
+            skip_list_put(list, (uint8_t *)key, strlen(key), (uint8_t *)value, strlen(value), -1),
+            0);
+    }
+
+    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    ASSERT_TRUE(cursor != NULL);
+
+    /* seek_for_prev with "key_025_5" should find "key_025" */
+    ASSERT_EQ(skip_list_cursor_seek_for_prev(cursor, (uint8_t *)"key_025_5", 9), 0);
+
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    time_t ttl = 0;
+    uint8_t deleted = 0;
+
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    printf("  seek_for_prev(\"key_025_5\") returned key: %.*s\n", (int)key_size, key);
+    ASSERT_EQ(memcmp(key, "key_025", 7), 0);
+
+    skip_list_cursor_free(cursor);
+    skip_list_free(list);
+}
+
 int main(void)
 {
     RUN_TEST(test_skip_list_create_node, tests_passed);
@@ -1710,6 +1749,7 @@ int main(void)
     RUN_TEST(test_skip_list_ttl, tests_passed);
     RUN_TEST(test_skip_list_cursor_seek, tests_passed);
     RUN_TEST(test_skip_list_cursor_seek_for_prev, tests_passed);
+    RUN_TEST(test_skip_list_seek_for_prev_nonexistent, tests_passed);
     RUN_TEST(test_skip_list_null_validation, tests_passed);
     RUN_TEST(test_skip_list_zero_size_key, tests_passed);
     RUN_TEST(test_skip_list_large_keys_values, tests_passed);

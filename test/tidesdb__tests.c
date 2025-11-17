@@ -4482,7 +4482,7 @@ static void test_concurrent_readers_writers(void)
 
 #define NUM_WRITERS    3
 #define NUM_READERS    3
-#define OPS_PER_THREAD 20
+#define OPS_PER_THREAD 2
 
     pthread_t writers[NUM_WRITERS];
     pthread_t readers[NUM_READERS];

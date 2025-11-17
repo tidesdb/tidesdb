@@ -1986,7 +1986,7 @@ int tidesdb_close(tidesdb_t *db)
 
         /* clear immutable memtables queue without flushing
          * background flush threads have been stopped
-         * need to release both queue reference and creation reference */
+         * force-free all memtables regardless of ref_count since we're shutting down */
         pthread_mutex_lock(&cf->flush_lock);
         tidesdb_memtable_t *mt;
         while ((mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
@@ -1997,14 +1997,9 @@ int tidesdb_close(tidesdb_t *db)
                 mt->wal = NULL;
             }
 
-            int remaining_refs = tidesdb_memtable_release(mt);
-            /* if memtable wasn't freed (ref_count > 0), release creation reference too
-             * (normally done by flush task via tidesdb_memtable_free)
-             * if ref_count reached 0, memtable was already freed by release */
-            if (remaining_refs > 0)
-            {
-                tidesdb_memtable_free(mt);
-            }
+            /* force-free memtable on shutdown -- set ref_count to 1 then release */
+            atomic_store(&mt->ref_count, 1);
+            tidesdb_memtable_release(mt);
         }
         pthread_mutex_unlock(&cf->flush_lock);
 
@@ -5747,7 +5742,7 @@ static int tidesdb_txn_get_internal(tidesdb_txn_t *txn, tidesdb_column_family_t 
             }
             else if (result == TDB_ERR_NOT_FOUND)
             {
-                /* found tombstone or expired key - stop searching older sstables */
+                /* found tombstone or expired key stop searching older sstables */
                 for (int j = i - 1; j >= 0; j--)
                 {
                     if (sst_snapshot[j])
@@ -5977,10 +5972,40 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         tidesdb_column_family_t *cf = tidesdb_get_column_family(txn->db, op->cf_name);
         if (!cf) return TDB_ERR_NOT_FOUND;
 
-        tidesdb_memtable_t *mt = atomic_load(&cf->active_memtable);
-        if (!mt) return -1;
+        /* acquire current active memtable and hold reference throughout operation
+         * loop until we successfully acquire the current active memtable */
+        tidesdb_memtable_t *mt = NULL;
+        while (1)
+        {
+            mt = atomic_load(&cf->active_memtable);
+            if (!mt) return -1;
 
-        tidesdb_memtable_acquire_fast(mt);
+            /* check if it's still active BEFORE trying to acquire */
+            tidesdb_memtable_t *check_mt = atomic_load(&cf->active_memtable);
+            if (check_mt != mt)
+            {
+                /* memtable changed, retry with new one */
+                continue;
+            }
+
+            /* try to acquire if it fails, memtable is being freed, retry */
+            if (!tidesdb_memtable_acquire(mt))
+            {
+                /* failed to acquire, retry with current active */
+                continue;
+            }
+
+            /* double-check it's still active after acquire */
+            check_mt = atomic_load(&cf->active_memtable);
+            if (check_mt == mt)
+            {
+                /* successfully acquired current active memtable */
+                break;
+            }
+
+            /* memtable changed after acquire, release and retry */
+            tidesdb_memtable_release(mt);
+        }
 
         /* get sequence number atomically for lock-free ordering */
         uint64_t seq = atomic_fetch_add(&cf->next_wal_seq, 1);
@@ -6057,10 +6082,13 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         if (wal_block) block_manager_block_release(wal_block);
         if (heap_buffer) free(heap_buffer);
 
-        tidesdb_memtable_release(mt);
+        if (result != 0)
+        {
+            tidesdb_memtable_release(mt);
+            return -1;
+        }
 
-        if (result != 0) return -1;
-
+        /* check if flush needed before releasing memtable reference */
         size_t memtable_size = (size_t)skip_list_get_size(mt->memtable);
         if (memtable_size >= cf->config.memtable_flush_size)
         {
@@ -6103,6 +6131,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
             /* if trylock failed, another thread is flushing we skip */
         }
+
+        /* release memtable reference after all uses */
+        tidesdb_memtable_release(mt);
 
         txn->committed = 1;
         return 0;
@@ -6198,17 +6229,48 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             tidesdb_get_column_family(txn->db, txn->operations[0].cf_name);
         if (!cf) return TDB_ERR_NOT_FOUND;
 
-        batch_mt = atomic_load(&cf->active_memtable);
-        if (!batch_mt) return -1;
+        /* loop until we successfully acquire the current active memtable */
+        while (1)
+        {
+            batch_mt = atomic_load(&cf->active_memtable);
+            if (!batch_mt) return -1;
 
-        /* acquire once for entire batch */
-        tidesdb_memtable_acquire_fast(batch_mt);
+            tidesdb_memtable_t *check_mt = atomic_load(&cf->active_memtable);
+            if (check_mt != batch_mt) continue;
+
+            if (!tidesdb_memtable_acquire(batch_mt)) continue;
+
+            check_mt = atomic_load(&cf->active_memtable);
+            if (check_mt == batch_mt) break;
+
+            tidesdb_memtable_release(batch_mt);
+        }
         last_cf = cf;
     }
 
     for (int i = 0; i < txn->num_ops; i++)
     {
         tidesdb_operation_t *op = &txn->operations[i];
+
+        /* re-acquire memtable reference for each operation to ensure it stays alive
+         * during skip_list_put which can take time with CAS retries */
+        tidesdb_memtable_t *current_mt = atomic_load(&last_cf->active_memtable);
+        if (!current_mt)
+        {
+            if (batch_mt) tidesdb_memtable_release(batch_mt);
+            return -1;
+        }
+
+        /* if memtable changed, release old and acquire new */
+        if (current_mt != batch_mt)
+        {
+            if (batch_mt) tidesdb_memtable_release(batch_mt);
+            if (!tidesdb_memtable_acquire(current_mt))
+            {
+                return -1;
+            }
+            batch_mt = current_mt;
+        }
 
         if (op->type == TIDESDB_OP_PUT)
         {
@@ -6238,8 +6300,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             if (memtable_size >= last_cf->config.memtable_flush_size ||
                 wal_size >= last_cf->config.memtable_flush_size)
             {
-                tidesdb_memtable_release(batch_mt);
-
                 /* try non-blocking flush trigger */
                 if (pthread_mutex_trylock(&last_cf->flush_lock) == 0)
                 {
@@ -6266,13 +6326,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                     }
                     pthread_mutex_unlock(&last_cf->flush_lock);
                 }
-
-                batch_mt = atomic_load(&last_cf->active_memtable);
-                if (!batch_mt)
-                {
-                    return -1;
-                }
-                tidesdb_memtable_acquire_fast(batch_mt);
+                /* batch_mt reference is still held, will be updated on next iteration */
             }
         }
     }

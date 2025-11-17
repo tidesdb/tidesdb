@@ -20,7 +20,6 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Optional compression using Snappy, LZ4, or ZSTD for both SSTables and WAL entries. Configurable per column family.
 - TTL (time-to-live) support for key-value pairs with automatic expiration. Expired entries are skipped during reads and removed during compaction.
 - Custom comparators allow registration of user-defined key comparison functions. Built-in comparators include memcmp, string, and numeric.
-- Memory optimizations include arena-based allocation for skip list nodes with atomic chaining and inline storage for small keys/values (≤24 bytes) to reduce malloc overhead. Internal queue structures use node pooling for efficient reuse.
 - Block manager cache with FIFO operations and configurable file handle cache to limit open file descriptors.
 - Shared thread pools for background flush and compaction operations with configurable thread counts at the database level.
 - Two sync modes: `TDB_SYNC_NONE` for maximum performance (OS-managed flushing) and `TDB_SYNC_FULL` for maximum durability (fsync on every write).

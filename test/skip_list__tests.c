@@ -1741,8 +1741,6 @@ int main(void)
     RUN_TEST(test_skip_list_ttl, tests_passed);
     RUN_TEST(test_skip_list_cursor_seek, tests_passed);
     RUN_TEST(test_skip_list_cursor_seek_for_prev, tests_passed);
-    RUN_TEST(test_skip_list_concurrent_read_write, tests_passed);
-    RUN_TEST(test_skip_list_lockfree_stress, tests_passed);
     RUN_TEST(test_skip_list_null_validation, tests_passed);
     RUN_TEST(test_skip_list_zero_size_key, tests_passed);
     RUN_TEST(test_skip_list_large_keys_values, tests_passed);
@@ -1751,13 +1749,15 @@ int main(void)
     RUN_TEST(test_skip_list_delete_existing_keys, tests_passed);
     RUN_TEST(test_skip_list_delete_nonexistent_keys, tests_passed);
     RUN_TEST(test_skip_list_delete_and_reinsert, tests_passed);
-    RUN_TEST(test_skip_list_iterate_with_deletes, tests_passed);
-    RUN_TEST(test_skip_list_update_patterns, tests_passed);
-    RUN_TEST(test_skip_list_large_value_updates, tests_passed);
-    RUN_TEST(benchmark_skip_list, tests_passed);
-    RUN_TEST(benchmark_skip_list_sequential, tests_passed);
-    RUN_TEST(benchmark_skip_list_zipfian, tests_passed);
-    RUN_TEST(benchmark_skip_list_deletions, tests_passed);
+     RUN_TEST(test_skip_list_iterate_with_deletes, tests_passed);
+     RUN_TEST(test_skip_list_update_patterns, tests_passed);
+     RUN_TEST(test_skip_list_large_value_updates, tests_passed);
+    RUN_TEST(test_skip_list_concurrent_read_write, tests_passed);
+    RUN_TEST(test_skip_list_lockfree_stress, tests_passed);
+     RUN_TEST(benchmark_skip_list, tests_passed);
+     RUN_TEST(benchmark_skip_list_sequential, tests_passed);
+     RUN_TEST(benchmark_skip_list_zipfian, tests_passed);
+     RUN_TEST(benchmark_skip_list_deletions, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

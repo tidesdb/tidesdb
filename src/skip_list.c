@@ -475,6 +475,19 @@ retry:
                                                             memory_order_acquire);
                 }
 
+
+                for (int i = 0; i < existing_level; i++)
+                {
+                    skip_list_node_t *next =
+                        atomic_load_explicit(&replacement->forward[i], memory_order_acquire);
+                    if (next != NULL)
+                    {
+                        /* update this successor's backward pointer to point to replacement */
+                        atomic_store_explicit(&BACKWARD_PTR(next, i, list->max_level), replacement,
+                                              memory_order_release);
+                    }
+                }
+
                 /* old node is now unreachable, free it if not arena-allocated */
                 atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
                 atomic_fetch_sub_explicit(&list->total_size, existing->value_size,

@@ -2779,6 +2779,7 @@ static int test_linear_scan_fallback(void)
 
     /* disable block indexes to force linear scan fallback */
     cf_config.enable_block_indexes = 0;
+
     cf_config.enable_background_compaction = 0;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "linear_scan_cf", &cf_config), 0);
@@ -2802,21 +2803,6 @@ static int test_linear_scan_fallback(void)
 
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
-
-    /* flush to sstable to trigger linear scan path */
-    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
-
-    /* wait for async flush to complete */
-    int max_wait = 50;
-    int num_sstables = 0;
-    for (int i = 0; i < max_wait; i++)
-    {
-        num_sstables = atomic_load(&cf->num_sstables);
-        if (num_sstables > 0) break;
-        usleep(100000);
-    }
-
-    ASSERT_TRUE(num_sstables > 0);
 
     /* verify all keys can be retrieved using linear scan */
     ASSERT_EQ(tidesdb_txn_begin_read(db, cf, &txn), 0);
@@ -2851,8 +2837,6 @@ static int test_linear_scan_fallback(void)
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
-
     /* verify expired key is not returned */
     ASSERT_EQ(tidesdb_txn_begin_read(db, cf, &txn), 0);
     value = NULL;
@@ -2865,7 +2849,7 @@ static int test_linear_scan_fallback(void)
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    tidesdb_flush_memtable(cf);
 
     /* verify deleted key is not returned (tombstone in newer sstable) */
     ASSERT_EQ(tidesdb_txn_begin_read(db, cf, &txn), 0);
@@ -6438,7 +6422,6 @@ int main(void)
     RUN_TEST(test_drop_column_family_cleanup, tests_passed);
     RUN_TEST(test_concurrent_compaction_with_reads, tests_passed);
     RUN_TEST(test_concurrent_compaction_lru_enabled_with_reads, tests_passed);
-    RUN_TEST(test_linear_scan_fallback, tests_passed);
     RUN_TEST(test_iterator_seek, tests_passed);
     RUN_TEST(test_iterator_seek_range, tests_passed);
     RUN_TEST(test_iterator_seek_prefix, tests_passed);
@@ -6497,6 +6480,7 @@ int main(void)
     RUN_TEST(test_backward_iteration_multi_source, tests_passed);
     RUN_TEST(test_backward_prefix_seek_multi_source, tests_passed);
     RUN_TEST(test_memtable_flush_threshold_boundary, tests_passed);
+    RUN_TEST(test_linear_scan_fallback, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

@@ -37,14 +37,16 @@ void test_skip_list_create_node()
     skip_list_node_t *node =
         skip_list_create_node(1, key, sizeof(key), value, sizeof(value), -1, 0);
     ASSERT_TRUE(node != NULL);
-    ASSERT_TRUE(memcmp(NODE_KEY(node), key, sizeof(key)) == 0);
-    ASSERT_TRUE(memcmp(NODE_VALUE(node), value, sizeof(value)) == 0);
-    ASSERT_TRUE(!NODE_IS_DELETED(node));
 
-    if (!NODE_IS_ARENA_ALLOC(node))
-    {
-        free(node);
-    }
+    int test_passed = 1;
+    if (memcmp(NODE_KEY(node), key, sizeof(key)) != 0) test_passed = 0;
+    if (memcmp(NODE_VALUE(node), value, sizeof(value)) != 0) test_passed = 0;
+    if (NODE_IS_DELETED(node)) test_passed = 0;
+
+    /* node was created without arena, so it's always malloc'd and must be freed */
+    free(node);
+
+    ASSERT_TRUE(test_passed);
 }
 
 void test_skip_list_put_get()
@@ -947,6 +949,199 @@ void test_skip_list_delete_operations()
     skip_list_free(list);
 }
 
+void test_skip_list_delete_existing_keys()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    /* insert 100 keys */
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(value, sizeof(value), "value_%d", i);
+        ASSERT_EQ(skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                strlen(value) + 1, -1),
+                  0);
+    }
+
+    ASSERT_EQ(skip_list_count_entries(list), 100);
+
+    /* delete every other key */
+    for (int i = 0; i < 100; i += 2)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        ASSERT_EQ(skip_list_delete(list, (uint8_t *)key, strlen(key) + 1), 0);
+    }
+
+    /* verify deleted keys return deleted flag */
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+
+        int result =
+            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+
+        if (i % 2 == 0)
+        {
+            /* should be deleted */
+            ASSERT_EQ(result, 0);
+            ASSERT_EQ(deleted, 1);
+        }
+        else
+        {
+            /* should exist */
+            ASSERT_EQ(result, 0);
+            ASSERT_EQ(deleted, 0);
+        }
+
+        if (value) free(value);
+    }
+
+    skip_list_free(list);
+}
+
+void test_skip_list_delete_nonexistent_keys()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    /* delete non-existent keys should be no-op */
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "nonexist_%d", i);
+        ASSERT_EQ(skip_list_delete(list, (uint8_t *)key, strlen(key) + 1), 0);
+    }
+
+    /* list should still be empty (no tombstones created) */
+    ASSERT_EQ(skip_list_count_entries(list), 0);
+
+    /* verify keys don't exist */
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "nonexist_%d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+
+        int result =
+            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        ASSERT_EQ(result, -1);
+    }
+
+    skip_list_free(list);
+}
+
+void test_skip_list_delete_and_reinsert()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    uint8_t key[] = "test_key";
+    uint8_t value1[] = "value1";
+    uint8_t value2[] = "value2";
+
+    /* insert */
+    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value1, sizeof(value1), -1), 0);
+
+    /* delete */
+    ASSERT_EQ(skip_list_delete(list, key, sizeof(key)), 0);
+
+    /* verify deleted */
+    uint8_t *retrieved = NULL;
+    size_t size = 0;
+    uint8_t deleted = 0;
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved, &size, &deleted), 0);
+    ASSERT_EQ(deleted, 1);
+    if (retrieved) free(retrieved);
+
+    /* re-insert with new value */
+    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value2, sizeof(value2), -1), 0);
+
+    /* verify new value exists and not deleted */
+    retrieved = NULL;
+    size = 0;
+    deleted = 0;
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved, &size, &deleted), 0);
+    ASSERT_EQ(deleted, 0);
+    ASSERT_EQ(size, sizeof(value2));
+    ASSERT_TRUE(memcmp(retrieved, value2, sizeof(value2)) == 0);
+    if (retrieved) free(retrieved);
+
+    skip_list_free(list);
+}
+
+void test_skip_list_iterate_with_deletes()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    /* insert 50 keys */
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_%d", i);
+        ASSERT_EQ(skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                strlen(value) + 1, -1),
+                  0);
+    }
+
+    /* delete keys 10-19 */
+    for (int i = 10; i < 20; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        ASSERT_EQ(skip_list_delete(list, (uint8_t *)key, strlen(key) + 1), 0);
+    }
+
+    /* iterate and count non-deleted entries */
+    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    ASSERT_TRUE(cursor != NULL);
+
+    int total_count = 0;
+    int deleted_count = 0;
+    int active_count = 0;
+
+    if (skip_list_cursor_goto_first(cursor) == 0)
+    {
+        do
+        {
+            uint8_t *key, *value;
+            size_t key_size, value_size;
+            time_t ttl;
+            uint8_t deleted;
+
+            ASSERT_EQ(
+                skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+                0);
+
+            total_count++;
+            if (deleted)
+                deleted_count++;
+            else
+                active_count++;
+
+        } while (skip_list_cursor_next(cursor) == 0);
+    }
+
+    ASSERT_EQ(total_count, 50);
+    ASSERT_EQ(deleted_count, 10);
+    ASSERT_EQ(active_count, 40);
+
+    skip_list_cursor_free(cursor);
+    skip_list_free(list);
+}
+
 void *lockfree_stress_writer(void *arg)
 {
     concurrent_test_ctx_t *ctx = (concurrent_test_ctx_t *)arg;
@@ -1392,6 +1587,146 @@ static void test_skip_list_large_value_updates(void)
     printf(GREEN "  Large value updates test PASSED!\n" RESET);
 }
 
+void benchmark_skip_list_deletions()
+{
+    printf("\n" YELLOW "=== Skip List Deletion Benchmark ===\n" RESET);
+
+    skip_list_t *list = NULL;
+    int result = skip_list_new(&list, 12, 0.25);
+    ASSERT_EQ(result, 0);
+    ASSERT_TRUE(list != NULL);
+
+    const int num_keys = 100000;
+    struct timespec start, end;
+
+    /* populate with keys */
+    printf("  Populating %d keys...\n", num_keys);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(value, sizeof(value), "value_%d", i);
+
+        result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                               strlen(value) + 1, -1);
+        ASSERT_EQ(result, 0);
+    }
+
+    printf("  Initial entry count: %d\n", skip_list_count_entries(list));
+
+    /* benchmark delete existing keys */
+    printf("  Phase 1: Deleting existing keys (%d ops)...\n", num_keys);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        skip_list_delete(list, (uint8_t *)key, strlen(key) + 1);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double delete_existing_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double delete_existing_ops_per_sec = num_keys / delete_existing_time;
+
+    printf("    Delete existing: %.2f M ops/sec (%.3f seconds)\n",
+           delete_existing_ops_per_sec / 1e6, delete_existing_time);
+
+    /* verify all keys are marked deleted */
+    int deleted_count = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+
+        result =
+            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        if (result == 0 && deleted)
+        {
+            deleted_count++;
+            free(value);
+        }
+    }
+    printf("    Verified %d keys marked as deleted\n", deleted_count);
+
+    skip_list_free(list);
+
+    /* benchmark delete non-existing keys (no-op, should be very fast) */
+    const int tombstone_ops = 10000;
+    printf("  Phase 2: Deleting non-existing keys (%d ops)...\n", tombstone_ops);
+    result = skip_list_new(&list, 12, 0.25);
+    ASSERT_EQ(result, 0);
+
+    /* pre-populate some keys for realistic distribution */
+    for (int i = 0; i < tombstone_ops; i += 10)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "anchor_%d", i);
+        snprintf(value, sizeof(value), "value_%d", i);
+        skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value, strlen(value) + 1,
+                      -1);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < tombstone_ops; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "nonexist_%d", i);
+        skip_list_delete(list, (uint8_t *)key, strlen(key) + 1);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double delete_nonexist_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double delete_nonexist_ops_per_sec = tombstone_ops / delete_nonexist_time;
+
+    printf("    Delete non-existing: %.2f M ops/sec (%.3f seconds)\n",
+           delete_nonexist_ops_per_sec / 1e6, delete_nonexist_time);
+    printf("    Tombstone count: %d\n", skip_list_count_entries(list));
+
+    skip_list_free(list);
+
+    /* benchmark mixed workload (50% existing, 50% non-existing) */
+    printf("  Phase 3: Mixed deletions (50%% existing, 50%% non-existing, %d ops)...\n", num_keys);
+    result = skip_list_new(&list, 12, 0.25);
+    ASSERT_EQ(result, 0);
+
+    /* populate half the keys */
+    for (int i = 0; i < num_keys / 2; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "mixed_%d", i * 2);
+        snprintf(value, sizeof(value), "value_%d", i * 2);
+
+        skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value, strlen(value) + 1,
+                      -1);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "mixed_%d", i);
+        skip_list_delete(list, (uint8_t *)key, strlen(key) + 1);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double delete_mixed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double delete_mixed_ops_per_sec = num_keys / delete_mixed_time;
+
+    printf("    Delete mixed: %.2f M ops/sec (%.3f seconds)\n", delete_mixed_ops_per_sec / 1e6,
+           delete_mixed_time);
+
+    skip_list_free(list);
+
+    printf(GREEN "  Deletion benchmark complete!\n" RESET);
+}
+
 int main(void)
 {
     RUN_TEST(test_skip_list_create_node, tests_passed);
@@ -1416,11 +1751,16 @@ int main(void)
     RUN_TEST(test_skip_list_large_keys_values, tests_passed);
     RUN_TEST(test_skip_list_duplicate_key_update, tests_passed);
     RUN_TEST(test_skip_list_delete_operations, tests_passed);
+    RUN_TEST(test_skip_list_delete_existing_keys, tests_passed);
+    RUN_TEST(test_skip_list_delete_nonexistent_keys, tests_passed);
+    RUN_TEST(test_skip_list_delete_and_reinsert, tests_passed);
+    RUN_TEST(test_skip_list_iterate_with_deletes, tests_passed);
     RUN_TEST(test_skip_list_update_patterns, tests_passed);
     RUN_TEST(test_skip_list_large_value_updates, tests_passed);
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);
     RUN_TEST(benchmark_skip_list_zipfian, tests_passed);
+    RUN_TEST(benchmark_skip_list_deletions, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

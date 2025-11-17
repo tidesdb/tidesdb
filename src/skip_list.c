@@ -246,7 +246,7 @@ skip_list_node_t *skip_list_create_node_with_arena(skip_list_arena_t **arena, in
 
     if (value_inline)
     {
-        memcpy(node->value_data.value_inline, value, value_size);
+        if (node->value_size > 0) memcpy(node->value_data.value_inline, value, value_size);
     }
     else
     {
@@ -488,7 +488,11 @@ retry:
 
                 return 0;
             }
-            /* CAS failed, another thread modified the list, retry */
+            /* CAS failed, another thread modified the list, free replacement and retry */
+            if (!NODE_IS_ARENA_ALLOC(replacement))
+            {
+                free(replacement);
+            }
             goto retry;
         }
     }
@@ -613,39 +617,7 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size)
         return 0;
     }
 
-    uint8_t empty_value = 0;
-    skip_list_node_t *tombstone =
-        skip_list_create_node_with_arena(&list->arena, 1, key, key_size, &empty_value, 1, -1, 1);
-    if (tombstone == NULL) return -1;
-
-    for (int i = current_level - 1; i >= 0; i--)
-    {
-        skip_list_node_t *next = atomic_load_explicit(&header->forward[i], memory_order_acquire);
-        skip_list_node_t *prev = header;
-
-        while (next != NULL)
-        {
-            const uint8_t *next_key = NODE_KEY(next);
-            int cmp = skip_list_compare_keys(list, next_key, next->key_size, key, key_size);
-            if (cmp > 0) break;
-            prev = next;
-            next = atomic_load_explicit(&next->forward[i], memory_order_acquire);
-        }
-
-        if (i == 0)
-        {
-            /* insert at level 0 */
-            atomic_store_explicit(&tombstone->forward[0], next, memory_order_release);
-            atomic_store_explicit(&prev->forward[0], tombstone, memory_order_release);
-            atomic_store_explicit(&BACKWARD_PTR(tombstone, 0, list->max_level), prev,
-                                  memory_order_release);
-            if (next == NULL)
-            {
-                atomic_store_explicit(&list->tail, tombstone, memory_order_release);
-            }
-        }
-    }
-
+    /* key not found - no-op */
     return 0;
 }
 
@@ -718,7 +690,7 @@ found:
     *value_size = x->value_size;
 
     return 0;
-    }
+}
 }
 
 skip_list_cursor_t *skip_list_cursor_init(skip_list_t *list)

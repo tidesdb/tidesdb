@@ -1143,7 +1143,7 @@ void benchmark_block_manager()
     (void)remove("benchmark.db");
 }
 
-void test_block_manager_lru_cache()
+void test_block_manager_fifo_cache()
 {
     block_manager_t *bm = NULL;
 
@@ -1151,7 +1151,7 @@ void test_block_manager_lru_cache()
         block_manager_open_with_cache(&bm, "cache_test.db", BLOCK_MANAGER_SYNC_NONE, 1024) == 0);
     ASSERT_TRUE(bm != NULL);
     ASSERT_TRUE(bm->block_manager_cache != NULL);
-    ASSERT_TRUE(bm->block_manager_cache->lru_cache != NULL);
+    ASSERT_TRUE(bm->block_manager_cache->fifo_cache != NULL);
     ASSERT_EQ(bm->block_manager_cache->max_size, 1024);
     ASSERT_EQ(bm->block_manager_cache->current_size, 0);
 
@@ -1271,7 +1271,7 @@ void test_block_manager_lru_cache()
     (void)remove("cache_test.db");
 }
 
-void test_block_manager_lru_cache_edge_cases()
+void test_block_manager_fifo_cache_edge_cases()
 {
     block_manager_t *bm = NULL;
 
@@ -1341,7 +1341,7 @@ void test_block_manager_lru_cache_edge_cases()
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("edge_test.db");
 
-    /*cache eviction behavior (LRU) */
+    /*cache eviction behavior (fifo) */
     printf("Test 3: Cache eviction behavior\n");
     ASSERT_TRUE(block_manager_open_with_cache(&bm, "edge_test.db", BLOCK_MANAGER_SYNC_NONE, 250) ==
                 0);
@@ -1408,7 +1408,7 @@ void test_block_manager_lru_cache_edge_cases()
 
     (void)block_manager_cursor_free(cursor);
 
-    /* test lru behavior with sync modes */
+    /* test fifo behavior with sync modes */
     printf("Test 5: Cache with different sync modes\n");
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("edge_test.db");
@@ -1996,8 +1996,8 @@ int main(void)
     RUN_TEST(test_block_manager_cursor_goto_last, tests_passed);
     RUN_TEST(test_block_manager_seek_and_goto, tests_passed);
     RUN_TEST(test_block_manager_validation_edge_cases, tests_passed);
-    RUN_TEST(test_block_manager_lru_cache, tests_passed);
-    RUN_TEST(test_block_manager_lru_cache_edge_cases, tests_passed);
+    RUN_TEST(test_block_manager_fifo_cache, tests_passed);
+    RUN_TEST(test_block_manager_fifo_cache_edge_cases, tests_passed);
     RUN_TEST(test_block_manager_cache_concurrent, tests_passed);
     RUN_TEST(test_block_manager_concurrent_rw, tests_passed);
     RUN_TEST(test_block_manager_sync_modes, tests_passed);

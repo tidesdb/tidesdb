@@ -445,8 +445,8 @@ retry:
         {
             /* create new node with same level as existing to maintain structure */
             int existing_level = existing->level;
-            /* use arena allocation - failed CAS attempts will waste arena space but that's acceptable
-             * arena memory is reclaimed when the skip list is freed */
+            /* use arena allocation - failed CAS attempts will waste arena space but that's
+             * acceptable arena memory is reclaimed when the skip list is freed */
             skip_list_node_t *replacement = skip_list_create_node_with_arena(
                 &list->arena, existing_level, key, key_size, value, value_size, ttl, 0);
             if (replacement == NULL) return -1;
@@ -473,7 +473,8 @@ retry:
             {
                 /* successfully replaced! now we update higher levels
                  * only update levels that exist in update[] (up to current_level) */
-                int max_update_level = (existing_level < current_level) ? existing_level : current_level;
+                int max_update_level =
+                    (existing_level < current_level) ? existing_level : current_level;
                 for (int i = 1; i < max_update_level; i++)
                 {
                     expected = existing;
@@ -481,7 +482,6 @@ retry:
                                                             replacement, memory_order_release,
                                                             memory_order_acquire);
                 }
-
 
                 for (int i = 0; i < existing_level; i++)
                 {
@@ -499,13 +499,6 @@ retry:
                 atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
                 atomic_fetch_sub_explicit(&list->total_size, existing->value_size,
                                           memory_order_relaxed);
-
-                /* DO NOT free the old node here - other threads may still have pointers to it
-                 * in a lock-free data structure, we need a memory reclamation scheme
-                 * (hazard pointers, epoch-based reclamation, or RCU) to safely free nodes
-                 * for now, we leak replaced nodes to avoid use-after-free bugs
-                 * they will be reclaimed when the entire skip list is freed
-                 */
 
                 return 0;
             }

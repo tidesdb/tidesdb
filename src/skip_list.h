@@ -95,9 +95,6 @@ struct skip_list_arena_t
  */
 struct skip_list_node_t
 {
-    /** packer flags byte
-     * deleted(1) | key_inline(1) | value_inline(1) | arena_alloc(1) | unused(4)
-     */
     _Atomic(uint8_t) flags;
     uint8_t level;
     uint16_t _padding;

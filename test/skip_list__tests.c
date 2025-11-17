@@ -1322,9 +1322,9 @@ void benchmark_skip_list_zipfian()
             unique_keys_accessed++;
         }
 
-        int result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                   strlen(value) + 1, -1);
-        ASSERT_EQ(result, 0);
+        int put_result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                       strlen(value) + 1, -1);
+        ASSERT_EQ(put_result, 0);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -1361,9 +1361,9 @@ void benchmark_skip_list_zipfian()
             size_t value_size = 0;
             uint8_t deleted = 0;
 
-            int result =
+            int get_result =
                 skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
-            if (result == 0 && !deleted)
+            if (get_result == 0 && !deleted)
             {
                 read_hits++;
                 free(value);
@@ -1409,9 +1409,9 @@ void benchmark_skip_list_zipfian()
         size_t value_size = 0;
         uint8_t deleted = 0;
 
-        int result =
+        int get_result =
             skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
-        if (result == 0 && !deleted)
+        if (get_result == 0 && !deleted)
         {
             pure_read_hits++;
             free(value);
@@ -1749,15 +1749,15 @@ int main(void)
     RUN_TEST(test_skip_list_delete_existing_keys, tests_passed);
     RUN_TEST(test_skip_list_delete_nonexistent_keys, tests_passed);
     RUN_TEST(test_skip_list_delete_and_reinsert, tests_passed);
-     RUN_TEST(test_skip_list_iterate_with_deletes, tests_passed);
-     RUN_TEST(test_skip_list_update_patterns, tests_passed);
-     RUN_TEST(test_skip_list_large_value_updates, tests_passed);
+    RUN_TEST(test_skip_list_iterate_with_deletes, tests_passed);
+    RUN_TEST(test_skip_list_update_patterns, tests_passed);
+    RUN_TEST(test_skip_list_large_value_updates, tests_passed);
     RUN_TEST(test_skip_list_concurrent_read_write, tests_passed);
     RUN_TEST(test_skip_list_lockfree_stress, tests_passed);
-     RUN_TEST(benchmark_skip_list, tests_passed);
-     RUN_TEST(benchmark_skip_list_sequential, tests_passed);
-     RUN_TEST(benchmark_skip_list_zipfian, tests_passed);
-     RUN_TEST(benchmark_skip_list_deletions, tests_passed);
+    RUN_TEST(benchmark_skip_list, tests_passed);
+    RUN_TEST(benchmark_skip_list_sequential, tests_passed);
+    RUN_TEST(benchmark_skip_list_zipfian, tests_passed);
+    RUN_TEST(benchmark_skip_list_deletions, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

@@ -506,6 +506,12 @@ retry:
                 atomic_fetch_sub_explicit(&list->total_size, existing->value_size,
                                           memory_order_relaxed);
 
+                /* free the old node if it was malloc'd (not arena-allocated) */
+                if (!NODE_IS_ARENA_ALLOC(existing))
+                {
+                    free(existing);
+                }
+
                 return 0;
             }
             /* CAS failed, another thread modified the list

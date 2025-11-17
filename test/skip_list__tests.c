@@ -82,8 +82,7 @@ void test_skip_list_destroy()
         printf(RED "Failed to create skip list\n" RESET);
         return;
     }
-    int result = skip_list_free(list);
-    ASSERT_EQ(result, 0);
+    skip_list_free(list);
 }
 
 void test_skip_list_clear()
@@ -147,13 +146,14 @@ void test_skip_list_cursor_init()
         printf(RED "Failed to create skip list\n" RESET);
         return;
     }
-    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
     ASSERT_EQ(cursor->list, list);
     ASSERT_EQ(cursor->current, list->header->forward[0]);
 
     (void)skip_list_cursor_free(cursor);
-    ASSERT_TRUE(skip_list_free(list) == 0);
+    skip_list_free(list);
 }
 
 void test_skip_list_cursor_next()
@@ -171,7 +171,8 @@ void test_skip_list_cursor_next()
     ASSERT_TRUE(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
     ASSERT_TRUE(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
 
-    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
     ASSERT_NE(cursor->current, NULL);
 
@@ -199,7 +200,8 @@ void test_skip_list_cursor_prev()
     ASSERT_TRUE(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
     ASSERT_TRUE(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
 
-    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
     ASSERT_NE(cursor->current, NULL);
 
@@ -402,7 +404,8 @@ void test_skip_list_cursor_functions()
     }
     ASSERT_TRUE(list != NULL);
 
-    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
 
     ASSERT_TRUE(skip_list_cursor_has_next(cursor) == -1);
@@ -424,7 +427,7 @@ void test_skip_list_cursor_functions()
     uint8_t value3[] = {30};
     ASSERT_TRUE(skip_list_put(list, key3, sizeof(key3), value3, sizeof(value3), -1) == 0);
 
-    cursor = skip_list_cursor_init(list);
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
 
     ASSERT_TRUE(skip_list_cursor_goto_first(cursor) == 0);
@@ -465,7 +468,7 @@ void test_skip_list_cursor_functions()
     ASSERT_EQ(memcmp(value, value3, value_size), 0);
 
     (void)skip_list_cursor_free(cursor);
-    ASSERT_TRUE(skip_list_free(list) == 0);
+    skip_list_free(list);
 }
 
 void test_skip_list_min_max_key()
@@ -534,7 +537,7 @@ void test_skip_list_min_max_key()
     ASSERT_EQ(memcmp(min_key, key1, min_key_size), 0);
     free(min_key);
 
-    ASSERT_TRUE(skip_list_free(list) == 0);
+    skip_list_free(list);
 }
 
 void test_skip_list_cursor_seek()
@@ -557,7 +560,8 @@ void test_skip_list_cursor_seek()
     }
 
     /* test seek to exact key */
-    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
 
     const char *seek_key = "key_50";
@@ -596,7 +600,7 @@ void test_skip_list_cursor_seek()
     ASSERT_EQ(memcmp(key, "key_00", strlen("key_00")), 0);
 
     skip_list_cursor_free(cursor);
-    ASSERT_TRUE(skip_list_free(list) == 0);
+    skip_list_free(list);
 }
 
 void test_skip_list_cursor_seek_for_prev()
@@ -618,7 +622,8 @@ void test_skip_list_cursor_seek_for_prev()
                                   strlen(value), -1) == 0);
     }
 
-    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
 
     const char *seek_key = "key_50";
@@ -648,7 +653,7 @@ void test_skip_list_cursor_seek_for_prev()
     ASSERT_EQ(memcmp(key, "key_90", strlen("key_90")), 0);
 
     skip_list_cursor_free(cursor);
-    ASSERT_TRUE(skip_list_free(list) == 0);
+    skip_list_free(list);
 }
 
 typedef struct
@@ -1073,7 +1078,8 @@ void test_skip_list_iterate_with_deletes()
     }
 
     /* iterate and count non-deleted entries */
-    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
 
     int total_count = 0;
@@ -1214,7 +1220,8 @@ void test_skip_list_lockfree_stress()
 
     /* verify we can iterate without crashes */
     printf("  Testing iteration...\n");
-    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
 
     int iterated = 0;
@@ -1711,7 +1718,8 @@ void test_skip_list_seek_for_prev_nonexistent()
             0);
     }
 
-    skip_list_cursor_t *cursor = skip_list_cursor_init(list);
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
 
     /* seek_for_prev with "key_025_5" should find "key_025" */

@@ -474,9 +474,9 @@ int skip_list_clear(skip_list_t *list)
     return 0;
 }
 
-int skip_list_free(skip_list_t *list)
+void skip_list_free(skip_list_t *list)
 {
-    if (list == NULL) return -1;
+    if (list == NULL) return;
 
     skip_list_clear(list);
 
@@ -486,7 +486,6 @@ int skip_list_free(skip_list_t *list)
     skip_list_free_node(tail);
 
     free(list);
-    return 0;
 }
 
 int skip_list_get_size(skip_list_t *list)
@@ -583,17 +582,17 @@ int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size)
     return 0;
 }
 
-skip_list_cursor_t *skip_list_cursor_init(skip_list_t *list)
+int skip_list_cursor_init(skip_list_cursor_t **cursor, skip_list_t *list)
 {
-    if (list == NULL) return NULL;
+    if (cursor == NULL || list == NULL) return -1;
 
-    skip_list_cursor_t *cursor = (skip_list_cursor_t *)malloc(sizeof(skip_list_cursor_t));
-    if (cursor == NULL) return NULL;
+    *cursor = (skip_list_cursor_t *)malloc(sizeof(skip_list_cursor_t));
+    if (*cursor == NULL) return -1;
 
-    cursor->list = list;
+    (*cursor)->list = list;
     skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
-    cursor->current = atomic_load_explicit(&header->forward[0], memory_order_acquire);
-    return cursor;
+    (*cursor)->current = atomic_load_explicit(&header->forward[0], memory_order_acquire);
+    return 0;
 }
 
 void skip_list_cursor_free(skip_list_cursor_t *cursor)
@@ -735,8 +734,7 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor)
 int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
 {
     if (cursor == NULL || list == NULL) return -1;
-    *cursor = skip_list_cursor_init(list);
-    if (*cursor == NULL) return -1;
+    if (skip_list_cursor_init(cursor, list) != 0) return -1;
     return skip_list_cursor_goto_last(*cursor);
 }
 

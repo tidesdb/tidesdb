@@ -3230,8 +3230,8 @@ static int tidesdb_flush_memtable_to_sstable(tidesdb_column_family_t *cf, tidesd
     sst->index = NULL; /* will be built after adding all entries */
 
     TDB_DEBUG_LOG("Creating skip list cursor for flush");
-    skip_list_cursor_t *cursor = skip_list_cursor_init(mt->memtable);
-    if (!cursor)
+    skip_list_cursor_t *cursor = NULL;
+    if (skip_list_cursor_init(&cursor, mt->memtable) != 0 || !cursor)
     {
         TDB_DEBUG_LOG("Failed to create skip list cursor");
         if (cf->db->block_manager_cache)
@@ -6551,8 +6551,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
         /* cache comparator to avoid atomic ops on every comparison */
         (*iter)->comparator = active_mt->memtable->comparator;
         (*iter)->comparator_ctx = active_mt->memtable->comparator_ctx;
-        (*iter)->memtable_cursor = skip_list_cursor_init(active_mt->memtable);
-        if (!(*iter)->memtable_cursor)
+        if (skip_list_cursor_init(&(*iter)->memtable_cursor, active_mt->memtable) != 0 ||
+            !(*iter)->memtable_cursor)
         {
             /* failed to create cursor -- release memtable and continue without it */
             tidesdb_memtable_release(active_mt);
@@ -6602,8 +6602,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter)
             {
                 if ((*iter)->immutable_memtables[i] && (*iter)->immutable_memtables[i]->memtable)
                 {
-                    (*iter)->immutable_memtable_cursors[i] =
-                        skip_list_cursor_init((*iter)->immutable_memtables[i]->memtable);
+                    skip_list_cursor_init(&(*iter)->immutable_memtable_cursors[i],
+                                          (*iter)->immutable_memtables[i]->memtable);
                 }
                 else
                 {

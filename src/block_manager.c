@@ -261,7 +261,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     }
     else
     {
-        /* If we can't get size, use lseek to get current position (end of file) */
+        /* if we can't get size, use lseek to get current position (end of file) */
         off_t pos = lseek(new_bm->fd, 0, SEEK_END);
         new_bm->current_file_size = (pos >= 0) ? (uint64_t)pos : 0;
     }

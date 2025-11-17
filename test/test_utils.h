@@ -16,8 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TEST_UTILS_H
-#define TEST_UTILS_H
+#ifndef __TEST_UTILS_H__
+#define __TEST_UTILS_H__
 
 #include <assert.h>
 
@@ -184,4 +184,4 @@ static inline void generate_random_key_value(uint8_t *key, size_t key_size, uint
 #pragma GCC diagnostic pop
 #endif
 
-#endif /* TEST_UTILS_H */
+#endif /* __TEST_UTILS_H__ */

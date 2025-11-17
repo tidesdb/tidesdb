@@ -254,7 +254,7 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
     skip_list_node_t **update = malloc((list->max_level + 1) * sizeof(skip_list_node_t *));
     if (!update) return -1;
 
-    /* Initialize all update entries to header to handle concurrent level increases */
+    /* initialize all update entries to header to handle concurrent level increases */
     for (int i = 0; i <= list->max_level; i++)
     {
         update[i] = header;

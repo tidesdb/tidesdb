@@ -587,7 +587,7 @@ void test_queue_multiple_waiters()
         pthread_create(&waiters[i], NULL, multi_waiter_thread, queue);
     }
 
-    usleep(100000); /* Let threads start waiting */
+    usleep(100000); /* let threads start waiting */
 
     /* enqueue 5 items, each waiter should get one */
     int values[5] = {10, 20, 30, 40, 50};

@@ -294,6 +294,7 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
             } while (!atomic_compare_exchange_weak_explicit(&existing->versions, &old_head,
                                                             new_version, memory_order_release,
                                                             memory_order_acquire));
+            free(update);
             return 0;
         }
     }

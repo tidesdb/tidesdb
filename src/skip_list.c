@@ -310,7 +310,6 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
     atomic_store_explicit(&(*list)->total_size, 0, memory_order_relaxed);
     (*list)->comparator = comparator;
     (*list)->comparator_ctx = comparator_ctx;
-    atomic_store_explicit(&(*list)->retired_head, NULL, memory_order_relaxed);
 
     (*list)->arena = skip_list_arena_create(SKIP_LIST_ARENA_SIZE);
     if ((*list)->arena == NULL)
@@ -404,8 +403,6 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
 retry:
     if (new_node != NULL)
     {
-        /* only free malloc'd nodes - arena nodes can't be individually freed
-         * arena-allocated nodes that fail CAS will remain in arena until skip list is freed */
         if (!NODE_IS_ARENA_ALLOC(new_node))
         {
             free(new_node);
@@ -446,7 +443,7 @@ retry:
         {
             /* create new node with same level as existing to maintain structure */
             int existing_level = existing->level;
-            /* use arena allocation - failed CAS attempts will waste arena space but that's
+            /* use arena allocation,failed CAS attempts will waste arena space but that's
              * acceptable arena memory is reclaimed when the skip list is freed */
             skip_list_node_t *replacement = skip_list_create_node_with_arena(
                 &list->arena, existing_level, key, key_size, value, value_size, ttl, 0);
@@ -509,28 +506,6 @@ retry:
                 atomic_fetch_sub_explicit(&list->total_size, existing->value_size,
                                           memory_order_relaxed);
 
-                /* add malloc'd old node to retired list for later cleanup
-                 * we can't free it immediately due to potential concurrent readers
-                 * arena-allocated nodes will be freed when arena is freed */
-                if (!NODE_IS_ARENA_ALLOC(existing))
-                {
-                    skip_list_retired_node_t *retired = malloc(sizeof(skip_list_retired_node_t));
-                    if (retired != NULL)
-                    {
-                        retired->node = existing;
-                        /* atomically prepend to retired list */
-                        skip_list_retired_node_t *old_head =
-                            atomic_load_explicit(&list->retired_head, memory_order_relaxed);
-                        do
-                        {
-                            retired->next = old_head;
-                        } while (!atomic_compare_exchange_weak_explicit(
-                            &list->retired_head, &old_head, retired, memory_order_release,
-                            memory_order_relaxed));
-                    }
-                    /* if malloc fails, we leak the node - acceptable for rare edge case */
-                }
-
                 return 0;
             }
             /* CAS failed, another thread modified the list
@@ -562,7 +537,7 @@ retry:
                                                 value_size, ttl, 0);
     if (new_node == NULL)
     {
-        /* allocation failed - nothing to clean up */
+        /* allocation failed, nothing to clean up */
         return -1;
     }
 
@@ -585,8 +560,6 @@ retry:
     /* verify our forward pointer is still correct */
     if (expected != new_node_next_0)
     {
-        /* list changed, retry - but don't leak new_node */
-        /* new_node is already set, will be freed in retry path */
         goto retry;
     }
 
@@ -594,8 +567,6 @@ retry:
     if (!atomic_compare_exchange_strong_explicit(&update[0]->forward[0], &expected, new_node,
                                                  memory_order_release, memory_order_acquire))
     {
-        /* CAS failed, list changed, retry - but don't leak new_node */
-        /* new_node is already set, will be freed in retry path */
         goto retry;
     }
 
@@ -908,46 +879,9 @@ int skip_list_free(skip_list_t *list)
 {
     if (list == NULL) return -1;
     (void)skip_list_clear(list);
-
-    /* free all retired nodes */
-    skip_list_retired_node_t *retired =
-        atomic_load_explicit(&list->retired_head, memory_order_acquire);
-    while (retired != NULL)
-    {
-        skip_list_retired_node_t *next = retired->next;
-        free(retired->node); /* free the actual skip list node */
-        free(retired);       /* free the retired list node wrapper */
-        retired = next;
-    }
-
     if (list->arena) skip_list_arena_free_all(list->arena);
     free(list);
     return 0;
-}
-
-skip_list_t *skip_list_copy(skip_list_t *list)
-{
-    if (list == NULL) return NULL;
-
-    skip_list_t *new_list = NULL;
-    if (skip_list_new_with_comparator(&new_list, list->max_level, list->probability,
-                                      list->comparator, list->comparator_ctx) != 0)
-        return NULL;
-
-    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
-    skip_list_node_t *current = atomic_load_explicit(&header->forward[0], memory_order_acquire);
-
-    while (current != NULL)
-    {
-        if (!NODE_IS_DELETED(current))
-        {
-            (void)skip_list_put(new_list, NODE_KEY(current), current->key_size, NODE_VALUE(current),
-                                current->value_size, current->ttl);
-        }
-        current = atomic_load_explicit(&current->forward[0], memory_order_acquire);
-    }
-
-    return new_list;
 }
 
 int skip_list_get_size(skip_list_t *list)
@@ -1052,6 +986,15 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
 {
     if (list == NULL || cursor == NULL) return -1;
 
+    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
+    skip_list_node_t *tail = atomic_load_explicit(&list->tail, memory_order_acquire);
+
+    if (tail == header)
+    {
+        return -1;
+    }
+
+    /* list is not empty, safe to allocate cursor */
     if (*cursor == NULL)
     {
         *cursor = (skip_list_cursor_t *)malloc(sizeof(skip_list_cursor_t));
@@ -1059,17 +1002,6 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
     }
 
     (*cursor)->list = list;
-
-    /* if list is empty (tail is header) */
-    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
-    skip_list_node_t *tail = atomic_load_explicit(&list->tail, memory_order_acquire);
-
-    if (tail == header)
-    {
-        (*cursor)->current = NULL;
-        return -1;
-    }
-
     (*cursor)->current = tail;
 
     return 0;

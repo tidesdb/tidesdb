@@ -138,36 +138,6 @@ void test_skip_list_get_size()
     (void)skip_list_free(list);
 }
 
-void test_skip_list_copy()
-{
-    skip_list_t *list = NULL;
-    if (skip_list_new(&list, 12, 0.24f) == -1)
-    {
-        printf(RED "Failed to create skip list\n" RESET);
-        return;
-    }
-    uint8_t key[] = "test_key";
-    uint8_t value[] = "test_value";
-    ASSERT_TRUE(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
-
-    skip_list_t *copy = skip_list_copy(list);
-    ASSERT_TRUE(copy != NULL);
-    ASSERT_TRUE(skip_list_count_entries(copy) == skip_list_count_entries(list));
-
-    uint8_t *retrieved_value;
-    size_t retrieved_value_size;
-    uint8_t deleted;
-
-    int result =
-        skip_list_get(copy, key, sizeof(key), &retrieved_value, &retrieved_value_size, &deleted);
-    ASSERT_EQ(result, 0);
-    ASSERT_TRUE(memcmp(retrieved_value, value, sizeof(value)) == 0);
-
-    free(retrieved_value);
-    (void)skip_list_free(copy);
-    (void)skip_list_free(list);
-}
-
 void test_skip_list_cursor_init()
 {
     skip_list_t *list = NULL;
@@ -1733,7 +1703,6 @@ int main(void)
     RUN_TEST(test_skip_list_min_max_key, tests_passed);
     RUN_TEST(test_skip_list_count_entries, tests_passed);
     RUN_TEST(test_skip_list_get_size, tests_passed);
-    RUN_TEST(test_skip_list_copy, tests_passed);
     RUN_TEST(test_skip_list_cursor_init, tests_passed);
     RUN_TEST(test_skip_list_cursor_next, tests_passed);
     RUN_TEST(test_skip_list_cursor_prev, tests_passed);
@@ -1744,14 +1713,14 @@ int main(void)
     RUN_TEST(test_skip_list_null_validation, tests_passed);
     RUN_TEST(test_skip_list_zero_size_key, tests_passed);
     RUN_TEST(test_skip_list_large_keys_values, tests_passed);
-    RUN_TEST(test_skip_list_duplicate_key_update, tests_passed);
     RUN_TEST(test_skip_list_delete_operations, tests_passed);
     RUN_TEST(test_skip_list_delete_existing_keys, tests_passed);
     RUN_TEST(test_skip_list_delete_nonexistent_keys, tests_passed);
     RUN_TEST(test_skip_list_delete_and_reinsert, tests_passed);
     RUN_TEST(test_skip_list_iterate_with_deletes, tests_passed);
-    RUN_TEST(test_skip_list_update_patterns, tests_passed);
     RUN_TEST(test_skip_list_large_value_updates, tests_passed);
+    RUN_TEST(test_skip_list_duplicate_key_update, tests_passed);
+    RUN_TEST(test_skip_list_update_patterns, tests_passed);
     RUN_TEST(test_skip_list_concurrent_read_write, tests_passed);
     RUN_TEST(test_skip_list_lockfree_stress, tests_passed);
     RUN_TEST(benchmark_skip_list, tests_passed);

@@ -133,31 +133,6 @@ struct skip_list_node_t
  * @param comparator_ctx optional context passed to comparator function
  * @param arena memory pool for efficient node allocation (reduces malloc overhead)
  */
-
-/**
- * skip_list_retired_node_t
- * @param node the retired node
- * @param next pointer to next retired node in list
- */
-typedef struct skip_list_retired_node_t
-{
-    skip_list_node_t *node;
-    struct skip_list_retired_node_t *next;
-} skip_list_retired_node_t;
-
-/**
- * skip_list_t
- * @param level atomic current maximum level in use (grows dynamically)
- * @param max_level maximum allowed level (typically 12)
- * @param probability probability for level promotion (typically 0.25)
- * @param header atomic pointer to sentinel header node (never deleted)
- * @param tail atomic pointer to sentinel tail node (for fast append)
- * @param total_size atomic total bytes of all key-value pairs (excludes metadata)
- * @param comparator function pointer for custom key comparison (default: memcmp)
- * @param comparator_ctx optional context passed to comparator function
- * @param arena memory pool for efficient node allocation (reduces malloc overhead)
- * @param retired_head list of retired malloc'd nodes
- */
 typedef struct skip_list_t
 {
     _Atomic(int) level;
@@ -169,7 +144,6 @@ typedef struct skip_list_t
     skip_list_comparator_fn comparator;
     void *comparator_ctx;
     skip_list_arena_t *arena;
-    _Atomic(skip_list_retired_node_t *) retired_head;
 } skip_list_t;
 
 /**
@@ -395,14 +369,6 @@ void skip_list_cursor_free(skip_list_cursor_t *cursor);
  * @return 0 if the skip list was cleared successfully, -1 otherwise on error
  */
 int skip_list_clear(skip_list_t *list);
-
-/**
- * skip_list_copy
- * copy the skip list
- * @param list the skip list
- * @return the copied skip list
- */
-skip_list_t *skip_list_copy(skip_list_t *list);
 
 /**
  * skip_list_check_and_update_ttl

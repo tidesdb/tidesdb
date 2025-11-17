@@ -2780,14 +2780,18 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         tidesdb_memtable_release(active_mt);
     }
 
+    /* hold flush_lock while freeing queue to prevent race with flush workers */
     if (cf->immutable_memtables)
     {
+        pthread_mutex_lock(&cf->flush_lock);
         tidesdb_memtable_t *cleanup_mt;
         while ((cleanup_mt = (tidesdb_memtable_t *)queue_dequeue(cf->immutable_memtables)) != NULL)
         {
             tidesdb_memtable_release(cleanup_mt);
         }
         queue_free(cf->immutable_memtables);
+        cf->immutable_memtables = NULL;
+        pthread_mutex_unlock(&cf->flush_lock);
     }
 
     int num_ssts = atomic_load(&cf->num_sstables);

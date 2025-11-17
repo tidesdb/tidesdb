@@ -696,7 +696,7 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
     }
 
 found:
-
+{
     /* check if deleted or expired (fast path most keys are not expired) */
     uint8_t is_deleted = NODE_IS_DELETED(x);
     uint8_t is_expired = 0;
@@ -718,6 +718,7 @@ found:
     *value_size = x->value_size;
 
     return 0;
+    }
 }
 
 skip_list_cursor_t *skip_list_cursor_init(skip_list_t *list)

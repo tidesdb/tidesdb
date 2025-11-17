@@ -310,6 +310,7 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
     atomic_store_explicit(&(*list)->total_size, 0, memory_order_relaxed);
     (*list)->comparator = comparator;
     (*list)->comparator_ctx = comparator_ctx;
+    atomic_store_explicit(&(*list)->retired_head, NULL, memory_order_relaxed);
 
     (*list)->arena = skip_list_arena_create(SKIP_LIST_ARENA_SIZE);
     if ((*list)->arena == NULL)
@@ -507,6 +508,28 @@ retry:
                 atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
                 atomic_fetch_sub_explicit(&list->total_size, existing->value_size,
                                           memory_order_relaxed);
+
+                /* add malloc'd old node to retired list for later cleanup
+                 * we can't free it immediately due to potential concurrent readers
+                 * arena-allocated nodes will be freed when arena is freed */
+                if (!NODE_IS_ARENA_ALLOC(existing))
+                {
+                    skip_list_retired_node_t *retired = malloc(sizeof(skip_list_retired_node_t));
+                    if (retired != NULL)
+                    {
+                        retired->node = existing;
+                        /* atomically prepend to retired list */
+                        skip_list_retired_node_t *old_head =
+                            atomic_load_explicit(&list->retired_head, memory_order_relaxed);
+                        do
+                        {
+                            retired->next = old_head;
+                        } while (!atomic_compare_exchange_weak_explicit(
+                            &list->retired_head, &old_head, retired, memory_order_release,
+                            memory_order_relaxed));
+                    }
+                    /* if malloc fails, we leak the node - acceptable for rare edge case */
+                }
 
                 return 0;
             }
@@ -885,6 +908,18 @@ int skip_list_free(skip_list_t *list)
 {
     if (list == NULL) return -1;
     (void)skip_list_clear(list);
+
+    /* free all retired nodes */
+    skip_list_retired_node_t *retired =
+        atomic_load_explicit(&list->retired_head, memory_order_acquire);
+    while (retired != NULL)
+    {
+        skip_list_retired_node_t *next = retired->next;
+        free(retired->node); /* free the actual skip list node */
+        free(retired);       /* free the retired list node wrapper */
+        retired = next;
+    }
+
     if (list->arena) skip_list_arena_free_all(list->arena);
     free(list);
     return 0;

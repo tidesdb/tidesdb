@@ -403,7 +403,12 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
 retry:
     if (new_node != NULL)
     {
-        skip_list_free_node(new_node);
+        /* only free malloc'd nodes - arena nodes can't be individually freed
+         * arena-allocated nodes that fail CAS will remain in arena until skip list is freed */
+        if (!NODE_IS_ARENA_ALLOC(new_node))
+        {
+            free(new_node);
+        }
         new_node = NULL;
     }
 
@@ -440,6 +445,8 @@ retry:
         {
             /* create new node with same level as existing to maintain structure */
             int existing_level = existing->level;
+            /* use arena allocation - failed CAS attempts will waste arena space but that's acceptable
+             * arena memory is reclaimed when the skip list is freed */
             skip_list_node_t *replacement = skip_list_create_node_with_arena(
                 &list->arena, existing_level, key, key_size, value, value_size, ttl, 0);
             if (replacement == NULL) return -1;
@@ -488,18 +495,17 @@ retry:
                     }
                 }
 
-                /* old node is now unreachable, free it if not arena-allocated */
+                /* old node is now unreachable from the skip list structure */
                 atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
                 atomic_fetch_sub_explicit(&list->total_size, existing->value_size,
                                           memory_order_relaxed);
 
-                /* free old node if not arena-allocated
-                 * do note key/value storage is part of the same allocation, don't free separately
+                /* DO NOT free the old node here - other threads may still have pointers to it
+                 * in a lock-free data structure, we need a memory reclamation scheme
+                 * (hazard pointers, epoch-based reclamation, or RCU) to safely free nodes
+                 * for now, we leak replaced nodes to avoid use-after-free bugs
+                 * they will be reclaimed when the entire skip list is freed
                  */
-                if (!NODE_IS_ARENA_ALLOC(existing))
-                {
-                    free(existing);
-                }
 
                 return 0;
             }
@@ -525,7 +531,9 @@ retry:
                                                 memory_order_release, memory_order_relaxed);
     }
 
-    /* create new node, we use arena allocation when available */
+    /* create new node using arena allocation
+     * failed CAS attempts will waste arena space but that's acceptable
+     * arena memory is reclaimed when the skip list is freed */
     new_node = skip_list_create_node_with_arena(&list->arena, level, key, key_size, value,
                                                 value_size, ttl, 0);
     if (new_node == NULL) return -1;
@@ -549,7 +557,8 @@ retry:
     /* verify our forward pointer is still correct */
     if (expected != new_node_next_0)
     {
-        /* list changed, retry */
+        /* list changed, retry - but don't leak new_node */
+        /* new_node is already set, will be freed in retry path */
         goto retry;
     }
 
@@ -557,7 +566,8 @@ retry:
     if (!atomic_compare_exchange_strong_explicit(&update[0]->forward[0], &expected, new_node,
                                                  memory_order_release, memory_order_acquire))
     {
-        /* CAS failed, list changed, retry */
+        /* CAS failed, list changed, retry - but don't leak new_node */
+        /* new_node is already set, will be freed in retry path */
         goto retry;
     }
 

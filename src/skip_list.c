@@ -464,8 +464,10 @@ retry:
                                                         replacement, memory_order_release,
                                                         memory_order_acquire))
             {
-                /* successfully replaced! now we update higher levels */
-                for (int i = 1; i < existing_level; i++)
+                /* successfully replaced! now we update higher levels
+                 * only update levels that exist in update[] (up to current_level) */
+                int max_update_level = (existing_level < current_level) ? existing_level : current_level;
+                for (int i = 1; i < max_update_level; i++)
                 {
                     expected = existing;
                     atomic_compare_exchange_strong_explicit(&update[i]->forward[i], &expected,

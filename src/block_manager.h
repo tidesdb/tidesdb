@@ -1,4 +1,4 @@
-/*
+/**
  *
  * Copyright (C) TidesDB
  *
@@ -19,7 +19,7 @@
 #ifndef __BLOCK_MANAGER_H__
 #define __BLOCK_MANAGER_H__
 #include "compat.h"
-#include "lru.h"
+#include "fifo.h"
 
 /* more time equals more results, but remember to take breaks to refresh your mind. */
 
@@ -81,13 +81,13 @@ typedef enum
  * used for block manager caching
  * @param max_size max size of cache in bytes
  * @param current_size current size of cache in bytes
- * @param lru_cache the LRU cache
+ * @param fifo_cache utilized for hot block caching
  */
 typedef struct
 {
     uint32_t max_size;
     uint32_t current_size;
-    lru_cache_t *lru_cache;
+    fifo_cache_t *fifo_cache;
 } block_manager_cache_t;
 
 /**
@@ -118,11 +118,13 @@ typedef struct
  * used for blocks in TidesDB
  * @param size the size of the data in the block
  * @param data the data in the block
+ * @param ref_count reference count for zero-copy caching (atomic)
  */
 typedef struct
 {
     uint64_t size;
     void *data;
+    _Atomic(int) ref_count;
 } block_manager_block_t;
 
 /**
@@ -199,10 +201,25 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
 /**
  * block_manager_block_free
- * frees a block
+ * frees a block (use this for non-cached blocks)
  * @param block the block to free
  */
 void block_manager_block_free(block_manager_block_t *block);
+
+/**
+ * block_manager_block_acquire
+ * increments reference count for a cached block
+ * @param block the block to acquire
+ * @return 1 if successful, 0 if block is being freed
+ */
+int block_manager_block_acquire(block_manager_block_t *block);
+
+/**
+ * block_manager_block_release
+ * decrements reference count and frees block when count reaches 0
+ * @param block the block to release
+ */
+void block_manager_block_release(block_manager_block_t *block);
 
 /**
  * block_manager_cursor_init
@@ -228,6 +245,17 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor);
  * @return the block read from the cursor
  */
 block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_read_partial
+ * reads only the first max_bytes of a block at cursor position
+ * useful for reading header+key without reading large values
+ * @param cursor the cursor to read from
+ * @param max_bytes maximum bytes to read (0 = read full block)
+ * @return the partial block read from the cursor
+ */
+block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t *cursor,
+                                                         size_t max_bytes);
 
 /**
  * block_manager_cursor_free

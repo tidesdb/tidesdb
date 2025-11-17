@@ -1,4 +1,4 @@
-/*
+/**
  *
  * Copyright (C) TidesDB
  *
@@ -36,7 +36,7 @@
 #define POPCOUNT32(x) __popcnt(x)
 #else
 /* fallback popcount */
-/*
+/**
  * popcount64_fallback
  * @param x the 64-bit integer to count 1s in
  */
@@ -78,7 +78,7 @@ int succinct_trie_comparator_string(const uint8_t *key1, size_t key1_size, const
     return (key1_size < key2_size) ? -1 : (key1_size > key2_size) ? 1 : 0;
 }
 
-/*
+/**
  * compute_lcp
  * compute longest common prefix
  * @param k1 the first key
@@ -95,7 +95,7 @@ static size_t compute_lcp(const uint8_t *k1, size_t len1, const uint8_t *k2, siz
     return lcp;
 }
 
-/*
+/**
  * rank1
  * count 1s up to position i (exclusive) - optimized with popcount
  * @param bm the bitvector
@@ -135,7 +135,7 @@ static uint32_t rank1(const uint8_t *bm, uint32_t i)
     return cnt;
 }
 
-/*
+/**
  * select0
  * find position of k-th 0 (1-indexed) - optimized with word-level scanning
  * @param bm the bitvector
@@ -179,7 +179,7 @@ static uint32_t select0(const uint8_t *bm, uint32_t max_bits, uint32_t k)
     return max_bits;
 }
 
-/*
+/**
  * get_children_start
  * get children start position in LOUDS for a node
  * @param trie the trie
@@ -834,7 +834,7 @@ void succinct_trie_builder_free(succinct_trie_builder_t *builder)
     free(builder);
 }
 
-/*
+/**
  * find_first_terminal
  * @param trie the succinct trie
  * @param node the node to find the first terminal for

@@ -1,4 +1,4 @@
-/*
+/**
  *
  * Copyright (C) TidesDB
  *
@@ -21,7 +21,7 @@
 
 #include "block_manager.h"
 
-/*
+/**
  * succinct_trie_comparator_fn
  * comparator function type for custom key comparison
  * @param key1 the first key
@@ -34,7 +34,7 @@
 typedef int (*succinct_trie_comparator_fn)(const uint8_t *key1, size_t key1_size,
                                            const uint8_t *key2, size_t key2_size, void *ctx);
 
-/*
+/**
  * succinct_trie_entry_t
  * temporary entry during construction
  * @param key the key
@@ -48,7 +48,7 @@ typedef struct
     int64_t value;
 } succinct_trie_entry_t;
 
-/*
+/**
  * succinct_trie_t
  * succinct trie using LOUDS encoding
  * 2 bits per node + labels + values
@@ -79,7 +79,7 @@ typedef struct
     void *comparator_ctx;
 } succinct_trie_t;
 
-/*
+/**
  * succinct_trie_builder_t
  * disk-based streaming builder
  * O(max_key_length) during construction
@@ -121,7 +121,7 @@ typedef struct
     void *comparator_ctx;
 } succinct_trie_builder_t;
 
-/*
+/**
  * succinct_trie_comparator_memcmp
  * default memcmp-based comparator for byte comparison
  * @param key1 the first key
@@ -134,7 +134,7 @@ typedef struct
 int succinct_trie_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                     size_t key2_size, void *ctx);
 
-/*
+/**
  * succinct_trie_comparator_string
  * string-based comparator using strcmp
  * @param key1 the first key
@@ -147,7 +147,7 @@ int succinct_trie_comparator_memcmp(const uint8_t *key1, size_t key1_size, const
 int succinct_trie_comparator_string(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                     size_t key2_size, void *ctx);
 
-/*
+/**
  * succinct_trie_builder_new
  * create a new disk-based streaming trie builder
  * keys MUST be added in sorted order
@@ -161,7 +161,7 @@ succinct_trie_builder_t *succinct_trie_builder_new(const char *temp_dir,
                                                    succinct_trie_comparator_fn comparator,
                                                    void *comparator_ctx);
 
-/*
+/**
  * succinct_trie_builder_add
  * add an entry to the builder
  * @param builder the builder to add to
@@ -173,7 +173,7 @@ succinct_trie_builder_t *succinct_trie_builder_new(const char *temp_dir,
 int succinct_trie_builder_add(succinct_trie_builder_t *builder, const uint8_t *key, size_t key_len,
                               int64_t value);
 
-/*
+/**
  * succinct_trie_builder_build
  * finalize the builder and create an immutable succinct trie
  * this consumes the builder and frees it
@@ -182,14 +182,14 @@ int succinct_trie_builder_add(succinct_trie_builder_t *builder, const uint8_t *k
  */
 succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder);
 
-/*
+/**
  * succinct_trie_builder_free
  * free a builder without building the trie
  * @param builder the builder to free
  */
 void succinct_trie_builder_free(succinct_trie_builder_t *builder);
 
-/*
+/**
  * succinct_trie_prefix_get
  * get the first value matching a prefix
  * @param trie succinct trie
@@ -201,13 +201,13 @@ void succinct_trie_builder_free(succinct_trie_builder_t *builder);
 int succinct_trie_prefix_get(const succinct_trie_t *trie, const uint8_t *prefix, size_t prefix_len,
                              int64_t *value);
 
-/*
+/**
  * succinct_trie_free
  * @param trie trie to free
  */
 void succinct_trie_free(succinct_trie_t *trie);
 
-/*
+/**
  * succinct_trie_serialize
  * @param trie trie to serialize
  * @param out_size pointer to store size of serialized data
@@ -215,7 +215,7 @@ void succinct_trie_free(succinct_trie_t *trie);
  */
 uint8_t *succinct_trie_serialize(const succinct_trie_t *trie, size_t *out_size);
 
-/*
+/**
  * succinct_trie_deserialize
  * @param data serialized data
  * @param data_size size of serialized data
@@ -223,7 +223,7 @@ uint8_t *succinct_trie_serialize(const succinct_trie_t *trie, size_t *out_size);
  */
 succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size);
 
-/*
+/**
  * succinct_trie_get_size
  * @param trie succinct trie
  * @return size of trie in bytes

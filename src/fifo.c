@@ -1,4 +1,4 @@
-/*
+/**
  *
  * Copyright (C) TidesDB
  *
@@ -16,36 +16,36 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "lru.h"
+#include "fifo.h"
 
 #include "xxhash.h"
 
-/*
- * lru_hash
+/**
+ * fifo_hash
  * hash function for string keys using xxhash
  * @param key the key to hash
  * @param key_len the length of the key (pre-computed)
  * @param table_size the size of the hash table
  * @return the hash value
  */
-static inline size_t lru_hash(const char *key, size_t key_len, size_t table_size)
+static inline size_t fifo_hash(const char *key, size_t key_len, size_t table_size)
 {
     XXH64_hash_t hash = XXH64(key, key_len, 0);
     return (size_t)(hash % table_size);
 }
 
-/*
- * lru_find_entry
+/**
+ * fifo_find_entry
  * find entry in hash table
  * @param cache the cache to search in
  * @param key the key to search for
  * @param key_len the length of the key
  * @return the entry if found, NULL otherwise
  */
-static lru_entry_t *lru_find_entry(lru_cache_t *cache, const char *key, size_t key_len)
+static fifo_entry_t *fifo_find_entry(fifo_cache_t *cache, const char *key, size_t key_len)
 {
-    size_t index = lru_hash(key, key_len, cache->table_size);
-    lru_entry_t *entry = cache->table[index];
+    size_t index = fifo_hash(key, key_len, cache->table_size);
+    fifo_entry_t *entry = cache->table[index];
 
     /* compare length first, then memcmp */
     while (entry != NULL)
@@ -57,13 +57,13 @@ static lru_entry_t *lru_find_entry(lru_cache_t *cache, const char *key, size_t k
     return NULL;
 }
 
-/*
- * lru_move_to_head
+/**
+ * fifo_move_to_head
  * move entry to head (most recently used)
  * @param cache the cache to move the entry to
  * @param entry the entry to move
  */
-static void lru_move_to_head(lru_cache_t *cache, lru_entry_t *entry)
+static void fifo_move_to_head(fifo_cache_t *cache, fifo_entry_t *entry)
 {
     if (entry == cache->head) return;
 
@@ -81,17 +81,17 @@ static void lru_move_to_head(lru_cache_t *cache, lru_entry_t *entry)
     if (cache->tail == NULL) cache->tail = entry;
 }
 
-/*
- * lru_remove_from_table
+/**
+ * fifo_remove_from_table
  * remove entry from hash table
  * @param cache the cache to remove the entry from
  * @param entry the entry to remove
  */
-static void lru_remove_from_table(lru_cache_t *cache, lru_entry_t *entry)
+static void fifo_remove_from_table(fifo_cache_t *cache, fifo_entry_t *entry)
 {
-    size_t index = lru_hash(entry->key, entry->key_len, cache->table_size);
-    lru_entry_t *current = cache->table[index];
-    lru_entry_t *prev = NULL;
+    size_t index = fifo_hash(entry->key, entry->key_len, cache->table_size);
+    fifo_entry_t *current = cache->table[index];
+    fifo_entry_t *prev = NULL;
 
     while (current != NULL)
     {
@@ -108,54 +108,58 @@ static void lru_remove_from_table(lru_cache_t *cache, lru_entry_t *entry)
     }
 }
 
-/*
- * lru_add_to_table
+/**
+ * fifo_add_to_table
  * add entry to hash table
  * @param cache the cache to add the entry to
  * @param entry the entry to add
  */
-static void lru_add_to_table(lru_cache_t *cache, lru_entry_t *entry)
+static void fifo_add_to_table(fifo_cache_t *cache, fifo_entry_t *entry)
 {
-    size_t index = lru_hash(entry->key, entry->key_len, cache->table_size);
+    size_t index = fifo_hash(entry->key, entry->key_len, cache->table_size);
     entry->hash_next = cache->table[index];
     cache->table[index] = entry;
 }
 
-/*
- * lru_evict_lru
- * evict least recently used entry
+/**
+ * fifo_evict_fifo
+ * evict oldest entry
  * @param cache the cache to evict from
  */
-static void lru_evict_lru(lru_cache_t *cache)
+static void fifo_evict_fifo(fifo_cache_t *cache)
 {
-    if (cache->tail == NULL) return;
+    if (cache->size == 0 || !cache->tail) return;
+    fifo_entry_t *victim = cache->tail;
 
-    lru_entry_t *lru = cache->tail;
-
-    /* remove from doubly linked list */
-    if (lru->prev)
-        lru->prev->next = NULL;
+    /* remove victim from doubly linked list */
+    if (victim->prev)
+    {
+        victim->prev->next = NULL;
+        cache->tail = victim->prev;
+    }
     else
+    {
+        /* only entry in cache */
         cache->head = NULL;
+        cache->tail = NULL;
+    }
 
-    cache->tail = lru->prev;
+    fifo_remove_from_table(cache, victim);
+    if (victim->evict_cb) victim->evict_cb(victim->key, victim->value, victim->user_data);
 
-    lru_remove_from_table(cache, lru);
-    if (lru->evict_cb) lru->evict_cb(lru->key, lru->value, lru->user_data);
-
-    free(lru->key);
-    free(lru);
+    free(victim->key);
+    free(victim);
 
     cache->size--;
 }
 
-/*
- * lru_free_entry
+/**
+ * fifo_free_entry
  * free an entry and call its eviction callback
  * @param cache the cache to free the entry from
  * @param entry the entry to free
  */
-static void lru_free_entry(lru_cache_t *cache, lru_entry_t *entry)
+static void fifo_free_entry(fifo_cache_t *cache, fifo_entry_t *entry)
 {
     if (entry->prev)
         entry->prev->next = entry->next;
@@ -167,7 +171,7 @@ static void lru_free_entry(lru_cache_t *cache, lru_entry_t *entry)
     else
         cache->tail = entry->prev;
 
-    lru_remove_from_table(cache, entry);
+    fifo_remove_from_table(cache, entry);
 
     if (entry->evict_cb) entry->evict_cb(entry->key, entry->value, entry->user_data);
 
@@ -177,11 +181,11 @@ static void lru_free_entry(lru_cache_t *cache, lru_entry_t *entry)
     cache->size--;
 }
 
-lru_cache_t *lru_cache_new(size_t capacity)
+fifo_cache_t *fifo_cache_new(size_t capacity)
 {
     if (capacity == 0) return NULL;
 
-    lru_cache_t *cache = (lru_cache_t *)malloc(sizeof(lru_cache_t));
+    fifo_cache_t *cache = (fifo_cache_t *)malloc(sizeof(fifo_cache_t));
     if (cache == NULL) return NULL;
 
     cache->capacity = capacity;
@@ -189,7 +193,7 @@ lru_cache_t *lru_cache_new(size_t capacity)
     cache->head = NULL;
     cache->tail = NULL;
     cache->table_size = capacity * 2;
-    cache->table = (lru_entry_t **)calloc(cache->table_size, sizeof(lru_entry_t *));
+    cache->table = (fifo_entry_t **)calloc(cache->table_size, sizeof(fifo_entry_t *));
     if (cache->table == NULL)
     {
         free(cache);
@@ -206,28 +210,34 @@ lru_cache_t *lru_cache_new(size_t capacity)
     return cache;
 }
 
-int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_callback_t evict_cb,
-                  void *user_data)
+int fifo_cache_put(fifo_cache_t *cache, const char *key, void *value,
+                   fifo_evict_callback_t evict_cb, void *user_data)
 {
     if (cache == NULL || key == NULL) return -1;
 
     size_t key_len = strlen(key);
     pthread_mutex_lock(&cache->lock);
 
-    lru_entry_t *existing = lru_find_entry(cache, key, key_len);
+    fifo_entry_t *existing = fifo_find_entry(cache, key, key_len);
     if (existing != NULL)
     {
+        /* call eviction callback on old value before replacing */
+        if (existing->evict_cb && existing->value)
+        {
+            existing->evict_cb(existing->key, existing->value, existing->user_data);
+        }
+
         existing->value = value;
         existing->evict_cb = evict_cb;
         existing->user_data = user_data;
-        lru_move_to_head(cache, existing);
+        fifo_move_to_head(cache, existing);
         pthread_mutex_unlock(&cache->lock);
         return 0;
     }
 
-    if (cache->size >= cache->capacity) lru_evict_lru(cache);
+    if (cache->size >= cache->capacity) fifo_evict_fifo(cache);
 
-    lru_entry_t *entry = (lru_entry_t *)malloc(sizeof(lru_entry_t));
+    fifo_entry_t *entry = (fifo_entry_t *)malloc(sizeof(fifo_entry_t));
     if (entry == NULL)
     {
         pthread_mutex_unlock(&cache->lock);
@@ -256,7 +266,7 @@ int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_ca
     /* if list was empty, this is also the tail */
     if (cache->tail == NULL) cache->tail = entry;
 
-    lru_add_to_table(cache, entry);
+    fifo_add_to_table(cache, entry);
 
     cache->size++;
 
@@ -264,58 +274,57 @@ int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_ca
     return 0;
 }
 
-void *lru_cache_get(lru_cache_t *cache, const char *key)
+void *fifo_cache_get(fifo_cache_t *cache, const char *key)
 {
     if (cache == NULL || key == NULL) return NULL;
 
     size_t key_len = strlen(key);
-    pthread_mutex_lock(&cache->lock);
+    size_t index = fifo_hash(key, key_len, cache->table_size);
+    fifo_entry_t *entry = cache->table[index];
 
-    lru_entry_t *entry = lru_find_entry(cache, key, key_len);
-    if (entry == NULL)
+    /* walk hash chain without lock */
+    while (entry != NULL)
     {
-        pthread_mutex_unlock(&cache->lock);
-        return NULL;
+        if (entry->key_len == key_len && memcmp(entry->key, key, key_len) == 0)
+        {
+            return entry->value;
+        }
+        entry = entry->hash_next;
     }
 
-    lru_move_to_head(cache, entry);
-
-    void *value = entry->value;
-    pthread_mutex_unlock(&cache->lock);
-
-    return value;
+    return NULL; /* not found */
 }
 
-int lru_cache_remove(lru_cache_t *cache, const char *key)
+int fifo_cache_remove(fifo_cache_t *cache, const char *key)
 {
     if (cache == NULL || key == NULL) return -1;
 
     size_t key_len = strlen(key);
     pthread_mutex_lock(&cache->lock);
 
-    lru_entry_t *entry = lru_find_entry(cache, key, key_len);
+    fifo_entry_t *entry = fifo_find_entry(cache, key, key_len);
     if (entry == NULL)
     {
         pthread_mutex_unlock(&cache->lock);
         return -1;
     }
 
-    lru_free_entry(cache, entry);
+    fifo_free_entry(cache, entry);
 
     pthread_mutex_unlock(&cache->lock);
     return 0;
 }
 
-void lru_cache_clear(lru_cache_t *cache)
+void fifo_cache_clear(fifo_cache_t *cache)
 {
     if (cache == NULL) return;
 
     pthread_mutex_lock(&cache->lock);
 
-    lru_entry_t *current = cache->head;
+    fifo_entry_t *current = cache->head;
     while (current != NULL)
     {
-        lru_entry_t *next = current->next;
+        fifo_entry_t *next = current->next;
 
         /* call eviction callback if set */
         if (current->evict_cb) current->evict_cb(current->key, current->value, current->user_data);
@@ -325,7 +334,7 @@ void lru_cache_clear(lru_cache_t *cache)
         current = next;
     }
 
-    memset(cache->table, 0, cache->table_size * sizeof(lru_entry_t *));
+    memset(cache->table, 0, cache->table_size * sizeof(fifo_entry_t *));
 
     cache->head = NULL;
     cache->tail = NULL;
@@ -334,34 +343,34 @@ void lru_cache_clear(lru_cache_t *cache)
     pthread_mutex_unlock(&cache->lock);
 }
 
-void lru_cache_free(lru_cache_t *cache)
+void fifo_cache_free(fifo_cache_t *cache)
 {
     if (cache == NULL) return;
 
-    lru_cache_clear(cache);
+    fifo_cache_clear(cache);
 
     pthread_mutex_destroy(&cache->lock);
     free(cache->table);
     free(cache);
 }
 
-void lru_cache_destroy(lru_cache_t *cache)
+void fifo_cache_destroy(fifo_cache_t *cache)
 {
     if (cache == NULL) return;
 
     pthread_mutex_lock(&cache->lock);
 
-    lru_entry_t *current = cache->head;
+    fifo_entry_t *current = cache->head;
     while (current != NULL)
     {
-        lru_entry_t *next = current->next;
+        fifo_entry_t *next = current->next;
 
         free(current->key);
         free(current);
         current = next;
     }
 
-    memset(cache->table, 0, cache->table_size * sizeof(lru_entry_t *));
+    memset(cache->table, 0, cache->table_size * sizeof(fifo_entry_t *));
 
     cache->head = NULL;
     cache->tail = NULL;
@@ -373,7 +382,7 @@ void lru_cache_destroy(lru_cache_t *cache)
     free(cache);
 }
 
-size_t lru_cache_size(lru_cache_t *cache)
+size_t fifo_cache_size(fifo_cache_t *cache)
 {
     if (cache == NULL) return 0;
 
@@ -384,20 +393,20 @@ size_t lru_cache_size(lru_cache_t *cache)
     return size;
 }
 
-size_t lru_cache_capacity(lru_cache_t *cache)
+size_t fifo_cache_capacity(fifo_cache_t *cache)
 {
     if (cache == NULL) return 0;
     return cache->capacity;
 }
 
-size_t lru_cache_foreach(lru_cache_t *cache, lru_foreach_callback_t callback, void *user_data)
+size_t fifo_cache_foreach(fifo_cache_t *cache, fifo_foreach_callback_t callback, void *user_data)
 {
     if (cache == NULL || callback == NULL) return 0;
 
     pthread_mutex_lock(&cache->lock);
 
     size_t count = 0;
-    lru_entry_t *current = cache->head;
+    fifo_entry_t *current = cache->head;
 
     /* iterate from most recently used to least recently used */
     while (current != NULL)

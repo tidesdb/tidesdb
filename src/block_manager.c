@@ -1,4 +1,4 @@
-/*
+/**
  *
  * Copyright (C) TidesDB
  *
@@ -20,29 +20,33 @@
 
 #include "xxhash.h"
 
-/* file format
- * [HEADER]
- * - magic (3 bytes) 0x544442 "TDB"
- * - version (1 byte) 3
- * - block_size (4 bytes) default block size
- * - padding (4 bytes) reserved
- * [BLOCKS]
- * - block_size (8 bytes)
- * - checksum (8 bytes) xxHash64 of data
- * - data (variable size)
- * - overflow_offset (8 bytes) 0 if no overflow, otherwise offset to next overflow block
+/**
  *
- * CONCURRENCY MODEL
- * - Single file descriptor shared by all operations
- * - pread/pwrite for lock-free reads (readers don't block readers or writers)
- * - Atomic offset allocation for lock-free writes
- * - Writers don't block writers - concurrent writes to different offsets
- * - Readers NEVER block -- they can read while writes happen
+ * file format *
+ *
+ * HEADER *
+ * magic (3 bytes) 0x544442 "TDB"
+ * version (1 byte) 3
+ * block_size (4 bytes) default block size
+ * padding (4 bytes) reserved
+ *
+ * BLOCKS *
+ * block_size (8 bytes)
+ * checksum (8 bytes) xxHash64 of data
+ * data (variable size)
+ * overflow_offset (8 bytes) 0 if no overflow, otherwise offset to next overflow block
+ *
+ * CONCURRENCY MODEL *
+ * single file descriptor shared by all operations
+ * pread/pwrite for lock-free reads (readers don't block readers or writers)
+ * atomic offset allocation for lock-free writes
+ * writers don't block writers, concurrent writes to different offsets
+ * readers never block, they can read while writes happen
  */
 
-/*
+/**
  * cached_block_evict_callback
- * callback function called when a cached block is evicted from LRU cache
+ * callback function called when a cached block is evicted from fifo cache
  * @param key the cache key (block offset as string)
  * @param value the cached block
  * @param user_data the block manager cache structure
@@ -56,11 +60,12 @@ static void cached_block_evict_callback(const char *key, void *value, void *user
     if (block && cache)
     {
         cache->current_size -= (uint32_t)block->size;
-        block_manager_block_free(block);
+        /* release cache's reference, block will be freed when all refs are released */
+        block_manager_block_release(block);
     }
 }
 
-/*
+/**
  * block_offset_to_key
  * converts a block offset to a string key for caching
  * @param offset the block offset
@@ -71,7 +76,7 @@ static void block_offset_to_key(int64_t offset, char *key_buffer)
     snprintf(key_buffer, BLOCK_MANAGER_CACHE_KEY_SIZE, "%" PRId64, offset);
 }
 
-/*
+/**
  * compute_checksum
  * compute xxHash64 checksum
  * @param data the data to compute the checksum for
@@ -83,7 +88,7 @@ static inline uint64_t compute_checksum(const void *data, size_t size)
     return XXH64(data, size, 0);
 }
 
-/*
+/**
  * verify_checksum
  * verify xxHash64 checksum
  * @param data the data to verify the checksum for
@@ -97,7 +102,7 @@ static inline int verify_checksum(const void *data, size_t size, uint64_t expect
     return (computed == expected_checksum) ? 0 : -1;
 }
 
-/*
+/**
  * write_header
  * write file header using pwrite
  * @param fd the file descriptor to write to
@@ -125,7 +130,7 @@ static int write_header(int fd, uint32_t block_size)
     return (written == BLOCK_MANAGER_HEADER_SIZE) ? 0 : -1;
 }
 
-/*
+/**
  * read_header
  * read and validate file header using pread
  * @param fd the file descriptor to read from
@@ -155,7 +160,7 @@ static int read_header(int fd, uint32_t *block_size)
     return 0;
 }
 
-/*
+/**
  * get_file_size
  * get file size using fstat
  * @param fd the file descriptor to get the size of
@@ -170,7 +175,7 @@ static int get_file_size(int fd, uint64_t *size)
     return 0;
 }
 
-/*
+/**
  * block_manager_open_internal
  * opens a block manager (no cache)
  * @param bm the block manager to open
@@ -278,8 +283,8 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         size_t max_entries = cache_size / new_bm->block_size;
         if (max_entries < MIN_CACHE_ENTRIES) max_entries = MIN_CACHE_ENTRIES;
 
-        new_bm->block_manager_cache->lru_cache = lru_cache_new(max_entries);
-        if (!new_bm->block_manager_cache->lru_cache)
+        new_bm->block_manager_cache->fifo_cache = fifo_cache_new(max_entries);
+        if (!new_bm->block_manager_cache->fifo_cache)
         {
             free(new_bm->block_manager_cache);
             close(new_bm->fd);
@@ -304,9 +309,9 @@ int block_manager_close(block_manager_t *bm)
 
     if (bm->block_manager_cache)
     {
-        if (bm->block_manager_cache->lru_cache)
+        if (bm->block_manager_cache->fifo_cache)
         {
-            lru_cache_free(bm->block_manager_cache->lru_cache);
+            fifo_cache_free(bm->block_manager_cache->fifo_cache);
         }
         free(bm->block_manager_cache);
     }
@@ -337,6 +342,7 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
     {
         memcpy(block->data, data, size);
     }
+    atomic_store(&block->ref_count, 1);
     return block;
 }
 
@@ -347,7 +353,7 @@ block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, voi
 
     block->size = size;
     block->data = data;
-
+    atomic_store(&block->ref_count, 1);
     return block;
 }
 
@@ -392,7 +398,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
     size_t buf_offset = 0;
 
-    /* use little-endian encoding for cross-platform compatibility */
+    /* we use little-endian encoding for cross-platform compatibility */
     encode_uint64_le_compat(main_block_buffer + buf_offset, block->size);
     buf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
 
@@ -501,7 +507,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
         }
     }
 
-    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
     {
         if (bm->block_manager_cache->current_size + block->size <=
             bm->block_manager_cache->max_size)
@@ -513,14 +519,14 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
                 char cache_key[BLOCK_MANAGER_CACHE_KEY_SIZE];
                 block_offset_to_key(offset, cache_key);
 
-                if (lru_cache_put(bm->block_manager_cache->lru_cache, cache_key, cached_block,
-                                  cached_block_evict_callback, bm->block_manager_cache) == 0)
+                if (fifo_cache_put(bm->block_manager_cache->fifo_cache, cache_key, cached_block,
+                                   cached_block_evict_callback, bm->block_manager_cache) == 0)
                 {
                     bm->block_manager_cache->current_size += (uint32_t)block->size;
                 }
                 else
                 {
-                    block_manager_block_free(cached_block);
+                    block_manager_block_release(cached_block);
                 }
             }
         }
@@ -531,11 +537,39 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
 void block_manager_block_free(block_manager_block_t *block)
 {
-    if (block)
+    if (!block) return;
+
+    if (block->data) free(block->data);
+    free(block);
+}
+
+int block_manager_block_acquire(block_manager_block_t *block)
+{
+    if (!block) return 0;
+
+    /* atomically increment ref_count only if it's positive */
+    int old_count = atomic_load(&block->ref_count);
+    while (old_count > 0)
     {
-        if (block->data) free(block->data);
-        free(block);
-        block = NULL;
+        if (atomic_compare_exchange_weak(&block->ref_count, &old_count, old_count + 1))
+        {
+            return 1; /* successfully acquired */
+        }
+        /* CAS failed, old_count was updated, retry */
+    }
+    return 0; /* block is being freed (ref_count <= 0) */
+}
+
+void block_manager_block_release(block_manager_block_t *block)
+{
+    if (!block) return;
+
+    int old_count = atomic_fetch_sub(&block->ref_count, 1);
+    int new_count = old_count - 1;
+
+    if (new_count == 0)
+    {
+        block_manager_block_free(block);
     }
 }
 
@@ -650,7 +684,7 @@ int block_manager_cursor_has_prev(block_manager_cursor_t *cursor)
     return (cursor->current_pos > BLOCK_MANAGER_HEADER_SIZE) ? 1 : 0;
 }
 
-/*
+/**
  * block_manager_read_block_at_offset
  * reads a block at a specific offset, checking cache first
  * @param bm the block manager
@@ -662,18 +696,21 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 {
     if (!bm) return NULL;
 
-    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
     {
         char cache_key[32];
         block_offset_to_key((int64_t)offset, cache_key);
 
         block_manager_block_t *cached_block =
-            (block_manager_block_t *)lru_cache_get(bm->block_manager_cache->lru_cache, cache_key);
+            (block_manager_block_t *)fifo_cache_get(bm->block_manager_cache->fifo_cache, cache_key);
 
         if (cached_block)
         {
-            /* return a copy of the cached block */
-            return block_manager_block_create(cached_block->size, cached_block->data);
+            if (block_manager_block_acquire(cached_block))
+            {
+                return cached_block;
+            }
+            /* block is being freed, fall through to disk read */
         }
     }
 
@@ -701,6 +738,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     if (!block) return NULL;
 
     block->size = block_size;
+    atomic_store(&block->ref_count, 1);
     block->data = malloc(block_size);
     if (!block->data)
     {
@@ -801,32 +839,29 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     }
 
     /* cache the block if caching is enabled and we have space */
-    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
     {
         if (bm->block_manager_cache->current_size + block->size <=
             bm->block_manager_cache->max_size)
         {
-            /* create a copy for caching */
-            block_manager_block_t *cached_block =
-                block_manager_block_create(block->size, block->data);
-            if (cached_block)
-            {
-                char cache_key[32];
-                block_offset_to_key((int64_t)offset, cache_key);
+            char cache_key[32];
+            block_offset_to_key((int64_t)offset, cache_key);
 
-                if (lru_cache_put(bm->block_manager_cache->lru_cache, cache_key, cached_block,
-                                  cached_block_evict_callback, bm->block_manager_cache) == 0)
-                {
-                    bm->block_manager_cache->current_size += (uint32_t)block->size;
-                }
-                else
-                {
-                    block_manager_block_free(cached_block);
-                }
+            /* cache takes ownership of the block (ref_count=1 from creation)
+             * acquire an additional reference for the caller */
+            if (fifo_cache_put(bm->block_manager_cache->fifo_cache, cache_key, block,
+                               cached_block_evict_callback, bm->block_manager_cache) == 0)
+            {
+                bm->block_manager_cache->current_size += (uint32_t)block->size;
+                /* acquire reference for caller, cache holds the original ref_count=1 */
+                block_manager_block_acquire(block);
+                return block;
             }
+            /* cache insertion failed, return block with original ref_count=1 */
         }
     }
 
+    /* not cached, return block with ref_count=1 */
     return block;
 }
 
@@ -835,6 +870,151 @@ block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)
     if (!cursor) return NULL;
 
     return block_manager_read_block_at_offset(cursor->bm, cursor->current_pos);
+}
+
+block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t *cursor,
+                                                         size_t max_bytes)
+{
+    if (!cursor) return NULL;
+    if (max_bytes == 0) return block_manager_cursor_read(cursor);
+
+    block_manager_t *bm = cursor->bm;
+    uint64_t offset = cursor->current_pos;
+
+    /* check cache first */
+    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
+    {
+        char cache_key[32];
+        block_offset_to_key((int64_t)offset, cache_key);
+
+        block_manager_block_t *cached_block =
+            (block_manager_block_t *)fifo_cache_get(bm->block_manager_cache->fifo_cache, cache_key);
+
+        if (cached_block)
+        {
+            /* if cached block is smaller than max_bytes, return full block (zero-copy) */
+            if (cached_block->size <= max_bytes)
+            {
+                if (block_manager_block_acquire(cached_block))
+                {
+                    return cached_block;
+                }
+                /* block is being freed, fall through to disk read */
+            }
+            else
+            {
+                /* need partial copy for large cached blocks */
+                block_manager_block_t *partial = malloc(sizeof(block_manager_block_t));
+                if (!partial) return NULL;
+                partial->size = max_bytes;
+                partial->data = malloc(max_bytes);
+                if (!partial->data)
+                {
+                    free(partial);
+                    return NULL;
+                }
+                memcpy(partial->data, cached_block->data, max_bytes);
+                atomic_store(&partial->ref_count, 1);
+                return partial;
+            }
+        }
+    }
+
+    /* read block size */
+    unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+    if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=
+        BLOCK_MANAGER_SIZE_FIELD_SIZE)
+        return NULL;
+    uint64_t block_size = decode_uint64_le_compat(size_buf);
+
+    if (block_size == 0 || block_size > MAX_REASONABLE_BLOCK_SIZE) return NULL;
+
+    /* if block is smaller than max_bytes, read full block */
+    if (block_size <= max_bytes)
+    {
+        return block_manager_read_block_at_offset(bm, offset);
+    }
+
+    /* read checksum */
+    unsigned char checksum_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
+    off_t checksum_pos = (off_t)offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE;
+    if (pread(bm->fd, checksum_buf, BLOCK_MANAGER_CHECKSUM_LENGTH, checksum_pos) !=
+        BLOCK_MANAGER_CHECKSUM_LENGTH)
+        return NULL;
+
+    /* allocate partial block */
+    block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
+    if (!block) return NULL;
+
+    block->size = max_bytes;
+    block->data = malloc(max_bytes);
+    if (!block->data)
+    {
+        free(block);
+        return NULL;
+    }
+
+    /* read only first max_bytes of data */
+    off_t data_pos = checksum_pos + (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH;
+    size_t bytes_to_read = max_bytes <= bm->block_size ? max_bytes : bm->block_size;
+
+    if (pread(bm->fd, block->data, bytes_to_read, data_pos) != (ssize_t)bytes_to_read)
+    {
+        free(block->data);
+        free(block);
+        return NULL;
+    }
+
+    /* if we need more bytes and they're in overflow, read from overflow */
+    if (max_bytes > bm->block_size)
+    {
+        off_t overflow_offset_pos = data_pos + (off_t)bm->block_size;
+        unsigned char overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+        if (pread(bm->fd, overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE, overflow_offset_pos) !=
+            BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
+        {
+            free(block->data);
+            free(block);
+            return NULL;
+        }
+        uint64_t overflow_offset = decode_uint64_le_compat(overflow_buf);
+
+        size_t data_offset = bm->block_size;
+        while (overflow_offset != 0 && data_offset < max_bytes)
+        {
+            /* skip chunk size and checksum, read data */
+            off_t chunk_data_pos = (off_t)overflow_offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+                                   (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH;
+            size_t remaining = max_bytes - data_offset;
+            size_t chunk_read = remaining <= bm->block_size ? remaining : bm->block_size;
+
+            if (pread(bm->fd, (unsigned char *)block->data + data_offset, chunk_read,
+                      chunk_data_pos) != (ssize_t)chunk_read)
+            {
+                free(block->data);
+                free(block);
+                return NULL;
+            }
+
+            data_offset += chunk_read;
+            if (data_offset >= max_bytes) break;
+
+            /* read next overflow offset */
+            off_t next_overflow_pos = chunk_data_pos + (off_t)bm->block_size;
+            unsigned char next_overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+            if (pread(bm->fd, next_overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+                      next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
+            {
+                free(block->data);
+                free(block);
+                return NULL;
+            }
+            overflow_offset = decode_uint64_le_compat(next_overflow_buf);
+        }
+    }
+
+    /* we don't verify checksum for partial reads since we don't have full data */
+    return block;
 }
 
 void block_manager_cursor_free(block_manager_cursor_t *cursor)
@@ -942,9 +1122,9 @@ int block_manager_truncate(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
     {
-        lru_cache_clear(bm->block_manager_cache->lru_cache);
+        fifo_cache_clear(bm->block_manager_cache->fifo_cache);
         bm->block_manager_cache->current_size = 0;
     }
 

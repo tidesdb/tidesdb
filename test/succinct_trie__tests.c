@@ -311,15 +311,15 @@ void test_succinct_trie_empty()
     succinct_trie_t *trie = succinct_trie_builder_build(builder);
 
     int64_t val;
-    /* Get from empty trie */
+    /* get from empty trie */
     ASSERT_EQ(succinct_trie_prefix_get(trie, (uint8_t *)"nonexistent", 11, &val), -1);
 
-    /* Serialize empty trie */
+    /* serialize empty trie */
     size_t size;
     uint8_t *data = succinct_trie_serialize(trie, &size);
     ASSERT_TRUE(data != NULL);
 
-    /* Deserialize and verify still empty */
+    /* deserialize and verify still empty */
     succinct_trie_t *trie2 = succinct_trie_deserialize(data, size);
     ASSERT_TRUE(trie2 != NULL);
     ASSERT_EQ(succinct_trie_prefix_get(trie2, (uint8_t *)"key", 3, &val), -1);
@@ -334,7 +334,7 @@ void test_succinct_trie_binary_keys()
     succinct_trie_builder_t *builder =
         succinct_trie_builder_new(NULL, succinct_trie_comparator_memcmp, NULL);
 
-    /* Binary keys with null bytes - must be sorted */
+    /* binary keys with null bytes - must be sorted */
     uint8_t key1[] = {0x00, 0xFF, 0x00, 0xAA};
     uint8_t key2[] = {0x00, 0xFF, 0x01, 0xBB};
 
@@ -357,9 +357,9 @@ void test_succinct_trie_duplicate_keys()
     succinct_trie_builder_t *builder =
         succinct_trie_builder_new(NULL, succinct_trie_comparator_string, NULL);
 
-    /* Add same key multiple times - only last should be kept */
+    /* add same key multiple times - only last should be kept */
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"key", 3, 100), 0);
-    /* Second add of same key should fail (not in sorted order) */
+    /* second add of same key should fail (not in sorted order) */
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"key", 3, 200), -1);
 
     succinct_trie_t *trie = succinct_trie_builder_build(builder);
@@ -376,7 +376,7 @@ void test_succinct_trie_long_keys()
     succinct_trie_builder_t *builder =
         succinct_trie_builder_new(NULL, succinct_trie_comparator_memcmp, NULL);
 
-    /* Very long key (1KB) */
+    /* very long key (1KB) */
     uint8_t long_key[1024];
     memset(long_key, 'A', sizeof(long_key));
 
@@ -396,7 +396,7 @@ void test_succinct_trie_prefix_edge_cases()
     succinct_trie_builder_t *builder =
         succinct_trie_builder_new(NULL, succinct_trie_comparator_string, NULL);
 
-    /* Keys where one is prefix of another - must be in sorted order */
+    /* keys where one is prefix of another - must be in sorted order */
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"a", 1, 1), 0);
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"ab", 2, 2), 0);
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"abc", 3, 3), 0);
@@ -404,7 +404,7 @@ void test_succinct_trie_prefix_edge_cases()
     succinct_trie_t *trie = succinct_trie_builder_build(builder);
 
     int64_t val;
-    /* Prefix queries */
+    /* prefix queries */
     ASSERT_EQ(succinct_trie_prefix_get(trie, (uint8_t *)"a", 1, &val), 0);
     ASSERT_EQ(val, 1);
     ASSERT_EQ(succinct_trie_prefix_get(trie, (uint8_t *)"ab", 2, &val), 0);
@@ -425,7 +425,7 @@ void test_succinct_trie_deserialize_corrupted()
     size_t size;
     uint8_t *data = succinct_trie_serialize(trie, &size);
 
-    /* Corrupt the data */
+    /* corrupt the data */
     if (size > 4)
     {
         data[0] = 0xFF;
@@ -434,9 +434,9 @@ void test_succinct_trie_deserialize_corrupted()
         data[3] = 0xFF;
     }
 
-    /* Should handle gracefully */
+    /* should handle gracefully */
     succinct_trie_t *trie2 = succinct_trie_deserialize(data, size);
-    /* May return NULL or corrupted trie - just shouldn't crash */
+    /* may return NULL or corrupted trie - just shouldn't crash */
 
     free(data);
     succinct_trie_free(trie);

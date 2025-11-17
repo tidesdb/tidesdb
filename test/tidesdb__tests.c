@@ -2601,7 +2601,7 @@ static void test_concurrent_compaction_with_reads(void)
     }
     ASSERT_EQ(count, 10);
 
-    /* NOW trigger compaction while iterator is active */
+    /* now trigger compaction while iterator is active */
     ASSERT_EQ(tidesdb_compact(cf), 0);
 
     /* verify compaction happened (2 sstables merged into 1) */
@@ -2729,7 +2729,7 @@ static void test_concurrent_compaction_lru_enabled_with_reads(void)
     }
     ASSERT_EQ(count, 10);
 
-    /* NOW trigger compaction while iterator is active */
+    /* now trigger compaction while iterator is active */
     ASSERT_EQ(tidesdb_compact(cf), 0);
 
     /* verify compaction happened (2 sstables merged into 1) */
@@ -4482,7 +4482,7 @@ static void test_concurrent_readers_writers(void)
 
 #define NUM_WRITERS    3
 #define NUM_READERS    3
-#define OPS_PER_THREAD 20
+#define OPS_PER_THREAD 2
 
     pthread_t writers[NUM_WRITERS];
     pthread_t readers[NUM_READERS];

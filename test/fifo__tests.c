@@ -137,7 +137,7 @@ static void test_fifo_cache_get_updates_order(void)
     /* access key1 (with FIFO, this doesn't affect eviction order) */
     ASSERT_TRUE(fifo_cache_get(cache, "key1") != NULL);
 
-    /* FIFO eviction: key1 is oldest, so it gets evicted */
+    /* FIFO eviction key1 is oldest, so it gets evicted */
     ASSERT_EQ(fifo_cache_put(cache, "key4", &v4, test_evict_callback, NULL), 0);
 
     ASSERT_EQ(eviction_count, 1);

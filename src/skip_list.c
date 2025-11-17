@@ -449,7 +449,15 @@ retry:
              * acceptable arena memory is reclaimed when the skip list is freed */
             skip_list_node_t *replacement = skip_list_create_node_with_arena(
                 &list->arena, existing_level, key, key_size, value, value_size, ttl, 0);
-            if (replacement == NULL) return -1;
+            if (replacement == NULL)
+            {
+                /* clean up new_node if it exists before returning */
+                if (new_node != NULL && !NODE_IS_ARENA_ALLOC(new_node))
+                {
+                    free(new_node);
+                }
+                return -1;
+            }
 
             /* copy forward and backward pointers from existing node */
             for (int i = 0; i < existing_level; i++)
@@ -529,7 +537,11 @@ retry:
      * arena memory is reclaimed when the skip list is freed */
     new_node = skip_list_create_node_with_arena(&list->arena, level, key, key_size, value,
                                                 value_size, ttl, 0);
-    if (new_node == NULL) return -1;
+    if (new_node == NULL)
+    {
+        /* allocation failed - nothing to clean up */
+        return -1;
+    }
 
     /* set all forward pointers atomically before making node visible
      * read the current next pointers from our predecessors */

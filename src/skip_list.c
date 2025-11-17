@@ -488,8 +488,9 @@ retry:
 
                 return 0;
             }
-            /* CAS failed, another thread modified the list, free replacement and retry */
-            skip_list_free_node(replacement);
+            /* CAS failed, another thread modified the list
+             * set new_node to replacement so retry path cleans it up */
+            new_node = replacement;
             goto retry;
         }
     }

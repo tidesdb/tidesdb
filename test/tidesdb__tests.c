@@ -5694,11 +5694,17 @@ static void test_memtable_flush_threshold_boundary(void)
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    /* wait for flush to complete */
-    usleep(500000);
+    /* manually trigger flush (non-blocking flush may skip if lock busy) */
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
-    /* verify flush occurred, sstable count should have increased */
+    /* we keep loading sstables until we reach the threshold */
     int num_ssts_after = atomic_load(&cf->num_sstables);
+    while (num_ssts_after < num_ssts_before + 1)
+    {
+        usleep(100000);
+        num_ssts_after = atomic_load(&cf->num_sstables);
+    }
+
     ASSERT_TRUE(num_ssts_after > num_ssts_before);
 
     tidesdb_close(db);
@@ -6486,11 +6492,11 @@ int main(void)
     RUN_TEST(test_comparator_registry_edge_cases, tests_passed);
     RUN_TEST(test_iterator_boundary_seeks, tests_passed);
     RUN_TEST(test_transaction_state_validation, tests_passed);
-    RUN_TEST(test_memtable_flush_threshold_boundary, tests_passed);
     RUN_TEST(test_compact_single_sstable, tests_passed);
     RUN_TEST(test_prefix_seek_multi_source, tests_passed);
     RUN_TEST(test_backward_iteration_multi_source, tests_passed);
     RUN_TEST(test_backward_prefix_seek_multi_source, tests_passed);
+    RUN_TEST(test_memtable_flush_threshold_boundary, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

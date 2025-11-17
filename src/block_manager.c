@@ -20,29 +20,33 @@
 
 #include "xxhash.h"
 
-/* file format
- * [HEADER]
- * - magic (3 bytes) 0x544442 "TDB"
- * - version (1 byte) 3
- * - block_size (4 bytes) default block size
- * - padding (4 bytes) reserved
- * [BLOCKS]
- * - block_size (8 bytes)
- * - checksum (8 bytes) xxHash64 of data
- * - data (variable size)
- * - overflow_offset (8 bytes) 0 if no overflow, otherwise offset to next overflow block
+/**
  *
- * CONCURRENCY MODEL
- * - Single file descriptor shared by all operations
- * - pread/pwrite for lock-free reads (readers don't block readers or writers)
- * - Atomic offset allocation for lock-free writes
- * - Writers don't block writers - concurrent writes to different offsets
- * - Readers NEVER block -- they can read while writes happen
+ * file format *
+ *
+ * HEADER *
+ * magic (3 bytes) 0x544442 "TDB"
+ * version (1 byte) 3
+ * block_size (4 bytes) default block size
+ * padding (4 bytes) reserved
+ *
+ * BLOCKS *
+ * block_size (8 bytes)
+ * checksum (8 bytes) xxHash64 of data
+ * data (variable size)
+ * overflow_offset (8 bytes) 0 if no overflow, otherwise offset to next overflow block
+ *
+ * CONCURRENCY MODEL *
+ * single file descriptor shared by all operations
+ * pread/pwrite for lock-free reads (readers don't block readers or writers)
+ * atomic offset allocation for lock-free writes
+ * writers don't block writers, concurrent writes to different offsets
+ * readers never block, they can read while writes happen
  */
 
-/*
+/**
  * cached_block_evict_callback
- * callback function called when a cached block is evicted from LRU cache
+ * callback function called when a cached block is evicted from fifo cache
  * @param key the cache key (block offset as string)
  * @param value the cached block
  * @param user_data the block manager cache structure
@@ -56,12 +60,12 @@ static void cached_block_evict_callback(const char *key, void *value, void *user
     if (block && cache)
     {
         cache->current_size -= (uint32_t)block->size;
-        /* release cache's reference - block will be freed when all refs are released */
+        /* release cache's reference, block will be freed when all refs are released */
         block_manager_block_release(block);
     }
 }
 
-/*
+/**
  * block_offset_to_key
  * converts a block offset to a string key for caching
  * @param offset the block offset
@@ -72,7 +76,7 @@ static void block_offset_to_key(int64_t offset, char *key_buffer)
     snprintf(key_buffer, BLOCK_MANAGER_CACHE_KEY_SIZE, "%" PRId64, offset);
 }
 
-/*
+/**
  * compute_checksum
  * compute xxHash64 checksum
  * @param data the data to compute the checksum for
@@ -84,7 +88,7 @@ static inline uint64_t compute_checksum(const void *data, size_t size)
     return XXH64(data, size, 0);
 }
 
-/*
+/**
  * verify_checksum
  * verify xxHash64 checksum
  * @param data the data to verify the checksum for
@@ -98,7 +102,7 @@ static inline int verify_checksum(const void *data, size_t size, uint64_t expect
     return (computed == expected_checksum) ? 0 : -1;
 }
 
-/*
+/**
  * write_header
  * write file header using pwrite
  * @param fd the file descriptor to write to
@@ -126,7 +130,7 @@ static int write_header(int fd, uint32_t block_size)
     return (written == BLOCK_MANAGER_HEADER_SIZE) ? 0 : -1;
 }
 
-/*
+/**
  * read_header
  * read and validate file header using pread
  * @param fd the file descriptor to read from
@@ -156,7 +160,7 @@ static int read_header(int fd, uint32_t *block_size)
     return 0;
 }
 
-/*
+/**
  * get_file_size
  * get file size using fstat
  * @param fd the file descriptor to get the size of
@@ -171,7 +175,7 @@ static int get_file_size(int fd, uint64_t *size)
     return 0;
 }
 
-/*
+/**
  * block_manager_open_internal
  * opens a block manager (no cache)
  * @param bm the block manager to open
@@ -279,8 +283,8 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         size_t max_entries = cache_size / new_bm->block_size;
         if (max_entries < MIN_CACHE_ENTRIES) max_entries = MIN_CACHE_ENTRIES;
 
-        new_bm->block_manager_cache->lru_cache = lru_cache_new(max_entries);
-        if (!new_bm->block_manager_cache->lru_cache)
+        new_bm->block_manager_cache->fifo_cache = fifo_cache_new(max_entries);
+        if (!new_bm->block_manager_cache->fifo_cache)
         {
             free(new_bm->block_manager_cache);
             close(new_bm->fd);
@@ -305,9 +309,9 @@ int block_manager_close(block_manager_t *bm)
 
     if (bm->block_manager_cache)
     {
-        if (bm->block_manager_cache->lru_cache)
+        if (bm->block_manager_cache->fifo_cache)
         {
-            lru_cache_free(bm->block_manager_cache->lru_cache);
+            fifo_cache_free(bm->block_manager_cache->fifo_cache);
         }
         free(bm->block_manager_cache);
     }
@@ -394,7 +398,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
     size_t buf_offset = 0;
 
-    /* use little-endian encoding for cross-platform compatibility */
+    /* we use little-endian encoding for cross-platform compatibility */
     encode_uint64_le_compat(main_block_buffer + buf_offset, block->size);
     buf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
 
@@ -503,7 +507,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
         }
     }
 
-    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
     {
         if (bm->block_manager_cache->current_size + block->size <=
             bm->block_manager_cache->max_size)
@@ -515,8 +519,8 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
                 char cache_key[BLOCK_MANAGER_CACHE_KEY_SIZE];
                 block_offset_to_key(offset, cache_key);
 
-                if (lru_cache_put(bm->block_manager_cache->lru_cache, cache_key, cached_block,
-                                  cached_block_evict_callback, bm->block_manager_cache) == 0)
+                if (fifo_cache_put(bm->block_manager_cache->fifo_cache, cache_key, cached_block,
+                                   cached_block_evict_callback, bm->block_manager_cache) == 0)
                 {
                     bm->block_manager_cache->current_size += (uint32_t)block->size;
                 }
@@ -680,7 +684,7 @@ int block_manager_cursor_has_prev(block_manager_cursor_t *cursor)
     return (cursor->current_pos > BLOCK_MANAGER_HEADER_SIZE) ? 1 : 0;
 }
 
-/*
+/**
  * block_manager_read_block_at_offset
  * reads a block at a specific offset, checking cache first
  * @param bm the block manager
@@ -692,18 +696,16 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 {
     if (!bm) return NULL;
 
-    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
     {
         char cache_key[32];
         block_offset_to_key((int64_t)offset, cache_key);
 
         block_manager_block_t *cached_block =
-            (block_manager_block_t *)lru_cache_get(bm->block_manager_cache->lru_cache, cache_key);
+            (block_manager_block_t *)fifo_cache_get(bm->block_manager_cache->fifo_cache, cache_key);
 
         if (cached_block)
         {
-            /* zero-copy: return pointer to cached block with incremented ref_count
-             * eliminates malloc/memcpy overhead for hot keys (Zipfian workloads) */
             if (block_manager_block_acquire(cached_block))
             {
                 return cached_block;
@@ -837,7 +839,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     }
 
     /* cache the block if caching is enabled and we have space */
-    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
     {
         if (bm->block_manager_cache->current_size + block->size <=
             bm->block_manager_cache->max_size)
@@ -847,11 +849,11 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 
             /* cache takes ownership of the block (ref_count=1 from creation)
              * acquire an additional reference for the caller */
-            if (lru_cache_put(bm->block_manager_cache->lru_cache, cache_key, block,
-                              cached_block_evict_callback, bm->block_manager_cache) == 0)
+            if (fifo_cache_put(bm->block_manager_cache->fifo_cache, cache_key, block,
+                               cached_block_evict_callback, bm->block_manager_cache) == 0)
             {
                 bm->block_manager_cache->current_size += (uint32_t)block->size;
-                /* acquire reference for caller - cache holds the original ref_count=1 */
+                /* acquire reference for caller, cache holds the original ref_count=1 */
                 block_manager_block_acquire(block);
                 return block;
             }
@@ -880,13 +882,13 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
     uint64_t offset = cursor->current_pos;
 
     /* check cache first */
-    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
     {
         char cache_key[32];
         block_offset_to_key((int64_t)offset, cache_key);
 
         block_manager_block_t *cached_block =
-            (block_manager_block_t *)lru_cache_get(bm->block_manager_cache->lru_cache, cache_key);
+            (block_manager_block_t *)fifo_cache_get(bm->block_manager_cache->fifo_cache, cache_key);
 
         if (cached_block)
         {
@@ -1011,7 +1013,7 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
         }
     }
 
-    /* note: we don't verify checksum for partial reads since we don't have full data */
+    /* we don't verify checksum for partial reads since we don't have full data */
     return block;
 }
 
@@ -1120,9 +1122,9 @@ int block_manager_truncate(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
     {
-        lru_cache_clear(bm->block_manager_cache->lru_cache);
+        fifo_cache_clear(bm->block_manager_cache->fifo_cache);
         bm->block_manager_cache->current_size = 0;
     }
 

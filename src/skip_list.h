@@ -28,7 +28,23 @@ typedef struct skip_list_arena_t skip_list_arena_t;
 /* inline threshold -- keys/values smaller than this are stored inline */
 #define SKIP_LIST_INLINE_THRESHOLD 24
 
-/* comparator function type for custom key comparison
+#define ARENA_ALLOC_RETRY_COUNT 32
+
+/* skip_list_node_t flag bits (packed into single byte) */
+#define SKIP_LIST_FLAG_DELETED      0x01 /* node is tombstone */
+#define SKIP_LIST_FLAG_KEY_INLINE   0x02 /* key stored inline */
+#define SKIP_LIST_FLAG_VALUE_INLINE 0x04 /* value stored inline */
+#define SKIP_LIST_FLAG_ARENA_ALLOC  0x08 /* allocated from arena */
+
+/* helper macros for flag access */
+#define NODE_IS_DELETED(node) \
+    (atomic_load_explicit(&(node)->flags, memory_order_acquire) & SKIP_LIST_FLAG_DELETED)
+#define NODE_KEY_IS_INLINE(node)   ((node)->flags & SKIP_LIST_FLAG_KEY_INLINE)
+#define NODE_VALUE_IS_INLINE(node) ((node)->flags & SKIP_LIST_FLAG_VALUE_INLINE)
+#define NODE_IS_ARENA_ALLOC(node)  ((node)->flags & SKIP_LIST_FLAG_ARENA_ALLOC)
+
+/**
+ * comparator function type for custom key comparison
  * @param key1 the first key
  * @param key1_size the first key size
  * @param key2 the second key
@@ -39,7 +55,7 @@ typedef struct skip_list_arena_t skip_list_arena_t;
 typedef int (*skip_list_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                        size_t key2_size, void *ctx);
 
-/*
+/**
  * skip_list_arena_t
  * memory pool for efficient node allocation
  * reduces malloc overhead and improves cache locality
@@ -59,10 +75,10 @@ struct skip_list_arena_t
 /* macro to access backward pointers at a specific level */
 #define BACKWARD_PTR(node, lvl, max_level) (node->forward[(node)->level + (lvl)])
 
-/*
+/**
  * skip_list_node_t
- * immutable node structure for LSM tree memtable
- * once created, contents never change - nodes are append-only
+ * node structure for LSM tree memtable with atomic replacement semantics
+ * when a key is updated, the entire node is atomically replaced (no duplicates)
  * optimized with inline storage for small keys/values (<24 bytes stored inline)
  * @param key_size size of the key in bytes
  * @param value_size size of the value in bytes
@@ -79,14 +95,15 @@ struct skip_list_arena_t
  */
 struct skip_list_node_t
 {
-    size_t key_size;
-    size_t value_size;
+    /** packer flags byte
+     * deleted(1) | key_inline(1) | value_inline(1) | arena_alloc(1) | unused(4)
+     */
+    _Atomic(uint8_t) flags;
+    uint8_t level;
+    uint16_t _padding;
+    uint32_t key_size;
+    uint32_t value_size;
     time_t ttl;
-    _Atomic(uint8_t) deleted;
-    uint8_t key_is_inline;
-    uint8_t value_is_inline;
-    uint8_t arena_allocated;
-    int level;
     union
     {
         uint8_t *key_ptr;
@@ -107,11 +124,8 @@ struct skip_list_node_t
 #endif
 };
 
-/*
+/**
  * skip_list_t
- * supports concurrent lock-free reads and lock-free writes
- * allows duplicate keys (for versioned entries)
- * nodes are append-only and immutable once inserted
  * @param level atomic current maximum level in use (grows dynamically)
  * @param max_level maximum allowed level (typically 12)
  * @param probability probability for level promotion (typically 0.25)
@@ -135,12 +149,11 @@ typedef struct skip_list_t
     skip_list_arena_t *arena;
 } skip_list_t;
 
-/*
+/**
  * skip_list_cursor_t
- * the cursor structure for the skip list
- * cursors hold references to nodes to prevent premature deallocation
+ * cursor structure for iterating through the skip list
  * @param list the skip list
- * @param current the current node (with reference held)
+ * @param current the current node
  */
 typedef struct
 {
@@ -191,9 +204,7 @@ int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, const uin
 int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                  size_t key2_size, void *ctx);
 
-/*** skip list function prototypes */
-
-/*
+/**
  * skip_list_create_node
  * create a new skip list node (immutable after creation)
  * @param level the level of the node
@@ -209,7 +220,7 @@ skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t ke
                                         const uint8_t *value, size_t value_size, time_t ttl,
                                         uint8_t deleted);
 
-/*
+/**
  * skip_list_free_node
  * free's a skip list node (internal use only)
  * @param node the node to free
@@ -217,7 +228,7 @@ skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t ke
  */
 int skip_list_free_node(skip_list_node_t *node);
 
-/*
+/**
  * skip_list_new
  * create a new skip list with default memcmp comparator
  * @param list the skip list to create
@@ -227,7 +238,7 @@ int skip_list_free_node(skip_list_node_t *node);
  */
 int skip_list_new(skip_list_t **list, int max_level, float probability);
 
-/*
+/**
  * skip_list_new_with_comparator
  * create a new skip list with a custom comparator
  * @param list the skip list to create
@@ -240,7 +251,7 @@ int skip_list_new(skip_list_t **list, int max_level, float probability);
 int skip_list_new_with_comparator(skip_list_t **list, int max_level, float probability,
                                   skip_list_comparator_fn comparator, void *comparator_ctx);
 
-/*
+/**
  * skip_list_free
  * free's a skip list
  * @param list the skip list to free
@@ -248,7 +259,7 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
  */
 int skip_list_free(skip_list_t *list);
 
-/*
+/**
  * skip_list_random_level
  * generate a random level for a new skip list node
  * @param list the skip list
@@ -256,7 +267,7 @@ int skip_list_free(skip_list_t *list);
  */
 int skip_list_random_level(skip_list_t *list);
 
-/*
+/**
  * skip_list_compare_keys
  * compares two keys using the skip list's comparator
  * @param list the skip list
@@ -269,21 +280,23 @@ int skip_list_random_level(skip_list_t *list);
 int skip_list_compare_keys(skip_list_t *list, const uint8_t *key1, size_t key1_size,
                            const uint8_t *key2, size_t key2_size);
 
-/*
+/**
  * skip_list_put
- * insert a new key-value pair into the skip list
+ * insert or update a key-value pair in the skip list
+ * if key exists, atomically replaces the node (no duplicates)
+ * if key is new, inserts a new node
  * @param list the skip list
  * @param key the key to put
  * @param key_size the key size
  * @param value the value to put
- * @param value_size the value size
+ * @param value_size the value size (0 allowed for empty values)
  * @param ttl an expiration time for the node (optional, -1 for none)
- * @return 0 if the key-value pair was inserted successfully, -1 otherwise
+ * @return 0 if successful, -1 on error
  */
 int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const uint8_t *value,
                   size_t value_size, time_t ttl);
 
-/*
+/**
  * skip_list_delete
  * mark a key as deleted in the skip list (sets deleted flag)
  * @param list the skip list
@@ -293,7 +306,7 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
  */
 int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size);
 
-/*
+/**
  * skip_list_get
  * get a value from the skip list
  * @param list the skip list
@@ -307,16 +320,15 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size);
 int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
                   size_t *value_size, uint8_t *deleted);
 
-/*
+/**
  * skip_list_cursor_init
  * initialize a new skip list cursor
- * creates a snapshot of the list at current version
  * @param list the skip list
- * @return the new skip list cursor
+ * @return the new skip list cursor, or NULL on error
  */
 skip_list_cursor_t *skip_list_cursor_init(skip_list_t *list);
 
-/*
+/**
  * skip_list_cursor_next
  * move the cursor to the next node
  * @param cursor the cursor
@@ -324,7 +336,7 @@ skip_list_cursor_t *skip_list_cursor_init(skip_list_t *list);
  */
 int skip_list_cursor_next(skip_list_cursor_t *cursor);
 
-/*
+/**
  * skip_list_cursor_prev
  * move the cursor to the previous node
  * @param cursor the cursor
@@ -332,7 +344,7 @@ int skip_list_cursor_next(skip_list_cursor_t *cursor);
  */
 int skip_list_cursor_prev(skip_list_cursor_t *cursor);
 
-/*
+/**
  * skip_list_cursor_get
  * get the key and value from the cursor
  * @param cursor the cursor
@@ -346,14 +358,14 @@ int skip_list_cursor_prev(skip_list_cursor_t *cursor);
 int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_size,
                          uint8_t **value, size_t *value_size, time_t *ttl, uint8_t *deleted);
 
-/*
+/**
  * skip_list_cursor_free
  * free the memory for the cursor
  * @param cursor the cursor
  */
 void skip_list_cursor_free(skip_list_cursor_t *cursor);
 
-/*
+/**
  * skip_list_clear
  * clear the skip list
  * @param list the skip list
@@ -361,7 +373,7 @@ void skip_list_cursor_free(skip_list_cursor_t *cursor);
  */
 int skip_list_clear(skip_list_t *list);
 
-/*
+/**
  * skip_list_copy
  * copy the skip list
  * @param list the skip list
@@ -369,7 +381,7 @@ int skip_list_clear(skip_list_t *list);
  */
 skip_list_t *skip_list_copy(skip_list_t *list);
 
-/*
+/**
  * skip_list_check_and_update_ttl
  * checks if a node has expired based on TTL
  * @param list the skip list
@@ -378,7 +390,7 @@ skip_list_t *skip_list_copy(skip_list_t *list);
  */
 int skip_list_check_and_update_ttl(skip_list_t *list, skip_list_node_t *node);
 
-/*
+/**
  * skip_list_get_size
  * get the size of the skip list
  * @param list the skip list
@@ -386,7 +398,7 @@ int skip_list_check_and_update_ttl(skip_list_t *list, skip_list_node_t *node);
  */
 int skip_list_get_size(skip_list_t *list);
 
-/*
+/**
  * skip_list_count_entries
  * count the number of entries/nodes in the skip list
  * @param list the skip list
@@ -394,7 +406,7 @@ int skip_list_get_size(skip_list_t *list);
  */
 int skip_list_count_entries(skip_list_t *list);
 
-/*
+/**
  * skip_list_cursor_at_start
  * check if the cursor is at the start of the skip list
  * @param cursor the cursor
@@ -402,7 +414,7 @@ int skip_list_count_entries(skip_list_t *list);
  */
 int skip_list_cursor_at_start(skip_list_cursor_t *cursor);
 
-/*
+/**
  * skip_list_cursor_at_end
  * check if the cursor is at the end of the skip list
  * @param cursor the cursor
@@ -410,7 +422,7 @@ int skip_list_cursor_at_start(skip_list_cursor_t *cursor);
  */
 int skip_list_cursor_at_end(skip_list_cursor_t *cursor);
 
-/*
+/**
  * skip_list_cursor_has_next
  * check if the cursor has a next node
  * @param cursor the cursor
@@ -418,7 +430,7 @@ int skip_list_cursor_at_end(skip_list_cursor_t *cursor);
  */
 int skip_list_cursor_has_next(skip_list_cursor_t *cursor);
 
-/*
+/**
  * skip_list_cursor_has_prev
  * check if the cursor has a previous node
  * @param cursor the cursor
@@ -426,7 +438,7 @@ int skip_list_cursor_has_next(skip_list_cursor_t *cursor);
  */
 int skip_list_cursor_has_prev(skip_list_cursor_t *cursor);
 
-/*
+/**
  * skip_list_cursor_goto_last
  * move the cursor to the last node in the skip list
  * @param cursor the cursor
@@ -434,7 +446,7 @@ int skip_list_cursor_has_prev(skip_list_cursor_t *cursor);
  */
 int skip_list_cursor_goto_last(skip_list_cursor_t *cursor);
 
-/*
+/**
  * skip_list_cursor_goto_first
  * move the cursor to the first node in the skip list
  * @param cursor the cursor
@@ -462,17 +474,16 @@ int skip_list_get_min_key(skip_list_t *list, uint8_t **key, size_t *key_size);
  */
 int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size);
 
-/*
+/**
  * skip_list_cursor_init_at_end
- * initialize an existing cursor and position it at the end of the skip list
- * creates a snapshot of the list at current version
- * @param cursor pointer to an existing cursor to initialize
+ * initialize a cursor and position it at the end of the skip list
+ * @param cursor pointer to store the cursor
  * @param list the skip list
- * @return 0 if the cursor was initialized successfully, -1 otherwise on error
+ * @return 0 if successful, -1 on error
  */
 int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list);
 
-/*
+/**
  * skip_list_cursor_seek
  * positions cursor at the first node with key >= target key
  * @param cursor the cursor to position
@@ -482,7 +493,7 @@ int skip_list_cursor_init_at_end(skip_list_cursor_t **cursor, skip_list_t *list)
  */
 int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size);
 
-/*
+/**
  * skip_list_cursor_seek_for_prev
  * positions cursor at the first node with key <= target key
  * @param cursor the cursor to position

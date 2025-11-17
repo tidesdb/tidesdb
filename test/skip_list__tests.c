@@ -21,9 +21,9 @@
 #include "test_utils.h"
 
 #define NODE_KEY(node) \
-    ((node)->key_is_inline ? (node)->key_data.key_inline : (node)->key_data.key_ptr)
+    (NODE_KEY_IS_INLINE(node) ? (node)->key_data.key_inline : (node)->key_data.key_ptr)
 #define NODE_VALUE(node) \
-    ((node)->value_is_inline ? (node)->value_data.value_inline : (node)->value_data.value_ptr)
+    (NODE_VALUE_IS_INLINE(node) ? (node)->value_data.value_inline : (node)->value_data.value_ptr)
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -39,10 +39,9 @@ void test_skip_list_create_node()
     ASSERT_TRUE(node != NULL);
     ASSERT_TRUE(memcmp(NODE_KEY(node), key, sizeof(key)) == 0);
     ASSERT_TRUE(memcmp(NODE_VALUE(node), value, sizeof(value)) == 0);
-    ASSERT_EQ(node->deleted, 0);
+    ASSERT_TRUE(!NODE_IS_DELETED(node));
 
-    /* Free node if not arena allocated */
-    if (!node->arena_allocated)
+    if (!NODE_IS_ARENA_ALLOC(node))
     {
         free(node);
     }
@@ -901,13 +900,13 @@ void test_skip_list_duplicate_key_update()
 
     ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &deleted),
               0);
-    /*  get returns first match, which could be either value */
-    /* just verify we got a valid value */
-    ASSERT_TRUE(retrieved_size == sizeof(value1) || retrieved_size == sizeof(value2));
+
+    /* GET should return the latest version (value2), atomic replacement, no duplicates */
+    ASSERT_EQ(retrieved_size, sizeof(value2));
+    ASSERT_EQ(memcmp(retrieved_value, value2, sizeof(value2)), 0);
     ASSERT_EQ(deleted, 0);
 
-    /* count should be 1 (counts unique keys, not versions) */
-
+    /* count should be 1 (atomic replacement, no duplicates in memtable) */
     ASSERT_EQ(skip_list_count_entries(list), 1);
 
     free(retrieved_value);
@@ -1076,6 +1075,323 @@ void test_skip_list_lockfree_stress()
     printf(GREEN "  Lock-free stress test PASSED!\n" RESET);
 }
 
+static uint64_t zipfian_next(uint64_t *state, uint64_t n)
+{
+    /* simple zipfian approximation: 80% of accesses go to 20% of keys */
+    *state = (*state * 1103515245 + 12345) & 0x7fffffff;
+    if ((*state % 100) < 80)
+    {
+        /* hot keys first 20% */
+        return (*state % (n / 5));
+    }
+    else
+    {
+        /* cold keys remaining 80% */
+        return (n / 5) + (*state % (n - n / 5));
+    }
+}
+
+void benchmark_skip_list_zipfian()
+{
+    printf("\n" YELLOW "=== Skip List Zipfian (Hot Key) Benchmark ===\n" RESET);
+
+    skip_list_t *list = NULL;
+    int result = skip_list_new(&list, 12, 0.25);
+    ASSERT_EQ(result, 0);
+    ASSERT_TRUE(list != NULL);
+
+    const int num_ops = 500000;
+    const int num_unique_keys = 56000;
+    uint64_t zipf_state = 12345;
+
+    /* track unique keys accessed */
+    int *key_seen = calloc(num_unique_keys, sizeof(int));
+    int unique_keys_accessed = 0;
+
+    /* zipfian writes (hot keys get updated many times) */
+    printf("  Phase 1: Zipfian writes (%d ops, ~%d unique keys)...\n", num_ops, num_unique_keys);
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        uint64_t key_num = zipfian_next(&zipf_state, num_unique_keys);
+        char key[32];
+        snprintf(key, sizeof(key), "key_%08" PRIu64, key_num);
+
+        char value[100];
+        snprintf(value, sizeof(value), "value_%d", i);
+
+        /* track unique keys */
+        if (!key_seen[key_num])
+        {
+            key_seen[key_num] = 1;
+            unique_keys_accessed++;
+        }
+
+        int result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                   strlen(value) + 1, -1);
+        ASSERT_EQ(result, 0);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double write_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double write_ops_per_sec = num_ops / write_time;
+
+    printf("    Writes: %.2f M ops/sec (%.3f seconds)\n", write_ops_per_sec / 1e6, write_time);
+    printf("    Unique keys accessed: %d\n", unique_keys_accessed);
+    printf("    New inserts: %d, Updates: %d\n", unique_keys_accessed,
+           num_ops - unique_keys_accessed);
+    printf("    Actual entries in skip list: %d\n", skip_list_count_entries(list));
+    printf("    Duplicates created: %d\n", skip_list_count_entries(list) - unique_keys_accessed);
+
+    free(key_seen);
+
+    /* mixed workload (50% read, 50% write) with zipfian distribution */
+    printf("  Phase 2: Zipfian mixed (50/50 read/write, %d ops)...\n", num_ops);
+
+    zipf_state = 12345; /* reset for consistent distribution */
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    int read_count = 0, write_count = 0;
+    int read_hits = 0;
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        uint64_t key_num = zipfian_next(&zipf_state, num_unique_keys);
+        char key[32];
+        snprintf(key, sizeof(key), "key_%08" PRIu64, key_num);
+
+        if (i % 2 == 0)
+        {
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            uint8_t deleted = 0;
+
+            int result =
+                skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+            if (result == 0 && !deleted)
+            {
+                read_hits++;
+                free(value);
+            }
+            read_count++;
+        }
+        else
+        {
+            char value[100];
+            snprintf(value, sizeof(value), "updated_value_%d", i);
+
+            skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                          strlen(value) + 1, -1);
+            write_count++;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double mixed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double mixed_ops_per_sec = num_ops / mixed_time;
+    double read_ops_per_sec = read_count / mixed_time;
+    double mixed_write_ops_per_sec = write_count / mixed_time;
+
+    printf("    Mixed: %.2f M ops/sec (%.3f seconds)\n", mixed_ops_per_sec / 1e6, mixed_time);
+    printf("    Reads: %.2f M ops/sec (%d ops, %d hits, %.1f%% hit rate)\n", read_ops_per_sec / 1e6,
+           read_count, read_hits, (read_hits * 100.0) / read_count);
+    printf("    Writes: %.2f M ops/sec (%d ops)\n", mixed_write_ops_per_sec / 1e6, write_count);
+
+    /* pure reads (all hot keys) */
+    printf("  Phase 3: Zipfian reads only (%d ops)...\n", num_ops);
+
+    zipf_state = 12345;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    int pure_read_hits = 0;
+    for (int i = 0; i < num_ops; i++)
+    {
+        uint64_t key_num = zipfian_next(&zipf_state, num_unique_keys);
+        char key[32];
+        snprintf(key, sizeof(key), "key_%08" PRIu64, key_num);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+
+        int result =
+            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        if (result == 0 && !deleted)
+        {
+            pure_read_hits++;
+            free(value);
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double read_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double pure_read_ops_per_sec = num_ops / read_time;
+
+    printf("    Reads: %.2f M ops/sec (%.3f seconds, %d hits, %.1f%% hit rate)\n",
+           pure_read_ops_per_sec / 1e6, read_time, pure_read_hits,
+           (pure_read_hits * 100.0) / num_ops);
+
+    skip_list_free(list);
+
+    printf(GREEN "  Zipfian benchmark complete!\n" RESET);
+}
+
+void test_skip_list_update_patterns()
+{
+    printf("\n" YELLOW "=== Skip List Update Patterns Test ===\n" RESET);
+
+    skip_list_t *list = NULL;
+    int result = skip_list_new(&list, 12, 0.25);
+    ASSERT_EQ(result, 0);
+    ASSERT_TRUE(list != NULL);
+
+    printf("  Writing version 1 for 50 keys...\n");
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "update_key_%d", i);
+        snprintf(value, sizeof(value), "version_1_value_%d", i);
+
+        result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                               strlen(value) + 1, -1);
+        ASSERT_EQ(result, 0);
+    }
+
+    int count_v1 = skip_list_count_entries(list);
+    printf("    After version 1: %d entries\n", count_v1);
+    ASSERT_EQ(count_v1, 50);
+
+    /* update same keys multiple times */
+    for (int version = 2; version <= 5; version++)
+    {
+        printf("  Writing version %d for 50 keys...\n", version);
+        for (int i = 0; i < 50; i++)
+        {
+            char key[32], value[64];
+            snprintf(key, sizeof(key), "update_key_%d", i);
+            snprintf(value, sizeof(value), "version_%d_value_%d", version, i);
+
+            result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                   strlen(value) + 1, -1);
+            ASSERT_EQ(result, 0);
+        }
+
+        int count = skip_list_count_entries(list);
+        printf("    After version %d: %d entries\n", version, count);
+    }
+
+    /* verify we get version 5 for all keys */
+    printf("  Verifying all keys return version 5...\n");
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], expected[64];
+        snprintf(key, sizeof(key), "update_key_%d", i);
+        snprintf(expected, sizeof(expected), "version_5_value_%d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+
+        result =
+            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        ASSERT_EQ(result, 0);
+        ASSERT_TRUE(!deleted);
+        ASSERT_EQ(value_size, strlen(expected) + 1);
+
+        if (memcmp(value, expected, strlen(expected)) != 0)
+        {
+            printf("    ERROR: key=%s expected=%s got=%s\n", key, expected, (char *)value);
+            ASSERT_TRUE(0);
+        }
+
+        free(value);
+    }
+
+    printf("    All 50 keys verified successfully!\n");
+
+    skip_list_free(list);
+
+    printf(GREEN "  Update patterns test PASSED!\n" RESET);
+}
+
+static void test_skip_list_large_value_updates(void)
+{
+    printf("\n" YELLOW "=== Skip List Large Value Updates Test ===\n" RESET);
+
+    skip_list_t *list = NULL;
+    int result = skip_list_new(&list, 12, 0.25);
+    ASSERT_EQ(result, 0);
+    ASSERT_TRUE(list != NULL);
+
+    printf("  Testing large value updates (100 bytes, 10 versions)...\n");
+
+    const int num_keys = 20;
+    const int num_versions = 10;
+    char large_value[100];
+
+    for (int version = 1; version <= num_versions; version++)
+    {
+        for (int i = 0; i < num_keys; i++)
+        {
+            char key[32];
+            snprintf(key, sizeof(key), "large_key_%d", i);
+            snprintf(large_value, sizeof(large_value), "large_version_%d_value_%d_padding", version,
+                     i);
+
+            result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)large_value,
+                                   strlen(large_value) + 1, -1);
+            ASSERT_EQ(result, 0);
+        }
+
+        int count = skip_list_count_entries(list);
+        printf("    After version %d: %d entries\n", version, count);
+
+        /* after first version, count should stay constant (in-place updates) */
+        if (version > 1)
+        {
+            ASSERT_EQ(count, num_keys);
+        }
+    }
+
+    /* verify we get the latest version for all keys */
+    printf("  Verifying all keys return version %d...\n", num_versions);
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32], expected[100];
+        snprintf(key, sizeof(key), "large_key_%d", i);
+        snprintf(expected, sizeof(expected), "large_version_%d_value_%d_padding", num_versions, i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+
+        result =
+            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        ASSERT_EQ(result, 0);
+        ASSERT_TRUE(!deleted);
+        ASSERT_EQ(value_size, strlen(expected) + 1);
+
+        if (memcmp(value, expected, strlen(expected)) != 0)
+        {
+            printf("    ERROR: key=%s expected=%s got=%s\n", key, expected, (char *)value);
+            ASSERT_TRUE(0);
+        }
+
+        free(value);
+    }
+
+    printf("    All %d keys verified successfully!\n", num_keys);
+    printf("    Final entry count: %d (should be %d, no duplicates)\n",
+           skip_list_count_entries(list), num_keys);
+
+    skip_list_free(list);
+
+    printf(GREEN "  Large value updates test PASSED!\n" RESET);
+}
+
 int main(void)
 {
     RUN_TEST(test_skip_list_create_node, tests_passed);
@@ -1100,8 +1416,11 @@ int main(void)
     RUN_TEST(test_skip_list_large_keys_values, tests_passed);
     RUN_TEST(test_skip_list_duplicate_key_update, tests_passed);
     RUN_TEST(test_skip_list_delete_operations, tests_passed);
+    RUN_TEST(test_skip_list_update_patterns, tests_passed);
+    RUN_TEST(test_skip_list_large_value_updates, tests_passed);
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);
+    RUN_TEST(benchmark_skip_list_zipfian, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

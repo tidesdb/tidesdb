@@ -21,8 +21,8 @@
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "compress.h"
+#include "fifo.h"
 #include "ini.h"
-#include "lru.h"
 #include "queue.h"
 #include "skip_list.h"
 #include "succinct_trie.h"
@@ -66,7 +66,7 @@ extern int _tidesdb_debug_enabled;
 
 /* defaults */
 #define TDB_DEFAULT_MEMTABLE_FLUSH_SIZE            (64 * 1024 * 1024)
-#define TDB_DEFAULT_MAX_SSTABLES                   64
+#define TDB_DEFAULT_MAX_SSTABLES                   32
 #define TDB_DEFAULT_COMPACTION_THREADS             2
 #define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000000
 #define TDB_DEFAULT_MAX_OPEN_FILE_HANDLES          1024
@@ -76,7 +76,7 @@ extern int _tidesdb_debug_enabled;
 #define TDB_DEFAULT_THREAD_POOL_SIZE               2
 #define TDB_DEFAULT_WAL_RECOVERY_POLL_INTERVAL_MS  100000
 #define TDB_DEFAULT_WAIT_FOR_WAL_RECOVERY          0
-#define TDB_DEFAULT_BLOCK_CACHE_SIZE               (64 * 1024 * 1024) /* 64MB block cache */
+#define TDB_DEFAULT_BLOCK_CACHE_SIZE               (64 * 1024 * 1024)
 
 /* limits */
 #define TDB_MAX_CF_NAME_LENGTH  128
@@ -147,7 +147,7 @@ typedef struct tidesdb_sstable_t tidesdb_sstable_t;
 typedef struct tidesdb_txn_t tidesdb_txn_t;
 typedef struct tidesdb_iter_t tidesdb_iter_t;
 
-/*
+/**
  * tidesdb_kv_pair_header_t
  * header for serialized key-value pairs
  * streamlined format [header][key][value]
@@ -159,16 +159,6 @@ typedef struct tidesdb_iter_t tidesdb_iter_t;
  */
 #ifdef _MSC_VER
 #pragma pack(push, 1)
-/*
- * tidesdb_kv_pair_header_t
- * header for serialized key-value pairs
- * streamlined format [header][key][value]
- * @param version format version
- * @param flags bit flags (bit 0 tombstone/deleted)
- * @param key_size size of key in bytes
- * @param value_size size of value in bytes
- * @param ttl time-to-live (expiration time)
- */
 typedef struct
 {
     uint8_t version;
@@ -179,16 +169,6 @@ typedef struct
 } tidesdb_kv_pair_header_t;
 #pragma pack(pop)
 #else
-/*
- * tidesdb_kv_pair_header_t
- * header for serialized key-value pairs
- * streamlined format [header][key][value]
- * @param version format version
- * @param flags bit flags (bit 0 tombstone/deleted)
- * @param key_size size of key in bytes
- * @param value_size size of value in bytes
- * @param ttl time-to-live (expiration time)
- */
 typedef struct __attribute__((packed))
 {
     uint8_t version;
@@ -199,7 +179,7 @@ typedef struct __attribute__((packed))
 } tidesdb_kv_pair_header_t;
 #endif
 
-/*
+/**
  * tidesdb_config_t
  * configuration for tidesdb instance
  * @param db_path path to the database directory
@@ -225,7 +205,7 @@ typedef struct
     int wal_recovery_poll_interval_ms;
 } tidesdb_config_t;
 
-/*
+/**
  * tidesdb_column_family_config_t
  * configuration for individual column families
  * @param memtable_flush_size size threshold for memtable flush (bytes)
@@ -269,7 +249,7 @@ typedef struct
     int block_manager_cache_size;
 } tidesdb_column_family_config_t;
 
-/*
+/**
  * tidesdb_sstable_t
  * represents an sstable on disk
  * @param id unique identifier for this sstable
@@ -301,7 +281,7 @@ struct tidesdb_sstable_t
     _Atomic(int) ref_count;
 };
 
-/*
+/**
  * tidesdb_memtable_t
  * represents a memtable instance with its own WAL
  * @param memtable in-memory skip list
@@ -321,7 +301,7 @@ typedef struct
     _Atomic(int) flushed;
 } tidesdb_memtable_t;
 
-/*
+/**
  * tidesdb_column_family_t
  * represents a column family (logical keyspace)
  * @param name name of the column family
@@ -349,9 +329,9 @@ struct tidesdb_column_family_t
     tidesdb_t *db;
     _Atomic(tidesdb_memtable_t *) active_memtable;
     queue_t *immutable_memtables;
-    tidesdb_sstable_t **sstables;
+    _Atomic(tidesdb_sstable_t **) sstables;
     _Atomic(int) num_sstables;
-    int sstable_array_capacity;
+    _Atomic(int) sstable_array_capacity;
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(uint64_t) next_memtable_id;
     _Atomic(uint64_t) next_wal_seq;
@@ -366,7 +346,7 @@ struct tidesdb_column_family_t
 /* forward declaration for thread pool */
 typedef struct tidesdb_thread_pool_t tidesdb_thread_pool_t;
 
-/*
+/**
  * tidesdb_t
  * main tidesdb instance
  * @param config database configuration
@@ -388,14 +368,14 @@ struct tidesdb_t
     int num_cfs;
     int cf_capacity;
     pthread_rwlock_t db_lock;
-    lru_cache_t *block_manager_cache;
+    fifo_cache_t *block_manager_cache;
     tidesdb_thread_pool_t *flush_pool;
     tidesdb_thread_pool_t *compaction_pool;
     size_t total_memory;
     size_t available_memory;
 };
 
-/*
+/**
  * tidesdb_operation_t
  * transaction operation type
  */
@@ -405,7 +385,7 @@ typedef enum
     TIDESDB_OP_DELETE
 } tidesdb_operation_type_t;
 
-/*
+/**
  * tidesdb_operation_t
  * represents a single operation in a transaction
  * @param type operation type (PUT or DELETE)
@@ -427,7 +407,7 @@ typedef struct
     time_t ttl;
 } tidesdb_operation_t;
 
-/*
+/**
  * tidesdb_txn_t
  * transaction handle
  * @param db pointer to tidesdb instance
@@ -448,7 +428,7 @@ struct tidesdb_txn_t
     int read_only;
 };
 
-/*
+/**
  * tidesdb_iter_entry_t
  * represents a pending entry from one source (memtable/sstable)
  * @param key key
@@ -471,7 +451,8 @@ typedef struct
     int source_type;
     int source_index;
 } tidesdb_iter_entry_t;
-/*
+
+/**
  * tidesdb_iter_t
  * iterator for traversing key-value pairs (tied to transaction)
  * @param txn transaction this iterator belongs to
@@ -519,12 +500,11 @@ struct tidesdb_iter_t
     tidesdb_iter_entry_t *heap;
     int heap_size;
     int heap_capacity;
-    /* cached comparator to avoid atomic ops on every comparison */
     int (*comparator)(const uint8_t *, size_t, const uint8_t *, size_t, void *);
     void *comparator_ctx;
 };
 
-/*
+/**
  * tidesdb_column_family_stat_t
  * statistics for a column family
  * @param name column family name
@@ -546,7 +526,7 @@ typedef struct
     tidesdb_column_family_config_t config;
 } tidesdb_column_family_stat_t;
 
-/*
+/**
  * tidesdb_column_family_update_config_t
  * runtime-updatable configuration for column families
  * only includes settings that can be safely changed without affecting existing data
@@ -577,7 +557,7 @@ typedef struct
     tidesdb_sync_mode_t sync_mode;
 } tidesdb_column_family_update_config_t;
 
-/*
+/**
  * tidesdb_open
  * opens or creates a tidesdb instance
  * @param config database configuration
@@ -586,7 +566,7 @@ typedef struct
  */
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
 
-/*
+/**
  * tidesdb_close
  * closes a tidesdb instance and frees resources
  * @param db tidesdb instance
@@ -594,14 +574,14 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
  */
 int tidesdb_close(tidesdb_t *db);
 
-/*
+/**
  * tidesdb_default_column_family_config
  * returns default column family configuration
  * @return default configuration
  */
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void);
 
-/*
+/**
  * tidesdb_create_column_family
  * creates a new column family with specified configuration
  * @param db tidesdb instance
@@ -612,7 +592,7 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void);
 int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config);
 
-/*
+/**
  * tidesdb_drop_column_family
  * drops a column family
  * @param db tidesdb instance
@@ -621,7 +601,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
  */
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
 
-/*
+/**
  * tidesdb_get_column_family
  * retrieves a column family by name
  * @param db tidesdb instance
@@ -630,7 +610,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
  */
 tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *name);
 
-/*
+/**
  * tidesdb_list_column_families
  * gets list of all column family names
  * @param db tidesdb instance
@@ -640,7 +620,7 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
  */
 int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count);
 
-/*
+/**
  * tidesdb_get_column_family_stats
  * gets statistics for a column family
  * @param db tidesdb instance
@@ -651,7 +631,7 @@ int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count);
 int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
                                     tidesdb_column_family_stat_t **stats);
 
-/*
+/**
  * tidesdb_update_column_family_config
  * updates runtime-safe configuration for a column family
  * only affects new operations, does not modify existing data
@@ -663,7 +643,7 @@ int tidesdb_get_column_family_stats(tidesdb_t *db, const char *name,
 int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
                                         const tidesdb_column_family_update_config_t *update_config);
 
-/*
+/**
  * tidesdb_flush_memtable
  * manually flushes memtable to sstable
  * @param cf column family
@@ -671,7 +651,7 @@ int tidesdb_update_column_family_config(tidesdb_t *db, const char *name,
  */
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf);
 
-/*
+/**
  * tidesdb_compact
  * manually trigger compaction for a column family
  * routes to parallel compaction if compaction_threads > 0
@@ -680,7 +660,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf);
  */
 int tidesdb_compact(tidesdb_column_family_t *cf);
 
-/*
+/**
  * tidesdb_compact_parallel
  * manual parallel compaction using multiple threads with semaphore-based work queue
  * each thread compacts a pair of SSTables concurrently
@@ -689,7 +669,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf);
  */
 int tidesdb_compact_parallel(tidesdb_column_family_t *cf);
 
-/*
+/**
  * tidesdb_txn_begin
  * begins a new read-write transaction
  * @param db tidesdb instance
@@ -699,7 +679,7 @@ int tidesdb_compact_parallel(tidesdb_column_family_t *cf);
  */
 int tidesdb_txn_begin(tidesdb_t *db, tidesdb_column_family_t *cf, tidesdb_txn_t **txn);
 
-/*
+/**
  * tidesdb_txn_begin_read
  * begins a new read-only transaction
  * @param db tidesdb instance
@@ -709,7 +689,7 @@ int tidesdb_txn_begin(tidesdb_t *db, tidesdb_column_family_t *cf, tidesdb_txn_t 
  */
 int tidesdb_txn_begin_read(tidesdb_t *db, tidesdb_column_family_t *cf, tidesdb_txn_t **txn);
 
-/*
+/**
  * tidesdb_txn_get
  * gets a value within a transaction
  * @param txn transaction handle
@@ -722,7 +702,7 @@ int tidesdb_txn_begin_read(tidesdb_t *db, tidesdb_column_family_t *cf, tidesdb_t
 int tidesdb_txn_get(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size, uint8_t **value,
                     size_t *value_size);
 
-/*
+/**
  * tidesdb_txn_put
  * adds a put operation to transaction
  * @param txn transaction handle
@@ -736,7 +716,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size, uin
 int tidesdb_txn_put(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size, const uint8_t *value,
                     size_t value_size, time_t ttl);
 
-/*
+/**
  * tidesdb_txn_delete
  * adds a delete operation to transaction
  * @param txn transaction handle
@@ -746,7 +726,7 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size, con
  */
 int tidesdb_txn_delete(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size);
 
-/*
+/**
  * tidesdb_txn_commit
  * commits a transaction atomically
  * @param txn transaction handle
@@ -754,7 +734,7 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, const uint8_t *key, size_t key_size);
  */
 int tidesdb_txn_commit(tidesdb_txn_t *txn);
 
-/*
+/**
  * tidesdb_txn_rollback
  * rolls back a transaction
  * @param txn transaction handle
@@ -762,14 +742,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn);
  */
 int tidesdb_txn_rollback(tidesdb_txn_t *txn);
 
-/*
+/**
  * tidesdb_txn_free
  * frees transaction resources
  * @param txn transaction handle
  */
 void tidesdb_txn_free(tidesdb_txn_t *txn);
 
-/*
+/**
  * tidesdb_iter_new
  * creates a new iterator for a column family within a transaction
  * @param txn transaction handle
@@ -778,7 +758,7 @@ void tidesdb_txn_free(tidesdb_txn_t *txn);
  */
 int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter);
 
-/*
+/**
  * tidesdb_iter_seek_to_first
  * positions iterator at first key
  * @param iter iterator
@@ -786,7 +766,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_iter_t **iter);
  */
 int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter);
 
-/*
+/**
  * tidesdb_iter_seek_to_last
  * positions iterator at last key
  * @param iter iterator
@@ -794,7 +774,7 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter);
  */
 int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter);
 
-/*
+/**
  * tidesdb_iter_seek
  * positions iterator at first key >= target key
  * @param iter iterator
@@ -804,7 +784,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter);
  */
 int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size);
 
-/*
+/**
  * tidesdb_iter_seek_for_prev
  * positions iterator at last key <= target key
  * @param iter iterator
@@ -814,7 +794,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
  */
 int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size);
 
-/*
+/**
  * tidesdb_iter_next
  * moves iterator to next key
  * @param iter iterator
@@ -822,7 +802,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
  */
 int tidesdb_iter_next(tidesdb_iter_t *iter);
 
-/*
+/**
  * tidesdb_iter_prev
  * moves iterator to previous key
  * @param iter iterator
@@ -830,7 +810,7 @@ int tidesdb_iter_next(tidesdb_iter_t *iter);
  */
 int tidesdb_iter_prev(tidesdb_iter_t *iter);
 
-/*
+/**
  * tidesdb_iter_valid
  * checks if iterator is at a valid position
  * @param iter iterator
@@ -838,7 +818,7 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter);
  */
 int tidesdb_iter_valid(tidesdb_iter_t *iter);
 
-/*
+/**
  * tidesdb_iter_key
  * gets current key from iterator
  * @param iter iterator
@@ -848,7 +828,7 @@ int tidesdb_iter_valid(tidesdb_iter_t *iter);
  */
 int tidesdb_iter_key(tidesdb_iter_t *iter, uint8_t **key, size_t *key_size);
 
-/*
+/**
  * tidesdb_iter_value
  * gets current value from iterator
  * @param iter iterator
@@ -858,14 +838,14 @@ int tidesdb_iter_key(tidesdb_iter_t *iter, uint8_t **key, size_t *key_size);
  */
 int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size);
 
-/*
+/**
  * tidesdb_iter_free
  * frees an iterator
  * @param iter iterator to free
  */
 void tidesdb_iter_free(tidesdb_iter_t *iter);
 
-/*
+/**
  * skip_list_comparator_memcmp
  * memcmp comparator for skip list
  * @param key1 first key
@@ -878,7 +858,7 @@ void tidesdb_iter_free(tidesdb_iter_t *iter);
 extern int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                        size_t key2_size, void *ctx);
 
-/*
+/**
  * skip_list_comparator_string
  * string comparator for skip list
  * @param key1 first key
@@ -891,7 +871,7 @@ extern int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, co
 extern int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                        size_t key2_size, void *ctx);
 
-/*
+/**
  * skip_list_comparator_numeric
  * numeric comparator for skip list
  * @param key1 first key
@@ -904,7 +884,7 @@ extern int skip_list_comparator_string(const uint8_t *key1, size_t key1_size, co
 extern int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                         size_t key2_size, void *ctx);
 
-/*
+/**
  * tidesdb_register_comparator
  * register a custom comparator function with a name
  * must be called before creating column families that use this comparator
@@ -914,7 +894,7 @@ extern int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, c
  */
 int tidesdb_register_comparator(const char *name, skip_list_comparator_fn compare_fn);
 
-/*
+/**
  * tidesdb_get_comparator
  * get a registered comparator by name
  * @param name name of the comparator

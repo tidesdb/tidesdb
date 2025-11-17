@@ -32,7 +32,7 @@ typedef enum
     COMPRESS_ZSTD
 } compression_algorithm;
 
-/*
+/**
  * compress_data
  * compresses data using the specified compression algorithm
  * @param data the data to compress
@@ -44,7 +44,7 @@ typedef enum
 uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
                        compression_algorithm type);
 
-/*
+/**
  * decompress_data
  * decompresses data using the specified compression algorithm
  * @param data the data to decompress

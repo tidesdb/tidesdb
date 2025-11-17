@@ -20,7 +20,7 @@
 #define __QUEUE_H__
 #include "compat.h"
 
-/*
+/**
  * queue_node_t
  * internal node structure for the queue
  * @param data pointer to user data
@@ -32,7 +32,7 @@ typedef struct queue_node_t
     struct queue_node_t *next;
 } queue_node_t;
 
-/*
+/**
  * queue_t
  * thread-safe FIFO queue implementation with node pooling
  * @param head pointer to first node (protected by lock for writes)
@@ -62,14 +62,14 @@ typedef struct
     size_t max_pool_size;
 } queue_t;
 
-/*
+/**
  * queue_new
  * create a new queue
  * @return pointer to new queue, NULL on failure
  */
 queue_t *queue_new(void);
 
-/*
+/**
  * queue_enqueue
  * add an item to the back of the queue
  * @param queue the queue
@@ -78,7 +78,7 @@ queue_t *queue_new(void);
  */
 int queue_enqueue(queue_t *queue, void *data);
 
-/*
+/**
  * queue_dequeue
  * remove and return item from front of queue
  * @param queue the queue
@@ -86,7 +86,7 @@ int queue_enqueue(queue_t *queue, void *data);
  */
 void *queue_dequeue(queue_t *queue);
 
-/*
+/**
  * queue_dequeue_wait
  * remove and return item from front of queue, blocking until available
  * @param queue the queue
@@ -94,7 +94,7 @@ void *queue_dequeue(queue_t *queue);
  */
 void *queue_dequeue_wait(queue_t *queue);
 
-/*
+/**
  * queue_peek
  * view item at front of queue without removing it
  * @param queue the queue
@@ -102,7 +102,7 @@ void *queue_dequeue_wait(queue_t *queue);
  */
 void *queue_peek(queue_t *queue);
 
-/*
+/**
  * queue_size
  * get current number of items in queue
  * @param queue the queue
@@ -110,7 +110,7 @@ void *queue_peek(queue_t *queue);
  */
 size_t queue_size(queue_t *queue);
 
-/*
+/**
  * queue_is_empty
  * check if queue is empty
  * @param queue the queue
@@ -118,7 +118,7 @@ size_t queue_size(queue_t *queue);
  */
 int queue_is_empty(queue_t *queue);
 
-/*
+/**
  * queue_clear
  * remove all items from queue without freeing the data
  * @param queue the queue
@@ -126,7 +126,7 @@ int queue_is_empty(queue_t *queue);
  */
 int queue_clear(queue_t *queue);
 
-/*
+/**
  * queue_foreach
  * iterate over all items in the queue and call function for each
  * does not remove items from queue
@@ -137,7 +137,7 @@ int queue_clear(queue_t *queue);
  */
 int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *context);
 
-/*
+/**
  * queue_peek_at
  * peek at item at specific index without removing it
  * index 0 is head (oldest), index size-1 is tail (newest)
@@ -147,14 +147,14 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
  */
 void *queue_peek_at(queue_t *queue, size_t index);
 
-/*
+/**
  * queue_free
  * free the queue structure (does not free the data pointers)
  * @param queue the queue to free
  */
 void queue_free(queue_t *queue);
 
-/*
+/**
  * queue_free_with_data
  * free the queue and all data using provided free function
  * @param queue the queue to free

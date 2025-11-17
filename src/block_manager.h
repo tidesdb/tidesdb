@@ -19,7 +19,7 @@
 #ifndef __BLOCK_MANAGER_H__
 #define __BLOCK_MANAGER_H__
 #include "compat.h"
-#include "lru.h"
+#include "fifo.h"
 
 /* more time equals more results, but remember to take breaks to refresh your mind. */
 
@@ -81,13 +81,13 @@ typedef enum
  * used for block manager caching
  * @param max_size max size of cache in bytes
  * @param current_size current size of cache in bytes
- * @param lru_cache the LRU cache
+ * @param fifo_cache utilized for hot block caching
  */
 typedef struct
 {
     uint32_t max_size;
     uint32_t current_size;
-    lru_cache_t *lru_cache;
+    fifo_cache_t *fifo_cache;
 } block_manager_cache_t;
 
 /**

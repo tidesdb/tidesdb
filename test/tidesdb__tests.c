@@ -6370,6 +6370,152 @@ static void test_backward_prefix_seek_multi_source(void)
     cleanup_test_dir();
 }
 
+static void test_temp_file_cleanup(void)
+{
+    printf("Testing temporary file cleanup...\n");
+
+    cleanup_test_dir();
+
+    /* create database and column family */
+    tidesdb_config_t config = {.db_path = TEST_DB_PATH, .enable_debug_logging = 1};
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = get_test_cf_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+
+    /* write some data to trigger flush */
+    tidesdb_column_family_t *cf = NULL;
+    for (int i = 0; i < db->num_cfs; i++)
+    {
+        if (strcmp(db->column_families[i]->name, "test_cf") == 0)
+        {
+            cf = db->column_families[i];
+            break;
+        }
+    }
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, cf, &txn), 0);
+
+    /* write enough data to trigger flush */
+    for (int i = 0; i < 1000; i++)
+    {
+        char key[32], value[128];
+        snprintf(key, sizeof(key), "key_%d", i);
+        snprintf(value, sizeof(value), "value_%d", i);
+        ASSERT_EQ(
+            tidesdb_txn_put(txn, (uint8_t *)key, strlen(key), (uint8_t *)value, strlen(value), -1),
+            0);
+    }
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* wait for flush to complete */
+    sleep(1);
+
+    /* close database */
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    /* manually create temporary files to simulate incomplete operations */
+    char root_tmp_file[512], root_trie_file[512];
+    snprintf(root_tmp_file, sizeof(root_tmp_file), "%s/test_incomplete.tmp", TEST_DB_PATH);
+    snprintf(root_trie_file, sizeof(root_trie_file), "%s/trie_labels_12345_67890", TEST_DB_PATH);
+
+    FILE *fp = fopen(root_tmp_file, "w");
+    ASSERT_TRUE(fp != NULL);
+    fprintf(fp, "incomplete compaction data");
+    fclose(fp);
+
+    fp = fopen(root_trie_file, "w");
+    ASSERT_TRUE(fp != NULL);
+    fprintf(fp, "incomplete trie index data");
+    fclose(fp);
+
+    /* create temp files in column family directory */
+    char cf_tmp_file[512], cf_trie_labels[512], cf_trie_parents[512], cf_trie_child_ids[512];
+    snprintf(cf_tmp_file, sizeof(cf_tmp_file), "%s/test_cf/sstable_999.sst.tmp", TEST_DB_PATH);
+    snprintf(cf_trie_labels, sizeof(cf_trie_labels), "%s/test_cf/trie_labels_11111_22222",
+             TEST_DB_PATH);
+    snprintf(cf_trie_parents, sizeof(cf_trie_parents), "%s/test_cf/trie_parents_11111_22222",
+             TEST_DB_PATH);
+    snprintf(cf_trie_child_ids, sizeof(cf_trie_child_ids), "%s/test_cf/trie_child_ids_11111_22222",
+             TEST_DB_PATH);
+
+    fp = fopen(cf_tmp_file, "w");
+    ASSERT_TRUE(fp != NULL);
+    fprintf(fp, "incomplete sstable data");
+    fclose(fp);
+
+    fp = fopen(cf_trie_labels, "w");
+    ASSERT_TRUE(fp != NULL);
+    fprintf(fp, "incomplete trie labels");
+    fclose(fp);
+
+    fp = fopen(cf_trie_parents, "w");
+    ASSERT_TRUE(fp != NULL);
+    fprintf(fp, "incomplete trie parents");
+    fclose(fp);
+
+    fp = fopen(cf_trie_child_ids, "w");
+    ASSERT_TRUE(fp != NULL);
+    fprintf(fp, "incomplete trie child ids");
+    fclose(fp);
+
+    /* verify temp files exist before reopening */
+    ASSERT_TRUE(access(root_tmp_file, F_OK) == 0);
+    ASSERT_TRUE(access(root_trie_file, F_OK) == 0);
+    ASSERT_TRUE(access(cf_tmp_file, F_OK) == 0);
+    ASSERT_TRUE(access(cf_trie_labels, F_OK) == 0);
+    ASSERT_TRUE(access(cf_trie_parents, F_OK) == 0);
+    ASSERT_TRUE(access(cf_trie_child_ids, F_OK) == 0);
+
+    printf("  Created 6 temporary files\n");
+
+    /* reopen database - cleanup should happen on open */
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    /* verify temp files were cleaned up on open */
+    ASSERT_TRUE(access(root_tmp_file, F_OK) != 0);     /* should be deleted */
+    ASSERT_TRUE(access(root_trie_file, F_OK) != 0);    /* should be deleted */
+    ASSERT_TRUE(access(cf_tmp_file, F_OK) != 0);       /* should be deleted */
+    ASSERT_TRUE(access(cf_trie_labels, F_OK) != 0);    /* should be deleted */
+    ASSERT_TRUE(access(cf_trie_parents, F_OK) != 0);   /* should be deleted */
+    ASSERT_TRUE(access(cf_trie_child_ids, F_OK) != 0); /* should be deleted */
+
+    printf("  ✓ All temp files cleaned up on open\n");
+
+    /* create more temp files while database is open */
+    fp = fopen(root_tmp_file, "w");
+    ASSERT_TRUE(fp != NULL);
+    fprintf(fp, "new incomplete data");
+    fclose(fp);
+
+    fp = fopen(cf_trie_labels, "w");
+    ASSERT_TRUE(fp != NULL);
+    fprintf(fp, "new incomplete trie");
+    fclose(fp);
+
+    ASSERT_TRUE(access(root_tmp_file, F_OK) == 0);
+    ASSERT_TRUE(access(cf_trie_labels, F_OK) == 0);
+
+    /* close database - cleanup should happen on close */
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    /* verify temp files were cleaned up on close */
+    ASSERT_TRUE(access(root_tmp_file, F_OK) != 0);  /* should be deleted */
+    ASSERT_TRUE(access(cf_trie_labels, F_OK) != 0); /* should be deleted */
+
+    printf("  ✓ All temp files cleaned up on close\n");
+
+    cleanup_test_dir();
+    printf("  ✓ Temporary file cleanup test passed\n");
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -6480,6 +6626,7 @@ int main(void)
     RUN_TEST(test_backward_prefix_seek_multi_source, tests_passed);
     RUN_TEST(test_memtable_flush_threshold_boundary, tests_passed);
     RUN_TEST(test_linear_scan_fallback, tests_passed);
+    RUN_TEST(test_temp_file_cleanup, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

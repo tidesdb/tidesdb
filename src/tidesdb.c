@@ -1823,6 +1823,44 @@ static block_manager_t *get_cached_block_manager(tidesdb_t *db, const char *path
     return bm;
 }
 
+/**
+ * _tidesdb_cleanup_temp_files
+ * cleans up temporary files (.tmp and trie_*) from a directory
+ * @param dir_path the directory path to clean
+ * @return void
+ */
+static void _tidesdb_cleanup_temp_files(const char *dir_path)
+{
+    if (!dir_path) return;
+
+    DIR *cleanup_dir = opendir(dir_path);
+    if (!cleanup_dir) return;
+
+    struct dirent *entry;
+    while ((entry = readdir(cleanup_dir)) != NULL)
+    {
+        /* remove .tmp files from incomplete compaction */
+        if (strstr(entry->d_name, TDB_TEMP_EXT) != NULL)
+        {
+            char temp_file_path[TDB_MAX_PATH_LENGTH];
+            (void)snprintf(temp_file_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", dir_path,
+                           entry->d_name);
+            TDB_DEBUG_LOG("Cleaning up incomplete temp file: %s", temp_file_path);
+            unlink(temp_file_path);
+        }
+        /* remove trie_* files from incomplete index building */
+        else if (strncmp(entry->d_name, "trie_", 5) == 0)
+        {
+            char temp_file_path[TDB_MAX_PATH_LENGTH];
+            (void)snprintf(temp_file_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", dir_path,
+                           entry->d_name);
+            TDB_DEBUG_LOG("Cleaning up incomplete trie file: %s", temp_file_path);
+            unlink(temp_file_path);
+        }
+    }
+    closedir(cleanup_dir);
+}
+
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 {
     if (!config || !db) return TDB_ERR_INVALID_ARGS;
@@ -1919,25 +1957,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     TDB_DEBUG_LOG("Database directory created/verified");
 
-    /* clean up any temp files from incomplete operations */
-    DIR *cleanup_dir = opendir(config->db_path);
-    if (cleanup_dir)
-    {
-        struct dirent *entry;
-        while ((entry = readdir(cleanup_dir)) != NULL)
-        {
-            if (strstr(entry->d_name, TDB_TEMP_EXT) != NULL)
-            {
-                char temp_file_path[TDB_MAX_PATH_LENGTH];
-                (void)snprintf(temp_file_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s",
-                               config->db_path, entry->d_name);
-                TDB_DEBUG_LOG("Cleaning up incomplete temp file: %s", temp_file_path);
-                unlink(temp_file_path);
-            }
-        }
-        closedir(cleanup_dir);
-    }
+    /* clean up any temp files from incomplete operations in root directory */
+    _tidesdb_cleanup_temp_files(config->db_path);
 
+    /* clean up temp files in all column family directories */
     DIR *dir = opendir(config->db_path);
     if (dir)
     {
@@ -1945,6 +1968,12 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         while ((entry = readdir(dir)) != NULL)
         {
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+            char cf_path[TDB_MAX_PATH_LENGTH];
+            (void)snprintf(cf_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s", config->db_path,
+                           entry->d_name);
+            _tidesdb_cleanup_temp_files(cf_path);
+
             {
                 tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
                 if (tidesdb_create_column_family(*db, entry->d_name, &cf_config) == -1)
@@ -2023,7 +2052,8 @@ int tidesdb_close(tidesdb_t *db)
         {
             if (sstables_ptr[j])
             {
-                /* release the array's reference -- sstable will be freed when ref count reaches 0
+                /* release the array's reference -- sstable will be freed when ref count reaches
+                 * 0
                  */
                 tidesdb_sstable_release(sstables_ptr[j]);
             }
@@ -2048,6 +2078,26 @@ int tidesdb_close(tidesdb_t *db)
 
     pthread_rwlock_unlock(&db->db_lock);
     pthread_rwlock_destroy(&db->db_lock);
+
+    /* clean up any temp files left over from this session */
+    _tidesdb_cleanup_temp_files(db->config.db_path);
+
+    /* clean up temp files in all column family directories */
+    DIR *cleanup_dir = opendir(db->config.db_path);
+    if (cleanup_dir)
+    {
+        struct dirent *entry;
+        while ((entry = readdir(cleanup_dir)) != NULL)
+        {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            char cf_path[TDB_MAX_PATH_LENGTH];
+            (void)snprintf(cf_path, TDB_MAX_PATH_LENGTH, "%s" PATH_SEPARATOR "%s",
+                           db->config.db_path, entry->d_name);
+            _tidesdb_cleanup_temp_files(cf_path);
+        }
+        closedir(cleanup_dir);
+    }
+
     free(db);
 
     return 0;
@@ -2637,7 +2687,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     else if (num_recovered_to_flush > 0)
     {
         TDB_DEBUG_LOG(
-            "Submitted %d recovered memtable(s) for background flush (wait_for_wal_recovery=false)",
+            "Submitted %d recovered memtable(s) for background flush "
+            "(wait_for_wal_recovery=false)",
             num_recovered_to_flush);
     }
 
@@ -5160,8 +5211,8 @@ static int tidesdb_load_sstable(tidesdb_column_family_t *cf, uint64_t sstable_id
  * @param key_size size of key
  * @param value pointer to store value
  * @param value_size pointer to store value size
- * @return 0 on success, TDB_ERR_CORRUPT if data is corrupted, TDB_ERR_NOT_FOUND if key not found or
- * expired, -1 on other failures
+ * @return 0 on success, TDB_ERR_CORRUPT if data is corrupted, TDB_ERR_NOT_FOUND if key not
+ * found or expired, -1 on other failures
  */
 static int tidesdb_sstable_get(tidesdb_sstable_t *sstable, const uint8_t *key, size_t key_size,
                                uint8_t **value, size_t *value_size)
@@ -7242,8 +7293,8 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
 
                     if (!positioned_via_index)
                     {
-                        /* block index didn't find exact match, position at beginning for backward
-                         * scan */
+                        /* block index didn't find exact match, position at beginning for
+                         * backward scan */
                         iter->sstable_cursors[i]->current_pos = BLOCK_MANAGER_HEADER_SIZE;
                         iter->sstable_cursors[i]->current_block_size = 0;
                     }

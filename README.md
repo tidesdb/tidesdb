@@ -17,7 +17,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Durability through write-ahead log (WAL) with sequence numbers for ordering and automatic recovery on startup that reconstructs memtables from persisted logs.
 - Automatic background compaction when SSTable count reaches configured threshold, or manual parallel compaction via API. Compaction removes tombstones and expired TTL entries. Locks only serialize array modifications, not reads.
 - Optional bloom filters provide probabilistic key existence checks to reduce disk reads. Configurable false positive rate per column family.
-- Optional compression using Snappy, LZ4, or ZSTD for both SSTables and WAL entries. Configurable per column family.
+- Optional compression using Snappy, LZ4, or ZSTD for SSTable data blocks. WAL entries remain uncompressed for fast writes and recovery. Configurable per column family.
 - TTL (time-to-live) support for key-value pairs with automatic expiration. Expired entries are skipped during reads and removed during compaction.
 - Custom comparators allow registration of user-defined key comparison functions. Built-in comparators include memcmp, string, and numeric.
 - Block manager cache with FIFO operations and configurable file handle cache to limit open file descriptors.

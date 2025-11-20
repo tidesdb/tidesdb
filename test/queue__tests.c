@@ -162,6 +162,9 @@ void test_queue_free_with_data(void)
     queue_enqueue(queue, str2);
     queue_enqueue(queue, str3);
 
+    char *item1 = (char *)queue_dequeue(queue);
+    free(item1);
+
     queue_free_with_data(queue, free);
 }
 

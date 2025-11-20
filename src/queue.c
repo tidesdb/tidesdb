@@ -383,6 +383,14 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         current = next;
     }
 
+    current = queue->node_pool;
+    while (current != NULL)
+    {
+        queue_node_t *next = current->next;
+        free(current);
+        current = next;
+    }
+
     queue->head = NULL;
     queue->tail = NULL;
     queue->size = 0;

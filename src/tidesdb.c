@@ -6436,7 +6436,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 uint64_t rollback_seq = atomic_fetch_add(&cf->next_seq_num, 1);
                 skip_list_put_with_seq(cf->active_memtable, op->key, op->key_size, NULL, 0, 0,
                                        rollback_seq, 1); /* tombstone */
-                seq_idx++;
             }
 
             pthread_mutex_unlock(&cf->flush_lock);

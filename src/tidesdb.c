@@ -8417,15 +8417,22 @@ static int tidesdb_recover_database(tidesdb_t *db)
         if (STAT_FUNC(full_path, &st) == 0 && S_ISDIR(st.st_mode))
         {
             /* found a potential column family directory */
-            tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
+            tidesdb_column_family_t *cf = tidesdb_get_column_family(db, entry->d_name);
 
-            if (tidesdb_create_column_family(db, entry->d_name, &config) == TDB_SUCCESS)
+            /* if CF doesn't exist yet, create it */
+            if (!cf)
             {
-                tidesdb_column_family_t *cf = tidesdb_get_column_family(db, entry->d_name);
-                if (cf)
+                tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
+                if (tidesdb_create_column_family(db, entry->d_name, &config) == TDB_SUCCESS)
                 {
-                    tidesdb_recover_column_family(cf);
+                    cf = tidesdb_get_column_family(db, entry->d_name);
                 }
+            }
+
+            /* recover the column family if we have it */
+            if (cf)
+            {
+                tidesdb_recover_column_family(cf);
             }
         }
     }

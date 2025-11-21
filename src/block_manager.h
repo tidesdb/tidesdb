@@ -106,7 +106,8 @@ typedef struct
     char file_path[MAX_FILE_PATH_LENGTH];
     block_manager_sync_mode_t sync_mode;
     uint32_t block_size;
-    _Atomic uint64_t current_file_size;
+    /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
+    _Atomic uint64_t current_file_size __attribute__((aligned(8)));
     block_manager_cache_t *block_manager_cache;
 } block_manager_t;
 

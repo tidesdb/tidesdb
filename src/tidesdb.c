@@ -983,8 +983,8 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
     if (!sst) return -1;
 
     /* create cache key from sstable id */
-    char cache_key[64];
-    snprintf(cache_key, sizeof(cache_key), "sst_%" PRIu64, sst->id);
+    char cache_key[TDB_CACHE_KEY_LEN];
+    snprintf(cache_key, sizeof(cache_key), TDB_SSTABLE_CACHE_PREFIX "%" PRIu64, sst->id);
 
     /* check if already in cache */
     void *cached = fifo_cache_get(db->sstable_cache, cache_key);
@@ -2971,8 +2971,9 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     /* create new sst for merged output */
     uint64_t new_id = atomic_fetch_add(&cf->next_sstable_id, 1);
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/L%d_", cf->directory, target_level);
+    char path[MAX_FILE_PATH_LENGTH];
+    snprintf(path, sizeof(path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d", cf->directory,
+             target_level);
 
     tidesdb_sstable_t *new_sst = tidesdb_sstable_create(path, new_id, &cf->config);
     if (!new_sst)
@@ -3491,8 +3492,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         /* create new sst for this partition */
         uint64_t sst_id = atomic_fetch_add(&cf->next_sstable_id, 1);
-        char sst_path[1024];
-        snprintf(sst_path, sizeof(sst_path), "%s/L%d_", cf->directory, target_level + 1);
+        char sst_path[MAX_FILE_PATH_LENGTH];
+        snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
+                 cf->directory, target_level + 1);
 
         tidesdb_sstable_t *new_sst = tidesdb_sstable_create(sst_path, sst_id, &cf->config);
         if (!new_sst) continue;
@@ -3814,8 +3816,10 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
         /* create output sst for this partition */
         uint64_t new_id = atomic_fetch_add(&cf->next_sstable_id, 1);
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/L%d_P%d_", cf->directory, end_level, partition);
+        char path[MAX_FILE_PATH_LENGTH];
+        snprintf(path, sizeof(path),
+                 "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d" TDB_LEVEL_PARTITION_PREFIX "%d",
+                 cf->directory, end_level, partition);
 
         tidesdb_sstable_t *new_sst = tidesdb_sstable_create(path, new_id, &cf->config);
         if (new_sst)
@@ -4468,6 +4472,149 @@ static void *tidesdb_background_compaction_thread(void *arg)
 }
 
 /**
+ * remove_directory
+ * safely removes a directory and all its contents iteratively
+ * @param path the directory path to remove
+ * @return 0 on success, -1 on failure
+ */
+static int remove_directory(const char *path)
+{
+    /* simple two-pass approach: first remove all files, then remove directories bottom-up */
+
+    /* pass 1 collect all paths (files and directories) */
+    char **paths = NULL;
+    int *is_dir = NULL;
+    int path_count = 0;
+    int path_capacity = MAX_FILE_PATH_LENGTH;
+
+    paths = malloc(path_capacity * sizeof(char *));
+    is_dir = malloc(path_capacity * sizeof(int));
+    if (!paths || !is_dir)
+    {
+        free(paths);
+        free(is_dir);
+        return -1;
+    }
+
+    /* stack for iterative traversal */
+    char **stack = malloc(path_capacity * sizeof(char *));
+    if (!stack)
+    {
+        free(paths);
+        free(is_dir);
+        return -1;
+    }
+
+    int stack_size = 0;
+    stack[stack_size++] = tdb_strdup(path);
+
+    /* traverse directory tree iteratively */
+    while (stack_size > 0)
+    {
+        char *current = stack[--stack_size];
+        DIR *dir = opendir(current);
+
+        if (!dir)
+        {
+            /* it's a file, add to list */
+            if (path_count >= path_capacity)
+            {
+                path_capacity *= 2;
+                char **new_paths = realloc(paths, path_capacity * sizeof(char *));
+                int *new_is_dir = realloc(is_dir, path_capacity * sizeof(int));
+                if (!new_paths || !new_is_dir)
+                {
+                    free(new_paths);
+                    free(new_is_dir);
+                    free(current);
+                    goto cleanup_error;
+                }
+                paths = new_paths;
+                is_dir = new_is_dir;
+            }
+            paths[path_count] = current;
+            is_dir[path_count] = 0;
+            path_count++;
+            continue;
+        }
+
+        /* add directory to list */
+        if (path_count >= path_capacity)
+        {
+            path_capacity *= 2;
+            char **new_paths = realloc(paths, path_capacity * sizeof(char *));
+            int *new_is_dir = realloc(is_dir, path_capacity * sizeof(int));
+            if (!new_paths || !new_is_dir)
+            {
+                free(new_paths);
+                free(new_is_dir);
+                closedir(dir);
+                free(current);
+                goto cleanup_error;
+            }
+            paths = new_paths;
+            is_dir = new_is_dir;
+        }
+        paths[path_count] = current;
+        is_dir[path_count] = 1;
+        path_count++;
+
+        /* add children to stack */
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL)
+        {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+            char full_path[MAX_FILE_PATH_LENGTH];
+            snprintf(full_path, sizeof(full_path), "%s%s%s", current, PATH_SEPARATOR,
+                     entry->d_name);
+
+            if (stack_size >= path_capacity)
+            {
+                path_capacity *= 2;
+                char **new_stack = realloc(stack, path_capacity * sizeof(char *));
+                if (!new_stack)
+                {
+                    closedir(dir);
+                    goto cleanup_error;
+                }
+                stack = new_stack;
+            }
+            stack[stack_size++] = tdb_strdup(full_path);
+        }
+        closedir(dir);
+    }
+
+    /* pass 2 remove in reverse order (files first, then directories bottom-up) */
+    int result = 0;
+    for (int i = path_count - 1; i >= 0; i--)
+    {
+        if (is_dir[i])
+        {
+            if (rmdir(paths[i]) != 0) result = -1;
+        }
+        else
+        {
+            if (unlink(paths[i]) != 0) result = -1;
+        }
+        free(paths[i]);
+    }
+
+    free(paths);
+    free(is_dir);
+    free(stack);
+    return result;
+
+cleanup_error:
+    for (int i = 0; i < stack_size; i++) free(stack[i]);
+    for (int i = 0; i < path_count; i++) free(paths[i]);
+    free(paths);
+    free(is_dir);
+    free(stack);
+    return -1;
+}
+
+/**
  * tidesdb_column_family_free
  * free column family
  * @param cf the column family
@@ -4476,10 +4623,11 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
 {
     if (!cf) return;
 
+    /* background compaction thread should already be stopped and joined by caller
+     * (see tidesdb_close), but set flag defensively */
     if (cf->config.enable_background_compaction)
     {
         atomic_store(&cf->compaction_should_stop, 1);
-        pthread_join(cf->compaction_thread, NULL);
     }
 
     skip_list_free(cf->active_memtable);
@@ -4541,8 +4689,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         skip_list_t *memtable = work->memtable;
         block_manager_t *wal = work->wal;
 
-        char sst_path[1024];
-        snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "1_",
+        char sst_path[MAX_FILE_PATH_LENGTH];
+        snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "1",
                  cf->directory);
 
         tidesdb_sstable_t *sst = tidesdb_sstable_create(sst_path, work->sst_id, &cf->config);
@@ -4880,6 +5028,32 @@ int tidesdb_close(tidesdb_t *db)
     /* clear cache before freeing column families to avoid use-after-free */
     fifo_cache_clear(db->sstable_cache);
 
+    /* stop all background compaction threads BEFORE acquiring cf_list_lock
+     * to avoid deadlock (threads might need cf_list_lock) */
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        tidesdb_column_family_t *cf = db->column_families[i];
+        if (cf && cf->config.enable_background_compaction)
+        {
+            atomic_store(&cf->compaction_should_stop, 1);
+        }
+    }
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    /* now join all compaction threads without holding any locks */
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        tidesdb_column_family_t *cf = db->column_families[i];
+        if (cf && cf->config.enable_background_compaction)
+        {
+            pthread_join(cf->compaction_thread, NULL);
+        }
+    }
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    /* now safe to free column families */
     pthread_rwlock_wrlock(&db->cf_list_lock);
     for (int i = 0; i < db->num_column_families; i++)
     {
@@ -4952,7 +5126,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
 
     char dir_path[TDB_MAX_PATH_LEN];
-    snprintf(dir_path, sizeof(dir_path), "%s/%s", db->db_path, name);
+    snprintf(dir_path, sizeof(dir_path), "%s" PATH_SEPARATOR "%s", db->db_path, name);
 
     struct stat st = {0};
     if (stat(dir_path, &st) == -1)
@@ -5125,9 +5299,15 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 
             pthread_rwlock_unlock(&db->cf_list_lock);
 
-            char cmd[2048];
-            snprintf(cmd, sizeof(cmd), "rm -rf %s", cf->directory);
-            int result = system(cmd);
+            /* stop and join background compaction thread before freeing */
+            if (cf->config.enable_background_compaction)
+            {
+                atomic_store(&cf->compaction_should_stop, 1);
+                pthread_join(cf->compaction_thread, NULL);
+            }
+
+            /* safely remove directory */
+            int result = remove_directory(cf->directory);
             TDB_DEBUG_LOG("Deleted column family directory: %s (result: %d)", cf->directory,
                           result);
 
@@ -5190,7 +5370,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     }
 
     uint64_t wal_id = atomic_fetch_add(&cf->memtable_id, 1);
-    char wal_path[1024];
+    char wal_path[MAX_FILE_PATH_LENGTH];
     snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR TDB_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
              cf->directory, TDB_U64_CAST(wal_id));
 
@@ -8075,13 +8255,14 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 
     while ((entry = readdir(dir)) != NULL)
     {
-        if (strstr(entry->d_name, "wal_") == entry->d_name)
+        if (strstr(entry->d_name, TDB_WAL_PREFIX) == entry->d_name)
         {
             size_t path_len = strlen(cf->directory) + strlen(entry->d_name) + 2;
             char *wal_path = malloc(path_len);
             if (wal_path)
             {
-                snprintf(wal_path, path_len, "%s/%s", cf->directory, entry->d_name);
+                snprintf(wal_path, path_len, "%s" PATH_SEPARATOR "%s", cf->directory,
+                         entry->d_name);
                 if (queue_enqueue(wal_files, wal_path) != 0)
                 {
                     free(wal_path);
@@ -8107,7 +8288,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                 uint64_t sst_id =
                     atomic_fetch_add_explicit(&cf->next_sstable_id, 1, memory_order_relaxed);
                 char sst_path[TDB_MAX_PATH_LEN];
-                snprintf(sst_path, sizeof(sst_path), "%s/L1_recovered_", cf->directory);
+                snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "1",
+                         cf->directory);
 
                 tidesdb_sstable_t *sst = tidesdb_sstable_create(sst_path, sst_id, &cf->config);
                 if (sst)
@@ -8115,6 +8297,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                     if (tidesdb_sstable_write_from_memtable(sst, recovered_memtable) == TDB_SUCCESS)
                     {
                         tidesdb_level_add_sstable(cf->levels[0], sst);
+                        /* release our reference, the level now owns it */
+                        tidesdb_sstable_unref(sst);
                     }
                     else
                     {
@@ -8153,10 +8337,12 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             int level_num = 1;
             unsigned long long sst_id_ull = 0;
 
-            if (sscanf(entry->d_name, "L%d__" TDB_U64_FMT ".klog", &level_num, &sst_id_ull) == 2)
+            if (sscanf(entry->d_name, TDB_LEVEL_PREFIX "%d_" TDB_U64_FMT TDB_SSTABLE_KLOG_EXT,
+                       &level_num, &sst_id_ull) == 2)
             {
                 char sst_base[TDB_MAX_PATH_LEN];
-                snprintf(sst_base, sizeof(sst_base), "%s/L%d_", cf->directory, level_num);
+                snprintf(sst_base, sizeof(sst_base), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
+                         cf->directory, level_num);
 
                 uint64_t sst_id = (uint64_t)sst_id_ull;
                 TDB_DEBUG_LOG("Parsed SSTable: level=%d, id=%" PRIu64, level_num, sst_id);
@@ -8223,7 +8409,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
         }
 
         /* check if entry is a directory using stat() for Windows compatibility */
-        char full_path[4096];
+        char full_path[MAX_FILE_PATH_LENGTH];
         snprintf(full_path, sizeof(full_path), "%s%s%s", db->db_path, PATH_SEPARATOR,
                  entry->d_name);
 
@@ -8561,9 +8747,11 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
     /* persist to disk if requested */
     if (persist_to_disk)
     {
-        char config_path[512];
-        snprintf(config_path, sizeof(config_path), "%s/%s/config.ini", cf->db->config.db_path,
-                 cf->name);
+        char config_path[MAX_FILE_PATH_LENGTH];
+        snprintf(config_path, sizeof(config_path),
+                 "%s" PATH_SEPARATOR
+                 "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+                 cf->db->config.db_path, cf->name);
 
         int result = tidesdb_cf_config_save_to_ini(config_path, cf->name, &cf->config);
         if (result != TDB_SUCCESS)

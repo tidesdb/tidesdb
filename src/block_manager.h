@@ -24,7 +24,7 @@
 /* more time equals more results, but remember to take breaks to refresh your mind. */
 
 /* max file path length for block manager file(s) */
-#define MAX_FILE_PATH_LENGTH 1024
+#define MAX_FILE_PATH_LENGTH 1024 * 4
 
 /* TDB in hex */
 #define BLOCK_MANAGER_MAGIC 0x544442

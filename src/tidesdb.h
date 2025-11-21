@@ -117,14 +117,14 @@ typedef enum
 
 #define TDB_WAL_PREFIX                "wal_"
 #define TDB_WAL_EXT                   ".log"
-#define TDB_SSTABLE_PREFIX            "sstable_"
 #define TDB_COLUMN_FAMILY_CONFIG_NAME "config"
 #define TDB_COLUMN_FAMILY_CONFIG_EXT  ".ini"
-#define TDB_TEMP_FILE_EXT             ".tmp"
 #define TDB_LEVEL_PREFIX              "L"
 #define TDB_LEVEL_PARTITION_PREFIX    "P"
 #define TDB_SSTABLE_KLOG_EXT          ".klog"
 #define TDB_SSTABLE_VLOG_EXT          ".vlog"
+#define TDB_SSTABLE_CACHE_PREFIX      "sst_"
+#define TDB_CACHE_KEY_LEN             128
 
 /* default configuration values */
 #define TDB_DEFAULT_WRITE_BUFFER_SIZE              (64 * 1024 * 1024) /* 64MB */

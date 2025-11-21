@@ -4725,6 +4725,14 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* check shutdown after getting work -- if stopping, clean up and exit */
         if (atomic_load(&db->flush_should_stop))
         {
+            /* dequeue corresponding immutable entry to prevent double-free */
+            tidesdb_immutable_memtable_t *to_free =
+                (tidesdb_immutable_memtable_t *)queue_dequeue(work->cf->immutable_memtables);
+            if (to_free)
+            {
+                free(to_free);
+            }
+
             /* clean up work item before exiting */
             skip_list_free(work->memtable);
             if (work->wal)
@@ -6413,7 +6421,7 @@ int tidesdb_txn_delete_cf(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const
 int tidesdb_txn_commit(tidesdb_txn_t *txn)
 {
     if (!txn || txn->is_committed || txn->is_aborted) return TDB_ERR_INVALID_ARGS;
-    if (txn->num_cfs == 0) return TDB_ERR_INVALID_ARGS;
+    if (txn->num_cfs <= 0) return TDB_ERR_INVALID_ARGS;
 
     /* prepare ~~ conflict detection across all CFs (for SERIALIZABLE) */
 
@@ -6490,7 +6498,13 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         int committed;
     } cf_commit_ctx_t;
 
-    cf_commit_ctx_t *cf_contexts = calloc(txn->num_cfs, sizeof(cf_commit_ctx_t));
+    /* defensive check to satisfy static analysis */
+    if (txn->num_cfs <= 0 || txn->num_cfs > TDB_MAX_TXN_CFS)
+    {
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    cf_commit_ctx_t *cf_contexts = calloc((size_t)txn->num_cfs, sizeof(cf_commit_ctx_t));
     if (!cf_contexts)
     {
         return TDB_ERR_MEMORY;

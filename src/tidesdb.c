@@ -4716,9 +4716,25 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* wait for work (blocking dequeue) */
         tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue_wait(db->flush_queue);
 
-        if (!work || atomic_load(&db->flush_should_stop))
+        if (!work)
         {
-            /* NULL work item or shutdown signal */
+            /* NULL work item means shutdown */
+            break;
+        }
+
+        /* check shutdown after getting work -- if stopping, clean up and exit */
+        if (atomic_load(&db->flush_should_stop))
+        {
+            /* clean up work item before exiting */
+            skip_list_free(work->memtable);
+            if (work->wal)
+            {
+                char *wal_path_to_delete = tdb_strdup(work->wal->file_path);
+                block_manager_close(work->wal);
+                unlink(wal_path_to_delete);
+                free(wal_path_to_delete);
+            }
+            free(work);
             break;
         }
 

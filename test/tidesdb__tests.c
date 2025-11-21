@@ -380,10 +380,7 @@ static void test_persistence_and_recovery(void)
             tidesdb_txn_free(txn);
 
             /* we should find at least some keys if recovery worked */
-            if (found_count > 0)
-            {
-                printf("Recovery successful: found %d/%d keys\n", found_count, NUM_KEYS / 5);
-            }
+            ASSERT_TRUE(found_count > 0);
         }
 
         tidesdb_close(db);
@@ -1156,17 +1153,16 @@ static void test_bidirectional_iterator(void)
     uint8_t *key = NULL;
     size_t key_size = 0;
     ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
-    printf("DEBUG: After 3 forward steps, at: '%s' (expected key_03)\n", (char *)key);
+
     ASSERT_TRUE(strcmp((char *)key, "key_03") == 0);
     free(key);
 
     /* now go backward 2 steps (should be at key_01) */
-    printf("DEBUG: Going backward 2 steps...\n");
     ASSERT_EQ(tidesdb_iter_prev(iter), 0);
     ASSERT_EQ(tidesdb_iter_prev(iter), 0);
 
     ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
-    printf("DEBUG: After 2 backward steps, at: '%s' (expected key_01)\n", (char *)key);
+
     if (strcmp((char *)key, "key_01") != 0)
     {
         printf("ERROR: Expected key_01 but got '%s'\n", (char *)key);
@@ -1389,30 +1385,21 @@ static void test_isolation_repeatable_read(void)
 
     /* REPEATABLE_READ should still see old value (snapshot isolation) */
     retrieved = NULL;
-    printf("DEBUG: About to call tidesdb_txn_get for second read, txn2->start_seq=%lu\n",
-           (unsigned long)txn2->start_seq);
-    fflush(stdout);
+
     result = tidesdb_txn_get(txn2, key, sizeof(key), &retrieved, &retrieved_size);
-    printf("DEBUG: Second read result=%d, retrieved=%p\n", result, (void *)retrieved);
-    fflush(stdout);
 
     if (result == 0 && retrieved)
     {
         /* should still see original value */
-        printf("DEBUG: Retrieved value: '%s' (len=%zu), expected: '%s' (len=%zu)\n",
-               (char *)retrieved, retrieved_size, (char *)value1, sizeof(value1));
-        fflush(stdout);
 
         int cmp = memcmp(retrieved, value1, sizeof(value1));
-        printf("DEBUG: memcmp result=%d\n", cmp);
-        fflush(stdout);
 
         ASSERT_TRUE(cmp == 0);
         free(retrieved);
     }
     else
     {
-        printf("DEBUG: Failed to retrieve value, result=%d\n", result);
+        printf("Failed to retrieve value, result=%d\n", result);
         fflush(stdout);
     }
 
@@ -3340,10 +3327,6 @@ static void test_dividing_merge_strategy(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "dividing_cf");
     ASSERT_TRUE(cf != NULL);
 
-    printf("\n=== Testing Dividing Merge Strategy ===\n");
-    printf("Config: write_buffer=%zu, ratio=%zu, offset=%d\n", cf_config.write_buffer_size,
-           cf_config.level_size_ratio, cf_config.dividing_level_offset);
-
     /* write data to create multiple levels
      * level 0 capacity = 256 * 4 = 1024 bytes
      * level 1 capacity = 1024 * 4 = 4096 bytes
@@ -3415,7 +3398,6 @@ static void test_dividing_merge_strategy(void)
     }
 
     tidesdb_txn_free(txn);
-    printf("✓ Dividing merge: All %d keys verified\n", num_keys);
 
     tidesdb_close(db);
     cleanup_test_dir();
@@ -3435,10 +3417,6 @@ static void test_partitioned_merge_strategy(void)
     ASSERT_EQ(tidesdb_create_column_family(db, "partition_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "partition_cf");
     ASSERT_TRUE(cf != NULL);
-
-    printf("\n=== Testing Partitioned Merge Strategy ===\n");
-    printf("Config: write_buffer=%zu, ratio=%zu, offset=%d\n", cf_config.write_buffer_size,
-           cf_config.level_size_ratio, cf_config.dividing_level_offset);
 
     /* write data in batches with compaction between batches to build up levels
      * level 0: 300 * 3 = 900 bytes
@@ -3572,7 +3550,6 @@ static void test_partitioned_merge_strategy(void)
     }
 
     tidesdb_txn_free(txn);
-    printf("✓ Partitioned merge: All %d keys verified across %d levels\n", num_keys, levels_after);
 
     tidesdb_close(db);
     cleanup_test_dir();
@@ -3591,8 +3568,6 @@ static void test_multi_level_compaction_strategies(void)
     ASSERT_EQ(tidesdb_create_column_family(db, "multi_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "multi_cf");
     ASSERT_TRUE(cf != NULL);
-
-    printf("\n=== Testing Multi-Level Compaction (All Strategies) ===\n");
 
     /* small dataset -- triggers full preemptive merge */
     printf("Phase 1: Writing 50 keys (full preemptive merge)\n");
@@ -3696,7 +3671,6 @@ static void test_multi_level_compaction_strategies(void)
     }
 
     tidesdb_txn_free(txn);
-    printf("✓ Multi-level: All 250 keys verified across %d levels\n", final_levels);
 
     tidesdb_close(db);
     cleanup_test_dir();
@@ -3715,8 +3689,6 @@ static void test_boundary_partitioning(void)
     ASSERT_EQ(tidesdb_create_column_family(db, "boundary_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "boundary_cf");
     ASSERT_TRUE(cf != NULL);
-
-    printf("\n=== Testing Boundary-Based Partitioning ===\n");
 
     /* write keys with specific patterns to test boundary detection
      * Use lexicographically distributed keys */
@@ -3773,7 +3745,6 @@ static void test_boundary_partitioning(void)
     }
 
     tidesdb_txn_free(txn);
-    printf("✓ Boundary partitioning: All %d keys verified\n", num_keys);
 
     tidesdb_close(db);
     cleanup_test_dir();
@@ -3793,8 +3764,6 @@ static void test_dynamic_capacity_adjustment(void)
     ASSERT_EQ(tidesdb_create_column_family(db, "dca_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "dca_cf");
     ASSERT_TRUE(cf != NULL);
-
-    printf("\n=== Testing Dynamic Capacity Adjustment (DCA) ===\n");
 
     int initial_levels = atomic_load(&cf->num_levels);
     printf("Initial levels: %d\n", initial_levels);
@@ -3858,7 +3827,6 @@ static void test_dynamic_capacity_adjustment(void)
     }
 
     tidesdb_txn_free(txn);
-    printf("All 200 keys verified, levels grew from %d to %d\n", initial_levels, final_levels);
 
     tidesdb_close(db);
     cleanup_test_dir();
@@ -4044,7 +4012,6 @@ void test_multi_cf_iterator(void)
 
     /* should see 20 entries total (10 from each CF) */
     assert(count == 20);
-    printf("✓ Multi-CF iterator: counted %d entries across 2 CFs\n", count);
 
     tidesdb_iter_free(iter);
     tidesdb_txn_free(txn);
@@ -4173,7 +4140,6 @@ void test_multi_cf_iterator_reverse(void)
         assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
 
         /* verify descending order */
-        printf("DEBUG: key='%.*s'\n", (int)key_size, key);
         assert(memcmp(key, prev_key, key_size < strlen(prev_key) ? key_size : strlen(prev_key)) <=
                0);
         memcpy(prev_key, key, key_size);
@@ -4182,7 +4148,6 @@ void test_multi_cf_iterator_reverse(void)
         count++;
     } while (tidesdb_iter_prev(iter) == TDB_SUCCESS);
 
-    printf("DEBUG: Got %d entries, expected 10\n", count);
     assert(count == 10); /* 5 keys * 2 CFs */
 
     tidesdb_iter_free(iter);
@@ -4304,15 +4269,13 @@ void test_multi_cf_iterator_seek_for_prev(void)
     size_t verify_size = 0;
     int get_result =
         tidesdb_txn_get_cf(txn, cf2, (uint8_t *)"cf2_key_30", 10, &verify_val, &verify_size);
-    printf("DEBUG: Checking if cf2_key_30 exists: result=%d\n", get_result);
+
     if (get_result == TDB_SUCCESS)
     {
-        printf("DEBUG: cf2_key_30 exists with value: %.*s\n", (int)verify_size, verify_val);
         free(verify_val);
     }
 
     /* list all keys in CF2 to see what's actually there */
-    printf("DEBUG: All keys in CF2:\n");
     for (int i = 0; i < 5; i++)
     {
         char test_key[32];
@@ -4335,7 +4298,6 @@ void test_multi_cf_iterator_seek_for_prev(void)
     uint8_t *found_key = NULL;
     size_t found_key_size = 0;
     assert(tidesdb_iter_key(iter, &found_key, &found_key_size) == TDB_SUCCESS);
-    printf("DEBUG: Sought '%s', found '%.*s'\n", seek_key, (int)found_key_size, found_key);
     assert(memcmp(found_key, seek_key, strlen(seek_key)) == 0);
     free(found_key);
 

@@ -76,6 +76,7 @@ queue_t *queue_new(void)
     atomic_store(&queue->atomic_head, NULL);
     queue->tail = NULL;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
+    queue->shutdown = 0;
     queue->waiter_count = 0;
     queue->node_pool = NULL;
     queue->pool_size = 0;
@@ -180,14 +181,22 @@ void *queue_dequeue_wait(queue_t *queue)
     /* increment waiter count before waiting */
     queue->waiter_count++;
 
-    /* wait until queue has data */
-    while (queue->head == NULL)
+    /* wait until queue has data or is being shut down */
+    while (queue->head == NULL && !queue->shutdown)
     {
         pthread_cond_wait(&queue->not_empty, &queue->lock);
     }
 
     /* decrement waiter count after waking up */
     queue->waiter_count--;
+
+    /* if shutdown, signal and return NULL */
+    if (queue->shutdown)
+    {
+        pthread_cond_broadcast(&queue->not_empty);
+        pthread_mutex_unlock(&queue->lock);
+        return NULL;
+    }
 
     queue_node_t *node = queue->head;
     void *data = node->data;
@@ -314,6 +323,7 @@ void queue_free(queue_t *queue)
     pthread_mutex_lock(&queue->lock);
 
     /* set shutdown flag and wake all waiting threads */
+    queue->shutdown = 1;
     pthread_cond_broadcast(&queue->not_empty);
 
     /* clear the queue while holding the lock */
@@ -338,8 +348,10 @@ void queue_free(queue_t *queue)
     queue->node_pool = NULL;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
+    /* wait for all waiting threads to exit */
     while (queue->waiter_count > 0)
     {
+        pthread_cond_broadcast(&queue->not_empty);
         pthread_cond_wait(&queue->not_empty, &queue->lock);
     }
 

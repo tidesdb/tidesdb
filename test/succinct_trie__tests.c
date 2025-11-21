@@ -36,7 +36,7 @@ void test_disk_streaming_basic()
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"date", 4, 4), 0);
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"elderberry", 10, 5), 0);
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
     ASSERT_TRUE(trie != NULL);
 
     /* verify lookups */
@@ -70,7 +70,7 @@ void test_disk_streaming_prefix_queries()
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"testing", 7, 3), 0);
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"toast", 5, 4), 0);
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
     ASSERT_TRUE(trie != NULL);
 
     /* test exact matches */
@@ -120,7 +120,7 @@ void test_disk_streaming_large_dataset()
         ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)key, strlen(key), i), 0);
     }
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
     ASSERT_TRUE(trie != NULL);
 
     clock_t end = clock();
@@ -156,7 +156,7 @@ void test_disk_streaming_common_prefix()
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"commonprefix_c", 14, 3), 0);
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"commonprefix_d", 14, 4), 0);
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
     ASSERT_TRUE(trie != NULL);
 
     int64_t value;
@@ -180,7 +180,7 @@ void test_disk_streaming_single_entry()
 
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"single", 6, 42), 0);
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
     ASSERT_TRUE(trie != NULL);
 
     int64_t value;
@@ -200,7 +200,7 @@ void test_disk_streaming_serialization()
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"beta", 4, 20), 0);
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"gamma", 5, 30), 0);
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
     ASSERT_TRUE(trie != NULL);
 
     size_t serialized_size;
@@ -249,7 +249,7 @@ void benchmark_succinct_trie()
         ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)keys[i], strlen(keys[i]), i), 0);
     }
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
     ASSERT_TRUE(trie != NULL);
     clock_t end = clock();
     double build_time = (double)(end - start) / CLOCKS_PER_SEC;
@@ -296,7 +296,7 @@ void test_succinct_trie_invalid_inputs()
     /* NULL prefix */
     builder = succinct_trie_builder_new(NULL, succinct_trie_comparator_memcmp, NULL);
     succinct_trie_builder_add(builder, (uint8_t *)"key", 3, 123);
-    trie = succinct_trie_builder_build(builder);
+    trie = succinct_trie_builder_build(builder, NULL);
     ASSERT_EQ(succinct_trie_prefix_get(trie, NULL, 3, &val), -1);
     succinct_trie_free(trie);
 
@@ -308,7 +308,7 @@ void test_succinct_trie_empty()
 {
     succinct_trie_builder_t *builder =
         succinct_trie_builder_new(NULL, succinct_trie_comparator_memcmp, NULL);
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
 
     int64_t val;
     /* get from empty trie */
@@ -341,7 +341,7 @@ void test_succinct_trie_binary_keys()
     ASSERT_EQ(succinct_trie_builder_add(builder, key1, sizeof(key1), 100), 0);
     ASSERT_EQ(succinct_trie_builder_add(builder, key2, sizeof(key2), 200), 0);
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
 
     int64_t val;
     ASSERT_EQ(succinct_trie_prefix_get(trie, key1, sizeof(key1), &val), 0);
@@ -357,12 +357,12 @@ void test_succinct_trie_duplicate_keys()
     succinct_trie_builder_t *builder =
         succinct_trie_builder_new(NULL, succinct_trie_comparator_string, NULL);
 
-    /* add same key multiple times - only last should be kept */
+    /* add same key multiple times -- only last should be kept */
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"key", 3, 100), 0);
     /* second add of same key should fail (not in sorted order) */
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"key", 3, 200), -1);
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
 
     int64_t val;
     ASSERT_EQ(succinct_trie_prefix_get(trie, (uint8_t *)"key", 3, &val), 0);
@@ -382,7 +382,7 @@ void test_succinct_trie_long_keys()
 
     ASSERT_EQ(succinct_trie_builder_add(builder, long_key, sizeof(long_key), 999), 0);
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
 
     int64_t val;
     ASSERT_EQ(succinct_trie_prefix_get(trie, long_key, sizeof(long_key), &val), 0);
@@ -396,12 +396,12 @@ void test_succinct_trie_prefix_edge_cases()
     succinct_trie_builder_t *builder =
         succinct_trie_builder_new(NULL, succinct_trie_comparator_string, NULL);
 
-    /* keys where one is prefix of another - must be in sorted order */
+    /* keys where one is prefix of another -- must be in sorted order */
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"a", 1, 1), 0);
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"ab", 2, 2), 0);
     ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"abc", 3, 3), 0);
 
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
 
     int64_t val;
     /* prefix queries */
@@ -420,7 +420,7 @@ void test_succinct_trie_deserialize_corrupted()
     succinct_trie_builder_t *builder =
         succinct_trie_builder_new(NULL, succinct_trie_comparator_string, NULL);
     succinct_trie_builder_add(builder, (uint8_t *)"test", 4, 123);
-    succinct_trie_t *trie = succinct_trie_builder_build(builder);
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
 
     size_t size;
     uint8_t *data = succinct_trie_serialize(trie, &size);
@@ -436,7 +436,7 @@ void test_succinct_trie_deserialize_corrupted()
 
     /* should handle gracefully */
     succinct_trie_t *trie2 = succinct_trie_deserialize(data, size);
-    /* may return NULL or corrupted trie - just shouldn't crash */
+    /* may return NULL or corrupted trie -- just shouldn't crash */
 
     free(data);
     succinct_trie_free(trie);
@@ -466,7 +466,7 @@ void benchmark_disk_streaming_vs_memory()
                   0);
     }
 
-    succinct_trie_t *disk_trie = succinct_trie_builder_build(disk_builder);
+    succinct_trie_t *disk_trie = succinct_trie_builder_build(disk_builder, NULL);
     ASSERT_TRUE(disk_trie != NULL);
     clock_t end = clock();
     double disk_time = (double)(end - start) / CLOCKS_PER_SEC;
@@ -482,7 +482,7 @@ void benchmark_disk_streaming_vs_memory()
                   0);
     }
 
-    succinct_trie_t *mem_trie = succinct_trie_builder_build(mem_builder);
+    succinct_trie_t *mem_trie = succinct_trie_builder_build(mem_builder, NULL);
     ASSERT_TRUE(mem_trie != NULL);
     end = clock();
     double mem_time = (double)(end - start) / CLOCKS_PER_SEC;

@@ -65,8 +65,9 @@ void test_skip_list_put_get()
     uint8_t *retrieved_value;
     size_t retrieved_value_size;
     uint8_t deleted;
-    int get_result =
-        skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size, &deleted);
+    time_t ttl;
+    int get_result = skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size,
+                                   &ttl, &deleted);
     ASSERT_EQ(get_result, 0);
     ASSERT_TRUE(memcmp(retrieved_value, value, sizeof(value)) == 0);
 
@@ -272,9 +273,10 @@ void benchmark_skip_list()
         uint8_t *retrieved_value;
         size_t retrieved_value_size;
         uint8_t deleted;
+        time_t ttl;
 
         int result = skip_list_get(list, keys[i], key_size, &retrieved_value, &retrieved_value_size,
-                                   &deleted);
+                                   &ttl, &deleted);
         ASSERT_EQ(result, 0);
         ASSERT_EQ(memcmp(retrieved_value, values[i], value_size), 0);
         free(retrieved_value);
@@ -342,7 +344,9 @@ void benchmark_skip_list_sequential()
         uint8_t *retrieved_value;
         size_t retrieved_value_size;
         uint8_t deleted;
-        skip_list_get(list, keys[i], key_size, &retrieved_value, &retrieved_value_size, &deleted);
+        time_t ttl;
+        skip_list_get(list, keys[i], key_size, &retrieved_value, &retrieved_value_size, &ttl,
+                      &deleted);
         free(retrieved_value);
     }
     end = clock();
@@ -384,8 +388,9 @@ void test_skip_list_ttl()
     uint8_t *retrieved_value;
     size_t retrieved_value_size;
     uint8_t deleted;
-    int result =
-        skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size, &deleted);
+    time_t retrieved_ttl;
+    int result = skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size,
+                               &retrieved_ttl, &deleted);
 
     ASSERT_EQ(result, 0);
     ASSERT_EQ(deleted, 1);
@@ -677,8 +682,9 @@ void *concurrent_reader(void *arg)
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
         int result = skip_list_get(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1, &value,
-                                   &value_size, &deleted);
+                                   &value_size, &ttl, &deleted);
 
         if (result == 0 && value != NULL)
         {
@@ -793,21 +799,22 @@ void test_skip_list_null_validation()
     uint8_t *out_value = NULL;
     size_t out_size = 0;
     uint8_t deleted = 0;
+    time_t ttl;
 
     /* null list */
     ASSERT_EQ(skip_list_put(NULL, key, sizeof(key), value, sizeof(value), -1), -1);
-    ASSERT_EQ(skip_list_get(NULL, key, sizeof(key), &out_value, &out_size, &deleted), -1);
+    ASSERT_EQ(skip_list_get(NULL, key, sizeof(key), &out_value, &out_size, &ttl, &deleted), -1);
 
     /* null key */
     ASSERT_EQ(skip_list_put(list, NULL, sizeof(key), value, sizeof(value), -1), -1);
-    ASSERT_EQ(skip_list_get(list, NULL, sizeof(key), &out_value, &out_size, &deleted), -1);
+    ASSERT_EQ(skip_list_get(list, NULL, sizeof(key), &out_value, &out_size, &ttl, &deleted), -1);
 
     /* null value on put */
     ASSERT_EQ(skip_list_put(list, key, sizeof(key), NULL, sizeof(value), -1), -1);
 
     /* null output pointers on get */
-    ASSERT_EQ(skip_list_get(list, key, sizeof(key), NULL, &out_size, &deleted), -1);
-    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &out_value, NULL, &deleted), -1);
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), NULL, &out_size, &ttl, &deleted), -1);
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &out_value, NULL, &ttl, &deleted), -1);
 
     skip_list_free(list);
 }
@@ -845,9 +852,10 @@ void test_skip_list_large_keys_values()
     uint8_t *retrieved_value = NULL;
     size_t retrieved_size = 0;
     uint8_t deleted = 0;
+    time_t ttl;
 
     ASSERT_EQ(skip_list_get(list, large_key, sizeof(large_key), &retrieved_value, &retrieved_size,
-                            &deleted),
+                            &ttl, &deleted),
               0);
     ASSERT_EQ(retrieved_size, sizeof(large_value));
     ASSERT_EQ(memcmp(retrieved_value, large_value, sizeof(large_value)), 0);
@@ -875,9 +883,11 @@ void test_skip_list_duplicate_key_update()
     uint8_t *retrieved_value = NULL;
     size_t retrieved_size = 0;
     uint8_t deleted = 0;
+    time_t ttl;
 
-    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &deleted),
-              0);
+    ASSERT_EQ(
+        skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &ttl, &deleted),
+        0);
 
     /* GET should return the latest version (value2), atomic replacement, no duplicates */
     ASSERT_EQ(retrieved_size, sizeof(value2));
@@ -908,8 +918,10 @@ void test_skip_list_delete_operations()
     uint8_t *retrieved_value = NULL;
     size_t retrieved_size = 0;
     uint8_t deleted = 0;
+    time_t ttl;
 
-    int result = skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &deleted);
+    int result =
+        skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &ttl, &deleted);
 
     if (result == 0 && retrieved_value != NULL)
     {
@@ -919,7 +931,7 @@ void test_skip_list_delete_operations()
     /* delete non-existent key */
     uint8_t nonexistent[] = "nonexistent";
     result = skip_list_get(list, nonexistent, sizeof(nonexistent), &retrieved_value,
-                           &retrieved_size, &deleted);
+                           &retrieved_size, &ttl, &deleted);
     ASSERT_EQ(result, -1);
 
     skip_list_free(list);
@@ -959,9 +971,10 @@ void test_skip_list_delete_existing_keys()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        int result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        int result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &ttl,
+                                   &deleted);
 
         if (i % 2 == 0)
         {
@@ -1007,9 +1020,10 @@ void test_skip_list_delete_nonexistent_keys()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        int result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        int result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &ttl,
+                                   &deleted);
         ASSERT_EQ(result, -1);
     }
 
@@ -1033,7 +1047,8 @@ void test_skip_list_delete_and_reinsert()
     uint8_t *retrieved = NULL;
     size_t size = 0;
     uint8_t deleted = 0;
-    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved, &size, &deleted), 0);
+    time_t ttl;
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved, &size, &ttl, &deleted), 0);
     ASSERT_EQ(deleted, 1);
     if (retrieved) free(retrieved);
 
@@ -1044,7 +1059,7 @@ void test_skip_list_delete_and_reinsert()
     retrieved = NULL;
     size = 0;
     deleted = 0;
-    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved, &size, &deleted), 0);
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved, &size, &ttl, &deleted), 0);
     ASSERT_EQ(deleted, 0);
     ASSERT_EQ(size, sizeof(value2));
     ASSERT_TRUE(memcmp(retrieved, value2, sizeof(value2)) == 0);
@@ -1205,9 +1220,10 @@ void test_skip_list_lockfree_stress()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
         int result = skip_list_get(list, (uint8_t *)key_buf, strlen(key_buf) + 1, &value,
-                                   &value_size, &deleted);
+                                   &value_size, &ttl, &deleted);
         if (result == 0 && value != NULL)
         {
             keys_found++;
@@ -1338,9 +1354,10 @@ void benchmark_skip_list_zipfian()
             uint8_t *value = NULL;
             size_t value_size = 0;
             uint8_t deleted = 0;
+            time_t ttl;
 
-            int get_result =
-                skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+            int get_result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value,
+                                           &value_size, &ttl, &deleted);
             if (get_result == 0 && !deleted)
             {
                 read_hits++;
@@ -1386,9 +1403,10 @@ void benchmark_skip_list_zipfian()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        int get_result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        int get_result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size,
+                                       &ttl, &deleted);
         if (get_result == 0 && !deleted)
         {
             pure_read_hits++;
@@ -1464,9 +1482,10 @@ void test_skip_list_update_patterns()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &ttl,
+                               &deleted);
         ASSERT_EQ(result, 0);
         ASSERT_TRUE(!deleted);
         ASSERT_EQ(value_size, strlen(expected) + 1);
@@ -1537,9 +1556,10 @@ static void test_skip_list_large_value_updates(void)
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &ttl,
+                               &deleted);
         ASSERT_EQ(result, 0);
         ASSERT_TRUE(!deleted);
         ASSERT_EQ(value_size, strlen(expected) + 1);
@@ -1617,9 +1637,10 @@ void benchmark_skip_list_deletions()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &ttl,
+                               &deleted);
         if (result == 0 && deleted)
         {
             deleted_count++;

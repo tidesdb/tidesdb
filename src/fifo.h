@@ -36,7 +36,7 @@ typedef void (*fifo_evict_callback_t)(const char *key, void *value, void *user_d
 
 /**
  * fifo_entry_t
- * represents a single entry in the fifo cache
+ * a single entry in the fifo cache
  * @param key the key string (owned by entry)
  * @param key_len the length of the key (pre-computed)
  * @param value the value pointer (not owned, managed by callback)
@@ -105,10 +105,10 @@ int fifo_cache_put(fifo_cache_t *cache, const char *key, void *value,
 
 /**
  * fifo_cache_get
- * retrieves a value from the cache
+ * retrieves a value from the cache by key (lock-free)
  * @param cache the cache
- * @param key the key string
- * @return the value pointer, or NULL if not found
+ * @param key the key
+ * @return the value if found, NULL otherwise
  */
 void *fifo_cache_get(fifo_cache_t *cache, const char *key);
 

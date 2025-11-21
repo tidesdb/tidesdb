@@ -181,7 +181,7 @@ void *queue_dequeue_wait(queue_t *queue)
     /* increment waiter count before waiting */
     queue->waiter_count++;
 
-    /* wait until queue is not empty or shutdown */
+    /* wait until queue has data or is being shut down */
     while (queue->head == NULL && !queue->shutdown)
     {
         pthread_cond_wait(&queue->not_empty, &queue->lock);
@@ -190,15 +190,10 @@ void *queue_dequeue_wait(queue_t *queue)
     /* decrement waiter count after waking up */
     queue->waiter_count--;
 
-    /* always broadcast when waiter_count changes to wake queue_free if waiting */
-    if (queue->waiter_count == 0)
+    /* if shutdown, signal and return NULL */
+    if (queue->shutdown)
     {
         pthread_cond_broadcast(&queue->not_empty);
-    }
-
-    /* if shutdown and no data, return NULL */
-    if (queue->shutdown && queue->head == NULL)
-    {
         pthread_mutex_unlock(&queue->lock);
         return NULL;
     }
@@ -301,7 +296,7 @@ void *queue_peek_at(queue_t *queue, size_t index)
 {
     if (!queue) return NULL;
 
-    /* lock-free read using atomic_head - no lock needed!
+    /* lock-free read using atomic_head
      * this is safe because:
      * 1. nodes are never freed while in queue (only when dequeued)
      * 2. atomic_head is updated with release semantics
@@ -353,8 +348,10 @@ void queue_free(queue_t *queue)
     queue->node_pool = NULL;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
+    /* wait for all waiting threads to exit */
     while (queue->waiter_count > 0)
     {
+        pthread_cond_broadcast(&queue->not_empty);
         pthread_cond_wait(&queue->not_empty, &queue->lock);
     }
 
@@ -383,19 +380,10 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         current = next;
     }
 
-    current = queue->node_pool;
-    while (current != NULL)
-    {
-        queue_node_t *next = current->next;
-        free(current);
-        current = next;
-    }
-
     queue->head = NULL;
     queue->tail = NULL;
     queue->size = 0;
 
-    queue->shutdown = 1;
     pthread_cond_broadcast(&queue->not_empty);
 
     pthread_mutex_unlock(&queue->lock);

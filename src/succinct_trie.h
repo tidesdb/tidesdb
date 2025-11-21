@@ -21,6 +21,10 @@
 
 #include "block_manager.h"
 
+#define PERIODIC_SHUTDOWN_CHECK_INTERVAL \
+    100 /* when building trie, check shutdown flag every 100 iterations */
+#define BUILDER_BUFFER_CAPACITY 1024 * 8
+
 /**
  * succinct_trie_comparator_fn
  * comparator function type for custom key comparison
@@ -119,6 +123,14 @@ typedef struct
     uint32_t n_vals;
     succinct_trie_comparator_fn comparator;
     void *comparator_ctx;
+    /* write buffers to reduce I/O operations (batch writes) */
+    uint8_t *label_buffer;
+    uint32_t *parent_buffer;
+    uint32_t *child_buffer;
+    uint8_t *term_buffer;
+    int64_t *val_buffer;
+    uint32_t buffer_size;
+    uint32_t buffer_capacity;
 } succinct_trie_builder_t;
 
 /**
@@ -180,7 +192,8 @@ int succinct_trie_builder_add(succinct_trie_builder_t *builder, const uint8_t *k
  * @param builder the builder to finalize (will be freed)
  * @return newly allocated trie or NULL on failure
  */
-succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder);
+succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder,
+                                             _Atomic(int) *shutdown_flag);
 
 /**
  * succinct_trie_builder_free
@@ -191,15 +204,27 @@ void succinct_trie_builder_free(succinct_trie_builder_t *builder);
 
 /**
  * succinct_trie_prefix_get
- * get the first value matching a prefix
- * @param trie succinct trie
- * @param prefix prefix to query
+ * get value for a key with exact prefix match
+ * @param trie trie to search
+ * @param prefix key prefix to search for
  * @param prefix_len length of prefix
  * @param value pointer to value to write
  * @return 0 on success, -1 on not found or error
  */
 int succinct_trie_prefix_get(const succinct_trie_t *trie, const uint8_t *prefix, size_t prefix_len,
                              int64_t *value);
+
+/**
+ * succinct_trie_find_predecessor
+ * find the largest key <= target key (for sparse index lookup)
+ * @param trie trie to search
+ * @param key target key
+ * @param key_len length of key
+ * @param value pointer to value to write
+ * @return 0 on success (exact or predecessor found), -1 if no predecessor exists
+ */
+int succinct_trie_find_predecessor(const succinct_trie_t *trie, const uint8_t *key, size_t key_len,
+                                   int64_t *value);
 
 /**
  * succinct_trie_free
@@ -209,6 +234,11 @@ void succinct_trie_free(succinct_trie_t *trie);
 
 /**
  * succinct_trie_serialize
+ * serializes trie to compact binary format using:
+ * - varint encoding for all integers (1-10 bytes depending on value)
+ * - delta encoding for vals array (store differences between consecutive values)
+ * - zigzag encoding for signed deltas
+ * typical space savings: 60-80% compared to fixed-width encoding
  * @param trie trie to serialize
  * @param out_size pointer to store size of serialized data
  * @return newly allocated buffer containing serialized data or NULL on failure

@@ -59,10 +59,11 @@ int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const ui
  * @param value_size size of value
  * @param ttl time-to-live
  * @param deleted tombstone flag
+ * @param seq sequence number for MVCC
  * @return pointer to new version, NULL on failure
  */
 static skip_list_version_t *skip_list_create_version(const uint8_t *value, size_t value_size,
-                                                     time_t ttl, uint8_t deleted)
+                                                     time_t ttl, uint8_t deleted, uint64_t seq)
 {
     skip_list_version_t *version = (skip_list_version_t *)malloc(sizeof(skip_list_version_t));
     if (version == NULL) return NULL;
@@ -85,6 +86,7 @@ static skip_list_version_t *skip_list_create_version(const uint8_t *value, size_
     }
 
     atomic_init(&version->flags, deleted ? SKIP_LIST_FLAG_DELETED : 0);
+    atomic_init(&version->seq, seq);
     version->ttl = ttl;
     atomic_init(&version->next, NULL);
     return version;
@@ -140,7 +142,7 @@ skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t ke
     skip_list_version_t *initial_version = NULL;
     if (value != NULL || deleted)
     {
-        initial_version = skip_list_create_version(value, value_size, ttl, deleted);
+        initial_version = skip_list_create_version(value, value_size, ttl, deleted, 0);
         if (initial_version == NULL && !deleted)
         {
             free(node->key);
@@ -281,7 +283,8 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
         int cmp = skip_list_compare_keys(list, existing->key, existing->key_size, key, key_size);
         if (cmp == 0)
         {
-            skip_list_version_t *new_version = skip_list_create_version(value, value_size, ttl, 0);
+            skip_list_version_t *new_version =
+                skip_list_create_version(value, value_size, ttl, 0, 0);
             if (new_version == NULL)
             {
                 free(update);
@@ -384,7 +387,7 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size)
     int cmp = skip_list_compare_keys(list, target->key, target->key_size, key, key_size);
     if (cmp != 0) return 0;
 
-    skip_list_version_t *tombstone = skip_list_create_version(NULL, 0, -1, 1);
+    skip_list_version_t *tombstone = skip_list_create_version(NULL, 0, -1, 1, 0);
     if (tombstone == NULL) return -1;
 
     skip_list_version_t *old_head;
@@ -398,7 +401,7 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size)
 }
 
 int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
-                  size_t *value_size, uint8_t *deleted)
+                  size_t *value_size, time_t *ttl, uint8_t *deleted)
 {
     if (list == NULL || key == NULL || key_size == 0 || value == NULL || value_size == NULL)
         return -1;
@@ -433,6 +436,7 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
         *deleted = 1;
         *value = NULL;
         *value_size = 0;
+        *ttl = version->ttl;
         return 0;
     }
 
@@ -451,6 +455,7 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
         if (*value == NULL) return -1;
         memcpy(*value, version->value, version->value_size);
         *value_size = version->value_size;
+        *ttl = version->ttl;
     }
     else
     {
@@ -801,5 +806,231 @@ int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *ke
     /* if current is still header, all keys are > target, so no valid position */
     /* set cursor to header to indicate invalid position */
     cursor->current = current;
+    return 0;
+}
+
+/* ============================================================================
+ * MVCC-aware functions with sequence numbers
+ * ============================================================================ */
+
+int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size,
+                           const uint8_t *value, size_t value_size, time_t ttl, uint64_t seq,
+                           uint8_t deleted)
+{
+    /* for tombstones, value can be NULL */
+    if (list == NULL || key == NULL || key_size == 0 || (!deleted && value == NULL)) return -1;
+
+    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
+    skip_list_node_t *tail = atomic_load_explicit(&list->tail, memory_order_acquire);
+    skip_list_node_t **update = malloc((list->max_level + 1) * sizeof(skip_list_node_t *));
+    if (!update) return -1;
+
+    for (int i = 0; i <= list->max_level; i++)
+    {
+        update[i] = header;
+    }
+
+    skip_list_node_t *current = header;
+
+    for (int i = atomic_load_explicit(&list->level, memory_order_acquire); i >= 0; i--)
+    {
+        skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        while (next != NULL && next != tail)
+        {
+            int cmp = skip_list_compare_keys(list, next->key, next->key_size, key, key_size);
+            if (cmp >= 0) break;
+            current = next;
+            next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        }
+        update[i] = current;
+    }
+
+    skip_list_node_t *existing = atomic_load_explicit(&current->forward[0], memory_order_acquire);
+    if (existing != NULL && existing != tail)
+    {
+        int cmp = skip_list_compare_keys(list, existing->key, existing->key_size, key, key_size);
+        if (cmp == 0)
+        {
+            /* key exists, we add new version to version chain */
+            uint8_t flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
+            skip_list_version_t *new_version =
+                skip_list_create_version(value, value_size, ttl, flags, seq);
+            if (new_version == NULL)
+            {
+                free(update);
+                return -1;
+            }
+
+            skip_list_version_t *old_head;
+            do
+            {
+                old_head = atomic_load_explicit(&existing->versions, memory_order_acquire);
+                atomic_store_explicit(&new_version->next, old_head, memory_order_relaxed);
+            } while (!atomic_compare_exchange_weak_explicit(&existing->versions, &old_head,
+                                                            new_version, memory_order_release,
+                                                            memory_order_acquire));
+            free(update);
+            return 0;
+        }
+    }
+
+    /* key doesn't exist, we create new node */
+    int new_level = skip_list_random_level(list);
+    int current_level = atomic_load_explicit(&list->level, memory_order_acquire);
+
+    if (new_level > current_level)
+    {
+        for (int i = current_level + 1; i <= new_level; i++)
+        {
+            update[i] = header;
+        }
+        atomic_store_explicit(&list->level, new_level, memory_order_release);
+    }
+
+    /* create node with initial version containing sequence number */
+    skip_list_node_t *new_node = malloc(
+        sizeof(skip_list_node_t) + (2 * (new_level + 1)) * sizeof(_Atomic(skip_list_node_t *)));
+    if (new_node == NULL)
+    {
+        free(update);
+        return -1;
+    }
+
+    new_node->key = malloc(key_size);
+    if (new_node->key == NULL)
+    {
+        free(new_node);
+        free(update);
+        return -1;
+    }
+    memcpy(new_node->key, key, key_size);
+    new_node->key_size = key_size;
+    new_node->level = (uint8_t)new_level;
+
+    uint8_t flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
+    skip_list_version_t *initial_version =
+        skip_list_create_version(value, value_size, ttl, flags, seq);
+    if (initial_version == NULL)
+    {
+        free(new_node->key);
+        free(new_node);
+        free(update);
+        return -1;
+    }
+    atomic_init(&new_node->versions, initial_version);
+
+    for (int i = 0; i <= new_level; i++)
+    {
+        atomic_init(&new_node->forward[i], NULL);
+        atomic_init(&BACKWARD_PTR(new_node, i, new_level), NULL);
+    }
+
+    /* link node into skip list */
+    for (int i = 0; i <= new_level; i++)
+    {
+        skip_list_node_t *next = atomic_load_explicit(&update[i]->forward[i], memory_order_acquire);
+        atomic_store_explicit(&new_node->forward[i], next, memory_order_relaxed);
+        atomic_store_explicit(&update[i]->forward[i], new_node, memory_order_release);
+
+        if (next != NULL && next != tail)
+        {
+            atomic_store_explicit(&BACKWARD_PTR(next, i, next->level), new_node,
+                                  memory_order_release);
+        }
+        atomic_store_explicit(&BACKWARD_PTR(new_node, i, new_level), update[i],
+                              memory_order_release);
+    }
+
+    atomic_fetch_add_explicit(&list->total_size, key_size + value_size, memory_order_relaxed);
+    free(update);
+    return 0;
+}
+
+int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
+                           size_t *value_size, time_t *ttl, uint8_t *deleted, uint64_t *seq,
+                           uint64_t snapshot_seq)
+{
+    if (list == NULL || key == NULL || key_size == 0 || value == NULL || value_size == NULL)
+        return -1;
+
+    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
+    skip_list_node_t *tail = atomic_load_explicit(&list->tail, memory_order_acquire);
+    skip_list_node_t *current = header;
+
+    /* find the node */
+    for (int i = atomic_load_explicit(&list->level, memory_order_acquire); i >= 0; i--)
+    {
+        skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        while (next != NULL && next != tail)
+        {
+            int cmp = skip_list_compare_keys(list, next->key, next->key_size, key, key_size);
+            if (cmp >= 0) break;
+            current = next;
+            next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        }
+    }
+
+    skip_list_node_t *target = atomic_load_explicit(&current->forward[0], memory_order_acquire);
+    if (target == NULL || target == tail) return -1;
+
+    int cmp = skip_list_compare_keys(list, target->key, target->key_size, key, key_size);
+    if (cmp != 0) return -1;
+
+    /* found the key, now we must find the appropriate version */
+    skip_list_version_t *version = atomic_load_explicit(&target->versions, memory_order_acquire);
+
+    if (snapshot_seq == 0)
+    {
+        /* read latest version */
+        if (version == NULL) return -1;
+    }
+    else
+    {
+        /* find version with seq < snapshot_seq (snapshot isolation) */
+        while (version != NULL)
+        {
+            uint64_t version_seq = atomic_load_explicit(&version->seq, memory_order_acquire);
+            if (version_seq < snapshot_seq)
+            {
+                break;
+            }
+            version = atomic_load_explicit(&version->next, memory_order_acquire);
+        }
+
+        if (version == NULL) return -1; /* no visible version */
+    }
+
+    /* check TTL */
+    if (version->ttl > 0 && version->ttl < time(NULL))
+    {
+        return -1; /* expired */
+    }
+
+    /* check if deleted */
+    uint8_t is_deleted = VERSION_IS_DELETED(version);
+    if (deleted != NULL) *deleted = is_deleted;
+
+    if (is_deleted)
+    {
+        return -1; /* tombstone */
+    }
+
+    /* return the value */
+    if (version->value != NULL && version->value_size > 0)
+    {
+        *value = malloc(version->value_size);
+        if (*value == NULL) return -1;
+        memcpy(*value, version->value, version->value_size);
+        *value_size = version->value_size;
+    }
+    else
+    {
+        *value = NULL;
+        *value_size = 0;
+    }
+
+    if (ttl != NULL) *ttl = version->ttl;
+    if (seq != NULL) *seq = atomic_load_explicit(&version->seq, memory_order_acquire);
+
     return 0;
 }

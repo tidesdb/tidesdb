@@ -196,7 +196,7 @@ jobs:
       - name: Run tests
         run: |
           cd build
-          ctest --output-on-failure --build-config Release
+          ctest -V --output-on-failure --timeout 300 --build-config Release
 
   create-portable-db:
     runs-on: ubuntu-latest

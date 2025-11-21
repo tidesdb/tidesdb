@@ -60,8 +60,17 @@ static void cached_block_evict_callback(const char *key, void *value, void *user
     if (block && cache)
     {
         cache->current_size -= (uint32_t)block->size;
-        /* release cache's reference, block will be freed when all refs are released */
-        block_manager_block_release(block);
+
+        /* check if block is currently in use (ref_count > 1)
+         * if so, don't release -- let the last user release it
+         * this prevents race where we free a block that's being acquired */
+        int current_refs = atomic_load(&block->ref_count);
+        if (current_refs == 1)
+        {
+            /* only the cache holds a reference, safe to release */
+            block_manager_block_release(block);
+        }
+        /* else: block is in use, will be freed when last user releases it */
     }
 }
 
@@ -586,6 +595,13 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
     (*cursor)->current_pos = BLOCK_MANAGER_HEADER_SIZE;
     (*cursor)->current_block_size = 0;
 
+    /* initialize position cache */
+    (*cursor)->position_cache = NULL;
+    (*cursor)->size_cache = NULL;
+    (*cursor)->cache_capacity = 0;
+    (*cursor)->cache_size = 0;
+    (*cursor)->cache_index = -1; /* -1 means cache not built */
+
     /* hint to OS that we'll be reading sequentially */
     set_file_sequential_hint(bm->fd);
 
@@ -701,16 +717,19 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         char cache_key[32];
         block_offset_to_key((int64_t)offset, cache_key);
 
+        /* lock-free cache lookup */
         block_manager_block_t *cached_block =
             (block_manager_block_t *)fifo_cache_get(bm->block_manager_cache->fifo_cache, cache_key);
 
         if (cached_block)
         {
+            /* atomically acquire reference -- safe even during concurrent eviction
+             * block won't be freed until ref_count reaches 0 */
             if (block_manager_block_acquire(cached_block))
             {
                 return cached_block;
             }
-            /* block is being freed, fall through to disk read */
+            /* block is being freed (ref_count was 0), fall through to disk read */
         }
     }
 
@@ -724,7 +743,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         return NULL;
     uint64_t block_size = decode_uint64_le_compat(size_buf);
 
-    if (block_size == 0 || block_size > MAX_REASONABLE_BLOCK_SIZE) return NULL;
+    if (block_size == 0) return NULL;
 
     /* read checksum with little-endian decoding */
     unsigned char checksum_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
@@ -781,7 +800,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         }
         uint64_t chunk_size = decode_uint64_le_compat(chunk_size_buf);
 
-        if (chunk_size == 0 || chunk_size > MAX_REASONABLE_BLOCK_SIZE)
+        if (chunk_size == 0)
         {
             free(block->data);
             free(block);
@@ -903,23 +922,39 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
             }
             else
             {
-                /* need partial copy for large cached blocks */
+                /* need partial copy for large cached blocks
+                 * must acquire reference first to prevent eviction during memcpy */
+                if (!block_manager_block_acquire(cached_block))
+                {
+                    /* block is being freed, fall through to disk read */
+                    goto read_from_disk;
+                }
+
                 block_manager_block_t *partial = malloc(sizeof(block_manager_block_t));
-                if (!partial) return NULL;
+                if (!partial)
+                {
+                    block_manager_block_release(cached_block);
+                    return NULL;
+                }
                 partial->size = max_bytes;
                 partial->data = malloc(max_bytes);
                 if (!partial->data)
                 {
                     free(partial);
+                    block_manager_block_release(cached_block);
                     return NULL;
                 }
                 memcpy(partial->data, cached_block->data, max_bytes);
                 atomic_store(&partial->ref_count, 1);
+
+                /* release cached block after copy */
+                block_manager_block_release(cached_block);
                 return partial;
             }
         }
     }
 
+read_from_disk:
     /* read block size */
     unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=
@@ -927,7 +962,7 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
         return NULL;
     uint64_t block_size = decode_uint64_le_compat(size_buf);
 
-    if (block_size == 0 || block_size > MAX_REASONABLE_BLOCK_SIZE) return NULL;
+    if (block_size == 0) return NULL;
 
     /* if block is smaller than max_bytes, read full block */
     if (block_size <= max_bytes)
@@ -1021,6 +1056,8 @@ void block_manager_cursor_free(block_manager_cursor_t *cursor)
 {
     if (cursor)
     {
+        if (cursor->position_cache) free(cursor->position_cache);
+        if (cursor->size_cache) free(cursor->size_cache);
         free(cursor);
         cursor = NULL;
     }
@@ -1033,6 +1070,17 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
     /* can't go back from first block */
     if (cursor->current_pos <= BLOCK_MANAGER_HEADER_SIZE) return -1;
 
+    /* if cache is built and we're using it, just decrement index */
+    if (cursor->cache_index >= 0)
+    {
+        if (cursor->cache_index == 0) return -1; /* already at first */
+        cursor->cache_index--;
+        cursor->current_pos = cursor->position_cache[cursor->cache_index];
+        cursor->current_block_size = cursor->size_cache[cursor->cache_index];
+        return 0;
+    }
+
+    /* cache not built - use old O(n) method to find previous block */
     uint64_t scan_pos = BLOCK_MANAGER_HEADER_SIZE;
 
     while (scan_pos < cursor->current_pos)
@@ -1099,6 +1147,76 @@ int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)
     cursor->current_block_size = 0;
 
     return 0;
+}
+
+int block_manager_cursor_build_cache(block_manager_cursor_t *cursor, uint64_t end_offset)
+{
+    if (!cursor) return -1;
+
+    /* free existing cache if any */
+    if (cursor->position_cache) free(cursor->position_cache);
+    if (cursor->size_cache) free(cursor->size_cache);
+
+    /* initial capacity estimate: assume ~160 bytes per block on average */
+    int initial_capacity = (int)((end_offset - BLOCK_MANAGER_HEADER_SIZE) / 160) + 100;
+    if (initial_capacity < 1000) initial_capacity = 1000;
+
+    cursor->position_cache = malloc(initial_capacity * sizeof(uint64_t));
+    cursor->size_cache = malloc(initial_capacity * sizeof(uint64_t));
+    if (!cursor->position_cache || !cursor->size_cache)
+    {
+        if (cursor->position_cache) free(cursor->position_cache);
+        if (cursor->size_cache) free(cursor->size_cache);
+        cursor->position_cache = NULL;
+        cursor->size_cache = NULL;
+        return -1;
+    }
+
+    cursor->cache_capacity = initial_capacity;
+    cursor->cache_size = 0;
+
+    /* scan forward and cache all block positions */
+    if (block_manager_cursor_goto_first(cursor) != 0) return -1;
+
+    do
+    {
+        /* check if we've reached the end offset */
+        if (end_offset > 0 && cursor->current_pos >= end_offset) break;
+
+        /* grow cache if needed */
+        if (cursor->cache_size >= cursor->cache_capacity)
+        {
+            int new_capacity = cursor->cache_capacity * 2;
+            uint64_t *new_pos = realloc(cursor->position_cache, new_capacity * sizeof(uint64_t));
+            uint64_t *new_size = realloc(cursor->size_cache, new_capacity * sizeof(uint64_t));
+            if (!new_pos || !new_size)
+            {
+                if (new_pos) free(new_pos);
+                if (new_size) free(new_size);
+                return -1;
+            }
+            cursor->position_cache = new_pos;
+            cursor->size_cache = new_size;
+            cursor->cache_capacity = new_capacity;
+        }
+
+        /* cache this block's position and size */
+        cursor->position_cache[cursor->cache_size] = cursor->current_pos;
+        cursor->size_cache[cursor->cache_size] = cursor->current_block_size;
+        cursor->cache_size++;
+
+    } while (block_manager_cursor_next(cursor) == 0);
+
+    /* position at last cached block and set index */
+    if (cursor->cache_size > 0)
+    {
+        cursor->cache_index = cursor->cache_size - 1;
+        cursor->current_pos = cursor->position_cache[cursor->cache_index];
+        cursor->current_block_size = cursor->size_cache[cursor->cache_index];
+        return 0;
+    }
+
+    return -1;
 }
 
 int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)

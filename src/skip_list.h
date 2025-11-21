@@ -34,8 +34,9 @@ typedef struct skip_list_version_t skip_list_version_t;
 
 /**
  * skip_list_version_t
- * represents a single version of a key's value
+ * a single version of a key's value
  * @param flags version flags (deleted, etc)
+ * @param seq sequence number for MVCC (monotonically increasing)
  * @param value value data
  * @param value_size size of value
  * @param ttl time-to-live
@@ -44,6 +45,7 @@ typedef struct skip_list_version_t skip_list_version_t;
 struct skip_list_version_t
 {
     _Atomic(uint8_t) flags;
+    _Atomic(uint64_t) seq;
     uint8_t *value;
     size_t value_size;
     time_t ttl;
@@ -68,7 +70,7 @@ typedef int (*skip_list_comparator_fn)(const uint8_t *key1, size_t key1_size, co
 
 /**
  * skip_list_node_t
- * represents a key in the skip list with multiple versions
+ * a key in the skip list with multiple versions
  * @param level node level in skip list
  * @param key key data
  * @param key_size size of key
@@ -250,6 +252,23 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
                   size_t value_size, time_t ttl);
 
 /**
+ * skip_list_put_with_seq
+ * inserts or updates a key-value pair with a specific sequence number
+ * @param list skip list
+ * @param key key
+ * @param key_size key size
+ * @param value value
+ * @param value_size value size
+ * @param ttl time-to-live
+ * @param seq sequence number for MVCC
+ * @param deleted whether this is a tombstone marker
+ * @return 0 on success, -1 on failure
+ */
+int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size,
+                           const uint8_t *value, size_t value_size, time_t ttl, uint64_t seq,
+                           uint8_t deleted);
+
+/**
  * skip_list_delete
  * deletes a key (creates tombstone)
  * @param list skip list
@@ -268,10 +287,29 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size);
  * @param value pointer to value pointer (caller must free)
  * @param value_size pointer to value size
  * @param deleted pointer to deleted flag
+ * @param ttl
  * @return 0 on success, -1 on failure
  */
 int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
-                  size_t *value_size, uint8_t *deleted);
+                  size_t *value_size, time_t *ttl, uint8_t *deleted);
+
+/**
+ * skip_list_get_with_seq
+ * retrieves a value by key with sequence number for MVCC snapshot reads
+ * @param list skip list
+ * @param key key data
+ * @param key_size size of key
+ * @param value pointer to value pointer (caller must free)
+ * @param value_size pointer to value size
+ * @param ttl pointer to ttl
+ * @param deleted pointer to deleted flag
+ * @param seq pointer to sequence number (output)
+ * @param snapshot_seq snapshot sequence number (0 = latest, >0 = read version <= snapshot_seq)
+ * @return 0 on success, -1 on failure
+ */
+int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
+                           size_t *value_size, time_t *ttl, uint8_t *deleted, uint64_t *seq,
+                           uint64_t snapshot_seq);
 
 /**
  * skip_list_cursor_init

@@ -27,9 +27,10 @@
 /* snappy, lz4, zstd supported to use for compression purposes */
 typedef enum
 {
-    COMPRESS_SNAPPY,
-    COMPRESS_LZ4,
-    COMPRESS_ZSTD
+    NO_COMPRESSION = 0,
+    SNAPPY_COMPRESSION,
+    LZ4_COMPRESSION,
+    ZSTD_COMPRESSION,
 } compression_algorithm;
 
 /**

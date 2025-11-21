@@ -282,7 +282,9 @@ void *fifo_cache_get(fifo_cache_t *cache, const char *key)
     size_t index = fifo_hash(key, key_len, cache->table_size);
     fifo_entry_t *entry = cache->table[index];
 
-    /* walk hash chain without lock */
+    /* lock-free read: walk hash chain without lock
+     * safe because entries are never freed while in cache,
+     * and block ref counting prevents use-after-free */
     while (entry != NULL)
     {
         if (entry->key_len == key_len && memcmp(entry->key, key, key_len) == 0)

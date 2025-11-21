@@ -29,11 +29,11 @@ void test_compress_decompress_snappy()
     size_t data_size = sizeof(data);
     size_t compressed_size;
     size_t decompressed_size;
-    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, COMPRESS_SNAPPY);
+    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, SNAPPY_COMPRESSION);
     ASSERT_TRUE(compressed_data != NULL);
 
     uint8_t *decompressed_data =
-        decompress_data(compressed_data, compressed_size, &decompressed_size, COMPRESS_SNAPPY);
+        decompress_data(compressed_data, compressed_size, &decompressed_size, SNAPPY_COMPRESSION);
     ASSERT_TRUE(decompressed_data != NULL);
     ASSERT_EQ(decompressed_size, data_size);
     ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);
@@ -47,11 +47,11 @@ void test_compress_decompress_lz4()
     size_t data_size = sizeof(data);
     size_t compressed_size;
     size_t decompressed_size;
-    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, COMPRESS_LZ4);
+    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, LZ4_COMPRESSION);
     ASSERT_TRUE(compressed_data != NULL);
 
     uint8_t *decompressed_data =
-        decompress_data(compressed_data, compressed_size, &decompressed_size, COMPRESS_LZ4);
+        decompress_data(compressed_data, compressed_size, &decompressed_size, LZ4_COMPRESSION);
     ASSERT_TRUE(decompressed_data != NULL);
     ASSERT_EQ(decompressed_size, data_size);
     ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);
@@ -65,11 +65,11 @@ void test_compress_decompress_zstd()
     size_t data_size = sizeof(data);
     size_t compressed_size;
     size_t decompressed_size;
-    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, COMPRESS_ZSTD);
+    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, ZSTD_COMPRESSION);
     ASSERT_TRUE(compressed_data != NULL);
 
     uint8_t *decompressed_data =
-        decompress_data(compressed_data, compressed_size, &decompressed_size, COMPRESS_ZSTD);
+        decompress_data(compressed_data, compressed_size, &decompressed_size, ZSTD_COMPRESSION);
     ASSERT_TRUE(decompressed_data != NULL);
     ASSERT_EQ(decompressed_size, data_size);
     ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);

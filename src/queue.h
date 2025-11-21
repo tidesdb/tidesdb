@@ -53,7 +53,6 @@ typedef struct
     _Atomic(queue_node_t *) atomic_head;
     queue_node_t *tail;
     _Atomic(size_t) size;
-    int shutdown;
     int waiter_count;
     pthread_mutex_t lock;
     pthread_cond_t not_empty;

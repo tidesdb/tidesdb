@@ -32,7 +32,7 @@
 #define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF
 
 /* block manager version */
-#define BLOCK_MANAGER_VERSION 4
+#define BLOCK_MANAGER_VERSION 5
 
 /* header field sizes */
 /* magic number size in bytes */
@@ -57,7 +57,6 @@
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE                              \
     (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH + \
      BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
-/* 32KB inline, larger blocks are overflowed */
 #define MAX_INLINE_BLOCK_SIZE (32 * 1024)
 /* extra bytes for headers in stack buffers */
 #define BLOCK_MANAGER_STACK_BUFFER_OVERHEAD 64
@@ -65,9 +64,8 @@
 #define BLOCK_MANAGER_CACHE_KEY_SIZE 32
 
 /* default file permissions (rw-r--r--) */
-#define BLOCK_MANAGER_FILE_MODE   0644
-#define MIN_CACHE_ENTRIES         10
-#define MAX_REASONABLE_BLOCK_SIZE (10ULL * 1024 * 1024 * 1024)
+#define BLOCK_MANAGER_FILE_MODE 0644
+#define MIN_CACHE_ENTRIES       10
 
 typedef enum
 {
@@ -140,6 +138,13 @@ typedef struct
     block_manager_t *bm;
     uint64_t current_pos;
     uint64_t current_block_size;
+
+    /* position cache for O(1) backward navigation */
+    uint64_t *position_cache; /* array of block positions */
+    uint64_t *size_cache;     /* array of block sizes */
+    int cache_capacity;       /* allocated capacity */
+    int cache_size;           /* number of cached positions */
+    int cache_index;          /* current index in cache (-1 if not using cache) */
 } block_manager_cursor_t;
 
 /**

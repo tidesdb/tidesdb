@@ -126,7 +126,7 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #define PREFETCH_READ(addr)  _mm_prefetch((const char *)(addr), _MM_HINT_T0)
 #define PREFETCH_WRITE(addr) _mm_prefetch((const char *)(addr), _MM_HINT_T0)
 #else
-/* no prefetch support - define as no-op */
+/* no prefetch support -- define as no-op */
 #define PREFETCH_READ(addr)  ((void)0)
 #define PREFETCH_WRITE(addr) ((void)0)
 #endif
@@ -235,7 +235,7 @@ static inline int _tidesdb_open_wrapper_2(const char *path, int flags)
 /* mingw and GCC have proper C11 stdatomic.h support */
 #include <stdatomic.h>
 #elif _MSC_VER < 1930
-/* MSVC < 2022 doesn't have stdatomic.h - use Windows Interlocked functions */
+/* MSVC < 2022 doesn't have stdatomic.h -- use Windows Interlocked functions */
 typedef volatile LONG atomic_int;
 typedef volatile LONGLONG atomic_size_t;
 typedef volatile LONGLONG atomic_uint64_t;
@@ -1411,6 +1411,337 @@ static inline uint64_t decode_uint64_le_compat(const uint8_t *buf)
     return ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
            ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
            ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
+}
+
+/* varint encoding/decoding for compact serialization */
+static inline uint8_t *encode_varint32(uint8_t *ptr, uint32_t value)
+{
+    while (value >= 0x80)
+    {
+        *ptr++ = (uint8_t)(value | 0x80);
+        value >>= 7;
+    }
+    *ptr++ = (uint8_t)value;
+    return ptr;
+}
+
+static inline uint8_t *encode_varint64(uint8_t *ptr, uint64_t value)
+{
+    while (value >= 0x80)
+    {
+        *ptr++ = (uint8_t)(value | 0x80);
+        value >>= 7;
+    }
+    *ptr++ = (uint8_t)value;
+    return ptr;
+}
+
+static inline const uint8_t *decode_varint32(const uint8_t *ptr, uint32_t *value)
+{
+    uint32_t result = 0;
+    int shift = 0;
+    while (*ptr & 0x80)
+    {
+        /* prevent shift overflow on corrupted data */
+        if (shift >= 32)
+        {
+            *value = 0;
+            return ptr;
+        }
+        result |= (uint32_t)(*ptr & 0x7F) << shift;
+        shift += 7;
+        ptr++;
+    }
+    /* final byte check */
+    if (shift >= 32)
+    {
+        *value = 0;
+        return ptr;
+    }
+    result |= (uint32_t)(*ptr) << shift;
+    *value = result;
+    return ptr + 1;
+}
+
+static inline const uint8_t *decode_varint64(const uint8_t *ptr, uint64_t *value)
+{
+    uint64_t result = 0;
+    int shift = 0;
+    while (*ptr & 0x80)
+    {
+        /* prevent shift overflow on corrupted data */
+        if (shift >= 64)
+        {
+            *value = 0;
+            return ptr;
+        }
+        result |= (uint64_t)(*ptr & 0x7F) << shift;
+        shift += 7;
+        ptr++;
+    }
+    /* final byte check */
+    if (shift >= 64)
+    {
+        *value = 0;
+        return ptr;
+    }
+    result |= (uint64_t)(*ptr) << shift;
+    *value = result;
+    return ptr + 1;
+}
+
+/* length-prefixed KV serialization helpers */
+
+/*
+ * serialize_kv_varint
+ * serialize key-value pair with varint length prefixes
+ * format: varint(key_size) + key + varint(value_size) + value
+ * @param ptr output buffer (must have enough space)
+ * @param key key data
+ * @param key_size key size
+ * @param value value data (can be NULL if value_size is 0)
+ * @param value_size value size
+ * @return pointer to end of written data
+ */
+static inline uint8_t *serialize_kv_varint(uint8_t *ptr, const uint8_t *key, uint32_t key_size,
+                                           const uint8_t *value, uint32_t value_size)
+{
+    /* write key size and key */
+    ptr = encode_varint32(ptr, key_size);
+    memcpy(ptr, key, key_size);
+    ptr += key_size;
+
+    /* write value size and value */
+    ptr = encode_varint32(ptr, value_size);
+    if (value_size > 0 && value)
+    {
+        memcpy(ptr, value, value_size);
+        ptr += value_size;
+    }
+
+    return ptr;
+}
+
+/*
+ * serialize_kv_varint_ex
+ * serialize key-value pair with flags and varint length prefixes (for SSTables)
+ * format: flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl)
+ * @param ptr output buffer (must have enough space)
+ * @param flags flags byte (e.g., tombstone marker)
+ * @param key key data
+ * @param key_size key size
+ * @param value value data (can be NULL if value_size is 0)
+ * @param value_size value size
+ * @param ttl time-to-live (0 = no expiration)
+ * @return pointer to end of written data
+ */
+static inline uint8_t *serialize_kv_varint_ex(uint8_t *ptr, uint8_t flags, const uint8_t *key,
+                                              uint32_t key_size, const uint8_t *value,
+                                              uint32_t value_size, int64_t ttl)
+{
+    /* write flags */
+    *ptr++ = flags;
+
+    /* write key size and key */
+    ptr = encode_varint32(ptr, key_size);
+    memcpy(ptr, key, key_size);
+    ptr += key_size;
+
+    /* write value size and value */
+    ptr = encode_varint32(ptr, value_size);
+    if (value_size > 0 && value)
+    {
+        memcpy(ptr, value, value_size);
+        ptr += value_size;
+    }
+
+    /* write ttl */
+    ptr = encode_varint64(ptr, (uint64_t)ttl);
+
+    return ptr;
+}
+
+/*
+ * serialize_kv_varint_full
+ * serialize key-value pair with all metadata (for WAL)
+ * format: flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl) +
+ * varint(seq)
+ * @param ptr output buffer (must have enough space)
+ * @param flags flags byte
+ * @param key key data
+ * @param key_size key size
+ * @param value value data (can be NULL if value_size is 0)
+ * @param value_size value size
+ * @param ttl time-to-live
+ * @param seq sequence number
+ * @return pointer to end of written data
+ */
+static inline uint8_t *serialize_kv_varint_full(uint8_t *ptr, uint8_t flags, const uint8_t *key,
+                                                uint32_t key_size, const uint8_t *value,
+                                                uint32_t value_size, int64_t ttl, uint64_t seq)
+{
+    /* write flags */
+    *ptr++ = flags;
+
+    /* write key size and key */
+    ptr = encode_varint32(ptr, key_size);
+    memcpy(ptr, key, key_size);
+    ptr += key_size;
+
+    /* write value size and value */
+    ptr = encode_varint32(ptr, value_size);
+    if (value_size > 0 && value)
+    {
+        memcpy(ptr, value, value_size);
+        ptr += value_size;
+    }
+
+    /* write ttl and seq */
+    ptr = encode_varint64(ptr, (uint64_t)ttl);
+    ptr = encode_varint64(ptr, seq);
+
+    return ptr;
+}
+
+/*
+ * deserialize_kv_varint
+ * deserialize key-value pair with varint length prefixes
+ * @param ptr input buffer
+ * @param end end of input buffer (for bounds checking)
+ * @param key_size output key size
+ * @param value_size output value size
+ * @param key_out output pointer to key data (points into input buffer)
+ * @param value_out output pointer to value data (points into input buffer)
+ * @return pointer to next entry, or NULL on error
+ */
+static inline const uint8_t *deserialize_kv_varint(const uint8_t *ptr, const uint8_t *end,
+                                                   uint32_t *key_size, uint32_t *value_size,
+                                                   const uint8_t **key_out,
+                                                   const uint8_t **value_out)
+{
+    /* read key size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, key_size);
+    if (ptr + *key_size > end) return NULL;
+
+    /* read key */
+    *key_out = ptr;
+    ptr += *key_size;
+
+    /* read value size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, value_size);
+    if (ptr + *value_size > end) return NULL;
+
+    /* read value */
+    *value_out = ptr;
+    ptr += *value_size;
+
+    return ptr;
+}
+
+/*
+ * deserialize_kv_varint_ex
+ * deserialize key-value pair with flags and varint length prefixes (for SSTables)
+ * @param ptr input buffer
+ * @param end end of input buffer (for bounds checking)
+ * @param flags output flags byte
+ * @param key_size output key size
+ * @param value_size output value size
+ * @param key_out output pointer to key data (points into input buffer)
+ * @param value_out output pointer to value data (points into input buffer)
+ * @param ttl output time-to-live
+ * @return pointer to next entry, or NULL on error
+ */
+static inline const uint8_t *deserialize_kv_varint_ex(const uint8_t *ptr, const uint8_t *end,
+                                                      uint8_t *flags, uint32_t *key_size,
+                                                      uint32_t *value_size, const uint8_t **key_out,
+                                                      const uint8_t **value_out, int64_t *ttl)
+{
+    /* read flags */
+    if (ptr >= end) return NULL;
+    *flags = *ptr++;
+
+    /* read key size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, key_size);
+    if (ptr + *key_size > end) return NULL;
+
+    /* read key */
+    *key_out = ptr;
+    ptr += *key_size;
+
+    /* read value size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, value_size);
+    if (ptr + *value_size > end) return NULL;
+
+    /* read value */
+    *value_out = ptr;
+    ptr += *value_size;
+
+    /* read ttl */
+    if (ptr >= end) return NULL;
+    uint64_t ttl_u64;
+    ptr = decode_varint64(ptr, &ttl_u64);
+    *ttl = (int64_t)ttl_u64;
+
+    return ptr;
+}
+
+/*
+ * deserialize_kv_varint_full
+ * deserialize key-value pair with all metadata (for WAL)
+ * @param ptr input buffer
+ * @param end end of input buffer (for bounds checking)
+ * @param flags output flags byte
+ * @param key_size output key size
+ * @param value_size output value size
+ * @param key_out output pointer to key data (points into input buffer)
+ * @param value_out output pointer to value data (points into input buffer)
+ * @param ttl output time-to-live
+ * @param seq output sequence number
+ * @return pointer to next entry, or NULL on error
+ */
+static inline const uint8_t *deserialize_kv_varint_full(const uint8_t *ptr, const uint8_t *end,
+                                                        uint8_t *flags, uint32_t *key_size,
+                                                        uint32_t *value_size,
+                                                        const uint8_t **key_out,
+                                                        const uint8_t **value_out, int64_t *ttl,
+                                                        uint64_t *seq)
+{
+    /* read flags */
+    if (ptr >= end) return NULL;
+    *flags = *ptr++;
+
+    /* read key size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, key_size);
+    if (ptr + *key_size > end) return NULL;
+
+    /* read key */
+    *key_out = ptr;
+    ptr += *key_size;
+
+    /* read value size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, value_size);
+    if (ptr + *value_size > end) return NULL;
+
+    /* read value */
+    *value_out = ptr;
+    ptr += *value_size;
+
+    /* read ttl and seq */
+    if (ptr >= end) return NULL;
+    uint64_t ttl_u64;
+    ptr = decode_varint64(ptr, &ttl_u64);
+    *ttl = (int64_t)ttl_u64;
+
+    if (ptr >= end) return NULL;
+    ptr = decode_varint64(ptr, seq);
+
+    return ptr;
 }
 
 /*

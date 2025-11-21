@@ -26,7 +26,7 @@
  *
  * HEADER *
  * magic (3 bytes) 0x544442 "TDB"
- * version (1 byte) 3
+ * version (1 byte) 5
  * block_size (4 bytes) default block size
  * padding (4 bytes) reserved
  *
@@ -954,7 +954,7 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
         }
     }
 
-read_from_disk:
+read_from_disk:; /* C11 compatibility: empty statement after label */
     /* read block size */
     unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=

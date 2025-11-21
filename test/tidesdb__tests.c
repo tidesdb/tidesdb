@@ -3341,7 +3341,7 @@ static void test_dividing_merge_strategy(void)
     ASSERT_TRUE(cf != NULL);
 
     printf("\n=== Testing Dividing Merge Strategy ===\n");
-    printf("Config: write_buffer=%zu, ratio=%ld, offset=%d\n", cf_config.write_buffer_size,
+    printf("Config: write_buffer=%zu, ratio=%zu, offset=%d\n", cf_config.write_buffer_size,
            cf_config.level_size_ratio, cf_config.dividing_level_offset);
 
     /* write data to create multiple levels

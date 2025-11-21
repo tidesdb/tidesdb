@@ -1145,14 +1145,14 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_sstable_t *sst, skip_list
 {
     if (block_manager_open_with_cache(&sst->klog_bm, sst->klog_path,
                                       convert_sync_mode(sst->config->sync_mode),
-                                      sst->config->block_manager_cache_size) != 0)
+                                      (uint32_t)sst->config->block_manager_cache_size) != 0)
     {
         return TDB_ERR_IO;
     }
 
     if (block_manager_open_with_cache(&sst->vlog_bm, sst->vlog_path,
                                       convert_sync_mode(sst->config->sync_mode),
-                                      sst->config->block_manager_cache_size) != 0)
+                                      (uint32_t)sst->config->block_manager_cache_size) != 0)
     {
         block_manager_close(sst->klog_bm);
         return TDB_ERR_IO;
@@ -2599,22 +2599,23 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                         {
                             source->source.sstable.current_entry_idx = 0;
 
-                            tidesdb_klog_block_t *kb = source->source.sstable.current_block;
-                            uint8_t *value = kb->inline_values[0];
+                            tidesdb_klog_block_t *current_kb = source->source.sstable.current_block;
+                            uint8_t *value = current_kb->inline_values[0];
 
                             uint8_t *vlog_value = NULL;
-                            if (kb->entries[0].vlog_offset > 0)
+                            if (current_kb->entries[0].vlog_offset > 0)
                             {
-                                tidesdb_vlog_read_value(source->source.sstable.sst,
-                                                        kb->entries[0].vlog_offset,
-                                                        kb->entries[0].value_size, &vlog_value);
+                                tidesdb_vlog_read_value(
+                                    source->source.sstable.sst, current_kb->entries[0].vlog_offset,
+                                    current_kb->entries[0].value_size, &vlog_value);
                                 value = vlog_value;
                             }
 
                             source->current_kv = tidesdb_kv_pair_create(
-                                kb->keys[0], kb->entries[0].key_size, value,
-                                kb->entries[0].value_size, kb->entries[0].ttl, kb->entries[0].seq,
-                                kb->entries[0].flags & TDB_KV_FLAG_TOMBSTONE);
+                                current_kb->keys[0], current_kb->entries[0].key_size, value,
+                                current_kb->entries[0].value_size, current_kb->entries[0].ttl,
+                                current_kb->entries[0].seq,
+                                (current_kb->entries[0].flags & TDB_KV_FLAG_TOMBSTONE) != 0);
 
                             free(vlog_value);
                             free(decompressed);
@@ -2727,24 +2728,25 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                             source->source.sstable.current_entry_idx =
                                 source->source.sstable.current_block->num_entries - 1;
 
-                            tidesdb_klog_block_t *kb = source->source.sstable.current_block;
+                            tidesdb_klog_block_t *current_kb = source->source.sstable.current_block;
                             int idx = source->source.sstable.current_entry_idx;
-                            uint8_t *value = kb->inline_values[idx];
+                            uint8_t *value = current_kb->inline_values[idx];
 
                             uint8_t *vlog_value = NULL;
-                            if (kb->entries[idx].vlog_offset > 0)
+                            if (current_kb->entries[idx].vlog_offset > 0)
                             {
                                 tidesdb_vlog_read_value(source->source.sstable.sst,
-                                                        kb->entries[idx].vlog_offset,
-                                                        kb->entries[idx].value_size, &vlog_value);
+                                                        current_kb->entries[idx].vlog_offset,
+                                                        current_kb->entries[idx].value_size,
+                                                        &vlog_value);
                                 value = vlog_value;
                             }
 
                             source->current_kv = tidesdb_kv_pair_create(
-                                kb->keys[idx], kb->entries[idx].key_size, value,
-                                kb->entries[idx].value_size, kb->entries[idx].ttl,
-                                kb->entries[idx].seq,
-                                kb->entries[idx].flags & TDB_KV_FLAG_TOMBSTONE);
+                                current_kb->keys[idx], current_kb->entries[idx].key_size, value,
+                                current_kb->entries[idx].value_size, current_kb->entries[idx].ttl,
+                                current_kb->entries[idx].seq,
+                                (current_kb->entries[idx].flags & TDB_KV_FLAG_TOMBSTONE) != 0);
 
                             free(vlog_value);
                             free(decompressed);
@@ -4763,9 +4765,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             }
             free((*db)->compaction_threads);
             atomic_store(&(*db)->flush_should_stop, 1);
-            for (int i = 0; i < config->num_flush_threads; i++)
+            for (int k = 0; k < config->num_flush_threads; k++)
             {
-                pthread_join((*db)->flush_threads[i], NULL);
+                pthread_join((*db)->flush_threads[k], NULL);
             }
             free((*db)->flush_threads);
             fifo_cache_free((*db)->sstable_cache);

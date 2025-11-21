@@ -107,7 +107,7 @@ typedef struct
     block_manager_sync_mode_t sync_mode;
     uint32_t block_size;
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
-    _Atomic uint64_t current_file_size __attribute__((aligned(8)));
+    ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
     block_manager_cache_t *block_manager_cache;
 } block_manager_t;
 

@@ -139,9 +139,9 @@ typedef enum
 #define TDB_DEFAULT_INDEX_SAMPLE_RATIO             16          /* sample every 16th key for index */
 #define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000        /* 1000ms = 1 second */
 
-#define TDB_MAX_TXN_CFS                            10000       /* maximum number of CFs per transaction */
-#define TDB_MAX_PATH_LEN                           4096        /* maximum path length */
-#define TDB_MAX_TXN_OPS                            100000      /* maximum transaction operations */
+#define TDB_MAX_TXN_CFS  10000  /* maximum number of CFs per transaction */
+#define TDB_MAX_PATH_LEN 4096   /* maximum path length */
+#define TDB_MAX_TXN_OPS  100000 /* maximum transaction operations */
 
 /**
  * tidesdb_column_family_config_t

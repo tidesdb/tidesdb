@@ -144,33 +144,46 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
 {
     if (!sst || !out_data || !out_size) return -1;
 
-    size_t header_size = sizeof(sstable_metadata_header_t);
+    /* calculate size: all fields + keys */
+    size_t header_size = 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4; /* fixed 68 bytes */
     size_t total_size = header_size + sst->min_key_size + sst->max_key_size;
 
     uint8_t *data = malloc(total_size);
     if (!data) return -1;
 
-    sstable_metadata_header_t *header = (sstable_metadata_header_t *)data;
-    header->magic = SSTABLE_METADATA_MAGIC;
-    header->num_entries = sst->num_entries;
-    header->num_klog_blocks = sst->num_klog_blocks;
-    header->num_vlog_blocks = sst->num_vlog_blocks;
-    header->klog_size = sst->klog_size;
-    header->vlog_size = sst->vlog_size;
-    header->min_key_size = sst->min_key_size;
-    header->max_key_size = sst->max_key_size;
-    header->compression_algorithm = sst->config->compression_algorithm;
-    header->reserved = 0;
+    uint8_t *ptr = data;
 
-    uint8_t *key_data = data + header_size;
+    /* serialize fields with explicit little-endian encoding */
+    encode_uint32_le_compat(ptr, SSTABLE_METADATA_MAGIC);
+    ptr += 4;
+    encode_uint64_le_compat(ptr, sst->num_entries);
+    ptr += 8;
+    encode_uint64_le_compat(ptr, sst->num_klog_blocks);
+    ptr += 8;
+    encode_uint64_le_compat(ptr, sst->num_vlog_blocks);
+    ptr += 8;
+    encode_uint64_le_compat(ptr, sst->klog_size);
+    ptr += 8;
+    encode_uint64_le_compat(ptr, sst->vlog_size);
+    ptr += 8;
+    encode_uint64_le_compat(ptr, sst->min_key_size);
+    ptr += 8;
+    encode_uint64_le_compat(ptr, sst->max_key_size);
+    ptr += 8;
+    encode_uint32_le_compat(ptr, sst->config->compression_algorithm);
+    ptr += 4;
+    encode_uint32_le_compat(ptr, 0); /* reserved */
+    ptr += 4;
+
+    /* copy keys */
     if (sst->min_key && sst->min_key_size > 0)
     {
-        memcpy(key_data, sst->min_key, sst->min_key_size);
-        key_data += sst->min_key_size;
+        memcpy(ptr, sst->min_key, sst->min_key_size);
+        ptr += sst->min_key_size;
     }
     if (sst->max_key && sst->max_key_size > 0)
     {
-        memcpy(key_data, sst->max_key, sst->max_key_size);
+        memcpy(ptr, sst->max_key, sst->max_key_size);
     }
 
     *out_data = data;
@@ -188,19 +201,43 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
 static int sstable_metadata_deserialize(const uint8_t *data, size_t data_size,
                                         tidesdb_sstable_t *sst)
 {
-    if (!data || !sst || data_size < sizeof(sstable_metadata_header_t)) return -1;
+    /* minimum size is 68 bytes for header */
+    if (!data || !sst || data_size < 68) return -1;
 
-    const sstable_metadata_header_t *header = (const sstable_metadata_header_t *)data;
+    const uint8_t *ptr = data;
 
-    if (header->magic != SSTABLE_METADATA_MAGIC)
+    /* deserialize fields with explicit little-endian decoding */
+    uint32_t magic = decode_uint32_le_compat(ptr);
+    ptr += 4;
+
+    if (magic != SSTABLE_METADATA_MAGIC)
     {
-        TDB_DEBUG_LOG("SSTable metadata: Invalid magic 0x%08x (expected 0x%08x)", header->magic,
+        TDB_DEBUG_LOG("SSTable metadata: Invalid magic 0x%08x (expected 0x%08x)", magic,
                       SSTABLE_METADATA_MAGIC);
         return -1;
     }
 
-    size_t expected_size =
-        sizeof(sstable_metadata_header_t) + header->min_key_size + header->max_key_size;
+    uint64_t num_entries = decode_uint64_le_compat(ptr);
+    ptr += 8;
+    uint64_t num_klog_blocks = decode_uint64_le_compat(ptr);
+    ptr += 8;
+    uint64_t num_vlog_blocks = decode_uint64_le_compat(ptr);
+    ptr += 8;
+    uint64_t klog_size = decode_uint64_le_compat(ptr);
+    ptr += 8;
+    uint64_t vlog_size = decode_uint64_le_compat(ptr);
+    ptr += 8;
+    uint64_t min_key_size = decode_uint64_le_compat(ptr);
+    ptr += 8;
+    uint64_t max_key_size = decode_uint64_le_compat(ptr);
+    ptr += 8;
+    uint32_t compression_algorithm = decode_uint32_le_compat(ptr);
+    ptr += 4;
+    /* skip reserved field */
+    ptr += 4;
+
+    /* validate size */
+    size_t expected_size = 68 + min_key_size + max_key_size;
     if (data_size < expected_size)
     {
         TDB_DEBUG_LOG("SSTable metadata: Size mismatch (expected %zu, got %zu)", expected_size,
@@ -208,39 +245,40 @@ static int sstable_metadata_deserialize(const uint8_t *data, size_t data_size,
         return -1;
     }
 
-    sst->num_entries = header->num_entries;
-    sst->num_klog_blocks = header->num_klog_blocks;
-    sst->num_vlog_blocks = header->num_vlog_blocks;
-    sst->klog_size = header->klog_size;
-    sst->vlog_size = header->vlog_size;
+    /* assign values */
+    sst->num_entries = num_entries;
+    sst->num_klog_blocks = num_klog_blocks;
+    sst->num_vlog_blocks = num_vlog_blocks;
+    sst->klog_size = klog_size;
+    sst->vlog_size = vlog_size;
 
     /* restore compression algorithm from metadata */
     if (sst->config)
     {
-        sst->config->compression_algorithm = header->compression_algorithm;
+        sst->config->compression_algorithm = compression_algorithm;
     }
 
-    const uint8_t *key_data = data + sizeof(sstable_metadata_header_t);
-    if (header->min_key_size > 0)
+    /* read keys */
+    if (min_key_size > 0)
     {
-        sst->min_key = malloc(header->min_key_size);
+        sst->min_key = malloc(min_key_size);
         if (!sst->min_key) return -1;
-        memcpy(sst->min_key, key_data, header->min_key_size);
-        sst->min_key_size = header->min_key_size;
-        key_data += header->min_key_size;
+        memcpy(sst->min_key, ptr, min_key_size);
+        sst->min_key_size = min_key_size;
+        ptr += min_key_size;
     }
 
-    if (header->max_key_size > 0)
+    if (max_key_size > 0)
     {
-        sst->max_key = malloc(header->max_key_size);
+        sst->max_key = malloc(max_key_size);
         if (!sst->max_key)
         {
             free(sst->min_key);
             sst->min_key = NULL;
             return -1;
         }
-        memcpy(sst->max_key, key_data, header->max_key_size);
-        sst->max_key_size = header->max_key_size;
+        memcpy(sst->max_key, ptr, max_key_size);
+        sst->max_key_size = max_key_size;
     }
 
     return 0;

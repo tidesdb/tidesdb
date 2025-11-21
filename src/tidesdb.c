@@ -5062,7 +5062,9 @@ int tidesdb_close(tidesdb_t *db)
     free(db->column_families);
     pthread_rwlock_unlock(&db->cf_list_lock);
 
-    fifo_cache_free(db->sstable_cache);
+    /* use destroy instead of free to avoid calling eviction callbacks twice
+     * (we already called fifo_cache_clear above) */
+    fifo_cache_destroy(db->sstable_cache);
 
     pthread_rwlock_destroy(&db->cf_list_lock);
 

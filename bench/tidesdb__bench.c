@@ -42,6 +42,7 @@ typedef struct
     int start;
     int end;
     int thread_id;
+    int *errors; /* pointer to shared error counter */
 } thread_data_t;
 
 /**
@@ -54,7 +55,8 @@ typedef struct
  */
 void generate_sequential_key(uint8_t *buffer, size_t size, int index)
 {
-    snprintf((char *)buffer, size, "key_%016d", index);
+    /* use a format that fits in the buffer size */
+    snprintf((char *)buffer, size, "k%06d", index);
 }
 
 /**
@@ -125,6 +127,19 @@ void generate_random_string(uint8_t *buffer, size_t size)
 }
 
 /**
+ * generate_deterministic_value
+ * generates a deterministic value based on index for verification
+ * @param buffer buffer to store value
+ * @param size size of buffer
+ * @param index index to generate value for
+ */
+void generate_deterministic_value(uint8_t *buffer, size_t size, int index)
+{
+    /* create a deterministic pattern: "val_XXXX" where XXXX is the index */
+    snprintf((char *)buffer, size, "val_%04d", index);
+}
+
+/**
  * get_time_ms
  * gets the current time in milliseconds
  * @return current time in milliseconds
@@ -150,7 +165,7 @@ void *thread_put(void *arg)
     for (int i = data->start; i < data->end;)
     {
         tidesdb_txn_t *txn = NULL;
-        if (tidesdb_txn_begin(data->tdb, data->cf, &txn) != 0)
+        if (tidesdb_txn_begin(data->tdb, &txn) != 0)
         {
             continue;
         }
@@ -161,7 +176,7 @@ void *thread_put(void *arg)
 
         for (int j = i; j < batch_end; j++)
         {
-            if (tidesdb_txn_put(txn, data->keys[j], data->key_sizes[j], data->values[j],
+            if (tidesdb_txn_put(txn, data->cf, data->keys[j], data->key_sizes[j], data->values[j],
                                 data->value_sizes[j], 0) != 0)
             {
                 printf(BOLDRED "Put operation failed\n" RESET);
@@ -195,7 +210,7 @@ void *thread_get(void *arg)
     for (int i = data->start; i < data->end;)
     {
         tidesdb_txn_t *txn = NULL;
-        if (tidesdb_txn_begin(data->tdb, data->cf, &txn) != 0)
+        if (tidesdb_txn_begin(data->tdb, &txn) != 0)
         {
             printf(BOLDRED "Failed to begin read transaction\n" RESET);
             continue;
@@ -210,10 +225,37 @@ void *thread_get(void *arg)
             uint8_t *value_out = NULL;
             size_t value_len = 0;
 
-            if (tidesdb_txn_get(txn, data->keys[j], data->key_sizes[j], &value_out, &value_len) ==
-                0)
+            if (tidesdb_txn_get(txn, data->cf, data->keys[j], data->key_sizes[j], &value_out,
+                                &value_len) == 0)
             {
+                /* verify the value matches what we wrote */
+                if (value_len != data->value_sizes[j] ||
+                    memcmp(value_out, data->values[j], value_len) != 0)
+                {
+                    if (data->errors)
+                    {
+                        __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+                    }
+                    printf(BOLDRED "[Thread %d] GET verification failed for key %d:\n" RESET,
+                           data->thread_id, j);
+                    printf("  Expected %zu bytes: ", data->value_sizes[j]);
+                    for (size_t k = 0; k < data->value_sizes[j] && k < 20; k++)
+                        printf("%02x ", data->values[j][k]);
+                    printf("\n  Got %zu bytes:      ", value_len);
+                    for (size_t k = 0; k < value_len && k < 20; k++) printf("%02x ", value_out[k]);
+                    printf("\n");
+                }
                 free(value_out);
+            }
+            else
+            {
+                /* key not found */
+                if (data->errors)
+                {
+                    __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+                }
+                printf(BOLDRED "[Thread %d] GET failed: key %d not found\n" RESET, data->thread_id,
+                       j);
             }
         }
 
@@ -238,7 +280,7 @@ void *thread_delete(void *arg)
     for (int i = data->start; i < data->end;)
     {
         tidesdb_txn_t *txn = NULL;
-        if (tidesdb_txn_begin(data->tdb, data->cf, &txn) != 0)
+        if (tidesdb_txn_begin(data->tdb, &txn) != 0)
         {
             printf(BOLDRED "Failed to begin transaction\n" RESET);
             continue;
@@ -250,7 +292,7 @@ void *thread_delete(void *arg)
 
         for (int j = i; j < batch_end; j++)
         {
-            if (tidesdb_txn_delete(txn, data->keys[j], data->key_sizes[j]) != 0)
+            if (tidesdb_txn_delete(txn, data->cf, data->keys[j], data->key_sizes[j]) != 0)
             {
                 printf(BOLDRED "Delete operation failed\n" RESET);
                 break;
@@ -278,27 +320,67 @@ void *thread_iter_forward(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(data->tdb, data->cf, &txn) != 0)
+    if (tidesdb_txn_begin(data->tdb, &txn) != 0)
     {
         printf(BOLDRED "Failed to begin read transaction\n" RESET);
         return NULL;
     }
 
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, &iter) != 0)
+    if (tidesdb_iter_new(txn, data->cf, &iter) != 0)
     {
         printf(BOLDRED "Failed to create iterator\n" RESET);
         tidesdb_txn_free(txn);
         return NULL;
     }
 
+    int count = 0;
+    uint8_t *prev_key = NULL;
+    size_t prev_key_size = 0;
+
     if (tidesdb_iter_seek_to_first(iter) == 0)
     {
-        do
+        while (tidesdb_iter_valid(iter))
         {
-            /* process current entry (in real code) */
-        } while (tidesdb_iter_next(iter) == 0 && tidesdb_iter_valid(iter));
+            uint8_t *key = NULL, *value = NULL;
+            size_t key_size = 0, value_size = 0;
+            tidesdb_iter_key(iter, &key, &key_size);
+            tidesdb_iter_value(iter, &value, &value_size);
+
+            /* verify keys are in sorted order */
+            if (prev_key != NULL)
+            {
+                if (memcmp(prev_key, key, prev_key_size < key_size ? prev_key_size : key_size) > 0)
+                {
+                    if (data->errors)
+                    {
+                        __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+                    }
+                    printf(BOLDRED
+                           "[Thread %d] Forward iterator: keys out of order at position %d\n" RESET,
+                           data->thread_id, count);
+                }
+                free(prev_key);
+            }
+
+            /* save current key for next comparison */
+            prev_key = malloc(key_size);
+            if (prev_key)
+            {
+                memcpy(prev_key, key, key_size);
+                prev_key_size = key_size;
+            }
+
+            count++;
+            /* keys/values are internal pointers, no need to free */
+            if (tidesdb_iter_next(iter) != 0) break;
+        }
     }
+
+    if (prev_key) free(prev_key);
+
+    /* store count in thread_id field for reporting */
+    data->thread_id = count;
 
     tidesdb_iter_free(iter);
     tidesdb_txn_free(txn);
@@ -317,14 +399,14 @@ void *thread_iter_backward(void *arg)
     thread_data_t *data = (thread_data_t *)arg;
 
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(data->tdb, data->cf, &txn) != 0)
+    if (tidesdb_txn_begin(data->tdb, &txn) != 0)
     {
         printf(BOLDRED "Failed to begin read transaction\n" RESET);
         return NULL;
     }
 
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, &iter) != 0)
+    if (tidesdb_iter_new(txn, data->cf, &iter) != 0)
     {
         printf(BOLDRED "Failed to create iterator\n" RESET);
         tidesdb_txn_free(txn);
@@ -333,10 +415,15 @@ void *thread_iter_backward(void *arg)
 
     if (tidesdb_iter_seek_to_last(iter) == 0)
     {
-        do
+        while (tidesdb_iter_valid(iter))
         {
-            /* process current entry (in real code) */
-        } while (tidesdb_iter_prev(iter) == 0 && tidesdb_iter_valid(iter));
+            uint8_t *key = NULL, *value = NULL;
+            size_t key_size = 0, value_size = 0;
+            tidesdb_iter_key(iter, &key, &key_size);
+            tidesdb_iter_value(iter, &value, &value_size);
+            /* keys/values are internal pointers, no need to free */
+            if (tidesdb_iter_prev(iter) != 0) break;
+        }
     }
 
     tidesdb_iter_free(iter);
@@ -357,7 +444,7 @@ void *thread_iter_seek(void *arg)
 
     tidesdb_txn_t *txn = NULL;
 
-    if (tidesdb_txn_begin(data->tdb, data->cf, &txn) != 0)
+    if (tidesdb_txn_begin(data->tdb, &txn) != 0)
     {
         printf(BOLDRED "[Thread %d] Failed to begin transaction\n" RESET, data->thread_id);
         return NULL;
@@ -368,7 +455,7 @@ void *thread_iter_seek(void *arg)
 
     /* create iterator once and reuse for all seeks */
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, &iter) != 0)
+    if (tidesdb_iter_new(txn, data->cf, &iter) != 0)
     {
         printf(BOLDRED "[Thread %d] Failed to create iterator\n" RESET, data->thread_id);
         tidesdb_txn_free(txn);
@@ -405,7 +492,7 @@ void *thread_iter_seek_for_prev(void *arg)
 
     tidesdb_txn_t *txn = NULL;
 
-    if (tidesdb_txn_begin(data->tdb, data->cf, &txn) != 0)
+    if (tidesdb_txn_begin(data->tdb, &txn) != 0)
     {
         printf(BOLDRED "[Thread %d] Failed to begin transaction\n" RESET, data->thread_id);
         return NULL;
@@ -416,7 +503,7 @@ void *thread_iter_seek_for_prev(void *arg)
 
     /* create iterator once and reuse for all seeks */
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, &iter) != 0)
+    if (tidesdb_iter_new(txn, data->cf, &iter) != 0)
     {
         printf(BOLDRED "[Thread %d] Failed to create iterator\n" RESET, data->thread_id);
         tidesdb_txn_free(txn);
@@ -518,6 +605,9 @@ int main()
         return 1;
     }
 
+    /* error counter for verification */
+    int verification_errors = 0;
+
     for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
     {
         keys[i] = malloc(BENCH_KEY_SIZE);
@@ -568,8 +658,8 @@ int main()
             free(value_sizes);
             return 1;
         }
-        generate_random_string(values[i], BENCH_VALUE_SIZE);
-        value_sizes[i] = BENCH_VALUE_SIZE - 1;
+        generate_deterministic_value(values[i], BENCH_VALUE_SIZE, i);
+        value_sizes[i] = strlen((char *)values[i]);
     }
 
     tidesdb_config_t config = {.db_path = BENCH_DB_PATH,
@@ -661,6 +751,8 @@ int main()
         thread_data[i].value_sizes = value_sizes;
         thread_data[i].start = i * (BENCH_NUM_OPERATIONS / BENCH_NUM_THREADS);
         thread_data[i].end = (i + 1) * (BENCH_NUM_OPERATIONS / BENCH_NUM_THREADS);
+        thread_data[i].thread_id = i;
+        thread_data[i].errors = &verification_errors;
     }
 
     printf(BOLDGREEN "\nBenchmarking Put operations...\n" RESET);
@@ -697,6 +789,16 @@ int main()
     printf(BOLDGREEN "Get: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, BENCH_NUM_OPERATIONS,
            end_time - start_time, (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
+    if (verification_errors == 0)
+    {
+        printf(BOLDGREEN "  ✓ All GET operations verified successfully\n" RESET);
+    }
+    else
+    {
+        printf(BOLDRED "  ✗ GET verification failed: %d errors\n" RESET, verification_errors);
+    }
+    verification_errors = 0; /* reset for next test */
+
     printf(BOLDGREEN "\nBenchmarking Forward Iterator (full scan)...\n" RESET);
     start_time = get_time_ms();
 
@@ -711,9 +813,30 @@ int main()
     }
 
     end_time = get_time_ms();
+
+    /* Each thread iterates ALL keys independently, so check one thread's count */
+    int keys_per_thread = thread_data[0].thread_id; /* we stored count in thread_id */
+
     printf(BOLDGREEN "Forward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET,
            BENCH_NUM_THREADS, end_time - start_time,
            (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
+
+    if (keys_per_thread == BENCH_NUM_OPERATIONS)
+    {
+        printf(BOLDGREEN "  ✓ Each thread iterated all %d keys successfully\n" RESET,
+               keys_per_thread);
+    }
+    else
+    {
+        printf(BOLDRED "  ✗ Iterator count mismatch: expected %d, got %d keys per thread\n" RESET,
+               BENCH_NUM_OPERATIONS, keys_per_thread);
+    }
+
+    if (verification_errors > 0)
+    {
+        printf(BOLDRED "  ✗ Iterator verification failed: %d errors\n" RESET, verification_errors);
+    }
+    verification_errors = 0; /* reset for next test */
 
     printf(BOLDGREEN "\nBenchmarking Backward Iterator (full scan)...\n" RESET);
     start_time = get_time_ms();
@@ -732,6 +855,23 @@ int main()
     printf(BOLDGREEN "Backward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET,
            BENCH_NUM_THREADS, end_time - start_time,
            (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
+
+    if (keys_per_thread == BENCH_NUM_OPERATIONS)
+    {
+        printf(BOLDGREEN "  ✓ Each thread iterated all %d keys successfully\n" RESET,
+               keys_per_thread);
+    }
+    else
+    {
+        printf(BOLDRED "  ✗ Iterator count mismatch: expected %d, got %d keys per thread\n" RESET,
+               BENCH_NUM_OPERATIONS, keys_per_thread);
+    }
+
+    if (verification_errors > 0)
+    {
+        printf(BOLDRED "  ✗ Iterator verification failed: %d errors\n" RESET, verification_errors);
+    }
+    verification_errors = 0; /* reset for next test */
 
     printf(BOLDGREEN "\nBenchmarking Iterator Seek operations...\n" RESET);
 

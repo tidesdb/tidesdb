@@ -60,9 +60,9 @@ include_directories(external) # for external libraries linking internally
 
 # build as STATIC on Windows to avoid DLL export/import complexity in tests
 if(WIN32)
-    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/fifo.c src/queue.c src/succinct_trie.c external/xxhash.c external/ini.c)
+    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/fifo.c src/queue.c src/succinct_trie.c src/buffer.c external/xxhash.c external/ini.c)
 else()
-    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/fifo.c src/queue.c src/succinct_trie.c external/xxhash.c external/ini.c)
+    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/fifo.c src/queue.c src/succinct_trie.c src/buffer.c external/xxhash.c external/ini.c)
 endif()
 
 target_include_directories(tidesdb PRIVATE src)
@@ -134,10 +134,10 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # benchmark configuration variables (can be overridden at build time with -D flags)
     if(NOT DEFINED BENCH_NUM_OPERATIONS)
-        set(BENCH_NUM_OPERATIONS 1000000)
+        set(BENCH_NUM_OPERATIONS 10000000)
     endif()
     if(NOT DEFINED BENCH_NUM_SEEK_OPS)
-        set(BENCH_NUM_SEEK_OPS 1000)
+        set(BENCH_NUM_SEEK_OPS 100)
     endif()
     if(NOT DEFINED BENCH_KEY_SIZE)
         set(BENCH_KEY_SIZE 16)
@@ -172,13 +172,13 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # column family configuration variables for benchmark
     if(NOT DEFINED BENCH_WRITE_BUFFER_SIZE)
-        set(BENCH_WRITE_BUFFER_SIZE 67108864)
-    endif()
-    if(NOT DEFINED BENCH_MAX_SSTABLES_BEFORE_COMPACTION)
-        set(BENCH_MAX_SSTABLES_BEFORE_COMPACTION 32)
+        math(EXPR BENCH_WRITE_BUFFER_SIZE 67108864)
     endif()
     if(NOT DEFINED BENCH_LEVEL_RATIO)
         set(BENCH_LEVEL_RATIO 10)
+    endif()
+    if (NOT DEFINED BENCH_TXN_ISOLATION_LEVEL)
+        set(BENCH_TXN_ISOLATION_LEVEL TDB_ISOLATION_READ_COMMITTED)
     endif()
     if(NOT DEFINED BENCH_DIVIDING_LEVEL_OFFSET)
         set(BENCH_DIVIDING_LEVEL_OFFSET 2)
@@ -214,7 +214,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_ENABLE_BLOCK_INDEXES 1)
     endif()
     if(NOT DEFINED BENCH_BLOCK_INDEX_SAMPLING_COUNT)
-        set(BENCH_BLOCK_INDEX_SAMPLING_COUNT 100)
+        set(BENCH_BLOCK_INDEX_SAMPLING_COUNT 16)
     endif()
     if(NOT DEFINED BENCH_SYNC_MODE)
         set(BENCH_SYNC_MODE TDB_SYNC_NONE)
@@ -223,7 +223,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_COMPARATOR_NAME "memcmp")
     endif()
     if (NOT DEFINED BENCH_COLUMN_FAMILY_BLOCK_CACHE)
-        set(BENCH_COLUMN_FAMILY_BLOCK_CACHE 67108864)
+        math(EXPR BENCH_COLUMN_FAMILY_BLOCK_CACHE 50331648)
     endif()
 
     add_executable(block_manager_tests test/block_manager__tests.c)
@@ -233,6 +233,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(fifo_tests test/fifo__tests.c)
     add_executable(queue_tests test/queue__tests.c)
     add_executable(succinct_trie_tests test/succinct_trie__tests.c)
+    add_executable(buffer_tests test/buffer__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
     add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
@@ -270,7 +271,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     )
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests fifo_tests queue_tests succinct_trie_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests fifo_tests queue_tests succinct_trie_tests buffer_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -282,6 +283,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME fifo_tests COMMAND fifo_tests)
     add_test(NAME queue_tests COMMAND queue_tests)
     add_test(NAME succinct_trie_tests COMMAND succinct_trie_tests)
+    add_test(NAME buffer_tests COMMAND buffer_tests)
     add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)

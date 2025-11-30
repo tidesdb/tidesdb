@@ -61,16 +61,7 @@ static void cached_block_evict_callback(const char *key, void *value, void *user
     {
         cache->current_size -= (uint32_t)block->size;
 
-        /* check if block is currently in use (ref_count > 1)
-         * if so, don't release -- let the last user release it
-         * this prevents race where we free a block that's being acquired */
-        int current_refs = atomic_load(&block->ref_count);
-        if (current_refs == 1)
-        {
-            /* only the cache holds a reference, safe to release */
-            block_manager_block_release(block);
-        }
-        /* else: block is in use, will be freed when last user releases it */
+        block_manager_block_release(block);
     }
 }
 
@@ -954,7 +945,7 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
         }
     }
 
-read_from_disk:; /* C11 compatibility: empty statement after label */
+read_from_disk:; /* C11 compatibility empty statement after label */
     /* read block size */
     unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=

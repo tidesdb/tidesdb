@@ -28,9 +28,14 @@ typedef struct skip_list_version_t skip_list_version_t;
 /* skip_list_version_t flag bits */
 #define SKIP_LIST_FLAG_DELETED 0x01 /* version is tombstone */
 
+/* skip_list_node_t flag bits */
+#define SKIP_LIST_NODE_FLAG_SENTINEL 0x01 /* node is a sentinel (header or tail) */
+
 /* helper macros for flag access */
 #define VERSION_IS_DELETED(version) \
     (atomic_load_explicit(&(version)->flags, memory_order_acquire) & SKIP_LIST_FLAG_DELETED)
+
+#define NODE_IS_SENTINEL(node) ((node)->node_flags & SKIP_LIST_NODE_FLAG_SENTINEL)
 
 /**
  * skip_list_version_t
@@ -72,14 +77,16 @@ typedef int (*skip_list_comparator_fn)(const uint8_t *key1, size_t key1_size, co
  * skip_list_node_t
  * a key in the skip list with multiple versions
  * @param level node level in skip list
- * @param key key data
- * @param key_size size of key
+ * @param node_flags node flags (sentinel, etc)
+ * @param key key data (NULL for sentinel nodes)
+ * @param key_size size of key (0 for sentinel nodes)
  * @param versions lock-free list of versions (newest first)
  * @param forward forward[0..level] forward pointers, forward[level+1..2*level+1] backward pointers
  */
 struct skip_list_node_t
 {
     uint8_t level;
+    uint8_t node_flags;
     uint8_t *key;
     size_t key_size;
     _Atomic(skip_list_version_t *) versions;
@@ -100,8 +107,8 @@ struct skip_list_node_t
  * @param level current maximum level
  * @param max_level maximum allowed level
  * @param probability probability for level generation
- * @param header sentinel header node
- * @param tail sentinel tail node
+ * @param header sentinel header node (compares less than all keys)
+ * @param tail sentinel tail node (compares greater than all keys)
  * @param total_size total size of all entries
  * @param comparator key comparison function
  * @param comparator_ctx context for comparator
@@ -287,7 +294,7 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size);
  * @param value pointer to value pointer (caller must free)
  * @param value_size pointer to value size
  * @param deleted pointer to deleted flag
- * @param ttl
+ * @param ttl pointer to ttl
  * @return 0 on success, -1 on failure
  */
 int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
@@ -352,6 +359,23 @@ int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_
                          uint8_t **value, size_t *value_size, time_t *ttl, uint8_t *deleted);
 
 /**
+ * skip_list_cursor_get_with_seq
+ * get key-value pair at cursor position with sequence number
+ * @param cursor cursor
+ * @param key pointer to key
+ * @param key_size pointer to key size
+ * @param value pointer to value
+ * @param value_size pointer to value size
+ * @param ttl pointer to TTL
+ * @param deleted pointer to deleted flag
+ * @param seq pointer to sequence number
+ * @return 0 on success, -1 on failure
+ */
+int skip_list_cursor_get_with_seq(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_size,
+                                  uint8_t **value, size_t *value_size, time_t *ttl,
+                                  uint8_t *deleted, uint64_t *seq);
+
+/**
  * skip_list_cursor_free
  * frees a cursor
  * @param cursor cursor to free
@@ -408,7 +432,7 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor);
 
 /**
  * skip_list_cursor_seek
- * seeks cursor to key >= target
+ * seeks cursor to first key >= target
  * @param cursor cursor
  * @param key target key
  * @param key_size size of target key
@@ -418,13 +442,21 @@ int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t
 
 /**
  * skip_list_cursor_seek_for_prev
- * seeks cursor to key <= target
+ * seeks cursor to last key <= target
  * @param cursor cursor
  * @param key target key
  * @param key_size size of target key
  * @return 0 on success, -1 on failure
  */
 int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size);
+
+/**
+ * skip_list_cursor_valid
+ * checks if cursor is at a valid position (not at sentinel)
+ * @param cursor cursor
+ * @return 1 if valid, 0 if not, -1 on error
+ */
+int skip_list_cursor_valid(skip_list_cursor_t *cursor);
 
 /**
  * skip_list_clear

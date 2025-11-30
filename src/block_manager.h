@@ -391,6 +391,15 @@ int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
 int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
 
 /**
+ * block_manager_cursor_build_cache
+ * builds a position cache for fast seeks when block index is enabled
+ * @param cursor the cursor to build cache for
+ * @param end_offset the end offset to cache up to
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_build_cache(block_manager_cursor_t *cursor, uint64_t end_offset);
+
+/**
  * block_manager_validate_last_block
  * validates the integrity of the last block in a block manager file
  * returns 0 if the last block is valid, -1 if validation fails

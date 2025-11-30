@@ -75,6 +75,7 @@
 
 #else /* posix */
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #define STAT_STRUCT stat
 #define STAT_FUNC   stat
 #define FSTAT_FUNC  fstat
@@ -1765,5 +1766,51 @@ static inline int set_file_sequential_hint(int fd)
     return 0;
 #endif
 }
+
+/**
+ * tdb_get_available_disk_space
+ * get available disk space for a given path
+ * @param path the path to check
+ * @param available pointer to store available bytes
+ * @return 0 on success, -1 on failure
+ */
+static inline int tdb_get_available_disk_space(const char *path, uint64_t *available)
+{
+    if (!path || !available) return -1;
+
+#if defined(_WIN32)
+    ULARGE_INTEGER free_bytes;
+    if (GetDiskFreeSpaceExA(path, &free_bytes, NULL, NULL))
+    {
+        *available = (uint64_t)free_bytes.QuadPart;
+        return 0;
+    }
+    return -1;
+#else
+    struct statvfs stat;
+    if (statvfs(path, &stat) == 0)
+    {
+        *available = (uint64_t)stat.f_bavail * (uint64_t)stat.f_frsize;
+        return 0;
+    }
+    return -1;
+#endif
+}
+
+/* cpu pause for spin-wait loops */
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#ifdef _MSC_VER
+#include <intrin.h>
+#define cpu_pause() _mm_pause()
+#else
+#define cpu_pause() __builtin_ia32_pause()
+#endif
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define cpu_pause() __asm__ __volatile__("yield" ::: "memory")
+#elif defined(__arm__) || defined(_M_ARM)
+#define cpu_pause() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define cpu_pause() ((void)0)
+#endif
 
 #endif /* __COMPAT_H__ */

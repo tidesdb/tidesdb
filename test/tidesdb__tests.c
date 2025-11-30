@@ -3287,7 +3287,7 @@ typedef struct
     int thread_id;
     int start_key;
     int end_key;
-    int *errors;
+    _Atomic(int) *errors;
 } concurrent_writes_thread_data_t;
 
 /* write thread for concurrent writes visibility test */
@@ -3346,7 +3346,7 @@ static void test_concurrent_writes_visibility(void)
     const int KEYS_PER_THREAD = 10;
     const int TOTAL_KEYS = NUM_THREADS * KEYS_PER_THREAD;
 
-    int errors = 0;
+    _Atomic(int) errors = 0;
     pthread_t *threads = (pthread_t *)malloc(NUM_THREADS * sizeof(pthread_t));
     concurrent_writes_thread_data_t *thread_data = (concurrent_writes_thread_data_t *)malloc(
         NUM_THREADS * sizeof(concurrent_writes_thread_data_t));

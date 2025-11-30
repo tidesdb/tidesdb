@@ -594,12 +594,12 @@ void *stress_worker(void *arg)
 
 void test_buffer_stress(void)
 {
-    buffer_t *buffer = NULL;
-    assert(buffer_new(&buffer, 16) == 0); /* small buffer for high contention */
-
     const int num_threads = 16;
     const int iterations = 10000;
     const int capacity = 16;
+
+    buffer_t *buffer = NULL;
+    assert(buffer_new(&buffer, capacity) == 0); /* small buffer for high contention */
 
     pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
     stress_args_t *args = (stress_args_t *)malloc(num_threads * sizeof(stress_args_t));

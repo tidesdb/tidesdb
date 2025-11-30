@@ -5791,6 +5791,7 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
     if (cf->active_txn_buffer)
     {
         buffer_free(cf->active_txn_buffer);
+        cf->active_txn_buffer = NULL;
     }
 
     /* destroy rwlocks */
@@ -6299,6 +6300,16 @@ int tidesdb_close(tidesdb_t *db)
     return TDB_SUCCESS;
 }
 
+/**
+ * txn_entry_evict
+ * eviction callback for active transaction buffer
+ */
+static void txn_entry_evict(void *data, void *ctx)
+{
+    (void)ctx;
+    if (data) free(data);
+}
+
 int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config)
 {
@@ -6469,12 +6480,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->compaction_should_stop, 0);
     atomic_init(&cf->commit_ticket, 0);
     atomic_init(&cf->commit_serving, 0);
-
-    void txn_entry_evict(void *data, void *ctx)
-    {
-        (void)ctx;
-        if (data) free(data);
-    }
 
     if (buffer_new_with_eviction(&cf->active_txn_buffer, TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE,
                                  txn_entry_evict, NULL) != 0)
@@ -7626,6 +7631,47 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const ui
     return TDB_SUCCESS;
 }
 
+/**
+ * ssi_check_ctx_t
+ * context for SSI conflict detection
+ */
+typedef struct
+{
+    tidesdb_txn_t *txn;
+    int conflict_found;
+} ssi_check_ctx_t;
+
+/**
+ * check_rw_conflict
+ * callback to check for read-write conflicts in SSI
+ */
+static void check_rw_conflict(uint32_t id, void *data, void *ctx)
+{
+    (void)id;
+    ssi_check_ctx_t *check_ctx = (ssi_check_ctx_t *)ctx;
+    tidesdb_txn_entry_t *active = (tidesdb_txn_entry_t *)data;
+
+    if (!active || check_ctx->conflict_found) return;
+
+    /* skip ourselves */
+    if (active->txn_id == check_ctx->txn->txn_id) return;
+
+    /* check if this active transaction's snapshot overlaps with our writes
+     * if they started before we commit and we're writing keys, we have a potential
+     * rw-conflict (they might have read data we're about to overwrite) */
+    for (int cf_idx = 0; cf_idx < check_ctx->txn->num_cfs; cf_idx++)
+    {
+        if (active->snapshot_seq <= check_ctx->txn->cf_snapshots[cf_idx])
+        {
+            /* abort to prevent potential write-skew */
+            TDB_DEBUG_LOG("SSI: rw-conflict detected, aborting txn %" PRIu64,
+                          check_ctx->txn->txn_id);
+            check_ctx->conflict_found = 1;
+            return;
+        }
+    }
+}
+
 int tidesdb_txn_commit(tidesdb_txn_t *txn)
 {
     if (!txn || txn->is_committed || txn->is_aborted) return TDB_ERR_INVALID_ARGS;
@@ -7709,40 +7755,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         {
             /* check if any concurrent transaction read keys we're writing
              * this is the rw-antidependency check for SSI using per-CF buffers */
-
-            /* context for conflict detection */
-            typedef struct
-            {
-                tidesdb_txn_t *txn;
-                int conflict_found;
-            } ssi_check_ctx_t;
-
-            void check_rw_conflict(uint32_t id, void *data, void *ctx)
-            {
-                (void)id;
-                ssi_check_ctx_t *check_ctx = (ssi_check_ctx_t *)ctx;
-                tidesdb_txn_entry_t *active = (tidesdb_txn_entry_t *)data;
-
-                if (!active || check_ctx->conflict_found) return;
-
-                /* skip ourselves */
-                if (active->txn_id == check_ctx->txn->txn_id) return;
-
-                /* check if this active transaction's snapshot overlaps with our writes
-                 * if they started before we commit and we're writing keys, we have a potential
-                 * rw-conflict (they might have read data we're about to overwrite) */
-                for (int cf_idx = 0; cf_idx < check_ctx->txn->num_cfs; cf_idx++)
-                {
-                    if (active->snapshot_seq <= check_ctx->txn->cf_snapshots[cf_idx])
-                    {
-                        /* abort to prevent potential write-skew */
-                        TDB_DEBUG_LOG("SSI: rw-conflict detected, aborting txn %" PRIu64,
-                                      check_ctx->txn->txn_id);
-                        check_ctx->conflict_found = 1;
-                        return;
-                    }
-                }
-            }
 
             /* check each CF's active transaction buffer */
             for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
@@ -8082,7 +8094,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         if (ops_written > 0)
         {
-            uint64_t old_commit = atomic_load_explicit(&cf->commit_seq, memory_order_relaxed);
             atomic_store_explicit(&cf->commit_seq, max_seq_written, memory_order_release);
         }
 

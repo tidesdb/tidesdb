@@ -59,28 +59,28 @@ void test_buffer_create(void)
     buffer_t *buffer = NULL;
 
     /* test basic creation */
-    assert(buffer_new(&buffer, 10) == 0);
-    assert(buffer != NULL);
-    assert(buffer_capacity(buffer) == 10);
-    assert(buffer_active_count(buffer) == 0);
+    ASSERT_EQ(buffer_new(&buffer, 10), 0);
+    ASSERT_TRUE(buffer != NULL);
+    ASSERT_EQ(buffer_capacity(buffer), 10);
+    ASSERT_EQ(buffer_active_count(buffer), 0);
     buffer_free(buffer);
 
     /* test with eviction callback */
     buffer = NULL;
     reset_eviction_counters();
-    assert(buffer_new_with_eviction(&buffer, 5, eviction_callback, NULL) == 0);
-    assert(buffer != NULL);
+    ASSERT_EQ(buffer_new_with_eviction(&buffer, 5, eviction_callback, NULL), 0);
+    ASSERT_TRUE(buffer != NULL);
     buffer_free(buffer);
 
     /* test invalid params */
-    assert(buffer_new(NULL, 10) == -1);
-    assert(buffer_new(&buffer, 0) == -1);
+    ASSERT_EQ(buffer_new(NULL, 10), -1);
+    ASSERT_EQ(buffer_new(&buffer, 0), -1);
 }
 
 void test_buffer_acquire_release(void)
 {
     buffer_t *buffer = NULL;
-    assert(buffer_new(&buffer, 5) == 0);
+    ASSERT_EQ(buffer_new(&buffer, 5), 0);
 
     int values[5] = {10, 20, 30, 40, 50};
     uint32_t ids[5];
@@ -88,32 +88,32 @@ void test_buffer_acquire_release(void)
     /* acquire all slots */
     for (int i = 0; i < 5; i++)
     {
-        assert(buffer_acquire(buffer, &values[i], &ids[i]) == 0);
-        assert(ids[i] < 5);
-        assert(buffer_active_count(buffer) == i + 1);
+        ASSERT_EQ(buffer_acquire(buffer, &values[i], &ids[i]), 0);
+        ASSERT_TRUE(ids[i] < 5);
+        ASSERT_EQ(buffer_active_count(buffer), i + 1);
     }
 
     /* verify all occupied */
     for (int i = 0; i < 5; i++)
     {
-        assert(buffer_is_occupied(buffer, ids[i]) == 1);
+        ASSERT_EQ(buffer_is_occupied(buffer, ids[i]), 1);
     }
 
     /* try acquire when full - should fail */
     uint32_t extra_id;
     buffer_set_retry_params(buffer, 10, 1); /* limit retries */
-    assert(buffer_try_acquire(buffer, &values[0], &extra_id) == -1);
-    assert(extra_id == BUFFER_INVALID_ID);
+    ASSERT_EQ(buffer_try_acquire(buffer, &values[0], &extra_id), -1);
+    ASSERT_EQ(extra_id, BUFFER_INVALID_ID);
 
     /* release one and acquire again */
-    assert(buffer_release(buffer, ids[2]) == 0);
-    assert(buffer_active_count(buffer) == 4);
-    assert(buffer_is_occupied(buffer, ids[2]) == 0);
+    ASSERT_EQ(buffer_release(buffer, ids[2]), 0);
+    ASSERT_EQ(buffer_active_count(buffer), 4);
+    ASSERT_EQ(buffer_is_occupied(buffer, ids[2]), 0);
 
     int new_value = 100;
     uint32_t new_id;
-    assert(buffer_acquire(buffer, &new_value, &new_id) == 0);
-    assert(buffer_active_count(buffer) == 5);
+    ASSERT_EQ(buffer_acquire(buffer, &new_value, &new_id), 0);
+    ASSERT_EQ(buffer_active_count(buffer), 5);
 
     buffer_free(buffer);
 }
@@ -121,28 +121,28 @@ void test_buffer_acquire_release(void)
 void test_buffer_get(void)
 {
     buffer_t *buffer = NULL;
-    assert(buffer_new(&buffer, 10) == 0);
+    ASSERT_EQ(buffer_new(&buffer, 10), 0);
 
     int values[3] = {111, 222, 333};
     uint32_t ids[3];
 
     for (int i = 0; i < 3; i++)
     {
-        assert(buffer_acquire(buffer, &values[i], &ids[i]) == 0);
+        ASSERT_EQ(buffer_acquire(buffer, &values[i], &ids[i]), 0);
     }
 
     /* get valid slots */
     for (int i = 0; i < 3; i++)
     {
         void *data;
-        assert(buffer_get(buffer, ids[i], &data) == 0);
-        assert(data == &values[i]);
-        assert(*(int *)data == values[i]);
+        ASSERT_EQ(buffer_get(buffer, ids[i], &data), 0);
+        ASSERT_EQ(data, &values[i]);
+        ASSERT_EQ(*(int *)data, values[i]);
     }
 
     /* get invalid slot */
     void *data;
-    assert(buffer_get(buffer, 100, &data) == -1); /* out of range */
+    ASSERT_EQ(buffer_get(buffer, 100, &data), -1); /* out of range */
 
     /* get free slot */
     uint32_t free_slot = 9;
@@ -151,7 +151,7 @@ void test_buffer_get(void)
         if (ids[i] != 9) free_slot = 9;
     }
 
-    assert(buffer_get(buffer, free_slot, &data) == -1);
+    ASSERT_EQ(buffer_get(buffer, free_slot, &data), -1);
 
     buffer_free(buffer);
 }
@@ -161,28 +161,28 @@ void test_buffer_eviction_callback(void)
     buffer_t *buffer = NULL;
     reset_eviction_counters();
 
-    assert(buffer_new_with_eviction(&buffer, 5, eviction_callback, NULL) == 0);
+    ASSERT_EQ(buffer_new_with_eviction(&buffer, 5, eviction_callback, NULL), 0);
 
     int values[3] = {10, 20, 30};
     uint32_t ids[3];
 
     for (int i = 0; i < 3; i++)
     {
-        assert(buffer_acquire(buffer, &values[i], &ids[i]) == 0);
+        ASSERT_EQ(buffer_acquire(buffer, &values[i], &ids[i]), 0);
     }
 
     /* release should trigger eviction */
-    assert(buffer_release(buffer, ids[0]) == 0);
-    assert(atomic_load(&eviction_count) == 1);
-    assert(atomic_load(&eviction_sum) == 10);
+    ASSERT_EQ(buffer_release(buffer, ids[0]), 0);
+    ASSERT_EQ(atomic_load(&eviction_count), 1);
+    ASSERT_EQ(atomic_load(&eviction_sum), 10);
 
-    assert(buffer_release(buffer, ids[1]) == 0);
-    assert(atomic_load(&eviction_count) == 2);
-    assert(atomic_load(&eviction_sum) == 30);
+    ASSERT_EQ(buffer_release(buffer, ids[1]), 0);
+    ASSERT_EQ(atomic_load(&eviction_count), 2);
+    ASSERT_EQ(atomic_load(&eviction_sum), 30);
 
     /* silent release should NOT trigger eviction */
-    assert(buffer_release_silent(buffer, ids[2]) == 0);
-    assert(atomic_load(&eviction_count) == 2);
+    ASSERT_EQ(buffer_release_silent(buffer, ids[2]), 0);
+    ASSERT_EQ(atomic_load(&eviction_count), 2);
 
     buffer_free(buffer);
 }
@@ -192,22 +192,22 @@ void test_buffer_clear(void)
     buffer_t *buffer = NULL;
     reset_eviction_counters();
 
-    assert(buffer_new_with_eviction(&buffer, 10, eviction_callback, NULL) == 0);
+    ASSERT_EQ(buffer_new_with_eviction(&buffer, 10, eviction_callback, NULL), 0);
 
     int values[5] = {1, 2, 3, 4, 5};
     uint32_t ids[5];
 
     for (int i = 0; i < 5; i++)
     {
-        assert(buffer_acquire(buffer, &values[i], &ids[i]) == 0);
+        ASSERT_EQ(buffer_acquire(buffer, &values[i], &ids[i]), 0);
     }
-    assert(buffer_active_count(buffer) == 5);
+    ASSERT_EQ(buffer_active_count(buffer), 5);
 
     /* clear should release all and call eviction for each */
-    assert(buffer_clear(buffer) == 0);
-    assert(buffer_active_count(buffer) == 0);
-    assert(atomic_load(&eviction_count) == 5);
-    assert(atomic_load(&eviction_sum) == 15); /* 1+2+3+4+5 */
+    ASSERT_EQ(buffer_clear(buffer), 0);
+    ASSERT_EQ(buffer_active_count(buffer), 0);
+    ASSERT_EQ(atomic_load(&eviction_count), 5);
+    ASSERT_EQ(atomic_load(&eviction_sum), 15); /* 1+2+3+4+5 */
 
     buffer_free(buffer);
 }
@@ -231,23 +231,23 @@ static void foreach_callback(uint32_t id, void *data, void *ctx)
 void test_buffer_foreach(void)
 {
     buffer_t *buffer = NULL;
-    assert(buffer_new(&buffer, 10) == 0);
+    ASSERT_EQ(buffer_new(&buffer, 10), 0);
 
     int values[5] = {10, 20, 30, 40, 50};
     uint32_t ids[5];
 
     for (int i = 0; i < 5; i++)
     {
-        assert(buffer_acquire(buffer, &values[i], &ids[i]) == 0);
+        ASSERT_EQ(buffer_acquire(buffer, &values[i], &ids[i]), 0);
     }
 
     /* count and sum via foreach */
     foreach_ctx_t ctx = {0, 0};
     int visited = buffer_foreach(buffer, foreach_callback, &ctx);
 
-    assert(visited == 5);
-    assert(ctx.count == 5);
-    assert(ctx.sum == 150); /* 10+20+30+40+50 */
+    ASSERT_EQ(visited, 5);
+    ASSERT_EQ(ctx.count, 5);
+    ASSERT_EQ(ctx.sum, 150); /* 10+20+30+40+50 */
 
     buffer_free(buffer);
 }
@@ -255,32 +255,32 @@ void test_buffer_foreach(void)
 void test_buffer_generation(void)
 {
     buffer_t *buffer = NULL;
-    assert(buffer_new(&buffer, 5) == 0);
+    ASSERT_EQ(buffer_new(&buffer, 5), 0);
 
     int value = 42;
     uint32_t id1, id2;
     uint64_t gen1, gen2;
 
-    assert(buffer_acquire(buffer, &value, &id1) == 0);
-    assert(buffer_get_generation(buffer, id1, &gen1) == 0);
+    ASSERT_EQ(buffer_acquire(buffer, &value, &id1), 0);
+    ASSERT_EQ(buffer_get_generation(buffer, id1, &gen1), 0);
 
     /* validate with correct generation */
-    assert(buffer_validate(buffer, id1, gen1) == 1);
+    ASSERT_EQ(buffer_validate(buffer, id1, gen1), 1);
 
     /* validate with wrong generation */
-    assert(buffer_validate(buffer, id1, gen1 + 100) == 0);
+    ASSERT_EQ(buffer_validate(buffer, id1, gen1 + 100), 0);
 
     /* validate with 0 (skip generation check) */
-    assert(buffer_validate(buffer, id1, 0) == 1);
+    ASSERT_EQ(buffer_validate(buffer, id1, 0), 1);
 
     /* release and reacquire - if we get same slot, generation should increase */
-    assert(buffer_release(buffer, id1) == 0);
+    ASSERT_EQ(buffer_release(buffer, id1), 0);
 
     /* fill other slots first so we're more likely to reuse the same one */
     uint32_t temp_ids[4];
     for (int i = 0; i < 4; i++)
     {
-        assert(buffer_acquire(buffer, &value, &temp_ids[i]) == 0);
+        ASSERT_EQ(buffer_acquire(buffer, &value, &temp_ids[i]), 0);
     }
     /* release all temp slots */
     for (int i = 0; i < 4; i++)
@@ -289,18 +289,18 @@ void test_buffer_generation(void)
     }
 
     /* now acquire - should get one of the freed slots */
-    assert(buffer_acquire(buffer, &value, &id2) == 0);
-    assert(buffer_get_generation(buffer, id2, &gen2) == 0);
+    ASSERT_EQ(buffer_acquire(buffer, &value, &id2), 0);
+    ASSERT_EQ(buffer_get_generation(buffer, id2, &gen2), 0);
 
     /* the generation for the NEW slot should be > 0 (incremented from initial) */
-    assert(gen2 >= 1);
+    ASSERT_TRUE(gen2 >= 1);
 
     /* if we got same slot, old generation is invalid */
     if (id2 == id1)
     {
-        assert(gen2 > gen1);
-        assert(buffer_validate(buffer, id2, gen1) == 0);
-        assert(buffer_validate(buffer, id2, gen2) == 1);
+        ASSERT_TRUE(gen2 > gen1);
+        ASSERT_EQ(buffer_validate(buffer, id2, gen1), 0);
+        ASSERT_EQ(buffer_validate(buffer, id2, gen2), 1);
     }
 
     buffer_free(buffer);
@@ -309,22 +309,22 @@ void test_buffer_generation(void)
 void test_buffer_null_validation(void)
 {
     buffer_t *buffer = NULL;
-    assert(buffer_new(&buffer, 5) == 0);
+    ASSERT_EQ(buffer_new(&buffer, 5), 0);
 
     /* test null parameters */
-    assert(buffer_acquire(NULL, (void *)1, NULL) == -1);
-    assert(buffer_get(NULL, 0, NULL) == -1);
-    assert(buffer_release(NULL, 0) == -1);
-    assert(buffer_is_occupied(NULL, 0) == -1);
-    assert(buffer_active_count(NULL) == -1);
-    assert(buffer_capacity(NULL) == -1);
-    assert(buffer_foreach(buffer, NULL, NULL) == -1);
+    ASSERT_EQ(buffer_acquire(NULL, (void *)1, NULL), -1);
+    ASSERT_EQ(buffer_get(NULL, 0, NULL), -1);
+    ASSERT_EQ(buffer_release(NULL, 0), -1);
+    ASSERT_EQ(buffer_is_occupied(NULL, 0), -1);
+    ASSERT_EQ(buffer_active_count(NULL), -1);
+    ASSERT_EQ(buffer_capacity(NULL), -1);
+    ASSERT_EQ(buffer_foreach(buffer, NULL, NULL), -1);
 
     uint32_t id;
     void *data;
-    assert(buffer_acquire(buffer, NULL, &id) == 0); /* NULL data is allowed */
-    assert(buffer_get(buffer, id, &data) == 0);
-    assert(data == NULL);
+    ASSERT_EQ(buffer_acquire(buffer, NULL, &id), 0); /* NULL data is allowed */
+    ASSERT_EQ(buffer_get(buffer, id, &data), 0);
+    ASSERT_EQ(data, NULL);
 
     buffer_free(buffer);
 }
@@ -334,7 +334,7 @@ void test_buffer_slot_reuse(void)
     buffer_t *buffer = NULL;
     reset_eviction_counters();
 
-    assert(buffer_new_with_eviction(&buffer, 3, eviction_free_callback, NULL) == 0);
+    ASSERT_EQ(buffer_new_with_eviction(&buffer, 3, eviction_free_callback, NULL), 0);
 
     /* allocate and free repeatedly */
     for (int round = 0; round < 10; round++)
@@ -345,19 +345,19 @@ void test_buffer_slot_reuse(void)
         {
             int *val = (int *)malloc(sizeof(int));
             *val = round * 10 + i;
-            assert(buffer_acquire(buffer, val, &ids[i]) == 0);
+            ASSERT_EQ(buffer_acquire(buffer, val, &ids[i]), 0);
         }
-        assert(buffer_active_count(buffer) == 3);
+        ASSERT_EQ(buffer_active_count(buffer), 3);
 
         for (int i = 0; i < 3; i++)
         {
-            assert(buffer_release(buffer, ids[i]) == 0);
+            ASSERT_EQ(buffer_release(buffer, ids[i]), 0);
         }
-        assert(buffer_active_count(buffer) == 0);
+        ASSERT_EQ(buffer_active_count(buffer), 0);
     }
 
     /* should have evicted 30 items (3 per round * 10 rounds) */
-    assert(atomic_load(&eviction_count) == 30);
+    ASSERT_EQ(atomic_load(&eviction_count), 30);
 
     buffer_free(buffer);
 }
@@ -395,7 +395,7 @@ void *concurrent_acquire_release(void *arg)
             void *data;
             if (buffer_get(buffer, id, &data) == 0)
             {
-                assert(data == value);
+                ASSERT_EQ(data, value);
             }
 
             buffer_release_silent(buffer, id);
@@ -718,6 +718,111 @@ void benchmark_buffer_concurrent(void)
     buffer_free(buffer);
 }
 
+/* eviction callback that frees allocated memory */
+static void free_allocated_data(void *data, void *ctx)
+{
+    (void)ctx;
+    if (data) free(data);
+}
+
+/* test buffer eviction with dynamically allocated memory */
+static void test_buffer_eviction_with_malloc(void)
+{
+    buffer_t *buffer = NULL;
+
+    /* create buffer with eviction callback that frees data */
+    ASSERT_EQ(buffer_new_with_eviction(&buffer, 16, free_allocated_data, NULL), 0);
+    ASSERT_TRUE(buffer != NULL);
+
+    /* allocate and store multiple entries */
+    uint32_t ids[10];
+    for (int i = 0; i < 10; i++)
+    {
+        /* allocate memory for entry */
+        int *entry = (int *)malloc(sizeof(int));
+        ASSERT_TRUE(entry != NULL);
+        *entry = i * 100;
+
+        /* acquire slot and store entry */
+        ASSERT_EQ(buffer_acquire(buffer, entry, &ids[i]), 0);
+        ASSERT_NE(ids[i], BUFFER_INVALID_ID);
+    }
+
+    /* verify entries are stored */
+    ASSERT_EQ(buffer_active_count(buffer), 10);
+
+    /* manually release some entries */
+    for (int i = 0; i < 5; i++)
+    {
+        ASSERT_EQ(buffer_release(buffer, ids[i]), 0);
+    }
+
+    ASSERT_EQ(buffer_active_count(buffer), 5);
+
+    /* free buffer - should call eviction callback for remaining entries */
+    buffer_free(buffer);
+
+    /* if we get here without crash, eviction worked correctly */
+}
+
+/* test struct similar to transaction entry */
+typedef struct
+{
+    uint64_t id;
+    uint64_t snapshot_seq;
+    void *data;
+} test_entry_t;
+
+/* eviction callback for test entries */
+static void free_test_entry(void *data, void *ctx)
+{
+    (void)ctx;
+    if (data)
+    {
+        test_entry_t *entry = (test_entry_t *)data;
+        if (entry->data) free(entry->data);
+        free(entry);
+    }
+}
+
+/* test buffer eviction with struct entries */
+static void test_buffer_struct_eviction(void)
+{
+    buffer_t *buffer = NULL;
+
+    /* create buffer with eviction callback */
+    ASSERT_EQ(buffer_new_with_eviction(&buffer, 32, free_test_entry, NULL), 0);
+    ASSERT_TRUE(buffer != NULL);
+
+    /* allocate and store entries */
+    uint32_t ids[20];
+    for (int i = 0; i < 20; i++)
+    {
+        test_entry_t *entry = (test_entry_t *)malloc(sizeof(test_entry_t));
+        ASSERT_TRUE(entry != NULL);
+
+        entry->id = i;
+        entry->snapshot_seq = i * 1000;
+        entry->data = malloc(64); /* allocate some data */
+        ASSERT_TRUE(entry->data != NULL);
+
+        ASSERT_EQ(buffer_acquire(buffer, entry, &ids[i]), 0);
+    }
+
+    ASSERT_EQ(buffer_active_count(buffer), 20);
+
+    /* release half manually */
+    for (int i = 0; i < 10; i++)
+    {
+        ASSERT_EQ(buffer_release(buffer, ids[i]), 0);
+    }
+
+    ASSERT_EQ(buffer_active_count(buffer), 10);
+
+    /* free buffer - should clean up remaining entries */
+    buffer_free(buffer);
+}
+
 int main(void)
 {
     RUN_TEST(test_buffer_create, tests_passed);
@@ -731,6 +836,8 @@ int main(void)
     RUN_TEST(test_buffer_slot_reuse, tests_passed);
     RUN_TEST(test_buffer_concurrent_acquire_release, tests_passed);
     RUN_TEST(test_buffer_concurrent_mixed, tests_passed);
+    RUN_TEST(test_buffer_eviction_with_malloc, tests_passed);
+    RUN_TEST(test_buffer_struct_eviction, tests_passed);
     RUN_TEST(test_buffer_stress, tests_passed);
     benchmark_buffer_sequential();
     benchmark_buffer_concurrent();

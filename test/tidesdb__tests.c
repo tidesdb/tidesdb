@@ -3353,7 +3353,7 @@ static void test_concurrent_writes_visibility(void)
     int missing_keys;
     uint64_t final_commit_seq;
 
-    /* Launch write threads */
+    /* launch write threads */
     for (int i = 0; i < NUM_THREADS; i++)
     {
         thread_data[i].db = db;
@@ -3365,7 +3365,7 @@ static void test_concurrent_writes_visibility(void)
         pthread_create(&threads[i], NULL, concurrent_writes_write_thread, &thread_data[i]);
     }
 
-    /* Wait for all writes to complete */
+    /* wait for all writes to complete */
     for (int i = 0; i < NUM_THREADS; i++)
     {
         pthread_join(threads[i], NULL);
@@ -3373,7 +3373,7 @@ static void test_concurrent_writes_visibility(void)
 
     ASSERT_EQ(errors, 0);
 
-    /* Read phase: verify ALL keys are visible */
+    /* verify ALL keys are visible */
     final_commit_seq = atomic_load_explicit(&cf->commit_seq, memory_order_acquire);
     printf("Starting read phase. Current commit_seq: %lu\n", (unsigned long)final_commit_seq);
 
@@ -3406,7 +3406,6 @@ static void test_concurrent_writes_visibility(void)
         tidesdb_txn_free(txn);
     }
 
-    /* The bug would cause missing_keys > 0 */
     ASSERT_EQ(missing_keys, 0);
 
     free(threads);

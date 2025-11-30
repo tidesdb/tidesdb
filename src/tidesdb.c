@@ -244,9 +244,9 @@ static int tidesdb_vlog_read_value(tidesdb_t *db, tidesdb_sstable_t *sst, uint64
                                    size_t value_size, uint8_t **value);
 static tidesdb_sstable_t *tidesdb_sstable_create(const char *base_path, uint64_t id,
                                                  const tidesdb_column_family_config_t *config);
-static void tidesdb_sstable_free(tidesdb_sstable_t *sst);
+static void tidesdb_sstable_free(tidesdb_t *db, tidesdb_sstable_t *sst);
 static void tidesdb_sstable_ref(tidesdb_sstable_t *sst);
-static void tidesdb_sstable_unref(tidesdb_sstable_t *sst);
+static void tidesdb_sstable_unref(tidesdb_t *db, tidesdb_sstable_t *sst);
 static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t *sst,
                                                skip_list_t *memtable);
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
@@ -1329,22 +1329,15 @@ static int tidesdb_sstable_get_block_managers(tidesdb_t *db, tidesdb_sstable_t *
 {
     if (!db || !sst || !bms) return TDB_ERR_IO;
 
-    /* ensure sstable is in cache and block managers are open */
+    /* ensure sstable block managers are open */
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
         return TDB_ERR_IO;
     }
 
-    /* get block managers from cache using sstable ID-based keys */
-    char klog_cache_key[TDB_CACHE_KEY_LEN];
-    char vlog_cache_key[TDB_CACHE_KEY_LEN];
-    snprintf(klog_cache_key, sizeof(klog_cache_key), "bm:" TDB_U64_FMT ":klog",
-             TDB_U64_CAST(sst->id));
-    snprintf(vlog_cache_key, sizeof(vlog_cache_key), "bm:" TDB_U64_FMT ":vlog",
-             TDB_U64_CAST(sst->id));
-
-    bms->klog_bm = (block_manager_t *)fifo_cache_get(db->sstable_cache, klog_cache_key);
-    bms->vlog_bm = (block_manager_t *)fifo_cache_get(db->sstable_cache, vlog_cache_key);
+    /* get block managers directly from the sst */
+    bms->klog_bm = sst->klog_bm;
+    bms->vlog_bm = sst->vlog_bm;
 
     if (!bms->klog_bm || !bms->vlog_bm)
     {
@@ -1355,23 +1348,6 @@ static int tidesdb_sstable_get_block_managers(tidesdb_t *db, tidesdb_sstable_t *
 }
 
 /**
- * tidesdb_block_manager_cache_evict_cb
- * callback when a block manager is evicted from cache
- * closes the block manager to free file descriptors
- */
-static void tidesdb_block_manager_cache_evict_cb(const char *key, void *value, void *user_data)
-{
-    (void)key;
-    (void)user_data;
-    block_manager_t *bm = (block_manager_t *)value;
-
-    if (bm)
-    {
-        block_manager_close(bm);
-    }
-}
-
-/**
  * tidesdb_sstable_cache_evict_cb
  * callback when an sstable is evicted from cache
  * releases the sstable reference
@@ -1379,13 +1355,13 @@ static void tidesdb_block_manager_cache_evict_cb(const char *key, void *value, v
 static void tidesdb_sstable_cache_evict_cb(const char *key, void *value, void *user_data)
 {
     (void)key;
-    (void)user_data;
+    tidesdb_t *db = (tidesdb_t *)user_data;
     tidesdb_sstable_t *sst = (tidesdb_sstable_t *)value;
 
     if (!sst) return;
 
     /* release the cache's reference to the sstable */
-    tidesdb_sstable_unref(sst);
+    tidesdb_sstable_unref(db, sst);
 }
 
 /**
@@ -1411,10 +1387,10 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
         tidesdb_sstable_ref(sst);
 
         /* add to cache, which will evict old entries if needed */
-        if (fifo_cache_put(db->sstable_cache, cache_key, sst, tidesdb_sstable_cache_evict_cb,
-                           NULL) != 0)
+        if (fifo_cache_put(db->sstable_cache, cache_key, sst, tidesdb_sstable_cache_evict_cb, db) !=
+            0)
         {
-            tidesdb_sstable_unref(sst); /* release ref if cache add failed */
+            tidesdb_sstable_unref(db, sst); /* release ref if cache add failed */
             return -1;
         }
     }
@@ -1446,11 +1422,8 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
         return atomic_load_explicit(&sst->bm_open_state, memory_order_acquire) == 2 ? 0 : -1;
     }
 
-    /* we won the race, open block managers and cache them */
-    block_manager_t *klog_bm = NULL;
-    block_manager_t *vlog_bm = NULL;
-
-    if (block_manager_open_with_cache(&klog_bm, sst->klog_path,
+    /* we won the race, open block managers and store them in the sstable */
+    if (block_manager_open_with_cache(&sst->klog_bm, sst->klog_path,
                                       convert_sync_mode(sst->config->sync_mode),
                                       (uint32_t)sst->config->block_manager_cache_size) != 0)
     {
@@ -1458,38 +1431,12 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
         return -1;
     }
 
-    if (block_manager_open_with_cache(&vlog_bm, sst->vlog_path,
+    if (block_manager_open_with_cache(&sst->vlog_bm, sst->vlog_path,
                                       convert_sync_mode(sst->config->sync_mode),
                                       (uint32_t)sst->config->block_manager_cache_size) != 0)
     {
-        block_manager_close(klog_bm);
-        atomic_store_explicit(&sst->bm_open_state, 0, memory_order_release);
-        return -1;
-    }
-
-    /* add block managers to cache */
-    char klog_cache_key[TDB_CACHE_KEY_LEN];
-    char vlog_cache_key[TDB_CACHE_KEY_LEN];
-    snprintf(klog_cache_key, sizeof(klog_cache_key), "bm:" TDB_U64_FMT ":klog",
-             TDB_U64_CAST(sst->id));
-    snprintf(vlog_cache_key, sizeof(vlog_cache_key), "bm:" TDB_U64_FMT ":vlog",
-             TDB_U64_CAST(sst->id));
-
-    if (fifo_cache_put(db->sstable_cache, klog_cache_key, klog_bm,
-                       tidesdb_block_manager_cache_evict_cb, NULL) != 0)
-    {
-        block_manager_close(klog_bm);
-        block_manager_close(vlog_bm);
-        atomic_store_explicit(&sst->bm_open_state, 0, memory_order_release);
-        return -1;
-    }
-
-    if (fifo_cache_put(db->sstable_cache, vlog_cache_key, vlog_bm,
-                       tidesdb_block_manager_cache_evict_cb, NULL) != 0)
-    {
-        /* remove klog from cache since we're failing */
-        fifo_cache_remove(db->sstable_cache, klog_cache_key);
-        block_manager_close(vlog_bm);
+        block_manager_close(sst->klog_bm);
+        sst->klog_bm = NULL;
         atomic_store_explicit(&sst->bm_open_state, 0, memory_order_release);
         return -1;
     }
@@ -1527,6 +1474,8 @@ static tidesdb_sstable_t *tidesdb_sstable_create(const char *base_path, uint64_t
     atomic_init(&sst->num_vlog_blocks, 0);
     sst->klog_data_end_offset = 0;
     atomic_init(&sst->bm_open_state, 0);
+    sst->klog_bm = NULL;
+    sst->vlog_bm = NULL;
 
     size_t path_len = strlen(base_path) + 32;
     sst->klog_path = malloc(path_len);
@@ -1551,11 +1500,25 @@ static tidesdb_sstable_t *tidesdb_sstable_create(const char *base_path, uint64_t
 /**
  * tidesdb_sstable_free
  * free an sstable
+ * @param db database instance
  * @param sst sstable to free
  */
-static void tidesdb_sstable_free(tidesdb_sstable_t *sst)
+static void tidesdb_sstable_free(tidesdb_t *db, tidesdb_sstable_t *sst)
 {
+    (void)db; /* db parameter kept for API consistency but not needed */
     if (!sst) return;
+
+    /* close block managers owned by this SSTable */
+    if (sst->klog_bm)
+    {
+        block_manager_close(sst->klog_bm);
+        sst->klog_bm = NULL;
+    }
+    if (sst->vlog_bm)
+    {
+        block_manager_close(sst->vlog_bm);
+        sst->vlog_bm = NULL;
+    }
 
     free(sst->klog_path);
     free(sst->vlog_path);
@@ -1565,7 +1528,6 @@ static void tidesdb_sstable_free(tidesdb_sstable_t *sst)
 
     if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
     if (sst->block_index) succinct_trie_free(sst->block_index);
-    /* block managers are managed by cache, not freed here */
 
     free(sst);
 }
@@ -1583,14 +1545,15 @@ static void tidesdb_sstable_ref(tidesdb_sstable_t *sst)
 /**
  * tidesdb_sstable_unref
  * decrement reference count of an sstable
+ * @param db database instance
  * @param sst sstable to unreference
  */
-static void tidesdb_sstable_unref(tidesdb_sstable_t *sst)
+static void tidesdb_sstable_unref(tidesdb_t *db, tidesdb_sstable_t *sst)
 {
     if (!sst) return;
     if (atomic_fetch_sub(&sst->refcount, 1) == 1)
     {
-        tidesdb_sstable_free(sst);
+        tidesdb_sstable_free(db, sst);
     }
 }
 
@@ -2495,7 +2458,7 @@ static void tidesdb_level_free(tidesdb_level_t *level)
     {
         if (level->sstables[i])
         {
-            tidesdb_sstable_unref(level->sstables[i]);
+            tidesdb_sstable_unref(NULL, level->sstables[i]);
         }
     }
     free(level->sstables);
@@ -2607,7 +2570,7 @@ static int tidesdb_level_remove_sstable(tidesdb_t *db, tidesdb_level_t *level,
             /* unref old array's sstables */
             for (int i = 0; i < old_num; i++)
             {
-                tidesdb_sstable_unref(old_arr[i]);
+                tidesdb_sstable_unref(db, old_arr[i]);
             }
 
             /* always free old array after unreffing contents */
@@ -2627,7 +2590,7 @@ static int tidesdb_level_remove_sstable(tidesdb_t *db, tidesdb_level_t *level,
         /* CAS failed, cleanup and retry */
         for (int i = 0; i < new_idx; i++)
         {
-            tidesdb_sstable_unref(new_arr[i]);
+            tidesdb_sstable_unref(db, new_arr[i]);
         }
         free(new_arr);
     }
@@ -3031,14 +2994,14 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
     tidesdb_block_managers_t bms;
     if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
     {
-        tidesdb_sstable_unref(sst);
+        tidesdb_sstable_unref(db, sst);
         free(source);
         return NULL;
     }
 
     if (block_manager_cursor_init(&source->source.sstable.klog_cursor, bms.klog_bm) != 0)
     {
-        tidesdb_sstable_unref(sst);
+        tidesdb_sstable_unref(db, sst);
         free(source);
         return NULL;
     }
@@ -3046,7 +3009,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
     /* ensure sstable is open through cache */
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
-        tidesdb_sstable_unref(sst);
+        tidesdb_sstable_unref(db, sst);
         block_manager_cursor_free(source->source.sstable.klog_cursor);
         free(source);
         return NULL;
@@ -3060,7 +3023,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
     if (atomic_load(&sst->num_klog_blocks) == 0)
     {
         /* empty sstable, no data blocks to read */
-        tidesdb_sstable_unref(sst);
+        tidesdb_sstable_unref(db, sst);
         block_manager_cursor_free(source->source.sstable.klog_cursor);
         free(source);
         return NULL;
@@ -3084,7 +3047,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
             source->source.sstable.klog_cursor->current_pos >= sst->klog_data_end_offset)
         {
             /* cursor is at or past data end offset */
-            tidesdb_sstable_unref(sst);
+            tidesdb_sstable_unref(db, sst);
             block_manager_cursor_free(source->source.sstable.klog_cursor);
             free(source);
             return NULL;
@@ -3096,7 +3059,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
         if (!block)
         {
             /* no block available */
-            tidesdb_sstable_unref(sst);
+            tidesdb_sstable_unref(db, sst);
             block_manager_cursor_free(source->source.sstable.klog_cursor);
             free(source);
             return NULL;
@@ -3194,7 +3157,7 @@ static void tidesdb_merge_source_free(tidesdb_merge_source_t *source)
             block_manager_block_release(source->source.sstable.current_block_data);
         }
         block_manager_cursor_free(source->source.sstable.klog_cursor);
-        tidesdb_sstable_unref(source->source.sstable.sst);
+        tidesdb_sstable_unref(NULL, source->source.sstable.sst);
     }
 
     tidesdb_kv_pair_free(source->current_kv);
@@ -3803,7 +3766,12 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     if (!new_sst)
     {
         tidesdb_merge_heap_free(heap);
-        queue_free_with_data(sstables_to_delete, (void (*)(void *))tidesdb_sstable_unref);
+        while (!queue_is_empty(sstables_to_delete))
+        {
+            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
+            if (sst) tidesdb_sstable_unref(cf->db, sst);
+        }
+        queue_free(sstables_to_delete);
         return TDB_ERR_MEMORY;
     }
 
@@ -3815,9 +3783,14 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                                       convert_sync_mode(cf->config.sync_mode),
                                       (uint32_t)cf->config.block_manager_cache_size) != 0)
     {
-        tidesdb_sstable_unref(new_sst);
+        tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
-        queue_free_with_data(sstables_to_delete, (void (*)(void *))tidesdb_sstable_unref);
+        while (!queue_is_empty(sstables_to_delete))
+        {
+            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
+            if (sst) tidesdb_sstable_unref(cf->db, sst);
+        }
+        queue_free(sstables_to_delete);
         return TDB_ERR_IO;
     }
 
@@ -3826,9 +3799,14 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                                       (uint32_t)cf->config.block_manager_cache_size) != 0)
     {
         block_manager_close(klog_bm);
-        tidesdb_sstable_unref(new_sst);
+        tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
-        queue_free_with_data(sstables_to_delete, (void (*)(void *))tidesdb_sstable_unref);
+        while (!queue_is_empty(sstables_to_delete))
+        {
+            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
+            if (sst) tidesdb_sstable_unref(cf->db, sst);
+        }
+        queue_free(sstables_to_delete);
         return TDB_ERR_IO;
     }
 
@@ -4182,7 +4160,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     levels = cf->levels;
     tidesdb_level_add_sstable(levels[target_level], new_sst);
 
-    tidesdb_sstable_unref(new_sst);
+    tidesdb_sstable_unref(cf->db, new_sst);
 
     while (!queue_is_empty(sstables_to_delete))
     {
@@ -4199,7 +4177,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         unlink(sst->klog_path);
         unlink(sst->vlog_path);
 
-        tidesdb_sstable_unref(sst);
+        tidesdb_sstable_unref(cf->db, sst);
     }
 
     pthread_rwlock_unlock(&cf->levels_rwlock);
@@ -4299,7 +4277,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         while (!queue_is_empty(sstables_to_delete))
         {
             tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
-            if (sst) tidesdb_sstable_unref(sst);
+            if (sst) tidesdb_sstable_unref(cf->db, sst);
         }
         queue_free(sstables_to_delete);
 
@@ -4345,7 +4323,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                                           convert_sync_mode(cf->config.sync_mode),
                                           (uint32_t)cf->config.block_manager_cache_size) != 0)
         {
-            tidesdb_sstable_unref(new_sst);
+            tidesdb_sstable_unref(cf->db, new_sst);
             continue;
         }
 
@@ -4354,7 +4332,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                                           (uint32_t)cf->config.block_manager_cache_size) != 0)
         {
             block_manager_close(klog_bm);
-            tidesdb_sstable_unref(new_sst);
+            tidesdb_sstable_unref(cf->db, new_sst);
             continue;
         }
 
@@ -4625,11 +4603,11 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             pthread_rwlock_wrlock(&cf->levels_rwlock);
             tidesdb_level_add_sstable(target, new_sst);
             pthread_rwlock_unlock(&cf->levels_rwlock);
-            tidesdb_sstable_unref(new_sst);
+            tidesdb_sstable_unref(cf->db, new_sst);
         }
         else
         {
-            tidesdb_sstable_unref(new_sst);
+            tidesdb_sstable_unref(cf->db, new_sst);
         }
     }
 
@@ -4649,7 +4627,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 tidesdb_level_remove_sstable(cf->db, levels[level], sst);
             }
             /* unref our reference from the merge */
-            tidesdb_sstable_unref(sst);
+            tidesdb_sstable_unref(cf->db, sst);
         }
     }
     queue_free(sstables_to_delete);
@@ -4707,7 +4685,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         while (!queue_is_empty(sstables_to_delete))
         {
             tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
-            if (sst) tidesdb_sstable_unref(sst);
+            if (sst) tidesdb_sstable_unref(cf->db, sst);
         }
         queue_free(sstables_to_delete);
 
@@ -5142,11 +5120,11 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 levels = cf->levels;
                 tidesdb_level_add_sstable(levels[end_level], new_sst);
                 pthread_rwlock_unlock(&cf->levels_rwlock);
-                tidesdb_sstable_unref(new_sst);
+                tidesdb_sstable_unref(cf->db, new_sst);
             }
             else
             {
-                tidesdb_sstable_unref(new_sst);
+                tidesdb_sstable_unref(cf->db, new_sst);
             }
         }
 
@@ -5169,7 +5147,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         unlink(sst->klog_path);
         unlink(sst->vlog_path);
 
-        tidesdb_sstable_unref(sst);
+        tidesdb_sstable_unref(cf->db, sst);
     }
 
     pthread_rwlock_unlock(&cf->levels_rwlock);
@@ -5881,7 +5859,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
                 TDB_DEBUG_LOG("CF '%s': Flushed SSTable %" PRIu64 " to level 0", cf->name,
                               work->sst_id);
                 /* release our reference the level now owns it */
-                tidesdb_sstable_unref(sst);
+                tidesdb_sstable_unref(cf->db, sst);
 
                 if (wal)
                 {
@@ -5951,7 +5929,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             {
                 TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64 " write FAILED (error %d)", cf->name,
                               work->sst_id, write_result);
-                tidesdb_sstable_unref(sst);
+                tidesdb_sstable_unref(cf->db, sst);
             }
         }
         else
@@ -7477,7 +7455,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                 sst, key, key_size, cf->config.comparator, cf->config.comparator_ctx);
             if (!in_range)
             {
-                tidesdb_sstable_unref(sst);
+                tidesdb_sstable_unref(cf->db, sst);
                 continue;
             }
 
@@ -7499,7 +7477,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                      * l0 ssts are ordered newest-first, so first match is most recent */
                     if (i == 0)
                     {
-                        tidesdb_sstable_unref(sst);
+                        tidesdb_sstable_unref(cf->db, sst);
                         pthread_rwlock_unlock(&cf->levels_rwlock);
                         goto check_found_result;
                     }
@@ -7510,7 +7488,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                 }
             }
 
-            tidesdb_sstable_unref(sst);
+            tidesdb_sstable_unref(cf->db, sst);
         }
 
         if (i == 0 && found_any)
@@ -9526,16 +9504,16 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                             tidesdb_level_add_sstable(cf->levels[level_num - 1], sst);
                             pthread_rwlock_unlock(&cf->levels_rwlock);
 
-                            tidesdb_sstable_unref(sst);
+                            tidesdb_sstable_unref(cf->db, sst);
                         }
                         else
                         {
-                            tidesdb_sstable_unref(sst);
+                            tidesdb_sstable_unref(cf->db, sst);
                         }
                     }
                     else
                     {
-                        tidesdb_sstable_unref(sst);
+                        tidesdb_sstable_unref(cf->db, sst);
                     }
                 }
             }

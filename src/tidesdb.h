@@ -374,6 +374,8 @@ struct tidesdb_sstable_t
     succinct_trie_t *block_index;
     _Atomic(int) refcount;
     _Atomic(int) bm_open_state;
+    block_manager_t *klog_bm;
+    block_manager_t *vlog_bm;
     tidesdb_column_family_config_t *config;
 };
 
@@ -475,16 +477,16 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) commit_ticket;
     _Atomic(uint64_t) commit_serving;
     buffer_t *active_txn_buffer;
-    _Atomic(tidesdb_level_t **) levels; /* atomic for safe concurrent reads */
-    _Atomic(int) num_levels;            /* atomic for safe concurrent reads */
+    _Atomic(tidesdb_level_t **) levels;
+    _Atomic(int) num_levels;
     pthread_t compaction_thread;
     _Atomic(int) compaction_should_stop;
     _Atomic(uint64_t) compaction_count;
     _Atomic(uint64_t) next_sstable_id;
     tidesdb_t *db;
-    pthread_rwlock_t levels_rwlock;     /* protects levels array and sstable operations */
-    pthread_rwlock_t flush_rwlock;      /* protects flush operations */
-    pthread_rwlock_t compaction_rwlock; /* protects compaction operations */
+    pthread_rwlock_t levels_rwlock;
+    pthread_rwlock_t flush_rwlock;
+    pthread_rwlock_t compaction_rwlock;
 };
 
 /**

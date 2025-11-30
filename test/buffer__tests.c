@@ -692,8 +692,8 @@ void benchmark_buffer_concurrent(void)
 
     assert(buffer_new(&buffer, capacity) == 0);
 
-    pthread_t threads[num_threads];
-    stress_args_t args[num_threads];
+    pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
+    stress_args_t *args = (stress_args_t *)malloc(num_threads * sizeof(stress_args_t));
     _Atomic(int) total_acquired = 0;
 
     clock_t start = clock();
@@ -719,6 +719,8 @@ void benchmark_buffer_concurrent(void)
     printf("Concurrent acquire/release (%d threads): %.2f M ops/sec (%.3f seconds)\n", num_threads,
            acquired / elapsed / 1000000.0, elapsed);
 
+    free(threads);
+    free(args);
     buffer_free(buffer);
 }
 

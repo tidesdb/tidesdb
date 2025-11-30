@@ -166,15 +166,24 @@ int queue_enqueue(queue_t *queue, void *data)
 
     while (1)
     {
-        /* read tail and its next pointer */
+        /* read tail */
         tail = atomic_load(&queue->tail);
         queue_node_t *tail_ptr = get_ptr(tail);
 
+        /* verify tail is still consistent before dereferencing */
+        tagged_ptr_t tail_check = atomic_load(&queue->tail);
+        if (!tagged_ptr_equals(tail, tail_check))
+        {
+            backoff(spin_count++);
+            continue;
+        }
+
+        /* now safe to read tail_ptr->next */
         next = atomic_load(&tail_ptr->next);
         queue_node_t *next_ptr = get_ptr(next);
 
-        /* check if tail is still consistent */
-        tagged_ptr_t tail_check = atomic_load(&queue->tail);
+        /* check if tail is still consistent after reading next */
+        tail_check = atomic_load(&queue->tail);
         if (!tagged_ptr_equals(tail, tail_check))
         {
             backoff(spin_count++);
@@ -226,16 +235,25 @@ void *queue_dequeue(queue_t *queue)
 
     while (1)
     {
-        /* read head, tail, and head's next */
+        /* read head and tail */
         head = atomic_load(&queue->head);
         tail = atomic_load(&queue->tail);
         queue_node_t *head_ptr = get_ptr(head);
 
+        /* verify head is still consistent before dereferencing */
+        tagged_ptr_t head_check = atomic_load(&queue->head);
+        if (!tagged_ptr_equals(head, head_check))
+        {
+            backoff(spin_count++);
+            continue;
+        }
+
+        /* now safe to read head_ptr->next */
         next = atomic_load(&head_ptr->next);
         queue_node_t *next_ptr = get_ptr(next);
 
-        /* check consistency */
-        tagged_ptr_t head_check = atomic_load(&queue->head);
+        /* check consistency after reading next */
+        head_check = atomic_load(&queue->head);
         if (!tagged_ptr_equals(head, head_check))
         {
             backoff(spin_count++);

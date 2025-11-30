@@ -2240,6 +2240,7 @@ cleanup:
  */
 static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
 {
+    (void)db; /* unused parameter */
     /* open block managers temporarily for loading; they'll be managed by cache later */
     block_manager_t *klog_bm = NULL;
     block_manager_t *vlog_bm = NULL;
@@ -8545,11 +8546,12 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         if (source->type == MERGE_SOURCE_MEMTABLE)
         {
             skip_list_cursor_t *cursor = source->source.memtable.cursor;
+            /* seek positions cursor at first entry >= key */
             if (skip_list_cursor_seek(cursor, (uint8_t *)key, key_size) == 0)
             {
-                skip_list_cursor_next(cursor);
+                /* cursor is positioned, now load it into source->current_kv */
+                tidesdb_merge_source_advance(source);
             }
-            tidesdb_merge_source_advance(source);
         }
         else /* MERGE_SOURCE_SSTABLE */
         {
@@ -8601,7 +8603,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 {
                     int left = 0;
                     int right = block->num_entries - 1;
-                    int result_idx = 0;
+                    int result_idx = block->num_entries; /* default: no match found */
 
                     while (left <= right)
                     {
@@ -8612,13 +8614,14 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
 
                         if (cmp >= 0)
                         {
+                            /* found entry >= target, record it and search left half */
                             result_idx = mid;
                             right = mid - 1;
                         }
                         else
                         {
+                            /* entry < target, search right half */
                             left = mid + 1;
-                            result_idx = left;
                         }
                     }
 
@@ -8659,19 +8662,31 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         heap_sift_down(iter->heap, i);
     }
 
-    /* pop first visible entry */
+    /* peek at first visible entry (don't pop yet - sources are already positioned) */
     while (!tidesdb_merge_heap_empty(iter->heap))
     {
-        tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop(iter->heap);
-        if (!kv) break;
+        tidesdb_merge_source_t *top = iter->heap->sources[0];
+        if (!top->current_kv) break;
 
-        if (!tidesdb_iter_kv_visible(iter, kv))
+        if (!tidesdb_iter_kv_visible(iter, top->current_kv))
         {
-            tidesdb_kv_pair_free(kv);
+            /* not visible, advance this source and re-heapify */
+            if (tidesdb_merge_source_advance(top) != 0)
+            {
+                /* source exhausted, remove from heap */
+                iter->heap->sources[0] = iter->heap->sources[iter->heap->num_sources - 1];
+                iter->heap->num_sources--;
+                tidesdb_merge_source_free(top);
+            }
+            if (iter->heap->num_sources > 0)
+            {
+                heap_sift_down(iter->heap, 0);
+            }
             continue;
         }
 
-        iter->current = kv;
+        /* found visible entry, clone it without advancing */
+        iter->current = tidesdb_kv_pair_clone(top->current_kv);
         iter->valid = 1;
         return TDB_SUCCESS;
     }
@@ -8698,10 +8713,22 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         if (source->type == MERGE_SOURCE_MEMTABLE)
         {
             skip_list_cursor_t *cursor = source->source.memtable.cursor;
+            /* seek_for_prev positions cursor at first entry <= key */
             if (skip_list_cursor_seek_for_prev(cursor, (uint8_t *)key, key_size) == 0)
             {
-                /* cursor already positioned at target or predecessor */
-                tidesdb_merge_source_advance(source);
+                /* read current entry without advancing (cursor is already positioned) */
+                uint8_t *k, *v;
+                size_t k_size, v_size;
+                time_t ttl;
+                uint8_t deleted;
+                uint64_t seq;
+
+                if (skip_list_cursor_get_with_seq(cursor, &k, &k_size, &v, &v_size, &ttl, &deleted,
+                                                  &seq) == 0)
+                {
+                    source->current_kv =
+                        tidesdb_kv_pair_create(k, k_size, v, v_size, ttl, seq, deleted);
+                }
             }
         }
         else /* MERGE_SOURCE_SSTABLE */

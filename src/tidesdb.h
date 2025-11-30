@@ -475,8 +475,8 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) commit_ticket;
     _Atomic(uint64_t) commit_serving;
     buffer_t *active_txn_buffer;
-    tidesdb_level_t **levels; /* no longer atomic - protected by levels_rwlock */
-    int num_levels;           /* no longer atomic - protected by levels_rwlock */
+    _Atomic(tidesdb_level_t **) levels; /* atomic for safe concurrent reads */
+    _Atomic(int) num_levels;            /* atomic for safe concurrent reads */
     pthread_t compaction_thread;
     _Atomic(int) compaction_should_stop;
     _Atomic(uint64_t) compaction_count;

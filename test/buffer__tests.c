@@ -212,6 +212,22 @@ void test_buffer_clear(void)
     buffer_free(buffer);
 }
 
+/* context for foreach test */
+typedef struct
+{
+    int count;
+    int sum;
+} foreach_ctx_t;
+
+/* callback for foreach test */
+static void foreach_callback(uint32_t id, void *data, void *ctx)
+{
+    (void)id;
+    foreach_ctx_t *fctx = (foreach_ctx_t *)ctx;
+    fctx->count++;
+    if (data) fctx->sum += *(int *)data;
+}
+
 void test_buffer_foreach(void)
 {
     buffer_t *buffer = NULL;
@@ -226,20 +242,6 @@ void test_buffer_foreach(void)
     }
 
     /* count and sum via foreach */
-    typedef struct
-    {
-        int count;
-        int sum;
-    } foreach_ctx_t;
-
-    void foreach_callback(uint32_t id, void *data, void *ctx)
-    {
-        (void)id;
-        foreach_ctx_t *fctx = (foreach_ctx_t *)ctx;
-        fctx->count++;
-        if (data) fctx->sum += *(int *)data;
-    }
-
     foreach_ctx_t ctx = {0, 0};
     int visited = buffer_foreach(buffer, foreach_callback, &ctx);
 

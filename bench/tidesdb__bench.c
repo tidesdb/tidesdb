@@ -42,7 +42,7 @@ typedef struct
     int start;
     int end;
     int thread_id;
-    int *errors; /* pointer to shared error counter */
+    _Atomic(int) *errors; /* pointer to shared error counter */
 } thread_data_t;
 
 /**
@@ -626,7 +626,7 @@ int main()
     }
 
     /* error counter for verification */
-    int verification_errors = 0;
+    _Atomic(int) verification_errors = 0;
 
     for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
     {

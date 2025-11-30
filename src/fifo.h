@@ -34,114 +34,70 @@ typedef struct fifo_entry_t fifo_entry_t;
  */
 typedef void (*fifo_evict_callback_t)(const char *key, void *value, void *user_data);
 
-/* entry states for lock-free lifecycle management */
-typedef enum
-{
-    ENTRY_STATE_EMPTY = 0, /* slot is empty/available */
-    ENTRY_STATE_INSERTING, /* entry is being inserted */
-    ENTRY_STATE_ACTIVE,    /* entry is active and valid */
-    ENTRY_STATE_UPDATING,  /* entry value is being updated */
-    ENTRY_STATE_EVICTING,  /* entry is being evicted */
-    ENTRY_STATE_DELETED    /* entry has been logically deleted */
-} fifo_entry_state_t;
-
-/* tagged pointer for aba prevention in hash chains */
-typedef struct
-{
-    uintptr_t value;
-} fifo_tagged_ptr_t;
-
-/* tagged pointer bit allocation */
-#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
-#define FIFO_TAG_BITS 16
-#define FIFO_MARK_BIT ((uintptr_t)1ULL << 47) /* logical deletion mark */
-#define FIFO_TAG_MASK ((uintptr_t)0xFFFF000000000000ULL)
-#define FIFO_PTR_MASK ((uintptr_t)0x00007FFFFFFFFFFFULL)
-#else
-#define FIFO_TAG_BITS 8
-#define FIFO_MARK_BIT ((uintptr_t)1UL << 23)
-#define FIFO_TAG_MASK ((uintptr_t)0xFF000000UL)
-#define FIFO_PTR_MASK ((uintptr_t)0x007FFFFFUL)
-#endif
-
 /**
  * fifo_entry_t
- * a single entry in the lock-free fifo cache
- * @param state atomic state for lifecycle management
- * @param key the key string (immutable after insertion)
- * @param key_len length of key (immutable after insertion)
- * @param key_hash cached hash value (immutable after insertion)
- * @param value atomic pointer to value
- * @param user_data user data for callback
- * @param evict_cb eviction callback
- * @param hash_next tagged pointer to next entry in hash chain
- * @param seq_num insertion sequence number for fifo ordering
+ * represents a single entry in the fifo cache
+ * @param key the key string (owned by entry)
+ * @param key_len the length of the key (pre-computed)
+ * @param value the value pointer (not owned, managed by callback)
+ * @param user_data optional user data for callback
+ * @param evict_cb eviction callback for this entry
+ * @param prev previous entry in doubly linked list
+ * @param next next entry in doubly linked list
+ * @param hash_next next entry in hash table chain
  */
 struct fifo_entry_t
 {
-    _Atomic(int) state;
     char *key;
     size_t key_len;
-    uint64_t key_hash;
-    _Atomic(void *) value;
+    void *value;
     void *user_data;
     fifo_evict_callback_t evict_cb;
-    _Atomic(fifo_tagged_ptr_t) hash_next;
-    _Atomic(uint64_t) seq_num;
+    fifo_entry_t *prev;
+    fifo_entry_t *next;
+    fifo_entry_t *hash_next;
 };
-
-/* fifo order node for eviction queue */
-typedef struct fifo_order_node_t
-{
-    fifo_entry_t *entry;
-    _Atomic(struct fifo_order_node_t *) next;
-} fifo_order_node_t;
 
 /**
  * fifo_cache_t
- * lock-free fifo cache structure
+ * thread-safe FIFO cache with lock-free reads and configurable capacity
+ * eviction policy is FIFO (oldest inserted entry evicted first)
  * @param capacity maximum number of entries
- * @param size current number of active entries (atomic)
- * @param table hash table buckets (array of atomic tagged pointers)
- * @param table_size number of hash buckets
- * @param evict_head head of fifo eviction queue (oldest)
- * @param evict_tail tail of fifo eviction queue (newest)
- * @param seq_counter global sequence counter for fifo ordering
- * @param retired_list list of entries pending deletion
- * @param retired_lock lock for retired list (only used for reclamation)
+ * @param size current number of entries
+ * @param head newest entry (most recently inserted)
+ * @param tail oldest entry (evicted first when cache is full)
+ * @param table hash table for O(1) lookups
+ * @param table_size hash table size
+ * @param lock mutex for write operations (reads are lock-free)
  */
 struct fifo_cache_t
 {
     size_t capacity;
-    _Atomic(size_t) size;
-    _Atomic(fifo_tagged_ptr_t) *table;
+    size_t size;
+    fifo_entry_t *head;
+    fifo_entry_t *tail;
+    fifo_entry_t **table;
     size_t table_size;
-    _Atomic(fifo_order_node_t *) evict_head;
-    _Atomic(fifo_order_node_t *) evict_tail;
-    _Atomic(uint64_t) seq_counter;
-    fifo_entry_t **retired_list;
-    size_t retired_capacity;
-    _Atomic(size_t) retired_count;
-    pthread_mutex_t retired_lock;
+    pthread_mutex_t lock;
 };
 
 /**
  * fifo_cache_new
- * creates a new lock-free fifo cache
- * @param capacity maximum number of entries
- * @return pointer to new cache, or NULL on failure
+ * creates a new fifo cache with the specified capacity
+ * @param capacity maximum number of entries in the cache
+ * @return pointer to the new cache, or NULL on failure
  */
 fifo_cache_t *fifo_cache_new(size_t capacity);
 
 /**
  * fifo_cache_put
- * inserts or updates an entry (lock-free)
- * if cache is full, evicts oldest entry first
+ * inserts or updates an entry in the cache
+ * if the cache is full, the oldest entry (FIFO) is evicted
  * @param cache the cache
  * @param key the key string (will be copied)
- * @param value the value pointer
- * @param evict_cb optional eviction callback
- * @param user_data optional user data for callback
+ * @param value the value pointer (not copied, managed by callback)
+ * @param evict_cb optional eviction callback (can be NULL)
+ * @param user_data optional user data to pass to the callback (can be NULL)
  * @return 0 on success, -1 on failure
  */
 int fifo_cache_put(fifo_cache_t *cache, const char *key, void *value,
@@ -149,75 +105,76 @@ int fifo_cache_put(fifo_cache_t *cache, const char *key, void *value,
 
 /**
  * fifo_cache_get
- * retrieves a value from the cache (lock-free)
+ * retrieves a value from the cache
  * @param cache the cache
- * @param key the key
- * @return the value if found and active, NULL otherwise
+ * @param key the key string
+ * @return the value pointer, or NULL if not found
  */
 void *fifo_cache_get(fifo_cache_t *cache, const char *key);
 
 /**
  * fifo_cache_remove
- * removes an entry from the cache (lock-free)
- * @param cache the cache
- * @param key the key
+ * removes an entry from the cache and calls its eviction callback
+ * @param cache the fifo cache
+ * @param key the key string
  * @return 0 on success, -1 if not found
  */
 int fifo_cache_remove(fifo_cache_t *cache, const char *key);
 
 /**
  * fifo_cache_clear
- * removes all entries from the cache
- * @param cache the cache
+ * removes all entries from the cache, calling eviction callbacks
+ * @param cache the fifo cache
  */
 void fifo_cache_clear(fifo_cache_t *cache);
 
 /**
  * fifo_cache_free
- * frees the cache and all entries (calls eviction callbacks)
- * @param cache the cache
+ * frees the cache and all its entries (calls eviction callbacks)
+ * @param cache the fifo cache
  */
 void fifo_cache_free(fifo_cache_t *cache);
 
 /**
  * fifo_cache_destroy
  * frees the cache without calling eviction callbacks
- * @param cache the cache
+ * use this when you want to clean up the cache but handle the values separately
+ * @param cache the fifo cache
  */
 void fifo_cache_destroy(fifo_cache_t *cache);
 
 /**
  * fifo_cache_size
- * returns approximate current size (lock-free)
- * @param cache the cache
- * @return number of entries
+ * returns the current number of entries in the cache
+ * @param cache the fifo cache
+ * @return the number of entries
  */
 size_t fifo_cache_size(fifo_cache_t *cache);
 
 /**
  * fifo_cache_capacity
- * returns the maximum capacity
- * @param cache the cache
- * @return capacity
+ * returns the maximum capacity of the cache
+ * @param cache the fifo cache
+ * @return the capacity
  */
 size_t fifo_cache_capacity(fifo_cache_t *cache);
 
 /**
  * fifo_foreach_callback_t
- * callback for iterating over entries
- * @param key the key
- * @param value the value
- * @param user_data user-provided context
- * @return 0 to continue, non-zero to stop
+ * callback function for iterating over cache entries
+ * @param key the key of the entry
+ * @param value the value of the entry
+ * @param user_data optional user data passed to fifo_cache_foreach
+ * @return 0 to continue iteration, non-zero to stop
  */
 typedef int (*fifo_foreach_callback_t)(const char *key, void *value, void *user_data);
 
 /**
  * fifo_cache_foreach
- * iterates over all active entries
- * @param cache the cache
- * @param callback callback function
- * @param user_data user context
+ * iterates over all entries in the cache (from most to least recently used)
+ * @param cache the fifo cache
+ * @param callback callback function to call for each entry
+ * @param user_data optional user data to pass to the callback
  * @return number of entries visited
  */
 size_t fifo_cache_foreach(fifo_cache_t *cache, fifo_foreach_callback_t callback, void *user_data);

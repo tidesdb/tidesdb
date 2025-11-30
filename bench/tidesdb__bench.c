@@ -234,7 +234,7 @@ void *thread_get(void *arg)
                 {
                     if (data->errors)
                     {
-                        __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+                        atomic_fetch_add(data->errors, 1);
                     }
                     printf(BOLDRED "[Thread %d] GET verification failed for key %d:\n" RESET,
                            data->thread_id, j);
@@ -252,7 +252,7 @@ void *thread_get(void *arg)
                 /* key not found */
                 if (data->errors)
                 {
-                    __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+                    atomic_fetch_add(data->errors, 1);
                 }
                 printf(BOLDRED "[Thread %d] GET failed: key %d not found\n" RESET, data->thread_id,
                        j);
@@ -354,7 +354,7 @@ void *thread_iter_forward(void *arg)
                 {
                     if (data->errors)
                     {
-                        __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+                        atomic_fetch_add(data->errors, 1);
                     }
                     printf(BOLDRED
                            "[Thread %d] Forward iterator: keys out of order at position %d\n" RESET,

@@ -3299,7 +3299,7 @@ static void *concurrent_writes_write_thread(void *arg)
         tidesdb_txn_t *txn = NULL;
         if (tidesdb_txn_begin(data->db, &txn) != 0)
         {
-            __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+            atomic_fetch_add(data->errors, 1);
             continue;
         }
 
@@ -3311,14 +3311,14 @@ static void *concurrent_writes_write_thread(void *arg)
         if (tidesdb_txn_put(txn, data->cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                             strlen(value) + 1, 0) != 0)
         {
-            __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+            atomic_fetch_add(data->errors, 1);
             tidesdb_txn_free(txn);
             continue;
         }
 
         if (tidesdb_txn_commit(txn) != 0)
         {
-            __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+            atomic_fetch_add(data->errors, 1);
         }
 
         tidesdb_txn_free(txn);
@@ -3347,8 +3347,9 @@ static void test_concurrent_writes_visibility(void)
     const int TOTAL_KEYS = NUM_THREADS * KEYS_PER_THREAD;
 
     int errors = 0;
-    pthread_t threads[NUM_THREADS];
-    concurrent_writes_thread_data_t thread_data[NUM_THREADS];
+    pthread_t *threads = (pthread_t *)malloc(NUM_THREADS * sizeof(pthread_t));
+    concurrent_writes_thread_data_t *thread_data = (concurrent_writes_thread_data_t *)malloc(
+        NUM_THREADS * sizeof(concurrent_writes_thread_data_t));
     int missing_keys;
     uint64_t final_commit_seq;
 
@@ -3408,6 +3409,8 @@ static void test_concurrent_writes_visibility(void)
     /* The bug would cause missing_keys > 0 */
     ASSERT_EQ(missing_keys, 0);
 
+    free(threads);
+    free(thread_data);
     tidesdb_close(db);
     cleanup_test_dir();
 }

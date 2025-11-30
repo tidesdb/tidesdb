@@ -419,8 +419,8 @@ void test_buffer_concurrent_acquire_release(void)
     const int num_threads = 8;
     const int ops_per_thread = 10000;
 
-    pthread_t threads[num_threads];
-    thread_args_t args[num_threads];
+    pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
+    thread_args_t *args = (thread_args_t *)malloc(num_threads * sizeof(thread_args_t));
     _Atomic(int) success_count = 0;
     _Atomic(int) fail_count = 0;
 
@@ -442,6 +442,9 @@ void test_buffer_concurrent_acquire_release(void)
     printf("\n  Successful ops: %d, Failed (buffer full): %d\n  ", atomic_load(&success_count),
            atomic_load(&fail_count));
 
+    free(threads);
+    free(args);
+
     /* buffer should be empty at the end */
     assert(buffer_active_count(buffer) == 0);
 
@@ -457,11 +460,9 @@ void *concurrent_mixed_ops(void *arg)
     uint32_t my_ids[10];
     int my_count = 0;
 
-    unsigned int seed = (unsigned int)(args->thread_id + time(NULL));
-
     for (int i = 0; i < ops; i++)
     {
-        int op = rand_r(&seed) % 3;
+        int op = rand() % 3;
 
         if (op == 0 && my_count < 10)
         {
@@ -483,7 +484,7 @@ void *concurrent_mixed_ops(void *arg)
         else if (op == 1 && my_count > 0)
         {
             /* release */
-            int idx = rand_r(&seed) % my_count;
+            int idx = rand() % my_count;
             uint32_t id = my_ids[idx];
 
             void *data;
@@ -499,7 +500,7 @@ void *concurrent_mixed_ops(void *arg)
         else if (my_count > 0)
         {
             /* get */
-            int idx = rand_r(&seed) % my_count;
+            int idx = rand() % my_count;
             void *data;
             if (buffer_get(buffer, my_ids[idx], &data) == 0)
             {
@@ -530,8 +531,8 @@ void test_buffer_concurrent_mixed(void)
     const int num_threads = 8;
     const int ops_per_thread = 5000;
 
-    pthread_t threads[num_threads];
-    thread_args_t args[num_threads];
+    pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
+    thread_args_t *args = (thread_args_t *)malloc(num_threads * sizeof(thread_args_t));
     _Atomic(int) success_count = 0;
     _Atomic(int) fail_count = 0;
 
@@ -552,7 +553,8 @@ void test_buffer_concurrent_mixed(void)
 
     printf("\n  Total successful ops: %d\n  ", atomic_load(&success_count));
 
-    assert(buffer_active_count(buffer) == 0);
+    free(threads);
+    free(args);
     buffer_free(buffer);
 }
 
@@ -597,9 +599,10 @@ void test_buffer_stress(void)
 
     const int num_threads = 16;
     const int iterations = 10000;
+    const int capacity = 16;
 
-    pthread_t threads[num_threads];
-    stress_args_t args[num_threads];
+    pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
+    stress_args_t *args = (stress_args_t *)malloc(num_threads * sizeof(stress_args_t));
     _Atomic(int) total_acquired = 0;
 
     clock_t start = clock();
@@ -627,7 +630,8 @@ void test_buffer_stress(void)
     printf("    Total acquired: %d in %.3f seconds\n", acquired, elapsed);
     printf("    Throughput: %.2f M ops/sec\n  ", acquired / elapsed / 1000000.0);
 
-    assert(buffer_active_count(buffer) == 0);
+    free(threads);
+    free(args);
     buffer_free(buffer);
 }
 

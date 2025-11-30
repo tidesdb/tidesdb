@@ -18,95 +18,52 @@
  */
 #include "queue.h"
 
-#include <sched.h>
+#include "compat.h"
 
-/* maximum spin iterations before yielding */
-#define MAX_SPIN_COUNT 100
-
-/**
- * make_tagged_ptr
- * create a tagged pointer combining a raw pointer and version tag.
- * @param ptr the raw pointer
- * @param tag the version counter
- * @return tagged pointer value
- */
-static inline tagged_ptr_t make_tagged_ptr(queue_node_t *ptr, uintptr_t tag)
-{
-    tagged_ptr_t tp;
-    tp.value = ((uintptr_t)ptr & QUEUE_PTR_MASK) |
-               ((tag << (sizeof(uintptr_t) * 8 - QUEUE_TAG_BITS)) & QUEUE_TAG_MASK);
-    return tp;
-}
+/* node pool configuration */
+#define QUEUE_MAX_POOL_SIZE 64
 
 /**
- * get_ptr
- * extract the raw pointer from a tagged pointer.
- * @param tp the tagged pointer
- * @return raw pointer to queue_node_t
+ * queue_alloc_node
+ * @param queue the queue to allocate the node from
+ * @return the allocated node, or NULL on failure
  */
-static inline queue_node_t *get_ptr(tagged_ptr_t tp)
+static inline queue_node_t *queue_alloc_node(queue_t *queue)
 {
-    return (queue_node_t *)(tp.value & QUEUE_PTR_MASK);
-}
+    queue_node_t *node = NULL;
 
-/**
- * get_tag
- * extract the version tag from a tagged pointer.
- * @param tp the tagged pointer
- * @return version counter
- */
-static inline uintptr_t get_tag(tagged_ptr_t tp)
-{
-    return (tp.value & QUEUE_TAG_MASK) >> (sizeof(uintptr_t) * 8 - QUEUE_TAG_BITS);
-}
-
-/**
- * tagged_ptr_equals
- * compare two tagged pointers for equality.
- * @param a first tagged pointer
- * @param b second tagged pointer
- * @return 1 if equal, 0 otherwise
- */
-static inline int tagged_ptr_equals(tagged_ptr_t a, tagged_ptr_t b)
-{
-    return a.value == b.value;
-}
-
-/**
- * atomic_cas_tagged_ptr
- * atomic compare-and-swap for tagged pointers.
- * @param target pointer to atomic tagged pointer
- * @param expected pointer to expected value (updated on failure)
- * @param desired new value to store
- * @return 1 if successful, 0 if failed
- */
-static inline int atomic_cas_tagged_ptr(_Atomic(tagged_ptr_t) *target, tagged_ptr_t *expected,
-                                        tagged_ptr_t desired)
-{
-    return atomic_compare_exchange_strong(target, expected, desired);
-}
-
-/**
- * backoff
- * exponential backoff for contention.
- * @param iteration current spin iteration
- */
-static inline void backoff(int iteration)
-{
-    if (iteration < 10)
+    if (queue->node_pool)
     {
-        cpu_pause();
-    }
-    else if (iteration < MAX_SPIN_COUNT)
-    {
-        for (int i = 0; i < iteration; i++)
-        {
-            cpu_pause();
-        }
+        node = queue->node_pool;
+        queue->node_pool = node->next;
+        queue->pool_size--;
     }
     else
     {
-        sched_yield();
+        node = (queue_node_t *)malloc(sizeof(queue_node_t));
+    }
+
+    return node;
+}
+
+/**
+ * queue_free_node
+ * @param queue the queue to return the node to
+ * @param node the node to return
+ */
+static inline void queue_free_node(queue_t *queue, queue_node_t *node)
+{
+    if (queue->pool_size < queue->max_pool_size)
+    {
+        /* return to pool */
+        node->next = queue->node_pool;
+        queue->node_pool = node;
+        queue->pool_size++;
+    }
+    else
+    {
+        /* pool full, actually free */
+        free(node);
     }
 }
 
@@ -115,35 +72,25 @@ queue_t *queue_new(void)
     queue_t *queue = (queue_t *)malloc(sizeof(queue_t));
     if (queue == NULL) return NULL;
 
-    /* create sentinel (dummy) node */
-    queue_node_t *sentinel = (queue_node_t *)malloc(sizeof(queue_node_t));
-    if (sentinel == NULL)
+    queue->head = NULL;
+    atomic_store(&queue->atomic_head, NULL);
+    queue->tail = NULL;
+    atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
+    queue->shutdown = 0;
+    queue->waiter_count = 0;
+    queue->node_pool = NULL;
+    queue->pool_size = 0;
+    queue->max_pool_size = QUEUE_MAX_POOL_SIZE;
+
+    if (pthread_mutex_init(&queue->lock, NULL) != 0)
     {
-        free(queue);
-        return NULL;
-    }
-
-    sentinel->data = NULL;
-    atomic_store(&sentinel->next, make_tagged_ptr(NULL, 0));
-
-    /* both head and tail point to sentinel initially */
-    atomic_store(&queue->head, make_tagged_ptr(sentinel, 0));
-    atomic_store(&queue->tail, make_tagged_ptr(sentinel, 0));
-    atomic_store(&queue->size, 0);
-    atomic_store(&queue->shutdown, 0);
-    atomic_store(&queue->waiter_count, 0);
-
-    if (pthread_mutex_init(&queue->wait_lock, NULL) != 0)
-    {
-        free(sentinel);
         free(queue);
         return NULL;
     }
 
     if (pthread_cond_init(&queue->not_empty, NULL) != 0)
     {
-        pthread_mutex_destroy(&queue->wait_lock);
-        free(sentinel);
+        pthread_mutex_destroy(&queue->lock);
         free(queue);
         return NULL;
     }
@@ -155,72 +102,38 @@ int queue_enqueue(queue_t *queue, void *data)
 {
     if (queue == NULL) return -1;
 
-    queue_node_t *node = (queue_node_t *)malloc(sizeof(queue_node_t));
-    if (node == NULL) return -1;
+    pthread_mutex_lock(&queue->lock);
+
+    /* allocate from pool (must be inside lock) */
+    queue_node_t *node = queue_alloc_node(queue);
+    if (node == NULL)
+    {
+        pthread_mutex_unlock(&queue->lock);
+        return -1;
+    }
 
     node->data = data;
-    atomic_store(&node->next, make_tagged_ptr(NULL, 0));
+    node->next = NULL;
 
-    int spin_count = 0;
-    tagged_ptr_t tail, next;
-
-    while (1)
+    if (queue->tail == NULL)
     {
-        /* read tail */
-        tail = atomic_load(&queue->tail);
-        queue_node_t *tail_ptr = get_ptr(tail);
-
-        /* verify tail is still consistent before dereferencing */
-        tagged_ptr_t tail_check = atomic_load(&queue->tail);
-        if (!tagged_ptr_equals(tail, tail_check))
-        {
-            backoff(spin_count++);
-            continue;
-        }
-
-        /* now safe to read tail_ptr->next */
-        next = atomic_load(&tail_ptr->next);
-        queue_node_t *next_ptr = get_ptr(next);
-
-        /* check if tail is still consistent after reading next */
-        tail_check = atomic_load(&queue->tail);
-        if (!tagged_ptr_equals(tail, tail_check))
-        {
-            backoff(spin_count++);
-            continue;
-        }
-
-        if (next_ptr == NULL)
-        {
-            /* tail is pointing to the last node, try to link new node */
-            tagged_ptr_t new_next = make_tagged_ptr(node, get_tag(next) + 1);
-            if (atomic_cas_tagged_ptr(&tail_ptr->next, &next, new_next))
-            {
-                /* enqueue successful, try to swing tail to new node */
-                tagged_ptr_t new_tail = make_tagged_ptr(node, get_tag(tail) + 1);
-                atomic_cas_tagged_ptr(&queue->tail, &tail, new_tail);
-                break;
-            }
-        }
-        else
-        {
-            /* tail is falling behind, try to advance it */
-            tagged_ptr_t new_tail = make_tagged_ptr(next_ptr, get_tag(tail) + 1);
-            atomic_cas_tagged_ptr(&queue->tail, &tail, new_tail);
-        }
-
-        backoff(spin_count++);
+        queue->head = node;
+        atomic_store_explicit(&queue->atomic_head, node, memory_order_release);
+        queue->tail = node;
+    }
+    else
+    {
+        /* add to end */
+        queue->tail->next = node;
+        queue->tail = node;
     }
 
-    atomic_fetch_add(&queue->size, 1);
+    atomic_fetch_add_explicit(&queue->size, 1, memory_order_relaxed);
 
-    /* signal waiting threads */
-    if (atomic_load(&queue->waiter_count) > 0)
-    {
-        pthread_mutex_lock(&queue->wait_lock);
-        pthread_cond_signal(&queue->not_empty);
-        pthread_mutex_unlock(&queue->wait_lock);
-    }
+    /* signal waiting threads that queue is not empty */
+    pthread_cond_signal(&queue->not_empty);
+
+    pthread_mutex_unlock(&queue->lock);
 
     return 0;
 }
@@ -229,151 +142,137 @@ void *queue_dequeue(queue_t *queue)
 {
     if (queue == NULL) return NULL;
 
-    int spin_count = 0;
-    tagged_ptr_t head, tail, next;
-    void *data;
+    pthread_mutex_lock(&queue->lock);
 
-    while (1)
+    if (queue->head == NULL)
     {
-        /* read head and tail */
-        head = atomic_load(&queue->head);
-        tail = atomic_load(&queue->tail);
-        queue_node_t *head_ptr = get_ptr(head);
-
-        /* verify head is still consistent before dereferencing */
-        tagged_ptr_t head_check = atomic_load(&queue->head);
-        if (!tagged_ptr_equals(head, head_check))
-        {
-            backoff(spin_count++);
-            continue;
-        }
-
-        /* now safe to read head_ptr->next */
-        next = atomic_load(&head_ptr->next);
-        queue_node_t *next_ptr = get_ptr(next);
-
-        /* check consistency after reading next */
-        head_check = atomic_load(&queue->head);
-        if (!tagged_ptr_equals(head, head_check))
-        {
-            backoff(spin_count++);
-            continue;
-        }
-
-        if (head_ptr == get_ptr(tail))
-        {
-            /* queue appears empty or tail is falling behind */
-            if (next_ptr == NULL)
-            {
-                /* queue is empty */
-                return NULL;
-            }
-
-            /* tail is falling behind, try to advance it */
-            tagged_ptr_t new_tail = make_tagged_ptr(next_ptr, get_tag(tail) + 1);
-            atomic_cas_tagged_ptr(&queue->tail, &tail, new_tail);
-        }
-        else
-        {
-            /* read data before CAS, otherwise another dequeue might free the node */
-            data = next_ptr->data;
-
-            /* try to swing head to next node */
-            tagged_ptr_t new_head = make_tagged_ptr(next_ptr, get_tag(head) + 1);
-            if (atomic_cas_tagged_ptr(&queue->head, &head, new_head))
-            {
-                /* dequeue successful, free the old sentinel */
-                free(head_ptr);
-                atomic_fetch_sub(&queue->size, 1);
-                return data;
-            }
-        }
-
-        backoff(spin_count++);
+        /* queue is empty */
+        pthread_mutex_unlock(&queue->lock);
+        return NULL;
     }
+
+    queue_node_t *node = queue->head;
+    void *data = node->data;
+
+    queue->head = node->next;
+    atomic_store_explicit(&queue->atomic_head, node->next, memory_order_release);
+    if (queue->head == NULL)
+    {
+        /* queue is now empty */
+        queue->tail = NULL;
+    }
+
+    atomic_fetch_sub_explicit(&queue->size, 1, memory_order_relaxed);
+
+    /* return node to pool */
+    queue_free_node(queue, node);
+
+    pthread_mutex_unlock(&queue->lock);
+
+    return data;
 }
 
 void *queue_dequeue_wait(queue_t *queue)
 {
     if (queue == NULL) return NULL;
 
-    void *data;
+    pthread_mutex_lock(&queue->lock);
 
-    data = queue_dequeue(queue);
-    if (data != NULL) return data;
+    /* increment waiter count before waiting */
+    queue->waiter_count++;
 
-    /* no data available, need to wait */
-    pthread_mutex_lock(&queue->wait_lock);
-    atomic_fetch_add(&queue->waiter_count, 1);
-
-    while (1)
+    /* wait until queue is not empty or shutdown */
+    while (queue->head == NULL && !queue->shutdown)
     {
-        /* check shutdown flag */
-        if (atomic_load(&queue->shutdown))
-        {
-            atomic_fetch_sub(&queue->waiter_count, 1);
-            pthread_mutex_unlock(&queue->wait_lock);
-            return NULL;
-        }
-
-        /* try dequeue again (might have data now) */
-        data = queue_dequeue(queue);
-        if (data != NULL)
-        {
-            atomic_fetch_sub(&queue->waiter_count, 1);
-            pthread_mutex_unlock(&queue->wait_lock);
-            return data;
-        }
-
-        /* wait for signal */
-        pthread_cond_wait(&queue->not_empty, &queue->wait_lock);
+        pthread_cond_wait(&queue->not_empty, &queue->lock);
     }
+
+    /* decrement waiter count after waking up */
+    queue->waiter_count--;
+
+    /* always broadcast when waiter_count changes to wake queue_free if waiting */
+    if (queue->waiter_count == 0)
+    {
+        pthread_cond_broadcast(&queue->not_empty);
+    }
+
+    /* if shutdown and no data, return NULL */
+    if (queue->shutdown && queue->head == NULL)
+    {
+        pthread_mutex_unlock(&queue->lock);
+        return NULL;
+    }
+
+    queue_node_t *node = queue->head;
+    void *data = node->data;
+
+    queue->head = node->next;
+    atomic_store_explicit(&queue->atomic_head, node->next, memory_order_release);
+    if (queue->head == NULL)
+    {
+        queue->tail = NULL;
+    }
+
+    atomic_fetch_sub_explicit(&queue->size, 1, memory_order_relaxed);
+
+    /* return node to pool */
+    queue_free_node(queue, node);
+
+    pthread_mutex_unlock(&queue->lock);
+
+    return data;
 }
 
 void *queue_peek(queue_t *queue)
 {
     if (queue == NULL) return NULL;
 
-    tagged_ptr_t head = atomic_load(&queue->head);
-    queue_node_t *head_ptr = get_ptr(head);
+    pthread_mutex_lock(&queue->lock);
 
-    tagged_ptr_t next = atomic_load(&head_ptr->next);
-    queue_node_t *next_ptr = get_ptr(next);
-
-    if (next_ptr == NULL)
+    void *data = NULL;
+    if (queue->head != NULL)
     {
-        /* queue is empty (only sentinel) */
-        return NULL;
+        data = queue->head->data;
     }
 
-    return next_ptr->data;
+    pthread_mutex_unlock(&queue->lock);
+
+    return data;
 }
 
 size_t queue_size(queue_t *queue)
 {
     if (queue == NULL) return 0;
 
-    return atomic_load(&queue->size);
+    return atomic_load_explicit(&queue->size, memory_order_relaxed);
 }
 
 int queue_is_empty(queue_t *queue)
 {
     if (queue == NULL) return -1;
 
-    return (atomic_load(&queue->size) == 0) ? 1 : 0;
+    return (atomic_load_explicit(&queue->size, memory_order_relaxed) == 0) ? 1 : 0;
 }
 
 int queue_clear(queue_t *queue)
 {
     if (queue == NULL) return -1;
 
-    /* drain the queue */
-    void *data;
-    while ((data = queue_dequeue(queue)) != NULL)
+    pthread_mutex_lock(&queue->lock);
+
+    queue_node_t *current = queue->head;
+    while (current != NULL)
     {
-        /* data is discarded (not freed) */
-        (void)data;
+        queue_node_t *next = current->next;
+        queue_free_node(queue, current); /* return to pool */
+        current = next;
     }
+
+    queue->head = NULL;
+    queue->tail = NULL;
+    atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
+
+    pthread_mutex_unlock(&queue->lock);
 
     return 0;
 }
@@ -382,87 +281,85 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
 {
     if (queue == NULL || fn == NULL) return -1;
 
+    pthread_mutex_lock(&queue->lock);
+
     int count = 0;
-
-    /* start from head's next (skip sentinel) */
-    tagged_ptr_t head = atomic_load(&queue->head);
-    queue_node_t *head_ptr = get_ptr(head);
-
-    tagged_ptr_t current_tagged = atomic_load(&head_ptr->next);
-    queue_node_t *current = get_ptr(current_tagged);
-
+    queue_node_t *current = queue->head;
     while (current != NULL)
     {
         fn(current->data, context);
         count++;
-
-        tagged_ptr_t next_tagged = atomic_load(&current->next);
-        current = get_ptr(next_tagged);
+        current = current->next;
     }
+
+    pthread_mutex_unlock(&queue->lock);
 
     return count;
 }
 
 void *queue_peek_at(queue_t *queue, size_t index)
 {
-    if (queue == NULL) return NULL;
+    if (!queue) return NULL;
 
-    /* start from head's next (skip sentinel) */
-    tagged_ptr_t head = atomic_load(&queue->head);
-    queue_node_t *head_ptr = get_ptr(head);
-
-    tagged_ptr_t current_tagged = atomic_load(&head_ptr->next);
-    queue_node_t *current = get_ptr(current_tagged);
-
-    size_t i = 0;
-    while (current != NULL)
+    /* lock-free read using atomic_head - no lock needed!
+     * this is safe because:
+     * 1. nodes are never freed while in queue (only when dequeued)
+     * 2. atomic_head is updated with release semantics
+     * 3. we use acquire semantics to see all previous writes */
+    size_t size = atomic_load_explicit(&queue->size, memory_order_relaxed);
+    if (index >= size)
     {
-        if (i == index)
-        {
-            return current->data;
-        }
-        i++;
-
-        tagged_ptr_t next_tagged = atomic_load(&current->next);
-        current = get_ptr(next_tagged);
+        return NULL;
     }
 
-    return NULL;
+    queue_node_t *current = atomic_load_explicit(&queue->atomic_head, memory_order_acquire);
+    for (size_t i = 0; i < index && current; i++)
+    {
+        current = current->next;
+    }
+
+    return current ? current->data : NULL;
 }
 
 void queue_free(queue_t *queue)
 {
     if (queue == NULL) return;
 
-    atomic_store(&queue->shutdown, 1);
+    pthread_mutex_lock(&queue->lock);
 
-    /* wake all waiting threads */
-    pthread_mutex_lock(&queue->wait_lock);
+    /* set shutdown flag and wake all waiting threads */
+    queue->shutdown = 1;
     pthread_cond_broadcast(&queue->not_empty);
-    pthread_mutex_unlock(&queue->wait_lock);
 
-    /* wait for all waiters to exit (spin with yield) */
-    while (atomic_load(&queue->waiter_count) > 0)
-    {
-        pthread_mutex_lock(&queue->wait_lock);
-        pthread_cond_broadcast(&queue->not_empty);
-        pthread_mutex_unlock(&queue->wait_lock);
-        sched_yield();
-    }
-
-    /* free all nodes including sentinel */
-    tagged_ptr_t head = atomic_load(&queue->head);
-    queue_node_t *current = get_ptr(head);
-
+    /* clear the queue while holding the lock */
+    queue_node_t *current = queue->head;
     while (current != NULL)
     {
-        tagged_ptr_t next_tagged = atomic_load(&current->next);
-        queue_node_t *next = get_ptr(next_tagged);
+        queue_node_t *next = current->next;
         free(current);
         current = next;
     }
 
-    pthread_mutex_destroy(&queue->wait_lock);
+    current = queue->node_pool;
+    while (current != NULL)
+    {
+        queue_node_t *next = current->next;
+        free(current);
+        current = next;
+    }
+
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->node_pool = NULL;
+    atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
+
+    while (queue->waiter_count > 0)
+    {
+        pthread_cond_wait(&queue->not_empty, &queue->lock);
+    }
+
+    pthread_mutex_unlock(&queue->lock);
+    pthread_mutex_destroy(&queue->lock);
     pthread_cond_destroy(&queue->not_empty);
 
     free(queue);
@@ -472,44 +369,38 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
 {
     if (queue == NULL) return;
 
-    atomic_store(&queue->shutdown, 1);
+    pthread_mutex_lock(&queue->lock);
 
-    /* wake all waiting threads */
-    pthread_mutex_lock(&queue->wait_lock);
-    pthread_cond_broadcast(&queue->not_empty);
-    pthread_mutex_unlock(&queue->wait_lock);
-
-    /* wait for all waiters to exit */
-    while (atomic_load(&queue->waiter_count) > 0)
-    {
-        pthread_mutex_lock(&queue->wait_lock);
-        pthread_cond_broadcast(&queue->not_empty);
-        pthread_mutex_unlock(&queue->wait_lock);
-        sched_yield();
-    }
-
-    /* free all nodes including sentinel, and optionally data */
-    tagged_ptr_t head = atomic_load(&queue->head);
-    queue_node_t *current = get_ptr(head);
-    int is_sentinel = 1;
-
+    queue_node_t *current = queue->head;
     while (current != NULL)
     {
-        tagged_ptr_t next_tagged = atomic_load(&current->next);
-        queue_node_t *next = get_ptr(next_tagged);
-
-        /* free data (skip sentinel which has NULL data) */
-        if (!is_sentinel && free_fn != NULL && current->data != NULL)
+        queue_node_t *next = current->next;
+        if (free_fn != NULL && current->data != NULL)
         {
             free_fn(current->data);
         }
-
         free(current);
         current = next;
-        is_sentinel = 0;
     }
 
-    pthread_mutex_destroy(&queue->wait_lock);
+    current = queue->node_pool;
+    while (current != NULL)
+    {
+        queue_node_t *next = current->next;
+        free(current);
+        current = next;
+    }
+
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->size = 0;
+
+    queue->shutdown = 1;
+    pthread_cond_broadcast(&queue->not_empty);
+
+    pthread_mutex_unlock(&queue->lock);
+
+    pthread_mutex_destroy(&queue->lock);
     pthread_cond_destroy(&queue->not_empty);
 
     free(queue);

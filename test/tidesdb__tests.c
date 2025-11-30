@@ -3279,6 +3279,53 @@ static void test_no_data_loss_across_operations(void)
     cleanup_test_dir();
 }
 
+/* thread data for concurrent writes visibility test */
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int thread_id;
+    int start_key;
+    int end_key;
+    int *errors;
+} concurrent_writes_thread_data_t;
+
+/* write thread for concurrent writes visibility test */
+static void *concurrent_writes_write_thread(void *arg)
+{
+    concurrent_writes_thread_data_t *data = (concurrent_writes_thread_data_t *)arg;
+    for (int i = data->start_key; i < data->end_key; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(data->db, &txn) != 0)
+        {
+            __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+            continue;
+        }
+
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "key_%05d", i);
+        snprintf(value, sizeof(value), "value_from_thread_%d_key_%d", data->thread_id, i);
+
+        if (tidesdb_txn_put(txn, data->cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                            strlen(value) + 1, 0) != 0)
+        {
+            __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+            tidesdb_txn_free(txn);
+            continue;
+        }
+
+        if (tidesdb_txn_commit(txn) != 0)
+        {
+            __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
+        }
+
+        tidesdb_txn_free(txn);
+    }
+    return NULL;
+}
+
 /**
  * test_concurrent_writes_visibility
  * Tests that concurrent writes from multiple threads don't create visibility holes
@@ -3299,57 +3346,11 @@ static void test_concurrent_writes_visibility(void)
     const int KEYS_PER_THREAD = 10;
     const int TOTAL_KEYS = NUM_THREADS * KEYS_PER_THREAD;
 
-    typedef struct
-    {
-        tidesdb_t *db;
-        tidesdb_column_family_t *cf;
-        int thread_id;
-        int start_key;
-        int end_key;
-        int *errors;
-    } thread_data_t;
-
     int errors = 0;
     pthread_t threads[NUM_THREADS];
-    thread_data_t thread_data[NUM_THREADS];
+    concurrent_writes_thread_data_t thread_data[NUM_THREADS];
     int missing_keys;
     uint64_t final_commit_seq;
-
-    /* Write phase: concurrent writes from multiple threads */
-    auto void *write_thread(void *arg)
-    {
-        thread_data_t *data = (thread_data_t *)arg;
-        for (int i = data->start_key; i < data->end_key; i++)
-        {
-            tidesdb_txn_t *txn = NULL;
-            if (tidesdb_txn_begin(data->db, &txn) != 0)
-            {
-                __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
-                continue;
-            }
-
-            char key[32];
-            char value[64];
-            snprintf(key, sizeof(key), "key_%05d", i);
-            snprintf(value, sizeof(value), "value_from_thread_%d_key_%d", data->thread_id, i);
-
-            if (tidesdb_txn_put(txn, data->cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                strlen(value) + 1, 0) != 0)
-            {
-                __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
-                tidesdb_txn_free(txn);
-                continue;
-            }
-
-            if (tidesdb_txn_commit(txn) != 0)
-            {
-                __atomic_fetch_add(data->errors, 1, __ATOMIC_SEQ_CST);
-            }
-
-            tidesdb_txn_free(txn);
-        }
-        return NULL;
-    }
 
     /* Launch write threads */
     for (int i = 0; i < NUM_THREADS; i++)
@@ -3360,7 +3361,7 @@ static void test_concurrent_writes_visibility(void)
         thread_data[i].start_key = i * KEYS_PER_THREAD;
         thread_data[i].end_key = (i + 1) * KEYS_PER_THREAD;
         thread_data[i].errors = &errors;
-        pthread_create(&threads[i], NULL, write_thread, &thread_data[i]);
+        pthread_create(&threads[i], NULL, concurrent_writes_write_thread, &thread_data[i]);
     }
 
     /* Wait for all writes to complete */

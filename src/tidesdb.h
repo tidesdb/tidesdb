@@ -89,7 +89,7 @@ typedef struct
     skip_list_t *memtable;
     block_manager_t *wal;
     _Atomic(int) refcount;
-    int flushed;
+    _Atomic(int) flushed;
 } tidesdb_immutable_memtable_t;
 
 /* error codes */

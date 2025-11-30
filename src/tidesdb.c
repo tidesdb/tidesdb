@@ -8637,7 +8637,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                     }
 
                     /* update to the found entry */
-                    if (result_idx < block->num_entries)
+                    if ((uint32_t)result_idx < block->num_entries)
                     {
                         source->source.sstable.current_entry_idx = result_idx;
 

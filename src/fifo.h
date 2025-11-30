@@ -28,7 +28,6 @@ typedef struct fifo_entry_t fifo_entry_t;
 /**
  * fifo_evict_callback_t
  * callback function called when an entry is evicted from the cache
- * note: in lock-free implementation, callbacks may be called concurrently
  * @param key the key of the evicted entry
  * @param value the value of the evicted entry
  * @param user_data optional user data passed during entry insertion
@@ -216,7 +215,6 @@ typedef int (*fifo_foreach_callback_t)(const char *key, void *value, void *user_
 /**
  * fifo_cache_foreach
  * iterates over all active entries
- * note: iteration is not strictly consistent in concurrent scenarios
  * @param cache the cache
  * @param callback callback function
  * @param user_data user context

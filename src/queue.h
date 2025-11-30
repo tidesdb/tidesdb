@@ -21,20 +21,6 @@
 #include "compat.h"
 
 /**
- * Michael-Scott Lock-Free Queue Implementation
- *
- * This implementation is based on the algorithm described in:
- * "Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms"
- * by Maged M. Michael and Michael L. Scott (1996)
- *
- * Key features:
- * - Lock-free enqueue and dequeue operations using CAS
- * - ABA problem mitigation using tagged pointers (version counters)
- * - Sentinel node to simplify boundary conditions
- * - Optional blocking wait with condition variables
- */
-
-/**
  * QUEUE_TAG_BITS
  * Number of bits used for the ABA counter in tagged pointers.
  * On 64-bit systems, we use the upper bits for the tag.
@@ -44,7 +30,7 @@
 #define QUEUE_TAG_MASK ((uintptr_t)0xFFFF000000000000ULL)
 #define QUEUE_PTR_MASK ((uintptr_t)0x0000FFFFFFFFFFFFULL)
 #else
-/* 32-bit systems: use upper 8 bits for tag */
+/* 32-bit systems use upper 8 bits for tag */
 #define QUEUE_TAG_BITS 8
 #define QUEUE_TAG_MASK ((uintptr_t)0xFF000000UL)
 #define QUEUE_PTR_MASK ((uintptr_t)0x00FFFFFFUL)
@@ -52,8 +38,9 @@
 
 /**
  * tagged_ptr_t
- * Tagged pointer to solve the ABA problem in lock-free algorithms.
- * Combines a pointer with a version counter.
+ * tagged pointer to solve the ABA problem in lock-free algorithms.
+ * combines a pointer with a version counter.
+ * @param value pointer to data
  */
 typedef struct
 {
@@ -62,7 +49,7 @@ typedef struct
 
 /**
  * queue_node_t
- * Internal node structure for the lock-free queue.
+ * internal node structure for the lock-free queue.
  * @param data pointer to user data
  * @param next tagged pointer to next node (includes ABA counter)
  */
@@ -74,7 +61,7 @@ typedef struct queue_node_t
 
 /**
  * queue_t
- * Michael-Scott lock-free FIFO queue implementation.
+ * michael-scott lock-free FIFO queue implementation.
  * @param head tagged pointer to sentinel/first node (atomic)
  * @param tail tagged pointer to last node (atomic)
  * @param size current number of elements (atomic, approximate)
@@ -96,16 +83,16 @@ typedef struct
 
 /**
  * queue_new
- * Create a new lock-free queue.
- * Initializes with a sentinel node.
+ * create a new lock-free queue.
+ * initializes with a sentinel node.
  * @return pointer to new queue, NULL on failure
  */
 queue_t *queue_new(void);
 
 /**
  * queue_enqueue
- * Add an item to the back of the queue (lock-free).
- * Uses CAS operations for thread safety.
+ * add an item to the back of the queue (lock-free).
+ * uses CAS operations for thread safety.
  * @param queue the queue
  * @param data pointer to data to enqueue
  * @return 0 on success, -1 on failure
@@ -114,8 +101,8 @@ int queue_enqueue(queue_t *queue, void *data);
 
 /**
  * queue_dequeue
- * Remove and return item from front of queue (lock-free).
- * Uses CAS operations for thread safety.
+ * remove and return item from front of queue (lock-free).
+ * uses CAS operations for thread safety.
  * @param queue the queue
  * @return pointer to dequeued data, NULL if queue is empty
  */
@@ -123,8 +110,8 @@ void *queue_dequeue(queue_t *queue);
 
 /**
  * queue_dequeue_wait
- * Remove and return item from front of queue, blocking until available.
- * Uses condition variable for efficient waiting.
+ * remove and return item from front of queue, blocking until available.
+ * uses condition variable for efficient waiting.
  * @param queue the queue
  * @return pointer to dequeued data, NULL if queue is destroyed or on error
  */
@@ -132,9 +119,7 @@ void *queue_dequeue_wait(queue_t *queue);
 
 /**
  * queue_peek
- * View item at front of queue without removing it.
- * Note: In a lock-free queue, the peeked value may be dequeued
- * by another thread before caller can act on it.
+ * view item at front of queue without removing it.
  * @param queue the queue
  * @return pointer to front data, NULL if queue is empty
  */
@@ -142,8 +127,7 @@ void *queue_peek(queue_t *queue);
 
 /**
  * queue_size
- * Get approximate number of items in queue.
- * Note: In a concurrent environment, this is approximate.
+ * get approximate number of items in queue.
  * @param queue the queue
  * @return number of items, 0 if queue is NULL or empty
  */
@@ -151,8 +135,7 @@ size_t queue_size(queue_t *queue);
 
 /**
  * queue_is_empty
- * Check if queue is empty.
- * Note: Result may be stale in concurrent environment.
+ * check if queue is empty.
  * @param queue the queue
  * @return 1 if empty, 0 if not empty, -1 on error
  */
@@ -160,8 +143,7 @@ int queue_is_empty(queue_t *queue);
 
 /**
  * queue_clear
- * Remove all items from queue without freeing the data.
- * Note: Not lock-free, acquires wait_lock.
+ * remove all items from queue without freeing the data.
  * @param queue the queue
  * @return 0 on success, -1 on error
  */
@@ -169,9 +151,8 @@ int queue_clear(queue_t *queue);
 
 /**
  * queue_foreach
- * Iterate over all items in the queue and call function for each.
- * Note: Not lock-free, provides snapshot iteration.
- * Items may be added/removed during iteration.
+ * iterate over all items in the queue and call function for each.
+ * items may be added/removed during iteration.
  * @param queue the queue
  * @param fn callback function called for each item
  * @param context user-provided context passed to callback
@@ -181,8 +162,7 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
 
 /**
  * queue_peek_at
- * Peek at item at specific index without removing it.
- * Note: Not lock-free, index may be invalid by the time caller acts.
+ * peek at item at specific index without removing it.
  * @param queue the queue
  * @param index the index to peek at (0 = head)
  * @return pointer to data at index, NULL if index out of bounds
@@ -191,15 +171,15 @@ void *queue_peek_at(queue_t *queue, size_t index);
 
 /**
  * queue_free
- * Free the queue structure (does not free the data pointers).
- * Wakes all waiting threads before destruction.
+ * free the queue structure (does not free the data pointers).
+ * wakes all waiting threads before destruction.
  * @param queue the queue to free
  */
 void queue_free(queue_t *queue);
 
 /**
  * queue_free_with_data
- * Free the queue and all data using provided free function.
+ * free the queue and all data using provided free function.
  * @param queue the queue to free
  * @param free_fn function to free each data element (can be NULL)
  */

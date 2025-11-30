@@ -22,19 +22,6 @@
 
 #include "xxhash.h"
 
-/*
- * lock-free fifo cache implementation
- *
- * this combines several lock-free techniques:
- * 1. harris-style logical deletion with mark bits for hash chains
- * 2. michael-scott queue algorithm for fifo eviction order
- * 3. atomic state machine for safe entry lifecycle
- *
- * memory reclamation uses a simplified approach with deferred freeing.
- * for production use, consider implementing hazard pointers or epoch-based
- * reclamation for stronger guarantees.
- */
-
 /* configuration */
 #define FIFO_MAX_RETRIES   1000
 #define FIFO_BACKOFF_LIMIT 64
@@ -51,8 +38,6 @@ static inline uint64_t fifo_hash(const char *key, size_t len)
 {
     return XXH64(key, len, 0);
 }
-
-/* tagged pointer helpers */
 
 /*
  * make_tagged_ptr
@@ -130,8 +115,11 @@ static inline int tagged_ptr_equals(fifo_tagged_ptr_t a, fifo_tagged_ptr_t b)
     return a.value == b.value;
 }
 
-/* backoff and utility */
-
+/**
+ * backoff
+ * exponential backoff for contention.
+ * @param iteration current spin iteration
+ */
 static inline void backoff(int iteration)
 {
     if (iteration < 10)
@@ -147,8 +135,6 @@ static inline void backoff(int iteration)
         sched_yield();
     }
 }
-
-/* entry allocation and state management */
 
 /*
  * fifo_entry_new
@@ -265,8 +251,6 @@ static void fifo_retire_entry(fifo_cache_t *cache, fifo_entry_t *entry)
 
     pthread_mutex_unlock(&cache->retired_lock);
 }
-
-/* fifo eviction queue (michael-scott style) */
 
 /*
  * fifo_order_node_new

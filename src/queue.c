@@ -20,27 +20,12 @@
 
 #include <sched.h>
 
-/**
- * Michael-Scott Lock-Free Queue Implementation
- *
- * Reference:
- * M. M. Michael and M. L. Scott, "Simple, Fast, and Practical Non-Blocking
- * and Blocking Concurrent Queue Algorithms," PODC 1996.
- *
- * This implementation uses tagged pointers to solve the ABA problem.
- * The queue always maintains a sentinel (dummy) node at the head.
- */
-
-/* Maximum spin iterations before yielding */
+/* maximum spin iterations before yielding */
 #define MAX_SPIN_COUNT 100
-
-/* --------------------------------------------------------------------------
- * Tagged Pointer Helpers
- * -------------------------------------------------------------------------- */
 
 /**
  * make_tagged_ptr
- * Create a tagged pointer combining a raw pointer and version tag.
+ * create a tagged pointer combining a raw pointer and version tag.
  * @param ptr the raw pointer
  * @param tag the version counter
  * @return tagged pointer value
@@ -55,7 +40,7 @@ static inline tagged_ptr_t make_tagged_ptr(queue_node_t *ptr, uintptr_t tag)
 
 /**
  * get_ptr
- * Extract the raw pointer from a tagged pointer.
+ * extract the raw pointer from a tagged pointer.
  * @param tp the tagged pointer
  * @return raw pointer to queue_node_t
  */
@@ -66,7 +51,7 @@ static inline queue_node_t *get_ptr(tagged_ptr_t tp)
 
 /**
  * get_tag
- * Extract the version tag from a tagged pointer.
+ * extract the version tag from a tagged pointer.
  * @param tp the tagged pointer
  * @return version counter
  */
@@ -77,7 +62,7 @@ static inline uintptr_t get_tag(tagged_ptr_t tp)
 
 /**
  * tagged_ptr_equals
- * Compare two tagged pointers for equality.
+ * compare two tagged pointers for equality.
  * @param a first tagged pointer
  * @param b second tagged pointer
  * @return 1 if equal, 0 otherwise
@@ -89,7 +74,7 @@ static inline int tagged_ptr_equals(tagged_ptr_t a, tagged_ptr_t b)
 
 /**
  * atomic_cas_tagged_ptr
- * Atomic compare-and-swap for tagged pointers.
+ * atomic compare-and-swap for tagged pointers.
  * @param target pointer to atomic tagged pointer
  * @param expected pointer to expected value (updated on failure)
  * @param desired new value to store
@@ -103,7 +88,7 @@ static inline int atomic_cas_tagged_ptr(_Atomic(tagged_ptr_t) *target, tagged_pt
 
 /**
  * backoff
- * Exponential backoff for contention.
+ * exponential backoff for contention.
  * @param iteration current spin iteration
  */
 static inline void backoff(int iteration)
@@ -124,10 +109,6 @@ static inline void backoff(int iteration)
         sched_yield();
     }
 }
-
-/* --------------------------------------------------------------------------
- * Queue Implementation
- * -------------------------------------------------------------------------- */
 
 queue_t *queue_new(void)
 {
@@ -174,7 +155,6 @@ int queue_enqueue(queue_t *queue, void *data)
 {
     if (queue == NULL) return -1;
 
-    /* allocate new node */
     queue_node_t *node = (queue_node_t *)malloc(sizeof(queue_node_t));
     if (node == NULL) return -1;
 
@@ -223,7 +203,6 @@ int queue_enqueue(queue_t *queue, void *data)
         backoff(spin_count++);
     }
 
-    /* increment size */
     atomic_fetch_add(&queue->size, 1);
 
     /* signal waiting threads */
@@ -302,7 +281,6 @@ void *queue_dequeue_wait(queue_t *queue)
 
     void *data;
 
-    /* first try lock-free dequeue */
     data = queue_dequeue(queue);
     if (data != NULL) return data;
 
@@ -438,7 +416,6 @@ void queue_free(queue_t *queue)
 {
     if (queue == NULL) return;
 
-    /* set shutdown flag */
     atomic_store(&queue->shutdown, 1);
 
     /* wake all waiting threads */
@@ -477,7 +454,6 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
 {
     if (queue == NULL) return;
 
-    /* set shutdown flag */
     atomic_store(&queue->shutdown, 1);
 
     /* wake all waiting threads */

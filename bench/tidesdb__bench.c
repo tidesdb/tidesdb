@@ -528,6 +528,25 @@ void *thread_iter_seek_for_prev(void *arg)
     return NULL;
 }
 
+char *get_isolation_level_name(int isolation_level)
+{
+    switch (isolation_level)
+    {
+        case TDB_ISOLATION_READ_COMMITTED:
+            return "READ_COMMITTED";
+        case TDB_ISOLATION_READ_UNCOMMITTED:
+            return "READ_UNCOMMITTED";
+        case TDB_ISOLATION_REPEATABLE_READ:
+            return "REPEATABLE_READ";
+        case TDB_ISOLATION_SNAPSHOT:
+            return "SNAPSHOT";
+        case TDB_ISOLATION_SERIALIZABLE:
+            return "SERIALIZABLE";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 int main()
 {
     remove_directory(BENCH_DB_PATH);
@@ -569,6 +588,7 @@ int main()
     printf("  Background Compaction Interval: %d\n", BENCH_BACKGROUND_COMPACTION_INTERVAL);
     printf("  Block Manager Cache Size: %d\n", BENCH_COLUMN_FAMILY_BLOCK_CACHE);
     printf("  Comparator: %s\n", BENCH_COMPARATOR_NAME);
+    printf("  Isolation Level: %s\n", get_isolation_level_name(BENCH_ISOLATION_LEVEL));
     printf("======================================\n\n" RESET);
 
     uint8_t **keys = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t *));
@@ -702,6 +722,7 @@ int main()
     cf_config.sync_mode = BENCH_SYNC_MODE;
     cf_config.block_manager_cache_size = BENCH_COLUMN_FAMILY_BLOCK_CACHE;
     cf_config.comparator = skip_list_comparator_memcmp;
+    cf_config.default_isolation_level = BENCH_ISOLATION_LEVEL;
 
     if (tidesdb_create_column_family(tdb, BENCH_CF_NAME, &cf_config) != 0)
     {

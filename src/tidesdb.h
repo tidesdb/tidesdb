@@ -80,9 +80,9 @@ typedef struct tidesdb_compaction_work_t tidesdb_compaction_work_t;
  * tidesdb_immutable_memtable_t
  * an memtable being flushed to disk
  * @param memtable the immutable memtable
- * @param wal associated WAL
+ * @param wal associated write ahead log.
  * @param refcount reference count for safe concurrent access
- * @param flushed 1 if flushed to SSTable, 0 otherwise
+ * @param flushed 1 if flushed to sstable, 0 otherwise
  */
 typedef struct
 {
@@ -149,14 +149,13 @@ typedef enum
 #define TDB_DEFAULT_KLOG_BLOCK_SIZE                (32 * 1024) /* 32KB per klog block */
 #define TDB_DEFAULT_VLOG_BLOCK_SIZE                (32 * 1024) /* 32KB per vlog block */
 #define TDB_DEFAULT_VALUE_THRESHOLD                1024        /* values >= 1KB go to vlog */
-#define TDB_DEFAULT_INDEX_SAMPLE_RATIO             8           /* sample every 16th key for index */
+#define TDB_DEFAULT_INDEX_SAMPLE_RATIO             8           /* sample every 8th key for index */
 #define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000        /* 1000ms = 1 second */
 #define TDB_DEFAULT_MIN_DISK_SPACE                 (100 * 1024 * 1024) /* 100MB minimum free space */
-#define TDB_DEFAULT_MAX_IMMUTABLE_MEMTABLES        8  /* max immutable memtables before stall */
-#define TDB_DEFAULT_WRITE_STALL_THRESHOLD          16 /* hard limit -- block writes */
-#define TDB_DEFAULT_MAX_OPEN_SSTABLES              256
-#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE         1024 /* max concurrent txns per CF */
-#define TDB_DEFAULT_COMMIT_BUFFER_SIZE             4096 /* pending commits tracking window */
+#define TDB_DEFAULT_MAX_IMMUTABLE_MEMTABLES        8   /* soft limit -- start slowing writes */
+#define TDB_DEFAULT_WRITE_STALL_THRESHOLD          32  /* hard limit -- block writes completely */
+#define TDB_DEFAULT_MAX_OPEN_SSTABLES              512 /* max open sstables globally */
+#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE         1024 * 64 /* max concurrent txns per CF */
 
 #define TDB_MAX_TXN_CFS     10000  /* maximum number of CFs per transaction */
 #define TDB_MAX_PATH_LEN    4096   /* maximum path length */
@@ -226,7 +225,7 @@ typedef struct
  * @param num_flush_threads number of flush threads
  * @param num_compaction_threads number of compaction threads
  * @param enable_debug_logging enable debug logging
- * @param max_open_sstables maximum number of open SSTables (FIFO cache)
+ * @param max_open_sstables maximum number of open sstables (FIFO cache)
  */
 typedef struct
 {
@@ -268,7 +267,7 @@ typedef struct
  * written before klog_entry when entry has multi-CF flag
  * @param num_participant_cfs number of column families in transaction
  * @param checksum xxHash64 checksum of num_participant_cfs + cf_names
- * followed by: char cf_names[num_participant_cfs][TDB_MAX_CF_NAME_LEN] - null-terminated CF names
+ * followed by: char cf_names[num_participant_cfs][TDB_MAX_CF_NAME_LEN] -- null-terminated CF names
  */
 #pragma pack(push, 1)
 typedef struct
@@ -339,9 +338,9 @@ typedef struct
  * @param vlog_path path to .vlog file
  * @param klog_bm block manager for klog
  * @param vlog_bm block manager for vlog
- * @param min_key minimum key in this SSTable
+ * @param min_key minimum key in this sstable
  * @param min_key_size size of minimum key
- * @param max_key maximum key in this SSTable
+ * @param max_key maximum key in this sstable
  * @param max_key_size size of maximum key
  * @param num_entries total number of keys
  * @param num_klog_blocks number of klog blocks
@@ -349,10 +348,10 @@ typedef struct
  * @param klog_data_end_offset file offset where data blocks end (before index/bloom/metadata)
  * @param klog_size size of klog file
  * @param vlog_size size of vlog file
- * @param created_at creation timestamp
  * @param bloom_filter bloom filter for fast lookups
  * @param block_index succinct trie for fast lookups
  * @param refcount reference count
+ * @param bm_open_state atomic state for block manager (0=closed, 1=opening, 2=open)
  * @param config column family configuration
  */
 struct tidesdb_sstable_t
@@ -360,8 +359,6 @@ struct tidesdb_sstable_t
     uint64_t id;
     char *klog_path;
     char *vlog_path;
-    block_manager_t *klog_bm;
-    block_manager_t *vlog_bm;
     uint8_t *min_key;
     size_t min_key_size;
     uint8_t *max_key;
@@ -372,19 +369,17 @@ struct tidesdb_sstable_t
     uint64_t klog_data_end_offset;
     uint64_t klog_size;
     uint64_t vlog_size;
-    time_t created_at;
     uint64_t max_seq;
     bloom_filter_t *bloom_filter;
     succinct_trie_t *block_index;
     _Atomic(int) refcount;
-    _Atomic(int)
-        bm_open_state; /* 0=closed, 1=opening, 2=open -- lockless state for block manager */
+    _Atomic(int) bm_open_state;
     tidesdb_column_family_config_t *config;
 };
 
 /**
  * tidesdb_level_t
- * a level in the LSM tree with reference counting for safe concurrent access
+ * a level in the LSM tree
  * @param level_num level number
  * @param capacity capacity of level in bytes
  * @param current_size current size of level in bytes
@@ -394,20 +389,18 @@ struct tidesdb_sstable_t
  * @param file_boundaries file boundaries for partitioning
  * @param boundary_sizes sizes of boundary keys
  * @param num_boundaries number of boundaries
- * @param refcount reference count for safe concurrent access
  */
 struct tidesdb_level_t
 {
     int level_num;
     size_t capacity;
     _Atomic(size_t) current_size;
-    _Atomic(tidesdb_sstable_t **) sstables; /* atomic pointer to array */
+    _Atomic(tidesdb_sstable_t **) sstables;
     _Atomic(int) num_sstables;
     _Atomic(int) sstables_capacity;
     uint8_t **file_boundaries;
     size_t *boundary_sizes;
     _Atomic(int) num_boundaries;
-    _Atomic(int) refcount; /* reference count for level */
 };
 
 /**
@@ -416,14 +409,12 @@ struct tidesdb_level_t
  * @param seq_num sequence number being committed
  * @param committed atomic flag: 0=pending, 1=committed
  * @param txn_id transaction ID for debugging
- * @param timestamp when this entry was created
  */
 typedef struct
 {
     uint64_t seq_num;
     _Atomic(int) committed;
     uint64_t txn_id;
-    uint64_t timestamp;
 } tidesdb_commit_entry_t;
 
 /**
@@ -434,7 +425,6 @@ typedef struct
  * @param isolation isolation level
  * @param buffer_slot_id slot ID in buffer for quick access
  * @param generation generation counter for ABA prevention
- * @param start_time transaction start timestamp
  */
 typedef struct
 {
@@ -443,7 +433,6 @@ typedef struct
     tidesdb_isolation_level_t isolation;
     uint32_t buffer_slot_id;
     uint64_t generation;
-    uint64_t start_time;
 } tidesdb_txn_entry_t;
 
 /**
@@ -464,13 +453,12 @@ typedef struct
  * @param num_levels number of disk levels
  * @param compaction_thread thread for background compaction
  * @param compaction_should_stop flag to stop compaction thread
- * @param total_writes total number of writes
- * @param total_reads total number of reads
  * @param compaction_count total number of compactions
- * @param next_sstable_id next SSTable ID
+ * @param next_sstable_id next sstable ID
  * @param db parent database reference
- * @param flush_state atomic state for memtable rotation (0=idle, 1=rotating, 2=flushing)
- * @param cf_state atomic state for lifecycle (0=closed, 1=opening, 2=open, 3=closing)
+ * @param levels_rwlock protects levels array and sstable add/remove operations
+ * @param flush_rwlock protects memtable flush operations
+ * @param compaction_rwlock protects compaction operations
  */
 struct tidesdb_column_family_t
 {
@@ -484,22 +472,19 @@ struct tidesdb_column_family_t
     queue_t *immutable_memtables;
     _Atomic(uint64_t) next_seq_num;
     _Atomic(uint64_t) commit_seq;
-    _Atomic(uint64_t) commit_ticket;  /* next ticket for commit ordering */
-    _Atomic(uint64_t) commit_serving; /* currently serving ticket */
-    buffer_t *active_txn_buffer;      /* lock-free buffer of active transactions */
-    _Atomic(tidesdb_level_t **) levels;
-    _Atomic(int) num_levels;
+    _Atomic(uint64_t) commit_ticket;
+    _Atomic(uint64_t) commit_serving;
+    buffer_t *active_txn_buffer;
+    tidesdb_level_t **levels; /* no longer atomic - protected by levels_rwlock */
+    int num_levels;           /* no longer atomic - protected by levels_rwlock */
     pthread_t compaction_thread;
     _Atomic(int) compaction_should_stop;
-    _Atomic(uint64_t) total_writes;
-    _Atomic(uint64_t) total_reads;
     _Atomic(uint64_t) compaction_count;
     _Atomic(uint64_t) next_sstable_id;
     tidesdb_t *db;
-    _Atomic(int) flush_state;      /* 0=idle, 1=rotating, 2=flushing - lockless memtable rotation */
-    _Atomic(int) cf_state;         /* 0=closed, 1=opening, 2=open, 3=closing - lockless lifecycle */
-    _Atomic(int) compaction_state; /* 0=idle, 1=compacting - lockless compaction state */
-    _Atomic(int) levels_lock;      /* 0=unlocked, 1=locked - protects level add/remove operations */
+    pthread_rwlock_t levels_rwlock;     /* protects levels array and sstable operations */
+    pthread_rwlock_t flush_rwlock;      /* protects flush operations */
+    pthread_rwlock_t compaction_rwlock; /* protects compaction operations */
 };
 
 /**
@@ -507,7 +492,7 @@ struct tidesdb_column_family_t
  * work item for flush thread pool
  * @param cf column family
  * @param imm immutable memtable wrapper (holds refcount)
- * @param sst_id SSTable ID
+ * @param sst_id sstable ID
  */
 struct tidesdb_flush_work_t
 {
@@ -530,8 +515,6 @@ struct tidesdb_compaction_work_t
     int target_level;
 };
 
-/* tidesdb_active_txn_t removed - replaced by buffer-based tidesdb_txn_entry_t */
-
 /**
  * tidesdb_t
  * main database handle
@@ -546,32 +529,38 @@ struct tidesdb_compaction_work_t
  * @param compaction_threads array of compaction threads
  * @param compaction_queue queue of compaction work items
  * @param compaction_should_stop flag to stop compaction threads
- * @param sstable_cache FIFO cache for SSTable file handles
+ * @param active_flush_workers number of workers actively processing
+ * @param active_compaction_workers number of workers actively processing
+ * @param sstable_cache FIFO cache for sstable file handles
  * @param is_open flag to indicate if database is open
+ * @param global_txn_seq global sequence counter for multi-CF transactions
+ * @param next_txn_id global transaction ID counter
+ * @param cached_available_disk_space cached available disk space in bytes
+ * @param last_disk_space_check timestamp of last disk space check
  * @param cf_list_state atomic state for CF list modifications (0=idle, 1=modifying)
  */
 struct tidesdb_t
 {
     char *db_path;
     tidesdb_config_t config;
-    _Atomic(tidesdb_column_family_t **) column_families; /* atomic pointer for lockless reads */
+    _Atomic(tidesdb_column_family_t **) column_families;
     _Atomic(int) num_column_families;
     _Atomic(int) cf_capacity;
     pthread_t *flush_threads;
     queue_t *flush_queue;
     _Atomic(int) flush_should_stop;
-    _Atomic(int) active_flush_workers; /* number of workers actively processing */
+    _Atomic(int) active_flush_workers;
     pthread_t *compaction_threads;
     queue_t *compaction_queue;
     _Atomic(int) compaction_should_stop;
-    _Atomic(int) active_compaction_workers; /* number of workers actively processing */
+    _Atomic(int) active_compaction_workers;
     fifo_cache_t *sstable_cache;
     _Atomic(int) is_open;
-    _Atomic(uint64_t) global_txn_seq; /* global sequence counter for multi-CF transactions */
-    _Atomic(uint64_t) next_txn_id;    /* global transaction ID counter */
-    _Atomic(uint64_t) cached_available_disk_space; /* cached available disk space in bytes */
-    _Atomic(time_t) last_disk_space_check;         /* timestamp of last disk space check */
-    _Atomic(int) cf_list_state; /* 0=idle, 1=modifying - lockless CF list management */
+    _Atomic(uint64_t) global_txn_seq;
+    _Atomic(uint64_t) next_txn_id;
+    _Atomic(uint64_t) cached_available_disk_space;
+    _Atomic(time_t) last_disk_space_check;
+    _Atomic(int) cf_list_state;
 };
 
 /**
@@ -618,8 +607,10 @@ typedef struct
  * @param write_set_capacity capacity of write keys array
  * @param cfs array of column families involved in transaction
  * @param cf_snapshots array of per-CF snapshot sequences (indexed same as cfs)
+ * @param cf_txn_slots array of per-CF transaction buffer slot IDs (indexed same as cfs)
  * @param num_cfs number of column families
  * @param cf_capacity capacity of column families array
+ * @param global_snapshot_seq global snapshot point for consistent multi-CF reads
  * @param parent parent transaction (for nested transactions)
  * @param savepoints array of savepoints
  * @param savepoint_names array of savepoint names
@@ -649,11 +640,11 @@ struct tidesdb_txn_t
     int write_set_count;
     int write_set_capacity;
     tidesdb_column_family_t **cfs;
-    uint64_t *cf_snapshots; /* per-CF snapshot sequences (indexed same as cfs) */
-    uint32_t *cf_txn_slots; /* per-CF transaction buffer slot IDs (indexed same as cfs) */
+    uint64_t *cf_snapshots;
+    uint32_t *cf_txn_slots;
     int num_cfs;
     int cf_capacity;
-    uint64_t global_snapshot_seq; /* global snapshot point for consistent multi-CF reads */
+    uint64_t global_snapshot_seq;
     tidesdb_txn_t *parent;
     tidesdb_txn_t **savepoints;
     char **savepoint_names;
@@ -666,12 +657,11 @@ struct tidesdb_txn_t
 
 /**
  * tidesdb_merge_source_t
- * is a source for merging (memtable or SSTable)
- * @param type type of source (memtable or SSTable)
- * @param source union of memtable or SSTable source
+ * is a source for merging (memtable or sstable)
+ * @param type type of source (memtable or sstable)
+ * @param source union of memtable or sstable source
  * @param current_kv current key-value pair
  * @param config column family configuration
-
  */
 typedef struct
 {
@@ -686,11 +676,12 @@ typedef struct
         struct
         {
             skip_list_cursor_t *cursor;
-            tidesdb_immutable_memtable_t *imm; /* NULL for active memtable, set for immutable */
+            tidesdb_immutable_memtable_t *imm;
         } memtable;
 
         struct
         {
+            tidesdb_t *db;
             tidesdb_sstable_t *sst;
             block_manager_cursor_t *klog_cursor;
             tidesdb_klog_block_t *current_block;
@@ -732,6 +723,7 @@ typedef struct
  * @param valid validity flag
  * @param direction direction of iteration (1=forward, -1=backward)
  * @param snapshot_time snapshot time for TTL checks
+ * @param cf_snapshot snapshot sequence for visibility checks
  */
 struct tidesdb_iter_t
 {
@@ -742,26 +734,20 @@ struct tidesdb_iter_t
     int valid;
     int direction;
     time_t snapshot_time;
-    uint64_t cf_snapshot; /* snapshot sequence for visibility checks */
+    uint64_t cf_snapshot;
 };
 
 /**
  * tidesdb_stats_t
  * statistics for database
- * @param total_writes total number of writes
- * @param total_reads total number of reads
- * @param compaction_count total number of compactions
  * @param num_levels number of levels
  * @param memtable_size size of memtable
  * @param level_sizes sizes of each level
- * @param level_num_sstables number of SSTables in each level
+ * @param level_num_sstables number of sstables in each level
  * @param config column family configuration
  */
 typedef struct tidesdb_stats_t
 {
-    uint64_t total_writes;
-    uint64_t total_reads;
-    uint64_t compaction_count;
     int num_levels;
     size_t memtable_size;
     size_t *level_sizes;

@@ -880,10 +880,6 @@ int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *ke
     return 0;
 }
 
-/* ============================================================================
- * MVCC-aware functions with sequence numbers
- * ============================================================================ */
-
 int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size,
                            const uint8_t *value, size_t value_size, time_t ttl, uint64_t seq,
                            uint8_t deleted)

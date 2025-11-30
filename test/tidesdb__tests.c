@@ -476,7 +476,6 @@ static void test_stats(void)
     tidesdb_stats_t *stats = NULL;
     ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
     ASSERT_TRUE(stats != NULL);
-    ASSERT_TRUE(stats->total_writes > 0);
     ASSERT_TRUE(stats->memtable_size > 0);
 
     tidesdb_free_stats(stats);

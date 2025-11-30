@@ -150,10 +150,8 @@ void test_buffer_get(void)
     {
         if (ids[i] != 9) free_slot = 9;
     }
-    if (free_slot < 10)
-    {
-        assert(buffer_get(buffer, free_slot, &data) == -1);
-    }
+
+    assert(buffer_get(buffer, free_slot, &data) == -1);
 
     buffer_free(buffer);
 }
@@ -261,7 +259,6 @@ void test_buffer_generation(void)
     uint32_t id1, id2;
     uint64_t gen1, gen2;
 
-    /* acquire and get generation */
     assert(buffer_acquire(buffer, &value, &id1) == 0);
     assert(buffer_get_generation(buffer, id1, &gen1) == 0);
 

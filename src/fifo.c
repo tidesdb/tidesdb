@@ -132,15 +132,6 @@ static inline int tagged_ptr_equals(fifo_tagged_ptr_t a, fifo_tagged_ptr_t b)
 
 /* backoff and utility */
 
-static inline void cpu_pause(void)
-{
-#if defined(__x86_64__) || defined(__i386__)
-    __asm__ __volatile__("pause");
-#elif defined(__aarch64__)
-    __asm__ __volatile__("yield");
-#endif
-}
-
 static inline void backoff(int iteration)
 {
     if (iteration < 10)

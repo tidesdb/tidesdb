@@ -18,30 +18,6 @@
  */
 #include "buffer.h"
 
-#ifdef _WIN32
-#include <windows.h>
-#define buffer_usleep(us) Sleep((us) / 1000 > 0 ? (us) / 1000 : 1)
-#else
-#include <unistd.h>
-#define buffer_usleep(us) usleep(us)
-#endif
-
-/* cpu pause for spin-wait loops */
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#ifdef _MSC_VER
-#include <intrin.h>
-#define cpu_pause() _mm_pause()
-#else
-#define cpu_pause() __builtin_ia32_pause()
-#endif
-#elif defined(__aarch64__) || defined(_M_ARM64)
-#define cpu_pause() __asm__ __volatile__("yield" ::: "memory")
-#elif defined(__arm__) || defined(_M_ARM)
-#define cpu_pause() __asm__ __volatile__("yield" ::: "memory")
-#else
-#define cpu_pause() ((void)0)
-#endif
-
 int buffer_new(buffer_t **buffer, uint32_t capacity)
 {
     return buffer_new_with_eviction(buffer, capacity, NULL, NULL);
@@ -71,7 +47,6 @@ int buffer_new_with_eviction(buffer_t **buffer, uint32_t capacity, buffer_evicti
     atomic_init(&new_buffer->hint_index, 0);
     atomic_init(&new_buffer->active_count, 0);
 
-    /* initialize all slots as free */
     for (uint32_t i = 0; i < capacity; i++)
     {
         atomic_init(&new_buffer->slots[i].state, BUFFER_SLOT_FREE);
@@ -176,7 +151,7 @@ int buffer_acquire(buffer_t *buffer, void *data, uint32_t *id)
             }
             else
             {
-                buffer_usleep(backoff);
+                usleep(backoff);
             }
 
             /* exponential increase, capped at 10ms */

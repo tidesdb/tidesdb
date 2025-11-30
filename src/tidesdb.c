@@ -2367,7 +2367,7 @@ static void tidesdb_level_ref(tidesdb_level_t *level)
 {
     if (level)
     {
-        int old_ref = atomic_fetch_add_explicit(&level->refcount, 1, memory_order_relaxed);
+        (void)atomic_fetch_add_explicit(&level->refcount, 1, memory_order_relaxed);
     }
 }
 
@@ -3527,44 +3527,6 @@ static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capaci
         capacity *= ratio;
     }
     return capacity;
-}
-
-/**
- * tidesdb_should_add_level
- * determine if a new level should be added based on the current level count and max levels
- * @param cf the column family
- * @return 1 if a new level should be added, 0 otherwise
- */
-static int tidesdb_should_add_level(tidesdb_column_family_t *cf)
-{
-    int num_levels = atomic_load(&cf->num_levels);
-    if (num_levels == 0) return 0;
-    if (num_levels >= cf->config.max_levels) return 0;
-
-    tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
-    tidesdb_level_t *largest = levels[num_levels - 1];
-    size_t current_size = atomic_load(&largest->current_size);
-
-    return current_size >= largest->capacity;
-}
-
-/**
- * tidesdb_should_remove_level
- * determine if a level should be removed based on the current level count and max levels
- * @param cf the column family
- * @return 1 if a level should be removed, 0 otherwise
- */
-static int tidesdb_should_remove_level(tidesdb_column_family_t *cf)
-{
-    int num_levels = atomic_load(&cf->num_levels);
-    if (num_levels <= 2) return 0;
-
-    tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
-    tidesdb_level_t *largest = levels[num_levels - 1];
-    size_t current_size = atomic_load(&largest->current_size);
-
-    /* remove level if data size < capacity/T */
-    return current_size < (largest->capacity / cf->config.level_size_ratio);
 }
 
 /**

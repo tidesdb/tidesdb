@@ -281,7 +281,6 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
     if (list == NULL || key == NULL || key_size == 0 || value == NULL) return -1;
 
     skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
-    skip_list_node_t *tail = atomic_load_explicit(&list->tail, memory_order_acquire);
     skip_list_node_t **update = malloc((list->max_level + 1) * sizeof(skip_list_node_t *));
     if (!update) return -1;
 
@@ -397,7 +396,6 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size)
     if (list == NULL || key == NULL || key_size == 0) return -1;
 
     skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
-    skip_list_node_t *tail = atomic_load_explicit(&list->tail, memory_order_acquire);
     skip_list_node_t *current = header;
 
     for (int i = atomic_load_explicit(&list->level, memory_order_acquire); i >= 0; i--)

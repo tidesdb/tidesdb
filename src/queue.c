@@ -102,24 +102,6 @@ static inline int atomic_cas_tagged_ptr(_Atomic(tagged_ptr_t) *target, tagged_pt
 }
 
 /**
- * cpu_pause
- * Pause hint for spin-wait loops to reduce power consumption
- * and improve performance on hyperthreaded processors.
- */
-static inline void cpu_pause(void)
-{
-#if defined(__x86_64__) || defined(__i386__)
-    __asm__ __volatile__("pause");
-#elif defined(__aarch64__)
-    __asm__ __volatile__("yield");
-#elif defined(_MSC_VER)
-    _mm_pause();
-#else
-    /* fallback: do nothing */
-#endif
-}
-
-/**
  * backoff
  * Exponential backoff for contention.
  * @param iteration current spin iteration

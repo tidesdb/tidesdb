@@ -231,6 +231,7 @@ jobs:
               tidesdb_config_t cfg = tidesdb_default_config();
               cfg.db_path = "./testdb";
               cfg.num_flush_threads = 1;
+              cfg.enable_debug_logging = 1;
               cfg.num_compaction_threads = 1;
               if (tidesdb_open(&cfg, &db) != 0) return 1;
 
@@ -263,7 +264,21 @@ jobs:
           EOF
           gcc -o create_db create_db.c -I../src -I../external -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
           LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./create_db
-      
+
+      - name: Verify database contents before upload
+        run: |
+          echo "=== Database directory structure ==="
+          ls -laR build/testdb/
+          echo ""
+          echo "=== Looking for SSTable files ==="
+          find build/testdb -name "*.klog" -o -name "*.vlog" | head -20
+          echo ""
+          echo "=== Looking for WAL files ==="
+          find build/testdb -name "*.log" | head -20
+          echo ""
+          echo "=== Looking for INI files ==="
+          find build/testdb -name "*.ini"
+
       - name: Upload database
         uses: actions/upload-artifact@v4
         with:
@@ -315,7 +330,22 @@ jobs:
         with:
           name: portable-db
           path: testdb
-      
+
+      - name: Verify downloaded database contents
+        shell: bash
+        run: |
+          echo "=== Downloaded database structure ==="
+          ls -laR testdb/ || ls -laR testdb || true
+          echo ""
+          echo "=== Looking for SSTable files ==="
+          find testdb -name "*.klog" -o -name "*.vlog" | head -20 || true
+          echo ""
+          echo "=== Looking for WAL files ==="
+          find testdb -name "*.log" | head -20 || true
+          echo ""
+          echo "=== Looking for INI files ==="
+          find testdb -name "*.ini" || true
+
       - name: Install dependencies (Linux x86)
         if: runner.os == 'Linux' && matrix.arch == 'x86'
         run: |
@@ -420,6 +450,7 @@ jobs:
               tidesdb_t *db;
               tidesdb_config_t cfg = tidesdb_default_config();
               cfg.db_path = "../testdb";
+              cfg.enable_debug_logging = 1;
               cfg.num_flush_threads = 1;
               cfg.num_compaction_threads = 1;
               if (tidesdb_open(&cfg, &db) != 0) { fprintf(stderr, "Failed to open\n"); return 1; }

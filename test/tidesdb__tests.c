@@ -4791,6 +4791,108 @@ static void test_recovery_with_corrupted_sstable(void)
     cleanup_test_dir();
 }
 
+/* Test that mimics the portability workflow: create, flush, compact, close, reopen, verify */
+static void test_portability_workflow(void)
+{
+    cleanup_test_dir();
+
+    /* Phase 1: Create database with data, flush, and compact (like create_db.c) */
+    {
+        tidesdb_config_t cfg = tidesdb_default_config();
+        cfg.db_path = TEST_DB_PATH;
+        cfg.num_flush_threads = 1;
+        cfg.enable_debug_logging = 1;
+        cfg.num_compaction_threads = 1;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&cfg, &db), 0);
+
+        tidesdb_column_family_config_t cf_cfg = tidesdb_default_column_family_config();
+        cf_cfg.write_buffer_size = 1024; /* Small buffer to force flush */
+        cf_cfg.enable_bloom_filter = 1;
+        cf_cfg.enable_block_indexes = 1;
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_cfg), 0);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        /* Write 100 keys in a transaction */
+        tidesdb_txn_t *txn;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        for (int i = 0; i < 100; i++)
+        {
+            char key[64], value[128];
+            snprintf(key, sizeof(key), "key_%d", i);
+            snprintf(value, sizeof(value), "value_%d", i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+        }
+
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        /* Flush memtable to create SSTables */
+        ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+        sleep(1); /* Wait for flush to complete */
+
+        /* Compact to ensure data is in SSTables */
+        ASSERT_EQ(tidesdb_compact(cf), 0);
+        sleep(1); /* Wait for compaction to complete */
+
+        /* Close database */
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+
+    /* Phase 2: Reopen database and verify all keys (like verify_db.c) */
+    {
+        tidesdb_config_t cfg = tidesdb_default_config();
+        cfg.db_path = TEST_DB_PATH;
+        cfg.enable_debug_logging = 1;
+        cfg.num_flush_threads = 1;
+        cfg.num_compaction_threads = 1;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&cfg, &db), 0);
+
+        /* Get existing column family */
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        /* Verify all 100 keys */
+        tidesdb_txn_t *txn;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        for (int i = 0; i < 100; i++)
+        {
+            char key[64], expected[128];
+            snprintf(key, sizeof(key), "key_%d", i);
+            snprintf(expected, sizeof(expected), "value_%d", i);
+
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            int result =
+                tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+            if (result != 0 || value == NULL)
+            {
+                printf("FAILED: Key not found: %s\n", key);
+                ASSERT_EQ(result, 0);
+            }
+
+            ASSERT_TRUE(value_size == strlen(expected) + 1);
+            ASSERT_TRUE(memcmp(value, expected, strlen(expected)) == 0);
+            free(value);
+        }
+
+        tidesdb_txn_free(txn);
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -4876,6 +4978,7 @@ int main(void)
     RUN_TEST(test_dynamic_capacity_adjustment, tests_passed);
     RUN_TEST(test_multi_level_compaction_strategies, tests_passed);
     RUN_TEST(test_recovery_with_corrupted_sstable, tests_passed);
+    RUN_TEST(test_portability_workflow, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

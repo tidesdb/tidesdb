@@ -1414,6 +1414,39 @@ static inline uint64_t decode_uint64_le_compat(const uint8_t *buf)
            ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
 }
 
+/**
+ * encode_int64_le_compat
+ * encodes a int64_t value in little-endian format
+ * @param buf output buffer (must be at least 8 bytes)
+ * @param val value to encode
+ */
+static inline void encode_int64_le_compat(uint8_t *buf, int64_t val)
+{
+    uint64_t uval = (uint64_t)val;
+    buf[0] = (uint8_t)(uval);
+    buf[1] = (uint8_t)(uval >> 8);
+    buf[2] = (uint8_t)(uval >> 16);
+    buf[3] = (uint8_t)(uval >> 24);
+    buf[4] = (uint8_t)(uval >> 32);
+    buf[5] = (uint8_t)(uval >> 40);
+    buf[6] = (uint8_t)(uval >> 48);
+    buf[7] = (uint8_t)(uval >> 56);
+}
+
+/**
+ * decode_int64_le_compat
+ * decodes a int64_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline int64_t decode_int64_le_compat(const uint8_t *buf)
+{
+    uint64_t uval = ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
+                    ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
+                    ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
+    return (int64_t)uval;
+}
+
 /* varint encoding/decoding for compact serialization */
 static inline uint8_t *encode_varint32(uint8_t *ptr, uint32_t value)
 {

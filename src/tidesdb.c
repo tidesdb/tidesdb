@@ -409,9 +409,10 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
 {
     if (!sst || !out_data || !out_size) return -1;
 
-    /* calculate size: all fields + keys */
+    /* calculate size: all fields + keys + checksum */
     size_t header_size = 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4; /* fixed 84 bytes */
-    size_t total_size = header_size + sst->min_key_size + sst->max_key_size;
+    size_t checksum_size = 8;
+    size_t total_size = header_size + sst->min_key_size + sst->max_key_size + checksum_size;
 
     uint8_t *data = malloc(total_size);
     if (!data) return -1;
@@ -452,7 +453,13 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
     if (sst->max_key && sst->max_key_size > 0)
     {
         memcpy(ptr, sst->max_key, sst->max_key_size);
+        ptr += sst->max_key_size;
     }
+
+    /* compute and append checksum over everything except the checksum field itself */
+    size_t checksum_data_size = total_size - checksum_size;
+    uint64_t checksum = XXH64(data, checksum_data_size, 0);
+    encode_uint64_le_compat(ptr, checksum);
 
     *out_data = data;
     *out_size = total_size;
@@ -858,8 +865,19 @@ static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **o
 
     for (uint32_t i = 0; i < block->num_entries; i++)
     {
-        memcpy(ptr, &block->entries[i], sizeof(tidesdb_klog_entry_t));
-        ptr += sizeof(tidesdb_klog_entry_t);
+        /* serialize entry fields with proper endianness */
+        *ptr++ = block->entries[i].version;
+        *ptr++ = block->entries[i].flags;
+        encode_uint32_le_compat(ptr, block->entries[i].key_size);
+        ptr += sizeof(uint32_t);
+        encode_uint32_le_compat(ptr, block->entries[i].value_size);
+        ptr += sizeof(uint32_t);
+        encode_int64_le_compat(ptr, block->entries[i].ttl);
+        ptr += sizeof(int64_t);
+        encode_uint64_le_compat(ptr, block->entries[i].seq);
+        ptr += sizeof(uint64_t);
+        encode_uint64_le_compat(ptr, block->entries[i].vlog_offset);
+        ptr += sizeof(uint64_t);
 
         memcpy(ptr, block->keys[i], block->entries[i].key_size);
         ptr += block->entries[i].key_size;
@@ -928,8 +946,19 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
             return TDB_ERR_CORRUPTION;
         }
 
-        memcpy(&(*block)->entries[i], ptr, sizeof(tidesdb_klog_entry_t));
-        ptr += sizeof(tidesdb_klog_entry_t);
+        /* deserialize entry fields with proper endianness */
+        (*block)->entries[i].version = *ptr++;
+        (*block)->entries[i].flags = *ptr++;
+        (*block)->entries[i].key_size = decode_uint32_le_compat(ptr);
+        ptr += sizeof(uint32_t);
+        (*block)->entries[i].value_size = decode_uint32_le_compat(ptr);
+        ptr += sizeof(uint32_t);
+        (*block)->entries[i].ttl = decode_int64_le_compat(ptr);
+        ptr += sizeof(int64_t);
+        (*block)->entries[i].seq = decode_uint64_le_compat(ptr);
+        ptr += sizeof(uint64_t);
+        (*block)->entries[i].vlog_offset = decode_uint64_le_compat(ptr);
+        ptr += sizeof(uint64_t);
 
         if (ptr + (*block)->entries[i].key_size > data + data_size)
         {
@@ -4156,6 +4185,21 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         new_sst->bloom_filter = bloom;
     }
 
+    /* write metadata block as the last block */
+    uint8_t *metadata_data = NULL;
+    size_t metadata_size = 0;
+    if (sstable_metadata_serialize(new_sst, &metadata_data, &metadata_size) == 0)
+    {
+        block_manager_block_t *metadata_block =
+            block_manager_block_create(metadata_size, metadata_data);
+        if (metadata_block)
+        {
+            block_manager_block_write(klog_bm, metadata_block);
+            block_manager_block_free(metadata_block);
+        }
+        free(metadata_data);
+    }
+
     block_manager_get_size(klog_bm, &new_sst->klog_size);
     block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
@@ -4598,6 +4642,21 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 free(bloom_data);
             }
             bloom_filter_free(bloom);
+        }
+
+        /* write metadata block as the last block */
+        uint8_t *metadata_data = NULL;
+        size_t metadata_size = 0;
+        if (sstable_metadata_serialize(new_sst, &metadata_data, &metadata_size) == 0)
+        {
+            block_manager_block_t *metadata_block =
+                block_manager_block_create(metadata_size, metadata_data);
+            if (metadata_block)
+            {
+                block_manager_block_write(klog_bm, metadata_block);
+                block_manager_block_free(metadata_block);
+            }
+            free(metadata_data);
         }
 
         block_manager_get_size(klog_bm, &new_sst->klog_size);
@@ -5116,6 +5175,21 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             new_sst->max_key = last_key;
             new_sst->max_key_size = last_key_size;
 
+            /* write metadata block as the last block */
+            uint8_t *metadata_data = NULL;
+            size_t metadata_size = 0;
+            if (sstable_metadata_serialize(new_sst, &metadata_data, &metadata_size) == 0)
+            {
+                block_manager_block_t *metadata_block =
+                    block_manager_block_create(metadata_size, metadata_data);
+                if (metadata_block)
+                {
+                    block_manager_block_write(klog_bm, metadata_block);
+                    block_manager_block_free(metadata_block);
+                }
+                free(metadata_data);
+            }
+
             block_manager_get_size(klog_bm, &new_sst->klog_size);
             block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
@@ -5357,16 +5431,16 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 
             if (remaining >= sizeof(tidesdb_multi_cf_txn_metadata_t))
             {
-                /* peek at potential metadata header */
-                tidesdb_multi_cf_txn_metadata_t peek_metadata;
-                memcpy(&peek_metadata, ptr, sizeof(tidesdb_multi_cf_txn_metadata_t));
+                /* peek at potential metadata header with proper endianness */
+                const uint8_t *peek_ptr = ptr;
+                uint8_t peek_num_cfs = *peek_ptr++;
+                uint64_t peek_checksum = decode_uint64_le_compat(peek_ptr);
 
                 /* if num_participant_cfs > 1, this is multi-CF metadata */
-                if (peek_metadata.num_participant_cfs > 1 &&
-                    peek_metadata.num_participant_cfs < 255)
+                if (peek_num_cfs > 1 && peek_num_cfs < 255)
                 {
                     is_multi_cf_entry = 1;
-                    num_participant_cfs = peek_metadata.num_participant_cfs;
+                    num_participant_cfs = peek_num_cfs;
 
                     /* calculate metadata size */
                     size_t cf_names_size = num_participant_cfs * TDB_MAX_CF_NAME_LEN;
@@ -5383,17 +5457,17 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                     uint8_t *checksum_data = malloc(checksum_data_size);
                     if (checksum_data)
                     {
-                        checksum_data[0] = peek_metadata.num_participant_cfs;
+                        checksum_data[0] = peek_num_cfs;
                         memcpy(checksum_data + 1, cf_names_ptr, cf_names_size);
                         uint64_t computed_checksum = XXH64(checksum_data, checksum_data_size, 0);
                         free(checksum_data);
 
-                        if (computed_checksum != peek_metadata.checksum)
+                        if (computed_checksum != peek_checksum)
                         {
                             TDB_DEBUG_LOG(
                                 "CF '%s': Multi-CF metadata checksum mismatch (expected: %" PRIu64
                                 ", got: %" PRIu64 ") - skipping entry",
-                                cf->name, peek_metadata.checksum, computed_checksum);
+                                cf->name, peek_checksum, computed_checksum);
                             block_manager_block_release(block);
                             continue;
                         }
@@ -5440,9 +5514,20 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                 continue;
             }
 
+            /* deserialize entry with proper endianness */
             tidesdb_klog_entry_t entry;
-            memcpy(&entry, ptr, sizeof(tidesdb_klog_entry_t));
-            ptr += sizeof(tidesdb_klog_entry_t);
+            entry.version = *ptr++;
+            entry.flags = *ptr++;
+            entry.key_size = decode_uint32_le_compat(ptr);
+            ptr += sizeof(uint32_t);
+            entry.value_size = decode_uint32_le_compat(ptr);
+            ptr += sizeof(uint32_t);
+            entry.ttl = decode_int64_le_compat(ptr);
+            ptr += sizeof(int64_t);
+            entry.seq = decode_uint64_le_compat(ptr);
+            ptr += sizeof(uint64_t);
+            entry.vlog_offset = decode_uint64_le_compat(ptr);
+            ptr += sizeof(uint64_t);
             remaining -= sizeof(tidesdb_klog_entry_t);
 
             if (remaining < entry.key_size)
@@ -7724,7 +7809,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         int committed;
     } cf_commit_ctx_t;
 
-    /* defensive check to satisfy static analysis */
     if (txn->num_cfs <= 0 || txn->num_cfs > TDB_MAX_TXN_CFS)
     {
         return TDB_ERR_INVALID_ARGS;
@@ -7832,15 +7916,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 /* write multi-CF metadata before first entry */
                 if (first_entry_for_cf)
                 {
-                    /* we prep metadata header */
-                    tidesdb_multi_cf_txn_metadata_t metadata;
-                    metadata.num_participant_cfs = (uint8_t)txn->num_cfs;
-
-                    /* we prep CF names buffer for checksum computation */
+                    uint8_t num_participant_cfs = (uint8_t)txn->num_cfs;
                     size_t cf_names_size = txn->num_cfs * TDB_MAX_CF_NAME_LEN;
-                    uint8_t *cf_names_buf = wal_ptr + sizeof(tidesdb_multi_cf_txn_metadata_t);
 
-                    uint8_t *name_ptr = cf_names_buf;
+                    /* write CF names first (we'll write metadata header after computing checksum)
+                     */
+                    uint8_t *cf_names_start =
+                        wal_ptr + 1 + sizeof(uint64_t); /* after num + checksum */
+                    uint8_t *name_ptr = cf_names_start;
                     for (int cf_i = 0; cf_i < txn->num_cfs; cf_i++)
                     {
                         strncpy((char *)name_ptr, txn->cfs[cf_i]->name, TDB_MAX_CF_NAME_LEN - 1);
@@ -7851,23 +7934,25 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                     /* compute checksum over num_participant_cfs + cf_names */
                     size_t checksum_data_size = sizeof(uint8_t) + cf_names_size;
                     uint8_t *checksum_data = malloc(checksum_data_size);
+                    uint64_t checksum;
                     if (checksum_data)
                     {
-                        checksum_data[0] = metadata.num_participant_cfs;
-                        memcpy(checksum_data + 1, cf_names_buf, cf_names_size);
-                        metadata.checksum = XXH64(checksum_data, checksum_data_size, 0);
+                        checksum_data[0] = num_participant_cfs;
+                        memcpy(checksum_data + 1, cf_names_start, cf_names_size);
+                        checksum = XXH64(checksum_data, checksum_data_size, 0);
                         free(checksum_data);
                     }
                     else
                     {
-                        /* fallback is checksum just the count if malloc fails */
-                        metadata.checksum =
-                            XXH64(&metadata.num_participant_cfs, sizeof(uint8_t), 0);
+                        /* fallback: checksum just the count if malloc fails */
+                        checksum = XXH64(&num_participant_cfs, sizeof(uint8_t), 0);
                     }
 
-                    memcpy(wal_ptr, &metadata, sizeof(tidesdb_multi_cf_txn_metadata_t));
-                    wal_ptr += sizeof(tidesdb_multi_cf_txn_metadata_t);
-                    wal_ptr += cf_names_size; /* we skip past CF names we already wrote */
+                    /* now serialize metadata header with proper endianness */
+                    *wal_ptr++ = num_participant_cfs;
+                    encode_uint64_le_compat(wal_ptr, checksum);
+                    wal_ptr += sizeof(uint64_t);
+                    wal_ptr += cf_names_size; /* skip past CF names we already wrote */
 
                     first_entry_for_cf = 0;
                 }
@@ -7880,16 +7965,20 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             cf_contexts[cf_idx].seq_numbers[seq_idx] = seq; /* placeholder for single-CF */
             seq_idx++;
 
-            tidesdb_klog_entry_t entry = {
-                .key_size = (uint32_t)op->key_size,
-                .value_size = (uint32_t)op->value_size,
-                .ttl = op->ttl,
-                .seq = seq, /* placeholder for single-CF, real for multi-CF */
-                .flags = op->is_delete ? TDB_KV_FLAG_TOMBSTONE : 0,
-                .vlog_offset = 0};
-
-            memcpy(wal_ptr, &entry, sizeof(tidesdb_klog_entry_t));
-            wal_ptr += sizeof(tidesdb_klog_entry_t);
+            /* serialize entry fields with proper endianness for WAL portability */
+            *wal_ptr++ = 0;                                         /* version */
+            *wal_ptr++ = op->is_delete ? TDB_KV_FLAG_TOMBSTONE : 0; /* flags */
+            encode_uint32_le_compat(wal_ptr, (uint32_t)op->key_size);
+            wal_ptr += sizeof(uint32_t);
+            encode_uint32_le_compat(wal_ptr, (uint32_t)op->value_size);
+            wal_ptr += sizeof(uint32_t);
+            encode_int64_le_compat(wal_ptr, op->ttl);
+            wal_ptr += sizeof(int64_t);
+            encode_uint64_le_compat(wal_ptr,
+                                    seq); /* placeholder for single-CF, real for multi-CF */
+            wal_ptr += sizeof(uint64_t);
+            encode_uint64_le_compat(wal_ptr, 0); /* vlog_offset */
+            wal_ptr += sizeof(uint64_t);
 
             memcpy(wal_ptr, op->key, op->key_size);
             wal_ptr += op->key_size;
@@ -7948,7 +8037,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         uint64_t my_ticket = atomic_fetch_add_explicit(&cf->commit_ticket, 1, memory_order_relaxed);
 
-        /* hybrid spin-then-yield approach:
+        /* hybrid spin-then-yield approach
          * spin for short waits (typical case -- critical section is microseconds)
          * yield CPU if waiting too long (high contention case) */
         uint64_t spin_count = 0;
@@ -9447,8 +9536,9 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                     }
                     else
                     {
-                        /* SSTable failed to load - likely corrupted
-                         * delete both klog and vlog files to prevent repeated recovery attempts */
+                        /* the sstable failed to load, likely corruption.
+                         * we delete both klog and vlog files to prevent repeated recovery attempts
+                         */
                         TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64
                                       " failed to load (corrupted), deleting files",
                                       cf->name, sst_id);
@@ -9879,13 +9969,7 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
     cf->config.sync_mode = new_config->sync_mode;
     cf->config.default_isolation_level = new_config->default_isolation_level;
     cf->config.value_threshold = new_config->value_threshold;
-
-    /* what cannot be changed at runtime?
-     * -- skip_list_max_level, skip_list_probability -- would affect active memtable structure
-     * -- klog_block_size, vlog_block_size -- would break existing sstable format
-     * -- block_manager_cache_size -- would require recreating cache
-     * -- comparator -- would break key ordering in existing data
-     * these settings are fixed at column family creation time */
+    cf->config.block_manager_cache_size = new_config->block_manager_cache_size;
 
     if (persist_to_disk)
     {

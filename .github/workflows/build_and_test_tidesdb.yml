@@ -233,22 +233,22 @@ jobs:
               cfg.num_flush_threads = 1;
               cfg.num_compaction_threads = 1;
               if (tidesdb_open(&cfg, &db) != 0) return 1;
-              
+
               tidesdb_column_family_config_t cf_cfg = tidesdb_default_column_family_config();
               cf_cfg.write_buffer_size = 1024;
               cf_cfg.enable_bloom_filter = 1;
               cf_cfg.enable_block_indexes = 1;
               if (tidesdb_create_column_family(db, "test_cf", &cf_cfg) != 0) return 1;
-              
+
               tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
               tidesdb_txn_t *txn;
-              if (tidesdb_txn_begin(db, cf, &txn) != 0) return 1;
-              
+              if (tidesdb_txn_begin(db, &txn) != 0) return 1;
+
               for (int i = 0; i < 100; i++) {
                   char key[64], value[128];
                   snprintf(key, sizeof(key), "key_%d", i);
                   snprintf(value, sizeof(value), "value_%d", i);
-                  tidesdb_txn_put(txn, (uint8_t*)key, strlen(key), (uint8_t*)value, strlen(value), 0);
+                  tidesdb_txn_put(txn, cf, (uint8_t*)key, strlen(key) + 1, (uint8_t*)value, strlen(value) + 1, 0);
               }
               tidesdb_txn_commit(txn);
               tidesdb_txn_free(txn);
@@ -423,25 +423,25 @@ jobs:
               cfg.num_flush_threads = 1;
               cfg.num_compaction_threads = 1;
               if (tidesdb_open(&cfg, &db) != 0) { fprintf(stderr, "Failed to open\n"); return 1; }
-              
+
               /* Get existing column family from the portable database */
               tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
               if (!cf) { fprintf(stderr, "CF not found\n"); return 1; }
-              
+
               tidesdb_txn_t *txn;
-              if (tidesdb_txn_begin(db, cf, &txn) != 0) return 1;
-              
+              if (tidesdb_txn_begin(db, &txn) != 0) return 1;
+
               for (int i = 0; i < 100; i++) {
                   char key[64], expected[128];
                   snprintf(key, sizeof(key), "key_%d", i);
                   snprintf(expected, sizeof(expected), "value_%d", i);
                   uint8_t *value = NULL;
                   size_t value_size = 0;
-                  if (tidesdb_txn_get(txn, (uint8_t*)key, strlen(key), &value, &value_size) != 0) {
+                  if (tidesdb_txn_get(txn, cf, (uint8_t*)key, strlen(key) + 1, &value, &value_size) != 0) {
                       fprintf(stderr, "Key not found: %s\n", key);
                       return 1;
                   }
-                  if (value_size != strlen(expected) || memcmp(value, expected, value_size) != 0) {
+                  if (value_size != strlen(expected) + 1 || memcmp(value, expected, strlen(expected)) != 0) {
                       fprintf(stderr, "Value mismatch\n");
                       return 1;
                   }

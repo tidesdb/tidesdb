@@ -128,24 +128,25 @@ typedef enum
     TDB_ISOLATION_SERIALIZABLE = 4      /* full serializability with rw-conflict detection */
 } tidesdb_isolation_level_t;
 
-#define TDB_WAL_PREFIX                "wal_"
-#define TDB_WAL_EXT                   ".log"
-#define TDB_COLUMN_FAMILY_CONFIG_NAME "config"
-#define TDB_COLUMN_FAMILY_CONFIG_EXT  ".ini"
-#define TDB_LEVEL_PREFIX              "L"
-#define TDB_LEVEL_PARTITION_PREFIX    "P"
-#define TDB_SSTABLE_KLOG_EXT          ".klog"
-#define TDB_SSTABLE_VLOG_EXT          ".vlog"
-#define TDB_SSTABLE_CACHE_PREFIX      "sst_"
-#define TDB_CACHE_KEY_LEN             128
+#define TDB_WAL_PREFIX                "wal_"   /* prefix for write-ahead log files */
+#define TDB_WAL_EXT                   ".log"   /* extension for write-ahead log files */
+#define TDB_COLUMN_FAMILY_CONFIG_NAME "config" /* base name for column family config files */
+#define TDB_COLUMN_FAMILY_CONFIG_EXT  ".ini"   /* extension for column family config files */
+#define TDB_LEVEL_PREFIX              "L"      /* prefix for level directories in LSM tree */
+#define TDB_LEVEL_PARTITION_PREFIX    "P" /* prefix for partition identifiers in sstable names */
+#define TDB_SSTABLE_KLOG_EXT          ".klog" /* extension for sstable key log files */
+#define TDB_SSTABLE_VLOG_EXT          ".vlog" /* extension for sstable value log files */
+#define TDB_SSTABLE_CACHE_PREFIX      "sst_"  /* prefix for sstable cache keys */
+#define TDB_CACHE_KEY_LEN             128     /* maximum length for cache key strings */
 
 /* default configuration values */
 #define TDB_DEFAULT_WRITE_BUFFER_SIZE              (64 * 1024 * 1024) /* 64MB */
-#define TDB_DEFAULT_LEVEL_SIZE_RATIO               10
-#define TDB_DEFAULT_MAX_LEVELS                     7
+#define TDB_DEFAULT_LEVEL_SIZE_RATIO               10 /* size ratio between levels (T) i.e. L1 = L0 * T */
+#define TDB_DEFAULT_MAX_LEVELS                     7 /* maximum number of levels for lsm tree's per cf */
 #define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET          2 /* X = L-2 */
-#define TDB_DEFAULT_THREAD_POOL_SIZE               2
-#define TDB_DEFAULT_BLOOM_FPR                      0.01
+#define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE    2 /* thread pool size for global compactions */
+#define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE         2 /* thread pool size for global flushes */
+#define TDB_DEFAULT_BLOOM_FPR                      0.01        /* 1% false positive rate */
 #define TDB_DEFAULT_KLOG_BLOCK_SIZE                (32 * 1024) /* 32KB per klog block */
 #define TDB_DEFAULT_VLOG_BLOCK_SIZE                (32 * 1024) /* 32KB per vlog block */
 #define TDB_DEFAULT_VALUE_THRESHOLD                1024        /* values >= 1KB go to vlog */
@@ -155,12 +156,24 @@ typedef enum
 #define TDB_DEFAULT_MAX_IMMUTABLE_MEMTABLES        8   /* soft limit -- start slowing writes */
 #define TDB_DEFAULT_WRITE_STALL_THRESHOLD          32  /* hard limit -- block writes completely */
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES              512 /* max open sstables globally */
-#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE         1024 * 64 /* max concurrent txns per CF */
+#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE         1024 * 64 /* max concurrent txns per cf */
 
-#define TDB_MAX_TXN_CFS     10000  /* maximum number of CFs per transaction */
+#define TDB_MAX_TXN_CFS     10000  /* maximum number of cfs per transaction */
 #define TDB_MAX_PATH_LEN    4096   /* maximum path length */
 #define TDB_MAX_TXN_OPS     100000 /* maximum transaction operations */
 #define TDB_MAX_CF_NAME_LEN 256    /* maximum column family name length */
+#define TDB_ENSURE_OPEN_SSTABLE_WAIT_US \
+    1024 /* microseconds to sleep when spinning on sstable open */
+#define TDB_ENSURE_OPEN_SSTABLE_WAIT_COUNT 128 /* spin count before sleeping during sstable open \
+                                                */
+#define TDB_WRITE_STALL_BACKOFF_US \
+    100000 /* microseconds to sleep during hard write stall (100ms) */
+#define TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS 500 /* maximum sleep time for write slowdown backpressure \
+                                             */
+#define TDB_WRITE_SLOWDOWN_EXPO             10 /* milliseconds per extra sstable in exponential backoff */
+#define TDB_L0_COMPACTION_TRIGGER           4  /* l0 sstable count that triggers compaction */
+#define TDB_L0_SLOWDOWN_THRESHOLD           8  /* l0 sstable count that triggers write throttling */
+#define TDB_IMMUTABLE_QUEUE_SLOWDOWN_FACTOR 50 /* milliseconds per extra immutable memtable */
 
 /**
  * tidesdb_column_family_config_t
@@ -410,7 +423,7 @@ struct tidesdb_level_t
  * entry in the commit buffer tracking a pending commit
  * @param seq_num sequence number being committed
  * @param committed atomic flag: 0=pending, 1=committed
- * @param txn_id transaction ID for debugging
+ * @param txn_id transaction id for debugging
  */
 typedef struct
 {
@@ -425,7 +438,7 @@ typedef struct
  * @param txn_id transaction ID
  * @param snapshot_seq snapshot sequence number
  * @param isolation isolation level
- * @param buffer_slot_id slot ID in buffer for quick access
+ * @param buffer_slot_id slot id in buffer for quick access
  * @param generation generation counter for ABA prevention
  */
 typedef struct
@@ -443,8 +456,8 @@ typedef struct
  * @param name name of column family
  * @param directory directory for column family
  * @param config column family configuration
- * @param active_memtable active memtable (Level 0)
- * @param memtable_id ID of active memtable
+ * @param active_memtable active memtable (level 0)
+ * @param memtable_id id of active memtable
  * @param active_wal active write-ahead log
  * @param immutable_memtables queue of immutable memtables
  * @param next_seq_num next sequence number for MVCC
@@ -456,7 +469,7 @@ typedef struct
  * @param compaction_thread thread for background compaction
  * @param compaction_should_stop flag to stop compaction thread
  * @param compaction_count total number of compactions
- * @param next_sstable_id next sstable ID
+ * @param next_sstable_id next sstable id
  * @param db parent database reference
  * @param levels_rwlock protects levels array and sstable add/remove operations
  * @param flush_rwlock protects memtable flush operations
@@ -494,7 +507,7 @@ struct tidesdb_column_family_t
  * work item for flush thread pool
  * @param cf column family
  * @param imm immutable memtable wrapper (holds refcount)
- * @param sst_id sstable ID
+ * @param sst_id sstable id
  */
 struct tidesdb_flush_work_t
 {
@@ -535,11 +548,11 @@ struct tidesdb_compaction_work_t
  * @param active_compaction_workers number of workers actively processing
  * @param sstable_cache FIFO cache for sstable file handles
  * @param is_open flag to indicate if database is open
- * @param global_txn_seq global sequence counter for multi-CF transactions
- * @param next_txn_id global transaction ID counter
+ * @param global_txn_seq global sequence counter for multi-cf transactions
+ * @param next_txn_id global transaction id counter
  * @param cached_available_disk_space cached available disk space in bytes
  * @param last_disk_space_check timestamp of last disk space check
- * @param cf_list_state atomic state for CF list modifications (0=idle, 1=modifying)
+ * @param cf_list_state atomic state for cf list modifications (0=idle, 1=modifying)
  */
 struct tidesdb_t
 {
@@ -574,7 +587,7 @@ struct tidesdb_t
  * @param value_size value size
  * @param ttl time-to-live
  * @param is_delete delete flag
- * @param cf column family (for multi-CF transactions)
+ * @param cf column family (for multi-cf transactions)
  */
 typedef struct
 {
@@ -599,20 +612,20 @@ typedef struct
  * @param read_keys array of read keys
  * @param read_key_sizes array of read key sizes
  * @param read_seqs array of read sequence numbers
- * @param read_cfs array of CFs for each read key
+ * @param read_cfs array of cfs for each read key
  * @param read_set_count number of read keys
  * @param read_set_capacity capacity of read keys array
  * @param write_keys array of write keys
  * @param write_key_sizes array of write key sizes
- * @param write_cfs array of CFs for each write key
+ * @param write_cfs array of cfs for each write key
  * @param write_set_count number of write keys
  * @param write_set_capacity capacity of write keys array
  * @param cfs array of column families involved in transaction
- * @param cf_snapshots array of per-CF snapshot sequences (indexed same as cfs)
- * @param cf_txn_slots array of per-CF transaction buffer slot IDs (indexed same as cfs)
+ * @param cf_snapshots array of per-cf snapshot sequences (indexed same as cfs)
+ * @param cf_txn_slots array of per-cf transaction buffer slot ids (indexed same as cfs)
  * @param num_cfs number of column families
  * @param cf_capacity capacity of column families array
- * @param global_snapshot_seq global snapshot point for consistent multi-CF reads
+ * @param global_snapshot_seq global snapshot point for consistent multi-cf reads
  * @param parent parent transaction (for nested transactions)
  * @param savepoints array of savepoints
  * @param savepoint_names array of savepoint names
@@ -920,7 +933,7 @@ int tidesdb_txn_rollback_to_savepoint(tidesdb_txn_t *txn, const char *name);
 
 /**
  * tidesdb_iter_new
- * creates a new iterator for a specific CF in the transaction
+ * creates a new iterator for a specific cf in the transaction
  * @param txn transaction handle
  * @param cf column family to iterate
  * @param iter pointer to iterator handle

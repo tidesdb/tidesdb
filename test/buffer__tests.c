@@ -19,7 +19,6 @@
 #include "../src/buffer.h"
 #include "test_utils.h"
 
-/* test counters */
 static int tests_passed = 0;
 static int tests_failed = 0;
 
@@ -288,7 +287,7 @@ void test_buffer_generation(void)
         buffer_release_silent(buffer, temp_ids[i]);
     }
 
-    /* now acquire - should get one of the freed slots */
+    /* now acquire -- should get one of the freed slots */
     ASSERT_EQ(buffer_acquire(buffer, &value, &id2), 0);
     ASSERT_EQ(buffer_get_generation(buffer, id2, &gen2), 0);
 
@@ -445,7 +444,6 @@ void test_buffer_concurrent_acquire_release(void)
     free(threads);
     free(args);
 
-    /* buffer should be empty at the end */
     assert(buffer_active_count(buffer) == 0);
 
     buffer_free(buffer);
@@ -509,7 +507,6 @@ void *concurrent_mixed_ops(void *arg)
         }
     }
 
-    /* cleanup remaining */
     for (int i = 0; i < my_count; i++)
     {
         void *data;
@@ -667,7 +664,6 @@ void benchmark_buffer_sequential(void)
         }
     }
 
-    /* cleanup remaining */
     for (int j = 0; j < idx; j++)
     {
         buffer_release_silent(buffer, ids[j]);
@@ -724,27 +720,22 @@ void benchmark_buffer_concurrent(void)
     buffer_free(buffer);
 }
 
-/* eviction callback that frees allocated memory */
 static void free_allocated_data(void *data, void *ctx)
 {
     (void)ctx;
     if (data) free(data);
 }
 
-/* test buffer eviction with dynamically allocated memory */
 static void test_buffer_eviction_with_malloc(void)
 {
     buffer_t *buffer = NULL;
 
-    /* create buffer with eviction callback that frees data */
     ASSERT_EQ(buffer_new_with_eviction(&buffer, 16, free_allocated_data, NULL), 0);
     ASSERT_TRUE(buffer != NULL);
 
-    /* allocate and store multiple entries */
     uint32_t ids[10];
     for (int i = 0; i < 10; i++)
     {
-        /* allocate memory for entry */
         int *entry = (int *)malloc(sizeof(int));
         ASSERT_TRUE(entry != NULL);
         *entry = i * 100;
@@ -757,7 +748,6 @@ static void test_buffer_eviction_with_malloc(void)
     /* verify entries are stored */
     ASSERT_EQ(buffer_active_count(buffer), 10);
 
-    /* manually release some entries */
     for (int i = 0; i < 5; i++)
     {
         ASSERT_EQ(buffer_release(buffer, ids[i]), 0);
@@ -765,13 +755,9 @@ static void test_buffer_eviction_with_malloc(void)
 
     ASSERT_EQ(buffer_active_count(buffer), 5);
 
-    /* free buffer - should call eviction callback for remaining entries */
     buffer_free(buffer);
-
-    /* if we get here without crash, eviction worked correctly */
 }
 
-/* test struct similar to transaction entry */
 typedef struct
 {
     uint64_t id;
@@ -779,7 +765,6 @@ typedef struct
     void *data;
 } test_entry_t;
 
-/* eviction callback for test entries */
 static void free_test_entry(void *data, void *ctx)
 {
     (void)ctx;
@@ -791,16 +776,13 @@ static void free_test_entry(void *data, void *ctx)
     }
 }
 
-/* test buffer eviction with struct entries */
 static void test_buffer_struct_eviction(void)
 {
     buffer_t *buffer = NULL;
 
-    /* create buffer with eviction callback */
     ASSERT_EQ(buffer_new_with_eviction(&buffer, 32, free_test_entry, NULL), 0);
     ASSERT_TRUE(buffer != NULL);
 
-    /* allocate and store entries */
     uint32_t ids[20];
     for (int i = 0; i < 20; i++)
     {
@@ -809,7 +791,7 @@ static void test_buffer_struct_eviction(void)
 
         entry->id = i;
         entry->snapshot_seq = i * 1000;
-        entry->data = malloc(64); /* allocate some data */
+        entry->data = malloc(64);
         ASSERT_TRUE(entry->data != NULL);
 
         ASSERT_EQ(buffer_acquire(buffer, entry, &ids[i]), 0);
@@ -817,7 +799,6 @@ static void test_buffer_struct_eviction(void)
 
     ASSERT_EQ(buffer_active_count(buffer), 20);
 
-    /* release half manually */
     for (int i = 0; i < 10; i++)
     {
         ASSERT_EQ(buffer_release(buffer, ids[i]), 0);
@@ -825,7 +806,6 @@ static void test_buffer_struct_eviction(void)
 
     ASSERT_EQ(buffer_active_count(buffer), 10);
 
-    /* free buffer - should clean up remaining entries */
     buffer_free(buffer);
 }
 

@@ -610,8 +610,8 @@ tidesdb_config_t tidesdb_default_config(void)
 {
     tidesdb_config_t config = {.db_path = "./tidesdb",
                                .enable_debug_logging = 0,
-                               .num_flush_threads = TDB_DEFAULT_THREAD_POOL_SIZE,
-                               .num_compaction_threads = TDB_DEFAULT_THREAD_POOL_SIZE,
+                               .num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE,
+                               .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
                                .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES};
     return config;
 }
@@ -1413,9 +1413,9 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
         int spin_count = 0;
         while (atomic_load_explicit(&sst->bm_open_state, memory_order_acquire) == 1)
         {
-            if (++spin_count > 100)
+            if (++spin_count > TDB_ENSURE_OPEN_SSTABLE_WAIT_COUNT)
             {
-                usleep(1000); /* 1ms */
+                usleep(TDB_ENSURE_OPEN_SSTABLE_WAIT_US);
                 spin_count = 0;
             }
         }
@@ -1508,7 +1508,6 @@ static void tidesdb_sstable_free(tidesdb_t *db, tidesdb_sstable_t *sst)
     (void)db; /* db parameter kept for API consistency but not needed */
     if (!sst) return;
 
-    /* close block managers owned by this SSTable */
     if (sst->klog_bm)
     {
         block_manager_close(sst->klog_bm);
@@ -5468,19 +5467,6 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 
                 /* only apply if transaction is complete across all CFs */
                 should_apply = multi_cf_tracker_is_complete(tracker, entry.seq);
-
-                if (!should_apply)
-                {
-                    TDB_DEBUG_LOG("WAL recovery: Skipping incomplete multi-CF txn seq=%" PRIu64
-                                  " for CF '%s'",
-                                  entry.seq, cf->name);
-                }
-                else
-                {
-                    TDB_DEBUG_LOG("WAL recovery: Applying complete multi-CF txn seq=%" PRIu64
-                                  " for CF '%s'",
-                                  entry.seq, cf->name);
-                }
             }
 
             if (should_apply)
@@ -5756,12 +5742,9 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
 
     int num = cf->num_levels;
     tidesdb_level_t **levels = cf->levels;
-    TDB_DEBUG_LOG("CF '%s': Freeing %d levels, levels array=%p", cf->name, num, (void *)levels);
     for (int i = 0; i < num; i++)
     {
         tidesdb_level_t *lvl = levels[i];
-        TDB_DEBUG_LOG("CF '%s': Level[%d] ptr=%p, level_num=%d, num_sstables=%d", cf->name, i,
-                      (void *)lvl, lvl->level_num, lvl->num_sstables);
         tidesdb_level_free(lvl);
     }
     free(levels);
@@ -5795,14 +5778,10 @@ static void *tidesdb_flush_worker_thread(void *arg)
     while (!atomic_load(&db->flush_should_stop))
     {
         /* wait for work (blocking dequeue) */
-        TDB_DEBUG_LOG("Flush worker waiting for work...");
         tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue_wait(db->flush_queue);
-        TDB_DEBUG_LOG("Flush worker got work: %p", (void *)work);
 
         if (!work)
         {
-            /* NULL work item means shutdown */
-            TDB_DEBUG_LOG("Flush worker received NULL, exiting");
             break;
         }
 
@@ -5903,14 +5882,14 @@ static void *tidesdb_flush_worker_thread(void *arg)
                     int l0_count =
                         atomic_load_explicit(&level0->num_sstables, memory_order_acquire);
 
-                    /* trigger compaction if L0 has more than 4 sstables
+                    /* trigger compaction if L0 has more than TDB_L0_COMPACTION_TRIGGER sstables
                      * this is independent of level capacity, we want to keep L0 small
                      * to minimize read amplification (L0 sstables have overlapping keys) */
-                    if (l0_count > 4)
+                    if (l0_count > TDB_L0_COMPACTION_TRIGGER)
                     {
                         TDB_DEBUG_LOG(
-                            "CF '%s': L0 has %d SSTables (threshold: 4), triggering compaction",
-                            cf->name, l0_count);
+                            "CF '%s': L0 has %d SSTables (threshold: %d), triggering compaction",
+                            cf->name, l0_count, TDB_L0_COMPACTION_TRIGGER);
 
                         tidesdb_compaction_work_t *compaction_work =
                             calloc(1, sizeof(tidesdb_compaction_work_t));
@@ -5940,7 +5919,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
         free(work);
     }
 
-    TDB_DEBUG_LOG("Flush worker thread exiting");
     return NULL;
 }
 
@@ -5960,11 +5938,9 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 
     while (!atomic_load(&db->compaction_should_stop))
     {
-        TDB_DEBUG_LOG("Compaction worker waiting for work...");
         /* wait for work (blocking dequeue) */
         tidesdb_compaction_work_t *work =
             (tidesdb_compaction_work_t *)queue_dequeue_wait(db->compaction_queue);
-        TDB_DEBUG_LOG("Compaction worker got work: %p", (void *)work);
 
         if (!work || atomic_load(&db->compaction_should_stop))
         {
@@ -6186,7 +6162,6 @@ int tidesdb_close(tidesdb_t *db)
         pthread_cond_broadcast(&db->compaction_queue->not_empty);
     }
 
-    TDB_DEBUG_LOG("Waiting for %d flush threads to finish", db->config.num_flush_threads);
     if (db->flush_threads)
     {
         for (int i = 0; i < db->config.num_flush_threads; i++)
@@ -6195,20 +6170,15 @@ int tidesdb_close(tidesdb_t *db)
         }
         free(db->flush_threads);
     }
-    TDB_DEBUG_LOG("Flush threads finished");
 
-    TDB_DEBUG_LOG("Waiting for %d compaction threads to finish", db->config.num_compaction_threads);
     if (db->compaction_threads)
     {
         for (int i = 0; i < db->config.num_compaction_threads; i++)
         {
-            TDB_DEBUG_LOG("Joining compaction thread %d", i);
             pthread_join(db->compaction_threads[i], NULL);
-            TDB_DEBUG_LOG("Compaction thread %d joined", i);
         }
         free(db->compaction_threads);
     }
-    TDB_DEBUG_LOG("Compaction threads finished");
 
     if (db->flush_queue)
     {
@@ -7766,11 +7736,13 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                     atomic_load_explicit(&level0->num_sstables, memory_order_acquire);
 
                 /* throttle if L0 has too many sstables (indicates compaction falling behind) */
-                if (l0_sstable_count > 8)
+                if (l0_sstable_count > TDB_L0_SLOWDOWN_THRESHOLD)
                 {
                     /* exponential backoff sleep more as count increases */
-                    int sleep_ms = (l0_sstable_count - 8) * 10; /* 10ms per extra sstable */
-                    if (sleep_ms > 500) sleep_ms = 500;         /* cap at 500ms */
+                    int sleep_ms =
+                        (l0_sstable_count - TDB_L0_SLOWDOWN_THRESHOLD) * TDB_WRITE_SLOWDOWN_EXPO;
+                    if (sleep_ms > TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS)
+                        sleep_ms = TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS;
                     usleep(sleep_ms * 1000);
                     TDB_DEBUG_LOG("CF '%s': Write throttled %dms (L0 SSTables: %d)", cf->name,
                                   sleep_ms, l0_sstable_count);
@@ -7786,15 +7758,17 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             TDB_DEBUG_LOG("CF '%s': Hard write stall - waiting for flush", cf->name);
             while (tidesdb_check_write_stall(cf) == 2)
             {
-                usleep(100000); /* 100ms */
+                usleep(TDB_WRITE_STALL_BACKOFF_US);
             }
         }
         else if (stall_level == 1)
         {
             /* soft limit, we slow down writes */
             size_t queue_depth = queue_size(cf->immutable_memtables);
-            int sleep_ms = (int)(queue_depth - cf->config.max_immutable_memtables) * 50;
-            if (sleep_ms > 500) sleep_ms = 500;
+            int sleep_ms = (int)(queue_depth - cf->config.max_immutable_memtables) *
+                           TDB_IMMUTABLE_QUEUE_SLOWDOWN_FACTOR;
+            if (sleep_ms > TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS)
+                sleep_ms = TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS;
             usleep(sleep_ms * 1000);
             TDB_DEBUG_LOG("CF '%s': Write slowdown %dms (queue depth: %zu)", cf->name, sleep_ms,
                           queue_depth);
@@ -9527,7 +9501,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     int num_levels = cf->num_levels;
     tidesdb_level_t **levels = cf->levels;
 
-    TDB_DEBUG_LOG("CF '%s': Scanning %d levels for max_seq", cf->name, num_levels);
+    TDB_DEBUG_LOG("CF '%s': Scanning sources for max_seq", cf->name);
 
     for (int level_idx = 0; level_idx < num_levels; level_idx++)
     {
@@ -9537,15 +9511,11 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
         tidesdb_sstable_t **sstables = level->sstables;
         int num_ssts = level->num_sstables;
 
-        TDB_DEBUG_LOG("CF '%s': Level %d has %d sstables", cf->name, level_idx, num_ssts);
-
         for (int sst_idx = 0; sst_idx < num_ssts; sst_idx++)
         {
             tidesdb_sstable_t *sst = sstables[sst_idx];
             if (sst)
             {
-                TDB_DEBUG_LOG("CF '%s': SSTable %d has max_seq=%" PRIu64, cf->name, sst_idx,
-                              sst->max_seq);
                 if (sst->max_seq > global_max_seq)
                 {
                     global_max_seq = sst->max_seq;
@@ -9559,7 +9529,6 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     if (cf->immutable_memtables)
     {
         size_t imm_count = queue_size(cf->immutable_memtables);
-        TDB_DEBUG_LOG("CF '%s': Scanning %zu immutable memtables for max_seq", cf->name, imm_count);
 
         for (size_t i = 0; i < imm_count; i++)
         {
@@ -9592,7 +9561,6 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                     }
                     skip_list_cursor_free(cursor);
                 }
-                TDB_DEBUG_LOG("CF '%s': Immutable memtable %zu scanned", cf->name, i);
             }
         }
     }

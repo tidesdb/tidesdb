@@ -666,8 +666,8 @@ static void test_compaction_basic(void)
 
     /* write enough data to trigger multiple flushes and fill level 0
      * level 0 capacity = write_buffer_size * level_size_ratio = 2048 * 10 = 20480 bytes
-     * each entry is ~160 bytes, so 10 entries = ~1600 bytes per SSTable
-     * 200 entries / 10 = 20 SSTables which should trigger compaction */
+     * each entry is ~160 bytes, so 10 entries = ~1600 bytes per sstable
+     * 200 entries / 10 = 20 sstables which should trigger compaction */
     for (int i = 0; i < 200; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -684,7 +684,7 @@ static void test_compaction_basic(void)
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
         tidesdb_txn_free(txn);
 
-        /* trigger flush periodically to create multiple SSTables */
+        /* trigger flush periodically to create multiple sstables */
         if (i % 10 == 9)
         {
             tidesdb_flush_memtable(cf);
@@ -794,7 +794,7 @@ static void test_compaction_with_deletes(void)
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
         tidesdb_txn_free(txn);
 
-        /* flush deletes periodically so tombstones are in SSTables */
+        /* flush deletes periodically so tombstones are in sstables */
         if (i % 20 == 18)
         {
             tidesdb_flush_memtable(cf);
@@ -1003,7 +1003,7 @@ static void test_many_keys(void)
     for (int wait = 0; wait < 100; wait++)
     {
         usleep(50000); /* 50ms */
-        /* check if flush queue is empty by checking level 0 SSTable count */
+        /* check if flush queue is empty by checking level 0 sstable count */
         if (cf->levels[0])
         {
             int num_ssts = atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
@@ -1014,7 +1014,7 @@ static void test_many_keys(void)
         }
     }
 
-    /* additional wait to ensure all SSTables are fully written */
+    /* additional wait to ensure all sstables are fully written */
     usleep(500000);
 
     /* verify random keys -- create transaction AFTER flushes complete */
@@ -1874,7 +1874,7 @@ static void test_block_indexes(void)
         tidesdb_txn_free(txn);
     }
 
-    /* flush to create SSTable with block indexes */
+    /* flush to create sstable with block indexes */
     tidesdb_flush_memtable(cf);
     usleep(200000);
 
@@ -2438,13 +2438,13 @@ static void test_read_across_multiple_sstables(void)
 {
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 512; /* small to create many SSTables */
+    cf_config.write_buffer_size = 512; /* small to create many sstables */
 
     ASSERT_EQ(tidesdb_create_column_family(db, "multi_sst_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "multi_sst_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* write 100 keys across multiple SSTables */
+    /* write 100 keys across multiple sstables */
     for (int i = 0; i < 100; i++)
     {
         tidesdb_txn_t *txn = NULL;

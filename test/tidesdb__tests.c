@@ -36,8 +36,6 @@ static tidesdb_t *create_test_db(void)
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
     ASSERT_TRUE(db != NULL);
 
-    cleanup_test_dir();
-
     return db;
 }
 

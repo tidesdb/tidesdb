@@ -1799,37 +1799,37 @@ static inline int tdb_get_available_disk_space(const char *path, uint64_t *avail
 
 /* cpu pause for spin-wait loops */
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    #ifdef _MSC_VER
-        #include <intrin.h>
-        #define cpu_pause() _mm_pause()
-    #else
-        #define cpu_pause() __builtin_ia32_pause()
-    #endif
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    #ifdef _MSC_VER
-        #include <intrin.h>
-        #define cpu_pause() __yield()
-    #else
-        #define cpu_pause() __asm__ __volatile__("yield" ::: "memory")
-    #endif
-#elif defined(__arm__) || defined(_M_ARM)
-    #ifdef _MSC_VER
-        #include <intrin.h>
-        #define cpu_pause() __yield()
-    #else
-        #define cpu_pause() __asm__ __volatile__("yield" ::: "memory")
-    #endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#define cpu_pause() _mm_pause()
 #else
-    #define cpu_pause() ((void)0)
+#define cpu_pause() __builtin_ia32_pause()
+#endif
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#ifdef _MSC_VER
+#include <intrin.h>
+#define cpu_pause() __yield()
+#else
+#define cpu_pause() __asm__ __volatile__("yield" ::: "memory")
+#endif
+#elif defined(__arm__) || defined(_M_ARM)
+#ifdef _MSC_VER
+#include <intrin.h>
+#define cpu_pause() __yield()
+#else
+#define cpu_pause() __asm__ __volatile__("yield" ::: "memory")
+#endif
+#else
+#define cpu_pause() ((void)0)
 #endif
 
 /* cpu yield for longer waits - gives up time slice to scheduler */
 #ifdef _WIN32
-    #include <windows.h>
-    #define cpu_yield() SwitchToThread()
+#include <windows.h>
+#define cpu_yield() SwitchToThread()
 #else
-    #include <sched.h>
-    #define cpu_yield() sched_yield()
+#include <sched.h>
+#define cpu_yield() sched_yield()
 #endif
 
 #endif /* __COMPAT_H__ */

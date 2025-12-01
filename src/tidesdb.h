@@ -176,7 +176,7 @@ typedef enum
 #define TDB_L0_COMPACTION_TRIGGER           4  /* l0 sstable count that triggers compaction */
 #define TDB_L0_SLOWDOWN_THRESHOLD           8  /* l0 sstable count that triggers write throttling */
 #define TDB_IMMUTABLE_QUEUE_SLOWDOWN_FACTOR 50 /* milliseconds per extra immutable memtable */
-#define TDB_TXN_SPIN_COUNT 1000
+#define TDB_TXN_SPIN_COUNT                  1000
 
 /**
  * tidesdb_column_family_config_t

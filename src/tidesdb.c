@@ -5853,6 +5853,10 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
                 atomic_store_explicit(&imm->flushed, 1, memory_order_release);
 
+                /* release the work item's reference now that flush is complete
+                 * this allows the cleanup loop to remove the immutable from the queue */
+                tidesdb_immutable_memtable_unref(imm);
+
                 while (!queue_is_empty(cf->immutable_memtables))
                 {
                     tidesdb_immutable_memtable_t *front =
@@ -5909,11 +5913,15 @@ static void *tidesdb_flush_worker_thread(void *arg)
                 TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64 " write FAILED (error %d)", cf->name,
                               work->sst_id, write_result);
                 tidesdb_sstable_unref(cf->db, sst);
+                /* release work's reference on failure */
+                tidesdb_immutable_memtable_unref(imm);
             }
         }
         else
         {
             TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64 " creation FAILED", cf->name, work->sst_id);
+            /* release work's reference on failure */
+            tidesdb_immutable_memtable_unref(imm);
         }
 
         free(work);
@@ -6187,9 +6195,8 @@ int tidesdb_close(tidesdb_t *db)
             tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue(db->flush_queue);
             if (work)
             {
-                /* do not unref work->imm here the immutable is still in cf->immutable_memtables
-                 * and will be freed when the column family is freed
-                 * the flush work just holds a pointer, not an additional reference */
+                /* flush work holds its own reference, must unref to avoid leak */
+                tidesdb_immutable_memtable_unref(work->imm);
                 free(work);
             }
         }
@@ -6710,8 +6717,12 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     work->imm = immutable;
     work->sst_id = sst_id;
 
+    /* flush work holds its own reference to prevent use-after-free during shutdown */
+    tidesdb_immutable_memtable_ref(immutable);
+
     if (queue_enqueue(cf->db->flush_queue, work) != 0)
     {
+        tidesdb_immutable_memtable_unref(immutable);
         free(work);
         return TDB_ERR_MEMORY;
     }
@@ -9421,8 +9432,13 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                             work->sst_id = atomic_fetch_add_explicit(&cf->next_sstable_id, 1,
                                                                      memory_order_relaxed);
 
+                            /* flush work holds its own reference to prevent use-after-free during
+                             * shutdown */
+                            tidesdb_immutable_memtable_ref(imm);
+
                             if (queue_enqueue(cf->db->flush_queue, work) != 0)
                             {
+                                tidesdb_immutable_memtable_unref(imm);
                                 free(work);
                             }
                         }

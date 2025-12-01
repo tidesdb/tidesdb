@@ -57,21 +57,18 @@ void test_buffer_create(void)
 {
     buffer_t *buffer = NULL;
 
-    /* test basic creation */
     ASSERT_EQ(buffer_new(&buffer, 10), 0);
     ASSERT_TRUE(buffer != NULL);
     ASSERT_EQ(buffer_capacity(buffer), 10);
     ASSERT_EQ(buffer_active_count(buffer), 0);
     buffer_free(buffer);
 
-    /* test with eviction callback */
     buffer = NULL;
     reset_eviction_counters();
     ASSERT_EQ(buffer_new_with_eviction(&buffer, 5, eviction_callback, NULL), 0);
     ASSERT_TRUE(buffer != NULL);
     buffer_free(buffer);
 
-    /* test invalid params */
     ASSERT_EQ(buffer_new(NULL, 10), -1);
     ASSERT_EQ(buffer_new(&buffer, 0), -1);
 }
@@ -211,14 +208,12 @@ void test_buffer_clear(void)
     buffer_free(buffer);
 }
 
-/* context for foreach test */
 typedef struct
 {
     int count;
     int sum;
 } foreach_ctx_t;
 
-/* callback for foreach test */
 static void foreach_callback(uint32_t id, void *data, void *ctx)
 {
     (void)id;

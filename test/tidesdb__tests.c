@@ -146,7 +146,6 @@ static void test_txn_rollback(void)
     uint8_t value[] = "rollback_value";
     ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
 
-    /* rollback instead of commit */
     ASSERT_EQ(tidesdb_txn_rollback(txn), 0);
     tidesdb_txn_free(txn);
 
@@ -244,14 +243,13 @@ static void test_memtable_flush(void)
     /* manually trigger flush and wait for background thread pool */
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
 
-    /* poll for flush completion -- check queue drains */
-    int max_wait = 50; /* 500ms total */
+    int max_wait = 50;
     for (int i = 0; i < max_wait; i++)
     {
-        usleep(10000); /* 10ms */
+        usleep(10000);
         if (queue_size(db->flush_queue) == 0) break;
     }
-    usleep(50000); /* extra 50ms for work to complete after dequeue */
+    usleep(50000);
 
     /* verify all data is still accessible */
     tidesdb_txn_t *txn = NULL;
@@ -311,11 +309,9 @@ static void test_persistence_and_recovery(void)
             tidesdb_txn_free(txn);
         }
 
-        /* flush to ensure data is on disk */
         ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
-        usleep(200000); /* wait 200ms for background flush to complete */
+        usleep(200000);
 
-        /* verify data before closing */
         tidesdb_txn_t *txn = NULL;
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -411,7 +407,6 @@ static void test_iterator_basic(void)
         tidesdb_txn_free(txn);
     }
 
-    /* create iterator */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -582,6 +577,7 @@ static void test_iterator_reverse(void)
             uint8_t *key = NULL;
             size_t key_size = 0;
             tidesdb_iter_key(iter, &key, &key_size);
+
             /* just verify we got a key */
             ASSERT_TRUE(key != NULL);
         }
@@ -871,7 +867,7 @@ static void test_ttl_expiration(void)
 
     uint8_t key[] = "ttl_key";
     uint8_t value[] = "ttl_value";
-    time_t ttl = time(NULL) + 2; /* expires in 2 seconds */
+    time_t ttl = time(NULL) + 2;
 
     ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), ttl), 0);
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
@@ -2522,7 +2518,7 @@ static void test_read_with_bloom_filter_disabled(void)
     cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.enable_bloom_filter = 0; /* disable bloom filter */
+    cf_config.enable_bloom_filter = 0;
     cf_config.write_buffer_size = 512;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "no_bloom_cf", &cf_config), 0);
@@ -2575,7 +2571,7 @@ static void test_read_with_block_indexes_disabled(void)
     cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.enable_block_indexes = 0; /* disable block indexes */
+    cf_config.enable_block_indexes = 0;
     cf_config.write_buffer_size = 512;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "no_index_cf", &cf_config), 0);
@@ -3069,7 +3065,6 @@ static void test_data_integrity_after_compaction(void)
 
     usleep(100000);
 
-    /* trigger compaction */
     tidesdb_compact(cf);
     usleep(2000000);
 
@@ -4739,7 +4734,7 @@ static void test_recovery_with_corrupted_sstable(void)
         }
 
         tidesdb_flush_memtable(cf);
-        usleep(100000); /* wait for flush */
+        usleep(100000);
 
         tidesdb_close(db);
     }
@@ -4791,12 +4786,10 @@ static void test_recovery_with_corrupted_sstable(void)
     cleanup_test_dir();
 }
 
-/* Test that mimics the portability workflow: create, flush, compact, close, reopen, verify */
 static void test_portability_workflow(void)
 {
     cleanup_test_dir();
 
-    /* Phase 1: Create database with data, flush, and compact (like create_db.c) */
     {
         tidesdb_config_t cfg = tidesdb_default_config();
         cfg.db_path = TEST_DB_PATH;
@@ -4808,7 +4801,7 @@ static void test_portability_workflow(void)
         ASSERT_EQ(tidesdb_open(&cfg, &db), 0);
 
         tidesdb_column_family_config_t cf_cfg = tidesdb_default_column_family_config();
-        cf_cfg.write_buffer_size = 1024; /* Small buffer to force flush */
+        cf_cfg.write_buffer_size = 1024;
         cf_cfg.enable_bloom_filter = 1;
         cf_cfg.enable_block_indexes = 1;
 
@@ -4816,7 +4809,6 @@ static void test_portability_workflow(void)
         tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
         ASSERT_TRUE(cf != NULL);
 
-        /* Write 100 keys in a transaction */
         tidesdb_txn_t *txn;
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -4833,19 +4825,15 @@ static void test_portability_workflow(void)
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
         tidesdb_txn_free(txn);
 
-        /* Flush memtable to create SSTables */
         ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
-        sleep(1); /* Wait for flush to complete */
+        sleep(1);
 
-        /* Compact to ensure data is in SSTables */
         ASSERT_EQ(tidesdb_compact(cf), 0);
-        sleep(1); /* Wait for compaction to complete */
+        sleep(1);
 
-        /* Close database */
         ASSERT_EQ(tidesdb_close(db), 0);
     }
 
-    /* Phase 2: Reopen database and verify all keys (like verify_db.c) */
     {
         tidesdb_config_t cfg = tidesdb_default_config();
         cfg.db_path = TEST_DB_PATH;
@@ -4856,11 +4844,9 @@ static void test_portability_workflow(void)
         tidesdb_t *db = NULL;
         ASSERT_EQ(tidesdb_open(&cfg, &db), 0);
 
-        /* Get existing column family */
         tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
         ASSERT_TRUE(cf != NULL);
 
-        /* Verify all 100 keys */
         tidesdb_txn_t *txn;
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 

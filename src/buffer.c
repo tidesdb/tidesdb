@@ -296,6 +296,7 @@ void buffer_free(buffer_t *buffer)
 
     free(buffer->slots);
     free(buffer);
+    buffer = NULL;
 }
 
 int buffer_foreach(buffer_t *buffer, void (*callback)(uint32_t id, void *data, void *ctx),

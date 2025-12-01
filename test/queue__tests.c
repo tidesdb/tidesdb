@@ -580,7 +580,6 @@ void test_queue_multiple_waiters()
 {
     queue_t *queue = queue_new();
 
-    /* start 5 waiting threads */
     pthread_t waiters[5];
     for (int i = 0; i < 5; i++)
     {
@@ -597,7 +596,6 @@ void test_queue_multiple_waiters()
         usleep(10000);
     }
 
-    /* wait for all threads */
     for (int i = 0; i < 5; i++)
     {
         void *result;

@@ -20,192 +20,608 @@
 
 #include "xxhash.h"
 
+/* configuration */
+#define FIFO_MAX_RETRIES   1000
+#define FIFO_BACKOFF_LIMIT 64
+#define FIFO_RETIRED_BATCH 64
+
 /**
  * fifo_hash
  * hash function for string keys using xxhash
  * @param key the key to hash
- * @param key_len the length of the key (pre-computed)
- * @param table_size the size of the hash table
+ * @param len the length of the key
  * @return the hash value
  */
-static inline size_t fifo_hash(const char *key, size_t key_len, size_t table_size)
+static inline uint64_t fifo_hash(const char *key, size_t len)
 {
-    XXH64_hash_t hash = XXH64(key, key_len, 0);
-    return (size_t)(hash % table_size);
+    return XXH64(key, len, 0);
 }
 
 /**
- * fifo_find_entry
- * find entry in hash table
- * @param cache the cache to search in
- * @param key the key to search for
- * @param key_len the length of the key
- * @return the entry if found, NULL otherwise
+ * make_tagged_ptr
+ * create a tagged pointer combining a raw pointer and version tag
+ * @param ptr the raw pointer
+ * @param tag the version counter
+ * @param marked whether the pointer is logically deleted
+ * @return tagged pointer value
  */
-static fifo_entry_t *fifo_find_entry(fifo_cache_t *cache, const char *key, size_t key_len)
+static inline fifo_tagged_ptr_t make_tagged_ptr(fifo_entry_t *ptr, uintptr_t tag, int marked)
 {
-    size_t index = fifo_hash(key, key_len, cache->table_size);
-    fifo_entry_t *entry = cache->table[index];
+    fifo_tagged_ptr_t tp;
+    uintptr_t p = (uintptr_t)ptr & FIFO_PTR_MASK;
+    uintptr_t t = (tag << (sizeof(uintptr_t) * 8 - FIFO_TAG_BITS)) & FIFO_TAG_MASK;
+    uintptr_t m = marked ? FIFO_MARK_BIT : 0;
+    tp.value = p | t | m;
+    return tp;
+}
 
-    /* compare length first, then memcmp */
-    while (entry != NULL)
+/**
+ * get_ptr
+ * extract the raw pointer from a tagged pointer
+ * @param tp the tagged pointer
+ * @return raw pointer to fifo_entry_t
+ */
+static inline fifo_entry_t *get_ptr(fifo_tagged_ptr_t tp)
+{
+    return (fifo_entry_t *)(tp.value & FIFO_PTR_MASK);
+}
+
+/**
+ * get_tag
+ * extract the version tag from a tagged pointer
+ * @param tp the tagged pointer
+ * @return version counter
+ */
+static inline uintptr_t get_tag(fifo_tagged_ptr_t tp)
+{
+    return (tp.value & FIFO_TAG_MASK) >> (sizeof(uintptr_t) * 8 - FIFO_TAG_BITS);
+}
+
+/**
+ * is_marked
+ * check if pointer is logically deleted
+ * @param tp the tagged pointer
+ * @return 1 if marked, 0 otherwise
+ */
+static inline int is_marked(fifo_tagged_ptr_t tp)
+{
+    return (tp.value & FIFO_MARK_BIT) != 0;
+}
+
+/**
+ * set_mark
+ * set the logical deletion mark on a tagged pointer
+ * @param tp the tagged pointer
+ * @return tagged pointer with mark bit set
+ */
+static inline fifo_tagged_ptr_t set_mark(fifo_tagged_ptr_t tp)
+{
+    fifo_tagged_ptr_t result;
+    result.value = tp.value | FIFO_MARK_BIT;
+    return result;
+}
+
+/**
+ * backoff
+ * exponential backoff for contention.
+ * @param iteration current spin iteration
+ */
+static inline void backoff(int iteration)
+{
+    if (iteration < 10)
     {
-        if (entry->key_len == key_len && memcmp(entry->key, key, key_len) == 0) return entry;
-        entry = entry->hash_next;
+        cpu_pause();
+    }
+    else if (iteration < FIFO_BACKOFF_LIMIT)
+    {
+        for (int i = 0; i < iteration; i++) cpu_pause();
+    }
+    else
+    {
+        sched_yield();
+    }
+}
+
+/**
+ * fifo_entry_new
+ * allocate and initialize a new entry
+ * @param key the key string
+ * @param key_len length of key
+ * @param key_hash precomputed hash
+ * @param value the value pointer
+ * @param evict_cb eviction callback
+ * @param user_data user data for callback
+ * @return new entry or NULL on failure
+ */
+static fifo_entry_t *fifo_entry_new(const char *key, size_t key_len, uint64_t key_hash, void *value,
+                                    fifo_evict_callback_t evict_cb, void *user_data)
+{
+    fifo_entry_t *entry = (fifo_entry_t *)malloc(sizeof(fifo_entry_t));
+    if (!entry) return NULL;
+
+    entry->key = (char *)malloc(key_len + 1);
+    if (!entry->key)
+    {
+        free(entry);
+        return NULL;
+    }
+
+    memcpy(entry->key, key, key_len);
+    entry->key[key_len] = '\0';
+    entry->key_len = key_len;
+    entry->key_hash = key_hash;
+
+    atomic_store(&entry->state, ENTRY_STATE_INSERTING);
+    atomic_store(&entry->value, value);
+    entry->evict_cb = evict_cb;
+    entry->user_data = user_data;
+    atomic_store(&entry->hash_next, make_tagged_ptr(NULL, 0, 0));
+
+    return entry;
+}
+
+/**
+ * fifo_entry_free
+ * free an entry and optionally call its callback
+ * @param entry the entry to free
+ * @param call_callback whether to call eviction callback
+ */
+static void fifo_entry_free(fifo_entry_t *entry, int call_callback)
+{
+    if (!entry) return;
+
+    if (call_callback && entry->evict_cb)
+    {
+        int state = atomic_load(&entry->state);
+        if (state != ENTRY_STATE_DELETED)
+        {
+            void *val = atomic_load(&entry->value);
+            entry->evict_cb(entry->key, val, entry->user_data);
+        }
+    }
+
+    free(entry->key);
+    free(entry);
+}
+
+/**
+ * entry_cas_state
+ * try to transition entry state atomically
+ * @param entry the entry
+ * @param expected expected current state
+ * @param desired desired new state
+ * @return 1 if successful, 0 otherwise
+ */
+static inline int entry_cas_state(fifo_entry_t *entry, int expected, int desired)
+{
+    return atomic_compare_exchange_strong(&entry->state, &expected, desired);
+}
+
+/**
+ * fifo_retired_node_new
+ * allocate a new retired node
+ * @param entry the entry to retire
+ * @return new node or NULL on failure
+ */
+static fifo_retired_node_t *fifo_retired_node_new(fifo_entry_t *entry)
+{
+    fifo_retired_node_t *node = (fifo_retired_node_t *)malloc(sizeof(fifo_retired_node_t));
+    if (!node) return NULL;
+
+    node->entry = entry;
+    atomic_store(&node->next, NULL);
+    return node;
+}
+
+/**
+ * fifo_retire_entry
+ * add entry to retired stack for deferred freeing
+ * @param cache the cache
+ * @param entry the entry to retire
+ */
+static void fifo_retire_entry(fifo_cache_t *cache, fifo_entry_t *entry)
+{
+    fifo_retired_node_t *node = fifo_retired_node_new(entry);
+    if (!node)
+    {
+        /* fallback: free immediately if can't allocate node */
+        fifo_entry_free(entry, 0);
+        return;
+    }
+
+    /* push onto stack */
+    int retries = 0;
+    while (retries < FIFO_MAX_RETRIES)
+    {
+        fifo_retired_node_t *head = atomic_load(&cache->retired_head);
+        atomic_store(&node->next, head);
+
+        if (atomic_compare_exchange_strong(&cache->retired_head, &head, node))
+        {
+            size_t count = atomic_fetch_add(&cache->retired_count, 1) + 1;
+
+            /* check if we should trigger batch reclamation */
+            if (count >= FIFO_RETIRED_BATCH)
+            {
+                /* try to claim the batch for reclamation */
+                fifo_retired_node_t *batch_head = atomic_exchange(&cache->retired_head, NULL);
+                if (batch_head)
+                {
+                    atomic_store(&cache->retired_count, 0);
+
+                    /* free the entire batch */
+                    fifo_retired_node_t *curr = batch_head;
+                    while (curr)
+                    {
+                        fifo_retired_node_t *next = atomic_load(&curr->next);
+                        fifo_entry_free(curr->entry, 0);
+                        free(curr);
+                        curr = next;
+                    }
+                }
+            }
+            return;
+        }
+
+        backoff(retries++);
+    }
+
+    /* failed to push, free immediately */
+    fifo_entry_free(entry, 0);
+    free(node);
+}
+
+/**
+ * fifo_flush_retired
+ * flush all entries in retired stack
+ * @param cache the cache
+ * @param call_callback whether to call eviction callbacks
+ */
+static void fifo_flush_retired(fifo_cache_t *cache, int call_callback)
+{
+    fifo_retired_node_t *head = atomic_exchange(&cache->retired_head, NULL);
+    atomic_store(&cache->retired_count, 0);
+
+    fifo_retired_node_t *curr = head;
+    while (curr)
+    {
+        fifo_retired_node_t *next = atomic_load(&curr->next);
+        fifo_entry_free(curr->entry, call_callback);
+        free(curr);
+        curr = next;
+    }
+}
+
+/**
+ * fifo_order_node_new
+ * allocate a new order node
+ * @param entry the entry this node tracks
+ * @return new node or NULL on failure
+ */
+static fifo_order_node_t *fifo_order_node_new(fifo_entry_t *entry)
+{
+    fifo_order_node_t *node = (fifo_order_node_t *)malloc(sizeof(fifo_order_node_t));
+    if (!node) return NULL;
+
+    node->entry = entry;
+    atomic_store(&node->next, NULL);
+    return node;
+}
+
+/**
+ * fifo_enqueue_order
+ * add entry to eviction queue
+ * @param cache the cache
+ * @param entry the entry to enqueue
+ * @return 0 on success, -1 on failure
+ */
+static int fifo_enqueue_order(fifo_cache_t *cache, fifo_entry_t *entry)
+{
+    fifo_order_node_t *node = fifo_order_node_new(entry);
+    if (!node) return -1;
+
+    int retries = 0;
+    while (retries < FIFO_MAX_RETRIES)
+    {
+        fifo_order_node_t *tail = atomic_load(&cache->evict_tail);
+        fifo_order_node_t *next = atomic_load(&tail->next);
+
+        if (tail == atomic_load(&cache->evict_tail))
+        {
+            if (next == NULL)
+            {
+                /* try to link node at end */
+                if (atomic_compare_exchange_strong(&tail->next, &next, node))
+                {
+                    /* try to swing tail (ok if fails, another thread will do it) */
+                    atomic_compare_exchange_strong(&cache->evict_tail, &tail, node);
+                    return 0;
+                }
+            }
+            else
+            {
+                /* tail is behind, try to advance */
+                atomic_compare_exchange_strong(&cache->evict_tail, &tail, next);
+            }
+        }
+
+        backoff(retries++);
+    }
+
+    free(node);
+    return -1;
+}
+
+/**
+ * fifo_dequeue_order
+ * remove oldest entry from eviction queue
+ * @param cache the cache
+ * @return the oldest entry, or NULL if empty
+ */
+static fifo_entry_t *fifo_dequeue_order(fifo_cache_t *cache)
+{
+    int retries = 0;
+    while (retries < FIFO_MAX_RETRIES)
+    {
+        fifo_order_node_t *head = atomic_load(&cache->evict_head);
+        fifo_order_node_t *tail = atomic_load(&cache->evict_tail);
+        fifo_order_node_t *next = atomic_load(&head->next);
+
+        if (head == atomic_load(&cache->evict_head))
+        {
+            if (head == tail)
+            {
+                if (next == NULL)
+                {
+                    /* queue is empty */
+                    return NULL;
+                }
+                /* tail is behind, advance it */
+                atomic_compare_exchange_strong(&cache->evict_tail, &tail, next);
+            }
+            else
+            {
+                /* read entry before cas */
+                fifo_entry_t *entry = next->entry;
+
+                /* try to swing head to next */
+                if (atomic_compare_exchange_strong(&cache->evict_head, &head, next))
+                {
+                    /* successfully dequeued, free old sentinel */
+                    free(head);
+                    return entry;
+                }
+            }
+        }
+
+        backoff(retries++);
     }
 
     return NULL;
 }
 
 /**
- * fifo_move_to_head
- * move entry to head (most recently used)
- * @param cache the cache to move the entry to
- * @param entry the entry to move
+ * fifo_find
+ * search for key in hash chain, physically removing marked nodes
+ * @param cache the cache
+ * @param key the key to find
+ * @param key_len length of key
+ * @param key_hash precomputed hash
+ * @param pred_ptr output: pointer to predecessor's next field
+ * @param pred_tagged output: predecessor's tagged pointer value
+ * @return entry if found and active, NULL otherwise
  */
-static void fifo_move_to_head(fifo_cache_t *cache, fifo_entry_t *entry)
+static fifo_entry_t *fifo_find(fifo_cache_t *cache, const char *key, size_t key_len,
+                               uint64_t key_hash, _Atomic(fifo_tagged_ptr_t) **pred_ptr,
+                               fifo_tagged_ptr_t *pred_tagged)
 {
-    if (entry == cache->head) return;
+    size_t bucket = key_hash % cache->table_size;
 
-    if (entry->prev) entry->prev->next = entry->next;
-    if (entry->next) entry->next->prev = entry->prev;
-    if (entry == cache->tail) cache->tail = entry->prev;
+retry:
+    *pred_ptr = &cache->table[bucket];
+    *pred_tagged = atomic_load(*pred_ptr);
+    fifo_entry_t *curr = get_ptr(*pred_tagged);
 
-    /* insert at head */
-    entry->prev = NULL;
-    entry->next = cache->head;
-    if (cache->head) cache->head->prev = entry;
-    cache->head = entry;
-
-    /* if list was empty, this is also the tail */
-    if (cache->tail == NULL) cache->tail = entry;
-}
-
-/**
- * fifo_remove_from_table
- * remove entry from hash table
- * @param cache the cache to remove the entry from
- * @param entry the entry to remove
- */
-static void fifo_remove_from_table(fifo_cache_t *cache, fifo_entry_t *entry)
-{
-    size_t index = fifo_hash(entry->key, entry->key_len, cache->table_size);
-    fifo_entry_t *current = cache->table[index];
-    fifo_entry_t *prev = NULL;
-
-    while (current != NULL)
+    while (curr != NULL)
     {
-        if (current == entry)
+        fifo_tagged_ptr_t curr_next = atomic_load(&curr->hash_next);
+        fifo_entry_t *next = get_ptr(curr_next);
+
+        if (is_marked(curr_next))
         {
-            if (prev)
-                prev->hash_next = current->hash_next;
-            else
-                cache->table[index] = current->hash_next;
-            return;
+            /* node is logically deleted, try to physically remove */
+            fifo_tagged_ptr_t new_ptr = make_tagged_ptr(next, get_tag(*pred_tagged) + 1, 0);
+            if (!atomic_compare_exchange_strong(*pred_ptr, pred_tagged, new_ptr))
+            {
+                goto retry;
+            }
+
+            /* successfully unlinked, retire the node */
+            fifo_retire_entry(cache, curr);
+            curr = next;
         }
-        prev = current;
-        current = current->hash_next;
+        else
+        {
+            /* check if this is our key */
+            if (curr->key_hash == key_hash && curr->key_len == key_len &&
+                memcmp(curr->key, key, key_len) == 0)
+            {
+                int state = atomic_load(&curr->state);
+                if (state == ENTRY_STATE_ACTIVE || state == ENTRY_STATE_UPDATING)
+                {
+                    return curr;
+                }
+                /* entry exists but not active */
+                return NULL;
+            }
+
+            /* move to next */
+            *pred_ptr = &curr->hash_next;
+            *pred_tagged = curr_next;
+            curr = next;
+        }
     }
+
+    return NULL;
 }
 
 /**
- * fifo_add_to_table
- * add entry to hash table
- * @param cache the cache to add the entry to
- * @param entry the entry to add
+ * fifo_insert_hash
+ * insert entry into hash chain
+ * @param cache the cache
+ * @param entry the entry to insert
+ * @return 0 on success, -1 on failure
  */
-static void fifo_add_to_table(fifo_cache_t *cache, fifo_entry_t *entry)
+static int fifo_insert_hash(fifo_cache_t *cache, fifo_entry_t *entry)
 {
-    size_t index = fifo_hash(entry->key, entry->key_len, cache->table_size);
-    entry->hash_next = cache->table[index];
-    cache->table[index] = entry;
-}
+    size_t bucket = entry->key_hash % cache->table_size;
+    int retries = 0;
 
-/**
- * fifo_evict_fifo
- * evict oldest entry
- * @param cache the cache to evict from
- */
-static void fifo_evict_fifo(fifo_cache_t *cache)
-{
-    if (cache->size == 0 || !cache->tail) return;
-    fifo_entry_t *victim = cache->tail;
-
-    /* remove victim from doubly linked list */
-    if (victim->prev)
+    while (retries < FIFO_MAX_RETRIES)
     {
-        victim->prev->next = NULL;
-        cache->tail = victim->prev;
+        fifo_tagged_ptr_t head = atomic_load(&cache->table[bucket]);
+        fifo_entry_t *head_ptr = get_ptr(head);
+
+        /* set entry's next to current head */
+        atomic_store(&entry->hash_next, make_tagged_ptr(head_ptr, 0, 0));
+
+        /* try to cas head to point to new entry */
+        fifo_tagged_ptr_t new_head = make_tagged_ptr(entry, get_tag(head) + 1, 0);
+        if (atomic_compare_exchange_strong(&cache->table[bucket], &head, new_head))
+        {
+            return 0;
+        }
+
+        backoff(retries++);
     }
-    else
-    {
-        /* only entry in cache */
-        cache->head = NULL;
-        cache->tail = NULL;
-    }
 
-    fifo_remove_from_table(cache, victim);
-    if (victim->evict_cb) victim->evict_cb(victim->key, victim->value, victim->user_data);
-
-    free(victim->key);
-    free(victim);
-
-    cache->size--;
+    return -1;
 }
 
 /**
- * fifo_free_entry
- * free an entry and call its eviction callback
- * @param cache the cache to free the entry from
- * @param entry the entry to free
+ * fifo_mark_deleted
+ * logically delete entry by setting mark bit
+ * @param entry the entry to mark
+ * @return 0 on success, -1 on failure
  */
-static void fifo_free_entry(fifo_cache_t *cache, fifo_entry_t *entry)
+static int fifo_mark_deleted(fifo_entry_t *entry)
 {
-    if (entry->prev)
-        entry->prev->next = entry->next;
-    else
-        cache->head = entry->next;
+    int retries = 0;
+    while (retries < FIFO_MAX_RETRIES)
+    {
+        fifo_tagged_ptr_t curr_next = atomic_load(&entry->hash_next);
+        if (is_marked(curr_next))
+        {
+            /* already marked */
+            return 0;
+        }
 
-    if (entry->next)
-        entry->next->prev = entry->prev;
-    else
-        cache->tail = entry->prev;
+        fifo_tagged_ptr_t marked = set_mark(curr_next);
+        if (atomic_compare_exchange_strong(&entry->hash_next, &curr_next, marked))
+        {
+            return 0;
+        }
 
-    fifo_remove_from_table(cache, entry);
-
-    if (entry->evict_cb) entry->evict_cb(entry->key, entry->value, entry->user_data);
-
-    free(entry->key);
-    free(entry);
-
-    cache->size--;
+        backoff(retries++);
+    }
+    return -1;
 }
+
+/* eviction */
+
+/**
+ * fifo_try_evict_one
+ * attempt to evict the oldest entry
+ * @param cache the cache
+ * @return 0 on success, -1 on failure
+ */
+static int fifo_try_evict_one(fifo_cache_t *cache)
+{
+    int attempts = 0;
+    while (attempts < FIFO_MAX_RETRIES)
+    {
+        fifo_entry_t *victim = fifo_dequeue_order(cache);
+        if (!victim)
+        {
+            /* no entries to evict */
+            return -1;
+        }
+
+        /* try to transition to evicting state */
+        int state = ENTRY_STATE_ACTIVE;
+        if (atomic_compare_exchange_strong(&victim->state, &state, ENTRY_STATE_EVICTING))
+        {
+            /* successfully claimed for eviction */
+
+            /* call eviction callback */
+            if (victim->evict_cb)
+            {
+                void *val = atomic_load(&victim->value);
+                victim->evict_cb(victim->key, val, victim->user_data);
+            }
+
+            /* mark as deleted in hash table */
+            fifo_mark_deleted(victim);
+
+            /* transition to deleted state */
+            atomic_store(&victim->state, ENTRY_STATE_DELETED);
+
+            /* decrement size */
+            atomic_fetch_sub(&cache->size, 1);
+
+            return 0;
+        }
+
+        /* entry was already being modified, try next */
+        attempts++;
+    }
+
+    return -1;
+}
+
+/* public api */
 
 fifo_cache_t *fifo_cache_new(size_t capacity)
 {
     if (capacity == 0) return NULL;
 
-    fifo_cache_t *cache = (fifo_cache_t *)malloc(sizeof(fifo_cache_t));
-    if (cache == NULL) return NULL;
+    fifo_cache_t *cache = (fifo_cache_t *)calloc(1, sizeof(fifo_cache_t));
+    if (!cache) return NULL;
 
     cache->capacity = capacity;
-    cache->size = 0;
-    cache->head = NULL;
-    cache->tail = NULL;
+    atomic_store(&cache->size, 0);
+
+    /* hash table with ~2x capacity for good load factor */
     cache->table_size = capacity * 2;
-    cache->table = (fifo_entry_t **)calloc(cache->table_size, sizeof(fifo_entry_t *));
-    if (cache->table == NULL)
+    if (cache->table_size < 16) cache->table_size = 16;
+
+    cache->table =
+        (_Atomic(fifo_tagged_ptr_t) *)calloc(cache->table_size, sizeof(_Atomic(fifo_tagged_ptr_t)));
+    if (!cache->table)
     {
         free(cache);
         return NULL;
     }
 
-    if (pthread_mutex_init(&cache->lock, NULL) != 0)
+    /* initialize all buckets to null */
+    for (size_t i = 0; i < cache->table_size; i++)
+    {
+        atomic_store(&cache->table[i], make_tagged_ptr(NULL, 0, 0));
+    }
+
+    /* create sentinel node for eviction queue */
+    fifo_order_node_t *sentinel = fifo_order_node_new(NULL);
+    if (!sentinel)
     {
         free(cache->table);
         free(cache);
         return NULL;
     }
+    atomic_store(&cache->evict_head, sentinel);
+    atomic_store(&cache->evict_tail, sentinel);
+
+    atomic_store(&cache->retired_head, NULL);
+    atomic_store(&cache->retired_count, 0);
 
     return cache;
 }
@@ -213,214 +629,298 @@ fifo_cache_t *fifo_cache_new(size_t capacity)
 int fifo_cache_put(fifo_cache_t *cache, const char *key, void *value,
                    fifo_evict_callback_t evict_cb, void *user_data)
 {
-    if (cache == NULL || key == NULL) return -1;
+    if (!cache || !key) return -1;
 
     size_t key_len = strlen(key);
-    pthread_mutex_lock(&cache->lock);
+    uint64_t key_hash = fifo_hash(key, key_len);
 
-    fifo_entry_t *existing = fifo_find_entry(cache, key, key_len);
-    if (existing != NULL)
+    int retries = 0;
+    while (retries < FIFO_MAX_RETRIES)
     {
-        /* call eviction callback on old value before replacing */
-        if (existing->evict_cb && existing->value)
+        /* check if entry already exists */
+        _Atomic(fifo_tagged_ptr_t) *pred_ptr;
+        fifo_tagged_ptr_t pred_tagged;
+        fifo_entry_t *existing = fifo_find(cache, key, key_len, key_hash, &pred_ptr, &pred_tagged);
+
+        if (existing)
         {
-            existing->evict_cb(existing->key, existing->value, existing->user_data);
+            /* try to update existing entry */
+            int state = ENTRY_STATE_ACTIVE;
+            if (atomic_compare_exchange_strong(&existing->state, &state, ENTRY_STATE_UPDATING))
+            {
+                /* call callback on old value */
+                if (existing->evict_cb)
+                {
+                    void *old_val = atomic_load(&existing->value);
+                    existing->evict_cb(existing->key, old_val, existing->user_data);
+                }
+
+                /* update value and callback */
+                atomic_store(&existing->value, value);
+                existing->evict_cb = evict_cb;
+                existing->user_data = user_data;
+
+                /* transition back to active */
+                atomic_store(&existing->state, ENTRY_STATE_ACTIVE);
+                return 0;
+            }
+            /* state changed, retry */
+            backoff(retries++);
+            continue;
         }
 
-        existing->value = value;
-        existing->evict_cb = evict_cb;
-        existing->user_data = user_data;
-        fifo_move_to_head(cache, existing);
-        pthread_mutex_unlock(&cache->lock);
+        /* need to insert new entry */
+
+        /* reserve our slot first by incrementing size */
+        size_t new_size = atomic_fetch_add(&cache->size, 1) + 1;
+
+        /* if over capacity, evict entries until we have room */
+        while (new_size > cache->capacity)
+        {
+            if (fifo_try_evict_one(cache) == 0)
+            {
+                new_size = atomic_load(&cache->size);
+            }
+            else
+            {
+                /* couldn't evict, someone else might be evicting */
+                sched_yield();
+                new_size = atomic_load(&cache->size);
+            }
+        }
+
+        /* create new entry */
+        fifo_entry_t *entry = fifo_entry_new(key, key_len, key_hash, value, evict_cb, user_data);
+        if (!entry)
+        {
+            atomic_fetch_sub(&cache->size, 1); /* release reserved slot */
+            return -1;
+        }
+
+        /* insert into hash table */
+        if (fifo_insert_hash(cache, entry) != 0)
+        {
+            fifo_entry_free(entry, 0);
+            atomic_fetch_sub(&cache->size, 1); /* release reserved slot */
+            backoff(retries++);
+            continue;
+        }
+
+        /* transition to active */
+        atomic_store(&entry->state, ENTRY_STATE_ACTIVE);
+
+        /* add to eviction queue */
+        if (fifo_enqueue_order(cache, entry) != 0)
+        {
+            fifo_mark_deleted(entry);
+            atomic_store(&entry->state, ENTRY_STATE_DELETED);
+            atomic_fetch_sub(&cache->size, 1); /* release our reserved slot */
+            backoff(retries++);
+            continue;
+        }
+
+        /* success! size was already incremented */
         return 0;
     }
 
-    if (cache->size >= cache->capacity) fifo_evict_fifo(cache);
-
-    fifo_entry_t *entry = (fifo_entry_t *)malloc(sizeof(fifo_entry_t));
-    if (entry == NULL)
-    {
-        pthread_mutex_unlock(&cache->lock);
-        return -1;
-    }
-
-    entry->key = tdb_strdup(key);
-
-    if (entry->key == NULL)
-    {
-        free(entry);
-        pthread_mutex_unlock(&cache->lock);
-        return -1;
-    }
-
-    entry->key_len = key_len;
-    entry->value = value;
-    entry->evict_cb = evict_cb;
-    entry->user_data = user_data;
-    entry->prev = NULL;
-    entry->next = cache->head;
-
-    if (cache->head) cache->head->prev = entry;
-    cache->head = entry;
-
-    /* if list was empty, this is also the tail */
-    if (cache->tail == NULL) cache->tail = entry;
-
-    fifo_add_to_table(cache, entry);
-
-    cache->size++;
-
-    pthread_mutex_unlock(&cache->lock);
-    return 0;
+    return -1;
 }
 
 void *fifo_cache_get(fifo_cache_t *cache, const char *key)
 {
-    if (cache == NULL || key == NULL) return NULL;
+    if (!cache || !key) return NULL;
 
     size_t key_len = strlen(key);
-    size_t index = fifo_hash(key, key_len, cache->table_size);
-    fifo_entry_t *entry = cache->table[index];
+    uint64_t key_hash = fifo_hash(key, key_len);
 
-    /* walk hash chain without lock */
-    while (entry != NULL)
+    _Atomic(fifo_tagged_ptr_t) *pred_ptr;
+    fifo_tagged_ptr_t pred_tagged;
+    fifo_entry_t *entry = fifo_find(cache, key, key_len, key_hash, &pred_ptr, &pred_tagged);
+
+    if (entry)
     {
-        if (entry->key_len == key_len && memcmp(entry->key, key, key_len) == 0)
+        int state = atomic_load(&entry->state);
+        if (state == ENTRY_STATE_ACTIVE || state == ENTRY_STATE_UPDATING)
         {
-            return entry->value;
+            return atomic_load(&entry->value);
         }
-        entry = entry->hash_next;
     }
 
-    return NULL; /* not found */
+    return NULL;
 }
 
 int fifo_cache_remove(fifo_cache_t *cache, const char *key)
 {
-    if (cache == NULL || key == NULL) return -1;
+    if (!cache || !key) return -1;
 
     size_t key_len = strlen(key);
-    pthread_mutex_lock(&cache->lock);
+    uint64_t key_hash = fifo_hash(key, key_len);
 
-    fifo_entry_t *entry = fifo_find_entry(cache, key, key_len);
-    if (entry == NULL)
+    int retries = 0;
+    while (retries < FIFO_MAX_RETRIES)
     {
-        pthread_mutex_unlock(&cache->lock);
-        return -1;
+        _Atomic(fifo_tagged_ptr_t) *pred_ptr;
+        fifo_tagged_ptr_t pred_tagged;
+        fifo_entry_t *entry = fifo_find(cache, key, key_len, key_hash, &pred_ptr, &pred_tagged);
+
+        if (!entry) return -1;
+
+        /* try to transition to evicting */
+        int state = ENTRY_STATE_ACTIVE;
+        if (atomic_compare_exchange_strong(&entry->state, &state, ENTRY_STATE_EVICTING))
+        {
+            /* call eviction callback */
+            if (entry->evict_cb)
+            {
+                void *val = atomic_load(&entry->value);
+                entry->evict_cb(entry->key, val, entry->user_data);
+            }
+
+            /* mark as deleted */
+            fifo_mark_deleted(entry);
+            atomic_store(&entry->state, ENTRY_STATE_DELETED);
+
+            atomic_fetch_sub(&cache->size, 1);
+            return 0;
+        }
+
+        backoff(retries++);
     }
 
-    fifo_free_entry(cache, entry);
-
-    pthread_mutex_unlock(&cache->lock);
-    return 0;
+    return -1;
 }
 
 void fifo_cache_clear(fifo_cache_t *cache)
 {
-    if (cache == NULL) return;
+    if (!cache) return;
 
-    pthread_mutex_lock(&cache->lock);
-
-    fifo_entry_t *current = cache->head;
-    while (current != NULL)
+    /* clear by evicting all entries */
+    while (atomic_load(&cache->size) > 0)
     {
-        fifo_entry_t *next = current->next;
-
-        /* call eviction callback if set */
-        if (current->evict_cb) current->evict_cb(current->key, current->value, current->user_data);
-
-        free(current->key);
-        free(current);
-        current = next;
+        if (fifo_try_evict_one(cache) != 0)
+        {
+            /* no more entries or eviction failed */
+            break;
+        }
     }
-
-    memset(cache->table, 0, cache->table_size * sizeof(fifo_entry_t *));
-
-    cache->head = NULL;
-    cache->tail = NULL;
-    cache->size = 0;
-
-    pthread_mutex_unlock(&cache->lock);
 }
 
 void fifo_cache_free(fifo_cache_t *cache)
 {
-    if (cache == NULL) return;
+    if (!cache) return;
 
+    /* clear all entries (calls callbacks) */
     fifo_cache_clear(cache);
 
-    pthread_mutex_destroy(&cache->lock);
+    /* free remaining entries in hash table, calling callbacks to ensure proper cleanup */
+    for (size_t i = 0; i < cache->table_size; i++)
+    {
+        fifo_tagged_ptr_t tp = atomic_load(&cache->table[i]);
+        fifo_entry_t *entry = get_ptr(tp);
+        while (entry)
+        {
+            fifo_tagged_ptr_t next_tp = atomic_load(&entry->hash_next);
+            fifo_entry_t *next = get_ptr(next_tp);
+            fifo_entry_free(entry, 1); /* call callback to unref SSTables/blocks */
+            entry = next;
+        }
+    }
+
+    /* free eviction queue */
+    fifo_order_node_t *node = atomic_load(&cache->evict_head);
+    while (node)
+    {
+        fifo_order_node_t *next = atomic_load(&node->next);
+        free(node);
+        node = next;
+    }
+
+    /* flush retired stack with callbacks */
+    fifo_flush_retired(cache, 1);
+
     free(cache->table);
     free(cache);
+    cache = NULL;
 }
 
 void fifo_cache_destroy(fifo_cache_t *cache)
 {
-    if (cache == NULL) return;
+    if (!cache) return;
 
-    pthread_mutex_lock(&cache->lock);
-
-    fifo_entry_t *current = cache->head;
-    while (current != NULL)
+    /* free entries without callbacks */
+    for (size_t i = 0; i < cache->table_size; i++)
     {
-        fifo_entry_t *next = current->next;
-
-        free(current->key);
-        free(current);
-        current = next;
+        fifo_tagged_ptr_t tp = atomic_load(&cache->table[i]);
+        fifo_entry_t *entry = get_ptr(tp);
+        while (entry)
+        {
+            fifo_tagged_ptr_t next_tp = atomic_load(&entry->hash_next);
+            fifo_entry_t *next = get_ptr(next_tp);
+            free(entry->key);
+            free(entry);
+            entry = next;
+        }
     }
 
-    memset(cache->table, 0, cache->table_size * sizeof(fifo_entry_t *));
+    /* free eviction queue */
+    fifo_order_node_t *node = atomic_load(&cache->evict_head);
+    while (node)
+    {
+        fifo_order_node_t *next = atomic_load(&node->next);
+        free(node);
+        node = next;
+    }
 
-    cache->head = NULL;
-    cache->tail = NULL;
-    cache->size = 0;
+    /* flush retired stack without callbacks */
+    fifo_flush_retired(cache, 0);
 
-    pthread_mutex_unlock(&cache->lock);
-    pthread_mutex_destroy(&cache->lock);
     free(cache->table);
     free(cache);
 }
 
 size_t fifo_cache_size(fifo_cache_t *cache)
 {
-    if (cache == NULL) return 0;
-
-    pthread_mutex_lock(&cache->lock);
-    size_t size = cache->size;
-    pthread_mutex_unlock(&cache->lock);
-
-    return size;
+    if (!cache) return 0;
+    return atomic_load(&cache->size);
 }
 
 size_t fifo_cache_capacity(fifo_cache_t *cache)
 {
-    if (cache == NULL) return 0;
+    if (!cache) return 0;
     return cache->capacity;
 }
 
 size_t fifo_cache_foreach(fifo_cache_t *cache, fifo_foreach_callback_t callback, void *user_data)
 {
-    if (cache == NULL || callback == NULL) return 0;
-
-    pthread_mutex_lock(&cache->lock);
+    if (!cache || !callback) return 0;
 
     size_t count = 0;
-    fifo_entry_t *current = cache->head;
 
-    /* iterate from most recently used to least recently used */
-    while (current != NULL)
+    for (size_t i = 0; i < cache->table_size; i++)
     {
-        int result = callback(current->key, current->value, user_data);
-        count++;
+        fifo_tagged_ptr_t tp = atomic_load(&cache->table[i]);
+        fifo_entry_t *entry = get_ptr(tp);
 
-        /* if callback returns non-zero, stop iteration */
-        if (result != 0) break;
+        while (entry)
+        {
+            fifo_tagged_ptr_t next_tp = atomic_load(&entry->hash_next);
 
-        current = current->next;
+            if (!is_marked(next_tp))
+            {
+                int state = atomic_load(&entry->state);
+                if (state == ENTRY_STATE_ACTIVE)
+                {
+                    void *val = atomic_load(&entry->value);
+                    int result = callback(entry->key, val, user_data);
+                    count++;
+
+                    if (result != 0) return count;
+                }
+            }
+
+            entry = get_ptr(next_tp);
+        }
     }
-
-    pthread_mutex_unlock(&cache->lock);
 
     return count;
 }

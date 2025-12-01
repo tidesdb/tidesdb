@@ -600,22 +600,12 @@ void test_block_manager_seek_and_goto()
     (void)remove("test.db");
 }
 
-/** multithreaded tests */
-/* shared block manager
- * for all threads **/
 block_manager_t *bm = NULL;
 
-/* mutex for thread-safe block manager operations */
 pthread_mutex_t bm_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/* number of blocks each writer will write */
 #define BLOCKS_PER_WRITER 10
-
-/* number of writer threads */
-#define NUM_WRITERS 3
-
-/* number of reader threads */
-#define NUM_READERS 2
+#define NUM_WRITERS       3
+#define NUM_READERS       2
 
 void *writer_thread(void *arg)
 {
@@ -802,7 +792,6 @@ void test_block_manager_concurrent_rw()
 
 void test_block_manager_validate_last_block()
 {
-    /* first, create a block manager and write some valid blocks */
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, "validate_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
@@ -954,10 +943,7 @@ void test_block_manager_open_safety()
     }
 }
 
-/* number of blocks to use in benchmark */
 #define NUM_BLOCKS 100000
-
-/* block size for benchmark (bytes) */
 #define BLOCK_SIZE 256
 
 void benchmark_block_manager()

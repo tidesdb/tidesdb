@@ -20,16 +20,16 @@
 #include "../src/skip_list.h"
 #include "test_utils.h"
 
+static int tests_passed = 0;
+static int tests_failed = 0;
+
+#define BENCH_N 1000000 /* number of entries to write and retrieve */
+
 /* helper macros for accessing node data */
 #define NODE_KEY(node)   ((node)->key)
 #define NODE_VALUE(node) (atomic_load_explicit(&(node)->versions, memory_order_acquire)->value)
 #define NODE_IS_DELETED(node) \
     (VERSION_IS_DELETED(atomic_load_explicit(&(node)->versions, memory_order_acquire)))
-
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define BENCH_N 1000000 /* number of entries to write and retrieve */
 
 void test_skip_list_create_node()
 {

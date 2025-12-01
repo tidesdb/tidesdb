@@ -26,7 +26,6 @@ static int tests_failed = 0;
 static int eviction_count = 0;
 static char last_evicted_key[256] = {0};
 
-/* simple eviction callback for testing */
 static void test_evict_callback(const char *key, void *value, void *user_data)
 {
     eviction_count++;
@@ -35,7 +34,6 @@ static void test_evict_callback(const char *key, void *value, void *user_data)
     (void)user_data;
 }
 
-/* eviction callback that frees allocated memory */
 static void free_evict_callback(const char *key, void *value, void *user_data)
 {
     (void)key;

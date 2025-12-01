@@ -4183,8 +4183,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     queue_free(sstables_to_delete);
 
-    atomic_fetch_add(&cf->compaction_count, 1);
-
     return TDB_SUCCESS;
 }
 
@@ -5159,8 +5157,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     free(boundaries);
     free(boundary_sizes);
 
-    atomic_fetch_add(&cf->compaction_count, 1);
-
     return TDB_SUCCESS;
 }
 
@@ -5550,14 +5546,27 @@ static void *tidesdb_background_compaction_thread(void *arg)
                 tidesdb_flush_memtable(cf);
             }
 
-            /* enqueue compaction work for thread pool to process */
-            tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
-            if (work)
+            /* only enqueue if no compaction is pending to prevent infinite loop */
+            int expected = 0;
+            if (atomic_compare_exchange_strong_explicit(&cf->compaction_pending, &expected, 1,
+                                                        memory_order_acq_rel, memory_order_acquire))
             {
-                work->cf = cf;
-                if (queue_enqueue(cf->db->compaction_queue, work) != 0)
+                /* enqueue compaction work for thread pool to process */
+                tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
+                if (work)
                 {
-                    free(work);
+                    work->cf = cf;
+                    if (queue_enqueue(cf->db->compaction_queue, work) != 0)
+                    {
+                        /* failed to enqueue, clear the pending flag */
+                        atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
+                        free(work);
+                    }
+                }
+                else
+                {
+                    /* malloc failed, clear the pending flag */
+                    atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
                 }
             }
         }
@@ -5895,14 +5904,28 @@ static void *tidesdb_flush_worker_thread(void *arg)
                             "CF '%s': L0 has %d SSTables (threshold: %d), triggering compaction",
                             cf->name, l0_count, TDB_L0_COMPACTION_TRIGGER);
 
-                        tidesdb_compaction_work_t *compaction_work =
-                            calloc(1, sizeof(tidesdb_compaction_work_t));
-                        if (compaction_work)
+                        /* only enqueue if no compaction is pending */
+                        int expected = 0;
+                        if (atomic_compare_exchange_strong_explicit(
+                                &cf->compaction_pending, &expected, 1, memory_order_acq_rel,
+                                memory_order_acquire))
                         {
-                            compaction_work->cf = cf;
-                            if (queue_enqueue(db->compaction_queue, compaction_work) != 0)
+                            tidesdb_compaction_work_t *compaction_work =
+                                calloc(1, sizeof(tidesdb_compaction_work_t));
+                            if (compaction_work)
                             {
-                                free(compaction_work);
+                                compaction_work->cf = cf;
+                                if (queue_enqueue(db->compaction_queue, compaction_work) != 0)
+                                {
+                                    atomic_store_explicit(&cf->compaction_pending, 0,
+                                                          memory_order_release);
+                                    free(compaction_work);
+                                }
+                            }
+                            else
+                            {
+                                atomic_store_explicit(&cf->compaction_pending, 0,
+                                                      memory_order_release);
                             }
                         }
                     }
@@ -5975,6 +5998,15 @@ static void *tidesdb_compaction_worker_thread(void *arg)
             tidesdb_trigger_compaction(cf);
             pthread_rwlock_unlock(&cf->compaction_rwlock);
         }
+        else
+        {
+            /* lock is busy, another compaction is running
+             * don't discard the work - it will be requeued by background thread */
+            TDB_DEBUG_LOG("CF '%s': Compaction lock busy, skipping", cf->name);
+        }
+
+        /* clear the pending flag to allow new work items to be queued */
+        atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
 
         free(work);
     }
@@ -6432,6 +6464,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->memtable_id, 0);
     atomic_init(&cf->memtable_generation, 0);
     atomic_init(&cf->compaction_should_stop, 0);
+    atomic_init(&cf->compaction_pending, 0);
     atomic_init(&cf->commit_ticket, 0);
     atomic_init(&cf->commit_serving, 0);
 
@@ -6735,12 +6768,26 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
+    /* only enqueue if no compaction is pending */
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&cf->compaction_pending, &expected, 1,
+                                                 memory_order_acq_rel, memory_order_acquire))
+    {
+        /* compaction already pending, this is not an error */
+        return TDB_SUCCESS;
+    }
+
     tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
-    if (!work) return TDB_ERR_MEMORY;
+    if (!work)
+    {
+        atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
+        return TDB_ERR_MEMORY;
+    }
 
     work->cf = cf;
     if (queue_enqueue(cf->db->compaction_queue, work) != 0)
     {
+        atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
         free(work);
         return TDB_ERR_MEMORY;
     }

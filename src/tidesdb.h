@@ -471,8 +471,8 @@ typedef struct
  * @param num_levels number of disk levels
  * @param compaction_thread thread for background compaction
  * @param compaction_should_stop flag to stop compaction thread
- * @param compaction_count total number of compactions
  * @param next_sstable_id next sstable id
+ * @param compaction_pending flag to prevent duplicate compaction work items
  * @param db parent database reference
  * @param levels_rwlock protects levels array and sstable add/remove operations
  * @param flush_rwlock protects memtable flush operations
@@ -497,8 +497,8 @@ struct tidesdb_column_family_t
     _Atomic(int) num_levels;
     pthread_t compaction_thread;
     _Atomic(int) compaction_should_stop;
-    _Atomic(uint64_t) compaction_count;
     _Atomic(uint64_t) next_sstable_id;
+    _Atomic(int) compaction_pending;
     tidesdb_t *db;
     pthread_rwlock_t levels_rwlock;
     pthread_rwlock_t flush_rwlock;

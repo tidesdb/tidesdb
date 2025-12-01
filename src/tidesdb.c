@@ -7116,8 +7116,14 @@ static int tidesdb_txn_add_cf_internal(tidesdb_txn_t *txn, tidesdb_column_family
         if (tidesdb_txn_register(cf, txn->txn_id, cf_snapshot, txn->isolation_level, &txn_slot) !=
             0)
         {
-            /* registration failed, but continue (best-effort) */
-            txn_slot = BUFFER_INVALID_ID;
+            /* registration failed -- buffer exhausted
+             * we cannot proceed without tracking this transaction as it would break
+             * isolation guarantees (SSI conflict detection requires tracking all active txns)
+             * fail the transaction to preserve correctness */
+            TDB_DEBUG_LOG("CF '%s': Failed to register txn %" PRIu64
+                          " - active_txn_buffer exhausted",
+                          cf->name, txn->txn_id);
+            return -1;
         }
     }
     txn->cf_txn_slots[cf_index] = txn_slot;
@@ -8012,11 +8018,28 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         uint64_t my_ticket = atomic_fetch_add_explicit(&cf->commit_ticket, 1, memory_order_relaxed);
 
+        /* hybrid spin-then-yield approach:
+         * spin for short waits (typical case -- critical section is microseconds)
+         * yield CPU if waiting too long (high contention case) */
+        uint64_t spin_count = 0;
         uint64_t current_serving;
         while ((current_serving =
                     atomic_load_explicit(&cf->commit_serving, memory_order_acquire)) != my_ticket)
         {
-            cpu_pause();
+            if (spin_count < TDB_TXN_SPIN_COUNT)
+            {
+                /* spin for ~TDB_TXN_SPIN_COUNT iterations before yielding
+                 * typical critical section is very short, so spinning is efficient */
+                cpu_pause();
+                spin_count++;
+            }
+            else
+            {
+                /* we've been waiting too long, yield CPU to avoid wasting cycles
+                 * this happens under high contention or if holder is preempted */
+                cpu_yield();
+                spin_count = 0; /* reset counter after yield */
+            }
         }
 
         skip_list_t *target_memtable =

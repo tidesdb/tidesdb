@@ -1813,4 +1813,12 @@ static inline int tdb_get_available_disk_space(const char *path, uint64_t *avail
 #define cpu_pause() ((void)0)
 #endif
 
+/* cpu yield for longer waits - gives up time slice to scheduler */
+#ifdef _WIN32
+#define cpu_yield() SwitchToThread()
+#else
+#include <sched.h>
+#define cpu_yield() sched_yield()
+#endif
+
 #endif /* __COMPAT_H__ */

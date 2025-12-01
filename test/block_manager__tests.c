@@ -954,7 +954,6 @@ void test_block_manager_open_safety()
     }
 }
 
-
 /* number of blocks to use in benchmark */
 #define NUM_BLOCKS 100000
 

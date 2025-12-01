@@ -36,11 +36,14 @@ static tidesdb_t *create_test_db(void)
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
     ASSERT_TRUE(db != NULL);
 
+    cleanup_test_dir();
+
     return db;
 }
 
 static void test_basic_open_close(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     ASSERT_EQ(tidesdb_close(db), 0);
     cleanup_test_dir();
@@ -48,6 +51,7 @@ static void test_basic_open_close(void)
 
 static void test_column_family_creation(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -63,6 +67,7 @@ static void test_column_family_creation(void)
 
 static void test_basic_txn_put_get(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -70,17 +75,14 @@ static void test_basic_txn_put_get(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* begin transaction */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
     ASSERT_TRUE(txn != NULL);
 
-    /* put key-value pair */
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
     ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
 
-    /* get the value back */
     uint8_t *retrieved_value = NULL;
     size_t retrieved_size = 0;
     ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved_value, &retrieved_size), 0);
@@ -89,7 +91,6 @@ static void test_basic_txn_put_get(void)
     ASSERT_TRUE(memcmp(retrieved_value, value, sizeof(value)) == 0);
     free(retrieved_value);
 
-    /* commit transaction */
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
@@ -99,13 +100,13 @@ static void test_basic_txn_put_get(void)
 
 static void test_txn_delete(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
 
-    /* put a key */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     uint8_t key[] = "delete_key";
@@ -114,14 +115,12 @@ static void test_txn_delete(void)
     ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
     tidesdb_txn_free(txn1);
 
-    /* delete the key */
     tidesdb_txn_t *txn2 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
     ASSERT_EQ(tidesdb_txn_delete(txn2, cf, key, sizeof(key)), 0);
     ASSERT_EQ(tidesdb_txn_commit(txn2), 0);
     tidesdb_txn_free(txn2);
 
-    /* try to get deleted key */
     tidesdb_txn_t *txn3 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn3), 0);
     uint8_t *retrieved_value = NULL;
@@ -136,13 +135,13 @@ static void test_txn_delete(void)
 
 static void test_txn_rollback(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
 
-    /* begin transaction and put a key */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
     uint8_t key[] = "rollback_key";
@@ -168,10 +167,10 @@ static void test_txn_rollback(void)
 
 static void test_multiple_column_families(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
-    /* create multiple column families */
     ASSERT_EQ(tidesdb_create_column_family(db, "cf1", &cf_config), 0);
     ASSERT_EQ(tidesdb_create_column_family(db, "cf2", &cf_config), 0);
     ASSERT_EQ(tidesdb_create_column_family(db, "cf3", &cf_config), 0);
@@ -218,15 +217,15 @@ static void test_multiple_column_families(void)
 
 static void test_memtable_flush(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 512;                /* small buffer to trigger flush */
-    cf_config.compression_algorithm = NO_COMPRESSION; /* disable compression for debugging */
+    cf_config.write_buffer_size = 512;
+    cf_config.compression_algorithm = NO_COMPRESSION;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
 
-    /* write a few entries */
     for (int i = 0; i < 5; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -284,19 +283,19 @@ static void test_memtable_flush(void)
 
 static void test_persistence_and_recovery(void)
 {
+    cleanup_test_dir();
     const int NUM_KEYS = 20;
 
     /* create database, write data, flush, close */
     {
         tidesdb_t *db = create_test_db();
         tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-        cf_config.compression_algorithm = NO_COMPRESSION; /* easier to debug */
+        cf_config.compression_algorithm = NO_COMPRESSION;
 
         ASSERT_EQ(tidesdb_create_column_family(db, "persist_cf", &cf_config), 0);
         tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "persist_cf");
         ASSERT_TRUE(cf != NULL);
 
-        /* write data */
         for (int i = 0; i < NUM_KEYS; i++)
         {
             tidesdb_txn_t *txn = NULL;
@@ -392,6 +391,7 @@ static void test_persistence_and_recovery(void)
 
 static void test_iterator_basic(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -421,7 +421,6 @@ static void test_iterator_basic(void)
     ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
     ASSERT_TRUE(iter != NULL);
 
-    /* seek to first */
     ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
     ASSERT_TRUE(tidesdb_iter_valid(iter));
 
@@ -448,6 +447,7 @@ static void test_iterator_basic(void)
 
 static void test_stats(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -472,7 +472,6 @@ static void test_stats(void)
         tidesdb_txn_free(txn);
     }
 
-    /* get stats */
     tidesdb_stats_t *stats = NULL;
     ASSERT_EQ(tidesdb_get_stats(cf, &stats), 0);
     ASSERT_TRUE(stats != NULL);
@@ -485,6 +484,7 @@ static void test_stats(void)
 
 static void test_iterator_seek(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -538,6 +538,7 @@ static void test_iterator_seek(void)
 
 static void test_iterator_reverse(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -596,6 +597,7 @@ static void test_iterator_reverse(void)
 
 static void test_iterator_boundaries(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -626,7 +628,6 @@ static void test_iterator_boundaries(void)
     tidesdb_iter_t *iter = NULL;
     ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
 
-    /* test seek_to_first */
     int result = tidesdb_iter_seek_to_first(iter);
     if (result == 0 && tidesdb_iter_valid(iter))
     {
@@ -636,7 +637,6 @@ static void test_iterator_boundaries(void)
         ASSERT_TRUE(key != NULL);
     }
 
-    /* test seek_to_last */
     result = tidesdb_iter_seek_to_last(iter);
     if (result == 0 && tidesdb_iter_valid(iter))
     {
@@ -654,9 +654,10 @@ static void test_iterator_boundaries(void)
 
 static void test_compaction_basic(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 2048; /* larger buffer to avoid compression issues */
+    cf_config.write_buffer_size = 2048;
     cf_config.level_size_ratio = 10;
     cf_config.compression_algorithm = LZ4_COMPRESSION;
 
@@ -744,9 +745,10 @@ static void test_compaction_basic(void)
 
 static void test_compaction_with_deletes(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 2048; /* larger buffer to avoid compression issues */
+    cf_config.write_buffer_size = 2048;
     cf_config.level_size_ratio = 10;
     cf_config.compression_algorithm = LZ4_COMPRESSION;
 
@@ -858,6 +860,7 @@ static void test_compaction_with_deletes(void)
 
 static void test_ttl_expiration(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -865,7 +868,6 @@ static void test_ttl_expiration(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ttl_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* insert key with 2 second TTL */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -906,6 +908,7 @@ static void test_ttl_expiration(void)
 
 static void test_large_values(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -962,6 +965,7 @@ static void test_large_values(void)
 
 static void test_many_keys(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 4096;
@@ -1017,7 +1021,7 @@ static void test_many_keys(void)
     /* additional wait to ensure all sstables are fully written */
     usleep(500000);
 
-    /* verify random keys -- create transaction AFTER flushes complete */
+    /* verify random keys -- create transaction after flushes complete */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -1058,6 +1062,7 @@ static void test_many_keys(void)
 
 static void test_bidirectional_iterator(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.compression_algorithm = NO_COMPRESSION;
@@ -1177,11 +1182,12 @@ static void test_bidirectional_iterator(void)
 
 static void test_background_compaction(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 512;          /* small to trigger automatic flushes */
-    cf_config.enable_background_compaction = 1; /* enable automatic background compaction */
-    cf_config.compaction_interval_ms = 100;     /* check every 100ms */
+    cf_config.write_buffer_size = 512;
+    cf_config.enable_background_compaction = 1;
+    cf_config.compaction_interval_ms = 100;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "auto_compact_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "auto_compact_cf");
@@ -1241,6 +1247,7 @@ static void test_background_compaction(void)
 
 static void test_isolation_read_uncommitted(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -1280,6 +1287,7 @@ static void test_isolation_read_uncommitted(void)
 
 static void test_isolation_read_committed(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -1334,11 +1342,9 @@ static void test_isolation_read_committed(void)
     cleanup_test_dir();
 }
 
-/* test_isolation_repeatable_read removed - REPEATABLE READ is not a supported isolation level.
- * Use test_snapshot_isolation_consistency instead, which tests SNAPSHOT isolation. */
-
 static void test_isolation_serializable_conflict(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -1402,6 +1408,7 @@ static void test_isolation_serializable_conflict(void)
 
 static void test_savepoints(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -1416,7 +1423,6 @@ static void test_savepoints(void)
     uint8_t value1[] = "value1";
     ASSERT_EQ(tidesdb_txn_put(txn, cf, key1, sizeof(key1), value1, sizeof(value1), 0), 0);
 
-    /* create savepoint */
     ASSERT_EQ(tidesdb_txn_savepoint(txn, "sp1"), 0);
 
     /* put another value */
@@ -1446,6 +1452,7 @@ static void test_savepoints(void)
 
 static void test_iterator_seek_for_prev(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -1500,6 +1507,7 @@ static void test_iterator_seek_for_prev(void)
 
 static void test_ini_config(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 1024 * 1024;
@@ -1526,6 +1534,7 @@ static void test_ini_config(void)
 
 static void test_runtime_config_update(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -1533,7 +1542,6 @@ static void test_runtime_config_update(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "rt_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* update runtime config */
     tidesdb_column_family_config_t new_config = tidesdb_default_column_family_config();
     new_config.write_buffer_size = 2 * 1024 * 1024; /* 2MB */
     new_config.enable_bloom_filter = 1;
@@ -1552,6 +1560,7 @@ static void test_runtime_config_update(void)
 
 static void test_error_invalid_args(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -1583,6 +1592,7 @@ static void test_error_invalid_args(void)
 
 static void test_drop_column_family(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -1590,7 +1600,6 @@ static void test_drop_column_family(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "drop_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* write some data */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
     uint8_t key[] = "key";
@@ -1599,7 +1608,6 @@ static void test_drop_column_family(void)
     ASSERT_EQ(tidesdb_txn_commit(txn), 0);
     tidesdb_txn_free(txn);
 
-    /* drop the column family */
     ASSERT_EQ(tidesdb_drop_column_family(db, "drop_cf"), 0);
 
     /* should not be able to get it anymore */
@@ -1612,6 +1620,7 @@ static void test_drop_column_family(void)
 
 static void test_empty_iterator(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -1638,6 +1647,7 @@ static void test_empty_iterator(void)
 
 static void test_compression_lz4(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.compression_algorithm = LZ4_COMPRESSION;
@@ -1690,6 +1700,7 @@ static void test_compression_lz4(void)
 
 static void test_compression_zstd(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.compression_algorithm = ZSTD_COMPRESSION;
@@ -1741,6 +1752,7 @@ static void test_compression_zstd(void)
 
 static void test_compression_snappy(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.compression_algorithm = SNAPPY_COMPRESSION;
@@ -1749,7 +1761,6 @@ static void test_compression_snappy(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "snappy_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* write data */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -1771,7 +1782,6 @@ static void test_compression_snappy(void)
     tidesdb_flush_memtable(cf);
     usleep(100000);
 
-    /* verify */
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
     snprintf(key, sizeof(key), "key_3");
 
@@ -1791,6 +1801,7 @@ static void test_compression_snappy(void)
 
 static void test_bloom_filter_enabled(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_bloom_filter = 1;
@@ -1847,6 +1858,7 @@ static void test_bloom_filter_enabled(void)
 
 static void test_block_indexes(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_block_indexes = 1;
@@ -1905,6 +1917,7 @@ static void test_block_indexes(void)
 
 static void test_sync_modes(void)
 {
+    cleanup_test_dir();
     /* test TDB_SYNC_NONE */
     {
         tidesdb_t *db = create_test_db();
@@ -1954,6 +1967,7 @@ static void test_sync_modes(void)
 
 static void test_concurrent_writes(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -1994,6 +2008,7 @@ static void test_concurrent_writes(void)
 
 static void test_empty_value(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2026,6 +2041,7 @@ static void test_empty_value(void)
 
 static void test_delete_nonexistent_key(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2056,6 +2072,7 @@ static void test_delete_nonexistent_key(void)
 
 static void test_multiple_deletes_same_key(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2099,6 +2116,7 @@ static void test_multiple_deletes_same_key(void)
 
 static void test_overwrite_same_key_multiple_times(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2138,6 +2156,7 @@ static void test_overwrite_same_key_multiple_times(void)
 
 static void test_put_delete_put_same_key(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2183,6 +2202,7 @@ static void test_put_delete_put_same_key(void)
 
 static void test_iterator_on_empty_cf(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2212,6 +2232,7 @@ static void test_iterator_on_empty_cf(void)
 
 static void test_iterator_single_key(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2248,6 +2269,7 @@ static void test_iterator_single_key(void)
 
 static void test_mixed_operations_in_transaction(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2291,6 +2313,7 @@ static void test_mixed_operations_in_transaction(void)
 
 static void test_read_own_writes_in_transaction(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2325,6 +2348,7 @@ static void test_read_own_writes_in_transaction(void)
 
 static void test_alternating_puts_deletes(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 512;
@@ -2396,6 +2420,7 @@ static void test_alternating_puts_deletes(void)
 
 static void test_very_long_key(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2436,15 +2461,15 @@ static void test_very_long_key(void)
 
 static void test_read_across_multiple_sstables(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 512; /* small to create many sstables */
+    cf_config.write_buffer_size = 512;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "multi_sst_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "multi_sst_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* write 100 keys across multiple sstables */
     for (int i = 0; i < 100; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -2496,6 +2521,7 @@ static void test_read_across_multiple_sstables(void)
 
 static void test_read_with_bloom_filter_disabled(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_bloom_filter = 0; /* disable bloom filter */
@@ -2548,6 +2574,7 @@ static void test_read_with_bloom_filter_disabled(void)
 
 static void test_read_with_block_indexes_disabled(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_block_indexes = 0; /* disable block indexes */
@@ -2600,6 +2627,7 @@ static void test_read_with_block_indexes_disabled(void)
 
 static void test_read_with_all_optimizations_disabled(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_bloom_filter = 0;
@@ -2654,9 +2682,10 @@ static void test_read_with_all_optimizations_disabled(void)
 
 static void test_read_after_multi_level_compaction(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 2048; /* larger buffer to avoid compression issues */
+    cf_config.write_buffer_size = 2048;
     cf_config.level_size_ratio = 10;
     cf_config.compression_algorithm = LZ4_COMPRESSION;
 
@@ -2732,9 +2761,10 @@ static void test_read_after_multi_level_compaction(void)
 
 static void test_iterator_across_multiple_sources(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 2048; /* larger buffer to avoid compression issues */
+    cf_config.write_buffer_size = 2048;
     cf_config.compression_algorithm = LZ4_COMPRESSION;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "iter_multi_cf", &cf_config), 0);
@@ -2804,6 +2834,7 @@ static void test_iterator_across_multiple_sources(void)
 
 static void test_overwrite_across_levels(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 512;
@@ -2858,6 +2889,7 @@ static void test_overwrite_across_levels(void)
 
 static void test_atomicity_transaction_rollback(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2865,7 +2897,6 @@ static void test_atomicity_transaction_rollback(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "atomic_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* write initial data */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     uint8_t key1[] = "key1";
@@ -2900,6 +2931,7 @@ static void test_atomicity_transaction_rollback(void)
 
 static void test_consistency_after_flush(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 512;
@@ -2925,7 +2957,6 @@ static void test_consistency_after_flush(void)
         tidesdb_txn_free(txn);
     }
 
-    /* flush to sst */
     tidesdb_flush_memtable(cf);
     usleep(100000);
 
@@ -2954,6 +2985,7 @@ static void test_consistency_after_flush(void)
 
 static void test_isolation_concurrent_transactions(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -2965,7 +2997,6 @@ static void test_isolation_concurrent_transactions(void)
     uint8_t value1[] = "value_from_txn1";
     uint8_t value2[] = "value_from_txn2";
 
-    /* start two transactions */
     tidesdb_txn_t *txn1 = NULL, *txn2 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
@@ -2997,6 +3028,7 @@ static void test_isolation_concurrent_transactions(void)
 
 static void test_durability_reopen_database(void)
 {
+    cleanup_test_dir();
     /* write data and close */
     {
         tidesdb_t *db = create_test_db();
@@ -3006,7 +3038,6 @@ static void test_durability_reopen_database(void)
         tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "durable_cf");
         ASSERT_TRUE(cf != NULL);
 
-        /* write data */
         for (int i = 0; i < 10; i++)
         {
             tidesdb_txn_t *txn = NULL;
@@ -3084,6 +3115,7 @@ static void test_durability_reopen_database(void)
 
 static void test_data_integrity_after_compaction(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 512;
@@ -3148,6 +3180,7 @@ static void test_data_integrity_after_compaction(void)
 
 static void test_snapshot_isolation_consistency(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -3159,7 +3192,6 @@ static void test_snapshot_isolation_consistency(void)
     uint8_t value1[] = "version_1";
     uint8_t value2[] = "version_2";
 
-    /* write initial value */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
@@ -3209,6 +3241,7 @@ static void test_snapshot_isolation_consistency(void)
 
 static void test_no_data_loss_across_operations(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 512;
@@ -3254,7 +3287,6 @@ static void test_no_data_loss_across_operations(void)
         tidesdb_txn_free(txn);
     }
 
-    /* flush */
     tidesdb_flush_memtable(cf);
     /* we do NOT wait -- reads should work immediately via immutable memtable search */
 
@@ -3279,7 +3311,6 @@ static void test_no_data_loss_across_operations(void)
     cleanup_test_dir();
 }
 
-/* thread data for concurrent writes visibility test */
 typedef struct
 {
     tidesdb_t *db;
@@ -3290,7 +3321,6 @@ typedef struct
     _Atomic(int) *errors;
 } concurrent_writes_thread_data_t;
 
-/* write thread for concurrent writes visibility test */
 static void *concurrent_writes_write_thread(void *arg)
 {
     concurrent_writes_thread_data_t *data = (concurrent_writes_thread_data_t *)arg;
@@ -3326,14 +3356,9 @@ static void *concurrent_writes_write_thread(void *arg)
     return NULL;
 }
 
-/**
- * test_concurrent_writes_visibility
- * Tests that concurrent writes from multiple threads don't create visibility holes
- * This reproduces the issue where Thread B (seq=101) commits before Thread A (seq=100),
- * causing seq=100 to be invisible even though seq=101 is visible
- */
 static void test_concurrent_writes_visibility(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 1024 * 1024; /* 1MB to avoid flushes during test */
@@ -3416,6 +3441,7 @@ static void test_concurrent_writes_visibility(void)
 
 static void test_dividing_merge_strategy(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -3508,6 +3534,7 @@ static void test_dividing_merge_strategy(void)
 
 static void test_partitioned_merge_strategy(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -3661,6 +3688,7 @@ static void test_partitioned_merge_strategy(void)
 
 static void test_multi_level_compaction_strategies(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -3783,6 +3811,7 @@ static void test_multi_level_compaction_strategies(void)
 
 static void test_boundary_partitioning(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -3796,7 +3825,7 @@ static void test_boundary_partitioning(void)
     ASSERT_TRUE(cf != NULL);
 
     /* write keys with specific patterns to test boundary detection
-     * Use lexicographically distributed keys */
+     * we use lexicographically distributed keys */
     int num_keys = 120;
     for (int i = 0; i < num_keys; i++)
     {
@@ -3858,6 +3887,7 @@ static void test_boundary_partitioning(void)
 
 static void test_dynamic_capacity_adjustment(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -3946,7 +3976,6 @@ void test_multi_cf_transaction(void)
     tidesdb_t *db = create_test_db();
     assert(db != NULL);
 
-    /* create two column families */
     tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
     assert(tidesdb_create_column_family(db, "cf1", &config) == TDB_SUCCESS);
     assert(tidesdb_create_column_family(db, "cf2", &config) == TDB_SUCCESS);
@@ -4380,9 +4409,9 @@ void test_multi_cf_iterator_seek_for_prev(void)
     cleanup_test_dir();
 }
 
-/* test REPEATABLE_READ isolation level */
 static void test_isolation_repeatable_read(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -4393,7 +4422,6 @@ static void test_isolation_repeatable_read(void)
     uint8_t value1[] = "version_1";
     uint8_t value2[] = "version_2";
 
-    /* write initial value */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
@@ -4430,9 +4458,9 @@ static void test_isolation_repeatable_read(void)
     cleanup_test_dir();
 }
 
-/* test write-write conflict detection */
 static void test_write_write_conflict(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -4444,7 +4472,6 @@ static void test_write_write_conflict(void)
     uint8_t value2[] = "update1";
     uint8_t value3[] = "update2";
 
-    /* write initial value */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
@@ -4472,9 +4499,9 @@ static void test_write_write_conflict(void)
     cleanup_test_dir();
 }
 
-/* test read-write conflict detection */
 static void test_read_write_conflict(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -4485,7 +4512,6 @@ static void test_read_write_conflict(void)
     uint8_t value1[] = "initial";
     uint8_t value2[] = "updated";
 
-    /* write initial value */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
@@ -4516,16 +4542,15 @@ static void test_read_write_conflict(void)
     cleanup_test_dir();
 }
 
-/* test phantom reads prevention in SERIALIZABLE */
 static void test_serializable_phantom_prevention(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     ASSERT_EQ(tidesdb_create_column_family(db, "phantom_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "phantom_cf");
 
-    /* write initial keys */
     for (int i = 0; i < 5; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -4540,7 +4565,6 @@ static void test_serializable_phantom_prevention(void)
         tidesdb_txn_free(txn);
     }
 
-    /* start SERIALIZABLE transaction */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SERIALIZABLE, &txn1), 0);
 
@@ -4580,9 +4604,9 @@ static void test_serializable_phantom_prevention(void)
     cleanup_test_dir();
 }
 
-/* test transaction abort and retry */
 static void test_transaction_abort_retry(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -4593,7 +4617,6 @@ static void test_transaction_abort_retry(void)
     uint8_t value1[] = "initial";
     uint8_t value2[] = "updated";
 
-    /* write initial value */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
@@ -4641,9 +4664,9 @@ static void test_transaction_abort_retry(void)
     cleanup_test_dir();
 }
 
-/* test mixed isolation levels in same database */
 static void test_mixed_isolation_levels(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
@@ -4654,7 +4677,6 @@ static void test_mixed_isolation_levels(void)
     uint8_t value1[] = "v1";
     uint8_t value2[] = "v2";
 
-    /* write initial value with READ_COMMITTED */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &txn1), 0);
     ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
@@ -4699,16 +4721,16 @@ static void test_mixed_isolation_levels(void)
     cleanup_test_dir();
 }
 
-/* test long-running transaction with multiple operations */
 static void test_long_running_transaction(void)
 {
+    cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     ASSERT_EQ(tidesdb_create_column_family(db, "long_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "long_cf");
 
-    /* start long-running SNAPSHOT transaction */
+    /* we start long-running SNAPSHOT transaction */
     tidesdb_txn_t *long_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &long_txn), 0);
 

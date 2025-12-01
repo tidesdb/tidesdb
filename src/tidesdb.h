@@ -164,12 +164,14 @@ typedef enum
 #define TDB_MAX_CF_NAME_LEN 256    /* maximum column family name length */
 #define TDB_ENSURE_OPEN_SSTABLE_WAIT_US \
     1024 /* microseconds to sleep when spinning on sstable open */
-#define TDB_ENSURE_OPEN_SSTABLE_WAIT_COUNT 128 /* spin count before sleeping during sstable open \
-                                                */
+#define TDB_ENSURE_OPEN_SSTABLE_WAIT_COUNT                \
+    128 /* spin count before sleeping during sstable open \
+         */
 #define TDB_WRITE_STALL_BACKOFF_US \
     100000 /* microseconds to sleep during hard write stall (100ms) */
-#define TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS 500 /* maximum sleep time for write slowdown backpressure \
-                                             */
+#define TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS                       \
+    500 /* maximum sleep time for write slowdown backpressure \
+         */
 #define TDB_WRITE_SLOWDOWN_EXPO             10 /* milliseconds per extra sstable in exponential backoff */
 #define TDB_L0_COMPACTION_TRIGGER           4  /* l0 sstable count that triggers compaction */
 #define TDB_L0_SLOWDOWN_THRESHOLD           8  /* l0 sstable count that triggers write throttling */

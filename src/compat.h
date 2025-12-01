@@ -1932,9 +1932,14 @@ static inline int remove_directory(const char *path)
         {
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 
-            char full_path[path_len];
-            snprintf(full_path, sizeof(full_path), "%s%s%s", current, PATH_SEPARATOR,
-                     entry->d_name);
+            /* use heap allocation instead of VLA for MSVC compatibility */
+            char *full_path = malloc(path_len);
+            if (!full_path)
+            {
+                closedir(dir);
+                goto cleanup_error;
+            }
+            snprintf(full_path, path_len, "%s%s%s", current, PATH_SEPARATOR, entry->d_name);
 
             if (stack_size >= stack_capacity)
             {
@@ -1942,6 +1947,7 @@ static inline int remove_directory(const char *path)
                 char **new_stack = realloc(stack, new_stack_capacity * sizeof(char *));
                 if (!new_stack)
                 {
+                    free(full_path);
                     closedir(dir);
                     goto cleanup_error;
                 }
@@ -1949,6 +1955,7 @@ static inline int remove_directory(const char *path)
                 stack_capacity = new_stack_capacity;
             }
             stack[stack_size++] = tdb_strdup(full_path);
+            free(full_path);
         }
         closedir(dir);
     }

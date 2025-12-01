@@ -33,7 +33,7 @@ void test_block_manager_open()
     ASSERT_EQ(bm->sync_mode, BLOCK_MANAGER_SYNC_NONE);
     (void)block_manager_close(bm);
 
-    remove("test.db"); /* remove created file */
+    remove("test.db");
 }
 
 void test_block_manager_block_create()
@@ -954,7 +954,6 @@ void test_block_manager_open_safety()
     }
 }
 
-/** benchmark tests */
 
 /* number of blocks to use in benchmark */
 #define NUM_BLOCKS 100000
@@ -1881,7 +1880,6 @@ void test_block_manager_empty_block()
     block_manager_t *bm = NULL;
     ASSERT_EQ(block_manager_open(&bm, "test_empty.db", BLOCK_MANAGER_SYNC_NONE), 0);
 
-    /* create empty block (size 0) */
     block_manager_block_t *block = block_manager_block_create(0, NULL);
     ASSERT_TRUE(block != NULL);
     int64_t offset = block_manager_block_write(bm, block);

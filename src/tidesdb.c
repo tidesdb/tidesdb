@@ -6187,7 +6187,9 @@ int tidesdb_close(tidesdb_t *db)
             tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue(db->flush_queue);
             if (work)
             {
-                if (work->imm) tidesdb_immutable_memtable_unref(work->imm);
+                /* do not unref work->imm here the immutable is still in cf->immutable_memtables
+                 * and will be freed when the column family is freed
+                 * the flush work just holds a pointer, not an additional reference */
                 free(work);
             }
         }

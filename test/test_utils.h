@@ -21,7 +21,7 @@
 
 #include <assert.h>
 
-#include "../src/compat.h" /* for PATH_SEPARATOR and platform compatibility */
+#include "../src/compat.h"
 #include "test_macros.h"
 
 /* disable format-truncation warnings for test utilities. all path buffers use 1024 bytes */
@@ -64,100 +64,12 @@
     } while (0)
 
 /*
- * remove_directory
- * @param path path to directory to remove
- * @return 0 on success, -1 on failure
- */
-static inline int remove_directory_recursive(const char *path)
-{
-    DIR *dir = opendir(path);
-    if (!dir)
-    {
-        /* directory doesn't exist, consider it success */
-        return 0;
-    }
-
-    struct dirent *entry;
-    int result = 0;
-
-    while ((entry = readdir(dir)) != NULL)
-    {
-        /* skip . and .. */
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-        {
-            continue;
-        }
-
-        char filepath[1024];
-        snprintf(filepath, sizeof(filepath), "%s" PATH_SEPARATOR "%s", path, entry->d_name);
-
-        struct stat statbuf;
-        if (stat(filepath, &statbuf) != 0)
-        {
-            result = -1;
-            continue;
-        }
-
-        if (S_ISDIR(statbuf.st_mode))
-        {
-            /* recursively remove subdirectory */
-            if (remove_directory_recursive(filepath) != 0)
-            {
-                result = -1;
-            }
-        }
-        else
-        {
-            /* remove file */
-            if (remove(filepath) != 0)
-            {
-                result = -1;
-            }
-        }
-    }
-
-    closedir(dir);
-
-    /* remove the directory itself */
-#ifdef _WIN32
-    if (_rmdir(path) != 0)
-#else
-    if (rmdir(path) != 0)
-#endif
-    {
-        result = -1;
-    }
-
-    return result;
-}
-
-static inline int remove_directory(const char *path)
-{
-    return remove_directory_recursive(path);
-}
-
-/*
  * cleanup_test_dir
  * @brief cleanup test directory
  */
 UNUSED static inline void cleanup_test_dir(void)
 {
-#ifdef _WIN32
-    /* brief wait for file handles to be released on Windows */
-    Sleep(100);
-#endif
-
-    /* retry a few times on Windows due to potential file locking */
-    for (int attempt = 0; attempt < 3; attempt++)
-    {
-        if (remove_directory(TEST_DB_PATH) == 0)
-        {
-            break;
-        }
-#ifdef _WIN32
-        if (attempt < 2) Sleep(100);
-#endif
-    }
+    (void)remove_directory(TEST_DB_PATH);
 }
 
 /*

@@ -2227,6 +2227,7 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
 
     /* read metadata from last block */
     block_manager_cursor_t *metadata_cursor;
+    int metadata_corrupt = 0;
     if (block_manager_cursor_init(&metadata_cursor, klog_bm) == 0)
     {
         if (block_manager_cursor_goto_last(metadata_cursor) == 0)
@@ -2244,10 +2245,24 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
                     /* metadata loaded successfully, skip reading min/max from blocks */
                     goto load_bloom_and_index;
                 }
+                else
+                {
+                    /* metadata block exists but deserialization failed - file is corrupted
+                     * do not attempt fallback to old format, return error immediately */
+                    metadata_corrupt = 1;
+                }
                 block_manager_block_release(metadata_block);
             }
         }
         block_manager_cursor_free(metadata_cursor);
+    }
+
+    /* if metadata was found but corrupted, fail immediately without attempting fallback */
+    if (metadata_corrupt)
+    {
+        block_manager_close(klog_bm);
+        block_manager_close(vlog_bm);
+        return TDB_ERR_CORRUPTION;
     }
 
     /* read min/max keys from first and last klog blocks (for old sstables without
@@ -5573,149 +5588,6 @@ static void *tidesdb_background_compaction_thread(void *arg)
     }
 
     return NULL;
-}
-
-/**
- * remove_directory
- * safely removes a directory and all its contents iteratively
- * @param path the directory path to remove
- * @return 0 on success, -1 on failure
- */
-static int remove_directory(const char *path)
-{
-    /* simple two-pass approach: first remove all files, then remove directories bottom-up */
-
-    /* pass 1 collect all paths (files and directories) */
-    char **paths = NULL;
-    int *is_dir = NULL;
-    int path_count = 0;
-    int path_capacity = MAX_FILE_PATH_LENGTH;
-
-    paths = malloc(path_capacity * sizeof(char *));
-    is_dir = malloc(path_capacity * sizeof(int));
-    if (!paths || !is_dir)
-    {
-        free(paths);
-        free(is_dir);
-        return -1;
-    }
-
-    /* stack for iterative traversal */
-    char **stack = malloc(path_capacity * sizeof(char *));
-    if (!stack)
-    {
-        free(paths);
-        free(is_dir);
-        return -1;
-    }
-
-    int stack_size = 0;
-    stack[stack_size++] = tdb_strdup(path);
-
-    /* traverse directory tree iteratively */
-    while (stack_size > 0)
-    {
-        char *current = stack[--stack_size];
-        DIR *dir = opendir(current);
-
-        if (!dir)
-        {
-            /* it's a file, add to list */
-            if (path_count >= path_capacity)
-            {
-                path_capacity *= 2;
-                char **new_paths = realloc(paths, path_capacity * sizeof(char *));
-                int *new_is_dir = realloc(is_dir, path_capacity * sizeof(int));
-                if (!new_paths || !new_is_dir)
-                {
-                    free(new_paths);
-                    free(new_is_dir);
-                    free(current);
-                    goto cleanup_error;
-                }
-                paths = new_paths;
-                is_dir = new_is_dir;
-            }
-            paths[path_count] = current;
-            is_dir[path_count] = 0;
-            path_count++;
-            continue;
-        }
-
-        /* add directory to list */
-        if (path_count >= path_capacity)
-        {
-            path_capacity *= 2;
-            char **new_paths = realloc(paths, path_capacity * sizeof(char *));
-            int *new_is_dir = realloc(is_dir, path_capacity * sizeof(int));
-            if (!new_paths || !new_is_dir)
-            {
-                free(new_paths);
-                free(new_is_dir);
-                closedir(dir);
-                free(current);
-                goto cleanup_error;
-            }
-            paths = new_paths;
-            is_dir = new_is_dir;
-        }
-        paths[path_count] = current;
-        is_dir[path_count] = 1;
-        path_count++;
-
-        /* add children to stack */
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL)
-        {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-
-            char full_path[MAX_FILE_PATH_LENGTH];
-            snprintf(full_path, sizeof(full_path), "%s%s%s", current, PATH_SEPARATOR,
-                     entry->d_name);
-
-            if (stack_size >= path_capacity)
-            {
-                path_capacity *= 2;
-                char **new_stack = realloc(stack, path_capacity * sizeof(char *));
-                if (!new_stack)
-                {
-                    closedir(dir);
-                    goto cleanup_error;
-                }
-                stack = new_stack;
-            }
-            stack[stack_size++] = tdb_strdup(full_path);
-        }
-        closedir(dir);
-    }
-
-    /* pass 2 remove in reverse order (files first, then directories bottom-up) */
-    int result = 0;
-    for (int i = path_count - 1; i >= 0; i--)
-    {
-        if (is_dir[i])
-        {
-            if (rmdir(paths[i]) != 0) result = -1;
-        }
-        else
-        {
-            if (unlink(paths[i]) != 0) result = -1;
-        }
-        free(paths[i]);
-    }
-
-    free(paths);
-    free(is_dir);
-    free(stack);
-    return result;
-
-cleanup_error:
-    for (int i = 0; i < stack_size; i++) free(stack[i]);
-    for (int i = 0; i < path_count; i++) free(paths[i]);
-    free(paths);
-    free(is_dir);
-    free(stack);
-    return -1;
 }
 
 /**
@@ -9575,7 +9447,23 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                     }
                     else
                     {
+                        /* SSTable failed to load - likely corrupted
+                         * delete both klog and vlog files to prevent repeated recovery attempts */
+                        TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64
+                                      " failed to load (corrupted), deleting files",
+                                      cf->name, sst_id);
+
+                        /* save paths before unreferencing */
+                        char klog_path[TDB_MAX_PATH_LEN];
+                        char vlog_path[TDB_MAX_PATH_LEN];
+                        snprintf(klog_path, sizeof(klog_path), "%s", sst->klog_path);
+                        snprintf(vlog_path, sizeof(vlog_path), "%s", sst->vlog_path);
+
                         tidesdb_sstable_unref(cf->db, sst);
+
+                        /* delete the corrupted files */
+                        (void)remove(klog_path);
+                        (void)remove(vlog_path);
                     }
                 }
             }

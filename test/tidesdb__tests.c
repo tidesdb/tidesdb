@@ -4709,6 +4709,88 @@ static void test_long_running_transaction(void)
     cleanup_test_dir();
 }
 
+static void test_recovery_with_corrupted_sstable(void)
+{
+    cleanup_test_dir();
+
+    {
+        tidesdb_t *db = create_test_db();
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.write_buffer_size = 512;
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "corrupt_cf", &cf_config), 0);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "corrupt_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        for (int i = 0; i < 50; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+            char key[32], value[64];
+            snprintf(key, sizeof(key), "corrupt_key_%d", i);
+            snprintf(value, sizeof(value), "corrupt_value_%d", i);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+
+        tidesdb_flush_memtable(cf);
+        usleep(100000); /* wait for flush */
+
+        tidesdb_close(db);
+    }
+
+    {
+        char corrupt_file[1024];
+        snprintf(corrupt_file, sizeof(corrupt_file), "%s/corrupt_cf/L1_0.klog", TEST_DB_PATH);
+
+        FILE *f = fopen(corrupt_file, "r+b");
+        if (f)
+        {
+            uint32_t bad_magic = 0xDEADBEEF;
+            fseek(f, 0, SEEK_SET);
+            fwrite(&bad_magic, sizeof(bad_magic), 1, f);
+            fclose(f);
+            printf("Corrupted SSTable: %s\n", corrupt_file);
+        }
+    }
+
+    {
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+        config.num_flush_threads = 1;
+        config.num_compaction_threads = 1;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "corrupt_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "new_key_after_corruption");
+        snprintf(value, sizeof(value), "new_value_after_corruption");
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        tidesdb_close(db);
+    }
+
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -4793,6 +4875,7 @@ int main(void)
     RUN_TEST(test_boundary_partitioning, tests_passed);
     RUN_TEST(test_dynamic_capacity_adjustment, tests_passed);
     RUN_TEST(test_multi_level_compaction_strategies, tests_passed);
+    RUN_TEST(test_recovery_with_corrupted_sstable, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

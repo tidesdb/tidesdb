@@ -1832,4 +1832,154 @@ static inline int tdb_get_available_disk_space(const char *path, uint64_t *avail
 #define cpu_yield() sched_yield()
 #endif
 
+/**
+ * remove_directory
+ * safely removes a directory and all its contents iteratively
+ * @param path the directory path to remove
+ * @return 0 on success, -1 on failure
+ */
+static inline int remove_directory(const char *path)
+{
+    /* simple two-pass approach, first remove all files, then remove directories bottom-up */
+
+    /* pass 1 collect all paths (files and directories) */
+    char **paths = NULL;
+    int *is_dir = NULL;
+    int path_count = 0;
+    int path_len = 1024 * 4; /*based on bm */
+    int path_capacity = path_len;
+
+    paths = malloc(path_capacity * sizeof(char *));
+    is_dir = malloc(path_capacity * sizeof(int));
+    if (!paths || !is_dir)
+    {
+        free(paths);
+        free(is_dir);
+        return -1;
+    }
+
+    /* stack for iterative traversal */
+    char **stack = malloc(path_capacity * sizeof(char *));
+    if (!stack)
+    {
+        free(paths);
+        free(is_dir);
+        return -1;
+    }
+
+    int stack_size = 0;
+    int stack_capacity = path_capacity;
+    stack[stack_size++] = tdb_strdup(path);
+
+    /* traverse directory tree iteratively */
+    while (stack_size > 0)
+    {
+        char *current = stack[--stack_size];
+        DIR *dir = opendir(current);
+
+        if (!dir)
+        {
+            /* it's a file, add to list */
+            if (path_count >= path_capacity)
+            {
+                int new_capacity = path_capacity * 2;
+                char **new_paths = realloc(paths, new_capacity * sizeof(char *));
+                int *new_is_dir = realloc(is_dir, new_capacity * sizeof(int));
+                if (!new_paths || !new_is_dir)
+                {
+                    /* realloc failure: original pointers are still valid, don't free new_* */
+                    if (new_paths && new_paths != paths) free(new_paths);
+                    if (new_is_dir && new_is_dir != is_dir) free(new_is_dir);
+                    free(current);
+                    goto cleanup_error;
+                }
+                paths = new_paths;
+                is_dir = new_is_dir;
+                path_capacity = new_capacity;
+            }
+            paths[path_count] = current;
+            is_dir[path_count] = 0;
+            path_count++;
+            continue;
+        }
+
+        /* add directory to list */
+        if (path_count >= path_capacity)
+        {
+            int new_capacity = path_capacity * 2;
+            char **new_paths = realloc(paths, new_capacity * sizeof(char *));
+            int *new_is_dir = realloc(is_dir, new_capacity * sizeof(int));
+            if (!new_paths || !new_is_dir)
+            {
+                /* realloc failure: original pointers are still valid, don't free new_* */
+                if (new_paths && new_paths != paths) free(new_paths);
+                if (new_is_dir && new_is_dir != is_dir) free(new_is_dir);
+                closedir(dir);
+                free(current);
+                goto cleanup_error;
+            }
+            paths = new_paths;
+            is_dir = new_is_dir;
+            path_capacity = new_capacity;
+        }
+        paths[path_count] = current;
+        is_dir[path_count] = 1;
+        path_count++;
+
+        /* add children to stack */
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL)
+        {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+            char full_path[path_len];
+            snprintf(full_path, sizeof(full_path), "%s%s%s", current, PATH_SEPARATOR,
+                     entry->d_name);
+
+            if (stack_size >= stack_capacity)
+            {
+                int new_stack_capacity = stack_capacity * 2;
+                char **new_stack = realloc(stack, new_stack_capacity * sizeof(char *));
+                if (!new_stack)
+                {
+                    closedir(dir);
+                    goto cleanup_error;
+                }
+                stack = new_stack;
+                stack_capacity = new_stack_capacity;
+            }
+            stack[stack_size++] = tdb_strdup(full_path);
+        }
+        closedir(dir);
+    }
+
+    /* pass 2 remove in reverse order (files first, then directories bottom-up) */
+    int result = 0;
+    for (int i = path_count - 1; i >= 0; i--)
+    {
+        if (is_dir[i])
+        {
+            if (rmdir(paths[i]) != 0) result = -1;
+        }
+        else
+        {
+            if (unlink(paths[i]) != 0) result = -1;
+        }
+        free(paths[i]);
+    }
+
+    free(paths);
+    free(is_dir);
+    free(stack);
+    return result;
+
+cleanup_error:
+    for (int i = 0; i < stack_size; i++) free(stack[i]);
+    for (int i = 0; i < path_count; i++) free(paths[i]);
+    free(paths);
+    free(is_dir);
+    free(stack);
+    return -1;
+}
+
 #endif /* __COMPAT_H__ */

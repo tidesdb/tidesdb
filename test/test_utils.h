@@ -71,6 +71,12 @@
  */
 static inline void cleanup_test_dir(void)
 {
+    /* check if directory exists first */
+    if (access(TEST_DB_PATH, F_OK) != 0)
+    {
+        return; /* directory doesn't exist, nothing to clean up */
+    }
+
     for (int i = 0; i < REMOVE_DIR_RETRY_COUNT; i++)
     {
         if (remove_directory(TEST_DB_PATH) == 0)

@@ -2879,6 +2879,14 @@ static int tidesdb_level_update_boundaries(tidesdb_level_t *level, tidesdb_level
         for (int i = 0; i < num_ssts; i++)
         {
             tidesdb_sstable_t *sst = sstables[i];
+            /* check for null as concurrent compactions may have removed sstables */
+            if (!sst)
+            {
+                level->boundary_sizes[i] = 0;
+                level->file_boundaries[i] = NULL;
+                continue;
+            }
+
             level->boundary_sizes[i] = sst->min_key_size;
             level->file_boundaries[i] = malloc(sst->min_key_size);
             if (!level->file_boundaries[i])
@@ -4027,6 +4035,9 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         for (int i = 0; i < num_ssts; i++)
         {
             tidesdb_sstable_t *sst = sstables[i];
+            /* check for null as concurrent compactions may have removed sstables */
+            if (!sst) continue;
+
             tidesdb_sstable_ref(sst);
 
             tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(cf->db, sst);
@@ -4117,7 +4128,11 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         for (int i = 0; i < num_ssts; i++)
         {
             tidesdb_sstable_t *sst = sstables[i];
-            estimated_entries += sst->num_entries;
+            /* check for null as concurrent compactions may have removed sstables */
+            if (sst)
+            {
+                estimated_entries += sst->num_entries;
+            }
         }
     }
 
@@ -4541,6 +4556,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         for (int i = 0; i < num_ssts; i++)
         {
             tidesdb_sstable_t *sst = sstables[i];
+            /* check for null as concurrent compactions may have removed sstables */
+            if (!sst) continue;
+
             tidesdb_sstable_ref(sst);
 
             tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(cf->db, sst);
@@ -4981,6 +4999,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
         for (int i = 0; i < num_ssts; i++)
         {
+            /* check for null as concurrent compactions may have removed sstables */
+            if (!sstables[i]) continue;
+
             tidesdb_sstable_ref(sstables[i]);
             queue_enqueue(sstables_to_delete, sstables[i]);
         }
@@ -5008,6 +5029,14 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
     for (int i = 0; i < num_partitions; i++)
     {
+        /* check for null as concurrent compactions may have removed sstables */
+        if (!largest_sstables[i])
+        {
+            boundaries[i] = NULL;
+            boundary_sizes[i] = 0;
+            continue;
+        }
+
         boundaries[i] = malloc(largest_sstables[i]->min_key_size);
         boundary_sizes[i] = largest_sstables[i]->min_key_size;
         memcpy(boundaries[i], largest_sstables[i]->min_key, boundary_sizes[i]);
@@ -5042,6 +5071,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             for (int i = 0; i < num_ssts; i++)
             {
                 tidesdb_sstable_t *sst = sstables[i];
+                /* check for null as concurrent compactions may have removed sstables */
+                if (!sst) continue;
+
                 tidesdb_sstable_ref(sst);
 
                 skip_list_comparator_fn cmp_fn = NULL;
@@ -7827,6 +7859,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         for (int j = start; j != end; j += step)
         {
             tidesdb_sstable_t *sst = sstables[j];
+            /* check for null as concurrent compactions may have removed sstables */
+            if (!sst) continue;
 
             /* acquire reference to protect against concurrent deletion */
             tidesdb_sstable_ref(sst);
@@ -8900,6 +8934,9 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         for (int j = 0; j < num_ssts; j++)
         {
             tidesdb_sstable_t *sst = sstables[j];
+            /* check for null as concurrent compactions may have removed sstables */
+            if (!sst) continue;
+
             tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable(cf->db, sst);
             if (sst_source && sst_source->current_kv != NULL)
             {

@@ -6699,6 +6699,20 @@ int tidesdb_close(tidesdb_t *db)
     atomic_store(&db->flush_should_stop, 1);
     atomic_store(&db->compaction_should_stop, 1);
 
+    /* signal all CFs to stop background compaction threads */
+    int num_cfs = atomic_load_explicit(&db->num_column_families, memory_order_acquire);
+    tidesdb_column_family_t **cfs =
+        atomic_load_explicit(&db->column_families, memory_order_acquire);
+
+    for (int i = 0; i < num_cfs; i++)
+    {
+        tidesdb_column_family_t *cf = cfs[i];
+        if (cf && cf->config.enable_background_compaction)
+        {
+            atomic_store(&cf->compaction_should_stop, 1);
+        }
+    }
+
     /* signal queues to wake waiting threads so they can exit */
     if (db->flush_queue)
     {
@@ -6766,19 +6780,7 @@ int tidesdb_close(tidesdb_t *db)
         queue_free(db->compaction_queue);
     }
 
-    int num_cfs = atomic_load_explicit(&db->num_column_families, memory_order_acquire);
-    tidesdb_column_family_t **cfs =
-        atomic_load_explicit(&db->column_families, memory_order_acquire);
-
-    for (int i = 0; i < num_cfs; i++)
-    {
-        tidesdb_column_family_t *cf = cfs[i];
-        if (cf->config.enable_background_compaction)
-        {
-            atomic_store(&cf->compaction_should_stop, 1);
-        }
-    }
-
+    /* join background compaction threads (already signaled to stop above) */
     for (int i = 0; i < num_cfs; i++)
     {
         tidesdb_column_family_t *cf = cfs[i];

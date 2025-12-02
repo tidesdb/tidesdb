@@ -7964,8 +7964,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     for (int i = 0; i < num_levels; i++)
     {
         tidesdb_level_t *level = levels[i];
-        tidesdb_sstable_t **sstables = level->sstables;
-        int num_ssts = level->num_sstables;
+
+        /* snapshot level state atomically to prevent race with concurrent compactions
+         * read num_sstables first, then sstables array, with proper memory ordering */
+        int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        atomic_thread_fence(memory_order_acquire); /* ensure we see all sstable writes */
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
 
         if (num_ssts == 0)
         {

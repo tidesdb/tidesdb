@@ -399,6 +399,7 @@ typedef struct
  * @param refcount reference count
  * @param bm_open_state atomic state for block manager (0=closed, 1=opening, 2=open)
  * @param config column family configuration
+ * @param marked_for_deletion atomic flag indicating if sstable is marked for deletion
  * @param db database handle (for resolving comparators from registry)
  */
 struct tidesdb_sstable_t
@@ -406,7 +407,6 @@ struct tidesdb_sstable_t
     uint64_t id;
     char *klog_path;
     char *vlog_path;
-    tidesdb_t *db;
     uint8_t *min_key;
     size_t min_key_size;
     uint8_t *max_key;
@@ -425,6 +425,8 @@ struct tidesdb_sstable_t
     block_manager_t *klog_bm;
     block_manager_t *vlog_bm;
     tidesdb_column_family_config_t *config;
+    _Atomic(int) marked_for_deletion;
+    tidesdb_t *db;
 };
 
 /**

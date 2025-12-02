@@ -2003,14 +2003,18 @@ static inline int remove_directory(const char *path)
         if (is_dir[i])
         {
 #ifdef _WIN32
-            /* on win we retry rmdir with small delay for file handle release */
+            /* on win we retry rmdir with exponential backoff for file handle release
+             * windows can take seconds to release handles (antivirus, indexer, etc.) */
+            int retry_delays[] = {50, 100, 200, 500, 1000}; /* exponential backoff in ms */
             int retry_count = 0;
-            while (rmdir(paths[i]) != 0 && retry_count < 3)
+            int max_retries = sizeof(retry_delays) / sizeof(retry_delays[0]);
+
+            while (rmdir(paths[i]) != 0 && retry_count < max_retries)
             {
-                Sleep(10); /* 10ms delay */
+                Sleep(retry_delays[retry_count]);
                 retry_count++;
             }
-            if (retry_count >= 3) result = -1;
+            if (retry_count >= max_retries) result = -1;
 #else
             if (rmdir(paths[i]) != 0) result = -1;
 #endif
@@ -2018,15 +2022,19 @@ static inline int remove_directory(const char *path)
         else
         {
 #ifdef _WIN32
-            /* on win remove read-only attribute before unlink, then retry on failure */
+            /* on win remove read-only attribute before unlink, then retry on failure
+             * use exponential backoff -- win can take seconds to release handles */
             SetFileAttributesA(paths[i], FILE_ATTRIBUTE_NORMAL);
+            int retry_delays[] = {50, 100, 200, 500, 1000}; /* exponential backoff in ms */
             int retry_count = 0;
-            while (unlink(paths[i]) != 0 && retry_count < 3)
+            int max_retries = sizeof(retry_delays) / sizeof(retry_delays[0]);
+
+            while (unlink(paths[i]) != 0 && retry_count < max_retries)
             {
-                Sleep(10); /* 10ms delay for file handle release */
+                Sleep(retry_delays[retry_count]);
                 retry_count++;
             }
-            if (retry_count >= 3) result = -1;
+            if (retry_count >= max_retries) result = -1;
 #else
             if (unlink(paths[i]) != 0) result = -1;
 #endif

@@ -1650,6 +1650,7 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
     atomic_init(&sst->num_vlog_blocks, 0);
     sst->klog_data_end_offset = 0;
     atomic_init(&sst->bm_open_state, 0);
+    atomic_init(&sst->marked_for_deletion, 0); /* not marked for deletion initially */
     sst->klog_bm = NULL;
     sst->vlog_bm = NULL;
 
@@ -1693,6 +1694,15 @@ static void tidesdb_sstable_free(tidesdb_t *db, tidesdb_sstable_t *sst)
     {
         block_manager_close(sst->vlog_bm);
         sst->vlog_bm = NULL;
+    }
+
+    /* delete files only when refcount reaches 0
+     * This ensures active transactions can still read from old SSTables
+     * during compaction, preventing data loss */
+    if (atomic_load_explicit(&sst->marked_for_deletion, memory_order_acquire))
+    {
+        unlink(sst->klog_path);
+        unlink(sst->vlog_path);
     }
 
     free(sst->klog_path);
@@ -4510,8 +4520,10 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             tidesdb_level_remove_sstable(cf->db, lvl, sst);
         }
 
-        unlink(sst->klog_path);
-        unlink(sst->vlog_path);
+        /* mark for deletion but don't unlink yet!
+         * files will be deleted in tidesdb_sstable_free when refcount reaches 0.
+         * this prevents data loss for active transactions reading these ssts. */
+        atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
 
         tidesdb_sstable_unref(cf->db, sst);
     }
@@ -4981,6 +4993,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             {
                 tidesdb_level_remove_sstable(cf->db, levels[level], sst);
             }
+            /* mark for deletion - files will be deleted when refcount reaches 0 */
+            atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
             /* unref our reference from the merge */
             tidesdb_sstable_unref(cf->db, sst);
         }
@@ -5533,8 +5547,10 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             tidesdb_level_remove_sstable(cf->db, levels[level], sst);
         }
 
-        unlink(sst->klog_path);
-        unlink(sst->vlog_path);
+        /* dark for deletion but don't unlink yet!
+         * files will be deleted in tidesdb_sstable_free when refcount reaches 0.
+         * this prevents data loss for active transactions reading these ssts. */
+        atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
 
         tidesdb_sstable_unref(cf->db, sst);
     }

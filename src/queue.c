@@ -200,10 +200,21 @@ void *queue_dequeue(queue_t *queue)
         queue_node_t *tail_ptr = get_ptr(tail);
         queue_counter_t tail_count = get_count(tail);
 
+        /* verify head hasn't changed before dereferencing head_ptr
+         * this prevents use-after-free if another thread dequeued and freed the node */
+        uint64_t head_check = atomic_load_explicit(&queue->head, memory_order_acquire);
+        if (head != head_check)
+        {
+            backoff(&backoff_count);
+            continue;
+        }
+
+        /* now safe to read head_ptr->next since we verified head is still valid */
         uint64_t next = atomic_load_explicit(&head_ptr->next, memory_order_acquire);
         queue_node_t *next_ptr = get_ptr(next);
 
-        uint64_t head_check = atomic_load_explicit(&queue->head, memory_order_acquire);
+        /* check again after reading next to ensure consistency */
+        head_check = atomic_load_explicit(&queue->head, memory_order_acquire);
         if (head == head_check)
         {
             if (head_ptr == tail_ptr)

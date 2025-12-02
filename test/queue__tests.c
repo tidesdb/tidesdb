@@ -524,13 +524,13 @@ void test_queue_free_with_waiting_threads(void)
         usleep(1000);
     }
 
-    /* Signal shutdown to waiting thread */
-    atomic_store(&queue->shutdown, 1);
+    pthread_mutex_lock(&queue->lock);
+    queue->shutdown = 1;
+    pthread_cond_broadcast(&queue->not_empty);
+    pthread_mutex_unlock(&queue->lock);
 
-    /* Wait for thread to exit */
     pthread_join(waiter, NULL);
 
-    /* Now safe to free the queue */
     queue_free(queue);
 
     pthread_mutex_destroy(&start_lock);

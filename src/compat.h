@@ -1884,8 +1884,8 @@ static inline int remove_directory(const char *path)
     char **paths = NULL;
     int *is_dir = NULL;
     int path_count = 0;
-    int path_len = 1024 * 4; /*based on bm */
-    int path_capacity = path_len;
+    int path_len = 1024 * 4; /* max path length: 4096 bytes */
+    int path_capacity = 256; /* initial capacity: 256 entries (NOT bytes!) */
 
     paths = malloc(path_capacity * sizeof(char *));
     is_dir = malloc(path_capacity * sizeof(int));
@@ -1917,7 +1917,8 @@ static inline int remove_directory(const char *path)
 
         if (!dir)
         {
-            /* it's a file, add to list */
+            /* opendir failed - could be a file, or an error
+             * assume it's a file and try to remove it later */
             if (path_count >= path_capacity)
             {
                 int new_capacity = path_capacity * 2;
@@ -2001,11 +2002,34 @@ static inline int remove_directory(const char *path)
     {
         if (is_dir[i])
         {
+#ifdef _WIN32
+            /* on win we retry rmdir with small delay for file handle release */
+            int retry_count = 0;
+            while (rmdir(paths[i]) != 0 && retry_count < 3)
+            {
+                Sleep(10); /* 10ms delay */
+                retry_count++;
+            }
+            if (retry_count >= 3) result = -1;
+#else
             if (rmdir(paths[i]) != 0) result = -1;
+#endif
         }
         else
         {
+#ifdef _WIN32
+            /* on win remove read-only attribute before unlink, then retry on failure */
+            SetFileAttributesA(paths[i], FILE_ATTRIBUTE_NORMAL);
+            int retry_count = 0;
+            while (unlink(paths[i]) != 0 && retry_count < 3)
+            {
+                Sleep(10); /* 10ms delay for file handle release */
+                retry_count++;
+            }
+            if (retry_count >= 3) result = -1;
+#else
             if (unlink(paths[i]) != 0) result = -1;
+#endif
         }
         free(paths[i]);
     }

@@ -128,6 +128,9 @@ typedef enum
     TDB_ISOLATION_SERIALIZABLE = 4      /* full serializability with rw-conflict detection */
 } tidesdb_isolation_level_t;
 
+typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                     size_t key2_size, void *ctx);
+
 #define TDB_WAL_PREFIX                "wal_"   /* prefix for write-ahead log files */
 #define TDB_WAL_EXT                   ".log"   /* extension for write-ahead log files */
 #define TDB_COLUMN_FAMILY_CONFIG_NAME "config" /* base name for column family config files */
@@ -148,9 +151,9 @@ typedef enum
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE         2 /* thread pool size for global flushes */
 #define TDB_DEFAULT_BLOOM_FPR                      0.01        /* 1% false positive rate */
 #define TDB_DEFAULT_KLOG_BLOCK_SIZE                (32 * 1024) /* 32KB per klog block */
-#define TDB_DEFAULT_VLOG_BLOCK_SIZE                (32 * 1024) /* 32KB per vlog block */
+#define TDB_DEFAULT_VLOG_BLOCK_SIZE                (4 * 1024)  /* 4KB per vlog block */
 #define TDB_DEFAULT_VALUE_THRESHOLD                1024        /* values >= 1KB go to vlog */
-#define TDB_DEFAULT_INDEX_SAMPLE_RATIO             8           /* sample every 8th key for index */
+#define TDB_DEFAULT_INDEX_SAMPLE_RATIO             16          /* sample every 16th key for index */
 #define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000        /* 1000ms = 1 second */
 #define TDB_DEFAULT_MIN_DISK_SPACE                 (100 * 1024 * 1024) /* 100MB minimum free space */
 #define TDB_DEFAULT_MAX_IMMUTABLE_MEMTABLES        8   /* soft limit -- start slowing writes */
@@ -158,10 +161,12 @@ typedef enum
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES              512 /* max open sstables globally */
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE         1024 * 64 /* max concurrent txns per cf */
 
-#define TDB_MAX_TXN_CFS     10000  /* maximum number of cfs per transaction */
-#define TDB_MAX_PATH_LEN    4096   /* maximum path length */
-#define TDB_MAX_TXN_OPS     100000 /* maximum transaction operations */
-#define TDB_MAX_CF_NAME_LEN 256    /* maximum column family name length */
+#define TDB_MAX_TXN_CFS         10000  /* maximum number of cfs per transaction */
+#define TDB_MAX_PATH_LEN        4096   /* maximum path length */
+#define TDB_MAX_TXN_OPS         100000 /* maximum transaction operations */
+#define TDB_MAX_CF_NAME_LEN     256    /* maximum column family name length */
+#define TDB_MAX_COMPARATOR_NAME 64     /* maximum comparator name length */
+#define TDB_MAX_COMPARATOR_CTX  256    /* maximum comparator context string length */
 #define TDB_ENSURE_OPEN_SSTABLE_WAIT_US \
     1024 /* microseconds to sleep when spinning on sstable open */
 #define TDB_ENSURE_OPEN_SSTABLE_WAIT_COUNT                \
@@ -176,7 +181,8 @@ typedef enum
 #define TDB_L0_COMPACTION_TRIGGER           4  /* l0 sstable count that triggers compaction */
 #define TDB_L0_SLOWDOWN_THRESHOLD           8  /* l0 sstable count that triggers write throttling */
 #define TDB_IMMUTABLE_QUEUE_SLOWDOWN_FACTOR 50 /* milliseconds per extra immutable memtable */
-#define TDB_TXN_SPIN_COUNT                  1000
+#define TDB_TXN_SPIN_COUNT \
+    1000 /* spin iterations before yielding in transaction conflict resolution */
 
 /**
  * tidesdb_column_family_config_t
@@ -195,8 +201,10 @@ typedef enum
  * @param index_sample_ratio sample every Nth key for sparse index
  * @param block_manager_cache_size block manager cache size
  * @param sync_mode sync mode
- * @param comparator comparator
- * @param comparator_ctx comparator context
+ * @param comparator_name name of registered comparator
+ * @param comparator_ctx_str optional context string for comparator
+ * @param comparator_fn_cached cached comparator function (avoid lock)
+ * @param comparator_ctx_cached cached comparator context (avoid lock)
  * @param compaction_interval_ms compaction interval in milliseconds
  * @param enable_background_compaction enable background compaction
  * @param skip_list_max_level skip list max level
@@ -222,8 +230,10 @@ typedef struct
     int index_sample_ratio;
     size_t block_manager_cache_size;
     int sync_mode;
-    skip_list_comparator_fn comparator;
-    void *comparator_ctx;
+    char comparator_name[TDB_MAX_COMPARATOR_NAME];
+    char comparator_ctx_str[TDB_MAX_COMPARATOR_CTX];
+    skip_list_comparator_fn comparator_fn_cached;
+    void *comparator_ctx_cached;
     unsigned int compaction_interval_ms;
     int enable_background_compaction;
     int skip_list_max_level;
@@ -233,6 +243,22 @@ typedef struct
     int max_immutable_memtables;
     int write_stall_threshold;
 } tidesdb_column_family_config_t;
+
+/**
+ * tidesdb_comparator_entry_t
+ * comparator registry entry
+ * @param name unique name for the comparator
+ * @param fn comparator function pointer
+ * @param ctx_str optional context string (for serialization)
+ * @param ctx runtime context pointer (reconstructed from ctx_str or set at registration)
+ */
+typedef struct
+{
+    char name[TDB_MAX_COMPARATOR_NAME];
+    tidesdb_comparator_fn fn;
+    char ctx_str[TDB_MAX_COMPARATOR_CTX];
+    void *ctx;
+} tidesdb_comparator_entry_t;
 
 /**
  * tidesdb_config_t
@@ -369,12 +395,14 @@ typedef struct
  * @param refcount reference count
  * @param bm_open_state atomic state for block manager (0=closed, 1=opening, 2=open)
  * @param config column family configuration
+ * @param db database handle (for resolving comparators from registry)
  */
 struct tidesdb_sstable_t
 {
     uint64_t id;
     char *klog_path;
     char *vlog_path;
+    tidesdb_t *db;
     uint8_t *min_key;
     size_t min_key_size;
     uint8_t *max_key;
@@ -476,7 +504,6 @@ typedef struct
  * @param db parent database reference
  * @param levels_rwlock protects levels array and sstable add/remove operations
  * @param flush_rwlock protects memtable flush operations
- * @param compaction_rwlock protects compaction operations
  */
 struct tidesdb_column_family_t
 {
@@ -499,10 +526,10 @@ struct tidesdb_column_family_t
     _Atomic(int) compaction_should_stop;
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(int) compaction_pending;
+    _Atomic(int) flush_pending;
     tidesdb_t *db;
     pthread_rwlock_t levels_rwlock;
     pthread_rwlock_t flush_rwlock;
-    pthread_rwlock_t compaction_rwlock;
 };
 
 /**
@@ -556,6 +583,10 @@ struct tidesdb_compaction_work_t
  * @param cached_available_disk_space cached available disk space in bytes
  * @param last_disk_space_check timestamp of last disk space check
  * @param cf_list_state atomic state for cf list modifications (0=idle, 1=modifying)
+ * @param comparators array of registered comparators
+ * @param num_comparators number of registered comparators
+ * @param comparators_capacity capacity of comparators array
+ * @param comparators_lock mutex for comparator registry
  */
 struct tidesdb_t
 {
@@ -564,6 +595,10 @@ struct tidesdb_t
     _Atomic(tidesdb_column_family_t **) column_families;
     _Atomic(int) num_column_families;
     _Atomic(int) cf_capacity;
+    tidesdb_comparator_entry_t *comparators;
+    int num_comparators;
+    int comparators_capacity;
+    pthread_mutex_t comparators_lock;
     pthread_t *flush_threads;
     queue_t *flush_queue;
     _Atomic(int) flush_should_stop;
@@ -795,6 +830,32 @@ tidesdb_config_t tidesdb_default_config(void);
  * @return 0 on success, -n on failure
  */
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
+
+/**
+ * tidesdb_register_comparator
+ * registers a custom comparator function
+ * must be called before creating column families that use this comparator
+ * @param db database handle
+ * @param name unique name for the comparator
+ * @param fn comparator function pointer
+ * @param ctx_str optional context string (for serialization, can be NULL or empty)
+ * @param ctx optional runtime context pointer (can be NULL)
+ * @return 0 on success, -1 on failure (duplicate name, invalid args, etc.)
+ */
+int tidesdb_register_comparator(tidesdb_t *db, const char *name, skip_list_comparator_fn fn,
+                                const char *ctx_str, void *ctx);
+
+/**
+ * tidesdb_get_comparator
+ * retrieves a registered comparator by name
+ * @param db database handle
+ * @param name comparator name
+ * @param fn output parameter for comparator function (can be NULL)
+ * @param ctx output parameter for runtime context pointer (can be NULL)
+ * @return 0 on success, -1 if not found
+ */
+int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator_fn *fn,
+                           void **ctx);
 
 /**
  * tidesdb_close
@@ -1030,6 +1091,90 @@ int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size
  * @param iter iterator handle
  */
 void tidesdb_iter_free(tidesdb_iter_t *iter);
+
+/**
+ * tidesdb_comparator_memcmp
+ * binary comparison using memcmp (default)
+ * compares keys byte-by-byte
+ * @param key1 first key
+ * @param key1_size size of first key
+ * @param key2 second key
+ * @param key2_size size of second key
+ * @param ctx unused context
+ * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
+ */
+int tidesdb_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                              size_t key2_size, void *ctx);
+
+/**
+ * tidesdb_comparator_lexicographic
+ * lexicographic string comparison
+ * treats keys as null-terminated strings
+ * @param key1 first key
+ * @param key1_size size of first key
+ * @param key2 second key
+ * @param key2_size size of second key
+ * @param ctx unused context
+ * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
+ */
+int tidesdb_comparator_lexicographic(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                     size_t key2_size, void *ctx);
+
+/**
+ * tidesdb_comparator_uint64
+ * compares keys as 64-bit unsigned integers (little-endian)
+ * keys must be exactly 8 bytes
+ * @param key1 first key (8 bytes)
+ * @param key1_size size of first key (must be 8)
+ * @param key2 second key (8 bytes)
+ * @param key2_size size of second key (must be 8)
+ * @param ctx unused context
+ * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
+ */
+int tidesdb_comparator_uint64(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                              size_t key2_size, void *ctx);
+
+/**
+ * tidesdb_comparator_int64
+ * compares keys as 64-bit signed integers (little-endian)
+ * keys must be exactly 8 bytes
+ * @param key1 first key (8 bytes)
+ * @param key1_size size of first key (must be 8)
+ * @param key2 second key (8 bytes)
+ * @param key2_size size of second key (must be 8)
+ * @param ctx unused context
+ * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
+ */
+int tidesdb_comparator_int64(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                             size_t key2_size, void *ctx);
+
+/**
+ * tidesdb_comparator_reverse_memcmp
+ * reverse binary comparison (descending order)
+ * useful for reverse-sorted indexes
+ * @param key1 first key
+ * @param key1_size size of first key
+ * @param key2 second key
+ * @param key2_size size of second key
+ * @param ctx unused context
+ * @return >0 if key1 < key2, 0 if equal, <0 if key1 > key2
+ */
+int tidesdb_comparator_reverse_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                      size_t key2_size, void *ctx);
+
+/**
+ * tidesdb_comparator_case_insensitive
+ * case-insensitive string comparison
+ * treats keys as ASCII strings
+ * @param key1 first key
+ * @param key1_size size of first key
+ * @param key2 second key
+ * @param key2_size size of second key
+ * @param ctx unused context
+ * @return <0 if key1 < key2, 0 if equal, >0 if key1 > key2
+ */
+int tidesdb_comparator_case_insensitive(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                        size_t key2_size, void *ctx);
 
 /**
  * tidesdb_compact

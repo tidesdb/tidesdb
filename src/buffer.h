@@ -31,6 +31,9 @@ typedef struct buffer_slot_t buffer_slot_t;
 #define BUFFER_SLOT_OCCUPIED  2 /* slot contains valid data */
 #define BUFFER_SLOT_RELEASING 3 /* slot is being released */
 
+#define BUFFER_ACQUIRE_BACKOFF               1000
+#define BUFFER_ACQUIRE_BACKOFF_EXPO_INCREASE 10000
+
 /* special ID value indicating invalid/no slot */
 #define BUFFER_INVALID_ID ((uint32_t)-1)
 

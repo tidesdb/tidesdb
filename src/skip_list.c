@@ -219,6 +219,7 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
     new_list->comparator = comparator;
     new_list->comparator_ctx = comparator_ctx;
     atomic_init(&new_list->total_size, 0);
+    atomic_init(&new_list->entry_count, 0);
 
     /* create sentinel nodes with no keys - they are identified by the sentinel flag */
     skip_list_node_t *header = skip_list_create_sentinel(max_level);
@@ -327,7 +328,13 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
             } while (!atomic_compare_exchange_weak_explicit(&existing->versions, &old_head,
                                                             new_version, memory_order_release,
                                                             memory_order_acquire));
-            /* update total_size to account for new version */
+            /* update total_size: subtract old version size, add new version size
+             * this keeps total_size reflecting current data, not version history */
+            if (old_head && old_head->value_size > 0)
+            {
+                atomic_fetch_sub_explicit(&list->total_size, old_head->value_size,
+                                          memory_order_relaxed);
+            }
             atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
             free(update);
             return 0;
@@ -387,6 +394,7 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
 
     size_t node_size = sizeof(skip_list_node_t) + key_size + value_size;
     atomic_fetch_add(&list->total_size, node_size);
+    atomic_fetch_add(&list->entry_count, 1);
     free(update);
     return 0;
 }
@@ -516,6 +524,7 @@ int skip_list_clear(skip_list_t *list)
 
     atomic_store_explicit(&list->level, 0, memory_order_release);
     atomic_store_explicit(&list->total_size, 0, memory_order_release);
+    atomic_store_explicit(&list->entry_count, 0, memory_order_release);
 
     return 0;
 }
@@ -534,26 +543,16 @@ void skip_list_free(skip_list_t *list)
     free(list);
 }
 
-int skip_list_get_size(skip_list_t *list)
+size_t skip_list_get_size(skip_list_t *list)
 {
-    if (list == NULL) return -1;
-    return (int)atomic_load_explicit(&list->total_size, memory_order_acquire);
+    if (list == NULL) return 0;
+    return atomic_load_explicit(&list->total_size, memory_order_acquire);
 }
 
 int skip_list_count_entries(skip_list_t *list)
 {
     if (list == NULL) return -1;
-
-    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
-    skip_list_node_t *current = atomic_load_explicit(&header->forward[0], memory_order_acquire);
-
-    int count = 0;
-    while (current != NULL && !NODE_IS_SENTINEL(current))
-    {
-        count++;
-        current = atomic_load_explicit(&current->forward[0], memory_order_acquire);
-    }
-    return count;
+    return atomic_load_explicit(&list->entry_count, memory_order_acquire);
 }
 
 int skip_list_get_min_key(skip_list_t *list, uint8_t **key, size_t *key_size)
@@ -935,10 +934,16 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
             } while (!atomic_compare_exchange_weak_explicit(&existing->versions, &old_head,
                                                             new_version, memory_order_release,
                                                             memory_order_acquire));
-            /* update total_size to account for new version */
+            /* update total_size: subtract old version size, add new version size
+             * this keeps total_size reflecting current data, not version history */
+            if (old_head && old_head->value_size > 0)
+            {
+                atomic_fetch_sub_explicit(&list->total_size, old_head->value_size,
+                                          memory_order_relaxed);
+            }
             atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
             free(update);
-            return 0;
+            return 0; /* updated existing key, no entry_count change */
         }
     }
 
@@ -1023,6 +1028,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     }
 
     atomic_fetch_add_explicit(&list->total_size, key_size + value_size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&list->entry_count, 1, memory_order_relaxed);
     free(update);
     return 0;
 }
@@ -1085,7 +1091,6 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     /* always set ttl if provided */
     if (ttl != NULL) *ttl = version->ttl;
 
-    /* check TTL */
     if (version->ttl > 0 && version->ttl < time(NULL))
     {
         if (deleted != NULL) *deleted = 1;
@@ -1095,7 +1100,6 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
         return 0; /* return success but mark as expired/deleted */
     }
 
-    /* check if deleted */
     uint8_t is_deleted = VERSION_IS_DELETED(version);
     if (deleted != NULL) *deleted = is_deleted;
 

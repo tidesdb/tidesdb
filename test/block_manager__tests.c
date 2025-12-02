@@ -53,13 +53,11 @@ void test_block_manager_block_write()
     block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
 
-    /* we set up a new block */
     uint64_t size = 10;
     char data[10] = "testdata";
     block_manager_block_t *block = block_manager_block_create(size, data);
-    ASSERT_TRUE(block != NULL); /* we verify that the block was created successfully */
+    ASSERT_TRUE(block != NULL);
 
-    /* now we write the block to the file */
     ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
 
     (void)block_manager_block_free(block);
@@ -74,13 +72,11 @@ void test_block_manager_block_write_close_reopen_read()
     block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
 
-    /* we set up a new block */
     uint64_t size = 10;
     char data[10] = "testdata";
     block_manager_block_t *block = block_manager_block_create(size, data);
-    ASSERT_TRUE(block != NULL); /* we verify that the block was created successfully */
+    ASSERT_TRUE(block != NULL);
 
-    /* now we write the block to the file */
     ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
 
     (void)block_manager_block_free(block);
@@ -118,9 +114,8 @@ void test_block_manager_truncate()
     uint64_t size = 10;
     char data[10] = "testdata";
     block_manager_block_t *block = block_manager_block_create(size, data);
-    ASSERT_TRUE(block != NULL); /* we verify that the block was created successfully */
+    ASSERT_TRUE(block != NULL);
 
-    /* now we write the block to the file */
     ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
 
     (void)block_manager_block_free(block);
@@ -131,7 +126,6 @@ void test_block_manager_truncate()
 
     if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
 
-    /* we use a cursor to verify the file is empty */
     block_manager_cursor_t *cursor;
     if (block_manager_cursor_init(&cursor, bm) != 0)
     {
@@ -153,23 +147,19 @@ void test_block_manager_cursor()
 {
     /* we create a block manager, write a few blocks and verify forward and backward iteration */
 
-    /* we set up a new block manager */
     block_manager_t *bm = NULL;
     if (block_manager_open(&bm, "test.db", BLOCK_MANAGER_SYNC_NONE) != 0) return;
 
     for (int i = 0; i < 3; i++)
     {
-        /* we set up a new block */
         uint64_t size = 10;
         char data[10];
 
         snprintf(data, 10, "testdata%d", i);
 
         block_manager_block_t *block = block_manager_block_create(size, data);
-        ASSERT_TRUE(block != NULL); /* we verify that the block was created successfully */
+        ASSERT_TRUE(block != NULL);
 
-        /* now we write the block to the file */
-        /* should not be -1 */
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
 
         (void)block_manager_block_free(block);
@@ -283,7 +273,6 @@ void test_block_manager_count_blocks()
         uint64_t size = 10;
         char data[10];
         snprintf(data, 10, "testdata%d", i);
-        printf("data: %s\n", data);
 
         block_manager_block_t *block = block_manager_block_create(size, data);
         ASSERT_TRUE(block != NULL);
@@ -593,7 +582,6 @@ void test_block_manager_seek_and_goto()
     ASSERT_EQ(memcmp(read_block->data, "testdata0", 10), 0);
     (void)block_manager_block_release(read_block);
 
-    /* we free the cursor */
     (void)block_manager_cursor_free(cursor);
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
@@ -732,28 +720,24 @@ void test_block_manager_concurrent_rw()
 
     ASSERT_TRUE(block_manager_open(&bm, "concurrent_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    /* we create thread IDs */
     pthread_t writer_threads[NUM_WRITERS];
     pthread_t reader_threads[NUM_READERS];
 
     int writer_ids[NUM_WRITERS];
     int reader_ids[NUM_READERS];
 
-    /* we start writer threads */
     for (int i = 0; i < NUM_WRITERS; i++)
     {
         writer_ids[i] = i;
         ASSERT_TRUE(pthread_create(&writer_threads[i], NULL, writer_thread, &writer_ids[i]) == 0);
     }
 
-    /*we start reader threads */
     for (int i = 0; i < NUM_READERS; i++)
     {
         reader_ids[i] = i;
         ASSERT_TRUE(pthread_create(&reader_threads[i], NULL, reader_thread, &reader_ids[i]) == 0);
     }
 
-    /* we wait for all threads to complete */
     for (int i = 0; i < NUM_WRITERS; i++)
     {
         ASSERT_TRUE(pthread_join(writer_threads[i], NULL) == 0);
@@ -842,14 +826,12 @@ void test_block_manager_validate_last_block()
     block_manager_cursor_t *cursor;
     ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
 
-    /* we go to the first block */
     ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
 
     /* we read and verify all blocks */
     int block_count = 0;
     for (int i = 0; i < 3; i++)
     {
-        /* read the current block */
         block_manager_block_t *block = block_manager_cursor_read(cursor);
         ASSERT_TRUE(block != NULL);
 
@@ -885,7 +867,6 @@ void test_block_manager_validation_edge_cases()
 {
     block_manager_t *bm = NULL;
 
-    /* opening a fresh empty database */
     (void)remove("empty_test.db");
     ASSERT_TRUE(block_manager_open(&bm, "empty_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
     ASSERT_TRUE(block_manager_close(bm) == 0);
@@ -1749,7 +1730,7 @@ void benchmark_block_manager_with_cache()
     }
     else
     {
-        printf("Repeated access throughput: N/A (completed too fast to measure)\n" RESET);
+        printf(YELLOW "Repeated access throughput: N/A (completed too fast to measure)\n" RESET);
     }
 
     for (int i = 0; i < NUM_BLOCKS; i++)
@@ -1941,15 +1922,16 @@ void benchmark_block_manager_parallel_write(void)
         }
         avg_thread_time /= threads;
 
-        printf("\n%d thread%s:\n", threads, threads > 1 ? "s" : "");
-        printf("  Wall time: %.3f seconds\n", wall_time);
-        printf("  Aggregate throughput: %.2f blocks/sec (%.2f MB/sec)\n", aggregate_throughput,
-               aggregate_mb_per_sec);
-        printf("  Average per-thread time: %.3f seconds\n", avg_thread_time);
+        printf(CYAN "\n%d thread%s:\n" RESET, threads, threads > 1 ? "s" : "");
+        printf(CYAN "  Wall time: %.3f seconds\n" RESET, wall_time);
+        printf(CYAN "  Aggregate throughput: %.2f blocks/sec (%.2f MB/sec)\n" RESET,
+               aggregate_throughput, aggregate_mb_per_sec);
+        printf(CYAN "  Average per-thread time: %.3f seconds\n" RESET, avg_thread_time);
 
         if (t > 0)
         {
-            printf("  Speedup vs 1 thread: %.2fx\n", (double)threads * wall_time / wall_time);
+            printf(CYAN "  Speedup vs 1 thread: %.2fx\n" RESET,
+                   (double)threads * wall_time / wall_time);
         }
 
         free(thread_ids);

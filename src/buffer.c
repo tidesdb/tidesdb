@@ -141,7 +141,7 @@ int buffer_acquire(buffer_t *buffer, void *data, uint32_t *id)
         /* exponential backoff with cap */
         if (backoff > 0)
         {
-            if (backoff < 1000)
+            if (backoff < BUFFER_ACQUIRE_BACKOFF)
             {
                 /* short backoff: just pause */
                 for (uint32_t i = 0; i < backoff; i++)
@@ -154,8 +154,8 @@ int buffer_acquire(buffer_t *buffer, void *data, uint32_t *id)
                 usleep(backoff);
             }
 
-            /* exponential increase, capped at 10ms */
-            if (backoff < 10000)
+            /* exponential increase, capped  */
+            if (backoff < BUFFER_ACQUIRE_BACKOFF_EXPO_INCREASE)
             {
                 backoff *= 2;
             }

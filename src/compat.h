@@ -194,7 +194,8 @@ typedef int mode_t;
 #endif
 
 /* ftruncate for windows */
-/*
+
+/**
  * ftruncate
  * @param fd the file descriptor to truncate
  * @param length the new length of the file
@@ -206,7 +207,8 @@ static inline int ftruncate(int fd, off_t length)
 }
 
 /* open for windows */
-/*
+
+/**
  * open
  * @param path the path to open
  * @param flags the flags to use
@@ -219,7 +221,8 @@ static inline int _tidesdb_open_wrapper_3(const char *path, int flags, mode_t mo
 }
 
 /* open for windows */
-/*
+
+/**
  * open
  * @param path the path to open
  * @param flags the flags to use
@@ -244,7 +247,8 @@ typedef volatile LONGLONG atomic_uint64_t;
 
 #ifdef _WIN64
 /* 64-bit atomic store */
-/*
+
+/**
  * atomic_store_explicit
  * @param ptr the pointer to store the value at
  * @param val the value to store
@@ -1141,7 +1145,8 @@ typedef pthread_rwlock_t rwlock_t;
 
 /* atomic compare exchange for pointers (all platforms with C11 atomics) */
 #if !defined(_MSC_VER) || _MSC_VER >= 1930
-/*
+
+/**
  * atomic_compare_exchange_strong_ptr
  * @param ptr pointer to atomic pointer
  * @param expected pointer to expected value
@@ -1155,7 +1160,7 @@ static inline int atomic_compare_exchange_strong_ptr(_Atomic(void *) *ptr, void 
 }
 #endif
 
-/*
+/**
  * get_available_memory
  * gets available system memory in bytes
  * @return available memory in bytes, or 0 on failure
@@ -1196,7 +1201,7 @@ static inline size_t get_available_memory(void)
 #endif
 }
 
-/*
+/**
  * get_total_memory
  * gets total system memory in bytes
  * @return total memory in bytes, or 0 on failure
@@ -1235,7 +1240,7 @@ static inline size_t get_total_memory(void)
 #endif
 }
 
-/*
+/**
  * get_file_mod_time
  * gets the modified time of a file
  * @param path the path of the file
@@ -1255,7 +1260,7 @@ static inline time_t get_file_mod_time(const char *path)
 
 /* cross-platform little-endian serialization functions */
 
-/*
+/**
  * encode_uint32_le_compat
  * encodes a uint32_t value in little-endian format
  * @param buf buffer to store encoded value
@@ -1269,7 +1274,7 @@ static inline void encode_uint32_le_compat(uint8_t *buf, uint32_t val)
     buf[3] = (uint8_t)((val >> 24) & 0xFF);
 }
 
-/*
+/**
  * decode_uint32_le_compat
  * decodes a uint32_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -1281,7 +1286,7 @@ static inline uint32_t decode_uint32_le_compat(const uint8_t *buf)
            ((uint32_t)buf[3] << 24);
 }
 
-/*
+/**
  * encode_uint64_le_compat
  * encodes a uint64_t value in little-endian format
  * @param buf buffer to store encoded value
@@ -1299,7 +1304,7 @@ static inline void encode_uint64_le_compat(uint8_t *buf, uint64_t val)
     buf[7] = (uint8_t)((val >> 56) & 0xFF);
 }
 
-/*
+/**
  * encode_uint32_le
  * encodes a uint32_t value in little-endian format
  * @param buf buffer to store encoded value
@@ -1313,7 +1318,7 @@ static inline void encode_uint32_le(uint8_t *buf, uint32_t val)
     buf[3] = (uint8_t)((val >> 24) & 0xFF);
 }
 
-/*
+/**
  * decode_uint32_le
  * decodes a uint32_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -1325,7 +1330,7 @@ static inline uint32_t decode_uint32_le(const uint8_t *buf)
            ((uint32_t)buf[3] << 24);
 }
 
-/*
+/**
  * encode_int64_le
  * encodes an int64_t value in little-endian format
  * @param buf buffer to store encoded value
@@ -1344,7 +1349,7 @@ static inline void encode_int64_le(uint8_t *buf, int64_t val)
     buf[7] = (uint8_t)((uval >> 56) & 0xFF);
 }
 
-/*
+/**
  * decode_int64_le
  * decodes an int64_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -1358,7 +1363,7 @@ static inline int64_t decode_int64_le(const uint8_t *buf)
     return (int64_t)uval;
 }
 
-/*
+/**
  * encode_uint64_le
  * encodes a uint64_t value in little-endian format
  * @param buf buffer to store encoded value
@@ -1376,7 +1381,7 @@ static inline void encode_uint64_le(uint8_t *buf, uint64_t val)
     buf[7] = (uint8_t)((val >> 56) & 0xFF);
 }
 
-/*
+/**
  * decode_uint64_le
  * decodes a uint64_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -1389,7 +1394,7 @@ static inline uint64_t decode_uint64_le(const uint8_t *buf)
            ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
 }
 
-/*
+/**
  * decode_fixed_32
  * decodes a uint32_t value in little-endian format
  * @param data buffer containing encoded value
@@ -1401,7 +1406,7 @@ static inline uint32_t decode_fixed_32(const char *data)
            ((uint32_t)(uint8_t)data[2] << 16) | ((uint32_t)(uint8_t)data[3] << 24);
 }
 
-/*
+/**
  * decode_uint64_le_compat
  * decodes a uint64_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -1526,7 +1531,7 @@ static inline const uint8_t *decode_varint64(const uint8_t *ptr, uint64_t *value
 
 /* length-prefixed KV serialization helpers */
 
-/*
+/**
  * serialize_kv_varint
  * serialize key-value pair with varint length prefixes
  * format: varint(key_size) + key + varint(value_size) + value
@@ -1556,7 +1561,7 @@ static inline uint8_t *serialize_kv_varint(uint8_t *ptr, const uint8_t *key, uin
     return ptr;
 }
 
-/*
+/**
  * serialize_kv_varint_ex
  * serialize key-value pair with flags and varint length prefixes (for SSTables)
  * format: flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl)
@@ -1595,7 +1600,7 @@ static inline uint8_t *serialize_kv_varint_ex(uint8_t *ptr, uint8_t flags, const
     return ptr;
 }
 
-/*
+/**
  * serialize_kv_varint_full
  * serialize key-value pair with all metadata (for WAL)
  * format: flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl) +
@@ -1637,7 +1642,7 @@ static inline uint8_t *serialize_kv_varint_full(uint8_t *ptr, uint8_t flags, con
     return ptr;
 }
 
-/*
+/**
  * deserialize_kv_varint
  * deserialize key-value pair with varint length prefixes
  * @param ptr input buffer
@@ -1674,7 +1679,7 @@ static inline const uint8_t *deserialize_kv_varint(const uint8_t *ptr, const uin
     return ptr;
 }
 
-/*
+/**
  * deserialize_kv_varint_ex
  * deserialize key-value pair with flags and varint length prefixes (for SSTables)
  * @param ptr input buffer
@@ -1723,7 +1728,7 @@ static inline const uint8_t *deserialize_kv_varint_ex(const uint8_t *ptr, const 
     return ptr;
 }
 
-/*
+/**
  * deserialize_kv_varint_full
  * deserialize key-value pair with all metadata (for WAL)
  * @param ptr input buffer
@@ -1778,7 +1783,7 @@ static inline const uint8_t *deserialize_kv_varint_full(const uint8_t *ptr, cons
     return ptr;
 }
 
-/*
+/**
  * set_file_sequential_hint
  * hints to the OS that file access will be sequential for read-ahead optimization
  * @param fd the file descriptor
@@ -1920,7 +1925,6 @@ static inline int remove_directory(const char *path)
                 int *new_is_dir = realloc(is_dir, new_capacity * sizeof(int));
                 if (!new_paths || !new_is_dir)
                 {
-                    /* realloc failure: original pointers are still valid, don't free new_* */
                     if (new_paths && new_paths != paths) free(new_paths);
                     if (new_is_dir && new_is_dir != is_dir) free(new_is_dir);
                     free(current);
@@ -1944,7 +1948,6 @@ static inline int remove_directory(const char *path)
             int *new_is_dir = realloc(is_dir, new_capacity * sizeof(int));
             if (!new_paths || !new_is_dir)
             {
-                /* realloc failure: original pointers are still valid, don't free new_* */
                 if (new_paths && new_paths != paths) free(new_paths);
                 if (new_is_dir && new_is_dir != is_dir) free(new_is_dir);
                 closedir(dir);

@@ -419,7 +419,6 @@ void test_queue_foreach_cleanup(void)
 
     ASSERT_EQ(queue_size(queue), 5);
 
-    /* cleanup all items using foreach */
     int cleanup_count = 0;
     int result = queue_foreach(queue, cleanup_callback, &cleanup_count);
     ASSERT_EQ(result, 5);
@@ -445,7 +444,6 @@ void test_queue_peek_at(void)
     queue_t *queue = queue_new();
     ASSERT_TRUE(queue != NULL);
 
-    /* test empty queue */
     ASSERT_EQ(queue_peek_at(queue, 0), NULL);
     ASSERT_EQ(queue_peek_at(queue, 10), NULL);
 

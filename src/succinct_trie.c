@@ -1249,6 +1249,63 @@ static int find_first_terminal(const succinct_trie_t *trie, uint32_t node, int64
     return -1;
 }
 
+/**
+ * find_last_terminal
+ * find the rightmost (lexicographically largest) terminal in a subtree
+ * @param trie the succinct trie
+ * @param node the node to find the last terminal for
+ * @param value pointer to store the value
+ * @return 0 on success, -1 on failure
+ */
+static int find_last_terminal(const succinct_trie_t *trie, uint32_t node, int64_t *value)
+{
+    if (!trie || node == 0 || node > trie->n_nodes) return -1;
+
+    /* find all children and traverse in reverse order to find last terminal */
+    uint32_t start_pos = get_children_start(trie, node);
+    if (start_pos < trie->louds_bits)
+    {
+        /* collect all child positions */
+        uint32_t child_positions[256]; /* max 256 children (one per byte value) */
+        uint32_t num_children = 0;
+
+        uint32_t pos = start_pos;
+        while (pos < trie->louds_bits && BIT_GET(trie->louds, pos) && num_children < 256)
+        {
+            child_positions[num_children++] = pos;
+            pos++;
+        }
+
+        /* traverse children in reverse order (largest label first) */
+        for (int i = num_children - 1; i >= 0; i--)
+        {
+            uint32_t edge_idx = rank1(trie->louds, child_positions[i] + 1) - 2;
+            if (edge_idx < trie->n_edges)
+            {
+                uint32_t child_node = trie->edge_child[edge_idx];
+                if (find_last_terminal(trie, child_node, value) == 0)
+                {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    /* check if this node itself is terminal (after checking children) */
+    uint32_t node_idx = node - 1;
+    if (BIT_GET(trie->term, node_idx))
+    {
+        uint32_t val_idx = rank1(trie->term, node_idx + 1) - 1;
+        if (val_idx < trie->n_vals)
+        {
+            *value = trie->vals[val_idx];
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
 int succinct_trie_prefix_get(const succinct_trie_t *trie, const uint8_t *prefix, size_t prefix_len,
                              int64_t *value)
 {
@@ -1297,16 +1354,18 @@ int succinct_trie_find_predecessor(const succinct_trie_t *trie, const uint8_t *k
     if (!trie || !key || key_len == 0 || !value) return -1;
     if (trie->n_nodes == 0) return -1;
 
-    uint32_t node = 1; /* start at root (node 1 in LOUDS) */
+    uint32_t node = 1;
     int64_t last_value = -1;
     int found_any = 0;
 
-    /* traverse trie following the key */
+    /* we track backtrack points,  where we had a smaller alternative */
+    uint32_t backtrack_edge_idx = UINT32_MAX;
+
     for (size_t depth = 0; depth < key_len; depth++)
     {
         uint8_t c = key[depth];
 
-        /* check if current node is terminal and save its value */
+        /* we check if current node is terminal */
         uint32_t node_idx = node - 1;
         if (BIT_GET(trie->term, node_idx))
         {
@@ -1318,27 +1377,58 @@ int succinct_trie_find_predecessor(const succinct_trie_t *trie, const uint8_t *k
             }
         }
 
-        /* try to follow edge with label c */
         uint32_t pos = get_children_start(trie, node);
-        if (pos >= trie->louds_bits) break; /* no children */
+        if (pos >= trie->louds_bits) break;
 
         int found_edge = 0;
+        uint32_t best_smaller_edge_idx = UINT32_MAX;
+
         while (pos < trie->louds_bits && BIT_GET(trie->louds, pos))
         {
             uint32_t edge_idx = rank1(trie->louds, pos + 1) - 2;
-            if (edge_idx < trie->n_edges && trie->labels[edge_idx] == c)
+            if (edge_idx < trie->n_edges)
             {
-                node = trie->edge_child[edge_idx];
-                found_edge = 1;
-                break;
+                uint8_t label = trie->labels[edge_idx];
+                if (label == c)
+                {
+                    node = trie->edge_child[edge_idx];
+                    found_edge = 1;
+                    break;
+                }
+                else if (label < c)
+                {
+                    if (best_smaller_edge_idx == UINT32_MAX ||
+                        label > trie->labels[best_smaller_edge_idx])
+                    {
+                        best_smaller_edge_idx = edge_idx;
+                    }
+                }
             }
             pos++;
         }
 
-        if (!found_edge) break; /* can't continue, return last terminal */
+        /* update backtrack point if we found a smaller alternative at this level */
+        if (best_smaller_edge_idx != UINT32_MAX)
+        {
+            backtrack_edge_idx = best_smaller_edge_idx;
+        }
+
+        if (!found_edge)
+        {
+            /* can't continue, we use backtrack point if available */
+            if (backtrack_edge_idx != UINT32_MAX)
+            {
+                uint32_t pred_node = trie->edge_child[backtrack_edge_idx];
+                if (find_last_terminal(trie, pred_node, &last_value) == 0)
+                {
+                    found_any = 1;
+                }
+            }
+            break;
+        }
     }
 
-    /* check if final node is terminal */
+    /* check final node */
     if (node > 0 && node <= trie->n_nodes)
     {
         uint32_t node_idx = node - 1;
@@ -1359,7 +1449,7 @@ int succinct_trie_find_predecessor(const succinct_trie_t *trie, const uint8_t *k
         return 0;
     }
 
-    return -1; /* no predecessor found */
+    return -1;
 }
 
 void succinct_trie_free(succinct_trie_t *trie)
@@ -1380,7 +1470,7 @@ uint8_t *succinct_trie_serialize(const succinct_trie_t *trie, size_t *out_size)
     uint32_t louds_bytes = (trie->louds_bits + 7) / 8;
     uint32_t term_bytes = (trie->n_nodes + 7) / 8;
 
-    /* allocate worst-case size: all varints at max (10 bytes for uint64, 5 bytes for uint32) */
+    /* allocate worst-case size all varints at max (10 bytes for uint64, 5 bytes for uint32) */
     size_t max_size = 5 * 4 +             /* header: 4 varint32s (worst case 5 bytes each) */
                       louds_bytes +       /* louds bitvector */
                       trie->n_edges +     /* labels array (1 byte each) */

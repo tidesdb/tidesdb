@@ -164,7 +164,6 @@ static void test_fifo_cache_update(void)
     ASSERT_TRUE(retrieved != NULL);
     ASSERT_EQ(*retrieved, 100);
 
-    /* update the value */
     ASSERT_EQ(fifo_cache_put(cache, "key1", &v2, NULL, NULL), 0);
     ASSERT_EQ(fifo_cache_size(cache), 1); /* size should not change */
 
@@ -429,11 +428,11 @@ void test_fifo_cache_destroy_vs_free()
     fifo_cache_put(cache1, "key1", &v1, test_evict_callback, NULL);
     fifo_cache_put(cache1, "key2", &v2, test_evict_callback, NULL);
 
-    /* destroy should NOT call callbacks */
+    /* destroy should not call callbacks */
     fifo_cache_destroy(cache1);
     ASSERT_EQ(eviction_count, 0);
 
-    /* free SHOULD call callbacks */
+    /* free should call callbacks */
     eviction_count = 0;
     fifo_cache_t *cache2 = fifo_cache_new(3);
     fifo_cache_put(cache2, "key1", &v1, test_evict_callback, NULL);
@@ -670,7 +669,6 @@ static void benchmark_fifo_concurrent_reads(void)
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    /* spawn reader threads */
     for (int i = 0; i < BENCH_THREADS; i++)
     {
         contexts[i].cache = cache;
@@ -680,7 +678,6 @@ static void benchmark_fifo_concurrent_reads(void)
         pthread_create(&threads[i], NULL, concurrent_read_worker, &contexts[i]);
     }
 
-    /* wait for all threads */
     for (int i = 0; i < BENCH_THREADS; i++)
     {
         pthread_join(threads[i], NULL);
@@ -724,13 +721,11 @@ static void *mixed_workload_worker(void *arg)
         /* 80% reads, 20% writes */
         if (i % 5 == 0)
         {
-            /* write */
             static int dummy = 0;
             fifo_cache_put(ctx->cache, key, &dummy, NULL, NULL);
         }
         else
         {
-            /* read */
             void *val = fifo_cache_get(ctx->cache, key);
             (void)val;
         }
@@ -777,7 +772,6 @@ static void benchmark_fifo_mixed_workload(void)
         pthread_create(&threads[i], NULL, mixed_workload_worker, &contexts[i]);
     }
 
-    /* wait for all threads */
     for (int i = 0; i < BENCH_THREADS; i++)
     {
         pthread_join(threads[i], NULL);

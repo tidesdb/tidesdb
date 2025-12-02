@@ -147,7 +147,6 @@ void test_disk_streaming_large_dataset()
 
 void test_disk_streaming_common_prefix()
 {
-    /* test keys with long common prefixes */
     succinct_trie_builder_t *builder = succinct_trie_builder_new(NULL, NULL, NULL);
     ASSERT_TRUE(builder != NULL);
 
@@ -311,15 +310,12 @@ void test_succinct_trie_empty()
     succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
 
     int64_t val;
-    /* get from empty trie */
     ASSERT_EQ(succinct_trie_prefix_get(trie, (uint8_t *)"nonexistent", 11, &val), -1);
 
-    /* serialize empty trie */
     size_t size;
     uint8_t *data = succinct_trie_serialize(trie, &size);
     ASSERT_TRUE(data != NULL);
 
-    /* deserialize and verify still empty */
     succinct_trie_t *trie2 = succinct_trie_deserialize(data, size);
     ASSERT_TRUE(trie2 != NULL);
     ASSERT_EQ(succinct_trie_prefix_get(trie2, (uint8_t *)"key", 3, &val), -1);
@@ -488,9 +484,9 @@ void benchmark_disk_streaming_vs_memory()
     double mem_time = (double)(end - start) / CLOCKS_PER_SEC;
 
     printf(CYAN "\n*=== Performance Comparison (%d entries) ===*\n" RESET, N);
-    printf(YELLOW "Disk streaming: %.3f seconds\n" RESET, disk_time);
-    printf(YELLOW "Memory streaming: %.3f seconds\n" RESET, mem_time);
-    printf(YELLOW "Disk/Memory ratio: %.2fx\n" RESET, disk_time / mem_time);
+    printf(CYAN "Disk streaming: %.3f seconds\n" RESET, disk_time);
+    printf(CYAN "Memory streaming: %.3f seconds\n" RESET, mem_time);
+    printf(CYAN "Disk/Memory ratio: %.2fx\n" RESET, disk_time / mem_time);
 
     /* verify both produce same results */
     int64_t disk_val, mem_val;
@@ -512,6 +508,130 @@ void benchmark_disk_streaming_vs_memory()
     free(keys);
 }
 
+void test_find_predecessor_simple()
+{
+    printf(YELLOW "Testing find_predecessor with simple case...\n" RESET);
+
+    succinct_trie_builder_t *builder = succinct_trie_builder_new(NULL, NULL, NULL);
+    ASSERT_TRUE(builder != NULL);
+
+    /* add just 3 keys to debug */
+    ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"key_00000000", 12, 0), 0);
+    printf(CYAN "  Added: key_00000000 -> block 0\n" RESET);
+    ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"key_00000128", 12, 1), 0);
+    printf(CYAN "  Added: key_00000128 -> block 1\n" RESET);
+    ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)"key_00000256", 12, 2), 0);
+    printf(CYAN "  Added: key_00000256 -> block 2\n" RESET);
+
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
+    ASSERT_TRUE(trie != NULL);
+
+    printf(YELLOW "  Trie has %u nodes, %u edges, %u values\n" RESET, trie->n_nodes, trie->n_edges,
+           trie->n_vals);
+
+    /* key between first two samples */
+    int64_t block;
+    int result = succinct_trie_find_predecessor(trie, (uint8_t *)"key_00000100", 12, &block);
+    printf("  key_00000100 -> result=%d, block=%" PRId64 " (expected block 0)\n", result, block);
+    if (result == 0)
+    {
+        printf(GREEN "  ✓ Found predecessor: block %" PRId64 "\n" RESET, block);
+        ASSERT_EQ(block, 0);
+    }
+    else
+    {
+        printf(RED "  ✗ FAILED: no predecessor found\n" RESET);
+    }
+
+    succinct_trie_free(trie);
+}
+
+void test_find_predecessor_sequential_keys()
+{
+    printf(YELLOW
+           "Testing find_predecessor with sequential numeric keys (like block index)...\n" RESET);
+
+    succinct_trie_builder_t *builder = succinct_trie_builder_new(NULL, NULL, NULL);
+    ASSERT_TRUE(builder != NULL);
+
+    /* simulate block index sample every 128th key */
+    /* keys key_00000000, key_00000128, key_00000256, ..., key_00001024, etccc */
+    for (int i = 0; i <= 1024; i += 128)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "key_%08d", i);
+        ASSERT_EQ(succinct_trie_builder_add(builder, (uint8_t *)key, 12, i / 128), 0);
+        printf(CYAN "  Added: %s -> block %d\n" RESET, key, i / 128);
+    }
+
+    succinct_trie_t *trie = succinct_trie_builder_build(builder, NULL);
+    ASSERT_TRUE(trie != NULL);
+
+    printf(YELLOW "  Testing predecessor lookups...\n" RESET);
+
+    /* exact match */
+    int64_t block;
+    ASSERT_EQ(succinct_trie_find_predecessor(trie, (uint8_t *)"key_00000000", 12, &block), 0);
+    ASSERT_EQ(block, 0);
+    printf(GREEN "  ✓ key_00000000 -> block %" PRId64 " (expected 0)\n" RESET, block);
+
+    /* key between samples (should find predecessor) */
+    int result = succinct_trie_find_predecessor(trie, (uint8_t *)"key_00000100", 12, &block);
+    printf("  key_00000100 -> result=%d, block=%" PRId64
+           " (expected block 0, predecessor of key_00000128)\n",
+           result, block);
+    if (result == 0)
+    {
+        printf(GREEN "  ✓ Found predecessor\n" RESET);
+        ASSERT_EQ(block, 0); /* should find key_00000000 (block 0) */
+    }
+    else
+    {
+        printf(RED "  ✗ FAILED: find_predecessor returned -1 (no predecessor found)\n" RESET);
+        printf(RED
+               "  This is the bug! key_00000100 is > key_00000000, so block 0 should be "
+               "returned\n" RESET);
+    }
+
+    /* another key between samples */
+    result = succinct_trie_find_predecessor(trie, (uint8_t *)"key_00001000", 12, &block);
+    printf("  key_00001000 -> result=%d, block=%" PRId64
+           " (expected block 7, predecessor of key_00001024)\n",
+           result, block);
+    if (result == 0)
+    {
+        printf(GREEN "  ✓ Found predecessor\n" RESET);
+        ASSERT_EQ(block, 7); /* should find key_00000896 (block 7) */
+    }
+    else
+    {
+        printf(RED "  ✗ FAILED: find_predecessor returned -1\n" RESET);
+    }
+
+    /* key before all samples */
+    result = succinct_trie_find_predecessor(trie, (uint8_t *)"key_00000000", 12, &block);
+    printf("  key_00000000 -> result=%d, block=%" PRId64 " (expected block 0, exact match)\n",
+           result, block);
+    ASSERT_EQ(result, 0);
+    ASSERT_EQ(block, 0);
+
+    /* key after all samples */
+    result = succinct_trie_find_predecessor(trie, (uint8_t *)"key_00002000", 12, &block);
+    printf("  key_00002000 -> result=%d, block=%" PRId64 " (expected block 8, last sample)\n",
+           result, block);
+    if (result == 0)
+    {
+        printf(GREEN "  ✓ Found predecessor\n" RESET);
+        ASSERT_EQ(block, 8); /* should find key_00001024 (block 8) */
+    }
+    else
+    {
+        printf(RED "  ✗ FAILED: find_predecessor returned -1\n" RESET);
+    }
+
+    succinct_trie_free(trie);
+}
+
 int main(void)
 {
     RUN_TEST(test_disk_streaming_basic, tests_passed);
@@ -528,6 +648,9 @@ int main(void)
     RUN_TEST(test_succinct_trie_long_keys, tests_passed);
     RUN_TEST(test_succinct_trie_prefix_edge_cases, tests_passed);
     RUN_TEST(test_succinct_trie_deserialize_corrupted, tests_passed);
+    RUN_TEST(test_find_predecessor_simple, tests_passed);
+    RUN_TEST(test_find_predecessor_sequential_keys, tests_passed);
+    RUN_TEST(test_find_predecessor_sequential_keys, tests_passed);
     RUN_TEST(benchmark_succinct_trie, tests_passed);
     RUN_TEST(benchmark_disk_streaming_vs_memory, tests_passed);
 

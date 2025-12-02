@@ -116,8 +116,6 @@ static int write_header(int fd, uint32_t block_size)
     uint8_t version = BLOCK_MANAGER_VERSION;
     uint32_t padding = 0;
 
-    /* use little-endian encoding for cross-platform compatibility */
-    /* magic is 3 bytes, encode as little-endian uint32 and take first 3 bytes */
     encode_uint32_le_compat(header, magic);
     header[BLOCK_MANAGER_MAGIC_SIZE] = version;
     encode_uint32_le_compat(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE,
@@ -398,7 +396,6 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
     size_t buf_offset = 0;
 
-    /* we use little-endian encoding for cross-platform compatibility */
     encode_uint64_le_compat(main_block_buffer + buf_offset, block->size);
     buf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
 
@@ -708,7 +705,6 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         char cache_key[32];
         block_offset_to_key((int64_t)offset, cache_key);
 
-        /* lock-free cache lookup */
         block_manager_block_t *cached_block =
             (block_manager_block_t *)fifo_cache_get(bm->block_manager_cache->fifo_cache, cache_key);
 

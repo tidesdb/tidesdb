@@ -110,6 +110,7 @@ struct skip_list_node_t
  * @param header sentinel header node (compares less than all keys)
  * @param tail sentinel tail node (compares greater than all keys)
  * @param total_size total size of all entries
+ * @param entry_count track entry count atomically to avoid O(n) traversals
  * @param comparator key comparison function
  * @param comparator_ctx context for comparator
  */
@@ -121,6 +122,7 @@ typedef struct skip_list_t
     _Atomic(skip_list_node_t *) header;
     _Atomic(skip_list_node_t *) tail;
     _Atomic(size_t) total_size;
+    _Atomic(int) entry_count;
     skip_list_comparator_fn comparator;
     void *comparator_ctx;
 } skip_list_t;
@@ -488,7 +490,7 @@ int skip_list_check_and_update_ttl(skip_list_t *list, skip_list_node_t *node);
  * @param list skip list
  * @return total size in bytes
  */
-int skip_list_get_size(skip_list_t *list);
+size_t skip_list_get_size(skip_list_t *list);
 
 /**
  * skip_list_count_entries

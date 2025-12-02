@@ -335,7 +335,6 @@ void benchmark_bloom_filter()
     ASSERT_TRUE(serialized_bf != NULL);
     free(serialized_bf);
 
-    /* we print the size of the serialized bloom filter */
     printf(BOLDWHITE "Bloom filter size: %f MB\n" RESET, (float)serialized_bf_size / 1000000);
 
     clock_t start_check = clock();

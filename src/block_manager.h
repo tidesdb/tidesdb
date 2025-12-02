@@ -21,8 +21,6 @@
 #include "compat.h"
 #include "fifo.h"
 
-/* more time equals more results, but remember to take breaks to refresh your mind. */
-
 /* max file path length for block manager file(s) */
 #define MAX_FILE_PATH_LENGTH 1024 * 4
 
@@ -133,6 +131,11 @@ typedef struct
  * @param bm the block manager
  * @param current_pos the current position of the cursor
  * @param current_block_size the size of the current block
+ * @param position_cache array of block positions
+ * @param size_cache array of block sizes
+ * @param cache_capacity allocated capacity
+ * @param cache_size number of cached positions
+ * @param cache_index current index in cache (-1 if not using cache)
  */
 typedef struct
 {
@@ -141,11 +144,11 @@ typedef struct
     uint64_t current_block_size;
 
     /* position cache for O(1) backward navigation */
-    uint64_t *position_cache; /* array of block positions */
-    uint64_t *size_cache;     /* array of block sizes */
-    int cache_capacity;       /* allocated capacity */
-    int cache_size;           /* number of cached positions */
-    int cache_index;          /* current index in cache (-1 if not using cache) */
+    uint64_t *position_cache;
+    uint64_t *size_cache;
+    int cache_capacity;
+    int cache_size;
+    int cache_index;
 } block_manager_cursor_t;
 
 /**

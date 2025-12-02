@@ -721,7 +721,8 @@ int main()
     cf_config.compaction_interval_ms = BENCH_BACKGROUND_COMPACTION_INTERVAL;
     cf_config.sync_mode = BENCH_SYNC_MODE;
     cf_config.block_manager_cache_size = BENCH_COLUMN_FAMILY_BLOCK_CACHE;
-    cf_config.comparator = skip_list_comparator_memcmp;
+    strncpy(cf_config.comparator_name, BENCH_COMPARATOR_NAME, TDB_MAX_COMPARATOR_NAME - 1);
+    cf_config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
     cf_config.default_isolation_level = BENCH_ISOLATION_LEVEL;
 
     if (tidesdb_create_column_family(tdb, BENCH_CF_NAME, &cf_config) != 0)
@@ -820,6 +821,65 @@ int main()
     }
     verification_errors = 0; /* reset for next test */
 
+    printf(BOLDGREEN "\nBenchmarking Iterator Seek operations...\n" RESET);
+
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        thread_data[i].start = 0;
+        thread_data[i].end = BENCH_NUM_OPERATIONS;
+        thread_data[i].thread_id = i;
+    }
+
+    start_time = get_time_ms();
+
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        (void)pthread_create(&threads[i], NULL, thread_iter_seek, &thread_data[i]);
+    }
+
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        (void)pthread_join(threads[i], NULL);
+    }
+
+    end_time = get_time_ms();
+    printf(BOLDGREEN "Iterator Seek: %d operations in %.2f ms (%.2f ops/sec)\n" RESET,
+           BENCH_NUM_SEEK_OPS, end_time - start_time,
+           (BENCH_NUM_SEEK_OPS / (end_time - start_time)) * 1000);
+
+    printf(BOLDGREEN "\nBenchmarking Iterator Seek For Prev operations...\n" RESET);
+
+    /* reuse same thread_data setup */
+    start_time = get_time_ms();
+
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        (void)pthread_create(&threads[i], NULL, thread_iter_seek_for_prev, &thread_data[i]);
+    }
+
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        (void)pthread_join(threads[i], NULL);
+    }
+
+    end_time = get_time_ms();
+    printf(BOLDGREEN "Iterator Seek For Prev: %d operations in %.2f ms (%.2f ops/sec)\n" RESET,
+           BENCH_NUM_SEEK_OPS, end_time - start_time,
+           (BENCH_NUM_SEEK_OPS / (end_time - start_time)) * 1000);
+
+    printf(BOLDGREEN "\nBenchmarking Delete operations...\n" RESET);
+    start_time = get_time_ms();
+
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        (void)pthread_create(&threads[i], NULL, thread_delete, &thread_data[i]);
+    }
+
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        (void)pthread_join(threads[i], NULL);
+    }
+
     printf(BOLDGREEN "\nBenchmarking Forward Iterator (full scan)...\n" RESET);
     start_time = get_time_ms();
 
@@ -893,68 +953,6 @@ int main()
         printf(BOLDRED "  ✗ Iterator verification failed: %d errors\n" RESET, verification_errors);
     }
     verification_errors = 0; /* reset for next test */
-
-    printf(BOLDGREEN "\nBenchmarking Iterator Seek operations...\n" RESET);
-
-    /* for seek benchmark, we want to perform BENCH_NUM_SEEK_OPS seeks
-     * but select keys from the full dataset (BENCH_NUM_OPERATIONS)
-     * so set start=0, end=BENCH_NUM_OPERATIONS for key selection range */
-    for (int i = 0; i < BENCH_NUM_THREADS; i++)
-    {
-        thread_data[i].start = 0;
-        thread_data[i].end = BENCH_NUM_OPERATIONS;
-        thread_data[i].thread_id = i;
-    }
-
-    start_time = get_time_ms();
-
-    for (int i = 0; i < BENCH_NUM_THREADS; i++)
-    {
-        (void)pthread_create(&threads[i], NULL, thread_iter_seek, &thread_data[i]);
-    }
-
-    for (int i = 0; i < BENCH_NUM_THREADS; i++)
-    {
-        (void)pthread_join(threads[i], NULL);
-    }
-
-    end_time = get_time_ms();
-    printf(BOLDGREEN "Iterator Seek: %d operations in %.2f ms (%.2f ops/sec)\n" RESET,
-           BENCH_NUM_SEEK_OPS, end_time - start_time,
-           (BENCH_NUM_SEEK_OPS / (end_time - start_time)) * 1000);
-
-    printf(BOLDGREEN "\nBenchmarking Iterator Seek For Prev operations...\n" RESET);
-
-    /* reuse same thread_data setup */
-    start_time = get_time_ms();
-
-    for (int i = 0; i < BENCH_NUM_THREADS; i++)
-    {
-        (void)pthread_create(&threads[i], NULL, thread_iter_seek_for_prev, &thread_data[i]);
-    }
-
-    for (int i = 0; i < BENCH_NUM_THREADS; i++)
-    {
-        (void)pthread_join(threads[i], NULL);
-    }
-
-    end_time = get_time_ms();
-    printf(BOLDGREEN "Iterator Seek For Prev: %d operations in %.2f ms (%.2f ops/sec)\n" RESET,
-           BENCH_NUM_SEEK_OPS, end_time - start_time,
-           (BENCH_NUM_SEEK_OPS / (end_time - start_time)) * 1000);
-
-    printf(BOLDGREEN "\nBenchmarking Delete operations...\n" RESET);
-    start_time = get_time_ms();
-
-    for (int i = 0; i < BENCH_NUM_THREADS; i++)
-    {
-        (void)pthread_create(&threads[i], NULL, thread_delete, &thread_data[i]);
-    }
-
-    for (int i = 0; i < BENCH_NUM_THREADS; i++)
-    {
-        (void)pthread_join(threads[i], NULL);
-    }
 
     end_time = get_time_ms();
     printf(BOLDGREEN "Delete: %d operations in %.2f ms (%.2f ops/sec)\n" RESET,

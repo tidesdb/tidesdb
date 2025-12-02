@@ -506,6 +506,7 @@ typedef struct
  * @param next_sstable_id next sstable id
  * @param compaction_pending flag to prevent duplicate compaction work items
  * @param levels_state atomic state for levels modifications (0=idle, 1=modifying)
+ * @param last_compaction_trigger timestamp of last compaction trigger to throttle
  * @param db parent database reference
  */
 struct tidesdb_column_family_t
@@ -531,6 +532,7 @@ struct tidesdb_column_family_t
     _Atomic(int) compaction_pending;
     _Atomic(int) flush_pending;
     _Atomic(int) levels_state;
+    _Atomic(time_t) last_compaction_trigger;
     tidesdb_t *db;
 };
 

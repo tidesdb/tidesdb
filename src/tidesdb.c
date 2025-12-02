@@ -2750,6 +2750,11 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
     /* add sstable and take reference */
     tidesdb_sstable_ref(sst);
     level->sstables[level->num_sstables] = sst;
+
+    /* ensure sstable write is visible before incrementing count
+     * this prevents readers from seeing incremented count but null sstable pointer */
+    atomic_thread_fence(memory_order_release);
+
     level->num_sstables++;
     level->current_size += sst->klog_size + sst->vlog_size;
 
@@ -2808,12 +2813,19 @@ static int tidesdb_level_remove_sstable(tidesdb_t *db, tidesdb_level_t *level,
             }
         }
 
+        /* update count first, before swapping array
+         * this ensures readers see either (old_arr, old_num) or (new_arr, new_idx)
+         * never (old_arr, new_idx) which would be out of bounds */
+        atomic_store_explicit(&level->num_sstables, new_idx, memory_order_release);
+
+        /* ensure count update is visible before array swap */
+        atomic_thread_fence(memory_order_seq_cst);
+
         /* try to swap in new array */
         if (atomic_compare_exchange_strong_explicit(&level->sstables, &old_arr, new_arr,
                                                     memory_order_release, memory_order_acquire))
         {
-            /* success! update counts */
-            atomic_store_explicit(&level->num_sstables, new_idx, memory_order_release);
+            /* success! update size */
             atomic_fetch_sub_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                       memory_order_relaxed);
 
@@ -4481,6 +4493,11 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     tidesdb_sstable_unref(cf->db, new_sst);
 
+    /* ensure new sstable is visible to all readers before removing old sstables
+     * this prevents readers from seeing a gap where old sstables are gone but new one isn't visible
+     */
+    atomic_thread_fence(memory_order_seq_cst);
+
     while (!queue_is_empty(sstables_to_delete))
     {
         tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
@@ -4945,6 +4962,11 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     }
 
     tidesdb_merge_heap_free(heap);
+
+    /* ensure all new sstables are visible to readers before removing old sstables
+     * this prevents readers from seeing a gap where old sstables are gone but new ones aren't
+     * visible */
+    atomic_thread_fence(memory_order_seq_cst);
 
     while (!queue_is_empty(sstables_to_delete))
     {
@@ -5492,6 +5514,11 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
         tidesdb_merge_heap_free(heap);
     }
+
+    /* ensure all new sstables are visible to readers before removing old sstables
+     * this prevents readers from seeing a gap where old sstables are gone but new ones aren't
+     * visible */
+    atomic_thread_fence(memory_order_seq_cst);
 
     levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
@@ -6049,19 +6076,19 @@ static void *tidesdb_flush_worker_thread(void *arg)
             break;
         }
 
-        /* check shutdown after getting work -- if stopping, clean up and exit */
+        tidesdb_column_family_t *cf = work->cf;
+        /* CF reference is already held by the work item (added when queued) */
+        tidesdb_immutable_memtable_t *imm = work->imm;
+        skip_list_t *memtable = imm->memtable;
+        block_manager_t *wal = imm->wal;
+
+        /* check shutdown before creating sstable -- if stopping, clean up and exit */
         if (atomic_load(&db->flush_should_stop))
         {
             tidesdb_immutable_memtable_unref(work->imm);
             free(work);
             break;
         }
-
-        tidesdb_column_family_t *cf = work->cf;
-        /* CF reference is already held by the work item (added when queued) */
-        tidesdb_immutable_memtable_t *imm = work->imm;
-        skip_list_t *memtable = imm->memtable;
-        block_manager_t *wal = imm->wal;
 
         int space_check = tidesdb_check_disk_space(db, cf->directory, cf->config.min_disk_space);
         if (space_check <= 0)
@@ -6080,6 +6107,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         snprintf(sst_path, sizeof(sst_path), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "1",
                  cf->directory);
 
+        /* once we create the sstable, we must complete the flush to avoid leaking it
+         * even if shutdown is requested */
         tidesdb_sstable_t *sst = tidesdb_sstable_create(db, sst_path, work->sst_id, &cf->config);
         if (sst)
         {

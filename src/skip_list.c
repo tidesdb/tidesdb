@@ -1022,6 +1022,9 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
         atomic_init(&BACKWARD_PTR(new_node, i, new_level), NULL);
     }
 
+    /* track if we detected a duplicate during insertion */
+    int is_duplicate = 0;
+
     /* link node into skip list using CAS for lock-free insertion */
     for (int i = 0; i <= new_level; i++)
     {
@@ -1032,6 +1035,19 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
             atomic_store_explicit(&new_node->forward[i], next, memory_order_relaxed);
         } while (!atomic_compare_exchange_weak_explicit(
             &update[i]->forward[i], &next, new_node, memory_order_release, memory_order_acquire));
+
+        /* immediately after level 0 insertion, check if another thread inserted same key
+         * this is the earliest point we can detect the race condition */
+        if (i == 0 && next != NULL && !NODE_IS_SENTINEL(next))
+        {
+            int cmp = skip_list_compare_keys(list, next->key, next->key_size, key, key_size);
+            if (cmp == 0)
+            {
+                /* we lost the race! another thread inserted this key first
+                 * our node is now a duplicate, don't count it */
+                is_duplicate = 1;
+            }
+        }
     }
 
     /* set backward pointers after successful forward linking */
@@ -1051,7 +1067,14 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     }
 
     atomic_fetch_add_explicit(&list->total_size, key_size + value_size, memory_order_relaxed);
-    atomic_fetch_add_explicit(&list->entry_count, 1, memory_order_relaxed);
+
+    /* only increment entry count if this is a unique key
+     * duplicates were detected during the insertion loop above */
+    if (!is_duplicate)
+    {
+        atomic_fetch_add_explicit(&list->entry_count, 1, memory_order_relaxed);
+    }
+
     free(update);
     return 0;
 }

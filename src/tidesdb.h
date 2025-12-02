@@ -78,9 +78,9 @@ typedef struct tidesdb_compaction_work_t tidesdb_compaction_work_t;
 
 /**
  * tidesdb_immutable_memtable_t
- * an memtable being flushed to disk
+ * an immutable memtable being flushed to disk
  * @param memtable the immutable memtable
- * @param wal associated write ahead log.
+ * @param wal associated write-ahead log
  * @param refcount reference count for safe concurrent access
  * @param flushed 1 if flushed to sstable, 0 otherwise
  */
@@ -194,7 +194,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param write_buffer_size write buffer size for memtable flushes
  * @param level_size_ratio size ratio between levels (T)
  * @param max_levels maximum number of levels
- * @param dividing_level_offset X = L -- dividing_level_offset
+ * @param dividing_level_offset X = L - dividing_level_offset
  * @param klog_block_size size of each klog block (holds multiple keys)
  * @param vlog_block_size size of each vlog block (holds multiple values)
  * @param value_threshold values >= this size go to vlog
@@ -202,13 +202,13 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param enable_bloom_filter enable bloom filter
  * @param bloom_fpr bloom filter false positive rate
  * @param enable_block_indexes enable block indexes
- * @param index_sample_ratio sample every Nth key for sparse index
+ * @param index_sample_ratio sample every nth key for sparse index
  * @param block_manager_cache_size block manager cache size
  * @param sync_mode sync mode
  * @param comparator_name name of registered comparator
  * @param comparator_ctx_str optional context string for comparator
- * @param comparator_fn_cached cached comparator function (avoid lock)
- * @param comparator_ctx_cached cached comparator context (avoid lock)
+ * @param comparator_fn_cached cached comparator function (avoids lock)
+ * @param comparator_ctx_cached cached comparator context (avoids lock)
  * @param compaction_interval_ms compaction interval in milliseconds
  * @param enable_background_compaction enable background compaction
  * @param skip_list_max_level skip list max level
@@ -287,11 +287,11 @@ typedef struct
  * entry in the klog (key log)
  * stores key metadata and either inline value or vlog offset
  * @param version format version
- * @param flags TDB_KV_FLAG_TOMBSTONE, etc
+ * @param flags TDB_KV_FLAG_TOMBSTONE, etc.
  * @param key_size size of key
  * @param value_size size of value (actual, not stored)
  * @param ttl unix timestamp (0 = no expiration)
- * @param seq sequence number for MVCC
+ * @param seq sequence number for mvcc
  * @param vlog_offset offset in vlog (0 if inline)
  */
 #pragma pack(push, 1)
@@ -309,11 +309,11 @@ typedef struct
 
 /**
  * tidesdb_multi_cf_txn_metadata_t
- * metadata for multi-CF transaction entries
- * written before klog_entry when entry has multi-CF flag
+ * metadata for multi-cf transaction entries
+ * written before klog_entry when entry has multi-cf flag
  * @param num_participant_cfs number of column families in transaction
- * @param checksum xxHash64 checksum of num_participant_cfs + cf_names
- * followed by: char cf_names[num_participant_cfs][TDB_MAX_CF_NAME_LEN] -- null-terminated CF names
+ * @param checksum xxhash64 checksum of num_participant_cfs + cf_names
+ * followed by: char cf_names[num_participant_cfs][TDB_MAX_CF_NAME_LEN] (null-terminated cf names)
  */
 #pragma pack(push, 1)
 typedef struct
@@ -330,7 +330,7 @@ typedef struct
  * @param block_size total size of this block
  * @param entries array of entries
  * @param keys array of key data
- * @param inline_values array of inline values (NULL if in vlog)
+ * @param inline_values array of inline values (null if in vlog)
  * @param max_key maximum key in this block (for seek optimization)
  * @param max_key_size size of maximum key
  */
@@ -382,8 +382,6 @@ typedef struct
  * @param id unique identifier
  * @param klog_path path to .klog file
  * @param vlog_path path to .vlog file
- * @param klog_bm block manager for klog
- * @param vlog_bm block manager for vlog
  * @param min_key minimum key in this sstable
  * @param min_key_size size of minimum key
  * @param max_key maximum key in this sstable
@@ -394,10 +392,13 @@ typedef struct
  * @param klog_data_end_offset file offset where data blocks end (before index/bloom/metadata)
  * @param klog_size size of klog file
  * @param vlog_size size of vlog file
+ * @param max_seq maximum sequence number in this sstable
  * @param bloom_filter bloom filter for fast lookups
  * @param block_index succinct trie for fast lookups
  * @param refcount reference count
  * @param bm_open_state atomic state for block manager (0=closed, 1=opening, 2=open)
+ * @param klog_bm block manager for klog
+ * @param vlog_bm block manager for vlog
  * @param config column family configuration
  * @param marked_for_deletion atomic flag indicating if sstable is marked for deletion
  * @param db database handle (for resolving comparators from registry)
@@ -431,7 +432,7 @@ struct tidesdb_sstable_t
 
 /**
  * tidesdb_level_t
- * a level in the LSM tree
+ * a level in the lsm tree
  * @param level_num level number
  * @param capacity capacity of level in bytes
  * @param current_size current size of level in bytes
@@ -495,15 +496,17 @@ typedef struct
  * @param config column family configuration
  * @param active_memtable active memtable (level 0)
  * @param memtable_id id of active memtable
+ * @param memtable_generation generation counter for memtable rotation
  * @param active_wal active write-ahead log
  * @param immutable_memtables queue of immutable memtables
- * @param next_seq_num next sequence number for MVCC
+ * @param next_seq_num next sequence number for mvcc
  * @param commit_seq commit sequence for isolation levels
- * @param active_txn_buffer buffer of active transactions for this CF
- * @param commit_buffer buffer tracking pending commits to prevent visibility holes
+ * @param commit_ticket ticket counter for serializing commits
+ * @param commit_serving serving counter for serializing commits
+ * @param active_txn_buffer buffer of active transactions for this cf
  * @param levels_lock protects levels and num_levels
- * @param flush_lock protects flush swaps
- * @param compaction_lock protects compaction state within cf
+ * @param flush_lock serializes flush operations
+ * @param compaction_lock serializes compaction operations
  * @param levels array of disk levels
  * @param num_levels number of disk levels
  * @param compaction_thread thread for background compaction
@@ -573,25 +576,25 @@ struct tidesdb_compaction_work_t
  * @param column_families array of column families
  * @param num_column_families number of column families
  * @param cf_capacity capacity of column families array
+ * @param comparators array of registered comparators
+ * @param num_comparators number of registered comparators
+ * @param comparators_capacity capacity of comparators array
+ * @param comparators_lock mutex for comparator registry
  * @param flush_threads array of flush threads
  * @param flush_queue queue of flush work items
  * @param flush_should_stop flag to stop flush threads
+ * @param active_flush_workers number of workers actively processing
  * @param compaction_threads array of compaction threads
  * @param compaction_queue queue of compaction work items
  * @param compaction_should_stop flag to stop compaction threads
- * @param active_flush_workers number of workers actively processing
  * @param active_compaction_workers number of workers actively processing
- * @param sstable_cache FIFO cache for sstable file handles
+ * @param sstable_cache fifo cache for sstable file handles
  * @param is_open flag to indicate if database is open
  * @param global_txn_seq global sequence counter for multi-cf transactions
  * @param next_txn_id global transaction id counter
  * @param cached_available_disk_space cached available disk space in bytes
  * @param last_disk_space_check timestamp of last disk space check
- * @param cf_list_state atomic state for cf list modifications (0=idle, 1=modifying)
- * @param comparators array of registered comparators
- * @param num_comparators number of registered comparators
- * @param comparators_capacity capacity of comparators array
- * @param comparators_lock mutex for comparator registry
+ * @param cf_list_lock rwlock for cf list modifications
  */
 struct tidesdb_t
 {
@@ -645,10 +648,10 @@ typedef struct
 
 /**
  * tidesdb_txn_t
- * transaction handle for batched operations with ACID guarantees
+ * transaction handle for batched operations with acid guarantees
  * @param db database handle
  * @param isolation_level isolation level
- * @param txn_id transaction ID
+ * @param txn_id transaction id
  * @param ops array of operations
  * @param num_ops number of operations
  * @param ops_capacity capacity of operations array
@@ -774,13 +777,13 @@ typedef struct
 /**
  * tidesdb_iter_t
  * iterator for database
- * @param cf column family (for single-CF iteration)
- * @param txn transaction (for isolation and multi-CF iteration)
+ * @param cf column family (for single-cf iteration)
+ * @param txn transaction (for isolation and multi-cf iteration)
  * @param heap merge heap
  * @param current current key-value pair
  * @param valid validity flag
  * @param direction direction of iteration (1=forward, -1=backward)
- * @param snapshot_time snapshot time for TTL checks
+ * @param snapshot_time snapshot time for ttl checks
  * @param cf_snapshot snapshot sequence for visibility checks
  */
 struct tidesdb_iter_t

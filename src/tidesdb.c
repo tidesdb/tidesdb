@@ -231,6 +231,8 @@ static int tidesdb_vlog_block_deserialize(const uint8_t *data, size_t data_size,
 /**
  * tidesdb_block_managers_t
  * temporary structure to hold block manager pointers retrieved from cache
+ * @param klog_bm klog block manager
+ * @param vlog_bm value log block manager
  */
 typedef struct
 {
@@ -3877,7 +3879,7 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     cf->levels = new_levels;
     cf->num_levels = num_levels + 1;
 
-    /* free old array BEFORE releasing lock - readers must acquire lock to see new array */
+    /* free old array BEFORE releasing lock -- readers must acquire lock to see new array */
     free(levels);
 
     pthread_rwlock_unlock(&cf->levels_lock);
@@ -3936,7 +3938,7 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
     cf->levels = new_levels;
     cf->num_levels = new_num_levels;
 
-    /* free old array BEFORE releasing lock - readers must acquire lock to see new array */
+    /* free old array before releasing lock -- readers must acquire lock to see new array */
     free(levels);
 
     pthread_rwlock_unlock(&cf->levels_lock);
@@ -4616,7 +4618,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         total_ssts += levels[level]->num_sstables;
     }
 
-    /* allocate array */
     tidesdb_sstable_t **ssts_array = malloc(total_ssts * sizeof(tidesdb_sstable_t *));
     if (!ssts_array)
     {
@@ -5113,7 +5114,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     tidesdb_sstable_t **largest_sstables = largest->sstables;
     int num_partitions = largest->num_sstables;
 
-    /* copy boundary data WHILE holding lock, before SSTables can be freed */
+    /* copy boundary data while holding lock, before ssts can be freed */
     if (num_partitions == 0)
     {
         pthread_rwlock_unlock(&cf->levels_lock);
@@ -5637,7 +5638,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
 int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 {
-    /* try to acquire compaction lock - if another compaction is running, skip */
+    /* try to acquire compaction lock -- if another compaction is running, skip */
     if (pthread_mutex_trylock(&cf->compaction_lock) != 0)
     {
         /* another compaction is already running, skip this one */
@@ -6115,7 +6116,7 @@ static void *tidesdb_background_compaction_thread(void *arg)
                 tidesdb_flush_memtable(cf);
             }
 
-            /* enqueue compaction work - worker will skip if compaction already running */
+            /* enqueue compaction work -- worker will skip if compaction already running */
             tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
             if (work)
             {
@@ -6334,7 +6335,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
                             "compaction",
                             cf->name, l0_count, TDB_L0_COMPACTION_TRIGGER);
 
-                        /* enqueue compaction work - worker will skip if compaction already running
+                        /* enqueue compaction work -- worker will skip if compaction already running
                          */
                         tidesdb_compaction_work_t *compaction_work =
                             calloc(1, sizeof(tidesdb_compaction_work_t));
@@ -6791,7 +6792,6 @@ int tidesdb_close(tidesdb_t *db)
         queue_free(db->compaction_queue);
     }
 
-    /* clear cache before freeing column families to avoid use-after-free */
     fifo_cache_clear(db->sstable_cache);
 
     /* stop all background compaction threads BEFORE acquiring cf_list_lock
@@ -7154,7 +7154,6 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 
     tidesdb_column_family_t *cf_to_drop = NULL;
 
-    /* acquire write lock to modify CF list */
     pthread_rwlock_wrlock(&db->cf_list_lock);
 
     while (1)
@@ -8439,7 +8438,16 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
     }
 
-    /* prepare context for each CF */
+    /**
+     * cf_commit_ctx_t
+     * context for committing operations to a single column family
+     * @param cf column family
+     * @param op_count number of operations for this cf
+     * @param wal_size size of wal batch
+     * @param wal_batch serialized wal entries
+     * @param seq_numbers assigned sequence numbers
+     * @param committed flag indicating if cf commit succeeded
+     */
     typedef struct
     {
         tidesdb_column_family_t *cf;
@@ -9289,7 +9297,6 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                     }
                 }
 
-                /* deserialize klog block */
                 tidesdb_klog_block_t *kb = NULL;
                 if (tidesdb_klog_block_deserialize(data, data_size, &kb) != 0 || !kb)
                 {
@@ -9535,7 +9542,6 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                     }
                 }
 
-                /* deserialize klog block */
                 tidesdb_klog_block_t *kb = NULL;
                 if (tidesdb_klog_block_deserialize(data, data_size, &kb) != 0 || !kb)
                 {
@@ -10832,7 +10838,6 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     }
     fprintf(fp, "default_isolation_level = %s\n", isolation_str);
 
-    /* save comparator configuration */
     fprintf(fp, "comparator_name = %s\n", config->comparator_name);
     if (config->comparator_ctx_str[0] != '\0')
     {

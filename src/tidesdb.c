@@ -5036,10 +5036,11 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
     if (num_partitions == 0)
     {
+        /* largest level is empty, fall back to full preemptive merge.
+         */
         while (!queue_is_empty(sstables_to_delete))
         {
-            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
-            if (sst) tidesdb_sstable_unref(cf->db, sst);
+            queue_dequeue(sstables_to_delete);
         }
         queue_free(sstables_to_delete);
 

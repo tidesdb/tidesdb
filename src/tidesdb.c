@@ -6530,7 +6530,19 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     }
     atomic_init(&(*db)->column_families, cfs);
     atomic_init(&(*db)->num_column_families, 0);
-    atomic_init(&(*db)->cf_list_state, 0); /* 0=idle, 1=modifying */
+
+    if (pthread_rwlock_init(&(*db)->cf_list_lock, NULL) != 0)
+    {
+        free(cfs);
+        queue_free((*db)->compaction_queue);
+        queue_free((*db)->flush_queue);
+        free((*db)->compaction_threads);
+        free((*db)->flush_threads);
+        fifo_cache_free((*db)->sstable_cache);
+        free((*db)->db_path);
+        free(*db);
+        return TDB_ERR_MEMORY;
+    }
 
     /* initialize comparator registry */
     (*db)->comparators_capacity = 8;
@@ -6696,41 +6708,44 @@ int tidesdb_close(tidesdb_t *db)
 
     TDB_DEBUG_LOG("Closing TidesDB at path: %s", db->db_path);
 
+    /* first, stop accepting new work */
     atomic_store(&db->flush_should_stop, 1);
     atomic_store(&db->compaction_should_stop, 1);
 
-    /* signal all CFs to stop background compaction threads */
-    int num_cfs = atomic_load_explicit(&db->num_column_families, memory_order_acquire);
-    tidesdb_column_family_t **cfs =
-        atomic_load_explicit(&db->column_families, memory_order_acquire);
-
-    for (int i = 0; i < num_cfs; i++)
-    {
-        tidesdb_column_family_t *cf = cfs[i];
-        if (cf && cf->config.enable_background_compaction)
-        {
-            atomic_store(&cf->compaction_should_stop, 1);
-        }
-    }
-
-    /* signal queues to wake waiting threads so they can exit */
+    /* wait for all pending work to drain */
     if (db->flush_queue)
     {
-        pthread_mutex_lock(&db->flush_queue->lock);
-        db->flush_queue->shutdown = 1;
-        pthread_cond_broadcast(&db->flush_queue->not_empty);
-        pthread_mutex_unlock(&db->flush_queue->lock);
+        while (queue_size(db->flush_queue) > 0)
+        {
+            usleep(10000);
+        }
     }
 
     if (db->compaction_queue)
     {
-        pthread_mutex_lock(&db->compaction_queue->lock);
-        db->compaction_queue->shutdown = 1;
-        pthread_cond_broadcast(&db->compaction_queue->not_empty);
-        pthread_mutex_unlock(&db->compaction_queue->lock);
+        while (queue_size(db->compaction_queue) > 0)
+        {
+            usleep(10000);
+        }
     }
 
-    /* now join threads (they will wake up and exit) */
+    if (db->flush_queue)
+    {
+        for (int i = 0; i < db->config.num_flush_threads; i++)
+        {
+            queue_enqueue(db->flush_queue, NULL);
+        }
+    }
+
+    if (db->compaction_queue)
+    {
+        for (int i = 0; i < db->config.num_compaction_threads; i++)
+        {
+            queue_enqueue(db->compaction_queue, NULL);
+        }
+    }
+
+    TDB_DEBUG_LOG("Waiting for %d flush threads to finish", db->config.num_flush_threads);
     if (db->flush_threads)
     {
         for (int i = 0; i < db->config.num_flush_threads; i++)
@@ -6739,64 +6754,82 @@ int tidesdb_close(tidesdb_t *db)
         }
         free(db->flush_threads);
     }
+    TDB_DEBUG_LOG("Flush threads finished");
 
+    TDB_DEBUG_LOG("Waiting for %d compaction threads to finish", db->config.num_compaction_threads);
     if (db->compaction_threads)
     {
         for (int i = 0; i < db->config.num_compaction_threads; i++)
         {
+            TDB_DEBUG_LOG("Joining compaction thread %d", i);
             pthread_join(db->compaction_threads[i], NULL);
+            TDB_DEBUG_LOG("Compaction thread %d joined", i);
         }
         free(db->compaction_threads);
     }
+    TDB_DEBUG_LOG("Compaction threads finished");
 
-    /* discard pending flush work without executing (shutdown, no flush) */
+    /* drain and free any remaining work items before freeing queues */
     if (db->flush_queue)
     {
         while (!queue_is_empty(db->flush_queue))
         {
             tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue(db->flush_queue);
-            if (work)
-            {
-                /* release work's reference to immutable memtable */
-                tidesdb_immutable_memtable_unref(work->imm);
-                free(work);
-            }
+            if (work) free(work);
         }
         queue_free(db->flush_queue);
     }
 
-    /* discard pending compaction work without executing (shutdown, no compaction) */
     if (db->compaction_queue)
     {
         while (!queue_is_empty(db->compaction_queue))
         {
             tidesdb_compaction_work_t *work =
                 (tidesdb_compaction_work_t *)queue_dequeue(db->compaction_queue);
-            if (work)
-            {
-                free(work);
-            }
+            if (work) free(work);
         }
         queue_free(db->compaction_queue);
     }
 
-    /* join background compaction threads (already signaled to stop above) */
-    for (int i = 0; i < num_cfs; i++)
+    /* clear cache before freeing column families to avoid use-after-free */
+    fifo_cache_clear(db->sstable_cache);
+
+    /* stop all background compaction threads BEFORE acquiring cf_list_lock
+     * to avoid deadlock (threads might need cf_list_lock) */
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    for (int i = 0; i < db->num_column_families; i++)
     {
-        tidesdb_column_family_t *cf = cfs[i];
-        if (cf->config.enable_background_compaction)
+        tidesdb_column_family_t *cf = db->column_families[i];
+        if (cf && cf->config.enable_background_compaction)
+        {
+            atomic_store(&cf->compaction_should_stop, 1);
+        }
+    }
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    /* now join all compaction threads without holding any locks */
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        tidesdb_column_family_t *cf = db->column_families[i];
+        if (cf && cf->config.enable_background_compaction)
         {
             pthread_join(cf->compaction_thread, NULL);
         }
     }
+    pthread_rwlock_unlock(&db->cf_list_lock);
 
-    for (int i = 0; i < num_cfs; i++)
+    pthread_rwlock_wrlock(&db->cf_list_lock);
+    for (int i = 0; i < db->num_column_families; i++)
     {
-        tidesdb_column_family_free(cfs[i]);
+        tidesdb_column_family_free(db->column_families[i]);
     }
-    free(cfs);
+    free(db->column_families);
+    pthread_rwlock_unlock(&db->cf_list_lock);
 
-    fifo_cache_free(db->sstable_cache);
+    fifo_cache_destroy(db->sstable_cache);
+
+    pthread_rwlock_destroy(&db->cf_list_lock);
 
     /* free comparator registry */
     if (db->comparators)
@@ -6806,7 +6839,7 @@ int tidesdb_close(tidesdb_t *db)
     pthread_mutex_destroy(&db->comparators_lock);
 
     free(db->db_path);
-    atomic_store_explicit(&db->is_open, 0, memory_order_release);
+    db->is_open = 0;
     free(db);
 
     return TDB_SUCCESS;
@@ -7035,14 +7068,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         }
     }
 
-    /* acquire cf_list_state to prevent concurrent modifications */
-    int expected_state = 0;
-    while (!atomic_compare_exchange_weak_explicit(&db->cf_list_state, &expected_state, 1,
-                                                  memory_order_acq_rel, memory_order_acquire))
-    {
-        expected_state = 0;
-        usleep(TDB_CF_LIST_BACKOFF_US); /* wait for other modification to complete */
-    }
+    /* acquire write lock to modify CF list */
+    pthread_rwlock_wrlock(&db->cf_list_lock);
 
     while (1)
     {
@@ -7078,8 +7105,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                       memory_order_release);
                 atomic_store_explicit(&db->cf_capacity, new_cap, memory_order_release);
                 free(current_array);
-                /* clear cf_list_state to indicate modification complete */
-                atomic_store_explicit(&db->cf_list_state, 0, memory_order_release);
+                pthread_rwlock_unlock(&db->cf_list_lock);
                 break;
             }
             /* CAS failed, retry */
@@ -7109,8 +7135,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                 atomic_store_explicit(&db->num_column_families, current_num + 1,
                                       memory_order_release);
                 free(current_array);
-                /* clear cf_list_state to indicate modification complete */
-                atomic_store_explicit(&db->cf_list_state, 0, memory_order_release);
+                pthread_rwlock_unlock(&db->cf_list_lock);
                 break;
             }
             free(new_array);
@@ -7131,14 +7156,8 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 
     tidesdb_column_family_t *cf_to_drop = NULL;
 
-    /* acquire cf_list_state to prevent concurrent modifications */
-    int expected_state = 0;
-    while (!atomic_compare_exchange_weak_explicit(&db->cf_list_state, &expected_state, 1,
-                                                  memory_order_acq_rel, memory_order_acquire))
-    {
-        expected_state = 0;
-        usleep(TDB_CF_LIST_BACKOFF_US); /* wait for other modification to complete */
-    }
+    /* acquire write lock to modify CF list */
+    pthread_rwlock_wrlock(&db->cf_list_lock);
 
     while (1)
     {
@@ -7169,8 +7188,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
             malloc(current_cap * sizeof(tidesdb_column_family_t *));
         if (!new_array)
         {
-            /* clear cf_list_state before returning */
-            atomic_store_explicit(&db->cf_list_state, 0, memory_order_release);
+            pthread_rwlock_unlock(&db->cf_list_lock);
             return TDB_ERR_MEMORY;
         }
 
@@ -7189,8 +7207,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         {
             atomic_store_explicit(&db->num_column_families, current_num - 1, memory_order_release);
             free(current_array);
-            /* clear cf_list_state to indicate modification complete */
-            atomic_store_explicit(&db->cf_list_state, 0, memory_order_release);
+            pthread_rwlock_unlock(&db->cf_list_lock);
             break;
         }
         /* CAS failed, retry */

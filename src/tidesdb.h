@@ -618,7 +618,7 @@ struct tidesdb_t
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) cached_available_disk_space;
     _Atomic(time_t) last_disk_space_check;
-    _Atomic(int) cf_list_state;
+    pthread_rwlock_t cf_list_lock;
 };
 
 /**

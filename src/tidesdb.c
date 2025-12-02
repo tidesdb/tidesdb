@@ -5638,7 +5638,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 {
     /* try to acquire compaction lock - if another compaction is running, skip */
-    if (pthread_rwlock_trywrlock(&cf->compaction_lock) != 0)
+    if (pthread_mutex_trylock(&cf->compaction_lock) != 0)
     {
         /* another compaction is already running, skip this one */
         return TDB_SUCCESS;
@@ -5831,7 +5831,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 
     tidesdb_apply_dca(cf);
 
-    pthread_rwlock_unlock(&cf->compaction_lock);
+    pthread_mutex_unlock(&cf->compaction_lock);
     return result;
 }
 
@@ -6172,8 +6172,8 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
     free(levels);
 
     pthread_rwlock_destroy(&cf->levels_lock);
-    pthread_rwlock_destroy(&cf->flush_lock);
-    pthread_rwlock_destroy(&cf->compaction_lock);
+    pthread_mutex_destroy(&cf->flush_lock);
+    pthread_mutex_destroy(&cf->compaction_lock);
 
     if (cf->active_txn_buffer)
     {
@@ -6979,7 +6979,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         return TDB_ERR_MEMORY;
     }
 
-    if (pthread_rwlock_init(&cf->flush_lock, NULL) != 0)
+    if (pthread_mutex_init(&cf->flush_lock, NULL) != 0)
     {
         pthread_rwlock_destroy(&cf->levels_lock);
         block_manager_close(atomic_load(&cf->active_wal));
@@ -6991,9 +6991,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         return TDB_ERR_MEMORY;
     }
 
-    if (pthread_rwlock_init(&cf->compaction_lock, NULL) != 0)
+    if (pthread_mutex_init(&cf->compaction_lock, NULL) != 0)
     {
-        pthread_rwlock_destroy(&cf->flush_lock);
+        pthread_mutex_destroy(&cf->flush_lock);
         pthread_rwlock_destroy(&cf->levels_lock);
         block_manager_close(atomic_load(&cf->active_wal));
         queue_free(cf->immutable_memtables);
@@ -7252,7 +7252,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
     /* try to acquire flush lock to prevent duplicate flush operations */
-    if (pthread_rwlock_trywrlock(&cf->flush_lock) != 0)
+    if (pthread_mutex_trylock(&cf->flush_lock) != 0)
     {
         /* flush already in progress */
         return TDB_SUCCESS;
@@ -7265,13 +7265,13 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
     if (current_entries == 0)
     {
-        pthread_rwlock_unlock(&cf->flush_lock);
+        pthread_mutex_unlock(&cf->flush_lock);
         return TDB_SUCCESS;
     }
 
     if (current_size < cf->config.write_buffer_size)
     {
-        pthread_rwlock_unlock(&cf->flush_lock);
+        pthread_mutex_unlock(&cf->flush_lock);
         return TDB_SUCCESS;
     }
 
@@ -7298,7 +7298,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     skip_list_t *new_memtable;
     if (skip_list_new_with_comparator(&new_memtable, 32, 0.25f, comparator_fn, comparator_ctx) != 0)
     {
-        pthread_rwlock_unlock(&cf->flush_lock);
+        pthread_mutex_unlock(&cf->flush_lock);
         return TDB_ERR_MEMORY;
     }
 
@@ -7313,7 +7313,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
                                       0) != 0)
     {
         skip_list_free(new_memtable);
-        pthread_rwlock_unlock(&cf->flush_lock);
+        pthread_mutex_unlock(&cf->flush_lock);
         return TDB_ERR_IO;
     }
 
@@ -7322,7 +7322,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     {
         skip_list_free(new_memtable);
         block_manager_close(new_wal);
-        pthread_rwlock_unlock(&cf->flush_lock);
+        pthread_mutex_unlock(&cf->flush_lock);
         return TDB_ERR_MEMORY;
     }
 
@@ -7337,7 +7337,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     atomic_fetch_add_explicit(&cf->memtable_generation, 1, memory_order_release);
 
     /* release flush lock now that memtable is swapped, new writes go to new memtable */
-    pthread_rwlock_unlock(&cf->flush_lock);
+    pthread_mutex_unlock(&cf->flush_lock);
 
     tidesdb_flush_work_t *work = malloc(sizeof(tidesdb_flush_work_t));
     if (!work)

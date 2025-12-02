@@ -527,8 +527,8 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) commit_serving;
     buffer_t *active_txn_buffer;
     pthread_rwlock_t levels_lock;
-    pthread_rwlock_t flush_lock;
-    pthread_rwlock_t compaction_lock;
+    pthread_mutex_t flush_lock;
+    pthread_mutex_t compaction_lock;
     tidesdb_level_t **levels;
     int num_levels;
     pthread_t compaction_thread;

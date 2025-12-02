@@ -395,6 +395,21 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
     size_t node_size = sizeof(skip_list_node_t) + key_size + value_size;
     atomic_fetch_add(&list->total_size, node_size);
     atomic_fetch_add(&list->entry_count, 1);
+
+    /* check if we created a duplicate due to race condition
+     * if the next node has the same key, another thread inserted it concurrently
+     * decrement counter to maintain accurate count */
+    skip_list_node_t *next_node = atomic_load_explicit(&new_node->forward[0], memory_order_acquire);
+    if (next_node != NULL && !NODE_IS_SENTINEL(next_node))
+    {
+        int cmp = skip_list_compare_keys(list, next_node->key, next_node->key_size, key, key_size);
+        if (cmp == 0)
+        {
+            /* duplicate detected - decrement counter */
+            atomic_fetch_sub(&list->entry_count, 1);
+        }
+    }
+
     free(update);
     return 0;
 }

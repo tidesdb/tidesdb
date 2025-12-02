@@ -5603,9 +5603,26 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 
     else if (num_levels > 1 && largest_size == 0)
     {
-        TDB_DEBUG_LOG("Largest level is empty, removing level for CF '%s'", cf->name);
-        tidesdb_remove_level(cf);
-        num_levels = atomic_load(&cf->num_levels);
+        /* only remove level if there's no pending work that might refill it
+         * check for queued flushes, level 0 sstables, and pending compactions */
+        size_t pending_flushes = queue_size(cf->immutable_memtables);
+        int level0_sstables = (levels[0] != NULL) ? atomic_load(&levels[0]->num_sstables) : 0;
+        int compaction_pending =
+            atomic_load_explicit(&cf->compaction_pending, memory_order_acquire);
+
+        if (pending_flushes == 0 && level0_sstables == 0 && compaction_pending == 0)
+        {
+            TDB_DEBUG_LOG("Largest level is empty, removing level for CF '%s'", cf->name);
+            tidesdb_remove_level(cf);
+            num_levels = atomic_load(&cf->num_levels);
+        }
+        else
+        {
+            TDB_DEBUG_LOG(
+                "Largest level is empty but work pending (flushes: %zu, L0 sstables: %d), keeping "
+                "level for CF '%s'",
+                pending_flushes, level0_sstables, cf->name);
+        }
     }
 
     tidesdb_apply_dca(cf);
@@ -6796,6 +6813,15 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         }
     }
 
+    /* acquire cf_list_state to prevent concurrent modifications */
+    int expected_state = 0;
+    while (!atomic_compare_exchange_weak_explicit(&db->cf_list_state, &expected_state, 1,
+                                                  memory_order_acq_rel, memory_order_acquire))
+    {
+        expected_state = 0;
+        usleep(TDB_CF_LIST_BACKOFF_US); /* wait for other modification to complete */
+    }
+
     while (1)
     {
         int current_num = atomic_load_explicit(&db->num_column_families, memory_order_acquire);
@@ -6830,6 +6856,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                       memory_order_release);
                 atomic_store_explicit(&db->cf_capacity, new_cap, memory_order_release);
                 free(current_array);
+                /* clear cf_list_state to indicate modification complete */
+                atomic_store_explicit(&db->cf_list_state, 0, memory_order_release);
                 break;
             }
             /* CAS failed, retry */
@@ -6859,6 +6887,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                 atomic_store_explicit(&db->num_column_families, current_num + 1,
                                       memory_order_release);
                 free(current_array);
+                /* clear cf_list_state to indicate modification complete */
+                atomic_store_explicit(&db->cf_list_state, 0, memory_order_release);
                 break;
             }
             free(new_array);
@@ -6878,6 +6908,15 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     TDB_DEBUG_LOG("Dropping column family: %s", name);
 
     tidesdb_column_family_t *cf_to_drop = NULL;
+
+    /* acquire cf_list_state to prevent concurrent modifications */
+    int expected_state = 0;
+    while (!atomic_compare_exchange_weak_explicit(&db->cf_list_state, &expected_state, 1,
+                                                  memory_order_acq_rel, memory_order_acquire))
+    {
+        expected_state = 0;
+        usleep(TDB_CF_LIST_BACKOFF_US); /* wait for other modification to complete */
+    }
 
     while (1)
     {
@@ -6908,6 +6947,8 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
             malloc(current_cap * sizeof(tidesdb_column_family_t *));
         if (!new_array)
         {
+            /* clear cf_list_state before returning */
+            atomic_store_explicit(&db->cf_list_state, 0, memory_order_release);
             return TDB_ERR_MEMORY;
         }
 
@@ -6926,6 +6967,8 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         {
             atomic_store_explicit(&db->num_column_families, current_num - 1, memory_order_release);
             free(current_array);
+            /* clear cf_list_state to indicate modification complete */
+            atomic_store_explicit(&db->cf_list_state, 0, memory_order_release);
             break;
         }
         /* CAS failed, retry */
@@ -6970,6 +7013,15 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
+
+    /* try to set flush_pending flag to prevent duplicate flush operations */
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&cf->flush_pending, &expected, 1,
+                                                 memory_order_acq_rel, memory_order_acquire))
+    {
+        /* flush already pending or in progress */
+        return TDB_SUCCESS;
+    }
 
     /* try to acquire flush lock */
     if (pthread_rwlock_trywrlock(&cf->flush_rwlock) != 0)

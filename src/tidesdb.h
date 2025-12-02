@@ -183,6 +183,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_IMMUTABLE_QUEUE_SLOWDOWN_FACTOR 50 /* milliseconds per extra immutable memtable */
 #define TDB_TXN_SPIN_COUNT \
     1000 /* spin iterations before yielding in transaction conflict resolution */
+#define TDB_CF_LIST_BACKOFF_US \
+    100 /* microseconds to sleep while waiting for CF list modification to complete */
 
 /**
  * tidesdb_column_family_config_t

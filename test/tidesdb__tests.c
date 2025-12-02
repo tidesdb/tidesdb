@@ -696,7 +696,9 @@ static void test_compaction_basic(void)
     }
 
     /* check initial state before compaction */
-    int initial_levels = atomic_load(&cf->num_levels);
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int initial_levels = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
     printf("Before compaction: %d level(s)\n", initial_levels);
 
     /* manually trigger compaction via thread pool */
@@ -711,7 +713,9 @@ static void test_compaction_basic(void)
     usleep(100000); /* extra time for work completion */
 
     /* check state after compaction */
-    int final_levels = atomic_load(&cf->num_levels);
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int final_levels = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
     printf("After compaction: %d level(s)\n", final_levels);
 
     /* verify all data is still accessible after compaction */
@@ -3405,7 +3409,9 @@ static void test_dividing_merge_strategy(void)
         if (queue_size(db->flush_queue) == 0) break;
     }
 
-    int levels_before = atomic_load(&cf->num_levels);
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int levels_before = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
     printf("Before compaction: %d levels\n", levels_before);
 
     /* trigger compaction -- should use dividing merge */
@@ -3419,7 +3425,9 @@ static void test_dividing_merge_strategy(void)
     }
     usleep(100000);
 
-    int levels_after = atomic_load(&cf->num_levels);
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int levels_after = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
     printf("After compaction: %d levels\n", levels_after);
     ASSERT_TRUE(levels_after >= 2); /* should have multiple levels */
 
@@ -3496,7 +3504,10 @@ static void test_partitioned_merge_strategy(void)
     usleep(100000);
     tidesdb_compact(cf);
     usleep(150000);
-    printf("After batch 1: %d levels\n", atomic_load(&cf->num_levels));
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int levels_batch1 = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
+    printf("After batch 1: %d levels\n", levels_batch1);
 
     /* batch 2 more data to push deeper */
     for (int i = 60; i < 140; i++)
@@ -3525,7 +3536,10 @@ static void test_partitioned_merge_strategy(void)
     usleep(100000);
     tidesdb_compact(cf);
     usleep(150000);
-    printf("After batch 2: %d levels\n", atomic_load(&cf->num_levels));
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int levels_batch2 = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
+    printf("After batch 2: %d levels\n", levels_batch2);
 
     /* batch 3 final push */
     for (int i = 140; i < 200; i++)
@@ -3569,7 +3583,9 @@ static void test_partitioned_merge_strategy(void)
     }
     usleep(150000);
 
-    int levels_after = atomic_load(&cf->num_levels);
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int levels_after = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
     printf("Final: %d levels\n", levels_after);
 
     /* level count may vary due to DCA removing empty levels after compaction.
@@ -3641,7 +3657,10 @@ static void test_multi_level_compaction_strategies(void)
 
     tidesdb_compact(cf);
     usleep(150000);
-    printf("  Levels after phase 1: %d\n", atomic_load(&cf->num_levels));
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int levels_phase1 = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
+    printf("  Levels after phase 1: %d\n", levels_phase1);
 
     /* medium dataset -- triggers dividing merge */
     printf("Phase 2: Writing 100 more keys (dividing merge)\n");
@@ -3669,7 +3688,10 @@ static void test_multi_level_compaction_strategies(void)
 
     tidesdb_compact(cf);
     usleep(150000);
-    printf("  Levels after phase 2: %d\n", atomic_load(&cf->num_levels));
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int levels_phase2 = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
+    printf("  Levels after phase 2: %d\n", levels_phase2);
 
     /* large dataset -- triggers partitioned merge */
     printf("Phase 3: Writing 100 more keys (partitioned merge)\n");
@@ -3697,7 +3719,9 @@ static void test_multi_level_compaction_strategies(void)
 
     tidesdb_compact(cf);
     usleep(150000);
-    int final_levels = atomic_load(&cf->num_levels);
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int final_levels = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
     printf("  Levels after phase 3: %d\n", final_levels);
 
     /* verify all 250 keys */
@@ -3815,7 +3839,9 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "dca_cf");
     ASSERT_TRUE(cf != NULL);
 
-    int initial_levels = atomic_load(&cf->num_levels);
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int initial_levels = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
     printf("Initial levels: %d\n", initial_levels);
 
     /* write data in batches, triggering level additions */
@@ -3850,11 +3876,15 @@ static void test_dynamic_capacity_adjustment(void)
         tidesdb_compact(cf);
         usleep(150000);
 
-        int current_levels = atomic_load(&cf->num_levels);
+        pthread_rwlock_rdlock(&cf->levels_lock);
+        int current_levels = cf->num_levels;
+        pthread_rwlock_unlock(&cf->levels_lock);
         printf("  After batch %d: %d levels\n", batch + 1, current_levels);
     }
 
-    int final_levels = atomic_load(&cf->num_levels);
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    int final_levels = cf->num_levels;
+    pthread_rwlock_unlock(&cf->levels_lock);
     printf("Final levels: %d (growth: %d levels)\n", final_levels, final_levels - initial_levels);
 
     /* verify DCA worked -- should have added levels */

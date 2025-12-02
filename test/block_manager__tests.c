@@ -1573,11 +1573,11 @@ void test_block_manager_cache_race_stress()
     ASSERT_TRUE(block_manager_open_with_cache(&bm, "cache_stress_test.db", BLOCK_MANAGER_SYNC_NONE,
                                               STRESS_CACHE_SIZE) == 0);
 
-    /* Write blocks that will fit in cache initially but cause evictions */
-    const int num_blocks = 20; /* More blocks than cache can hold */
-    uint64_t offsets[num_blocks];
+    /* write blocks that will fit in cache initially but cause evictions */
+#define STRESS_NUM_BLOCKS 20 /* more blocks than cache can hold */
+    uint64_t offsets[STRESS_NUM_BLOCKS];
 
-    for (int i = 0; i < num_blocks; i++)
+    for (int i = 0; i < STRESS_NUM_BLOCKS; i++)
     {
         char data[64];
         snprintf(data, sizeof(data), "stress_block_%d", i);
@@ -1603,7 +1603,7 @@ void test_block_manager_cache_race_stress()
         args[i].bm = bm;
         args[i].thread_id = i;
         args[i].offsets = offsets;
-        args[i].num_blocks = num_blocks;
+        args[i].num_blocks = STRESS_NUM_BLOCKS;
 
         ASSERT_TRUE(pthread_create(&threads[i], NULL, cache_stress_thread, &args[i]) == 0);
     }

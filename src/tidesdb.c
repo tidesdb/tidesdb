@@ -4989,7 +4989,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 }
                 free(bloom_data);
             }
-            bloom_filter_free(bloom);
         }
 
         new_sst->bloom_filter = bloom;
@@ -5110,12 +5109,11 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     /* get file boundaries from largest level */
     tidesdb_sstable_t **largest_sstables = largest->sstables;
     int num_partitions = largest->num_sstables;
-    pthread_rwlock_unlock(&cf->levels_lock);
 
-    /* merge sources will be created later in the partition loop, outside the lock */
-
+    /* copy boundary data WHILE holding lock, before SSTables can be freed */
     if (num_partitions == 0)
     {
+        pthread_rwlock_unlock(&cf->levels_lock);
         /* largest level is empty, fall back to full preemptive merge.
          */
         while (!queue_is_empty(sstables_to_delete))
@@ -5144,6 +5142,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         boundary_sizes[i] = largest_sstables[i]->min_key_size;
         memcpy(boundaries[i], largest_sstables[i]->min_key, boundary_sizes[i]);
     }
+
+    pthread_rwlock_unlock(&cf->levels_lock);
 
     /* merge one partition at a time */
     for (int partition = 0; partition < num_partitions; partition++)
@@ -5553,7 +5553,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                     }
                     free(bloom_data);
                 }
-                bloom_filter_free(bloom);
             }
 
             new_sst->bloom_filter = bloom;
@@ -5712,10 +5711,16 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         result = tidesdb_dividing_merge(cf, X);
     }
 
-    /* check if partitioned merge is needed */
+    /* re-acquire lock and get FRESH level pointers after merge modified levels
+     * this prevents use-after-free where partitioned merge tries to access
+     * sstables that were just freed by the dividing merge above */
     pthread_rwlock_rdlock(&cf->levels_lock);
     num_levels = cf->num_levels;
     levels = cf->levels;
+
+    /* recalculate X with potentially new num_levels */
+    X = num_levels - 1 - cf->config.dividing_level_offset;
+    if (X < 1) X = 1;
 
     int z = -1;
     int need_partitioned_merge = 0;
@@ -5774,20 +5779,34 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         pthread_rwlock_unlock(&cf->levels_lock);
     }
 
-    else if (num_levels > 1 && largest_size == 0)
+    /* check if largest level is truly empty by checking num_sstables, not current_size
+     * current_size uses relaxed memory ordering and can be stale
+     * IMPORTANT: re-fetch levels and largest pointer as they may have changed due to compactions */
+    pthread_rwlock_rdlock(&cf->levels_lock);
+    num_levels = cf->num_levels;
+    levels = cf->levels;
+    int largest_num_sstables =
+        (num_levels > 1)
+            ? atomic_load_explicit(&levels[num_levels - 1]->num_sstables, memory_order_acquire)
+            : -1;
+    pthread_rwlock_unlock(&cf->levels_lock);
+
+    if (num_levels > 1 && largest_num_sstables == 0)
     {
-        /* only remove level if there's no pending work that might refill it
-         * check for queued flushes, level 0 sstables, and pending compactions */
+        /* remove empty level if there's no work that might refill it
+         * don't check compaction_pending here - it's set during the current compaction
+         * and would always prevent removal. If level is truly empty (num_sstables==0),
+         * it's safe to remove - future compactions will recreate it if needed */
         size_t pending_flushes = queue_size(cf->immutable_memtables);
 
         pthread_rwlock_rdlock(&cf->levels_lock);
-        int level0_sstables = (cf->levels[0] != NULL) ? cf->levels[0]->num_sstables : 0;
+        int level0_sstables =
+            (cf->levels[0] != NULL)
+                ? atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire)
+                : 0;
         pthread_rwlock_unlock(&cf->levels_lock);
 
-        int compaction_pending =
-            atomic_load_explicit(&cf->compaction_pending, memory_order_acquire);
-
-        if (pending_flushes == 0 && level0_sstables == 0 && compaction_pending == 0)
+        if (pending_flushes == 0 && level0_sstables == 0)
         {
             TDB_DEBUG_LOG("Largest level is empty, removing level for CF '%s'", cf->name);
             tidesdb_remove_level(cf);
@@ -6314,40 +6333,35 @@ static void *tidesdb_flush_worker_thread(void *arg)
                      * to minimize read amplification (L0 sstables have overlapping keys) */
                     if (l0_count > TDB_L0_COMPACTION_TRIGGER)
                     {
-                        
-                           
-                                TDB_DEBUG_LOG(
-                                    "CF '%s': L0 has %d SSTables (threshold: %d), triggering "
-                                    "compaction",
-                                    cf->name, l0_count, TDB_L0_COMPACTION_TRIGGER);
+                        TDB_DEBUG_LOG(
+                            "CF '%s': L0 has %d SSTables (threshold: %d), triggering "
+                            "compaction",
+                            cf->name, l0_count, TDB_L0_COMPACTION_TRIGGER);
 
-                                /* only enqueue if no compaction is pending */
-                                int expected = 0;
-                                if (atomic_compare_exchange_strong_explicit(
-                                        &cf->compaction_pending, &expected, 1, memory_order_acq_rel,
-                                        memory_order_acquire))
+                        /* only enqueue if no compaction is pending */
+                        int expected = 0;
+                        if (atomic_compare_exchange_strong_explicit(
+                                &cf->compaction_pending, &expected, 1, memory_order_acq_rel,
+                                memory_order_acquire))
+                        {
+                            tidesdb_compaction_work_t *compaction_work =
+                                calloc(1, sizeof(tidesdb_compaction_work_t));
+                            if (compaction_work)
+                            {
+                                compaction_work->cf = cf;
+                                if (queue_enqueue(db->compaction_queue, compaction_work) != 0)
                                 {
-                                    tidesdb_compaction_work_t *compaction_work =
-                                        calloc(1, sizeof(tidesdb_compaction_work_t));
-                                    if (compaction_work)
-                                    {
-                                        compaction_work->cf = cf;
-                                        if (queue_enqueue(db->compaction_queue, compaction_work) !=
-                                            0)
-                                        {
-                                            atomic_store_explicit(&cf->compaction_pending, 0,
-                                                                  memory_order_release);
-                                            free(compaction_work);
-                                        }
-                                    }
-                                    else
-                                    {
-                                        atomic_store_explicit(&cf->compaction_pending, 0,
-                                                              memory_order_release);
-                                    }
+                                    atomic_store_explicit(&cf->compaction_pending, 0,
+                                                          memory_order_release);
+                                    free(compaction_work);
                                 }
-                            
-                        
+                            }
+                            else
+                            {
+                                atomic_store_explicit(&cf->compaction_pending, 0,
+                                                      memory_order_release);
+                            }
+                        }
                     }
                 }
             }
@@ -7366,7 +7380,6 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         free(work);
         return TDB_ERR_MEMORY;
     }
-
 
     return TDB_SUCCESS;
 }

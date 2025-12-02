@@ -355,6 +355,7 @@ void queue_free(queue_t *queue)
     pthread_cond_destroy(&queue->not_empty);
 
     free(queue);
+    queue = NULL;
 }
 
 void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))

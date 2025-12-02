@@ -6314,21 +6314,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
                      * to minimize read amplification (L0 sstables have overlapping keys) */
                     if (l0_count > TDB_L0_COMPACTION_TRIGGER)
                     {
-                        /* throttle compaction triggers to prevent infinite loop
-                         * only trigger if at least 1 second has passed since last trigger
-                         * this prevents flush workers from continuously enqueuing compaction
-                         * work while a compaction is already running */
-                        time_t now = time(NULL);
-                        time_t last_trigger = atomic_load_explicit(&cf->last_compaction_trigger,
-                                                                   memory_order_acquire);
-
-                        if (now - last_trigger >= 1)
-                        {
-                            /* try to update the timestamp atomically */
-                            if (atomic_compare_exchange_strong_explicit(
-                                    &cf->last_compaction_trigger, &last_trigger, now,
-                                    memory_order_acq_rel, memory_order_acquire))
-                            {
+                        
+                           
                                 TDB_DEBUG_LOG(
                                     "CF '%s': L0 has %d SSTables (threshold: %d), triggering "
                                     "compaction",
@@ -6359,8 +6346,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
                                                               memory_order_release);
                                     }
                                 }
-                            }
-                        }
+                            
+                        
                     }
                 }
             }
@@ -7004,7 +6991,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->compaction_should_stop, 0);
     atomic_init(&cf->compaction_pending, 0);
     atomic_init(&cf->flush_pending, 0);
-    atomic_init(&cf->last_compaction_trigger, 0);
     atomic_init(&cf->commit_ticket, 0);
     atomic_init(&cf->commit_serving, 0);
 
@@ -7381,8 +7367,6 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
         return TDB_ERR_MEMORY;
     }
 
-    /* update last trigger timestamp for throttling */
-    atomic_store_explicit(&cf->last_compaction_trigger, time(NULL), memory_order_release);
 
     return TDB_SUCCESS;
 }

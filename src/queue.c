@@ -20,9 +20,6 @@
 
 #include "compat.h"
 
-/* node pool configuration */
-#define QUEUE_MAX_POOL_SIZE 64
-
 /**
  * queue_alloc_node
  * @param queue the queue to allocate the node from
@@ -301,11 +298,6 @@ void *queue_peek_at(queue_t *queue, size_t index)
 {
     if (!queue) return NULL;
 
-    /* lock-free read using atomic_head - no lock needed!
-     * this is safe because:
-     * 1. nodes are never freed while in queue (only when dequeued)
-     * 2. atomic_head is updated with release semantics
-     * 3. we use acquire semantics to see all previous writes */
     size_t size = atomic_load_explicit(&queue->size, memory_order_relaxed);
     if (index >= size)
     {
@@ -379,6 +371,14 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         {
             free_fn(current->data);
         }
+        free(current);
+        current = next;
+    }
+
+    current = queue->node_pool;
+    while (current != NULL)
+    {
+        queue_node_t *next = current->next;
         free(current);
         current = next;
     }

@@ -2362,9 +2362,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         if (deser_result == 0)
         {
-            skip_list_comparator_fn comparator_fn = NULL;
-            void *comparator_ctx = NULL;
-            tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+            /* reuse comparator_fn and comparator_ctx from function scope */
 
             /* search entries in this block */
             for (uint32_t i = 0; i < klog_block->num_entries; i++)
@@ -5140,20 +5138,18 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
                 tidesdb_sstable_ref(sst);
 
-                skip_list_comparator_fn cmp_fn = NULL;
-                void *cmp_ctx = NULL;
-                tidesdb_resolve_comparator(cf->db, &cf->config, &cmp_fn, &cmp_ctx);
+                /* reuse comparator_fn and comparator_ctx from outer scope */
 
                 int overlaps = 1;
 
-                if (cmp_fn(sst->max_key, sst->max_key_size, range_start, range_start_size,
-                           cmp_ctx) < 0)
+                if (comparator_fn(sst->max_key, sst->max_key_size, range_start, range_start_size,
+                                  comparator_ctx) < 0)
                 {
                     overlaps = 0;
                 }
 
-                if (range_end && cmp_fn(sst->min_key, sst->min_key_size, range_end, range_end_size,
-                                        cmp_ctx) >= 0)
+                if (range_end && comparator_fn(sst->min_key, sst->min_key_size, range_end,
+                                               range_end_size, comparator_ctx) >= 0)
                 {
                     overlaps = 0;
                 }
@@ -5203,10 +5199,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
             if (cf->config.enable_block_indexes)
             {
-                skip_list_comparator_fn comparator_fn = NULL;
-                void *comparator_ctx = NULL;
-                tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
-
+                /* reuse comparator_fn and comparator_ctx from outer scope */
                 index_builder = succinct_trie_builder_new(NULL, comparator_fn, comparator_ctx);
             }
 
@@ -6646,16 +6639,24 @@ int tidesdb_close(tidesdb_t *db)
     atomic_store(&db->flush_should_stop, 1);
     atomic_store(&db->compaction_should_stop, 1);
 
+    /* signal queues to wake waiting threads so they can exit */
     if (db->flush_queue)
     {
-        atomic_store(&db->flush_queue->shutdown, 1);
+        pthread_mutex_lock(&db->flush_queue->lock);
+        db->flush_queue->shutdown = 1;
+        pthread_cond_broadcast(&db->flush_queue->not_empty);
+        pthread_mutex_unlock(&db->flush_queue->lock);
     }
 
     if (db->compaction_queue)
     {
-        atomic_store(&db->compaction_queue->shutdown, 1);
+        pthread_mutex_lock(&db->compaction_queue->lock);
+        db->compaction_queue->shutdown = 1;
+        pthread_cond_broadcast(&db->compaction_queue->not_empty);
+        pthread_mutex_unlock(&db->compaction_queue->lock);
     }
 
+    /* now join threads (they will wake up and exit) */
     if (db->flush_threads)
     {
         for (int i = 0; i < db->config.num_flush_threads; i++)
@@ -6674,6 +6675,7 @@ int tidesdb_close(tidesdb_t *db)
         free(db->compaction_threads);
     }
 
+    /* discard pending flush work without executing (shutdown, no flush) */
     if (db->flush_queue)
     {
         while (!queue_is_empty(db->flush_queue))
@@ -6681,7 +6683,7 @@ int tidesdb_close(tidesdb_t *db)
             tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue(db->flush_queue);
             if (work)
             {
-                /* flush work holds its own reference, must unref to avoid leak */
+                /* release work's reference to immutable memtable */
                 tidesdb_immutable_memtable_unref(work->imm);
                 free(work);
             }
@@ -6689,6 +6691,7 @@ int tidesdb_close(tidesdb_t *db)
         queue_free(db->flush_queue);
     }
 
+    /* discard pending compaction work without executing (shutdown, no compaction) */
     if (db->compaction_queue)
     {
         while (!queue_is_empty(db->compaction_queue))

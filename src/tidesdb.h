@@ -185,6 +185,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
     1000 /* spin iterations before yielding in transaction conflict resolution */
 #define TDB_CF_LIST_BACKOFF_US \
     100 /* microseconds to sleep while waiting for CF list modification to complete */
+#define TDB_CF_LEVELS_BACKOFF_US \
+    100 /* microseconds to sleep while waiting for CF levels modification to complete */
 
 /**
  * tidesdb_column_family_config_t
@@ -503,9 +505,8 @@ typedef struct
  * @param compaction_should_stop flag to stop compaction thread
  * @param next_sstable_id next sstable id
  * @param compaction_pending flag to prevent duplicate compaction work items
+ * @param levels_state atomic state for levels modifications (0=idle, 1=modifying)
  * @param db parent database reference
- * @param levels_rwlock protects levels array and sstable add/remove operations
- * @param flush_rwlock protects memtable flush operations
  */
 struct tidesdb_column_family_t
 {
@@ -529,9 +530,8 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(int) compaction_pending;
     _Atomic(int) flush_pending;
+    _Atomic(int) levels_state;
     tidesdb_t *db;
-    pthread_rwlock_t levels_rwlock;
-    pthread_rwlock_t flush_rwlock;
 };
 
 /**

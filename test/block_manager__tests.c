@@ -1510,6 +1510,116 @@ void test_block_manager_cache_concurrent()
     (void)remove("cache_concurrent_test.db");
 }
 
+/* stress test for cache eviction race conditions */
+#define STRESS_NUM_THREADS 8
+#define STRESS_ITERATIONS  1000
+#define STRESS_CACHE_SIZE  512 /* small cache to force evictions */
+
+typedef struct
+{
+    block_manager_t *bm;
+    int thread_id;
+    uint64_t *offsets;
+    int num_blocks;
+} stress_thread_args_t;
+
+static void *cache_stress_thread(void *arg)
+{
+    stress_thread_args_t *args = (stress_thread_args_t *)arg;
+
+    /* Each thread gets its own cursor */
+    block_manager_cursor_t *cursor;
+    if (block_manager_cursor_init(&cursor, args->bm) != 0)
+    {
+        return NULL;
+    }
+
+    for (int i = 0; i < STRESS_ITERATIONS; i++)
+    {
+        /* Read random blocks to cause cache hits and misses */
+        int block_idx = rand() % args->num_blocks;
+
+        if (block_manager_cursor_goto(cursor, args->offsets[block_idx]) == 0)
+        {
+            block_manager_block_t *block = block_manager_cursor_read(cursor);
+
+            if (block != NULL)
+            {
+                /* Verify block content */
+                char expected[64];
+                snprintf(expected, sizeof(expected), "stress_block_%d", block_idx);
+
+                if (memcmp(block->data, expected, strlen(expected)) != 0)
+                {
+                    printf("Thread %d: Block %d content mismatch!\n", args->thread_id, block_idx);
+                }
+
+                /* Small delay to increase chance of race */
+                for (volatile int j = 0; j < 100; j++)
+                    ;
+
+                block_manager_block_release(block);
+            }
+        }
+    }
+
+    block_manager_cursor_free(cursor);
+    return NULL;
+}
+
+void test_block_manager_cache_race_stress()
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open_with_cache(&bm, "cache_stress_test.db", BLOCK_MANAGER_SYNC_NONE,
+                                              STRESS_CACHE_SIZE) == 0);
+
+    /* Write blocks that will fit in cache initially but cause evictions */
+    const int num_blocks = 20; /* More blocks than cache can hold */
+    uint64_t offsets[num_blocks];
+
+    for (int i = 0; i < num_blocks; i++)
+    {
+        char data[64];
+        snprintf(data, sizeof(data), "stress_block_%d", i);
+
+        block_manager_block_t *block = block_manager_block_create(64, data);
+        ASSERT_TRUE(block != NULL);
+
+        offsets[i] = block_manager_block_write(bm, block);
+        ASSERT_TRUE(offsets[i] != (uint64_t)-1);
+
+        block_manager_block_release(block);
+    }
+
+    printf("Starting cache stress test with %d threads, %d iterations each...\n",
+           STRESS_NUM_THREADS, STRESS_ITERATIONS);
+
+    /* Create threads that will hammer the cache */
+    pthread_t threads[STRESS_NUM_THREADS];
+    stress_thread_args_t args[STRESS_NUM_THREADS];
+
+    for (int i = 0; i < STRESS_NUM_THREADS; i++)
+    {
+        args[i].bm = bm;
+        args[i].thread_id = i;
+        args[i].offsets = offsets;
+        args[i].num_blocks = num_blocks;
+
+        ASSERT_TRUE(pthread_create(&threads[i], NULL, cache_stress_thread, &args[i]) == 0);
+    }
+
+    /* Wait for all threads */
+    for (int i = 0; i < STRESS_NUM_THREADS; i++)
+    {
+        ASSERT_TRUE(pthread_join(threads[i], NULL) == 0);
+    }
+
+    printf("Cache stress test completed successfully\n");
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove("cache_stress_test.db");
+}
+
 void benchmark_block_manager_with_cache()
 {
     block_manager_t *bm = NULL;
@@ -1964,6 +2074,8 @@ int main(void)
     RUN_TEST(test_block_manager_fifo_cache, tests_passed);
     RUN_TEST(test_block_manager_fifo_cache_edge_cases, tests_passed);
     RUN_TEST(test_block_manager_cache_concurrent, tests_passed);
+    RUN_TEST(test_block_manager_cache_concurrent, tests_passed);
+    RUN_TEST(test_block_manager_cache_race_stress, tests_passed);
     RUN_TEST(test_block_manager_concurrent_rw, tests_passed);
     RUN_TEST(test_block_manager_sync_modes, tests_passed);
     RUN_TEST(test_block_manager_overflow_blocks, tests_passed);

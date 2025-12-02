@@ -361,6 +361,9 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
         return -1;
     }
 
+    /* track if we detected a duplicate during insertion */
+    int is_duplicate = 0;
+
     for (int i = 0; i <= new_level; i++)
     {
         skip_list_node_t *next;
@@ -370,6 +373,19 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
             atomic_store_explicit(&new_node->forward[i], next, memory_order_relaxed);
         } while (!atomic_compare_exchange_weak_explicit(
             &update[i]->forward[i], &next, new_node, memory_order_release, memory_order_acquire));
+
+        /* immediately after level 0 insertion, check if another thread inserted same key
+         * this is the earliest point we can detect the race condition */
+        if (i == 0 && next != NULL && !NODE_IS_SENTINEL(next))
+        {
+            int cmp = skip_list_compare_keys(list, next->key, next->key_size, key, key_size);
+            if (cmp == 0)
+            {
+                /* we lost the race! another thread inserted this key first
+                 * our node is now a duplicate, don't count it */
+                is_duplicate = 1;
+            }
+        }
     }
 
     /* after successful insertion, set new node's backward pointers */
@@ -394,20 +410,12 @@ int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const 
 
     size_t node_size = sizeof(skip_list_node_t) + key_size + value_size;
     atomic_fetch_add(&list->total_size, node_size);
-    atomic_fetch_add(&list->entry_count, 1);
 
-    /* check if we created a duplicate due to race condition
-     * if the next node has the same key, another thread inserted it concurrently
-     * decrement counter to maintain accurate count */
-    skip_list_node_t *next_node = atomic_load_explicit(&new_node->forward[0], memory_order_acquire);
-    if (next_node != NULL && !NODE_IS_SENTINEL(next_node))
+    /* only increment entry count if this is a unique key
+     * duplicates were detected during the insertion loop above */
+    if (!is_duplicate)
     {
-        int cmp = skip_list_compare_keys(list, next_node->key, next_node->key_size, key, key_size);
-        if (cmp == 0)
-        {
-            /* duplicate detected - decrement counter */
-            atomic_fetch_sub(&list->entry_count, 1);
-        }
+        atomic_fetch_add(&list->entry_count, 1);
     }
 
     free(update);

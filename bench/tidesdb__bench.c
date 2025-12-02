@@ -867,19 +867,6 @@ int main()
            BENCH_NUM_SEEK_OPS, end_time - start_time,
            (BENCH_NUM_SEEK_OPS / (end_time - start_time)) * 1000);
 
-    printf(BOLDGREEN "\nBenchmarking Delete operations...\n" RESET);
-    start_time = get_time_ms();
-
-    for (int i = 0; i < BENCH_NUM_THREADS; i++)
-    {
-        (void)pthread_create(&threads[i], NULL, thread_delete, &thread_data[i]);
-    }
-
-    for (int i = 0; i < BENCH_NUM_THREADS; i++)
-    {
-        (void)pthread_join(threads[i], NULL);
-    }
-
     printf(BOLDGREEN "\nBenchmarking Forward Iterator (full scan)...\n" RESET);
     start_time = get_time_ms();
 
@@ -953,6 +940,19 @@ int main()
         printf(BOLDRED "  ✗ Iterator verification failed: %d errors\n" RESET, verification_errors);
     }
     verification_errors = 0; /* reset for next test */
+
+    printf(BOLDGREEN "\nBenchmarking Delete operations...\n" RESET);
+    start_time = get_time_ms();
+
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        (void)pthread_create(&threads[i], NULL, thread_delete, &thread_data[i]);
+    }
+
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        (void)pthread_join(threads[i], NULL);
+    }
 
     end_time = get_time_ms();
     printf(BOLDGREEN "Delete: %d operations in %.2f ms (%.2f ops/sec)\n" RESET,

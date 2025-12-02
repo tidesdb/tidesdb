@@ -3877,8 +3877,10 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     cf->levels = new_levels;
     cf->num_levels = num_levels + 1;
 
-    pthread_rwlock_unlock(&cf->levels_lock);
+    /* free old array BEFORE releasing lock - readers must acquire lock to see new array */
     free(levels);
+
+    pthread_rwlock_unlock(&cf->levels_lock);
 
     return TDB_SUCCESS;
 }
@@ -3934,9 +3936,10 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
     cf->levels = new_levels;
     cf->num_levels = new_num_levels;
 
-    pthread_rwlock_unlock(&cf->levels_lock);
-    /* old array can now be safely freed */
+    /* free old array BEFORE releasing lock - readers must acquire lock to see new array */
     free(levels);
+
+    pthread_rwlock_unlock(&cf->levels_lock);
 
     return TDB_SUCCESS;
 }
@@ -5634,8 +5637,12 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
 int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 {
-    /* acquire compaction lock to ensure only one compaction runs at a time */
-    pthread_rwlock_wrlock(&cf->compaction_lock);
+    /* try to acquire compaction lock - if another compaction is running, skip */
+    if (pthread_rwlock_trywrlock(&cf->compaction_lock) != 0)
+    {
+        /* another compaction is already running, skip this one */
+        return TDB_SUCCESS;
+    }
 
     pthread_rwlock_rdlock(&cf->levels_lock);
     int num_levels = cf->num_levels;
@@ -6108,7 +6115,7 @@ static void *tidesdb_background_compaction_thread(void *arg)
                 tidesdb_flush_memtable(cf);
             }
 
-            /* enqueue compaction work for thread pool to process */
+            /* enqueue compaction work - worker will skip if compaction already running */
             tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
             if (work)
             {
@@ -6327,7 +6334,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
                             "compaction",
                             cf->name, l0_count, TDB_L0_COMPACTION_TRIGGER);
 
-                        /* enqueue compaction work */
+                        /* enqueue compaction work - worker will skip if compaction already running
+                         */
                         tidesdb_compaction_work_t *compaction_work =
                             calloc(1, sizeof(tidesdb_compaction_work_t));
                         if (compaction_work)
@@ -7349,7 +7357,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
-    /* enqueue compaction work */
+    /* enqueue compaction work - worker will skip if compaction already running */
     tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
     if (!work)
     {
@@ -8025,11 +8033,10 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         free(immutable_refs);
     }
 
-    /* acquire read lock to snapshot levels metadata */
+    /* acquire read lock and hold it during level iteration to prevent UAF */
     pthread_rwlock_rdlock(&cf->levels_lock);
     int num_levels = cf->num_levels;
     tidesdb_level_t **levels = cf->levels;
-    pthread_rwlock_unlock(&cf->levels_lock);
 
     tidesdb_kv_pair_t *best_kv = NULL;
     uint64_t best_seq = UINT64_MAX;
@@ -8107,6 +8114,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     }
 
 check_found_result:
+    /* release levels lock after iteration completes */
+    pthread_rwlock_unlock(&cf->levels_lock);
+
     /* check if we found a valid (non-deleted, non-expired) version */
     if (found_any && best_kv)
     {
@@ -9118,10 +9128,10 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         }
     }
 
+    /* hold levels_lock during iteration to prevent UAF */
     pthread_rwlock_rdlock(&cf->levels_lock);
     int num_levels = cf->num_levels;
     tidesdb_level_t **levels = cf->levels;
-    pthread_rwlock_unlock(&cf->levels_lock);
 
     for (int i = 0; i < num_levels; i++)
     {
@@ -9146,6 +9156,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             }
         }
     }
+
+    pthread_rwlock_unlock(&cf->levels_lock);
 
     return TDB_SUCCESS;
 }
@@ -10406,10 +10418,10 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 
     uint64_t global_max_seq = 0;
 
+    /* hold levels_lock during iteration to prevent UAF */
     pthread_rwlock_rdlock(&cf->levels_lock);
     int num_levels = cf->num_levels;
     tidesdb_level_t **levels = cf->levels;
-    pthread_rwlock_unlock(&cf->levels_lock);
 
     TDB_DEBUG_LOG("CF '%s': Scanning sources for max_seq", cf->name);
 
@@ -10433,6 +10445,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             }
         }
     }
+
+    pthread_rwlock_unlock(&cf->levels_lock);
 
     if (cf->immutable_memtables)
     {

@@ -5634,6 +5634,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
 int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 {
+    /* acquire compaction lock to ensure only one compaction runs at a time */
+    pthread_rwlock_wrlock(&cf->compaction_lock);
+
     pthread_rwlock_rdlock(&cf->levels_lock);
     int num_levels = cf->num_levels;
 
@@ -5793,10 +5796,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 
     if (num_levels > 1 && largest_num_sstables == 0)
     {
-        /* remove empty level if there's no work that might refill it
-         * don't check compaction_pending here - it's set during the current compaction
-         * and would always prevent removal. If level is truly empty (num_sstables==0),
-         * it's safe to remove - future compactions will recreate it if needed */
         size_t pending_flushes = queue_size(cf->immutable_memtables);
 
         pthread_rwlock_rdlock(&cf->levels_lock);
@@ -5825,6 +5824,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 
     tidesdb_apply_dca(cf);
 
+    pthread_rwlock_unlock(&cf->compaction_lock);
     return result;
 }
 
@@ -6108,27 +6108,14 @@ static void *tidesdb_background_compaction_thread(void *arg)
                 tidesdb_flush_memtable(cf);
             }
 
-            /* only enqueue if no compaction is pending to prevent infinite loop */
-            int expected = 0;
-            if (atomic_compare_exchange_strong_explicit(&cf->compaction_pending, &expected, 1,
-                                                        memory_order_acq_rel, memory_order_acquire))
+            /* enqueue compaction work for thread pool to process */
+            tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
+            if (work)
             {
-                /* enqueue compaction work for thread pool to process */
-                tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
-                if (work)
+                work->cf = cf;
+                if (queue_enqueue(cf->db->compaction_queue, work) != 0)
                 {
-                    work->cf = cf;
-                    if (queue_enqueue(cf->db->compaction_queue, work) != 0)
-                    {
-                        /* failed to enqueue, clear the pending flag */
-                        atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
-                        free(work);
-                    }
-                }
-                else
-                {
-                    /* malloc failed, clear the pending flag */
-                    atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
+                    free(work);
                 }
             }
         }
@@ -6178,6 +6165,8 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
     free(levels);
 
     pthread_rwlock_destroy(&cf->levels_lock);
+    pthread_rwlock_destroy(&cf->flush_lock);
+    pthread_rwlock_destroy(&cf->compaction_lock);
 
     if (cf->active_txn_buffer)
     {
@@ -6338,28 +6327,15 @@ static void *tidesdb_flush_worker_thread(void *arg)
                             "compaction",
                             cf->name, l0_count, TDB_L0_COMPACTION_TRIGGER);
 
-                        /* only enqueue if no compaction is pending */
-                        int expected = 0;
-                        if (atomic_compare_exchange_strong_explicit(
-                                &cf->compaction_pending, &expected, 1, memory_order_acq_rel,
-                                memory_order_acquire))
+                        /* enqueue compaction work */
+                        tidesdb_compaction_work_t *compaction_work =
+                            calloc(1, sizeof(tidesdb_compaction_work_t));
+                        if (compaction_work)
                         {
-                            tidesdb_compaction_work_t *compaction_work =
-                                calloc(1, sizeof(tidesdb_compaction_work_t));
-                            if (compaction_work)
+                            compaction_work->cf = cf;
+                            if (queue_enqueue(db->compaction_queue, compaction_work) != 0)
                             {
-                                compaction_work->cf = cf;
-                                if (queue_enqueue(db->compaction_queue, compaction_work) != 0)
-                                {
-                                    atomic_store_explicit(&cf->compaction_pending, 0,
-                                                          memory_order_release);
-                                    free(compaction_work);
-                                }
-                            }
-                            else
-                            {
-                                atomic_store_explicit(&cf->compaction_pending, 0,
-                                                      memory_order_release);
+                                free(compaction_work);
                             }
                         }
                     }
@@ -6421,17 +6397,12 @@ static void *tidesdb_compaction_worker_thread(void *arg)
             TDB_DEBUG_LOG("CF '%s': Insufficient disk space for compaction (required: %" PRIu64
                           " bytes)",
                           cf->name, cf->config.min_disk_space);
-            /* clear pending flag so compaction can be retried later */
-            atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
             free(work);
             continue;
         }
 
         TDB_DEBUG_LOG("Compacting CF '%s'", cf->name);
         tidesdb_trigger_compaction(cf);
-
-        /* clear the pending flag to allow new work items to be queued */
-        atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
 
         free(work);
     }
@@ -6955,9 +6926,34 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
     atomic_init(&cf->active_wal, new_wal);
 
-    /* initialize rwlock for levels protection */
+    /* initialize rwlocks for levels, flush, and compaction protection */
     if (pthread_rwlock_init(&cf->levels_lock, NULL) != 0)
     {
+        block_manager_close(atomic_load(&cf->active_wal));
+        queue_free(cf->immutable_memtables);
+        skip_list_free(atomic_load(&cf->active_memtable));
+        free(cf->directory);
+        free(cf->name);
+        free(cf);
+        return TDB_ERR_MEMORY;
+    }
+
+    if (pthread_rwlock_init(&cf->flush_lock, NULL) != 0)
+    {
+        pthread_rwlock_destroy(&cf->levels_lock);
+        block_manager_close(atomic_load(&cf->active_wal));
+        queue_free(cf->immutable_memtables);
+        skip_list_free(atomic_load(&cf->active_memtable));
+        free(cf->directory);
+        free(cf->name);
+        free(cf);
+        return TDB_ERR_MEMORY;
+    }
+
+    if (pthread_rwlock_init(&cf->compaction_lock, NULL) != 0)
+    {
+        pthread_rwlock_destroy(&cf->flush_lock);
+        pthread_rwlock_destroy(&cf->levels_lock);
         block_manager_close(atomic_load(&cf->active_wal));
         queue_free(cf->immutable_memtables);
         skip_list_free(atomic_load(&cf->active_memtable));
@@ -7003,8 +6999,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->memtable_id, 0);
     atomic_init(&cf->memtable_generation, 0);
     atomic_init(&cf->compaction_should_stop, 0);
-    atomic_init(&cf->compaction_pending, 0);
-    atomic_init(&cf->flush_pending, 0);
     atomic_init(&cf->commit_ticket, 0);
     atomic_init(&cf->commit_serving, 0);
 
@@ -7232,12 +7226,10 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
-    /* try to set flush_pending flag to prevent duplicate flush operations */
-    int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(&cf->flush_pending, &expected, 1,
-                                                 memory_order_acq_rel, memory_order_acquire))
+    /* try to acquire flush lock to prevent duplicate flush operations */
+    if (pthread_rwlock_trywrlock(&cf->flush_lock) != 0)
     {
-        /* flush already pending or in progress */
+        /* flush already in progress */
         return TDB_SUCCESS;
     }
 
@@ -7248,13 +7240,13 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
     if (current_entries == 0)
     {
-        atomic_store_explicit(&cf->flush_pending, 0, memory_order_release);
+        pthread_rwlock_unlock(&cf->flush_lock);
         return TDB_SUCCESS;
     }
 
     if (current_size < cf->config.write_buffer_size)
     {
-        atomic_store_explicit(&cf->flush_pending, 0, memory_order_release);
+        pthread_rwlock_unlock(&cf->flush_lock);
         return TDB_SUCCESS;
     }
 
@@ -7281,7 +7273,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     skip_list_t *new_memtable;
     if (skip_list_new_with_comparator(&new_memtable, 32, 0.25f, comparator_fn, comparator_ctx) != 0)
     {
-        atomic_store_explicit(&cf->flush_pending, 0, memory_order_release);
+        pthread_rwlock_unlock(&cf->flush_lock);
         return TDB_ERR_MEMORY;
     }
 
@@ -7296,7 +7288,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
                                       0) != 0)
     {
         skip_list_free(new_memtable);
-        atomic_store_explicit(&cf->flush_pending, 0, memory_order_release);
+        pthread_rwlock_unlock(&cf->flush_lock);
         return TDB_ERR_IO;
     }
 
@@ -7305,7 +7297,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     {
         skip_list_free(new_memtable);
         block_manager_close(new_wal);
-        atomic_store_explicit(&cf->flush_pending, 0, memory_order_release);
+        pthread_rwlock_unlock(&cf->flush_lock);
         return TDB_ERR_MEMORY;
     }
 
@@ -7319,8 +7311,8 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     atomic_store_explicit(&cf->active_wal, new_wal, memory_order_release);
     atomic_fetch_add_explicit(&cf->memtable_generation, 1, memory_order_release);
 
-    /* clear pending flag now that memtable is swapped, new writes go to new memtable */
-    atomic_store_explicit(&cf->flush_pending, 0, memory_order_release);
+    /* release flush lock now that memtable is swapped, new writes go to new memtable */
+    pthread_rwlock_unlock(&cf->flush_lock);
 
     tidesdb_flush_work_t *work = malloc(sizeof(tidesdb_flush_work_t));
     if (!work)
@@ -7357,26 +7349,16 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
-    /* only enqueue if no compaction is pending */
-    int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(&cf->compaction_pending, &expected, 1,
-                                                 memory_order_acq_rel, memory_order_acquire))
-    {
-        /* compaction already pending, this is not an error */
-        return TDB_SUCCESS;
-    }
-
+    /* enqueue compaction work */
     tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
     if (!work)
     {
-        atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
         return TDB_ERR_MEMORY;
     }
 
     work->cf = cf;
     if (queue_enqueue(cf->db->compaction_queue, work) != 0)
     {
-        atomic_store_explicit(&cf->compaction_pending, 0, memory_order_release);
         free(work);
         return TDB_ERR_MEMORY;
     }

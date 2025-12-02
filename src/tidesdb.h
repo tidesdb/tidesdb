@@ -502,6 +502,8 @@ typedef struct
  * @param active_txn_buffer buffer of active transactions for this CF
  * @param commit_buffer buffer tracking pending commits to prevent visibility holes
  * @param levels_lock protects levels and num_levels
+ * @param flush_lock protects flush swaps
+ * @param compaction_lock protects compaction state within cf
  * @param levels array of disk levels
  * @param num_levels number of disk levels
  * @param compaction_thread thread for background compaction
@@ -526,13 +528,13 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) commit_serving;
     buffer_t *active_txn_buffer;
     pthread_rwlock_t levels_lock;
+    pthread_rwlock_t flush_lock;
+    pthread_rwlock_t compaction_lock;
     tidesdb_level_t **levels;
     int num_levels;
     pthread_t compaction_thread;
     _Atomic(int) compaction_should_stop;
     _Atomic(uint64_t) next_sstable_id;
-    _Atomic(int) compaction_pending;
-    _Atomic(int) flush_pending;
     tidesdb_t *db;
 };
 

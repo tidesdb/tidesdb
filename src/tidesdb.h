@@ -501,13 +501,13 @@ typedef struct
  * @param commit_seq commit sequence for isolation levels
  * @param active_txn_buffer buffer of active transactions for this CF
  * @param commit_buffer buffer tracking pending commits to prevent visibility holes
+ * @param levels_lock protects levels and num_levels
  * @param levels array of disk levels
  * @param num_levels number of disk levels
  * @param compaction_thread thread for background compaction
  * @param compaction_should_stop flag to stop compaction thread
  * @param next_sstable_id next sstable id
  * @param compaction_pending flag to prevent duplicate compaction work items
- * @param levels_state atomic state for levels modifications (0=idle, 1=modifying)
  * @param last_compaction_trigger timestamp of last compaction trigger to throttle
  * @param db parent database reference
  */
@@ -526,14 +526,14 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) commit_ticket;
     _Atomic(uint64_t) commit_serving;
     buffer_t *active_txn_buffer;
-    _Atomic(tidesdb_level_t **) levels;
-    _Atomic(int) num_levels;
+    pthread_rwlock_t levels_lock;
+    tidesdb_level_t **levels;
+    int num_levels;
     pthread_t compaction_thread;
     _Atomic(int) compaction_should_stop;
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(int) compaction_pending;
     _Atomic(int) flush_pending;
-    _Atomic(int) levels_state;
     _Atomic(time_t) last_compaction_trigger;
     tidesdb_t *db;
 };

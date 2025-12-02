@@ -6528,7 +6528,7 @@ int main(void)
     // RUN_TEST(test_txn_rollback, tests_passed);
     // RUN_TEST(test_multiple_column_families, tests_passed);
     // RUN_TEST(test_memtable_flush, tests_passed);
-    // RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
+    RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
     // RUN_TEST(test_persistence_and_recovery, tests_passed);
     // RUN_TEST(test_iterator_basic, tests_passed);
     // RUN_TEST(test_stats, tests_passed);
@@ -6590,7 +6590,7 @@ int main(void)
     // RUN_TEST(test_read_with_bloom_filter_disabled, tests_passed);
     // RUN_TEST(test_read_with_block_indexes_disabled, tests_passed);
     // RUN_TEST(test_read_with_all_optimizations_disabled, tests_passed);
-    // RUN_TEST(test_iterator_across_multiple_sources, tests_passed);
+    RUN_TEST(test_iterator_across_multiple_sources, tests_passed);
     // RUN_TEST(test_overwrite_across_levels, tests_passed);
     // RUN_TEST(test_atomicity_transaction_rollback, tests_passed);
     // RUN_TEST(test_consistency_after_flush, tests_passed);
@@ -6628,8 +6628,8 @@ int main(void)
     // RUN_TEST(test_many_sstables_with_lz4_compression, tests_passed);
     // RUN_TEST(test_many_sstables_with_zstd_compression, tests_passed);
     // RUN_TEST(test_many_sstables_with_snappy_compression, tests_passed);
-    // RUN_TEST(test_many_sstables_all_features_enabled, tests_passed);
-    // RUN_TEST(test_many_sstables_all_features_disabled, tests_passed);
+    RUN_TEST(test_many_sstables_all_features_enabled, tests_passed);
+    RUN_TEST(test_many_sstables_all_features_disabled, tests_passed);
     // RUN_TEST(test_many_sstables_bloom_and_compression, tests_passed);
     // RUN_TEST(test_many_sstables_indexes_and_compression, tests_passed);
     // RUN_TEST(test_many_sstables_with_bloom_filter_cached, tests_passed);

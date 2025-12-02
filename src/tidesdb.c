@@ -7184,9 +7184,15 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
     if (queue_enqueue(cf->db->flush_queue, work) != 0)
     {
-        tidesdb_immutable_memtable_unref(immutable);
+        /* immutable is in cf->immutable_memtables queue with refcount=2
+         * (1 from creation, +1 from work ref at line 7183)
+         * since flush will never happen, we must clean up properly:
+         * - unref the work reference we just added
+         * - unref the queue reference (immutable will never be flushed)
+         **/
+        tidesdb_immutable_memtable_unref(immutable); /* remove work ref */
+        tidesdb_immutable_memtable_unref(immutable); /* remove queue ref, triggers cleanup */
         free(work);
-        /* note: flush_pending was already cleared after memtable swap */
         return TDB_ERR_MEMORY;
     }
 

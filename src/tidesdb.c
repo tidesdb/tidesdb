@@ -2759,14 +2759,25 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
 
     /* add sstable and take reference */
     tidesdb_sstable_ref(sst);
-    level->sstables[level->num_sstables] = sst;
+
+    /* get current count atomically */
+    int current_count = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+    /* write sstable pointer at current position */
+    atomic_store_explicit(&level->sstables, level->sstables, memory_order_release);
+    level->sstables[current_count] = sst;
 
     /* ensure sstable write is visible before incrementing count
      * this prevents readers from seeing incremented count but null sstable pointer */
     atomic_thread_fence(memory_order_release);
 
-    level->num_sstables++;
-    level->current_size += sst->klog_size + sst->vlog_size;
+    /* atomically increment count -- now readers will see the new sstable */
+    atomic_store_explicit(&level->num_sstables, current_count + 1, memory_order_release);
+
+    /* update size (not critical for correctness, so non-atomic is ok) */
+    size_t new_size = atomic_load_explicit(&level->current_size, memory_order_relaxed) +
+                      sst->klog_size + sst->vlog_size;
+    atomic_store_explicit(&level->current_size, new_size, memory_order_relaxed);
 
     return TDB_SUCCESS;
 }
@@ -3859,7 +3870,7 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
         return TDB_ERR_MEMORY;
     }
 
-    /* allocate new array - don't use realloc as it can free the old array
+    /* allocate new array -- don't use realloc as it can free the old array
      * while concurrent readers are still accessing it */
     tidesdb_level_t **new_levels = malloc((num_levels + 1) * sizeof(tidesdb_level_t *));
     if (!new_levels)
@@ -3881,7 +3892,6 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     atomic_store_explicit(&cf->levels, new_levels, memory_order_release);
     atomic_store_explicit(&cf->num_levels, num_levels + 1, memory_order_release);
 
-    /* old array can now be safely freed - readers will use new array */
     free(old_levels);
 
     /* clear levels_state to indicate modification complete */
@@ -3928,12 +3938,12 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
 
     int new_num_levels = num_levels - 1;
 
-    /* allocate new array - don't use realloc to avoid freeing old array
+    /* allocate new array -- don't use realloc to avoid freeing old array
      * while concurrent readers might still be accessing it */
     tidesdb_level_t **new_levels = malloc(new_num_levels * sizeof(tidesdb_level_t *));
     if (!new_levels)
     {
-        /* if malloc fails, just update count - array still has old size but last level is freed */
+        /* if malloc fails, just update count -- array still has old size but last level is freed */
         atomic_store_explicit(&cf->num_levels, new_num_levels, memory_order_release);
         atomic_store_explicit(&cf->levels_state, 0, memory_order_release);
         return TDB_ERR_MEMORY;
@@ -4051,8 +4061,12 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     for (int level = start_level; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = levels[level];
-        tidesdb_sstable_t **sstables = lvl->sstables;
-        int num_ssts = lvl->num_sstables;
+
+        /* snapshot level state atomically to prevent race with concurrent flushes
+         * read num_sstables first, then sstables array, with proper memory ordering */
+        int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+        atomic_thread_fence(memory_order_acquire); /* ensure we see all sstable writes */
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
 
         for (int i = 0; i < num_ssts; i++)
         {
@@ -4144,8 +4158,11 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     for (int level = start_level; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = levels[level];
-        tidesdb_sstable_t **sstables = lvl->sstables;
-        int num_ssts = lvl->num_sstables;
+
+        /* snapshot level state atomically */
+        int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+        atomic_thread_fence(memory_order_acquire);
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
 
         for (int i = 0; i < num_ssts; i++)
         {
@@ -4579,8 +4596,11 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     for (int level = 0; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = levels[level];
-        tidesdb_sstable_t **sstables = lvl->sstables;
-        int num_ssts = lvl->num_sstables;
+
+        /* snapshot level state atomically */
+        int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+        atomic_thread_fence(memory_order_acquire);
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
 
         for (int i = 0; i < num_ssts; i++)
         {
@@ -4993,7 +5013,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             {
                 tidesdb_level_remove_sstable(cf->db, levels[level], sst);
             }
-            /* mark for deletion - files will be deleted when refcount reaches 0 */
+            /* mark for deletion -- files will be deleted when refcount reaches 0 */
             atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
             /* unref our reference from the merge */
             tidesdb_sstable_unref(cf->db, sst);
@@ -5030,8 +5050,11 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     for (int level = start_level; level < end_level; level++)
     {
         tidesdb_level_t *lvl = levels[level];
-        tidesdb_sstable_t **sstables = lvl->sstables;
-        int num_ssts = lvl->num_sstables;
+
+        /* snapshot level state atomically */
+        int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+        atomic_thread_fence(memory_order_acquire);
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
 
         for (int i = 0; i < num_ssts; i++)
         {
@@ -5102,8 +5125,12 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         for (int level = start_level; level <= end_level; level++)
         {
             tidesdb_level_t *lvl = levels[level];
-            tidesdb_sstable_t **sstables = lvl->sstables;
-            int num_ssts = lvl->num_sstables;
+
+            /* snapshot level state atomically */
+            int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+            atomic_thread_fence(memory_order_acquire);
+            tidesdb_sstable_t **sstables =
+                atomic_load_explicit(&lvl->sstables, memory_order_acquire);
 
             for (int i = 0; i < num_ssts; i++)
             {
@@ -6172,16 +6199,31 @@ static void *tidesdb_flush_worker_thread(void *arg)
                     if (!front) break;
 
                     int is_flushed = atomic_load_explicit(&front->flushed, memory_order_acquire);
-                    int refcount = atomic_load_explicit(&front->refcount, memory_order_acquire);
 
-                    if (is_flushed && refcount == 1)
+                    /* only proceed if flushed */
+                    if (!is_flushed)
                     {
+                        break;
+                    }
+
+                    /* try to atomically transition refcount from 1 to 0
+                     * this prevents TOCTOU race where another thread refs between check and unref
+                     */
+                    int expected_refcount = 1;
+                    if (atomic_compare_exchange_strong_explicit(
+                            &front->refcount, &expected_refcount, 0, memory_order_acq_rel,
+                            memory_order_acquire))
+                    {
+                        /* we successfully claimed the last reference, safe to dequeue and free
+                         * refcount is now 0, so we do cleanup directly without calling unref */
                         queue_dequeue(cf->immutable_memtables);
-                        tidesdb_immutable_memtable_unref(front); /* releases queue's reference */
+                        if (front->memtable) skip_list_free(front->memtable);
+                        if (front->wal) block_manager_close(front->wal);
+                        free(front);
                     }
                     else
                     {
-                        /* front is either not flushed or has active readers, stop */
+                        /* front has active readers (refcount > 1) or was already freed, stop */
                         break;
                     }
                 }
@@ -7203,8 +7245,8 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
         /* immutable is in cf->immutable_memtables queue with refcount=2
          * (1 from creation, +1 from work ref at line 7183)
          * since flush will never happen, we must clean up properly:
-         * - unref the work reference we just added
-         * - unref the queue reference (immutable will never be flushed)
+         *   unref the work reference we just added
+         *   unref the queue reference (immutable will never be flushed)
          **/
         tidesdb_immutable_memtable_unref(immutable); /* remove work ref */
         tidesdb_immutable_memtable_unref(immutable); /* remove queue ref, triggers cleanup */

@@ -80,7 +80,71 @@ static inline queue_node_t *queue_alloc_node(void)
  */
 static inline void queue_free_node(queue_node_t *node)
 {
-    free(node);
+    if (node) free(node);
+}
+
+/* forward declaration */
+static void queue_reclaim_retired(queue_t *queue);
+
+/**
+ * queue_retire_node
+ * add a node to the retire list for deferred reclamation.
+ * nodes are not freed immediately to prevent use-after-free.
+ * @param queue the queue
+ * @param node the node to retire
+ */
+static void queue_retire_node(queue_t *queue, queue_node_t *node)
+{
+    if (queue == NULL || node == NULL) return;
+
+    queue_retired_node_t *retired = (queue_retired_node_t *)malloc(sizeof(queue_retired_node_t));
+    if (retired == NULL)
+    {
+        /* fallback: free immediately if we can't allocate retire node */
+        queue_free_node(node);
+        return;
+    }
+
+    retired->node = node;
+
+    pthread_mutex_lock(&queue->retire_lock);
+    retired->next = queue->retire_list;
+    queue->retire_list = retired;
+    size_t count = atomic_fetch_add_explicit(&queue->retire_count, 1, memory_order_relaxed) + 1;
+    pthread_mutex_unlock(&queue->retire_lock);
+
+    /* reclaim aggressively to prevent unbounded growth in long-lived queues
+     * threshold of QUEUE_RETIRE_THRESHOLD provides grace period while keeping memory bounded */
+    if (count > QUEUE_RETIRE_THRESHOLD)
+    {
+        queue_reclaim_retired(queue);
+    }
+}
+
+/**
+ * queue_reclaim_retired
+ * free all nodes in the retire list.
+ * called periodically to reclaim memory after a grace period.
+ * @param queue the queue
+ */
+static void queue_reclaim_retired(queue_t *queue)
+{
+    if (queue == NULL) return;
+
+    pthread_mutex_lock(&queue->retire_lock);
+    queue_retired_node_t *current = queue->retire_list;
+    queue->retire_list = NULL;
+    atomic_store_explicit(&queue->retire_count, 0, memory_order_relaxed);
+    pthread_mutex_unlock(&queue->retire_lock);
+
+    /* free all retired nodes outside the lock */
+    while (current != NULL)
+    {
+        queue_retired_node_t *next = current->next;
+        queue_free_node(current->node);
+        free(current);
+        current = next;
+    }
 }
 
 /**
@@ -123,6 +187,16 @@ queue_t *queue_new(void)
     atomic_store_explicit(&queue->tail, make_tagged_ptr(dummy, 0), memory_order_relaxed);
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
     atomic_store_explicit(&queue->shutdown, 0, memory_order_relaxed);
+
+    /* initialize retire list for deferred reclamation */
+    queue->retire_list = NULL;
+    atomic_store_explicit(&queue->retire_count, 0, memory_order_relaxed);
+    if (pthread_mutex_init(&queue->retire_lock, NULL) != 0)
+    {
+        free(dummy);
+        free(queue);
+        return NULL;
+    }
 
     return queue;
 }
@@ -247,7 +321,8 @@ void *queue_dequeue(queue_t *queue)
 
     if (old_head_ptr != NULL)
     {
-        queue_free_node(old_head_ptr);
+        /* defer freeing to prevent use-after-free in concurrent operations */
+        queue_retire_node(queue, old_head_ptr);
     }
 
     atomic_fetch_sub_explicit(&queue->size, 1, memory_order_relaxed);
@@ -395,6 +470,9 @@ void queue_free(queue_t *queue)
 
     cpu_yield();
 
+    /* reclaim all retired nodes before freeing queue */
+    queue_reclaim_retired(queue);
+
     uint64_t head = atomic_load_explicit(&queue->head, memory_order_acquire);
     queue_node_t *current = get_ptr(head);
 
@@ -406,6 +484,7 @@ void queue_free(queue_t *queue)
         current = next_ptr;
     }
 
+    pthread_mutex_destroy(&queue->retire_lock);
     free(queue);
 }
 
@@ -416,6 +495,10 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     atomic_store_explicit(&queue->shutdown, 1, memory_order_release);
 
     cpu_yield();
+
+    /* reclaim all retired nodes before freeing queue */
+    queue_reclaim_retired(queue);
+
     uint64_t head = atomic_load_explicit(&queue->head, memory_order_acquire);
     queue_node_t *current = get_ptr(head);
 
@@ -437,5 +520,6 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         current = next_ptr;
     }
 
+    pthread_mutex_destroy(&queue->retire_lock);
     free(queue);
 }

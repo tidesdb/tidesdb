@@ -25,6 +25,8 @@
 
 #define QUEUE_INITIAL_BACKOFF 4
 
+#define QUEUE_RETIRE_THRESHOLD 10
+
 /**
  * QUEUE_POINTER_BITS
  * number of bits used for the pointer in the tagged pointer.
@@ -62,7 +64,7 @@ typedef uint32_t queue_counter_t; /* 32-bit arch: 32-bit counter */
 typedef struct queue_node_t
 {
     void *data;
-    _Atomic(uint64_t) next; /* tagged pointer: pointer + counter (architecture-specific split) */
+    _Atomic(uint64_t) next;
 } queue_node_t;
 
 /**
@@ -78,12 +80,27 @@ typedef struct
 } queue_tagged_ptr_t;
 
 /**
+ * queue_retired_node_t
+ * node in the retire list for deferred reclamation
+ * @param node the retired node to be freed later
+ * @param next next retired node in the list
+ */
+typedef struct queue_retired_node_t
+{
+    queue_node_t *node;
+    struct queue_retired_node_t *next;
+} queue_retired_node_t;
+
+/**
  * queue_t
  * FIFO queue implementation
  * @param head tagged pointer to dummy node (dequeue end)
  * @param tail tagged pointer to last node (enqueue end)
  * @param size current number of elements (approximate, for monitoring only)
  * @param shutdown flag to signal queue shutdown for waiting operations
+ * @param retire_list list of nodes waiting to be freed (deferred reclamation)
+ * @param retire_lock mutex protecting the retire list
+ * @param retire_count number of nodes in retire list
  */
 typedef struct
 {
@@ -91,6 +108,9 @@ typedef struct
     ATOMIC_ALIGN(16) _Atomic(uint64_t) tail;
     _Atomic(size_t) size;
     _Atomic(int) shutdown;
+    queue_retired_node_t *retire_list;
+    pthread_mutex_t retire_lock;
+    _Atomic(size_t) retire_count;
 } queue_t;
 
 /**

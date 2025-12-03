@@ -4769,6 +4769,7 @@ static void test_portability_workflow(void)
         cf_cfg.write_buffer_size = 1024;
         cf_cfg.enable_bloom_filter = 1;
         cf_cfg.enable_block_indexes = 1;
+        cfg.block_cache_size = 0;
 
         ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_cfg), 0);
         tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");

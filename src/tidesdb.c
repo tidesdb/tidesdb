@@ -2458,25 +2458,33 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     TDB_DEBUG_LOG("SSTable %" PRIu64 ": Klog cursor initialized, num_klog_blocks=%" PRIu64, sst->id, atomic_load(&sst->num_klog_blocks));
 
     /* build position cache if block index exists (for O(1) jumping) */
-    if (sst->block_index && sst->klog_data_end_offset > 0 &&
-        block_manager_cursor_build_cache(klog_cursor, sst->klog_data_end_offset) == 0)
+    TDB_DEBUG_LOG("SSTable %" PRIu64 ": block_index=%p, klog_data_end_offset=%" PRIu64, sst->id, (void*)sst->block_index, sst->klog_data_end_offset);
+    if (sst->block_index && sst->klog_data_end_offset > 0)
     {
-        /* use position cache to jump directly to the target block */
-        if (start_block >= 0 && start_block < klog_cursor->cache_size)
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Calling block_manager_cursor_build_cache", sst->id);
+        int cache_result = block_manager_cursor_build_cache(klog_cursor, sst->klog_data_end_offset);
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": block_manager_cursor_build_cache returned %d", sst->id, cache_result);
+        if (cache_result == 0)
         {
-            klog_cursor->cache_index = start_block;
-            klog_cursor->current_pos = klog_cursor->position_cache[start_block];
-            klog_cursor->current_block_size = klog_cursor->size_cache[start_block];
-        }
-        else
-        {
-            /* fallback to first block if index out of range */
-            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Calling goto_first (fallback path)", sst->id);
-            if (block_manager_cursor_goto_first(klog_cursor) != 0)
+            /* use position cache to jump directly to the target block */
+            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Cache built successfully, cache_size=%d, start_block=%" PRId64, sst->id, klog_cursor->cache_size, start_block);
+            if (start_block >= 0 && start_block < klog_cursor->cache_size)
             {
-                TDB_DEBUG_LOG("SSTable %" PRIu64 ": goto_first FAILED (fallback path)", sst->id);
-                block_manager_cursor_free(klog_cursor);
-                return TDB_ERR_NOT_FOUND;
+                TDB_DEBUG_LOG("SSTable %" PRIu64 ": Jumping to block %" PRId64 " using cache", sst->id, start_block);
+                klog_cursor->cache_index = start_block;
+                klog_cursor->current_pos = klog_cursor->position_cache[start_block];
+                klog_cursor->current_block_size = klog_cursor->size_cache[start_block];
+            }
+            else
+            {
+                /* fallback to first block if index out of range */
+                TDB_DEBUG_LOG("SSTable %" PRIu64 ": Calling goto_first (fallback path)", sst->id);
+                if (block_manager_cursor_goto_first(klog_cursor) != 0)
+                {
+                    TDB_DEBUG_LOG("SSTable %" PRIu64 ": goto_first FAILED (fallback path)", sst->id);
+                    block_manager_cursor_free(klog_cursor);
+                    return TDB_ERR_NOT_FOUND;
+                }
             }
         }
     }

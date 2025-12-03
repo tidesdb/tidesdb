@@ -6843,7 +6843,7 @@ int main(void)
     // RUN_TEST(test_stats, tests_passed);
     // RUN_TEST(test_iterator_seek, tests_passed);
     // RUN_TEST(test_iterator_seek_for_prev, tests_passed);
-    // RUN_TEST(test_tidesdb_block_index_seek, tests_passed);
+    RUN_TEST(test_tidesdb_block_index_seek, tests_passed);
     // RUN_TEST(test_iterator_reverse, tests_passed);
     // RUN_TEST(test_iterator_boundaries, tests_passed);
     // RUN_TEST(test_bidirectional_iterator, tests_passed);

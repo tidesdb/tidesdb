@@ -2729,9 +2729,10 @@ load_bloom_and_index:
 
     block_manager_cursor_free(cursor);
 
-    /* close temporary block managers; they'll be reopened through cache when needed */
-    block_manager_close(klog_bm);
-    block_manager_close(vlog_bm);
+    /* keep block managers open and store them in the sstable
+     * they will be managed by the cache and closed when the sstable is evicted or freed */
+    sst->klog_bm = klog_bm;
+    sst->vlog_bm = vlog_bm;
 
     return TDB_SUCCESS;
 }

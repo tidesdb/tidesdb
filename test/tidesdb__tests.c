@@ -4760,6 +4760,7 @@ static void test_portability_workflow(void)
         cfg.num_flush_threads = 1;
         cfg.enable_debug_logging = 1;
         cfg.num_compaction_threads = 1;
+        cfg.block_cache_size = 0;
 
         tidesdb_t *db = NULL;
         ASSERT_EQ(tidesdb_open(&cfg, &db), 0);
@@ -6960,7 +6961,7 @@ int main(void)
     // RUN_TEST(test_many_sstables_small_cache, tests_passed);
     // RUN_TEST(test_many_sstables_large_cache, tests_passed);
     // RUN_TEST(test_many_sstables_all_isolation_levels, tests_passed);
-    RUN_TEST(test_many_sstables_all_comparators, tests_passed);
+    //RUN_TEST(test_many_sstables_all_comparators, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

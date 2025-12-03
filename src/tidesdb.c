@@ -2449,10 +2449,13 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     /* search klog blocks using block manager cursor */
     block_manager_cursor_t *klog_cursor;
+    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Initializing klog cursor", sst->id);
     if (block_manager_cursor_init(&klog_cursor, bms.klog_bm) != 0)
     {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": FAILED to initialize klog cursor", sst->id);
         return TDB_ERR_IO;
     }
+    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Klog cursor initialized, num_klog_blocks=%" PRIu64, sst->id, atomic_load(&sst->num_klog_blocks));
 
     /* build position cache if block index exists (for O(1) jumping) */
     if (sst->block_index && sst->klog_data_end_offset > 0 &&
@@ -2468,8 +2471,10 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         else
         {
             /* fallback to first block if index out of range */
+            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Calling goto_first (fallback path)", sst->id);
             if (block_manager_cursor_goto_first(klog_cursor) != 0)
             {
+                TDB_DEBUG_LOG("SSTable %" PRIu64 ": goto_first FAILED (fallback path)", sst->id);
                 block_manager_cursor_free(klog_cursor);
                 return TDB_ERR_NOT_FOUND;
             }
@@ -2478,8 +2483,10 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     else
     {
         /* no block index or cache build failed, start from first block */
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Calling goto_first (no cache path)", sst->id);
         if (block_manager_cursor_goto_first(klog_cursor) != 0)
         {
+            TDB_DEBUG_LOG("SSTable %" PRIu64 ": goto_first FAILED (no cache path)", sst->id);
             block_manager_cursor_free(klog_cursor);
             return TDB_ERR_NOT_FOUND;
         }
@@ -2612,6 +2619,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     }
 
 cleanup:
+    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Search complete, result=%d", sst->id, result);
     block_manager_cursor_free(klog_cursor);
     return result;
 }

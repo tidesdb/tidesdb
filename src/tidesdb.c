@@ -1532,10 +1532,6 @@ static void tidesdb_sstable_cache_evict_cb(const char *key, void *value, void *u
 
     if (!sst) return;
 
-    int refcount_before = atomic_load(&sst->refcount);
-    TDB_DEBUG_LOG("Cache evicting SSTable %" PRIu64 " (refcount before unref: %d)", sst->id,
-                  refcount_before);
-
     /* release the cache's reference to the sstable */
     tidesdb_sstable_unref(db, sst);
 }
@@ -1732,11 +1728,8 @@ static void tidesdb_sstable_unref(tidesdb_t *db, tidesdb_sstable_t *sst)
 {
     if (!sst) return;
     int old_refcount = atomic_fetch_sub(&sst->refcount, 1);
-    TDB_DEBUG_LOG("SSTable %" PRIu64 " unref: refcount %d -> %d", sst->id, old_refcount,
-                  old_refcount - 1);
     if (old_refcount == 1)
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 " refcount reached 0, freeing", sst->id);
         tidesdb_sstable_free(db, sst);
     }
 }
@@ -1778,15 +1771,20 @@ static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm)
 static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t *sst,
                                                skip_list_t *memtable)
 {
+    int num_entries = skip_list_count_entries(memtable);
+    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Writing from memtable (%d entries)", sst->id, num_entries);
+
     /* ensure sstable is in cache and get block managers */
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to ensure open", sst->id);
         return TDB_ERR_IO;
     }
 
     tidesdb_block_managers_t bms;
     if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
     {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to get block managers", sst->id);
         return TDB_ERR_IO;
     }
 
@@ -1794,14 +1792,19 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     bloom_filter_t *bloom = NULL;
     succinct_trie_builder_t *index_builder = NULL;
 
-    int num_entries = skip_list_count_entries(memtable);
-
     if (sst->config->enable_bloom_filter)
     {
         if (bloom_filter_new(&bloom, sst->config->bloom_fpr, num_entries) != 0)
         {
+            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to create bloom filter", sst->id);
             return TDB_ERR_MEMORY;
         }
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter created (fpr: %.4f, entries: %d)", sst->id,
+                      sst->config->bloom_fpr, num_entries);
+    }
+    else
+    {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter disabled", sst->id);
     }
 
     if (sst->config->enable_block_indexes)
@@ -1813,9 +1816,16 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
         index_builder = succinct_trie_builder_new(NULL, comparator_fn, comparator_ctx);
         if (!index_builder)
         {
+            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to create block index builder", sst->id);
             if (bloom) bloom_filter_free(bloom);
             return TDB_ERR_MEMORY;
         }
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block index enabled (sample ratio: %d)", sst->id,
+                      sst->config->index_sample_ratio);
+    }
+    else
+    {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block index disabled", sst->id);
     }
 
     /* init blocks */
@@ -2622,13 +2632,10 @@ static void tidesdb_level_free(tidesdb_t *db, tidesdb_level_t *level)
 {
     if (!level) return;
 
-    TDB_DEBUG_LOG("Freeing level %d with %d SSTables", level->level_num, level->num_sstables);
     for (int i = 0; i < level->num_sstables; i++)
     {
         if (level->sstables[i])
         {
-            TDB_DEBUG_LOG("Level %d unreffing SSTable %" PRIu64, level->level_num,
-                          level->sstables[i]->id);
             tidesdb_sstable_unref(db, level->sstables[i]);
         }
     }
@@ -4121,18 +4128,40 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     bloom_filter_t *bloom = NULL;
     succinct_trie_builder_t *index_builder = NULL;
 
-    if (cf->config.enable_bloom_filter)
+    if (new_sst->config->enable_bloom_filter)
     {
-        bloom_filter_new(&bloom, cf->config.bloom_fpr, estimated_entries);
+        bloom = bloom_filter_new_default(estimated_entries);
+        if (bloom)
+        {
+            TDB_DEBUG_LOG("Full preemptive merge: Bloom filter created (estimated entries: %" PRIu64
+                          ")",
+                          estimated_entries);
+        }
+        else
+        {
+            TDB_DEBUG_LOG("Full preemptive merge: Bloom filter creation failed");
+        }
+    }
+    else
+    {
+        TDB_DEBUG_LOG("Full preemptive merge: Bloom filter disabled");
     }
 
-    if (cf->config.enable_block_indexes)
+    if (new_sst->config->enable_block_indexes)
     {
-        skip_list_comparator_fn comparator_fn = NULL;
-        void *comparator_ctx = NULL;
-        tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
-
         index_builder = succinct_trie_builder_new(NULL, comparator_fn, comparator_ctx);
+        if (index_builder)
+        {
+            TDB_DEBUG_LOG("Full preemptive merge: Block index builder created");
+        }
+        else
+        {
+            TDB_DEBUG_LOG("Full preemptive merge: Block index builder creation failed");
+        }
+    }
+    else
+    {
+        TDB_DEBUG_LOG("Full preemptive merge: Block index disabled");
     }
 
     tidesdb_klog_block_t *current_klog_block = tidesdb_klog_block_create();
@@ -4417,6 +4446,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
         if (bloom_data)
         {
+            TDB_DEBUG_LOG("Full preemptive merge: Bloom filter serialized to %zu bytes",
+                          bloom_size);
             block_manager_block_t *bloom_block = block_manager_block_create(bloom_size, bloom_data);
             if (bloom_block)
             {
@@ -4424,6 +4455,10 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                 block_manager_block_free(bloom_block);
             }
             free(bloom_data);
+        }
+        else
+        {
+            TDB_DEBUG_LOG("Full preemptive merge: Bloom filter serialization failed");
         }
         new_sst->bloom_filter = bloom;
     }
@@ -4484,6 +4519,11 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     pthread_rwlock_unlock(&cf->levels_lock);
 
     queue_free(sstables_to_delete);
+
+    TDB_DEBUG_LOG("Full preemptive merge complete: CF '%s', created SSTable %" PRIu64
+                  " with %" PRIu64 " entries, %" PRIu64 " klog blocks, %" PRIu64 " vlog blocks",
+                  cf->name, new_sst->id, new_sst->num_entries,
+                  atomic_load(&new_sst->num_klog_blocks), atomic_load(&new_sst->num_vlog_blocks));
 
     return TDB_SUCCESS;
 }
@@ -5085,12 +5125,20 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     /* merge one partition at a time */
     for (int partition = 0; partition < num_partitions; partition++)
     {
+        TDB_DEBUG_LOG("Partitioned merge: Processing partition %d/%d", partition + 1,
+                      num_partitions);
+
         skip_list_comparator_fn comparator_fn = NULL;
         void *comparator_ctx = NULL;
         tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
 
         tidesdb_merge_heap_t *heap = tidesdb_merge_heap_create(comparator_fn, comparator_ctx);
-        if (!heap) continue;
+        if (!heap)
+        {
+            TDB_DEBUG_LOG("Partitioned merge: Failed to create merge heap for partition %d",
+                          partition);
+            continue;
+        }
 
         uint8_t *range_start = boundaries[partition];
         size_t range_start_size = boundary_sizes[partition];
@@ -5491,6 +5539,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
                 if (bloom_data)
                 {
+                    TDB_DEBUG_LOG(
+                        "Partitioned merge partition %d: Bloom filter serialized to %zu bytes",
+                        partition, bloom_size);
                     block_manager_block_t *bloom_block =
                         block_manager_block_create(bloom_size, bloom_data);
                     if (bloom_block)
@@ -5499,6 +5550,12 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                         block_manager_block_free(bloom_block);
                     }
                     free(bloom_data);
+                }
+                else
+                {
+                    TDB_DEBUG_LOG(
+                        "Partitioned merge partition %d: Bloom filter serialization failed",
+                        partition);
                 }
             }
 
@@ -5535,10 +5592,20 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 levels = cf->levels;
                 tidesdb_level_add_sstable(levels[end_level], new_sst);
                 pthread_rwlock_unlock(&cf->levels_lock);
+
+                TDB_DEBUG_LOG(
+                    "Partitioned merge partition %d complete: Created SSTable %" PRIu64
+                    " with %" PRIu64 " entries, %" PRIu64 " klog blocks, %" PRIu64 " vlog blocks",
+                    partition, new_sst->id, new_sst->num_entries,
+                    atomic_load(&new_sst->num_klog_blocks), atomic_load(&new_sst->num_vlog_blocks));
+
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
             else
             {
+                TDB_DEBUG_LOG(
+                    "Partitioned merge partition %d: No entries, skipping SSTable creation",
+                    partition);
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
         }
@@ -5576,6 +5643,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     }
     free(boundaries);
     free(boundary_sizes);
+
+    TDB_DEBUG_LOG("Partitioned merge complete: CF '%s', processed %d partitions", cf->name,
+                  num_partitions);
 
     return TDB_SUCCESS;
 }
@@ -6170,8 +6240,16 @@ static void *tidesdb_flush_worker_thread(void *arg)
                         /* we successfully claimed the last reference, safe to dequeue and free
                          * refcount is now 0, so we do cleanup directly without calling unref */
                         queue_dequeue(cf->immutable_memtables);
-                        if (front->memtable) skip_list_free(front->memtable);
-                        if (front->wal) block_manager_close(front->wal);
+
+                        /* NULL out pointers before freeing to prevent double-free if another
+                         * thread still has a stale reference during shutdown */
+                        skip_list_t *memtable_to_free = front->memtable;
+                        block_manager_t *wal_to_free = front->wal;
+                        front->memtable = NULL;
+                        front->wal = NULL;
+
+                        if (memtable_to_free) skip_list_free(memtable_to_free);
+                        if (wal_to_free) block_manager_close(wal_to_free);
                         free(front);
                     }
                     else
@@ -10221,7 +10299,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
     DIR *dir = opendir(db->db_path);
     if (!dir)
     {
-        TDB_DEBUG_LOG("Recovery: No existing database directory found (fresh start)");
+        TDB_DEBUG_LOG("No existing database directory found (fresh start)");
         return TDB_SUCCESS; /* not an error, fresh database */
     }
 
@@ -10240,7 +10318,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
         struct STAT_STRUCT st;
         if (STAT_FUNC(full_path, &st) == 0 && S_ISDIR(st.st_mode))
         {
-            TDB_DEBUG_LOG("Recovery: Found CF directory: %s", entry->d_name);
+            TDB_DEBUG_LOG("Found CF directory: %s", entry->d_name);
             tidesdb_column_family_t *cf = tidesdb_get_column_family(db, entry->d_name);
 
             if (!cf)
@@ -10254,12 +10332,12 @@ static int tidesdb_recover_database(tidesdb_t *db)
 
             if (cf)
             {
-                TDB_DEBUG_LOG("Recovery: Recovering CF: %s", entry->d_name);
+                TDB_DEBUG_LOG("Recovering CF: %s", entry->d_name);
                 tidesdb_recover_column_family(cf);
             }
             else
             {
-                TDB_DEBUG_LOG("Recovery: Failed to get/create CF: %s", entry->d_name);
+                TDB_DEBUG_LOG("Failed to get/create CF: %s", entry->d_name);
             }
         }
     }

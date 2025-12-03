@@ -6197,13 +6197,14 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
     TDB_DEBUG_LOG("Flush worker thread started");
 
-    while (!atomic_load(&db->flush_should_stop))
+    while (1)
     {
         /* wait for work (blocking dequeue) */
         tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue_wait(db->flush_queue);
 
         if (!work)
         {
+            /* NULL sentinel signals shutdown */
             break;
         }
 
@@ -6212,14 +6213,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
         tidesdb_immutable_memtable_t *imm = work->imm;
         skip_list_t *memtable = imm->memtable;
         block_manager_t *wal = imm->wal;
-
-        /* check shutdown before creating sstable -- if stopping, clean up and exit */
-        if (atomic_load(&db->flush_should_stop))
-        {
-            tidesdb_immutable_memtable_unref(work->imm);
-            free(work);
-            break;
-        }
 
         int space_check = tidesdb_check_disk_space(db, cf->directory, cf->config.min_disk_space);
         if (space_check <= 0)
@@ -6386,15 +6379,15 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 
     TDB_DEBUG_LOG("Compaction worker thread started");
 
-    while (!atomic_load(&db->compaction_should_stop))
+    while (1)
     {
         /* wait for work (blocking dequeue) */
         tidesdb_compaction_work_t *work =
             (tidesdb_compaction_work_t *)queue_dequeue_wait(db->compaction_queue);
 
-        if (!work || atomic_load(&db->compaction_should_stop))
+        if (!work)
         {
-            /* NULL work item or shutdown signal */
+            /* NULL work item signals shutdown */
             break;
         }
 

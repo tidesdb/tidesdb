@@ -6854,18 +6854,17 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
     TDB_DEBUG_LOG("Creating column family: %s", name);
 
-    int num_cfs = atomic_load_explicit(&db->num_column_families, memory_order_acquire);
-    tidesdb_column_family_t **cfs =
-        atomic_load_explicit(&db->column_families, memory_order_acquire);
-
-    for (int i = 0; i < num_cfs; i++)
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    for (int i = 0; i < db->num_column_families; i++)
     {
-        if (strcmp(cfs[i]->name, name) == 0)
+        if (db->column_families[i] && strcmp(db->column_families[i]->name, name) == 0)
         {
+            pthread_rwlock_unlock(&db->cf_list_lock);
             TDB_DEBUG_LOG("Column family already exists: %s", name);
             return TDB_ERR_EXISTS;
         }
     }
+    pthread_rwlock_unlock(&db->cf_list_lock);
 
     tidesdb_column_family_t *cf = calloc(1, sizeof(tidesdb_column_family_t));
     if (!cf)
@@ -7062,78 +7061,34 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     /* acquire write lock to modify CF list */
     pthread_rwlock_wrlock(&db->cf_list_lock);
 
-    while (1)
+    /* check if we need to grow the array */
+    if (db->num_column_families >= db->cf_capacity)
     {
-        int current_num = atomic_load_explicit(&db->num_column_families, memory_order_acquire);
-        int current_cap = atomic_load_explicit(&db->cf_capacity, memory_order_acquire);
-        tidesdb_column_family_t **current_array =
-            atomic_load_explicit(&db->column_families, memory_order_acquire);
-
-        /* check if we need to grow the array */
-        if (current_num >= current_cap)
+        int new_cap = db->cf_capacity * 2;
+        tidesdb_column_family_t **new_array =
+            realloc(db->column_families, new_cap * sizeof(tidesdb_column_family_t *));
+        if (!new_array)
         {
-            int new_cap = current_cap * 2;
-            tidesdb_column_family_t **new_array =
-                malloc(new_cap * sizeof(tidesdb_column_family_t *));
-            if (!new_array)
-            {
-                tidesdb_column_family_free(cf);
-                return TDB_ERR_MEMORY;
-            }
-
-            for (int i = 0; i < current_num; i++)
-            {
-                new_array[i] = current_array[i];
-            }
-            new_array[current_num] = cf;
-
-            /* try to swap in new array */
-            if (atomic_compare_exchange_strong_explicit(&db->column_families, &current_array,
-                                                        new_array, memory_order_release,
-                                                        memory_order_acquire))
-            {
-                atomic_store_explicit(&db->num_column_families, current_num + 1,
-                                      memory_order_release);
-                atomic_store_explicit(&db->cf_capacity, new_cap, memory_order_release);
-                free(current_array);
-                pthread_rwlock_unlock(&db->cf_list_lock);
-                break;
-            }
-            /* CAS failed, retry */
-            free(new_array);
+            pthread_rwlock_unlock(&db->cf_list_lock);
+            tidesdb_column_family_free(cf);
+            return TDB_ERR_MEMORY;
         }
-        else
+
+        /* initialize new slots */
+        for (int i = db->cf_capacity; i < new_cap; i++)
         {
-            /* no need to grow we just add to existing array */
-            tidesdb_column_family_t **new_array =
-                malloc(current_cap * sizeof(tidesdb_column_family_t *));
-            if (!new_array)
-            {
-                tidesdb_column_family_free(cf);
-                return TDB_ERR_MEMORY;
-            }
-
-            for (int i = 0; i < current_num; i++)
-            {
-                new_array[i] = current_array[i];
-            }
-            new_array[current_num] = cf;
-
-            if (atomic_compare_exchange_strong_explicit(&db->column_families, &current_array,
-                                                        new_array, memory_order_release,
-                                                        memory_order_acquire))
-            {
-                atomic_store_explicit(&db->num_column_families, current_num + 1,
-                                      memory_order_release);
-                free(current_array);
-                pthread_rwlock_unlock(&db->cf_list_lock);
-                break;
-            }
-            free(new_array);
+            new_array[i] = NULL;
         }
+
+        db->column_families = new_array;
+        db->cf_capacity = new_cap;
     }
 
-    TDB_DEBUG_LOG("Created CF '%s' (total: %d)", name, atomic_load(&db->num_column_families));
+    db->column_families[db->num_column_families] = cf;
+    db->num_column_families++;
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    TDB_DEBUG_LOG("Created CF '%s' (total: %d)", name, db->num_column_families);
 
     return TDB_SUCCESS;
 }
@@ -7149,61 +7104,33 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 
     pthread_rwlock_wrlock(&db->cf_list_lock);
 
-    while (1)
+    /* find the CF to drop */
+    int found_idx = -1;
+    for (int i = 0; i < db->num_column_families; i++)
     {
-        int current_num = atomic_load_explicit(&db->num_column_families, memory_order_acquire);
-        int current_cap = atomic_load_explicit(&db->cf_capacity, memory_order_acquire);
-        tidesdb_column_family_t **current_array =
-            atomic_load_explicit(&db->column_families, memory_order_acquire);
-
-        /* find the CF to drop */
-        int found_idx = -1;
-        for (int i = 0; i < current_num; i++)
+        if (db->column_families[i] && strcmp(db->column_families[i]->name, name) == 0)
         {
-            if (strcmp(current_array[i]->name, name) == 0)
-            {
-                found_idx = i;
-                cf_to_drop = current_array[i];
-                break;
-            }
-        }
-
-        if (found_idx == -1)
-        {
-            return TDB_ERR_NOT_FOUND;
-        }
-
-        /* create new array without the dropped CF */
-        tidesdb_column_family_t **new_array =
-            malloc(current_cap * sizeof(tidesdb_column_family_t *));
-        if (!new_array)
-        {
-            pthread_rwlock_unlock(&db->cf_list_lock);
-            return TDB_ERR_MEMORY;
-        }
-
-        int new_idx = 0;
-        for (int i = 0; i < current_num; i++)
-        {
-            if (i != found_idx)
-            {
-                new_array[new_idx++] = current_array[i];
-            }
-        }
-
-        /* try to swap in new array */
-        if (atomic_compare_exchange_strong_explicit(&db->column_families, &current_array, new_array,
-                                                    memory_order_release, memory_order_acquire))
-        {
-            atomic_store_explicit(&db->num_column_families, current_num - 1, memory_order_release);
-            free(current_array);
-            pthread_rwlock_unlock(&db->cf_list_lock);
+            found_idx = i;
+            cf_to_drop = db->column_families[i];
             break;
         }
-        /* CAS failed, retry */
-        free(new_array);
-        cf_to_drop = NULL; /* will be found again in next iteration */
     }
+
+    if (found_idx == -1)
+    {
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        return TDB_ERR_NOT_FOUND;
+    }
+
+    /* shift remaining CFs down */
+    for (int i = found_idx; i < db->num_column_families - 1; i++)
+    {
+        db->column_families[i] = db->column_families[i + 1];
+    }
+    db->column_families[db->num_column_families - 1] = NULL;
+    db->num_column_families--;
+
+    pthread_rwlock_unlock(&db->cf_list_lock);
 
     if (cf_to_drop->config.enable_background_compaction)
     {
@@ -7224,19 +7151,20 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
 {
     if (!db || !name) return NULL;
 
-    int num_cfs = atomic_load_explicit(&db->num_column_families, memory_order_acquire);
-    tidesdb_column_family_t **cfs =
-        atomic_load_explicit(&db->column_families, memory_order_acquire);
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    tidesdb_column_family_t *result = NULL;
 
-    for (int i = 0; i < num_cfs; i++)
+    for (int i = 0; i < db->num_column_families; i++)
     {
-        if (strcmp(cfs[i]->name, name) == 0)
+        if (db->column_families[i] && strcmp(db->column_families[i]->name, name) == 0)
         {
-            return cfs[i];
+            result = db->column_families[i];
+            break;
         }
     }
 
-    return NULL;
+    pthread_rwlock_unlock(&db->cf_list_lock);
+    return result;
 }
 
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf)

@@ -600,9 +600,9 @@ struct tidesdb_t
 {
     char *db_path;
     tidesdb_config_t config;
-    _Atomic(tidesdb_column_family_t **) column_families;
-    _Atomic(int) num_column_families;
-    _Atomic(int) cf_capacity;
+    tidesdb_column_family_t **column_families;
+    int num_column_families;
+    int cf_capacity;
     tidesdb_comparator_entry_t *comparators;
     int num_comparators;
     int comparators_capacity;
@@ -614,7 +614,6 @@ struct tidesdb_t
     pthread_t *compaction_threads;
     queue_t *compaction_queue;
     _Atomic(int) compaction_should_stop;
-    _Atomic(int) active_compaction_workers;
     fifo_cache_t *sstable_cache;
     _Atomic(int) is_open;
     _Atomic(uint64_t) global_txn_seq;

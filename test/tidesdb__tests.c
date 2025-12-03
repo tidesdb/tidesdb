@@ -6399,7 +6399,6 @@ static void test_background_flush_multiple_immutable_memtables(void)
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     cf_config.write_buffer_size = 1024;
-    cf_config.max_immutable_memtables = 24;
     cf_config.compression_algorithm = NO_COMPRESSION;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "bg_flush_cf", &cf_config), 0);

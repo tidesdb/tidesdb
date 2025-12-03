@@ -255,7 +255,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                                size_t key_size, tidesdb_kv_pair_t **kv);
 static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst);
 static tidesdb_level_t *tidesdb_level_create(int level_num, size_t capacity);
-static void tidesdb_level_free(tidesdb_level_t *level);
+static void tidesdb_level_free(tidesdb_t *db, tidesdb_level_t *level);
 static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *sst);
 static int tidesdb_level_remove_sstable(tidesdb_t *db, tidesdb_level_t *level,
                                         tidesdb_sstable_t *sst);
@@ -1532,6 +1532,10 @@ static void tidesdb_sstable_cache_evict_cb(const char *key, void *value, void *u
 
     if (!sst) return;
 
+    int refcount_before = atomic_load(&sst->refcount);
+    TDB_DEBUG_LOG("Cache evicting SSTable %" PRIu64 " (refcount before unref: %d)", sst->id,
+                  refcount_before);
+
     /* release the cache's reference to the sstable */
     tidesdb_sstable_unref(db, sst);
 }
@@ -1578,21 +1582,36 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
         /* if put_result == 0, new entry was inserted successfully */
     }
 
-    /* we won the race, open block managers and store them in the sstable */
-    if (block_manager_open_with_cache(&sst->klog_bm, sst->klog_path,
-                                      convert_sync_mode(sst->config->sync_mode),
-                                      (uint32_t)sst->config->block_manager_cache_size) != 0)
+    /* only open block managers if not already open */
+    if (sst->klog_bm && sst->vlog_bm)
     {
-        return -1;
+        return 0; /* already open */
     }
 
-    if (block_manager_open_with_cache(&sst->vlog_bm, sst->vlog_path,
-                                      convert_sync_mode(sst->config->sync_mode),
-                                      (uint32_t)sst->config->block_manager_cache_size) != 0)
+    /* open block managers if needed */
+    if (!sst->klog_bm)
     {
-        block_manager_close(sst->klog_bm);
-        sst->klog_bm = NULL;
-        return -1;
+        if (block_manager_open_with_cache(&sst->klog_bm, sst->klog_path,
+                                          convert_sync_mode(sst->config->sync_mode),
+                                          (uint32_t)sst->config->block_manager_cache_size) != 0)
+        {
+            return -1;
+        }
+    }
+
+    if (!sst->vlog_bm)
+    {
+        if (block_manager_open_with_cache(&sst->vlog_bm, sst->vlog_path,
+                                          convert_sync_mode(sst->config->sync_mode),
+                                          (uint32_t)sst->config->block_manager_cache_size) != 0)
+        {
+            if (sst->klog_bm)
+            {
+                block_manager_close(sst->klog_bm);
+                sst->klog_bm = NULL;
+            }
+            return -1;
+        }
     }
 
     return 0;
@@ -1712,7 +1731,8 @@ static void tidesdb_sstable_ref(tidesdb_sstable_t *sst)
 static void tidesdb_sstable_unref(tidesdb_t *db, tidesdb_sstable_t *sst)
 {
     if (!sst) return;
-    if (atomic_fetch_sub(&sst->refcount, 1) == 1)
+    int old_refcount = atomic_fetch_sub(&sst->refcount, 1);
+    if (old_refcount == 1)
     {
         tidesdb_sstable_free(db, sst);
     }
@@ -2595,15 +2615,18 @@ static tidesdb_level_t *tidesdb_level_create(int level_num, size_t capacity)
  * free a level
  * @param level level to free
  */
-static void tidesdb_level_free(tidesdb_level_t *level)
+static void tidesdb_level_free(tidesdb_t *db, tidesdb_level_t *level)
 {
     if (!level) return;
 
+    TDB_DEBUG_LOG("Freeing level %d with %d SSTables", level->level_num, level->num_sstables);
     for (int i = 0; i < level->num_sstables; i++)
     {
         if (level->sstables[i])
         {
-            tidesdb_sstable_unref(NULL, level->sstables[i]);
+            TDB_DEBUG_LOG("Level %d unreffing SSTable %" PRIu64, level->level_num,
+                          level->sstables[i]->id);
+            tidesdb_sstable_unref(db, level->sstables[i]);
         }
     }
     free(level->sstables);
@@ -2643,7 +2666,10 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
     }
 
     /* add sstable and take reference */
+    int refcount_before = atomic_load(&sst->refcount);
     tidesdb_sstable_ref(sst);
+    TDB_DEBUG_LOG("Level %d adding SSTable %" PRIu64 " (refcount: %d -> %d)", level->level_num,
+                  sst->id, refcount_before, refcount_before + 1);
 
     /* get current count atomically */
     int current_count = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
@@ -3758,7 +3784,7 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     tidesdb_level_t **new_levels = malloc((num_levels + 1) * sizeof(tidesdb_level_t *));
     if (!new_levels)
     {
-        tidesdb_level_free(new_level);
+        tidesdb_level_free(cf->db, new_level);
         pthread_rwlock_unlock(&cf->levels_lock);
         return TDB_ERR_MEMORY;
     }
@@ -3808,7 +3834,7 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
         return TDB_SUCCESS;
     }
 
-    tidesdb_level_free(levels[num_levels - 1]);
+    tidesdb_level_free(cf->db, levels[num_levels - 1]);
 
     int new_num_levels = num_levels - 1;
 
@@ -6018,7 +6044,7 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
     for (int i = 0; i < num; i++)
     {
         tidesdb_level_t *lvl = levels[i];
-        tidesdb_level_free(lvl);
+        tidesdb_level_free(cf->db, lvl);
     }
     free(levels);
 
@@ -6606,11 +6632,15 @@ int tidesdb_close(tidesdb_t *db)
     free(db->column_families);
     pthread_rwlock_unlock(&db->cf_list_lock);
 
-    /* free cache after freeing column families
-     * this ensures sstables in levels are unreffed first (level ref released)
-     * then remaining cached sstables are unreffed (cache ref released)
-     * handles case where sstable is in cache but not yet added to level during compaction
-     * fifo_cache_free calls eviction callbacks which unref remaining sstables */
+    /* explicitly clear cache to ensure all sstables are unreferenced
+     * this calls eviction callbacks for all cached sstables
+     * must be done after freeing column families (which unref sstables from levels)
+     * so that sstables can be fully freed when cache releases its reference */
+    TDB_DEBUG_LOG("Clearing SSTable cache (size: %zu)", fifo_cache_size(db->sstable_cache));
+    fifo_cache_clear(db->sstable_cache);
+    TDB_DEBUG_LOG("SSTable cache cleared");
+
+    /* now free the cache structure itself */
     fifo_cache_free(db->sstable_cache);
 
     pthread_rwlock_destroy(&db->cf_list_lock);

@@ -1533,7 +1533,8 @@ static void tidesdb_sstable_cache_evict_cb(const char *key, void *value, void *u
     if (!sst) return;
 
     int refcount_before = atomic_load(&sst->refcount);
-    TDB_DEBUG_LOG("Cache evicting SSTable %" PRIu64 " (refcount before unref: %d)", sst->id, refcount_before);
+    TDB_DEBUG_LOG("Cache evicting SSTable %" PRIu64 " (refcount before unref: %d)", sst->id,
+                  refcount_before);
 
     /* release the cache's reference to the sstable */
     tidesdb_sstable_unref(db, sst);
@@ -1731,7 +1732,8 @@ static void tidesdb_sstable_unref(tidesdb_t *db, tidesdb_sstable_t *sst)
 {
     if (!sst) return;
     int old_refcount = atomic_fetch_sub(&sst->refcount, 1);
-    TDB_DEBUG_LOG("SSTable %" PRIu64 " unref: refcount %d -> %d", sst->id, old_refcount, old_refcount - 1);
+    TDB_DEBUG_LOG("SSTable %" PRIu64 " unref: refcount %d -> %d", sst->id, old_refcount,
+                  old_refcount - 1);
     if (old_refcount == 1)
     {
         TDB_DEBUG_LOG("SSTable %" PRIu64 " refcount reached 0, freeing", sst->id);
@@ -2625,7 +2627,8 @@ static void tidesdb_level_free(tidesdb_t *db, tidesdb_level_t *level)
     {
         if (level->sstables[i])
         {
-            TDB_DEBUG_LOG("Level %d unreffing SSTable %" PRIu64, level->level_num, level->sstables[i]->id);
+            TDB_DEBUG_LOG("Level %d unreffing SSTable %" PRIu64, level->level_num,
+                          level->sstables[i]->id);
             tidesdb_sstable_unref(db, level->sstables[i]);
         }
     }
@@ -2668,7 +2671,8 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
     /* add sstable and take reference */
     int refcount_before = atomic_load(&sst->refcount);
     tidesdb_sstable_ref(sst);
-    TDB_DEBUG_LOG("Level %d adding SSTable %" PRIu64 " (refcount: %d -> %d)", level->level_num, sst->id, refcount_before, refcount_before + 1);
+    TDB_DEBUG_LOG("Level %d adding SSTable %" PRIu64 " (refcount: %d -> %d)", level->level_num,
+                  sst->id, refcount_before, refcount_before + 1);
 
     /* get current count atomically */
     int current_count = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
@@ -5021,7 +5025,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
     queue_t *sstables_to_delete = queue_new();
 
-    for (int level = start_level; level < end_level; level++)
+    for (int level = start_level; level <= end_level; level++)
     {
         tidesdb_level_t *lvl = levels[level];
         int num_ssts = lvl->num_sstables;
@@ -5112,8 +5116,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 /* check for null as concurrent compactions may have removed sstables */
                 if (!sst) continue;
 
-                tidesdb_sstable_ref(sst);
-
                 /* reuse comparator_fn and comparator_ctx from outer scope */
 
                 int overlaps = 1;
@@ -5132,6 +5134,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
                 if (overlaps)
                 {
+                    /* tidesdb_merge_source_from_sstable takes its own reference */
                     tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(cf->db, sst);
                     if (source)
                     {
@@ -5145,17 +5148,10 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                             tidesdb_merge_source_free(source);
                         }
                     }
-                    else
-                    {
-                        /* merge source creation failed, release ref */
-                        tidesdb_sstable_unref(cf->db, sst);
-                    }
+                    /* if merge source creation failed, no reference was taken, nothing to clean up
+                     */
                 }
-                else
-                {
-                    /* sstable doesn't overlap with partition range, release ref */
-                    tidesdb_sstable_unref(cf->db, sst);
-                }
+                /* if sstable doesn't overlap, we don't need to do anything */
             }
         }
 
@@ -5559,7 +5555,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
         if (!sst) continue;
 
-        for (int level = start_level; level < end_level; level++)
+        for (int level = start_level; level <= end_level; level++)
         {
             tidesdb_level_remove_sstable(cf->db, levels[level], sst);
         }
@@ -6638,7 +6634,7 @@ int tidesdb_close(tidesdb_t *db)
     TDB_DEBUG_LOG("Clearing SSTable cache (size: %zu)", fifo_cache_size(db->sstable_cache));
     fifo_cache_clear(db->sstable_cache);
     TDB_DEBUG_LOG("SSTable cache cleared");
-    
+
     /* now free the cache structure itself */
     fifo_cache_free(db->sstable_cache);
 

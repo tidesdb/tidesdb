@@ -60,7 +60,7 @@ struct fifo_entry_t
 
 /**
  * fifo_cache_t
- * thread-safe FIFO cache with lock-free reads and configurable capacity
+ * thread-safe FIFO cache with configurable capacity
  * eviction policy is FIFO (oldest inserted entry evicted first)
  * @param capacity maximum number of entries
  * @param size current number of entries
@@ -68,7 +68,7 @@ struct fifo_entry_t
  * @param tail oldest entry (evicted first when cache is full)
  * @param table hash table for O(1) lookups
  * @param table_size hash table size
- * @param lock mutex for write operations (reads are lock-free)
+ * @param lock mutex for all operations (reads and writes)
  */
 struct fifo_cache_t
 {
@@ -98,7 +98,7 @@ fifo_cache_t *fifo_cache_new(size_t capacity);
  * @param value the value pointer (not copied, managed by callback)
  * @param evict_cb optional eviction callback (can be NULL)
  * @param user_data optional user data to pass to the callback (can be NULL)
- * @return 0 on success, -1 on failure
+ * @return 0 on new insertion, 1 on update of existing entry, -1 on failure
  */
 int fifo_cache_put(fifo_cache_t *cache, const char *key, void *value,
                    fifo_evict_callback_t evict_cb, void *user_data);

@@ -58,30 +58,6 @@ static fifo_entry_t *fifo_find_entry(fifo_cache_t *cache, const char *key, size_
 }
 
 /**
- * fifo_move_to_head
- * move entry to head (most recently used)
- * @param cache the cache to move the entry to
- * @param entry the entry to move
- */
-static void fifo_move_to_head(fifo_cache_t *cache, fifo_entry_t *entry)
-{
-    if (entry == cache->head) return;
-
-    if (entry->prev) entry->prev->next = entry->next;
-    if (entry->next) entry->next->prev = entry->prev;
-    if (entry == cache->tail) cache->tail = entry->prev;
-
-    /* insert at head */
-    entry->prev = NULL;
-    entry->next = cache->head;
-    if (cache->head) cache->head->prev = entry;
-    cache->head = entry;
-
-    /* if list was empty, this is also the tail */
-    if (cache->tail == NULL) cache->tail = entry;
-}
-
-/**
  * fifo_remove_from_table
  * remove entry from hash table
  * @param cache the cache to remove the entry from
@@ -233,9 +209,9 @@ int fifo_cache_put(fifo_cache_t *cache, const char *key, void *value,
         existing->value = value;
         existing->evict_cb = evict_cb;
         existing->user_data = user_data;
-        fifo_move_to_head(cache, existing);
+
         pthread_mutex_unlock(&cache->lock);
-        return 0;
+        return 1; /* return 1 to indicate entry was updated, not inserted */
     }
 
     if (cache->size >= cache->capacity) fifo_evict_fifo(cache);
@@ -282,20 +258,16 @@ void *fifo_cache_get(fifo_cache_t *cache, const char *key)
     if (cache == NULL || key == NULL) return NULL;
 
     size_t key_len = strlen(key);
-    size_t index = fifo_hash(key, key_len, cache->table_size);
-    fifo_entry_t *entry = cache->table[index];
 
-    /* walk hash chain without lock */
-    while (entry != NULL)
-    {
-        if (entry->key_len == key_len && memcmp(entry->key, key, key_len) == 0)
-        {
-            return entry->value;
-        }
-        entry = entry->hash_next;
-    }
+    /* lock to prevent use-after-free if another thread is modifying the cache */
+    pthread_mutex_lock(&cache->lock);
 
-    return NULL; /* not found */
+    fifo_entry_t *entry = fifo_find_entry(cache, key, key_len);
+    void *value = entry ? entry->value : NULL;
+
+    pthread_mutex_unlock(&cache->lock);
+
+    return value;
 }
 
 int fifo_cache_remove(fifo_cache_t *cache, const char *key)

@@ -164,12 +164,50 @@ static void test_fifo_cache_update(void)
     ASSERT_TRUE(retrieved != NULL);
     ASSERT_EQ(*retrieved, 100);
 
-    ASSERT_EQ(fifo_cache_put(cache, "key1", &v2, NULL, NULL), 0);
+    /* update should return 1 */
+    ASSERT_EQ(fifo_cache_put(cache, "key1", &v2, NULL, NULL), 1);
     ASSERT_EQ(fifo_cache_size(cache), 1); /* size should not change */
 
     retrieved = (int *)fifo_cache_get(cache, "key1");
     ASSERT_TRUE(retrieved != NULL);
     ASSERT_EQ(*retrieved, 200);
+
+    fifo_cache_free(cache);
+}
+
+static void test_fifo_cache_update_preserves_order(void)
+{
+    eviction_count = 0;
+    memset(last_evicted_key, 0, sizeof(last_evicted_key));
+
+    fifo_cache_t *cache = fifo_cache_new(3);
+    ASSERT_TRUE(cache != NULL);
+
+    int v1 = 1, v2 = 2, v3 = 3, v4 = 4;
+    int v1_updated = 100;
+
+    ASSERT_EQ(fifo_cache_put(cache, "key1", &v1, test_evict_callback, NULL), 0);
+    ASSERT_EQ(fifo_cache_put(cache, "key2", &v2, test_evict_callback, NULL), 0);
+    ASSERT_EQ(fifo_cache_put(cache, "key3", &v3, test_evict_callback, NULL), 0);
+
+    /* update key1 - should NOT move it to head (FIFO, not LRU) */
+    ASSERT_EQ(fifo_cache_put(cache, "key1", &v1_updated, test_evict_callback, NULL), 1);
+
+    /* eviction callback was called once to clean up old value */
+    ASSERT_EQ(eviction_count, 1);
+
+    /* adding key4 should still evict key1 (oldest), not key2 */
+    ASSERT_EQ(fifo_cache_put(cache, "key4", &v4, test_evict_callback, NULL), 0);
+
+    /* eviction callback called again when key1 is evicted from cache */
+    ASSERT_EQ(eviction_count, 2);
+    ASSERT_TRUE(strcmp(last_evicted_key, "key1") == 0);
+
+    /* key1 should be gone even though it was updated */
+    ASSERT_TRUE(fifo_cache_get(cache, "key1") == NULL);
+    ASSERT_TRUE(fifo_cache_get(cache, "key2") != NULL);
+    ASSERT_TRUE(fifo_cache_get(cache, "key3") != NULL);
+    ASSERT_TRUE(fifo_cache_get(cache, "key4") != NULL);
 
     fifo_cache_free(cache);
 }
@@ -515,6 +553,129 @@ void test_fifo_cache_free_null()
     fifo_cache_clear(NULL);
 }
 
+/* test for race condition where multiple threads try to add same key */
+typedef struct
+{
+    fifo_cache_t *cache;
+    const char *key;
+    int *refcount;
+    pthread_mutex_t *refcount_lock;
+    int thread_id;
+} race_test_arg_t;
+
+static void race_evict_callback(const char *key, void *value, void *user_data)
+{
+    (void)key;
+    (void)value;
+    race_test_arg_t *arg = (race_test_arg_t *)user_data;
+    pthread_mutex_lock(arg->refcount_lock);
+    (*arg->refcount)--;
+    pthread_mutex_unlock(arg->refcount_lock);
+}
+
+static void *race_condition_thread(void *arg)
+{
+    race_test_arg_t *targ = (race_test_arg_t *)arg;
+
+    /* check if already in cache */
+    void *cached = fifo_cache_get(targ->cache, targ->key);
+    if (!cached)
+    {
+        /* simulate taking a reference */
+        pthread_mutex_lock(targ->refcount_lock);
+        (*targ->refcount)++;
+        pthread_mutex_unlock(targ->refcount_lock);
+
+        /* try to add to cache */
+        int result = fifo_cache_put(targ->cache, targ->key, targ, race_evict_callback, targ);
+
+        if (result == 1)
+        {
+            /* entry already existed (race detected), release our extra ref */
+            pthread_mutex_lock(targ->refcount_lock);
+            (*targ->refcount)--;
+            pthread_mutex_unlock(targ->refcount_lock);
+        }
+    }
+
+    return NULL;
+}
+
+void test_fifo_cache_race_condition()
+{
+    printf(BOLDWHITE "\nTest: Race Condition - Multiple Threads Adding Same Key\n" RESET);
+
+    fifo_cache_t *cache = fifo_cache_new(100);
+    ASSERT_TRUE(cache != NULL);
+
+    int refcount = 0;
+    pthread_mutex_t refcount_lock;
+    pthread_mutex_init(&refcount_lock, NULL);
+
+    const char *shared_key = "shared_sstable_key";
+
+#define RACE_THREADS 10
+    pthread_t threads[RACE_THREADS];
+    race_test_arg_t args[RACE_THREADS];
+
+    /* spawn multiple threads trying to add the same key */
+    for (int i = 0; i < RACE_THREADS; i++)
+    {
+        args[i].cache = cache;
+        args[i].key = shared_key;
+        args[i].refcount = &refcount;
+        args[i].refcount_lock = &refcount_lock;
+        args[i].thread_id = i;
+        pthread_create(&threads[i], NULL, race_condition_thread, &args[i]);
+    }
+
+    for (int i = 0; i < RACE_THREADS; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    /* refcount should be 1 (only the cache holds a reference) */
+    printf("  Final refcount: %d (expected: 1)\n", refcount);
+    ASSERT_EQ(refcount, 1);
+
+    /* clear cache, which should call evict callback and decrement refcount to 0 */
+    fifo_cache_clear(cache);
+    printf("  Refcount after cache clear: %d (expected: 0)\n", refcount);
+    ASSERT_EQ(refcount, 0);
+
+    pthread_mutex_destroy(&refcount_lock);
+    fifo_cache_free(cache);
+
+#undef RACE_THREADS
+}
+
+void test_fifo_cache_put_return_values()
+{
+    fifo_cache_t *cache = fifo_cache_new(5);
+    ASSERT_TRUE(cache != NULL);
+
+    int v1 = 100;
+    int v2 = 200;
+
+    /* first put should return 0 (new insertion) */
+    int result = fifo_cache_put(cache, "key1", &v1, NULL, NULL);
+    ASSERT_EQ(result, 0);
+
+    /* second put with same key should return 1 (update) */
+    result = fifo_cache_put(cache, "key1", &v2, NULL, NULL);
+    ASSERT_EQ(result, 1);
+
+    /* verify value was updated */
+    int *retrieved = (int *)fifo_cache_get(cache, "key1");
+    ASSERT_TRUE(retrieved != NULL);
+    ASSERT_EQ(*retrieved, 200);
+
+    /* size should still be 1 */
+    ASSERT_EQ(fifo_cache_size(cache), 1);
+
+    fifo_cache_free(cache);
+}
+
 #define BENCH_ITERATIONS 1000000
 #define BENCH_CACHE_SIZE 10000
 #define BENCH_THREADS    8
@@ -646,7 +807,7 @@ static void *concurrent_read_worker(void *arg)
 
 static void benchmark_fifo_concurrent_reads(void)
 {
-    printf(BOLDWHITE "\nBenchmark 3: Concurrent Read Performance (Lock-Free)\n" RESET);
+    printf(BOLDWHITE "\nBenchmark 3: Concurrent Read Performance\n" RESET);
 
     fifo_cache_t *cache = fifo_cache_new(BENCH_CACHE_SIZE);
     ASSERT_TRUE(cache != NULL);
@@ -804,6 +965,7 @@ int main(void)
     RUN_TEST(test_fifo_cache_eviction, tests_passed);
     RUN_TEST(test_fifo_cache_get_updates_order, tests_passed);
     RUN_TEST(test_fifo_cache_update, tests_passed);
+    RUN_TEST(test_fifo_cache_update_preserves_order, tests_passed);
     RUN_TEST(test_fifo_cache_remove, tests_passed);
     RUN_TEST(test_fifo_cache_clear, tests_passed);
     RUN_TEST(test_fifo_cache_with_malloc, tests_passed);
@@ -816,6 +978,8 @@ int main(void)
     RUN_TEST(test_fifo_cache_empty_key, tests_passed);
     RUN_TEST(test_fifo_cache_hash_collisions, tests_passed);
     RUN_TEST(test_fifo_cache_free_null, tests_passed);
+    RUN_TEST(test_fifo_cache_race_condition, tests_passed);
+    RUN_TEST(test_fifo_cache_put_return_values, tests_passed);
 
     benchmark_fifo_sequential();
     benchmark_fifo_random_access();

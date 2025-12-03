@@ -1203,6 +1203,7 @@ void succinct_trie_builder_free(succinct_trie_builder_t *builder)
     free(builder->val_buffer);
 
     free(builder);
+    builder = NULL;
 }
 
 /**

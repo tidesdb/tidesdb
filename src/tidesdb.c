@@ -1568,14 +1568,12 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
             tidesdb_sstable_unref(db, sst);
             return -1;
         }
-        else if (put_result == 1)
-        {
-            /* entry already existed (race condition detected)
-             * the old entry was unreffed by evict callback, new entry assigned
-             * but we already took a ref, so release it to avoid leak */
-            tidesdb_sstable_unref(db, sst);
-        }
-        /* if put_result == 0, new entry was inserted successfully */
+        /* if put_result == 0, new entry was inserted successfully
+         * if put_result == 1, entry was updated
+         *   evict callback unreffed old value
+         *   we took a ref before calling put
+         *   cache now holds the new value with correct refcount
+         *   do not unref here, refcount is already correct */
     }
 
     /* only open block managers if not already open */
@@ -6742,17 +6740,6 @@ int tidesdb_close(tidesdb_t *db)
     free(db->column_families);
     pthread_rwlock_unlock(&db->cf_list_lock);
 
-    /* explicitly clear cache to ensure all sstables are unreferenced
-     * this calls eviction callbacks for all cached sstables
-     * must be done after freeing column families (which unref sstables from levels)
-     * so that sstables can be fully freed when cache releases its reference */
-    TDB_DEBUG_LOG("Clearing SSTable cache (size: %zu)", fifo_cache_size(db->sstable_cache));
-    fifo_cache_clear(db->sstable_cache);
-    TDB_DEBUG_LOG("SSTable cache cleared");
-
-    /* now free the cache structure itself */
-    fifo_cache_free(db->sstable_cache);
-
     pthread_rwlock_destroy(&db->cf_list_lock);
 
     /* free comparator registry */
@@ -6764,6 +6751,10 @@ int tidesdb_close(tidesdb_t *db)
 
     free(db->db_path);
     db->is_open = 0;
+    TDB_DEBUG_LOG("Freeing SSTable cache (size: %zu)", fifo_cache_size(db->sstable_cache));
+    fifo_cache_free(db->sstable_cache);
+    TDB_DEBUG_LOG("SSTable cache freed");
+
     free(db);
 
     db = NULL;

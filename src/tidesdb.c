@@ -4130,8 +4130,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     if (new_sst->config->enable_bloom_filter)
     {
-        bloom = bloom_filter_new_default(estimated_entries);
-        if (bloom)
+        if (bloom_filter_new(&bloom, new_sst->config->bloom_fpr, estimated_entries) == 0)
         {
             TDB_DEBUG_LOG("Full preemptive merge: Bloom filter created (estimated entries: %" PRIu64
                           ")",
@@ -4140,6 +4139,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         else
         {
             TDB_DEBUG_LOG("Full preemptive merge: Bloom filter creation failed");
+            bloom = NULL;
         }
     }
     else
@@ -4658,8 +4658,24 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         return result;
     }
 
+    /* calculate total estimated entries from all SSTables being merged */
+    uint64_t total_estimated_entries = 0;
+    size_t num_sstables_to_merge = queue_size(sstables_to_delete);
+    for (size_t i = 0; i < num_sstables_to_merge; i++)
+    {
+        tidesdb_sstable_t *sst = queue_peek_at(sstables_to_delete, i);
+        if (sst)
+        {
+            total_estimated_entries += sst->num_entries;
+        }
+    }
+
     /* partitioned merge create one sstable per partition */
     int num_partitions = target->num_boundaries + 1;
+
+    /* estimate entries per partition (divide total by number of partitions) */
+    uint64_t partition_estimated_entries = total_estimated_entries / num_partitions;
+    if (partition_estimated_entries < 100) partition_estimated_entries = 100;
 
     for (int partition = 0; partition < num_partitions; partition++)
     {
@@ -4728,8 +4744,17 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         if (cf->config.enable_bloom_filter)
         {
-            if (bloom_filter_new(&bloom, cf->config.bloom_fpr, 10000) != 0)
+            if (bloom_filter_new(&bloom, cf->config.bloom_fpr, partition_estimated_entries) == 0)
             {
+                TDB_DEBUG_LOG(
+                    "Dividing merge partition %d: Bloom filter created (estimated entries: %" PRIu64
+                    ")",
+                    partition, partition_estimated_entries);
+            }
+            else
+            {
+                TDB_DEBUG_LOG("Dividing merge partition %d: Bloom filter creation failed",
+                              partition);
                 bloom = NULL;
             }
         }
@@ -5233,7 +5258,19 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
             if (cf->config.enable_bloom_filter)
             {
-                bloom_filter_new(&bloom, cf->config.bloom_fpr, estimated_entries);
+                if (bloom_filter_new(&bloom, cf->config.bloom_fpr, estimated_entries) == 0)
+                {
+                    TDB_DEBUG_LOG(
+                        "Partitioned merge partition %d: Bloom filter created (estimated entries: "
+                        "%" PRIu64 ")",
+                        partition, estimated_entries);
+                }
+                else
+                {
+                    TDB_DEBUG_LOG("Partitioned merge partition %d: Bloom filter creation failed",
+                                  partition);
+                    bloom = NULL;
+                }
             }
 
             if (cf->config.enable_block_indexes)

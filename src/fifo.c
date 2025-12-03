@@ -149,6 +149,7 @@ static void fifo_evict_fifo(fifo_cache_t *cache)
 
     free(victim->key);
     free(victim);
+    victim = NULL;
 
     cache->size--;
 }
@@ -177,6 +178,7 @@ static void fifo_free_entry(fifo_cache_t *cache, fifo_entry_t *entry)
 
     free(entry->key);
     free(entry);
+    entry = NULL;
 
     cache->size--;
 }
@@ -204,6 +206,7 @@ fifo_cache_t *fifo_cache_new(size_t capacity)
     {
         free(cache->table);
         free(cache);
+        cache = NULL;
         return NULL;
     }
 
@@ -352,6 +355,7 @@ void fifo_cache_free(fifo_cache_t *cache)
     pthread_mutex_destroy(&cache->lock);
     free(cache->table);
     free(cache);
+    cache = NULL;
 }
 
 void fifo_cache_destroy(fifo_cache_t *cache)
@@ -380,6 +384,7 @@ void fifo_cache_destroy(fifo_cache_t *cache)
     pthread_mutex_destroy(&cache->lock);
     free(cache->table);
     free(cache);
+    cache = NULL;
 }
 
 size_t fifo_cache_size(fifo_cache_t *cache)

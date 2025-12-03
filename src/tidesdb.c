@@ -2457,6 +2457,8 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
                                       convert_sync_mode(sst->config->sync_mode),
                                       (uint32_t)sst->config->block_manager_cache_size) != 0)
     {
+        TDB_DEBUG_LOG("Failed to open klog file: %s (may be leftover from incomplete cleanup)",
+                      sst->klog_path);
         return -1;
     }
 
@@ -2464,12 +2466,23 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
                                       convert_sync_mode(sst->config->sync_mode),
                                       (uint32_t)sst->config->block_manager_cache_size) != 0)
     {
+        TDB_DEBUG_LOG("Failed to open vlog file: %s (may be leftover from incomplete cleanup)",
+                      sst->vlog_path);
         block_manager_close(klog_bm);
         return -1;
     }
 
     block_manager_get_size(klog_bm, &sst->klog_size);
     block_manager_get_size(vlog_bm, &sst->vlog_size);
+
+    /* check for empty or corrupted files */
+    if (sst->klog_size == 0)
+    {
+        TDB_DEBUG_LOG("Empty klog file: %s (corrupted or incomplete SSTable)", sst->klog_path);
+        block_manager_close(klog_bm);
+        block_manager_close(vlog_bm);
+        return TDB_ERR_CORRUPTION;
+    }
 
     /* read metadata from last block */
     block_manager_cursor_t *metadata_cursor;
@@ -2528,6 +2541,16 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
     if (block_manager_cursor_goto_first(cursor) == 0)
     {
         block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block)
+        {
+            TDB_DEBUG_LOG(
+                "Failed to read first block for min key: %s (file may be corrupted or locked)",
+                sst->klog_path);
+            block_manager_cursor_free(cursor);
+            block_manager_close(klog_bm);
+            block_manager_close(vlog_bm);
+            return TDB_ERR_CORRUPTION;
+        }
         if (block)
         {
             uint8_t *data = block->data;
@@ -2575,7 +2598,14 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
             if (block_manager_cursor_prev(cursor) == 0)
             {
                 block_manager_block_t *block = block_manager_cursor_read(cursor);
-                if (block)
+                if (!block)
+                {
+                    TDB_DEBUG_LOG(
+                        "Failed to read last block for max key: %s (continuing without max key)",
+                        sst->klog_path);
+                    /* continue without max key min key was already read */
+                }
+                else if (block)
                 {
                     uint8_t *data = block->data;
                     size_t data_size = block->size;
@@ -2835,7 +2865,7 @@ static int tidesdb_level_remove_sstable(tidesdb_t *db, tidesdb_level_t *level,
         }
 
         /* try to swap in new array first
-         * we must swap array BEFORE updating count to prevent race where
+         * we must swap array before updating count to prevent race where
          * readers see new (smaller) count with old (larger) array, missing ssts */
         if (atomic_compare_exchange_strong_explicit(&level->sstables, &old_arr, new_arr,
                                                     memory_order_release, memory_order_acquire))
@@ -3544,7 +3574,9 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                     block_manager_cursor_read(source->source.sstable.klog_cursor);
                 if (block)
                 {
-                    /* acquire block to prevent eviction during decompression */
+                    /* acquire block to prevent eviction during decompression
+                     * we must keep the block acquired until decompression completes
+                     * to prevent use-after-free if cache evicts it */
                     if (!block_manager_block_acquire(block))
                     {
                         block_manager_block_release(block);
@@ -3553,7 +3585,6 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
 
                     /* release cursor's reference, keep our acquired reference */
                     block_manager_block_release(block);
-                    source->source.sstable.current_block_data = block;
 
                     uint8_t *data = block->data;
                     size_t data_size = block->size;
@@ -3718,7 +3749,9 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                     block_manager_cursor_read(source->source.sstable.klog_cursor);
                 if (block)
                 {
-                    /* acquire block to prevent eviction during decompression */
+                    /* acquire block to prevent eviction during decompression
+                     * we must keep the block acquired until decompression completes
+                     * to prevent use-after-free if cache evicts it */
                     if (!block_manager_block_acquire(block))
                     {
                         block_manager_block_release(block);
@@ -3727,7 +3760,6 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
 
                     /* release cursor's reference, keep our acquired reference */
                     block_manager_block_release(block);
-                    source->source.sstable.current_block_data = block;
 
                     uint8_t *data = block->data;
                     size_t data_size = block->size;
@@ -3746,6 +3778,9 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                             source->source.sstable.decompressed_data = decompressed;
                         }
                     }
+
+                    /* now safe to store block reference after decompression complete */
+                    source->source.sstable.current_block_data = block;
 
                     tidesdb_klog_block_free(source->source.sstable.current_block);
                     source->source.sstable.current_block = NULL;
@@ -3879,7 +3914,7 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     cf->levels = new_levels;
     cf->num_levels = num_levels + 1;
 
-    /* free old array BEFORE releasing lock -- readers must acquire lock to see new array */
+    /* free old array before releasing lock -- readers must acquire lock to see new array */
     free(levels);
 
     pthread_rwlock_unlock(&cf->levels_lock);
@@ -6197,6 +6232,22 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
     TDB_DEBUG_LOG("Flush worker thread started");
 
+    /* wait for database to finish recovery before processing work */
+    pthread_mutex_lock(&db->recovery_lock);
+    while (!db->recovery_complete && !atomic_load(&db->flush_should_stop))
+    {
+        pthread_cond_wait(&db->recovery_cond, &db->recovery_lock);
+    }
+    pthread_mutex_unlock(&db->recovery_lock);
+
+    /* if we're stopping before recovery completes, exit early */
+    if (atomic_load(&db->flush_should_stop))
+    {
+        TDB_DEBUG_LOG("Flush worker: stopping before recovery complete");
+        return NULL;
+    }
+    TDB_DEBUG_LOG("Flush worker: recovery complete, starting work loop");
+
     while (1)
     {
         /* wait for work (blocking dequeue) */
@@ -6379,6 +6430,22 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 
     TDB_DEBUG_LOG("Compaction worker thread started");
 
+    /* wait for database to finish recovery before processing work */
+    pthread_mutex_lock(&db->recovery_lock);
+    while (!db->recovery_complete && !atomic_load(&db->compaction_should_stop))
+    {
+        pthread_cond_wait(&db->recovery_cond, &db->recovery_lock);
+    }
+    pthread_mutex_unlock(&db->recovery_lock);
+
+    /* if we're stopping before recovery completes, exit early */
+    if (atomic_load(&db->compaction_should_stop))
+    {
+        TDB_DEBUG_LOG("Compaction worker: stopping before recovery complete");
+        return NULL;
+    }
+    TDB_DEBUG_LOG("Compaction worker: recovery complete, starting work loop");
+
     while (1)
     {
         /* wait for work (blocking dequeue) */
@@ -6538,6 +6605,33 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_MEMORY;
     }
 
+    if (pthread_mutex_init(&(*db)->recovery_lock, NULL) != 0)
+    {
+        pthread_rwlock_destroy(&(*db)->cf_list_lock);
+        free(cfs);
+        queue_free((*db)->compaction_queue);
+        queue_free((*db)->flush_queue);
+        fifo_cache_free((*db)->sstable_cache);
+        free((*db)->db_path);
+        free(*db);
+        return TDB_ERR_MEMORY;
+    }
+
+    if (pthread_cond_init(&(*db)->recovery_cond, NULL) != 0)
+    {
+        pthread_mutex_destroy(&(*db)->recovery_lock);
+        pthread_rwlock_destroy(&(*db)->cf_list_lock);
+        free(cfs);
+        queue_free((*db)->compaction_queue);
+        queue_free((*db)->flush_queue);
+        fifo_cache_free((*db)->sstable_cache);
+        free((*db)->db_path);
+        free(*db);
+        return TDB_ERR_MEMORY;
+    }
+
+    (*db)->recovery_complete = 0; /* recovery not yet done */
+
     /* initialize comparator registry */
     (*db)->comparators_capacity = 8;
     (*db)->comparators = calloc((*db)->comparators_capacity, sizeof(tidesdb_comparator_entry_t));
@@ -6611,6 +6705,11 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_MEMORY;
     }
 
+    /* recover database before starting ANY background workers
+     * no locks needed;  workers don't exist yet, recovery has exclusive access */
+    tidesdb_recover_database(*db);
+
+    /* now start background workers;  they will wait for recovery_complete signal */
     (*db)->flush_threads = malloc(config->num_flush_threads * sizeof(pthread_t));
     if (!(*db)->flush_threads)
     {
@@ -6688,9 +6787,14 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         }
     }
 
-    (*db)->is_open = 1;
+    /* signal workers that recovery is complete; they can now process work */
+    pthread_mutex_lock(&(*db)->recovery_lock);
+    (*db)->recovery_complete = 1;
+    pthread_cond_broadcast(&(*db)->recovery_cond);
+    pthread_mutex_unlock(&(*db)->recovery_lock);
 
-    tidesdb_recover_database(*db);
+    /* mark database as open only after recovery and worker startup complete */
+    (*db)->is_open = 1;
 
     return TDB_SUCCESS;
 }
@@ -6705,6 +6809,11 @@ int tidesdb_close(tidesdb_t *db)
     /* first, stop accepting new work */
     atomic_store(&db->flush_should_stop, 1);
     atomic_store(&db->compaction_should_stop, 1);
+
+    /* wake up any workers waiting for recovery to complete */
+    pthread_mutex_lock(&db->recovery_lock);
+    pthread_cond_broadcast(&db->recovery_cond);
+    pthread_mutex_unlock(&db->recovery_lock);
 
     /* wait for all pending work to drain */
     if (db->flush_queue)
@@ -6787,7 +6896,7 @@ int tidesdb_close(tidesdb_t *db)
 
     fifo_cache_clear(db->sstable_cache);
 
-    /* stop all background compaction threads BEFORE acquiring cf_list_lock
+    /* stop all background compaction threads before acquiring cf_list_lock
      * to avoid deadlock (threads might need cf_list_lock) */
     pthread_rwlock_rdlock(&db->cf_list_lock);
     for (int i = 0; i < db->num_column_families; i++)
@@ -6833,6 +6942,8 @@ int tidesdb_close(tidesdb_t *db)
     db->is_open = 0;
     free(db);
 
+    db = NULL;
+
     return TDB_SUCCESS;
 }
 
@@ -6850,7 +6961,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config)
 {
     if (!db || !name || !config) return TDB_ERR_INVALID_ARGS;
-    if (!db->is_open) return TDB_ERR_INVALID_ARGS;
 
     TDB_DEBUG_LOG("Creating column family: %s", name);
 
@@ -7297,7 +7407,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
-    /* enqueue compaction work - worker will skip if compaction already running */
+    /* enqueue compaction work; worker will skip if compaction already running */
     tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
     if (!work)
     {
@@ -10451,10 +10561,16 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
  */
 static int tidesdb_recover_database(tidesdb_t *db)
 {
-    if (!db || !db->is_open) return TDB_ERR_INVALID_ARGS;
+    if (!db) return TDB_ERR_INVALID_ARGS;
+
+    TDB_DEBUG_LOG("Starting database recovery from: %s", db->db_path);
 
     DIR *dir = opendir(db->db_path);
-    if (!dir) return TDB_ERR_IO;
+    if (!dir)
+    {
+        TDB_DEBUG_LOG("Recovery: No existing database directory found (fresh start)");
+        return TDB_SUCCESS; /* not an error, fresh database */
+    }
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL)
@@ -10471,6 +10587,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
         struct STAT_STRUCT st;
         if (STAT_FUNC(full_path, &st) == 0 && S_ISDIR(st.st_mode))
         {
+            TDB_DEBUG_LOG("Recovery: Found CF directory: %s", entry->d_name);
             tidesdb_column_family_t *cf = tidesdb_get_column_family(db, entry->d_name);
 
             if (!cf)
@@ -10484,12 +10601,18 @@ static int tidesdb_recover_database(tidesdb_t *db)
 
             if (cf)
             {
+                TDB_DEBUG_LOG("Recovery: Recovering CF: %s", entry->d_name);
                 tidesdb_recover_column_family(cf);
+            }
+            else
+            {
+                TDB_DEBUG_LOG("Recovery: Failed to get/create CF: %s", entry->d_name);
             }
         }
     }
     closedir(dir);
 
+    TDB_DEBUG_LOG("Database recovery completed successfully");
     return TDB_SUCCESS;
 }
 

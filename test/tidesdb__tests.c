@@ -6642,6 +6642,7 @@ static void test_multi_cf_wal_recovery(void)
     {
         tidesdb_config_t config = tidesdb_default_config();
         config.db_path = TEST_DB_PATH;
+        config.enable_debug_logging = 1;
 
         tidesdb_t *db = NULL;
         ASSERT_EQ(tidesdb_open(&config, &db), 0);

@@ -1866,12 +1866,37 @@ static inline int tdb_get_available_disk_space(const char *path, uint64_t *avail
 #endif
 
 /**
- * remove_directory
- * recursively removes a directory and all its contents
+ * is_directory_empty
+ * checks if a directory is empty (contains only . and ..)
+ * @param path the directory path to check
+ * @return 1 if empty, 0 if not empty or error
+ */
+static inline int is_directory_empty(const char *path)
+{
+    DIR *dir = opendir(path);
+    if (!dir) return 0;
+
+    struct dirent *entry;
+    int count = 0;
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        count++;
+        break; /* found at least one entry */
+    }
+
+    closedir(dir);
+    return count == 0;
+}
+
+/**
+ * remove_directory_once
+ * single pass of recursive directory removal
  * @param path the directory path to remove
  * @return 0 on success, -1 on failure
  */
-static inline int remove_directory(const char *path)
+static inline int remove_directory_once(const char *path)
 {
     DIR *dir = opendir(path);
     if (!dir) return -1;
@@ -1899,11 +1924,12 @@ static inline int remove_directory(const char *path)
             if (S_ISDIR(st.st_mode))
             {
                 /* recursive call for subdirectory */
-                if (remove_directory(full_path) != 0) result = -1;
+                if (remove_directory_once(full_path) != 0) result = -1;
             }
             else
             {
 #ifdef _WIN32
+                /* clear read-only and other attributes that might prevent deletion */
                 SetFileAttributesA(full_path, FILE_ATTRIBUTE_NORMAL);
                 if (_unlink(full_path) != 0) result = -1;
 #else
@@ -1917,18 +1943,76 @@ static inline int remove_directory(const char *path)
 
     closedir(dir);
 
-    /* remove the directory itself */
+    /* try to remove the directory itself */
 #ifdef _WIN32
-    for (int i = 0; i < 3; i++)
-    {
-        if (_rmdir(path) == 0) return result;
-        Sleep(10);
-    }
-    return -1;
+    if (_rmdir(path) != 0) result = -1;
 #else
-    if (rmdir(path) != 0) return -1;
-    return result;
+    if (rmdir(path) != 0) result = -1;
 #endif
+
+    return result;
+}
+
+/**
+ * remove_directory
+ * recursively removes a directory and all its contents with retry logic
+ * retries if directory is not empty after deletion attempt (handles file locking)
+ * @param path the directory path to remove
+ * @return 0 on success, -1 on failure
+ */
+static inline int remove_directory(const char *path)
+{
+    /* check if directory exists */
+    DIR *dir = opendir(path);
+    if (!dir) return 0; /* already gone, success */
+    closedir(dir);
+
+    /* try up to 16 times with fixed 128ms delay */
+    for (int attempt = 0; attempt < 16; attempt++)
+    {
+        /* attempt removal */
+        (void)remove_directory_once(path);
+
+        /* check if directory is gone or empty */
+        dir = opendir(path);
+        if (!dir)
+        {
+            /* directory successfully removed */
+            return 0;
+        }
+
+        /* directory still exists, check if empty */
+        if (is_directory_empty(path))
+        {
+            closedir(dir);
+            /* empty but not removed, try rmdir directly */
+#ifdef _WIN32
+            if (_rmdir(path) == 0) return 0;
+#else
+            if (rmdir(path) == 0) return 0;
+#endif
+        }
+        else
+        {
+            closedir(dir);
+        }
+
+        /* directory not empty or removal failed, wait and retry */
+        if (attempt < 15)
+        {
+#ifdef _WIN32
+            Sleep(128);
+#else
+            usleep(128000);
+#endif
+        }
+    }
+
+    /* final check */
+    dir = opendir(path);
+    if (!dir) return 0; /* success */
+    closedir(dir);
+    return -1; /* failed after all retries */
 }
 
 #endif /* __COMPAT_H__ */

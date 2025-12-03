@@ -594,6 +594,9 @@ struct tidesdb_compaction_work_t
  * @param cached_available_disk_space cached available disk space in bytes
  * @param last_disk_space_check timestamp of last disk space check
  * @param cf_list_lock rwlock for cf list modifications
+ * @param recovery_lock protects recovery_complete flag
+ * @param recovery_cond signals when recovery is complete
+ * @param recovery_complete flag indicating if recovery process is complete
  */
 struct tidesdb_t
 {
@@ -620,6 +623,9 @@ struct tidesdb_t
     _Atomic(uint64_t) cached_available_disk_space;
     _Atomic(time_t) last_disk_space_check;
     pthread_rwlock_t cf_list_lock;
+    pthread_mutex_t recovery_lock;
+    pthread_cond_t recovery_cond;
+    int recovery_complete;
 };
 
 /**

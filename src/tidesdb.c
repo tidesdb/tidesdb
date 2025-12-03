@@ -9577,7 +9577,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
             {
                 /* use position cache to jump directly to last block if available */
                 if (cursor->position_cache && cursor->cache_size > 0 &&
-                    num_blocks <= cursor->cache_size)
+                    num_blocks <= (uint64_t)cursor->cache_size)
                 {
                     /* jump directly to last block using cached position */
                     cursor->cache_index = num_blocks - 1;

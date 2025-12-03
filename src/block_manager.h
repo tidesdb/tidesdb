@@ -221,7 +221,7 @@ void block_manager_block_free(block_manager_block_t *block);
  * @param block the block to acquire
  * @return true if successful, false if block is being freed
  */
-bool block_manager_block_acquire(block_manager_block_t *block);
+int block_manager_block_acquire(block_manager_block_t *block);
 
 /**
  * block_manager_block_release

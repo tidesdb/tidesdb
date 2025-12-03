@@ -559,17 +559,17 @@ void block_manager_block_free(block_manager_block_t *block)
     free(block);
 }
 
-bool block_manager_block_acquire(block_manager_block_t *block)
+int block_manager_block_acquire(block_manager_block_t *block)
 {
-    if (!block) return false;
+    if (!block) return 0;
 
     uint32_t old_ref = atomic_load_explicit(&block->ref_count, memory_order_relaxed);
     do
     {
-        if (old_ref == 0) return false; /* block is being freed */
+        if (old_ref == 0) return 0; /* block is being freed */
     } while (!atomic_compare_exchange_weak_explicit(&block->ref_count, &old_ref, old_ref + 1,
                                                     memory_order_acquire, memory_order_relaxed));
-    return true;
+    return 1;
 }
 
 void block_manager_block_release(block_manager_block_t *block)

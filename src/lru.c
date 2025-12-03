@@ -40,15 +40,15 @@ static inline size_t lru_hash(const char *key, size_t key_len, size_t table_size
  * @param entry the entry to acquire
  * @return true if acquired successfully, false if entry is being deleted
  */
-static inline bool lru_entry_acquire(lru_entry_t *entry)
+static inline int lru_entry_acquire(lru_entry_t *entry)
 {
     uint32_t old_ref = atomic_load_explicit(&entry->ref_count, memory_order_relaxed);
     do
     {
-        if (old_ref == 0) return false; /* entry is being freed */
+        if (old_ref == 0) return 0; /* entry is being freed */
     } while (!atomic_compare_exchange_weak_explicit(&entry->ref_count, &old_ref, old_ref + 1,
                                                     memory_order_acquire, memory_order_relaxed));
-    return true;
+    return 1;
 }
 
 /**
@@ -57,7 +57,7 @@ static inline bool lru_entry_acquire(lru_entry_t *entry)
  * @param entry the entry to release
  * @param call_evict whether to call eviction callback
  */
-static void lru_entry_release(lru_entry_t *entry, bool call_evict)
+static void lru_entry_release(lru_entry_t *entry, int call_evict)
 {
     uint32_t old_ref = atomic_fetch_sub_explicit(&entry->ref_count, 1, memory_order_release);
     if (old_ref == 1)
@@ -109,7 +109,7 @@ retry:;
                         return entry;
                     }
                     /* state changed, release and retry */
-                    lru_entry_release(entry, false);
+                    lru_entry_release(entry, 0);
                     goto retry;
                 }
                 /* couldn't acquire, entry is being deleted, retry */
@@ -147,7 +147,7 @@ static size_t lru_find_slot(lru_cache_t *cache)
  * @param cache the cache
  * @return true if an entry was evicted, false otherwise
  */
-static bool lru_evict_one(lru_cache_t *cache)
+static int lru_evict_one(lru_cache_t *cache)
 {
     size_t start_hand = atomic_load_explicit(&cache->clock_hand, memory_order_relaxed);
     size_t hand = start_hand;
@@ -213,9 +213,9 @@ static bool lru_evict_one(lru_cache_t *cache)
                         atomic_store_explicit(&cache->clock_hand, next_hand, memory_order_relaxed);
 
                         /* release entry (will free when ref count hits 0) */
-                        lru_entry_release(entry, true);
+                        lru_entry_release(entry, 1);
 
-                        return true;
+                        return 1;
                     }
                 }
                 else
@@ -234,7 +234,7 @@ static bool lru_evict_one(lru_cache_t *cache)
         }
     }
 
-    return false;
+    return 0;
 }
 
 lru_cache_t *lru_cache_new(size_t capacity)
@@ -308,7 +308,7 @@ int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_ca
         /* bump access count */
         atomic_fetch_add_explicit(&existing->access_count, 1, memory_order_relaxed);
 
-        lru_entry_release(existing, false);
+        lru_entry_release(existing, 0);
         return 1; /* updated */
     }
 
@@ -417,7 +417,7 @@ void *lru_cache_get(lru_cache_t *cache, const char *key)
 
     void *value = atomic_load_explicit(&entry->value, memory_order_acquire);
 
-    lru_entry_release(entry, false);
+    lru_entry_release(entry, 0);
 
     return value;
 }
@@ -442,7 +442,7 @@ void *lru_cache_get_copy(lru_cache_t *cache, const char *key, void *(*copy_fn)(v
         copy = copy_fn(value);
     }
 
-    lru_entry_release(entry, false);
+    lru_entry_release(entry, 0);
 
     return copy;
 }
@@ -462,7 +462,7 @@ int lru_cache_remove(lru_cache_t *cache, const char *key)
                                                  memory_order_acq_rel, memory_order_relaxed))
     {
         /* already being deleted or updated */
-        lru_entry_release(entry, false);
+        lru_entry_release(entry, 0);
         return -1;
     }
 
@@ -505,10 +505,10 @@ int lru_cache_remove(lru_cache_t *cache, const char *key)
     atomic_fetch_sub_explicit(&cache->size, 1, memory_order_relaxed);
 
     /* release our reference (from find) */
-    lru_entry_release(entry, false);
+    lru_entry_release(entry, 0);
 
     /* release the entry's own reference (will call eviction callback) */
-    lru_entry_release(entry, true);
+    lru_entry_release(entry, 1);
 
     return 0;
 }
@@ -622,13 +622,13 @@ size_t lru_cache_foreach(lru_cache_t *cache, lru_foreach_callback_t callback, vo
                         int result = callback(entry->key, value, user_data);
                         count++;
 
-                        lru_entry_release(entry, false);
+                        lru_entry_release(entry, 0);
 
                         if (result != 0) break;
                     }
                     else
                     {
-                        lru_entry_release(entry, false);
+                        lru_entry_release(entry, 0);
                     }
                 }
             }

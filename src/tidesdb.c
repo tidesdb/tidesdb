@@ -261,13 +261,13 @@ static void tidesdb_sstable_free(tidesdb_t *db, tidesdb_sstable_t *sst);
  * @param sstable_id sstable id
  * @param block_type 'k' for klog, 'v' for vlog
  * @param offset block offset
- * @param key_buffer buffer to store the key (must be at least TDB_CACHE_KEY_BUFFER_SIZE bytes)
+ * @param key_buffer buffer to store the key (must be at least TDB_CACHE_KEY_SIZE bytes)
  */
 static void tidesdb_block_cache_key(const char *cf_name, uint64_t sstable_id, char block_type,
                                     uint64_t offset, char *key_buffer)
 {
-    snprintf(key_buffer, TDB_CACHE_KEY_BUFFER_SIZE, "%s:%" PRIu64 ":%c:%" PRIu64, cf_name,
-             sstable_id, block_type, offset);
+    snprintf(key_buffer, TDB_CACHE_KEY_SIZE, "%s:%" PRIu64 ":%c:%" PRIu64, cf_name, sstable_id,
+             block_type, offset);
 }
 
 /**
@@ -313,7 +313,7 @@ static void *tidesdb_block_acquire_copy_fn(void *value)
  * tidesdb_get_cf_name_from_path
  * extracts column family name from sstable path
  * @param path the sstable path (e.g., "/path/to/cf_name/123.klog")
- * @param cf_name_out buffer to store CF name (must be at least TDB_CACHE_KEY_BUFFER_SIZE bytes)
+ * @param cf_name_out buffer to store CF name (must be at least TDB_CACHE_KEY_SIZE bytes)
  * @return 0 on success, -1 on failure
  */
 static int tidesdb_get_cf_name_from_path(const char *path, char *cf_name_out)
@@ -334,7 +334,7 @@ static int tidesdb_get_cf_name_from_path(const char *path, char *cf_name_out)
 
     /* copy the CF name */
     size_t cf_name_len = last_slash - second_last_slash - 1;
-    if (cf_name_len >= TDB_CACHE_KEY_BUFFER_SIZE) cf_name_len = TDB_CACHE_KEY_BUFFER_SIZE - 1;
+    if (cf_name_len >= TDB_CACHE_KEY_SIZE) cf_name_len = TDB_CACHE_KEY_SIZE - 1;
 
     memcpy(cf_name_out, second_last_slash + 1, cf_name_len);
     cf_name_out[cf_name_len] = '\0';
@@ -363,7 +363,7 @@ static block_manager_block_t *tidesdb_cached_block_read(tidesdb_t *db, const cha
     /* check global cache first */
     if (db->block_cache)
     {
-        char cache_key[TDB_CACHE_KEY_BUFFER_SIZE];
+        char cache_key[TDB_CACHE_KEY_SIZE];
         tidesdb_block_cache_key(cf_name, sstable_id, block_type, offset, cache_key);
 
         /* use get_copy with acquire function to atomically get and acquire reference */
@@ -384,7 +384,7 @@ static block_manager_block_t *tidesdb_cached_block_read(tidesdb_t *db, const cha
     /* try to cache the block for future reads */
     if (db->block_cache)
     {
-        char cache_key[TDB_CACHE_KEY_BUFFER_SIZE];
+        char cache_key[TDB_CACHE_KEY_SIZE];
         tidesdb_block_cache_key(cf_name, sstable_id, block_type, offset, cache_key);
 
         /* acquire reference for cache before inserting */
@@ -1697,7 +1697,7 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
     if (!sst) return -1;
 
     /* create cache key from sstable id */
-    char cache_key[TDB_CACHE_KEY_LEN];
+    char cache_key[TDB_CACHE_KEY_SIZE];
     snprintf(cache_key, sizeof(cache_key), TDB_SSTABLE_CACHE_PREFIX "%" PRIu64, sst->id);
 
     /* check if already in cache */
@@ -2477,7 +2477,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     int result = TDB_ERR_NOT_FOUND;
     uint64_t block_num = 0;
 
-    char cf_name[TDB_CACHE_KEY_BUFFER_SIZE];
+    char cf_name[TDB_CACHE_KEY_SIZE];
     if (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) != 0)
     {
         block_manager_cursor_free(klog_cursor);
@@ -2931,7 +2931,7 @@ static int tidesdb_level_remove_sstable(tidesdb_t *db, tidesdb_level_t *level,
             /* remove from cache if present to avoid stale cache entries */
             if (db && db->sstable_cache)
             {
-                char cache_key[TDB_CACHE_KEY_LEN];
+                char cache_key[TDB_CACHE_KEY_SIZE];
                 snprintf(cache_key, sizeof(cache_key), TDB_SSTABLE_CACHE_PREFIX "%" PRIu64,
                          sst->id);
                 lru_cache_remove(db->sstable_cache, cache_key);
@@ -3416,7 +3416,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
         }
 
         /* read first block and first entry */
-        char cf_name[TDB_CACHE_KEY_BUFFER_SIZE];
+        char cf_name[TDB_CACHE_KEY_SIZE];
         if (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) != 0)
         {
             /* failed to extract CF name */
@@ -3636,7 +3636,7 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                     return TDB_ERR_NOT_FOUND;
                 }
 
-                char cf_name[TDB_CACHE_KEY_BUFFER_SIZE];
+                char cf_name[TDB_CACHE_KEY_SIZE];
                 if (tidesdb_get_cf_name_from_path(source->source.sstable.sst->klog_path, cf_name) !=
                     0)
                 {
@@ -3819,7 +3819,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
             /* move to previous block */
             if (block_manager_cursor_prev(source->source.sstable.klog_cursor) == 0)
             {
-                char cf_name[TDB_CACHE_KEY_BUFFER_SIZE];
+                char cf_name[TDB_CACHE_KEY_SIZE];
                 if (tidesdb_get_cf_name_from_path(source->source.sstable.sst->klog_path, cf_name) !=
                     0)
                 {

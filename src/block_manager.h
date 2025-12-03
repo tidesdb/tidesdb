@@ -180,6 +180,21 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 void block_manager_block_free(block_manager_block_t *block);
 
 /**
+ * block_manager_block_acquire
+ * increments reference count for a block
+ * @param block the block to acquire
+ * @return 1 if successful, 0 if block is being freed
+ */
+int block_manager_block_acquire(block_manager_block_t *block);
+
+/**
+ * block_manager_block_release
+ * decrements reference count and frees block when count reaches 0
+ * @param block the block to release
+ */
+void block_manager_block_release(block_manager_block_t *block);
+
+/**
  * block_manager_cursor_init
  * initializes a block manager cursor
  * @param cursor the cursor to initialize

@@ -44,12 +44,13 @@
  * writers don't block writers, concurrent writes to different offsets
  * readers never block, they can read while writes happen
  *
- * CACHE LIFECYCLE *
- * LRU cache stores blocks with atomic reference counting
- * cache returns pointers to blocks, callers must acquire/release
- * eviction callback releases the cache's reference
- * lock-free LRU ensures thread-safe concurrent access
- * blocks are freed when refcount reaches 0
+ * REFERENCE COUNTING *
+ * blocks use atomic reference counting for safe concurrent access
+ * blocks start with ref_count=1 when created
+ * callers must call block_manager_block_release when done
+ * blocks are freed when ref_count reaches 0
+ * block_manager_block_acquire/release provide thread-safe ref management
+ * global block cache in tidesdb.c uses these functions for safe sharing
  */
 
 /**
@@ -158,7 +159,7 @@ static int get_file_size(int fd, uint64_t *size)
  * @return 0 if successful, -1 if not
  */
 static int block_manager_open_internal(block_manager_t **bm, const char *file_path,
-                                       block_manager_sync_mode_t sync_mode, uint32_t cache_size)
+                                       block_manager_sync_mode_t sync_mode)
 {
     block_manager_t *new_bm = malloc(sizeof(block_manager_t));
     if (!new_bm)
@@ -597,26 +598,6 @@ int block_manager_cursor_has_prev(block_manager_cursor_t *cursor)
 }
 
 /**
- * block_acquire_copy_fn
- * copy function for lru_cache_get_copy that acquires a block reference
- * this is called while the LRU entry reference is held, preventing eviction
- * @param value the cached block
- * @return the block if reference acquired, NULL otherwise
- */
-static void *block_acquire_copy_fn(void *value)
-{
-    block_manager_block_t *block = (block_manager_block_t *)value;
-    if (!block) return NULL;
-
-    /* try to acquire reference while LRU entry is protected */
-    if (block_manager_block_acquire(block))
-    {
-        return block;
-    }
-    return NULL;
-}
-
-/**
  * block_manager_read_block_at_offset
  * reads a block at a specific offset, checking cache first
  * @param bm the block manager
@@ -771,7 +752,6 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
     block_manager_t *bm = cursor->bm;
     uint64_t offset = cursor->current_pos;
 
-read_from_disk:; /* C11 compatibility empty statement after label */
     /* read block size */
     unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=
@@ -1407,5 +1387,5 @@ block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode)
 
 int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode)
 {
-    return block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode), 0);
+    return block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode));
 }

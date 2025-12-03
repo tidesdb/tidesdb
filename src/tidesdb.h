@@ -141,7 +141,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_SSTABLE_KLOG_EXT          ".klog" /* extension for sstable key log files */
 #define TDB_SSTABLE_VLOG_EXT          ".vlog" /* extension for sstable value log files */
 #define TDB_SSTABLE_CACHE_PREFIX      "sst_"  /* prefix for sstable cache keys */
-#define TDB_CACHE_KEY_BUFFER_SIZE     256     /* maximum size for cache key strings */
+#define TDB_CACHE_KEY_SIZE            256     /* maximum size for cache key strings */
 
 /* default configuration values */
 #define TDB_DEFAULT_WRITE_BUFFER_SIZE           (64 * 1024 * 1024) /* 64MB */

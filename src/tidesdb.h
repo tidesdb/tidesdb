@@ -587,7 +587,6 @@ struct tidesdb_compaction_work_t
  * @param compaction_threads array of compaction threads
  * @param compaction_queue queue of compaction work items
  * @param compaction_should_stop flag to stop compaction threads
- * @param active_compaction_workers number of workers actively processing
  * @param sstable_cache fifo cache for sstable file handles
  * @param is_open flag to indicate if database is open
  * @param global_txn_seq global sequence counter for multi-cf transactions

@@ -6522,8 +6522,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(*db);
         return TDB_ERR_MEMORY;
     }
-    atomic_init(&(*db)->column_families, cfs);
-    atomic_init(&(*db)->num_column_families, 0);
+    (*db)->column_families = cfs;
+    (*db)->num_column_families = 0;
 
     if (pthread_rwlock_init(&(*db)->cf_list_lock, NULL) != 0)
     {

@@ -2365,6 +2365,8 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
                                size_t key_size, tidesdb_kv_pair_t **kv)
 {
+    TDB_DEBUG_LOG("SSTable %" PRIu64 ": tidesdb_sstable_get called for key", sst->id);
+    
     /* ensure sstable is open through cache */
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
@@ -2372,11 +2374,16 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         return TDB_ERR_IO;
     }
 
+    TDB_DEBUG_LOG("SSTable %" PRIu64 ": ensure_open succeeded", sst->id);
+
     tidesdb_block_managers_t bms;
     if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
     {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": get_block_managers FAILED", sst->id);
         return TDB_ERR_IO;
     }
+
+    TDB_DEBUG_LOG("SSTable %" PRIu64 ": get_block_managers succeeded", sst->id);
 
     if (!sst->min_key || !sst->max_key)
     {

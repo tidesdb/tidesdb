@@ -2427,8 +2427,10 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     if (sst->bloom_filter && !bloom_filter_contains(sst->bloom_filter, key, key_size))
     {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter check FAILED - key not in bloom filter", sst->id);
         return TDB_ERR_NOT_FOUND;
     }
+    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter check passed (or no bloom filter)", sst->id);
 
     /* use block index to find starting klog block */
     int64_t start_block = 0;
@@ -2438,6 +2440,11 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         {
             start_block = 0;
         }
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block index lookup - starting at block %" PRId64, sst->id, start_block);
+    }
+    else
+    {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": No block index, starting at block 0", sst->id);
     }
 
     /* search klog blocks using block manager cursor */

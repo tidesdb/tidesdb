@@ -352,7 +352,6 @@ void fifo_cache_free(fifo_cache_t *cache)
     pthread_mutex_destroy(&cache->lock);
     free(cache->table);
     free(cache);
-    cache = NULL;
 }
 
 void fifo_cache_destroy(fifo_cache_t *cache)
@@ -381,7 +380,6 @@ void fifo_cache_destroy(fifo_cache_t *cache)
     pthread_mutex_destroy(&cache->lock);
     free(cache->table);
     free(cache);
-    cache = NULL;
 }
 
 size_t fifo_cache_size(fifo_cache_t *cache)

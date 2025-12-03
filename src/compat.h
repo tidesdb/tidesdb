@@ -194,8 +194,7 @@ typedef int mode_t;
 #endif
 
 /* ftruncate for windows */
-
-/**
+/*
  * ftruncate
  * @param fd the file descriptor to truncate
  * @param length the new length of the file
@@ -207,8 +206,7 @@ static inline int ftruncate(int fd, off_t length)
 }
 
 /* open for windows */
-
-/**
+/*
  * open
  * @param path the path to open
  * @param flags the flags to use
@@ -221,8 +219,7 @@ static inline int _tidesdb_open_wrapper_3(const char *path, int flags, mode_t mo
 }
 
 /* open for windows */
-
-/**
+/*
  * open
  * @param path the path to open
  * @param flags the flags to use
@@ -247,8 +244,7 @@ typedef volatile LONGLONG atomic_uint64_t;
 
 #ifdef _WIN64
 /* 64-bit atomic store */
-
-/**
+/*
  * atomic_store_explicit
  * @param ptr the pointer to store the value at
  * @param val the value to store
@@ -1145,8 +1141,7 @@ typedef pthread_rwlock_t rwlock_t;
 
 /* atomic compare exchange for pointers (all platforms with C11 atomics) */
 #if !defined(_MSC_VER) || _MSC_VER >= 1930
-
-/**
+/*
  * atomic_compare_exchange_strong_ptr
  * @param ptr pointer to atomic pointer
  * @param expected pointer to expected value
@@ -1160,7 +1155,7 @@ static inline int atomic_compare_exchange_strong_ptr(_Atomic(void *) *ptr, void 
 }
 #endif
 
-/**
+/*
  * get_available_memory
  * gets available system memory in bytes
  * @return available memory in bytes, or 0 on failure
@@ -1201,7 +1196,7 @@ static inline size_t get_available_memory(void)
 #endif
 }
 
-/**
+/*
  * get_total_memory
  * gets total system memory in bytes
  * @return total memory in bytes, or 0 on failure
@@ -1240,7 +1235,7 @@ static inline size_t get_total_memory(void)
 #endif
 }
 
-/**
+/*
  * get_file_mod_time
  * gets the modified time of a file
  * @param path the path of the file
@@ -1260,7 +1255,7 @@ static inline time_t get_file_mod_time(const char *path)
 
 /* cross-platform little-endian serialization functions */
 
-/**
+/*
  * encode_uint32_le_compat
  * encodes a uint32_t value in little-endian format
  * @param buf buffer to store encoded value
@@ -1274,7 +1269,7 @@ static inline void encode_uint32_le_compat(uint8_t *buf, uint32_t val)
     buf[3] = (uint8_t)((val >> 24) & 0xFF);
 }
 
-/**
+/*
  * decode_uint32_le_compat
  * decodes a uint32_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -1286,7 +1281,7 @@ static inline uint32_t decode_uint32_le_compat(const uint8_t *buf)
            ((uint32_t)buf[3] << 24);
 }
 
-/**
+/*
  * encode_uint64_le_compat
  * encodes a uint64_t value in little-endian format
  * @param buf buffer to store encoded value
@@ -1304,7 +1299,7 @@ static inline void encode_uint64_le_compat(uint8_t *buf, uint64_t val)
     buf[7] = (uint8_t)((val >> 56) & 0xFF);
 }
 
-/**
+/*
  * encode_uint32_le
  * encodes a uint32_t value in little-endian format
  * @param buf buffer to store encoded value
@@ -1318,7 +1313,7 @@ static inline void encode_uint32_le(uint8_t *buf, uint32_t val)
     buf[3] = (uint8_t)((val >> 24) & 0xFF);
 }
 
-/**
+/*
  * decode_uint32_le
  * decodes a uint32_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -1330,7 +1325,7 @@ static inline uint32_t decode_uint32_le(const uint8_t *buf)
            ((uint32_t)buf[3] << 24);
 }
 
-/**
+/*
  * encode_int64_le
  * encodes an int64_t value in little-endian format
  * @param buf buffer to store encoded value
@@ -1349,7 +1344,7 @@ static inline void encode_int64_le(uint8_t *buf, int64_t val)
     buf[7] = (uint8_t)((uval >> 56) & 0xFF);
 }
 
-/**
+/*
  * decode_int64_le
  * decodes an int64_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -1363,7 +1358,7 @@ static inline int64_t decode_int64_le(const uint8_t *buf)
     return (int64_t)uval;
 }
 
-/**
+/*
  * encode_uint64_le
  * encodes a uint64_t value in little-endian format
  * @param buf buffer to store encoded value
@@ -1381,7 +1376,7 @@ static inline void encode_uint64_le(uint8_t *buf, uint64_t val)
     buf[7] = (uint8_t)((val >> 56) & 0xFF);
 }
 
-/**
+/*
  * decode_uint64_le
  * decodes a uint64_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -1394,7 +1389,7 @@ static inline uint64_t decode_uint64_le(const uint8_t *buf)
            ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
 }
 
-/**
+/*
  * decode_fixed_32
  * decodes a uint32_t value in little-endian format
  * @param data buffer containing encoded value
@@ -1406,7 +1401,7 @@ static inline uint32_t decode_fixed_32(const char *data)
            ((uint32_t)(uint8_t)data[2] << 16) | ((uint32_t)(uint8_t)data[3] << 24);
 }
 
-/**
+/*
  * decode_uint64_le_compat
  * decodes a uint64_t value in little-endian format
  * @param buf buffer containing encoded value
@@ -1531,7 +1526,7 @@ static inline const uint8_t *decode_varint64(const uint8_t *ptr, uint64_t *value
 
 /* length-prefixed KV serialization helpers */
 
-/**
+/*
  * serialize_kv_varint
  * serialize key-value pair with varint length prefixes
  * format: varint(key_size) + key + varint(value_size) + value
@@ -1561,7 +1556,7 @@ static inline uint8_t *serialize_kv_varint(uint8_t *ptr, const uint8_t *key, uin
     return ptr;
 }
 
-/**
+/*
  * serialize_kv_varint_ex
  * serialize key-value pair with flags and varint length prefixes (for SSTables)
  * format: flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl)
@@ -1600,7 +1595,7 @@ static inline uint8_t *serialize_kv_varint_ex(uint8_t *ptr, uint8_t flags, const
     return ptr;
 }
 
-/**
+/*
  * serialize_kv_varint_full
  * serialize key-value pair with all metadata (for WAL)
  * format: flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl) +
@@ -1642,7 +1637,7 @@ static inline uint8_t *serialize_kv_varint_full(uint8_t *ptr, uint8_t flags, con
     return ptr;
 }
 
-/**
+/*
  * deserialize_kv_varint
  * deserialize key-value pair with varint length prefixes
  * @param ptr input buffer
@@ -1679,7 +1674,7 @@ static inline const uint8_t *deserialize_kv_varint(const uint8_t *ptr, const uin
     return ptr;
 }
 
-/**
+/*
  * deserialize_kv_varint_ex
  * deserialize key-value pair with flags and varint length prefixes (for SSTables)
  * @param ptr input buffer
@@ -1728,7 +1723,7 @@ static inline const uint8_t *deserialize_kv_varint_ex(const uint8_t *ptr, const 
     return ptr;
 }
 
-/**
+/*
  * deserialize_kv_varint_full
  * deserialize key-value pair with all metadata (for WAL)
  * @param ptr input buffer
@@ -1783,7 +1778,7 @@ static inline const uint8_t *deserialize_kv_varint_full(const uint8_t *ptr, cons
     return ptr;
 }
 
-/**
+/*
  * set_file_sequential_hint
  * hints to the OS that file access will be sequential for read-ahead optimization
  * @param fd the file descriptor
@@ -1872,188 +1867,68 @@ static inline int tdb_get_available_disk_space(const char *path, uint64_t *avail
 
 /**
  * remove_directory
- * safely removes a directory and all its contents iteratively
+ * recursively removes a directory and all its contents
  * @param path the directory path to remove
  * @return 0 on success, -1 on failure
  */
 static inline int remove_directory(const char *path)
 {
-    /* simple two-pass approach, first remove all files, then remove directories bottom-up */
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
 
-    /* pass 1 collect all paths (files and directories) */
-    char **paths = NULL;
-    int *is_dir = NULL;
-    int path_count = 0;
-    int path_len = 1024 * 4; /* max path length: 4096 bytes */
-    int path_capacity = 256; /* initial capacity: 256 entries (NOT bytes!) */
+    struct dirent *entry;
+    int result = 0;
 
-    paths = malloc(path_capacity * sizeof(char *));
-    is_dir = malloc(path_capacity * sizeof(int));
-    if (!paths || !is_dir)
+    while ((entry = readdir(dir)) != NULL)
     {
-        free(paths);
-        free(is_dir);
-        return -1;
-    }
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 
-    /* stack for iterative traversal */
-    char **stack = malloc(path_capacity * sizeof(char *));
-    if (!stack)
-    {
-        free(paths);
-        free(is_dir);
-        return -1;
-    }
-
-    int stack_size = 0;
-    int stack_capacity = path_capacity;
-    stack[stack_size++] = tdb_strdup(path);
-
-    /* traverse directory tree iteratively */
-    while (stack_size > 0)
-    {
-        char *current = stack[--stack_size];
-        DIR *dir = opendir(current);
-
-        if (!dir)
+        size_t len = strlen(path) + strlen(PATH_SEPARATOR) + strlen(entry->d_name) + 1;
+        char *full_path = malloc(len);
+        if (!full_path)
         {
-            /* opendir failed - could be a file, or an error
-             * assume it's a file and try to remove it later */
-            if (path_count >= path_capacity)
-            {
-                int new_capacity = path_capacity * 2;
-                char **new_paths = realloc(paths, new_capacity * sizeof(char *));
-                int *new_is_dir = realloc(is_dir, new_capacity * sizeof(int));
-                if (!new_paths || !new_is_dir)
-                {
-                    if (new_paths && new_paths != paths) free(new_paths);
-                    if (new_is_dir && new_is_dir != is_dir) free(new_is_dir);
-                    free(current);
-                    goto cleanup_error;
-                }
-                paths = new_paths;
-                is_dir = new_is_dir;
-                path_capacity = new_capacity;
-            }
-            paths[path_count] = current;
-            is_dir[path_count] = 0;
-            path_count++;
+            result = -1;
             continue;
         }
 
-        /* add directory to list */
-        if (path_count >= path_capacity)
+        snprintf(full_path, len, "%s%s%s", path, PATH_SEPARATOR, entry->d_name);
+
+        struct STAT_STRUCT st;
+        if (STAT_FUNC(full_path, &st) == 0)
         {
-            int new_capacity = path_capacity * 2;
-            char **new_paths = realloc(paths, new_capacity * sizeof(char *));
-            int *new_is_dir = realloc(is_dir, new_capacity * sizeof(int));
-            if (!new_paths || !new_is_dir)
+            if (S_ISDIR(st.st_mode))
             {
-                if (new_paths && new_paths != paths) free(new_paths);
-                if (new_is_dir && new_is_dir != is_dir) free(new_is_dir);
-                closedir(dir);
-                free(current);
-                goto cleanup_error;
+                /* recursive call for subdirectory */
+                if (remove_directory(full_path) != 0) result = -1;
             }
-            paths = new_paths;
-            is_dir = new_is_dir;
-            path_capacity = new_capacity;
+            else
+            {
+#ifdef _WIN32
+                SetFileAttributesA(full_path, FILE_ATTRIBUTE_NORMAL);
+                if (_unlink(full_path) != 0) result = -1;
+#else
+                if (unlink(full_path) != 0) result = -1;
+#endif
+            }
         }
-        paths[path_count] = current;
-        is_dir[path_count] = 1;
-        path_count++;
 
-        /* add children to stack */
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL)
-        {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-
-            char *full_path = malloc(path_len);
-            if (!full_path)
-            {
-                closedir(dir);
-                goto cleanup_error;
-            }
-            snprintf(full_path, path_len, "%s%s%s", current, PATH_SEPARATOR, entry->d_name);
-
-            if (stack_size >= stack_capacity)
-            {
-                int new_stack_capacity = stack_capacity * 2;
-                char **new_stack = realloc(stack, new_stack_capacity * sizeof(char *));
-                if (!new_stack)
-                {
-                    free(full_path);
-                    closedir(dir);
-                    goto cleanup_error;
-                }
-                stack = new_stack;
-                stack_capacity = new_stack_capacity;
-            }
-
-            stack[stack_size++] = full_path;
-        }
-        closedir(dir);
+        free(full_path);
     }
 
-    /* pass 2 remove in reverse order (files first, then directories bottom-up) */
-    int result = 0;
-    for (int i = path_count - 1; i >= 0; i--)
+    closedir(dir);
+
+    /* remove the directory itself */
+#ifdef _WIN32
+    for (int i = 0; i < 3; i++)
     {
-        if (is_dir[i])
-        {
-#ifdef _WIN32
-            /* on win we retry rmdir with exponential backoff for file handle release
-             * windows can take seconds to release handles (antivirus, indexer, etc.) */
-            int retry_delays[] = {50, 100, 200, 500, 1000}; /* exponential backoff in ms */
-            int retry_count = 0;
-            int max_retries = sizeof(retry_delays) / sizeof(retry_delays[0]);
-
-            while (rmdir(paths[i]) != 0 && retry_count < max_retries)
-            {
-                Sleep(retry_delays[retry_count]);
-                retry_count++;
-            }
-            if (retry_count >= max_retries) result = -1;
-#else
-            if (rmdir(paths[i]) != 0) result = -1;
-#endif
-        }
-        else
-        {
-#ifdef _WIN32
-            /* on win remove read-only attribute before unlink, then retry on failure
-             * use exponential backoff -- win can take seconds to release handles */
-            SetFileAttributesA(paths[i], FILE_ATTRIBUTE_NORMAL);
-            int retry_delays[] = {50, 100, 200, 500, 1000}; /* exponential backoff in ms */
-            int retry_count = 0;
-            int max_retries = sizeof(retry_delays) / sizeof(retry_delays[0]);
-
-            while (unlink(paths[i]) != 0 && retry_count < max_retries)
-            {
-                Sleep(retry_delays[retry_count]);
-                retry_count++;
-            }
-            if (retry_count >= max_retries) result = -1;
-#else
-            if (unlink(paths[i]) != 0) result = -1;
-#endif
-        }
-        free(paths[i]);
+        if (_rmdir(path) == 0) return result;
+        Sleep(10);
     }
-
-    free(paths);
-    free(is_dir);
-    free(stack);
-    return result;
-
-cleanup_error:
-    for (int i = 0; i < stack_size; i++) free(stack[i]);
-    for (int i = 0; i < path_count; i++) free(paths[i]);
-    free(paths);
-    free(is_dir);
-    free(stack);
     return -1;
+#else
+    if (rmdir(path) != 0) return -1;
+    return result;
+#endif
 }
 
 #endif /* __COMPAT_H__ */

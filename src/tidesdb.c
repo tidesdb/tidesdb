@@ -2539,7 +2539,7 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
 load_bloom_and_index:
     /* load bloom filter and index from last blocks */
     /* [klog blocks...] [index block] [bloom filter block] [metadata block] */
-
+    ;
     block_manager_cursor_t *cursor;
     if (block_manager_cursor_init(&cursor, klog_bm) != 0)
     {

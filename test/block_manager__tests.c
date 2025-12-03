@@ -23,6 +23,73 @@
 static int tests_passed = 0;
 static int tests_failed = 0;
 
+/* context for cache eviction race test */
+typedef struct
+{
+    block_manager_t *bm;
+    int num_blocks;
+    _Atomic(int) *errors;
+    int thread_id;
+} race_test_ctx_t;
+
+/* thread function for cache eviction race test */
+static void *race_reader_thread(void *arg)
+{
+    race_test_ctx_t *ctx = (race_test_ctx_t *)arg;
+
+    /* each thread creates its own cursor - this matches the benchmark scenario */
+    block_manager_cursor_t *cursor = NULL;
+    if (block_manager_cursor_init(&cursor, ctx->bm) != 0)
+    {
+        atomic_fetch_add(ctx->errors, 1);
+        return NULL;
+    }
+
+    /* each thread reads blocks sequentially, causing cache thrashing */
+    for (int iteration = 0; iteration < 1000; iteration++)
+    {
+        /* reset cursor to beginning */
+        if (block_manager_cursor_goto_first(cursor) != 0)
+        {
+            atomic_fetch_add(ctx->errors, 1);
+            continue;
+        }
+
+        /* read through ALL blocks to maximize cache pressure */
+        for (int b = 0; b < ctx->num_blocks; b++)
+        {
+            block_manager_block_t *block = block_manager_cursor_read(cursor);
+
+            if (!block)
+            {
+                break; /* end of blocks */
+            }
+
+            /* simulate some work with the block */
+            volatile int sum = 0;
+            uint8_t *data = (uint8_t *)block->data;
+            for (size_t i = 0; i < block->size && i < 100; i++)
+            {
+                sum += data[i];
+            }
+
+            /* release the block */
+            block_manager_block_release(block);
+
+            /* move to next block */
+            if (block_manager_cursor_next(cursor) != 0)
+            {
+                break; /* no more blocks */
+            }
+        }
+
+        /* NO delay - maximize race window */
+    }
+
+    block_manager_cursor_free(cursor);
+    return NULL;
+}
+
 void test_block_manager_open()
 {
     block_manager_t *bm = NULL;
@@ -45,7 +112,7 @@ void test_block_manager_block_create()
     ASSERT_EQ(block->size, size);
 
     ASSERT_EQ(memcmp(block->data, data, size), 0);
-    (void)block_manager_block_free(block);
+    (void)block_manager_block_release(block);
 }
 
 void test_block_manager_block_write()
@@ -60,7 +127,7 @@ void test_block_manager_block_write()
 
     ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
 
-    (void)block_manager_block_free(block);
+    (void)block_manager_block_release(block);
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
@@ -79,7 +146,7 @@ void test_block_manager_block_write_close_reopen_read()
 
     ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
 
-    (void)block_manager_block_free(block);
+    (void)block_manager_block_release(block);
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
@@ -118,7 +185,7 @@ void test_block_manager_truncate()
 
     ASSERT_TRUE(block_manager_block_write(bm, block) >= 0);
 
-    (void)block_manager_block_free(block);
+    (void)block_manager_block_release(block);
 
     ASSERT_TRUE(block_manager_truncate(bm) == 0);
 
@@ -162,7 +229,7 @@ void test_block_manager_cursor()
 
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
 
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     /* now we create a cursor */
@@ -278,7 +345,7 @@ void test_block_manager_count_blocks()
         ASSERT_TRUE(block != NULL);
 
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     ASSERT_TRUE(block_manager_count_blocks(bm) == 3);
@@ -302,7 +369,7 @@ void test_block_manager_cursor_goto_first()
         ASSERT_TRUE(block != NULL);
 
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     block_manager_cursor_t *cursor;
@@ -339,7 +406,7 @@ void test_block_manager_cursor_goto_last()
         ASSERT_TRUE(block != NULL);
 
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     block_manager_cursor_t *cursor;
@@ -377,7 +444,7 @@ void test_block_manager_cursor_has_next()
         ASSERT_TRUE(block != NULL);
 
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     block_manager_cursor_t *cursor;
@@ -416,7 +483,7 @@ void test_block_manager_cursor_has_prev()
         ASSERT_TRUE(block != NULL);
 
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     block_manager_cursor_t *cursor;
@@ -455,7 +522,7 @@ void test_block_manager_cursor_position_checks()
         ASSERT_TRUE(block != NULL);
 
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     block_manager_cursor_t *cursor;
@@ -508,7 +575,7 @@ void test_block_manager_get_size()
         ASSERT_TRUE(block != NULL);
 
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     uint64_t after_write_size;
@@ -544,7 +611,7 @@ void test_block_manager_seek_and_goto()
         /* we save the offset for each block */
         block_offsets[i] = block_manager_block_write(bm, block);
         ASSERT_TRUE(block_offsets[i] >= 0);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     /* we test block_manager_cursor_goto with block_offsets */
@@ -617,7 +684,7 @@ void *writer_thread(void *arg)
 
         printf("Writer %d wrote block %d: %s\n", thread_id, i, data);
 
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
 
         usleep((unsigned int)(rand() % 10000)); /* NOLINT(cert-msc30-c,cert-msc50-cpp) */
     }
@@ -790,7 +857,7 @@ void test_block_manager_validate_last_block()
         ASSERT_TRUE(block != NULL);
 
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     ASSERT_TRUE(block_manager_close(bm) == 0);
@@ -885,7 +952,7 @@ void test_block_manager_validation_edge_cases()
         if (block != NULL)
         {
             block_manager_block_write(bm, block);
-            (void)block_manager_block_free(block);
+            (void)block_manager_block_release(block);
         }
 
         ASSERT_TRUE(block_manager_close(bm) == 0);
@@ -965,7 +1032,7 @@ void benchmark_block_manager()
         block_offsets[i] = block_manager_block_write(bm, block);
         ASSERT_NE(block_offsets[i], -1);
 
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     clock_t end_write = clock();
@@ -1108,7 +1175,7 @@ void benchmark_block_manager()
     (void)remove("benchmark.db");
 }
 
-void test_block_manager_fifo_cache()
+void test_block_manager_lru_cache()
 {
     block_manager_t *bm = NULL;
 
@@ -1116,7 +1183,7 @@ void test_block_manager_fifo_cache()
         block_manager_open_with_cache(&bm, "cache_test.db", BLOCK_MANAGER_SYNC_NONE, 1024) == 0);
     ASSERT_TRUE(bm != NULL);
     ASSERT_TRUE(bm->block_manager_cache != NULL);
-    ASSERT_TRUE(bm->block_manager_cache->fifo_cache != NULL);
+    ASSERT_TRUE(bm->block_manager_cache->lru_cache != NULL);
     ASSERT_EQ(bm->block_manager_cache->max_size, 1024);
     ASSERT_EQ(bm->block_manager_cache->current_size, 0);
 
@@ -1143,7 +1210,7 @@ void test_block_manager_fifo_cache()
         printf("Wrote block %d at offset %ld, cache size: %u\n", i, block_offsets[i],
                bm->block_manager_cache->current_size);
 
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     /* cache should have some blocks but not all (due to size limit) */
@@ -1220,7 +1287,7 @@ void test_block_manager_fifo_cache()
 
     long offset = block_manager_block_write(bm, block);
     ASSERT_NE(offset, -1);
-    (void)block_manager_block_free(block);
+    (void)block_manager_block_release(block);
 
     ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
     ASSERT_TRUE(block_manager_cursor_goto(cursor, (uint64_t)offset) == 0);
@@ -1236,7 +1303,7 @@ void test_block_manager_fifo_cache()
     (void)remove("cache_test.db");
 }
 
-void test_block_manager_fifo_cache_edge_cases()
+void test_block_manager_lru_cache_edge_cases()
 {
     block_manager_t *bm = NULL;
 
@@ -1255,7 +1322,7 @@ void test_block_manager_fifo_cache_edge_cases()
 
     long offset = block_manager_block_write(bm, block);
     ASSERT_NE(offset, -1);
-    (void)block_manager_block_free(block);
+    (void)block_manager_block_release(block);
 
     block_manager_cursor_t *cursor;
     ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
@@ -1287,7 +1354,7 @@ void test_block_manager_fifo_cache_edge_cases()
 
     offset = block_manager_block_write(bm, block);
     ASSERT_NE(offset, -1);
-    (void)block_manager_block_free(block);
+    (void)block_manager_block_release(block);
 
     /* cache should remain empty since block is too large */
     ASSERT_EQ(bm->block_manager_cache->current_size, 0);
@@ -1306,7 +1373,7 @@ void test_block_manager_fifo_cache_edge_cases()
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("edge_test.db");
 
-    /*cache eviction behavior (fifo) */
+    /*cache eviction behavior (lru) */
     printf("Test 3: Cache eviction behavior\n");
     ASSERT_TRUE(block_manager_open_with_cache(&bm, "edge_test.db", BLOCK_MANAGER_SYNC_NONE, 250) ==
                 0);
@@ -1326,7 +1393,7 @@ void test_block_manager_fifo_cache_edge_cases()
 
         block_offsets[i] = block_manager_block_write(bm, block);
         ASSERT_NE(block_offsets[i], -1);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
 
         printf("Wrote eviction test block %d, cache size: %u\n", i,
                bm->block_manager_cache->current_size);
@@ -1373,7 +1440,7 @@ void test_block_manager_fifo_cache_edge_cases()
 
     (void)block_manager_cursor_free(cursor);
 
-    /* test fifo behavior with sync modes */
+    /* test lru behavior with sync modes */
     printf("Test 5: Cache with different sync modes\n");
     ASSERT_TRUE(block_manager_close(bm) == 0);
     (void)remove("edge_test.db");
@@ -1390,7 +1457,7 @@ void test_block_manager_fifo_cache_edge_cases()
 
     offset = block_manager_block_write(bm, block);
     ASSERT_NE(offset, -1);
-    (void)block_manager_block_free(block);
+    (void)block_manager_block_release(block);
 
     /* cache should work with sync mode */
     ASSERT_TRUE(bm->block_manager_cache->current_size > 0);
@@ -1429,7 +1496,7 @@ void test_block_manager_cache_concurrent()
 
         initial_offsets[i] = block_manager_block_write(bm, block);
         ASSERT_NE(initial_offsets[i], -1);
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
     }
 
     printf("Initial cache size: %u / %u\n", bm->block_manager_cache->current_size,
@@ -1493,7 +1560,7 @@ void test_block_manager_cache_concurrent()
 
         long new_offset = block_manager_block_write(bm, new_block);
         ASSERT_NE(new_offset, -1);
-        (void)block_manager_block_free(new_block);
+        (void)block_manager_block_release(new_block);
 
         printf("Wrote new block %d while reading, cache size: %u\n", i,
                bm->block_manager_cache->current_size);
@@ -1662,7 +1729,7 @@ void benchmark_block_manager_with_cache()
         block_offsets[i] = block_manager_block_write(bm, block);
         ASSERT_NE(block_offsets[i], -1);
 
-        (void)block_manager_block_free(block);
+        (void)block_manager_block_release(block);
 
         if (i % 10000 == 0 && i > 0)
         {
@@ -1879,7 +1946,7 @@ void *parallel_write_worker(void *arg)
         if (block)
         {
             block_manager_block_write(ctx->bm, block);
-            block_manager_block_free(block);
+            block_manager_block_release(block);
         }
     }
 
@@ -1900,7 +1967,7 @@ void test_block_manager_sync_modes()
     int64_t offset = block_manager_block_write(bm_none, block);
     ASSERT_TRUE(offset != -1);
 
-    block_manager_block_free(block);
+    block_manager_block_release(block);
     block_manager_close(bm_none);
     remove("test_sync_none.db");
 
@@ -1913,7 +1980,7 @@ void test_block_manager_sync_modes()
     offset = block_manager_block_write(bm_full, block);
     ASSERT_TRUE(offset != -1);
 
-    block_manager_block_free(block);
+    block_manager_block_release(block);
     block_manager_close(bm_full);
     remove("test_sync_full.db");
 }
@@ -1943,10 +2010,10 @@ void test_block_manager_overflow_blocks()
     ASSERT_EQ(read_block->size, large_size);
     ASSERT_EQ(memcmp(read_block->data, large_data, large_size), 0);
 
-    block_manager_block_free(read_block);
+    block_manager_block_release(read_block);
     block_manager_cursor_free(cursor);
     free(large_data);
-    block_manager_block_free(block);
+    block_manager_block_release(block);
     block_manager_close(bm);
     remove("test_overflow.db");
 }
@@ -1971,14 +2038,14 @@ void test_block_manager_empty_block()
                 if (read_block != NULL)
                 {
                     ASSERT_EQ(read_block->size, 0);
-                    block_manager_block_free(read_block);
+                    block_manager_block_release(read_block);
                 }
             }
             block_manager_cursor_free(cursor);
         }
     }
 
-    block_manager_block_free(block);
+    block_manager_block_release(block);
     block_manager_close(bm);
     remove("test_empty.db");
 }
@@ -2052,6 +2119,73 @@ void benchmark_block_manager_parallel_write(void)
     (void)remove("test_parallel.db");
 }
 
+/**
+ * test_block_manager_cache_eviction_race
+ * reproduces the race condition where a block is evicted from cache
+ * while another thread is trying to acquire a reference to it
+ */
+void test_block_manager_cache_eviction_race()
+{
+    block_manager_t *bm = NULL;
+
+    /* create block manager with small cache to force evictions */
+    ASSERT_TRUE(block_manager_open(&bm, "test_eviction_race.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* set up a VERY small cache to force constant evictions */
+    block_manager_cache_t *cache = malloc(sizeof(block_manager_cache_t));
+    cache->max_size = 2 * 1024; /* 2KB cache - very small! */
+    cache->current_size = 0;
+    cache->lru_cache = lru_cache_new(2); /* only 2 slots! */
+    bm->block_manager_cache = cache;
+
+    /* write several blocks (more than cache can hold) */
+    const int num_blocks = 10;
+
+    for (int i = 0; i < num_blocks; i++)
+    {
+        char data[1024];
+        snprintf(data, sizeof(data), "Block %d data", i);
+
+        block_manager_block_t *block = block_manager_block_create(1024, (uint8_t *)data);
+        ASSERT_TRUE(block != NULL);
+
+        int64_t offset = block_manager_block_write(bm, block);
+        ASSERT_TRUE(offset >= 0);
+
+        block_manager_block_release(block);
+    }
+
+    _Atomic(int) errors = 0;
+
+    /* create multiple threads to trigger the race - each with its own cursor */
+    const int num_threads = 8;
+    pthread_t threads[8];
+    race_test_ctx_t contexts[8];
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        contexts[i].bm = bm;
+        contexts[i].num_blocks = num_blocks;
+        contexts[i].errors = &errors;
+        contexts[i].thread_id = i;
+
+        pthread_create(&threads[i], NULL, race_reader_thread, &contexts[i]);
+    }
+
+    /* wait for all threads */
+    for (int i = 0; i < num_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    /* if we get here without ASAN errors, the race is fixed */
+    printf("  Cache eviction race test completed with %d errors\n", atomic_load(&errors));
+    ASSERT_EQ(atomic_load(&errors), 0);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove("test_eviction_race.db");
+}
+
 int main(void)
 {
     RUN_TEST(test_block_manager_open, tests_passed);
@@ -2071,8 +2205,8 @@ int main(void)
     RUN_TEST(test_block_manager_cursor_goto_last, tests_passed);
     RUN_TEST(test_block_manager_seek_and_goto, tests_passed);
     RUN_TEST(test_block_manager_validation_edge_cases, tests_passed);
-    RUN_TEST(test_block_manager_fifo_cache, tests_passed);
-    RUN_TEST(test_block_manager_fifo_cache_edge_cases, tests_passed);
+    RUN_TEST(test_block_manager_lru_cache, tests_passed);
+    RUN_TEST(test_block_manager_lru_cache_edge_cases, tests_passed);
     RUN_TEST(test_block_manager_cache_concurrent, tests_passed);
     RUN_TEST(test_block_manager_cache_concurrent, tests_passed);
     RUN_TEST(test_block_manager_cache_race_stress, tests_passed);
@@ -2080,6 +2214,7 @@ int main(void)
     RUN_TEST(test_block_manager_sync_modes, tests_passed);
     RUN_TEST(test_block_manager_overflow_blocks, tests_passed);
     RUN_TEST(test_block_manager_empty_block, tests_passed);
+    RUN_TEST(test_block_manager_cache_eviction_race, tests_passed);
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);

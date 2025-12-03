@@ -23,8 +23,8 @@
 #include "bloom_filter.h"
 #include "buffer.h"
 #include "compress.h"
-#include "fifo.h"
 #include "ini.h"
+#include "lru.h"
 #include "queue.h"
 #include "skip_list.h"
 #include "succinct_trie.h"
@@ -247,7 +247,7 @@ typedef struct
  * @param num_flush_threads number of flush threads
  * @param num_compaction_threads number of compaction threads
  * @param enable_debug_logging enable debug logging
- * @param max_open_sstables maximum number of open sstables (FIFO cache)
+ * @param max_open_sstables maximum number of open sstables (LRU cache)
  */
 typedef struct
 {
@@ -554,7 +554,7 @@ struct tidesdb_compaction_work_t
  * @param flush_queue queue of flush work items
  * @param compaction_threads array of compaction threads
  * @param compaction_queue queue of compaction work items
- * @param sstable_cache fifo cache for sstable file handles
+ * @param sstable_cache lru cache for sstable file handles
  * @param is_open flag to indicate if database is open
  * @param global_txn_seq global sequence counter for multi-cf transactions
  * @param next_txn_id global transaction id counter
@@ -577,7 +577,7 @@ struct tidesdb_t
     queue_t *flush_queue;
     pthread_t *compaction_threads;
     queue_t *compaction_queue;
-    fifo_cache_t *sstable_cache;
+    lru_cache_t *sstable_cache;
     _Atomic(int) is_open;
     _Atomic(uint64_t) global_txn_seq;
     _Atomic(uint64_t) next_txn_id;

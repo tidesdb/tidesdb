@@ -18,6 +18,7 @@
  */
 #include "block_manager.h"
 
+#include "lru.h"
 #include "xxhash.h"
 
 /**
@@ -42,26 +43,35 @@
  * atomic offset allocation for lock-free writes
  * writers don't block writers, concurrent writes to different offsets
  * readers never block, they can read while writes happen
+ *
+ * CACHE LIFECYCLE *
+ * LRU cache stores blocks with atomic reference counting
+ * cache returns pointers to blocks, callers must acquire/release
+ * eviction callback releases the cache's reference
+ * lock-free LRU ensures thread-safe concurrent access
+ * blocks are freed when refcount reaches 0
  */
 
 /**
  * cached_block_evict_callback
- * callback function called when a cached block is evicted from fifo cache
- * @param key the cache key (block offset as string)
+ * called when a block is evicted from LRU cache
+ * releases the cache's reference to the block
+ * @param key the cache key
  * @param value the cached block
  * @param user_data the block manager cache structure
  */
 static void cached_block_evict_callback(const char *key, void *value, void *user_data)
 {
     (void)key;
-    block_manager_block_t *block = (block_manager_block_t *)value;
     block_manager_cache_t *cache = (block_manager_cache_t *)user_data;
+    block_manager_block_t *block = (block_manager_block_t *)value;
 
     if (block && cache)
     {
-        cache->current_size -= (uint32_t)block->size;
-
+        /* read size before releasing, as release might free the block */
+        uint32_t block_size = (uint32_t)block->size;
         block_manager_block_release(block);
+        cache->current_size -= block_size;
     }
 }
 
@@ -281,8 +291,8 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         size_t max_entries = cache_size / new_bm->block_size;
         if (max_entries < MIN_CACHE_ENTRIES) max_entries = MIN_CACHE_ENTRIES;
 
-        new_bm->block_manager_cache->fifo_cache = fifo_cache_new(max_entries);
-        if (!new_bm->block_manager_cache->fifo_cache)
+        new_bm->block_manager_cache->lru_cache = lru_cache_new(max_entries);
+        if (!new_bm->block_manager_cache->lru_cache)
         {
             free(new_bm->block_manager_cache);
             close(new_bm->fd);
@@ -307,9 +317,9 @@ int block_manager_close(block_manager_t *bm)
 
     if (bm->block_manager_cache)
     {
-        if (bm->block_manager_cache->fifo_cache)
+        if (bm->block_manager_cache->lru_cache)
         {
-            fifo_cache_free(bm->block_manager_cache->fifo_cache);
+            lru_cache_free(bm->block_manager_cache->lru_cache);
         }
         free(bm->block_manager_cache);
     }
@@ -326,6 +336,7 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
     if (!block) return NULL;
 
     block->size = size;
+    atomic_init(&block->ref_count, 1);
 
     block->data = malloc(size);
     if (!block->data)
@@ -340,7 +351,6 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
     {
         memcpy(block->data, data, size);
     }
-    atomic_store(&block->ref_count, 1);
     return block;
 }
 
@@ -351,7 +361,7 @@ block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, voi
 
     block->size = size;
     block->data = data;
-    atomic_store(&block->ref_count, 1);
+    atomic_init(&block->ref_count, 1);
     return block;
 }
 
@@ -504,7 +514,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
         }
     }
 
-    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
     {
         if (bm->block_manager_cache->current_size + block->size <=
             bm->block_manager_cache->max_size)
@@ -516,13 +526,22 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
                 char cache_key[BLOCK_MANAGER_CACHE_KEY_SIZE];
                 block_offset_to_key(offset, cache_key);
 
-                if (fifo_cache_put(bm->block_manager_cache->fifo_cache, cache_key, cached_block,
-                                   cached_block_evict_callback, bm->block_manager_cache) == 0)
+                int put_result =
+                    lru_cache_put(bm->block_manager_cache->lru_cache, cache_key, cached_block,
+                                  cached_block_evict_callback, bm->block_manager_cache);
+                if (put_result == 0)
                 {
+                    /* new insertion */
+                    bm->block_manager_cache->current_size += (uint32_t)block->size;
+                }
+                else if (put_result == 1)
+                {
+                    /* updated existing - old size was decremented in eviction callback */
                     bm->block_manager_cache->current_size += (uint32_t)block->size;
                 }
                 else
                 {
+                    /* insertion failed */
                     block_manager_block_release(cached_block);
                 }
             }
@@ -540,32 +559,28 @@ void block_manager_block_free(block_manager_block_t *block)
     free(block);
 }
 
-int block_manager_block_acquire(block_manager_block_t *block)
+bool block_manager_block_acquire(block_manager_block_t *block)
 {
-    if (!block) return 0;
+    if (!block) return false;
 
-    /* atomically increment ref_count only if it's positive */
-    int old_count = atomic_load(&block->ref_count);
-    while (old_count > 0)
+    uint32_t old_ref = atomic_load_explicit(&block->ref_count, memory_order_relaxed);
+    do
     {
-        if (atomic_compare_exchange_weak(&block->ref_count, &old_count, old_count + 1))
-        {
-            return 1; /* successfully acquired */
-        }
-        /* CAS failed, old_count was updated, retry */
-    }
-    return 0; /* block is being freed (ref_count <= 0) */
+        if (old_ref == 0) return false; /* block is being freed */
+    } while (!atomic_compare_exchange_weak_explicit(&block->ref_count, &old_ref, old_ref + 1,
+                                                    memory_order_acquire, memory_order_relaxed));
+    return true;
 }
 
 void block_manager_block_release(block_manager_block_t *block)
 {
     if (!block) return;
 
-    int old_count = atomic_fetch_sub(&block->ref_count, 1);
-    int new_count = old_count - 1;
-
-    if (new_count == 0)
+    uint32_t old_ref = atomic_fetch_sub_explicit(&block->ref_count, 1, memory_order_release);
+    if (old_ref == 1)
     {
+        /* we were the last reference, free the block */
+        atomic_thread_fence(memory_order_acquire);
         block_manager_block_free(block);
     }
 }
@@ -700,23 +715,23 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 {
     if (!bm) return NULL;
 
-    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
+    /* check cache first */
+    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
     {
         char cache_key[32];
         block_offset_to_key((int64_t)offset, cache_key);
 
         block_manager_block_t *cached_block =
-            (block_manager_block_t *)fifo_cache_get(bm->block_manager_cache->fifo_cache, cache_key);
+            (block_manager_block_t *)lru_cache_get(bm->block_manager_cache->lru_cache, cache_key);
 
         if (cached_block)
         {
-            /* atomically acquire reference -- safe even during concurrent eviction
-             * block won't be freed until ref_count reaches 0 */
+            /* try to acquire reference while block is still in cache */
             if (block_manager_block_acquire(cached_block))
             {
                 return cached_block;
             }
-            /* block is being freed (ref_count was 0), fall through to disk read */
+            /* block is being freed, fall through to disk read */
         }
     }
 
@@ -744,7 +759,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     if (!block) return NULL;
 
     block->size = block_size;
-    atomic_store(&block->ref_count, 1);
+    atomic_init(&block->ref_count, 1); /* initial reference for caller */
     block->data = malloc(block_size);
     if (!block->data)
     {
@@ -844,8 +859,8 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         return NULL;
     }
 
-    /* cache the block if caching is enabled and we have space */
-    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
+    /* try to cache the block */
+    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
     {
         if (bm->block_manager_cache->current_size + block->size <=
             bm->block_manager_cache->max_size)
@@ -853,21 +868,32 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
             char cache_key[32];
             block_offset_to_key((int64_t)offset, cache_key);
 
-            /* cache takes ownership of the block (ref_count=1 from creation)
-             * acquire an additional reference for the caller */
-            if (fifo_cache_put(bm->block_manager_cache->fifo_cache, cache_key, block,
-                               cached_block_evict_callback, bm->block_manager_cache) == 0)
+            /* acquire reference for cache before inserting */
+            if (block_manager_block_acquire(block))
             {
-                bm->block_manager_cache->current_size += (uint32_t)block->size;
-                /* acquire reference for caller, cache holds the original ref_count=1 */
-                block_manager_block_acquire(block);
-                return block;
+                int put_result =
+                    lru_cache_put(bm->block_manager_cache->lru_cache, cache_key, block,
+                                  cached_block_evict_callback, bm->block_manager_cache);
+                if (put_result == 0)
+                {
+                    /* new insertion */
+                    bm->block_manager_cache->current_size += (uint32_t)block->size;
+                }
+                else if (put_result == 1)
+                {
+                    /* updated existing - old size was decremented in eviction callback */
+                    bm->block_manager_cache->current_size += (uint32_t)block->size;
+                }
+                else
+                {
+                    /* insertion failed, release the extra reference */
+                    block_manager_block_release(block);
+                }
             }
-            /* cache insertion failed, return block with original ref_count=1 */
         }
     }
 
-    /* not cached, return block with ref_count=1 */
+    /* return block to caller (caller has initial reference) */
     return block;
 }
 
@@ -888,19 +914,20 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
     uint64_t offset = cursor->current_pos;
 
     /* check cache first */
-    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
     {
         char cache_key[32];
         block_offset_to_key((int64_t)offset, cache_key);
 
         block_manager_block_t *cached_block =
-            (block_manager_block_t *)fifo_cache_get(bm->block_manager_cache->fifo_cache, cache_key);
+            (block_manager_block_t *)lru_cache_get(bm->block_manager_cache->lru_cache, cache_key);
 
         if (cached_block)
         {
-            /* if cached block is smaller than max_bytes, return full block (zero-copy) */
+            /* cache hit */
             if (cached_block->size <= max_bytes)
             {
+                /* full block fits, try to acquire and return it */
                 if (block_manager_block_acquire(cached_block))
                 {
                     return cached_block;
@@ -909,21 +936,23 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
             }
             else
             {
-                /* need partial copy for large cached blocks
-                 * must acquire reference first to prevent eviction during memcpy */
+                /* need partial block - must acquire reference before copying */
                 if (!block_manager_block_acquire(cached_block))
                 {
                     /* block is being freed, fall through to disk read */
                     goto read_from_disk;
                 }
 
+                /* create new block with partial data */
                 block_manager_block_t *partial = malloc(sizeof(block_manager_block_t));
                 if (!partial)
                 {
                     block_manager_block_release(cached_block);
                     return NULL;
                 }
+
                 partial->size = max_bytes;
+                atomic_init(&partial->ref_count, 1);
                 partial->data = malloc(max_bytes);
                 if (!partial->data)
                 {
@@ -931,11 +960,13 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
                     block_manager_block_release(cached_block);
                     return NULL;
                 }
-                memcpy(partial->data, cached_block->data, max_bytes);
-                atomic_store(&partial->ref_count, 1);
 
-                /* release cached block after copy */
+                /* safe to copy now that we hold a reference */
+                memcpy(partial->data, cached_block->data, max_bytes);
+
+                /* release our reference to the cached block */
                 block_manager_block_release(cached_block);
+
                 return partial;
             }
         }
@@ -969,6 +1000,7 @@ read_from_disk:; /* C11 compatibility empty statement after label */
     if (!block) return NULL;
 
     block->size = max_bytes;
+    atomic_init(&block->ref_count, 1);
     block->data = malloc(max_bytes);
     if (!block->data)
     {
@@ -1227,9 +1259,9 @@ int block_manager_truncate(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    if (bm->block_manager_cache && bm->block_manager_cache->fifo_cache)
+    if (bm->block_manager_cache && bm->block_manager_cache->lru_cache)
     {
-        fifo_cache_clear(bm->block_manager_cache->fifo_cache);
+        lru_cache_clear(bm->block_manager_cache->lru_cache);
         bm->block_manager_cache->current_size = 0;
     }
 

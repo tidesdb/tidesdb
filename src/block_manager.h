@@ -19,7 +19,7 @@
 #ifndef __BLOCK_MANAGER_H__
 #define __BLOCK_MANAGER_H__
 #include "compat.h"
-#include "fifo.h"
+#include "lru.h"
 
 /* max file path length for block manager file(s) */
 #define MAX_FILE_PATH_LENGTH 1024 * 4
@@ -77,13 +77,13 @@ typedef enum
  * used for block manager caching
  * @param max_size max size of cache in bytes
  * @param current_size current size of cache in bytes
- * @param fifo_cache utilized for hot block caching
+ * @param lru_cache utilized for hot block caching
  */
 typedef struct
 {
+    lru_cache_t *lru_cache;
     uint32_t max_size;
     uint32_t current_size;
-    fifo_cache_t *fifo_cache;
 } block_manager_cache_t;
 
 /**
@@ -115,13 +115,13 @@ typedef struct
  * used for blocks in TidesDB
  * @param size the size of the data in the block
  * @param data the data in the block
- * @param ref_count reference count for zero-copy caching (atomic)
+ * @param ref_count atomic reference count for safe concurrent access
  */
 typedef struct
 {
     uint64_t size;
     void *data;
-    _Atomic(int) ref_count;
+    _Atomic(uint32_t) ref_count;
 } block_manager_block_t;
 
 /**
@@ -210,7 +210,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
 /**
  * block_manager_block_free
- * frees a block (use this for non-cached blocks)
+ * frees a block
  * @param block the block to free
  */
 void block_manager_block_free(block_manager_block_t *block);
@@ -219,9 +219,9 @@ void block_manager_block_free(block_manager_block_t *block);
  * block_manager_block_acquire
  * increments reference count for a cached block
  * @param block the block to acquire
- * @return 1 if successful, 0 if block is being freed
+ * @return true if successful, false if block is being freed
  */
-int block_manager_block_acquire(block_manager_block_t *block);
+bool block_manager_block_acquire(block_manager_block_t *block);
 
 /**
  * block_manager_block_release

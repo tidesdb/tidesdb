@@ -2387,8 +2387,11 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     if (!sst->min_key || !sst->max_key)
     {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": min_key=%p, max_key=%p - returning NOT_FOUND", sst->id, (void*)sst->min_key, (void*)sst->max_key);
         return TDB_ERR_NOT_FOUND;
     }
+
+    TDB_DEBUG_LOG("SSTable %" PRIu64 ": min_key and max_key are valid, checking range", sst->id);
 
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
@@ -2663,6 +2666,8 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
                 if (sstable_metadata_deserialize(metadata_block->data, metadata_block->size, sst) ==
                     0)
                 {
+                    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Metadata deserialized - min_key=%p, max_key=%p, num_entries=%" PRIu64, 
+                                  sst->id, (void*)sst->min_key, (void*)sst->max_key, sst->num_entries);
                     block_manager_block_release(metadata_block);
                     block_manager_cursor_free(metadata_cursor);
 

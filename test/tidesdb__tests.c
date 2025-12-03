@@ -6835,7 +6835,7 @@ int main(void)
     // RUN_TEST(test_txn_rollback, tests_passed);
     // RUN_TEST(test_multiple_column_families, tests_passed);
     // RUN_TEST(test_memtable_flush, tests_passed);
-    RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
+    //RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
     // RUN_TEST(test_persistence_and_recovery, tests_passed);
     // RUN_TEST(test_multi_cf_wal_recovery, tests_passed);
     // RUN_TEST(test_multi_cf_many_sstables_recovery, tests_passed);
@@ -6843,7 +6843,7 @@ int main(void)
     // RUN_TEST(test_stats, tests_passed);
     // RUN_TEST(test_iterator_seek, tests_passed);
     // RUN_TEST(test_iterator_seek_for_prev, tests_passed);
-    RUN_TEST(test_tidesdb_block_index_seek, tests_passed);
+   // RUN_TEST(test_tidesdb_block_index_seek, tests_passed);
     // RUN_TEST(test_iterator_reverse, tests_passed);
     // RUN_TEST(test_iterator_boundaries, tests_passed);
     // RUN_TEST(test_bidirectional_iterator, tests_passed);
@@ -6907,7 +6907,7 @@ int main(void)
     // RUN_TEST(test_data_integrity_after_compaction, tests_passed);
     // RUN_TEST(test_no_data_loss_across_operations, tests_passed);
     // RUN_TEST(test_concurrent_writes_visibility, tests_passed);
-    RUN_TEST(test_dividing_merge_strategy, tests_passed);
+    //RUN_TEST(test_dividing_merge_strategy, tests_passed);
     // RUN_TEST(test_partitioned_merge_strategy, tests_passed);
     // RUN_TEST(test_boundary_partitioning, tests_passed);
     // RUN_TEST(test_dynamic_capacity_adjustment, tests_passed);

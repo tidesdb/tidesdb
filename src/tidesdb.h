@@ -156,10 +156,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_VALUE_THRESHOLD             1024        /* values >= 1KB go to vlog */
 #define TDB_DEFAULT_INDEX_SAMPLE_RATIO          16          /* sample every 16th key for index */
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024) /* 100MB minimum free space */
-#define TDB_DEFAULT_MAX_IMMUTABLE_MEMTABLES     8   /* soft limit -- start slowing writes */
-#define TDB_DEFAULT_WRITE_STALL_THRESHOLD       32  /* hard limit -- block writes completely */
-#define TDB_DEFAULT_MAX_OPEN_SSTABLES           512 /* max open sstables globally */
-#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      1024 * 64 /* max concurrent txns per cf */
+#define TDB_DEFAULT_MAX_OPEN_SSTABLES           512                 /* max open sstables globally */
+#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      1024 * 64           /* max concurrent txns per cf */
 
 #define TDB_MAX_TXN_CFS         10000  /* maximum number of cfs per transaction */
 #define TDB_MAX_PATH_LEN        4096   /* maximum path length */
@@ -167,20 +165,6 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_MAX_CF_NAME_LEN     256    /* maximum column family name length */
 #define TDB_MAX_COMPARATOR_NAME 64     /* maximum comparator name length */
 #define TDB_MAX_COMPARATOR_CTX  256    /* maximum comparator context string length */
-#define TDB_ENSURE_OPEN_SSTABLE_WAIT_US \
-    1024 /* microseconds to sleep when spinning on sstable open */
-#define TDB_ENSURE_OPEN_SSTABLE_WAIT_COUNT                \
-    128 /* spin count before sleeping during sstable open \
-         */
-#define TDB_WRITE_STALL_BACKOFF_US \
-    100000 /* microseconds to sleep during hard write stall (100ms) */
-#define TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS                       \
-    500 /* maximum sleep time for write slowdown backpressure \
-         */
-#define TDB_WRITE_SLOWDOWN_EXPO             10 /* milliseconds per extra sstable in exponential backoff */
-#define TDB_L0_COMPACTION_TRIGGER           4  /* l0 sstable count that triggers compaction */
-#define TDB_L0_SLOWDOWN_THRESHOLD           8  /* l0 sstable count that triggers write throttling */
-#define TDB_IMMUTABLE_QUEUE_SLOWDOWN_FACTOR 50 /* milliseconds per extra immutable memtable */
 #define TDB_TXN_SPIN_COUNT \
     1000 /* spin iterations before yielding in transaction conflict resolution */
 
@@ -213,8 +197,6 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param skip_list_probability skip list probability
  * @param default_isolation_level default isolation level
  * @param min_disk_space minimum free disk space required (bytes)
- * @param max_immutable_memtables soft limit for immutable memtables (triggers slowdown)
- * @param write_stall_threshold hard limit for immutable memtables (blocks writes)
  */
 typedef struct
 {
@@ -240,8 +222,6 @@ typedef struct
     float skip_list_probability;
     tidesdb_isolation_level_t default_isolation_level;
     uint64_t min_disk_space;
-    int max_immutable_memtables;
-    int write_stall_threshold;
 } tidesdb_column_family_config_t;
 
 /**
@@ -392,7 +372,6 @@ typedef struct
  * @param bloom_filter bloom filter for fast lookups
  * @param block_index succinct trie for fast lookups
  * @param refcount reference count
- * @param bm_open_state atomic state for block manager (0=closed, 1=opening, 2=open)
  * @param klog_bm block manager for klog
  * @param vlog_bm block manager for vlog
  * @param config column family configuration
@@ -418,7 +397,6 @@ struct tidesdb_sstable_t
     bloom_filter_t *bloom_filter;
     succinct_trie_t *block_index;
     _Atomic(int) refcount;
-    _Atomic(int) bm_open_state;
     block_manager_t *klog_bm;
     block_manager_t *vlog_bm;
     tidesdb_column_family_config_t *config;
@@ -505,8 +483,6 @@ typedef struct
  * @param compaction_lock serializes compaction operations
  * @param levels array of disk levels
  * @param num_levels number of disk levels
- * @param compaction_thread thread for background compaction
- * @param compaction_should_stop flag to stop compaction thread
  * @param next_sstable_id next sstable id
  * @param db parent database reference
  */

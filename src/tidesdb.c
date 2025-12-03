@@ -367,38 +367,6 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, size_t key_size, size_t value
     return 0;
 }
 
-/**
- * tidesdb_check_write_stall
- * Check if writes should be stalled due to backpressure
- * Implements soft and hard limits on immutable memtable queue depth
- * @param cf column family
- * @return 0 if OK to write, 1 if should slow down, 2 if must stall
- */
-static int tidesdb_check_write_stall(tidesdb_column_family_t *cf)
-{
-    if (!cf) return 0;
-
-    size_t queue_depth = queue_size(cf->immutable_memtables);
-
-    /* hard limit, we block writes completely */
-    if (queue_depth >= (size_t)cf->config.write_stall_threshold)
-    {
-        TDB_DEBUG_LOG("CF '%s': Write stall (queue depth: %zu >= threshold: %d)", cf->name,
-                      queue_depth, cf->config.write_stall_threshold);
-        return 2;
-    }
-
-    /* soft limit, we slow down writes */
-    if (queue_depth >= (size_t)cf->config.max_immutable_memtables)
-    {
-        TDB_DEBUG_LOG("CF '%s': Write slowdown (queue depth: %zu >= max: %d)", cf->name,
-                      queue_depth, cf->config.max_immutable_memtables);
-        return 1;
-    }
-
-    return 0;
-}
-
 /* sstable metadata structure */
 #define SSTABLE_METADATA_MAGIC 0x5353544D /* SSTM */
 
@@ -761,9 +729,7 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .skip_list_max_level = 12,
         .skip_list_probability = 0.25f,
         .default_isolation_level = TDB_ISOLATION_READ_COMMITTED,
-        .min_disk_space = TDB_DEFAULT_MIN_DISK_SPACE,
-        .max_immutable_memtables = TDB_DEFAULT_MAX_IMMUTABLE_MEMTABLES,
-        .write_stall_threshold = TDB_DEFAULT_WRITE_STALL_THRESHOLD};
+        .min_disk_space = TDB_DEFAULT_MIN_DISK_SPACE};
     return config;
 }
 
@@ -1593,7 +1559,7 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
         tidesdb_sstable_ref(sst);
 
         /* add to cache, which will evict old entries if needed
-         * returns: 0 = new insertion, 1 = updated existing, -1 = error */
+         * returns 0 = new insertion, 1 = updated existing, -1 = error */
         int put_result =
             fifo_cache_put(db->sstable_cache, cache_key, sst, tidesdb_sstable_cache_evict_cb, db);
         if (put_result < 0)
@@ -1612,39 +1578,11 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
         /* if put_result == 0, new entry was inserted successfully */
     }
 
-    int expected_state = 2; /* check if already open */
-    if (atomic_load_explicit(&sst->bm_open_state, memory_order_acquire) == 2)
-    {
-        return 0; /* already open */
-    }
-
-    /* try to transition from closed (0) to opening (1) */
-    expected_state = 0;
-    if (!atomic_compare_exchange_strong_explicit(&sst->bm_open_state, &expected_state, 1,
-                                                 memory_order_acquire, memory_order_relaxed))
-    {
-        /* someone else is opening or already opened */
-        if (expected_state == 2) return 0; /* now open */
-
-        /* wait for opening to complete (spin briefly, then yield) */
-        int spin_count = 0;
-        while (atomic_load_explicit(&sst->bm_open_state, memory_order_acquire) == 1)
-        {
-            if (++spin_count > TDB_ENSURE_OPEN_SSTABLE_WAIT_COUNT)
-            {
-                usleep(TDB_ENSURE_OPEN_SSTABLE_WAIT_US);
-                spin_count = 0;
-            }
-        }
-        return atomic_load_explicit(&sst->bm_open_state, memory_order_acquire) == 2 ? 0 : -1;
-    }
-
     /* we won the race, open block managers and store them in the sstable */
     if (block_manager_open_with_cache(&sst->klog_bm, sst->klog_path,
                                       convert_sync_mode(sst->config->sync_mode),
                                       (uint32_t)sst->config->block_manager_cache_size) != 0)
     {
-        atomic_store_explicit(&sst->bm_open_state, 0, memory_order_release);
         return -1;
     }
 
@@ -1654,12 +1592,9 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
     {
         block_manager_close(sst->klog_bm);
         sst->klog_bm = NULL;
-        atomic_store_explicit(&sst->bm_open_state, 0, memory_order_release);
         return -1;
     }
 
-    /* successfully opened, transition to open state */
-    atomic_store_explicit(&sst->bm_open_state, 2, memory_order_release);
     return 0;
 }
 
@@ -1691,7 +1626,6 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
     atomic_init(&sst->num_klog_blocks, 0);
     atomic_init(&sst->num_vlog_blocks, 0);
     sst->klog_data_end_offset = 0;
-    atomic_init(&sst->bm_open_state, 0);
     atomic_init(&sst->marked_for_deletion, 0); /* not marked for deletion initially */
     sst->klog_bm = NULL;
     sst->vlog_bm = NULL;
@@ -2615,9 +2549,6 @@ load_bloom_and_index:
     /* close temporary block managers; they'll be reopened through cache when needed */
     block_manager_close(klog_bm);
     block_manager_close(vlog_bm);
-
-    /* mark as successfully loaded (not opened yet) */
-    atomic_store_explicit(&sst->bm_open_state, 0, memory_order_release);
 
     return TDB_SUCCESS;
 }
@@ -4514,9 +4445,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             tidesdb_level_remove_sstable(cf->db, lvl, sst);
         }
 
-        /* mark for deletion but don't unlink yet!
-         * files will be deleted in tidesdb_sstable_free when refcount reaches 0.
-         * this prevents data loss for active transactions reading these ssts. */
         atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
 
         /* release the reference we took at line 4004 when collecting sstables */
@@ -6231,47 +6159,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
                         break;
                     }
                 }
-
-                /* check if L0 has too many sstables
-                 * this ensures read amplification stays bounded and prevents write stalls */
-                tidesdb_level_t *level0 = cf->levels[0];
-                if (level0)
-                {
-                    int l0_count =
-                        atomic_load_explicit(&level0->num_sstables, memory_order_acquire);
-
-                    /* trigger compaction if L0 has more than TDB_L0_COMPACTION_TRIGGER sstables
-                     * this is independent of level capacity, we want to keep L0 small
-                     * to minimize read amplification (L0 sstables have overlapping keys) */
-                    if (l0_count > TDB_L0_COMPACTION_TRIGGER)
-                    {
-                        TDB_DEBUG_LOG(
-                            "CF '%s': L0 has %d SSTables (threshold: %d), triggering "
-                            "compaction",
-                            cf->name, l0_count, TDB_L0_COMPACTION_TRIGGER);
-
-                        /* enqueue compaction work -- worker will skip if compaction already running
-                         */
-                        tidesdb_compaction_work_t *compaction_work =
-                            calloc(1, sizeof(tidesdb_compaction_work_t));
-                        if (compaction_work)
-                        {
-                            compaction_work->cf = cf;
-                            if (queue_enqueue(db->compaction_queue, compaction_work) != 0)
-                            {
-                                free(compaction_work);
-                            }
-                        }
-                    }
-                }
-            }
-            else
-            {
-                TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64 " write FAILED (error %d)", cf->name,
-                              work->sst_id, write_result);
-                tidesdb_sstable_unref(cf->db, sst);
-                /* release work's reference on failure */
-                tidesdb_immutable_memtable_unref(imm);
             }
         }
         else
@@ -8196,63 +8083,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                     return TDB_ERR_CONFLICT;
                 }
             }
-        }
-    }
-
-    /* check compaction debt and slow writes if needed
-     * this prevents writes from outpacing compaction */
-    for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
-    {
-        tidesdb_column_family_t *cf = txn->cfs[cf_idx];
-
-        /* check L0 sstable count, if too many, apply backpressure */
-        int num_levels = cf->num_levels;
-        if (num_levels > 0)
-        {
-            tidesdb_level_t **levels = cf->levels;
-            tidesdb_level_t *level0 = levels[0];
-            if (level0)
-            {
-                int l0_sstable_count =
-                    atomic_load_explicit(&level0->num_sstables, memory_order_acquire);
-
-                /* throttle if L0 has too many sstables (indicates compaction falling behind) */
-                if (l0_sstable_count > TDB_L0_SLOWDOWN_THRESHOLD)
-                {
-                    /* exponential backoff sleep more as count increases */
-                    int sleep_ms =
-                        (l0_sstable_count - TDB_L0_SLOWDOWN_THRESHOLD) * TDB_WRITE_SLOWDOWN_EXPO;
-                    if (sleep_ms > TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS)
-                        sleep_ms = TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS;
-                    usleep(sleep_ms * 1000);
-                    TDB_DEBUG_LOG("CF '%s': Write throttled %dms (L0 SSTables: %d)", cf->name,
-                                  sleep_ms, l0_sstable_count);
-                }
-            }
-        }
-
-        /* check immutable memtable queue depth for backpressure */
-        int stall_level = tidesdb_check_write_stall(cf);
-        if (stall_level == 2)
-        {
-            /* hard limit, we stall until queue drains */
-            TDB_DEBUG_LOG("CF '%s': Hard write stall - waiting for flush", cf->name);
-            while (tidesdb_check_write_stall(cf) == 2)
-            {
-                usleep(TDB_WRITE_STALL_BACKOFF_US);
-            }
-        }
-        else if (stall_level == 1)
-        {
-            /* soft limit, we slow down writes */
-            size_t queue_depth = queue_size(cf->immutable_memtables);
-            int sleep_ms = (int)(queue_depth - cf->config.max_immutable_memtables) *
-                           TDB_IMMUTABLE_QUEUE_SLOWDOWN_FACTOR;
-            if (sleep_ms > TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS)
-                sleep_ms = TDB_WRITE_SLOWDOWN_MAX_SLEEP_MS;
-            usleep(sleep_ms * 1000);
-            TDB_DEBUG_LOG("CF '%s': Write slowdown %dms (queue depth: %zu)", cf->name, sleep_ms,
-                          queue_depth);
         }
     }
 

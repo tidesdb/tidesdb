@@ -327,9 +327,14 @@ static void *concurrent_put_thread(void *arg)
         snprintf(key, sizeof(key), "thread%d_key%d", targ->thread_id, i);
 
         int *value = (int *)malloc(sizeof(int));
+        if (value == NULL) continue; /* skip if allocation fails */
+
         *value = targ->thread_id * 1000 + i;
 
-        lru_cache_put(targ->cache, key, value, free_evict_callback, NULL);
+        /* lru_cache_put takes ownership of the value and will call free_evict_callback
+         * on failure to prevent leaks, so we don't need to free manually on error */
+        int result = lru_cache_put(targ->cache, key, value, free_evict_callback, NULL);
+        (void)result; /* result: 0=inserted, 1=updated, -1=failed (callback already called) */
     }
 
     return NULL;
@@ -571,7 +576,10 @@ static void race_evict_callback(const char *key, void *value, void *user_data)
     (void)key;
     (void)value;
     race_test_arg_t *arg = (race_test_arg_t *)user_data;
-    atomic_fetch_sub(arg->refcount, 1);
+    if (arg && arg->refcount)
+    {
+        atomic_fetch_sub(arg->refcount, 1);
+    }
 }
 
 static void *race_condition_thread(void *arg)
@@ -591,6 +599,11 @@ static void *race_condition_thread(void *arg)
         if (result == 1)
         {
             /* entry already existed (race detected), release our extra ref */
+            atomic_fetch_sub(targ->refcount, 1);
+        }
+        else if (result == -1)
+        {
+            /* put failed, release our ref */
             atomic_fetch_sub(targ->refcount, 1);
         }
     }
@@ -671,7 +684,6 @@ void test_lru_cache_put_return_values()
     lru_cache_free(cache);
 }
 
-/* test LRU-specific behavior: frequently accessed items stay in cache */
 void test_lru_cache_access_pattern()
 {
     printf(BOLDWHITE "\nTest: LRU Access Pattern - Frequently Accessed Items Stay\n" RESET);
@@ -685,7 +697,6 @@ void test_lru_cache_access_pattern()
         values[i] = i * 100;
     }
 
-    /* insert 5 items */
     for (int i = 0; i < 5; i++)
     {
         char key[32];
@@ -715,7 +726,6 @@ void test_lru_cache_access_pattern()
     lru_cache_free(cache);
 }
 
-/* test get_copy function */
 static void *int_copy_fn(void *value)
 {
     if (value == NULL) return NULL;

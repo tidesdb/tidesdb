@@ -570,6 +570,7 @@ int main()
 #endif
     printf("  DB Flush Pool Threads: %d\n", BENCH_DB_FLUSH_POOL_THREADS);
     printf("  DB Compaction Pool Threads: %d\n", BENCH_DB_COMPACTION_POOL_THREADS);
+    printf("  DB Block Cache Size: %d\n", BENCH_BLOCK_CACHE_SIZE);
 
     printf("\n" BOLDWHITE "Column Family Configuration:\n" RESET);
     printf("  Write Buffer Size: %zu bytes (%.2f MB)\n", (size_t)BENCH_WRITE_BUFFER_SIZE,
@@ -583,7 +584,6 @@ int main()
     printf("  Bloom Filter: %s\n", BENCH_ENABLE_BLOOM_FILTER ? "enabled" : "disabled");
     printf("  Bloom Filter FP Rate: %.4f\n", BENCH_BLOOM_FILTER_FP_RATE);
     printf("  Block Indexes: %s\n", BENCH_ENABLE_BLOCK_INDEXES ? "enabled" : "disabled");
-    printf("  Block Manager Cache Size: %d\n", BENCH_COLUMN_FAMILY_BLOCK_CACHE);
     printf("  Comparator: %s\n", BENCH_COMPARATOR_NAME);
     printf("  Isolation Level: %s\n", get_isolation_level_name(BENCH_ISOLATION_LEVEL));
     printf("======================================\n\n" RESET);
@@ -683,6 +683,7 @@ int main()
                                .enable_debug_logging = BENCH_DB_DEBUG,
                                .num_flush_threads = BENCH_DB_FLUSH_POOL_THREADS,
                                .num_compaction_threads = BENCH_DB_COMPACTION_POOL_THREADS,
+                               .block_cache_size = BENCH_BLOCK_CACHE_SIZE,
                                .max_open_sstables = 1000};
     int open_result = tidesdb_open(&config, &tdb);
     if (open_result != 0)
@@ -715,7 +716,6 @@ int main()
     cf_config.enable_block_indexes = BENCH_ENABLE_BLOCK_INDEXES;
     cf_config.index_sample_ratio = BENCH_BLOCK_INDEX_SAMPLING_COUNT;
     cf_config.sync_mode = BENCH_SYNC_MODE;
-    cf_config.block_manager_cache_size = BENCH_COLUMN_FAMILY_BLOCK_CACHE;
     strncpy(cf_config.comparator_name, BENCH_COMPARATOR_NAME, TDB_MAX_COMPARATOR_NAME - 1);
     cf_config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
     cf_config.default_isolation_level = BENCH_ISOLATION_LEVEL;

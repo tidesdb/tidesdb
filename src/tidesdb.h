@@ -141,7 +141,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_SSTABLE_KLOG_EXT          ".klog" /* extension for sstable key log files */
 #define TDB_SSTABLE_VLOG_EXT          ".vlog" /* extension for sstable value log files */
 #define TDB_SSTABLE_CACHE_PREFIX      "sst_"  /* prefix for sstable cache keys */
-#define TDB_CACHE_KEY_LEN             256     /* maximum length for cache key strings */
+#define TDB_CACHE_KEY_BUFFER_SIZE     256     /* maximum size for cache key strings */
 
 /* default configuration values */
 #define TDB_DEFAULT_WRITE_BUFFER_SIZE           (64 * 1024 * 1024) /* 64MB */
@@ -158,6 +158,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024) /* 100MB minimum free space */
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES           512                 /* max open sstables globally */
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      1024 * 64           /* max concurrent txns per cf */
+#define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024) /* default global block cache size */
 
 #define TDB_MAX_TXN_CFS         10000  /* maximum number of cfs per transaction */
 #define TDB_MAX_PATH_LEN        4096   /* maximum path length */
@@ -187,7 +188,6 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param bloom_fpr bloom filter false positive rate
  * @param enable_block_indexes enable block indexes
  * @param index_sample_ratio sample every nth key for sparse index
- * @param block_manager_cache_size block manager cache size
  * @param sync_mode sync mode
  * @param comparator_name name of registered comparator
  * @param comparator_ctx_str optional context string for comparator
@@ -212,7 +212,6 @@ typedef struct
     double bloom_fpr;
     int enable_block_indexes;
     int index_sample_ratio;
-    size_t block_manager_cache_size;
     int sync_mode;
     char comparator_name[TDB_MAX_COMPARATOR_NAME];
     char comparator_ctx_str[TDB_MAX_COMPARATOR_CTX];
@@ -247,6 +246,7 @@ typedef struct
  * @param num_flush_threads number of flush threads
  * @param num_compaction_threads number of compaction threads
  * @param enable_debug_logging enable debug logging
+ * @param cache of blocks across column families
  * @param max_open_sstables maximum number of open sstables (LRU cache)
  */
 typedef struct
@@ -255,6 +255,7 @@ typedef struct
     int num_flush_threads;
     int num_compaction_threads;
     int enable_debug_logging;
+    size_t block_cache_size;
     size_t max_open_sstables;
 } tidesdb_config_t;
 
@@ -555,6 +556,7 @@ struct tidesdb_compaction_work_t
  * @param compaction_threads array of compaction threads
  * @param compaction_queue queue of compaction work items
  * @param sstable_cache lru cache for sstable file handles
+ * @param block_cache lru cache for sstable blocks
  * @param is_open flag to indicate if database is open
  * @param global_txn_seq global sequence counter for multi-cf transactions
  * @param next_txn_id global transaction id counter
@@ -578,6 +580,7 @@ struct tidesdb_t
     pthread_t *compaction_threads;
     queue_t *compaction_queue;
     lru_cache_t *sstable_cache;
+    lru_cache_t *block_cache;
     _Atomic(int) is_open;
     _Atomic(uint64_t) global_txn_seq;
     _Atomic(uint64_t) next_txn_id;

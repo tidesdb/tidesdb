@@ -24,6 +24,8 @@
 /* forward declarations */
 typedef struct lru_cache_t lru_cache_t;
 typedef struct lru_entry_t lru_entry_t;
+typedef struct lru_hazard_pointer_t lru_hazard_pointer_t;
+typedef struct lru_retired_entry_t lru_retired_entry_t;
 
 /**
  * lru_evict_callback_t
@@ -35,7 +37,7 @@ typedef struct lru_entry_t lru_entry_t;
 typedef void (*lru_evict_callback_t)(const char *key, void *value, void *user_data);
 
 /**
- * entry states for lock-free operations
+ * entry states for lock-free ops
  */
 typedef enum
 {
@@ -57,6 +59,7 @@ typedef enum
  * @param state atomic state for lock-free deletion
  * @param ref_count atomic reference count for safe memory reclamation
  * @param hash_next atomic pointer to next entry in hash chain
+ * @param retired flag indicating if entry is retired (waiting to be freed)
  */
 struct lru_entry_t
 {
@@ -69,6 +72,30 @@ struct lru_entry_t
     _Atomic(lru_entry_state_t) state;
     _Atomic(uint32_t) ref_count;
     _Atomic(lru_entry_t *) hash_next;
+    _Atomic(int) retired;
+};
+
+/**
+ * lru_hazard_pointer_t
+ * per-thread hazard pointer record
+ * each thread gets K hazard pointers to protect entries it's accessing
+ */
+#define LRU_HAZARDS_PER_THREAD 2
+struct lru_hazard_pointer_t
+{
+    _Atomic(lru_entry_t *) pointers[LRU_HAZARDS_PER_THREAD];
+    _Atomic(int) active; /* 1 if this record is in use by a thread */
+    _Atomic(lru_hazard_pointer_t *) next;
+};
+
+/**
+ * lru_retired_entry_t
+ * list node for retired entries waiting to be freed
+ */
+struct lru_retired_entry_t
+{
+    lru_entry_t *entry;
+    lru_retired_entry_t *next;
 };
 
 /**
@@ -81,6 +108,10 @@ struct lru_entry_t
  * @param clock_hand atomic index for clock algorithm sweep
  * @param entries array of entry pointers for clock algorithm
  * @param global_clock atomic global access counter
+ * @param hazard_pointers atomic linked list of hazard pointer records
+ * @param retired_list per-cache retired entries list (protected by simple lock for now)
+ * @param retired_lock mutex for retired list
+ * @param retired_count number of retired entries
  */
 struct lru_cache_t
 {
@@ -91,6 +122,12 @@ struct lru_cache_t
     _Atomic(size_t) clock_hand;
     _Atomic(lru_entry_t *) *entries;
     _Atomic(uint64_t) global_clock;
+
+    /* hazard pointers */
+    _Atomic(lru_hazard_pointer_t *) hazard_pointers;
+    pthread_mutex_t retired_lock;
+    lru_retired_entry_t *retired_list;
+    _Atomic(size_t) retired_count;
 };
 
 /**

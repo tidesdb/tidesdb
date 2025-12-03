@@ -115,6 +115,17 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #define UNUSED
 #endif
 
+/* cross-platform thread-local storage */
+#if defined(_MSC_VER)
+#define THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define THREAD_LOCAL _Thread_local
+#elif defined(__GNUC__) || defined(__clang__)
+#define THREAD_LOCAL __thread
+#else
+#define THREAD_LOCAL /* fallback: no thread-local support */
+#endif
+
 /* cross-platform prefetch hints for cache optimization */
 #if defined(__GNUC__) || defined(__clang__)
 /* __builtin_prefetch(addr, rw, locality)

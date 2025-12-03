@@ -6297,14 +6297,23 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
     skip_list_free(memtable);
     block_manager_close(wal);
 
+    int immutable_count = 0;
     while (!queue_is_empty(cf->immutable_memtables))
     {
         tidesdb_immutable_memtable_t *immutable =
             (tidesdb_immutable_memtable_t *)queue_dequeue(cf->immutable_memtables);
         if (immutable)
         {
+            int refcount = atomic_load_explicit(&immutable->refcount, memory_order_acquire);
+            TDB_DEBUG_LOG("CF '%s': Cleaning immutable with refcount=%d", cf->name, refcount);
             tidesdb_immutable_memtable_unref(immutable);
+            immutable_count++;
         }
+    }
+    if (immutable_count > 0)
+    {
+        TDB_DEBUG_LOG("CF '%s': Freed %d immutable memtables in CF cleanup", cf->name,
+                      immutable_count);
     }
     queue_free(cf->immutable_memtables);
 
@@ -6416,52 +6425,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
                 atomic_store_explicit(&imm->flushed, 1, memory_order_release);
 
                 /* release the work item's reference now that flush is complete
-                 * this allows the cleanup loop to remove the immutable from the queue */
+                 * the immutable stays in cf->immutable_memtables queue with refcount=1
+                 * and will be cleaned up during shutdown */
                 tidesdb_immutable_memtable_unref(imm);
-
-                while (!queue_is_empty(cf->immutable_memtables))
-                {
-                    tidesdb_immutable_memtable_t *front =
-                        (tidesdb_immutable_memtable_t *)queue_peek(cf->immutable_memtables);
-                    if (!front) break;
-
-                    int is_flushed = atomic_load_explicit(&front->flushed, memory_order_acquire);
-
-                    /* only proceed if flushed */
-                    if (!is_flushed)
-                    {
-                        break;
-                    }
-
-                    /* try to atomically transition refcount from 1 to 0
-                     * this prevents TOCTOU race where another thread refs between check and unref
-                     */
-                    int expected_refcount = 1;
-                    if (atomic_compare_exchange_strong_explicit(
-                            &front->refcount, &expected_refcount, 0, memory_order_acq_rel,
-                            memory_order_acquire))
-                    {
-                        /* we successfully claimed the last reference, safe to dequeue and free
-                         * refcount is now 0, so we do cleanup directly without calling unref */
-                        queue_dequeue(cf->immutable_memtables);
-
-                        /* NULL out pointers before freeing to prevent double-free if another
-                         * thread still has a stale reference during shutdown */
-                        skip_list_t *memtable_to_free = front->memtable;
-                        block_manager_t *wal_to_free = front->wal;
-                        front->memtable = NULL;
-                        front->wal = NULL;
-
-                        if (memtable_to_free) skip_list_free(memtable_to_free);
-                        if (wal_to_free) block_manager_close(wal_to_free);
-                        free(front);
-                    }
-                    else
-                    {
-                        /* front has active readers (refcount > 1) or was already freed, stop */
-                        break;
-                    }
-                }
             }
         }
         else
@@ -6922,7 +6888,40 @@ int tidesdb_close(tidesdb_t *db)
         queue_free(db->compaction_queue);
     }
 
+    /* clean up all immutable memtables that remain in CF queues
+     * after flush workers have exited, we need to clean up any remaining immutables
+     * whether flushed or not */
     pthread_rwlock_wrlock(&db->cf_list_lock);
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        tidesdb_column_family_t *cf = db->column_families[i];
+        if (cf && cf->immutable_memtables)
+        {
+            int queue_count = (int)queue_size(cf->immutable_memtables);
+            TDB_DEBUG_LOG("CF '%s': %d immutables in queue before shutdown cleanup", cf->name,
+                          queue_count);
+            int cleaned = 0;
+            while (!queue_is_empty(cf->immutable_memtables))
+            {
+                tidesdb_immutable_memtable_t *imm =
+                    (tidesdb_immutable_memtable_t *)queue_dequeue(cf->immutable_memtables);
+                if (imm)
+                {
+                    int refcount = atomic_load_explicit(&imm->refcount, memory_order_acquire);
+                    TDB_DEBUG_LOG("CF '%s': Dequeuing immutable with refcount=%d", cf->name,
+                                  refcount);
+                    tidesdb_immutable_memtable_unref(imm);
+                    cleaned++;
+                }
+            }
+            if (cleaned > 0)
+            {
+                TDB_DEBUG_LOG("CF '%s': Cleaned up %d immutable memtables during shutdown",
+                              cf->name, cleaned);
+            }
+        }
+    }
+    /* lock is still held from above, continue to free column families */
     for (int i = 0; i < db->num_column_families; i++)
     {
         tidesdb_column_family_free(db->column_families[i]);
@@ -9093,7 +9092,16 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         return TDB_ERR_MEMORY;
     }
 
+    /* hold flush_lock to get consistent snapshot of active + immutable memtables
+     * prevents race where keys are moved from active to immutable while we're capturing */
+    pthread_mutex_lock(&cf->flush_lock);
+
     skip_list_t *active_mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    size_t imm_count = queue_size(cf->immutable_memtables);
+
+    pthread_mutex_unlock(&cf->flush_lock);
+
+    /* now create merge sources from the snapshot (outside the lock) */
     tidesdb_merge_source_t *memtable_source =
         tidesdb_merge_source_from_memtable(active_mt, &cf->config, NULL);
     if (memtable_source && memtable_source->current_kv != NULL)
@@ -9108,7 +9116,6 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         tidesdb_merge_source_free(memtable_source);
     }
 
-    size_t imm_count = queue_size(cf->immutable_memtables);
     for (size_t i = 0; i < imm_count; i++)
     {
         tidesdb_immutable_memtable_t *imm =

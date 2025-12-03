@@ -42,7 +42,7 @@ static void lru_reclaim_retired(lru_cache_t *cache);
 /**
  * thread-local hazard pointer record
  */
-static __thread lru_hazard_pointer_t *tls_hazard_record = NULL;
+static THREAD_LOCAL lru_hazard_pointer_t *tls_hazard_record = NULL;
 
 /**
  * lru_hazard_acquire

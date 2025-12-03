@@ -6406,8 +6406,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
                 atomic_thread_fence(memory_order_seq_cst);
 
-                TDB_DEBUG_LOG("CF '%s': Flushed SSTable %" PRIu64 " to level 0", cf->name,
-                              work->sst_id);
+                TDB_DEBUG_LOG("CF '%s': Flushed SSTable %" PRIu64 " to level %d (array index 0)",
+                              cf->name, work->sst_id, levels[0]->level_num);
                 /* release our reference the level now owns it */
                 tidesdb_sstable_unref(cf->db, sst);
 
@@ -6803,8 +6803,12 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         }
     }
 
-    /* mark database as open only after recovery and worker startup complete */
+    /* mark database as open only after recovery and worker startup complete
+     * recovery has queued all immutable memtables and flush work
+     * workers are now running and will process the queued work
+     * data in immutable memtables is immediately readable */
     (*db)->is_open = 1;
+    TDB_DEBUG_LOG("Database is now open and ready for operations");
 
     return TDB_SUCCESS;
 }

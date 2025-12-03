@@ -583,9 +583,6 @@ int main()
     printf("  Bloom Filter: %s\n", BENCH_ENABLE_BLOOM_FILTER ? "enabled" : "disabled");
     printf("  Bloom Filter FP Rate: %.4f\n", BENCH_BLOOM_FILTER_FP_RATE);
     printf("  Block Indexes: %s\n", BENCH_ENABLE_BLOCK_INDEXES ? "enabled" : "disabled");
-    printf("  Background Compaction: %s\n",
-           BENCH_ENABLE_BACKGROUND_COMPACTION ? "enabled" : "disabled");
-    printf("  Background Compaction Interval: %d\n", BENCH_BACKGROUND_COMPACTION_INTERVAL);
     printf("  Block Manager Cache Size: %d\n", BENCH_COLUMN_FAMILY_BLOCK_CACHE);
     printf("  Comparator: %s\n", BENCH_COMPARATOR_NAME);
     printf("  Isolation Level: %s\n", get_isolation_level_name(BENCH_ISOLATION_LEVEL));

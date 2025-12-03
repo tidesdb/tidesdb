@@ -1533,8 +1533,7 @@ static void tidesdb_sstable_cache_evict_cb(const char *key, void *value, void *u
     if (!sst) return;
 
     int refcount_before = atomic_load(&sst->refcount);
-    TDB_DEBUG_LOG("Cache evicting SSTable %" PRIu64 " (refcount before unref: %d)", sst->id,
-                  refcount_before);
+    TDB_DEBUG_LOG("Cache evicting SSTable %" PRIu64 " (refcount before unref: %d)", sst->id, refcount_before);
 
     /* release the cache's reference to the sstable */
     tidesdb_sstable_unref(db, sst);
@@ -1732,8 +1731,10 @@ static void tidesdb_sstable_unref(tidesdb_t *db, tidesdb_sstable_t *sst)
 {
     if (!sst) return;
     int old_refcount = atomic_fetch_sub(&sst->refcount, 1);
+    TDB_DEBUG_LOG("SSTable %" PRIu64 " unref: refcount %d -> %d", sst->id, old_refcount, old_refcount - 1);
     if (old_refcount == 1)
     {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 " refcount reached 0, freeing", sst->id);
         tidesdb_sstable_free(db, sst);
     }
 }
@@ -2624,8 +2625,7 @@ static void tidesdb_level_free(tidesdb_t *db, tidesdb_level_t *level)
     {
         if (level->sstables[i])
         {
-            TDB_DEBUG_LOG("Level %d unreffing SSTable %" PRIu64, level->level_num,
-                          level->sstables[i]->id);
+            TDB_DEBUG_LOG("Level %d unreffing SSTable %" PRIu64, level->level_num, level->sstables[i]->id);
             tidesdb_sstable_unref(db, level->sstables[i]);
         }
     }
@@ -2668,8 +2668,7 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
     /* add sstable and take reference */
     int refcount_before = atomic_load(&sst->refcount);
     tidesdb_sstable_ref(sst);
-    TDB_DEBUG_LOG("Level %d adding SSTable %" PRIu64 " (refcount: %d -> %d)", level->level_num,
-                  sst->id, refcount_before, refcount_before + 1);
+    TDB_DEBUG_LOG("Level %d adding SSTable %" PRIu64 " (refcount: %d -> %d)", level->level_num, sst->id, refcount_before, refcount_before + 1);
 
     /* get current count atomically */
     int current_count = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
@@ -6639,7 +6638,7 @@ int tidesdb_close(tidesdb_t *db)
     TDB_DEBUG_LOG("Clearing SSTable cache (size: %zu)", fifo_cache_size(db->sstable_cache));
     fifo_cache_clear(db->sstable_cache);
     TDB_DEBUG_LOG("SSTable cache cleared");
-
+    
     /* now free the cache structure itself */
     fifo_cache_free(db->sstable_cache);
 

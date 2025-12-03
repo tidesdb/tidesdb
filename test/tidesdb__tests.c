@@ -3765,7 +3765,7 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     /* config that will trigger level additions */
-    cf_config.write_buffer_size = 300;
+    cf_config.write_buffer_size = 4096;
     cf_config.level_size_ratio = 5;
     cf_config.dividing_level_offset = 1;
     cf_config.max_levels = 15;
@@ -3800,16 +3800,44 @@ static void test_dynamic_capacity_adjustment(void)
             ASSERT_EQ(tidesdb_txn_commit(txn), 0);
             tidesdb_txn_free(txn);
 
-            if (i % 8 == 7)
+            /* flush every 10 keys to create SSTables */
+            if (i % 10 == 9)
             {
                 tidesdb_flush_memtable(cf);
-                usleep(15000);
             }
         }
 
-        /* trigger compaction and observe level changes */
+        /* trigger compaction and wait for it to complete */
         tidesdb_compact(cf);
-        usleep(150000);
+
+        /* wait for compaction queue to drain (max 5 seconds) */
+        for (int wait = 0; wait < 500; wait++)
+        {
+            size_t queue_depth = queue_size(db->compaction_queue);
+            if (queue_depth == 0)
+            {
+                /* queue empty, but compaction might still be running
+                 * check if L0 has been reduced */
+                pthread_rwlock_rdlock(&cf->levels_lock);
+                int num_levels = cf->num_levels;
+                if (num_levels > 0)
+                {
+                    int l0_count = atomic_load(&cf->levels[0]->num_sstables);
+                    pthread_rwlock_unlock(&cf->levels_lock);
+
+                    /* if L0 is reasonable, compaction succeeded */
+                    if (l0_count <= TDB_L0_COMPACTION_TRIGGER)
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    pthread_rwlock_unlock(&cf->levels_lock);
+                }
+            }
+            usleep(10000); /* 10ms */
+        }
 
         pthread_rwlock_rdlock(&cf->levels_lock);
         int current_levels = cf->num_levels;

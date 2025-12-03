@@ -1178,71 +1178,6 @@ static void test_bidirectional_iterator(void)
     cleanup_test_dir();
 }
 
-static void test_background_compaction(void)
-{
-    cleanup_test_dir();
-    tidesdb_t *db = create_test_db();
-    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 512;
-    cf_config.enable_background_compaction = 1;
-    cf_config.compaction_interval_ms = 100;
-
-    ASSERT_EQ(tidesdb_create_column_family(db, "auto_compact_cf", &cf_config), 0);
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "auto_compact_cf");
-    ASSERT_TRUE(cf != NULL);
-
-    /* write data that should trigger background flush and compaction */
-    for (int i = 0; i < 50; i++)
-    {
-        tidesdb_txn_t *txn = NULL;
-        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
-
-        char key[32];
-        char value[128];
-        snprintf(key, sizeof(key), "key_%03d", i);
-        snprintf(value, sizeof(value), "value_%03d_automatic_compaction_test", i);
-
-        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                  strlen(value) + 1, 0),
-                  0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
-        tidesdb_txn_free(txn);
-    }
-
-    /* wait for background thread to detect need and queue work */
-    usleep(500000); /* 500ms -- should be enough for several compaction interval checks */
-
-    /* wait for queues to drain */
-    int max_wait = 100;
-    for (int i = 0; i < max_wait; i++)
-    {
-        usleep(10000);
-        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0) break;
-    }
-
-    /* verify all data is accessible */
-    tidesdb_txn_t *txn = NULL;
-    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
-
-    for (int i = 0; i < 50; i++)
-    {
-        char key[32];
-        snprintf(key, sizeof(key), "key_%03d", i);
-
-        uint8_t *value = NULL;
-        size_t value_size = 0;
-        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
-
-        ASSERT_EQ(result, 0);
-        ASSERT_TRUE(value != NULL);
-        free(value);
-    }
-
-    tidesdb_txn_free(txn);
-    tidesdb_close(db);
-    cleanup_test_dir();
-}
-
 static void test_isolation_read_uncommitted(void)
 {
     cleanup_test_dir();
@@ -6948,7 +6883,6 @@ int main(void)
     RUN_TEST(test_compression_snappy, tests_passed);
     RUN_TEST(test_compaction_basic, tests_passed);
     RUN_TEST(test_compaction_with_deletes, tests_passed);
-    RUN_TEST(test_background_compaction, tests_passed);
     RUN_TEST(test_concurrent_writes, tests_passed);
     RUN_TEST(test_empty_value, tests_passed);
     RUN_TEST(test_delete_nonexistent_key, tests_passed);

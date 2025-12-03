@@ -104,6 +104,7 @@ typedef struct
 #define TDB_ERR_CONFLICT     -8
 #define TDB_ERR_OVERFLOW     -9
 #define TDB_ERR_TOO_LARGE    -10
+#define TDB_ERR_MEMORY_LIMIT -11
 
 /* sync modes */
 typedef enum
@@ -140,26 +141,25 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_SSTABLE_KLOG_EXT          ".klog" /* extension for sstable key log files */
 #define TDB_SSTABLE_VLOG_EXT          ".vlog" /* extension for sstable value log files */
 #define TDB_SSTABLE_CACHE_PREFIX      "sst_"  /* prefix for sstable cache keys */
-#define TDB_CACHE_KEY_LEN             128     /* maximum length for cache key strings */
+#define TDB_CACHE_KEY_LEN             256     /* maximum length for cache key strings */
 
 /* default configuration values */
-#define TDB_DEFAULT_WRITE_BUFFER_SIZE              (64 * 1024 * 1024) /* 64MB */
-#define TDB_DEFAULT_LEVEL_SIZE_RATIO               10 /* size ratio between levels (T) i.e. L1 = L0 * T */
-#define TDB_DEFAULT_MAX_LEVELS                     7 /* maximum number of levels for lsm tree's per cf */
-#define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET          2 /* X = L-2 */
-#define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE    2 /* thread pool size for global compactions */
-#define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE         2 /* thread pool size for global flushes */
-#define TDB_DEFAULT_BLOOM_FPR                      0.01        /* 1% false positive rate */
-#define TDB_DEFAULT_KLOG_BLOCK_SIZE                (32 * 1024) /* 32KB per klog block */
-#define TDB_DEFAULT_VLOG_BLOCK_SIZE                (4 * 1024)  /* 4KB per vlog block */
-#define TDB_DEFAULT_VALUE_THRESHOLD                1024        /* values >= 1KB go to vlog */
-#define TDB_DEFAULT_INDEX_SAMPLE_RATIO             16          /* sample every 16th key for index */
-#define TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL 1000        /* 1000ms = 1 second */
-#define TDB_DEFAULT_MIN_DISK_SPACE                 (100 * 1024 * 1024) /* 100MB minimum free space */
-#define TDB_DEFAULT_MAX_IMMUTABLE_MEMTABLES        8   /* soft limit -- start slowing writes */
-#define TDB_DEFAULT_WRITE_STALL_THRESHOLD          32  /* hard limit -- block writes completely */
-#define TDB_DEFAULT_MAX_OPEN_SSTABLES              512 /* max open sstables globally */
-#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE         1024 * 64 /* max concurrent txns per cf */
+#define TDB_DEFAULT_WRITE_BUFFER_SIZE           (64 * 1024 * 1024) /* 64MB */
+#define TDB_DEFAULT_LEVEL_SIZE_RATIO            10 /* size ratio between levels (T) i.e. L1 = L0 * T */
+#define TDB_DEFAULT_MAX_LEVELS                  7 /* maximum number of levels for lsm tree's per cf */
+#define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       2    /* X = L-2 */
+#define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2    /* thread pool size for global compactions */
+#define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2    /* thread pool size for global flushes */
+#define TDB_DEFAULT_BLOOM_FPR                   0.01 /* 1% false positive rate */
+#define TDB_DEFAULT_KLOG_BLOCK_SIZE             (32 * 1024) /* 32KB per klog block */
+#define TDB_DEFAULT_VLOG_BLOCK_SIZE             (4 * 1024)  /* 4KB per vlog block */
+#define TDB_DEFAULT_VALUE_THRESHOLD             1024        /* values >= 1KB go to vlog */
+#define TDB_DEFAULT_INDEX_SAMPLE_RATIO          16          /* sample every 16th key for index */
+#define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024) /* 100MB minimum free space */
+#define TDB_DEFAULT_MAX_IMMUTABLE_MEMTABLES     8   /* soft limit -- start slowing writes */
+#define TDB_DEFAULT_WRITE_STALL_THRESHOLD       32  /* hard limit -- block writes completely */
+#define TDB_DEFAULT_MAX_OPEN_SSTABLES           512 /* max open sstables globally */
+#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      1024 * 64 /* max concurrent txns per cf */
 
 #define TDB_MAX_TXN_CFS         10000  /* maximum number of cfs per transaction */
 #define TDB_MAX_PATH_LEN        4096   /* maximum path length */
@@ -183,10 +183,10 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_IMMUTABLE_QUEUE_SLOWDOWN_FACTOR 50 /* milliseconds per extra immutable memtable */
 #define TDB_TXN_SPIN_COUNT \
     1000 /* spin iterations before yielding in transaction conflict resolution */
-#define TDB_CF_LIST_BACKOFF_US \
-    100 /* microseconds to sleep while waiting for CF list modification to complete */
-#define TDB_CF_LEVELS_BACKOFF_US \
-    100 /* microseconds to sleep while waiting for CF levels modification to complete */
+
+/* memory limit constants */
+#define TDB_MEMORY_PERCENTAGE  0.6           /* 60% of available memory */
+#define TDB_MIN_KEY_VALUE_SIZE (1024 * 1024) /* 1MB minimum threshold */
 
 /**
  * tidesdb_column_family_config_t
@@ -209,8 +209,6 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param comparator_ctx_str optional context string for comparator
  * @param comparator_fn_cached cached comparator function (avoids lock)
  * @param comparator_ctx_cached cached comparator context (avoids lock)
- * @param compaction_interval_ms compaction interval in milliseconds
- * @param enable_background_compaction enable background compaction
  * @param skip_list_max_level skip list max level
  * @param skip_list_probability skip list probability
  * @param default_isolation_level default isolation level
@@ -238,8 +236,6 @@ typedef struct
     char comparator_ctx_str[TDB_MAX_COMPARATOR_CTX];
     skip_list_comparator_fn comparator_fn_cached;
     void *comparator_ctx_cached;
-    unsigned int compaction_interval_ms;
-    int enable_background_compaction;
     int skip_list_max_level;
     float skip_list_probability;
     tidesdb_isolation_level_t default_isolation_level;
@@ -534,8 +530,6 @@ struct tidesdb_column_family_t
     pthread_mutex_t compaction_lock;
     tidesdb_level_t **levels;
     int num_levels;
-    pthread_t compaction_thread;
-    _Atomic(int) compaction_should_stop;
     _Atomic(uint64_t) next_sstable_id;
     tidesdb_t *db;
 };
@@ -582,11 +576,8 @@ struct tidesdb_compaction_work_t
  * @param comparators_lock mutex for comparator registry
  * @param flush_threads array of flush threads
  * @param flush_queue queue of flush work items
- * @param flush_should_stop flag to stop flush threads
- * @param active_flush_workers number of workers actively processing
  * @param compaction_threads array of compaction threads
  * @param compaction_queue queue of compaction work items
- * @param compaction_should_stop flag to stop compaction threads
  * @param sstable_cache fifo cache for sstable file handles
  * @param is_open flag to indicate if database is open
  * @param global_txn_seq global sequence counter for multi-cf transactions
@@ -594,9 +585,6 @@ struct tidesdb_compaction_work_t
  * @param cached_available_disk_space cached available disk space in bytes
  * @param last_disk_space_check timestamp of last disk space check
  * @param cf_list_lock rwlock for cf list modifications
- * @param recovery_lock protects recovery_complete flag
- * @param recovery_cond signals when recovery is complete
- * @param recovery_complete flag indicating if recovery process is complete
  */
 struct tidesdb_t
 {
@@ -611,21 +599,17 @@ struct tidesdb_t
     pthread_mutex_t comparators_lock;
     pthread_t *flush_threads;
     queue_t *flush_queue;
-    _Atomic(int) flush_should_stop;
-    _Atomic(int) active_flush_workers;
     pthread_t *compaction_threads;
     queue_t *compaction_queue;
-    _Atomic(int) compaction_should_stop;
     fifo_cache_t *sstable_cache;
     _Atomic(int) is_open;
     _Atomic(uint64_t) global_txn_seq;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) cached_available_disk_space;
     _Atomic(time_t) last_disk_space_check;
+    uint64_t available_memory;
+    uint64_t total_memory;
     pthread_rwlock_t cf_list_lock;
-    pthread_mutex_t recovery_lock;
-    pthread_cond_t recovery_cond;
-    int recovery_complete;
 };
 
 /**

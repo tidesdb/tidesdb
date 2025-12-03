@@ -337,6 +337,37 @@ static int tidesdb_check_disk_space(tidesdb_t *db, const char *path, uint64_t mi
 }
 
 /**
+ * tidesdb_validate_kv_size
+ * Validates that a key-value pair size does not exceed memory limits
+ * Maximum allowed size is max(available_memory * TDB_MEMORY_PERCENTAGE, TDB_MIN_KEY_VALUE_SIZE)
+ * @param db database handle
+ * @param key_size size of key in bytes
+ * @param value_size size of value in bytes
+ * @return 0 if valid, TDB_ERR_MEMORY_LIMIT if too large
+ */
+static int tidesdb_validate_kv_size(tidesdb_t *db, size_t key_size, size_t value_size)
+{
+    if (!db) return TDB_ERR_INVALID_ARGS;
+
+    size_t total_size = key_size + value_size;
+
+    /* calculate max allowed size: max(60% of available memory, 1MB) */
+    uint64_t memory_based_limit = (uint64_t)(db->available_memory * TDB_MEMORY_PERCENTAGE);
+    uint64_t max_allowed_size =
+        memory_based_limit > TDB_MIN_KEY_VALUE_SIZE ? memory_based_limit : TDB_MIN_KEY_VALUE_SIZE;
+
+    if (total_size > max_allowed_size)
+    {
+        TDB_DEBUG_LOG("Key-value pair size (%zu bytes) exceeds memory limit (%" PRIu64
+                      " bytes, based on available memory: %" PRIu64 " bytes)",
+                      total_size, max_allowed_size, (uint64_t)db->available_memory);
+        return TDB_ERR_MEMORY_LIMIT;
+    }
+
+    return 0;
+}
+
+/**
  * tidesdb_check_write_stall
  * Check if writes should be stalled due to backpressure
  * Implements soft and hard limits on immutable memtable queue depth
@@ -727,8 +758,6 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .sync_mode = TDB_SYNC_NONE,
         .comparator_fn_cached = NULL,
         .comparator_ctx_cached = NULL,
-        .compaction_interval_ms = TDB_DEFAULT_BACKGROUND_COMPACTION_INTERVAL,
-        .enable_background_compaction = 1,
         .skip_list_max_level = 12,
         .skip_list_probability = 0.25f,
         .default_isolation_level = TDB_ISOLATION_READ_COMMITTED,
@@ -6031,74 +6060,6 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 }
 
 /**
- * tidesdb_background_compaction_thread
- * background compaction thread
- * @param arg the column family
- * @return NULL
- */
-static void *tidesdb_background_compaction_thread(void *arg)
-{
-    tidesdb_column_family_t *cf = (tidesdb_column_family_t *)arg;
-
-    while (!atomic_load(&cf->compaction_should_stop))
-    {
-        usleep(cf->config.compaction_interval_ms * 1000);
-
-        if (atomic_load(&cf->compaction_should_stop)) break;
-
-        pthread_rwlock_rdlock(&cf->levels_lock);
-        int num_levels = cf->num_levels;
-        pthread_rwlock_unlock(&cf->levels_lock);
-        int needs_compaction = 0;
-        int needs_flush = 0;
-
-        skip_list_t *memtable = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-        size_t memtable_size = (size_t)skip_list_get_size(memtable);
-
-        if (memtable_size >= cf->config.write_buffer_size)
-        {
-            needs_flush = 1;
-            needs_compaction = 1;
-        }
-
-        pthread_rwlock_rdlock(&cf->levels_lock);
-        tidesdb_level_t **levels = cf->levels;
-        for (int i = 0; i < num_levels; i++)
-        {
-            size_t current = levels[i]->current_size;
-            if (current >= levels[i]->capacity)
-            {
-                needs_compaction = 1;
-                break;
-            }
-        }
-
-        pthread_rwlock_unlock(&cf->levels_lock);
-
-        if (needs_compaction)
-        {
-            if (needs_flush)
-            {
-                tidesdb_flush_memtable(cf);
-            }
-
-            /* enqueue compaction work -- worker will skip if compaction already running */
-            tidesdb_compaction_work_t *work = malloc(sizeof(tidesdb_compaction_work_t));
-            if (work)
-            {
-                work->cf = cf;
-                if (queue_enqueue(cf->db->compaction_queue, work) != 0)
-                {
-                    free(work);
-                }
-            }
-        }
-    }
-
-    return NULL;
-}
-
-/**
  * tidesdb_column_family_free
  * free column family
  * @param cf the column family
@@ -6106,11 +6067,6 @@ static void *tidesdb_background_compaction_thread(void *arg)
 static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
 {
     if (!cf) return;
-
-    if (cf->config.enable_background_compaction)
-    {
-        atomic_store(&cf->compaction_should_stop, 1);
-    }
 
     skip_list_t *memtable = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
     block_manager_t *wal = atomic_load_explicit(&cf->active_wal, memory_order_acquire);
@@ -6162,22 +6118,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
     tidesdb_t *db = (tidesdb_t *)arg;
 
     TDB_DEBUG_LOG("Flush worker thread started");
-
-    /* wait for database to finish recovery before processing work */
-    pthread_mutex_lock(&db->recovery_lock);
-    while (!db->recovery_complete && !atomic_load(&db->flush_should_stop))
-    {
-        pthread_cond_wait(&db->recovery_cond, &db->recovery_lock);
-    }
-    pthread_mutex_unlock(&db->recovery_lock);
-
-    /* if we're stopping before recovery completes, exit early */
-    if (atomic_load(&db->flush_should_stop))
-    {
-        TDB_DEBUG_LOG("Flush worker: stopping before recovery complete");
-        return NULL;
-    }
-    TDB_DEBUG_LOG("Flush worker: recovery complete, starting work loop");
 
     while (1)
     {
@@ -6361,22 +6301,6 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 
     TDB_DEBUG_LOG("Compaction worker thread started");
 
-    /* wait for database to finish recovery before processing work */
-    pthread_mutex_lock(&db->recovery_lock);
-    while (!db->recovery_complete && !atomic_load(&db->compaction_should_stop))
-    {
-        pthread_cond_wait(&db->recovery_cond, &db->recovery_lock);
-    }
-    pthread_mutex_unlock(&db->recovery_lock);
-
-    /* if we're stopping before recovery completes, exit early */
-    if (atomic_load(&db->compaction_should_stop))
-    {
-        TDB_DEBUG_LOG("Compaction worker: stopping before recovery complete");
-        return NULL;
-    }
-    TDB_DEBUG_LOG("Compaction worker: recovery complete, starting work loop");
-
     while (1)
     {
         /* wait for work (blocking dequeue) */
@@ -6536,33 +6460,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_MEMORY;
     }
 
-    if (pthread_mutex_init(&(*db)->recovery_lock, NULL) != 0)
-    {
-        pthread_rwlock_destroy(&(*db)->cf_list_lock);
-        free(cfs);
-        queue_free((*db)->compaction_queue);
-        queue_free((*db)->flush_queue);
-        fifo_cache_free((*db)->sstable_cache);
-        free((*db)->db_path);
-        free(*db);
-        return TDB_ERR_MEMORY;
-    }
-
-    if (pthread_cond_init(&(*db)->recovery_cond, NULL) != 0)
-    {
-        pthread_mutex_destroy(&(*db)->recovery_lock);
-        pthread_rwlock_destroy(&(*db)->cf_list_lock);
-        free(cfs);
-        queue_free((*db)->compaction_queue);
-        queue_free((*db)->flush_queue);
-        fifo_cache_free((*db)->sstable_cache);
-        free((*db)->db_path);
-        free(*db);
-        return TDB_ERR_MEMORY;
-    }
-
-    (*db)->recovery_complete = 0; /* recovery not yet done */
-
     /* initialize comparator registry */
     (*db)->comparators_capacity = 8;
     (*db)->comparators = calloc((*db)->comparators_capacity, sizeof(tidesdb_comparator_entry_t));
@@ -6605,8 +6502,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_MEMORY;
     }
 
-    atomic_init(&(*db)->flush_should_stop, 0);
-    atomic_init(&(*db)->compaction_should_stop, 0);
     atomic_init(&(*db)->global_txn_seq, 0); /* global sequence for multi-CF transactions */
     atomic_init(&(*db)->next_txn_id, 1);    /* transaction ID counter (start at 1) */
     atomic_init(&(*db)->is_open, 0);
@@ -6624,6 +6519,22 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         TDB_DEBUG_LOG("Warning: Failed to get initial disk space");
     }
     atomic_init(&(*db)->last_disk_space_check, time(NULL));
+
+    /* initialize memory information for key-value size validation */
+    (*db)->total_memory = get_total_memory();
+    (*db)->available_memory = get_available_memory();
+    if ((*db)->total_memory > 0 && (*db)->available_memory > 0)
+    {
+        TDB_DEBUG_LOG("System memory: total=%" PRIu64 " bytes, available=%" PRIu64 " bytes",
+                      (uint64_t)(*db)->total_memory, (uint64_t)(*db)->available_memory);
+    }
+    else
+    {
+        TDB_DEBUG_LOG("Warning: Failed to get system memory information");
+        /* set conservative defaults */
+        (*db)->total_memory = TDB_MIN_KEY_VALUE_SIZE * 10;
+        (*db)->available_memory = TDB_MIN_KEY_VALUE_SIZE * 10;
+    }
 
     (*db)->sstable_cache = fifo_cache_new(config->max_open_sstables);
     if (!(*db)->sstable_cache)
@@ -6657,7 +6568,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     {
         if (pthread_create(&(*db)->flush_threads[i], NULL, tidesdb_flush_worker_thread, *db) != 0)
         {
-            atomic_store(&(*db)->flush_should_stop, 1);
             for (int j = 0; j < i; j++)
             {
                 pthread_join((*db)->flush_threads[j], NULL);
@@ -6676,7 +6586,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->compaction_threads = malloc(config->num_compaction_threads * sizeof(pthread_t));
     if (!(*db)->compaction_threads)
     {
-        atomic_store(&(*db)->flush_should_stop, 1);
         for (int i = 0; i < config->num_flush_threads; i++)
         {
             pthread_join((*db)->flush_threads[i], NULL);
@@ -6696,13 +6605,12 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         if (pthread_create(&(*db)->compaction_threads[i], NULL, tidesdb_compaction_worker_thread,
                            *db) != 0)
         {
-            atomic_store(&(*db)->compaction_should_stop, 1);
             for (int j = 0; j < i; j++)
             {
                 pthread_join((*db)->compaction_threads[j], NULL);
             }
             free((*db)->compaction_threads);
-            atomic_store(&(*db)->flush_should_stop, 1);
+
             for (int k = 0; k < config->num_flush_threads; k++)
             {
                 pthread_join((*db)->flush_threads[k], NULL);
@@ -6718,12 +6626,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         }
     }
 
-    /* signal workers that recovery is complete; they can now process work */
-    pthread_mutex_lock(&(*db)->recovery_lock);
-    (*db)->recovery_complete = 1;
-    pthread_cond_broadcast(&(*db)->recovery_cond);
-    pthread_mutex_unlock(&(*db)->recovery_lock);
-
     /* mark database as open only after recovery and worker startup complete */
     (*db)->is_open = 1;
 
@@ -6738,13 +6640,6 @@ int tidesdb_close(tidesdb_t *db)
     TDB_DEBUG_LOG("Closing TidesDB at path: %s", db->db_path);
 
     /* first, stop accepting new work */
-    atomic_store(&db->flush_should_stop, 1);
-    atomic_store(&db->compaction_should_stop, 1);
-
-    /* wake up any workers waiting for recovery to complete */
-    pthread_mutex_lock(&db->recovery_lock);
-    pthread_cond_broadcast(&db->recovery_cond);
-    pthread_mutex_unlock(&db->recovery_lock);
 
     /* shut down queues to wake all blocked workers immediately
      * this prevents deadlock where workers are stuck in queue_dequeue_wait()
@@ -6814,29 +6709,6 @@ int tidesdb_close(tidesdb_t *db)
             if (work) free(work);
         }
         queue_free(db->compaction_queue);
-    }
-
-    /* stop all background compaction threads before acquiring cf_list_lock
-     * to avoid deadlock (threads might need cf_list_lock) */
-    pthread_rwlock_rdlock(&db->cf_list_lock);
-    for (int i = 0; i < db->num_column_families; i++)
-    {
-        tidesdb_column_family_t *cf = db->column_families[i];
-        if (cf && cf->config.enable_background_compaction)
-        {
-            atomic_store(&cf->compaction_should_stop, 1);
-        }
-    }
-    pthread_rwlock_unlock(&db->cf_list_lock);
-
-    /* now join all compaction threads without holding any locks */
-    for (int i = 0; i < db->num_column_families; i++)
-    {
-        tidesdb_column_family_t *cf = db->column_families[i];
-        if (cf && cf->config.enable_background_compaction)
-        {
-            pthread_join(cf->compaction_thread, NULL);
-        }
     }
 
     pthread_rwlock_wrlock(&db->cf_list_lock);
@@ -7066,7 +6938,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->commit_seq, 0);
     atomic_init(&cf->memtable_id, 0);
     atomic_init(&cf->memtable_generation, 0);
-    atomic_init(&cf->compaction_should_stop, 0);
     atomic_init(&cf->commit_ticket, 0);
     atomic_init(&cf->commit_serving, 0);
 
@@ -7081,16 +6952,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         free(cf->name);
         free(cf);
         return TDB_ERR_MEMORY;
-    }
-
-    /* start background compaction thread if enabled */
-    if (config->enable_background_compaction)
-    {
-        if (pthread_create(&cf->compaction_thread, NULL, tidesdb_background_compaction_thread,
-                           cf) != 0)
-        {
-            /* non-fatal, continue without background compaction */
-        }
     }
 
     /* acquire write lock to modify CF list */
@@ -7166,12 +7027,6 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     db->num_column_families--;
 
     pthread_rwlock_unlock(&db->cf_list_lock);
-
-    if (cf_to_drop->config.enable_background_compaction)
-    {
-        atomic_store(&cf_to_drop->compaction_should_stop, 1);
-        pthread_join(cf_to_drop->compaction_thread, NULL);
-    }
 
     int result = remove_directory(cf_to_drop->directory);
     TDB_DEBUG_LOG("Deleted column family directory: %s (result: %d)", cf_to_drop->directory,
@@ -7748,6 +7603,10 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     size_t key_size, const uint8_t *value, size_t value_size, time_t ttl)
 {
     if (!txn || !cf || !key || key_size == 0 || !value) return TDB_ERR_INVALID_ARGS;
+
+    /* validate key-value size against memory limits */
+    int size_check = tidesdb_validate_kv_size(txn->db, key_size, value_size);
+    if (size_check != 0) return size_check;
     if (txn->is_committed || txn->is_aborted) return TDB_ERR_INVALID_ARGS;
 
     /* add CF to transaction if not already added */
@@ -10690,14 +10549,6 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     {
         ctx->config->sync_mode = atoi(value);
     }
-    else if (strcmp(name, "compaction_interval_ms") == 0)
-    {
-        ctx->config->compaction_interval_ms = (unsigned int)atoi(value);
-    }
-    else if (strcmp(name, "enable_background_compaction") == 0)
-    {
-        ctx->config->enable_background_compaction = atoi(value);
-    }
     else if (strcmp(name, "skip_list_max_level") == 0)
     {
         ctx->config->skip_list_max_level = atoi(value);
@@ -10798,8 +10649,6 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     fprintf(fp, "index_sample_ratio = %d\n", config->index_sample_ratio);
     fprintf(fp, "block_manager_cache_size = %zu\n", config->block_manager_cache_size);
     fprintf(fp, "sync_mode = %d\n", config->sync_mode);
-    fprintf(fp, "compaction_interval_ms = %u\n", config->compaction_interval_ms);
-    fprintf(fp, "enable_background_compaction = %d\n", config->enable_background_compaction);
     fprintf(fp, "skip_list_max_level = %d\n", config->skip_list_max_level);
     fprintf(fp, "skip_list_probability = %f\n", config->skip_list_probability);
 
@@ -10840,8 +10689,6 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
 {
     if (!cf || !new_config) return TDB_ERR_INVALID_ARGS;
 
-    cf->config.compaction_interval_ms = new_config->compaction_interval_ms;
-    cf->config.enable_background_compaction = new_config->enable_background_compaction;
     cf->config.enable_bloom_filter = new_config->enable_bloom_filter;
     cf->config.bloom_fpr = new_config->bloom_fpr;
     cf->config.enable_block_indexes = new_config->enable_block_indexes;

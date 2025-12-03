@@ -7262,6 +7262,9 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     tidesdb_flush_work_t *work = malloc(sizeof(tidesdb_flush_work_t));
     if (!work)
     {
+        /* immutable is already queued but flush will never happen
+         * we must clean it up to prevent memory leak */
+        tidesdb_immutable_memtable_unref(immutable);
         return TDB_ERR_MEMORY;
     }
 

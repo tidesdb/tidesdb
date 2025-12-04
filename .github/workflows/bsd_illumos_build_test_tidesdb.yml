@@ -1,0 +1,212 @@
+name: BSD and Illumos TidesDB Build & Test
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+jobs:
+  freebsd-build:
+    runs-on: ubuntu-latest
+    name: FreeBSD 14.0 x64
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.0'
+          usesh: true
+          prepare: |
+            pkg install -y cmake pkgconf zstd lz4 snappy
+          run: |
+            set -e
+            echo "=== FreeBSD System Info ==="
+            uname -a
+            freebsd-version
+            echo ""
+            echo "=== Checking for sys/sysinfo.h ==="
+            if [ -f /usr/include/sys/sysinfo.h ]; then
+              echo "✓ sys/sysinfo.h exists"
+            else
+              echo "✗ sys/sysinfo.h NOT FOUND (expected on FreeBSD)"
+            fi
+            echo ""
+            echo "=== Attempting CMake configuration ==="
+            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF || {
+              echo "CMake configuration failed (expected - sysinfo issue)"
+              exit 1
+            }
+            echo ""
+            echo "=== Attempting build ==="
+            cmake --build build --config Release || {
+              echo "Build failed (expected - sysinfo issue)"
+              exit 1
+            }
+            echo "✓ Build succeeded!"
+
+  openbsd-build:
+    runs-on: ubuntu-latest
+    name: OpenBSD 7.4 x64
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build on OpenBSD
+        uses: vmactions/openbsd-vm@v1
+        with:
+          release: '7.4'
+          usesh: true
+          prepare: |
+            pkg_add cmake pkgconf zstd lz4 snappy
+          run: |
+            set -e
+            echo "=== OpenBSD System Info ==="
+            uname -a
+            echo ""
+            echo "=== Checking for sys/sysinfo.h ==="
+            if [ -f /usr/include/sys/sysinfo.h ]; then
+              echo "✓ sys/sysinfo.h exists"
+            else
+              echo "✗ sys/sysinfo.h NOT FOUND (expected on OpenBSD)"
+            fi
+            echo ""
+            echo "=== Attempting CMake configuration ==="
+            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF || {
+              echo "CMake configuration failed (expected - sysinfo issue)"
+              exit 1
+            }
+            echo ""
+            echo "=== Attempting build ==="
+            cmake --build build --config Release || {
+              echo "Build failed (expected - sysinfo issue)"
+              exit 1
+            }
+            echo "✓ Build succeeded!"
+
+  netbsd-build:
+    runs-on: ubuntu-latest
+    name: NetBSD 9.3 x64
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build on NetBSD
+        uses: vmactions/netbsd-vm@v1
+        with:
+          release: '9.3'
+          usesh: true
+          prepare: |
+            /usr/sbin/pkg_add cmake pkgconf zstd lz4 snappy
+          run: |
+            set -e
+            echo "=== NetBSD System Info ==="
+            uname -a
+            echo ""
+            echo "=== Checking for sys/sysinfo.h ==="
+            if [ -f /usr/include/sys/sysinfo.h ]; then
+              echo "✓ sys/sysinfo.h exists"
+            else
+              echo "✗ sys/sysinfo.h NOT FOUND (expected on NetBSD)"
+            fi
+            echo ""
+            echo "=== Attempting CMake configuration ==="
+            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF || {
+              echo "CMake configuration failed (expected - sysinfo issue)"
+              exit 1
+            }
+            echo ""
+            echo "=== Attempting build ==="
+            cmake --build build --config Release || {
+              echo "Build failed (expected - sysinfo issue)"
+              exit 1
+            }
+            echo "✓ Build succeeded!"
+
+  omnios-build:
+    runs-on: ubuntu-latest
+    name: OmniOS (Illumos) r151048
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build on OmniOS (Illumos)
+        uses: vmactions/omnios-vm@v1
+        with:
+          release: 'r151048'
+          usesh: true
+          prepare: |
+            pkg install cmake gcc13 zstd lz4 snappy
+          run: |
+            set -e
+            echo "=== OmniOS/Illumos System Info ==="
+            uname -a
+            echo ""
+            echo "=== Checking for sys/sysinfo.h ==="
+            if [ -f /usr/include/sys/sysinfo.h ]; then
+              echo "✓ sys/sysinfo.h exists"
+            else
+              echo "✗ sys/sysinfo.h NOT FOUND (expected on Illumos)"
+            fi
+            echo ""
+            echo "=== Attempting CMake configuration ==="
+            export CC=gcc
+            export CXX=g++
+            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF || {
+              echo "CMake configuration failed (expected - sysinfo issue)"
+              exit 1
+            }
+            echo ""
+            echo "=== Attempting build ==="
+            cmake --build build --config Release || {
+              echo "Build failed (expected - sysinfo issue)"
+              exit 1
+            }
+            echo "✓ Build succeeded!"
+
+  dragonflybsd-build:
+    runs-on: ubuntu-latest
+    name: DragonFlyBSD 6.4 x64
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build on DragonFlyBSD
+        uses: vmactions/dragonflybsd-vm@v1
+        with:
+          release: '6.4.0'
+          usesh: true
+          prepare: |
+            pkg install -y cmake pkgconf zstd lz4 snappy
+          run: |
+            set -e
+            echo "=== DragonFlyBSD System Info ==="
+            uname -a
+            echo ""
+            echo "=== Checking for sys/sysinfo.h ==="
+            if [ -f /usr/include/sys/sysinfo.h ]; then
+              echo "✓ sys/sysinfo.h exists"
+            else
+              echo "✗ sys/sysinfo.h NOT FOUND (expected on DragonFlyBSD)"
+            fi
+            echo ""
+            echo "=== Attempting CMake configuration ==="
+            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF || {
+              echo "CMake configuration failed (expected - sysinfo issue)"
+              exit 1
+            }
+            echo ""
+            echo "=== Attempting build ==="
+            cmake --build build --config Release || {
+              echo "Build failed (expected - sysinfo issue)"
+              exit 1
+            }
+            echo "✓ Build succeeded!"

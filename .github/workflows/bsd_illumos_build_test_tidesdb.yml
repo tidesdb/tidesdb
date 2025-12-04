@@ -24,7 +24,6 @@ jobs:
           prepare: |
             pkg install -y cmake pkgconf zstd liblz4 snappy
           run: |
-            set -e
             echo "=== FreeBSD System Info ==="
             uname -a
             freebsd-version
@@ -36,18 +35,39 @@ jobs:
               echo "✗ sys/sysinfo.h NOT FOUND (expected on FreeBSD)"
             fi
             echo ""
-            echo "=== Attempting CMake configuration ==="
-            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF || {
-              echo "CMake configuration failed (expected - sysinfo issue)"
-              exit 1
+            echo "=== Checking for sysinfo() function ==="
+            cat > test_sysinfo.c << 'EOF'
+            #include <sys/sysinfo.h>
+            int main() {
+                struct sysinfo si;
+                sysinfo(&si);
+                return 0;
             }
+            EOF
+            if cc -o test_sysinfo test_sysinfo.c 2>&1; then
+              echo "✓ sysinfo() compiles successfully"
+              rm -f test_sysinfo test_sysinfo.c
+            else
+              echo "✗ sysinfo() compilation failed (expected)"
+              rm -f test_sysinfo test_sysinfo.c
+            fi
             echo ""
-            echo "=== Attempting build ==="
-            cmake --build build --config Release || {
-              echo "Build failed (expected - sysinfo issue)"
+            echo "=== Attempting CMake configuration ==="
+            if cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
+              echo "✓ CMake configuration succeeded"
+            else
+              echo "✗ CMake configuration failed"
               exit 1
-            }
-            echo "✓ Build succeeded!"
+            fi
+            echo ""
+            echo "=== Attempting build (showing first error) ==="
+            if cmake --build build --config Release 2>&1 | tee build.log; then
+              echo "✓ Build succeeded!"
+            else
+              echo "✗ Build failed - showing first 50 lines of errors:"
+              grep -A 5 "error:" build.log | head -50 || cat build.log | head -100
+              exit 1
+            fi
 
   openbsd-build:
     runs-on: ubuntu-latest
@@ -65,7 +85,6 @@ jobs:
           prepare: |
             pkg_add cmake lz4 zstd snappy
           run: |
-            set -e
             echo "=== OpenBSD System Info ==="
             uname -a
             echo ""
@@ -77,17 +96,21 @@ jobs:
             fi
             echo ""
             echo "=== Attempting CMake configuration ==="
-            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF || {
-              echo "CMake configuration failed (expected - sysinfo issue)"
+            if cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
+              echo "✓ CMake configuration succeeded"
+            else
+              echo "✗ CMake configuration failed"
               exit 1
-            }
+            fi
             echo ""
-            echo "=== Attempting build ==="
-            cmake --build build --config Release || {
-              echo "Build failed (expected - sysinfo issue)"
+            echo "=== Attempting build (showing first error) ==="
+            if cmake --build build --config Release 2>&1 | tee build.log; then
+              echo "✓ Build succeeded!"
+            else
+              echo "✗ Build failed - showing errors:"
+              grep -A 5 "error:" build.log | head -50 || cat build.log | head -100
               exit 1
-            }
-            echo "✓ Build succeeded!"
+            fi
 
   netbsd-build:
     runs-on: ubuntu-latest
@@ -105,7 +128,6 @@ jobs:
           prepare: |
             /usr/sbin/pkg_add cmake lz4 zstd snappy
           run: |
-            set -e
             echo "=== NetBSD System Info ==="
             uname -a
             echo ""
@@ -117,17 +139,21 @@ jobs:
             fi
             echo ""
             echo "=== Attempting CMake configuration ==="
-            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF || {
-              echo "CMake configuration failed (expected - sysinfo issue)"
+            if cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
+              echo "✓ CMake configuration succeeded"
+            else
+              echo "✗ CMake configuration failed"
               exit 1
-            }
+            fi
             echo ""
-            echo "=== Attempting build ==="
-            cmake --build build --config Release || {
-              echo "Build failed (expected - sysinfo issue)"
+            echo "=== Attempting build (showing first error) ==="
+            if cmake --build build --config Release 2>&1 | tee build.log; then
+              echo "✓ Build succeeded!"
+            else
+              echo "✗ Build failed - showing errors:"
+              grep -A 5 "error:" build.log | head -50 || cat build.log | head -100
               exit 1
-            }
-            echo "✓ Build succeeded!"
+            fi
 
   omnios-build:
     runs-on: ubuntu-latest
@@ -145,7 +171,6 @@ jobs:
           prepare: |
             pkg install cmake gcc-13 library/lz4 library/zstd compress/snappy
           run: |
-            set -e
             echo "=== OmniOS/Illumos System Info ==="
             uname -a
             echo ""
@@ -159,17 +184,21 @@ jobs:
             echo "=== Attempting CMake configuration ==="
             export CC=gcc
             export CXX=g++
-            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF || {
-              echo "CMake configuration failed (expected - sysinfo issue)"
+            if cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
+              echo "✓ CMake configuration succeeded"
+            else
+              echo "✗ CMake configuration failed"
               exit 1
-            }
+            fi
             echo ""
-            echo "=== Attempting build ==="
-            cmake --build build --config Release || {
-              echo "Build failed (expected - sysinfo issue)"
+            echo "=== Attempting build (showing first error) ==="
+            if cmake --build build --config Release 2>&1 | tee build.log; then
+              echo "✓ Build succeeded!"
+            else
+              echo "✗ Build failed - showing errors:"
+              grep -A 5 "error:" build.log | head -50 || cat build.log | head -100
               exit 1
-            }
-            echo "✓ Build succeeded!"
+            fi
 
   dragonflybsd-build:
     runs-on: ubuntu-latest
@@ -187,7 +216,6 @@ jobs:
           prepare: |
             pkg install -y cmake pkgconf zstd liblz4 snappy
           run: |
-            set -e
             echo "=== DragonFlyBSD System Info ==="
             uname -a
             echo ""
@@ -199,14 +227,18 @@ jobs:
             fi
             echo ""
             echo "=== Attempting CMake configuration ==="
-            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF || {
-              echo "CMake configuration failed (expected - sysinfo issue)"
+            if cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
+              echo "✓ CMake configuration succeeded"
+            else
+              echo "✗ CMake configuration failed"
               exit 1
-            }
+            fi
             echo ""
-            echo "=== Attempting build ==="
-            cmake --build build --config Release || {
-              echo "Build failed (expected - sysinfo issue)"
+            echo "=== Attempting build (showing first error) ==="
+            if cmake --build build --config Release 2>&1 | tee build.log; then
+              echo "✓ Build succeeded!"
+            else
+              echo "✗ Build failed - showing errors:"
+              grep -A 5 "error:" build.log | head -50 || cat build.log | head -100
               exit 1
-            }
-            echo "✓ Build succeeded!"
+            fi

@@ -22,7 +22,7 @@ jobs:
           release: '14.0'
           usesh: true
           prepare: |
-            pkg install -y cmake pkgconf zstd lz4 snappy
+            pkg install -y cmake pkgconf zstd liblz4 snappy
           run: |
             set -e
             echo "=== FreeBSD System Info ==="
@@ -63,7 +63,7 @@ jobs:
           release: '7.4'
           usesh: true
           prepare: |
-            pkg_add cmake pkgconf zstd lz4 snappy
+            pkg_add cmake lz4 zstd snappy
           run: |
             set -e
             echo "=== OpenBSD System Info ==="
@@ -103,7 +103,7 @@ jobs:
           release: '9.3'
           usesh: true
           prepare: |
-            /usr/sbin/pkg_add cmake pkgconf zstd lz4 snappy
+            /usr/sbin/pkg_add cmake lz4 zstd snappy
           run: |
             set -e
             echo "=== NetBSD System Info ==="
@@ -143,7 +143,7 @@ jobs:
           release: 'r151048'
           usesh: true
           prepare: |
-            pkg install cmake gcc13 zstd lz4 snappy
+            pkg install cmake gcc-13 library/lz4 library/zstd compress/snappy
           run: |
             set -e
             echo "=== OmniOS/Illumos System Info ==="
@@ -185,7 +185,7 @@ jobs:
           release: '6.4.0'
           usesh: true
           prepare: |
-            pkg install -y cmake pkgconf zstd lz4 snappy
+            pkg install -y cmake pkgconf zstd liblz4 snappy
           run: |
             set -e
             echo "=== DragonFlyBSD System Info ==="

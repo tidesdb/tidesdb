@@ -159,6 +159,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES           512                 /* max open sstables globally */
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      1024 * 64           /* max concurrent txns per cf */
 #define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024) /* default global block cache size */
+#define TDB_DEFAULT_L0_COMPACTION_THRESHOLD \
+    4 /* trigger compaction when L0 has this many sstables */
 
 #define TDB_MAX_TXN_CFS         10000  /* maximum number of cfs per transaction */
 #define TDB_MAX_PATH_LEN        4096   /* maximum path length */
@@ -197,6 +199,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param skip_list_probability skip list probability
  * @param default_isolation_level default isolation level
  * @param min_disk_space minimum free disk space required (bytes)
+ * @param l0_compaction_threshold trigger compaction when L0 has this many SSTables
  */
 typedef struct
 {
@@ -221,6 +224,7 @@ typedef struct
     float skip_list_probability;
     tidesdb_isolation_level_t default_isolation_level;
     uint64_t min_disk_space;
+    int l0_compaction_threshold;
 } tidesdb_column_family_config_t;
 
 /**
@@ -508,6 +512,7 @@ struct tidesdb_column_family_t
     tidesdb_level_t **levels;
     int num_levels;
     _Atomic(uint64_t) next_sstable_id;
+    _Atomic(int) is_compacting;
     tidesdb_t *db;
 };
 
@@ -712,6 +717,7 @@ typedef struct
             tidesdb_t *db;
             tidesdb_sstable_t *sst;
             block_manager_cursor_t *klog_cursor;
+            block_manager_cursor_t *vlog_cursor; /* reusable cursor for vlog reads */
             tidesdb_klog_block_t *current_block;
             block_manager_block_t *current_block_data;
             uint8_t *decompressed_data;
@@ -867,6 +873,16 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
  * @return pointer to column family, NULL on failure
  */
 tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *name);
+
+/**
+ * tidesdb_list_column_families
+ * lists all column families in the database
+ * @param db database handle
+ * @param names pointer to array of column family names (caller must free each name and the array)
+ * @param count pointer to store the number of column families
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count);
 
 /**
  * tidesdb_txn_begin

@@ -63,6 +63,54 @@ static void test_column_family_creation(void)
     cleanup_test_dir();
 }
 
+static void test_list_column_families(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    /* test with no column families */
+    char **names = NULL;
+    int count = 0;
+    ASSERT_EQ(tidesdb_list_column_families(db, &names, &count), 0);
+    ASSERT_EQ(count, 0);
+    ASSERT_TRUE(names == NULL);
+
+    /* create multiple column families */
+    ASSERT_EQ(tidesdb_create_column_family(db, "cf1", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "cf2", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "cf3", &cf_config), 0);
+
+    /* list column families */
+    ASSERT_EQ(tidesdb_list_column_families(db, &names, &count), 0);
+    ASSERT_EQ(count, 3);
+    ASSERT_TRUE(names != NULL);
+
+    /* verify all names are present */
+    int found_cf1 = 0, found_cf2 = 0, found_cf3 = 0;
+    for (int i = 0; i < count; i++)
+    {
+        ASSERT_TRUE(names[i] != NULL);
+        if (strcmp(names[i], "cf1") == 0) found_cf1 = 1;
+        if (strcmp(names[i], "cf2") == 0) found_cf2 = 1;
+        if (strcmp(names[i], "cf3") == 0) found_cf3 = 1;
+        free(names[i]);
+    }
+    free(names);
+
+    ASSERT_TRUE(found_cf1);
+    ASSERT_TRUE(found_cf2);
+    ASSERT_TRUE(found_cf3);
+
+    /* test invalid arguments */
+    ASSERT_EQ(tidesdb_list_column_families(NULL, &names, &count), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_list_column_families(db, NULL, &count), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_list_column_families(db, &names, NULL), TDB_ERR_INVALID_ARGS);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_basic_txn_put_get(void)
 {
     cleanup_test_dir();
@@ -6832,6 +6880,7 @@ int main(void)
     cleanup_test_dir();
     RUN_TEST(test_basic_open_close, tests_passed);
     RUN_TEST(test_column_family_creation, tests_passed);
+    RUN_TEST(test_list_column_families, tests_passed);
     RUN_TEST(test_basic_txn_put_get, tests_passed);
     RUN_TEST(test_txn_delete, tests_passed);
     RUN_TEST(test_txn_rollback, tests_passed);

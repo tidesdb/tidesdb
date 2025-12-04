@@ -7300,6 +7300,56 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
     return result;
 }
 
+int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
+{
+    if (!db || !names || !count) return TDB_ERR_INVALID_ARGS;
+
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+
+    *count = db->num_column_families;
+    if (*count == 0)
+    {
+        *names = NULL;
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        return TDB_SUCCESS;
+    }
+
+    *names = malloc(sizeof(char *) * (*count));
+    if (!*names)
+    {
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        return TDB_ERR_MEMORY;
+    }
+
+    for (int i = 0; i < *count; i++)
+    {
+        if (db->column_families[i] && db->column_families[i]->name)
+        {
+            (*names)[i] = strdup(db->column_families[i]->name);
+            if (!(*names)[i])
+            {
+                /* cleanup on failure */
+                for (int j = 0; j < i; j++)
+                {
+                    free((*names)[j]);
+                }
+                free(*names);
+                *names = NULL;
+                *count = 0;
+                pthread_rwlock_unlock(&db->cf_list_lock);
+                return TDB_ERR_MEMORY;
+            }
+        }
+        else
+        {
+            (*names)[i] = NULL;
+        }
+    }
+
+    pthread_rwlock_unlock(&db->cf_list_lock);
+    return TDB_SUCCESS;
+}
+
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;

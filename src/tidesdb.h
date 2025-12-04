@@ -869,6 +869,16 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
 tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *name);
 
 /**
+ * tidesdb_list_column_families
+ * lists all column families in the database
+ * @param db database handle
+ * @param names pointer to array of column family names (caller must free each name and the array)
+ * @param count pointer to store the number of column families
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count);
+
+/**
  * tidesdb_txn_begin
  * begins a transaction with default isolation level (READ_COMMITTED)
  * @param db database handle

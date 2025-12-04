@@ -18,7 +18,6 @@
  */
 #include "block_manager.h"
 
-#include "lru.h"
 #include "xxhash.h"
 
 /**

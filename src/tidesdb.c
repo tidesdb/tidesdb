@@ -315,28 +315,39 @@ static void *tidesdb_block_acquire_copy_fn(void *value)
  * @param path the sstable path (e.g., "/path/to/cf_name/123.klog")
  * @param cf_name_out buffer to store CF name (must be at least TDB_CACHE_KEY_SIZE bytes)
  * @return 0 on success, -1 on failure
+ *
+ * this method handles both '/' and '\\' separators for cross-platform portability.
+ * a database created on linux (using '/') must be readable on windows (using '\\') and vice versa.
  */
 static int tidesdb_get_cf_name_from_path(const char *path, char *cf_name_out)
 {
     if (!path || !cf_name_out) return -1;
 
-    /* find the last two directory separators */
-    const char *last_slash = strrchr(path, '/');
-    if (!last_slash) return -1;
+    /* define both separator types for cross-platform compatibility */
+    const char sep_unix = '/';
+    const char sep_windows = '\\';
 
-    const char *second_last_slash = last_slash - 1;
-    while (second_last_slash > path && *second_last_slash != '/')
+    /* find the last directory separator (check both types for portability) */
+    const char *last_slash = strrchr(path, sep_unix);
+    const char *last_backslash = strrchr(path, sep_windows);
+    const char *last_sep = (last_slash > last_backslash) ? last_slash : last_backslash;
+    if (!last_sep) return -1;
+
+    /* find the second-to-last directory separator */
+    const char *second_last_sep = last_sep - 1;
+    while (second_last_sep > path && *second_last_sep != sep_unix &&
+           *second_last_sep != sep_windows)
     {
-        second_last_slash--;
+        second_last_sep--;
     }
 
-    if (*second_last_slash != '/') return -1;
+    if (*second_last_sep != sep_unix && *second_last_sep != sep_windows) return -1;
 
     /* copy the CF name */
-    size_t cf_name_len = last_slash - second_last_slash - 1;
+    size_t cf_name_len = last_sep - second_last_sep - 1;
     if (cf_name_len >= TDB_CACHE_KEY_SIZE) cf_name_len = TDB_CACHE_KEY_SIZE - 1;
 
-    memcpy(cf_name_out, second_last_slash + 1, cf_name_len);
+    memcpy(cf_name_out, second_last_sep + 1, cf_name_len);
     cf_name_out[cf_name_len] = '\0';
 
     return 0;
@@ -2365,16 +2376,12 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
                                size_t key_size, tidesdb_kv_pair_t **kv)
 {
-    TDB_DEBUG_LOG("SSTable %" PRIu64 ": tidesdb_sstable_get called for key", sst->id);
-    
     /* ensure sstable is open through cache */
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
         TDB_DEBUG_LOG("SSTable " TDB_U64_FMT " ensure_open FAILED", TDB_U64_CAST(sst->id));
         return TDB_ERR_IO;
     }
-
-    TDB_DEBUG_LOG("SSTable %" PRIu64 ": ensure_open succeeded", sst->id);
 
     tidesdb_block_managers_t bms;
     if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
@@ -2383,15 +2390,12 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         return TDB_ERR_IO;
     }
 
-    TDB_DEBUG_LOG("SSTable %" PRIu64 ": get_block_managers succeeded", sst->id);
-
     if (!sst->min_key || !sst->max_key)
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": min_key=%p, max_key=%p - returning NOT_FOUND", sst->id, (void*)sst->min_key, (void*)sst->max_key);
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": min_key=%p, max_key=%p - returning NOT_FOUND", sst->id,
+                      (void *)sst->min_key, (void *)sst->max_key);
         return TDB_ERR_NOT_FOUND;
     }
-
-    TDB_DEBUG_LOG("SSTable %" PRIu64 ": min_key and max_key are valid, checking range", sst->id);
 
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
@@ -2427,10 +2431,10 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     if (sst->bloom_filter && !bloom_filter_contains(sst->bloom_filter, key, key_size))
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter check FAILED - key not in bloom filter", sst->id);
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter check FAILED - key not in bloom filter",
+                      sst->id);
         return TDB_ERR_NOT_FOUND;
     }
-    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter check passed (or no bloom filter)", sst->id);
 
     /* use block index to find starting klog block */
     int64_t start_block = 0;
@@ -2440,37 +2444,28 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         {
             start_block = 0;
         }
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block index lookup - starting at block %" PRId64, sst->id, start_block);
-    }
-    else
-    {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": No block index, starting at block 0", sst->id);
     }
 
     /* search klog blocks using block manager cursor */
     block_manager_cursor_t *klog_cursor;
-    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Initializing klog cursor", sst->id);
+
     if (block_manager_cursor_init(&klog_cursor, bms.klog_bm) != 0)
     {
         TDB_DEBUG_LOG("SSTable %" PRIu64 ": FAILED to initialize klog cursor", sst->id);
         return TDB_ERR_IO;
     }
-    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Klog cursor initialized, num_klog_blocks=%" PRIu64, sst->id, atomic_load(&sst->num_klog_blocks));
 
     /* build position cache if block index exists (for O(1) jumping) */
-    TDB_DEBUG_LOG("SSTable %" PRIu64 ": block_index=%p, klog_data_end_offset=%" PRIu64, sst->id, (void*)sst->block_index, sst->klog_data_end_offset);
+
     if (sst->block_index && sst->klog_data_end_offset > 0)
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Calling block_manager_cursor_build_cache", sst->id);
         int cache_result = block_manager_cursor_build_cache(klog_cursor, sst->klog_data_end_offset);
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": block_manager_cursor_build_cache returned %d", sst->id, cache_result);
+
         if (cache_result == 0)
         {
             /* use position cache to jump directly to the target block */
-            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Cache built successfully, cache_size=%d, start_block=%" PRId64, sst->id, klog_cursor->cache_size, start_block);
             if (start_block >= 0 && start_block < klog_cursor->cache_size)
             {
-                TDB_DEBUG_LOG("SSTable %" PRIu64 ": Jumping to block %" PRId64 " using cache", sst->id, start_block);
                 klog_cursor->cache_index = start_block;
                 klog_cursor->current_pos = klog_cursor->position_cache[start_block];
                 klog_cursor->current_block_size = klog_cursor->size_cache[start_block];
@@ -2478,10 +2473,8 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             else
             {
                 /* fallback to first block if index out of range */
-                TDB_DEBUG_LOG("SSTable %" PRIu64 ": Calling goto_first (fallback path)", sst->id);
                 if (block_manager_cursor_goto_first(klog_cursor) != 0)
                 {
-                    TDB_DEBUG_LOG("SSTable %" PRIu64 ": goto_first FAILED (fallback path)", sst->id);
                     block_manager_cursor_free(klog_cursor);
                     return TDB_ERR_NOT_FOUND;
                 }
@@ -2491,10 +2484,8 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     else
     {
         /* no block index or cache build failed, start from first block */
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Calling goto_first (no cache path)", sst->id);
         if (block_manager_cursor_goto_first(klog_cursor) != 0)
         {
-            TDB_DEBUG_LOG("SSTable %" PRIu64 ": goto_first FAILED (no cache path)", sst->id);
             block_manager_cursor_free(klog_cursor);
             return TDB_ERR_NOT_FOUND;
         }
@@ -2627,7 +2618,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     }
 
 cleanup:
-    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Search complete, result=%d", sst->id, result);
     block_manager_cursor_free(klog_cursor);
     return result;
 }
@@ -2689,8 +2679,10 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
                 if (sstable_metadata_deserialize(metadata_block->data, metadata_block->size, sst) ==
                     0)
                 {
-                    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Metadata deserialized - min_key=%p, max_key=%p, num_entries=%" PRIu64, 
-                                  sst->id, (void*)sst->min_key, (void*)sst->max_key, sst->num_entries);
+                    TDB_DEBUG_LOG(
+                        "SSTable %" PRIu64
+                        ": Metadata deserialized - min_key=%p, max_key=%p, num_entries=%" PRIu64,
+                        sst->id, (void *)sst->min_key, (void *)sst->max_key, sst->num_entries);
                     block_manager_block_release(metadata_block);
                     block_manager_cursor_free(metadata_cursor);
 

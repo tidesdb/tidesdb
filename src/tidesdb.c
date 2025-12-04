@@ -3635,7 +3635,7 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
             /* move to next block, cursor will handle position tracking */
 
             /* release previous block and decompressed data before moving to next */
-            /* CRITICAL: Free current_block FIRST since its pointers reference decompressed_data */
+            /* free current_block FIRST since its pointers reference decompressed_data */
             if (source->source.sstable.current_block)
             {
                 tidesdb_klog_block_free(source->source.sstable.current_block);
@@ -3827,7 +3827,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
             }
 
             /* release previous block and decompressed data before moving to prior block */
-            /* CRITICAL: Free current_block FIRST since its pointers reference decompressed_data */
+            /* free current_block FIRST since its pointers reference decompressed_data */
             if (source->source.sstable.current_block)
             {
                 tidesdb_klog_block_free(source->source.sstable.current_block);

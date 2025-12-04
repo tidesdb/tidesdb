@@ -574,7 +574,12 @@ typedef struct
 static void race_evict_callback(const char *key, void *value, void *user_data)
 {
     (void)key;
-    (void)value;
+    /* free the dummy value */
+    if (value)
+    {
+        free(value);
+    }
+    /* decrement the shared refcount */
     race_test_arg_t *arg = (race_test_arg_t *)user_data;
     if (arg && arg->refcount)
     {
@@ -586,27 +591,39 @@ static void *race_condition_thread(void *arg)
 {
     race_test_arg_t *targ = (race_test_arg_t *)arg;
 
-    /* check if already in cache */
-    void *cached = lru_cache_get(targ->cache, targ->key);
-    if (!cached)
+    /* atomically increment refcount and try to insert
+     * we pass a dummy value (the thread_id) since all threads are inserting the same key
+     * the cache will handle duplicate detection and call evict callback appropriately */
+    atomic_fetch_add(targ->refcount, 1);
+
+    /* create a unique value pointer for this thread (just use the thread_id as a dummy value) */
+    int *dummy_value = malloc(sizeof(int));
+    if (!dummy_value)
     {
-        /* simulate taking a reference */
-        atomic_fetch_add(targ->refcount, 1);
-
-        /* try to add to cache */
-        int result = lru_cache_put(targ->cache, targ->key, targ, race_evict_callback, targ);
-
-        if (result == 1)
-        {
-            /* entry already existed (race detected), release our extra ref */
-            atomic_fetch_sub(targ->refcount, 1);
-        }
-        else if (result == -1)
-        {
-            /* put failed, release our ref */
-            atomic_fetch_sub(targ->refcount, 1);
-        }
+        atomic_fetch_sub(targ->refcount, 1);
+        return NULL;
     }
+    *dummy_value = targ->thread_id;
+
+    /* try to add to cache -- pass targ as user_data for the evict callback */
+    int result = lru_cache_put(targ->cache, targ->key, dummy_value, race_evict_callback, targ);
+
+    if (result == 1)
+    {
+        /* entry already existed (duplicate detected by cache)
+         * the cache called evict callback on the OLD value (which decremented refcount)
+         * and updated the entry with our NEW value (dummy_value)
+         * our value is now in the cache, so we keep our refcount increment */
+        /* no additional decrement needed here */
+    }
+    else if (result == -1)
+    {
+        /* put failed, free our value and release our ref */
+        free(dummy_value);
+        atomic_fetch_sub(targ->refcount, 1);
+    }
+    /* if result == 0, we successfully inserted, keep the refcount
+     * the cache now owns dummy_value and will free it via evict callback */
 
     return NULL;
 }

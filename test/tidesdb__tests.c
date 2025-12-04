@@ -3350,7 +3350,7 @@ static void test_dividing_merge_strategy(void)
     cf_config.write_buffer_size = 256;   /* small for frequent flushes */
     cf_config.level_size_ratio = 4;      /* small ratio = faster level filling */
     cf_config.dividing_level_offset = 1; /* x = num_levels - 2 */
-    cf_config.max_levels = 10;
+    cf_config.max_levels = 2;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "dividing_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "dividing_cf");
@@ -3361,7 +3361,7 @@ static void test_dividing_merge_strategy(void)
      * level 1 capacity = 1024 * 4 = 4096 bytes
      * level 2 capacity = 4096 * 4 = 16384 bytes
      * need ~20KB total to reach level 2 */
-    int num_keys = 150;
+    int num_keys = 500;
     for (int i = 0; i < num_keys; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -6309,6 +6309,140 @@ static void test_many_sstables_all_comparators(void)
     run_sstable_simulation(&config);
 }
 
+static void test_large_value_iteration(void)
+{
+    printf(CYAN "\n=== Testing Large Value Iteration (256B keys, 4KB values) ===\n" RESET);
+
+    cleanup_test_dir();
+
+    tidesdb_t *db = NULL;
+    tidesdb_config_t config = {.db_path = TEST_DB_PATH,
+                               .num_flush_threads = 2,
+                               .num_compaction_threads = 2,
+                               .enable_debug_logging = 1,
+                               .max_open_sstables = 256};
+
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 64 * 1024;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+    cf_config.compression_algorithm = ZSTD_COMPRESSION;
+    cf_config.klog_block_size = 16 * 1024;
+    cf_config.vlog_block_size = 4 * 1024;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int NUM_KEYS = 10000;
+    const size_t KEY_SIZE = 256;
+    const size_t VALUE_SIZE = 4096;
+
+    printf(CYAN "  Inserting %d keys (256B keys, 4KB values)...\n" RESET, NUM_KEYS);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+        uint8_t key[KEY_SIZE];
+        uint8_t value[VALUE_SIZE];
+
+        snprintf((char *)key, KEY_SIZE, "large_key_%08d", i);
+        memset(key + strlen((char *)key), 'K', KEY_SIZE - strlen((char *)key));
+        snprintf((char *)value, VALUE_SIZE, "large_value_%08d_", i);
+        memset(value + strlen((char *)value), 'V', VALUE_SIZE - strlen((char *)value));
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, key, KEY_SIZE, value, VALUE_SIZE, 0), TDB_SUCCESS);
+
+        if ((i + 1) % 1000 == 0)
+        {
+            printf(CYAN "    Inserted %d keys...\n" RESET, i + 1);
+        }
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+
+    printf(CYAN "  Waiting for flushes to complete...\n" RESET);
+    sleep(2);
+
+    printf(CYAN "  Starting iteration test...\n" RESET);
+
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), TDB_SUCCESS);
+    ASSERT_TRUE(iter != NULL);
+
+    printf(CYAN "  Seeking to first...\n" RESET);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), TDB_SUCCESS);
+
+    int count = 0;
+    time_t start_time = time(NULL);
+    time_t last_report = start_time;
+
+    printf(CYAN "  Iterating through entries...\n" RESET);
+
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_iter_value(iter, &value, &value_size), TDB_SUCCESS);
+
+        ASSERT_EQ(key_size, KEY_SIZE);
+        ASSERT_EQ(value_size, VALUE_SIZE);
+
+        count++;
+
+        time_t now = time(NULL);
+        if (now - last_report >= 1)
+        {
+            double elapsed = difftime(now, start_time);
+            double rate = count / elapsed;
+            printf(CYAN "    Iterated %d entries (%.1f entries/sec)...\n" RESET, count, rate);
+            last_report = now;
+        }
+
+        if (difftime(now, start_time) > 30)
+        {
+            printf(RED "  ERROR: Iteration timeout after 30 seconds (only %d/%d entries)\n" RESET,
+                   count, NUM_KEYS);
+            ASSERT_TRUE(0);
+        }
+
+        if (tidesdb_iter_next(iter) != TDB_SUCCESS)
+        {
+            break;
+        }
+    }
+
+    time_t end_time = time(NULL);
+    double total_time = difftime(end_time, start_time);
+    double rate = count / total_time;
+
+    printf(GREEN "  ✓ Iterated %d entries in %.2f seconds (%.1f entries/sec)\n" RESET, count,
+           total_time, rate);
+
+    ASSERT_EQ(count, NUM_KEYS);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    cleanup_test_dir();
+
+    printf(GREEN "  ✓ Large value iteration test passed\n" RESET);
+}
+
 void test_tidesdb_block_index_seek()
 {
     tidesdb_t *db = NULL;
@@ -7012,6 +7146,7 @@ int main(void)
     RUN_TEST(test_many_sstables_large_cache, tests_passed);
     RUN_TEST(test_many_sstables_all_isolation_levels, tests_passed);
     RUN_TEST(test_many_sstables_all_comparators, tests_passed);
+    RUN_TEST(test_large_value_iteration, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

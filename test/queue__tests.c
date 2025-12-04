@@ -162,9 +162,6 @@ void test_queue_free_with_data(void)
     queue_enqueue(queue, str2);
     queue_enqueue(queue, str3);
 
-    char *item1 = (char *)queue_dequeue(queue);
-    free(item1);
-
     queue_free_with_data(queue, free);
 }
 
@@ -422,7 +419,6 @@ void test_queue_foreach_cleanup(void)
 
     ASSERT_EQ(queue_size(queue), 5);
 
-    /* cleanup all items using foreach */
     int cleanup_count = 0;
     int result = queue_foreach(queue, cleanup_callback, &cleanup_count);
     ASSERT_EQ(result, 5);
@@ -448,7 +444,6 @@ void test_queue_peek_at(void)
     queue_t *queue = queue_new();
     ASSERT_TRUE(queue != NULL);
 
-    /* test empty queue */
     ASSERT_EQ(queue_peek_at(queue, 0), NULL);
     ASSERT_EQ(queue_peek_at(queue, 10), NULL);
 
@@ -529,9 +524,14 @@ void test_queue_free_with_waiting_threads(void)
         usleep(1000);
     }
 
-    queue_free(queue);
+    pthread_mutex_lock(&queue->lock);
+    queue->shutdown = 1;
+    pthread_cond_broadcast(&queue->not_empty);
+    pthread_mutex_unlock(&queue->lock);
 
     pthread_join(waiter, NULL);
+
+    queue_free(queue);
 
     pthread_mutex_destroy(&start_lock);
 }
@@ -583,7 +583,6 @@ void test_queue_multiple_waiters()
 {
     queue_t *queue = queue_new();
 
-    /* start 5 waiting threads */
     pthread_t waiters[5];
     for (int i = 0; i < 5; i++)
     {
@@ -600,7 +599,6 @@ void test_queue_multiple_waiters()
         usleep(10000);
     }
 
-    /* wait for all threads */
     for (int i = 0; i < 5; i++)
     {
         void *result;

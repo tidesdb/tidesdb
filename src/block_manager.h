@@ -19,12 +19,9 @@
 #ifndef __BLOCK_MANAGER_H__
 #define __BLOCK_MANAGER_H__
 #include "compat.h"
-#include "fifo.h"
-
-/* more time equals more results, but remember to take breaks to refresh your mind. */
 
 /* max file path length for block manager file(s) */
-#define MAX_FILE_PATH_LENGTH 1024
+#define MAX_FILE_PATH_LENGTH 1024 * 4
 
 /* TDB in hex */
 #define BLOCK_MANAGER_MAGIC 0x544442
@@ -32,7 +29,7 @@
 #define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF
 
 /* block manager version */
-#define BLOCK_MANAGER_VERSION 4
+#define BLOCK_MANAGER_VERSION 5
 
 /* header field sizes */
 /* magic number size in bytes */
@@ -57,38 +54,17 @@
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE                              \
     (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH + \
      BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
-/* 32KB inline, larger blocks are overflowed */
 #define MAX_INLINE_BLOCK_SIZE (32 * 1024)
 /* extra bytes for headers in stack buffers */
 #define BLOCK_MANAGER_STACK_BUFFER_OVERHEAD 64
-/* size of cache key buffer for offset-to-string conversion */
-#define BLOCK_MANAGER_CACHE_KEY_SIZE 32
-
 /* default file permissions (rw-r--r--) */
-#define BLOCK_MANAGER_FILE_MODE   0644
-#define MIN_CACHE_ENTRIES         10
-#define MAX_REASONABLE_BLOCK_SIZE (10ULL * 1024 * 1024 * 1024)
+#define BLOCK_MANAGER_FILE_MODE 0644
 
 typedef enum
 {
     BLOCK_MANAGER_SYNC_NONE,
     BLOCK_MANAGER_SYNC_FULL,
 } block_manager_sync_mode_t;
-
-/**
- * block_manager_cache_t
- * block manager cache struct
- * used for block manager caching
- * @param max_size max size of cache in bytes
- * @param current_size current size of cache in bytes
- * @param fifo_cache utilized for hot block caching
- */
-typedef struct
-{
-    uint32_t max_size;
-    uint32_t current_size;
-    fifo_cache_t *fifo_cache;
-} block_manager_cache_t;
 
 /**
  * block_manager_t
@@ -98,9 +74,7 @@ typedef struct
  * @param file_path the path of the file
  * @param sync_mode sync mode for this block manager
  * @param block_size the default block size for this block manager
- * @param cache_size size of lru cache of blocks in bytes
  * @param current_file_size track file size in memory to avoid syscalls
- * @param block_manager_cache the block manager cache
  */
 typedef struct
 {
@@ -108,8 +82,8 @@ typedef struct
     char file_path[MAX_FILE_PATH_LENGTH];
     block_manager_sync_mode_t sync_mode;
     uint32_t block_size;
-    _Atomic uint64_t current_file_size;
-    block_manager_cache_t *block_manager_cache;
+    /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
+    ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
 } block_manager_t;
 
 /**
@@ -118,13 +92,13 @@ typedef struct
  * used for blocks in TidesDB
  * @param size the size of the data in the block
  * @param data the data in the block
- * @param ref_count reference count for zero-copy caching (atomic)
+ * @param ref_count atomic reference count for safe concurrent access
  */
 typedef struct
 {
     uint64_t size;
     void *data;
-    _Atomic(int) ref_count;
+    _Atomic(uint32_t) ref_count;
 } block_manager_block_t;
 
 /**
@@ -134,36 +108,35 @@ typedef struct
  * @param bm the block manager
  * @param current_pos the current position of the cursor
  * @param current_block_size the size of the current block
+ * @param position_cache array of block positions
+ * @param size_cache array of block sizes
+ * @param cache_capacity allocated capacity
+ * @param cache_size number of cached positions
+ * @param cache_index current index in cache (-1 if not using cache)
  */
 typedef struct
 {
     block_manager_t *bm;
     uint64_t current_pos;
     uint64_t current_block_size;
+
+    /* position cache for O(1) backward navigation */
+    uint64_t *position_cache;
+    uint64_t *size_cache;
+    int cache_capacity;
+    int cache_size;
+    int cache_index;
 } block_manager_cursor_t;
 
 /**
  * block_manager_open
- * opens a block manager (no cache)
+ * opens a block manager
  * @param bm the block manager to open
  * @param file_path the path of the file
- * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL)
+ * @param sync_mode the sync mode (BLOCK_MANAGER_SYNC_NONE, BLOCK_MANAGER_SYNC_FULL)
  * @return 0 if successful, -1 if not
  */
 int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode);
-
-/**
- * block_manager_open_with_cache
- * opens a block manager with LRU cache support for blocks, if you provide cache_size of 0, will
- * open with no caching.
- * @param bm the block manager to open
- * @param file_path the path of the file
- * @param sync_mode the sync mode
- * @param cache_size size of block manager lru block cache in bytes
- * @return 0 if successful, -1 if not
- */
-int block_manager_open_with_cache(block_manager_t **bm, const char *file_path,
-                                  block_manager_sync_mode_t sync_mode, uint32_t cache_size);
 
 /**
  * block_manager_close
@@ -201,14 +174,14 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
 /**
  * block_manager_block_free
- * frees a block (use this for non-cached blocks)
+ * frees a block
  * @param block the block to free
  */
 void block_manager_block_free(block_manager_block_t *block);
 
 /**
  * block_manager_block_acquire
- * increments reference count for a cached block
+ * increments reference count for a block
  * @param block the block to acquire
  * @return 1 if successful, 0 if block is being freed
  */
@@ -383,6 +356,15 @@ int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
  * @return 1 if the cursor is at the second block, 0 if not.  can return -1 if error
  */
 int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
+
+/**
+ * block_manager_cursor_build_cache
+ * builds a position cache for fast seeks when block index is enabled
+ * @param cursor the cursor to build cache for
+ * @param end_offset the end offset to cache up to
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_build_cache(block_manager_cursor_t *cursor, uint64_t end_offset);
 
 /**
  * block_manager_validate_last_block

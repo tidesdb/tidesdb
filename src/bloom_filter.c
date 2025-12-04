@@ -160,9 +160,19 @@ unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
 
 uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
 {
-    /* calculate the size of the serialized data (packed format) */
-    *out_size = sizeof(int32_t) * 2 + (size_t)bf->size_in_words * sizeof(uint64_t);
-    uint8_t *buffer = malloc(*out_size);
+    /* count non-zero words for sparse encoding */
+    int non_zero_count = 0;
+    for (int i = 0; i < bf->size_in_words; i++)
+    {
+        if (bf->bitset[i] != 0) non_zero_count++;
+    }
+
+    /* we allocate worst-case size
+     * - header: 3 varint32s (m, h, non_zero_count) = 15 bytes max
+     * - sparse data: each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
+     */
+    size_t max_size = 15 + non_zero_count * 15;
+    uint8_t *buffer = malloc(max_size);
     if (buffer == NULL)
     {
         return NULL;
@@ -170,51 +180,41 @@ uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
 
     uint8_t *ptr = buffer;
 
-    /* write the size of the bitset (m)  */
-    ptr[0] = (uint8_t)(bf->m & 0xFF);
-    ptr[1] = (uint8_t)((bf->m >> 8) & 0xFF);
-    ptr[2] = (uint8_t)((bf->m >> 16) & 0xFF);
-    ptr[3] = (uint8_t)((bf->m >> 24) & 0xFF);
-    ptr += sizeof(int32_t);
+    /* write header with varint encoding */
+    ptr = encode_varint32(ptr, (uint32_t)bf->m);
+    ptr = encode_varint32(ptr, (uint32_t)bf->h);
+    ptr = encode_varint32(ptr, (uint32_t)non_zero_count);
 
-    /* write the number of hash functions (h) */
-    ptr[0] = (uint8_t)(bf->h & 0xFF);
-    ptr[1] = (uint8_t)((bf->h >> 8) & 0xFF);
-    ptr[2] = (uint8_t)((bf->h >> 16) & 0xFF);
-    ptr[3] = (uint8_t)((bf->h >> 24) & 0xFF);
-    ptr += sizeof(int32_t);
-
-    /* write the packed bitset */
+    /* write sparse bitset: only non-zero words with their indices */
     for (int i = 0; i < bf->size_in_words; i++)
     {
-        uint64_t word = bf->bitset[i];
-        ptr[0] = (uint8_t)(word & 0xFF);
-        ptr[1] = (uint8_t)((word >> 8) & 0xFF);
-        ptr[2] = (uint8_t)((word >> 16) & 0xFF);
-        ptr[3] = (uint8_t)((word >> 24) & 0xFF);
-        ptr[4] = (uint8_t)((word >> 32) & 0xFF);
-        ptr[5] = (uint8_t)((word >> 40) & 0xFF);
-        ptr[6] = (uint8_t)((word >> 48) & 0xFF);
-        ptr[7] = (uint8_t)((word >> 56) & 0xFF);
-        ptr += sizeof(uint64_t);
+        if (bf->bitset[i] != 0)
+        {
+            ptr = encode_varint32(ptr, (uint32_t)i);   /* word index */
+            ptr = encode_varint64(ptr, bf->bitset[i]); /* word value */
+        }
     }
 
-    return buffer;
+    /* return actual size used */
+    *out_size = ptr - buffer;
+
+    /* shrink buffer to actual size */
+    uint8_t *final_buffer = realloc(buffer, *out_size);
+    return final_buffer ? final_buffer : buffer;
 }
 
 bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
 {
     const uint8_t *ptr = data;
 
-    /* read the size of the bitset (m) */
-    int32_t m = (int32_t)(((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
-                          ((uint32_t)ptr[3] << 24));
-    ptr += sizeof(int32_t);
+    /* read header with varint decoding */
+    uint32_t m_u32, h_u32, non_zero_count;
+    ptr = decode_varint32(ptr, &m_u32);
+    ptr = decode_varint32(ptr, &h_u32);
+    ptr = decode_varint32(ptr, &non_zero_count);
 
-    /* read the number of hash functions (h)*/
-    int32_t h = (int32_t)(((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
-                          ((uint32_t)ptr[3] << 24));
-    ptr += sizeof(int32_t);
+    int32_t m = (int32_t)m_u32;
+    int32_t h = (int32_t)h_u32;
 
     /* validate deserialized values */
     if (m <= 0 || h <= 0)
@@ -236,19 +236,29 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
         return NULL;
     }
 
-    /* read the packed bitset */
-    uint64_t *bitset = malloc((size_t)size_in_words * sizeof(uint64_t));
+    /* allocate and zero-initialize bitset */
+    uint64_t *bitset = calloc((size_t)size_in_words, sizeof(uint64_t));
     if (bitset == NULL)
     {
         return NULL;
     }
 
-    for (int i = 0; i < size_in_words; i++)
+    /* read sparse bitset: only non-zero words */
+    for (uint32_t i = 0; i < non_zero_count; i++)
     {
-        bitset[i] = ((uint64_t)ptr[0]) | ((uint64_t)ptr[1] << 8) | ((uint64_t)ptr[2] << 16) |
-                    ((uint64_t)ptr[3] << 24) | ((uint64_t)ptr[4] << 32) | ((uint64_t)ptr[5] << 40) |
-                    ((uint64_t)ptr[6] << 48) | ((uint64_t)ptr[7] << 56);
-        ptr += sizeof(uint64_t);
+        uint32_t index;
+        uint64_t value;
+        ptr = decode_varint32(ptr, &index);
+        ptr = decode_varint64(ptr, &value);
+
+        /* validate index is within bounds */
+        if (index >= (uint32_t)size_in_words)
+        {
+            free(bitset);
+            return NULL;
+        }
+
+        bitset[index] = value;
     }
 
     bloom_filter_t *bf = malloc(sizeof(bloom_filter_t));

@@ -17,6 +17,8 @@
 *.exe
 *.out
 *.app
+benchtool
+docs
 cmake-build-debug
 cmake-build-release
 .idea
@@ -25,3 +27,8 @@ build
 vcpkg_installed
 .vs
 test_tidesdb
+how-does-tidesdb-work.md
+c.md
+building.md
+what-is-tidesdb.md
+test_runs.log

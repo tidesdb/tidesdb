@@ -20,16 +20,16 @@
 #include "../src/skip_list.h"
 #include "test_utils.h"
 
+static int tests_passed = 0;
+static int tests_failed = 0;
+
+#define BENCH_N 1000000 /* number of entries to write and retrieve */
+
 /* helper macros for accessing node data */
 #define NODE_KEY(node)   ((node)->key)
 #define NODE_VALUE(node) (atomic_load_explicit(&(node)->versions, memory_order_acquire)->value)
 #define NODE_IS_DELETED(node) \
     (VERSION_IS_DELETED(atomic_load_explicit(&(node)->versions, memory_order_acquire)))
-
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define BENCH_N 1000000 /* number of entries to write and retrieve */
 
 void test_skip_list_create_node()
 {
@@ -65,8 +65,9 @@ void test_skip_list_put_get()
     uint8_t *retrieved_value;
     size_t retrieved_value_size;
     uint8_t deleted;
-    int get_result =
-        skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size, &deleted);
+    time_t ttl;
+    int get_result = skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size,
+                                   &ttl, &deleted);
     ASSERT_EQ(get_result, 0);
     ASSERT_TRUE(memcmp(retrieved_value, value, sizeof(value)) == 0);
 
@@ -272,9 +273,10 @@ void benchmark_skip_list()
         uint8_t *retrieved_value;
         size_t retrieved_value_size;
         uint8_t deleted;
+        time_t ttl;
 
         int result = skip_list_get(list, keys[i], key_size, &retrieved_value, &retrieved_value_size,
-                                   &deleted);
+                                   &ttl, &deleted);
         ASSERT_EQ(result, 0);
         ASSERT_EQ(memcmp(retrieved_value, values[i], value_size), 0);
         free(retrieved_value);
@@ -342,7 +344,9 @@ void benchmark_skip_list_sequential()
         uint8_t *retrieved_value;
         size_t retrieved_value_size;
         uint8_t deleted;
-        skip_list_get(list, keys[i], key_size, &retrieved_value, &retrieved_value_size, &deleted);
+        time_t ttl;
+        skip_list_get(list, keys[i], key_size, &retrieved_value, &retrieved_value_size, &ttl,
+                      &deleted);
         free(retrieved_value);
     }
     end = clock();
@@ -374,7 +378,6 @@ void test_skip_list_ttl()
 
     ASSERT_TRUE(skip_list_put(list, key, sizeof(key), value, sizeof(value), time(NULL) + ttl) == 0);
 
-    /* take a snooze */
 #ifdef _WIN32
     Sleep((ttl + 1) * 1000);
 #else
@@ -384,8 +387,9 @@ void test_skip_list_ttl()
     uint8_t *retrieved_value;
     size_t retrieved_value_size;
     uint8_t deleted;
-    int result =
-        skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size, &deleted);
+    time_t retrieved_ttl;
+    int result = skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size,
+                               &retrieved_ttl, &deleted);
 
     ASSERT_EQ(result, 0);
     ASSERT_EQ(deleted, 1);
@@ -677,8 +681,9 @@ void *concurrent_reader(void *arg)
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
         int result = skip_list_get(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1, &value,
-                                   &value_size, &deleted);
+                                   &value_size, &ttl, &deleted);
 
         if (result == 0 && value != NULL)
         {
@@ -758,13 +763,13 @@ void test_skip_list_concurrent_read_write()
     for (int i = 0; i < num_readers; i++)
     {
         pthread_join(readers[i], NULL);
-        printf("  Reader %d completed %d reads\n", i, reader_ctx[i].reads_completed);
+        printf(YELLOW "  Reader %d completed %d reads\n" RESET, i, reader_ctx[i].reads_completed);
     }
 
     for (int i = 0; i < num_writers; i++)
     {
         pthread_join(writers[i], NULL);
-        printf("  Writer %d completed %d writes\n", i, writer_ctx[i].writes_completed);
+        printf(YELLOW "  Writer %d completed %d writes\n" RESET, i, writer_ctx[i].writes_completed);
     }
 
     int total_reads = 0;
@@ -793,21 +798,22 @@ void test_skip_list_null_validation()
     uint8_t *out_value = NULL;
     size_t out_size = 0;
     uint8_t deleted = 0;
+    time_t ttl;
 
     /* null list */
     ASSERT_EQ(skip_list_put(NULL, key, sizeof(key), value, sizeof(value), -1), -1);
-    ASSERT_EQ(skip_list_get(NULL, key, sizeof(key), &out_value, &out_size, &deleted), -1);
+    ASSERT_EQ(skip_list_get(NULL, key, sizeof(key), &out_value, &out_size, &ttl, &deleted), -1);
 
     /* null key */
     ASSERT_EQ(skip_list_put(list, NULL, sizeof(key), value, sizeof(value), -1), -1);
-    ASSERT_EQ(skip_list_get(list, NULL, sizeof(key), &out_value, &out_size, &deleted), -1);
+    ASSERT_EQ(skip_list_get(list, NULL, sizeof(key), &out_value, &out_size, &ttl, &deleted), -1);
 
     /* null value on put */
     ASSERT_EQ(skip_list_put(list, key, sizeof(key), NULL, sizeof(value), -1), -1);
 
     /* null output pointers on get */
-    ASSERT_EQ(skip_list_get(list, key, sizeof(key), NULL, &out_size, &deleted), -1);
-    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &out_value, NULL, &deleted), -1);
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), NULL, &out_size, &ttl, &deleted), -1);
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &out_value, NULL, &ttl, &deleted), -1);
 
     skip_list_free(list);
 }
@@ -845,9 +851,10 @@ void test_skip_list_large_keys_values()
     uint8_t *retrieved_value = NULL;
     size_t retrieved_size = 0;
     uint8_t deleted = 0;
+    time_t ttl;
 
     ASSERT_EQ(skip_list_get(list, large_key, sizeof(large_key), &retrieved_value, &retrieved_size,
-                            &deleted),
+                            &ttl, &deleted),
               0);
     ASSERT_EQ(retrieved_size, sizeof(large_value));
     ASSERT_EQ(memcmp(retrieved_value, large_value, sizeof(large_value)), 0);
@@ -875,9 +882,11 @@ void test_skip_list_duplicate_key_update()
     uint8_t *retrieved_value = NULL;
     size_t retrieved_size = 0;
     uint8_t deleted = 0;
+    time_t ttl;
 
-    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &deleted),
-              0);
+    ASSERT_EQ(
+        skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &ttl, &deleted),
+        0);
 
     /* GET should return the latest version (value2), atomic replacement, no duplicates */
     ASSERT_EQ(retrieved_size, sizeof(value2));
@@ -899,17 +908,17 @@ void test_skip_list_delete_operations()
     uint8_t key[] = "delete_me";
     uint8_t value[] = "value";
 
-    /* insert then delete */
     ASSERT_EQ(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1), 0);
-    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1),
-              0); /* mark deleted */
+    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1), 0);
 
     /* get should return with deleted flag */
     uint8_t *retrieved_value = NULL;
     size_t retrieved_size = 0;
     uint8_t deleted = 0;
+    time_t ttl;
 
-    int result = skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &deleted);
+    int result =
+        skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_size, &ttl, &deleted);
 
     if (result == 0 && retrieved_value != NULL)
     {
@@ -919,7 +928,7 @@ void test_skip_list_delete_operations()
     /* delete non-existent key */
     uint8_t nonexistent[] = "nonexistent";
     result = skip_list_get(list, nonexistent, sizeof(nonexistent), &retrieved_value,
-                           &retrieved_size, &deleted);
+                           &retrieved_size, &ttl, &deleted);
     ASSERT_EQ(result, -1);
 
     skip_list_free(list);
@@ -959,9 +968,10 @@ void test_skip_list_delete_existing_keys()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        int result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        int result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &ttl,
+                                   &deleted);
 
         if (i % 2 == 0)
         {
@@ -1007,9 +1017,10 @@ void test_skip_list_delete_nonexistent_keys()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        int result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        int result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &ttl,
+                                   &deleted);
         ASSERT_EQ(result, -1);
     }
 
@@ -1033,7 +1044,8 @@ void test_skip_list_delete_and_reinsert()
     uint8_t *retrieved = NULL;
     size_t size = 0;
     uint8_t deleted = 0;
-    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved, &size, &deleted), 0);
+    time_t ttl;
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved, &size, &ttl, &deleted), 0);
     ASSERT_EQ(deleted, 1);
     if (retrieved) free(retrieved);
 
@@ -1044,7 +1056,7 @@ void test_skip_list_delete_and_reinsert()
     retrieved = NULL;
     size = 0;
     deleted = 0;
-    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved, &size, &deleted), 0);
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved, &size, &ttl, &deleted), 0);
     ASSERT_EQ(deleted, 0);
     ASSERT_EQ(size, sizeof(value2));
     ASSERT_TRUE(memcmp(retrieved, value2, sizeof(value2)) == 0);
@@ -1058,7 +1070,6 @@ void test_skip_list_iterate_with_deletes()
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
 
-    /* insert 50 keys */
     for (int i = 0; i < 50; i++)
     {
         char key[32], value[64];
@@ -1069,7 +1080,6 @@ void test_skip_list_iterate_with_deletes()
                   0);
     }
 
-    /* delete keys 10-19 */
     for (int i = 10; i < 20; i++)
     {
         char key[32];
@@ -1134,8 +1144,8 @@ void *lockfree_stress_writer(void *arg)
 
         if (result != 0)
         {
-            printf("ERROR: Thread %d failed to insert key %s at iteration %d\n", ctx->thread_id,
-                   key_buf, i);
+            printf(RED "ERROR: Thread %d failed to insert key %s at iteration %d\n" RESET,
+                   ctx->thread_id, key_buf, i);
             return NULL;
         }
 
@@ -1147,8 +1157,6 @@ void *lockfree_stress_writer(void *arg)
 
 void test_skip_list_lockfree_stress()
 {
-    printf(CYAN "\nRunning lock-free stress test (high contention)...\n" RESET);
-
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
     ASSERT_TRUE(list != NULL);
@@ -1159,7 +1167,8 @@ void test_skip_list_lockfree_stress()
     pthread_t *writers = malloc(num_writers * sizeof(pthread_t));
     concurrent_test_ctx_t *writer_ctx = malloc(num_writers * sizeof(concurrent_test_ctx_t));
 
-    printf("  Starting %d writer threads, %d ops each...\n", num_writers, ops_per_thread);
+    printf(YELLOW "  Starting %d writer threads, %d ops each...\n" RESET, num_writers,
+           ops_per_thread);
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1176,7 +1185,7 @@ void test_skip_list_lockfree_stress()
     for (int i = 0; i < num_writers; i++)
     {
         pthread_join(writers[i], NULL);
-        printf("  Writer %d completed %d writes\n", i, writer_ctx[i].writes_completed);
+        printf(YELLOW "  Writer %d completed %d writes\n" RESET, i, writer_ctx[i].writes_completed);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -1195,7 +1204,7 @@ void test_skip_list_lockfree_stress()
     ASSERT_EQ(total_writes, num_writers * ops_per_thread);
 
     /* verify list integrity, check that we can read all keys */
-    printf("  Verifying list integrity...\n");
+    printf(YELLOW "  Verifying list integrity...\n" RESET);
     int keys_found = 0;
     for (int i = 0; i < 100; i++)
     {
@@ -1205,9 +1214,10 @@ void test_skip_list_lockfree_stress()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
         int result = skip_list_get(list, (uint8_t *)key_buf, strlen(key_buf) + 1, &value,
-                                   &value_size, &deleted);
+                                   &value_size, &ttl, &deleted);
         if (result == 0 && value != NULL)
         {
             keys_found++;
@@ -1215,11 +1225,11 @@ void test_skip_list_lockfree_stress()
         }
     }
 
-    printf("  Found %d/100 keys (some may have been deleted)\n", keys_found);
+    printf(YELLOW "  Found %d/100 keys (some may have been deleted)\n" RESET, keys_found);
     ASSERT_TRUE(keys_found > 0); /* at least some keys should exist */
 
     /* verify we can iterate without crashes */
-    printf("  Testing iteration...\n");
+    printf(YELLOW "  Testing iteration...\n" RESET);
     skip_list_cursor_t *cursor = NULL;
     ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
@@ -1235,14 +1245,12 @@ void test_skip_list_lockfree_stress()
         } while (skip_list_cursor_next(cursor) == 0);
     }
 
-    printf("  Iterated through %d entries\n", iterated);
+    printf(YELLOW "  Iterated through %d entries\n" RESET, iterated);
     skip_list_cursor_free(cursor);
 
     free(writers);
     free(writer_ctx);
     skip_list_free(list);
-
-    printf(GREEN "  Lock-free stress test PASSED!\n" RESET);
 }
 
 static uint64_t zipfian_next(uint64_t *state, uint64_t n)
@@ -1263,8 +1271,6 @@ static uint64_t zipfian_next(uint64_t *state, uint64_t n)
 
 void benchmark_skip_list_zipfian()
 {
-    printf("\n" YELLOW "=== Skip List Zipfian (Hot Key) Benchmark ===\n" RESET);
-
     skip_list_t *list = NULL;
     int result = skip_list_new(&list, 12, 0.25);
     ASSERT_EQ(result, 0);
@@ -1279,7 +1285,8 @@ void benchmark_skip_list_zipfian()
     int unique_keys_accessed = 0;
 
     /* zipfian writes (hot keys get updated many times) */
-    printf("  Phase 1: Zipfian writes (%d ops, ~%d unique keys)...\n", num_ops, num_unique_keys);
+    printf(YELLOW "  Phase 1: Zipfian writes (%d ops, ~%d unique keys)...\n" RESET, num_ops,
+           num_unique_keys);
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1309,17 +1316,19 @@ void benchmark_skip_list_zipfian()
     double write_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     double write_ops_per_sec = num_ops / write_time;
 
-    printf("    Writes: %.2f M ops/sec (%.3f seconds)\n", write_ops_per_sec / 1e6, write_time);
-    printf("    Unique keys accessed: %d\n", unique_keys_accessed);
-    printf("    New inserts: %d, Updates: %d\n", unique_keys_accessed,
+    printf(CYAN "    Writes: %.2f M ops/sec (%.3f seconds)\n" RESET, write_ops_per_sec / 1e6,
+           write_time);
+    printf(CYAN "    Unique keys accessed: %d\n" RESET, unique_keys_accessed);
+    printf(CYAN "    New inserts: %d, Updates: %d\n" RESET, unique_keys_accessed,
            num_ops - unique_keys_accessed);
-    printf("    Actual entries in skip list: %d\n", skip_list_count_entries(list));
-    printf("    Duplicates created: %d\n", skip_list_count_entries(list) - unique_keys_accessed);
+    printf(CYAN "    Actual entries in skip list: %d\n" RESET, skip_list_count_entries(list));
+    printf(YELLOW "    Duplicates created: %d\n" RESET,
+           skip_list_count_entries(list) - unique_keys_accessed);
 
     free(key_seen);
 
     /* mixed workload (50% read, 50% write) with zipfian distribution */
-    printf("  Phase 2: Zipfian mixed (50/50 read/write, %d ops)...\n", num_ops);
+    printf(YELLOW "  Phase 2: Zipfian mixed (50/50 read/write, %d ops)...\n" RESET, num_ops);
 
     zipf_state = 12345; /* reset for consistent distribution */
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1338,9 +1347,10 @@ void benchmark_skip_list_zipfian()
             uint8_t *value = NULL;
             size_t value_size = 0;
             uint8_t deleted = 0;
+            time_t ttl;
 
-            int get_result =
-                skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+            int get_result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value,
+                                           &value_size, &ttl, &deleted);
             if (get_result == 0 && !deleted)
             {
                 read_hits++;
@@ -1365,13 +1375,15 @@ void benchmark_skip_list_zipfian()
     double read_ops_per_sec = read_count / mixed_time;
     double mixed_write_ops_per_sec = write_count / mixed_time;
 
-    printf("    Mixed: %.2f M ops/sec (%.3f seconds)\n", mixed_ops_per_sec / 1e6, mixed_time);
-    printf("    Reads: %.2f M ops/sec (%d ops, %d hits, %.1f%% hit rate)\n", read_ops_per_sec / 1e6,
-           read_count, read_hits, (read_hits * 100.0) / read_count);
-    printf("    Writes: %.2f M ops/sec (%d ops)\n", mixed_write_ops_per_sec / 1e6, write_count);
+    printf(CYAN "    Mixed: %.2f M ops/sec (%.3f seconds)\n" RESET, mixed_ops_per_sec / 1e6,
+           mixed_time);
+    printf(CYAN "    Reads: %.2f M ops/sec (%d ops, %d hits, %.1f%% hit rate)\n" RESET,
+           read_ops_per_sec / 1e6, read_count, read_hits, (read_hits * 100.0) / read_count);
+    printf(CYAN "    Writes: %.2f M ops/sec (%d ops)\n" RESET, mixed_write_ops_per_sec / 1e6,
+           write_count);
 
     /* pure reads (all hot keys) */
-    printf("  Phase 3: Zipfian reads only (%d ops)...\n", num_ops);
+    printf(YELLOW "  Phase 3: Zipfian reads only (%d ops)...\n" RESET, num_ops);
 
     zipf_state = 12345;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1386,9 +1398,10 @@ void benchmark_skip_list_zipfian()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        int get_result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        int get_result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size,
+                                       &ttl, &deleted);
         if (get_result == 0 && !deleted)
         {
             pure_read_hits++;
@@ -1400,25 +1413,21 @@ void benchmark_skip_list_zipfian()
     double read_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     double pure_read_ops_per_sec = num_ops / read_time;
 
-    printf("    Reads: %.2f M ops/sec (%.3f seconds, %d hits, %.1f%% hit rate)\n",
+    printf(CYAN "    Reads: %.2f M ops/sec (%.3f seconds, %d hits, %.1f%% hit rate)\n" RESET,
            pure_read_ops_per_sec / 1e6, read_time, pure_read_hits,
            (pure_read_hits * 100.0) / num_ops);
 
     skip_list_free(list);
-
-    printf(GREEN "  Zipfian benchmark complete!\n" RESET);
 }
 
 void test_skip_list_update_patterns()
 {
-    printf("\n" YELLOW "=== Skip List Update Patterns Test ===\n" RESET);
-
     skip_list_t *list = NULL;
     int result = skip_list_new(&list, 12, 0.25);
     ASSERT_EQ(result, 0);
     ASSERT_TRUE(list != NULL);
 
-    printf("  Writing version 1 for 50 keys...\n");
+    printf(YELLOW "  Writing version 1 for 50 keys...\n" RESET);
     for (int i = 0; i < 50; i++)
     {
         char key[32], value[64];
@@ -1431,13 +1440,13 @@ void test_skip_list_update_patterns()
     }
 
     int count_v1 = skip_list_count_entries(list);
-    printf("    After version 1: %d entries\n", count_v1);
+    printf(YELLOW "    After version 1: %d entries\n" RESET, count_v1);
     ASSERT_EQ(count_v1, 50);
 
     /* update same keys multiple times */
     for (int version = 2; version <= 5; version++)
     {
-        printf("  Writing version %d for 50 keys...\n", version);
+        printf(YELLOW "  Writing version %d for 50 keys...\n" RESET, version);
         for (int i = 0; i < 50; i++)
         {
             char key[32], value[64];
@@ -1450,11 +1459,10 @@ void test_skip_list_update_patterns()
         }
 
         int count = skip_list_count_entries(list);
-        printf("    After version %d: %d entries\n", version, count);
+        printf(YELLOW "    After version %d: %d entries\n" RESET, version, count);
     }
 
-    /* verify we get version 5 for all keys */
-    printf("  Verifying all keys return version 5...\n");
+    printf(YELLOW "  Verifying all keys return version 5...\n" RESET);
     for (int i = 0; i < 50; i++)
     {
         char key[32], expected[64];
@@ -1464,39 +1472,37 @@ void test_skip_list_update_patterns()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &ttl,
+                               &deleted);
         ASSERT_EQ(result, 0);
         ASSERT_TRUE(!deleted);
         ASSERT_EQ(value_size, strlen(expected) + 1);
 
         if (memcmp(value, expected, strlen(expected)) != 0)
         {
-            printf("    ERROR: key=%s expected=%s got=%s\n", key, expected, (char *)value);
+            printf(RED "    ERROR: key=%s expected=%s got=%s\n" RESET, key, expected,
+                   (char *)value);
             ASSERT_TRUE(0);
         }
 
         free(value);
     }
 
-    printf("    All 50 keys verified successfully!\n");
+    printf(YELLOW "    All 50 keys verified successfully!\n" RESET);
 
     skip_list_free(list);
-
-    printf(GREEN "  Update patterns test PASSED!\n" RESET);
 }
 
 static void test_skip_list_large_value_updates(void)
 {
-    printf("\n" YELLOW "=== Skip List Large Value Updates Test ===\n" RESET);
-
     skip_list_t *list = NULL;
     int result = skip_list_new(&list, 12, 0.25);
     ASSERT_EQ(result, 0);
     ASSERT_TRUE(list != NULL);
 
-    printf("  Testing large value updates (100 bytes, 10 versions)...\n");
+    printf(YELLOW "  Testing large value updates (100 bytes, 10 versions)...\n" RESET);
 
     const int num_keys = 20;
     const int num_versions = 10;
@@ -1517,7 +1523,7 @@ static void test_skip_list_large_value_updates(void)
         }
 
         int count = skip_list_count_entries(list);
-        printf("    After version %d: %d entries\n", version, count);
+        printf(YELLOW "    After version %d: %d entries\n" RESET, version, count);
 
         /* after first version, count should stay constant (in-place updates) */
         if (version > 1)
@@ -1527,7 +1533,7 @@ static void test_skip_list_large_value_updates(void)
     }
 
     /* verify we get the latest version for all keys */
-    printf("  Verifying all keys return version %d...\n", num_versions);
+    printf(YELLOW "  Verifying all keys return version %d...\n" RESET, num_versions);
     for (int i = 0; i < num_keys; i++)
     {
         char key[32], expected[100];
@@ -1537,35 +1543,33 @@ static void test_skip_list_large_value_updates(void)
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &ttl,
+                               &deleted);
         ASSERT_EQ(result, 0);
         ASSERT_TRUE(!deleted);
         ASSERT_EQ(value_size, strlen(expected) + 1);
 
         if (memcmp(value, expected, strlen(expected)) != 0)
         {
-            printf("    ERROR: key=%s expected=%s got=%s\n", key, expected, (char *)value);
+            printf(RED "    ERROR: key=%s expected=%s got=%s\n" RESET, key, expected,
+                   (char *)value);
             ASSERT_TRUE(0);
         }
 
         free(value);
     }
 
-    printf("    All %d keys verified successfully!\n", num_keys);
-    printf("    Final entry count: %d (should be %d, no duplicates)\n",
+    printf(CYAN "    All %d keys verified successfully!\n" RESET, num_keys);
+    printf(CYAN "    Final entry count: %d (should be %d, no duplicates)\n" RESET,
            skip_list_count_entries(list), num_keys);
 
     skip_list_free(list);
-
-    printf(GREEN "  Large value updates test PASSED!\n" RESET);
 }
 
 void benchmark_skip_list_deletions()
 {
-    printf("\n" YELLOW "=== Skip List Deletion Benchmark ===\n" RESET);
-
     skip_list_t *list = NULL;
     int result = skip_list_new(&list, 12, 0.25);
     ASSERT_EQ(result, 0);
@@ -1574,8 +1578,7 @@ void benchmark_skip_list_deletions()
     const int num_keys = 100000;
     struct timespec start, end;
 
-    /* populate with keys */
-    printf("  Populating %d keys...\n", num_keys);
+    printf(YELLOW "  Populating %d keys...\n" RESET, num_keys);
     for (int i = 0; i < num_keys; i++)
     {
         char key[32], value[64];
@@ -1587,10 +1590,10 @@ void benchmark_skip_list_deletions()
         ASSERT_EQ(result, 0);
     }
 
-    printf("  Initial entry count: %d\n", skip_list_count_entries(list));
+    printf(YELLOW "  Initial entry count: %d\n" RESET, skip_list_count_entries(list));
 
     /* benchmark delete existing keys */
-    printf("  Phase 1: Deleting existing keys (%d ops)...\n", num_keys);
+    printf(YELLOW "  Phase 1: Deleting existing keys (%d ops)...\n" RESET, num_keys);
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     for (int i = 0; i < num_keys; i++)
@@ -1604,7 +1607,7 @@ void benchmark_skip_list_deletions()
     double delete_existing_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     double delete_existing_ops_per_sec = num_keys / delete_existing_time;
 
-    printf("    Delete existing: %.2f M ops/sec (%.3f seconds)\n",
+    printf(YELLOW "    Delete existing: %.2f M ops/sec (%.3f seconds)\n" RESET,
            delete_existing_ops_per_sec / 1e6, delete_existing_time);
 
     /* verify all keys are marked deleted */
@@ -1617,22 +1620,23 @@ void benchmark_skip_list_deletions()
         uint8_t *value = NULL;
         size_t value_size = 0;
         uint8_t deleted = 0;
+        time_t ttl;
 
-        result =
-            skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &deleted);
+        result = skip_list_get(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size, &ttl,
+                               &deleted);
         if (result == 0 && deleted)
         {
             deleted_count++;
             free(value);
         }
     }
-    printf("    Verified %d keys marked as deleted\n", deleted_count);
+    printf(YELLOW "    Verified %d keys marked as deleted\n" RESET, deleted_count);
 
     skip_list_free(list);
 
     /* benchmark delete non-existing keys (no-op, should be very fast) */
     const int tombstone_ops = 10000;
-    printf("  Phase 2: Deleting non-existing keys (%d ops)...\n", tombstone_ops);
+    printf(YELLOW "  Phase 2: Deleting non-existing keys (%d ops)...\n" RESET, tombstone_ops);
     result = skip_list_new(&list, 12, 0.25);
     ASSERT_EQ(result, 0);
 
@@ -1659,14 +1663,16 @@ void benchmark_skip_list_deletions()
     double delete_nonexist_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     double delete_nonexist_ops_per_sec = tombstone_ops / delete_nonexist_time;
 
-    printf("    Delete non-existing: %.2f M ops/sec (%.3f seconds)\n",
+    printf(YELLOW "    Delete non-existing: %.2f M ops/sec (%.3f seconds)\n" RESET,
            delete_nonexist_ops_per_sec / 1e6, delete_nonexist_time);
-    printf("    Tombstone count: %d\n", skip_list_count_entries(list));
+    printf(YELLOW "    Tombstone count: %d\n" RESET, skip_list_count_entries(list));
 
     skip_list_free(list);
 
     /* benchmark mixed workload (50% existing, 50% non-existing) */
-    printf("  Phase 3: Mixed deletions (50%% existing, 50%% non-existing, %d ops)...\n", num_keys);
+    printf(YELLOW
+           "  Phase 3: Mixed deletions (50%% existing, 50%% non-existing, %d ops)...\n" RESET,
+           num_keys);
     result = skip_list_new(&list, 12, 0.25);
     ASSERT_EQ(result, 0);
 
@@ -1694,12 +1700,10 @@ void benchmark_skip_list_deletions()
     double delete_mixed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     double delete_mixed_ops_per_sec = num_keys / delete_mixed_time;
 
-    printf("    Delete mixed: %.2f M ops/sec (%.3f seconds)\n", delete_mixed_ops_per_sec / 1e6,
-           delete_mixed_time);
+    printf(CYAN "    Delete mixed: %.2f M ops/sec (%.3f seconds)\n" RESET,
+           delete_mixed_ops_per_sec / 1e6, delete_mixed_time);
 
     skip_list_free(list);
-
-    printf(GREEN "  Deletion benchmark complete!\n" RESET);
 }
 
 void test_skip_list_seek_for_prev_nonexistent()
@@ -1734,8 +1738,73 @@ void test_skip_list_seek_for_prev_nonexistent()
 
     ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
               0);
-    printf("  seek_for_prev(\"key_025_5\") returned key: %.*s\n", (int)key_size, key);
     ASSERT_EQ(memcmp(key, "key_025", 7), 0);
+
+    skip_list_cursor_free(cursor);
+    skip_list_free(list);
+}
+
+/* reverse comparator for testing */
+static int reverse_memcmp_comparator(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                     size_t key2_size, void *ctx)
+{
+    (void)ctx;
+    size_t min_size = key1_size < key2_size ? key1_size : key2_size;
+    int result = memcmp(key1, key2, min_size);
+    if (result != 0) return -result;      /* negate to reverse */
+    if (key1_size < key2_size) return 1;  /* reverse: shorter is greater */
+    if (key1_size > key2_size) return -1; /* reverse: longer is smaller */
+    return 0;
+}
+
+void test_skip_list_reverse_comparator()
+{
+    printf("Running: test_skip_list_reverse_comparator...\n");
+
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new_with_comparator(&list, 12, 0.25, reverse_memcmp_comparator, NULL), 0);
+    ASSERT_TRUE(list != NULL);
+
+    /* insert keys 0-9 */
+    for (int i = 0; i < 10; i++)
+    {
+        char key[32], value[32];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_%03d", i);
+        ASSERT_EQ(skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                strlen(value) + 1, -1),
+                  0);
+    }
+
+    /* iterate forward -- should get keys in reverse order (9, 8, 7, ..., 0) */
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+    ASSERT_EQ(skip_list_cursor_goto_first(cursor), 0);
+
+    int expected = 9;
+    while (skip_list_cursor_valid(cursor))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        time_t ttl = 0;
+        uint8_t deleted = 0;
+
+        ASSERT_EQ(
+            skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted), 0);
+
+        char expected_key[32];
+        snprintf(expected_key, sizeof(expected_key), "key_%03d", expected);
+
+        printf("  Expected: %s, Got: %s\n", expected_key, (char *)key);
+        ASSERT_EQ(strcmp((char *)key, expected_key), 0);
+
+        expected--;
+        if (skip_list_cursor_next(cursor) != 0) break;
+    }
+
+    ASSERT_EQ(expected, -1); /* should have iterated through all 10 keys */
 
     skip_list_cursor_free(cursor);
     skip_list_free(list);
@@ -1771,6 +1840,8 @@ int main(void)
     RUN_TEST(test_skip_list_update_patterns, tests_passed);
     RUN_TEST(test_skip_list_concurrent_read_write, tests_passed);
     RUN_TEST(test_skip_list_lockfree_stress, tests_passed);
+    RUN_TEST(test_skip_list_reverse_comparator, tests_passed);
+
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);
     RUN_TEST(benchmark_skip_list_zipfian, tests_passed);

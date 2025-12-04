@@ -75,6 +75,7 @@
 
 #else /* posix */
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #define STAT_STRUCT stat
 #define STAT_FUNC   stat
 #define FSTAT_FUNC  fstat
@@ -114,6 +115,17 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #define UNUSED
 #endif
 
+/* cross-platform thread-local storage */
+#if defined(_MSC_VER)
+#define THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define THREAD_LOCAL _Thread_local
+#elif defined(__GNUC__) || defined(__clang__)
+#define THREAD_LOCAL __thread
+#else
+#define THREAD_LOCAL /* fallback: no thread-local support */
+#endif
+
 /* cross-platform prefetch hints for cache optimization */
 #if defined(__GNUC__) || defined(__clang__)
 /* __builtin_prefetch(addr, rw, locality)
@@ -126,7 +138,7 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #define PREFETCH_READ(addr)  _mm_prefetch((const char *)(addr), _MM_HINT_T0)
 #define PREFETCH_WRITE(addr) _mm_prefetch((const char *)(addr), _MM_HINT_T0)
 #else
-/* no prefetch support - define as no-op */
+/* no prefetch support -- define as no-op */
 #define PREFETCH_READ(addr)  ((void)0)
 #define PREFETCH_WRITE(addr) ((void)0)
 #endif
@@ -235,7 +247,7 @@ static inline int _tidesdb_open_wrapper_2(const char *path, int flags)
 /* mingw and GCC have proper C11 stdatomic.h support */
 #include <stdatomic.h>
 #elif _MSC_VER < 1930
-/* MSVC < 2022 doesn't have stdatomic.h - use Windows Interlocked functions */
+/* MSVC < 2022 doesn't have stdatomic.h -- use Windows Interlocked functions */
 typedef volatile LONG atomic_int;
 typedef volatile LONGLONG atomic_size_t;
 typedef volatile LONGLONG atomic_uint64_t;
@@ -1413,6 +1425,370 @@ static inline uint64_t decode_uint64_le_compat(const uint8_t *buf)
            ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
 }
 
+/**
+ * encode_int64_le_compat
+ * encodes a int64_t value in little-endian format
+ * @param buf output buffer (must be at least 8 bytes)
+ * @param val value to encode
+ */
+static inline void encode_int64_le_compat(uint8_t *buf, int64_t val)
+{
+    uint64_t uval = (uint64_t)val;
+    buf[0] = (uint8_t)(uval);
+    buf[1] = (uint8_t)(uval >> 8);
+    buf[2] = (uint8_t)(uval >> 16);
+    buf[3] = (uint8_t)(uval >> 24);
+    buf[4] = (uint8_t)(uval >> 32);
+    buf[5] = (uint8_t)(uval >> 40);
+    buf[6] = (uint8_t)(uval >> 48);
+    buf[7] = (uint8_t)(uval >> 56);
+}
+
+/**
+ * decode_int64_le_compat
+ * decodes a int64_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline int64_t decode_int64_le_compat(const uint8_t *buf)
+{
+    uint64_t uval = ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
+                    ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
+                    ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
+    return (int64_t)uval;
+}
+
+/* varint encoding/decoding for compact serialization */
+static inline uint8_t *encode_varint32(uint8_t *ptr, uint32_t value)
+{
+    while (value >= 0x80)
+    {
+        *ptr++ = (uint8_t)(value | 0x80);
+        value >>= 7;
+    }
+    *ptr++ = (uint8_t)value;
+    return ptr;
+}
+
+static inline uint8_t *encode_varint64(uint8_t *ptr, uint64_t value)
+{
+    while (value >= 0x80)
+    {
+        *ptr++ = (uint8_t)(value | 0x80);
+        value >>= 7;
+    }
+    *ptr++ = (uint8_t)value;
+    return ptr;
+}
+
+static inline const uint8_t *decode_varint32(const uint8_t *ptr, uint32_t *value)
+{
+    uint32_t result = 0;
+    int shift = 0;
+    while (*ptr & 0x80)
+    {
+        /* prevent shift overflow on corrupted data */
+        if (shift >= 32)
+        {
+            *value = 0;
+            return ptr;
+        }
+        result |= (uint32_t)(*ptr & 0x7F) << shift;
+        shift += 7;
+        ptr++;
+    }
+    /* final byte check */
+    if (shift >= 32)
+    {
+        *value = 0;
+        return ptr;
+    }
+    result |= (uint32_t)(*ptr) << shift;
+    *value = result;
+    return ptr + 1;
+}
+
+static inline const uint8_t *decode_varint64(const uint8_t *ptr, uint64_t *value)
+{
+    uint64_t result = 0;
+    int shift = 0;
+    while (*ptr & 0x80)
+    {
+        /* prevent shift overflow on corrupted data */
+        if (shift >= 64)
+        {
+            *value = 0;
+            return ptr;
+        }
+        result |= (uint64_t)(*ptr & 0x7F) << shift;
+        shift += 7;
+        ptr++;
+    }
+    /* final byte check */
+    if (shift >= 64)
+    {
+        *value = 0;
+        return ptr;
+    }
+    result |= (uint64_t)(*ptr) << shift;
+    *value = result;
+    return ptr + 1;
+}
+
+/* length-prefixed KV serialization helpers */
+
+/*
+ * serialize_kv_varint
+ * serialize key-value pair with varint length prefixes
+ * format: varint(key_size) + key + varint(value_size) + value
+ * @param ptr output buffer (must have enough space)
+ * @param key key data
+ * @param key_size key size
+ * @param value value data (can be NULL if value_size is 0)
+ * @param value_size value size
+ * @return pointer to end of written data
+ */
+static inline uint8_t *serialize_kv_varint(uint8_t *ptr, const uint8_t *key, uint32_t key_size,
+                                           const uint8_t *value, uint32_t value_size)
+{
+    /* write key size and key */
+    ptr = encode_varint32(ptr, key_size);
+    memcpy(ptr, key, key_size);
+    ptr += key_size;
+
+    /* write value size and value */
+    ptr = encode_varint32(ptr, value_size);
+    if (value_size > 0 && value)
+    {
+        memcpy(ptr, value, value_size);
+        ptr += value_size;
+    }
+
+    return ptr;
+}
+
+/*
+ * serialize_kv_varint_ex
+ * serialize key-value pair with flags and varint length prefixes (for SSTables)
+ * format: flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl)
+ * @param ptr output buffer (must have enough space)
+ * @param flags flags byte (e.g., tombstone marker)
+ * @param key key data
+ * @param key_size key size
+ * @param value value data (can be NULL if value_size is 0)
+ * @param value_size value size
+ * @param ttl time-to-live (0 = no expiration)
+ * @return pointer to end of written data
+ */
+static inline uint8_t *serialize_kv_varint_ex(uint8_t *ptr, uint8_t flags, const uint8_t *key,
+                                              uint32_t key_size, const uint8_t *value,
+                                              uint32_t value_size, int64_t ttl)
+{
+    /* write flags */
+    *ptr++ = flags;
+
+    /* write key size and key */
+    ptr = encode_varint32(ptr, key_size);
+    memcpy(ptr, key, key_size);
+    ptr += key_size;
+
+    /* write value size and value */
+    ptr = encode_varint32(ptr, value_size);
+    if (value_size > 0 && value)
+    {
+        memcpy(ptr, value, value_size);
+        ptr += value_size;
+    }
+
+    /* write ttl */
+    ptr = encode_varint64(ptr, (uint64_t)ttl);
+
+    return ptr;
+}
+
+/*
+ * serialize_kv_varint_full
+ * serialize key-value pair with all metadata (for WAL)
+ * format: flags(1) + varint(key_size) + key + varint(value_size) + value + varint(ttl) +
+ * varint(seq)
+ * @param ptr output buffer (must have enough space)
+ * @param flags flags byte
+ * @param key key data
+ * @param key_size key size
+ * @param value value data (can be NULL if value_size is 0)
+ * @param value_size value size
+ * @param ttl time-to-live
+ * @param seq sequence number
+ * @return pointer to end of written data
+ */
+static inline uint8_t *serialize_kv_varint_full(uint8_t *ptr, uint8_t flags, const uint8_t *key,
+                                                uint32_t key_size, const uint8_t *value,
+                                                uint32_t value_size, int64_t ttl, uint64_t seq)
+{
+    /* write flags */
+    *ptr++ = flags;
+
+    /* write key size and key */
+    ptr = encode_varint32(ptr, key_size);
+    memcpy(ptr, key, key_size);
+    ptr += key_size;
+
+    /* write value size and value */
+    ptr = encode_varint32(ptr, value_size);
+    if (value_size > 0 && value)
+    {
+        memcpy(ptr, value, value_size);
+        ptr += value_size;
+    }
+
+    /* write ttl and seq */
+    ptr = encode_varint64(ptr, (uint64_t)ttl);
+    ptr = encode_varint64(ptr, seq);
+
+    return ptr;
+}
+
+/*
+ * deserialize_kv_varint
+ * deserialize key-value pair with varint length prefixes
+ * @param ptr input buffer
+ * @param end end of input buffer (for bounds checking)
+ * @param key_size output key size
+ * @param value_size output value size
+ * @param key_out output pointer to key data (points into input buffer)
+ * @param value_out output pointer to value data (points into input buffer)
+ * @return pointer to next entry, or NULL on error
+ */
+static inline const uint8_t *deserialize_kv_varint(const uint8_t *ptr, const uint8_t *end,
+                                                   uint32_t *key_size, uint32_t *value_size,
+                                                   const uint8_t **key_out,
+                                                   const uint8_t **value_out)
+{
+    /* read key size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, key_size);
+    if (ptr + *key_size > end) return NULL;
+
+    /* read key */
+    *key_out = ptr;
+    ptr += *key_size;
+
+    /* read value size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, value_size);
+    if (ptr + *value_size > end) return NULL;
+
+    /* read value */
+    *value_out = ptr;
+    ptr += *value_size;
+
+    return ptr;
+}
+
+/*
+ * deserialize_kv_varint_ex
+ * deserialize key-value pair with flags and varint length prefixes (for SSTables)
+ * @param ptr input buffer
+ * @param end end of input buffer (for bounds checking)
+ * @param flags output flags byte
+ * @param key_size output key size
+ * @param value_size output value size
+ * @param key_out output pointer to key data (points into input buffer)
+ * @param value_out output pointer to value data (points into input buffer)
+ * @param ttl output time-to-live
+ * @return pointer to next entry, or NULL on error
+ */
+static inline const uint8_t *deserialize_kv_varint_ex(const uint8_t *ptr, const uint8_t *end,
+                                                      uint8_t *flags, uint32_t *key_size,
+                                                      uint32_t *value_size, const uint8_t **key_out,
+                                                      const uint8_t **value_out, int64_t *ttl)
+{
+    /* read flags */
+    if (ptr >= end) return NULL;
+    *flags = *ptr++;
+
+    /* read key size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, key_size);
+    if (ptr + *key_size > end) return NULL;
+
+    /* read key */
+    *key_out = ptr;
+    ptr += *key_size;
+
+    /* read value size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, value_size);
+    if (ptr + *value_size > end) return NULL;
+
+    /* read value */
+    *value_out = ptr;
+    ptr += *value_size;
+
+    /* read ttl */
+    if (ptr >= end) return NULL;
+    uint64_t ttl_u64;
+    ptr = decode_varint64(ptr, &ttl_u64);
+    *ttl = (int64_t)ttl_u64;
+
+    return ptr;
+}
+
+/*
+ * deserialize_kv_varint_full
+ * deserialize key-value pair with all metadata (for WAL)
+ * @param ptr input buffer
+ * @param end end of input buffer (for bounds checking)
+ * @param flags output flags byte
+ * @param key_size output key size
+ * @param value_size output value size
+ * @param key_out output pointer to key data (points into input buffer)
+ * @param value_out output pointer to value data (points into input buffer)
+ * @param ttl output time-to-live
+ * @param seq output sequence number
+ * @return pointer to next entry, or NULL on error
+ */
+static inline const uint8_t *deserialize_kv_varint_full(const uint8_t *ptr, const uint8_t *end,
+                                                        uint8_t *flags, uint32_t *key_size,
+                                                        uint32_t *value_size,
+                                                        const uint8_t **key_out,
+                                                        const uint8_t **value_out, int64_t *ttl,
+                                                        uint64_t *seq)
+{
+    /* read flags */
+    if (ptr >= end) return NULL;
+    *flags = *ptr++;
+
+    /* read key size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, key_size);
+    if (ptr + *key_size > end) return NULL;
+
+    /* read key */
+    *key_out = ptr;
+    ptr += *key_size;
+
+    /* read value size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, value_size);
+    if (ptr + *value_size > end) return NULL;
+
+    /* read value */
+    *value_out = ptr;
+    ptr += *value_size;
+
+    /* read ttl and seq */
+    if (ptr >= end) return NULL;
+    uint64_t ttl_u64;
+    ptr = decode_varint64(ptr, &ttl_u64);
+    *ttl = (int64_t)ttl_u64;
+
+    if (ptr >= end) return NULL;
+    ptr = decode_varint64(ptr, seq);
+
+    return ptr;
+}
+
 /*
  * set_file_sequential_hint
  * hints to the OS that file access will be sequential for read-ahead optimization
@@ -1433,6 +1809,221 @@ static inline int set_file_sequential_hint(int fd)
     (void)fd; /* unused on other platforms */
     return 0;
 #endif
+}
+
+/**
+ * tdb_get_available_disk_space
+ * get available disk space for a given path
+ * @param path the path to check
+ * @param available pointer to store available bytes
+ * @return 0 on success, -1 on failure
+ */
+static inline int tdb_get_available_disk_space(const char *path, uint64_t *available)
+{
+    if (!path || !available) return -1;
+
+#if defined(_WIN32)
+    ULARGE_INTEGER free_bytes;
+    if (GetDiskFreeSpaceExA(path, &free_bytes, NULL, NULL))
+    {
+        *available = (uint64_t)free_bytes.QuadPart;
+        return 0;
+    }
+    return -1;
+#else
+    struct statvfs stat;
+    if (statvfs(path, &stat) == 0)
+    {
+        *available = (uint64_t)stat.f_bavail * (uint64_t)stat.f_frsize;
+        return 0;
+    }
+    return -1;
+#endif
+}
+
+/* cpu pause for spin-wait loops */
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#ifdef _MSC_VER
+#include <intrin.h>
+#define cpu_pause() _mm_pause()
+#else
+#define cpu_pause() __builtin_ia32_pause()
+#endif
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#ifdef _MSC_VER
+#include <intrin.h>
+#define cpu_pause() __yield()
+#else
+#define cpu_pause() __asm__ __volatile__("yield" ::: "memory")
+#endif
+#elif defined(__arm__) || defined(_M_ARM)
+#ifdef _MSC_VER
+#include <intrin.h>
+#define cpu_pause() __yield()
+#else
+#define cpu_pause() __asm__ __volatile__("yield" ::: "memory")
+#endif
+#else
+#define cpu_pause() ((void)0)
+#endif
+
+/* cpu yield for longer waits - gives up time slice to scheduler */
+#ifdef _WIN32
+#include <windows.h>
+#define cpu_yield() SwitchToThread()
+#else
+#include <sched.h>
+#define cpu_yield() sched_yield()
+#endif
+
+/**
+ * is_directory_empty
+ * checks if a directory is empty (contains only . and ..)
+ * @param path the directory path to check
+ * @return 1 if empty, 0 if not empty or error
+ */
+static inline int is_directory_empty(const char *path)
+{
+    DIR *dir = opendir(path);
+    if (!dir) return 0;
+
+    struct dirent *entry;
+    int count = 0;
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        count++;
+        break; /* found at least one entry */
+    }
+
+    closedir(dir);
+    return count == 0;
+}
+
+/**
+ * remove_directory_once
+ * single pass of recursive directory removal
+ * @param path the directory path to remove
+ * @return 0 on success, -1 on failure
+ */
+static inline int remove_directory_once(const char *path)
+{
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+
+    struct dirent *entry;
+    int result = 0;
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+        size_t len = strlen(path) + strlen(PATH_SEPARATOR) + strlen(entry->d_name) + 1;
+        char *full_path = malloc(len);
+        if (!full_path)
+        {
+            result = -1;
+            continue;
+        }
+
+        snprintf(full_path, len, "%s%s%s", path, PATH_SEPARATOR, entry->d_name);
+
+        struct STAT_STRUCT st;
+        if (STAT_FUNC(full_path, &st) == 0)
+        {
+            if (S_ISDIR(st.st_mode))
+            {
+                /* recursive call for subdirectory */
+                if (remove_directory_once(full_path) != 0) result = -1;
+            }
+            else
+            {
+#ifdef _WIN32
+                /* clear read-only and other attributes that might prevent deletion */
+                SetFileAttributesA(full_path, FILE_ATTRIBUTE_NORMAL);
+                if (_unlink(full_path) != 0) result = -1;
+#else
+                if (unlink(full_path) != 0) result = -1;
+#endif
+            }
+        }
+
+        free(full_path);
+    }
+
+    closedir(dir);
+
+    /* try to remove the directory itself */
+#ifdef _WIN32
+    if (_rmdir(path) != 0) result = -1;
+#else
+    if (rmdir(path) != 0) result = -1;
+#endif
+
+    return result;
+}
+
+/**
+ * remove_directory
+ * recursively removes a directory and all its contents with retry logic
+ * retries if directory is not empty after deletion attempt (handles file locking)
+ * @param path the directory path to remove
+ * @return 0 on success, -1 on failure
+ */
+static inline int remove_directory(const char *path)
+{
+    /* check if directory exists */
+    DIR *dir = opendir(path);
+    if (!dir) return 0; /* already gone, success */
+    closedir(dir);
+
+    /* try up to 16 times with fixed 128ms delay */
+    for (int attempt = 0; attempt < 16; attempt++)
+    {
+        /* attempt removal */
+        (void)remove_directory_once(path);
+
+        /* check if directory is gone or empty */
+        dir = opendir(path);
+        if (!dir)
+        {
+            /* directory successfully removed */
+            return 0;
+        }
+
+        /* directory still exists, check if empty */
+        if (is_directory_empty(path))
+        {
+            closedir(dir);
+            /* empty but not removed, try rmdir directly */
+#ifdef _WIN32
+            if (_rmdir(path) == 0) return 0;
+#else
+            if (rmdir(path) == 0) return 0;
+#endif
+        }
+        else
+        {
+            closedir(dir);
+        }
+
+        /* directory not empty or removal failed, wait and retry */
+        if (attempt < 15)
+        {
+#ifdef _WIN32
+            Sleep(128);
+#else
+            usleep(128000);
+#endif
+        }
+    }
+
+    /* final check */
+    dir = opendir(path);
+    if (!dir) return 0; /* success */
+    closedir(dir);
+    return -1; /* failed after all retries */
 }
 
 #endif /* __COMPAT_H__ */

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 4.0.1)
+set(PROJECT_VERSION 5.0.0)
 
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -60,9 +60,9 @@ include_directories(external) # for external libraries linking internally
 
 # build as STATIC on Windows to avoid DLL export/import complexity in tests
 if(WIN32)
-    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/fifo.c src/queue.c src/succinct_trie.c external/xxhash.c external/ini.c)
+    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c src/buffer.c external/xxhash.c external/ini.c)
 else()
-    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/fifo.c src/queue.c src/succinct_trie.c external/xxhash.c external/ini.c)
+    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c src/buffer.c external/xxhash.c external/ini.c)
 endif()
 
 target_include_directories(tidesdb PRIVATE src)
@@ -134,10 +134,10 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # benchmark configuration variables (can be overridden at build time with -D flags)
     if(NOT DEFINED BENCH_NUM_OPERATIONS)
-        set(BENCH_NUM_OPERATIONS 100000)
+        set(BENCH_NUM_OPERATIONS 10000000)
     endif()
     if(NOT DEFINED BENCH_NUM_SEEK_OPS)
-        set(BENCH_NUM_SEEK_OPS 100000)
+        set(BENCH_NUM_SEEK_OPS 100)
     endif()
     if(NOT DEFINED BENCH_KEY_SIZE)
         set(BENCH_KEY_SIZE 16)
@@ -151,37 +151,49 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_NUM_THREADS)
         set(BENCH_NUM_THREADS 2)
     endif()
-    if(NOT DEFINED BENCH_DEBUG)
-        set(BENCH_DEBUG 1)
+    if(NOT DEFINED BENCH_KEY_PATTERN)
+        set(BENCH_KEY_PATTERN "sequential")
+    endif()
+
+    # tidesdb config variables for benchmark
+    if(NOT DEFINED BENCH_DB_DEBUG)
+        set(BENCH_DB_DEBUG 1)
     endif()
     if(NOT DEFINED BENCH_DB_PATH)
         set(BENCH_DB_PATH "benchmark_db")
     endif()
-    if(NOT DEFINED BENCH_KEY_PATTERN)
-        set(BENCH_KEY_PATTERN "random")
+    if(NOT DEFINED BENCH_DB_FLUSH_POOL_THREADS)
+        set(BENCH_DB_FLUSH_POOL_THREADS 2)
     endif()
+    if(NOT DEFINED BENCH_DB_COMPACTION_POOL_THREADS)
+        set(BENCH_DB_COMPACTION_POOL_THREADS 2)
+    endif()
+        
 
     # column family configuration variables for benchmark
-    if(NOT DEFINED BENCH_MEMTABLE_FLUSH_SIZE)
-        set(BENCH_MEMTABLE_FLUSH_SIZE 67108864/4)
+    if(NOT DEFINED BENCH_WRITE_BUFFER_SIZE)
+        math(EXPR BENCH_WRITE_BUFFER_SIZE 67108864) 
     endif()
-    if(NOT DEFINED BENCH_MAX_SSTABLES_BEFORE_COMPACTION)
-        set(BENCH_MAX_SSTABLES_BEFORE_COMPACTION 128)
+    if(NOT DEFINED BENCH_LEVEL_RATIO)
+        set(BENCH_LEVEL_RATIO 10)
     endif()
-    if(NOT DEFINED BENCH_COMPACTION_THREADS)
-        set(BENCH_COMPACTION_THREADS 4)
+    if(NOT DEFINED BENCH_DIVIDING_LEVEL_OFFSET)
+        set(BENCH_DIVIDING_LEVEL_OFFSET 2)
     endif()
-    if(NOT DEFINED BENCH_SL_MAX_LEVEL)
-        set(BENCH_SL_MAX_LEVEL 12)
+    if(NOT DEFINED BENCH_MAX_LEVELS)
+        set(BENCH_MAX_LEVELS 7)
     endif()
-    if(NOT DEFINED BENCH_SL_PROBABILITY)
-        set(BENCH_SL_PROBABILITY 0.25)
+    if(NOT DEFINED BENCH_SKIP_LIST_MAX_LEVEL)
+        set(BENCH_SKIP_LIST_MAX_LEVEL 16)  
+    endif()
+    if(NOT DEFINED BENCH_SKIP_LIST_PROBABILITY)
+        set(BENCH_SKIP_LIST_PROBABILITY 0.25) 
     endif()
     if(NOT DEFINED BENCH_ENABLE_COMPRESSION)
         set(BENCH_ENABLE_COMPRESSION 1)
     endif()
     if(NOT DEFINED BENCH_COMPRESSION_ALGORITHM)
-        set(BENCH_COMPRESSION_ALGORITHM COMPRESS_LZ4)
+        set(BENCH_COMPRESSION_ALGORITHM LZ4_COMPRESSION)
     endif()
     if(NOT DEFINED BENCH_ENABLE_BLOOM_FILTER)
         set(BENCH_ENABLE_BLOOM_FILTER 1)
@@ -189,14 +201,11 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_BLOOM_FILTER_FP_RATE)
         set(BENCH_BLOOM_FILTER_FP_RATE 0.01)
     endif()
-    if(NOT DEFINED BENCH_ENABLE_BACKGROUND_COMPACTION)
-        set(BENCH_ENABLE_BACKGROUND_COMPACTION 1)
-    endif()
-    if(NOT DEFINED BENCH_BACKGROUND_COMPACTION_INTERVAL)
-        set(BENCH_BACKGROUND_COMPACTION_INTERVAL 1000000)
-    endif()
     if(NOT DEFINED BENCH_ENABLE_BLOCK_INDEXES)
         set(BENCH_ENABLE_BLOCK_INDEXES 1)
+    endif()
+    if(NOT DEFINED BENCH_BLOCK_INDEX_SAMPLING_COUNT)
+        set(BENCH_BLOCK_INDEX_SAMPLING_COUNT 16)
     endif()
     if(NOT DEFINED BENCH_SYNC_MODE)
         set(BENCH_SYNC_MODE TDB_SYNC_NONE)
@@ -204,17 +213,21 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_COMPARATOR_NAME)
         set(BENCH_COMPARATOR_NAME "memcmp")
     endif()
-    if (NOT DEFINED BENCH_COLUMN_FAMILY_BLOCK_CACHE)
-        set(BENCH_COLUMN_FAMILY_BLOCK_CACHE 0)
+    if (NOT DEFINED BENCH_BLOCK_CACHE_SIZE)
+        math(EXPR BENCH_BLOCK_CACHE_SIZE 67108864)
+    endif()
+    if(NOT DEFINED BENCH_ISOLATION_LEVEL)
+        set(BENCH_ISOLATION_LEVEL TDB_ISOLATION_READ_COMMITTED)
     endif()
 
     add_executable(block_manager_tests test/block_manager__tests.c)
     add_executable(skip_list_tests test/skip_list__tests.c)
     add_executable(compress_tests test/compress__tests.c)
     add_executable(bloom_filter_tests test/bloom_filter__tests.c)
-    add_executable(fifo_tests test/fifo__tests.c)
+    add_executable(lru_tests test/lru__tests.c)
     add_executable(queue_tests test/queue__tests.c)
     add_executable(succinct_trie_tests test/succinct_trie__tests.c)
+    add_executable(buffer_tests test/buffer__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
     add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
@@ -226,29 +239,31 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         BENCH_VALUE_SIZE=${BENCH_VALUE_SIZE}
         BENCH_CF_NAME=\"${BENCH_CF_NAME}\"
         BENCH_NUM_THREADS=${BENCH_NUM_THREADS}
-        BENCH_DEBUG=${BENCH_DEBUG}
+        BENCH_DB_DEBUG=${BENCH_DB_DEBUG}
         BENCH_DB_PATH=\"${BENCH_DB_PATH}\"
         BENCH_KEY_PATTERN=\"${BENCH_KEY_PATTERN}\"
-        BENCH_MEMTABLE_FLUSH_SIZE=${BENCH_MEMTABLE_FLUSH_SIZE}
-        BENCH_MAX_SSTABLES_BEFORE_COMPACTION=${BENCH_MAX_SSTABLES_BEFORE_COMPACTION}
-        BENCH_COMPACTION_THREADS=${BENCH_COMPACTION_THREADS}
-        BENCH_SL_MAX_LEVEL=${BENCH_SL_MAX_LEVEL}
-        BENCH_SL_PROBABILITY=${BENCH_SL_PROBABILITY}
+        BENCH_WRITE_BUFFER_SIZE=${BENCH_WRITE_BUFFER_SIZE}
+        BENCH_LEVEL_RATIO=${BENCH_LEVEL_RATIO}
+        BENCH_DIVIDING_LEVEL_OFFSET=${BENCH_DIVIDING_LEVEL_OFFSET}
+        BENCH_MAX_LEVELS=${BENCH_MAX_LEVELS}
+        BENCH_SKIP_LIST_MAX_LEVEL=${BENCH_SKIP_LIST_MAX_LEVEL}
+        BENCH_SKIP_LIST_PROBABILITY=${BENCH_SKIP_LIST_PROBABILITY}
         BENCH_ENABLE_COMPRESSION=${BENCH_ENABLE_COMPRESSION}
         BENCH_COMPRESSION_ALGORITHM=${BENCH_COMPRESSION_ALGORITHM}
         BENCH_ENABLE_BLOOM_FILTER=${BENCH_ENABLE_BLOOM_FILTER}
         BENCH_BLOOM_FILTER_FP_RATE=${BENCH_BLOOM_FILTER_FP_RATE}
-        BENCH_ENABLE_BACKGROUND_COMPACTION=${BENCH_ENABLE_BACKGROUND_COMPACTION}
-        BENCH_BACKGROUND_COMPACTION_INTERVAL=${BENCH_BACKGROUND_COMPACTION_INTERVAL}
         BENCH_ENABLE_BLOCK_INDEXES=${BENCH_ENABLE_BLOCK_INDEXES}
+        BENCH_BLOCK_INDEX_SAMPLING_COUNT=${BENCH_BLOCK_INDEX_SAMPLING_COUNT}
         BENCH_SYNC_MODE=${BENCH_SYNC_MODE}
         BENCH_COMPARATOR_NAME=\"${BENCH_COMPARATOR_NAME}\"
-        BENCH_COLUMN_FAMILY_BLOCK_CACHE=${BENCH_COLUMN_FAMILY_BLOCK_CACHE}
-
+        BENCH_BLOCK_CACHE_SIZE=${BENCH_BLOCK_CACHE_SIZE}
+        BENCH_DB_FLUSH_POOL_THREADS=${BENCH_DB_FLUSH_POOL_THREADS}
+        BENCH_DB_COMPACTION_POOL_THREADS=${BENCH_DB_COMPACTION_POOL_THREADS}
+        BENCH_ISOLATION_LEVEL=${BENCH_ISOLATION_LEVEL}
     )
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests fifo_tests queue_tests succinct_trie_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests lru_tests queue_tests succinct_trie_tests buffer_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -257,9 +272,10 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME skip_list_tests COMMAND skip_list_tests)
     add_test(NAME compress_tests COMMAND compress_tests)
     add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
-    add_test(NAME fifo_tests COMMAND fifo_tests)
+    add_test(NAME lru_tests COMMAND lru_tests)
     add_test(NAME queue_tests COMMAND queue_tests)
     add_test(NAME succinct_trie_tests COMMAND succinct_trie_tests)
+    add_test(NAME buffer_tests COMMAND buffer_tests)
     add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)
@@ -280,7 +296,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         # only proceed if we found DLLs
         if(VCPKG_DLLS)
             # copy DLLs to build directory after building tests
-            foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests fifo_tests queue_tests tidesdb_tests tidesdb_bench)
+            foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests lru_tests queue_tests tidesdb_tests tidesdb_bench)
                 add_custom_command(TARGET ${test_target} POST_BUILD
                         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                         ${VCPKG_DLLS}

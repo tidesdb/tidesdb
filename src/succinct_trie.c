@@ -193,6 +193,143 @@ static uint32_t get_children_start(const succinct_trie_t *trie, uint32_t node)
     return zero_pos + 1;
 }
 
+/**
+ * counting_sort_children
+ * sort children by label using counting sort - O(n) for uint8_t labels [0-255]
+ * much faster than qsort's O(n log n) for small fixed ranges
+ * @param arr array of child entry pointers to sort
+ * @param count number of entries
+ */
+static void counting_sort_children(void **arr, int count)
+{
+    typedef struct child_entry
+    {
+        uint8_t label;
+        uint32_t child_id;
+        struct child_entry *next;
+    } child_entry_t;
+
+    if (count <= 1) return;
+
+    /* count occurrences of each label (0-255) */
+    int label_counts[256] = {0};
+    for (int i = 0; i < count; i++)
+    {
+        child_entry_t *entry = (child_entry_t *)arr[i];
+        label_counts[entry->label]++;
+    }
+
+    /* compute cumulative positions */
+    int positions[256];
+    positions[0] = 0;
+    for (int i = 1; i < 256; i++)
+    {
+        positions[i] = positions[i - 1] + label_counts[i - 1];
+    }
+
+    /* create output array */
+    void **output = malloc(count * sizeof(void *));
+    if (!output) return; /* fallback: array stays unsorted */
+
+    /* place entries in sorted order */
+    for (int i = 0; i < count; i++)
+    {
+        child_entry_t *entry = (child_entry_t *)arr[i];
+        output[positions[entry->label]++] = arr[i];
+    }
+
+    /* copy back to original array */
+    memcpy(arr, output, count * sizeof(void *));
+    free(output);
+}
+
+/**
+ * flush_builder_buffers
+ * flush accumulated write buffers to disk
+ * @param builder the builder
+ * @return 0 on success, -1 on failure
+ */
+static int flush_builder_buffers(succinct_trie_builder_t *builder)
+{
+    if (!builder || builder->buffer_size == 0) return 0;
+
+    /* write labels in one batch */
+    block_manager_block_t *block =
+        block_manager_block_create(builder->buffer_size * sizeof(uint8_t), builder->label_buffer);
+    if (!block || block_manager_block_write((block_manager_t *)builder->labels_bm, block) < 0)
+    {
+        if (block) block_manager_block_free(block);
+        return -1;
+    }
+    block_manager_block_free(block);
+
+    /* write parent IDs in one batch */
+    uint8_t *parent_bytes = malloc(builder->buffer_size * sizeof(uint32_t));
+    if (!parent_bytes) return -1;
+    for (uint32_t i = 0; i < builder->buffer_size; i++)
+    {
+        encode_uint32_le_compat(parent_bytes + i * 4, builder->parent_buffer[i]);
+    }
+    block = block_manager_block_create(builder->buffer_size * sizeof(uint32_t), parent_bytes);
+    if (!block || block_manager_block_write((block_manager_t *)builder->parents_bm, block) < 0)
+    {
+        free(parent_bytes);
+        if (block) block_manager_block_free(block);
+        return -1;
+    }
+    block_manager_block_free(block);
+    free(parent_bytes);
+
+    /* write child IDs in one batch */
+    uint8_t *child_bytes = malloc(builder->buffer_size * sizeof(uint32_t));
+    if (!child_bytes) return -1;
+    for (uint32_t i = 0; i < builder->buffer_size; i++)
+    {
+        encode_uint32_le_compat(child_bytes + i * 4, builder->child_buffer[i]);
+    }
+    block = block_manager_block_create(builder->buffer_size * sizeof(uint32_t), child_bytes);
+    if (!block || block_manager_block_write((block_manager_t *)builder->child_ids_bm, block) < 0)
+    {
+        free(child_bytes);
+        if (block) block_manager_block_free(block);
+        return -1;
+    }
+    block_manager_block_free(block);
+    free(child_bytes);
+
+    /* write terminal flags in one batch */
+    block =
+        block_manager_block_create(builder->buffer_size * sizeof(uint8_t), builder->term_buffer);
+    if (!block || block_manager_block_write((block_manager_t *)builder->term_bm, block) < 0)
+    {
+        if (block) block_manager_block_free(block);
+        return -1;
+    }
+    block_manager_block_free(block);
+
+    /* write values for terminal nodes (must write individually since not all nodes have values) */
+    for (uint32_t i = 0; i < builder->buffer_size; i++)
+    {
+        if (builder->term_buffer[i] && builder->val_buffer[i] != -1)
+        {
+            uint8_t val_buf[8];
+            encode_uint64_le_compat(val_buf, (uint64_t)builder->val_buffer[i]);
+            block = block_manager_block_create(sizeof(int64_t), val_buf);
+            if (!block || block_manager_block_write((block_manager_t *)builder->vals_bm, block) < 0)
+            {
+                if (block) block_manager_block_free(block);
+                return -1;
+            }
+            block_manager_block_free(block);
+            builder->n_vals++; /* increment when actually written */
+        }
+    }
+
+    /* reset buffer */
+    builder->buffer_size = 0;
+    return 0;
+}
+
 succinct_trie_builder_t *succinct_trie_builder_new(const char *temp_dir,
                                                    succinct_trie_comparator_fn comparator,
                                                    void *comparator_ctx)
@@ -303,6 +440,32 @@ succinct_trie_builder_t *succinct_trie_builder_new(const char *temp_dir,
     builder->n_vals = 0;
     builder->prev_key_len = 0;
 
+    builder->buffer_capacity = BUILDER_BUFFER_CAPACITY;
+    builder->buffer_size = 0;
+    builder->label_buffer = malloc(builder->buffer_capacity * sizeof(uint8_t));
+    builder->parent_buffer = malloc(builder->buffer_capacity * sizeof(uint32_t));
+    builder->child_buffer = malloc(builder->buffer_capacity * sizeof(uint32_t));
+    builder->term_buffer = malloc(builder->buffer_capacity * sizeof(uint8_t));
+    builder->val_buffer = malloc(builder->buffer_capacity * sizeof(int64_t));
+
+    if (!builder->label_buffer || !builder->parent_buffer || !builder->child_buffer ||
+        !builder->term_buffer || !builder->val_buffer)
+    {
+        free(builder->label_buffer);
+        free(builder->parent_buffer);
+        free(builder->child_buffer);
+        free(builder->term_buffer);
+        free(builder->val_buffer);
+        free(builder->prev_key);
+        block_manager_close((block_manager_t *)builder->vals_bm);
+        block_manager_close((block_manager_t *)builder->term_bm);
+        block_manager_close((block_manager_t *)builder->child_ids_bm);
+        block_manager_close((block_manager_t *)builder->parents_bm);
+        block_manager_close((block_manager_t *)builder->labels_bm);
+        free(builder);
+        return NULL;
+    }
+
     /* write terminal bit for root (always non-terminal) */
     uint8_t root_term = 0;
     block_manager_block_t *block = block_manager_block_create(sizeof(uint8_t), &root_term);
@@ -367,65 +530,31 @@ int succinct_trie_builder_add(succinct_trie_builder_t *builder, const uint8_t *k
         /* store this node in path stack */
         builder->path_stack[i] = child_node_id;
 
-        /* write label */
-        block_manager_block_t *block = block_manager_block_create(sizeof(uint8_t), &label);
-        if (!block) return -1;
-        if (block_manager_block_write((block_manager_t *)builder->labels_bm, block) < 0)
-        {
-            block_manager_block_free(block);
-            return -1;
-        }
-        block_manager_block_free(block);
+        /* add to buffers instead of immediate write */
+        builder->label_buffer[builder->buffer_size] = label;
+        builder->parent_buffer[builder->buffer_size] = parent_id;
+        builder->child_buffer[builder->buffer_size] = child_node_id;
+        builder->term_buffer[builder->buffer_size] = is_terminal;
 
-        /* write parent ID (little-endian) */
-        uint8_t parent_buf[4];
-        encode_uint32_le_compat(parent_buf, parent_id);
-        block = block_manager_block_create(sizeof(uint32_t), parent_buf);
-        if (!block) return -1;
-        if (block_manager_block_write((block_manager_t *)builder->parents_bm, block) < 0)
-        {
-            block_manager_block_free(block);
-            return -1;
-        }
-        block_manager_block_free(block);
-
-        /* write child node ID (little-endian) */
-        uint8_t child_buf[4];
-        encode_uint32_le_compat(child_buf, child_node_id);
-        block = block_manager_block_create(sizeof(uint32_t), child_buf);
-        if (!block) return -1;
-        if (block_manager_block_write((block_manager_t *)builder->child_ids_bm, block) < 0)
-        {
-            block_manager_block_free(block);
-            return -1;
-        }
-        block_manager_block_free(block);
-
-        /* write terminal flag */
-        block = block_manager_block_create(sizeof(uint8_t), &is_terminal);
-        if (!block) return -1;
-        if (block_manager_block_write((block_manager_t *)builder->term_bm, block) < 0)
-        {
-            block_manager_block_free(block);
-            return -1;
-        }
-        block_manager_block_free(block);
-
-        /* write value if terminal */
+        /* store value if terminal (will be written during flush) */
         if (is_terminal && value != -1)
         {
-            /* write value (little-endian) */
-            uint8_t val_buf[8];
-            encode_uint64_le_compat(val_buf, (uint64_t)value);
-            block = block_manager_block_create(sizeof(int64_t), val_buf);
-            if (!block) return -1;
-            if (block_manager_block_write((block_manager_t *)builder->vals_bm, block) < 0)
+            builder->val_buffer[builder->buffer_size] = value;
+        }
+        else
+        {
+            builder->val_buffer[builder->buffer_size] = -1; /* mark as no value */
+        }
+
+        builder->buffer_size++;
+
+        /* flush buffer when full */
+        if (builder->buffer_size >= builder->buffer_capacity)
+        {
+            if (flush_builder_buffers(builder) != 0)
             {
-                block_manager_block_free(block);
                 return -1;
             }
-            block_manager_block_free(block);
-            builder->n_vals++;
         }
 
         builder->n_edges++;
@@ -447,9 +576,25 @@ int succinct_trie_builder_add(succinct_trie_builder_t *builder, const uint8_t *k
     return 0;
 }
 
-succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
+succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder,
+                                             _Atomic(int) *shutdown_flag)
 {
     if (!builder) return NULL;
+
+    /* check shutdown flag early */
+    if (shutdown_flag && atomic_load(shutdown_flag))
+    {
+        succinct_trie_builder_free(builder);
+        return NULL;
+    }
+
+    /* flush any remaining buffered data before building */
+    if (flush_builder_buffers(builder) != 0)
+    {
+        succinct_trie_builder_free(builder);
+        return NULL;
+    }
+
     succinct_trie_t *trie = calloc(1, sizeof(succinct_trie_t));
     if (!trie)
     {
@@ -479,16 +624,36 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
 
     block_manager_cursor_t *cursor = NULL;
 
-    /* read labels */
+    /* read labels (written in batches during flush) */
     if (block_manager_cursor_init(&cursor, (block_manager_t *)builder->labels_bm) == 0)
     {
         uint32_t idx = 0;
+
         while (block_manager_cursor_has_next(cursor) > 0 && idx < builder->n_edges)
         {
+            /* check shutdown flag */
+            if (shutdown_flag && atomic_load(shutdown_flag))
+            {
+                block_manager_cursor_free(cursor);
+                free(labels);
+                free(parents);
+                free(child_ids);
+                free(trie);
+                succinct_trie_builder_free(builder);
+                return NULL;
+            }
+
             block_manager_block_t *block = block_manager_cursor_read(cursor);
             if (block)
             {
-                labels[idx++] = *(uint8_t *)block->data;
+                /* each block contains a batch of entries */
+                uint32_t entries_in_block = block->size / sizeof(uint8_t);
+                if (idx + entries_in_block > builder->n_edges)
+                {
+                    entries_in_block = builder->n_edges - idx;
+                }
+                memcpy(labels + idx, block->data, entries_in_block);
+                idx += entries_in_block;
                 block_manager_block_free(block);
             }
             block_manager_cursor_next(cursor);
@@ -496,16 +661,40 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
         block_manager_cursor_free(cursor);
     }
 
-    /* read parent IDs */
+    /* read parent IDs (written in batches during flush) */
     if (block_manager_cursor_init(&cursor, (block_manager_t *)builder->parents_bm) == 0)
     {
         uint32_t idx = 0;
+
         while (block_manager_cursor_has_next(cursor) > 0 && idx < builder->n_edges)
         {
+            /* check shutdown flag */
+            if (shutdown_flag && atomic_load(shutdown_flag))
+            {
+                block_manager_cursor_free(cursor);
+                free(labels);
+                free(parents);
+                free(child_ids);
+                free(trie);
+                succinct_trie_builder_free(builder);
+                return NULL;
+            }
+
             block_manager_block_t *block = block_manager_cursor_read(cursor);
             if (block)
             {
-                parents[idx++] = decode_uint32_le_compat((uint8_t *)block->data);
+                /* each block contains a batch of uint32_t entries */
+                uint32_t entries_in_block = block->size / sizeof(uint32_t);
+                if (idx + entries_in_block > builder->n_edges)
+                {
+                    entries_in_block = builder->n_edges - idx;
+                }
+                /* decode little-endian uint32s */
+                for (uint32_t i = 0; i < entries_in_block; i++)
+                {
+                    parents[idx + i] = decode_uint32_le_compat((uint8_t *)block->data + i * 4);
+                }
+                idx += entries_in_block;
                 block_manager_block_free(block);
             }
             block_manager_cursor_next(cursor);
@@ -513,16 +702,40 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
         block_manager_cursor_free(cursor);
     }
 
-    /* read child IDs */
+    /* read child IDs (written in batches during flush) */
     if (block_manager_cursor_init(&cursor, (block_manager_t *)builder->child_ids_bm) == 0)
     {
         uint32_t idx = 0;
+
         while (block_manager_cursor_has_next(cursor) > 0 && idx < builder->n_edges)
         {
+            /* check shutdown flag */
+            if (shutdown_flag && atomic_load(shutdown_flag))
+            {
+                block_manager_cursor_free(cursor);
+                free(labels);
+                free(parents);
+                free(child_ids);
+                free(trie);
+                succinct_trie_builder_free(builder);
+                return NULL;
+            }
+
             block_manager_block_t *block = block_manager_cursor_read(cursor);
             if (block)
             {
-                child_ids[idx++] = decode_uint32_le_compat((uint8_t *)block->data);
+                /* each block contains a batch of uint32_t entries */
+                uint32_t entries_in_block = block->size / sizeof(uint32_t);
+                if (idx + entries_in_block > builder->n_edges)
+                {
+                    entries_in_block = builder->n_edges - idx;
+                }
+                /* decode little-endian uint32s */
+                for (uint32_t i = 0; i < entries_in_block; i++)
+                {
+                    child_ids[idx + i] = decode_uint32_le_compat((uint8_t *)block->data + i * 4);
+                }
+                idx += entries_in_block;
                 block_manager_block_free(block);
             }
             block_manager_cursor_next(cursor);
@@ -550,24 +763,63 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
         return NULL;
     }
 
-    /* build adjacency list from edges */
+    /* allocate memory pool for all child entries at once (reduces malloc overhead) */
+    child_entry_t *entry_pool = malloc(builder->n_edges * sizeof(child_entry_t));
+    if (!entry_pool)
+    {
+        free(labels);
+        free(parents);
+        free(child_ids);
+        free(children);
+        free(trie);
+        succinct_trie_builder_free(builder);
+        return NULL;
+    }
+
+    /* build adjacency list from edges using memory pool */
     for (uint32_t i = 0; i < builder->n_edges; i++)
     {
+        if (shutdown_flag && (i % PERIODIC_SHUTDOWN_CHECK_INTERVAL == 0) &&
+            atomic_load(shutdown_flag))
+        {
+            free(entry_pool);
+            free(children);
+            free(labels);
+            free(parents);
+            free(child_ids);
+            free(trie);
+            succinct_trie_builder_free(builder);
+            return NULL;
+        }
+
         uint32_t parent = parents[i];
         uint32_t child = child_ids[i];
         uint8_t label = labels[i];
 
-        child_entry_t *entry = malloc(sizeof(child_entry_t));
+        child_entry_t *entry = &entry_pool[i];
         entry->label = label;
         entry->child_id = child;
         entry->next = children[parent];
         children[parent] = entry;
     }
 
-    /* sort children by label for each node */
-
+    /* sort children by label for each node using counting sort (O(n) for uint8_t range) */
     for (uint32_t node = 0; node < builder->next_node_id; node++)
     {
+        /* check shutdown flag periodically  */
+        if (shutdown_flag && (node % PERIODIC_SHUTDOWN_CHECK_INTERVAL == 0) &&
+            atomic_load(shutdown_flag))
+        {
+            free(entry_pool);
+            free(children);
+            free(labels);
+            free(parents);
+            free(child_ids);
+            free(trie);
+            succinct_trie_builder_free(builder);
+            return NULL;
+        }
+
         if (!children[node]) continue;
 
         /* count children */
@@ -577,22 +829,15 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
         if (count == 0) continue;
         if (count == 1) continue; /* already sorted */
 
-        /* sort using array */
+        /* sort using array with counting sort */
         child_entry_t **arr = malloc(count * sizeof(child_entry_t *));
         if (!arr) continue;
 
         int idx = 0;
         for (child_entry_t *c = children[node]; c; c = c->next) arr[idx++] = c;
 
-        /* bubble sort by label */
-        for (int i = 0; i < count - 1; i++)
-            for (int j = 0; j < count - i - 1; j++)
-                if (arr[j]->label > arr[j + 1]->label)
-                {
-                    child_entry_t *tmp = arr[j];
-                    arr[j] = arr[j + 1];
-                    arr[j + 1] = tmp;
-                }
+        /* counting sort by label O(n) for uint8_t labels [0-255] */
+        counting_sort_children((void **)arr, count);
 
         /* rebuild linked list in sorted order */
         children[node] = arr[0];
@@ -652,6 +897,24 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
 
     while (head < tail)
     {
+        if (shutdown_flag && (head % PERIODIC_SHUTDOWN_CHECK_INTERVAL == 0) &&
+            atomic_load(shutdown_flag))
+        {
+            free(queue);
+            free(node_id_to_louds);
+            free(entry_pool);
+            free(children);
+            free(labels);
+            free(parents);
+            free(child_ids);
+            free(trie->edge_child);
+            free(trie->louds);
+            free(trie->labels);
+            free(trie);
+            succinct_trie_builder_free(builder);
+            return NULL;
+        }
+
         uint32_t node = queue[head++];
 
         /* write 1-bits for each child, then 0 */
@@ -681,16 +944,8 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
     free(labels);
     free(parents);
     free(child_ids);
-    for (uint32_t i = 0; i < builder->next_node_id; i++)
-    {
-        child_entry_t *c = children[i];
-        while (c)
-        {
-            child_entry_t *next = c->next;
-            free(c);
-            c = next;
-        }
-    }
+
+    free(entry_pool);
     free(children);
 
     /* read terminal bits and values from disk into temporary arrays (in builder node ID order) */
@@ -712,19 +967,47 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
         return NULL;
     }
 
-    /* read terminal bits into temp array (builder node ID order) */
+    /* read terminal bits into temp array (written in batches during flush) */
     if (block_manager_cursor_init(&cursor, (block_manager_t *)builder->term_bm) == 0)
     {
         uint32_t idx = 0;
+
         while (block_manager_cursor_has_next(cursor) > 0 && idx < builder->n_nodes)
         {
+            /* check shutdown flag */
+            if (shutdown_flag && atomic_load(shutdown_flag))
+            {
+                block_manager_cursor_free(cursor);
+                free(temp_term);
+                free(temp_vals);
+                free(node_id_to_louds);
+                free(trie->term);
+                free(trie->vals);
+                free(trie->labels);
+                free(trie->edge_child);
+                free(trie->louds);
+                free(trie);
+                succinct_trie_builder_free(builder);
+                return NULL;
+            }
+
             block_manager_block_t *block = block_manager_cursor_read(cursor);
             if (block)
             {
-                if (*(uint8_t *)block->data) BIT_SET(temp_term, idx);
+                /* each block contains a batch of uint8_t entries */
+                uint32_t entries_in_block = block->size / sizeof(uint8_t);
+                if (idx + entries_in_block > builder->n_nodes)
+                {
+                    entries_in_block = builder->n_nodes - idx;
+                }
+                /* set bits for entries in this block */
+                for (uint32_t i = 0; i < entries_in_block; i++)
+                {
+                    if (((uint8_t *)block->data)[i]) BIT_SET(temp_term, idx + i);
+                }
+                idx += entries_in_block;
                 block_manager_block_free(block);
             }
-            idx++;
             block_manager_cursor_next(cursor);
         }
         block_manager_cursor_free(cursor);
@@ -734,6 +1017,22 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
     uint32_t val_idx_in = 0; /* index for reading from temp_vals */
     for (uint32_t builder_node_id = 1; builder_node_id < builder->next_node_id; builder_node_id++)
     {
+        if (shutdown_flag && (builder_node_id % PERIODIC_SHUTDOWN_CHECK_INTERVAL == 0) &&
+            atomic_load(shutdown_flag))
+        {
+            free(temp_term);
+            free(temp_vals);
+            free(node_id_to_louds);
+            free(trie->term);
+            free(trie->vals);
+            free(trie->labels);
+            free(trie->edge_child);
+            free(trie->louds);
+            free(trie);
+            succinct_trie_builder_free(builder);
+            return NULL;
+        }
+
         uint32_t louds_node = node_id_to_louds[builder_node_id];
         if (louds_node > 0 && BIT_GET(temp_term, builder_node_id - 1))
         {
@@ -741,20 +1040,69 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
         }
     }
 
-    /* read values into temp array (builder node ID order) */
+    /* read values into temp array (builder node ID order) in batches */
     if (block_manager_cursor_init(&cursor, (block_manager_t *)builder->vals_bm) == 0)
     {
         uint32_t idx = 0;
-        while (block_manager_cursor_has_next(cursor) > 0 && idx < builder->n_vals)
+        const uint32_t BATCH_SIZE = 8192;
+        int64_t *batch_buffer = malloc(BATCH_SIZE * sizeof(int64_t));
+
+        while (idx < builder->n_vals)
         {
-            block_manager_block_t *block = block_manager_cursor_read(cursor);
-            if (block)
+            /* check shutdown flag */
+            if (shutdown_flag && atomic_load(shutdown_flag))
             {
-                temp_vals[idx++] = (int64_t)decode_uint64_le_compat((uint8_t *)block->data);
-                block_manager_block_free(block);
+                free(batch_buffer);
+                block_manager_cursor_free(cursor);
+                free(temp_term);
+                free(temp_vals);
+                free(node_id_to_louds);
+                free(trie->term);
+                free(trie->vals);
+                free(trie->labels);
+                free(trie->edge_child);
+                free(trie->louds);
+                free(trie);
+                succinct_trie_builder_free(builder);
+                return NULL;
             }
-            block_manager_cursor_next(cursor);
+
+            uint32_t batch_count = 0;
+            while (block_manager_cursor_has_next(cursor) > 0 && batch_count < BATCH_SIZE &&
+                   idx + batch_count < builder->n_vals)
+            {
+                /* check shutdown flag periodically within batch */
+                if (shutdown_flag && (batch_count % PERIODIC_SHUTDOWN_CHECK_INTERVAL == 0) &&
+                    atomic_load(shutdown_flag))
+                {
+                    free(batch_buffer);
+                    block_manager_cursor_free(cursor);
+                    free(temp_term);
+                    free(temp_vals);
+                    free(node_id_to_louds);
+                    free(trie->term);
+                    free(trie->vals);
+                    free(trie->labels);
+                    free(trie->edge_child);
+                    free(trie->louds);
+                    free(trie);
+                    succinct_trie_builder_free(builder);
+                    return NULL;
+                }
+
+                block_manager_block_t *block = block_manager_cursor_read(cursor);
+                if (block)
+                {
+                    batch_buffer[batch_count++] =
+                        (int64_t)decode_uint64_le_compat((uint8_t *)block->data);
+                    block_manager_block_free(block);
+                }
+                block_manager_cursor_next(cursor);
+            }
+            memcpy(temp_vals + idx, batch_buffer, batch_count * sizeof(int64_t));
+            idx += batch_count;
         }
+        free(batch_buffer);
         block_manager_cursor_free(cursor);
     }
 
@@ -763,6 +1111,22 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder)
 
     for (uint32_t builder_node_id = 1; builder_node_id < builder->next_node_id; builder_node_id++)
     {
+        if (shutdown_flag && (builder_node_id % PERIODIC_SHUTDOWN_CHECK_INTERVAL == 0) &&
+            atomic_load(shutdown_flag))
+        {
+            free(temp_term);
+            free(temp_vals);
+            free(node_id_to_louds);
+            free(trie->term);
+            free(trie->vals);
+            free(trie->labels);
+            free(trie->edge_child);
+            free(trie->louds);
+            free(trie);
+            succinct_trie_builder_free(builder);
+            return NULL;
+        }
+
         if (BIT_GET(temp_term, builder_node_id - 1))
         {
             uint32_t louds_node = node_id_to_louds[builder_node_id];
@@ -831,7 +1195,15 @@ void succinct_trie_builder_free(succinct_trie_builder_t *builder)
 
     free(builder->prev_key);
     free(builder->path_stack);
+
+    free(builder->label_buffer);
+    free(builder->parent_buffer);
+    free(builder->child_buffer);
+    free(builder->term_buffer);
+    free(builder->val_buffer);
+
     free(builder);
+    builder = NULL;
 }
 
 /**
@@ -873,6 +1245,63 @@ static int find_first_terminal(const succinct_trie_t *trie, uint32_t node, int64
             }
         }
         pos++;
+    }
+
+    return -1;
+}
+
+/**
+ * find_last_terminal
+ * find the rightmost (lexicographically largest) terminal in a subtree
+ * @param trie the succinct trie
+ * @param node the node to find the last terminal for
+ * @param value pointer to store the value
+ * @return 0 on success, -1 on failure
+ */
+static int find_last_terminal(const succinct_trie_t *trie, uint32_t node, int64_t *value)
+{
+    if (!trie || node == 0 || node > trie->n_nodes) return -1;
+
+    /* find all children and traverse in reverse order to find last terminal */
+    uint32_t start_pos = get_children_start(trie, node);
+    if (start_pos < trie->louds_bits)
+    {
+        /* collect all child positions */
+        uint32_t child_positions[256]; /* max 256 children (one per byte value) */
+        uint32_t num_children = 0;
+
+        uint32_t pos = start_pos;
+        while (pos < trie->louds_bits && BIT_GET(trie->louds, pos) && num_children < 256)
+        {
+            child_positions[num_children++] = pos;
+            pos++;
+        }
+
+        /* traverse children in reverse order (largest label first) */
+        for (int i = num_children - 1; i >= 0; i--)
+        {
+            uint32_t edge_idx = rank1(trie->louds, child_positions[i] + 1) - 2;
+            if (edge_idx < trie->n_edges)
+            {
+                uint32_t child_node = trie->edge_child[edge_idx];
+                if (find_last_terminal(trie, child_node, value) == 0)
+                {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    /* check if this node itself is terminal (after checking children) */
+    uint32_t node_idx = node - 1;
+    if (BIT_GET(trie->term, node_idx))
+    {
+        uint32_t val_idx = rank1(trie->term, node_idx + 1) - 1;
+        if (val_idx < trie->n_vals)
+        {
+            *value = trie->vals[val_idx];
+            return 0;
+        }
     }
 
     return -1;
@@ -920,6 +1349,110 @@ int succinct_trie_prefix_get(const succinct_trie_t *trie, const uint8_t *prefix,
     return find_first_terminal(trie, node, value);
 }
 
+int succinct_trie_find_predecessor(const succinct_trie_t *trie, const uint8_t *key, size_t key_len,
+                                   int64_t *value)
+{
+    if (!trie || !key || key_len == 0 || !value) return -1;
+    if (trie->n_nodes == 0) return -1;
+
+    uint32_t node = 1;
+    int64_t last_value = -1;
+    int found_any = 0;
+
+    /* we track backtrack points,  where we had a smaller alternative */
+    uint32_t backtrack_edge_idx = UINT32_MAX;
+
+    for (size_t depth = 0; depth < key_len; depth++)
+    {
+        uint8_t c = key[depth];
+
+        /* we check if current node is terminal */
+        uint32_t node_idx = node - 1;
+        if (BIT_GET(trie->term, node_idx))
+        {
+            uint32_t val_idx = rank1(trie->term, node_idx + 1) - 1;
+            if (val_idx < trie->n_vals)
+            {
+                last_value = trie->vals[val_idx];
+                found_any = 1;
+            }
+        }
+
+        uint32_t pos = get_children_start(trie, node);
+        if (pos >= trie->louds_bits) break;
+
+        int found_edge = 0;
+        uint32_t best_smaller_edge_idx = UINT32_MAX;
+
+        while (pos < trie->louds_bits && BIT_GET(trie->louds, pos))
+        {
+            uint32_t edge_idx = rank1(trie->louds, pos + 1) - 2;
+            if (edge_idx < trie->n_edges)
+            {
+                uint8_t label = trie->labels[edge_idx];
+                if (label == c)
+                {
+                    node = trie->edge_child[edge_idx];
+                    found_edge = 1;
+                    break;
+                }
+                else if (label < c)
+                {
+                    if (best_smaller_edge_idx == UINT32_MAX ||
+                        label > trie->labels[best_smaller_edge_idx])
+                    {
+                        best_smaller_edge_idx = edge_idx;
+                    }
+                }
+            }
+            pos++;
+        }
+
+        /* update backtrack point if we found a smaller alternative at this level */
+        if (best_smaller_edge_idx != UINT32_MAX)
+        {
+            backtrack_edge_idx = best_smaller_edge_idx;
+        }
+
+        if (!found_edge)
+        {
+            /* can't continue, we use backtrack point if available */
+            if (backtrack_edge_idx != UINT32_MAX)
+            {
+                uint32_t pred_node = trie->edge_child[backtrack_edge_idx];
+                if (find_last_terminal(trie, pred_node, &last_value) == 0)
+                {
+                    found_any = 1;
+                }
+            }
+            break;
+        }
+    }
+
+    /* check final node */
+    if (node > 0 && node <= trie->n_nodes)
+    {
+        uint32_t node_idx = node - 1;
+        if (BIT_GET(trie->term, node_idx))
+        {
+            uint32_t val_idx = rank1(trie->term, node_idx + 1) - 1;
+            if (val_idx < trie->n_vals)
+            {
+                last_value = trie->vals[val_idx];
+                found_any = 1;
+            }
+        }
+    }
+
+    if (found_any)
+    {
+        *value = last_value;
+        return 0;
+    }
+
+    return -1;
+}
+
 void succinct_trie_free(succinct_trie_t *trie)
 {
     if (!trie) return;
@@ -938,117 +1471,101 @@ uint8_t *succinct_trie_serialize(const succinct_trie_t *trie, size_t *out_size)
     uint32_t louds_bytes = (trie->louds_bits + 7) / 8;
     uint32_t term_bytes = (trie->n_nodes + 7) / 8;
 
-    *out_size = sizeof(uint32_t) * 4 + louds_bytes + trie->n_edges +
-                trie->n_edges * sizeof(uint32_t) + term_bytes + trie->n_vals * sizeof(int64_t);
+    /* allocate worst-case size all varints at max (10 bytes for uint64, 5 bytes for uint32) */
+    size_t max_size = 5 * 4 +             /* header: 4 varint32s (worst case 5 bytes each) */
+                      louds_bytes +       /* louds bitvector */
+                      trie->n_edges +     /* labels array (1 byte each) */
+                      trie->n_edges * 5 + /* edge_child array (varint32, worst case 5 bytes) */
+                      term_bytes +        /* term bitvector */
+                      (trie->n_vals > 0 ? 10 : 0) + /* first val (varint64, worst case 10 bytes) */
+                      (trie->n_vals > 1 ? (trie->n_vals - 1) * 10 : 0); /* delta vals (varint64) */
 
-    uint8_t *buffer = malloc(*out_size);
+    uint8_t *buffer = malloc(max_size);
     if (!buffer) return NULL;
     uint8_t *ptr = buffer;
 
-    /* write louds_bits - little-endian */
-    ptr[0] = (uint8_t)(trie->louds_bits & 0xFF);
-    ptr[1] = (uint8_t)((trie->louds_bits >> 8) & 0xFF);
-    ptr[2] = (uint8_t)((trie->louds_bits >> 16) & 0xFF);
-    ptr[3] = (uint8_t)((trie->louds_bits >> 24) & 0xFF);
-    ptr += sizeof(uint32_t);
+    /* write header with varint encoding */
+    ptr = encode_varint32(ptr, trie->louds_bits);
+    ptr = encode_varint32(ptr, trie->n_edges);
+    ptr = encode_varint32(ptr, trie->n_nodes);
+    ptr = encode_varint32(ptr, trie->n_vals);
 
-    /* write n_edges - little-endian */
-    ptr[0] = (uint8_t)(trie->n_edges & 0xFF);
-    ptr[1] = (uint8_t)((trie->n_edges >> 8) & 0xFF);
-    ptr[2] = (uint8_t)((trie->n_edges >> 16) & 0xFF);
-    ptr[3] = (uint8_t)((trie->n_edges >> 24) & 0xFF);
-    ptr += sizeof(uint32_t);
-
-    /* write n_nodes - little-endian */
-    ptr[0] = (uint8_t)(trie->n_nodes & 0xFF);
-    ptr[1] = (uint8_t)((trie->n_nodes >> 8) & 0xFF);
-    ptr[2] = (uint8_t)((trie->n_nodes >> 16) & 0xFF);
-    ptr[3] = (uint8_t)((trie->n_nodes >> 24) & 0xFF);
-    ptr += sizeof(uint32_t);
-
-    /* write n_vals - little-endian */
-    ptr[0] = (uint8_t)(trie->n_vals & 0xFF);
-    ptr[1] = (uint8_t)((trie->n_vals >> 8) & 0xFF);
-    ptr[2] = (uint8_t)((trie->n_vals >> 16) & 0xFF);
-    ptr[3] = (uint8_t)((trie->n_vals >> 24) & 0xFF);
-    ptr += sizeof(uint32_t);
-
+    /* write louds bitvector (already compact) */
     memcpy(ptr, trie->louds, louds_bytes);
     ptr += louds_bytes;
 
     if (trie->n_edges > 0)
     {
+        /* write labels array (already 1 byte each, can't compress further) */
         memcpy(ptr, trie->labels, trie->n_edges);
         ptr += trie->n_edges;
 
-        /* write edge_child array - little-endian */
+        /* write edge_child array with varint encoding (typically saves 60-70%) */
         for (uint32_t i = 0; i < trie->n_edges; i++)
         {
-            uint32_t val = trie->edge_child[i];
-            ptr[0] = (uint8_t)(val & 0xFF);
-            ptr[1] = (uint8_t)((val >> 8) & 0xFF);
-            ptr[2] = (uint8_t)((val >> 16) & 0xFF);
-            ptr[3] = (uint8_t)((val >> 24) & 0xFF);
-            ptr += sizeof(uint32_t);
+            ptr = encode_varint32(ptr, trie->edge_child[i]);
         }
     }
 
+    /* write term bitvector (already compact) */
     memcpy(ptr, trie->term, term_bytes);
     ptr += term_bytes;
 
     if (trie->n_vals > 0)
     {
-        /* write vals array - little-endian */
-        for (uint32_t i = 0; i < trie->n_vals; i++)
+        /* write vals array with delta + varint encoding (typically saves 70-80%)
+         * store first value, then deltas between consecutive values */
+        ptr = encode_varint64(ptr, (uint64_t)trie->vals[0]);
+
+        for (uint32_t i = 1; i < trie->n_vals; i++)
         {
-            int64_t val = trie->vals[i];
-            uint64_t uval = (uint64_t)val;
-            ptr[0] = (uint8_t)(uval & 0xFF);
-            ptr[1] = (uint8_t)((uval >> 8) & 0xFF);
-            ptr[2] = (uint8_t)((uval >> 16) & 0xFF);
-            ptr[3] = (uint8_t)((uval >> 24) & 0xFF);
-            ptr[4] = (uint8_t)((uval >> 32) & 0xFF);
-            ptr[5] = (uint8_t)((uval >> 40) & 0xFF);
-            ptr[6] = (uint8_t)((uval >> 48) & 0xFF);
-            ptr[7] = (uint8_t)((uval >> 56) & 0xFF);
-            ptr += sizeof(int64_t);
+            /* compute delta (difference from previous value) */
+            int64_t delta = trie->vals[i] - trie->vals[i - 1];
+            /* zigzag encode to handle negative deltas efficiently
+             * cast to unsigned before shifting to avoid UB on negative values */
+            uint64_t zigzag = ((uint64_t)delta << 1) ^ (uint64_t)(delta >> 63);
+            ptr = encode_varint64(ptr, zigzag);
         }
     }
 
-    return buffer;
+    /* return actual size used (much smaller than max_size) */
+    *out_size = ptr - buffer;
+
+    /* optionally shrink buffer to actual size to save memory */
+    uint8_t *final_buffer = realloc(buffer, *out_size);
+    return final_buffer ? final_buffer : buffer;
 }
 
 succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size)
 {
-    if (!data || data_size < sizeof(uint32_t) * 4) return NULL;
+    if (!data || data_size == 0) return NULL;
 
     const uint8_t *ptr = data;
+    const uint8_t *end = data + data_size;
     succinct_trie_t *trie = calloc(1, sizeof(succinct_trie_t));
     if (!trie) return NULL;
 
-    /* read louds_bits - little-endian */
-    trie->louds_bits = ((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
-                       ((uint32_t)ptr[3] << 24);
-    ptr += sizeof(uint32_t);
+    /* read header with varint decoding */
+    ptr = decode_varint32(ptr, &trie->louds_bits);
+    ptr = decode_varint32(ptr, &trie->n_edges);
+    ptr = decode_varint32(ptr, &trie->n_nodes);
+    ptr = decode_varint32(ptr, &trie->n_vals);
 
-    /* read n_edges - little-endian */
-    trie->n_edges = ((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
-                    ((uint32_t)ptr[3] << 24);
-    ptr += sizeof(uint32_t);
-
-    /* read n_nodes - little-endian */
-    trie->n_nodes = ((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
-                    ((uint32_t)ptr[3] << 24);
-    ptr += sizeof(uint32_t);
-
-    /* read n_vals - little-endian */
-    trie->n_vals = ((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) |
-                   ((uint32_t)ptr[3] << 24);
-    ptr += sizeof(uint32_t);
+    if (ptr >= end)
+    {
+        free(trie);
+        return NULL;
+    }
 
     uint32_t louds_bytes = (trie->louds_bits + 7) / 8;
     uint32_t term_bytes = (trie->n_nodes + 7) / 8;
 
+    /* check that we have enough data remaining for louds bitvector */
+    if (ptr + louds_bytes > end)
+    {
+        free(trie);
+        return NULL;
+    }
     trie->louds = malloc(louds_bytes);
     if (!trie->louds)
     {
@@ -1060,6 +1577,15 @@ succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size
 
     if (trie->n_edges > 0)
     {
+        /* check that we have enough data for labels */
+        if (ptr + trie->n_edges > end)
+        {
+            free(trie->louds);
+            free(trie);
+            return NULL;
+        }
+
+        /* read labels array */
         trie->labels = malloc(trie->n_edges);
         if (!trie->labels)
         {
@@ -1070,6 +1596,7 @@ succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size
         memcpy(trie->labels, ptr, trie->n_edges);
         ptr += trie->n_edges;
 
+        /* read edge_child array with varint decoding */
         trie->edge_child = malloc(trie->n_edges * sizeof(uint32_t));
         if (!trie->edge_child)
         {
@@ -1079,12 +1606,17 @@ succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size
             return NULL;
         }
 
-        /* read edge_child array - little-endian */
         for (uint32_t i = 0; i < trie->n_edges; i++)
         {
-            trie->edge_child[i] = ((uint32_t)ptr[0]) | ((uint32_t)ptr[1] << 8) |
-                                  ((uint32_t)ptr[2] << 16) | ((uint32_t)ptr[3] << 24);
-            ptr += sizeof(uint32_t);
+            if (ptr >= end)
+            {
+                free(trie->edge_child);
+                free(trie->labels);
+                free(trie->louds);
+                free(trie);
+                return NULL;
+            }
+            ptr = decode_varint32(ptr, &trie->edge_child[i]);
         }
     }
     else
@@ -1093,9 +1625,21 @@ succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size
         trie->edge_child = NULL;
     }
 
+    /* check that we have enough data for term bitvector */
+    if (ptr + term_bytes > end)
+    {
+        free(trie->edge_child);
+        free(trie->labels);
+        free(trie->louds);
+        free(trie);
+        return NULL;
+    }
+
+    /* read term bitvector */
     trie->term = malloc(term_bytes);
     if (!trie->term)
     {
+        free(trie->edge_child);
         free(trie->labels);
         free(trie->louds);
         free(trie);
@@ -1106,25 +1650,44 @@ succinct_trie_t *succinct_trie_deserialize(const uint8_t *data, size_t data_size
 
     if (trie->n_vals > 0)
     {
+        /* read vals array with delta + varint decoding */
         trie->vals = malloc(trie->n_vals * sizeof(int64_t));
         if (!trie->vals)
         {
             free(trie->term);
+            free(trie->edge_child);
             free(trie->labels);
             free(trie->louds);
             free(trie);
             return NULL;
         }
 
-        /* read vals array - little-endian */
-        for (uint32_t i = 0; i < trie->n_vals; i++)
+        /* read first value */
+        uint64_t uval;
+        ptr = decode_varint64(ptr, &uval);
+        trie->vals[0] = (int64_t)uval;
+
+        /* read deltas and reconstruct values */
+        for (uint32_t i = 1; i < trie->n_vals; i++)
         {
-            uint64_t uval = ((uint64_t)ptr[0]) | ((uint64_t)ptr[1] << 8) |
-                            ((uint64_t)ptr[2] << 16) | ((uint64_t)ptr[3] << 24) |
-                            ((uint64_t)ptr[4] << 32) | ((uint64_t)ptr[5] << 40) |
-                            ((uint64_t)ptr[6] << 48) | ((uint64_t)ptr[7] << 56);
-            trie->vals[i] = (int64_t)uval;
-            ptr += sizeof(int64_t);
+            if (ptr >= end)
+            {
+                free(trie->vals);
+                free(trie->term);
+                free(trie->edge_child);
+                free(trie->labels);
+                free(trie->louds);
+                free(trie);
+                return NULL;
+            }
+
+            /* decode zigzag-encoded delta */
+            uint64_t zigzag;
+            ptr = decode_varint64(ptr, &zigzag);
+            int64_t delta = (int64_t)((zigzag >> 1) ^ (-(int64_t)(zigzag & 1)));
+
+            /* reconstruct value from previous value + delta */
+            trie->vals[i] = trie->vals[i - 1] + delta;
         }
     }
     else

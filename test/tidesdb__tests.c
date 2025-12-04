@@ -6338,7 +6338,7 @@ static void test_large_value_iteration(void)
     ASSERT_TRUE(cf != NULL);
 
     const int NUM_KEYS = 10000;
-#define TEST_KEY_SIZE 256
+#define TEST_KEY_SIZE   256
 #define TEST_VALUE_SIZE 4096
 
     printf(CYAN "  Inserting %d keys (256B keys, 4KB values)...\n" RESET, NUM_KEYS);
@@ -6358,7 +6358,8 @@ static void test_large_value_iteration(void)
         snprintf((char *)value, TEST_VALUE_SIZE, "large_value_%08d_", i);
         memset(value + strlen((char *)value), 'V', TEST_VALUE_SIZE - strlen((char *)value));
 
-        ASSERT_EQ(tidesdb_txn_put(txn, cf, key, TEST_KEY_SIZE, value, TEST_VALUE_SIZE, 0), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, key, TEST_KEY_SIZE, value, TEST_VALUE_SIZE, 0),
+                  TDB_SUCCESS);
 
         if ((i + 1) % 1000 == 0)
         {

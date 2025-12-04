@@ -6338,31 +6338,36 @@ static void test_large_value_iteration(void)
     ASSERT_TRUE(cf != NULL);
 
     const int NUM_KEYS = 10000;
-    const size_t KEY_SIZE = 256;
-    const size_t VALUE_SIZE = 4096;
+#define TEST_KEY_SIZE 256
+#define TEST_VALUE_SIZE 4096
 
     printf(CYAN "  Inserting %d keys (256B keys, 4KB values)...\n" RESET, NUM_KEYS);
 
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
 
+    /* allocate buffers once outside loop for MSVC compatibility */
+    uint8_t *key = malloc(TEST_KEY_SIZE);
+    uint8_t *value = malloc(TEST_VALUE_SIZE);
+    ASSERT_TRUE(key != NULL && value != NULL);
+
     for (int i = 0; i < NUM_KEYS; i++)
     {
-        uint8_t key[KEY_SIZE];
-        uint8_t value[VALUE_SIZE];
+        snprintf((char *)key, TEST_KEY_SIZE, "large_key_%08d", i);
+        memset(key + strlen((char *)key), 'K', TEST_KEY_SIZE - strlen((char *)key));
+        snprintf((char *)value, TEST_VALUE_SIZE, "large_value_%08d_", i);
+        memset(value + strlen((char *)value), 'V', TEST_VALUE_SIZE - strlen((char *)value));
 
-        snprintf((char *)key, KEY_SIZE, "large_key_%08d", i);
-        memset(key + strlen((char *)key), 'K', KEY_SIZE - strlen((char *)key));
-        snprintf((char *)value, VALUE_SIZE, "large_value_%08d_", i);
-        memset(value + strlen((char *)value), 'V', VALUE_SIZE - strlen((char *)value));
-
-        ASSERT_EQ(tidesdb_txn_put(txn, cf, key, KEY_SIZE, value, VALUE_SIZE, 0), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, key, TEST_KEY_SIZE, value, TEST_VALUE_SIZE, 0), TDB_SUCCESS);
 
         if ((i + 1) % 1000 == 0)
         {
             printf(CYAN "    Inserted %d keys...\n" RESET, i + 1);
         }
     }
+
+    free(key);
+    free(value);
 
     ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
     tidesdb_txn_free(txn);
@@ -6398,8 +6403,8 @@ static void test_large_value_iteration(void)
         ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), TDB_SUCCESS);
         ASSERT_EQ(tidesdb_iter_value(iter, &value, &value_size), TDB_SUCCESS);
 
-        ASSERT_EQ(key_size, KEY_SIZE);
-        ASSERT_EQ(value_size, VALUE_SIZE);
+        ASSERT_EQ(key_size, (size_t)TEST_KEY_SIZE);
+        ASSERT_EQ(value_size, (size_t)TEST_VALUE_SIZE);
 
         count++;
 
@@ -6441,6 +6446,9 @@ static void test_large_value_iteration(void)
     cleanup_test_dir();
 
     printf(GREEN "  ✓ Large value iteration test passed\n" RESET);
+
+#undef TEST_KEY_SIZE
+#undef TEST_VALUE_SIZE
 }
 
 void test_tidesdb_block_index_seek()

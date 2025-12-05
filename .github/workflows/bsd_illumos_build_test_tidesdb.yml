@@ -83,7 +83,7 @@ jobs:
           release: '7.4'
           usesh: true
           prepare: |
-            pkg_add cmake lz4 zstd snappy
+            pkg_add cmake gmake lz4 zstd snappy
           run: |
             echo "=== OpenBSD System Info ==="
             uname -a
@@ -96,7 +96,7 @@ jobs:
             fi
             echo ""
             echo "=== Attempting CMake configuration ==="
-            if cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
+            if cmake -S . -B build -DCMAKE_MAKE_PROGRAM=/usr/local/bin/gmake -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
               echo "✓ CMake configuration succeeded"
             else
               echo "✗ CMake configuration failed"
@@ -104,11 +104,15 @@ jobs:
             fi
             echo ""
             echo "=== Attempting build (showing first error) ==="
-            if cmake --build build --config Release 2>&1 | tee build.log; then
+            if gmake -C build 2>&1 | tee build.log; then
               echo "✓ Build succeeded!"
             else
               echo "✗ Build failed - showing errors:"
-              grep -A 5 "error:" build.log | head -50 || cat build.log | head -100
+              echo "--- First 100 lines of build output ---"
+              head -100 build.log
+              echo ""
+              echo "--- Compilation errors ---"
+              grep -B 2 -A 5 "error:" build.log | head -100 || true
               exit 1
             fi
 
@@ -169,7 +173,7 @@ jobs:
           release: 'r151048'
           usesh: true
           prepare: |
-            pkg install cmake gcc-13 library/lz4 library/zstd compress/snappy
+            pkg install build-essential cmake gcc-13
           run: |
             echo "=== OmniOS/Illumos System Info ==="
             uname -a

@@ -24,7 +24,7 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            pkg install -y cmake pkgconf zstd liblz4 snappy
+            pkg install -y cmake pkgconf lz4 zstd snappy
           run: |
             echo "====================================="
             echo "System Information"
@@ -84,7 +84,7 @@ jobs:
           copyback: false
           prepare: |
             export PKG_PATH=https://cloudflare.cdn.openbsd.org/pub/OpenBSD/7.4/packages/amd64/
-            pkg_add cmake gmake lz4 zstd snappy
+            pkg_add cmake gmake lz4 zstd snappy pkgconf
           run: |
             echo "====================================="
             echo "System Information"
@@ -143,7 +143,7 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            /usr/sbin/pkg_add cmake lz4 zstd snappy pkgconf
+            /usr/sbin/pkg_add cmake lz4 zstd snappy pkgconf gmake
           run: |
             echo "====================================="
             echo "System Information"
@@ -201,7 +201,8 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            pkg install developer/build/cmake
+            pkg set-publisher -g https://pkg.omnios.org/r151048/extra extra.omnios
+            pkg install ooce/developer/cmake ooce/library/lz4 ooce/library/zstd ooce/library/snappy
           run: |
             echo "====================================="
             echo "System Information"
@@ -244,7 +245,7 @@ jobs:
 
   dragonflybsd-build:
     runs-on: ubuntu-latest
-    name: DragonFlyBSD 6.4 x64
+    name: DragonFlyBSD 6.4.2 x64
     
     steps:
       - name: Checkout repository
@@ -253,15 +254,14 @@ jobs:
       - name: Build and test on DragonFlyBSD
         uses: vmactions/dragonflybsd-vm@v1
         with:
-          release: '6.4.0'
-          usesh: true
+          usesh: false
           sync: rsync
           copyback: false
           prepare: |
             mkdir -p /usr/local/etc/pkg/repos
             echo 'Avalon: { enabled: no }' > /usr/local/etc/pkg/repos/df-latest.conf
             echo 'AUTO: { url: "https://pkg.dragonflybsd.org/pkg/$''{ABI}/LATEST", mirror_type: HTTP, enabled: yes }' >> /usr/local/etc/pkg/repos/df-latest.conf
-            pkg install -y cmake pkgconf zstd liblz4 snappy
+            pkg install -y cmake pkgconf lz4 zstd snappy
           run: |
             echo "====================================="
             echo "System Information"

@@ -81,7 +81,7 @@ jobs:
           copyback: false
           prepare: |
             export PKG_PATH=https://cloudflare.cdn.openbsd.org/pub/OpenBSD/7.4/packages/amd64/
-            pkg_add cmake gmake liblz4 zstd snappy pkgconf
+            pkg_add cmake gmake lz4 zstd snappy pkgconf
           run: |
             echo "====================================="
             echo "System Information"
@@ -136,7 +136,7 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            /usr/sbin/pkg_add cmake liblz4 zstd snappy pkgconf gmake
+            /usr/sbin/pkg_add cmake lz4 zstd snappy pkgconf gmake
           run: |
             echo "====================================="
             echo "System Information"

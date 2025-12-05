@@ -113,7 +113,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     target_link_directories(tidesdb PUBLIC /usr/local/lib)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            liblz4      # lz4 compression
+            lz4         # lz4 compression
             zstd        # zstandard compression
             snappy      # snappy compression
             pthread     # pthread library
@@ -124,7 +124,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
     target_link_directories(tidesdb PUBLIC /usr/local/lib)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            liblz4      # lz4 compression
+            lz4         # lz4 compression
             zstd        # zstandard compression
             snappy      # snappy compression
             pthread     # pthread library
@@ -135,7 +135,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
     target_link_directories(tidesdb PUBLIC /usr/pkg/lib)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            liblz4      # lz4 compression
+            lz4         # lz4 compression
             zstd        # zstandard compression
             snappy      # snappy compression
             pthread     # pthread library
@@ -146,7 +146,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
     target_link_directories(tidesdb PUBLIC /usr/local/lib)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            liblz4      # lz4 compression
+            lz4         # lz4 compression
             zstd        # zstandard compression
             snappy      # snappy compression
             pthread     # pthread library

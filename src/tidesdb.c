@@ -2521,6 +2521,14 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         return TDB_ERR_NOT_FOUND;
     }
 
+    /* check bloom filter first (faster than comparisons: ~50-100ns vs ~100-200ns) */
+    if (sst->bloom_filter && !bloom_filter_contains(sst->bloom_filter, key, key_size))
+    {
+        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter check FAILED - key not in bloom filter",
+                      sst->id);
+        return TDB_ERR_NOT_FOUND;
+    }
+
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
     tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
@@ -2551,13 +2559,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         {
             return TDB_ERR_NOT_FOUND;
         }
-    }
-
-    if (sst->bloom_filter && !bloom_filter_contains(sst->bloom_filter, key, key_size))
-    {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter check FAILED - key not in bloom filter",
-                      sst->id);
-        return TDB_ERR_NOT_FOUND;
     }
 
     /* use block index to find starting klog block */
@@ -8554,12 +8555,16 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         int index;
     } sst_ref_t;
 
+    /* use stack allocation for common case to avoid malloc overhead */
+#define TDB_STACK_SSTS 64
+    sst_ref_t stack_ssts[TDB_STACK_SSTS];
     sst_ref_t *ssts_array = NULL;
     int sst_count = 0;
 
     if (total_ssts > 0)
     {
-        ssts_array = malloc(total_ssts * sizeof(sst_ref_t));
+        ssts_array =
+            (total_ssts <= TDB_STACK_SSTS) ? stack_ssts : malloc(total_ssts * sizeof(sst_ref_t));
         if (ssts_array)
         {
             for (int i = 0; i < num_levels; i++)
@@ -8586,6 +8591,11 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     pthread_rwlock_unlock(&cf->levels_lock);
 
+    /* resolve comparator once for all SSTables (optimization) */
+    skip_list_comparator_fn comparator_fn = NULL;
+    void *comparator_ctx = NULL;
+    tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
+
     /* now search sstables outside the lock (expensive I/O operations) */
     tidesdb_kv_pair_t *best_kv = NULL;
     uint64_t best_seq = UINT64_MAX;
@@ -8598,12 +8608,26 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             tidesdb_sstable_t *sst = ssts_array[idx].sst;
             int level = ssts_array[idx].level;
 
-            /* skip ssts whose key range doesn't contain our key */
-            int in_range = tidesdb_sstable_contains_key_range(sst, key, key_size);
-            if (!in_range)
+            /* skip ssts whose key range doesn't contain our key
+             * inline range check to avoid function call overhead and redundant comparator
+             * resolution */
+            if (sst->min_key && sst->max_key)
             {
-                tidesdb_sstable_unref(cf->db, sst);
-                continue;
+                int min_max_cmp = comparator_fn(sst->min_key, sst->min_key_size, sst->max_key,
+                                                sst->max_key_size, comparator_ctx);
+                int is_reverse = (min_max_cmp > 0);
+                int cmp_min =
+                    comparator_fn(key, key_size, sst->min_key, sst->min_key_size, comparator_ctx);
+                int cmp_max =
+                    comparator_fn(key, key_size, sst->max_key, sst->max_key_size, comparator_ctx);
+
+                int out_of_range =
+                    is_reverse ? (cmp_min > 0 || cmp_max < 0) : (cmp_min < 0 || cmp_max > 0);
+                if (out_of_range)
+                {
+                    tidesdb_sstable_unref(cf->db, sst);
+                    continue;
+                }
             }
 
             tidesdb_kv_pair_t *candidate_kv = NULL;
@@ -8630,7 +8654,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                         {
                             tidesdb_sstable_unref(cf->db, ssts_array[k].sst);
                         }
-                        free(ssts_array);
+                        if (ssts_array != stack_ssts) free(ssts_array);
                         goto check_found_result;
                     }
                 }
@@ -8654,7 +8678,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             }
         }
 
-        free(ssts_array);
+        if (ssts_array != stack_ssts) free(ssts_array);
     }
 
 check_found_result:
@@ -9779,6 +9803,11 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 block_manager_cursor_goto_first(cursor);
             }
 
+            /* resolve comparator once before block scanning loop (optimization) */
+            skip_list_comparator_fn comparator_fn = NULL;
+            void *comparator_ctx = NULL;
+            tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+
             /* manually load and scan blocks to find target (advance() won't work here) */
             source->source.sstable.current_entry_idx = 0;
 
@@ -9826,10 +9855,6 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 }
 
                 source->source.sstable.current_block = kb;
-
-                skip_list_comparator_fn comparator_fn = NULL;
-                void *comparator_ctx = NULL;
-                tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
 
                 /* check if target could be in this block */
                 int cmp_last = comparator_fn(kb->keys[kb->num_entries - 1],
@@ -10541,17 +10566,29 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
     /* set direction to forward */
     iter->direction = 1;
 
-    /* save current key to skip duplicates */
+    /* save current key to skip duplicates - use stack for small keys */
+#define TDB_ITER_STACK_KEY_SIZE 256
+    uint8_t stack_key[TDB_ITER_STACK_KEY_SIZE];
     uint8_t *current_key = NULL;
     size_t current_key_size = 0;
+    int key_on_heap = 0;
 
     if (iter->current)
     {
-        current_key = malloc(iter->current->entry.key_size);
-        if (current_key)
+        current_key_size = iter->current->entry.key_size;
+        if (current_key_size <= TDB_ITER_STACK_KEY_SIZE)
         {
-            memcpy(current_key, iter->current->key, iter->current->entry.key_size);
-            current_key_size = iter->current->entry.key_size;
+            current_key = stack_key;
+            memcpy(current_key, iter->current->key, current_key_size);
+        }
+        else
+        {
+            current_key = malloc(current_key_size);
+            if (current_key)
+            {
+                memcpy(current_key, iter->current->key, current_key_size);
+                key_on_heap = 1;
+            }
         }
     }
 
@@ -10603,13 +10640,13 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
                                         kv->entry.seq);
         }
 
-        free(current_key);
+        if (key_on_heap) free(current_key);
         iter->current = kv;
         iter->valid = 1;
         return TDB_SUCCESS;
     }
 
-    free(current_key);
+    if (key_on_heap) free(current_key);
     return TDB_ERR_NOT_FOUND;
 }
 
@@ -10624,17 +10661,28 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
     /* set direction to backward */
     iter->direction = -1;
 
-    /* save current key to skip duplicates */
+    /* save current key to skip duplicates - use stack for small keys */
+    uint8_t stack_key[TDB_ITER_STACK_KEY_SIZE];
     uint8_t *current_key = NULL;
     size_t current_key_size = 0;
+    int key_on_heap = 0;
 
     if (iter->current)
     {
-        current_key = malloc(iter->current->entry.key_size);
-        if (current_key)
+        current_key_size = iter->current->entry.key_size;
+        if (current_key_size <= TDB_ITER_STACK_KEY_SIZE)
         {
-            memcpy(current_key, iter->current->key, iter->current->entry.key_size);
-            current_key_size = iter->current->entry.key_size;
+            current_key = stack_key;
+            memcpy(current_key, iter->current->key, current_key_size);
+        }
+        else
+        {
+            current_key = malloc(current_key_size);
+            if (current_key)
+            {
+                memcpy(current_key, iter->current->key, current_key_size);
+                key_on_heap = 1;
+            }
         }
     }
 
@@ -10686,13 +10734,13 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
                                         kv->entry.seq);
         }
 
-        free(current_key);
+        if (key_on_heap) free(current_key);
         iter->current = kv;
         iter->valid = 1;
         return TDB_SUCCESS;
     }
 
-    free(current_key);
+    if (key_on_heap) free(current_key);
     return TDB_ERR_NOT_FOUND;
 }
 

@@ -92,16 +92,16 @@ jobs:
           wget https://github.com/lz4/lz4/archive/refs/tags/v1.9.4.tar.gz -O lz4.tar.gz
           tar xzf lz4.tar.gz
           cd lz4-1.9.4
-          CC=powerpc-linux-gnu-gcc make lib
-          sudo make PREFIX=/usr/powerpc-linux-gnu install
+          make CC=powerpc-linux-gnu-gcc lib
+          sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
           cd ..
 
           # Build Zstandard
           wget https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-1.5.5.tar.gz
           tar xzf zstd-1.5.5.tar.gz
           cd zstd-1.5.5
-          CC=powerpc-linux-gnu-gcc make lib
-          sudo make PREFIX=/usr/powerpc-linux-gnu install
+          make CC=powerpc-linux-gnu-gcc lib
+          sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
           cd ..
 
           # Build Snappy
@@ -139,16 +139,16 @@ jobs:
           wget https://github.com/lz4/lz4/archive/refs/tags/v1.9.4.tar.gz -O lz4.tar.gz
           tar xzf lz4.tar.gz
           cd lz4-1.9.4
-          CC=powerpc-linux-gnu-gcc make lib
-          sudo make PREFIX=/usr/powerpc-linux-gnu install
+          make CC=powerpc-linux-gnu-gcc lib
+          sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
           cd ..
 
           # Build Zstandard
           wget https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-1.5.5.tar.gz
           tar xzf zstd-1.5.5.tar.gz
           cd zstd-1.5.5
-          CC=powerpc-linux-gnu-gcc make lib
-          sudo make PREFIX=/usr/powerpc-linux-gnu install
+          make CC=powerpc-linux-gnu-gcc lib
+          sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
           cd ..
 
           # Build Snappy

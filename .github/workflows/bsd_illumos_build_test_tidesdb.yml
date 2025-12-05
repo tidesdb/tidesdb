@@ -70,6 +70,7 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
+            export PKG_PATH=http://ftp.openbsd.org/pub/OpenBSD/7.4/packages/amd64/
             pkg_add cmake gmake lz4 zstd snappy pkgconf
           run: |
             echo "*=====================================*"
@@ -161,7 +162,7 @@ jobs:
           copyback: false
           prepare: |
             pkg set-publisher -G '*' -g https://pkg.omnios.org/r151048/extra extra.omnios || true
-            pkg install ooce/developer/cmake ooce/library/lz4 ooce/library/zstd ooce/library/snappy
+            pkg install ooce/developer/cmake gcc13 lz4 zstd snappy
           run: |
             echo "*=====================================*"
             echo " System Information"
@@ -209,7 +210,7 @@ jobs:
             mkdir -p /usr/local/etc/pkg/repos
             echo 'Avalon: { enabled: no }' > /usr/local/etc/pkg/repos/df-latest.conf
             echo 'AUTO: { url: "https://pkg.dragonflybsd.org/pkg/$''{ABI}/LATEST", mirror_type: HTTP, enabled: yes }' >> /usr/local/etc/pkg/repos/df-latest.conf
-            pkg install -y cmake pkgconf lz4 zstd snappy
+            pkg install -y cmake pkgconf liblz4 zstd snappy
           run: |
             echo "*=====================================*"
             echo " System Information"

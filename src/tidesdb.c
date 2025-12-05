@@ -3108,13 +3108,21 @@ static int tidesdb_level_remove_sstable(tidesdb_t *db, tidesdb_level_t *level,
  */
 static int tidesdb_level_update_boundaries(tidesdb_level_t *level, tidesdb_level_t *largest_level)
 {
-    /* free old boundaries */
-    for (int i = 0; i < level->num_boundaries; i++)
+    /* free old boundaries, we check for NULL to prevent double-free in concurrent scenarios.. */
+    if (level->file_boundaries)
     {
-        free(level->file_boundaries[i]);
+        for (int i = 0; i < level->num_boundaries; i++)
+        {
+            free(level->file_boundaries[i]);
+        }
+        free(level->file_boundaries);
+        level->file_boundaries = NULL;
     }
-    free(level->file_boundaries);
-    free(level->boundary_sizes);
+    if (level->boundary_sizes)
+    {
+        free(level->boundary_sizes);
+        level->boundary_sizes = NULL;
+    }
 
     tidesdb_sstable_t **sstables = largest_level->sstables;
     int num_ssts = largest_level->num_sstables;

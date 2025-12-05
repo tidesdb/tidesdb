@@ -26,41 +26,31 @@ jobs:
           prepare: |
             pkg install -y cmake pkgconf liblz4 zstd snappy
           run: |
-            echo "====================================="
-            echo "System Information"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " System Information"
+            echo "*=====================================*"
             uname -a
             freebsd-version
             
             echo ""
-            echo "====================================="
-            echo "Portability Check"
-            echo "====================================="
-            if [ -f /usr/include/sys/sysinfo.h ]; then
-              echo "✓ sys/sysinfo.h exists (Linux compatibility)"
-            else
-              echo "✓ Using BSD sysctl() for memory info"
-            fi
-            
-            echo ""
-            echo "====================================="
-            echo "Configure CMake"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Configure CMake"
+            echo "*=====================================*"
             export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=OFF
             
             echo ""
-            echo "====================================="
-            echo "Build"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Build"
+            echo "*=====================================*"
             cmake --build build --config Release
             
             echo ""
-            echo "====================================="
-            echo "Run Tests"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Run Tests"
+            echo "*=====================================*"
             cd build
             ctest -V --output-on-failure --timeout 1800 --build-config Release
 
@@ -80,43 +70,32 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            export PKG_PATH=https://cloudflare.cdn.openbsd.org/pub/OpenBSD/7.4/packages/amd64/
             pkg_add cmake gmake lz4 zstd snappy pkgconf
           run: |
-            echo "====================================="
-            echo "System Information"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " System Information"
+            echo "*=====================================*"
             uname -a
             
             echo ""
-            echo "====================================="
-            echo "Portability Check"
-            echo "====================================="
-            if [ -f /usr/include/sys/sysinfo.h ]; then
-              echo "✓ sys/sysinfo.h exists (Linux compatibility)"
-            else
-              echo "✓ Using BSD sysctl() for memory info"
-            fi
-            
-            echo ""
-            echo "====================================="
-            echo "Configure CMake"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Configure CMake"
+            echo "*=====================================*"
             export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=OFF
             
             echo ""
-            echo "====================================="
-            echo "Build"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Build"
+            echo "*=====================================*"
             gmake -C build
             
             echo ""
-            echo "====================================="
-            echo "Run Tests"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Run Tests"
+            echo "*=====================================*"
             cd build
             ctest -V --output-on-failure --timeout 1800 --build-config Release
 
@@ -138,40 +117,30 @@ jobs:
           prepare: |
             /usr/sbin/pkg_add cmake lz4 zstd snappy pkgconf gmake
           run: |
-            echo "====================================="
-            echo "System Information"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " System Information"
+            echo "*=====================================*"
             uname -a
             
             echo ""
-            echo "====================================="
-            echo "Portability Check"
-            echo "====================================="
-            if [ -f /usr/include/sys/sysinfo.h ]; then
-              echo "✓ sys/sysinfo.h exists (Linux compatibility)"
-            else
-              echo "✓ Using BSD sysctl() for memory info"
-            fi
-            
-            echo ""
-            echo "====================================="
-            echo "Configure CMake"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Configure CMake"
+            echo "*=====================================*"
             export PKG_CONFIG_PATH=/usr/pkg/lib/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=OFF
             
             echo ""
-            echo "====================================="
-            echo "Build"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Build"
+            echo "*=====================================*"
             cmake --build build --config Release
             
             echo ""
-            echo "====================================="
-            echo "Run Tests"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Run Tests"
+            echo "*=====================================*"
             cd build
             ctest -V --output-on-failure --timeout 1800 --build-config Release
 
@@ -191,28 +160,18 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            pkg set-publisher -g https://pkg.omnios.org/r151048/extra extra.omnios
+            pkg set-publisher -G '*' -g https://pkg.omnios.org/r151048/extra extra.omnios || true
             pkg install ooce/developer/cmake ooce/library/lz4 ooce/library/zstd ooce/library/snappy
           run: |
-            echo "====================================="
-            echo "System Information"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " System Information"
+            echo "*=====================================*"
             uname -a
             
             echo ""
-            echo "====================================="
-            echo "Portability Check"
-            echo "====================================="
-            if [ -f /usr/include/sys/sysinfo.h ]; then
-              echo "✓ sys/sysinfo.h exists (Linux compatibility)"
-            else
-              echo "✓ Using BSD sysctl() for memory info"
-            fi
-            
-            echo ""
-            echo "====================================="
-            echo "Configure CMake"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Configure CMake"
+            echo "*=====================================*"
             export PATH=/opt/ooce/bin:$PATH
             export PKG_CONFIG_PATH=/opt/ooce/lib/pkgconfig
             cmake -S . -B build \
@@ -220,15 +179,15 @@ jobs:
               -DTIDESDB_WITH_SANITIZER=OFF 
             
             echo ""
-            echo "====================================="
-            echo "Build"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Build"
+            echo "*=====================================*"
             cmake --build build --config Release
             
             echo ""
-            echo "====================================="
-            echo "Run Tests"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Run Tests"
+            echo "*=====================================*"
             cd build
             ctest -V --output-on-failure --timeout 1800 --build-config Release
 
@@ -250,41 +209,31 @@ jobs:
             mkdir -p /usr/local/etc/pkg/repos
             echo 'Avalon: { enabled: no }' > /usr/local/etc/pkg/repos/df-latest.conf
             echo 'AUTO: { url: "https://pkg.dragonflybsd.org/pkg/$''{ABI}/LATEST", mirror_type: HTTP, enabled: yes }' >> /usr/local/etc/pkg/repos/df-latest.conf
-            pkg install -y cmake pkgconf liblz4 zstd snappy
+            pkg install -y cmake pkgconf lz4 zstd snappy
           run: |
-            echo "====================================="
-            echo "System Information"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " System Information"
+            echo "*=====================================*"
             uname -a
             
             echo ""
-            echo "====================================="
-            echo "Portability Check"
-            echo "====================================="
-            if [ -f /usr/include/sys/sysinfo.h ]; then
-              echo "✓ sys/sysinfo.h exists (Linux compatibility)"
-            else
-              echo "✓ Using BSD sysctl() for memory info"
-            fi
-            
-            echo ""
-            echo "====================================="
-            echo "Configure CMake"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Configure CMake"
+            echo "*=====================================*"
             export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=OFF
             
             echo ""
-            echo "====================================="
-            echo "Build"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Build"
+            echo "*=====================================*"
             cmake --build build --config Release
             
             echo ""
-            echo "====================================="
-            echo "Run Tests"
-            echo "====================================="
+            echo "*=====================================*"
+            echo " Run Tests"
+            echo "*=====================================*"
             cd build
             ctest -V --output-on-failure --timeout 1800 --build-config Release

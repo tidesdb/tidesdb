@@ -264,8 +264,7 @@ jobs:
         run: |
           export PKG_CONFIG_PATH=/usr/powerpc-linux-gnu/lib/pkgconfig
           cmake -S . -B build \
-            -DCMAKE_SYSTEM_NAME=Darwin \
-            -DCMAKE_SYSTEM_VERSION=10.6.8 \
+            -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_SYSTEM_PROCESSOR=powerpc \
             -DCMAKE_C_COMPILER=powerpc-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=powerpc-linux-gnu-g++ \

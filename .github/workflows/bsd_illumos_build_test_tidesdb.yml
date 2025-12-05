@@ -48,9 +48,6 @@ jobs:
             echo "====================================="
             export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
             cmake -S . -B build \
-              -DCMAKE_PREFIX_PATH=/usr/local \
-              -DCMAKE_INCLUDE_PATH=/usr/local/include \
-              -DCMAKE_LIBRARY_PATH=/usr/local/lib \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=OFF
             
@@ -107,10 +104,6 @@ jobs:
             echo "====================================="
             export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
             cmake -S . -B build \
-              -DCMAKE_MAKE_PROGRAM=/usr/local/bin/gmake \
-              -DCMAKE_PREFIX_PATH=/usr/local \
-              -DCMAKE_INCLUDE_PATH=/usr/local/include \
-              -DCMAKE_LIBRARY_PATH=/usr/local/lib \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=OFF
             
@@ -166,9 +159,6 @@ jobs:
             echo "====================================="
             export PKG_CONFIG_PATH=/usr/pkg/lib/pkgconfig
             cmake -S . -B build \
-              -DCMAKE_PREFIX_PATH=/usr/pkg \
-              -DCMAKE_INCLUDE_PATH=/usr/pkg/include \
-              -DCMAKE_LIBRARY_PATH=/usr/pkg/lib \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=OFF
             
@@ -226,9 +216,7 @@ jobs:
             export PKG_CONFIG_PATH=/usr/lib/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
-              -DTIDESDB_WITH_SANITIZER=OFF \
-              -DCMAKE_INCLUDE_PATH=/usr/include \
-              -DCMAKE_LIBRARY_PATH=/usr/lib
+              -DTIDESDB_WITH_SANITIZER=OFF 
             
             echo ""
             echo "====================================="
@@ -284,9 +272,6 @@ jobs:
             echo "====================================="
             export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
             cmake -S . -B build \
-              -DCMAKE_PREFIX_PATH=/usr/local \
-              -DCMAKE_INCLUDE_PATH=/usr/local/include \
-              -DCMAKE_LIBRARY_PATH=/usr/local/lib \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=OFF
             

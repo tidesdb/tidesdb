@@ -107,6 +107,61 @@ elseif(WIN32)
             lz4::lz4
             PThreads4W::PThreads4W
     )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+    # FreeBSD packages installed in /usr/local
+    target_include_directories(tidesdb PUBLIC /usr/local/include)
+    target_link_directories(tidesdb PUBLIC /usr/local/lib)
+    target_link_libraries(tidesdb PUBLIC
+            m           # math library
+            liblz4      # lz4 compression
+            zstd        # zstandard compression
+            snappy      # snappy compression
+            pthread     # pthread library
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
+    # OpenBSD -- packages installed in /usr/local
+    target_include_directories(tidesdb PUBLIC /usr/local/include)
+    target_link_directories(tidesdb PUBLIC /usr/local/lib)
+    target_link_libraries(tidesdb PUBLIC
+            m           # math library
+            liblz4      # lz4 compression (OpenBSD uses liblz4)
+            zstd        # zstandard compression
+            snappy      # snappy compression
+            pthread     # pthread library
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
+    # NetBSD -- packages installed in /usr/pkg
+    target_include_directories(tidesdb PUBLIC /usr/pkg/include)
+    target_link_directories(tidesdb PUBLIC /usr/pkg/lib)
+    target_link_libraries(tidesdb PUBLIC
+            m           # math library
+            liblz4      # lz4 compression
+            zstd        # zstandard compression
+            snappy      # snappy compression
+            pthread     # pthread library
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
+    # DragonFlyBSD -- packages installed in /usr/local
+    target_include_directories(tidesdb PUBLIC /usr/local/include)
+    target_link_directories(tidesdb PUBLIC /usr/local/lib)
+    target_link_libraries(tidesdb PUBLIC
+            m           # math library
+            liblz4      # lz4 compression
+            zstd        # zstandard compression
+            snappy      # snappy compression
+            pthread     # pthread library
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
+    # OmniOS/Illumos -- OpenIndiana Community Edition packages in /opt/ooce
+    target_include_directories(tidesdb PUBLIC /opt/ooce/include)
+    target_link_directories(tidesdb PUBLIC /opt/ooce/lib/amd64)
+    target_link_libraries(tidesdb PUBLIC
+            m           # math library
+            lz4         # lz4 compression
+            zstd        # zstandard compression
+            snappy      # snappy compression
+            pthread     # pthread library
+    )
 else()
     # for linux and other unix systems
     target_link_libraries(tidesdb PUBLIC

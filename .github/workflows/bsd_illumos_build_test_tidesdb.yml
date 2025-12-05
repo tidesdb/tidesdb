@@ -34,12 +34,12 @@ jobs:
             
             echo ""
             echo "====================================="
-            echo "Portability Diagnostics"
+            echo "Portability Check"
             echo "====================================="
             if [ -f /usr/include/sys/sysinfo.h ]; then
-              echo "✓ sys/sysinfo.h exists"
+              echo "✓ sys/sysinfo.h exists (Linux compatibility)"
             else
-              echo "✗ sys/sysinfo.h NOT FOUND"
+              echo "✓ Using BSD sysctl() for memory info"
             fi
             
             echo ""
@@ -86,12 +86,12 @@ jobs:
             
             echo ""
             echo "====================================="
-            echo "Portability Diagnostics"
+            echo "Portability Check"
             echo "====================================="
             if [ -f /usr/include/sys/sysinfo.h ]; then
-              echo "✓ sys/sysinfo.h exists"
+              echo "✓ sys/sysinfo.h exists (Linux compatibility)"
             else
-              echo "✗ sys/sysinfo.h NOT FOUND"
+              echo "✓ Using BSD sysctl() for memory info"
             fi
             
             echo ""
@@ -138,12 +138,12 @@ jobs:
             
             echo ""
             echo "====================================="
-            echo "Portability Diagnostics"
+            echo "Portability Check"
             echo "====================================="
             if [ -f /usr/include/sys/sysinfo.h ]; then
-              echo "✓ sys/sysinfo.h exists"
+              echo "✓ sys/sysinfo.h exists (Linux compatibility)"
             else
-              echo "✗ sys/sysinfo.h NOT FOUND"
+              echo "✓ Using BSD sysctl() for memory info"
             fi
             
             echo ""
@@ -190,12 +190,12 @@ jobs:
             
             echo ""
             echo "====================================="
-            echo "Portability Diagnostics"
+            echo "Portability Check"
             echo "====================================="
             if [ -f /usr/include/sys/sysinfo.h ]; then
-              echo "✓ sys/sysinfo.h exists"
+              echo "✓ sys/sysinfo.h exists (Linux compatibility)"
             else
-              echo "✗ sys/sysinfo.h NOT FOUND"
+              echo "✓ Using BSD sysctl() for memory info"
             fi
             
             echo ""
@@ -244,12 +244,12 @@ jobs:
             
             echo ""
             echo "====================================="
-            echo "Portability Diagnostics"
+            echo "Portability Check"
             echo "====================================="
             if [ -f /usr/include/sys/sysinfo.h ]; then
-              echo "✓ sys/sysinfo.h exists"
+              echo "✓ sys/sysinfo.h exists (Linux compatibility)"
             else
-              echo "✗ sys/sysinfo.h NOT FOUND"
+              echo "✓ Using BSD sysctl() for memory info"
             fi
             
             echo ""

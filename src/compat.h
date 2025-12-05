@@ -1142,9 +1142,13 @@ static inline int sem_post(sem_t *sem)
 /* sysinfo is Linux-specific, BSD uses sysctl */
 #if defined(__linux__)
 #include <sys/sysinfo.h>
-#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
 #include <sys/sysctl.h>
 #include <sys/types.h>
+#elif defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#include <uvm/uvm_extern.h>
 #endif
 
 /* pread, pwrite, and fdatasync are available natively on POSIX systems via unistd.h */
@@ -1228,16 +1232,14 @@ static inline size_t get_available_memory(void)
     }
 #elif defined(__OpenBSD__) || defined(__NetBSD__)
     int mib[2];
-    int free_mem;
-    len = sizeof(free_mem);
+    struct uvmexp uvmexp;
+    len = sizeof(uvmexp);
 
     mib[0] = CTL_VM;
     mib[1] = VM_UVMEXP;
-    struct uvmexp uvmexp;
-    len = sizeof(uvmexp);
     if (sysctl(mib, 2, &uvmexp, &len, NULL, 0) == 0)
     {
-        return (size_t)(uvmexp.free * uvmexp.pagesize);
+        return (size_t)((uint64_t)uvmexp.free * (uint64_t)uvmexp.pagesize);
     }
 #endif
     return 0;

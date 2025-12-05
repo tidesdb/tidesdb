@@ -98,7 +98,13 @@ jobs:
             echo "====================================="
             echo "Configure CMake"
             echo "====================================="
-            cmake -S . -B build -DCMAKE_MAKE_PROGRAM=/usr/local/bin/gmake -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+            cmake -S . -B build \
+              -DCMAKE_MAKE_PROGRAM=/usr/local/bin/gmake \
+              -DCMAKE_C_FLAGS="-I/usr/local/include" \
+              -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/lib" \
+              -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/lib" \
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DTIDESDB_WITH_SANITIZER=OFF
             
             echo ""
             echo "====================================="
@@ -129,7 +135,7 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            /usr/sbin/pkg_add cmake lz4 zstd snappy
+            /usr/sbin/pkg_add cmake lz4 zstd snappy pkgconf
           run: |
             echo "====================================="
             echo "System Information"

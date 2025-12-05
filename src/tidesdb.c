@@ -2423,7 +2423,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     /* build and write index */
     if (index_builder)
     {
-        sst->block_index = succinct_trie_builder_build(index_builder, &sst->db->is_open);
+        sst->block_index = succinct_trie_builder_build(index_builder, NULL);
         if (sst->block_index)
         {
             TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block index built - %u samples, %u nodes, %" PRIu64
@@ -4776,7 +4776,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     if (index_builder)
     {
         TDB_DEBUG_LOG("Full preemptive merge: building index from builder");
-        new_sst->block_index = succinct_trie_builder_build(index_builder, &cf->db->is_open);
+        new_sst->block_index = succinct_trie_builder_build(index_builder, NULL);
         TDB_DEBUG_LOG("Full preemptive merge: index build %s",
                       new_sst->block_index ? "succeeded" : "failed");
         if (new_sst->block_index)
@@ -5317,7 +5317,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         /* write index */
         if (index_builder)
         {
-            new_sst->block_index = succinct_trie_builder_build(index_builder, &cf->db->is_open);
+            new_sst->block_index = succinct_trie_builder_build(index_builder, NULL);
             if (new_sst->block_index)
             {
                 size_t index_size;
@@ -5915,7 +5915,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             /* write index */
             if (index_builder)
             {
-                new_sst->block_index = succinct_trie_builder_build(index_builder, &cf->db->is_open);
+                new_sst->block_index = succinct_trie_builder_build(index_builder, NULL);
                 if (new_sst->block_index)
                 {
                     size_t index_size;

@@ -902,7 +902,8 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .enable_block_indexes = 1,
         .index_sample_ratio = TDB_DEFAULT_INDEX_SAMPLE_RATIO,
         .sync_mode = TDB_SYNC_NONE,
-        .sync_interval_us = 0, /* disabled by default */
+        .sync_interval_us =
+            TDB_DEFAULT_SYNC_INTERVAL_US, /* 128ms default for TDB_SYNC_INTERVAL mode */
         .comparator_fn_cached = NULL,
         .comparator_ctx_cached = NULL,
         .skip_list_max_level = 12,
@@ -7344,6 +7345,13 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 {
     if (!db || !name || !config) return TDB_ERR_INVALID_ARGS;
 
+    /* validate sync configuration */
+    if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us == 0)
+    {
+        TDB_DEBUG_LOG("Invalid config: TDB_SYNC_INTERVAL requires sync_interval_us > 0");
+        return TDB_ERR_INVALID_ARGS;
+    }
+
     TDB_DEBUG_LOG("Creating column family: %s", name);
 
     pthread_rwlock_rdlock(&db->cf_list_lock);
@@ -11205,6 +11213,10 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     {
         ctx->config->sync_mode = atoi(value);
     }
+    else if (strcmp(name, "sync_interval_us") == 0)
+    {
+        ctx->config->sync_interval_us = (uint64_t)atoll(value);
+    }
     else if (strcmp(name, "skip_list_max_level") == 0)
     {
         ctx->config->skip_list_max_level = atoi(value);
@@ -11310,6 +11322,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     fprintf(fp, "enable_block_indexes = %d\n", config->enable_block_indexes);
     fprintf(fp, "index_sample_ratio = %d\n", config->index_sample_ratio);
     fprintf(fp, "sync_mode = %d\n", config->sync_mode);
+    fprintf(fp, "sync_interval_us = %" PRIu64 "\n", config->sync_interval_us);
     fprintf(fp, "skip_list_max_level = %d\n", config->skip_list_max_level);
     fprintf(fp, "skip_list_probability = %f\n", config->skip_list_probability);
 
@@ -11361,6 +11374,7 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
     cf->config.level_size_ratio = new_config->level_size_ratio;
     cf->config.dividing_level_offset = new_config->dividing_level_offset;
     cf->config.sync_mode = new_config->sync_mode;
+    cf->config.sync_interval_us = new_config->sync_interval_us;
     cf->config.default_isolation_level = new_config->default_isolation_level;
     cf->config.value_threshold = new_config->value_threshold;
 

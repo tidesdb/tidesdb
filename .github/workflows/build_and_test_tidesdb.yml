@@ -252,9 +252,9 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
             -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
-            -DCMAKE_EXE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib" \
-            -DCMAKE_MODULE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib" \
+            -DCMAKE_EXE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
             -DTIDESDB_BUILD_TESTS=ON \
             -DTIDESDB_WITH_SANITIZER=OFF
 
@@ -272,9 +272,9 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
             -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
-            -DCMAKE_EXE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib" \
-            -DCMAKE_MODULE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib" \
+            -DCMAKE_EXE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
             -DUSE_HOMEBREW=OFF \
             -DTIDESDB_BUILD_TESTS=ON \
             -DTIDESDB_WITH_SANITIZER=OFF

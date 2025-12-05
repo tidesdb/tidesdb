@@ -190,24 +190,10 @@ else()
             snappy
             lz4
             pthread
+            m           # math library
+            stdc++      # C++ standard library (required by Snappy)
+            atomic      # atomic operations library (required for 32-bit architectures like PowerPC)
     )
-    find_library(MATH_LIBRARY m)
-    if(MATH_LIBRARY)
-        target_link_libraries(tidesdb PUBLIC ${MATH_LIBRARY})
-    endif()
-    
-    # snappy is a c++ library, so we need to link against c++ standard library
-    # also needed for cross-compilation targets
-    find_library(STDCXX_LIBRARY stdc++)
-    if(STDCXX_LIBRARY)
-        target_link_libraries(tidesdb PUBLIC ${STDCXX_LIBRARY})
-    endif()
-    
-    # PowerPC 32-bit and other 32-bit architectures need libatomic for 64-bit atomic operation capabilities..
-    find_library(ATOMIC_LIBRARY atomic)
-    if(ATOMIC_LIBRARY)
-        target_link_libraries(tidesdb PUBLIC ${ATOMIC_LIBRARY})
-    endif()
 endif()
 
 install(TARGETS tidesdb

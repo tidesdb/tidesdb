@@ -275,6 +275,7 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Run tests
+        shell: bash
         run: |
           cd build
           if [ "${{ matrix.arch }}" == "ppc" ]; then

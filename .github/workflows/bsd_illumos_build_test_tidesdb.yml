@@ -46,7 +46,13 @@ jobs:
             echo "====================================="
             echo "Configure CMake"
             echo "====================================="
-            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+            export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
+            cmake -S . -B build \
+              -DCMAKE_PREFIX_PATH=/usr/local \
+              -DCMAKE_INCLUDE_PATH=/usr/local/include \
+              -DCMAKE_LIBRARY_PATH=/usr/local/lib \
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DTIDESDB_WITH_SANITIZER=OFF
             
             echo ""
             echo "====================================="
@@ -77,6 +83,7 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
+            export PKG_PATH=https://cloudflare.cdn.openbsd.org/pub/OpenBSD/7.4/packages/amd64/
             pkg_add cmake gmake lz4 zstd snappy
           run: |
             echo "====================================="
@@ -98,11 +105,12 @@ jobs:
             echo "====================================="
             echo "Configure CMake"
             echo "====================================="
+            export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
             cmake -S . -B build \
               -DCMAKE_MAKE_PROGRAM=/usr/local/bin/gmake \
-              -DCMAKE_C_FLAGS="-I/usr/local/include" \
-              -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/lib" \
-              -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/lib" \
+              -DCMAKE_PREFIX_PATH=/usr/local \
+              -DCMAKE_INCLUDE_PATH=/usr/local/include \
+              -DCMAKE_LIBRARY_PATH=/usr/local/lib \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=OFF
             
@@ -156,7 +164,13 @@ jobs:
             echo "====================================="
             echo "Configure CMake"
             echo "====================================="
-            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+            export PKG_CONFIG_PATH=/usr/pkg/lib/pkgconfig
+            cmake -S . -B build \
+              -DCMAKE_PREFIX_PATH=/usr/pkg \
+              -DCMAKE_INCLUDE_PATH=/usr/pkg/include \
+              -DCMAKE_LIBRARY_PATH=/usr/pkg/lib \
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DTIDESDB_WITH_SANITIZER=OFF
             
             echo ""
             echo "====================================="
@@ -187,7 +201,7 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            pkg install build-essential cmake gcc-13
+            pkg install developer/build/cmake
           run: |
             echo "====================================="
             echo "System Information"
@@ -208,9 +222,12 @@ jobs:
             echo "====================================="
             echo "Configure CMake"
             echo "====================================="
-            export CC=gcc
-            export CXX=g++
-            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+            export PKG_CONFIG_PATH=/usr/lib/pkgconfig
+            cmake -S . -B build \
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DTIDESDB_WITH_SANITIZER=OFF \
+              -DCMAKE_INCLUDE_PATH=/usr/include \
+              -DCMAKE_LIBRARY_PATH=/usr/lib
             
             echo ""
             echo "====================================="
@@ -241,6 +258,9 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
+            mkdir -p /usr/local/etc/pkg/repos
+            echo 'Avalon: { enabled: no }' > /usr/local/etc/pkg/repos/df-latest.conf
+            echo 'AUTO: { url: "https://pkg.dragonflybsd.org/pkg/$''{ABI}/LATEST", mirror_type: HTTP, enabled: yes }' >> /usr/local/etc/pkg/repos/df-latest.conf
             pkg install -y cmake pkgconf zstd liblz4 snappy
           run: |
             echo "====================================="
@@ -262,7 +282,13 @@ jobs:
             echo "====================================="
             echo "Configure CMake"
             echo "====================================="
-            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+            export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
+            cmake -S . -B build \
+              -DCMAKE_PREFIX_PATH=/usr/local \
+              -DCMAKE_INCLUDE_PATH=/usr/local/include \
+              -DCMAKE_LIBRARY_PATH=/usr/local/lib \
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DTIDESDB_WITH_SANITIZER=OFF
             
             echo ""
             echo "====================================="

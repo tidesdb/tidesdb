@@ -902,7 +902,8 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .enable_block_indexes = 1,
         .index_sample_ratio = TDB_DEFAULT_INDEX_SAMPLE_RATIO,
         .sync_mode = TDB_SYNC_NONE,
-        .sync_interval_us = TDB_DEFAULT_SYNC_INTERVAL_US, /* 128ms default for TDB_SYNC_INTERVAL mode */
+        .sync_interval_us =
+            TDB_DEFAULT_SYNC_INTERVAL_US, /* 128ms default for TDB_SYNC_INTERVAL mode */
         .comparator_fn_cached = NULL,
         .comparator_ctx_cached = NULL,
         .skip_list_max_level = 12,

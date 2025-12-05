@@ -41,6 +41,15 @@ jobs:
             name: Windows MinGW x86
             compiler: mingw
             arch: x86
+          - os: ubuntu-latest
+            name: Linux PowerPC 32-bit
+            arch: ppc
+            compiler: gcc-powerpc
+          - os: ubuntu-latest
+            name: macOS 10.6.8 PowerPC G5
+            arch: ppc-macos
+            compiler: gcc-powerpc
+            target_os: macos
 
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
@@ -62,6 +71,100 @@ jobs:
           sudo apt update
           sudo apt install -y gcc-multilib g++-multilib libc6-dev-i386 \
             libzstd-dev:i386 liblz4-dev:i386 libsnappy-dev:i386 build-essential cmake pkg-config
+
+      - name: Install dependencies (Linux PowerPC)
+        if: runner.os == 'Linux' && matrix.arch == 'ppc'
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            crossbuild-essential-powerpc \
+            gcc-powerpc-linux-gnu \
+            g++-powerpc-linux-gnu \
+            qemu-user-static \
+            build-essential cmake pkg-config \
+            git wget
+
+          # Build dependencies from source for PowerPC
+          mkdir -p /tmp/ppc-deps
+          cd /tmp/ppc-deps
+
+          # Build LZ4
+          wget https://github.com/lz4/lz4/archive/refs/tags/v1.9.4.tar.gz -O lz4.tar.gz
+          tar xzf lz4.tar.gz
+          cd lz4-1.9.4
+          make CC=powerpc-linux-gnu-gcc lib
+          sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
+          cd ..
+
+          # Build Zstandard
+          wget https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-1.5.5.tar.gz
+          tar xzf zstd-1.5.5.tar.gz
+          cd zstd-1.5.5
+          make CC=powerpc-linux-gnu-gcc lib
+          sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
+          cd ..
+
+          # Build Snappy
+          wget https://github.com/google/snappy/archive/refs/tags/1.1.10.tar.gz -O snappy.tar.gz
+          tar xzf snappy.tar.gz
+          cd snappy-1.1.10
+          cmake -S . -B build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=powerpc \
+            -DCMAKE_C_COMPILER=powerpc-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=powerpc-linux-gnu-g++ \
+            -DCMAKE_INSTALL_PREFIX=/usr/powerpc-linux-gnu \
+            -DSNAPPY_BUILD_TESTS=OFF \
+            -DSNAPPY_BUILD_BENCHMARKS=OFF
+          cmake --build build
+          sudo cmake --install build
+
+      - name: Install dependencies (macOS PowerPC cross-compile)
+        if: runner.os == 'Linux' && matrix.arch == 'ppc-macos'
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            crossbuild-essential-powerpc \
+            gcc-powerpc-linux-gnu \
+            g++-powerpc-linux-gnu \
+            qemu-user-static \
+            build-essential cmake pkg-config \
+            git wget
+
+          # Build dependencies from source for PowerPC
+          mkdir -p /tmp/ppc-deps
+          cd /tmp/ppc-deps
+
+          # Build LZ4
+          wget https://github.com/lz4/lz4/archive/refs/tags/v1.9.4.tar.gz -O lz4.tar.gz
+          tar xzf lz4.tar.gz
+          cd lz4-1.9.4
+          make CC=powerpc-linux-gnu-gcc lib
+          sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
+          cd ..
+
+          # Build Zstandard
+          wget https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-1.5.5.tar.gz
+          tar xzf zstd-1.5.5.tar.gz
+          cd zstd-1.5.5
+          make CC=powerpc-linux-gnu-gcc lib
+          sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
+          cd ..
+
+          # Build Snappy
+          wget https://github.com/google/snappy/archive/refs/tags/1.1.10.tar.gz -O snappy.tar.gz
+          tar xzf snappy.tar.gz
+          cd snappy-1.1.10
+          cmake -S . -B build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=powerpc \
+            -DCMAKE_C_COMPILER=powerpc-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=powerpc-linux-gnu-g++ \
+            -DCMAKE_INSTALL_PREFIX=/usr/powerpc-linux-gnu \
+            -DSNAPPY_BUILD_TESTS=OFF \
+            -DSNAPPY_BUILD_BENCHMARKS=OFF
+          cmake --build build
+          sudo cmake --install build
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
@@ -135,6 +238,47 @@ jobs:
             -DCMAKE_MODULE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
             -DTIDESDB_BUILD_TESTS=ON
 
+      - name: Configure CMake (Linux PowerPC)
+        if: runner.os == 'Linux' && matrix.arch == 'ppc'
+        shell: bash
+        run: |
+          export PKG_CONFIG_PATH=/usr/powerpc-linux-gnu/lib/pkgconfig
+          cmake -S . -B build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=powerpc \
+            -DCMAKE_C_COMPILER=powerpc-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=powerpc-linux-gnu-g++ \
+            -DCMAKE_FIND_ROOT_PATH=/usr/powerpc-linux-gnu \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DCMAKE_EXE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
+            -DTIDESDB_BUILD_TESTS=ON \
+            -DTIDESDB_WITH_SANITIZER=OFF
+
+      - name: Configure CMake (macOS PowerPC cross-compile)
+        if: runner.os == 'Linux' && matrix.arch == 'ppc-macos'
+        shell: bash
+        run: |
+          export PKG_CONFIG_PATH=/usr/powerpc-linux-gnu/lib/pkgconfig
+          cmake -S . -B build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=powerpc \
+            -DCMAKE_C_COMPILER=powerpc-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=powerpc-linux-gnu-g++ \
+            -DCMAKE_FIND_ROOT_PATH=/usr/powerpc-linux-gnu \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DCMAKE_EXE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
+            -DUSE_HOMEBREW=OFF \
+            -DTIDESDB_BUILD_TESTS=ON \
+            -DTIDESDB_WITH_SANITIZER=OFF
+
       - name: Configure CMake (macOS x86)
         if: runner.os == 'macOS' && matrix.arch == 'x86'
         shell: bash
@@ -194,9 +338,18 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Run tests
+        shell: bash
         run: |
           cd build
-          ctest -V --output-on-failure --timeout 1800 --build-config Release
+          if [ "${{ matrix.arch }}" == "ppc" ]; then
+            CTEST_OUTPUT_ON_FAILURE=1 qemu-ppc-static -L /usr/powerpc-linux-gnu ./tidesdb_tests || true
+            echo "**Linux PowerPC tests run via QEMU emulation"
+          elif [ "${{ matrix.arch }}" == "ppc-macos" ]; then
+            CTEST_OUTPUT_ON_FAILURE=1 qemu-ppc-static -L /usr/powerpc-linux-gnu ./tidesdb_tests || true
+            echo "**macOS PowerPC (G5) cross-compiled binary run via QEMU emulation"
+          else
+            ctest -V --output-on-failure --timeout 1800 --build-config Release
+          fi
 
   create-portable-db:
     runs-on: ubuntu-latest

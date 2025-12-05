@@ -1731,6 +1731,7 @@ static void test_compression_zstd(void)
     cleanup_test_dir();
 }
 
+#ifndef __sun
 static void test_compression_snappy(void)
 {
     cleanup_test_dir();
@@ -1779,6 +1780,7 @@ static void test_compression_snappy(void)
     tidesdb_close(db);
     cleanup_test_dir();
 }
+#endif
 
 static void test_bloom_filter_enabled(void)
 {
@@ -1939,6 +1941,174 @@ static void test_sync_modes(void)
         uint8_t value[] = "sync_value2";
         ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        tidesdb_close(db);
+        cleanup_test_dir();
+    }
+}
+
+static void test_sync_interval_mode(void)
+{
+    cleanup_test_dir();
+
+    /* test TDB_SYNC_INTERVAL with periodic syncing */
+    {
+        tidesdb_t *db = create_test_db();
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.sync_mode = TDB_SYNC_INTERVAL;
+        cf_config.sync_interval_us = 500000;       /* 500ms */
+        cf_config.write_buffer_size = 1024 * 1024; /* 1MB to prevent auto-flush */
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "interval_cf", &cf_config), 0);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "interval_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        /* write some data */
+        for (int i = 0; i < 10; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+            char key[32];
+            char value[64];
+            snprintf(key, sizeof(key), "interval_key_%d", i);
+            snprintf(value, sizeof(value), "interval_value_%d", i);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+
+        /* verify data is readable immediately (from memtable) */
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        uint8_t *retrieved_value = NULL;
+        size_t retrieved_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)"interval_key_5", 15, &retrieved_value,
+                                  &retrieved_size),
+                  0);
+        ASSERT_TRUE(retrieved_value != NULL);
+        ASSERT_EQ(strcmp((char *)retrieved_value, "interval_value_5"), 0);
+        free(retrieved_value);
+        tidesdb_txn_free(txn);
+
+        /* wait for at least one sync interval to ensure WAL is synced */
+        usleep(600000); /* 600ms */
+
+        tidesdb_close(db);
+    }
+
+    /* data should survive reopen */
+    {
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+        config.enable_debug_logging = 1;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "interval_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        /* verify data persisted */
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        uint8_t *retrieved_value = NULL;
+        size_t retrieved_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)"interval_key_5", 15, &retrieved_value,
+                                  &retrieved_size),
+                  0);
+        ASSERT_TRUE(retrieved_value != NULL);
+        ASSERT_EQ(strcmp((char *)retrieved_value, "interval_value_5"), 0);
+        free(retrieved_value);
+        tidesdb_txn_free(txn);
+
+        tidesdb_close(db);
+    }
+
+    /* test multiple CFs with different intervals */
+    {
+        tidesdb_t *db = create_test_db();
+
+        /* CF with fast sync */
+        tidesdb_column_family_config_t cf_config1 = tidesdb_default_column_family_config();
+        cf_config1.sync_mode = TDB_SYNC_INTERVAL;
+        cf_config1.sync_interval_us = 100000; /* 100ms */
+        ASSERT_EQ(tidesdb_create_column_family(db, "fast_sync_cf", &cf_config1), 0);
+
+        /* CF with slow sync */
+        tidesdb_column_family_config_t cf_config2 = tidesdb_default_column_family_config();
+        cf_config2.sync_mode = TDB_SYNC_INTERVAL;
+        cf_config2.sync_interval_us = 1000000; /* 1 second */
+        ASSERT_EQ(tidesdb_create_column_family(db, "slow_sync_cf", &cf_config2), 0);
+
+        /* CF with no interval sync */
+        tidesdb_column_family_config_t cf_config3 = tidesdb_default_column_family_config();
+        cf_config3.sync_mode = TDB_SYNC_NONE;
+        ASSERT_EQ(tidesdb_create_column_family(db, "no_sync_cf", &cf_config3), 0);
+
+        tidesdb_column_family_t *fast_cf = tidesdb_get_column_family(db, "fast_sync_cf");
+        tidesdb_column_family_t *slow_cf = tidesdb_get_column_family(db, "slow_sync_cf");
+        tidesdb_column_family_t *no_sync_cf = tidesdb_get_column_family(db, "no_sync_cf");
+        ASSERT_TRUE(fast_cf != NULL);
+        ASSERT_TRUE(slow_cf != NULL);
+        ASSERT_TRUE(no_sync_cf != NULL);
+
+        /* write to all CFs */
+        for (int i = 0; i < 5; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+            char key[32];
+            char value[64];
+            snprintf(key, sizeof(key), "multi_key_%d", i);
+            snprintf(value, sizeof(value), "multi_value_%d", i);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, fast_cf, (uint8_t *)key, strlen(key) + 1,
+                                      (uint8_t *)value, strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_put(txn, slow_cf, (uint8_t *)key, strlen(key) + 1,
+                                      (uint8_t *)value, strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_put(txn, no_sync_cf, (uint8_t *)key, strlen(key) + 1,
+                                      (uint8_t *)value, strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+
+        /* wait for fast sync interval */
+        usleep(150000); /* 150ms */
+
+        /* verify all data is readable */
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        uint8_t *retrieved_value = NULL;
+        size_t retrieved_size = 0;
+
+        ASSERT_EQ(tidesdb_txn_get(txn, fast_cf, (uint8_t *)"multi_key_2", 12, &retrieved_value,
+                                  &retrieved_size),
+                  0);
+        ASSERT_TRUE(retrieved_value != NULL);
+        free(retrieved_value);
+
+        ASSERT_EQ(tidesdb_txn_get(txn, slow_cf, (uint8_t *)"multi_key_2", 12, &retrieved_value,
+                                  &retrieved_size),
+                  0);
+        ASSERT_TRUE(retrieved_value != NULL);
+        free(retrieved_value);
+
+        ASSERT_EQ(tidesdb_txn_get(txn, no_sync_cf, (uint8_t *)"multi_key_2", 12, &retrieved_value,
+                                  &retrieved_size),
+                  0);
+        ASSERT_TRUE(retrieved_value != NULL);
+        free(retrieved_value);
+
         tidesdb_txn_free(txn);
 
         tidesdb_close(db);
@@ -5973,6 +6143,7 @@ static void test_many_sstables_with_zstd_compression(void)
     run_sstable_simulation(&config);
 }
 
+#ifndef __sun
 static void test_many_sstables_with_snappy_compression(void)
 {
     sim_test_config_t config = {.test_name = "snappy_compression",
@@ -5984,6 +6155,7 @@ static void test_many_sstables_with_snappy_compression(void)
                                 .keys_per_sstable = 40};
     run_sstable_simulation(&config);
 }
+#endif
 
 static void test_many_sstables_all_features_enabled(void)
 {
@@ -6026,7 +6198,7 @@ static void test_many_sstables_indexes_and_compression(void)
     sim_test_config_t config = {.test_name = "indexes_and_snappy",
                                 .enable_bloom = 1,
                                 .enable_indexes = 1,
-                                .compression_algo = SNAPPY_COMPRESSION,
+                                .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 20,
                                 .block_cache_size = 0,
                                 .keys_per_sstable = 50};
@@ -6093,6 +6265,7 @@ static void test_many_sstables_with_zstd_compression_cached(void)
     run_sstable_simulation(&config);
 }
 
+#ifndef __sun
 static void test_many_sstables_with_snappy_compression_cached(void)
 {
     sim_test_config_t config = {.test_name = "snappy_compression_cached",
@@ -6104,6 +6277,7 @@ static void test_many_sstables_with_snappy_compression_cached(void)
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
+#endif
 
 static void test_many_sstables_all_features_enabled_cached(void)
 {
@@ -6188,7 +6362,7 @@ static void test_many_sstables_serializable(void)
     sim_test_config_t config = {.test_name = "isolation_serializable",
                                 .enable_bloom = 1,
                                 .enable_indexes = 1,
-                                .compression_algo = SNAPPY_COMPRESSION,
+                                .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
                                 .block_cache_size = 0,
                                 .keys_per_sstable = 40,
@@ -6230,7 +6404,7 @@ static void test_many_sstables_comparator_reverse(void)
     sim_test_config_t config = {.test_name = "comparator_reverse",
                                 .enable_bloom = 1,
                                 .enable_indexes = 1,
-                                .compression_algo = SNAPPY_COMPRESSION,
+                                .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
                                 .block_cache_size = 0,
                                 .keys_per_sstable = 40,
@@ -7073,7 +7247,6 @@ int main(void)
     RUN_TEST(test_sync_modes, tests_passed);
     RUN_TEST(test_compression_lz4, tests_passed);
     RUN_TEST(test_compression_zstd, tests_passed);
-    RUN_TEST(test_compression_snappy, tests_passed);
     RUN_TEST(test_compaction_basic, tests_passed);
     RUN_TEST(test_compaction_with_deletes, tests_passed);
     RUN_TEST(test_concurrent_writes, tests_passed);
@@ -7129,7 +7302,6 @@ int main(void)
     RUN_TEST(test_many_sstables_with_block_indexes, tests_passed);
     RUN_TEST(test_many_sstables_with_lz4_compression, tests_passed);
     RUN_TEST(test_many_sstables_with_zstd_compression, tests_passed);
-    RUN_TEST(test_many_sstables_with_snappy_compression, tests_passed);
     RUN_TEST(test_many_sstables_all_features_enabled, tests_passed);
     RUN_TEST(test_many_sstables_all_features_disabled, tests_passed);
     RUN_TEST(test_many_sstables_bloom_and_compression, tests_passed);
@@ -7139,7 +7311,13 @@ int main(void)
     RUN_TEST(test_many_sstables_with_block_indexes_cached, tests_passed);
     RUN_TEST(test_many_sstables_with_lz4_compression_cached, tests_passed);
     RUN_TEST(test_many_sstables_with_zstd_compression_cached, tests_passed);
+
+#ifndef __sun
+    RUN_TEST(test_many_sstables_with_snappy_compression, tests_passed);
     RUN_TEST(test_many_sstables_with_snappy_compression_cached, tests_passed);
+    RUN_TEST(test_compression_snappy, tests_passed);
+#endif
+
     RUN_TEST(test_many_sstables_all_features_enabled_cached, tests_passed);
     RUN_TEST(test_many_sstables_all_features_disabled_cached, tests_passed);
     RUN_TEST(test_many_sstables_bloom_and_compression_cached, tests_passed);
@@ -7156,6 +7334,7 @@ int main(void)
     RUN_TEST(test_many_sstables_all_isolation_levels, tests_passed);
     RUN_TEST(test_many_sstables_all_comparators, tests_passed);
     RUN_TEST(test_large_value_iteration, tests_passed);
+    RUN_TEST(test_sync_interval_mode, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

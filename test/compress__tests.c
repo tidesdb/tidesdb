@@ -23,6 +23,7 @@
 static int tests_passed = 0;
 static int tests_failed = 0;
 
+#ifndef __sun
 void test_compress_decompress_snappy()
 {
     uint8_t data[] = "test data";
@@ -40,6 +41,7 @@ void test_compress_decompress_snappy()
     free(compressed_data);
     free(decompressed_data);
 }
+#endif
 
 void test_compress_decompress_lz4()
 {
@@ -79,7 +81,10 @@ void test_compress_decompress_zstd()
 
 int main(void)
 {
+#ifndef __sun
     RUN_TEST(test_compress_decompress_snappy, tests_passed);
+#endif
+
     RUN_TEST(test_compress_decompress_lz4, tests_passed);
     RUN_TEST(test_compress_decompress_zstd, tests_passed);
 

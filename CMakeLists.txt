@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 5.1.0)
+set(PROJECT_VERSION 5.1.1)
 
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -75,23 +75,44 @@ if(WIN32)
     find_package(PThreads4W REQUIRED)
 endif()
 
-if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
-    # for apple silicon macs, homebrew installs packages in /opt/homebrew
-    target_include_directories(tidesdb PUBLIC /opt/homebrew/include)
-    target_link_directories(tidesdb PUBLIC /opt/homebrew/lib)
-    # link against compression libraries for apple silicon
-    target_link_libraries(tidesdb PUBLIC
-            m           # math library
-            lz4         # lz4 compression
-            zstd        # zstandard compression
-            snappy      # snappy compression
-            pthread     # pthread library
-    )
-elseif(APPLE)
-    # for intel macs, homebrew typically installs in /usr/local
-    target_include_directories(tidesdb PUBLIC /usr/local/include)
-    target_link_directories(tidesdb PUBLIC /usr/local/lib)
-    # link against compression libraries for intel mac
+if(APPLE)
+    # macOS supports multiple package managers (Homebrew, MacPorts, pkgsrc, Fink, etc)
+    # we allow user to specify custom paths via -DMACOS_DEPENDENCY_PREFIX=/path
+    # or use -DUSE_HOMEBREW=ON/OFF to control Homebrew detection (the default is ON)
+
+    option(USE_HOMEBREW "Auto-detect and use Homebrew paths on macOS" ON)
+
+    if(DEFINED MACOS_DEPENDENCY_PREFIX)
+        # user explicitly specified a prefix (e.g., MacPorts /opt/local, pkgsrc /usr/pkg)
+        message(STATUS "Using custom macOS dependency prefix: ${MACOS_DEPENDENCY_PREFIX}")
+        target_include_directories(tidesdb PUBLIC ${MACOS_DEPENDENCY_PREFIX}/include)
+        target_link_directories(tidesdb PUBLIC ${MACOS_DEPENDENCY_PREFIX}/lib)
+    elseif(USE_HOMEBREW)
+        # auto-detect homebrew installation
+        if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+            # Apple Silicon -- Homebrew uses /opt/homebrew
+            set(HOMEBREW_PREFIX "/opt/homebrew")
+        else()
+            # Intel Mac -- Homebrew uses /usr/local
+            set(HOMEBREW_PREFIX "/usr/local")
+        endif()
+
+        # verify homebrew prefix exists before using it
+        if(EXISTS "${HOMEBREW_PREFIX}/bin/brew")
+            message(STATUS "Detected Homebrew at ${HOMEBREW_PREFIX}")
+            target_include_directories(tidesdb PUBLIC ${HOMEBREW_PREFIX}/include)
+            target_link_directories(tidesdb PUBLIC ${HOMEBREW_PREFIX}/lib)
+        else()
+            message(WARNING "Homebrew not found at ${HOMEBREW_PREFIX}, relying on system paths. "
+                           "If using MacPorts, pkgsrc, or Fink, specify -DMACOS_DEPENDENCY_PREFIX=/path or -DUSE_HOMEBREW=OFF")
+        endif()
+    else()
+        message(STATUS "Using system default paths on macOS (USE_HOMEBREW=OFF)")
+        # let CMake find packages in standard locations
+        # or rely on CMAKE_PREFIX_PATH being set by the user
+    endif()
+
+    # Link against compression libraries for macOS
     target_link_libraries(tidesdb PUBLIC
             m           # math library
             lz4         # lz4 compression
@@ -107,6 +128,61 @@ elseif(WIN32)
             lz4::lz4
             PThreads4W::PThreads4W
     )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+    # FreeBSD packages installed in /usr/local
+    target_include_directories(tidesdb PUBLIC /usr/local/include)
+    target_link_directories(tidesdb PUBLIC /usr/local/lib)
+    target_link_libraries(tidesdb PUBLIC
+            m           # math library
+            lz4         # lz4 compression
+            zstd        # zstandard compression
+            snappy      # snappy compression
+            pthread     # pthread library
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
+    # OpenBSD -- packages installed in /usr/local
+    target_include_directories(tidesdb PUBLIC /usr/local/include)
+    target_link_directories(tidesdb PUBLIC /usr/local/lib)
+    target_link_libraries(tidesdb PUBLIC
+            m           # math library
+            lz4         # lz4 compression
+            zstd        # zstandard compression
+            snappy      # snappy compression
+            pthread     # pthread library
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
+    # NetBSD -- packages installed in /usr/pkg
+    target_include_directories(tidesdb PUBLIC /usr/pkg/include)
+    target_link_directories(tidesdb PUBLIC /usr/pkg/lib)
+    target_link_libraries(tidesdb PUBLIC
+            m           # math library
+            lz4         # lz4 compression
+            zstd        # zstandard compression
+            snappy      # snappy compression
+            pthread     # pthread library
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
+    # DragonFlyBSD -- packages installed in /usr/local
+    target_include_directories(tidesdb PUBLIC /usr/local/include)
+    target_link_directories(tidesdb PUBLIC /usr/local/lib)
+    target_link_libraries(tidesdb PUBLIC
+            m           # math library
+            lz4         # lz4 compression
+            zstd        # zstandard compression
+            snappy      # snappy compression
+            pthread     # pthread library
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
+    # OmniOS/Illumos -- OpenIndiana Community Edition packages in /opt/ooce
+    # Note: snappy is not available in OmniOS repos, using only lz4 and zstd
+    target_include_directories(tidesdb PUBLIC /opt/ooce/include /usr/include)
+    target_link_directories(tidesdb PUBLIC /opt/ooce/lib/amd64 /usr/lib/amd64)
+    target_link_libraries(tidesdb PUBLIC
+            m           # math library
+            lz4         # lz4 compression
+            zstd        # zstandard compression
+            pthread     # pthread library
+    )
 else()
     # for linux and other unix systems
     target_link_libraries(tidesdb PUBLIC
@@ -114,11 +190,10 @@ else()
             snappy
             lz4
             pthread
+            m           # math library
+            stdc++      # C++ standard library (required by Snappy)
+            atomic      # atomic operations library (required for 32-bit architectures like PowerPC)
     )
-    find_library(MATH_LIBRARY m)
-    if(MATH_LIBRARY)
-        target_link_libraries(tidesdb PUBLIC ${MATH_LIBRARY})
-    endif()
 endif()
 
 install(TARGETS tidesdb

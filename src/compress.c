@@ -25,6 +25,7 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
 
     switch (type)
     {
+#ifndef __sun
         case SNAPPY_COMPRESSION:
         {
             *compressed_size = snappy_max_compressed_length(data_size);
@@ -35,6 +36,7 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
                             compressed_size);
             break;
         }
+#endif
 
         case LZ4_COMPRESSION:
         case ZSTD_COMPRESSION:
@@ -90,6 +92,7 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
 
     switch (type)
     {
+#ifndef __sun
         case SNAPPY_COMPRESSION:
         {
             if (snappy_uncompressed_length((const char *)data, data_size, decompressed_size) !=
@@ -107,6 +110,7 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
             }
             break;
         }
+#endif
 
         case LZ4_COMPRESSION:
         case ZSTD_COMPRESSION:

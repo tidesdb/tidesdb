@@ -19,16 +19,21 @@
 #ifndef __COMPRESS_H__
 #define __COMPRESS_H__
 #include <lz4.h>
+#ifndef __sun
 #include <snappy-c.h>
+#endif
 #include <zstd.h>
 
 #include "compat.h"
 
 /* snappy, lz4, zstd supported to use for compression purposes */
+/* Note: snappy is not available on SunOS/OmniOS/Illumos */
 typedef enum
 {
     NO_COMPRESSION = 0,
+#ifndef __sun
     SNAPPY_COMPRESSION,
+#endif
     LZ4_COMPRESSION,
     ZSTD_COMPRESSION,
 } compression_algorithm;

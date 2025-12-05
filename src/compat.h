@@ -1136,9 +1136,20 @@ static inline int sem_post(sem_t *sem)
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/stat.h>
-#include <sys/sysinfo.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+/* sysinfo is Linux-specific, BSD uses sysctl */
+#if defined(__linux__)
+#include <sys/sysinfo.h>
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#elif defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#include <uvm/uvm_extern.h>
+#endif
 
 /* pread, pwrite, and fdatasync are available natively on POSIX systems via unistd.h */
 /* no additional implementation needed using system pread/pwrite/fdatasync */
@@ -1196,12 +1207,49 @@ static inline size_t get_available_memory(void)
         return (size_t)(vm_stats.free_count * page_size);
     }
     return 0;
-#else
-    /* linux and other POSIX systems */
+#elif defined(__linux__)
+    /* linux-specific sysinfo */
     struct sysinfo si;
     if (sysinfo(&si) == 0)
     {
         return (size_t)si.freeram * (size_t)si.mem_unit;
+    }
+    return 0;
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+    /* BSD systems use sysctl.. */
+    unsigned long free_pages = 0;
+    unsigned long page_size = 0;
+    size_t len = sizeof(free_pages);
+
+#if defined(__FreeBSD__) || defined(__DragonFly__)
+    if (sysctlbyname("vm.stats.vm.v_free_count", &free_pages, &len, NULL, 0) == 0)
+    {
+        len = sizeof(page_size);
+        if (sysctlbyname("vm.stats.vm.v_page_size", &page_size, &len, NULL, 0) == 0)
+        {
+            return (size_t)(free_pages * page_size);
+        }
+    }
+#elif defined(__OpenBSD__) || defined(__NetBSD__)
+    int mib[2];
+    struct uvmexp uvmexp;
+    len = sizeof(uvmexp);
+
+    mib[0] = CTL_VM;
+    mib[1] = VM_UVMEXP;
+    if (sysctl(mib, 2, &uvmexp, &len, NULL, 0) == 0)
+    {
+        return (size_t)((uint64_t)uvmexp.free * (uint64_t)uvmexp.pagesize);
+    }
+#endif
+    return 0;
+#else
+    /* illumos/solaris and other POSIX systems */
+    long pages = sysconf(_SC_AVPHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0)
+    {
+        return (size_t)(pages * page_size);
     }
     return 0;
 #endif
@@ -1235,12 +1283,43 @@ static inline size_t get_total_memory(void)
         return (size_t)physical_memory;
     }
     return 0;
-#else
-    /* linux and other POSIX systems */
+#elif defined(__linux__)
     struct sysinfo si;
     if (sysinfo(&si) == 0)
     {
         return (size_t)si.totalram * (size_t)si.mem_unit;
+    }
+    return 0;
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+    int mib[2];
+    size_t physical_memory;
+    size_t len;
+
+    mib[0] = CTL_HW;
+#if defined(__OpenBSD__)
+    mib[1] = HW_PHYSMEM64;
+    int64_t physmem64;
+    len = sizeof(physmem64);
+    if (sysctl(mib, 2, &physmem64, &len, NULL, 0) == 0)
+    {
+        return (size_t)physmem64;
+    }
+#else
+    mib[1] = HW_PHYSMEM;
+    len = sizeof(physical_memory);
+    if (sysctl(mib, 2, &physical_memory, &len, NULL, 0) == 0)
+    {
+        return physical_memory;
+    }
+#endif
+    return 0;
+#else
+    /* illumos/solaris and other POSIX systems */
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0)
+    {
+        return (size_t)(pages * page_size);
     }
     return 0;
 #endif

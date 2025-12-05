@@ -1,0 +1,240 @@
+name: BSD and Illumos TidesDB Build & Test
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+jobs:
+  freebsd-build:
+    runs-on: ubuntu-latest
+    name: FreeBSD 14.0 x64
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build and test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.0'
+          usesh: true
+          sync: rsync
+          copyback: false
+          prepare: |
+            pkg install -y cmake pkgconf liblz4 zstd snappy
+          run: |
+            echo "*=====================================*"
+            echo " System Information"
+            echo "*=====================================*"
+            uname -a
+            freebsd-version
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Configure CMake"
+            echo "*=====================================*"
+            export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
+            cmake -S . -B build \
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DTIDESDB_WITH_SANITIZER=OFF
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Build"
+            echo "*=====================================*"
+            cmake --build build --config Release
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Run Tests"
+            echo "*=====================================*"
+            cd build
+            ctest -V --output-on-failure --timeout 1800 --build-config Release
+
+  openbsd-build:
+    runs-on: ubuntu-latest
+    name: OpenBSD 7.4 x64
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build and test on OpenBSD
+        uses: vmactions/openbsd-vm@v1
+        with:
+          release: '7.4'
+          usesh: true
+          sync: rsync
+          copyback: false
+          prepare: |
+            export PKG_PATH=http://ftp.openbsd.org/pub/OpenBSD/7.4/packages/amd64/
+            pkg_add cmake gmake lz4 zstd snappy pkgconf
+          run: |
+            echo "*=====================================*"
+            echo " System Information"
+            echo "*=====================================*"
+            uname -a
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Configure CMake"
+            echo "*=====================================*"
+            export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
+            cmake -S . -B build \
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DTIDESDB_WITH_SANITIZER=OFF
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Build"
+            echo "*=====================================*"
+            gmake -C build
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Run Tests"
+            echo "*=====================================*"
+            cd build
+            ctest -V --output-on-failure --timeout 1800 --build-config Release
+
+  netbsd-build:
+    runs-on: ubuntu-latest
+    name: NetBSD 9.3 x64
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build and test on NetBSD
+        uses: vmactions/netbsd-vm@v1
+        with:
+          release: '9.3'
+          usesh: true
+          sync: rsync
+          copyback: false
+          prepare: |
+            /usr/sbin/pkg_add cmake lz4 zstd snappy pkgconf gmake
+          run: |
+            echo "*=====================================*"
+            echo " System Information"
+            echo "*=====================================*"
+            uname -a
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Configure CMake"
+            echo "*=====================================*"
+            export PKG_CONFIG_PATH=/usr/pkg/lib/pkgconfig
+            cmake -S . -B build \
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DTIDESDB_WITH_SANITIZER=OFF
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Build"
+            echo "*=====================================*"
+            cmake --build build --config Release
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Run Tests"
+            echo "*=====================================*"
+            cd build
+            ctest -V --output-on-failure --timeout 1800 --build-config Release
+
+  omnios-build:
+    runs-on: ubuntu-latest
+    name: OmniOS (Illumos) r151048
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build and test on OmniOS (Illumos)
+        uses: vmactions/omnios-vm@v1
+        with:
+          release: 'r151048'
+          usesh: true
+          sync: rsync
+          copyback: false
+          prepare: |
+            pkg set-publisher -G '*' -g https://pkg.omnios.org/r151048/extra extra.omnios || true
+            pkg install ooce/developer/cmake gcc13 lz4 zstd
+          run: |
+            echo "*=====================================*"
+            echo " System Information"
+            echo "*=====================================*"
+            uname -a
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Configure CMake"
+            echo "*=====================================*"
+            export PATH=/opt/ooce/bin:$PATH
+            export PKG_CONFIG_PATH=/opt/ooce/lib/pkgconfig
+            cmake -S . -B build \
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DTIDESDB_WITH_SANITIZER=OFF 
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Build"
+            echo "*=====================================*"
+            cmake --build build --config Release
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Run Tests"
+            echo "*=====================================*"
+            cd build
+            ctest -V --output-on-failure --timeout 1800 --build-config Release
+
+  dragonflybsd-build:
+    runs-on: ubuntu-latest
+    name: DragonFlyBSD 6.4.2 x64
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build and test on DragonFlyBSD
+        uses: vmactions/dragonflybsd-vm@v1
+        with:
+          usesh: false
+          sync: rsync
+          copyback: false
+          prepare: |
+            mkdir -p /usr/local/etc/pkg/repos
+            echo 'Avalon: { enabled: no }' > /usr/local/etc/pkg/repos/df-latest.conf
+            echo 'AUTO: { url: "https://pkg.dragonflybsd.org/pkg/$''{ABI}/LATEST", mirror_type: HTTP, enabled: yes }' >> /usr/local/etc/pkg/repos/df-latest.conf
+            pkg install -y cmake pkgconf liblz4 zstd snappy
+          run: |
+            echo "*=====================================*"
+            echo " System Information"
+            echo "*=====================================*"
+            uname -a
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Configure CMake"
+            echo "*=====================================*"
+            export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
+            cmake -S . -B build \
+              -DTIDESDB_BUILD_TESTS=ON \
+              -DTIDESDB_WITH_SANITIZER=OFF
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Build"
+            echo "*=====================================*"
+            cmake --build build --config Release
+            
+            echo ""
+            echo "*=====================================*"
+            echo " Run Tests"
+            echo "*=====================================*"
+            cd build
+            ctest -V --output-on-failure --timeout 1800 --build-config Release

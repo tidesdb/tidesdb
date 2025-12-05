@@ -21,6 +21,8 @@ jobs:
         with:
           release: '14.0'
           usesh: true
+          sync: rsync
+          copyback: false
           prepare: |
             pkg install -y cmake pkgconf zstd liblz4 snappy
           run: |
@@ -72,6 +74,8 @@ jobs:
         with:
           release: '7.4'
           usesh: true
+          sync: rsync
+          copyback: false
           prepare: |
             pkg_add cmake gmake lz4 zstd snappy
           run: |
@@ -122,6 +126,8 @@ jobs:
         with:
           release: '9.3'
           usesh: true
+          sync: rsync
+          copyback: false
           prepare: |
             /usr/sbin/pkg_add cmake lz4 zstd snappy
           run: |
@@ -172,6 +178,8 @@ jobs:
         with:
           release: 'r151048'
           usesh: true
+          sync: rsync
+          copyback: false
           prepare: |
             pkg install build-essential cmake gcc-13
           run: |
@@ -224,6 +232,8 @@ jobs:
         with:
           release: '6.4.0'
           usesh: true
+          sync: rsync
+          copyback: false
           prepare: |
             pkg install -y cmake pkgconf zstd liblz4 snappy
           run: |

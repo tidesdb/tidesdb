@@ -4917,8 +4917,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         return tidesdb_full_preemptive_merge(cf, 0, target_level);
     }
 
-    /* already have rdlock from earlier, but it was released -- reacquire */
-    pthread_rwlock_rdlock(&cf->levels_lock);
+    /* acquire write lock since update_boundaries modifies level structure */
+    pthread_rwlock_wrlock(&cf->levels_lock);
     tidesdb_level_t **levels = cf->levels;
     tidesdb_level_t *largest = levels[num_levels - 1];
     tidesdb_level_update_boundaries(levels[target_level], largest);

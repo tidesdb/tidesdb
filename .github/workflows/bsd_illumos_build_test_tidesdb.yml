@@ -16,7 +16,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Build on FreeBSD
+      - name: Build and test on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
           release: '14.0'
@@ -24,50 +24,40 @@ jobs:
           prepare: |
             pkg install -y cmake pkgconf zstd liblz4 snappy
           run: |
-            echo "=== FreeBSD System Info ==="
+            echo "====================================="
+            echo "System Information"
+            echo "====================================="
             uname -a
             freebsd-version
+            
             echo ""
-            echo "=== Checking for sys/sysinfo.h ==="
+            echo "====================================="
+            echo "Portability Diagnostics"
+            echo "====================================="
             if [ -f /usr/include/sys/sysinfo.h ]; then
               echo "✓ sys/sysinfo.h exists"
             else
-              echo "✗ sys/sysinfo.h NOT FOUND (expected on FreeBSD)"
+              echo "✗ sys/sysinfo.h NOT FOUND"
             fi
+            
             echo ""
-            echo "=== Checking for sysinfo() function ==="
-            cat > test_sysinfo.c << 'EOF'
-            #include <sys/sysinfo.h>
-            int main() {
-                struct sysinfo si;
-                sysinfo(&si);
-                return 0;
-            }
-            EOF
-            if cc -o test_sysinfo test_sysinfo.c 2>&1; then
-              echo "✓ sysinfo() compiles successfully"
-              rm -f test_sysinfo test_sysinfo.c
-            else
-              echo "✗ sysinfo() compilation failed (expected)"
-              rm -f test_sysinfo test_sysinfo.c
-            fi
+            echo "====================================="
+            echo "Configure CMake"
+            echo "====================================="
+            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+            
             echo ""
-            echo "=== Attempting CMake configuration ==="
-            if cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
-              echo "✓ CMake configuration succeeded"
-            else
-              echo "✗ CMake configuration failed"
-              exit 1
-            fi
+            echo "====================================="
+            echo "Build"
+            echo "====================================="
+            cmake --build build --config Release
+            
             echo ""
-            echo "=== Attempting build (showing first error) ==="
-            if cmake --build build --config Release 2>&1 | tee build.log; then
-              echo "✓ Build succeeded!"
-            else
-              echo "✗ Build failed - showing first 50 lines of errors:"
-              grep -A 5 "error:" build.log | head -50 || cat build.log | head -100
-              exit 1
-            fi
+            echo "====================================="
+            echo "Run Tests"
+            echo "====================================="
+            cd build
+            ctest -V --output-on-failure --timeout 1800 --build-config Release
 
   openbsd-build:
     runs-on: ubuntu-latest
@@ -77,7 +67,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Build on OpenBSD
+      - name: Build and test on OpenBSD
         uses: vmactions/openbsd-vm@v1
         with:
           release: '7.4'
@@ -85,36 +75,39 @@ jobs:
           prepare: |
             pkg_add cmake gmake lz4 zstd snappy
           run: |
-            echo "=== OpenBSD System Info ==="
+            echo "====================================="
+            echo "System Information"
+            echo "====================================="
             uname -a
+            
             echo ""
-            echo "=== Checking for sys/sysinfo.h ==="
+            echo "====================================="
+            echo "Portability Diagnostics"
+            echo "====================================="
             if [ -f /usr/include/sys/sysinfo.h ]; then
               echo "✓ sys/sysinfo.h exists"
             else
-              echo "✗ sys/sysinfo.h NOT FOUND (expected on OpenBSD)"
+              echo "✗ sys/sysinfo.h NOT FOUND"
             fi
+            
             echo ""
-            echo "=== Attempting CMake configuration ==="
-            if cmake -S . -B build -DCMAKE_MAKE_PROGRAM=/usr/local/bin/gmake -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
-              echo "✓ CMake configuration succeeded"
-            else
-              echo "✗ CMake configuration failed"
-              exit 1
-            fi
+            echo "====================================="
+            echo "Configure CMake"
+            echo "====================================="
+            cmake -S . -B build -DCMAKE_MAKE_PROGRAM=/usr/local/bin/gmake -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+            
             echo ""
-            echo "=== Attempting build (showing first error) ==="
-            if gmake -C build 2>&1 | tee build.log; then
-              echo "✓ Build succeeded!"
-            else
-              echo "✗ Build failed - showing errors:"
-              echo "--- First 100 lines of build output ---"
-              head -100 build.log
-              echo ""
-              echo "--- Compilation errors ---"
-              grep -B 2 -A 5 "error:" build.log | head -100 || true
-              exit 1
-            fi
+            echo "====================================="
+            echo "Build"
+            echo "====================================="
+            gmake -C build
+            
+            echo ""
+            echo "====================================="
+            echo "Run Tests"
+            echo "====================================="
+            cd build
+            ctest -V --output-on-failure --timeout 1800 --build-config Release
 
   netbsd-build:
     runs-on: ubuntu-latest
@@ -124,7 +117,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Build on NetBSD
+      - name: Build and test on NetBSD
         uses: vmactions/netbsd-vm@v1
         with:
           release: '9.3'
@@ -132,32 +125,39 @@ jobs:
           prepare: |
             /usr/sbin/pkg_add cmake lz4 zstd snappy
           run: |
-            echo "=== NetBSD System Info ==="
+            echo "====================================="
+            echo "System Information"
+            echo "====================================="
             uname -a
+            
             echo ""
-            echo "=== Checking for sys/sysinfo.h ==="
+            echo "====================================="
+            echo "Portability Diagnostics"
+            echo "====================================="
             if [ -f /usr/include/sys/sysinfo.h ]; then
               echo "✓ sys/sysinfo.h exists"
             else
-              echo "✗ sys/sysinfo.h NOT FOUND (expected on NetBSD)"
+              echo "✗ sys/sysinfo.h NOT FOUND"
             fi
+            
             echo ""
-            echo "=== Attempting CMake configuration ==="
-            if cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
-              echo "✓ CMake configuration succeeded"
-            else
-              echo "✗ CMake configuration failed"
-              exit 1
-            fi
+            echo "====================================="
+            echo "Configure CMake"
+            echo "====================================="
+            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+            
             echo ""
-            echo "=== Attempting build (showing first error) ==="
-            if cmake --build build --config Release 2>&1 | tee build.log; then
-              echo "✓ Build succeeded!"
-            else
-              echo "✗ Build failed - showing errors:"
-              grep -A 5 "error:" build.log | head -50 || cat build.log | head -100
-              exit 1
-            fi
+            echo "====================================="
+            echo "Build"
+            echo "====================================="
+            cmake --build build --config Release
+            
+            echo ""
+            echo "====================================="
+            echo "Run Tests"
+            echo "====================================="
+            cd build
+            ctest -V --output-on-failure --timeout 1800 --build-config Release
 
   omnios-build:
     runs-on: ubuntu-latest
@@ -167,7 +167,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Build on OmniOS (Illumos)
+      - name: Build and test on OmniOS (Illumos)
         uses: vmactions/omnios-vm@v1
         with:
           release: 'r151048'
@@ -175,34 +175,41 @@ jobs:
           prepare: |
             pkg install build-essential cmake gcc-13
           run: |
-            echo "=== OmniOS/Illumos System Info ==="
+            echo "====================================="
+            echo "System Information"
+            echo "====================================="
             uname -a
+            
             echo ""
-            echo "=== Checking for sys/sysinfo.h ==="
+            echo "====================================="
+            echo "Portability Diagnostics"
+            echo "====================================="
             if [ -f /usr/include/sys/sysinfo.h ]; then
               echo "✓ sys/sysinfo.h exists"
             else
-              echo "✗ sys/sysinfo.h NOT FOUND (expected on Illumos)"
+              echo "✗ sys/sysinfo.h NOT FOUND"
             fi
+            
             echo ""
-            echo "=== Attempting CMake configuration ==="
+            echo "====================================="
+            echo "Configure CMake"
+            echo "====================================="
             export CC=gcc
             export CXX=g++
-            if cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
-              echo "✓ CMake configuration succeeded"
-            else
-              echo "✗ CMake configuration failed"
-              exit 1
-            fi
+            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+            
             echo ""
-            echo "=== Attempting build (showing first error) ==="
-            if cmake --build build --config Release 2>&1 | tee build.log; then
-              echo "✓ Build succeeded!"
-            else
-              echo "✗ Build failed - showing errors:"
-              grep -A 5 "error:" build.log | head -50 || cat build.log | head -100
-              exit 1
-            fi
+            echo "====================================="
+            echo "Build"
+            echo "====================================="
+            cmake --build build --config Release
+            
+            echo ""
+            echo "====================================="
+            echo "Run Tests"
+            echo "====================================="
+            cd build
+            ctest -V --output-on-failure --timeout 1800 --build-config Release
 
   dragonflybsd-build:
     runs-on: ubuntu-latest
@@ -212,7 +219,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Build on DragonFlyBSD
+      - name: Build and test on DragonFlyBSD
         uses: vmactions/dragonflybsd-vm@v1
         with:
           release: '6.4.0'
@@ -220,29 +227,36 @@ jobs:
           prepare: |
             pkg install -y cmake pkgconf zstd liblz4 snappy
           run: |
-            echo "=== DragonFlyBSD System Info ==="
+            echo "====================================="
+            echo "System Information"
+            echo "====================================="
             uname -a
+            
             echo ""
-            echo "=== Checking for sys/sysinfo.h ==="
+            echo "====================================="
+            echo "Portability Diagnostics"
+            echo "====================================="
             if [ -f /usr/include/sys/sysinfo.h ]; then
               echo "✓ sys/sysinfo.h exists"
             else
-              echo "✗ sys/sysinfo.h NOT FOUND (expected on DragonFlyBSD)"
+              echo "✗ sys/sysinfo.h NOT FOUND"
             fi
+            
             echo ""
-            echo "=== Attempting CMake configuration ==="
-            if cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF; then
-              echo "✓ CMake configuration succeeded"
-            else
-              echo "✗ CMake configuration failed"
-              exit 1
-            fi
+            echo "====================================="
+            echo "Configure CMake"
+            echo "====================================="
+            cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+            
             echo ""
-            echo "=== Attempting build (showing first error) ==="
-            if cmake --build build --config Release 2>&1 | tee build.log; then
-              echo "✓ Build succeeded!"
-            else
-              echo "✗ Build failed - showing errors:"
-              grep -A 5 "error:" build.log | head -50 || cat build.log | head -100
-              exit 1
-            fi
+            echo "====================================="
+            echo "Build"
+            echo "====================================="
+            cmake --build build --config Release
+            
+            echo ""
+            echo "====================================="
+            echo "Run Tests"
+            echo "====================================="
+            cd build
+            ctest -V --output-on-failure --timeout 1800 --build-config Release

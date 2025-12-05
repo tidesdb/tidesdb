@@ -7344,6 +7344,13 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 {
     if (!db || !name || !config) return TDB_ERR_INVALID_ARGS;
 
+    /* validate sync configuration */
+    if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us == 0)
+    {
+        TDB_DEBUG_LOG("Invalid config: TDB_SYNC_INTERVAL requires sync_interval_us > 0");
+        return TDB_ERR_INVALID_ARGS;
+    }
+
     TDB_DEBUG_LOG("Creating column family: %s", name);
 
     pthread_rwlock_rdlock(&db->cf_list_lock);

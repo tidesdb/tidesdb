@@ -75,23 +75,44 @@ if(WIN32)
     find_package(PThreads4W REQUIRED)
 endif()
 
-if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
-    # for apple silicon macs, homebrew installs packages in /opt/homebrew
-    target_include_directories(tidesdb PUBLIC /opt/homebrew/include)
-    target_link_directories(tidesdb PUBLIC /opt/homebrew/lib)
-    # link against compression libraries for apple silicon
-    target_link_libraries(tidesdb PUBLIC
-            m           # math library
-            lz4         # lz4 compression
-            zstd        # zstandard compression
-            snappy      # snappy compression
-            pthread     # pthread library
-    )
-elseif(APPLE)
-    # for intel macs, homebrew typically installs in /usr/local
-    target_include_directories(tidesdb PUBLIC /usr/local/include)
-    target_link_directories(tidesdb PUBLIC /usr/local/lib)
-    # link against compression libraries for intel mac
+if(APPLE)
+    # macOS supports multiple package managers (Homebrew, MacPorts, pkgsrc, Fink, etc)
+    # we allow user to specify custom paths via -DMACOS_DEPENDENCY_PREFIX=/path
+    # or use -DUSE_HOMEBREW=ON/OFF to control Homebrew detection (the default is ON)
+
+    option(USE_HOMEBREW "Auto-detect and use Homebrew paths on macOS" ON)
+
+    if(DEFINED MACOS_DEPENDENCY_PREFIX)
+        # user explicitly specified a prefix (e.g., MacPorts /opt/local, pkgsrc /usr/pkg)
+        message(STATUS "Using custom macOS dependency prefix: ${MACOS_DEPENDENCY_PREFIX}")
+        target_include_directories(tidesdb PUBLIC ${MACOS_DEPENDENCY_PREFIX}/include)
+        target_link_directories(tidesdb PUBLIC ${MACOS_DEPENDENCY_PREFIX}/lib)
+    elseif(USE_HOMEBREW)
+        # auto-detect homebrew installation
+        if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+            # Apple Silicon -- Homebrew uses /opt/homebrew
+            set(HOMEBREW_PREFIX "/opt/homebrew")
+        else()
+            # Intel Mac -- Homebrew uses /usr/local
+            set(HOMEBREW_PREFIX "/usr/local")
+        endif()
+
+        # verify homebrew prefix exists before using it
+        if(EXISTS "${HOMEBREW_PREFIX}/bin/brew")
+            message(STATUS "Detected Homebrew at ${HOMEBREW_PREFIX}")
+            target_include_directories(tidesdb PUBLIC ${HOMEBREW_PREFIX}/include)
+            target_link_directories(tidesdb PUBLIC ${HOMEBREW_PREFIX}/lib)
+        else()
+            message(WARNING "Homebrew not found at ${HOMEBREW_PREFIX}, relying on system paths. "
+                           "If using MacPorts, pkgsrc, or Fink, specify -DMACOS_DEPENDENCY_PREFIX=/path or -DUSE_HOMEBREW=OFF")
+        endif()
+    else()
+        message(STATUS "Using system default paths on macOS (USE_HOMEBREW=OFF)")
+        # let CMake find packages in standard locations
+        # or rely on CMAKE_PREFIX_PATH being set by the user
+    endif()
+
+    # Link against compression libraries for macOS
     target_link_libraries(tidesdb PUBLIC
             m           # math library
             lz4         # lz4 compression

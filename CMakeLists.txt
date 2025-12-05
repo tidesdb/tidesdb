@@ -153,13 +153,13 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
     )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
     # OmniOS/Illumos -- OpenIndiana Community Edition packages in /opt/ooce
-    target_include_directories(tidesdb PUBLIC /opt/ooce/include)
-    target_link_directories(tidesdb PUBLIC /opt/ooce/lib/amd64)
+    # Note: snappy is not available in OmniOS repos, using only lz4 and zstd
+    target_include_directories(tidesdb PUBLIC /opt/ooce/include /usr/include)
+    target_link_directories(tidesdb PUBLIC /opt/ooce/lib/amd64 /usr/lib/amd64)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
             lz4         # lz4 compression
             zstd        # zstandard compression
-            snappy      # snappy compression
             pthread     # pthread library
     )
 else()

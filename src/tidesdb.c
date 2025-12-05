@@ -11030,8 +11030,10 @@ static int ini_config_handler(void *user, const char *section, const char *name,
             ctx->config->compression_algorithm = LZ4_COMPRESSION;
         else if (strcmp(value, "ZSTD") == 0)
             ctx->config->compression_algorithm = ZSTD_COMPRESSION;
+#ifndef __sun
         else if (strcmp(value, "SNAPPY") == 0)
             ctx->config->compression_algorithm = SNAPPY_COMPRESSION;
+#endif
     }
     else if (strcmp(name, "enable_bloom_filter") == 0)
     {
@@ -11145,9 +11147,11 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
         case ZSTD_COMPRESSION:
             compression_str = "ZSTD";
             break;
+#ifndef __sun
         case SNAPPY_COMPRESSION:
             compression_str = "SNAPPY";
             break;
+#endif
     }
     fprintf(fp, "compression_algorithm = %s\n", compression_str);
 

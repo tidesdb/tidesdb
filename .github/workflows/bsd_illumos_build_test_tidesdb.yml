@@ -162,7 +162,7 @@ jobs:
           copyback: false
           prepare: |
             pkg set-publisher -G '*' -g https://pkg.omnios.org/r151048/extra extra.omnios || true
-            pkg install ooce/developer/cmake gcc13 lz4 zstd snappy
+            pkg install ooce/developer/cmake gcc13 lz4 zstd
           run: |
             echo "*=====================================*"
             echo " System Information"

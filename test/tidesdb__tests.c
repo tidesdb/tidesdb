@@ -1731,6 +1731,7 @@ static void test_compression_zstd(void)
     cleanup_test_dir();
 }
 
+#ifndef __sun
 static void test_compression_snappy(void)
 {
     cleanup_test_dir();
@@ -1779,6 +1780,7 @@ static void test_compression_snappy(void)
     tidesdb_close(db);
     cleanup_test_dir();
 }
+#endif
 
 static void test_bloom_filter_enabled(void)
 {
@@ -5973,6 +5975,7 @@ static void test_many_sstables_with_zstd_compression(void)
     run_sstable_simulation(&config);
 }
 
+#ifndef __sun
 static void test_many_sstables_with_snappy_compression(void)
 {
     sim_test_config_t config = {.test_name = "snappy_compression",
@@ -5984,6 +5987,7 @@ static void test_many_sstables_with_snappy_compression(void)
                                 .keys_per_sstable = 40};
     run_sstable_simulation(&config);
 }
+#endif
 
 static void test_many_sstables_all_features_enabled(void)
 {
@@ -6026,7 +6030,7 @@ static void test_many_sstables_indexes_and_compression(void)
     sim_test_config_t config = {.test_name = "indexes_and_snappy",
                                 .enable_bloom = 1,
                                 .enable_indexes = 1,
-                                .compression_algo = SNAPPY_COMPRESSION,
+                                .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 20,
                                 .block_cache_size = 0,
                                 .keys_per_sstable = 50};
@@ -6093,6 +6097,7 @@ static void test_many_sstables_with_zstd_compression_cached(void)
     run_sstable_simulation(&config);
 }
 
+#ifndef __sun
 static void test_many_sstables_with_snappy_compression_cached(void)
 {
     sim_test_config_t config = {.test_name = "snappy_compression_cached",
@@ -6104,6 +6109,7 @@ static void test_many_sstables_with_snappy_compression_cached(void)
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
+#endif
 
 static void test_many_sstables_all_features_enabled_cached(void)
 {
@@ -6188,7 +6194,7 @@ static void test_many_sstables_serializable(void)
     sim_test_config_t config = {.test_name = "isolation_serializable",
                                 .enable_bloom = 1,
                                 .enable_indexes = 1,
-                                .compression_algo = SNAPPY_COMPRESSION,
+                                .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
                                 .block_cache_size = 0,
                                 .keys_per_sstable = 40,
@@ -6230,7 +6236,7 @@ static void test_many_sstables_comparator_reverse(void)
     sim_test_config_t config = {.test_name = "comparator_reverse",
                                 .enable_bloom = 1,
                                 .enable_indexes = 1,
-                                .compression_algo = SNAPPY_COMPRESSION,
+                                .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
                                 .block_cache_size = 0,
                                 .keys_per_sstable = 40,
@@ -7073,7 +7079,6 @@ int main(void)
     RUN_TEST(test_sync_modes, tests_passed);
     RUN_TEST(test_compression_lz4, tests_passed);
     RUN_TEST(test_compression_zstd, tests_passed);
-    RUN_TEST(test_compression_snappy, tests_passed);
     RUN_TEST(test_compaction_basic, tests_passed);
     RUN_TEST(test_compaction_with_deletes, tests_passed);
     RUN_TEST(test_concurrent_writes, tests_passed);
@@ -7129,7 +7134,6 @@ int main(void)
     RUN_TEST(test_many_sstables_with_block_indexes, tests_passed);
     RUN_TEST(test_many_sstables_with_lz4_compression, tests_passed);
     RUN_TEST(test_many_sstables_with_zstd_compression, tests_passed);
-    RUN_TEST(test_many_sstables_with_snappy_compression, tests_passed);
     RUN_TEST(test_many_sstables_all_features_enabled, tests_passed);
     RUN_TEST(test_many_sstables_all_features_disabled, tests_passed);
     RUN_TEST(test_many_sstables_bloom_and_compression, tests_passed);
@@ -7139,7 +7143,13 @@ int main(void)
     RUN_TEST(test_many_sstables_with_block_indexes_cached, tests_passed);
     RUN_TEST(test_many_sstables_with_lz4_compression_cached, tests_passed);
     RUN_TEST(test_many_sstables_with_zstd_compression_cached, tests_passed);
+
+#ifndef __sun
+    RUN_TEST(test_many_sstables_with_snappy_compression, tests_passed);
     RUN_TEST(test_many_sstables_with_snappy_compression_cached, tests_passed);
+    RUN_TEST(test_compression_snappy, tests_passed);
+#endif
+
     RUN_TEST(test_many_sstables_all_features_enabled_cached, tests_passed);
     RUN_TEST(test_many_sstables_all_features_disabled_cached, tests_passed);
     RUN_TEST(test_many_sstables_bloom_and_compression_cached, tests_passed);

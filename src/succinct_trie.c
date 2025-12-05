@@ -796,6 +796,20 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder,
         uint32_t child = child_ids[i];
         uint8_t label = labels[i];
 
+        /* validate parent ID to prevent heap corruption */
+        if (parent >= builder->next_node_id)
+        {
+            /* corrupted data! parent ID out of bounds */
+            free(entry_pool);
+            free(children);
+            free(labels);
+            free(parents);
+            free(child_ids);
+            free(trie);
+            succinct_trie_builder_free(builder);
+            return NULL;
+        }
+
         child_entry_t *entry = &entry_pool[i];
         entry->label = label;
         entry->child_id = child;
@@ -831,7 +845,18 @@ succinct_trie_t *succinct_trie_builder_build(succinct_trie_builder_t *builder,
 
         /* sort using array with counting sort */
         child_entry_t **arr = malloc(count * sizeof(child_entry_t *));
-        if (!arr) continue;
+        if (!arr)
+        {
+            /* malloc failed - cleanup and fail */
+            free(entry_pool);
+            free(children);
+            free(labels);
+            free(parents);
+            free(child_ids);
+            free(trie);
+            succinct_trie_builder_free(builder);
+            return NULL;
+        }
 
         int idx = 0;
         for (child_entry_t *c = children[node]; c; c = c->next) arr[idx++] = c;

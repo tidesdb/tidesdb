@@ -839,24 +839,22 @@ int lru_cache_put(lru_cache_t *cache, const char *key, void *value, lru_evict_ca
 
                     atomic_fetch_sub_explicit(&cache->size, 1, memory_order_relaxed);
 
-                    /* atomically extract our value and NULL out entry->value to transfer ownership.
-                     * */
+                    /* atomically extract our value and NULL out entry->value */
                     void *our_value =
                         atomic_exchange_explicit(&entry->value, NULL, memory_order_acq_rel);
 
-                    /* update the existing entry with our value */
-                    void *old_value =
-                        atomic_exchange_explicit(&curr->value, our_value, memory_order_acq_rel);
-                    if (curr->evict_cb && old_value)
+                    /* we detected a duplicate after insertion
+                     * the existing entry wins, so we discard our entry and value
+                     * call evict callback on our value to clean it up */
+                    if (evict_cb && our_value)
                     {
-                        curr->evict_cb(curr->key, old_value, curr->user_data);
+                        evict_cb(key, our_value, user_data);
                     }
-                    curr->evict_cb = evict_cb;
-                    curr->user_data = user_data;
+
+                    /* just bump access count on existing entry, don't update its value */
                     atomic_fetch_add_explicit(&curr->access_count, 1, memory_order_relaxed);
 
                     lru_entry_release(curr, 0, cache);
-
                     lru_entry_release(entry, 0, cache);
 
                     return 1; /* updated existing */

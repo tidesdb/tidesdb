@@ -124,7 +124,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
     target_link_directories(tidesdb PUBLIC /usr/local/lib)
     target_link_libraries(tidesdb PUBLIC
             m           # math library
-            liblz4      # lz4 compression (OpenBSD uses liblz4)
+            liblz4      # lz4 compression
             zstd        # zstandard compression
             snappy      # snappy compression
             pthread     # pthread library

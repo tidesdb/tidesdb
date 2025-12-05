@@ -24,7 +24,7 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            pkg install -y cmake pkgconf lz4 zstd snappy
+            pkg install -y cmake pkgconf liblz4 zstd snappy
           run: |
             echo "====================================="
             echo "System Information"
@@ -81,7 +81,7 @@ jobs:
           copyback: false
           prepare: |
             export PKG_PATH=https://cloudflare.cdn.openbsd.org/pub/OpenBSD/7.4/packages/amd64/
-            pkg_add cmake gmake lz4 zstd snappy pkgconf
+            pkg_add cmake gmake liblz4 zstd snappy pkgconf
           run: |
             echo "====================================="
             echo "System Information"
@@ -136,7 +136,7 @@ jobs:
           sync: rsync
           copyback: false
           prepare: |
-            /usr/sbin/pkg_add cmake lz4 zstd snappy pkgconf gmake
+            /usr/sbin/pkg_add cmake liblz4 zstd snappy pkgconf gmake
           run: |
             echo "====================================="
             echo "System Information"
@@ -213,7 +213,8 @@ jobs:
             echo "====================================="
             echo "Configure CMake"
             echo "====================================="
-            export PKG_CONFIG_PATH=/usr/lib/pkgconfig
+            export PATH=/opt/ooce/bin:$PATH
+            export PKG_CONFIG_PATH=/opt/ooce/lib/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
               -DTIDESDB_WITH_SANITIZER=OFF 
@@ -249,7 +250,7 @@ jobs:
             mkdir -p /usr/local/etc/pkg/repos
             echo 'Avalon: { enabled: no }' > /usr/local/etc/pkg/repos/df-latest.conf
             echo 'AUTO: { url: "https://pkg.dragonflybsd.org/pkg/$''{ABI}/LATEST", mirror_type: HTTP, enabled: yes }' >> /usr/local/etc/pkg/repos/df-latest.conf
-            pkg install -y cmake pkgconf lz4 zstd snappy
+            pkg install -y cmake pkgconf liblz4 zstd snappy
           run: |
             echo "====================================="
             echo "System Information"

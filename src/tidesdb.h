@@ -112,6 +112,9 @@ typedef enum
     TDB_SYNC_NONE, /* no fsync/fdatasync -- fastest, least durable */
     TDB_SYNC_FULL, /* full fsync/fdatasync on every write to a block manager, slowest, most durable
                     */
+    TDB_SYNC_INTERVAL, /* sync based on interval in microseconds, 0 means disabled, if any column
+                          family has this set tidesdb will open a background thread just to
+                          synchronize column family WAL block manager writes */
 } tidesdb_sync_mode_t;
 
 /* KV pair flags */
@@ -191,6 +194,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param enable_block_indexes enable block indexes
  * @param index_sample_ratio sample every nth key for sparse index
  * @param sync_mode sync mode
+ * @param sync_interval_us sync interval in microseconds (only used if sync_mode ==
+ * TDB_SYNC_INTERVAL)
  * @param comparator_name name of registered comparator
  * @param comparator_ctx_str optional context string for comparator
  * @param comparator_fn_cached cached comparator function (avoids lock)
@@ -216,6 +221,7 @@ typedef struct
     int enable_block_indexes;
     int index_sample_ratio;
     int sync_mode;
+    uint64_t sync_interval_us;
     char comparator_name[TDB_MAX_COMPARATOR_NAME];
     char comparator_ctx_str[TDB_MAX_COMPARATOR_CTX];
     skip_list_comparator_fn comparator_fn_cached;
@@ -560,6 +566,9 @@ struct tidesdb_compaction_work_t
  * @param flush_queue queue of flush work items
  * @param compaction_threads array of compaction threads
  * @param compaction_queue queue of compaction work items
+ * @param sync_thread background thread for interval syncing across column families
+ * @param sync_thread_active atomic flag indicating if sync thread is active
+ * @param sync_lock mutex for sync operations
  * @param sstable_cache lru cache for sstable file handles
  * @param block_cache lru cache for sstable blocks
  * @param is_open flag to indicate if database is open
@@ -584,6 +593,9 @@ struct tidesdb_t
     queue_t *flush_queue;
     pthread_t *compaction_threads;
     queue_t *compaction_queue;
+    pthread_t sync_thread;
+    _Atomic(int) sync_thread_active;
+    pthread_mutex_t sync_lock;
     lru_cache_t *sstable_cache;
     lru_cache_t *block_cache;
     _Atomic(int) is_open;
@@ -717,7 +729,7 @@ typedef struct
             tidesdb_t *db;
             tidesdb_sstable_t *sst;
             block_manager_cursor_t *klog_cursor;
-            block_manager_cursor_t *vlog_cursor; /* reusable cursor for vlog reads */
+            block_manager_cursor_t *vlog_cursor;
             tidesdb_klog_block_t *current_block;
             block_manager_block_t *current_block_data;
             uint8_t *decompressed_data;

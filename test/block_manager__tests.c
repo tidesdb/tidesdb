@@ -800,8 +800,11 @@ void test_block_manager_validate_last_block()
     ASSERT_TRUE(file != NULL);
 
     /* we append just a size prefix (8 bytes) without the actual data */
+    /* must use little-endian encoding to match block manager's format */
     uint64_t corrupt_size = 100; /* size that's larger than what we'll actually write */
-    ASSERT_TRUE(fwrite(&corrupt_size, sizeof(uint64_t), 1, file) == 1);
+    uint8_t size_buf[8];
+    encode_uint64_le_compat(size_buf, corrupt_size);
+    ASSERT_TRUE(fwrite(size_buf, sizeof(size_buf), 1, file) == 1);
 
     fclose(file);
 

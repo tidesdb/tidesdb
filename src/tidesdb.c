@@ -7308,9 +7308,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         return TDB_ERR_MEMORY;
     }
 
+    /* initialize memtable_id before creating WAL so we can use it for filename */
+    atomic_init(&cf->memtable_id, 0);
+
     char wal_path[TDB_MAX_PATH_LEN];
     snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR TDB_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT,
-             cf->directory, TDB_U64_CAST(time(NULL)));
+             cf->directory, TDB_U64_CAST(atomic_load(&cf->memtable_id)));
 
     block_manager_t *new_wal = NULL;
     if (block_manager_open(&new_wal, wal_path, BLOCK_MANAGER_SYNC_NONE) != 0)
@@ -10899,9 +10902,22 @@ static int tidesdb_recover_database(tidesdb_t *db)
             if (!cf)
             {
                 tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
-                if (tidesdb_create_column_family(db, entry->d_name, &config) == TDB_SUCCESS)
+                int create_result = tidesdb_create_column_family(db, entry->d_name, &config);
+
+                if (create_result == TDB_SUCCESS)
                 {
                     cf = tidesdb_get_column_family(db, entry->d_name);
+                }
+                else if (create_result == TDB_ERR_EXISTS)
+                {
+                    /* CF already exists in memory, try to get it again */
+                    cf = tidesdb_get_column_family(db, entry->d_name);
+                    TDB_DEBUG_LOG("CF already exists during recovery: %s", entry->d_name);
+                }
+                else
+                {
+                    TDB_DEBUG_LOG("Failed to create CF during recovery: %s (error code: %d)",
+                                  entry->d_name, create_result);
                 }
             }
 

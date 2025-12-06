@@ -29,7 +29,7 @@
 #define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF
 
 /* block manager version */
-#define BLOCK_MANAGER_VERSION 5
+#define BLOCK_MANAGER_VERSION 6
 
 /* header field sizes */
 /* magic number size in bytes */
@@ -54,11 +54,13 @@
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE                              \
     (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH + \
      BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
-#define MAX_INLINE_BLOCK_SIZE (32 * 1024)
+#define MAX_INLINE_BLOCK_SIZE (64 * 1024)
 /* extra bytes for headers in stack buffers */
 #define BLOCK_MANAGER_STACK_BUFFER_OVERHEAD 64
 /* default file permissions (rw-r--r--) */
 #define BLOCK_MANAGER_FILE_MODE 0644
+
+#define BLOCK_MANAGER_BATCH_READ_META_SIZE 4096 /* batch reading block metadata */
 
 typedef enum
 {
@@ -75,6 +77,9 @@ typedef enum
  * @param sync_mode sync mode for this block manager
  * @param block_size the default block size for this block manager
  * @param current_file_size track file size in memory to avoid syscalls
+ * @param block_positions shared position cache for O(1) random access (all blocks)
+ * @param block_sizes shared size cache for O(1) random access (all blocks)
+ * @param block_count number of blocks in cache
  */
 typedef struct
 {
@@ -84,6 +89,11 @@ typedef struct
     uint32_t block_size;
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
+
+    /* shared position cache; built once on open, shared by all cursors */
+    uint64_t *block_positions;
+    uint64_t *block_sizes;
+    int block_count;
 } block_manager_t;
 
 /**
@@ -108,24 +118,14 @@ typedef struct
  * @param bm the block manager
  * @param current_pos the current position of the cursor
  * @param current_block_size the size of the current block
- * @param position_cache array of block positions
- * @param size_cache array of block sizes
- * @param cache_capacity allocated capacity
- * @param cache_size number of cached positions
- * @param cache_index current index in cache (-1 if not using cache)
+ * @param block_index current index in shared position cache (-1 if before first block)
  */
 typedef struct
 {
     block_manager_t *bm;
     uint64_t current_pos;
     uint64_t current_block_size;
-
-    /* position cache for O(1) backward navigation */
-    uint64_t *position_cache;
-    uint64_t *size_cache;
-    int cache_capacity;
-    int cache_size;
-    int cache_index;
+    int block_index;
 } block_manager_cursor_t;
 
 /**
@@ -358,15 +358,6 @@ int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
 int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
 
 /**
- * block_manager_cursor_build_cache
- * builds a position cache for fast seeks when block index is enabled
- * @param cursor the cursor to build cache for
- * @param end_offset the end offset to cache up to
- * @return 0 if successful, -1 if not
- */
-int block_manager_cursor_build_cache(block_manager_cursor_t *cursor, uint64_t end_offset);
-
-/**
  * block_manager_validate_last_block
  * validates the integrity of the last block in a block manager file
  * returns 0 if the last block is valid, -1 if validation fails
@@ -374,6 +365,15 @@ int block_manager_cursor_build_cache(block_manager_cursor_t *cursor, uint64_t en
  *** if the validation fails, the file is truncated to the last valid block.
  */
 int block_manager_validate_last_block(block_manager_t *bm);
+
+/**
+ * block_manager_build_position_cache
+ * builds shared position cache by scanning all blocks once
+ * provides O(1) random access and backward navigation for all cursors
+ * @param bm the block manager to build cache for
+ * @return 0 if successful, -1 otherwise
+ */
+int block_manager_build_position_cache(block_manager_t *bm);
 
 /**
  * convert_sync_mode

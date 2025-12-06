@@ -221,7 +221,7 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
     atomic_init(&new_list->total_size, 0);
     atomic_init(&new_list->entry_count, 0);
 
-    /* create sentinel nodes with no keys - they are identified by the sentinel flag */
+    /* create sentinel nodes with no keys -- they are identified by the sentinel flag */
     skip_list_node_t *header = skip_list_create_sentinel(max_level);
     skip_list_node_t *tail = skip_list_create_sentinel(max_level);
 
@@ -246,14 +246,45 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
     return 0;
 }
 
+/* fast thread-local RNG for skip list level selection
+ * uses xorshift64* algorithm */
+static inline uint64_t skip_list_xorshift64star(uint64_t *state)
+{
+    uint64_t x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
 int skip_list_random_level(skip_list_t *list)
 {
     if (list == NULL) return -1;
-    int level = 0;
-    while ((rand() / (float)RAND_MAX) < list->probability && level < list->max_level)
+
+    /* thread-local RNG state */
+    static _Thread_local uint64_t rng_state = 0;
+    if (rng_state == 0)
     {
+        /* initialize with thread ID + timestamp for uniqueness */
+        rng_state = (uint64_t)pthread_self() ^ (uint64_t)time(NULL);
+    }
+
+    /* convert probability to threshold for fast comparison
+     * probability range is (0.0, 1.0), we scale to [0, UINT64_MAX] */
+    uint64_t threshold = (uint64_t)(list->probability * (double)UINT64_MAX);
+
+    int level = 0;
+    uint64_t rnd;
+
+    /* keep generating levels while random value < threshold */
+    while (level < list->max_level)
+    {
+        rnd = skip_list_xorshift64star(&rng_state);
+        if (rnd >= threshold) break;
         level++;
     }
+
     return level;
 }
 
@@ -682,6 +713,16 @@ int skip_list_cursor_next(skip_list_cursor_t *cursor)
 
     cursor->current = atomic_load_explicit(&cursor->current->forward[0], memory_order_acquire);
     if (cursor->current == NULL || cursor->current == tail) return -1;
+
+    /* prefetch next node to hide memory latency during iteration */
+    skip_list_node_t *next =
+        atomic_load_explicit(&cursor->current->forward[0], memory_order_relaxed);
+    if (next && !NODE_IS_SENTINEL(next))
+    {
+        PREFETCH_READ(next);
+        PREFETCH_READ(next->key);
+    }
+
     return 0;
 }
 
@@ -843,6 +884,18 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor)
     return 0;
 }
 
+/**
+ * skip_list_cursor_seek
+ * positions cursor at the node BEFORE the first key >= target
+ * @param cursor the cursor to position
+ * @param key the target key to seek to
+ * @param key_size size of the target key
+ * @return 0 on success, -1 on failure
+ *
+ * after calling this function, cursor->current points to the predecessor node.
+ * Callers must call skip_list_cursor_next() or similar to access the actual target key.
+ * This behavior allows efficient insertion and supports both exact matches and range queries.
+ */
 int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size)
 {
     if (cursor == NULL || key == NULL || key_size == 0) return -1;
@@ -864,7 +917,8 @@ int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t
         }
     }
 
-    /* position cursor at the node before target (original behavior) */
+    /* position cursor at the node before target
+     * caller must call skip_list_cursor_next() to access first key >= target */
     cursor->current = current;
     return 0;
 }

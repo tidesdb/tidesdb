@@ -1346,6 +1346,29 @@ static inline time_t get_file_mod_time(const char *path)
 /* cross-platform little-endian serialization functions */
 
 /*
+ * encode_uint16_le_compat
+ * encodes a uint16_t value in little-endian format
+ * @param buf buffer to store encoded value
+ * @param val value to encode
+ */
+static inline void encode_uint16_le_compat(uint8_t *buf, uint16_t val)
+{
+    buf[0] = (uint8_t)(val & 0xFF);
+    buf[1] = (uint8_t)((val >> 8) & 0xFF);
+}
+
+/*
+ * decode_uint16_le_compat
+ * decodes a uint16_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline uint16_t decode_uint16_le_compat(const uint8_t *buf)
+{
+    return ((uint16_t)buf[0]) | ((uint16_t)buf[1] << 8);
+}
+
+/*
  * encode_uint32_le_compat
  * encodes a uint32_t value in little-endian format
  * @param buf buffer to store encoded value

@@ -27,7 +27,6 @@
 #include "lru.h"
 #include "queue.h"
 #include "skip_list.h"
-#include "succinct_trie.h"
 
 extern int _tidesdb_debug_enabled;
 
@@ -147,17 +146,18 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_CACHE_KEY_SIZE            256     /* maximum size for cache key strings */
 
 /* default configuration values */
-#define TDB_DEFAULT_WRITE_BUFFER_SIZE           (64 * 1024 * 1024) /* 64MB */
-#define TDB_DEFAULT_LEVEL_SIZE_RATIO            10 /* size ratio between levels (T) i.e. L1 = L0 * T */
-#define TDB_DEFAULT_MAX_LEVELS                  7 /* maximum number of levels for lsm tree's per cf */
+#define TDB_DEFAULT_WRITE_BUFFER_SIZE (64 * 1024 * 1024) /* 64MB */
+#define TDB_DEFAULT_LEVEL_SIZE_RATIO  10 /* size ratio between levels (T) i.e. L1 = L0 * T */
+#define TDB_DEFAULT_MIN_LEVELS        3 /* minimum number of levels to maintain (DCA can expand beyond) \
+                                         */
 #define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       2    /* X = L-2 */
 #define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2    /* thread pool size for global compactions */
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2    /* thread pool size for global flushes */
 #define TDB_DEFAULT_BLOOM_FPR                   0.01 /* 1% false positive rate */
-#define TDB_DEFAULT_KLOG_BLOCK_SIZE             (32 * 1024) /* 32KB per klog block */
+#define TDB_DEFAULT_KLOG_BLOCK_SIZE             (64 * 1024) /* 64KB per klog block */
 #define TDB_DEFAULT_VLOG_BLOCK_SIZE             (4 * 1024)  /* 4KB per vlog block */
 #define TDB_DEFAULT_VALUE_THRESHOLD             1024        /* values >= 1KB go to vlog */
-#define TDB_DEFAULT_INDEX_SAMPLE_RATIO          16          /* sample every 16th key for index */
+#define TDB_DEFAULT_INDEX_SAMPLE_RATIO          2 /* sample first key in every klog block */
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024) /* 100MB minimum free space */
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES           512                 /* max open sstables globally */
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      1024 * 64           /* max concurrent txns per cf */
@@ -174,7 +174,6 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_MAX_COMPARATOR_CTX  256    /* maximum comparator context string length */
 #define TDB_TXN_SPIN_COUNT \
     1000 /* spin iterations before yielding in transaction conflict resolution */
-
 /* memory limit constants */
 #define TDB_MEMORY_PERCENTAGE  0.6           /* 60% of available memory */
 #define TDB_MIN_KEY_VALUE_SIZE (1024 * 1024) /* 1MB minimum threshold */
@@ -184,7 +183,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * configuration for a column family
  * @param write_buffer_size write buffer size for memtable flushes
  * @param level_size_ratio size ratio between levels (T)
- * @param max_levels maximum number of levels
+ * @param min_levels minimum number of levels to maintain (DCA can expand beyond this)
  * @param dividing_level_offset X = L - dividing_level_offset
  * @param klog_block_size size of each klog block (holds multiple keys)
  * @param vlog_block_size size of each vlog block (holds multiple values)
@@ -193,14 +192,14 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param enable_bloom_filter enable bloom filter
  * @param bloom_fpr bloom filter false positive rate
  * @param enable_block_indexes enable block indexes
- * @param index_sample_ratio sample every nth key for sparse index
+ * @param index_sample_ratio sample every Nth block (1 = all blocks, 2 = every other block, etc)
  * @param sync_mode sync mode
  * @param sync_interval_us sync interval in microseconds (only used if sync_mode ==
  * TDB_SYNC_INTERVAL)
  * @param comparator_name name of registered comparator
  * @param comparator_ctx_str optional context string for comparator
- * @param comparator_fn_cached cached comparator function (avoids lock)
- * @param comparator_ctx_cached cached comparator context (avoids lock)
+ * @param comparator_fn_cached cached comparator function
+ * @param comparator_ctx_cached cached comparator context
  * @param skip_list_max_level skip list max level
  * @param skip_list_probability skip list probability
  * @param default_isolation_level default isolation level
@@ -211,7 +210,7 @@ typedef struct
 {
     size_t write_buffer_size;
     size_t level_size_ratio;
-    int max_levels;
+    int min_levels;
     int dividing_level_offset;
     size_t klog_block_size;
     size_t vlog_block_size;
@@ -334,6 +333,41 @@ typedef struct
 } tidesdb_klog_block_t;
 
 /**
+ * tidesdb_compact_block_index_t
+ * compact array-based sparse block index with prefix + delta + varint compression
+ * - samples first key of every Nth block (configurable via index_sample_ratio)
+ * - uses prefix compression to reduce memory footprint
+ * - delta encoding + varint compression for offsets and block numbers (60-75% space savings)
+ * - O(log n) binary search for predecessor lookups
+ * - ~1000x faster to build than succinct trie
+ * - ~70% more compact than raw key storage (with all optimizations)
+ *
+ * Serialization format:
+ * - key_offsets: delta-encoded + varint (first absolute, rest as deltas)
+ * - key_lens: varint-encoded (no delta, already small)
+ * - prefix_lens: raw bytes (already 1 byte each)
+ * - block_nums: delta-encoded + zigzag varint (signed deltas)
+ * - key_data: raw bytes (already prefix-compressed)
+ */
+typedef struct
+{
+    uint8_t *key_data;      /* packed key data (prefix-compressed) */
+    uint32_t *key_offsets;  /* offset to each key in key_data */
+    uint16_t *key_lens;     /* length of each decompressed key */
+    uint8_t *prefix_lens;   /* prefix length shared with previous key */
+    int64_t *block_nums;    /* block number for each sample */
+    uint32_t count;         /* number of samples */
+    uint32_t capacity;      /* allocated capacity */
+    size_t total_key_bytes; /* total bytes in key_data */
+    uint16_t max_key_len;   /* cached max key length for search optimization */
+    tidesdb_comparator_fn comparator;
+    void *comparator_ctx;
+    /* Optimization: cache last full key to avoid reconstruction during add */
+    uint8_t *last_full_key;     /* last added key (full, not compressed) */
+    uint16_t last_full_key_len; /* length of last full key */
+} tidesdb_block_index_t;
+
+/**
  * tidesdb_vlog_block_t
  * a block in the vlog containing multiple values
  * @param num_values number of values in this block
@@ -382,7 +416,7 @@ typedef struct
  * @param vlog_size size of vlog file
  * @param max_seq maximum sequence number in this sstable
  * @param bloom_filter bloom filter for fast lookups
- * @param block_index succinct trie for fast lookups
+ * @param block_index got fast lookups
  * @param refcount reference count
  * @param klog_bm block manager for klog
  * @param vlog_bm block manager for vlog
@@ -407,7 +441,7 @@ struct tidesdb_sstable_t
     uint64_t vlog_size;
     uint64_t max_seq;
     bloom_filter_t *bloom_filter;
-    succinct_trie_t *block_index;
+    tidesdb_block_index_t *block_index; /* new compact array index (fast to build) */
     _Atomic(int) refcount;
     block_manager_t *klog_bm;
     block_manager_t *vlog_bm;
@@ -432,14 +466,16 @@ struct tidesdb_sstable_t
 struct tidesdb_level_t
 {
     int level_num;
-    size_t capacity;
+    _Atomic(size_t) capacity;
     _Atomic(size_t) current_size;
     _Atomic(tidesdb_sstable_t **) sstables;
     _Atomic(int) num_sstables;
     _Atomic(int) sstables_capacity;
-    uint8_t **file_boundaries;
+    _Atomic(uint8_t) **file_boundaries;
     size_t *boundary_sizes;
     _Atomic(int) num_boundaries;
+    _Atomic(int) refcount;            /* reference count for safe concurrent access */
+    _Atomic(int) marked_for_deletion; /* 1 if level should be freed when refcount hits 0 */
 };
 
 /**
@@ -490,12 +526,12 @@ typedef struct
  * @param commit_ticket ticket counter for serializing commits
  * @param commit_serving serving counter for serializing commits
  * @param active_txn_buffer buffer of active transactions for this cf
- * @param levels_lock protects levels and num_levels
- * @param flush_lock serializes flush operations
- * @param compaction_lock serializes compaction operations
  * @param levels array of disk levels
  * @param num_levels number of disk levels
  * @param next_sstable_id next sstable id
+ * @param is_compacting whether a column family compaction has triggered and queued
+ * @param is_flushing whether a column family memtable has been swapped and queued
+ * @param dca_in_progress  prevents concurrent level access during DCA operations which increase or decrease levels
  * @param db parent database reference
  */
 struct tidesdb_column_family_t
@@ -513,13 +549,12 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) commit_ticket;
     _Atomic(uint64_t) commit_serving;
     buffer_t *active_txn_buffer;
-    pthread_rwlock_t levels_lock;
-    pthread_mutex_t flush_lock;
-    pthread_mutex_t compaction_lock;
-    tidesdb_level_t **levels;
-    int num_levels;
+    _Atomic(tidesdb_level_t **) levels;
+    _Atomic(int) num_levels;
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(int) is_compacting;
+    _Atomic(int) is_flushing;
+    _Atomic(int) dca_in_progress;
     tidesdb_t *db;
 };
 

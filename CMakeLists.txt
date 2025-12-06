@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 5.1.3)
+set(PROJECT_VERSION 6.0.0)
 
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -60,9 +60,9 @@ include_directories(external) # for external libraries linking internally
 
 # build as STATIC on Windows to avoid DLL export/import complexity in tests
 if(WIN32)
-    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c src/buffer.c external/xxhash.c external/ini.c)
+    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
 else()
-    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/succinct_trie.c src/buffer.c external/xxhash.c external/ini.c)
+    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/lru.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
 endif()
 
 target_include_directories(tidesdb PRIVATE src)
@@ -224,7 +224,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_CF_NAME "benchmark_cf")
     endif()
     if(NOT DEFINED BENCH_NUM_THREADS)
-        set(BENCH_NUM_THREADS 2)
+        set(BENCH_NUM_THREADS 8)
     endif()
     if(NOT DEFINED BENCH_KEY_PATTERN)
         set(BENCH_KEY_PATTERN "sequential")
@@ -255,8 +255,8 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_DIVIDING_LEVEL_OFFSET)
         set(BENCH_DIVIDING_LEVEL_OFFSET 2)
     endif()
-    if(NOT DEFINED BENCH_MAX_LEVELS)
-        set(BENCH_MAX_LEVELS 7)
+    if(NOT DEFINED BENCH_MIN_LEVELS)
+        set(BENCH_MIN_LEVELS 3)
     endif()
     if(NOT DEFINED BENCH_SKIP_LIST_MAX_LEVEL)
         set(BENCH_SKIP_LIST_MAX_LEVEL 16)  
@@ -280,7 +280,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_ENABLE_BLOCK_INDEXES 1)
     endif()
     if(NOT DEFINED BENCH_BLOCK_INDEX_SAMPLING_COUNT)
-        set(BENCH_BLOCK_INDEX_SAMPLING_COUNT 16)
+        set(BENCH_BLOCK_INDEX_SAMPLING_COUNT 2)
     endif()
     if(NOT DEFINED BENCH_SYNC_MODE)
         set(BENCH_SYNC_MODE TDB_SYNC_NONE)
@@ -304,7 +304,6 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(bloom_filter_tests test/bloom_filter__tests.c)
     add_executable(lru_tests test/lru__tests.c)
     add_executable(queue_tests test/queue__tests.c)
-    add_executable(succinct_trie_tests test/succinct_trie__tests.c)
     add_executable(buffer_tests test/buffer__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
     add_executable(tidesdb_bench bench/tidesdb__bench.c)
@@ -323,7 +322,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         BENCH_WRITE_BUFFER_SIZE=${BENCH_WRITE_BUFFER_SIZE}
         BENCH_LEVEL_RATIO=${BENCH_LEVEL_RATIO}
         BENCH_DIVIDING_LEVEL_OFFSET=${BENCH_DIVIDING_LEVEL_OFFSET}
-        BENCH_MAX_LEVELS=${BENCH_MAX_LEVELS}
+        BENCH_MIN_LEVELS=${BENCH_MIN_LEVELS}
         BENCH_SKIP_LIST_MAX_LEVEL=${BENCH_SKIP_LIST_MAX_LEVEL}
         BENCH_SKIP_LIST_PROBABILITY=${BENCH_SKIP_LIST_PROBABILITY}
         BENCH_ENABLE_COMPRESSION=${BENCH_ENABLE_COMPRESSION}
@@ -342,7 +341,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     )
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests lru_tests queue_tests succinct_trie_tests buffer_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests lru_tests queue_tests buffer_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -353,7 +352,6 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
     add_test(NAME lru_tests COMMAND lru_tests)
     add_test(NAME queue_tests COMMAND queue_tests)
-    add_test(NAME succinct_trie_tests COMMAND succinct_trie_tests)
     add_test(NAME buffer_tests COMMAND buffer_tests)
     add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
 

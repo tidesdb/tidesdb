@@ -577,7 +577,7 @@ int main()
            (double)BENCH_WRITE_BUFFER_SIZE / (1024.0 * 1024.0));
     printf("  Level Size Ratio: %dx\n", BENCH_LEVEL_RATIO);
     printf("  Dividing Level Offset: %d\n", BENCH_DIVIDING_LEVEL_OFFSET);
-    printf("  Max Levels: %d\n", BENCH_MAX_LEVELS);
+    printf("  Min Levels: %d\n", BENCH_MIN_LEVELS);
     printf("  Skip List Max Level: %d\n", BENCH_SKIP_LIST_MAX_LEVEL);
     printf("  Skip List Probability: %.2f\n", BENCH_SKIP_LIST_PROBABILITY);
     printf("  Compression: %s\n", BENCH_ENABLE_COMPRESSION ? "enabled" : "disabled");
@@ -707,7 +707,7 @@ int main()
     cf_config.write_buffer_size = BENCH_WRITE_BUFFER_SIZE;
     cf_config.level_size_ratio = BENCH_LEVEL_RATIO;
     cf_config.dividing_level_offset = BENCH_DIVIDING_LEVEL_OFFSET;
-    cf_config.max_levels = BENCH_MAX_LEVELS;
+    cf_config.min_levels = BENCH_MIN_LEVELS;
     cf_config.skip_list_max_level = BENCH_SKIP_LIST_MAX_LEVEL;
     cf_config.skip_list_probability = BENCH_SKIP_LIST_PROBABILITY;
     cf_config.compression_algorithm = BENCH_COMPRESSION_ALGORITHM;

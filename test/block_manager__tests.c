@@ -777,6 +777,7 @@ void test_block_manager_concurrent_rw()
 void test_block_manager_validate_last_block()
 {
     block_manager_t *bm = NULL;
+    (void)remove("validate_test.db");
     ASSERT_TRUE(block_manager_open(&bm, "validate_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
     /* we write 3 valid blocks */
@@ -857,6 +858,8 @@ void test_block_manager_validate_last_block()
     ASSERT_EQ(block_count, 3);
 
     /* we verify there are no more blocks (the corrupted one was removed) */
+    printf("DEBUG: cursor->block_index = %d, bm->block_count = %d\n", cursor->block_index,
+           cursor->bm->block_count);
     int at_last = block_manager_cursor_at_last(cursor);
     printf("Cursor at last block: %d\n", at_last);
     ASSERT_EQ(at_last, 1); /* should be at the last block */
@@ -933,6 +936,7 @@ void test_block_manager_open_safety()
 void benchmark_block_manager()
 {
     block_manager_t *bm = NULL;
+    (void)remove("benchmark.db");
     ASSERT_TRUE(block_manager_open(&bm, "benchmark.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
     uint8_t **block_data = malloc(NUM_BLOCKS * sizeof(uint8_t *));
@@ -1240,6 +1244,143 @@ void test_block_manager_empty_block()
     remove("test_empty.db");
 }
 
+void benchmark_block_manager_iteration(void)
+{
+    printf("\nBenchmark: Position Cache Impact on Iteration Performance\n");
+    printf("==========================================================\n");
+
+    block_manager_t *bm = NULL;
+    (void)remove("iteration_bench.db");
+    ASSERT_TRUE(block_manager_open(&bm, "iteration_bench.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* Test with different block counts to show cache scaling */
+    const int test_configs[][2] = {
+        {1000, 1024},  /* 1K blocks (1KB each) */
+        {5000, 1024},  /* 5K blocks (1KB each) */
+        {10000, 1024}, /* 10K blocks (1KB each) */
+        {20000, 1024}, /* 20K blocks (1KB each) */
+    };
+
+    for (size_t config = 0; config < sizeof(test_configs) / sizeof(test_configs[0]); config++)
+    {
+        int num_blocks = test_configs[config][0];
+        int block_size = test_configs[config][1];
+
+        block_manager_truncate(bm);
+
+        printf("\n" BOLDWHITE "Config: %d blocks × %d bytes\n" RESET, num_blocks, block_size);
+
+        /* Write blocks */
+        uint8_t *data = malloc(block_size);
+        memset(data, 'X', block_size);
+
+        for (int i = 0; i < num_blocks; i++)
+        {
+            block_manager_block_t *block = block_manager_block_create(block_size, data);
+            block_manager_block_write(bm, block);
+            block_manager_block_free(block);
+        }
+        free(data);
+
+        /* Close and reopen to clear any in-memory state */
+        block_manager_close(bm);
+        ASSERT_TRUE(block_manager_open(&bm, "iteration_bench.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+        /* ===== ITERATION WITHOUT CACHE ===== */
+        printf(YELLOW "  WITHOUT position cache:\n" RESET);
+
+        /* Ensure no cache exists */
+        if (bm->block_positions)
+        {
+            free(bm->block_positions);
+            bm->block_positions = NULL;
+        }
+        if (bm->block_sizes)
+        {
+            free(bm->block_sizes);
+            bm->block_sizes = NULL;
+        }
+        bm->block_count = 0;
+
+        block_manager_cursor_t *cursor;
+        ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        int blocks_read = 0;
+        ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+        do
+        {
+            blocks_read++;
+        } while (block_manager_cursor_next(cursor) == 0);
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed_no_cache = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+        double throughput_no_cache = blocks_read / elapsed_no_cache;
+        double mb_per_sec_no_cache = (throughput_no_cache * block_size) / (1024.0 * 1024.0);
+
+        printf("    Blocks iterated: %d\n", blocks_read);
+        printf("    Time: %.3f seconds\n", elapsed_no_cache);
+        printf("    Throughput: %.2f blocks/sec\n", throughput_no_cache);
+        printf("    Throughput: %.2f MB/sec\n", mb_per_sec_no_cache);
+        printf("    Avg latency: %.2f μs/block\n", (elapsed_no_cache / blocks_read) * 1e6);
+
+        block_manager_cursor_free(cursor);
+
+        /* ===== BUILD POSITION CACHE ===== */
+        printf(CYAN "  Building position cache...\n" RESET);
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        ASSERT_TRUE(block_manager_build_position_cache(bm) == 0);
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double cache_build_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        printf("    Cache build time: %.3f seconds\n", cache_build_time);
+        printf("    Cache entries: %d\n", bm->block_count);
+
+        /* ===== ITERATION WITH CACHE ===== */
+        printf(GREEN "  WITH position cache:\n" RESET);
+
+        ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        blocks_read = 0;
+        ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+        do
+        {
+            blocks_read++;
+        } while (block_manager_cursor_next(cursor) == 0);
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed_with_cache =
+            (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+        double throughput_with_cache = blocks_read / elapsed_with_cache;
+        double mb_per_sec_with_cache = (throughput_with_cache * block_size) / (1024.0 * 1024.0);
+
+        printf("    Blocks iterated: %d\n", blocks_read);
+        printf("    Time: %.3f seconds\n", elapsed_with_cache);
+        printf("    Throughput: %.2f blocks/sec\n", throughput_with_cache);
+        printf("    Throughput: %.2f MB/sec\n", mb_per_sec_with_cache);
+        printf("    Avg latency: %.2f μs/block\n", (elapsed_with_cache / blocks_read) * 1e6);
+
+        block_manager_cursor_free(cursor);
+
+        /* ===== PERFORMANCE COMPARISON ===== */
+        double speedup = elapsed_no_cache / elapsed_with_cache;
+        printf(BOLDWHITE "  Performance improvement:\n" RESET);
+        printf("    Speedup: " BOLDGREEN "%.2fx faster" RESET " with cache\n", speedup);
+        printf("    Time saved: %.3f seconds (%.1f%%)\n", elapsed_no_cache - elapsed_with_cache,
+               ((elapsed_no_cache - elapsed_with_cache) / elapsed_no_cache) * 100.0);
+        printf("    Cache overhead: %.3f seconds (%.1f%% of iteration time)\n", cache_build_time,
+               (cache_build_time / elapsed_with_cache) * 100.0);
+    }
+
+    block_manager_close(bm);
+    remove("iteration_bench.db");
+}
+
 void benchmark_block_manager_parallel_write(void)
 {
     block_manager_t *bm = NULL;
@@ -1335,6 +1476,7 @@ int main(void)
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);
+    RUN_TEST(benchmark_block_manager_iteration, tests_passed);
     RUN_TEST(benchmark_block_manager_parallel_write, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

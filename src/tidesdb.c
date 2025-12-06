@@ -6231,32 +6231,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     /* load levels atomically */
     int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
 
-    if (num_levels == 1)
-    {
-        tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
-        tidesdb_level_t *level0 = levels[0];
-        tidesdb_level_ref(level0);
-
-        size_t current_size = atomic_load_explicit(&level0->current_size, memory_order_relaxed);
-        size_t capacity = atomic_load_explicit(&level0->capacity, memory_order_relaxed);
-        int num_sstables = atomic_load_explicit(&level0->num_sstables, memory_order_acquire);
-
-        tidesdb_level_unref(cf->db, level0);
-
-        /* trigger compaction if L0 exceeds capacity OR has too many ssts
-         * sst count threshold prevents L0 explosion with small write buffers */
-        if (current_size >= capacity || num_sstables >= cf->config.l0_compaction_threshold)
-        {
-            tidesdb_add_level(cf);
-            num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
-        }
-        else
-        {
-            atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
-            return TDB_SUCCESS;
-        }
-    }
-
     TDB_DEBUG_LOG("Triggering compaction for column family: %s (levels: %d)", cf->name, num_levels);
 
     /* calculate X (dividing level) */
@@ -6303,7 +6277,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         tidesdb_level_unref(cf->db, levels[i]);
     }
 
-    /* perform compaction without holding lock */
     int result = TDB_SUCCESS;
     if (target_lvl < X)
     {
@@ -6341,13 +6314,8 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         size_t level_x_capacity = atomic_load_explicit(&level_x->capacity, memory_order_relaxed);
         int level_x_sstables = atomic_load_explicit(&level_x->num_sstables, memory_order_acquire);
 
-        int trigger = (X == 0)
-        ? level_x_sstables >= cf->config.l0_compaction_threshold
-        : level_x_size >= level_x_capacity;
 
-
-        /* trigger partitioned merge if level X is full by size or has too many ssts based on l0_compaction_threshold if l0 */
-        if (trigger)
+        if (level_x_size >= level_x_capacity)
         {
             need_partitioned_merge = 1;
 
@@ -6383,7 +6351,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 
             if (z == -1 || z <= X)
             {
-                z = num_levels; /* use 1-indexed level number, not array index */
+                z = num_levels;
             }
         }
         else
@@ -6897,7 +6865,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* trigger compaction after flush to prevent L0 explosion */
         int l0_sstables = atomic_load_explicit(&levels[0]->num_sstables, memory_order_acquire);
 
-        if (l0_sstables >= cf->config.l0_compaction_threshold)
+        if (l0_sstables >= cf->config.l0_compaction_threshold && !atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
         {
             TDB_DEBUG_LOG(
                 "CF '%s': L0 has %d SSTables after flush (threshold: %d), triggering "

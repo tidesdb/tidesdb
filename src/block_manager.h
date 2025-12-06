@@ -367,18 +367,9 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
 int block_manager_validate_last_block(block_manager_t *bm);
 
 /**
- * block_manager_build_position_cache
- * builds shared position cache by scanning all blocks once
- * provides O(1) random access and backward navigation for all cursors
- * @param bm the block manager to build cache for
- * @return 0 if successful, -1 otherwise
- */
-int block_manager_build_position_cache(block_manager_t *bm);
-
-/**
  * convert_sync_mode
  * converts TidesDB sync mode enum values to block manager sync mode enum values
- * This function provides compatibility between the public TidesDB API (which uses
+ * this method provides compatibility between the public TidesDB API (which uses
  * TDB_SYNC_NONE/TDB_SYNC_FULL) and the internal block manager API (which uses
  * BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_TDB_SYNC_FULL)
  * @param tdb_sync_mode the TidesDB sync mode (TDB_SYNC_NONE=0, TDB_SYNC_FULL=1)

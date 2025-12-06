@@ -434,7 +434,7 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor);
 
 /**
  * skip_list_cursor_seek
- * positions cursor at the node BEFORE the first key >= target
+ * positions cursor at the node before the first key >= target
  * @param cursor cursor to position
  * @param key target key
  * @param key_size size of target key

@@ -156,7 +156,7 @@ static int get_file_size(int fd, uint64_t *size)
  * @param bm the block manager to build cache for
  * @return 0 if successful, -1 otherwise
  */
-int block_manager_build_position_cache(block_manager_t *bm)
+static int block_manager_build_position_cache(block_manager_t *bm)
 {
     if (!bm) return -1;
 
@@ -412,7 +412,6 @@ int block_manager_close(block_manager_t *bm)
 
     if (close(bm->fd) != 0) return -1;
 
-    /* free shared position cache */
     if (bm->block_positions) free(bm->block_positions);
     if (bm->block_sizes) free(bm->block_sizes);
 

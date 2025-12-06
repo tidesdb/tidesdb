@@ -1253,7 +1253,7 @@ void benchmark_block_manager_iteration(void)
     (void)remove("iteration_bench.db");
     ASSERT_TRUE(block_manager_open(&bm, "iteration_bench.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
-    /* Test with different block counts to show cache scaling */
+    /* we test with different block counts to show cache scaling */
     const int test_configs[][2] = {
         {1000, 1024},  /* 1K blocks (1KB each) */
         {5000, 1024},  /* 5K blocks (1KB each) */
@@ -1270,7 +1270,6 @@ void benchmark_block_manager_iteration(void)
 
         printf("\n" BOLDWHITE "Config: %d blocks × %d bytes\n" RESET, num_blocks, block_size);
 
-        /* Write blocks */
         uint8_t *data = malloc(block_size);
         memset(data, 'X', block_size);
 
@@ -1282,14 +1281,12 @@ void benchmark_block_manager_iteration(void)
         }
         free(data);
 
-        /* Close and reopen to clear any in-memory state */
         block_manager_close(bm);
         ASSERT_TRUE(block_manager_open(&bm, "iteration_bench.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
-        /* ===== ITERATION WITHOUT CACHE ===== */
         printf(YELLOW "  WITHOUT position cache:\n" RESET);
 
-        /* Ensure no cache exists */
+        /* we ensure no cache exists */
         if (bm->block_positions)
         {
             free(bm->block_positions);
@@ -1329,7 +1326,6 @@ void benchmark_block_manager_iteration(void)
 
         block_manager_cursor_free(cursor);
 
-        /* ===== BUILD POSITION CACHE ===== */
         printf(CYAN "  Building position cache...\n" RESET);
         clock_gettime(CLOCK_MONOTONIC, &start);
         ASSERT_TRUE(block_manager_build_position_cache(bm) == 0);
@@ -1338,7 +1334,6 @@ void benchmark_block_manager_iteration(void)
         printf("    Cache build time: %.3f seconds\n", cache_build_time);
         printf("    Cache entries: %d\n", bm->block_count);
 
-        /* ===== ITERATION WITH CACHE ===== */
         printf(GREEN "  WITH position cache:\n" RESET);
 
         ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
@@ -1367,7 +1362,6 @@ void benchmark_block_manager_iteration(void)
 
         block_manager_cursor_free(cursor);
 
-        /* ===== PERFORMANCE COMPARISON ===== */
         double speedup = elapsed_no_cache / elapsed_with_cache;
         printf(BOLDWHITE "  Performance improvement:\n" RESET);
         printf("    Speedup: " BOLDGREEN "%.2fx faster" RESET " with cache\n", speedup);

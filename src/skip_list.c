@@ -886,15 +886,15 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor)
 
 /**
  * skip_list_cursor_seek
- * positions cursor at the node BEFORE the first key >= target
+ * positions cursor at the node before the first key >= target
  * @param cursor the cursor to position
  * @param key the target key to seek to
  * @param key_size size of the target key
  * @return 0 on success, -1 on failure
  *
  * after calling this function, cursor->current points to the predecessor node.
- * Callers must call skip_list_cursor_next() or similar to access the actual target key.
- * This behavior allows efficient insertion and supports both exact matches and range queries.
+ * callers must call skip_list_cursor_next() or similar to access the actual target key.
+ * this behavior allows efficient insertion and supports both exact matches and range queries.
  */
 int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size)
 {

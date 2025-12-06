@@ -1984,7 +1984,7 @@ static void tidesdb_sstable_free(tidesdb_t *db, tidesdb_sstable_t *sst)
     free(sst->config);
 
     if (sst->bloom_filter) bloom_filter_free(sst->bloom_filter);
-    if (sst->block_index) compact_block_index_free(sst->block_index);
+    if (sst->block_indexes) compact_block_index_free(sst->block_indexes);
 
     free(sst);
 }
@@ -2436,13 +2436,13 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     if (block_indexes)
     {
         /* we assign the built index to the sst */
-        sst->block_index = block_indexes;
+        sst->block_indexes = block_indexes;
 
         TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block indexes built - %u samples, %" PRIu64
                       " total blocks",
-                      sst->id, sst->block_index->count, klog_block_num);
+                      sst->id, sst->block_indexes->count, klog_block_num);
         size_t index_size;
-        uint8_t *index_data = compact_block_index_serialize(sst->block_index, &index_size);
+        uint8_t *index_data = compact_block_index_serialize(sst->block_indexes, &index_size);
         if (index_data)
         {
             TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block indexes serialized to %zu bytes", sst->id,
@@ -2570,9 +2570,9 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     /* use block indexes to find starting klog block */
     int64_t start_block = 0;
-    if (sst->block_index)
+    if (sst->block_indexes)
     {
-        if (compact_block_index_find_predecessor(sst->block_index, key, key_size, &start_block) !=
+        if (compact_block_index_find_predecessor(sst->block_indexes, key, key_size, &start_block) !=
             0)
         {
             start_block = 0;
@@ -2848,18 +2848,18 @@ load_bloom_and_index:
                 {
                     if (index_block->size > 0)
                     {
-                        sst->block_index =
+                        sst->block_indexes =
                             compact_block_index_deserialize(index_block->data, index_block->size);
 
                         /* we set comparator after deserialization */
-                        if (sst->block_index)
+                        if (sst->block_indexes)
                         {
                             skip_list_comparator_fn comparator_fn = NULL;
                             void *comparator_ctx = NULL;
                             tidesdb_resolve_comparator(db, sst->config, &comparator_fn,
                                                        &comparator_ctx);
-                            sst->block_index->comparator = comparator_fn;
-                            sst->block_index->comparator_ctx = comparator_ctx;
+                            sst->block_indexes->comparator = comparator_fn;
+                            sst->block_indexes->comparator_ctx = comparator_ctx;
                         }
                     }
                     block_manager_block_release(index_block);
@@ -4728,7 +4728,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             bloom_filter_add(bloom, kv->key, kv->entry.key_size);
         }
 
-        /* we when index enabled always sample first key of every Nth block (or all blocks if ratio <= 1) */
+        /* we when index enabled always sample first key of every Nth block (or all blocks if ratio
+         * <= 1) */
         if (block_indexes && is_first_entry_in_block)
         {
             if (cf->config.index_sample_ratio <= 1 ||
@@ -4837,12 +4838,12 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     if (block_indexes)
     {
         /* we assign the built index to the sstable */
-        new_sst->block_index = block_indexes;
+        new_sst->block_indexes = block_indexes;
 
         TDB_DEBUG_LOG("Full preemptive merge: Block index built with %u samples",
-                      new_sst->block_index->count);
+                      new_sst->block_indexes->count);
         size_t index_size;
-        uint8_t *index_data = compact_block_index_serialize(new_sst->block_index, &index_size);
+        uint8_t *index_data = compact_block_index_serialize(new_sst->block_indexes, &index_size);
         if (index_data)
         {
             block_manager_block_t *index_block = block_manager_block_create(index_size, index_data);
@@ -5429,10 +5430,11 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         /* write index */
         if (block_indexes)
         {
-            new_sst->block_index = block_indexes;
+            new_sst->block_indexes = block_indexes;
 
             size_t index_size;
-            uint8_t *index_data = compact_block_index_serialize(new_sst->block_index, &index_size);
+            uint8_t *index_data =
+                compact_block_index_serialize(new_sst->block_indexes, &index_size);
             if (index_data)
             {
                 block_manager_block_t *index_block =
@@ -5527,7 +5529,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             /* mark for deletion BEFORE removing from levels to avoid use-after-free */
             atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
 
-            /* try to remove from each level -- break on first success since each sst is only in one level */
+            /* try to remove from each level -- break on first success since each sst is only in one
+             * level */
             for (int level = 0; level <= target_level && level < current_num_levels; level++)
             {
                 int result = tidesdb_level_remove_sstable(cf->db, levels[level], sst);
@@ -6075,11 +6078,11 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             /* write index */
             if (block_indexes)
             {
-                new_sst->block_index = block_indexes;
+                new_sst->block_indexes = block_indexes;
 
                 size_t index_size;
                 uint8_t *index_data =
-                    compact_block_index_serialize(new_sst->block_index, &index_size);
+                    compact_block_index_serialize(new_sst->block_indexes, &index_size);
                 if (index_data)
                 {
                     block_manager_block_t *index_block =
@@ -6185,7 +6188,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         /* mark for deletion BEFORE removing from levels to avoid use-after-free */
         atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
 
-        /* try to remove from each level -- break on first success since each sst is only in one level */
+        /* try to remove from each level -- break on first success since each sst is only in one
+         * level */
         for (int level_idx = start_idx; level_idx <= end_idx; level_idx++)
         {
             int result = tidesdb_level_remove_sstable(cf->db, levels[level_idx], sst);
@@ -6922,8 +6926,10 @@ static void *tidesdb_flush_worker_thread(void *arg)
                     (tidesdb_immutable_memtable_t *)queue_dequeue(cf->immutable_memtables);
                 if (queued_imm)
                 {
-                    int is_flushed = atomic_load_explicit(&queued_imm->flushed, memory_order_acquire);
-                    int refcount = atomic_load_explicit(&queued_imm->refcount, memory_order_acquire);
+                    int is_flushed =
+                        atomic_load_explicit(&queued_imm->flushed, memory_order_acquire);
+                    int refcount =
+                        atomic_load_explicit(&queued_imm->refcount, memory_order_acquire);
 
                     /* only remove if flushed AND refcount is 1 (only queue holds reference)
                      * if refcount > 1, there are active reads -- must keep in queue */
@@ -10025,20 +10031,13 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
             }
             source->source.sstable.current_entry_idx = 0;
 
-            /* use block indexes to jump to target block
-             * Block index contains first key of each (sampled) block.
-             * Find predecessor = largest block whose first_key <= target.
-             * Target must be in this block or a later block.
-             *
-             * Without position cache, we scan from first block. The block index
-             * optimization helps us skip blocks early by comparing against indexed keys. */
             block_manager_cursor_goto_first(cursor);
 
-            if (sst->block_index && sst->block_index->count > 0)
+            if (sst->block_indexes && sst->block_indexes->count > 0)
             {
                 int64_t block_num = 0;
                 /* find predecessor largest indexed block where first_key <= target */
-                int lookup_result = compact_block_index_find_predecessor(sst->block_index, key,
+                int lookup_result = compact_block_index_find_predecessor(sst->block_indexes, key,
                                                                          key_size, &block_num);
 
                 if (lookup_result == 0 && block_num > 0)
@@ -10118,7 +10117,6 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 int cmp_last = comparator_fn(kb->keys[kb->num_entries - 1],
                                              kb->entries[kb->num_entries - 1].key_size, key,
                                              key_size, comparator_ctx);
-
 
                 if (cmp_last >= 0)
                 {
@@ -10293,10 +10291,10 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
              * Without position cache, we scan from first block. */
             block_manager_cursor_goto_first(cursor);
 
-            if (sst->block_index && sst->block_index->count > 0)
+            if (sst->block_indexes && sst->block_indexes->count > 0)
             {
                 int64_t block_num = 0;
-                if (compact_block_index_find_predecessor(sst->block_index, key, key_size,
+                if (compact_block_index_find_predecessor(sst->block_indexes, key, key_size,
                                                          &block_num) == 0 &&
                     block_num > 0)
                 {
@@ -12171,7 +12169,6 @@ static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *
     memcpy(index->key_data + index->total_key_bytes, key + prefix_len, suffix_len);
     index->total_key_bytes += suffix_len;
 
-    /* we update max_key_len for search optimization */
     if ((uint16_t)key_len > index->max_key_len)
     {
         index->max_key_len = (uint16_t)key_len;

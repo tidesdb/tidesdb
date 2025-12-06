@@ -6263,6 +6263,8 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     int X = num_levels - 1 - cf->config.dividing_level_offset;
     if (X < 1) X = 1;
 
+    TDB_DEBUG_LOG("Target compaction X %d", X);
+
     /* determine target level for compaction */
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
@@ -6273,6 +6275,8 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     }
 
     int target_lvl = X; /* default to X if no suitable level found */
+
+    TDB_DEBUG_LOG("Target compaction level %d", target_lvl);
 
     for (int q = 1; q <= X && q < num_levels; q++)
     {
@@ -6337,9 +6341,13 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         size_t level_x_capacity = atomic_load_explicit(&level_x->capacity, memory_order_relaxed);
         int level_x_sstables = atomic_load_explicit(&level_x->num_sstables, memory_order_acquire);
 
-        /* trigger partitioned merge if level X is full by size OR has too many ssts */
-        if (level_x_size >= level_x_capacity ||
-            level_x_sstables >= (cf->config.l0_compaction_threshold * 2))
+        int trigger = (X == 0)
+        ? level_x_sstables >= cf->config.l0_compaction_threshold
+        : level_x_size >= level_x_capacity;
+
+
+        /* trigger partitioned merge if level X is full by size or has too many ssts based on l0_compaction_threshold if l0 */
+        if (trigger)
         {
             need_partitioned_merge = 1;
 
@@ -6995,6 +7003,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
         /* check if database is closing before blocking on queue */
         if (!atomic_load(&db->is_open))
         {
+            TDB_DEBUG_LOG("Compaction worker thread closing");
             break;
         }
 

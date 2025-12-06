@@ -149,14 +149,7 @@ static int get_file_size(int fd, uint64_t *size)
     return 0;
 }
 
-/**
- * block_manager_build_position_cache
- * builds shared position cache by scanning all blocks once
- * provides O(1) random access and backward navigation for all cursors
- * @param bm the block manager to build cache for
- * @return 0 if successful, -1 otherwise
- */
-static int block_manager_build_position_cache(block_manager_t *bm)
+int block_manager_build_position_cache(block_manager_t *bm)
 {
     if (!bm) return -1;
 

@@ -377,4 +377,14 @@ int block_manager_validate_last_block(block_manager_t *bm);
  */
 block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode);
 
+/**
+ * block_manager_build_position_cache
+ * builds shared position cache by scanning all blocks once
+ * provides O(1) random access and backward navigation for all cursors
+ * it will recreate cache so be careful
+ * @param bm the block manager to build cache for
+ * @return 0 if successful, -1 otherwise
+ */
+int block_manager_build_position_cache(block_manager_t *bm);
+
 #endif /* __BLOCK_MANAGER_H__ */

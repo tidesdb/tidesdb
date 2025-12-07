@@ -5127,11 +5127,12 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     tidesdb_wait_for_dca(cf);
 
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
-    tidesdb_level_t *largest = levels[num_levels - 1];
 
     tidesdb_level_t *target = levels[target_level];
+    /* dividing merge: use boundaries from target_level+1 (the level we're merging into) */
+    tidesdb_level_t *next_level = levels[target_level + 1];
 
-    tidesdb_level_update_boundaries(target, largest);
+    tidesdb_level_update_boundaries(target, next_level);
 
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
@@ -5234,6 +5235,11 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         size_t range_end_size =
             (partition < num_boundaries) ? target->boundary_sizes[partition] : 0;
 
+        TDB_DEBUG_LOG("Dividing merge partition %d: range [%s, %s)",
+                      partition,
+                      range_start ? (char*)range_start : "NULL",
+                      range_end ? (char*)range_end : "NULL");
+
         /* add only overlapping sstables to this partition's heap */
         uint64_t partition_estimated_entries = 0;
         size_t num_sstables_to_merge = queue_size(sstables_to_delete);
@@ -5260,6 +5266,10 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
             if (overlaps)
             {
+                TDB_DEBUG_LOG("Dividing merge partition %d: SSTable %" PRIu64 " overlaps (min=%s, max=%s)",
+                              partition, sst->id,
+                              sst->min_key ? (char*)sst->min_key : "NULL",
+                              sst->max_key ? (char*)sst->max_key : "NULL");
                 tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(cf->db, sst);
                 if (source)
                 {
@@ -5379,6 +5389,23 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             {
                 memcpy(last_key, kv->key, kv->entry.key_size);
                 last_key_size = kv->entry.key_size;
+            }
+
+            /* filter keys by partition range to prevent data loss */
+            if (range_start && comparator_fn(kv->key, kv->entry.key_size, range_start,
+                                             range_start_size, comparator_ctx) < 0)
+            {
+                /* key is before this partition's range, skip it */
+                tidesdb_kv_pair_free(kv);
+                continue;
+            }
+
+            if (range_end && comparator_fn(kv->key, kv->entry.key_size, range_end,
+                                           range_end_size, comparator_ctx) >= 0)
+            {
+                /* key is at or after partition end, skip it */
+                tidesdb_kv_pair_free(kv);
+                continue;
             }
 
             /* skip tombstones (deleted keys) */
@@ -5627,6 +5654,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         atomic_thread_fence(memory_order_seq_cst);
 
         /* add to target level */
+        TDB_DEBUG_LOG("Dividing merge partition %d: Merged %" PRIu64 " entries",
+                      partition, entry_count);
+
         if (entry_count > 0)
         {
             levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
@@ -6998,6 +7028,26 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* clear is_flushing flag now that flush is complete
          * this allows new flushes to be triggered */
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+
+        /* check if compaction is needed after flush (standard LSM-tree behavior)
+         * we check level 0 capacity to decide if compaction should be triggered
+         * reload levels atomically in case they changed during flush */
+        levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+        int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+        
+        if (num_levels > 0 && levels[0])
+        {
+            size_t level0_size = atomic_load_explicit(&levels[0]->current_size, memory_order_acquire);
+            size_t level0_capacity = atomic_load_explicit(&levels[0]->capacity, memory_order_acquire);
+            
+            /* trigger compaction if level 0 is at or above capacity */
+            if (level0_size >= level0_capacity)
+            {
+                TDB_DEBUG_LOG("CF '%s': Level 0 full (size=%zu >= capacity=%zu), triggering compaction",
+                              cf->name, level0_size, level0_capacity);
+                tidesdb_compact(cf);
+            }
+        }
 
         free(work);
     }

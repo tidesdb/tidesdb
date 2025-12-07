@@ -144,6 +144,11 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_SSTABLE_VLOG_EXT          ".vlog" /* extension for sstable value log files */
 #define TDB_SSTABLE_CACHE_PREFIX      "sst_"  /* prefix for sstable cache keys */
 #define TDB_CACHE_KEY_SIZE            256     /* maximum size for cache key strings */
+/* sstable metadata structure */
+#define SSTABLE_METADATA_MAGIC 0x5353544D /* SSTM */
+
+#define TDB_STACK_SSTS          64 /* stack allocation for common case to avoid malloc overhead on reads */
+#define TDB_ITER_STACK_KEY_SIZE 256
 
 /* default configuration values */
 #define TDB_DEFAULT_WRITE_BUFFER_SIZE (64 * 1024 * 1024) /* 64MB */
@@ -165,8 +170,6 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE 1024 * 64           /* max concurrent txns per cf */
 #define TDB_DEFAULT_BLOCK_CACHE_SIZE       (64 * 1024 * 1024)  /* default global block cache size */
 #define TDB_DEFAULT_SYNC_INTERVAL_US       128000 /* 128ms sync interval for TDB_SYNC_INTERVAL mode */
-#define TDB_DEFAULT_L0_COMPACTION_THRESHOLD \
-    4 /* trigger compaction when L0 has this many sstables */
 
 #define TDB_MAX_TXN_CFS         10000  /* maximum number of cfs per transaction */
 #define TDB_MAX_PATH_LEN        4096   /* maximum path length */
@@ -179,6 +182,13 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 /* memory limit constants */
 #define TDB_MEMORY_PERCENTAGE  0.6           /* 60% of available memory */
 #define TDB_MIN_KEY_VALUE_SIZE (1024 * 1024) /* 1MB minimum threshold */
+#define TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY \
+    32 /* initial level sstable allocation capacity and expo */
+#define DISK_SPACE_CHECK_INTERVAL_SECONDS \
+    60 /* interval in-which system checks and caches avail disk space */
+#define NO_CF_SYNC_SLEEP_US                                                                       \
+    100000 /* when background sync thread is waiting for an existing or new column family to work \
+              on syncing in background */
 
 /**
  * tidesdb_column_family_config_t
@@ -206,7 +216,6 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param skip_list_probability skip list probability
  * @param default_isolation_level default isolation level
  * @param min_disk_space minimum free disk space required (bytes)
- * @param l0_compaction_threshold trigger compaction when L0 has this many SSTables
  */
 typedef struct
 {
@@ -232,7 +241,6 @@ typedef struct
     float skip_list_probability;
     tidesdb_isolation_level_t default_isolation_level;
     uint64_t min_disk_space;
-    int l0_compaction_threshold;
 } tidesdb_column_family_config_t;
 
 /**
@@ -435,8 +443,8 @@ struct tidesdb_sstable_t
     uint8_t *max_key;
     size_t max_key_size;
     uint64_t num_entries;
-    _Atomic(uint64_t) num_klog_blocks;
-    _Atomic(uint64_t) num_vlog_blocks;
+    uint64_t num_klog_blocks;
+    uint64_t num_vlog_blocks;
     uint64_t klog_data_end_offset;
     uint64_t klog_size;
     uint64_t vlog_size;
@@ -463,7 +471,6 @@ struct tidesdb_sstable_t
  * @param file_boundaries file boundaries for partitioning
  * @param boundary_sizes sizes of boundary keys
  * @param num_boundaries number of boundaries
- * @param refcount reference count for safe concurrent access
  * @param marked_for_deletion when ref count reaches 0 and its marked for deletion its removed.
  */
 struct tidesdb_level_t
@@ -474,10 +481,9 @@ struct tidesdb_level_t
     _Atomic(tidesdb_sstable_t **) sstables;
     _Atomic(int) num_sstables;
     _Atomic(int) sstables_capacity;
-    _Atomic(uint8_t) **file_boundaries;
-    size_t *boundary_sizes;
+    _Atomic(uint8_t **) file_boundaries;
+    _Atomic(size_t *) boundary_sizes;
     _Atomic(int) num_boundaries;
-    _Atomic(int) refcount;
     _Atomic(int) marked_for_deletion;
 };
 

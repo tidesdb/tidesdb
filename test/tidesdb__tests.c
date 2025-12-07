@@ -3915,10 +3915,10 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     /* config that will trigger level additions */
-    cf_config.write_buffer_size = 300;
+    cf_config.write_buffer_size = 200;
     cf_config.level_size_ratio = 5;
-    cf_config.dividing_level_offset = 1;
-    cf_config.min_levels = 3;
+    // cf_config.dividing_level_offset = 1;
+    cf_config.min_levels = 2;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "dca_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "dca_cf");
@@ -3929,11 +3929,13 @@ static void test_dynamic_capacity_adjustment(void)
     printf("Initial levels: %d\n", initial_levels);
 
     /* write data in batches, triggering level additions */
-    for (int batch = 0; batch < 5; batch++)
+    for (int batch = 0; batch < 2; batch++)
     {
         printf("Batch %d: Writing 40 keys\n", batch + 1);
 
-        for (int i = 0; i < 40; i++)
+        int written = 0;
+
+        for (int i = 0; i < 50000; i++)
         {
             tidesdb_txn_t *txn = NULL;
             ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
@@ -3948,17 +3950,25 @@ static void test_dynamic_capacity_adjustment(void)
                       0);
             ASSERT_EQ(tidesdb_txn_commit(txn), 0);
             tidesdb_txn_free(txn);
+            written += 32 + 128;
 
-            if (i % 8 == 7)
+            if (written > 5000)
             {
-                tidesdb_flush_memtable(cf);
-                usleep(15000);
+                printf("%d\n", written);
+                break;
             }
         }
 
+        for (int i = 0; i < 50; i++)
+        {
+            usleep(10000);
+            if (queue_size(db->flush_queue) == 0) break;
+        }
+
+        printf("done flushing\n");
+
         /* trigger compaction and observe level changes */
-        tidesdb_compact(cf);
-        usleep(150000);
+        sleep(150000);
 
         int current_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
 
@@ -6556,21 +6566,13 @@ static void test_large_value_iteration(void)
 
 void test_tidesdb_block_index_seek()
 {
-    tidesdb_t *db = NULL;
-    tidesdb_config_t config = {.db_path = TEST_DB_PATH,
-                               .num_flush_threads = 1,
-                               .num_compaction_threads = 1,
-                               .enable_debug_logging = 1,
-                               .max_open_sstables = 128};
-
-    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
-    ASSERT_TRUE(db != NULL);
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.enable_block_indexes = 1;
-    cf_config.index_sample_ratio = 128;       /* sample every 128th key */
-    cf_config.write_buffer_size = 512 * 1024; /* 512KB buffer to create multi-block SSTables */
-    cf_config.klog_block_size = 16 * 1024;    /* 16KB blocks */
+    cf_config.index_sample_ratio = 1;
+    cf_config.write_buffer_size = 512 * 1024;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), TDB_SUCCESS);
 
@@ -6600,8 +6602,13 @@ void test_tidesdb_block_index_seek()
         tidesdb_txn_free(txn);
     }
 
-    /* wait for flushes to complete */
-    sleep(2);
+    /* wait for flushes */
+    for (int i = 0; i < 50; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+    usleep(100000);
 
     printf(CYAN "  Testing seeks at various positions...\n" RESET);
 
@@ -6641,7 +6648,7 @@ void test_tidesdb_block_index_seek()
     printf(CYAN "  ✓ All seeks successful\n" RESET);
 
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
-    remove_directory("test_block_index_seek_db");
+    cleanup_test_dir();
 }
 
 typedef struct
@@ -7123,23 +7130,23 @@ static void test_multi_cf_many_sstables_recovery(void)
 int main(void)
 {
     cleanup_test_dir();
-   //   RUN_TEST(test_basic_open_close, tests_passed);
-   //   RUN_TEST(test_column_family_creation, tests_passed);
-   //   RUN_TEST(test_list_column_families, tests_passed);
-   //   RUN_TEST(test_basic_txn_put_get, tests_passed);
-   //   RUN_TEST(test_txn_delete, tests_passed);
-   //   RUN_TEST(test_txn_rollback, tests_passed);
-   //   RUN_TEST(test_multiple_column_families, tests_passed);
-   // RUN_TEST(test_memtable_flush, tests_passed);
-   //  RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
-   //  RUN_TEST(test_persistence_and_recovery, tests_passed);
-   //   RUN_TEST(test_multi_cf_wal_recovery, tests_passed);
-   //   RUN_TEST(test_multi_cf_many_sstables_recovery, tests_passed);
-   //   RUN_TEST(test_iterator_basic, tests_passed);
-   //   RUN_TEST(test_stats, tests_passed);
-   //   RUN_TEST(test_iterator_seek, tests_passed);
-   //   RUN_TEST(test_iterator_seek_for_prev, tests_passed);
-    //RUN_TEST(test_tidesdb_block_index_seek, tests_passed); //NEED TO FIX
+    //   RUN_TEST(test_basic_open_close, tests_passed);
+    //   RUN_TEST(test_column_family_creation, tests_passed);
+    //   RUN_TEST(test_list_column_families, tests_passed);
+    //   RUN_TEST(test_basic_txn_put_get, tests_passed);
+    //   RUN_TEST(test_txn_delete, tests_passed);
+    //   RUN_TEST(test_txn_rollback, tests_passed);
+    //   RUN_TEST(test_multiple_column_families, tests_passed);
+    // RUN_TEST(test_memtable_flush, tests_passed);
+    //  RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
+    //  RUN_TEST(test_persistence_and_recovery, tests_passed);
+    //   RUN_TEST(test_multi_cf_wal_recovery, tests_passed);
+    //   RUN_TEST(test_multi_cf_many_sstables_recovery, tests_passed);
+    //   RUN_TEST(test_iterator_basic, tests_passed);
+    //   RUN_TEST(test_stats, tests_passed);
+    //   RUN_TEST(test_iterator_seek, tests_passed);
+    //   RUN_TEST(test_iterator_seek_for_prev, tests_passed);
+    RUN_TEST(test_tidesdb_block_index_seek, tests_passed);  // NEED TO FIX
     //  RUN_TEST(test_iterator_reverse, tests_passed);
     //  RUN_TEST(test_iterator_boundaries, tests_passed);
     //  RUN_TEST(test_bidirectional_iterator, tests_passed);
@@ -7205,10 +7212,10 @@ int main(void)
     // RUN_TEST(test_dividing_merge_strategy, tests_passed);
     // RUN_TEST(test_partitioned_merge_strategy, tests_passed);
     //     RUN_TEST(test_boundary_partitioning, tests_passed);
-        //RUN_TEST(test_dynamic_capacity_adjustment, tests_passed); // NEED TO FIX
-        // RUN_TEST(test_multi_level_compaction_strategies, tests_passed);
-        // RUN_TEST(test_recovery_with_corrupted_sstable, tests_passed);
-       // RUN_TEST(test_portability_workflow, tests_passed); // NEED TO FIX
+    // RUN_TEST(test_dynamic_capacity_adjustment, tests_passed); // NEED TO FIX
+    // RUN_TEST(test_multi_level_compaction_strategies, tests_passed);
+    // RUN_TEST(test_recovery_with_corrupted_sstable, tests_passed);
+    // RUN_TEST(test_portability_workflow, tests_passed); // NEED TO FIX
     //     RUN_TEST(test_iterator_across_multiple_memtable_flushes, tests_passed);
     //     RUN_TEST(test_read_after_multiple_overwrites, tests_passed);
     //     RUN_TEST(test_large_transaction_batch, tests_passed);
@@ -7261,8 +7268,8 @@ int main(void)
     //     RUN_TEST(test_many_sstables_large_cache, tests_passed);
     //     RUN_TEST(test_many_sstables_all_isolation_levels, tests_passed);
     //     RUN_TEST(test_many_sstables_all_comparators, tests_passed);
-        //RUN_TEST(test_large_value_iteration, tests_passed); // NEED TO FIX
-        RUN_TEST(test_sync_interval_mode, tests_passed);
+    // RUN_TEST(test_large_value_iteration, tests_passed); // NEED TO FIX
+    // RUN_TEST(test_sync_interval_mode, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

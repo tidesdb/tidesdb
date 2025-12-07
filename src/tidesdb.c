@@ -2903,15 +2903,16 @@ static tidesdb_level_t *tidesdb_level_create(int level_num, size_t capacity)
     atomic_init(&level->capacity, capacity);
     atomic_init(&level->current_size, 0);
 
-    tidesdb_sstable_t **sstables = calloc(TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY, sizeof(tidesdb_sstable_t *));
+    tidesdb_sstable_t **sstables =
+        calloc(TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY, sizeof(tidesdb_sstable_t *));
     if (!sstables)
     {
         free(level);
         return NULL;
     }
 
-    TDB_DEBUG_LOG("tidesdb_level_create: Allocated sstables array %p for level %d (capacity %d)", 
-                  (void*)sstables, level_num, TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY);
+    TDB_DEBUG_LOG("tidesdb_level_create: Allocated sstables array %p for level %d (capacity %d)",
+                  (void *)sstables, level_num, TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY);
 
     atomic_init(&level->sstables, sstables);
     atomic_init(&level->num_sstables, 0);
@@ -2989,14 +2990,16 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
         int old_capacity = atomic_load_explicit(&level->sstables_capacity, memory_order_acquire);
         int old_num = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
-        TDB_DEBUG_LOG("tidesdb_level_add_sstable: SSTable %" PRIu64 " to level %d: old_num=%d, old_capacity=%d, old_arr=%p",
-                      sst->id, level->level_num, old_num, old_capacity, (void*)old_arr);
+        TDB_DEBUG_LOG("tidesdb_level_add_sstable: SSTable %" PRIu64
+                      " to level %d: old_num=%d, old_capacity=%d, old_arr=%p",
+                      sst->id, level->level_num, old_num, old_capacity, (void *)old_arr);
 
         /* check if we need to grow the array */
         if (old_num >= old_capacity)
         {
-            TDB_DEBUG_LOG("tidesdb_level_add_sstable: RESIZE PATH - level %d needs resize (num=%d >= cap=%d)",
-                          level->level_num, old_num, old_capacity);
+            TDB_DEBUG_LOG(
+                "tidesdb_level_add_sstable: RESIZE PATH - level %d needs resize (num=%d >= cap=%d)",
+                level->level_num, old_num, old_capacity);
             int new_capacity =
                 old_capacity == 0 ? TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY : old_capacity * 2;
             tidesdb_sstable_t **new_arr = malloc(new_capacity * sizeof(tidesdb_sstable_t *));
@@ -3044,14 +3047,14 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
                           level->level_num, old_num, old_capacity);
             /* atomically reserve a slot by incrementing count first */
             int expected = old_num;
-            
+
             /* verify we have space before trying to reserve */
             if (expected >= old_capacity)
             {
                 /* no space, retry with resize path */
                 continue;
             }
-            
+
             /* try to atomically reserve slot by incrementing count */
             if (atomic_compare_exchange_strong_explicit(&level->num_sstables, &expected,
                                                         old_num + 1, memory_order_release,
@@ -3059,7 +3062,8 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
             {
                 /* success! we reserved slot at index old_num */
                 /* verify array pointer hasn't changed (another thread might have resized) */
-                tidesdb_sstable_t **current_arr = atomic_load_explicit(&level->sstables, memory_order_acquire);
+                tidesdb_sstable_t **current_arr =
+                    atomic_load_explicit(&level->sstables, memory_order_acquire);
                 if (current_arr != old_arr)
                 {
                     /* array was resized, write to the NEW array at our reserved index */
@@ -3069,13 +3073,13 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
                                               memory_order_relaxed);
                     return TDB_SUCCESS;
                 }
-                
+
                 /* array is still valid, write to our reserved slot */
                 old_arr[old_num] = sst;
-                
+
                 /* ensure write is visible */
                 atomic_thread_fence(memory_order_release);
-                
+
                 /* update size */
                 atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                           memory_order_relaxed);
@@ -6317,7 +6321,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         /* another compaction is already running, skip this one */
         return TDB_SUCCESS;
     }
-    
 
     /* load levels atomically */
     int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);

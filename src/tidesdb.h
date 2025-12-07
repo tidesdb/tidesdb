@@ -161,15 +161,14 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2    /* thread pool size for global flushes */
 #define TDB_DEFAULT_BLOOM_FPR                   0.01 /* 1% false positive rate */
 #define TDB_DEFAULT_KLOG_BLOCK_SIZE             (64 * 1024) /* 64KB per klog block */
-#define TDB_DEFAULT_VLOG_BLOCK_SIZE             (4 * 1024)  /* 4KB per vlog block */
-#define TDB_DEFAULT_VALUE_THRESHOLD             1024        /* values >= 1KB go to vlog */
-#define TDB_DEFAULT_INDEX_SAMPLE_RATIO \
-    2 /*  sample first key of each block (or every Nth block based on sample ratio) */
-#define TDB_DEFAULT_MIN_DISK_SPACE         (100 * 1024 * 1024) /* 100MB minimum free space */
-#define TDB_DEFAULT_MAX_OPEN_SSTABLES      512                 /* max open sstables globally */
-#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE 1024 * 64           /* max concurrent txns per cf */
-#define TDB_DEFAULT_BLOCK_CACHE_SIZE       (64 * 1024 * 1024)  /* default global block cache size */
-#define TDB_DEFAULT_SYNC_INTERVAL_US       128000 /* 128ms sync interval for TDB_SYNC_INTERVAL mode */
+#define TDB_DEFAULT_VLOG_BLOCK_SIZE             (8 * 1024)  /* 8KB per vlog block */
+#define TDB_DEFAULT_VALUE_THRESHOLD             512         /* values >= 1KB go to vlog */
+#define TDB_DEFAULT_INDEX_SAMPLE_RATIO          1
+#define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024) /* 100MB minimum free space */
+#define TDB_DEFAULT_MAX_OPEN_SSTABLES           512                 /* max open sstables globally */
+#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      1024 * 64           /* max concurrent txns per cf */
+#define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024) /* default global block cache size */
+#define TDB_DEFAULT_SYNC_INTERVAL_US            128000 /* 128ms sync interval for TDB_SYNC_INTERVAL mode */
 
 #define TDB_MAX_TXN_CFS         10000  /* maximum number of cfs per transaction */
 #define TDB_MAX_PATH_LEN        4096   /* maximum path length */
@@ -343,37 +342,28 @@ typedef struct
 } tidesdb_klog_block_t;
 
 /**
- * tidesdb_compact_block_index_t
- * compact array-based sparse block index with prefix + delta + varint compression
- * @param  key_data packed key data (prefix-compressed)
- * @param key_offsets offset to each key in key_data
- * @param key_lens length of each decompressed key
- * @param prefix_lens prefix length shared with previous key
- * @param block_nums block number for each sample
- * @param count number of samples
+ * tidesdb_block_index_t
+ * sparse block index with fixed-length min/max key prefixes per block
+ * stores range boundaries for efficient range queries and prefix scans
+ * @param min_key_prefixes fixed-length prefixes of minimum key in each block
+ * @param max_key_prefixes fixed-length prefixes of maximum key in each block
+ * @param block_nums block number for each indexed block
+ * @param count number of indexed blocks
  * @param capacity allocated capacity
- * @param total_key_bytes total bytes in key_data
- * @param max_key_len cached max key length for search optimization
- * @param comparator passed comparator
+ * @param prefix_len fixed length of each prefix (e.g., 32 bytes)
+ * @param comparator comparator function
  * @param comparator_ctx comparator context
- * @param last_full_key last added key (full, not compressed)
- * @param last_full_key_len length of last full key
  */
 typedef struct
 {
-    uint8_t *key_data;
-    uint32_t *key_offsets;
-    uint16_t *key_lens;
-    uint8_t *prefix_lens;
+    uint8_t *min_key_prefixes;
+    uint8_t *max_key_prefixes;
     int64_t *block_nums;
     uint32_t count;
     uint32_t capacity;
-    size_t total_key_bytes;
-    uint16_t max_key_len;
+    uint8_t prefix_len;
     tidesdb_comparator_fn comparator;
     void *comparator_ctx;
-    uint8_t *last_full_key;
-    uint16_t last_full_key_len;
 } tidesdb_block_index_t;
 
 /**

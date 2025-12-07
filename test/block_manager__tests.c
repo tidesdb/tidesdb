@@ -1212,6 +1212,126 @@ void test_block_manager_overflow_blocks()
     remove("test_overflow.db");
 }
 
+void test_block_manager_overflowed_and_not_position_cache_iteration()
+{
+    block_manager_t *bm = NULL;
+    ASSERT_EQ(block_manager_open(&bm, "test_overflow_and_not_position_cache_iteration.db",
+                                 BLOCK_MANAGER_SYNC_NONE),
+              0);
+
+    printf("\n" BOLDWHITE
+           "Testing position cache with mixed small/large (overflow) blocks\n" RESET);
+
+    /* write mix of small and large blocks */
+    const int num_blocks = 20;
+    int64_t offsets[num_blocks];
+    uint64_t sizes[num_blocks];
+
+    printf("Writing %d mixed blocks...\n", num_blocks);
+    for (int i = 0; i < num_blocks; i++)
+    {
+        /* alternate between small (1KB) and large (64KB overflow) blocks */
+        uint64_t size = (i % 2 == 0) ? 1024 : (64 * 1024);
+        sizes[i] = size;
+
+        uint8_t *data = malloc(size);
+        memset(data, 'A' + (i % 26), size);
+
+        block_manager_block_t *block = block_manager_block_create(size, data);
+        ASSERT_TRUE(block != NULL);
+
+        offsets[i] = block_manager_block_write(bm, block);
+        ASSERT_TRUE(offsets[i] != -1);
+
+        printf("  Block %d: size=%lu bytes, offset=%ld, %s\n", i, size, offsets[i],
+               (size > 32768) ? "OVERFLOW" : "regular");
+
+        block_manager_block_free(block);
+        free(data);
+    }
+
+    printf("\n" YELLOW "Building position cache...\n" RESET);
+    ASSERT_EQ(block_manager_build_position_cache(bm), 0);
+    printf("Position cache built: %d blocks\n", bm->block_count);
+    ASSERT_EQ(bm->block_count, num_blocks);
+
+    /* test 1: sequential iteration with cache */
+    printf("\n" GREEN "Test 1: Sequential iteration with cache\n" RESET);
+    block_manager_cursor_t *cursor;
+    ASSERT_EQ(block_manager_cursor_init(&cursor, bm), 0);
+    ASSERT_EQ(block_manager_cursor_goto_first(cursor), 0);
+
+    int blocks_read = 0;
+    do
+    {
+        block_manager_block_t *read_block = block_manager_cursor_read(cursor);
+        ASSERT_TRUE(read_block != NULL);
+        ASSERT_EQ(read_block->size, sizes[blocks_read]);
+
+        /* verify data pattern */
+        uint8_t expected_byte = 'A' + (blocks_read % 26);
+        uint8_t *data_bytes = (uint8_t *)read_block->data;
+        ASSERT_EQ(data_bytes[0], expected_byte);
+        ASSERT_EQ(data_bytes[read_block->size - 1], expected_byte);
+
+        printf("  Read block %d: size=%lu, index=%d\n", blocks_read, read_block->size,
+               cursor->block_index);
+
+        block_manager_block_free(read_block);
+        blocks_read++;
+    } while (block_manager_cursor_next(cursor) == 0);
+
+    ASSERT_EQ(blocks_read, num_blocks);
+    printf("Successfully iterated %d blocks\n", blocks_read);
+    block_manager_cursor_free(cursor);
+
+    /* test 2: random access with cache (direct positioning) */
+    printf("\n" CYAN "Test 2: Random access with cache\n" RESET);
+    ASSERT_EQ(block_manager_cursor_init(&cursor, bm), 0);
+
+    /* test accessing blocks in random order */
+    int test_indices[] = {5, 0, 15, 10, 19, 3, 12};
+    for (size_t i = 0; i < sizeof(test_indices) / sizeof(test_indices[0]); i++)
+    {
+        int idx = test_indices[i];
+
+        /* manually set cursor using position cache (simulating what tidesdb does) */
+        cursor->block_index = idx;
+        cursor->current_pos = bm->block_positions[idx];
+        cursor->current_block_size = bm->block_sizes[idx];
+
+        block_manager_block_t *read_block = block_manager_cursor_read(cursor);
+        ASSERT_TRUE(read_block != NULL);
+        ASSERT_EQ(read_block->size, sizes[idx]);
+
+        uint8_t expected_byte = 'A' + (idx % 26);
+        uint8_t *data_bytes = (uint8_t *)read_block->data;
+        ASSERT_EQ(data_bytes[0], expected_byte);
+
+        printf("  Random access block %d: size=%lu, %s\n", idx, read_block->size,
+               (sizes[idx] > 32768) ? "OVERFLOW" : "regular");
+
+        block_manager_block_free(read_block);
+    }
+
+    printf("Successfully performed random access\n");
+    block_manager_cursor_free(cursor);
+
+    /* test 3: verify cache entries match actual file positions */
+    printf("\n" BOLDWHITE "Test 3: Verify cache accuracy\n" RESET);
+    for (int i = 0; i < num_blocks; i++)
+    {
+        printf("  Block %d: cached_pos=%lu, actual_offset=%ld, size=%lu\n", i,
+               bm->block_positions[i], offsets[i], bm->block_sizes[i]);
+        ASSERT_EQ(bm->block_positions[i], (uint64_t)offsets[i]);
+        ASSERT_EQ(bm->block_sizes[i], sizes[i]);
+    }
+
+    block_manager_close(bm);
+    remove("test_overflow_and_not_position_cache_iteration.db");
+    printf("\n" BOLDGREEN "All tests passed!\n" RESET);
+}
+
 void test_block_manager_empty_block()
 {
     block_manager_t *bm = NULL;
@@ -1467,6 +1587,7 @@ int main(void)
     RUN_TEST(test_block_manager_sync_modes, tests_passed);
     RUN_TEST(test_block_manager_overflow_blocks, tests_passed);
     RUN_TEST(test_block_manager_empty_block, tests_passed);
+    RUN_TEST(test_block_manager_overflowed_and_not_position_cache_iteration, tests_passed);
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);

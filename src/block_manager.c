@@ -153,6 +153,9 @@ int block_manager_build_position_cache(block_manager_t *bm)
 {
     if (!bm) return -1;
 
+    /* set flag to prevent concurrent cache access during rebuild */
+    atomic_store(&bm->cache_rebuilding, 1);
+
     /* free existing cache if present */
     if (bm->block_positions)
     {
@@ -289,6 +292,8 @@ int block_manager_build_position_cache(block_manager_t *bm)
     }
 
 done_scanning:
+    /* clear flag to allow cache access again */
+    atomic_store(&bm->cache_rebuilding, 0);
     return 0;
 }
 
@@ -314,6 +319,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     new_bm->block_positions = NULL;
     new_bm->block_sizes = NULL;
     new_bm->block_count = 0;
+    atomic_store(&new_bm->cache_rebuilding, 0);
 
     int file_exists = access(file_path, F_OK) == 0;
 
@@ -659,8 +665,9 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    /* if cache is available, use O(1) lookup */
-    if (cursor->bm->block_count > 0 && cursor->bm->block_positions)
+    /* if cache is available and not being rebuilt, use O(1) lookup */
+    if (cursor->bm->block_count > 0 && cursor->bm->block_positions &&
+        !atomic_load(&cursor->bm->cache_rebuilding))
     {
         int next_index = cursor->block_index + 1;
         if (next_index >= cursor->bm->block_count)
@@ -1056,8 +1063,9 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    /* if cache is available, use O(1) lookup */
-    if (cursor->bm->block_count > 0 && cursor->bm->block_positions)
+    /* if cache is available and not being rebuilt, use O(1) lookup */
+    if (cursor->bm->block_count > 0 && cursor->bm->block_positions &&
+        !atomic_load(&cursor->bm->cache_rebuilding))
     {
         if (cursor->block_index <= 0) return -1; /* already at or before first block */
 
@@ -1132,8 +1140,9 @@ int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    /* if cache available, position at first block */
-    if (cursor->bm->block_count > 0 && cursor->bm->block_positions)
+    /* if cache available and not being rebuilt, position at first block */
+    if (cursor->bm->block_count > 0 && cursor->bm->block_positions &&
+        !atomic_load(&cursor->bm->cache_rebuilding))
     {
         cursor->block_index = 0;
         cursor->current_pos = cursor->bm->block_positions[0];
@@ -1153,8 +1162,9 @@ int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    /* if cache is available, use O(1) jump to last block */
-    if (cursor->bm->block_count > 0 && cursor->bm->block_positions)
+    /* if cache is available and not being rebuilt, use O(1) jump to last block */
+    if (cursor->bm->block_count > 0 && cursor->bm->block_positions &&
+        !atomic_load(&cursor->bm->cache_rebuilding))
     {
         cursor->block_index = cursor->bm->block_count - 1;
         cursor->current_pos = cursor->bm->block_positions[cursor->block_index];
@@ -1272,8 +1282,9 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    /* if cache available, use O(1) check */
-    if (cursor->bm->block_count > 0 && cursor->bm->block_positions)
+    /* if cache available and not being rebuilt, use O(1) check */
+    if (cursor->bm->block_count > 0 && cursor->bm->block_positions &&
+        !atomic_load(&cursor->bm->cache_rebuilding))
     {
         return (cursor->block_index == cursor->bm->block_count - 1) ? 1 : 0;
     }

@@ -17,14 +17,10 @@
  * limitations under the License.
  */
 #include "tidesdb.h"
-
 #include "xxhash.h"
 
 /* global debug flag definition */
 int _tidesdb_debug_enabled = 0;
-
-/* block index prefix length (32 bytes for good discrimination) */
-#define TDB_BLOCK_INDEX_PREFIX_LEN 32
 
 /**
  * multi_cf_txn_entry_t
@@ -258,8 +254,7 @@ static void compact_block_index_free(tidesdb_block_index_t *index);
 static int compact_block_index_find_predecessor(const tidesdb_block_index_t *index,
                                                 const uint8_t *key, size_t key_len,
                                                 int64_t *block_num);
-static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *min_key,
-                                   size_t min_key_len, const uint8_t *max_key, size_t max_key_len,
+static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *key, size_t key_len,
                                    int64_t block_num);
 static tidesdb_block_index_t *compact_block_index_create(uint32_t initial_capacity,
                                                          tidesdb_comparator_fn comparator,
@@ -1649,36 +1644,14 @@ static int tidesdb_vlog_read_value_with_cursor(tidesdb_t *db, tidesdb_sstable_t 
     uint64_t block_num = vlog_offset / sst->config->vlog_block_size;
     uint64_t offset_in_block = vlog_offset % sst->config->vlog_block_size;
 
-    /* use position cache for O(1) random access if available */
-    if (cursor->bm->block_count > 0 && cursor->bm->block_positions &&
-        !atomic_load(&cursor->bm->cache_rebuilding))
+    if (block_manager_cursor_goto_first(cursor) != 0)
     {
-        /* position cache available and not being rebuilt - direct jump to block */
-        if (block_num >= (uint64_t)cursor->bm->block_count)
-        {
-            return TDB_ERR_IO; /* block number out of range */
-        }
-        cursor->block_index = (int)block_num;
-        cursor->current_pos = cursor->bm->block_positions[block_num];
-        cursor->current_block_size = cursor->bm->block_sizes[block_num];
+        return TDB_ERR_IO;
     }
-    else
-    {
-        /* no position cache - fall back to sequential seek */
-        if (block_manager_cursor_goto_first(cursor) != 0)
-        {
-            return TDB_ERR_IO;
-        }
 
-        /* goto_first without cache positions at header (block_index=-1)
-         * so we need to advance to first block (block 0) first */
-        for (uint64_t i = 0; i <= block_num && block_manager_cursor_has_next(cursor); i++)
-        {
-            if (block_manager_cursor_next(cursor) != 0)
-            {
-                return TDB_ERR_IO;
-            }
-        }
+    for (uint64_t i = 0; i < block_num && block_manager_cursor_has_next(cursor); i++)
+    {
+        block_manager_cursor_next(cursor);
     }
 
     block_manager_block_t *block = block_manager_cursor_read(cursor);
@@ -1746,6 +1719,50 @@ static int tidesdb_vlog_read_value_with_cursor(tidesdb_t *db, tidesdb_sstable_t 
 
     tidesdb_vlog_block_free(vlog_block);
     return TDB_ERR_NOT_FOUND;
+}
+
+/**
+ * tidesdb_sstable_contains_key_range
+ * check if a key falls within an sstable's range
+ * @param sst sstable to check
+ * @param key key to check
+ * @param key_size size of key
+ * @return 1 if key is within range, 0 otherwise
+ */
+static int tidesdb_sstable_contains_key_range(tidesdb_sstable_t *sst, const uint8_t *key,
+                                              size_t key_size)
+{
+    if (!sst->min_key || !sst->max_key) return 1; /* no range info, must check */
+
+    skip_list_comparator_fn comparator = NULL;
+    void *comparator_ctx = NULL;
+    if (tidesdb_resolve_comparator(sst->db, sst->config, &comparator, &comparator_ctx) != 0)
+    {
+        return 1; /* comparator not found, must check */
+    }
+
+    /* check if this is a reverse comparator (min > max in comparator order) */
+    int min_max_cmp = comparator(sst->min_key, sst->min_key_size, sst->max_key, sst->max_key_size,
+                                 comparator_ctx);
+    int is_reverse = (min_max_cmp > 0);
+
+    int cmp_min = comparator(key, key_size, sst->min_key, sst->min_key_size, comparator_ctx);
+    int cmp_max = comparator(key, key_size, sst->max_key, sst->max_key_size, comparator_ctx);
+
+    if (is_reverse)
+    {
+        /* for reverse comparators, min_key is actually the largest, max_key is smallest */
+        if (cmp_min > 0) return 0; /* key > min (which is largest), not in range */
+        if (cmp_max < 0) return 0; /* key < max (which is smallest), not in range */
+    }
+    else
+    {
+        /* min_key is smallest, max_key is largest */
+        if (cmp_min < 0) return 0; /* key < min, not in range */
+        if (cmp_max > 0) return 0; /* key > max, not in range */
+    }
+
+    return 1; /* key is within range */
 }
 
 /**
@@ -2119,12 +2136,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     uint64_t entry_count = 0;
     uint64_t max_seq = 0; /* track maximum sequence number */
 
-    /* track first and last key of current block for block index */
-    uint8_t *block_first_key = NULL;
-    size_t block_first_key_size = 0;
-    uint8_t *block_last_key = NULL;
-    size_t block_last_key_size = 0;
-
     if (skip_list_cursor_goto_first(cursor) == 0)
     {
         do
@@ -2216,18 +2227,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 
             if (tidesdb_klog_block_is_full(current_klog_block, sst->config->klog_block_size))
             {
-                /* add completed block to index before writing */
-                if (block_indexes && block_first_key && block_last_key)
-                {
-                    if (sst->config->index_sample_ratio <= 1 ||
-                        (klog_block_num % sst->config->index_sample_ratio == 0))
-                    {
-                        compact_block_index_add(block_indexes, block_first_key,
-                                                block_first_key_size, block_last_key,
-                                                block_last_key_size, klog_block_num);
-                    }
-                }
-
                 uint8_t *klog_data;
                 size_t klog_size;
                 if (tidesdb_klog_block_serialize(current_klog_block, &klog_data, &klog_size) == 0)
@@ -2258,8 +2257,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                             skip_list_cursor_free(cursor);
                             if (bloom) bloom_filter_free(bloom);
                             if (block_indexes) compact_block_index_free(block_indexes);
-                            free(block_first_key);
-                            free(block_last_key);
                             return TDB_ERR_CORRUPTION;
                         }
                     }
@@ -2277,12 +2274,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 
                 tidesdb_klog_block_free(current_klog_block);
                 current_klog_block = tidesdb_klog_block_create();
-
-                /* reset block tracking for new block */
-                free(block_first_key);
-                free(block_last_key);
-                block_first_key = NULL;
-                block_last_key = NULL;
             }
 
             /* check if this is the first entry in a new block */
@@ -2290,25 +2281,15 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 
             tidesdb_klog_block_add_entry(current_klog_block, kv, sst->db, sst->config);
 
-            /* track first key of block */
-            if (is_first_entry_in_block)
+            /* sample first key of each block (or every Nth block based on sample ratio) */
+            if (block_indexes && is_first_entry_in_block)
             {
-                free(block_first_key);
-                block_first_key = malloc(key_size);
-                if (block_first_key)
+                /* sample every Nth block, or all blocks if sample_ratio <= 1 */
+                if (sst->config->index_sample_ratio <= 1 ||
+                    (klog_block_num % sst->config->index_sample_ratio == 0))
                 {
-                    memcpy(block_first_key, key, key_size);
-                    block_first_key_size = key_size;
+                    compact_block_index_add(block_indexes, key, key_size, klog_block_num);
                 }
-            }
-
-            /* always update last key of block */
-            free(block_last_key);
-            block_last_key = malloc(key_size);
-            if (block_last_key)
-            {
-                memcpy(block_last_key, key, key_size);
-                block_last_key_size = key_size;
             }
 
             /* track maximum sequence number */
@@ -2352,17 +2333,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     /* write remaining blocks */
     if (current_klog_block->num_entries > 0)
     {
-        /* add final block to index */
-        if (block_indexes && block_first_key && block_last_key)
-        {
-            if (sst->config->index_sample_ratio <= 1 ||
-                (klog_block_num % sst->config->index_sample_ratio == 0))
-            {
-                compact_block_index_add(block_indexes, block_first_key, block_first_key_size,
-                                        block_last_key, block_last_key_size, klog_block_num);
-            }
-        }
-
         uint8_t *klog_data;
         size_t klog_size;
         if (tidesdb_klog_block_serialize(current_klog_block, &klog_data, &klog_size) == 0)
@@ -2386,8 +2356,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                     tidesdb_vlog_block_free(current_vlog_block);
                     if (bloom) bloom_filter_free(bloom);
                     if (block_indexes) compact_block_index_free(block_indexes);
-                    free(block_first_key);
-                    free(block_last_key);
                     return TDB_ERR_CORRUPTION;
                 }
             }
@@ -2402,10 +2370,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
             free(klog_data);
         }
     }
-
-    /* cleanup block tracking */
-    free(block_first_key);
-    free(block_last_key);
 
     if (current_vlog_block->num_values > 0)
     {
@@ -2985,10 +2949,10 @@ static void tidesdb_level_free(tidesdb_t *db, tidesdb_level_t *level)
 
     TDB_DEBUG_LOG("tidesdb_level_free: Freeing sstables array %p for level %d", (void *)ssts,
                   level->level_num);
+    free(ssts);
     TDB_DEBUG_LOG("tidesdb_level_free: Freed sstables array %p for level %d", (void *)ssts,
                   level->level_num);
 
-    free(ssts);
     int num_boundaries = atomic_load_explicit(&level->num_boundaries, memory_order_acquire);
     uint8_t **file_boundaries = atomic_load_explicit(&level->file_boundaries, memory_order_acquire);
 
@@ -4562,15 +4526,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         total_ssts += atomic_load_explicit(&levels[level]->num_sstables, memory_order_acquire);
     }
 
-    /* if no sstables to merge, return early */
-    if (total_ssts == 0)
-    {
-        TDB_DEBUG_LOG("Full preemptive merge: No SSTables to merge, skipping");
-        tidesdb_merge_heap_free(heap);
-        queue_free(sstables_to_delete);
-        return TDB_SUCCESS;
-    }
-
     /* allocate array to hold sstable pointers */
     tidesdb_sstable_t **ssts_array = malloc(total_ssts * sizeof(tidesdb_sstable_t *));
     if (!ssts_array)
@@ -4756,12 +4711,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     uint8_t *last_key = NULL;
     size_t last_key_size = 0;
 
-    /* track first and last key of current block for block index */
-    uint8_t *block_first_key = NULL;
-    size_t block_first_key_size = 0;
-    uint8_t *block_last_key = NULL;
-    size_t block_last_key_size = 0;
-
     /* merge using heap */
     while (!tidesdb_merge_heap_empty(heap))
     {
@@ -4852,19 +4801,9 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             }
         }
 
+        int is_first_entry_in_block = 0;
         if (tidesdb_klog_block_is_full(current_klog_block, cf->config.klog_block_size))
         {
-            /* add completed block to index before writing */
-            if (block_indexes && block_first_key && block_last_key)
-            {
-                if (cf->config.index_sample_ratio <= 1 ||
-                    (klog_block_num % cf->config.index_sample_ratio == 0))
-                {
-                    compact_block_index_add(block_indexes, block_first_key, block_first_key_size,
-                                            block_last_key, block_last_key_size, klog_block_num);
-                }
-            }
-
             uint8_t *klog_data;
             size_t klog_size;
             if (tidesdb_klog_block_serialize(current_klog_block, &klog_data, &klog_size) == 0)
@@ -4898,39 +4837,9 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
             tidesdb_klog_block_free(current_klog_block);
             current_klog_block = tidesdb_klog_block_create();
-
-            /* reset block tracking for new block */
-            free(block_first_key);
-            free(block_last_key);
-            block_first_key = NULL;
-            block_last_key = NULL;
+            is_first_entry_in_block = 1; /* next entry will be first in new block */
         }
-
-        /* check if this is the first entry in a new block */
-        int is_first_entry_in_block = (current_klog_block->num_entries == 0);
-
         tidesdb_klog_block_add_entry(current_klog_block, kv, cf->db, &cf->config);
-
-        /* track first key of block */
-        if (is_first_entry_in_block)
-        {
-            free(block_first_key);
-            block_first_key = malloc(kv->entry.key_size);
-            if (block_first_key)
-            {
-                memcpy(block_first_key, kv->key, kv->entry.key_size);
-                block_first_key_size = kv->entry.key_size;
-            }
-        }
-
-        /* always update last key of block */
-        free(block_last_key);
-        block_last_key = malloc(kv->entry.key_size);
-        if (block_last_key)
-        {
-            memcpy(block_last_key, kv->key, kv->entry.key_size);
-            block_last_key_size = kv->entry.key_size;
-        }
 
         if (kv->entry.seq > max_seq)
         {
@@ -4940,6 +4849,17 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         if (bloom)
         {
             bloom_filter_add(bloom, kv->key, kv->entry.key_size);
+        }
+
+        /* we when index enabled always sample first key of every Nth block (or all blocks if ratio
+         * <= 1) */
+        if (block_indexes && is_first_entry_in_block)
+        {
+            if (cf->config.index_sample_ratio <= 1 ||
+                (klog_block_num % cf->config.index_sample_ratio == 0))
+            {
+                compact_block_index_add(block_indexes, kv->key, kv->entry.key_size, klog_block_num);
+            }
         }
 
         if (!new_sst->min_key)
@@ -4972,17 +4892,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     if (current_klog_block->num_entries > 0)
     {
-        /* add final block to index */
-        if (block_indexes && block_first_key && block_last_key)
-        {
-            if (cf->config.index_sample_ratio <= 1 ||
-                (klog_block_num % cf->config.index_sample_ratio == 0))
-            {
-                compact_block_index_add(block_indexes, block_first_key, block_first_key_size,
-                                        block_last_key, block_last_key_size, klog_block_num);
-            }
-        }
-
         uint8_t *klog_data;
         size_t klog_size;
         if (tidesdb_klog_block_serialize(current_klog_block, &klog_data, &klog_size) == 0)
@@ -5010,10 +4919,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             free(klog_data);
         }
     }
-
-    /* cleanup block tracking */
-    free(block_first_key);
-    free(block_last_key);
 
     if (current_vlog_block->num_values > 0)
     {
@@ -5128,34 +5033,15 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     /* ensure all writes are visible before making sstable discoverable */
     atomic_thread_fence(memory_order_seq_cst);
 
-    /* save metadata for logging before potentially freeing sstable */
-    uint64_t sst_id = new_sst->id;
-    uint64_t num_entries = new_sst->num_entries;
-    uint64_t num_klog_blocks = new_sst->num_klog_blocks;
-    uint64_t num_vlog_blocks = new_sst->num_vlog_blocks;
+    /* reload levels to add new sst */
+    levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+    num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+    TDB_DEBUG_LOG("Full preemptive merge: Adding merged SSTable %" PRIu64
+                  " to level %d (array index %d)",
+                  new_sst->id, levels[target_level + 1]->level_num, target_level + 1);
+    tidesdb_level_add_sstable(levels[target_level + 1], new_sst);
 
-    /* only add sstable if it has entries - empty sstables cause corruption */
-    if (num_entries > 0)
-    {
-        /* reload levels to add new sst */
-        levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
-        num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
-        TDB_DEBUG_LOG("Full preemptive merge: Adding merged SSTable %" PRIu64
-                      " to level %d (array index %d)",
-                      new_sst->id, levels[target_level + 1]->level_num, target_level + 1);
-        tidesdb_level_add_sstable(levels[target_level + 1], new_sst);
-
-        tidesdb_sstable_unref(cf->db, new_sst);
-    }
-    else
-    {
-        TDB_DEBUG_LOG("Full preemptive merge: Skipping empty SSTable %" PRIu64 " (0 entries)",
-                      sst_id);
-        /* delete the empty sstable files */
-        remove(new_sst->klog_path);
-        remove(new_sst->vlog_path);
-        tidesdb_sstable_unref(cf->db, new_sst);
-    }
+    tidesdb_sstable_unref(cf->db, new_sst);
 
     /* remove old sstables from levels */
     while (!queue_is_empty(sstables_to_delete))
@@ -5189,7 +5075,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     TDB_DEBUG_LOG("Full preemptive merge complete: CF '%s', created SSTable %" PRIu64
                   " with %" PRIu64 " entries, %" PRIu64 " klog blocks, %" PRIu64 " vlog blocks",
-                  cf->name, sst_id, num_entries, num_klog_blocks, num_vlog_blocks);
+                  cf->name, new_sst->id, new_sst->num_entries, new_sst->num_klog_blocks,
+                  new_sst->num_vlog_blocks);
 
     return TDB_SUCCESS;
 }
@@ -5246,23 +5133,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
     tidesdb_level_update_boundaries(target, next_level);
 
-    /* debug: log SSTables in next_level to understand boundary calculation */
-    TDB_DEBUG_LOG("Dividing merge: next_level (L%d) has %d SSTables", next_level->level_num,
-                  atomic_load_explicit(&next_level->num_sstables, memory_order_acquire));
-    tidesdb_sstable_t **next_level_ssts =
-        atomic_load_explicit(&next_level->sstables, memory_order_acquire);
-    int next_level_num_ssts = atomic_load_explicit(&next_level->num_sstables, memory_order_acquire);
-    for (int i = 0; i < next_level_num_ssts; i++)
-    {
-        tidesdb_sstable_t *sst = next_level_ssts[i];
-        if (sst)
-        {
-            TDB_DEBUG_LOG("Dividing merge: next_level SSTable %" PRIu64 " min=%s max=%s", sst->id,
-                          sst->min_key ? (char *)sst->min_key : "NULL",
-                          sst->max_key ? (char *)sst->max_key : "NULL");
-        }
-    }
-
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
     tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
@@ -5273,23 +5143,17 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
     /* collect all sstables to delete (take references) */
-    TDB_DEBUG_LOG("Dividing merge: collecting SSTables from levels 0-%d", target_level);
     for (int level = 0; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = levels[level];
         int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
         tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
 
-        TDB_DEBUG_LOG("Dividing merge: L%d has %d SSTables", level, num_ssts);
         for (int i = 0; i < num_ssts; i++)
         {
             tidesdb_sstable_t *sst = sstables[i];
             if (!sst) continue;
 
-            TDB_DEBUG_LOG("Dividing merge: collecting SSTable %" PRIu64
-                          " from L%d (min=%s, max=%s)",
-                          sst->id, level, sst->min_key ? (char *)sst->min_key : "NULL",
-                          sst->max_key ? (char *)sst->max_key : "NULL");
             tidesdb_sstable_ref(sst);
             queue_enqueue(sstables_to_delete, sst);
         }
@@ -5298,12 +5162,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     /* get partition boundaries from target level */
     target = levels[target_level];
     int num_boundaries = atomic_load_explicit(&target->num_boundaries, memory_order_acquire);
-    uint8_t **file_boundaries =
-        atomic_load_explicit(&target->file_boundaries, memory_order_acquire);
-    size_t *boundary_sizes = atomic_load_explicit(&target->boundary_sizes, memory_order_acquire);
-
-    /* get number of sstables being merged */
-    size_t num_sstables_to_merge = queue_size(sstables_to_delete);
 
     /* if no boundaries, do a simple full merge */
     if (num_boundaries == 0)
@@ -5320,82 +5178,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         return result;
     }
 
-    /* check if any sstable being merged overlaps with boundaries
-     * if no overlap, fall back to full merge to avoid empty partitions */
-    int has_overlap = 0;
-    for (size_t i = 0; i < num_sstables_to_merge; i++)
-    {
-        tidesdb_sstable_t *sst = queue_peek_at(sstables_to_delete, i);
-        if (!sst) continue;
-
-        /* check if sst overlaps with any boundary range */
-        for (int b = 0; b < num_boundaries; b++)
-        {
-            uint8_t *boundary_start = (b > 0) ? file_boundaries[b - 1] : NULL;
-            size_t boundary_start_size = (b > 0) ? boundary_sizes[b - 1] : 0;
-            uint8_t *boundary_end = file_boundaries[b];
-            size_t boundary_end_size = boundary_sizes[b];
-
-            /* check if sst overlaps with range [boundary_start, boundary_end) */
-            int overlaps = 1;
-
-            if (boundary_start && comparator_fn(sst->max_key, sst->max_key_size, boundary_start,
-                                                boundary_start_size, comparator_ctx) < 0)
-            {
-                overlaps = 0; /* sst is entirely before this range */
-            }
-
-            if (overlaps && boundary_end &&
-                comparator_fn(sst->min_key, sst->min_key_size, boundary_end, boundary_end_size,
-                              comparator_ctx) >= 0)
-            {
-                overlaps = 0; /* sst is entirely after this range */
-            }
-
-            if (overlaps)
-            {
-                has_overlap = 1;
-                break;
-            }
-        }
-
-        /* also check last partition [last_boundary, NULL) */
-        if (!has_overlap && num_boundaries > 0)
-        {
-            uint8_t *last_boundary = file_boundaries[num_boundaries - 1];
-            size_t last_boundary_size = boundary_sizes[num_boundaries - 1];
-
-            if (comparator_fn(sst->max_key, sst->max_key_size, last_boundary, last_boundary_size,
-                              comparator_ctx) >= 0)
-            {
-                has_overlap = 1;
-            }
-        }
-
-        if (has_overlap) break;
-    }
-
-    /* if no overlap with existing boundaries, use full merge instead of dividing merge
-     * this prevents creating empty partitions and losing keys */
-    if (!has_overlap)
-    {
-        TDB_DEBUG_LOG(
-            "Dividing merge: No overlap with existing boundaries, falling back to full "
-            "preemptive merge");
-        int result = tidesdb_full_preemptive_merge(cf, 0, target_level);
-
-        while (!queue_is_empty(sstables_to_delete))
-        {
-            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
-            if (sst) tidesdb_sstable_unref(cf->db, sst);
-        }
-        queue_free(sstables_to_delete);
-
-        return result;
-    }
-
     /* calculate total estimated entries from all ssts being merged */
     uint64_t total_estimated_entries = 0;
+    size_t num_sstables_to_merge = queue_size(sstables_to_delete);
     for (size_t i = 0; i < num_sstables_to_merge; i++)
     {
         tidesdb_sstable_t *sst = queue_peek_at(sstables_to_delete, i);
@@ -5414,6 +5199,24 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
     for (int partition = 0; partition < num_partitions; partition++)
     {
+        /* determine key range for this partition */
+        uint8_t *start_key = NULL;
+        size_t start_key_size = 0;
+        uint8_t *end_key = NULL;
+        size_t end_key_size = 0;
+
+        if (partition > 0)
+        {
+            start_key = target->file_boundaries[partition - 1];
+            start_key_size = target->boundary_sizes[partition - 1];
+        }
+
+        if (partition < num_boundaries)
+        {
+            end_key = target->file_boundaries[partition];
+            end_key_size = target->boundary_sizes[partition];
+        }
+
         /* create separate heap for this partition to avoid data loss */
         tidesdb_merge_heap_t *partition_heap =
             tidesdb_merge_heap_create(comparator_fn, comparator_ctx);
@@ -5540,12 +5343,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         bloom_filter_t *bloom = NULL;
         tidesdb_block_index_t *block_indexes = NULL;
 
-        /* track first and last key of current block for block index */
-        uint8_t *block_first_key = NULL;
-        size_t block_first_key_size = 0;
-        uint8_t *block_last_key = NULL;
-        size_t block_last_key_size = 0;
-
         if (cf->config.enable_bloom_filter)
         {
             if (bloom_filter_new(&bloom, cf->config.bloom_fpr, partition_estimated_entries) == 0)
@@ -5590,6 +5387,23 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             {
                 memcpy(last_key, kv->key, kv->entry.key_size);
                 last_key_size = kv->entry.key_size;
+            }
+
+            /* filter keys by partition range to prevent data loss */
+            if (range_start && comparator_fn(kv->key, kv->entry.key_size, range_start,
+                                             range_start_size, comparator_ctx) < 0)
+            {
+                /* key is before this partition's range, skip it */
+                tidesdb_kv_pair_free(kv);
+                continue;
+            }
+
+            if (range_end && comparator_fn(kv->key, kv->entry.key_size, range_end, range_end_size,
+                                           comparator_ctx) >= 0)
+            {
+                /* key is at or after partition end, skip it */
+                tidesdb_kv_pair_free(kv);
+                continue;
             }
 
             /* skip tombstones (deleted keys) */
@@ -5665,20 +5479,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                     offset_in_block; /* will be adjusted with file offset later */
             }
 
+            int is_first_entry_in_block = 0;
             if (tidesdb_klog_block_is_full(klog_block, cf->config.klog_block_size))
             {
-                /* add completed block to index before writing */
-                if (block_indexes && block_first_key && block_last_key)
-                {
-                    if (cf->config.index_sample_ratio <= 1 ||
-                        (klog_block_num % cf->config.index_sample_ratio == 0))
-                    {
-                        compact_block_index_add(block_indexes, block_first_key,
-                                                block_first_key_size, block_last_key,
-                                                block_last_key_size, klog_block_num);
-                    }
-                }
-
                 /* serialize and write klog block */
                 uint8_t *klog_data;
                 size_t klog_size;
@@ -5697,38 +5500,19 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
                 tidesdb_klog_block_free(klog_block);
                 klog_block = tidesdb_klog_block_create();
-
-                /* reset block tracking for new block */
-                free(block_first_key);
-                free(block_last_key);
-                block_first_key = NULL;
-                block_last_key = NULL;
+                is_first_entry_in_block = 1; /* next entry will be first in new block */
             }
-
-            /* check if this is the first entry in a new block */
-            int is_first_entry_in_block = (klog_block->num_entries == 0);
-
             tidesdb_klog_block_add_entry(klog_block, kv, cf->db, &cf->config);
 
-            /* track first key of block */
-            if (is_first_entry_in_block)
+            /* we sample first key of every Nth block (or all blocks if ratio <= 1) */
+            if (block_indexes && is_first_entry_in_block)
             {
-                free(block_first_key);
-                block_first_key = malloc(kv->entry.key_size);
-                if (block_first_key)
+                if (cf->config.index_sample_ratio <= 1 ||
+                    (klog_block_num % cf->config.index_sample_ratio == 0))
                 {
-                    memcpy(block_first_key, kv->key, kv->entry.key_size);
-                    block_first_key_size = kv->entry.key_size;
+                    compact_block_index_add(block_indexes, kv->key, kv->entry.key_size,
+                                            klog_block_num);
                 }
-            }
-
-            /* always update last key of block */
-            free(block_last_key);
-            block_last_key = malloc(kv->entry.key_size);
-            if (block_last_key)
-            {
-                memcpy(block_last_key, kv->key, kv->entry.key_size);
-                block_last_key_size = kv->entry.key_size;
             }
 
             /* track maximum sequence number */
@@ -5745,7 +5529,10 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         /* free partition heap */
         tidesdb_merge_heap_free(partition_heap);
 
-        /* NOTE: last_key is transferred to new_sst->max_key below, so don't free it here */
+        /* free last_key used for duplicate detection */
+        free(last_key);
+        last_key = NULL;
+        last_key_size = 0;
 
         /* write remaining vlog block if it has data */
         if (vlog_block->num_values > 0)
@@ -5770,17 +5557,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         /* write remaining klog block if it has data */
         if (klog_block->num_entries > 0)
         {
-            /* add final block to index */
-            if (block_indexes && block_first_key && block_last_key)
-            {
-                if (cf->config.index_sample_ratio <= 1 ||
-                    (klog_block_num % cf->config.index_sample_ratio == 0))
-                {
-                    compact_block_index_add(block_indexes, block_first_key, block_first_key_size,
-                                            block_last_key, block_last_key_size, klog_block_num);
-                }
-            }
-
             uint8_t *klog_data;
             size_t klog_size;
             if (tidesdb_klog_block_serialize(klog_block, &klog_data, &klog_size) == 0)
@@ -5795,10 +5571,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 free(klog_data);
             }
         }
-
-        /* cleanup block tracking */
-        free(block_first_key);
-        free(block_last_key);
 
         tidesdb_klog_block_free(klog_block);
 
@@ -5896,12 +5668,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         }
         else
         {
-            TDB_DEBUG_LOG("Dividing merge partition %d: Skipping empty SSTable %" PRIu64
-                          " (0 entries)",
-                          partition, new_sst->id);
-            /* delete the empty sstable files */
-            remove(new_sst->klog_path);
-            remove(new_sst->vlog_path);
             tidesdb_sstable_unref(cf->db, new_sst);
         }
     }
@@ -6173,12 +5939,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             uint8_t *last_key = NULL;
             size_t last_key_size = 0;
 
-            /* track first and last key of current block for block index */
-            uint8_t *block_first_key = NULL;
-            size_t block_first_key_size = 0;
-            uint8_t *block_last_key = NULL;
-            size_t block_last_key_size = 0;
-
             while (!tidesdb_merge_heap_empty(heap))
             {
                 tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop(heap);
@@ -6292,25 +6052,15 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 /* add to klog block */
                 tidesdb_klog_block_add_entry(klog_block, kv, cf->db, &cf->config);
 
-                /* track first key of block */
-                if (is_first_entry_in_block)
+                /* we sample first key of every Nth block (or all blocks if ratio <= 1) */
+                if (block_indexes && is_first_entry_in_block)
                 {
-                    free(block_first_key);
-                    block_first_key = malloc(kv->entry.key_size);
-                    if (block_first_key)
+                    if (cf->config.index_sample_ratio <= 1 ||
+                        (klog_block_num % cf->config.index_sample_ratio == 0))
                     {
-                        memcpy(block_first_key, kv->key, kv->entry.key_size);
-                        block_first_key_size = kv->entry.key_size;
+                        compact_block_index_add(block_indexes, kv->key, kv->entry.key_size,
+                                                klog_block_num);
                     }
-                }
-
-                /* always update last key of block */
-                free(block_last_key);
-                block_last_key = malloc(kv->entry.key_size);
-                if (block_last_key)
-                {
-                    memcpy(block_last_key, kv->key, kv->entry.key_size);
-                    block_last_key_size = kv->entry.key_size;
                 }
 
                 /* track maximum sequence number */
@@ -6324,18 +6074,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 /* flush klog block if full */
                 if (tidesdb_klog_block_is_full(klog_block, cf->config.klog_block_size))
                 {
-                    /* add completed block to index before writing */
-                    if (block_indexes && block_first_key && block_last_key)
-                    {
-                        if (cf->config.index_sample_ratio <= 1 ||
-                            (klog_block_num % cf->config.index_sample_ratio == 0))
-                        {
-                            compact_block_index_add(block_indexes, block_first_key,
-                                                    block_first_key_size, block_last_key,
-                                                    block_last_key_size, klog_block_num);
-                        }
-                    }
-
                     uint8_t *klog_data;
                     size_t klog_size;
                     if (tidesdb_klog_block_serialize(klog_block, &klog_data, &klog_size) == 0)
@@ -6370,12 +6108,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                     }
                     tidesdb_klog_block_free(klog_block);
                     klog_block = tidesdb_klog_block_create();
-
-                    /* reset block tracking for new block */
-                    free(block_first_key);
-                    free(block_last_key);
-                    block_first_key = NULL;
-                    block_last_key = NULL;
                 }
 
                 tidesdb_kv_pair_free(kv);
@@ -6420,18 +6152,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             /* write remaining block */
             if (klog_block->num_entries > 0)
             {
-                /* add final block to index */
-                if (block_indexes && block_first_key && block_last_key)
-                {
-                    if (cf->config.index_sample_ratio <= 1 ||
-                        (klog_block_num % cf->config.index_sample_ratio == 0))
-                    {
-                        compact_block_index_add(block_indexes, block_first_key,
-                                                block_first_key_size, block_last_key,
-                                                block_last_key_size, klog_block_num);
-                    }
-                }
-
                 uint8_t *klog_data;
                 size_t klog_size;
                 if (tidesdb_klog_block_serialize(klog_block, &klog_data, &klog_size) == 0)
@@ -6465,10 +6185,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             }
 
             tidesdb_klog_block_free(klog_block);
-
-            /* cleanup block tracking */
-            free(block_first_key);
-            free(block_last_key);
 
             new_sst->num_klog_blocks = klog_block_num;
             new_sst->num_vlog_blocks = vlog_block_num;
@@ -6576,9 +6292,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 TDB_DEBUG_LOG(
                     "Partitioned merge partition %d: No entries, skipping SSTable creation",
                     partition);
-                /* delete the empty sstable files */
-                remove(new_sst->klog_path);
-                remove(new_sst->vlog_path);
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
         }
@@ -6661,7 +6374,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     {
         size_t cumulative_size = 0;
 
-        for (int i = 0; i <= q && i < num_levels; i++)
+        for (int i = 0; i <= q; i++)
         {
             cumulative_size += atomic_load_explicit(&levels[i]->current_size, memory_order_relaxed);
         }
@@ -6708,7 +6421,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     int z = -1;
     int need_partitioned_merge = 0;
 
-    if (X > 0 && X < num_levels)
+    if (X < num_levels)
     {
         tidesdb_level_t *level_x = levels[X - 1];
 
@@ -6724,7 +6437,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
             for (int candidate_z = X + 1; candidate_z <= num_levels; candidate_z++)
             {
                 size_t cumulative = 0;
-                for (int i = X; i <= candidate_z && (i - 1) < num_levels; i++)
+                for (int i = X; i <= candidate_z; i++)
                 {
                     cumulative +=
                         atomic_load_explicit(&levels[i - 1]->current_size, memory_order_relaxed);
@@ -6749,12 +6462,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     }
 
     /* get largest level info for later checks */
-    if (num_levels == 0)
-    {
-        atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
-        return TDB_SUCCESS;
-    }
-
     tidesdb_level_t *largest = levels[num_levels - 1];
     size_t largest_size = atomic_load_explicit(&largest->current_size, memory_order_relaxed);
     size_t largest_capacity = atomic_load_explicit(&largest->capacity, memory_order_relaxed);
@@ -7667,19 +7374,16 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_MEMORY;
     }
 
-    if (config->block_cache_size > 0)
+    (*db)->block_cache = lru_cache_new(config->block_cache_size);
+    if (!(*db)->block_cache)
     {
-        (*db)->block_cache = lru_cache_new(config->block_cache_size);
-        if (!(*db)->block_cache)
-        {
-            lru_cache_free((*db)->sstable_cache);
-            queue_free((*db)->flush_queue);
-            queue_free((*db)->compaction_queue);
-            free((*db)->column_families);
-            free((*db)->db_path);
-            free(*db);
-            return TDB_ERR_MEMORY;
-        }
+        lru_cache_free((*db)->sstable_cache);
+        queue_free((*db)->flush_queue);
+        queue_free((*db)->compaction_queue);
+        free((*db)->column_families);
+        free((*db)->db_path);
+        free(*db);
+        return TDB_ERR_MEMORY;
     }
 
     tidesdb_recover_database(*db);
@@ -10405,26 +10109,11 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         if (source->type == MERGE_SOURCE_MEMTABLE)
         {
             skip_list_cursor_t *cursor = source->source.memtable.cursor;
-            /* seek positions cursor at node BEFORE target, need to advance once */
+            /* seek positions cursor at first entry >= key */
             if (skip_list_cursor_seek(cursor, (uint8_t *)key, key_size) == 0)
             {
-                /* advance to the actual target node */
-                if (skip_list_cursor_next(cursor) == 0)
-                {
-                    /* read current entry directly without advance overhead */
-                    uint8_t *k, *v;
-                    size_t k_size, v_size;
-                    time_t ttl;
-                    uint8_t deleted;
-                    uint64_t seq;
-
-                    if (skip_list_cursor_get_with_seq(cursor, &k, &k_size, &v, &v_size, &ttl,
-                                                      &deleted, &seq) == 0)
-                    {
-                        source->current_kv =
-                            tidesdb_kv_pair_create(k, k_size, v, v_size, ttl, seq, deleted);
-                    }
-                }
+                /* cursor is positioned, now load it into source->current_kv */
+                tidesdb_merge_source_advance(source);
             }
         }
         else /* MERGE_SOURCE_SSTABLE */
@@ -10527,28 +10216,11 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
 
                 source->source.sstable.current_block = kb;
 
-                /* check if target could be in this block - check both min and max */
-                int cmp_first = comparator_fn(kb->keys[0], kb->entries[0].key_size, key, key_size,
-                                              comparator_ctx);
+                /* check if target could be in this block */
                 int cmp_last = comparator_fn(kb->keys[kb->num_entries - 1],
                                              kb->entries[kb->num_entries - 1].key_size, key,
                                              key_size, comparator_ctx);
 
-                /* if first key > target, we've gone past it - stop searching */
-                if (cmp_first > 0)
-                {
-                    tidesdb_klog_block_free(kb);
-                    source->source.sstable.current_block = NULL;
-                    if (decompressed)
-                    {
-                        free(decompressed);
-                        source->source.sstable.decompressed_data = NULL;
-                    }
-                    block_manager_block_release(bmblock);
-                    break; /* target not in SSTable */
-                }
-
-                /* target is in range [first, last] if first <= target <= last */
                 if (cmp_last >= 0)
                 {
                     /* target might be in this block, binary search */
@@ -12258,27 +11930,37 @@ static tidesdb_block_index_t *compact_block_index_create(uint32_t initial_capaci
                                                          tidesdb_comparator_fn comparator,
                                                          void *comparator_ctx)
 {
-    if (initial_capacity == 0) initial_capacity = 16;
+    if (initial_capacity == 0) initial_capacity = 1024;
 
     tidesdb_block_index_t *index = calloc(1, sizeof(tidesdb_block_index_t));
     if (!index) return NULL;
 
-    index->min_key_prefixes = malloc(initial_capacity * TDB_BLOCK_INDEX_PREFIX_LEN);
-    index->max_key_prefixes = malloc(initial_capacity * TDB_BLOCK_INDEX_PREFIX_LEN);
+    index->key_offsets = malloc(initial_capacity * sizeof(uint32_t));
+    index->key_lens = malloc(initial_capacity * sizeof(uint16_t));
+    index->prefix_lens = malloc(initial_capacity * sizeof(uint8_t));
     index->block_nums = malloc(initial_capacity * sizeof(int64_t));
+    index->key_data = malloc(initial_capacity * 32);
 
-    if (!index->min_key_prefixes || !index->max_key_prefixes || !index->block_nums)
+    index->comparator = comparator;
+    index->comparator_ctx = comparator_ctx;
+
+    if (!index->key_offsets || !index->key_lens || !index->prefix_lens || !index->block_nums ||
+        !index->key_data)
     {
-        compact_block_index_free(index);
+        free(index->key_offsets);
+        free(index->key_lens);
+        free(index->prefix_lens);
+        free(index->block_nums);
+        free(index->key_data);
+        free(index);
         return NULL;
     }
 
     index->capacity = initial_capacity;
     index->count = 0;
-    index->prefix_len = TDB_BLOCK_INDEX_PREFIX_LEN;
-    index->comparator = comparator;
-    index->comparator_ctx = comparator_ctx;
-
+    index->total_key_bytes = 0;
+    index->last_full_key = NULL;
+    index->last_full_key_len = 0;
     return index;
 }
 
@@ -12359,22 +12041,49 @@ static uint8_t *compact_block_index_serialize(const tidesdb_block_index_t *index
 {
     if (!index || !out_size) return NULL;
 
-    /* header: count (4) + prefix_len (1) + block_nums (varint) + min/max prefixes */
-    size_t max_size = sizeof(uint32_t) + sizeof(uint8_t) +
-                      index->count * 10 +                   /* block_nums (varint) */
-                      index->count * index->prefix_len * 2; /* min + max prefixes */
+    size_t max_size = sizeof(uint32_t) + sizeof(size_t) + sizeof(uint16_t) + /* header */
+                      index->count * 10 * 3 +          /* varint arrays (worst case) */
+                      index->count * sizeof(uint8_t) + /* prefix_lens (not delta encoded) */
+                      index->total_key_bytes;
 
     uint8_t *data = malloc(max_size);
     if (!data) return NULL;
 
     uint8_t *ptr = data;
 
-    /* header: count + prefix_len */
+    /* header is count + total_key_bytes + max_key_len */
     encode_uint32_le_compat(ptr, index->count);
     ptr += sizeof(uint32_t);
-    *ptr++ = index->prefix_len;
+    encode_uint64_le_compat(ptr, index->total_key_bytes);
+    ptr += sizeof(size_t);
+    encode_uint16_le_compat(ptr, index->max_key_len);
+    ptr += sizeof(uint16_t);
 
-    /* delta encode + varint compress block_nums */
+    /* delta encode + varint compress key_offsets */
+    if (index->count > 0)
+    {
+        /* first offset is stored as-is */
+        ptr += encode_varint(index->key_offsets[0], ptr);
+
+        /* remaining offsets stored as deltas (which are just key lengths) */
+        for (uint32_t i = 1; i < index->count; i++)
+        {
+            uint32_t delta = index->key_offsets[i] - index->key_offsets[i - 1];
+            ptr += encode_varint(delta, ptr);
+        }
+    }
+
+    /* varint compress key_lens (no delta encoding needed, already small) */
+    for (uint32_t i = 0; i < index->count; i++)
+    {
+        ptr += encode_varint(index->key_lens[i], ptr);
+    }
+
+    /* prefix_lens are already 1 byte each, copy directly */
+    memcpy(ptr, index->prefix_lens, index->count * sizeof(uint8_t));
+    ptr += index->count * sizeof(uint8_t);
+
+    /* delta encode + varint compress block_nums (signed, use zigzag) */
     if (index->count > 0)
     {
         /* first block number stored as-is */
@@ -12388,14 +12097,9 @@ static uint8_t *compact_block_index_serialize(const tidesdb_block_index_t *index
         }
     }
 
-    /* copy min_key_prefixes */
-    size_t prefix_bytes = index->count * index->prefix_len;
-    memcpy(ptr, index->min_key_prefixes, prefix_bytes);
-    ptr += prefix_bytes;
-
-    /* copy max_key_prefixes */
-    memcpy(ptr, index->max_key_prefixes, prefix_bytes);
-    ptr += prefix_bytes;
+    /* we copy key_data as-is (already prefix-compressed) */
+    memcpy(ptr, index->key_data, index->total_key_bytes);
+    ptr += index->total_key_bytes;
 
     /* calc actual size and shrink buffer */
     size_t actual_size = ptr - data;
@@ -12413,33 +12117,68 @@ static uint8_t *compact_block_index_serialize(const tidesdb_block_index_t *index
 
 static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *data, size_t data_size)
 {
-    if (!data || data_size < sizeof(uint32_t) + sizeof(uint8_t)) return NULL;
+    if (!data || data_size < sizeof(uint32_t) + sizeof(size_t) + sizeof(uint16_t)) return NULL;
 
     const uint8_t *ptr = data;
     const uint8_t *end = data + data_size;
 
-    /* read header: count + prefix_len */
+    /* to read header its count + total_key_bytes + max_key_len */
     uint32_t count = decode_uint32_le_compat(ptr);
     ptr += sizeof(uint32_t);
-    uint8_t prefix_len = *ptr++;
-
-    if (prefix_len != TDB_BLOCK_INDEX_PREFIX_LEN)
-    {
-        return NULL; /* incompatible format */
-    }
+    size_t total_key_bytes = decode_uint64_le_compat(ptr);
+    ptr += sizeof(size_t);
+    uint16_t max_key_len = decode_uint16_le_compat(ptr);
+    ptr += sizeof(uint16_t);
 
     tidesdb_block_index_t *index = calloc(1, sizeof(tidesdb_block_index_t));
     if (!index) return NULL;
 
-    index->min_key_prefixes = malloc(count * prefix_len);
-    index->max_key_prefixes = malloc(count * prefix_len);
+    index->key_offsets = malloc(count * sizeof(uint32_t));
+    index->key_lens = malloc(count * sizeof(uint16_t));
+    index->prefix_lens = malloc(count * sizeof(uint8_t));
     index->block_nums = malloc(count * sizeof(int64_t));
+    index->key_data = malloc(total_key_bytes);
 
-    if (!index->min_key_prefixes || !index->max_key_prefixes || !index->block_nums)
+    if (!index->key_offsets || !index->key_lens || !index->prefix_lens || !index->block_nums ||
+        !index->key_data)
     {
         compact_block_index_free(index);
         return NULL;
     }
+
+    /** we decode delta-encoded varint key_offsets */
+    if (count > 0)
+    {
+        size_t bytes_read;
+
+        /* first offset */
+        if (ptr >= end) goto error;
+        index->key_offsets[0] = (uint32_t)decode_varint(ptr, &bytes_read);
+        ptr += bytes_read;
+
+        /* remaining offsets (deltas) */
+        for (uint32_t i = 1; i < count; i++)
+        {
+            if (ptr >= end) goto error;
+            uint32_t delta = (uint32_t)decode_varint(ptr, &bytes_read);
+            ptr += bytes_read;
+            index->key_offsets[i] = index->key_offsets[i - 1] + delta;
+        }
+    }
+
+    /* we decode varint key_lens */
+    for (uint32_t i = 0; i < count; i++)
+    {
+        if (ptr >= end) goto error;
+        size_t bytes_read;
+        index->key_lens[i] = (uint16_t)decode_varint(ptr, &bytes_read);
+        ptr += bytes_read;
+    }
+
+    /* copy prefix_lens directly */
+    if (ptr + count > end) goto error;
+    memcpy(index->prefix_lens, ptr, count * sizeof(uint8_t));
+    ptr += count * sizeof(uint8_t);
 
     /* decode delta-encoded varint block_nums */
     if (count > 0)
@@ -12461,20 +12200,13 @@ static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *dat
         }
     }
 
-    /* copy min_key_prefixes */
-    size_t prefix_bytes = count * prefix_len;
-    if (ptr + prefix_bytes > end) goto error;
-    memcpy(index->min_key_prefixes, ptr, prefix_bytes);
-    ptr += prefix_bytes;
-
-    /* copy max_key_prefixes */
-    if (ptr + prefix_bytes > end) goto error;
-    memcpy(index->max_key_prefixes, ptr, prefix_bytes);
-    ptr += prefix_bytes;
+    if (ptr + total_key_bytes > end) goto error;
+    memcpy(index->key_data, ptr, total_key_bytes);
 
     index->count = count;
     index->capacity = count;
-    index->prefix_len = prefix_len;
+    index->total_key_bytes = total_key_bytes;
+    index->max_key_len = max_key_len;
     index->comparator = NULL; /* set by caller */
     index->comparator_ctx = NULL;
 
@@ -12485,53 +12217,76 @@ error:
     return NULL;
 }
 
-static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *min_key,
-                                   size_t min_key_len, const uint8_t *max_key, size_t max_key_len,
+static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *key, size_t key_len,
                                    int64_t block_num)
 {
-    if (!index || !min_key || !max_key || min_key_len == 0 || max_key_len == 0) return -1;
+    if (!index || !key || key_len == 0 || key_len > UINT16_MAX) return -1;
 
-    /* resize arrays if needed */
+    /* resize metadata arrays if needed */
     if (index->count >= index->capacity)
     {
         uint32_t new_cap = index->capacity * 2;
-        uint8_t *new_min_prefixes = realloc(index->min_key_prefixes, new_cap * index->prefix_len);
-        uint8_t *new_max_prefixes = realloc(index->max_key_prefixes, new_cap * index->prefix_len);
+        uint32_t *new_offsets = realloc(index->key_offsets, new_cap * sizeof(uint32_t));
+        uint16_t *new_lens = realloc(index->key_lens, new_cap * sizeof(uint16_t));
+        uint8_t *new_prefix_lens = realloc(index->prefix_lens, new_cap * sizeof(uint8_t));
         int64_t *new_block_nums = realloc(index->block_nums, new_cap * sizeof(int64_t));
 
-        if (!new_min_prefixes || !new_max_prefixes || !new_block_nums)
+        if (!new_offsets || !new_lens || !new_prefix_lens || !new_block_nums)
         {
             return -1;
         }
 
-        index->min_key_prefixes = new_min_prefixes;
-        index->max_key_prefixes = new_max_prefixes;
+        index->key_offsets = new_offsets;
+        index->key_lens = new_lens;
+        index->prefix_lens = new_prefix_lens;
         index->block_nums = new_block_nums;
         index->capacity = new_cap;
     }
 
-    /* store fixed-length prefixes (zero-padded if key is shorter) */
-    uint8_t *min_dest = index->min_key_prefixes + (index->count * index->prefix_len);
-    uint8_t *max_dest = index->max_key_prefixes + (index->count * index->prefix_len);
+    uint8_t prefix_len = 0; /* always 0 = store full keys */
 
-    /* copy min key prefix (zero-pad if shorter) */
-    size_t min_copy_len = (min_key_len < index->prefix_len) ? min_key_len : index->prefix_len;
-    memcpy(min_dest, min_key, min_copy_len);
-    if (min_copy_len < index->prefix_len)
+    /* we store only the suffix (bytes after prefix) */
+    size_t suffix_len = key_len - prefix_len;
+    size_t needed = index->total_key_bytes + suffix_len;
+
+    /* we resize key_data buffer if needed */
+    size_t current_key_capacity = index->capacity * 32;
+    if (needed > current_key_capacity)
     {
-        memset(min_dest + min_copy_len, 0, index->prefix_len - min_copy_len);
+        size_t new_size = needed * 2;
+        uint8_t *new_key_data = realloc(index->key_data, new_size);
+        if (!new_key_data) return -1;
+        index->key_data = new_key_data;
     }
 
-    /* copy max key prefix (zero-pad if shorter) */
-    size_t max_copy_len = (max_key_len < index->prefix_len) ? max_key_len : index->prefix_len;
-    memcpy(max_dest, max_key, max_copy_len);
-    if (max_copy_len < index->prefix_len)
-    {
-        memset(max_dest + max_copy_len, 0, index->prefix_len - max_copy_len);
-    }
-
+    /* we store entry metadata */
+    index->key_offsets[index->count] = index->total_key_bytes;
+    index->key_lens[index->count] = (uint16_t)key_len;
+    index->prefix_lens[index->count] = prefix_len;
     index->block_nums[index->count] = block_num;
+
+    /* we store only the suffix */
+    memcpy(index->key_data + index->total_key_bytes, key + prefix_len, suffix_len);
+    index->total_key_bytes += suffix_len;
+
+    if ((uint16_t)key_len > index->max_key_len)
+    {
+        index->max_key_len = (uint16_t)key_len;
+    }
+
     index->count++;
+
+    /* we update last_full_key cache for next add operation */
+    if (index->last_full_key)
+    {
+        free(index->last_full_key);
+    }
+    index->last_full_key = malloc(key_len);
+    if (index->last_full_key)
+    {
+        memcpy(index->last_full_key, key, key_len);
+        index->last_full_key_len = (uint16_t)key_len;
+    }
 
     return 0;
 }
@@ -12542,46 +12297,77 @@ static int compact_block_index_find_predecessor(const tidesdb_block_index_t *ind
 {
     if (!index || !key || index->count == 0) return -1;
 
-    /* create prefix of search key for comparison */
-    uint8_t search_prefix[TDB_BLOCK_INDEX_PREFIX_LEN];
-    size_t copy_len = (key_len < index->prefix_len) ? key_len : index->prefix_len;
-    memcpy(search_prefix, key, copy_len);
-    if (copy_len < index->prefix_len)
+    /* we utilize stack allocation for small keys (most common case) */
+    uint8_t stack_buffer[512];
+    uint8_t *reconstructed_key = NULL;
+    uint8_t *heap_key = NULL;
+
+    /* we utilize cached max_key_len for allocation (O(1) instead of O(n) scan) */
+    if (index->max_key_len <= sizeof(stack_buffer))
     {
-        memset(search_prefix + copy_len, 0, index->prefix_len - copy_len);
+        reconstructed_key = stack_buffer;
+    }
+    else
+    {
+        heap_key = malloc(index->max_key_len);
+        if (!heap_key) return -1;
+        reconstructed_key = heap_key;
     }
 
-    /* binary search to find rightmost block where min_key <= search_key */
+    /* find largest key <= target */
     int64_t left = 0, right = index->count - 1, result = -1;
 
     while (left <= right)
     {
         int64_t mid = left + (right - left) / 2;
-        const uint8_t *mid_min_prefix = index->min_key_prefixes + (mid * index->prefix_len);
+        uint16_t mid_key_len = index->key_lens[mid];
+        uint32_t mid_offset = index->key_offsets[mid];
+        uint8_t mid_prefix_len = index->prefix_lens[mid];
 
-        /* compare search key with block's min key */
+        if (mid_prefix_len > 0 && mid > 0)
+        {
+            /* compression is copy prefix from previous key, then suffix */
+            uint32_t prev_offset = index->key_offsets[mid - 1];
+            memcpy(reconstructed_key, index->key_data + prev_offset, mid_prefix_len);
+            size_t suffix_len = mid_key_len - mid_prefix_len;
+            memcpy(reconstructed_key + mid_prefix_len, index->key_data + mid_offset, suffix_len);
+        }
+        else
+        {
+            memcpy(reconstructed_key, index->key_data + mid_offset, mid_key_len);
+        }
+
+        /* compare keys */
         int cmp;
         if (index->comparator)
         {
-            cmp = index->comparator(mid_min_prefix, index->prefix_len, search_prefix,
-                                    index->prefix_len, index->comparator_ctx);
+            cmp = index->comparator(reconstructed_key, mid_key_len, key, key_len,
+                                    index->comparator_ctx);
         }
         else
         {
-            cmp = memcmp(mid_min_prefix, search_prefix, index->prefix_len);
+            size_t min_len = (mid_key_len < key_len) ? mid_key_len : key_len;
+            cmp = memcmp(reconstructed_key, key, min_len);
+            if (cmp == 0)
+            {
+                /* keys equal up to min length, shorter key is "less than" */
+                cmp = (mid_key_len < key_len) ? -1 : (mid_key_len > key_len) ? 1 : 0;
+            }
         }
 
-        /* find rightmost block where min_key <= search_key */
+        /* binary search to find rightmost position where indexed_key <= search_key */
         if (cmp <= 0)
         {
             result = mid;
-            left = mid + 1; /* continue searching right */
+            left = mid + 1; /* continue searching right for larger matches */
         }
         else
         {
-            right = mid - 1; /* search left */
+            right = mid - 1; /* we search left for smaller keys */
         }
     }
+
+    if (heap_key) free(heap_key);
 
     if (result >= 0)
     {
@@ -12595,8 +12381,11 @@ static int compact_block_index_find_predecessor(const tidesdb_block_index_t *ind
 static void compact_block_index_free(tidesdb_block_index_t *index)
 {
     if (!index) return;
-    free(index->min_key_prefixes);
-    free(index->max_key_prefixes);
+    free(index->key_data);
+    free(index->key_offsets);
+    free(index->key_lens);
+    free(index->prefix_lens);
     free(index->block_nums);
+    free(index->last_full_key);
     free(index);
 }

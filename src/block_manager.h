@@ -54,7 +54,7 @@
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE                              \
     (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH + \
      BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
-#define MAX_INLINE_BLOCK_SIZE (64 * 1024)
+#define MAX_INLINE_BLOCK_SIZE (8 * 1024)
 /* extra bytes for headers in stack buffers */
 #define BLOCK_MANAGER_STACK_BUFFER_OVERHEAD 64
 /* default file permissions (rw-r--r--) */
@@ -94,6 +94,7 @@ typedef struct
     uint64_t *block_positions;
     uint64_t *block_sizes;
     int block_count;
+    _Atomic(int) cache_rebuilding; /* flag to prevent cache access during rebuild */
 } block_manager_t;
 
 /**
@@ -381,7 +382,6 @@ block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode);
  * block_manager_build_position_cache
  * builds shared position cache by scanning all blocks once
  * provides O(1) random access and backward navigation for all cursors
- * it will recreate cache so be careful
  * @param bm the block manager to build cache for
  * @return 0 if successful, -1 otherwise
  */

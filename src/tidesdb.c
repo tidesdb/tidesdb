@@ -9310,14 +9310,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
-    /* count total sstables to allocate array */
-    int total_ssts = 0;
-    for (int i = 0; i < num_levels; i++)
-    {
-        int num_ssts = atomic_load_explicit(&levels[i]->num_sstables, memory_order_acquire);
-        total_ssts += num_ssts;
-    }
-
     /* collect sstable pointers with references held */
     typedef struct
     {
@@ -9327,37 +9319,54 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     } sst_ref_t;
 
     sst_ref_t stack_ssts[TDB_STACK_SSTS];
-    sst_ref_t *ssts_array = NULL;
+    sst_ref_t *ssts_array = stack_ssts;
+    int ssts_capacity = TDB_STACK_SSTS;
     int sst_count = 0;
 
-    if (total_ssts > 0)
+    /* iterate through levels and take refs immediately to minimize race window */
+    for (int i = 0; i < num_levels; i++)
     {
-        ssts_array =
-            (total_ssts <= TDB_STACK_SSTS) ? stack_ssts : malloc(total_ssts * sizeof(sst_ref_t));
-        if (!ssts_array)
-        {
-            return TDB_ERR_MEMORY;
-        }
+        tidesdb_level_t *level = levels[i];
+        
+        /* load array pointer and count atomically */
+        tidesdb_sstable_t **sstables =
+            atomic_load_explicit(&level->sstables, memory_order_acquire);
+        int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
-        for (int i = 0; i < num_levels; i++)
+        /* take refs on all sstables in this level immediately in tight loop
+         * this minimizes window where compaction could free the array */
+        for (int j = 0; j < num_ssts; j++)
         {
-            tidesdb_level_t *level = levels[i];
-            tidesdb_sstable_t **sstables =
-                atomic_load_explicit(&level->sstables, memory_order_acquire);
-            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+            tidesdb_sstable_t *sst = sstables[j];
+            if (!sst) continue;
 
-            for (int j = 0; j < num_ssts; j++)
+            /* expand array if needed */
+            if (sst_count >= ssts_capacity)
             {
-                tidesdb_sstable_t *sst = sstables[j];
-                if (!sst) continue;
-
-                /* acquire reference to protect against concurrent deletion */
-                tidesdb_sstable_ref(sst);
-                ssts_array[sst_count].sst = sst;
-                ssts_array[sst_count].level = i;
-                ssts_array[sst_count].index = j;
-                sst_count++;
+                int new_capacity = ssts_capacity * 2;
+                sst_ref_t *new_array = malloc(new_capacity * sizeof(sst_ref_t));
+                if (!new_array)
+                {
+                    /* cleanup refs taken so far */
+                    for (int k = 0; k < sst_count; k++)
+                    {
+                        tidesdb_sstable_unref(cf->db, ssts_array[k].sst);
+                    }
+                    if (ssts_array != stack_ssts) free(ssts_array);
+                    return TDB_ERR_MEMORY;
+                }
+                memcpy(new_array, ssts_array, sst_count * sizeof(sst_ref_t));
+                if (ssts_array != stack_ssts) free(ssts_array);
+                ssts_array = new_array;
+                ssts_capacity = new_capacity;
             }
+
+            /* acquire reference to protect against concurrent deletion */
+            tidesdb_sstable_ref(sst);
+            ssts_array[sst_count].sst = sst;
+            ssts_array[sst_count].level = i;
+            ssts_array[sst_count].index = j;
+            sst_count++;
         }
     }
 
@@ -10470,38 +10479,58 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
-    /* count total sstables to allocate array */
-    int total_ssts = 0;
-    for (int i = 0; i < num_levels; i++)
-    {
-        total_ssts += atomic_load_explicit(&levels[i]->num_sstables, memory_order_acquire);
-    }
-
-    /* collect sstable pointers with references held */
-    tidesdb_sstable_t **ssts_array = NULL;
+    /* collect sstable pointers with references held
+     * use dynamic array that grows as needed */
+    int ssts_capacity = 64;
+    tidesdb_sstable_t **ssts_array = malloc(ssts_capacity * sizeof(tidesdb_sstable_t *));
     int sst_count = 0;
 
-    if (total_ssts > 0)
+    if (ssts_array)
     {
-        ssts_array = malloc(total_ssts * sizeof(tidesdb_sstable_t *));
-        if (ssts_array)
+        /* iterate through levels and take refs immediately to minimize race window */
+        for (int i = 0; i < num_levels; i++)
         {
-            for (int i = 0; i < num_levels; i++)
+            tidesdb_level_t *level = levels[i];
+            
+            /* load array pointer and count atomically */
+            tidesdb_sstable_t **sstables =
+                atomic_load_explicit(&level->sstables, memory_order_acquire);
+            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+            /* take refs on all sstables in this level immediately in tight loop
+             * this minimizes window where compaction could free the array */
+            for (int j = 0; j < num_ssts; j++)
             {
-                tidesdb_level_t *level = levels[i];
-                tidesdb_sstable_t **sstables = level->sstables;
-                int num_ssts = level->num_sstables;
+                tidesdb_sstable_t *sst = sstables[j];
+                if (!sst) continue;
 
-                for (int j = 0; j < num_ssts; j++)
+                /* expand array if needed */
+                if (sst_count >= ssts_capacity)
                 {
-                    tidesdb_sstable_t *sst = sstables[j];
-                    if (!sst) continue;
-
-                    /* acquire reference to protect against concurrent deletion */
-                    tidesdb_sstable_ref(sst);
-                    ssts_array[sst_count++] = sst;
+                    int new_capacity = ssts_capacity * 2;
+                    tidesdb_sstable_t **new_array =
+                        realloc(ssts_array, new_capacity * sizeof(tidesdb_sstable_t *));
+                    if (!new_array)
+                    {
+                        /* cleanup refs taken so far */
+                        for (int k = 0; k < sst_count; k++)
+                        {
+                            tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                        }
+                        free(ssts_array);
+                        ssts_array = NULL;
+                        break;
+                    }
+                    ssts_array = new_array;
+                    ssts_capacity = new_capacity;
                 }
+
+                /* acquire reference to protect against concurrent deletion */
+                tidesdb_sstable_ref(sst);
+                ssts_array[sst_count++] = sst;
             }
+            
+            if (!ssts_array) break; /* allocation failed */
         }
     }
 

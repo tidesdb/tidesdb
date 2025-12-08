@@ -128,8 +128,9 @@ static int read_header(int fd, uint32_t *block_size)
     memcpy(&version, header + BLOCK_MANAGER_MAGIC_SIZE, BLOCK_MANAGER_VERSION_SIZE);
     if (version != BLOCK_MANAGER_VERSION) return -1;
 
-    memcpy(block_size, header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE,
-           BLOCK_MANAGER_BLOCK_SIZE_SIZE);
+    /* decode block_size using little-endian conversion for cross-platform compatibility */
+    *block_size =
+        decode_uint32_le_compat(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE);
 
     return 0;
 }
@@ -1236,10 +1237,12 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor)
     /* if at first block, not at second */
     if (cursor->current_pos == BLOCK_MANAGER_HEADER_SIZE) return 0;
 
-    uint64_t first_block_size;
-    if (pread(cursor->bm->fd, &first_block_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+    /* read first block size using proper endianness conversion */
+    unsigned char first_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+    if (pread(cursor->bm->fd, first_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
               (off_t)BLOCK_MANAGER_HEADER_SIZE) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
         return -1;
+    uint64_t first_block_size = decode_uint64_le_compat(first_size_buf);
 
     uint64_t inline_size =
         first_block_size <= cursor->bm->block_size ? first_block_size : cursor->bm->block_size;
@@ -1249,10 +1252,12 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor)
                                 (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                 (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
 
-    uint64_t overflow_offset;
-    if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+    /* read overflow offset using proper endianness conversion */
+    unsigned char overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+    if (pread(cursor->bm->fd, overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
               (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
         return -1;
+    uint64_t overflow_offset = decode_uint64_le_compat(overflow_buf);
 
     /* calculate second block position */
     uint64_t second_block_pos =
@@ -1260,16 +1265,21 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor)
 
     while (overflow_offset != 0)
     {
-        uint64_t chunk_size;
-        if (pread(cursor->bm->fd, &chunk_size, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+        /* read chunk size using proper endianness conversion */
+        unsigned char chunk_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+        if (pread(cursor->bm->fd, chunk_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
                   (off_t)overflow_offset) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
             return -1;
+        uint64_t chunk_size = decode_uint64_le_compat(chunk_size_buf);
 
         off_t next_overflow_pos = (off_t)overflow_offset + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                   (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
-        if (pread(cursor->bm->fd, &overflow_offset, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
+        /* read next overflow offset using proper endianness conversion */
+        unsigned char next_overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+        if (pread(cursor->bm->fd, next_overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
                   (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             return -1;
+        overflow_offset = decode_uint64_le_compat(next_overflow_buf);
 
         second_block_pos =
             (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);

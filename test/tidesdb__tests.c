@@ -4868,9 +4868,12 @@ static void test_recovery_with_corrupted_sstable(void)
         FILE *f = fopen(corrupt_file, "r+b");
         if (f)
         {
+            /* use little-endian encoding to match block manager's format */
             uint32_t bad_magic = 0xDEADBEEF;
+            uint8_t magic_buf[4];
+            encode_uint32_le_compat(magic_buf, bad_magic);
             fseek(f, 0, SEEK_SET);
-            fwrite(&bad_magic, sizeof(bad_magic), 1, f);
+            fwrite(magic_buf, sizeof(magic_buf), 1, f);
             fclose(f);
             printf("Corrupted SSTable: %s\n", corrupt_file);
         }

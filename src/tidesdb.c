@@ -9524,14 +9524,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         return TDB_ERR_INVALID_ARGS;
     }
 
-    if (queue_size(txn->db->flush_queue) >= TDB_DEFAULT_FLUSH_QUEUE_THRESHOLD)
-    {
-        while (queue_size(txn->db->flush_queue) > txn->db->config.flush_queue_threshold)
-        {
-            cpu_pause();
-        }
-    }
-
     if (txn->isolation_level == TDB_ISOLATION_REPEATABLE_READ ||
         txn->isolation_level == TDB_ISOLATION_SNAPSHOT ||
         txn->isolation_level == TDB_ISOLATION_SERIALIZABLE)

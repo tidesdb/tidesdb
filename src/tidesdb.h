@@ -161,14 +161,18 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2    /* thread pool size for global flushes */
 #define TDB_DEFAULT_BLOOM_FPR                   0.01 /* 1% false positive rate */
 #define TDB_DEFAULT_KLOG_BLOCK_SIZE             (64 * 1024) /* 64KB per klog block */
-#define TDB_DEFAULT_VLOG_BLOCK_SIZE             (8 * 1024)  /* 8KB per vlog block */
-#define TDB_DEFAULT_VALUE_THRESHOLD             512         /* values >= 1KB go to vlog */
+#define TDB_DEFAULT_VLOG_BLOCK_SIZE             (4 * 1024)  /* 4KB per vlog block */
+#define TDB_DEFAULT_VALUE_THRESHOLD             512         /* values >= 512 bytes go to vlog */
 #define TDB_DEFAULT_INDEX_SAMPLE_RATIO          2
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024) /* 100MB minimum free space */
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES           512                 /* max open sstables globally */
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      1024 * 64           /* max concurrent txns per cf */
 #define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024) /* default global block cache size */
 #define TDB_DEFAULT_SYNC_INTERVAL_US            128000 /* 128ms sync interval for TDB_SYNC_INTERVAL mode */
+#define TDB_DEFAULT_FLUSH_QUEUE_THRESHOLD                                                        \
+    4 /* max threshold before blocking and waiting for flushes to keep up, saving memory.  this  \
+         goes for all column families so if cf1 as 2 enqueued flushes and cf2 as 2 and threshold \
+         is 4, the system will block on commit temporarily */
 
 #define TDB_MAX_TXN_CFS         10000  /* maximum number of cfs per transaction */
 #define TDB_MAX_PATH_LEN        4096   /* maximum path length */
@@ -267,6 +271,7 @@ typedef struct
  * @param enable_debug_logging enable debug logging
  * @param cache of blocks across column families
  * @param max_open_sstables maximum number of open sstables (LRU cache)
+ * @param flush_queue_threshold global flush queue threshold
  */
 typedef struct
 {
@@ -276,6 +281,7 @@ typedef struct
     int enable_debug_logging;
     size_t block_cache_size;
     size_t max_open_sstables;
+    int flush_queue_threshold;
 } tidesdb_config_t;
 
 /**

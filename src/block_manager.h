@@ -54,7 +54,7 @@
 #define BLOCK_MANAGER_BLOCK_HEADER_SIZE                              \
     (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH + \
      BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
-#define MAX_INLINE_BLOCK_SIZE (8 * 1024)
+#define MAX_INLINE_BLOCK_SIZE (64 * 1024)
 /* extra bytes for headers in stack buffers */
 #define BLOCK_MANAGER_STACK_BUFFER_OVERHEAD 64
 /* default file permissions (rw-r--r--) */

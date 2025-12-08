@@ -931,7 +931,8 @@ tidesdb_config_t tidesdb_default_config(void)
                                .num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE,
                                .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
                                .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
-                               .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES};
+                               .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES,
+                               .flush_queue_threshold = TDB_DEFAULT_FLUSH_QUEUE_THRESHOLD};
     return config;
 }
 
@@ -9521,6 +9522,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     {
         TDB_DEBUG_LOG("Transaction too large: %d ops (max: %d)", txn->num_ops, TDB_MAX_TXN_OPS);
         return TDB_ERR_INVALID_ARGS;
+    }
+
+    if (queue_size(txn->db->flush_queue) >= TDB_DEFAULT_FLUSH_QUEUE_THRESHOLD)
+    {
+        while (queue_size(txn->db->flush_queue) > txn->db->config.flush_queue_threshold)
+        {
+            cpu_pause();
+        }
     }
 
     if (txn->isolation_level == TDB_ISOLATION_REPEATABLE_READ ||

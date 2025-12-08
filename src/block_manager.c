@@ -1432,16 +1432,15 @@ int block_manager_validate_last_block(block_manager_t *bm)
     }
 
     /* ensure we have at least header + one block header */
-    if (file_size < BLOCK_MANAGER_HEADER_SIZE + BLOCK_MANAGER_SIZE_FIELD_SIZE +
-                        BLOCK_MANAGER_CHECKSUM_LENGTH + BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
+    if (file_size < BLOCK_MANAGER_HEADER_SIZE + BLOCK_MANAGER_BLOCK_HEADER_SIZE)
     {
         /* truncate to header only */
-        if (ftruncate(bm->fd, BLOCK_MANAGER_HEADER_SIZE) == -1)
+        if (ftruncate(bm->fd, (off_t)BLOCK_MANAGER_HEADER_SIZE) == -1)
         {
             return -1;
         }
         lseek(bm->fd, 0, SEEK_SET);
-        return (bm->fd != -1) ? 0 : -1;
+        return 0;
     }
 
     uint64_t valid_size = BLOCK_MANAGER_HEADER_SIZE;
@@ -1450,12 +1449,18 @@ int block_manager_validate_last_block(block_manager_t *bm)
 
     while (scan_pos < file_size)
     {
+        /* safe conversion of scan_pos to off_t */
+        if (scan_pos > (uint64_t)LLONG_MAX) break;
+        off_t off_scan = (off_t)(int64_t)scan_pos;
+
         unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
-        if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)scan_pos) !=
-            BLOCK_MANAGER_SIZE_FIELD_SIZE)
+        ssize_t n = pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, off_scan);
+        if (n != BLOCK_MANAGER_SIZE_FIELD_SIZE)
         {
+            /* short read, we treat as corruption */
             break;
         }
+
         uint64_t block_size = decode_uint64_le_compat(size_buf);
 
         uint64_t inline_size = block_size <= bm->block_size ? block_size : bm->block_size;
@@ -1468,16 +1473,19 @@ int block_manager_validate_last_block(block_manager_t *bm)
             break;
         }
 
-        off_t overflow_offset_pos = (off_t)scan_pos + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+        off_t overflow_offset_pos = off_scan + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                     (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)inline_size;
-        unsigned char overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
-        if (pread(bm->fd, overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
-                  (off_t)overflow_offset_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
-            break;
-        uint64_t overflow_offset = decode_uint64_le_compat(overflow_buf);
 
-        uint64_t next_pos =
-            (uint64_t)(overflow_offset_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
+        unsigned char overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
+        n = pread(bm->fd, overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE, overflow_offset_pos);
+        if (n != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
+        {
+            valid_size = scan_pos;
+            break;
+        }
+
+        uint64_t overflow_offset = decode_uint64_le_compat(overflow_buf);
+        uint64_t next_pos = (uint64_t)(overflow_offset_pos + BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
 
         while (overflow_offset != 0)
         {
@@ -1487,13 +1495,21 @@ int block_manager_validate_last_block(block_manager_t *bm)
                 goto done_scanning;
             }
 
-            unsigned char chunk_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
-            if (pread(bm->fd, chunk_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
-                      (off_t)overflow_offset) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
+            if (overflow_offset > (uint64_t)LLONG_MAX)
             {
                 valid_size = scan_pos;
                 goto done_scanning;
             }
+            off_t off_overflow = (off_t)(int64_t)overflow_offset;
+
+            unsigned char chunk_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+            n = pread(bm->fd, chunk_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, off_overflow);
+            if (n != BLOCK_MANAGER_SIZE_FIELD_SIZE)
+            {
+                valid_size = scan_pos;
+                goto done_scanning;
+            }
+
             uint64_t chunk_size = decode_uint64_le_compat(chunk_size_buf);
 
             if (overflow_offset + BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH +
@@ -1504,19 +1520,17 @@ int block_manager_validate_last_block(block_manager_t *bm)
                 goto done_scanning;
             }
 
-            off_t next_overflow_pos = (off_t)overflow_offset +
-                                      (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
+            off_t next_overflow_pos = off_overflow + (off_t)BLOCK_MANAGER_SIZE_FIELD_SIZE +
                                       (off_t)BLOCK_MANAGER_CHECKSUM_LENGTH + (off_t)chunk_size;
-            unsigned char next_overflow_buf[BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE];
-            if (pread(bm->fd, next_overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE,
-                      (off_t)next_overflow_pos) != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
+            n = pread(bm->fd, overflow_buf, BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE, next_overflow_pos);
+            if (n != BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
             {
                 valid_size = scan_pos;
                 goto done_scanning;
             }
-            overflow_offset = decode_uint64_le_compat(next_overflow_buf);
 
-            next_pos = (uint64_t)(next_overflow_pos + (off_t)BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
+            overflow_offset = decode_uint64_le_compat(overflow_buf);
+            next_pos = (uint64_t)(next_overflow_pos + BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE);
         }
 
         valid_size = next_pos;
@@ -1527,12 +1541,18 @@ int block_manager_validate_last_block(block_manager_t *bm)
 done_scanning:
     if (valid_size != file_size)
     {
-        if (ftruncate(bm->fd, (long)valid_size) != 0)
+        /* truncate to last valid block */
+        if (valid_size > (uint64_t)LLONG_MAX)
+        {
+            return -1; /* file too large */
+        }
+        off_t truncate_off = (off_t)(int64_t)valid_size;
+
+        if (ftruncate(bm->fd, truncate_off) != 0)
         {
             return -1;
         }
 
-        /* sync truncation to disk before closing */
         fdatasync(bm->fd);
 
         close(bm->fd);
@@ -1552,7 +1572,6 @@ done_scanning:
         bm->block_sizes = NULL;
         bm->block_count = 0;
 
-        /* rebuild cache with new file size */
         block_manager_build_position_cache(bm);
     }
 

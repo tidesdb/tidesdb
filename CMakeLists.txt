@@ -120,6 +120,10 @@ if(APPLE)
             snappy      # snappy compression
             pthread     # pthread library
     )
+
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        target_link_libraries(tidesdb PUBLIC atomic)
+    endif()
 elseif(WIN32)
     # for windows, link against compression libraries and pthreads
     target_link_libraries(tidesdb PUBLIC

@@ -3930,17 +3930,18 @@ static void test_dynamic_capacity_adjustment(void)
 
     /* write data in batches, triggering level additions
      * need to write enough to fill L2 (8192 bytes) and trigger DCA
-     * each key+value ~48 bytes, so need ~200+ keys to fill L2
-     * write 5 batches of ~100KB each to ensure L2 fills up */
+     * after partitioned merge fix, data accumulates in L2, so we need significantly more data
+     * write 10 batches of ~200KB each to ensure L2 fills beyond capacity and triggers L3 creation
+     */
     int total_keys_written = 0;
-    for (int batch = 0; batch < 5; batch++)
+    for (int batch = 0; batch < 10; batch++)
     {
         printf("Batch %d: Writing keys\n", batch + 1);
 
         int written = 0;
 
-        /* write ~100KB per batch (100000 bytes / 160 bytes per key = ~625 keys) */
-        for (int i = 0; i < 50000 && written < 100000; i++)
+        /* write ~200KB per batch (200000 bytes / 160 bytes per key = ~1250 keys) */
+        for (int i = 0; i < 100000 && written < 200000; i++)
         {
             tidesdb_txn_t *txn = NULL;
             ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
@@ -4003,10 +4004,14 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
-    for (int i = 0; i < 200; i++)
+    /* check a sample of keys across the range to verify data integrity */
+    int keys_to_check = total_keys_written < 500 ? total_keys_written : 500;
+    for (int i = 0; i < keys_to_check; i++)
     {
+        /* sample keys evenly across the range */
+        int key_idx = (i * total_keys_written) / keys_to_check;
         char key[32];
-        snprintf(key, sizeof(key), "dca_key_%05d", i);
+        snprintf(key, sizeof(key), "dca_key_%05d", key_idx);
 
         uint8_t *value = NULL;
         size_t value_size = 0;

@@ -9303,6 +9303,10 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         }
         free(immutable_refs);
     }
+
+    /* wait for any DCA operation to complete before accessing levels */
+    tidesdb_wait_for_dca(cf);
+
     int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
@@ -10459,6 +10463,9 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             }
         }
     }
+
+    /* wait for any DCA operation to complete before accessing levels */
+    tidesdb_wait_for_dca(cf);
 
     int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);

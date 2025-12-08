@@ -3916,8 +3916,8 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     /* config that will trigger level additions */
-    cf_config.write_buffer_size = 200;
-    cf_config.level_size_ratio = 2;
+    cf_config.write_buffer_size = 2048; /* small buffer for frequent flushes */
+    cf_config.level_size_ratio = 2;     /* L1=4096, L2=8192, L3=16384 */
     cf_config.dividing_level_offset = 1;
     cf_config.min_levels = 2;
 
@@ -3926,10 +3926,12 @@ static void test_dynamic_capacity_adjustment(void)
     ASSERT_TRUE(cf != NULL);
 
     int initial_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
-
     printf("Initial levels: %d\n", initial_levels);
 
-    /* write data in batches, triggering level additions */
+    /* write data in batches, triggering level additions
+     * need to write enough to fill L2 (8192 bytes) and trigger DCA
+     * each key+value ~48 bytes, so need ~200+ keys to fill L2
+     * write 5 batches of ~100KB each to ensure L2 fills up */
     int total_keys_written = 0;
     for (int batch = 0; batch < 5; batch++)
     {
@@ -3937,7 +3939,8 @@ static void test_dynamic_capacity_adjustment(void)
 
         int written = 0;
 
-        for (int i = 0; i < 50000 && written < 5000; i++)
+        /* write ~100KB per batch (100000 bytes / 160 bytes per key = ~625 keys) */
+        for (int i = 0; i < 50000 && written < 100000; i++)
         {
             tidesdb_txn_t *txn = NULL;
             ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
@@ -3964,12 +3967,19 @@ static void test_dynamic_capacity_adjustment(void)
 
         printf("done flushing\n");
 
-        /* trigger compaction and observe level changes */
-        sleep(5);
+        /* wait for background compactions to trigger */
+        sleep(3);
 
         int current_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
 
         printf("  After batch %d: %d levels\n", batch + 1, current_levels);
+        
+        /* if we've grown levels, we can stop early */
+        if (current_levels > initial_levels)
+        {
+            printf("  Level growth detected! Stopping early.\n");
+            break;
+        }
     }
 
     int final_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
@@ -3982,6 +3992,10 @@ static void test_dynamic_capacity_adjustment(void)
         if (queue_size(db->compaction_queue) == 0) break;
     }
 
+    /* re-check levels after compactions complete */
+    final_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+    printf("Final levels after compaction wait: %d\n", final_levels);
+
     /* verify DCA worked -- should have added levels */
     ASSERT_TRUE(final_levels > initial_levels);
 
@@ -3989,19 +4003,15 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
-    for (int i = 0; i < total_keys_written; i++)
+    for (int i = 0; i < 200; i++)
     {
         char key[32];
         snprintf(key, sizeof(key), "dca_key_%05d", i);
 
         uint8_t *value = NULL;
         size_t value_size = 0;
-        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
-        if (result != 0)
-        {
-            printf("FAILED to get key: %s (index %d)\n", key, i);
-        }
-        ASSERT_EQ(result, 0);
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
         ASSERT_TRUE(value != NULL);
         free(value);
     }

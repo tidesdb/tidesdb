@@ -1216,22 +1216,24 @@ static inline size_t get_available_memory(void)
 
     mach_port = mach_host_self();
 
-#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1060
-    /* macOS 10.6+ has 64-bit vm statistics */
+    /* use 32-bit vm statistics on PPC 32-bit regardless of OS version
+     * host_statistics64 is not available on PPC 32-bit even on 10.6+ */
+#if defined(__ppc__) || defined(__ppc) || (MAC_OS_X_VERSION_MIN_REQUIRED < 1060)
+    /* PPC 32-bit or macOS 10.5 and earlier use 32-bit vm statistics */
+    vm_statistics_data_t vm_stats;
+    count = HOST_VM_INFO_COUNT;
+    if (host_page_size(mach_port, &page_size) == KERN_SUCCESS &&
+        host_statistics(mach_port, HOST_VM_INFO, (host_info_t)&vm_stats, &count) == KERN_SUCCESS)
+    {
+        return (size_t)(vm_stats.free_count * page_size);
+    }
+#else
+    /* macOS 10.6+ on x86/x86_64/ARM has 64-bit vm statistics */
     vm_statistics64_data_t vm_stats;
     count = sizeof(vm_stats) / sizeof(natural_t);
     if (host_page_size(mach_port, &page_size) == KERN_SUCCESS &&
         host_statistics64(mach_port, HOST_VM_INFO, (host_info64_t)&vm_stats, &count) ==
             KERN_SUCCESS)
-    {
-        return (size_t)(vm_stats.free_count * page_size);
-    }
-#else
-    /* macOS 10.5 and earlier use 32-bit vm statistics */
-    vm_statistics_data_t vm_stats;
-    count = HOST_VM_INFO_COUNT;
-    if (host_page_size(mach_port, &page_size) == KERN_SUCCESS &&
-        host_statistics(mach_port, HOST_VM_INFO, (host_info_t)&vm_stats, &count) == KERN_SUCCESS)
     {
         return (size_t)(vm_stats.free_count * page_size);
     }

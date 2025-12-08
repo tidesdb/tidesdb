@@ -118,8 +118,8 @@ static int read_header(int fd, uint32_t *block_size)
     ssize_t nread = pread(fd, header, BLOCK_MANAGER_HEADER_SIZE, 0);
     if (nread != BLOCK_MANAGER_HEADER_SIZE) return -1;
 
-    uint32_t magic;
-    memcpy(&magic, header, BLOCK_MANAGER_MAGIC_SIZE);
+    /* decode magic using little-endian conversion for cross-platform compatibility */
+    uint32_t magic = decode_uint32_le_compat(header);
     magic &= BLOCK_MANAGER_MAGIC_MASK;
 
     if (magic != BLOCK_MANAGER_MAGIC) return -1;

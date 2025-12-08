@@ -6635,8 +6635,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 int current_num_levels =
                     atomic_load_explicit(&cf->num_levels, memory_order_acquire);
 
-                /* find the target level by level_num, not by stale array index */
-                int target_level_num = end_level + 1;
+                /* find the target level by level_num, not by stale array index
+                 * partitioned merge writes to end_level (the largest level being merged) */
+                int target_level_num = end_level;
                 int target_idx = -1;
                 for (int i = 0; i < current_num_levels; i++)
                 {
@@ -6651,7 +6652,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 {
                     TDB_DEBUG_LOG(
                         "Partitioned merge partition %d: Target level %d not found "
-                        "(current_num_levels=%d)",
+                        "(current_num_levels=%d), data would be lost!",
                         partition, target_level_num, current_num_levels);
                     tidesdb_sstable_unref(cf->db, new_sst);
                     tidesdb_merge_heap_free(heap);

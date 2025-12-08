@@ -3976,6 +3976,12 @@ static void test_dynamic_capacity_adjustment(void)
     printf("Final levels: %d (growth: %d levels)\n", final_levels, final_levels - initial_levels);
     printf("Total keys written: %d\n", total_keys_written);
 
+    for (int i = 0; i < 128; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->compaction_queue) == 0) break;
+    }
+
     /* verify DCA worked -- should have added levels */
     ASSERT_TRUE(final_levels > initial_levels);
 

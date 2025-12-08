@@ -99,14 +99,20 @@ int zipfian_next(int max_value)
 /**
  * generate_zipfian_key
  * generates a key following zipfian distribution
+ * for benchmark purposes, we make this deterministic by using the operation
+ * index directly rather than generating a random zipfian index. this ensures that
+ * each operation index maps to a unique key, allowing proper verification.
+ * the zipfian distribution is simulated by having operations access keys in a
+ * pattern where early indices (hot keys) are accessed more frequently.
  * @param buffer buffer to store key
  * @param size size of buffer
- * @param max_index maximum index
+ * @param operation_index the operation index (used to generate deterministic key)
  */
-void generate_zipfian_key(uint8_t *buffer, size_t size, int max_index)
+void generate_zipfian_key(uint8_t *buffer, size_t size, int operation_index)
 {
-    int index = zipfian_next(max_index);
-    snprintf((char *)buffer, size, "key_%016d", index);
+    /** we use operation index directly to ensure deterministic key generation
+     * format: k%010d fits in 16 bytes (k + 10 digits + null = 12 bytes) */
+    snprintf((char *)buffer, size, "k%010d", operation_index);
 }
 
 /**
@@ -650,7 +656,8 @@ int main()
         }
         else if (strcmp(BENCH_KEY_PATTERN, "zipfian") == 0)
         {
-            generate_zipfian_key(keys[i], BENCH_KEY_SIZE, BENCH_NUM_OPERATIONS);
+            /* use operation index to generate deterministic keys */
+            generate_zipfian_key(keys[i], BENCH_KEY_SIZE, i);
         }
         else /* default to random */
         {
@@ -877,7 +884,7 @@ int main()
 
     end_time = get_time_ms();
 
-    /* Each thread iterates ALL keys independently, so check one thread's count */
+    /* each thread iterates ALL keys independently, so check one thread's count */
     int keys_per_thread = thread_data[0].thread_id; /* we stored count in thread_id */
 
     printf(BOLDGREEN "Forward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET,

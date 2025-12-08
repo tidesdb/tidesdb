@@ -9913,20 +9913,20 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         /* block if flush queue exceeds threshold before triggering a new flush
          * this provides backpressure to prevent memory exhaustion from too many
          * immutable memtables waiting to be flushed */
-        if (should_flush && cf->db->flush_queue_threshold > 0)
+        if (should_flush && cf->db->config.flush_queue_threshold > 0)
         {
             int wait_count = 0;
             int current_queue_size;
 
             while ((current_queue_size = queue_size(cf->db->flush_queue)) >=
-                   cf->db->flush_queue_threshold)
+                   cf->db->config.flush_queue_threshold)
             {
                 if (wait_count == 0)
                 {
                     TDB_DEBUG_LOG(
                         "CF '%s': Flush queue full (%d >= %d), blocking commit until flushes "
                         "complete",
-                        cf->name, current_queue_size, cf->db->flush_queue_threshold);
+                        cf->name, current_queue_size, cf->db->config.flush_queue_threshold);
                 }
                 wait_count++;
 

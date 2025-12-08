@@ -539,6 +539,7 @@ typedef struct
  * @param is_flushing whether a column family memtable has been swapped and queued
  * @param dca_in_progress  prevents concurrent level access during DCA operations which increase or
  * decrease levels
+ * @param levels_readers count of active readers accessing levels array
  * @param db parent database reference
  */
 struct tidesdb_column_family_t
@@ -562,6 +563,7 @@ struct tidesdb_column_family_t
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
     _Atomic(int) dca_in_progress;
+    _Atomic(int) levels_readers;
     tidesdb_t *db;
 };
 

@@ -5164,15 +5164,37 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     /* only add sstable if it has entries - empty sstables cause corruption */
     if (num_entries > 0)
     {
-        /* reload levels to add new sst */
+        /* reload levels and num_levels as DCA may have changed them */
         levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
         num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
-        TDB_DEBUG_LOG("Full preemptive merge: Adding merged SSTable %" PRIu64
-                      " to level %d (array index %d)",
-                      new_sst->id, levels[target_level + 1]->level_num, target_level + 1);
-        tidesdb_level_add_sstable(levels[target_level + 1], new_sst);
 
-        tidesdb_sstable_unref(cf->db, new_sst);
+        /* find the target level by level_num, not by stale array index */
+        int target_level_num = target_level + 1;
+        int target_idx = -1;
+        for (int i = 0; i < num_levels; i++)
+        {
+            if (levels[i]->level_num == target_level_num)
+            {
+                target_idx = i;
+                break;
+            }
+        }
+
+        if (target_idx < 0 || target_idx >= num_levels)
+        {
+            TDB_DEBUG_LOG(
+                "Full preemptive merge: Target level %d not found (current_num_levels=%d)",
+                target_level_num, num_levels);
+            tidesdb_sstable_unref(cf->db, new_sst);
+        }
+        else
+        {
+            TDB_DEBUG_LOG("Full preemptive merge: Adding merged SSTable %" PRIu64
+                          " to level %d (array index %d)",
+                          new_sst->id, levels[target_idx]->level_num, target_idx);
+            tidesdb_level_add_sstable(levels[target_idx], new_sst);
+            tidesdb_sstable_unref(cf->db, new_sst);
+        }
     }
     else
     {
@@ -5901,14 +5923,38 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         if (entry_count > 0)
         {
+            /* reload levels and num_levels as DCA may have changed them */
             levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
-            TDB_DEBUG_LOG("Dividing merge partition %d: Adding merged SSTable %" PRIu64
-                          " to level %d (array index %d)",
-                          partition, new_sst->id, levels[target_level + 1]->level_num,
-                          target_level + 1);
-            tidesdb_level_add_sstable(levels[target_level + 1], new_sst);
+            int current_num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
 
-            tidesdb_sstable_unref(cf->db, new_sst);
+            /* find the target level by level_num, not by stale array index */
+            int target_level_num = target_level + 1;
+            int target_idx = -1;
+            for (int i = 0; i < current_num_levels; i++)
+            {
+                if (levels[i]->level_num == target_level_num)
+                {
+                    target_idx = i;
+                    break;
+                }
+            }
+
+            if (target_idx < 0 || target_idx >= current_num_levels)
+            {
+                TDB_DEBUG_LOG(
+                    "Dividing merge partition %d: Target level %d not found "
+                    "(current_num_levels=%d)",
+                    partition, target_level_num, current_num_levels);
+                tidesdb_sstable_unref(cf->db, new_sst);
+            }
+            else
+            {
+                TDB_DEBUG_LOG("Dividing merge partition %d: Adding merged SSTable %" PRIu64
+                              " to level %d (array index %d)",
+                              partition, new_sst->id, levels[target_idx]->level_num, target_idx);
+                tidesdb_level_add_sstable(levels[target_idx], new_sst);
+                tidesdb_sstable_unref(cf->db, new_sst);
+            }
         }
         else
         {

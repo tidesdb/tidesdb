@@ -3973,7 +3973,7 @@ static void test_dynamic_capacity_adjustment(void)
         int current_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
 
         printf("  After batch %d: %d levels\n", batch + 1, current_levels);
-        
+
         /* if we've grown levels, we can stop early */
         if (current_levels > initial_levels)
         {

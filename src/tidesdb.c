@@ -6582,8 +6582,35 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             /* add to level if not empty */
             if (entry_count > 0)
             {
+                /* reload levels and num_levels as DCA may have changed them */
                 levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
-                tidesdb_level_add_sstable(levels[end_idx + 1], new_sst);
+                int current_num_levels =
+                    atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+
+                /* find the target level by level_num, not by stale array index */
+                int target_level_num = end_level + 1;
+                int target_idx = -1;
+                for (int i = 0; i < current_num_levels; i++)
+                {
+                    if (levels[i]->level_num == target_level_num)
+                    {
+                        target_idx = i;
+                        break;
+                    }
+                }
+
+                if (target_idx < 0 || target_idx >= current_num_levels)
+                {
+                    TDB_DEBUG_LOG(
+                        "Partitioned merge partition %d: Target level %d not found "
+                        "(current_num_levels=%d)",
+                        partition, target_level_num, current_num_levels);
+                    tidesdb_sstable_unref(cf->db, new_sst);
+                    tidesdb_merge_heap_free(heap);
+                    continue;
+                }
+
+                tidesdb_level_add_sstable(levels[target_idx], new_sst);
 
                 TDB_DEBUG_LOG("Partitioned merge partition %d complete: Created SSTable %" PRIu64
                               " with %" PRIu64 " entries, %" PRIu64 " klog blocks, %" PRIu64

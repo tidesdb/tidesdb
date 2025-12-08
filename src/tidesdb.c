@@ -6064,7 +6064,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     if (num_partitions == 0)
     {
         /* largest level is empty, fall back to full preemptive merge.
-         * unref all collected sstables before freeing queue */
+         * unref all collected sstables before freeing queue
+         * tidesdb_full_preemptive_merge expects 0-indexed array indices, not 1-indexed level
+         * numbers */
         while (!queue_is_empty(sstables_to_delete))
         {
             tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
@@ -6072,7 +6074,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         }
         queue_free(sstables_to_delete);
 
-        return tidesdb_full_preemptive_merge(cf, start_level, end_level - 1);
+        return tidesdb_full_preemptive_merge(cf, start_idx, end_idx);
     }
 
     uint8_t **boundaries = malloc(num_partitions * sizeof(uint8_t *));

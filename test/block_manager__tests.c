@@ -1224,8 +1224,10 @@ void test_block_manager_overflowed_and_not_position_cache_iteration()
 
     /* write mix of small and large blocks */
     const int num_blocks = 20;
-    int64_t offsets[num_blocks];
-    uint64_t sizes[num_blocks];
+    int64_t *offsets = malloc(num_blocks * sizeof(int64_t));
+    uint64_t *sizes = malloc(num_blocks * sizeof(uint64_t));
+    ASSERT_TRUE(offsets != NULL);
+    ASSERT_TRUE(sizes != NULL);
 
     printf("Writing %d mixed blocks...\n", num_blocks);
     for (int i = 0; i < num_blocks; i++)
@@ -1243,7 +1245,7 @@ void test_block_manager_overflowed_and_not_position_cache_iteration()
         offsets[i] = block_manager_block_write(bm, block);
         ASSERT_TRUE(offsets[i] != -1);
 
-        printf("  Block %d: size=%lu bytes, offset=%ld, %s\n", i, size, offsets[i],
+        printf("  Block %d: size=%" PRIu64 " bytes, offset=%" PRId64 ", %s\n", i, size, offsets[i],
                (size > 32768) ? "OVERFLOW" : "regular");
 
         block_manager_block_free(block);
@@ -1274,7 +1276,7 @@ void test_block_manager_overflowed_and_not_position_cache_iteration()
         ASSERT_EQ(data_bytes[0], expected_byte);
         ASSERT_EQ(data_bytes[read_block->size - 1], expected_byte);
 
-        printf("  Read block %d: size=%lu, index=%d\n", blocks_read, read_block->size,
+        printf("  Read block %d: size=%" PRIu64 ", index=%d\n", blocks_read, read_block->size,
                cursor->block_index);
 
         block_manager_block_free(read_block);
@@ -1308,7 +1310,7 @@ void test_block_manager_overflowed_and_not_position_cache_iteration()
         uint8_t *data_bytes = (uint8_t *)read_block->data;
         ASSERT_EQ(data_bytes[0], expected_byte);
 
-        printf("  Random access block %d: size=%lu, %s\n", idx, read_block->size,
+        printf("  Random access block %d: size=%" PRIu64 ", %s\n", idx, read_block->size,
                (sizes[idx] > 32768) ? "OVERFLOW" : "regular");
 
         block_manager_block_free(read_block);
@@ -1321,12 +1323,14 @@ void test_block_manager_overflowed_and_not_position_cache_iteration()
     printf("\n" BOLDWHITE "Test 3: Verify cache accuracy\n" RESET);
     for (int i = 0; i < num_blocks; i++)
     {
-        printf("  Block %d: cached_pos=%lu, actual_offset=%ld, size=%lu\n", i,
-               bm->block_positions[i], offsets[i], bm->block_sizes[i]);
+        printf("  Block %d: cached_pos=%" PRIu64 ", actual_offset=%" PRId64 ", size=%" PRIu64 "\n",
+               i, bm->block_positions[i], offsets[i], bm->block_sizes[i]);
         ASSERT_EQ(bm->block_positions[i], (uint64_t)offsets[i]);
         ASSERT_EQ(bm->block_sizes[i], sizes[i]);
     }
 
+    free(offsets);
+    free(sizes);
     block_manager_close(bm);
     remove("test_overflow_and_not_position_cache_iteration.db");
     printf("\n" BOLDGREEN "All tests passed!\n" RESET);

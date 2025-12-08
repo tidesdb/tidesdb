@@ -123,11 +123,6 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
             /* decode original size from uint64_t for cross-architecture portability */
             uint64_t original_size = decode_uint64_le_compat(data);
 
-            if (original_size == 0)
-            {
-                return NULL;
-            }
-
             *decompressed_size = (size_t)original_size;
 
             decompressed_data = malloc(*decompressed_size);

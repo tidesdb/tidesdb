@@ -3592,21 +3592,22 @@ static void test_partitioned_merge_strategy(void)
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     /* config to force partitioned merge
-     * Strategy: Make level X very small so it fills up during ONE compaction cycle
+     * strategy: make level X very small so it fills up during one compaction cycle
      * dividing_level_offset=1 means X = num_levels - 2 (higher X than default)
-     * Small ratio (2x) creates many smaller levels
-     * This way, when we compact, level X will STAY full and trigger partitioned merge
+     * small ratio (2x) creates many smaller levels
+     * this way, when we compact, level X will stay full and trigger partitioned merge
      */
-    cf_config.write_buffer_size = 150;   /* very small buffer */
-    cf_config.level_size_ratio = 2;      /* 2x growth = many small levels */
-    cf_config.dividing_level_offset = 1; /* X = num_levels - 2 (not -3) */
-    cf_config.min_levels = 4;            /* force at least 4 levels */
+    cf_config.write_buffer_size = 150 * 8; /* very small buffer */
+    cf_config.level_size_ratio = 2;        /* 2x growth = many small levels */
+    cf_config.dividing_level_offset = 1;   /* X = num_levels - 2 (not -3) */
+    cf_config.min_levels = 4;              /* force at least 4 levels */
+    // cf_config.compression_algorithm = NO_COMPRESSION;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "partition_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "partition_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* Level capacity calculations with write_buffer_size=150, ratio=2, min_levels=4:
+    /* level capacity calculations with write_buffer_size=150, ratio=2, min_levels=4:
      * L0: 150 * 2 = 300 bytes
      * L1: 300 * 2 = 600 bytes
      * L2: 600 * 2 = 1,200 bytes
@@ -7209,10 +7210,10 @@ int main(void)
     RUN_TEST(test_no_data_loss_across_operations, tests_passed);
     RUN_TEST(test_concurrent_writes_visibility, tests_passed);
     RUN_TEST(test_dividing_merge_strategy, tests_passed);
-    // RUN_TEST(test_partitioned_merge_strategy, tests_passed); // MUST FIX!!
-    // RUN_TEST(test_boundary_partitioning, tests_passed); // MUST FIX!!
+    RUN_TEST(test_partitioned_merge_strategy, tests_passed);
+    RUN_TEST(test_boundary_partitioning, tests_passed);
     RUN_TEST(test_dynamic_capacity_adjustment, tests_passed);
-    // RUN_TEST(test_multi_level_compaction_strategies, tests_passed); MUST FIX
+    RUN_TEST(test_multi_level_compaction_strategies, tests_passed);
     RUN_TEST(test_recovery_with_corrupted_sstable, tests_passed);
     RUN_TEST(test_portability_workflow, tests_passed);
     RUN_TEST(test_iterator_across_multiple_memtable_flushes, tests_passed);

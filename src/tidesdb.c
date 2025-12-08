@@ -2625,6 +2625,14 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         block_manager_cursor_next(klog_cursor);
     }
 
+    /* check if we're already past data blocks after navigation */
+    if (sst->klog_data_end_offset > 0 && klog_cursor->current_pos >= sst->klog_data_end_offset)
+    {
+        /* block index pointed us to auxiliary structures, key not found */
+        block_manager_cursor_free(klog_cursor);
+        return TDB_ERR_NOT_FOUND;
+    }
+
     int result = TDB_ERR_NOT_FOUND;
     uint64_t block_num = 0;
 
@@ -2637,6 +2645,13 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     while (block_manager_cursor_has_next(klog_cursor) && block_num < sst->num_klog_blocks)
     {
+        /* check if cursor is past data end offset (into auxiliary structures) */
+        if (sst->klog_data_end_offset > 0 && klog_cursor->current_pos >= sst->klog_data_end_offset)
+        {
+            /* reached auxiliary structures, stop reading data blocks */
+            break;
+        }
+
         block_manager_block_t *block =
             tidesdb_cached_block_read(db, cf_name, sst->id, 'k', klog_cursor);
         if (!block)
@@ -2994,10 +3009,10 @@ static void tidesdb_level_free(tidesdb_t *db, tidesdb_level_t *level)
 
     for (int i = 0; i < num_boundaries; i++)
     {
-        free(file_boundaries);
+        free(file_boundaries[i]); /* free individual boundary entries */
     }
 
-    free(file_boundaries);
+    free(file_boundaries); /* then free the array itself */
 
     free(level->boundary_sizes);
 
@@ -4094,11 +4109,20 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
             /* move to previous block */
             if (block_manager_cursor_prev(source->source.sstable.klog_cursor) == 0)
             {
+                /* check if cursor is past data end offset (into auxiliary structures) */
+                if (source->source.sstable.sst->klog_data_end_offset > 0 &&
+                    source->source.sstable.klog_cursor->current_pos >=
+                        source->source.sstable.sst->klog_data_end_offset)
+                {
+                    /* reached end of data blocks (moved into auxiliary structures) */
+                    return TDB_ERR_NOT_FOUND;
+                }
+
                 block_manager_block_t *block =
                     block_manager_cursor_read(source->source.sstable.klog_cursor);
                 if (block)
                 {
-                    /* block is owned by us, decompress it */
+                    /* block is owned by us, decompress if needed */
                     uint8_t *data = block->data;
                     size_t data_size = block->size;
                     uint8_t *decompressed = NULL;
@@ -5053,7 +5077,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     block_manager_get_size(klog_bm, &new_sst->klog_data_end_offset);
 
-    if (block_indexes)
+    /* only write auxiliary structures if we have entries */
+    if (new_sst->num_entries > 0 && block_indexes)
     {
         /* we assign the built index to the sstable */
         new_sst->block_indexes = block_indexes;
@@ -5074,7 +5099,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         }
     }
 
-    if (bloom)
+    if (new_sst->num_entries > 0 && bloom)
     {
         size_t bloom_size;
         uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
@@ -5097,10 +5122,11 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         new_sst->bloom_filter = bloom;
     }
 
-    /* write metadata block as the last block */
+    /* write metadata block as the last block - only if we have entries */
     uint8_t *metadata_data = NULL;
     size_t metadata_size = 0;
-    if (sstable_metadata_serialize(new_sst, &metadata_data, &metadata_size) == 0)
+    if (new_sst->num_entries > 0 &&
+        sstable_metadata_serialize(new_sst, &metadata_data, &metadata_size) == 0)
     {
         block_manager_block_t *metadata_block =
             block_manager_block_create(metadata_size, metadata_data);
@@ -5320,80 +5346,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         return result;
     }
 
-    /* check if any sstable being merged overlaps with boundaries
-     * if no overlap, fall back to full merge to avoid empty partitions */
-    int has_overlap = 0;
-    for (size_t i = 0; i < num_sstables_to_merge; i++)
-    {
-        tidesdb_sstable_t *sst = queue_peek_at(sstables_to_delete, i);
-        if (!sst) continue;
-
-        /* check if sst overlaps with any boundary range */
-        for (int b = 0; b < num_boundaries; b++)
-        {
-            uint8_t *boundary_start = (b > 0) ? file_boundaries[b - 1] : NULL;
-            size_t boundary_start_size = (b > 0) ? boundary_sizes[b - 1] : 0;
-            uint8_t *boundary_end = file_boundaries[b];
-            size_t boundary_end_size = boundary_sizes[b];
-
-            /* check if sst overlaps with range [boundary_start, boundary_end) */
-            int overlaps = 1;
-
-            if (boundary_start && comparator_fn(sst->max_key, sst->max_key_size, boundary_start,
-                                                boundary_start_size, comparator_ctx) < 0)
-            {
-                overlaps = 0; /* sst is entirely before this range */
-            }
-
-            if (overlaps && boundary_end &&
-                comparator_fn(sst->min_key, sst->min_key_size, boundary_end, boundary_end_size,
-                              comparator_ctx) >= 0)
-            {
-                overlaps = 0; /* sst is entirely after this range */
-            }
-
-            if (overlaps)
-            {
-                has_overlap = 1;
-                break;
-            }
-        }
-
-        /* also check last partition [last_boundary, NULL) */
-        if (!has_overlap && num_boundaries > 0)
-        {
-            uint8_t *last_boundary = file_boundaries[num_boundaries - 1];
-            size_t last_boundary_size = boundary_sizes[num_boundaries - 1];
-
-            if (comparator_fn(sst->max_key, sst->max_key_size, last_boundary, last_boundary_size,
-                              comparator_ctx) >= 0)
-            {
-                has_overlap = 1;
-            }
-        }
-
-        if (has_overlap) break;
-    }
-
-    /* if no overlap with existing boundaries, use full merge instead of dividing merge
-     * this prevents creating empty partitions and losing keys */
-    if (!has_overlap)
-    {
-        TDB_DEBUG_LOG(
-            "Dividing merge: No overlap with existing boundaries, falling back to full "
-            "preemptive merge");
-        int result = tidesdb_full_preemptive_merge(cf, 0, target_level);
-
-        while (!queue_is_empty(sstables_to_delete))
-        {
-            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
-            if (sst) tidesdb_sstable_unref(cf->db, sst);
-        }
-        queue_free(sstables_to_delete);
-
-        return result;
-    }
-
     /* calculate total estimated entries from all ssts being merged */
     uint64_t total_estimated_entries = 0;
     for (size_t i = 0; i < num_sstables_to_merge; i++)
@@ -5489,6 +5441,16 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         /* use minimum of 100 entries for bloom filter sizing */
         if (partition_estimated_entries < 100) partition_estimated_entries = 100;
+
+        /* skip empty partitions - don't create SSTable if heap is empty */
+        if (tidesdb_merge_heap_empty(partition_heap))
+        {
+            TDB_DEBUG_LOG(
+                "Dividing merge partition %d: Skipping empty partition (no overlapping SSTables)",
+                partition);
+            tidesdb_merge_heap_free(partition_heap);
+            continue;
+        }
 
         /* create new sst for this partition with partition naming */
         uint64_t sst_id = atomic_fetch_add(&cf->next_sstable_id, 1);
@@ -5684,15 +5646,31 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 size_t klog_size;
                 if (tidesdb_klog_block_serialize(klog_block, &klog_data, &klog_size) == 0)
                 {
+                    uint8_t *final_klog_data = klog_data;
+                    size_t final_klog_size = klog_size;
+
+                    if (cf->config.compression_algorithm != NO_COMPRESSION)
+                    {
+                        size_t compressed_size;
+                        uint8_t *compressed = compress_data(klog_data, klog_size, &compressed_size,
+                                                            cf->config.compression_algorithm);
+                        if (compressed)
+                        {
+                            free(klog_data);
+                            final_klog_data = compressed;
+                            final_klog_size = compressed_size;
+                        }
+                    }
+
                     block_manager_block_t *kblock =
-                        block_manager_block_create(klog_size, klog_data);
+                        block_manager_block_create(final_klog_size, final_klog_data);
                     if (kblock)
                     {
                         block_manager_block_write(klog_bm, kblock);
                         block_manager_block_release(kblock);
                         klog_block_num++;
                     }
-                    free(klog_data);
+                    free(final_klog_data);
                 }
 
                 tidesdb_klog_block_free(klog_block);
@@ -5754,14 +5732,31 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             size_t vlog_size;
             if (tidesdb_vlog_block_serialize(vlog_block, &vlog_data, &vlog_size) == 0)
             {
-                block_manager_block_t *vblock = block_manager_block_create(vlog_size, vlog_data);
+                uint8_t *final_vlog_data = vlog_data;
+                size_t final_vlog_size = vlog_size;
+
+                if (cf->config.compression_algorithm != NO_COMPRESSION)
+                {
+                    size_t compressed_size;
+                    uint8_t *compressed = compress_data(vlog_data, vlog_size, &compressed_size,
+                                                        cf->config.compression_algorithm);
+                    if (compressed)
+                    {
+                        free(vlog_data);
+                        final_vlog_data = compressed;
+                        final_vlog_size = compressed_size;
+                    }
+                }
+
+                block_manager_block_t *vblock =
+                    block_manager_block_create(final_vlog_size, final_vlog_data);
                 if (vblock)
                 {
                     block_manager_block_write(vlog_bm, vblock);
                     block_manager_block_release(vblock);
                     vlog_block_num++;
                 }
-                free(vlog_data);
+                free(final_vlog_data);
             }
         }
 
@@ -5785,14 +5780,31 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             size_t klog_size;
             if (tidesdb_klog_block_serialize(klog_block, &klog_data, &klog_size) == 0)
             {
-                block_manager_block_t *block = block_manager_block_create(klog_size, klog_data);
+                uint8_t *final_klog_data = klog_data;
+                size_t final_klog_size = klog_size;
+
+                if (cf->config.compression_algorithm != NO_COMPRESSION)
+                {
+                    size_t compressed_size;
+                    uint8_t *compressed = compress_data(klog_data, klog_size, &compressed_size,
+                                                        cf->config.compression_algorithm);
+                    if (compressed)
+                    {
+                        free(klog_data);
+                        final_klog_data = compressed;
+                        final_klog_size = compressed_size;
+                    }
+                }
+
+                block_manager_block_t *block =
+                    block_manager_block_create(final_klog_size, final_klog_data);
                 if (block)
                 {
                     block_manager_block_write(klog_bm, block);
                     block_manager_block_release(block);
                     klog_block_num++;
                 }
-                free(klog_data);
+                free(final_klog_data);
             }
         }
 
@@ -5815,8 +5827,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         /* capture klog file offset where data blocks end (before writing index/bloom/metadata) */
         block_manager_get_size(klog_bm, &new_sst->klog_data_end_offset);
 
-        /* write index */
-        if (block_indexes)
+        /* write index - only if we have entries */
+        if (entry_count > 0 && block_indexes)
         {
             new_sst->block_indexes = block_indexes;
 
@@ -5836,8 +5848,10 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             }
         }
 
-        if (bloom)
+        if (entry_count > 0 && bloom)
         {
+            new_sst->bloom_filter = bloom;
+
             size_t bloom_size;
             uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
             if (bloom_data)
@@ -5853,12 +5867,11 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             }
         }
 
-        new_sst->bloom_filter = bloom;
-
-        /* write metadata block as the last block */
+        /* write metadata block as the last block - only if we have entries */
         uint8_t *metadata_data = NULL;
         size_t metadata_size = 0;
-        if (sstable_metadata_serialize(new_sst, &metadata_data, &metadata_size) == 0)
+        if (entry_count > 0 &&
+            sstable_metadata_serialize(new_sst, &metadata_data, &metadata_size) == 0)
         {
             block_manager_block_t *metadata_block =
                 block_manager_block_create(metadata_size, metadata_data);
@@ -5899,6 +5912,11 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             TDB_DEBUG_LOG("Dividing merge partition %d: Skipping empty SSTable %" PRIu64
                           " (0 entries)",
                           partition, new_sst->id);
+
+            /* free bloom and block_indexes since they won't be freed by sstable_unref */
+            if (bloom) bloom_filter_free(bloom);
+            if (block_indexes) compact_block_index_free(block_indexes);
+
             /* delete the empty sstable files */
             remove(new_sst->klog_path);
             remove(new_sst->vlog_path);
@@ -6484,8 +6502,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
              */
             block_manager_get_size(klog_bm, &new_sst->klog_data_end_offset);
 
-            /* write index */
-            if (block_indexes)
+            /* write index - only if we have entries */
+            if (entry_count > 0 && block_indexes)
             {
                 new_sst->block_indexes = block_indexes;
 
@@ -6505,7 +6523,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 }
             }
 
-            if (bloom)
+            if (entry_count > 0 && bloom)
             {
                 size_t bloom_size;
                 uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
@@ -6533,10 +6551,11 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
             new_sst->bloom_filter = bloom;
 
-            /* write metadata block as the last block */
+            /* write metadata block as the last block - only if we have entries */
             uint8_t *metadata_data = NULL;
             size_t metadata_size = 0;
-            if (sstable_metadata_serialize(new_sst, &metadata_data, &metadata_size) == 0)
+            if (entry_count > 0 &&
+                sstable_metadata_serialize(new_sst, &metadata_data, &metadata_size) == 0)
             {
                 block_manager_block_t *metadata_block =
                     block_manager_block_create(metadata_size, metadata_data);
@@ -6779,7 +6798,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 
     if (largest_size >= largest_capacity)
     {
-        TDB_DEBUG_LOG("Largest size: %lu Largest capacity %lu Number of levels %d", largest_size,
+        TDB_DEBUG_LOG("Largest size: %zu Largest capacity %zu Number of levels %d", largest_size,
                       largest_capacity, num_levels);
         tidesdb_add_level(cf);
         /* re-fetch levels pointer after add_level since it reallocates */
@@ -10462,9 +10481,9 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                     {
                         if (block_manager_cursor_next(cursor) != 0)
                         {
-                            TDB_DEBUG_LOG(
-                                "Seek: failed to advance to block %ld, stopping at block %ld",
-                                block_num, i);
+                            TDB_DEBUG_LOG("Seek: failed to advance to block " TDB_I64_FMT
+                                          ", stopping at block " TDB_I64_FMT,
+                                          block_num, i);
                             break;
                         }
                     }
@@ -12430,6 +12449,18 @@ static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *dat
 
     tidesdb_block_index_t *index = calloc(1, sizeof(tidesdb_block_index_t));
     if (!index) return NULL;
+
+    /* handle empty index (count = 0) */
+    if (count == 0)
+    {
+        index->count = 0;
+        index->capacity = 0;
+        index->prefix_len = prefix_len;
+        index->min_key_prefixes = NULL;
+        index->max_key_prefixes = NULL;
+        index->block_nums = NULL;
+        return index;
+    }
 
     index->min_key_prefixes = malloc(count * prefix_len);
     index->max_key_prefixes = malloc(count * prefix_len);

@@ -267,7 +267,7 @@ int skip_list_random_level(skip_list_t *list)
     if (rng_state == 0)
     {
         /* initialize with thread ID + timestamp for uniqueness */
-        rng_state = (uint64_t)pthread_self() ^ (uint64_t)time(NULL);
+        rng_state = (uint64_t)TDB_THREAD_ID() ^ (uint64_t)time(NULL);
     }
 
     /* convert probability to threshold for fast comparison

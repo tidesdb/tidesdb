@@ -5327,6 +5327,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     uint8_t **file_boundaries =
         atomic_load_explicit(&target->file_boundaries, memory_order_acquire);
     size_t *boundary_sizes = atomic_load_explicit(&target->boundary_sizes, memory_order_acquire);
+    (void)file_boundaries; /* used for partition range determination */
+    (void)boundary_sizes;  /* used for partition range determination */
 
     /* get number of sstables being merged */
     size_t num_sstables_to_merge = queue_size(sstables_to_delete);
@@ -10481,8 +10483,8 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                     {
                         if (block_manager_cursor_next(cursor) != 0)
                         {
-                            TDB_DEBUG_LOG("Seek: failed to advance to block " TDB_I64_FMT
-                                          ", stopping at block " TDB_I64_FMT,
+                            TDB_DEBUG_LOG("Seek: failed to advance to block %" PRId64
+                                          ", stopping at block %" PRId64,
                                           block_num, i);
                             break;
                         }

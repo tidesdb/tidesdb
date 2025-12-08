@@ -1038,7 +1038,6 @@ static inline int fdatasync(int fd)
 
 #elif defined(__APPLE__)
 #include <dirent.h>
-#include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <pthread.h>
@@ -1046,6 +1045,17 @@ static inline int fdatasync(int fd)
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+/* Grand Central Dispatch (dispatch/dispatch.h) is only available on macOS 10.6+
+ * For older macOS versions (e.g., 10.5 PPC64), use POSIX semaphores instead */
+#include <AvailabilityMacros.h>
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1060
+#define TDB_USE_DISPATCH_SEMAPHORE 1
+#include <dispatch/dispatch.h>
+#else
+#define TDB_USE_DISPATCH_SEMAPHORE 0
+#include <semaphore.h>
+#endif
 
 /* pread and pwrite are available natively on macOS via unistd.h */
 /* no additional implementation needed using system pread/pwrite */
@@ -1072,7 +1082,8 @@ static inline int fdatasync(int fd)
 #endif
 }
 
-/* semaphore compatibility for macOS using Grand Central Dispatch
+#if TDB_USE_DISPATCH_SEMAPHORE
+/* semaphore compatibility for macOS 10.6+ using Grand Central Dispatch
  * macOS deprecated POSIX semaphores (sem_init, sem_destroy, etc.)
  * use dispatch_semaphore instead */
 typedef dispatch_semaphore_t sem_t;
@@ -1130,6 +1141,11 @@ static inline int sem_post(sem_t *sem)
     dispatch_semaphore_signal(*sem);
     return 0;
 }
+#else
+/* for macOS < 10.6 (e.g., 10.5 PPC64), use POSIX semaphores
+ * note: POSIX semaphores are deprecated on modern macOS but work on older versions */
+/* sem_t, sem_init, sem_destroy, sem_wait, sem_post are provided by semaphore.h */
+#endif
 
 #else /* posix systems */
 #include <dirent.h>

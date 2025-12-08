@@ -192,6 +192,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define NO_CF_SYNC_SLEEP_US                                                                       \
     100000 /* when background sync thread is waiting for an existing or new column family to work \
               on syncing in background */
+#define L0_QUEUE_CHECK_BACKOFF_MICRO_SECONDS 10000 /* 10ms */
 
 /**
  * tidesdb_column_family_config_t

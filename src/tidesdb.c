@@ -9910,6 +9910,48 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         size_t current_memtable_size = (size_t)skip_list_get_size(target_memtable);
         int should_flush = (current_memtable_size >= cf->config.write_buffer_size) ? 1 : 0;
 
+        /* block if flush queue exceeds threshold before triggering a new flush
+         * this provides backpressure to prevent memory exhaustion from too many
+         * immutable memtables waiting to be flushed */
+        if (should_flush && cf->db->flush_queue_threshold > 0)
+        {
+            int wait_count = 0;
+            int current_queue_size;
+
+            while ((current_queue_size = queue_size(cf->db->flush_queue)) >=
+                   cf->db->flush_queue_threshold)
+            {
+                if (wait_count == 0)
+                {
+                    TDB_DEBUG_LOG(
+                        "CF '%s': Flush queue full (%d >= %d), blocking commit until flushes "
+                        "complete",
+                        cf->name, current_queue_size, cf->db->flush_queue_threshold);
+                }
+                wait_count++;
+
+                /* release commit ticket temporarily to allow other commits to proceed */
+                atomic_store_explicit(&cf->commit_serving, my_ticket + 1, memory_order_release);
+
+                /* sleep briefly to avoid busy-waiting (L0_QUEUE_CHECK_BACKOFF_MICRO_SECONDS) */
+                usleep(L0_QUEUE_CHECK_BACKOFF_MICRO_SECONDS);
+
+                /* re-acquire commit ticket */
+                my_ticket = atomic_fetch_add_explicit(&cf->commit_ticket, 1, memory_order_relaxed);
+                while (atomic_load_explicit(&cf->commit_serving, memory_order_acquire) != my_ticket)
+                {
+                    cpu_pause();
+                }
+            }
+
+            if (wait_count > 0)
+            {
+                TDB_DEBUG_LOG(
+                    "CF '%s': Flush queue drained after %d waits (now %d), proceeding with commit",
+                    cf->name, wait_count, current_queue_size);
+            }
+        }
+
         atomic_store_explicit(&cf->commit_serving, my_ticket + 1, memory_order_release);
 
         if (should_flush)

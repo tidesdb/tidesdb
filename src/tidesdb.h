@@ -193,6 +193,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
     100000 /* when background sync thread is waiting for an existing or new column family to work \
               on syncing in background */
 #define L0_QUEUE_CHECK_BACKOFF_MICRO_SECONDS 10000 /* 10ms */
+/* block index prefix length (32 bytes for good discrimination) */
+#define TDB_BLOCK_INDEX_PREFIX_LEN 32
 
 /**
  * tidesdb_column_family_config_t
@@ -539,7 +541,6 @@ typedef struct
  * @param is_flushing whether a column family memtable has been swapped and queued
  * @param dca_in_progress  prevents concurrent level access during DCA operations which increase or
  * decrease levels
- * @param levels_readers count of active readers accessing levels array
  * @param db parent database reference
  */
 struct tidesdb_column_family_t
@@ -562,8 +563,7 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
-    _Atomic(int) dca_in_progress;
-    _Atomic(int) levels_readers;
+    _Atomic(int) dca_in_progress; /* flag indicating DCA (add/remove level) is in progress */
     tidesdb_t *db;
 };
 

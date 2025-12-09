@@ -23,9 +23,6 @@
 /* global debug flag definition */
 int _tidesdb_debug_enabled = 0;
 
-/* block index prefix length (32 bytes for good discrimination) */
-#define TDB_BLOCK_INDEX_PREFIX_LEN 32
-
 /**
  * multi_cf_txn_entry_t
  * @param seq global sequence number
@@ -471,6 +468,20 @@ static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf);
 static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path,
                                skip_list_t **memtable, multi_cf_txn_tracker_t *tracker);
 static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capacity, size_t ratio);
+
+/**
+ * tidesdb_wait_for_dca
+ * spin-wait until DCA operation completes
+ * @param cf the column family
+ */
+static inline void tidesdb_wait_for_dca(tidesdb_column_family_t *cf)
+{
+    while (atomic_load_explicit(&cf->dca_in_progress, memory_order_acquire))
+    {
+        cpu_pause(); /* yield CPU during spin-wait */
+    }
+}
+
 static int tidesdb_add_level(tidesdb_column_family_t *cf);
 static int tidesdb_remove_level(tidesdb_column_family_t *cf);
 static int tidesdb_apply_dca(tidesdb_column_family_t *cf);
@@ -1654,7 +1665,7 @@ static int tidesdb_vlog_read_value_with_cursor(tidesdb_t *db, tidesdb_sstable_t 
     if (cursor->bm->block_count > 0 && cursor->bm->block_positions &&
         !atomic_load(&cursor->bm->cache_rebuilding))
     {
-        /* position cache available and not being rebuilt - direct jump to block */
+        /* position cache available and not being rebuilt -- direct jump to block */
         if (block_num >= (uint64_t)cursor->bm->block_count)
         {
             return TDB_ERR_IO; /* block number out of range */
@@ -1665,7 +1676,7 @@ static int tidesdb_vlog_read_value_with_cursor(tidesdb_t *db, tidesdb_sstable_t 
     }
     else
     {
-        /* no position cache - fall back to sequential seek */
+        /* no position cache -- fall back to sequential seek */
         if (block_manager_cursor_goto_first(cursor) != 0)
         {
             return TDB_ERR_IO;
@@ -1972,7 +1983,10 @@ static void tidesdb_sstable_free(tidesdb_t *db, tidesdb_sstable_t *sst)
  */
 static void tidesdb_sstable_ref(tidesdb_sstable_t *sst)
 {
-    if (sst) atomic_fetch_add(&sst->refcount, 1);
+    if (sst)
+    {
+        atomic_fetch_add(&sst->refcount, 1);
+    }
 }
 
 /**
@@ -1987,6 +2001,7 @@ static void tidesdb_sstable_unref(tidesdb_t *db, tidesdb_sstable_t *sst)
     int old_refcount = atomic_fetch_sub(&sst->refcount, 1);
     if (old_refcount == 1)
     {
+        TDB_DEBUG_LOG("tidesdb_sstable_unref: FREEING SSTable %" PRIu64, sst->id);
         tidesdb_sstable_free(db, sst);
     }
 }
@@ -2919,24 +2934,6 @@ load_bloom_and_index:
 }
 
 /**
- * tidesdb_sstable_array_create
- * create a new reference-counted sstable array
- */
-
-/**
- * tidesdb_wait_for_dca
- * spin-wait until DCA operation completes
- * @param cf the column family
- */
-static inline void tidesdb_wait_for_dca(tidesdb_column_family_t *cf)
-{
-    while (atomic_load_explicit(&cf->dca_in_progress, memory_order_acquire))
-    {
-        cpu_pause(); /* yield CPU during spin-wait */
-    }
-}
-
-/**
  * tidesdb_level_create
  * create a new level
  * @param level_num level number
@@ -2969,7 +2966,6 @@ static tidesdb_level_t *tidesdb_level_create(int level_num, size_t capacity)
     atomic_init(&level->num_sstables, 0);
     atomic_init(&level->sstables_capacity, TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY);
     atomic_init(&level->num_boundaries, 0);
-    atomic_init(&level->marked_for_deletion, 0);
 
     return level;
 }
@@ -4236,18 +4232,20 @@ static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capaci
 static int tidesdb_add_level(tidesdb_column_family_t *cf)
 {
     TDB_DEBUG_LOG("tidesdb_add_level called for CF '%s'", cf->name);
+    TDB_DEBUG_LOG("DCA: add_level starting");
 
-    /* we set DCA flag to block concurrent level access */
+    /* set DCA flag to block concurrent level access */
     int expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&cf->dca_in_progress, &expected, 1,
                                                  memory_order_acquire, memory_order_relaxed))
     {
         /* another DCA operation is already running, skip this one */
-        TDB_DEBUG_LOG("tidesdb_add_level: DCA already in progress, skipping");
+        TDB_DEBUG_LOG("DCA: add_level skipped - another DCA in progress");
         return TDB_SUCCESS;
     }
 
-    /* read current state atomically */
+    /* read current state atomically
+     * we load in same order as we store (num_levels first, then levels) */
     int old_num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
     tidesdb_level_t **old_levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
@@ -4282,12 +4280,29 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     tidesdb_level_t **new_levels = malloc((old_num_levels + 1) * sizeof(tidesdb_level_t *));
     if (!new_levels)
     {
+        tidesdb_level_free(cf->db, new_level);
         atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         return TDB_ERR_MEMORY;
     }
 
-    /* copy existing levels and add new one */
-    memcpy(new_levels, old_levels, old_num_levels * sizeof(tidesdb_level_t *));
+    if (old_num_levels > 0)
+    {
+        tidesdb_level_t *old_largest = old_levels[old_num_levels - 1];
+        size_t old_largest_capacity =
+            atomic_load_explicit(&old_largest->capacity, memory_order_relaxed);
+
+        tidesdb_level_t *empty_level =
+            tidesdb_level_create(old_largest->level_num, old_largest_capacity);
+        if (!empty_level)
+        {
+            free(new_levels);
+            tidesdb_level_free(cf->db, new_level);
+            atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
+            return TDB_ERR_MEMORY;
+        }
+        new_levels[old_num_levels - 1] = empty_level;
+    }
+
     new_levels[old_num_levels] = new_level;
 
     /* spooky algo 1 from paper "If the number of levels changed, the run at the previously largest
@@ -4304,52 +4319,66 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
         TDB_DEBUG_LOG("Moving %d SSTables from old level %d to new level %d", num_ssts,
                       old_largest->level_num, new_level->level_num);
 
-        /* move each sstable to the new largest level */
+        /* move each sstable to the new largest level
+         * tidesdb_level_add_sstable takes a NEW reference for new_level.
+         * We need to unref the old reference since we're moving, not copying. */
         for (int i = 0; i < num_ssts; i++)
         {
             if (sstables[i])
             {
-                /* tidesdb_level_add_sstable takes its own reference, so we don't need to ref here
-                 */
-                tidesdb_level_add_sstable(new_level, sstables[i]);
-
-                /* unref from the old level since it no longer owns this sstable */
-                tidesdb_sstable_unref(cf->db, sstables[i]);
+                int before_ref = atomic_load_explicit(&sstables[i]->refcount, memory_order_acquire);
+                TDB_DEBUG_LOG("DCA: SSTable %" PRIu64 " refcount before move: %d", sstables[i]->id,
+                              before_ref);
+                tidesdb_level_add_sstable(new_level, sstables[i]); /* new_level takes ref */
+                int after_add = atomic_load_explicit(&sstables[i]->refcount, memory_order_acquire);
+                TDB_DEBUG_LOG("DCA: SSTable %" PRIu64 " refcount after add: %d", sstables[i]->id,
+                              after_add);
+                tidesdb_sstable_unref(cf->db, sstables[i]); /* release old level's ref */
+                int after_unref =
+                    atomic_load_explicit(&sstables[i]->refcount, memory_order_acquire);
+                TDB_DEBUG_LOG("DCA: SSTable %" PRIu64 " refcount after unref: %d", sstables[i]->id,
+                              after_unref);
             }
         }
 
-        /* DO NOT clear old_largest here yet -- must wait until after publishing new levels
-         * to avoid race where reads see old L2 as empty before new L3 is visible */
-    }
-
-    /* publish new levels array - new readers will use this */
-    atomic_store_explicit(&cf->levels, new_levels, memory_order_release);
-    atomic_store_explicit(&cf->num_levels, old_num_levels + 1, memory_order_release);
-
-    /* NOW it's safe to clear the old largest level to prevent double-unref in tidesdb_level_free
-     * new levels array is published, so new reads will see L3 with the ssts */
-    if (old_num_levels > 0)
-    {
-        tidesdb_level_t *old_largest = old_levels[old_num_levels - 1];
+        /* Clear the old level's SSTable count to prevent tidesdb_level_free from
+         * trying to unref the SSTables again (we already unref'd them above). */
         atomic_store_explicit(&old_largest->num_sstables, 0, memory_order_release);
         atomic_store_explicit(&old_largest->current_size, 0, memory_order_release);
     }
 
-    /* wait for all readers using old levels array to finish (RCU grace period)
-     * readers increment levels_readers before accessing, decrement after */
-    while (atomic_load_explicit(&cf->levels_readers, memory_order_acquire) > 0)
+    atomic_thread_fence(memory_order_release);
+
+    /* copy levels 0 to old_num_levels-2 to new array */
+    for (int i = 0; i < old_num_levels - 1; i++)
     {
-        cpu_pause(); /* spin-wait for readers to finish */
+        new_levels[i] = old_levels[i];
     }
 
-    /* now safe to free old array - all readers have finished */
-    if (old_levels && old_num_levels > 0)
-    {
-        free(old_levels);
-    }
+    /* publish new levels array -- new readers will use this
+     * we must update num_levels first, then levels array.
+     * this ensures any reader who sees the new levels array will also see the correct count.
+     * readers load levels first, then num_levels, so if we publish in reverse order,
+     * they'll always see a consistent view. */
+    TDB_DEBUG_LOG("DCA: Publishing new levels array with %d levels", old_num_levels + 1);
+    atomic_store_explicit(&cf->num_levels, old_num_levels + 1, memory_order_release);
+    atomic_thread_fence(memory_order_seq_cst); /* ensure num_levels is visible before levels */
+    atomic_store_explicit(&cf->levels, new_levels, memory_order_release);
 
-    /* we clear DCA flag to allow level access */
+    if (old_num_levels > 0)
+    {
+        tidesdb_level_t *old_largest = old_levels[old_num_levels - 1];
+        int old_largest_ssts =
+            atomic_load_explicit(&old_largest->num_sstables, memory_order_acquire);
+        TDB_DEBUG_LOG("DCA: Freeing old_largest level %d with %d SSTables", old_largest->level_num,
+                      old_largest_ssts);
+        tidesdb_level_free(cf->db, old_largest);
+    }
+    free(old_levels);
+
+    /* clear DCA flag to allow level access */
     atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
+    TDB_DEBUG_LOG("DCA: add_level complete");
 
     TDB_DEBUG_LOG("Added level %d, now have %d levels", new_level->level_num, old_num_levels + 1);
 
@@ -4366,13 +4395,13 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
 {
     TDB_DEBUG_LOG("tidesdb_remove_level called for CF '%s'", cf->name);
 
-    /* we set DCA flag to block concurrent level access */
+    /* set DCA flag to block concurrent level access */
     int expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&cf->dca_in_progress, &expected, 1,
                                                  memory_order_acquire, memory_order_relaxed))
     {
         /* another DCA operation is already running, skip this one */
-        TDB_DEBUG_LOG("tidesdb_remove_level: DCA already in progress, skipping");
+        TDB_DEBUG_LOG("DCA: remove_level skipped - another DCA in progress");
         return TDB_SUCCESS;
     }
 
@@ -4382,9 +4411,9 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
     /* enforce minimum levels! never go below min_levels */
     if (old_num_levels <= cf->config.min_levels)
     {
+        atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         TDB_DEBUG_LOG("tidesdb_remove_level: At minimum levels (%d <= %d), not removing",
                       old_num_levels, cf->config.min_levels);
-        atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         return TDB_SUCCESS; /* not an error, just at minimum */
     }
 
@@ -4431,11 +4460,13 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
                     tidesdb_sstable_unref(cf->db, largest_sstables[i]);
                 }
             }
+
+            /* Clear the level's SSTable count to prevent tidesdb_level_free from
+             * trying to unref the SSTables again (we already unref'd them above) */
+            atomic_store_explicit(&largest->num_sstables, 0, memory_order_release);
+            atomic_store_explicit(&largest->current_size, 0, memory_order_release);
         }
     }
-
-    /* mark level for deletion */
-    atomic_store_explicit(&largest->marked_for_deletion, 1, memory_order_release);
 
     /* allocate new array without last level */
     int new_num_levels = old_num_levels - 1;
@@ -4470,9 +4501,12 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
                       atomic_load_explicit(&new_largest->capacity, memory_order_relaxed));
     }
 
-    /* we swap in new array -- safe because DCA flag blocks concurrent readers */
-    atomic_store_explicit(&cf->levels, new_levels, memory_order_release);
+    /* we swap in new array -- safe because DCA flag blocks concurrent readers
+     * we must update num_levels first, then levels array.
+     * this ensures any reader who sees the new levels array will also see the correct count. */
     atomic_store_explicit(&cf->num_levels, new_num_levels, memory_order_release);
+    atomic_thread_fence(memory_order_seq_cst); /* ensure num_levels is visible before levels */
+    atomic_store_explicit(&cf->levels, new_levels, memory_order_release);
 
     /* we free old array now that new one is published and DCA flag protects us */
     if (old_levels && old_num_levels > 0)
@@ -4481,14 +4515,15 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
     }
 
     /* now free the actual largest level struct that we removed
-     * it's safe to do this after swapping arrays since no one can access it anymore */
-    TDB_DEBUG_LOG("Freeing removed level %d (num_sstables=%d, current_size=%zu)",
-                  largest->level_num,
-                  atomic_load_explicit(&largest->num_sstables, memory_order_acquire),
-                  atomic_load_explicit(&largest->current_size, memory_order_relaxed));
+     * Note: we've already cleared num_sstables above if any SSTables were moved,
+     * so tidesdb_level_free won't try to unref any SSTables */
+    TDB_DEBUG_LOG(
+        "DCA: All readers done, freeing removed level %d (num_sstables=%d, current_size=%zu)",
+        largest->level_num, atomic_load_explicit(&largest->num_sstables, memory_order_acquire),
+        atomic_load_explicit(&largest->current_size, memory_order_relaxed));
     tidesdb_level_free(cf->db, largest);
 
-    /* we clear DCA flag to allow level access */
+    /* clear DCA flag to allow level access */
     atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
 
     TDB_DEBUG_LOG("Removed level, now have %d levels", new_num_levels);
@@ -4509,12 +4544,6 @@ static int tidesdb_apply_dca(tidesdb_column_family_t *cf)
     {
         return TDB_SUCCESS;
     }
-
-    /* wait for any DCA operation to complete before accessing levels */
-    tidesdb_wait_for_dca(cf);
-
-    /* increment reader count to prevent DCA from freeing levels array while we use it */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
 
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
@@ -4549,9 +4578,6 @@ static int tidesdb_apply_dca(tidesdb_column_family_t *cf)
             }
         }
     }
-
-    /* decrement reader count */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
     return TDB_SUCCESS;
 }
@@ -4598,9 +4624,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     /* wait for any DCA operation to complete before accessing levels */
     tidesdb_wait_for_dca(cf);
 
-    /* increment reader count to prevent DCA from freeing levels array while we use it */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
     /* count total sstables first */
@@ -4645,9 +4668,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             ssts_array[sst_idx++] = sst;
         }
     }
-
-    /* decrement reader count - done collecting SSTables from levels */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
     for (int i = 0; i < sst_idx; i++)
     {
@@ -4733,9 +4753,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
      * the bloom filter is adequately sized. */
     uint64_t estimated_entries = 0;
 
-    /* increment reader count for levels reload */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
     /* reload levels for estimated entries calculation */
     levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
     for (int level = start_level; level <= target_level; level++)
@@ -4755,9 +4772,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             }
         }
     }
-
-    /* decrement reader count - done with levels reload */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
     if (estimated_entries < 100) estimated_entries = 100;
 
@@ -5155,7 +5169,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         new_sst->bloom_filter = bloom;
     }
 
-    /* write metadata block as the last block - only if we have entries */
+    /* write metadata block as the last block -- only if we have entries */
     uint8_t *metadata_data = NULL;
     size_t metadata_size = 0;
     if (new_sst->num_entries > 0 &&
@@ -5193,15 +5207,16 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     uint64_t num_klog_blocks = new_sst->num_klog_blocks;
     uint64_t num_vlog_blocks = new_sst->num_vlog_blocks;
 
-    /* only add sstable if it has entries - empty sstables cause corruption */
+    /* only add sstable if it has entries -- empty sstables cause corruption */
     if (num_entries > 0)
     {
-        /* increment reader count for levels reload */
-        atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
+        /* wait for any DCA operation to complete before accessing levels */
+        tidesdb_wait_for_dca(cf);
 
-        /* reload levels and num_levels as DCA may have changed them */
-        levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+        /* reload levels and num_levels as DCA may have changed them
+         * we load num_levels first to match store order */
         num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+        levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
         /* find the target level by level_num, not by stale array index */
         int target_level_num = target_level + 1;
@@ -5230,9 +5245,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             tidesdb_level_add_sstable(levels[target_idx], new_sst);
             tidesdb_sstable_unref(cf->db, new_sst);
         }
-
-        /* decrement reader count - done with levels reload */
-        atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
     }
     else
     {
@@ -5250,14 +5262,15 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
         if (!sst) continue;
 
-        /* increment reader count for levels reload */
-        atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
+        /* wait for any DCA operation to complete before accessing levels */
+        tidesdb_wait_for_dca(cf);
 
-        /* reload levels for removal */
-        levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+        /* reload levels for removal
+         * we load num_levels first to match store order */
         num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+        levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
-        /* mark for deletion BEFORE removing from levels to avoid use-after-free */
+        /* mark for deletion before removing from levels to avoid use-after-free */
         atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
 
         /* find which level this sst belongs to and remove it -- break on first success */
@@ -5273,9 +5286,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
         /* release the reference we took when collecting sstables */
         tidesdb_sstable_unref(cf->db, sst);
-
-        /* decrement reader count - done with this iteration's levels reload */
-        atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
     }
 
     queue_free(sstables_to_delete);
@@ -5331,9 +5341,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     /* wait for any DCA operation to complete before accessing levels */
     tidesdb_wait_for_dca(cf);
 
-    /* increment reader count to prevent DCA from freeing levels array while we use it */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
     tidesdb_level_t *target = levels[target_level];
@@ -5342,7 +5349,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
     tidesdb_level_update_boundaries(target, next_level);
 
-    /* debug: log SSTables in next_level to understand boundary calculation */
     TDB_DEBUG_LOG("Dividing merge: next_level (L%d) has %d SSTables", next_level->level_num,
                   atomic_load_explicit(&next_level->num_sstables, memory_order_acquire));
     tidesdb_sstable_t **next_level_ssts =
@@ -5364,6 +5370,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
 
     queue_t *sstables_to_delete = queue_new();
+
+    /* wait for any DCA operation to complete before accessing levels */
+    tidesdb_wait_for_dca(cf);
 
     /* reload levels for sst collection */
     levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
@@ -5399,9 +5408,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     size_t *boundary_sizes = atomic_load_explicit(&target->boundary_sizes, memory_order_acquire);
     (void)file_boundaries; /* used for partition range determination */
     (void)boundary_sizes;  /* used for partition range determination */
-
-    /* decrement reader count - done accessing levels array */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
     /* get number of sstables being merged */
     size_t num_sstables_to_merge = queue_size(sstables_to_delete);
@@ -5515,7 +5521,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         /* use minimum of 100 entries for bloom filter sizing */
         if (partition_estimated_entries < 100) partition_estimated_entries = 100;
 
-        /* skip empty partitions - don't create SSTable if heap is empty */
         if (tidesdb_merge_heap_empty(partition_heap))
         {
             TDB_DEBUG_LOG(
@@ -5796,8 +5801,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         /* free partition heap */
         tidesdb_merge_heap_free(partition_heap);
 
-        /* NOTE: last_key is transferred to new_sst->max_key below, so don't free it here */
-
         /* write remaining vlog block if it has data */
         if (vlog_block->num_values > 0)
         {
@@ -5940,7 +5943,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             }
         }
 
-        /* write metadata block as the last block - only if we have entries */
+        /* write metadata block as the last block -- only if we have entries */
         uint8_t *metadata_data = NULL;
         size_t metadata_size = 0;
         if (entry_count > 0 &&
@@ -5971,8 +5974,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         if (entry_count > 0)
         {
-            /* increment reader count for levels reload */
-            atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
+            /* wait for any DCA operation to complete before accessing levels */
+            tidesdb_wait_for_dca(cf);
 
             /* reload levels and num_levels as DCA may have changed them */
             levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
@@ -6006,9 +6009,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 tidesdb_level_add_sstable(levels[target_idx], new_sst);
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
-
-            /* decrement reader count - done with levels reload */
-            atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
         }
         else
         {
@@ -6027,8 +6027,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         }
     }
 
-    /* increment reader count for levels reload */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
+    /* wait for any DCA operation to complete before accessing levels */
+    tidesdb_wait_for_dca(cf);
 
     /* reload levels for removal */
     levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
@@ -6039,7 +6039,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
         if (sst)
         {
-            /* mark for deletion BEFORE removing from levels to avoid use-after-free */
+            /* mark for deletion before removing from levels to avoid use-after-free */
             atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
 
             /* try to remove from each level -- break on first success since each sst is only in one
@@ -6059,9 +6059,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     }
 
     queue_free(sstables_to_delete);
-
-    /* decrement reader count - done with levels reload */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
     TDB_DEBUG_LOG("Completed dividing merge for CF '%s'", cf->name);
     return TDB_SUCCESS;
@@ -6091,14 +6088,27 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     TDB_DEBUG_LOG("Starting partitioned merge: CF '%s', levels %d->%d (array indices %d->%d)",
                   cf->name, start_level, end_level, start_idx, end_idx);
 
-    /* wait for any DCA operation to complete before accessing levels */
-    tidesdb_wait_for_dca(cf);
-
-    /* increment reader count to prevent DCA from freeing levels array while we use it */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
+    tidesdb_level_t *largest = levels[num_levels - 1];
+
+    /* get file boundaries from largest level */
+    tidesdb_sstable_t **largest_sstables =
+        atomic_load_explicit(&largest->sstables, memory_order_acquire);
+    int num_partitions = atomic_load_explicit(&largest->num_sstables, memory_order_acquire);
+
+    /* check if largest level is empty before collecting sstables */
+    if (num_partitions == 0)
+    {
+        /* largest level is empty, fall back to full preemptive merge.
+         * Don't collect sstables since we're not doing partitioned merge.
+         * tidesdb_full_preemptive_merge expects 0-indexed array indices, not 1-indexed level
+         * numbers */
+
+        return tidesdb_full_preemptive_merge(cf, start_idx, end_idx);
+    }
+
+    /* now collect sstables to delete after merge completes */
     queue_t *sstables_to_delete = queue_new();
 
     for (int level_idx = start_idx; level_idx <= end_idx; level_idx++)
@@ -6114,37 +6124,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             tidesdb_sstable_ref(sstables[i]);
             queue_enqueue(sstables_to_delete, sstables[i]);
         }
-    }
-
-    tidesdb_level_t *largest = levels[num_levels - 1];
-
-    /* get file boundaries from largest level */
-    tidesdb_sstable_t **largest_sstables =
-        atomic_load_explicit(&largest->sstables, memory_order_acquire);
-    int num_partitions = atomic_load_explicit(&largest->num_sstables, memory_order_acquire);
-
-    /* copy boundary data before ssts can be freed */
-    if (num_partitions == 0)
-    {
-        /* largest level is empty, fall back to full preemptive merge.
-         * DON'T unref the sstables - just free the queue and let tidesdb_full_preemptive_merge
-         * handle them. The levels still hold references so they won't leak.
-         * If we unref here, the sstables might be freed before tidesdb_full_preemptive_merge
-         * can collect them, causing data loss.
-         * tidesdb_full_preemptive_merge expects 0-indexed array indices, not 1-indexed level
-         * numbers */
-        while (!queue_is_empty(sstables_to_delete))
-        {
-            tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
-            /* Don't unref - tidesdb_full_preemptive_merge will handle it */
-            (void)sst;
-        }
-        queue_free(sstables_to_delete);
-
-        /* decrement reader count before early return */
-        atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
-
-        return tidesdb_full_preemptive_merge(cf, start_idx, end_idx);
     }
 
     uint8_t **boundaries = malloc(num_partitions * sizeof(uint8_t *));
@@ -6167,9 +6146,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             memcpy(boundaries[i], largest_sstables[i]->min_key, boundary_sizes[i]);
         }
     }
-
-    /* decrement reader count - done accessing levels array */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
     /* merge one partition at a time */
     for (int partition = 0; partition < num_partitions; partition++)
@@ -6198,8 +6174,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         /* add overlapping ssts as sources and calculate estimated entries */
         uint64_t estimated_entries = 0;
 
-        /* increment reader count for levels reload */
-        atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
+        /* wait for any DCA operation to complete before accessing levels */
+        tidesdb_wait_for_dca(cf);
 
         /* reload levels for each partition */
         levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
@@ -6259,9 +6235,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
         /* use a minimum of 100 entries to avoid degenerate bloom filters */
         if (estimated_entries < 100) estimated_entries = 100;
-
-        /* decrement reader count - done with levels reload */
-        atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
         /* create output sst for this partition */
         uint64_t new_id = atomic_fetch_add(&cf->next_sstable_id, 1);
@@ -6632,7 +6605,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
              */
             block_manager_get_size(klog_bm, &new_sst->klog_data_end_offset);
 
-            /* write index - only if we have entries */
+            /* write index -- only if we have entries */
             if (entry_count > 0 && block_indexes)
             {
                 new_sst->block_indexes = block_indexes;
@@ -6681,7 +6654,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
             new_sst->bloom_filter = bloom;
 
-            /* write metadata block as the last block - only if we have entries */
+            /* write metadata block as the last block -- only if we have entries */
             uint8_t *metadata_data = NULL;
             size_t metadata_size = 0;
             if (entry_count > 0 &&
@@ -6709,8 +6682,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             /* add to level if not empty */
             if (entry_count > 0)
             {
-                /* increment reader count for levels reload */
-                atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
+                /* wait for any DCA operation to complete before accessing levels */
+                tidesdb_wait_for_dca(cf);
 
                 /* reload levels and num_levels as DCA may have changed them */
                 levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
@@ -6750,9 +6723,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                               new_sst->num_klog_blocks, new_sst->num_vlog_blocks);
 
                 tidesdb_sstable_unref(cf->db, new_sst);
-
-                /* decrement reader count - done with levels reload */
-                atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
             }
             else
             {
@@ -6769,8 +6739,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         tidesdb_merge_heap_free(heap);
     }
 
-    /* increment reader count for levels reload */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
+    /* wait for any DCA operation to complete before accessing levels */
+    tidesdb_wait_for_dca(cf);
 
     /* reload levels for removal */
     levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
@@ -6780,7 +6750,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         tidesdb_sstable_t *sst = queue_dequeue(sstables_to_delete);
         if (!sst) continue;
 
-        /* mark for deletion BEFORE removing from levels to avoid use-after-free */
+        /* mark for deletion before removing from levels to avoid use-after-free */
         atomic_store_explicit(&sst->marked_for_deletion, 1, memory_order_release);
 
         /* try to remove from each level -- break on first success since each sst is only in one
@@ -6799,9 +6769,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     }
 
     queue_free(sstables_to_delete);
-
-    /* decrement reader count - done with levels reload */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
     for (int i = 0; i < num_partitions; i++)
     {
@@ -6826,8 +6793,12 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         return TDB_SUCCESS;
     }
 
+    /* wait for any DCA operation to complete before accessing levels */
+    tidesdb_wait_for_dca(cf);
+
     /* load levels atomically */
     int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+    tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
     TDB_DEBUG_LOG("Triggering compaction for column family: %s (levels: %d)", cf->name, num_levels);
 
@@ -6836,12 +6807,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     if (X < 1) X = 1;
 
     TDB_DEBUG_LOG("Target compaction X %d", X);
-
-    /* increment reader count for first levels access */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
-    /* determine target level for compaction */
-    tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
     int target_lvl = X; /* default to X if no suitable level found */
 
@@ -6872,9 +6837,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 
     TDB_DEBUG_LOG("Final target compaction level: %d", target_lvl);
 
-    /* decrement reader count - done with first levels access */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
-
     int result = TDB_SUCCESS;
     if (target_lvl < X)
     {
@@ -6891,9 +6853,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         TDB_DEBUG_LOG("Warning: target_lvl > X, defaulting to dividing merge");
         result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
     }
-
-    /* increment reader count for second levels access */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
 
     /* reload levels atomically after compaction */
     num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
@@ -6949,7 +6908,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     /* get largest level info for later checks */
     if (num_levels == 0)
     {
-        atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
         atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
         return TDB_SUCCESS;
     }
@@ -6958,18 +6916,12 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     size_t largest_size = atomic_load_explicit(&largest->current_size, memory_order_relaxed);
     size_t largest_capacity = atomic_load_explicit(&largest->capacity, memory_order_relaxed);
 
-    /* decrement reader count - done with second levels access */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
-
     /* perform partitioned merge if needed */
     if (need_partitioned_merge)
     {
         TDB_DEBUG_LOG("Level %d is full, triggering partitioned preemptive merge", X);
         TDB_DEBUG_LOG("Partitioned preemptive merge: levels %d to %d", X, z);
         result = tidesdb_partitioned_merge(cf, X, z);
-
-        /* increment reader count for third levels access */
-        atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
 
         /* reload levels after merge */
         num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
@@ -6980,9 +6932,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
             largest_size = atomic_load_explicit(&largest->current_size, memory_order_relaxed);
             largest_capacity = atomic_load_explicit(&largest->capacity, memory_order_relaxed);
         }
-
-        /* decrement reader count - done with third levels access */
-        atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
     }
 
     if (largest_size >= largest_capacity)
@@ -6991,10 +6940,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
                       largest_capacity, num_levels);
         tidesdb_add_level(cf);
         /* re-fetch levels pointer after add_level since it reallocates */
-
-        /* increment reader count for fourth levels access */
-        atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
         num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
         levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
         if (num_levels > 0)
@@ -7003,17 +6948,11 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
             largest_size = atomic_load_explicit(&largest->current_size, memory_order_relaxed);
             largest_capacity = atomic_load_explicit(&largest->capacity, memory_order_relaxed);
         }
-
-        /* decrement reader count - done with fourth levels access */
-        atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
     }
 
     /* check if largest level is truly empty by checking num_sstables, not current_size
      * current_size uses relaxed memory ordering and can be stale
      * we re-fetch levels and largest pointer as they may have changed due to compactions */
-
-    /* increment reader count for fifth levels access */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
 
     num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
     levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
@@ -7036,7 +6975,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         {
             TDB_DEBUG_LOG("Largest level is empty, removing level for CF '%s'", cf->name);
             tidesdb_remove_level(cf);
-
             num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
         }
         else
@@ -7047,9 +6985,6 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
                 pending_flushes, level0_sstables, cf->name);
         }
     }
-
-    /* decrement reader count - done with fifth levels access */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
     tidesdb_apply_dca(cf);
 
@@ -7453,13 +7388,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* ensure all writes are visible before making sstable discoverable */
         atomic_thread_fence(memory_order_seq_cst);
 
-        /* wait for any DCA operation to complete before accessing levels */
-        tidesdb_wait_for_dca(cf);
-
-        /* increment reader count to prevent DCA from freeing levels array while we use it */
-        atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
         /* add sstable to level 0 -- load levels atomically */
+        tidesdb_wait_for_dca(cf);
         tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
         tidesdb_level_add_sstable(levels[0], sst);
 
@@ -7470,9 +7400,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
         /* release our reference -- the level now owns it */
         tidesdb_sstable_unref(cf->db, sst);
-
-        /* decrement reader count - done with levels access */
-        atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
         if (wal)
         {
@@ -7546,13 +7473,10 @@ static void *tidesdb_flush_worker_thread(void *arg)
          * this allows new flushes to be triggered */
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
 
-        /* check if compaction is needed after flush (standard LSM-tree behavior)
-         * we check level 0 capacity to decide if compaction should be triggered
-         * reload levels atomically in case they changed during flush */
-        atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
-        levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+        tidesdb_wait_for_dca(cf);
+        /* load num_levels first to match store order */
         int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+        levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
 
         if (num_levels > 0 && levels[0])
         {
@@ -7570,9 +7494,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
                 tidesdb_compact(cf);
             }
         }
-
-        /* decrement reader count - done with second levels access */
-        atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
         free(work);
     }
@@ -8442,10 +8363,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->is_compacting, 0);
     atomic_init(&cf->is_flushing, 0);
     atomic_init(&cf->dca_in_progress, 0);
-    atomic_init(&cf->levels_readers, 0);
     atomic_init(&cf->memtable_generation, 0);
     atomic_init(&cf->commit_ticket, 0);
     atomic_init(&cf->commit_serving, 0);
+
+    /* initialize DCA flag */
+    atomic_init(&cf->dca_in_progress, 0);
 
     if (buffer_new_with_eviction(&cf->active_txn_buffer, TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE,
                                  txn_entry_evict, NULL) != 0)
@@ -9438,14 +9361,22 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         free(immutable_refs);
     }
 
-    /* wait for any DCA operation to complete before accessing levels */
-    tidesdb_wait_for_dca(cf);
-
-    /* increment reader count to prevent DCA from freeing levels array while we use it */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
-    int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
-    tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+    /* we load levels with TOCTOU protection: check dca_in_progress before and after loading.
+     * if DCA started between the check and load, retry to get the new levels.
+     * we must ensure num_levels and levels are consistent. DCA could complete
+     * between loading them, so we verify num_levels hasn't changed. */
+    tidesdb_level_t **levels;
+    int num_levels;
+    int verify_num_levels;
+    do
+    {
+        tidesdb_wait_for_dca(cf);
+        num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+        levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+        verify_num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+        /* if DCA started between wait and load, or if num_levels changed, retry */
+    } while (atomic_load_explicit(&cf->dca_in_progress, memory_order_acquire) ||
+             num_levels != verify_num_levels);
 
     /* collect sstable pointers with references held */
     typedef struct
@@ -9489,6 +9420,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                         tidesdb_sstable_unref(cf->db, ssts_array[k].sst);
                     }
                     if (ssts_array != stack_ssts) free(ssts_array);
+
                     return TDB_ERR_MEMORY;
                 }
                 memcpy(new_array, ssts_array, sst_count * sizeof(sst_ref_t));
@@ -9505,9 +9437,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             sst_count++;
         }
     }
-
-    /* decrement reader count - we've collected all SSTable refs, no longer need levels array */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
@@ -9544,7 +9473,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             }
 
             tidesdb_kv_pair_t *candidate_kv = NULL;
-            if (tidesdb_sstable_get(cf->db, sst, key, key_size, &candidate_kv) == TDB_SUCCESS)
+            if (tidesdb_sstable_get(cf->db, sst, key, key_size, &candidate_kv) == TDB_SUCCESS &&
+                candidate_kv)
             {
                 uint64_t candidate_seq = candidate_kv->entry.seq;
                 int accept = (snapshot_seq == UINT64_MAX) ? 1 : (candidate_seq <= snapshot_seq);
@@ -9609,6 +9539,7 @@ check_found_result:
                 tidesdb_txn_add_to_read_set(txn, cf, key, key_size, best_seq);
 
                 tidesdb_kv_pair_free(best_kv);
+
                 return TDB_SUCCESS;
             }
         }
@@ -10616,14 +10547,19 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         }
     }
 
-    /* wait for any DCA operation to complete before accessing levels */
-    tidesdb_wait_for_dca(cf);
-
-    /* increment reader count to prevent DCA from freeing levels array while we use it */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
-    int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
-    tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+    /* Load levels with TOCTOU protection: check dca_in_progress before AND after loading.
+     * If DCA started between the check and load, retry to get the new levels. */
+    tidesdb_level_t **levels;
+    int num_levels;
+    do
+    {
+        tidesdb_wait_for_dca(cf);
+        /* load levels array and take references on all levels
+         * load levels FIRST, then num_levels to match publication order in tidesdb_add_level */
+        levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+        num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+        /* if DCA started between wait and load, the levels pointer is stale -- retry */
+    } while (atomic_load_explicit(&cf->dca_in_progress, memory_order_acquire));
 
     /* collect sstable pointers with references held
      * use dynamic array that grows as needed */
@@ -10680,9 +10616,6 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         }
     }
 
-    /* decrement reader count - we've collected all SSTable refs, no longer need levels array */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
-
     if (ssts_array)
     {
         for (int i = 0; i < sst_count; i++)
@@ -10730,7 +10663,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         if (source->type == MERGE_SOURCE_MEMTABLE)
         {
             skip_list_cursor_t *cursor = source->source.memtable.cursor;
-            /* seek positions cursor at node BEFORE target, need to advance once */
+            /* seek positions cursor at node before target, need to advance once */
             if (skip_list_cursor_seek(cursor, (uint8_t *)key, key_size) == 0)
             {
                 /* advance to the actual target node */
@@ -10852,14 +10785,14 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
 
                 source->source.sstable.current_block = kb;
 
-                /* check if target could be in this block - check both min and max */
+                /* check if target could be in this block -- check both min and max */
                 int cmp_first = comparator_fn(kb->keys[0], kb->entries[0].key_size, key, key_size,
                                               comparator_ctx);
                 int cmp_last = comparator_fn(kb->keys[kb->num_entries - 1],
                                              kb->entries[kb->num_entries - 1].key_size, key,
                                              key_size, comparator_ctx);
 
-                /* if first key > target, we've gone past it - stop searching */
+                /* if first key > target, we've gone past it -- stop searching */
                 if (cmp_first > 0)
                 {
                     tidesdb_klog_block_free(kb);
@@ -10870,7 +10803,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                         source->source.sstable.decompressed_data = NULL;
                     }
                     block_manager_block_release(bmblock);
-                    break; /* target not in SSTable */
+                    break; /* target not in sst */
                 }
 
                 /* target is in range [first, last] if first <= target <= last */
@@ -11861,6 +11794,7 @@ void tidesdb_iter_free(tidesdb_iter_t *iter)
 
     tidesdb_kv_pair_free(iter->current);
     tidesdb_merge_heap_free(iter->heap);
+
     free(iter);
 }
 
@@ -12121,8 +12055,11 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 
     uint64_t global_max_seq = 0;
 
-    int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+    /* wait for any DCA operation to complete before accessing levels */
+    tidesdb_wait_for_dca(cf);
+
     tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+    int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
 
     TDB_DEBUG_LOG("CF '%s': Scanning sources for max_seq", cf->name);
 
@@ -12278,7 +12215,13 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
     *stats = calloc(1, sizeof(tidesdb_stats_t));
     if (!*stats) return TDB_ERR_MEMORY;
 
-    (*stats)->num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+    /* wait for any DCA operation to complete before accessing levels */
+    tidesdb_wait_for_dca(cf);
+
+    tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
+    int num_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+
+    (*stats)->num_levels = num_levels;
     skip_list_t *active_mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
     (*stats)->memtable_size = skip_list_get_size(active_mt);
 
@@ -12292,20 +12235,12 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
         free(*stats);
         return TDB_ERR_MEMORY;
     }
-
-    /* increment reader count to prevent DCA from freeing levels array while we use it */
-    atomic_fetch_add_explicit(&cf->levels_readers, 1, memory_order_acquire);
-
-    tidesdb_level_t **levels = atomic_load_explicit(&cf->levels, memory_order_acquire);
     for (int i = 0; i < (*stats)->num_levels; i++)
     {
         (*stats)->level_sizes[i] = atomic_load(&levels[i]->current_size);
         (*stats)->level_num_sstables[i] =
             atomic_load_explicit(&levels[i]->num_sstables, memory_order_acquire);
     }
-
-    /* decrement reader count - done with levels access */
-    atomic_fetch_sub_explicit(&cf->levels_readers, 1, memory_order_release);
 
     return TDB_SUCCESS;
 }

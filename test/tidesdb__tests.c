@@ -3916,8 +3916,8 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     /* config that will trigger level additions */
-    cf_config.write_buffer_size = 2048; /* small buffer for frequent flushes */
-    cf_config.level_size_ratio = 2;     /* L1=4096, L2=8192, L3=16384 */
+    cf_config.write_buffer_size = 200;
+    cf_config.level_size_ratio = 2;
     cf_config.dividing_level_offset = 1;
     cf_config.min_levels = 2;
 
@@ -3926,22 +3926,18 @@ static void test_dynamic_capacity_adjustment(void)
     ASSERT_TRUE(cf != NULL);
 
     int initial_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+
     printf("Initial levels: %d\n", initial_levels);
 
-    /* write data in batches, triggering level additions
-     * need to write enough to fill L2 (8192 bytes) and trigger DCA
-     * after partitioned merge fix, data accumulates in L2, so we need significantly more data
-     * write 10 batches of ~200KB each to ensure L2 fills beyond capacity and triggers L3 creation
-     */
+    /* write data in batches, triggering level additions */
     int total_keys_written = 0;
-    for (int batch = 0; batch < 10; batch++)
+    for (int batch = 0; batch < 5; batch++)
     {
         printf("Batch %d: Writing keys\n", batch + 1);
 
         int written = 0;
 
-        /* write ~200KB per batch (200000 bytes / 160 bytes per key = ~1250 keys) */
-        for (int i = 0; i < 100000 && written < 200000; i++)
+        for (int i = 0; i < 50000 && written < 5000; i++)
         {
             tidesdb_txn_t *txn = NULL;
             ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
@@ -3968,19 +3964,12 @@ static void test_dynamic_capacity_adjustment(void)
 
         printf("done flushing\n");
 
-        /* wait for background compactions to trigger */
-        sleep(3);
+        /* trigger compaction and observe level changes */
+        sleep(5);
 
         int current_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
 
         printf("  After batch %d: %d levels\n", batch + 1, current_levels);
-
-        /* if we've grown levels, we can stop early */
-        if (current_levels > initial_levels)
-        {
-            printf("  Level growth detected! Stopping early.\n");
-            break;
-        }
     }
 
     int final_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
@@ -3993,10 +3982,6 @@ static void test_dynamic_capacity_adjustment(void)
         if (queue_size(db->compaction_queue) == 0) break;
     }
 
-    /* re-check levels after compactions complete */
-    final_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
-    printf("Final levels after compaction wait: %d\n", final_levels);
-
     /* verify DCA worked -- should have added levels */
     ASSERT_TRUE(final_levels > initial_levels);
 
@@ -4004,19 +3989,19 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
-    /* check a sample of keys across the range to verify data integrity */
-    int keys_to_check = total_keys_written < 500 ? total_keys_written : 500;
-    for (int i = 0; i < keys_to_check; i++)
+    for (int i = 0; i < total_keys_written; i++)
     {
-        /* sample keys evenly across the range */
-        int key_idx = (i * total_keys_written) / keys_to_check;
         char key[32];
-        snprintf(key, sizeof(key), "dca_key_%05d", key_idx);
+        snprintf(key, sizeof(key), "dca_key_%05d", i);
 
         uint8_t *value = NULL;
         size_t value_size = 0;
-        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
-                  0);
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        if (result != 0)
+        {
+            printf("FAILED to get key: %s (index %d)\n", key, i);
+        }
+        ASSERT_EQ(result, 0);
         ASSERT_TRUE(value != NULL);
         free(value);
     }
@@ -7154,146 +7139,146 @@ static void test_multi_cf_many_sstables_recovery(void)
 int main(void)
 {
     cleanup_test_dir();
-    // RUN_TEST(test_basic_open_close, tests_passed);
-    // RUN_TEST(test_column_family_creation, tests_passed);
-    // RUN_TEST(test_list_column_families, tests_passed);
-    // RUN_TEST(test_basic_txn_put_get, tests_passed);
-    // RUN_TEST(test_txn_delete, tests_passed);
-    // RUN_TEST(test_txn_rollback, tests_passed);
-    // RUN_TEST(test_multiple_column_families, tests_passed);
-    // RUN_TEST(test_memtable_flush, tests_passed);
-    // RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
-    // RUN_TEST(test_persistence_and_recovery, tests_passed);
-    // RUN_TEST(test_multi_cf_wal_recovery, tests_passed);
-    // RUN_TEST(test_multi_cf_many_sstables_recovery, tests_passed);
-    // RUN_TEST(test_iterator_basic, tests_passed);
-    // RUN_TEST(test_stats, tests_passed);
-    // RUN_TEST(test_iterator_seek, tests_passed);
-    // RUN_TEST(test_iterator_seek_for_prev, tests_passed);
-    // RUN_TEST(test_tidesdb_block_index_seek, tests_passed);
-    // RUN_TEST(test_iterator_reverse, tests_passed);
-    // RUN_TEST(test_iterator_boundaries, tests_passed);
-    // RUN_TEST(test_bidirectional_iterator, tests_passed);
-    // RUN_TEST(test_ttl_expiration, tests_passed);
-    // RUN_TEST(test_large_values, tests_passed);
-    // RUN_TEST(test_many_keys, tests_passed);
-    // RUN_TEST(test_isolation_read_uncommitted, tests_passed);
-    // RUN_TEST(test_isolation_read_committed, tests_passed);
-    // RUN_TEST(test_isolation_repeatable_read, tests_passed);
-    // RUN_TEST(test_isolation_serializable_conflict, tests_passed);
-    // RUN_TEST(test_snapshot_isolation_consistency, tests_passed);
-    // RUN_TEST(test_write_write_conflict, tests_passed);
-    // RUN_TEST(test_read_write_conflict, tests_passed);
-    // RUN_TEST(test_serializable_phantom_prevention, tests_passed);
-    // RUN_TEST(test_transaction_abort_retry, tests_passed);
-    // RUN_TEST(test_mixed_isolation_levels, tests_passed);
-    // RUN_TEST(test_long_running_transaction, tests_passed);
-    // RUN_TEST(test_multi_cf_transaction, tests_passed);
-    // RUN_TEST(test_multi_cf_transaction_rollback, tests_passed);
-    // RUN_TEST(test_multi_cf_iterator, tests_passed);
-    // RUN_TEST(test_multi_cf_iterator_boundaries, tests_passed);
-    // RUN_TEST(test_multi_cf_iterator_reverse, tests_passed);
-    // RUN_TEST(test_multi_cf_iterator_seek, tests_passed);
-    // RUN_TEST(test_multi_cf_iterator_seek_for_prev, tests_passed);
-    // RUN_TEST(test_savepoints, tests_passed);
-    // RUN_TEST(test_ini_config, tests_passed);
-    // RUN_TEST(test_runtime_config_update, tests_passed);
-    // RUN_TEST(test_error_invalid_args, tests_passed);
-    // RUN_TEST(test_drop_column_family, tests_passed);
-    // RUN_TEST(test_empty_iterator, tests_passed);
-    // RUN_TEST(test_bloom_filter_enabled, tests_passed);
-    // RUN_TEST(test_block_indexes, tests_passed);
-    // RUN_TEST(test_sync_modes, tests_passed);
-    // RUN_TEST(test_compression_lz4, tests_passed);
-    // RUN_TEST(test_compression_zstd, tests_passed);
-    // RUN_TEST(test_compaction_basic, tests_passed);
-    // RUN_TEST(test_compaction_with_deletes, tests_passed);
-    // RUN_TEST(test_concurrent_writes, tests_passed);
-    // RUN_TEST(test_empty_value, tests_passed);
-    // RUN_TEST(test_delete_nonexistent_key, tests_passed);
-    // RUN_TEST(test_multiple_deletes_same_key, tests_passed);
-    // RUN_TEST(test_overwrite_same_key_multiple_times, tests_passed);
-    // RUN_TEST(test_put_delete_put_same_key, tests_passed);
-    // RUN_TEST(test_iterator_on_empty_cf, tests_passed);
-    // RUN_TEST(test_iterator_single_key, tests_passed);
-    // RUN_TEST(test_mixed_operations_in_transaction, tests_passed);
-    // RUN_TEST(test_read_own_writes_in_transaction, tests_passed);
-    // RUN_TEST(test_alternating_puts_deletes, tests_passed);
-    // RUN_TEST(test_very_long_key, tests_passed);
-    // RUN_TEST(test_read_across_multiple_sstables, tests_passed);
-    // RUN_TEST(test_read_with_bloom_filter_disabled, tests_passed);
-    // RUN_TEST(test_read_with_block_indexes_disabled, tests_passed);
-    // RUN_TEST(test_read_with_all_optimizations_disabled, tests_passed);
-    // RUN_TEST(test_iterator_across_multiple_sources, tests_passed);
-    // RUN_TEST(test_overwrite_across_levels, tests_passed);
-    // RUN_TEST(test_atomicity_transaction_rollback, tests_passed);
-    // RUN_TEST(test_consistency_after_flush, tests_passed);
-    // RUN_TEST(test_isolation_concurrent_transactions, tests_passed);
-    // RUN_TEST(test_durability_reopen_database, tests_passed);
-    // RUN_TEST(test_data_integrity_after_compaction, tests_passed);
-    // RUN_TEST(test_no_data_loss_across_operations, tests_passed);
-    // RUN_TEST(test_concurrent_writes_visibility, tests_passed);
-    // RUN_TEST(test_dividing_merge_strategy, tests_passed);
-    // RUN_TEST(test_partitioned_merge_strategy, tests_passed);
-    // RUN_TEST(test_boundary_partitioning, tests_passed);
+    RUN_TEST(test_basic_open_close, tests_passed);
+    RUN_TEST(test_column_family_creation, tests_passed);
+    RUN_TEST(test_list_column_families, tests_passed);
+    RUN_TEST(test_basic_txn_put_get, tests_passed);
+    RUN_TEST(test_txn_delete, tests_passed);
+    RUN_TEST(test_txn_rollback, tests_passed);
+    RUN_TEST(test_multiple_column_families, tests_passed);
+    RUN_TEST(test_memtable_flush, tests_passed);
+    RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
+    RUN_TEST(test_persistence_and_recovery, tests_passed);
+    RUN_TEST(test_multi_cf_wal_recovery, tests_passed);
+    RUN_TEST(test_multi_cf_many_sstables_recovery, tests_passed);
+    RUN_TEST(test_iterator_basic, tests_passed);
+    RUN_TEST(test_stats, tests_passed);
+    RUN_TEST(test_iterator_seek, tests_passed);
+    RUN_TEST(test_iterator_seek_for_prev, tests_passed);
+    RUN_TEST(test_tidesdb_block_index_seek, tests_passed);
+    RUN_TEST(test_iterator_reverse, tests_passed);
+    RUN_TEST(test_iterator_boundaries, tests_passed);
+    RUN_TEST(test_bidirectional_iterator, tests_passed);
+    RUN_TEST(test_ttl_expiration, tests_passed);
+    RUN_TEST(test_large_values, tests_passed);
+    RUN_TEST(test_many_keys, tests_passed);
+    RUN_TEST(test_isolation_read_uncommitted, tests_passed);
+    RUN_TEST(test_isolation_read_committed, tests_passed);
+    RUN_TEST(test_isolation_repeatable_read, tests_passed);
+    RUN_TEST(test_isolation_serializable_conflict, tests_passed);
+    RUN_TEST(test_snapshot_isolation_consistency, tests_passed);
+    RUN_TEST(test_write_write_conflict, tests_passed);
+    RUN_TEST(test_read_write_conflict, tests_passed);
+    RUN_TEST(test_serializable_phantom_prevention, tests_passed);
+    RUN_TEST(test_transaction_abort_retry, tests_passed);
+    RUN_TEST(test_mixed_isolation_levels, tests_passed);
+    RUN_TEST(test_long_running_transaction, tests_passed);
+    RUN_TEST(test_multi_cf_transaction, tests_passed);
+    RUN_TEST(test_multi_cf_transaction_rollback, tests_passed);
+    RUN_TEST(test_multi_cf_iterator, tests_passed);
+    RUN_TEST(test_multi_cf_iterator_boundaries, tests_passed);
+    RUN_TEST(test_multi_cf_iterator_reverse, tests_passed);
+    RUN_TEST(test_multi_cf_iterator_seek, tests_passed);
+    RUN_TEST(test_multi_cf_iterator_seek_for_prev, tests_passed);
+    RUN_TEST(test_savepoints, tests_passed);
+    RUN_TEST(test_ini_config, tests_passed);
+    RUN_TEST(test_runtime_config_update, tests_passed);
+    RUN_TEST(test_error_invalid_args, tests_passed);
+    RUN_TEST(test_drop_column_family, tests_passed);
+    RUN_TEST(test_empty_iterator, tests_passed);
+    RUN_TEST(test_bloom_filter_enabled, tests_passed);
+    RUN_TEST(test_block_indexes, tests_passed);
+    RUN_TEST(test_sync_modes, tests_passed);
+    RUN_TEST(test_compression_lz4, tests_passed);
+    RUN_TEST(test_compression_zstd, tests_passed);
+    RUN_TEST(test_compaction_basic, tests_passed);
+    RUN_TEST(test_compaction_with_deletes, tests_passed);
+    RUN_TEST(test_concurrent_writes, tests_passed);
+    RUN_TEST(test_empty_value, tests_passed);
+    RUN_TEST(test_delete_nonexistent_key, tests_passed);
+    RUN_TEST(test_multiple_deletes_same_key, tests_passed);
+    RUN_TEST(test_overwrite_same_key_multiple_times, tests_passed);
+    RUN_TEST(test_put_delete_put_same_key, tests_passed);
+    RUN_TEST(test_iterator_on_empty_cf, tests_passed);
+    RUN_TEST(test_iterator_single_key, tests_passed);
+    RUN_TEST(test_mixed_operations_in_transaction, tests_passed);
+    RUN_TEST(test_read_own_writes_in_transaction, tests_passed);
+    RUN_TEST(test_alternating_puts_deletes, tests_passed);
+    RUN_TEST(test_very_long_key, tests_passed);
+    RUN_TEST(test_read_across_multiple_sstables, tests_passed);
+    RUN_TEST(test_read_with_bloom_filter_disabled, tests_passed);
+    RUN_TEST(test_read_with_block_indexes_disabled, tests_passed);
+    RUN_TEST(test_read_with_all_optimizations_disabled, tests_passed);
+    RUN_TEST(test_iterator_across_multiple_sources, tests_passed);
+    RUN_TEST(test_overwrite_across_levels, tests_passed);
+    RUN_TEST(test_atomicity_transaction_rollback, tests_passed);
+    RUN_TEST(test_consistency_after_flush, tests_passed);
+    RUN_TEST(test_isolation_concurrent_transactions, tests_passed);
+    RUN_TEST(test_durability_reopen_database, tests_passed);
+    RUN_TEST(test_data_integrity_after_compaction, tests_passed);
+    RUN_TEST(test_no_data_loss_across_operations, tests_passed);
+    RUN_TEST(test_concurrent_writes_visibility, tests_passed);
+    RUN_TEST(test_dividing_merge_strategy, tests_passed);
+    RUN_TEST(test_partitioned_merge_strategy, tests_passed);
+    RUN_TEST(test_boundary_partitioning, tests_passed);
     RUN_TEST(test_dynamic_capacity_adjustment, tests_passed);
-    //     RUN_TEST(test_multi_level_compaction_strategies, tests_passed);
-    //     RUN_TEST(test_recovery_with_corrupted_sstable, tests_passed);
-    //     RUN_TEST(test_portability_workflow, tests_passed);
-    //     RUN_TEST(test_iterator_across_multiple_memtable_flushes, tests_passed);
-    //     RUN_TEST(test_read_after_multiple_overwrites, tests_passed);
-    //     RUN_TEST(test_large_transaction_batch, tests_passed);
-    //     RUN_TEST(test_delete_and_recreate_same_key, tests_passed);
-    //     RUN_TEST(test_concurrent_reads_same_key, tests_passed);
-    //     RUN_TEST(test_zero_ttl_means_no_expiration, tests_passed);
-    //     RUN_TEST(test_mixed_ttl_expiration, tests_passed);
-    //     RUN_TEST(test_get_nonexistent_cf, tests_passed);
-    //     RUN_TEST(test_create_duplicate_cf, tests_passed);
-    //     RUN_TEST(test_drop_nonexistent_cf, tests_passed);
-    //     RUN_TEST(test_nested_savepoints, tests_passed);
-    //     RUN_TEST(test_savepoint_with_delete_operations, tests_passed);
-    //     RUN_TEST(test_iterator_with_tombstones, tests_passed);
-    //     RUN_TEST(test_transaction_isolation_snapshot_with_updates, tests_passed);
-    //     RUN_TEST(test_read_own_uncommitted_writes, tests_passed);
-    //     RUN_TEST(test_multi_cf_transaction_conflict, tests_passed);
-    //     RUN_TEST(test_many_sstables_with_bloom_filter, tests_passed);
-    //     RUN_TEST(test_many_sstables_without_bloom_filter, tests_passed);
-    //     RUN_TEST(test_many_sstables_with_block_indexes, tests_passed);
-    //     RUN_TEST(test_many_sstables_with_lz4_compression, tests_passed);
-    //     RUN_TEST(test_many_sstables_with_zstd_compression, tests_passed);
-    //     RUN_TEST(test_many_sstables_all_features_enabled, tests_passed);
-    //     RUN_TEST(test_many_sstables_all_features_disabled, tests_passed);
-    //     RUN_TEST(test_many_sstables_bloom_and_compression, tests_passed);
-    //     RUN_TEST(test_many_sstables_indexes_and_compression, tests_passed);
-    //     RUN_TEST(test_many_sstables_with_bloom_filter_cached, tests_passed);
-    //     RUN_TEST(test_many_sstables_without_bloom_filter_cached, tests_passed);
-    //     RUN_TEST(test_many_sstables_with_block_indexes_cached, tests_passed);
-    //     RUN_TEST(test_many_sstables_with_lz4_compression_cached, tests_passed);
-    //     RUN_TEST(test_many_sstables_with_zstd_compression_cached, tests_passed);
+    RUN_TEST(test_multi_level_compaction_strategies, tests_passed);
+    RUN_TEST(test_recovery_with_corrupted_sstable, tests_passed);
+    RUN_TEST(test_portability_workflow, tests_passed);
+    RUN_TEST(test_iterator_across_multiple_memtable_flushes, tests_passed);
+    RUN_TEST(test_read_after_multiple_overwrites, tests_passed);
+    RUN_TEST(test_large_transaction_batch, tests_passed);
+    RUN_TEST(test_delete_and_recreate_same_key, tests_passed);
+    RUN_TEST(test_concurrent_reads_same_key, tests_passed);
+    RUN_TEST(test_zero_ttl_means_no_expiration, tests_passed);
+    RUN_TEST(test_mixed_ttl_expiration, tests_passed);
+    RUN_TEST(test_get_nonexistent_cf, tests_passed);
+    RUN_TEST(test_create_duplicate_cf, tests_passed);
+    RUN_TEST(test_drop_nonexistent_cf, tests_passed);
+    RUN_TEST(test_nested_savepoints, tests_passed);
+    RUN_TEST(test_savepoint_with_delete_operations, tests_passed);
+    RUN_TEST(test_iterator_with_tombstones, tests_passed);
+    RUN_TEST(test_transaction_isolation_snapshot_with_updates, tests_passed);
+    RUN_TEST(test_read_own_uncommitted_writes, tests_passed);
+    RUN_TEST(test_multi_cf_transaction_conflict, tests_passed);
+    RUN_TEST(test_many_sstables_with_bloom_filter, tests_passed);
+    RUN_TEST(test_many_sstables_without_bloom_filter, tests_passed);
+    RUN_TEST(test_many_sstables_with_block_indexes, tests_passed);
+    RUN_TEST(test_many_sstables_with_lz4_compression, tests_passed);
+    RUN_TEST(test_many_sstables_with_zstd_compression, tests_passed);
+    RUN_TEST(test_many_sstables_all_features_enabled, tests_passed);
+    RUN_TEST(test_many_sstables_all_features_disabled, tests_passed);
+    RUN_TEST(test_many_sstables_bloom_and_compression, tests_passed);
+    RUN_TEST(test_many_sstables_indexes_and_compression, tests_passed);
+    RUN_TEST(test_many_sstables_with_bloom_filter_cached, tests_passed);
+    RUN_TEST(test_many_sstables_without_bloom_filter_cached, tests_passed);
+    RUN_TEST(test_many_sstables_with_block_indexes_cached, tests_passed);
+    RUN_TEST(test_many_sstables_with_lz4_compression_cached, tests_passed);
+    RUN_TEST(test_many_sstables_with_zstd_compression_cached, tests_passed);
 
-    // #ifndef __sun
-    //     RUN_TEST(test_many_sstables_with_snappy_compression, tests_passed);
-    //     RUN_TEST(test_many_sstables_with_snappy_compression_cached, tests_passed);
-    //     RUN_TEST(test_compression_snappy, tests_passed);
-    // #endif
+#ifndef __sun
+    RUN_TEST(test_many_sstables_with_snappy_compression, tests_passed);
+    RUN_TEST(test_many_sstables_with_snappy_compression_cached, tests_passed);
+    RUN_TEST(test_compression_snappy, tests_passed);
+#endif
 
-    //     RUN_TEST(test_many_sstables_all_features_enabled_cached, tests_passed);
-    //     RUN_TEST(test_many_sstables_all_features_disabled_cached, tests_passed);
-    //     RUN_TEST(test_many_sstables_bloom_and_compression_cached, tests_passed);
-    //     RUN_TEST(test_many_sstables_read_uncommitted, tests_passed);
-    //     RUN_TEST(test_many_sstables_read_committed, tests_passed);
-    //     RUN_TEST(test_many_sstables_repeatable_read, tests_passed);
-    //     RUN_TEST(test_many_sstables_serializable, tests_passed);
-    //     RUN_TEST(test_many_sstables_comparator_memcmp, tests_passed);
-    //     RUN_TEST(test_many_sstables_comparator_lexicographic, tests_passed);
-    //     RUN_TEST(test_many_sstables_comparator_reverse, tests_passed);
-    //     RUN_TEST(test_many_sstables_comparator_case_insensitive, tests_passed);
-    //     RUN_TEST(test_many_sstables_small_cache, tests_passed);
-    //     RUN_TEST(test_many_sstables_large_cache, tests_passed);
-    //     RUN_TEST(test_many_sstables_all_isolation_levels, tests_passed);
-    //     RUN_TEST(test_many_sstables_all_comparators, tests_passed);
-    //     RUN_TEST(test_large_value_iteration, tests_passed);
-    //     RUN_TEST(test_sync_interval_mode, tests_passed);
+    RUN_TEST(test_many_sstables_all_features_enabled_cached, tests_passed);
+    RUN_TEST(test_many_sstables_all_features_disabled_cached, tests_passed);
+    RUN_TEST(test_many_sstables_bloom_and_compression_cached, tests_passed);
+    RUN_TEST(test_many_sstables_read_uncommitted, tests_passed);
+    RUN_TEST(test_many_sstables_read_committed, tests_passed);
+    RUN_TEST(test_many_sstables_repeatable_read, tests_passed);
+    RUN_TEST(test_many_sstables_serializable, tests_passed);
+    RUN_TEST(test_many_sstables_comparator_memcmp, tests_passed);
+    RUN_TEST(test_many_sstables_comparator_lexicographic, tests_passed);
+    RUN_TEST(test_many_sstables_comparator_reverse, tests_passed);
+    RUN_TEST(test_many_sstables_comparator_case_insensitive, tests_passed);
+    RUN_TEST(test_many_sstables_small_cache, tests_passed);
+    RUN_TEST(test_many_sstables_large_cache, tests_passed);
+    RUN_TEST(test_many_sstables_all_isolation_levels, tests_passed);
+    RUN_TEST(test_many_sstables_all_comparators, tests_passed);
+    RUN_TEST(test_large_value_iteration, tests_passed);
+    RUN_TEST(test_sync_interval_mode, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

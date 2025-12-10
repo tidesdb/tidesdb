@@ -176,17 +176,15 @@ void *queue_dequeue_wait(queue_t *queue)
 
     pthread_mutex_lock(&queue->lock);
 
-    /* increment waiter count before waiting */
-    queue->waiter_count++;
-
     /* wait until queue is not empty or shutdown */
     while (queue->head == NULL && !queue->shutdown)
     {
+        /* increment waiter count only when actually waiting */
+        queue->waiter_count++;
         pthread_cond_wait(&queue->not_empty, &queue->lock);
+        /* decrement waiter count after waking up */
+        queue->waiter_count--;
     }
-
-    /* decrement waiter count after waking up */
-    queue->waiter_count--;
 
     /* always broadcast when waiter_count changes to wake queue_free if waiting */
     if (queue->waiter_count == 0)

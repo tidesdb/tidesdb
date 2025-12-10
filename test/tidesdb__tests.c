@@ -7242,12 +7242,12 @@ int main(void)
     // RUN_TEST(test_data_integrity_after_compaction, tests_passed);
     // RUN_TEST(test_no_data_loss_across_operations, tests_passed);
     // RUN_TEST(test_concurrent_writes_visibility, tests_passed);
-    // RUN_TEST(test_dividing_merge_strategy, tests_passed);
-    // RUN_TEST(test_partitioned_merge_strategy, tests_passed);
-    // RUN_TEST(test_boundary_partitioning, tests_passed);
-    // RUN_TEST(test_dynamic_capacity_adjustment, tests_passed);
-    // RUN_TEST(test_multi_level_compaction_strategies, tests_passed);
-    // RUN_TEST(test_recovery_with_corrupted_sstable, tests_passed);
+    RUN_TEST(test_dividing_merge_strategy, tests_passed);
+    RUN_TEST(test_partitioned_merge_strategy, tests_passed);
+    RUN_TEST(test_boundary_partitioning, tests_passed);
+    RUN_TEST(test_dynamic_capacity_adjustment, tests_passed);
+    RUN_TEST(test_multi_level_compaction_strategies, tests_passed);
+    RUN_TEST(test_recovery_with_corrupted_sstable, tests_passed);
     RUN_TEST(test_portability_workflow, tests_passed);
     //     RUN_TEST(test_iterator_across_multiple_memtable_flushes, tests_passed);
     //     RUN_TEST(test_read_after_multiple_overwrites, tests_passed);

@@ -7198,7 +7198,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
             break;
         }
 
-        TDB_DEBUG_LOG("Flush worker: waiting for work (queue size: %zu)", queue_size(db->flush_queue));
+        TDB_DEBUG_LOG("Flush worker: waiting for work (queue size: %zu)",
+                      queue_size(db->flush_queue));
         /* wait for work (blocking dequeue) */
         tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue_wait(db->flush_queue);
 
@@ -8536,7 +8537,8 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
     if (queue_enqueue(cf->db->flush_queue, work) != 0)
     {
-        TDB_DEBUG_LOG("CF '%s': FAILED to enqueue flush work for SSTable %" PRIu64, cf->name, sst_id);
+        TDB_DEBUG_LOG("CF '%s': FAILED to enqueue flush work for SSTable %" PRIu64, cf->name,
+                      sst_id);
         tidesdb_immutable_memtable_unref(immutable); /* remove work ref */
         tidesdb_immutable_memtable_unref(immutable); /* remove queue ref, triggers cleanup */
         free(work);
@@ -8545,7 +8547,8 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     }
 
     size_t queue_size_after = queue_size(cf->db->flush_queue);
-    TDB_DEBUG_LOG("CF '%s': Successfully enqueued flush work for SSTable %" PRIu64 " (queue size after: %zu)",
+    TDB_DEBUG_LOG("CF '%s': Successfully enqueued flush work for SSTable %" PRIu64
+                  " (queue size after: %zu)",
                   cf->name, sst_id, queue_size_after);
 
     return TDB_SUCCESS;

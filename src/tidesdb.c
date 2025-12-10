@@ -9974,12 +9974,12 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
         }
 
-        atomic_store_explicit(&cf->commit_serving, my_ticket + 1, memory_order_release);
-
         if (should_flush)
         {
             tidesdb_flush_memtable(cf);
         }
+
+        atomic_store_explicit(&cf->commit_serving, my_ticket + 1, memory_order_release);
     }
 
     if (commit_failed_at >= 0)

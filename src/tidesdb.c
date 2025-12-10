@@ -8505,13 +8505,7 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
     immutable->flushed = 0;               /* not yet flushed */
     queue_enqueue(cf->immutable_memtables, immutable);
 
-    /* wait for all in-flight commits to complete before swapping memtable */
-    uint64_t ticket = atomic_load_explicit(&cf->commit_ticket, memory_order_acquire);
-    while (atomic_load_explicit(&cf->commit_serving, memory_order_acquire) != ticket)
-    {
-        cpu_pause();
-    }
-
+    /* swap active memtable with new empty one */
     atomic_store_explicit(&cf->active_memtable, new_memtable, memory_order_release);
     atomic_store_explicit(&cf->active_wal, new_wal, memory_order_release);
     atomic_fetch_add_explicit(&cf->memtable_generation, 1, memory_order_release);
@@ -9974,12 +9968,12 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
         }
 
+        atomic_store_explicit(&cf->commit_serving, my_ticket + 1, memory_order_release);
+
         if (should_flush)
         {
             tidesdb_flush_memtable(cf);
         }
-
-        atomic_store_explicit(&cf->commit_serving, my_ticket + 1, memory_order_release);
     }
 
     if (commit_failed_at >= 0)

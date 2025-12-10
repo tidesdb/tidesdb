@@ -150,6 +150,20 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_STACK_SSTS          64 /* stack allocation for common case to avoid malloc overhead on reads */
 #define TDB_ITER_STACK_KEY_SIZE 256
 
+/* file system permissions */
+#define TDB_DIR_PERMISSIONS 0755 /* directory creation permissions (rwxr-xr-x) */
+
+/* initial capacity values for dynamic arrays */
+#define TDB_INITIAL_MERGE_HEAP_CAPACITY    16 /* initial merge heap source capacity */
+#define TDB_INITIAL_CF_CAPACITY            16 /* initial column family array capacity */
+#define TDB_INITIAL_COMPARATOR_CAPACITY    8  /* initial comparator registry capacity */
+#define TDB_INITIAL_TXN_OPS_CAPACITY       16 /* initial transaction operations capacity */
+#define TDB_INITIAL_TXN_READ_SET_CAPACITY  16 /* initial transaction read set capacity */
+#define TDB_INITIAL_TXN_WRITE_SET_CAPACITY 16 /* initial transaction write set capacity */
+#define TDB_INITIAL_TXN_CF_CAPACITY        4  /* initial transaction column family capacity */
+#define TDB_INITIAL_TXN_SAVEPOINT_CAPACITY 4  /* initial transaction savepoint capacity */
+#define TDB_INITIAL_BLOCK_INDEX_CAPACITY   16 /* initial block index capacity */
+
 /* default configuration values */
 #define TDB_DEFAULT_WRITE_BUFFER_SIZE (64 * 1024 * 1024) /* 64MB */
 #define TDB_DEFAULT_LEVEL_SIZE_RATIO  10 /* size ratio between levels (T) i.e. L1 = L0 * T */
@@ -165,10 +179,21 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_VALUE_THRESHOLD             512         /* values >= 512 bytes go to vlog */
 #define TDB_DEFAULT_INDEX_SAMPLE_RATIO          1
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024) /* 100MB minimum free space */
-#define TDB_DEFAULT_MAX_OPEN_SSTABLES           512                 /* max open sstables globally */
-#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      1024 * 64           /* max concurrent txns per cf */
-#define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024) /* default global block cache size */
-#define TDB_DEFAULT_SYNC_INTERVAL_US            128000 /* 128ms sync interval for TDB_SYNC_INTERVAL mode */
+#define TDB_DEFAULT_MAX_OPEN_SSTABLES \
+    512 /* max open sstables (hard FD limit, ops block if exceeded) */
+#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE 1024 * 64          /* max concurrent txns per cf */
+#define TDB_DEFAULT_BLOCK_CACHE_SIZE       (64 * 1024 * 1024) /* default global block cache size */
+#define TDB_DEFAULT_SYNC_INTERVAL_US       128000 /* 128ms sync interval for TDB_SYNC_INTERVAL mode */
+
+/* SSTable cache retry configuration (for enforcing FD limits) */
+#define TDB_SSTABLE_CACHE_MAX_RETRIES          100 /* max retries when cache is full */
+#define TDB_SSTABLE_CACHE_FAST_RETRY_THRESHOLD 10  /* use cpu_pause for retries < this */
+#define TDB_SSTABLE_CACHE_MED_RETRY_THRESHOLD  50  /* use short sleep for retries < this */
+#define TDB_SSTABLE_CACHE_SHORT_SLEEP_US \
+    100 /* sleep duration for medium contention (microseconds) */
+#define TDB_SSTABLE_CACHE_LONG_SLEEP_US \
+    1000 /* sleep duration for heavy contention (microseconds) */
+#define TDB_SSTABLE_CACHE_RETRY_LOG_INTERVAL 10 /* log every N retries */
 #define TDB_DEFAULT_FLUSH_QUEUE_THRESHOLD                                                        \
     4 /* max threshold before blocking and waiting for flushes to keep up, saving memory.  this  \
          goes for all column families so if cf1 as 2 enqueued flushes and cf2 as 2 and threshold \

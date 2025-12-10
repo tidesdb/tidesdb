@@ -7194,17 +7194,22 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* check if database is closing before blocking on queue */
         if (!atomic_load(&db->is_open))
         {
+            TDB_DEBUG_LOG("Flush worker: database closing, exiting loop");
             break;
         }
 
+        TDB_DEBUG_LOG("Flush worker: waiting for work (queue size: %zu)", queue_size(db->flush_queue));
         /* wait for work (blocking dequeue) */
         tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue_wait(db->flush_queue);
 
         if (!work)
         {
             /* NULL sentinel signals shutdown */
+            TDB_DEBUG_LOG("Flush worker: received NULL work, exiting");
             break;
         }
+
+        TDB_DEBUG_LOG("Flush worker: received work for SSTable %" PRIu64, work->sst_id);
 
         tidesdb_column_family_t *cf = work->cf;
         tidesdb_immutable_memtable_t *imm = work->imm;
@@ -7682,7 +7687,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     atomic_init(&(*db)->global_txn_seq, 0); /* global sequence for multi-CF transactions */
     atomic_init(&(*db)->next_txn_id, 1);    /* transaction ID counter (start at 1) */
-    atomic_init(&(*db)->is_open, 0);
+    atomic_init(&(*db)->is_open, 1);        /* set to 1 before starting workers */
 
     uint64_t initial_space = 0;
     if (tdb_get_available_disk_space((*db)->db_path, &initial_space) == 0)
@@ -7854,11 +7859,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         atomic_store(&(*db)->sync_thread_active, 0);
     }
 
-    /* mark database as open only after recovery and worker startup complete
+    /* database is already marked as open (set before worker thread creation)
      * recovery has queued all immutable memtables and flush work
      * workers are now running and will process the queued work
      * data in immutable memtables is immediately readable */
-    (*db)->is_open = 1;
     TDB_DEBUG_LOG("Database is now open and ready for operations");
 
     return TDB_SUCCESS;
@@ -8526,14 +8530,23 @@ int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 
     tidesdb_immutable_memtable_ref(immutable);
 
+    size_t queue_size_before = queue_size(cf->db->flush_queue);
+    TDB_DEBUG_LOG("CF '%s': Enqueueing flush work for SSTable %" PRIu64 " (queue size before: %zu)",
+                  cf->name, sst_id, queue_size_before);
+
     if (queue_enqueue(cf->db->flush_queue, work) != 0)
     {
+        TDB_DEBUG_LOG("CF '%s': FAILED to enqueue flush work for SSTable %" PRIu64, cf->name, sst_id);
         tidesdb_immutable_memtable_unref(immutable); /* remove work ref */
         tidesdb_immutable_memtable_unref(immutable); /* remove queue ref, triggers cleanup */
         free(work);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_ERR_MEMORY;
     }
+
+    size_t queue_size_after = queue_size(cf->db->flush_queue);
+    TDB_DEBUG_LOG("CF '%s': Successfully enqueued flush work for SSTable %" PRIu64 " (queue size after: %zu)",
+                  cf->name, sst_id, queue_size_after);
 
     return TDB_SUCCESS;
 }

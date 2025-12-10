@@ -4231,23 +4231,12 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     TDB_DEBUG_LOG("tidesdb_add_level called for CF '%s'", cf->name);
     TDB_DEBUG_LOG("DCA: add_level starting");
 
-    // /* set DCA flag to block concurrent level access */
-    // int expected = 0;
-    // if (!atomic_compare_exchange_strong_explicit(&cf->dca_in_progress, &expected, 1,
-    //                                              memory_order_acquire, memory_order_relaxed))
-    // {
-    //     /* another DCA operation is already running, skip this one */
-    //     TDB_DEBUG_LOG("DCA: add_level skipped - another DCA in progress");
-    //     return TDB_SUCCESS;
-    // }
-
     int old_num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
     /* check if we've hit max levels */
     if (old_num_levels >= TDB_MAX_LEVELS)
     {
         TDB_DEBUG_LOG("DCA: Cannot add level - already at max (%d)", TDB_MAX_LEVELS);
-        // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         return TDB_ERR_INVALID_ARGS;
     }
 
@@ -4261,7 +4250,6 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
         /* recheck if largest level still needs expansion */
         if (num_sstables == 0 && largest_size < largest_capacity)
         {
-            // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
             return TDB_SUCCESS;
         }
     }
@@ -4274,7 +4262,6 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     tidesdb_level_t *new_level = tidesdb_level_create(old_num_levels + 1, new_capacity);
     if (!new_level)
     {
-        // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         return TDB_ERR_MEMORY;
     }
     cf->levels[old_num_levels] = new_level;
@@ -4305,11 +4292,8 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
         }
     }
 
-    /* ensure all level updates are visible before clearing DCA flag */
     atomic_thread_fence(memory_order_seq_cst);
 
-    /* clear DCA flag to allow level access */
-    // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
     TDB_DEBUG_LOG("DCA: add_level complete");
 
     TDB_DEBUG_LOG("Added level %d, now have %d levels", new_level->level_num, old_num_levels + 1);
@@ -4327,22 +4311,12 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
 {
     TDB_DEBUG_LOG("tidesdb_remove_level called for CF '%s'", cf->name);
 
-    /* set DCA flag to block concurrent level access */
-    // int expected = 0;
-    // if (!atomic_compare_exchange_strong_explicit(&cf->dca_in_progress, &expected, 1,
-    //                                              memory_order_acquire, memory_order_relaxed))
-    // {
-    //     /* another DCA operation is already running, skip this one */
-    //     TDB_DEBUG_LOG("DCA: remove_level skipped - another DCA in progress");
-    //     return TDB_SUCCESS;
-    // }
 
     int old_num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
     /* enforce minimum levels! never go below min_levels */
     if (old_num_levels <= cf->config.min_levels)
     {
-        // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         TDB_DEBUG_LOG("tidesdb_remove_level: At minimum levels (%d <= %d), not removing",
                       old_num_levels, cf->config.min_levels);
         return TDB_SUCCESS; /* not an error, just at minimum */
@@ -4356,7 +4330,6 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
     {
         TDB_DEBUG_LOG("DCA: Cannot remove level %d - has %d SSTables", largest->level_num,
                       num_largest_ssts);
-        // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         return TDB_SUCCESS;
     }
 
@@ -4393,10 +4366,7 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
      * release ordering ensures the level removal is visible to other threads */
     atomic_store_explicit(&cf->num_active_levels, new_num_levels, memory_order_release);
 
-    /* ensure all level updates are visible before clearing DCA flag */
     atomic_thread_fence(memory_order_seq_cst);
-
-    // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
 
     TDB_DEBUG_LOG("Removed level, now have %d levels", new_num_levels);
 
@@ -8251,7 +8221,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->memtable_id, 0);
     atomic_init(&cf->is_compacting, 0);
     atomic_init(&cf->is_flushing, 0);
-    // atomic_init(&cf->dca_in_progress, 0);
     atomic_init(&cf->memtable_generation, 0);
     atomic_init(&cf->commit_ticket, 0);
     atomic_init(&cf->commit_serving, 0);

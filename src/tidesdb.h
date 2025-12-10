@@ -538,8 +538,6 @@ typedef struct
  * @param next_sstable_id next sstable id
  * @param is_compacting whether a column family compaction has triggered and queued
  * @param is_flushing whether a column family memtable has been swapped and queued
- * @param dca_in_progress  prevents concurrent level access during DCA operations which increase or
- * decrease levels
  * @param db parent database reference
  */
 struct tidesdb_column_family_t
@@ -562,7 +560,6 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
-    //_Atomic(int) dca_in_progress;
     tidesdb_t *db;
 };
 

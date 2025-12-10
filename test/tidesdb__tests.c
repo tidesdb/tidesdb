@@ -3915,7 +3915,10 @@ static void test_dynamic_capacity_adjustment(void)
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
-    /* config that will trigger level additions */
+    /* config that will trigger level additions
+     * Level 1 capacity: 200 * 2^0 = 200 bytes
+     * Level 2 capacity: 200 * 2^1 = 400 bytes
+     * Need to fill Level 2 to 400+ bytes to trigger Level 3 creation */
     cf_config.write_buffer_size = 200;
     cf_config.level_size_ratio = 2;
     cf_config.dividing_level_offset = 1;
@@ -3929,58 +3932,84 @@ static void test_dynamic_capacity_adjustment(void)
 
     printf("Initial levels: %d\n", initial_levels);
 
-    /* write data in batches, triggering level additions */
+    /* write enough data to fill Level 2 and trigger level addition
+     * Each key+value is ~160 bytes, need 400+ bytes in L2
+     * Write many keys to ensure data flows through L0→L1→L2 via compaction */
     int total_keys_written = 0;
-    for (int batch = 0; batch < 5; batch++)
+
+    printf("Writing keys to trigger level growth...\n");
+    for (int i = 0; i < 200; i++) /* write 200 keys total (~32KB) */
     {
-        printf("Batch %d: Writing keys\n", batch + 1);
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
-        int written = 0;
+        char key[32], value[128];
+        snprintf(key, sizeof(key), "dca_key_%05d", i);
+        snprintf(value, sizeof(value), "dca_value_%05d_with_padding_data", i);
 
-        for (int i = 0; i < 50000 && written < 5000; i++)
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        total_keys_written++;
+
+        /* trigger flush every 20 keys to create multiple SSTables */
+        if ((i + 1) % 20 == 0)
         {
-            tidesdb_txn_t *txn = NULL;
-            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
-
-            char key[32], value[128];
-            snprintf(key, sizeof(key), "dca_key_%05d", total_keys_written);
-            snprintf(value, sizeof(value), "dca_value_%05d_with_padding_data", total_keys_written);
-
-            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                      strlen(value) + 1, 0),
-                      0);
-            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
-            tidesdb_txn_free(txn);
-
-            total_keys_written++;
-            written += 160; /* approximate size per key */
+            tidesdb_flush_memtable(cf);
         }
+    }
 
-        for (int i = 0; i < 50; i++)
+    /* wait for all flushes to complete */
+    printf("Waiting for flushes to complete...\n");
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    printf("Triggering compactions to push data through levels...\n");
+
+    /* trigger multiple compaction cycles to push data L0→L1→L2 */
+    for (int round = 0; round < 5; round++)
+    {
+        printf("  Compaction round %d\n", round + 1);
+        tidesdb_compact(cf);
+
+        /* wait for this compaction round to complete */
+        for (int i = 0; i < 200; i++)
         {
             usleep(10000);
-            if (queue_size(db->flush_queue) == 0) break;
+            if (queue_size(db->compaction_queue) == 0) break;
         }
 
-        printf("done flushing\n");
-
-        /* trigger compaction and observe level changes */
-        sleep(5);
+        sleep(2); /* extra time for DCA to apply */
 
         int current_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
+        printf("    After round %d: %d levels\n", round + 1, current_levels);
 
-        printf("  After batch %d: %d levels\n", batch + 1, current_levels);
+        /* if we've grown levels, we can stop */
+        if (current_levels > initial_levels)
+        {
+            printf("  Level growth detected after round %d\n", round + 1);
+            break;
+        }
     }
 
     int final_levels = atomic_load_explicit(&cf->num_levels, memory_order_acquire);
     printf("Final levels: %d (growth: %d levels)\n", final_levels, final_levels - initial_levels);
     printf("Total keys written: %d\n", total_keys_written);
 
-    for (int i = 0; i < 128; i++)
+    /* final wait for any remaining compactions */
+    printf("Final wait for compactions...\n");
+    for (int i = 0; i < 300; i++)
     {
         usleep(10000);
         if (queue_size(db->compaction_queue) == 0) break;
     }
+    sleep(2); /* additional grace period for DCA */
 
     /* verify DCA worked -- should have added levels */
     ASSERT_TRUE(final_levels > initial_levels);

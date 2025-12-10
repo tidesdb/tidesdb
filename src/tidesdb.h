@@ -186,7 +186,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_MEMORY_PERCENTAGE  0.6           /* 60% of available memory */
 #define TDB_MIN_KEY_VALUE_SIZE (1024 * 1024) /* 1MB minimum threshold */
 #define TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY \
-    32 /* initial level sstable allocation capacity and expo */
+    32                    /* initial level sstable allocation capacity and expo */
+#define TDB_MAX_LEVELS 32 /* maximum number of levels in LSM-tree */
 #define DISK_SPACE_CHECK_INTERVAL_SECONDS \
     60 /* interval in-which system checks and caches avail disk space */
 #define NO_CF_SYNC_SLEEP_US                                                                       \
@@ -470,7 +471,6 @@ struct tidesdb_sstable_t
  * @param file_boundaries file boundaries for partitioning
  * @param boundary_sizes sizes of boundary keys
  * @param num_boundaries number of boundaries
- * @param marked_for_deletion when ref count reaches 0 and its marked for deletion its removed.
  */
 struct tidesdb_level_t
 {
@@ -483,7 +483,6 @@ struct tidesdb_level_t
     _Atomic(uint8_t **) file_boundaries;
     _Atomic(size_t *) boundary_sizes;
     _Atomic(int) num_boundaries;
-    _Atomic(int) marked_for_deletion;
 };
 
 /**
@@ -534,8 +533,8 @@ typedef struct
  * @param commit_ticket ticket counter for serializing commits
  * @param commit_serving serving counter for serializing commits
  * @param active_txn_buffer buffer of active transactions for this cf
- * @param levels array of disk levels
- * @param num_levels number of disk levels
+ * @param levels fixed array of disk levels (max TDB_MAX_LEVELS)
+ * @param num_active_levels number of currently active disk levels
  * @param next_sstable_id next sstable id
  * @param is_compacting whether a column family compaction has triggered and queued
  * @param is_flushing whether a column family memtable has been swapped and queued
@@ -558,12 +557,12 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) commit_ticket;
     _Atomic(uint64_t) commit_serving;
     buffer_t *active_txn_buffer;
-    _Atomic(tidesdb_level_t **) levels;
-    _Atomic(int) num_levels;
+    tidesdb_level_t *levels[TDB_MAX_LEVELS];
+    _Atomic(int) num_active_levels;
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
-    _Atomic(int) dca_in_progress; /* flag indicating DCA (add/remove level) is in progress */
+    _Atomic(int) dca_in_progress;
     tidesdb_t *db;
 };
 

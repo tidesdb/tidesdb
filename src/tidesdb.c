@@ -476,10 +476,10 @@ static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capaci
  */
 static inline void tidesdb_wait_for_dca(tidesdb_column_family_t *cf)
 {
-    while (atomic_load_explicit(&cf->dca_in_progress, memory_order_acquire))
-    {
-        cpu_pause(); /* yield CPU during spin-wait */
-    }
+    /* No-op: DCA operations are now safe to run concurrently with reads.
+     * Readers take atomic snapshots of num_active_levels and use refcounting
+     * to protect SSTables from deletion during access. */
+    (void)cf;
 }
 
 static int tidesdb_add_level(tidesdb_column_family_t *cf);
@@ -1835,9 +1835,13 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
             lru_cache_put(db->sstable_cache, cache_key, sst, tidesdb_sstable_cache_evict_cb, db);
         if (put_result < 0)
         {
-            /* cache add failed, release ref */
+            /* Cache add failed (likely full with all entries protected by hazard pointers).
+             * This is OK - we can still open the SSTable, it just won't be cached.
+             * Release the ref we took for the cache. */
+            TDB_DEBUG_LOG("SSTable %" PRIu64 ": cache_put FAILED - proceeding without cache",
+                          sst->id);
             tidesdb_sstable_unref(db, sst);
-            return -1;
+            /* Continue to open the SSTable below - cache is an optimization, not required */
         }
         /* if put_result == 0, new entry was inserted successfully
          * if put_result == 1, entry was updated
@@ -2975,8 +2979,9 @@ static void tidesdb_level_free(tidesdb_t *db, tidesdb_level_t *level)
 
     TDB_DEBUG_LOG("tidesdb_level_free: Freeing level %d", level->level_num);
 
-    tidesdb_sstable_t **ssts = atomic_load_explicit(&level->sstables, memory_order_acquire);
+    /* Load count before array to prevent TOCTOU race */
     int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+    tidesdb_sstable_t **ssts = atomic_load_explicit(&level->sstables, memory_order_acquire);
 
     TDB_DEBUG_LOG("tidesdb_level_free: Level %d has %d sstables to unref, array ptr=%p",
                   level->level_num, num_ssts, (void *)ssts);
@@ -3255,9 +3260,10 @@ static int tidesdb_level_update_boundaries(tidesdb_level_t *level, tidesdb_level
         free(boundary_sizes);
     }
 
+    /* Load count before array to prevent TOCTOU race */
+    int num_ssts = atomic_load_explicit(&largest_level->num_sstables, memory_order_relaxed);
     tidesdb_sstable_t **sstables =
         atomic_load_explicit(&largest_level->sstables, memory_order_relaxed);
-    int num_ssts = atomic_load_explicit(&largest_level->num_sstables, memory_order_relaxed);
 
     if (num_ssts > 0)
     {
@@ -4225,15 +4231,15 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     TDB_DEBUG_LOG("tidesdb_add_level called for CF '%s'", cf->name);
     TDB_DEBUG_LOG("DCA: add_level starting");
 
-    /* set DCA flag to block concurrent level access */
-    int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(&cf->dca_in_progress, &expected, 1,
-                                                 memory_order_acquire, memory_order_relaxed))
-    {
-        /* another DCA operation is already running, skip this one */
-        TDB_DEBUG_LOG("DCA: add_level skipped - another DCA in progress");
-        return TDB_SUCCESS;
-    }
+    // /* set DCA flag to block concurrent level access */
+    // int expected = 0;
+    // if (!atomic_compare_exchange_strong_explicit(&cf->dca_in_progress, &expected, 1,
+    //                                              memory_order_acquire, memory_order_relaxed))
+    // {
+    //     /* another DCA operation is already running, skip this one */
+    //     TDB_DEBUG_LOG("DCA: add_level skipped - another DCA in progress");
+    //     return TDB_SUCCESS;
+    // }
 
     int old_num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
@@ -4241,7 +4247,7 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     if (old_num_levels >= TDB_MAX_LEVELS)
     {
         TDB_DEBUG_LOG("DCA: Cannot add level - already at max (%d)", TDB_MAX_LEVELS);
-        atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
+        // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         return TDB_ERR_INVALID_ARGS;
     }
 
@@ -4255,7 +4261,7 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
         /* recheck if largest level still needs expansion */
         if (num_sstables == 0 && largest_size < largest_capacity)
         {
-            atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
+            // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
             return TDB_SUCCESS;
         }
     }
@@ -4268,7 +4274,7 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     tidesdb_level_t *new_level = tidesdb_level_create(old_num_levels + 1, new_capacity);
     if (!new_level)
     {
-        atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
+        // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         return TDB_ERR_MEMORY;
     }
     cf->levels[old_num_levels] = new_level;
@@ -4303,7 +4309,7 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
     atomic_thread_fence(memory_order_seq_cst);
 
     /* clear DCA flag to allow level access */
-    atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
+    // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
     TDB_DEBUG_LOG("DCA: add_level complete");
 
     TDB_DEBUG_LOG("Added level %d, now have %d levels", new_level->level_num, old_num_levels + 1);
@@ -4322,21 +4328,21 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
     TDB_DEBUG_LOG("tidesdb_remove_level called for CF '%s'", cf->name);
 
     /* set DCA flag to block concurrent level access */
-    int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(&cf->dca_in_progress, &expected, 1,
-                                                 memory_order_acquire, memory_order_relaxed))
-    {
-        /* another DCA operation is already running, skip this one */
-        TDB_DEBUG_LOG("DCA: remove_level skipped - another DCA in progress");
-        return TDB_SUCCESS;
-    }
+    // int expected = 0;
+    // if (!atomic_compare_exchange_strong_explicit(&cf->dca_in_progress, &expected, 1,
+    //                                              memory_order_acquire, memory_order_relaxed))
+    // {
+    //     /* another DCA operation is already running, skip this one */
+    //     TDB_DEBUG_LOG("DCA: remove_level skipped - another DCA in progress");
+    //     return TDB_SUCCESS;
+    // }
 
     int old_num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
     /* enforce minimum levels! never go below min_levels */
     if (old_num_levels <= cf->config.min_levels)
     {
-        atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
+        // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         TDB_DEBUG_LOG("tidesdb_remove_level: At minimum levels (%d <= %d), not removing",
                       old_num_levels, cf->config.min_levels);
         return TDB_SUCCESS; /* not an error, just at minimum */
@@ -4350,7 +4356,7 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
     {
         TDB_DEBUG_LOG("DCA: Cannot remove level %d - has %d SSTables", largest->level_num,
                       num_largest_ssts);
-        atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
+        // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
         return TDB_SUCCESS;
     }
 
@@ -4390,7 +4396,7 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
     /* ensure all level updates are visible before clearing DCA flag */
     atomic_thread_fence(memory_order_seq_cst);
 
-    atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
+    // atomic_store_explicit(&cf->dca_in_progress, 0, memory_order_release);
 
     TDB_DEBUG_LOG("Removed level, now have %d levels", new_num_levels);
 
@@ -5218,11 +5224,12 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
     tidesdb_level_update_boundaries(target, next_level);
 
+    /* Load count before array to prevent TOCTOU race */
+    int next_level_num_ssts = atomic_load_explicit(&next_level->num_sstables, memory_order_acquire);
     TDB_DEBUG_LOG("Dividing merge: next_level (L%d) has %d SSTables", next_level->level_num,
-                  atomic_load_explicit(&next_level->num_sstables, memory_order_acquire));
+                  next_level_num_ssts);
     tidesdb_sstable_t **next_level_ssts =
         atomic_load_explicit(&next_level->sstables, memory_order_acquire);
-    int next_level_num_ssts = atomic_load_explicit(&next_level->num_sstables, memory_order_acquire);
     for (int i = 0; i < next_level_num_ssts; i++)
     {
         tidesdb_sstable_t *sst = next_level_ssts[i];
@@ -8244,11 +8251,10 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->memtable_id, 0);
     atomic_init(&cf->is_compacting, 0);
     atomic_init(&cf->is_flushing, 0);
-    atomic_init(&cf->dca_in_progress, 0);
+    // atomic_init(&cf->dca_in_progress, 0);
     atomic_init(&cf->memtable_generation, 0);
     atomic_init(&cf->commit_ticket, 0);
     atomic_init(&cf->commit_serving, 0);
-    atomic_init(&cf->dca_in_progress, 0);
 
     if (buffer_new_with_eviction(&cf->active_txn_buffer, TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE,
                                  txn_entry_evict, NULL) != 0)
@@ -9268,9 +9274,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     {
         tidesdb_level_t *level = cf->levels[i];
 
-        /* load array pointer and count atomically */
-        tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
+        /* CRITICAL: load count BEFORE array pointer to prevent TOCTOU race.
+         * If we load array first, compaction could remove an SSTable and decrement count,
+         * causing us to skip the last entry. Loading count first ensures we check
+         * at least the SSTables that existed when we started. */
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
 
         for (int j = 0; j < num_ssts; j++)
         {
@@ -10432,10 +10441,13 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         {
             tidesdb_level_t *level = cf->levels[i];
 
-            /* load array pointer and count atomically */
+            /* CRITICAL: load count BEFORE array pointer to prevent TOCTOU race.
+             * If we load array first, compaction could remove an SSTable and decrement count,
+             * causing us to skip the last entry. Loading count first ensures we iterate
+             * through at least the SSTables that existed when we started. */
+            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&level->sstables, memory_order_acquire);
-            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
             /* take refs on all sstables in this level immediately in tight loop
              * this minimizes window where compaction could free the array */

@@ -213,7 +213,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # benchmark configuration variables (can be overridden at build time with -D flags)
     if(NOT DEFINED BENCH_NUM_OPERATIONS)
-        set(BENCH_NUM_OPERATIONS 1000000)
+        set(BENCH_NUM_OPERATIONS 10000000)
     endif()
     if(NOT DEFINED BENCH_NUM_SEEK_OPS)
         set(BENCH_NUM_SEEK_OPS 100)
@@ -228,10 +228,10 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_CF_NAME "benchmark_cf")
     endif()
     if(NOT DEFINED BENCH_NUM_THREADS)
-        set(BENCH_NUM_THREADS 1)
+        set(BENCH_NUM_THREADS 4)
     endif()
     if(NOT DEFINED BENCH_KEY_PATTERN)
-        set(BENCH_KEY_PATTERN "zipfian")
+        set(BENCH_KEY_PATTERN "sequential")
     endif()
 
     # tidesdb config variables for benchmark
@@ -299,7 +299,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         math(EXPR BENCH_BLOCK_CACHE_SIZE 67108864)
     endif()
     if(NOT DEFINED BENCH_ISOLATION_LEVEL)
-        set(BENCH_ISOLATION_LEVEL TDB_ISOLATION_READ_COMMITTED)
+        set(BENCH_ISOLATION_LEVEL TDB_ISOLATION_READ_UNCOMMITTED)
     endif()
 
     add_executable(block_manager_tests test/block_manager__tests.c)

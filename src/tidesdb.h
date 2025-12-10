@@ -163,7 +163,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_KLOG_BLOCK_SIZE             (64 * 1024) /* 64KB per klog block */
 #define TDB_DEFAULT_VLOG_BLOCK_SIZE             (4 * 1024)  /* 4KB per vlog block */
 #define TDB_DEFAULT_VALUE_THRESHOLD             512         /* values >= 512 bytes go to vlog */
-#define TDB_DEFAULT_INDEX_SAMPLE_RATIO          2
+#define TDB_DEFAULT_INDEX_SAMPLE_RATIO          1
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024) /* 100MB minimum free space */
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES           512                 /* max open sstables globally */
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      1024 * 64           /* max concurrent txns per cf */
@@ -562,7 +562,7 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
-    _Atomic(int) dca_in_progress;
+    //_Atomic(int) dca_in_progress;
     tidesdb_t *db;
 };
 

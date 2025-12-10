@@ -4311,7 +4311,6 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
 {
     TDB_DEBUG_LOG("tidesdb_remove_level called for CF '%s'", cf->name);
 
-
     int old_num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
     /* enforce minimum levels! never go below min_levels */

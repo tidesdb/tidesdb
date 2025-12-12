@@ -656,7 +656,7 @@ struct tidesdb_column_family_t
     pthread_mutex_t wal_group_commit_lock;
     pthread_cond_t wal_group_commit_cond;
     uint8_t *wal_group_buffer;
-    size_t wal_group_buffer_size;
+    _Atomic(size_t) wal_group_buffer_size;
     size_t wal_group_buffer_capacity;
     _Atomic(int) wal_group_leader;
     _Atomic(int) wal_group_waiters;

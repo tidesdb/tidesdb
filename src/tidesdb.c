@@ -5217,7 +5217,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     uint64_t klog_block_num = 0;
     uint64_t vlog_block_num = 0;
     uint64_t current_vlog_file_offset = 0;
-    uint64_t entry_count = 0;
     uint64_t max_seq = 0;
 
     uint8_t *last_key = NULL;
@@ -5441,7 +5440,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         }
 
         new_sst->num_entries++;
-        entry_count++;
 
         tidesdb_kv_pair_free(kv);
     }
@@ -9087,7 +9085,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         free(cf);
         return TDB_ERR_MEMORY;
     }
-    cf->wal_group_buffer_size = 0;
+    atomic_init(&cf->wal_group_buffer_size, 0);
     cf->wal_group_buffer_capacity = TDB_WAL_GROUP_COMMIT_BUFFER_SIZE;
     atomic_init(&cf->wal_group_leader, 0);
     atomic_init(&cf->wal_group_waiters, 0);
@@ -10962,8 +10960,6 @@ skip_ssi_check:
 
         skip_list_t *memtable = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
 
-        int ops_written = 0;
-
 #define TXN_KEY_HASH_SIZE 1024
         typedef struct
         {
@@ -11002,7 +10998,6 @@ skip_ssi_check:
                     atomic_fetch_sub_explicit(&cf->pending_commits, 1, memory_order_relaxed);
                     return TDB_ERR_IO;
                 }
-                ops_written++;
             }
         }
         else
@@ -11050,7 +11045,6 @@ skip_ssi_check:
                     atomic_fetch_sub_explicit(&cf->pending_commits, 1, memory_order_relaxed);
                     return TDB_ERR_IO;
                 }
-                ops_written++;
             }
             free(seen_keys);
         }

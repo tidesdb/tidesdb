@@ -19,10 +19,6 @@
 
 #include "queue.h"
 
-#if !defined(_WIN32)
-#include <sched.h>
-#endif
-
 /**
  * aligned_malloc
  * allocate memory with specified alignment.
@@ -147,10 +143,31 @@ static inline int atomic_cas_tagged_ptr(_Atomic(tagged_ptr_t) *target, tagged_pt
     /* 64-bit: standard cas on single value */
     return atomic_compare_exchange_strong(target, expected, desired);
 #else
-    /* 32-bit: use gcc/clang builtin for 8-byte cas on x86-32 (cmpxchg8b)
-     * this is more reliable than c11 atomics which may use locks */
-#if (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(_M_IX86))
-    /* use gcc/clang __sync builtin for 64-bit cas on 32-bit x86 */
+    /* 32-bit: use platform-specific 64-bit cas intrinsics
+     * c11 atomics on 8-byte structs are unreliable on 32-bit platforms */
+#if defined(_MSC_VER)
+    /* msvc: use _InterlockedCompareExchange64 intrinsic (available via compat.h) */
+    typedef __int64 i64;
+    union
+    {
+        tagged_ptr_t tp;
+        i64 i;
+    } exp_u, des_u;
+    exp_u.tp = *expected;
+    des_u.tp = desired;
+    i64 old = _InterlockedCompareExchange64((volatile i64 *)target, des_u.i, exp_u.i);
+    if (old == exp_u.i)
+    {
+        return 1;
+    }
+    else
+    {
+        exp_u.i = old;
+        *expected = exp_u.tp;
+        return 0;
+    }
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(_M_IX86))
+    /* gcc/clang: use __sync builtin for 64-bit cas on 32-bit x86 */
     typedef unsigned long long u64;
     union
     {
@@ -198,11 +215,7 @@ static inline void backoff(int iteration)
     else
     {
         /* yield cpu time slice to other threads */
-#if defined(_WIN32)
-        Sleep(0);
-#else
-        sched_yield();
-#endif
+        cpu_yield();
     }
 }
 
@@ -756,11 +769,7 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         pthread_mutex_lock(&queue->wait_lock);
         pthread_cond_broadcast(&queue->not_empty);
         pthread_mutex_unlock(&queue->wait_lock);
-#if defined(_WIN32)
-        Sleep(0);
-#else
-        sched_yield();
-#endif
+        cpu_yield();
     }
 
     /* free all nodes in the queue */

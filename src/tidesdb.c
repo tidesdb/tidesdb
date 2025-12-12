@@ -2484,7 +2484,7 @@ static void tidesdb_write_set_hash_insert(tidesdb_write_set_hash_t *hash, tidesd
         /* collision, try next slot */
         slot = (slot + 1) % hash->capacity;
     }
-    /* probe limit exceeded - hash table may be too full, but continue without hash */
+    /* probe limit exceeded--hash table may be too full, but continue without hash */
 }
 
 /**
@@ -2523,7 +2523,7 @@ static int tidesdb_write_set_hash_lookup(tidesdb_write_set_hash_t *hash, tidesdb
         slot = (slot + 1) % hash->capacity;
     }
 
-    /* probe limit exceeded - assume not found */
+    /* probe limit exceeded--assume not found */
     return -1;
 }
 
@@ -2625,7 +2625,7 @@ static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, tidesdb_
         /* collision, try next slot */
         slot = (slot + 1) % hash->capacity;
     }
-    /* probe limit exceeded - hash table may be too full, but continue without hash */
+    /* probe limit exceeded -- hash table may be too full, but continue without hash */
 }
 
 /**
@@ -2664,7 +2664,7 @@ static int tidesdb_read_set_hash_check_conflict(tidesdb_read_set_hash_t *hash, t
         slot = (slot + 1) % hash->capacity;
     }
 
-    /* probe limit exceeded - assume no conflict (conservative) */
+    /* probe limit exceeded -- assume no conflict (conservative) */
     return 0;
 }
 
@@ -3256,13 +3256,13 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
         free(metadata_data);
     }
 
-    /* get final file sizes AFTER writing metadata block
+    /* get final file sizes after writing metadata block
      * this ensures in-memory sst struct has correct sizes */
     block_manager_get_size(bms.klog_bm, &sst->klog_size);
     block_manager_get_size(bms.vlog_bm, &sst->vlog_size);
 
-    /* ensure all SSTable data is durably written before it becomes visible to readers
-     * this prevents reads from seeing partially-written SSTables which can cause
+    /* ensure all sst data is durably written before it becomes visible to readers
+     * this prevents reads from seeing partially-written ssts which can cause
      * deserialization errors and stalls */
     if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
     if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
@@ -4377,7 +4377,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
 
     tidesdb_sstable_ref(sst);
 
-    /* ensure sstable is open through cache BEFORE getting block managers */
+    /* ensure sstable is open through cache before getting block managers */
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
         tidesdb_sstable_unref(db, sst);
@@ -9400,6 +9400,19 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     db->num_column_families++;
     pthread_rwlock_unlock(&db->cf_list_lock);
 
+    /* save configuration to disk for recovery */
+    char config_path[MAX_FILE_PATH_LENGTH];
+    snprintf(config_path, sizeof(config_path),
+             "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+             cf->directory);
+
+    int save_result = tidesdb_cf_config_save_to_ini(config_path, name, config);
+    if (save_result != TDB_SUCCESS)
+    {
+        TDB_DEBUG_LOG("Warning: Failed to save CF config for '%s' (error: %d)", name, save_result);
+        /* non-fatal, continue */
+    }
+
     TDB_DEBUG_LOG("Created CF '%s' (total: %d)", name, db->num_column_families);
 
     return TDB_SUCCESS;
@@ -10049,8 +10062,8 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
         }
         else
         {
-            /* Capacity exceeded - log warning but continue.
-             * This transaction won't participate in SSI conflict detection,
+            /* capacity exceeded -- log warning but continue.
+             * this transaction won't participate in SSI conflict detection,
              * but will still get correct snapshot isolation semantics. */
             TDB_DEBUG_LOG("Active transaction list full (%d), SSI may be less effective",
                           db->active_txns_capacity);
@@ -10381,7 +10394,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     }
     pthread_mutex_unlock(&cf->immutable_memtables->lock);
 
-    /* now load active memtable - any keys that rotated are already in our immutable snapshot */
+    /* now load active memtable -- any keys that rotated are already in our immutable snapshot */
     skip_list_t *active_mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
 
     /* memory fence ensures we see consistent state */
@@ -10981,7 +10994,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
         pthread_rwlock_unlock(&txn->db->active_txns_lock);
 
-        /* process snapshot lock-free - transaction pointers remain valid because
+        /* process snapshot lock-free -- transaction pointers remain valid because
          * transactions are only freed after removal from active list */
         for (int i = 0; i < snapshot_count; i++)
         {
@@ -11008,14 +11021,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
             else
             {
-                /* O(n*m) nested loop for small read sets - better cache locality */
+                /* O(n*m) nested loop for small read sets -- better cache locality */
                 for (int r = 0; r < txn->read_set_count && !txn->has_rw_conflict_out; r++)
                 {
                     for (int w = 0; w < other->write_set_count; w++)
                     {
-                        /* size check first (int comparison - fastest) */
+                        /* size check first (int comparison -- fastest) */
                         if (txn->read_key_sizes[r] != other->write_key_sizes[w]) continue;
-                        /* CF pointer check (pointer comparison - fast) */
+                        /* CF pointer check (pointer comparison -- fast) */
                         if (txn->read_cfs[r] != other->write_cfs[w]) continue;
                         /* memcmp last (most expensive) */
                         if (memcmp(txn->read_keys[r], other->write_keys[w],
@@ -11053,7 +11066,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             goto skip_ssi_check;
         }
 
-        /* check for dangerous structures - process snapshot lock-free */
+        /* check for dangerous structures--process snapshot lock-free */
         for (int i = 0; i < snapshot_count; i++)
         {
             tidesdb_txn_t *other = snapshot[i];
@@ -11293,7 +11306,7 @@ skip_ssi_check:
     {
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
 
-        /* use relaxed ordering for increment - only final decrement needs release */
+        /* use relaxed ordering for increment--only final decrement needs release */
         atomic_fetch_add_explicit(&cf->pending_commits, 1, memory_order_relaxed);
 
         skip_list_t *memtable = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
@@ -11332,7 +11345,7 @@ skip_ssi_check:
                                            op->value_size, op->ttl, txn->commit_seq, op->is_delete);
                 if (put_result != 0)
                 {
-                    /* error path - use relaxed since we're aborting anyway */
+                    /* error path -- use relaxed since we're aborting anyway */
                     atomic_fetch_sub_explicit(&cf->pending_commits, 1, memory_order_relaxed);
                     return TDB_ERR_IO;
                 }
@@ -11379,7 +11392,7 @@ skip_ssi_check:
                 if (put_result != 0)
                 {
                     free(seen_keys);
-                    /* error path - use relaxed since we're aborting anyway */
+                    /* error path -- use relaxed since we're aborting anyway */
                     atomic_fetch_sub_explicit(&cf->pending_commits, 1, memory_order_relaxed);
                     return TDB_ERR_IO;
                 }
@@ -11422,7 +11435,7 @@ skip_ssi_check:
         {
             /* immutable memtable queue backpressure -- if too many pending flushes,
              * slow down writes to prevent unbounded queue growth and stalls.
-             * This is critical when writes outpace flush workers. */
+             * this is critical when writes outpace flush workers. */
             size_t immutable_queue_depth = queue_size(cf->immutable_memtables);
 
             if (immutable_queue_depth >= TDB_BACKPRESSURE_IMMUTABLE_EMERGENCY)
@@ -11481,7 +11494,6 @@ skip_ssi_check:
                 }
             }
 
-            /* trigger async flush - tidesdb_flush_memtable will acquire is_flushing lock */
             tidesdb_flush_memtable(cf);
         }
     }
@@ -11827,7 +11839,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     }
     pthread_mutex_unlock(&cf->immutable_memtables->lock);
 
-    /* now load active memtable - any keys that rotated are already in our snapshot */
+    /* now load active memtable -- any keys that rotated are already in our snapshot */
     skip_list_t *active_mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
 
     /* memory fence ensures consistent view */
@@ -12130,7 +12142,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                         source->source.sstable.decompressed_data = NULL;
                     }
                     block_manager_block_release(bmblock);
-                    break; /* target not in sst - early exit */
+                    break; /* target not in sst -- early exit */
                 }
 
                 /* target is in range [first, last] if first <= target <= last */
@@ -13530,7 +13542,27 @@ static int tidesdb_recover_database(tidesdb_t *db)
 
             if (!cf)
             {
+                /* try to load persisted config from disk */
                 tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
+                char config_path[MAX_FILE_PATH_LENGTH];
+                snprintf(
+                    config_path, sizeof(config_path),
+                    "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+                    full_path);
+
+                if (tidesdb_cf_config_load_from_ini(config_path, entry->d_name, &config) ==
+                    TDB_SUCCESS)
+                {
+                    TDB_DEBUG_LOG(
+                        "CF '%s': Loaded config from disk (write_buffer_size=%zu, "
+                        "level_size_ratio=%d)",
+                        entry->d_name, config.write_buffer_size, config.level_size_ratio);
+                }
+                else
+                {
+                    TDB_DEBUG_LOG("CF '%s': No saved config found, using defaults", entry->d_name);
+                }
+
                 int create_result = tidesdb_create_column_family(db, entry->d_name, &config);
 
                 if (create_result == TDB_SUCCESS)

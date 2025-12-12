@@ -5007,6 +5007,7 @@ static void test_portability_workflow(void)
         cfg.enable_debug_logging = 1;
         cfg.num_flush_threads = 1;
         cfg.num_compaction_threads = 1;
+        cfg.block_cache_size = 0;
 
         tidesdb_t *db = NULL;
         ASSERT_EQ(tidesdb_open(&cfg, &db), 0);

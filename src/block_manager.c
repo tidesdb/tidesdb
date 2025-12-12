@@ -1066,7 +1066,6 @@ int block_manager_validate_last_block(block_manager_t *bm)
         /* block is valid, move to next */
         valid_size = scan_pos + total_block_size;
         scan_pos = scan_pos + total_block_size;
-        block_num++;
     }
 
     if (valid_size != file_size)

@@ -8722,7 +8722,12 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     if (config->block_cache_size > 0)
     {
-        (*db)->block_cache = lru_cache_new(config->block_cache_size);
+        /* convert block_cache_size (bytes) to capacity (number of entries)
+         * assume average block size of 64KB for estimation */
+        size_t block_cache_capacity = config->block_cache_size / (64 * 1024);
+        if (block_cache_capacity < 100) block_cache_capacity = 100; /* minimum capacity */
+
+        (*db)->block_cache = lru_cache_new(block_cache_capacity);
         if (!(*db)->block_cache)
         {
             lru_cache_free((*db)->sstable_cache);

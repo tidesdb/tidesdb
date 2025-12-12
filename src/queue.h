@@ -21,16 +21,18 @@
 #include "compat.h"
 
 /**
- * QUEUE_TAG_BITS
- * number of bits used for the ABA counter in tagged pointers.
- * on 64-bit systems, we use the upper bits for the tag.
+ * queue_tag_bits
+ * number of bits used for the aba counter in tagged pointers.
+ * on 64-bit systems (x86_64, arm64), we use the upper 16 bits for the tag.
+ * on 32-bit systems (x86, arm), we use the upper 8 bits for the tag.
  */
 #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
+/* 64-bit systems: use upper 16 bits for tag, lower 48 bits for pointer */
 #define QUEUE_TAG_BITS 16
 #define QUEUE_TAG_MASK ((uintptr_t)0xFFFF000000000000ULL)
 #define QUEUE_PTR_MASK ((uintptr_t)0x0000FFFFFFFFFFFFULL)
 #else
-/* 32-bit systems we use upper 8 bits for tag */
+/* 32-bit systems: use upper 8 bits for tag, lower 24 bits for pointer */
 #define QUEUE_TAG_BITS 8
 #define QUEUE_TAG_MASK ((uintptr_t)0xFF000000UL)
 #define QUEUE_PTR_MASK ((uintptr_t)0x00FFFFFFUL)
@@ -54,8 +56,8 @@ typedef struct ATOMIC_ALIGN(8)
  * queue_node_t
  * internal node structure for the lock-free queue.
  * @param data pointer to user data
- * @param next tagged pointer to next node (includes ABA counter)
- * aligned to 8 bytes for atomic operations on x86.
+ * @param next tagged pointer to next node (includes aba counter)
+ * aligned to 8 bytes for atomic operations on x86/x64 and arm/arm64.
  */
 typedef struct ATOMIC_ALIGN(8) queue_node_t
 {
@@ -64,8 +66,19 @@ typedef struct ATOMIC_ALIGN(8) queue_node_t
 } queue_node_t;
 
 /**
+ * retired_node_t
+ * node in the retired list for deferred reclamation
+ */
+typedef struct retired_node_t
+{
+    queue_node_t *node;
+    uint64_t retire_epoch; /* epoch when node was retired */
+    struct retired_node_t *next;
+} retired_node_t;
+
+/**
  * queue_t
- * lock-free FIFO queue implementation.
+ * lock-free fifo queue implementation with epoch-based reclamation.
  * @param head tagged pointer to sentinel/first node (atomic)
  * @param tail tagged pointer to last node (atomic)
  * @param size current number of elements (atomic, approximate)
@@ -73,7 +86,11 @@ typedef struct ATOMIC_ALIGN(8) queue_node_t
  * @param waiter_count number of threads currently waiting
  * @param wait_lock mutex for blocking wait operations
  * @param not_empty condition variable for blocking waits
- * aligned to 8 bytes for atomic operations on x86.
+ * @param retired_head head of retired nodes list (deferred reclamation)
+ * @param retired_lock mutex protecting retired list
+ * @param global_epoch global epoch counter for reclamation
+ * @param retired_count number of retired nodes pending reclamation
+ * aligned to 8 bytes for atomic operations on x86/x64 and arm/arm64.
  */
 typedef struct ATOMIC_ALIGN(8)
 {
@@ -84,20 +101,24 @@ typedef struct ATOMIC_ALIGN(8)
     _Atomic(int) waiter_count;
     pthread_mutex_t wait_lock;
     pthread_cond_t not_empty;
+    retired_node_t *retired_head;
+    pthread_mutex_t retired_lock;
+    _Atomic(uint64_t) global_epoch; /* global epoch counter */
+    _Atomic(size_t) retired_count;  /* number of retired nodes */
 } queue_t;
 
 /**
  * queue_new
  * create a new lock-free queue.
- * init with a sentinel node.
- * @return pointer to new queue, NULL on failure
+ * initializes with a sentinel node for simplified enqueue/dequeue logic.
+ * @return pointer to new queue, null on failure
  */
 queue_t *queue_new(void);
 
 /**
  * queue_enqueue
  * add an item to the back of the queue (lock-free).
- * uses CAS operations for thread safety.
+ * uses cas (compare-and-swap) operations for thread safety.
  * @param queue the queue
  * @param data pointer to data to enqueue
  * @return 0 on success, -1 on failure
@@ -107,9 +128,9 @@ int queue_enqueue(queue_t *queue, void *data);
 /**
  * queue_dequeue
  * remove and return item from front of queue (lock-free).
- * uses CAS operations for thread safety.
+ * uses cas (compare-and-swap) operations for thread safety.
  * @param queue the queue
- * @return pointer to dequeued data, NULL if queue is empty
+ * @return pointer to dequeued data, null if queue is empty
  */
 void *queue_dequeue(queue_t *queue);
 
@@ -125,10 +146,10 @@ void *queue_dequeue_wait(queue_t *queue);
 /**
  * queue_peek
  * view item at front of queue without removing it.
- * inn a lock-free queue, the peeked value may be dequeued
+ * in a lock-free queue, the peeked value may be dequeued
  * by another thread before caller can act on it.
  * @param queue the queue
- * @return pointer to front data, NULL if queue is empty
+ * @return pointer to front data, null if queue is empty
  */
 void *queue_peek(queue_t *queue);
 
@@ -163,7 +184,7 @@ int queue_clear(queue_t *queue);
  * queue_foreach
  * iterate over all items in the queue and call function for each.
  * not lock-free, provides snapshot iteration.
- * items may be added/removed during iteration.
+ * items may be added/removed during iteration by other threads.
  * @param queue the queue
  * @param fn callback function called for each item
  * @param context user-provided context passed to callback

@@ -16,9 +16,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include "queue.h"
 
+#if !defined(_WIN32)
 #include <sched.h>
+#endif
 
 /**
  * aligned_malloc
@@ -32,11 +35,11 @@ static inline void *aligned_malloc(size_t size, size_t alignment)
 #if defined(_WIN32)
     return _aligned_malloc(size, alignment);
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-    /* C11 aligned_alloc requires size to be multiple of alignment */
+    /* c11 aligned_alloc requires size to be multiple of alignment */
     size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
     return aligned_alloc(alignment, aligned_size);
 #else
-    /* POSIX posix_memalign */
+    /* posix posix_memalign */
     void *ptr = NULL;
     if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
     return ptr;
@@ -140,7 +143,113 @@ static inline void backoff(int iteration)
     }
     else
     {
+        /* yield cpu time slice to other threads */
+#if defined(_WIN32)
+        Sleep(0);
+#else
         sched_yield();
+#endif
+    }
+}
+
+/**
+ * epoch-based reclamation
+ *
+ * to prevent use-after-free in the lock-free queue, we use epoch-based reclamation:
+ * - each enqueue/dequeue increments a global epoch counter
+ * - when a node is retired, we record the current epoch
+ * - nodes are only freed when they're older than (current_epoch - grace_period)
+ * - this ensures no thread can be accessing a node when it's freed
+ *
+ * the grace period of 2 epochs is sufficient because:
+ * - a thread reads a node pointer in epoch n
+ * - by epoch n+1, that thread has either completed or moved to a new node
+ * - by epoch n+2, it's guaranteed safe to free the node from epoch n
+ */
+
+/* grace period: nodes must be at least this many epochs old to reclaim */
+#define EPOCH_GRACE_PERIOD 2
+/* reclaim threshold: trigger reclamation when this many nodes retired */
+#define RECLAIM_THRESHOLD 100
+
+/**
+ * reclaim_retired_nodes
+ * free nodes that are old enough (beyond grace period).
+ * @param queue the queue
+ */
+static void reclaim_retired_nodes(queue_t *queue)
+{
+    uint64_t current_epoch = atomic_load(&queue->global_epoch);
+    if (current_epoch < EPOCH_GRACE_PERIOD) return;
+
+    uint64_t safe_epoch = current_epoch - EPOCH_GRACE_PERIOD;
+
+    pthread_mutex_lock(&queue->retired_lock);
+
+    retired_node_t **prev_ptr = &queue->retired_head;
+    retired_node_t *current = queue->retired_head;
+    size_t reclaimed = 0;
+
+    while (current != NULL)
+    {
+        if (current->retire_epoch <= safe_epoch)
+        {
+            /* node is old enough, reclaim it */
+            retired_node_t *to_free = current;
+            *prev_ptr = current->next;
+            current = current->next;
+
+            aligned_free(to_free->node);
+            free(to_free);
+            reclaimed++;
+        }
+        else
+        {
+            /* keep this node, move to next */
+            prev_ptr = &current->next;
+            current = current->next;
+        }
+    }
+
+    pthread_mutex_unlock(&queue->retired_lock);
+
+    if (reclaimed > 0)
+    {
+        atomic_fetch_sub(&queue->retired_count, reclaimed);
+    }
+}
+
+/**
+ * retire_node
+ * add node to retired list for deferred reclamation.
+ * prevents use-after-free in concurrent dequeue operations.
+ * @param queue the queue
+ * @param node the node to retire
+ */
+static void retire_node(queue_t *queue, queue_node_t *node)
+{
+    retired_node_t *retired = malloc(sizeof(retired_node_t));
+    if (retired == NULL)
+    {
+        /* fallback: immediate free (not ideal but prevents memory leak) */
+        aligned_free(node);
+        return;
+    }
+
+    retired->node = node;
+    retired->retire_epoch = atomic_load(&queue->global_epoch);
+
+    pthread_mutex_lock(&queue->retired_lock);
+    retired->next = queue->retired_head;
+    queue->retired_head = retired;
+    pthread_mutex_unlock(&queue->retired_lock);
+
+    size_t retired_count = atomic_fetch_add(&queue->retired_count, 1) + 1;
+
+    /* periodically reclaim old nodes */
+    if (retired_count >= RECLAIM_THRESHOLD)
+    {
+        reclaim_retired_nodes(queue);
     }
 }
 
@@ -166,6 +275,9 @@ queue_t *queue_new(void)
     atomic_store(&queue->size, 0);
     atomic_store(&queue->shutdown, 0);
     atomic_store(&queue->waiter_count, 0);
+    atomic_store(&queue->global_epoch, 0);
+    atomic_store(&queue->retired_count, 0);
+    queue->retired_head = NULL;
 
     if (pthread_mutex_init(&queue->wait_lock, NULL) != 0)
     {
@@ -176,6 +288,15 @@ queue_t *queue_new(void)
 
     if (pthread_cond_init(&queue->not_empty, NULL) != 0)
     {
+        pthread_mutex_destroy(&queue->wait_lock);
+        aligned_free(sentinel);
+        aligned_free(queue);
+        return NULL;
+    }
+
+    if (pthread_mutex_init(&queue->retired_lock, NULL) != 0)
+    {
+        pthread_cond_destroy(&queue->not_empty);
         pthread_mutex_destroy(&queue->wait_lock);
         aligned_free(sentinel);
         aligned_free(queue);
@@ -240,6 +361,9 @@ int queue_enqueue(queue_t *queue, void *data)
     /* increment size */
     atomic_fetch_add(&queue->size, 1);
 
+    /* advance epoch for reclamation */
+    atomic_fetch_add(&queue->global_epoch, 1);
+
     /* signal waiting threads */
     if (atomic_load(&queue->waiter_count) > 0)
     {
@@ -292,16 +416,21 @@ void *queue_dequeue(queue_t *queue)
         }
         else
         {
-            /* read data before CAS, otherwise another dequeue might free the node */
+            /* read data before CAS
+             * safe because nodes are retired (not freed immediately) */
             data = next_ptr->data;
 
             /* try to swing head to next node */
             tagged_ptr_t new_head = make_tagged_ptr(next_ptr, get_tag(head) + 1);
             if (atomic_cas_tagged_ptr(&queue->head, &head, new_head))
             {
-                /* dequeue successful, free the old sentinel */
-                aligned_free(head_ptr);
+                /* dequeue successful, retire the old sentinel for deferred reclamation */
+                retire_node(queue, head_ptr);
                 atomic_fetch_sub(&queue->size, 1);
+
+                /* advance epoch for reclamation */
+                atomic_fetch_add(&queue->global_epoch, 1);
+
                 return data;
             }
         }
@@ -521,9 +650,14 @@ void queue_free(queue_t *queue)
         pthread_mutex_lock(&queue->wait_lock);
         pthread_cond_broadcast(&queue->not_empty);
         pthread_mutex_unlock(&queue->wait_lock);
+#if defined(_WIN32)
+        Sleep(0);
+#else
         sched_yield();
+#endif
     }
 
+    /* free all nodes in the queue */
     tagged_ptr_t head = atomic_load(&queue->head);
     queue_node_t *current = get_ptr(head);
 
@@ -535,6 +669,19 @@ void queue_free(queue_t *queue)
         current = next;
     }
 
+    /* free all retired nodes */
+    pthread_mutex_lock(&queue->retired_lock);
+    retired_node_t *retired = queue->retired_head;
+    while (retired != NULL)
+    {
+        retired_node_t *next_retired = retired->next;
+        aligned_free(retired->node);
+        free(retired);
+        retired = next_retired;
+    }
+    pthread_mutex_unlock(&queue->retired_lock);
+
+    pthread_mutex_destroy(&queue->retired_lock);
     pthread_mutex_destroy(&queue->wait_lock);
     pthread_cond_destroy(&queue->not_empty);
 
@@ -555,9 +702,14 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         pthread_mutex_lock(&queue->wait_lock);
         pthread_cond_broadcast(&queue->not_empty);
         pthread_mutex_unlock(&queue->wait_lock);
+#if defined(_WIN32)
+        Sleep(0);
+#else
         sched_yield();
+#endif
     }
 
+    /* free all nodes in the queue */
     tagged_ptr_t head = atomic_load(&queue->head);
     queue_node_t *current = get_ptr(head);
     int is_sentinel = 1;
@@ -577,6 +729,19 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         is_sentinel = 0;
     }
 
+    /* free all retired nodes (data already freed by dequeue) */
+    pthread_mutex_lock(&queue->retired_lock);
+    retired_node_t *retired = queue->retired_head;
+    while (retired != NULL)
+    {
+        retired_node_t *next_retired = retired->next;
+        aligned_free(retired->node);
+        free(retired);
+        retired = next_retired;
+    }
+    pthread_mutex_unlock(&queue->retired_lock);
+
+    pthread_mutex_destroy(&queue->retired_lock);
     pthread_mutex_destroy(&queue->wait_lock);
     pthread_cond_destroy(&queue->not_empty);
 

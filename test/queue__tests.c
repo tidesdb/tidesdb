@@ -709,7 +709,7 @@ void test_queue_snapshot_with_refs()
 
     /* create ref-counted items */
     const int num_items = 5;
-    ref_counted_item_t *rc_items[num_items];
+    ref_counted_item_t *rc_items[5]; /* fixed size for msvc compatibility */
     for (int i = 0; i < num_items; i++)
     {
         rc_items[i] = malloc(sizeof(ref_counted_item_t));
@@ -940,8 +940,8 @@ void test_queue_snapshot_with_refs_stress()
 
     /* take multiple snapshots concurrently */
     const int num_concurrent_snapshots = 5;
-    void **snapshots[num_concurrent_snapshots];
-    size_t counts[num_concurrent_snapshots];
+    void **snapshots[5]; /* fixed size for msvc compatibility */
+    size_t counts[5];    /* fixed size for msvc compatibility */
 
     /* all snapshots should succeed */
     for (int i = 0; i < num_concurrent_snapshots; i++)

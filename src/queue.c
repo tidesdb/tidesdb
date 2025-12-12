@@ -70,8 +70,15 @@ static inline void aligned_free(void *ptr)
 static inline tagged_ptr_t make_tagged_ptr(queue_node_t *ptr, uintptr_t tag)
 {
     tagged_ptr_t tp;
+#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
+    /* 64-bit: pack pointer and tag into single value */
     tp.value = ((uintptr_t)ptr & QUEUE_PTR_MASK) |
                ((tag << (sizeof(uintptr_t) * 8 - QUEUE_TAG_BITS)) & QUEUE_TAG_MASK);
+#else
+    /* 32-bit: use separate fields */
+    tp.ptr = ptr;
+    tp.counter = (uint32_t)tag;
+#endif
     return tp;
 }
 
@@ -83,7 +90,11 @@ static inline tagged_ptr_t make_tagged_ptr(queue_node_t *ptr, uintptr_t tag)
  */
 static inline queue_node_t *get_ptr(tagged_ptr_t tp)
 {
+#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
     return (queue_node_t *)(tp.value & QUEUE_PTR_MASK);
+#else
+    return (queue_node_t *)tp.ptr;
+#endif
 }
 
 /**
@@ -94,7 +105,11 @@ static inline queue_node_t *get_ptr(tagged_ptr_t tp)
  */
 static inline uintptr_t get_tag(tagged_ptr_t tp)
 {
+#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
     return (tp.value & QUEUE_TAG_MASK) >> (sizeof(uintptr_t) * 8 - QUEUE_TAG_BITS);
+#else
+    return tp.counter;
+#endif
 }
 
 /**
@@ -112,6 +127,8 @@ static inline int tagged_ptr_equals(tagged_ptr_t a, tagged_ptr_t b)
 /**
  * atomic_cas_tagged_ptr
  * atomic compare-and-swap for tagged pointers.
+ * on 64-bit: cas on single 64-bit value
+ * on 32-bit: cas on 8-byte struct (pointer + counter) using cmpxchg8b on x86
  * @param target pointer to atomic tagged pointer
  * @param expected pointer to expected value (updated on failure)
  * @param desired new value to store
@@ -120,7 +137,38 @@ static inline int tagged_ptr_equals(tagged_ptr_t a, tagged_ptr_t b)
 static inline int atomic_cas_tagged_ptr(_Atomic(tagged_ptr_t) *target, tagged_ptr_t *expected,
                                         tagged_ptr_t desired)
 {
+#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
+    /* 64-bit: standard cas on single value */
     return atomic_compare_exchange_strong(target, expected, desired);
+#else
+    /* 32-bit: use gcc/clang builtin for 8-byte cas on x86-32 (cmpxchg8b)
+     * this is more reliable than c11 atomics which may use locks */
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(_M_IX86))
+    /* use gcc/clang __sync builtin for 64-bit cas on 32-bit x86 */
+    typedef unsigned long long u64;
+    union
+    {
+        tagged_ptr_t tp;
+        u64 u;
+    } exp_u, des_u;
+    exp_u.tp = *expected;
+    des_u.tp = desired;
+    u64 old = __sync_val_compare_and_swap((u64 *)target, exp_u.u, des_u.u);
+    if (old == exp_u.u)
+    {
+        return 1;
+    }
+    else
+    {
+        exp_u.u = old;
+        *expected = exp_u.tp;
+        return 0;
+    }
+#else
+    /* fallback to c11 atomics (may use locks on some platforms) */
+    return atomic_compare_exchange_strong(target, expected, desired);
+#endif
+#endif
 }
 
 /**

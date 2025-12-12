@@ -20,37 +20,40 @@
 #define __QUEUE_H__
 #include "compat.h"
 
-/**
- * queue_tag_bits
- * number of bits used for the aba counter in tagged pointers.
- * on 64-bit systems (x86_64, arm64), we use the upper 16 bits for the tag.
- * on 32-bit systems (x86, arm), we use the upper 8 bits for the tag.
- */
-#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
-/* 64-bit systems: use upper 16 bits for tag, lower 48 bits for pointer */
-#define QUEUE_TAG_BITS 16
-#define QUEUE_TAG_MASK ((uintptr_t)0xFFFF000000000000ULL)
-#define QUEUE_PTR_MASK ((uintptr_t)0x0000FFFFFFFFFFFFULL)
-#else
-/* 32-bit systems: use upper 8 bits for tag, lower 24 bits for pointer */
-#define QUEUE_TAG_BITS 8
-#define QUEUE_TAG_MASK ((uintptr_t)0xFF000000UL)
-#define QUEUE_PTR_MASK ((uintptr_t)0x00FFFFFFUL)
-#endif
-
 /* max spin iterations before yielding */
 #define MAX_SPIN_COUNT 100
 
 /**
  * tagged_ptr_t
- * tagged pointer to solve the ABA problem in lock-free algorithms.
- * combines a pointer with a version counter.
- * aligned to 8 bytes for atomic operations (required on x86).
+ * tagged pointer to solve the aba problem in lock-free algorithms.
+ * on 64-bit systems: uses upper 16 bits for tag (48-bit pointers are sufficient)
+ * on 32-bit systems: uses separate pointer and counter fields (requires dwcas)
+ * aligned to 8/16 bytes for atomic operations on x86/x64 and arm/arm64.
  */
+#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
+/* 64-bit: pack pointer and tag into single 64-bit value */
+#define QUEUE_TAG_BITS 16
+#define QUEUE_TAG_MASK ((uintptr_t)0xFFFF000000000000ULL)
+#define QUEUE_PTR_MASK ((uintptr_t)0x0000FFFFFFFFFFFFULL)
+
 typedef struct ATOMIC_ALIGN(8)
 {
     uintptr_t value;
 } tagged_ptr_t;
+#else
+/* 32-bit: use separate pointer and counter
+ * on 32-bit systems, we cannot steal bits from pointers because the full
+ * 32-bit address space is needed. instead, we use a struct with separate
+ * pointer (4 bytes) and counter (4 bytes) = 8 bytes total.
+ * this requires 64-bit atomic cas (cmpxchg8b on x86-32) to atomically
+ * update both fields. gcc/clang provide __sync_val_compare_and_swap for this.
+ * the struct must be 8-byte aligned for atomic operations. */
+typedef struct ATOMIC_ALIGN(8)
+{
+    void *ptr;
+    uint32_t counter;
+} tagged_ptr_t;
+#endif
 
 /**
  * queue_node_t

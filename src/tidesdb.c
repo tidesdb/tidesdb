@@ -13587,7 +13587,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
                 {
                     TDB_DEBUG_LOG(
                         "CF '%s': Loaded config from disk (write_buffer_size=%zu, "
-                        "level_size_ratio=%d)",
+                        "level_size_ratio=%zu)",
                         entry->d_name, config.write_buffer_size, config.level_size_ratio);
                 }
                 else

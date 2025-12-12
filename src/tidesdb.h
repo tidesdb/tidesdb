@@ -69,44 +69,44 @@ extern int _tidesdb_debug_enabled;
  * isolation levels for transactions
  *
  * tdb_isolation_read_uncommitted (0)
- *   - sees all versions including uncommitted changes (dirty reads)
- *   - no snapshot isolation, uses uint64_max to bypass filtering
- *   - fastest but allows dirty reads, non-repeatable reads, and phantom reads
- *   - no conflict detection
- *   - good for analytics on non-critical data where performance is paramount
+ *   -- sees all versions including uncommitted changes (dirty reads)
+ *   -- no snapshot isolation, uses uint64_max to bypass filtering
+ *   -- fastest but allows dirty reads, non-repeatable reads, and phantom reads
+ *   -- no conflict detection
+ *   -- good for analytics on non-critical data where performance is paramount
  *
  * tdb_isolation_read_committed (1)
- *   - refreshes snapshot on each read operation
- *   - prevents dirty reads by only seeing committed data
- *   - allows non-repeatable reads (same key may return different values)
- *   - allows phantom reads (range queries may see different rows)
- *   - no conflict detection
- *   - good default for most applications, good balance of consistency and performance
+ *   -- refreshes snapshot on each read operation
+ *   -- prevents dirty reads by only seeing committed data
+ *   -- allows non-repeatable reads (same key may return different values)
+ *   -- allows phantom reads (range queries may see different rows)
+ *   -- no conflict detection
+ *   -- good default for most applications, good balance of consistency and performance
  *
  * tdb_isolation_repeatable_read (2)
- *   - consistent snapshot taken at transaction start
- *   - prevents dirty reads and non-repeatable reads for point reads
- *   - allows phantom reads (new rows can appear in range queries)
- *   - uses read-write conflict detection only
- *   - aborts if a read key was modified by another transaction
- *   - good for applications requiring consistent reads but tolerating some write conflicts
+ *   -- consistent snapshot taken at transaction start
+ *   -- prevents dirty reads and non-repeatable reads for point reads
+ *   -- allows phantom reads (new rows can appear in range queries)
+ *   -- uses read-write conflict detection only
+ *   -- aborts if a read key was modified by another transaction
+ *   -- good for applications requiring consistent reads but tolerating some write conflicts
  *
  * tdb_isolation_snapshot (3)
- *   - consistent snapshot with first-committer-wins semantics
- *   - prevents dirty reads and non-repeatable reads
- *   - prevents lost updates via write-write conflict detection
- *   - still allows some phantom reads
- *   - uses read-write and write-write conflict detection
- *   - aborts on any read or write conflict
- *   - good for financial transactions, inventory management
+ *   -- consistent snapshot with first-committer-wins semantics
+ *   -- prevents dirty reads and non-repeatable reads
+ *   -- prevents lost updates via write-write conflict detection
+ *   -- still allows some phantom reads
+ *   -- uses read-write and write-write conflict detection
+ *   -- aborts on any read or write conflict
+ *   -- good for financial transactions, inventory management
  *
  * tdb_isolation_serializable (4)
- *   - full serializability using ssi (serializable snapshot isolation)
- *   - prevents dirty reads, non-repeatable reads, and phantom reads
- *   - uses read-write, write-write, and rw-antidependency conflict detection
- *   - tracks active transactions for dangerous structure detection
- *   - highest isolation but lowest concurrency
- *   - great for critical transactions requiring full acid guarantees
+ *   -- full serializability using ssi (serializable snapshot isolation)
+ *   -- prevents dirty reads, non-repeatable reads, and phantom reads
+ *   -- uses read-write, write-write, and rw-antidependency conflict detection
+ *   -- tracks active transactions for dangerous structure detection
+ *   -- highest isolation but lowest concurrency
+ *   -- great for critical transactions requiring full acid guarantees
  */
 typedef enum
 {
@@ -235,17 +235,28 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_WAL_GROUP_COMMIT_TIMEOUT_US         10
 
 /* transaction optimization configuration */
-#define TDB_TXN_WRITE_HASH_THRESHOLD    64   /* create write set hash table at this many ops */
-#define TDB_TXN_READ_HASH_THRESHOLD     64   /* create read set hash table at this many reads */
-#define TDB_TXN_SMALL_SCAN_LIMIT        64   /* scan last N ops for small txns */
-#define TDB_TXN_READ_SET_BATCH_GROW     256  /* grow read set by this amount */
-#define TDB_ACTIVE_TXN_INITIAL_CAPACITY 1024 /* initial capacity for active txn list */
-#define TDB_WRITE_SET_HASH_CAPACITY     2048 /* hash table capacity for write set (power of 2) */
-#define TDB_READ_SET_HASH_CAPACITY      2048 /* hash table capacity for read set (power of 2) */
-#define TDB_WRITE_SET_HASH_EMPTY        -1   /* empty slot marker */
-#define TDB_READ_SET_HASH_EMPTY         -1   /* empty slot marker */
-#define TDB_TXN_HASH_SEED               0x9e3779b9 /* xxhash seed for transaction hash tables */
-#define TDB_TXN_MAX_PROBE_LENGTH        32         /* max linear probe attempts before giving up */
+/* create write set hash table at this many ops */
+#define TDB_TXN_WRITE_HASH_THRESHOLD 64
+/* create read set hash table at this many reads */
+#define TDB_TXN_READ_HASH_THRESHOLD 64
+/* scan last N ops for small txns */
+#define TDB_TXN_SMALL_SCAN_LIMIT 64
+/* grow read set by this amount */
+#define TDB_TXN_READ_SET_BATCH_GROW 256
+/* initial capacity for active txn list */
+#define TDB_ACTIVE_TXN_INITIAL_CAPACITY 1024
+/* hash table capacity for write set (power of 2) */
+#define TDB_WRITE_SET_HASH_CAPACITY 2048
+/* hash table capacity for read set (power of 2) */
+#define TDB_READ_SET_HASH_CAPACITY 2048
+/* empty slot marker for write set hash */
+#define TDB_WRITE_SET_HASH_EMPTY -1
+/* empty slot marker for read set hash */
+#define TDB_READ_SET_HASH_EMPTY -1
+/* xxhash seed for transaction hash tables */
+#define TDB_TXN_HASH_SEED 0x9e3779b9
+/* max linear probe attempts before giving up */
+#define TDB_TXN_MAX_PROBE_LENGTH 32
 
 /* flush and close retry configuration */
 #define TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS         100
@@ -312,8 +323,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_MULTI_CF_TRACKER_INITIAL_CAPACITY 1024
 
 /* iterator seek configuration */
-#define TDB_ITER_SEEK_MAX_BLOCKS_SCAN \
-    100000 /* max blocks to scan during seek (prevents infinite loops) */
+/* max blocks to scan during seek (prevents infinite loops) */
+#define TDB_ITER_SEEK_MAX_BLOCKS_SCAN 100000
 
 /**
  * tidesdb_column_family_config_t
@@ -814,18 +825,18 @@ typedef struct
  * transaction handle for batched operations with acid guarantees
  *
  * supports multiple isolation levels:
- * - read_uncommitted: sees all versions including uncommitted (dirty reads allowed)
- * - read_committed: refreshes snapshot on each read (prevents dirty reads)
- * - repeatable_read: consistent snapshot, read-write conflict detection
- * - snapshot: consistent snapshot, read-write + write-write conflict detection
- * - serializable: full ssi with dangerous structure detection (prevents all anomalies)
+ * -- read_uncommitted -- sees all versions including uncommitted (dirty reads allowed)
+ * -- read_committed -- refreshes snapshot on each read (prevents dirty reads)
+ * -- repeatable_read -- consistent snapshot, read-write conflict detection
+ * -- snapshot -- consistent snapshot, read-write + write-write conflict detection
+ * -- serializable -- full ssi with dangerous structure detection (prevents all anomalies)
  *
  * snapshot isolation semantics:
- * - snapshot captured at begin (all committed txns with seq <= snapshot_seq are visible)
- * - conflict detection at commit (isolation level dependent)
- * - commit sequence acquired after conflict detection
- * - no retries - conflicts cause immediate abort
- * - works across multiple column families
+ * -- snapshot captured at begin (all committed txns with seq <= snapshot_seq are visible)
+ * -- conflict detection at commit (isolation level dependent)
+ * -- commit sequence acquired after conflict detection
+ * -- no retries -- conflicts cause immediate abort
+ * -- works across multiple column families
  *
  * @param db database handle
  * @param txn_id transaction id

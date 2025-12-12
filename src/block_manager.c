@@ -26,14 +26,14 @@
  *
  * HEADER *
  * magic (3 bytes) 0x544442 "TDB"
- * version (1 byte) 5
+ * version (1 byte) 6
  * block_size (4 bytes) default block size
  * padding (4 bytes) reserved
  *
  * BLOCKS *
- * block_size (4 bytes) - size of data (uint32_t, supports up to 4GB)
- * checksum (4 bytes) - xxHash32 of data
- * data (variable size) - actual block data
+ * block_size (4 bytes) -- size of data (uint32_t, supports up to 4GB)
+ * checksum (4 bytes) -- xxHash32 of data
+ * data (variable size) -- actual block data
  *
  * CONCURRENCY MODEL *
  * single file descriptor shared by all operations
@@ -188,8 +188,11 @@ int block_manager_build_position_cache(block_manager_t *bm)
     }
 
     /* estimate initial capacity based on file size and average block size */
-    int initial_capacity = (int)((file_size - BLOCK_MANAGER_HEADER_SIZE) / 160) + 100;
-    if (initial_capacity < 1000) initial_capacity = 1000;
+    int initial_capacity =
+        (int)((file_size - BLOCK_MANAGER_HEADER_SIZE) / BLOCK_MANAGER_AVG_BLOCK_SIZE_ESTIMATE) +
+        BLOCK_MANAGER_POSITION_CACHE_BUFFER;
+    if (initial_capacity < BLOCK_MANAGER_MIN_POSITION_CACHE_CAPACITY)
+        initial_capacity = BLOCK_MANAGER_MIN_POSITION_CACHE_CAPACITY;
 
     bm->block_positions = malloc(initial_capacity * sizeof(uint64_t));
     bm->block_sizes = malloc(initial_capacity * sizeof(uint64_t));
@@ -714,7 +717,7 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
         return NULL;
     }
 
-    /* note: we don't verify checksum for partial reads since we don't have full data */
+    /* we don't verify checksum for partial reads since we don't have full data */
     return block;
 }
 
@@ -915,7 +918,7 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
     uint64_t total_block_size = BLOCK_MANAGER_BLOCK_HEADER_SIZE + block_size;
     uint64_t next_block_pos = cursor->current_pos + total_block_size;
 
-    /* try to read next block size - if we can't, we're at last block */
+    /* try to read next block size -- if we can't, we're at last block */
     unsigned char next_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     ssize_t read_result =
         pread(cursor->bm->fd, next_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)next_block_pos);
@@ -1030,7 +1033,6 @@ int block_manager_validate_last_block(block_manager_t *bm)
 
     uint64_t valid_size = BLOCK_MANAGER_HEADER_SIZE;
     uint64_t scan_pos = BLOCK_MANAGER_HEADER_SIZE;
-    int block_num = 0;
 
     while (scan_pos < file_size)
     {

@@ -1087,9 +1087,9 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                     }
                 }
 
-                uint8_t flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
+                uint8_t version_flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
                 skip_list_version_t *new_version =
-                    skip_list_create_version(value, value_size, ttl, flags, seq);
+                    skip_list_create_version(value, value_size, ttl, version_flags, seq);
                 if (new_version != NULL)
                 {
                     skip_list_version_t *old_head;
@@ -1167,9 +1167,9 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                     }
                 }
 
-                uint8_t flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
+                uint8_t version_flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
                 skip_list_version_t *new_version =
-                    skip_list_create_version(value, value_size, ttl, flags, seq);
+                    skip_list_create_version(value, value_size, ttl, version_flags, seq);
                 if (new_version != NULL)
                 {
                     skip_list_version_t *old_head;

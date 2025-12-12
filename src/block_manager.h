@@ -44,7 +44,7 @@
 #define BLOCK_MANAGER_HEADER_SIZE 12
 
 /* block field sizes */
-/* block size field (uint32_t) - supports blocks up to 4GB */
+/* block size field (uint32_t) -- supports blocks up to 4GB */
 #define BLOCK_MANAGER_SIZE_FIELD_SIZE 4
 /* xxHash32 = 4 bytes (sufficient for block-level checksums) */
 #define BLOCK_MANAGER_CHECKSUM_LENGTH 4
@@ -57,7 +57,16 @@
 /* default file permissions (rw-r--r--) */
 #define BLOCK_MANAGER_FILE_MODE 0644
 
-#define BLOCK_MANAGER_BATCH_READ_META_SIZE 4096 /* batch reading block metadata */
+/* batch reading block metadata */
+#define BLOCK_MANAGER_BATCH_READ_META_SIZE 4096
+
+/* position cache sizing constants */
+/* average block size estimate for initial capacity calculation */
+#define BLOCK_MANAGER_AVG_BLOCK_SIZE_ESTIMATE 160
+/* buffer for position cache initial capacity */
+#define BLOCK_MANAGER_POSITION_CACHE_BUFFER 100
+/* minimum position cache capacity */
+#define BLOCK_MANAGER_MIN_POSITION_CACHE_CAPACITY 1000
 
 typedef enum
 {
@@ -77,6 +86,7 @@ typedef enum
  * @param block_positions shared position cache for O(1) random access (all blocks)
  * @param block_sizes shared size cache for O(1) random access (all blocks)
  * @param block_count number of blocks in cache
+ * @param cache_rebuilding flag to prevent cache access during rebuild
  */
 typedef struct
 {
@@ -86,12 +96,11 @@ typedef struct
     uint32_t block_size;
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
-
     /* shared position cache; built once on open, shared by all cursors */
     uint64_t *block_positions;
     uint64_t *block_sizes;
     int block_count;
-    _Atomic(int) cache_rebuilding; /* flag to prevent cache access during rebuild */
+    _Atomic(int) cache_rebuilding;
 } block_manager_t;
 
 /**

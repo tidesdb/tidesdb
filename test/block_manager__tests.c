@@ -1579,12 +1579,12 @@ int main(void)
     RUN_TEST(test_block_manager_cursor_goto_first, tests_passed);
     RUN_TEST(test_block_manager_cursor_has_next, tests_passed);
     RUN_TEST(test_block_manager_cursor_has_prev, tests_passed);
+    RUN_TEST(test_block_manager_cursor, tests_passed);
+    RUN_TEST(test_block_manager_cursor_goto_last, tests_passed);
     RUN_TEST(test_block_manager_cursor_position_checks, tests_passed);
     RUN_TEST(test_block_manager_open_safety, tests_passed);
     RUN_TEST(test_block_manager_validate_last_block, tests_passed);
     RUN_TEST(test_block_manager_get_size, tests_passed);
-    RUN_TEST(test_block_manager_cursor, tests_passed);
-    RUN_TEST(test_block_manager_cursor_goto_last, tests_passed);
     RUN_TEST(test_block_manager_seek_and_goto, tests_passed);
     RUN_TEST(test_block_manager_validation_edge_cases, tests_passed);
     RUN_TEST(test_block_manager_concurrent_rw, tests_passed);

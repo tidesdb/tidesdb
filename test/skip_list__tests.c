@@ -60,7 +60,8 @@ void test_skip_list_put_get()
     }
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
-    ASSERT_TRUE(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
+    ASSERT_TRUE(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0) ==
+                0);
 
     uint8_t *retrieved_value;
     size_t retrieved_value_size;
@@ -96,7 +97,8 @@ void test_skip_list_clear()
     }
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
-    ASSERT_TRUE(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
+    ASSERT_TRUE(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0) ==
+                0);
     int result = skip_list_clear(list);
     ASSERT_EQ(result, 0);
     ASSERT_TRUE(skip_list_count_entries(list) == 0);
@@ -115,7 +117,8 @@ void test_skip_list_count_entries()
 
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
-    ASSERT_TRUE(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
+    ASSERT_TRUE(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0) ==
+                0);
     ASSERT_TRUE(skip_list_count_entries(list) == 1);
 
     (void)skip_list_free(list);
@@ -133,7 +136,8 @@ void test_skip_list_get_size()
 
     uint8_t key[] = "test_key";
     uint8_t value[] = "test_value";
-    ASSERT_TRUE(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1) == 0);
+    ASSERT_TRUE(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0) ==
+                0);
     ASSERT_TRUE(skip_list_get_size(list) > 0);
 
     (void)skip_list_free(list);
@@ -169,8 +173,10 @@ void test_skip_list_cursor_next()
     uint8_t value1[] = "value1";
     uint8_t key2[] = "key2";
     uint8_t value2[] = "value2";
-    ASSERT_TRUE(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
-    ASSERT_TRUE(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
+    ASSERT_TRUE(
+        skip_list_put_with_seq(list, key1, sizeof(key1), value1, sizeof(value1), -1, 1, 0) == 0);
+    ASSERT_TRUE(
+        skip_list_put_with_seq(list, key2, sizeof(key2), value2, sizeof(value2), -1, 2, 0) == 0);
 
     skip_list_cursor_t *cursor = NULL;
     ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
@@ -198,8 +204,10 @@ void test_skip_list_cursor_prev()
     uint8_t value1[] = "value1";
     uint8_t key2[] = "key2";
     uint8_t value2[] = "value2";
-    ASSERT_TRUE(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
-    ASSERT_TRUE(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
+    ASSERT_TRUE(
+        skip_list_put_with_seq(list, key1, sizeof(key1), value1, sizeof(value1), -1, 1, 0) == 0);
+    ASSERT_TRUE(
+        skip_list_put_with_seq(list, key2, sizeof(key2), value2, sizeof(value2), -1, 2, 0) == 0);
 
     skip_list_cursor_t *cursor = NULL;
     ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
@@ -261,7 +269,9 @@ void benchmark_skip_list()
     clock_t start_write = clock();
     for (size_t i = 0; i < BENCH_N; i++)
     {
-        ASSERT_EQ(skip_list_put(list, keys[i], key_size, values[i], value_size, -1), 0);
+        ASSERT_EQ(
+            skip_list_put_with_seq(list, keys[i], key_size, values[i], value_size, -1, i + 1, 0),
+            0);
     }
     clock_t end_write = clock();
     double write_time = (double)(end_write - start_write) / CLOCKS_PER_SEC;
@@ -331,7 +341,7 @@ void benchmark_skip_list_sequential()
     clock_t start = clock();
     for (size_t i = 0; i < BENCH_N; i++)
     {
-        skip_list_put(list, keys[i], key_size, values[i], value_size, -1);
+        skip_list_put_with_seq(list, keys[i], key_size, values[i], value_size, -1, i + 1, 0);
     }
     clock_t end = clock();
     double write_time = (double)(end - start) / CLOCKS_PER_SEC;
@@ -376,7 +386,8 @@ void test_skip_list_ttl()
     uint8_t value[] = "test_value";
     time_t ttl = 1;
 
-    ASSERT_TRUE(skip_list_put(list, key, sizeof(key), value, sizeof(value), time(NULL) + ttl) == 0);
+    ASSERT_TRUE(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value),
+                                       time(NULL) + ttl, 1, 0) == 0);
 
 #ifdef _WIN32
     Sleep((ttl + 1) * 1000);
@@ -421,15 +432,18 @@ void test_skip_list_cursor_functions()
 
     uint8_t key1[] = {1};
     uint8_t value1[] = {10};
-    ASSERT_TRUE(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
+    ASSERT_TRUE(
+        skip_list_put_with_seq(list, key1, sizeof(key1), value1, sizeof(value1), -1, 1, 0) == 0);
 
     uint8_t key2[] = {2};
     uint8_t value2[] = {20};
-    ASSERT_TRUE(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
+    ASSERT_TRUE(
+        skip_list_put_with_seq(list, key2, sizeof(key2), value2, sizeof(value2), -1, 2, 0) == 0);
 
     uint8_t key3[] = {3};
     uint8_t value3[] = {30};
-    ASSERT_TRUE(skip_list_put(list, key3, sizeof(key3), value3, sizeof(value3), -1) == 0);
+    ASSERT_TRUE(
+        skip_list_put_with_seq(list, key3, sizeof(key3), value3, sizeof(value3), -1, 3, 0) == 0);
 
     ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
     ASSERT_TRUE(cursor != NULL);
@@ -495,15 +509,18 @@ void test_skip_list_min_max_key()
 
     uint8_t key2[] = {2};
     uint8_t value2[] = {20};
-    ASSERT_TRUE(skip_list_put(list, key2, sizeof(key2), value2, sizeof(value2), -1) == 0);
+    ASSERT_TRUE(
+        skip_list_put_with_seq(list, key2, sizeof(key2), value2, sizeof(value2), -1, 1, 0) == 0);
 
     uint8_t key1[] = {1};
     uint8_t value1[] = {10};
-    ASSERT_TRUE(skip_list_put(list, key1, sizeof(key1), value1, sizeof(value1), -1) == 0);
+    ASSERT_TRUE(
+        skip_list_put_with_seq(list, key1, sizeof(key1), value1, sizeof(value1), -1, 2, 0) == 0);
 
     uint8_t key3[] = {3};
     uint8_t value3[] = {30};
-    ASSERT_TRUE(skip_list_put(list, key3, sizeof(key3), value3, sizeof(value3), -1) == 0);
+    ASSERT_TRUE(
+        skip_list_put_with_seq(list, key3, sizeof(key3), value3, sizeof(value3), -1, 3, 0) == 0);
 
     ASSERT_TRUE(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);
     ASSERT_TRUE(min_key != NULL);
@@ -520,8 +537,8 @@ void test_skip_list_min_max_key()
     uint8_t key0[] = {0};
     uint8_t value0[] = {5};
     time_t ttl = 1;
-    ASSERT_TRUE(skip_list_put(list, key0, sizeof(key0), value0, sizeof(value0), time(NULL) + ttl) ==
-                0);
+    ASSERT_TRUE(skip_list_put_with_seq(list, key0, sizeof(key0), value0, sizeof(value0),
+                                       time(NULL) + ttl, 4, 0) == 0);
 
     ASSERT_TRUE(skip_list_get_min_key(list, &min_key, &min_key_size) == 0);
     ASSERT_TRUE(min_key != NULL);
@@ -559,8 +576,8 @@ void test_skip_list_cursor_seek()
         char value[16];
         snprintf(key, sizeof(key), "key_%02d", i);
         snprintf(value, sizeof(value), "value_%02d", i);
-        ASSERT_TRUE(skip_list_put(list, (uint8_t *)key, strlen(key), (uint8_t *)value,
-                                  strlen(value), -1) == 0);
+        ASSERT_TRUE(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                           strlen(value), -1, (i / 10) + 1, 0) == 0);
     }
 
     /* test seek to exact key */
@@ -622,8 +639,8 @@ void test_skip_list_cursor_seek_for_prev()
         char value[16];
         snprintf(key, sizeof(key), "key_%02d", i);
         snprintf(value, sizeof(value), "value_%02d", i);
-        ASSERT_TRUE(skip_list_put(list, (uint8_t *)key, strlen(key), (uint8_t *)value,
-                                  strlen(value), -1) == 0);
+        ASSERT_TRUE(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                           strlen(value), -1, (i / 10) + 1, 0) == 0);
     }
 
     skip_list_cursor_t *cursor = NULL;
@@ -667,6 +684,7 @@ typedef struct
     int num_ops;
     int reads_completed;
     int writes_completed;
+    _Atomic(uint64_t) *shared_seq; /* shared sequence counter for concurrent tests */
 } concurrent_test_ctx_t;
 
 void *concurrent_reader(void *arg)
@@ -708,10 +726,25 @@ void *concurrent_writer(void *arg)
         snprintf(key_buf, sizeof(key_buf), "key%d", i % 10);
         snprintf(value_buf, sizeof(value_buf), "thread%d_value%d", ctx->thread_id, i);
 
-        skip_list_put(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1, (uint8_t *)value_buf,
-                      strlen(value_buf) + 1, -1);
+        /* retry loop: if write fails due to sequence conflict, get new seq and retry */
+        int result = -1;
+        int retry_count = 0;
+        while (result != 0 && retry_count < 100)
+        {
+            /* get next sequence number atomically */
+            uint64_t seq = atomic_fetch_add_explicit(ctx->shared_seq, 1, memory_order_relaxed) + 1;
 
-        ctx->writes_completed++;
+            result =
+                skip_list_put_with_seq(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1,
+                                       (uint8_t *)value_buf, strlen(value_buf) + 1, -1, seq, 0);
+            retry_count++;
+        }
+
+        /* if still failed after retries, just continue (shouldn't happen with retry logic) */
+        if (result == 0)
+        {
+            ctx->writes_completed++;
+        }
     }
 
     return NULL;
@@ -729,8 +762,8 @@ void test_skip_list_concurrent_read_write()
         char value_buf[32];
         snprintf(key_buf, sizeof(key_buf), "key%d", i);
         snprintf(value_buf, sizeof(value_buf), "initial_value%d", i);
-        skip_list_put(list, (uint8_t *)key_buf, strlen(key_buf) + 1, (uint8_t *)value_buf,
-                      strlen(value_buf) + 1, -1);
+        skip_list_put_with_seq(list, (uint8_t *)key_buf, strlen(key_buf) + 1, (uint8_t *)value_buf,
+                               strlen(value_buf) + 1, -1, i + 1, 0);
     }
 
     const int num_readers = 4;
@@ -741,6 +774,9 @@ void test_skip_list_concurrent_read_write()
     pthread_t *writers = malloc(num_writers * sizeof(pthread_t));
     concurrent_test_ctx_t *reader_ctx = malloc(num_readers * sizeof(concurrent_test_ctx_t));
     concurrent_test_ctx_t *writer_ctx = malloc(num_writers * sizeof(concurrent_test_ctx_t));
+
+    /* shared atomic sequence counter starting after initial keys */
+    _Atomic(uint64_t) shared_seq = 10;
 
     for (int i = 0; i < num_readers; i++)
     {
@@ -757,6 +793,7 @@ void test_skip_list_concurrent_read_write()
         writer_ctx[i].thread_id = i;
         writer_ctx[i].num_ops = ops_per_thread;
         writer_ctx[i].writes_completed = 0;
+        writer_ctx[i].shared_seq = &shared_seq;
         pthread_create(&writers[i], NULL, concurrent_writer, &writer_ctx[i]);
     }
 
@@ -801,15 +838,15 @@ void test_skip_list_null_validation()
     time_t ttl;
 
     /* null list */
-    ASSERT_EQ(skip_list_put(NULL, key, sizeof(key), value, sizeof(value), -1), -1);
+    ASSERT_EQ(skip_list_put_with_seq(NULL, key, sizeof(key), value, sizeof(value), -1, 1, 0), -1);
     ASSERT_EQ(skip_list_get(NULL, key, sizeof(key), &out_value, &out_size, &ttl, &deleted), -1);
 
     /* null key */
-    ASSERT_EQ(skip_list_put(list, NULL, sizeof(key), value, sizeof(value), -1), -1);
+    ASSERT_EQ(skip_list_put_with_seq(list, NULL, sizeof(key), value, sizeof(value), -1, 1, 0), -1);
     ASSERT_EQ(skip_list_get(list, NULL, sizeof(key), &out_value, &out_size, &ttl, &deleted), -1);
 
     /* null value on put */
-    ASSERT_EQ(skip_list_put(list, key, sizeof(key), NULL, sizeof(value), -1), -1);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), NULL, sizeof(value), -1, 1, 0), -1);
 
     /* null output pointers on get */
     ASSERT_EQ(skip_list_get(list, key, sizeof(key), NULL, &out_size, &ttl, &deleted), -1);
@@ -827,7 +864,7 @@ void test_skip_list_zero_size_key()
     uint8_t value[] = "value";
 
     /* zero-size key should fail */
-    ASSERT_EQ(skip_list_put(list, key, 0, value, sizeof(value), -1), -1);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, 0, value, sizeof(value), -1, 1, 0), -1);
 
     skip_list_free(list);
 }
@@ -845,8 +882,9 @@ void test_skip_list_large_keys_values()
     uint8_t large_value[200];
     memset(large_value, 'V', sizeof(large_value));
 
-    ASSERT_EQ(
-        skip_list_put(list, large_key, sizeof(large_key), large_value, sizeof(large_value), -1), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, large_key, sizeof(large_key), large_value,
+                                     sizeof(large_value), -1, 1, 0),
+              0);
 
     uint8_t *retrieved_value = NULL;
     size_t retrieved_size = 0;
@@ -873,10 +911,10 @@ void test_skip_list_duplicate_key_update()
     uint8_t value2[] = "updated_value";
 
     /* insert first value */
-    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value1, sizeof(value1), -1), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value1, sizeof(value1), -1, 1, 0), 0);
 
     /* insert second value with same key (LSM tree allows duplicates) */
-    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value2, sizeof(value2), -1), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value2, sizeof(value2), -1, 2, 0), 0);
 
     /* verify we get the first matching value (search finds first occurrence) */
     uint8_t *retrieved_value = NULL;
@@ -908,8 +946,8 @@ void test_skip_list_delete_operations()
     uint8_t key[] = "delete_me";
     uint8_t value[] = "value";
 
-    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1), 0);
-    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value, sizeof(value), -1), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 2, 0), 0);
 
     /* get should return with deleted flag */
     uint8_t *retrieved_value = NULL;
@@ -944,8 +982,8 @@ void test_skip_list_delete_existing_keys()
         char key[32], value[64];
         snprintf(key, sizeof(key), "key_%d", i);
         snprintf(value, sizeof(value), "value_%d", i);
-        ASSERT_EQ(skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                strlen(value) + 1, -1),
+        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                         strlen(value) + 1, -1, i + 1, 0),
                   0);
     }
 
@@ -956,7 +994,7 @@ void test_skip_list_delete_existing_keys()
     {
         char key[32];
         snprintf(key, sizeof(key), "key_%d", i);
-        ASSERT_EQ(skip_list_delete(list, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(skip_list_delete(list, (uint8_t *)key, strlen(key) + 1, 101 + (i / 2)), 0);
     }
 
     /* verify deleted keys return deleted flag */
@@ -1002,7 +1040,7 @@ void test_skip_list_delete_nonexistent_keys()
     {
         char key[32];
         snprintf(key, sizeof(key), "nonexist_%d", i);
-        ASSERT_EQ(skip_list_delete(list, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(skip_list_delete(list, (uint8_t *)key, strlen(key) + 1, i + 1), 0);
     }
 
     /* list should still be empty (no tombstones created) */
@@ -1036,9 +1074,9 @@ void test_skip_list_delete_and_reinsert()
     uint8_t value1[] = "value1";
     uint8_t value2[] = "value2";
 
-    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value1, sizeof(value1), -1), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value1, sizeof(value1), -1, 1, 0), 0);
 
-    ASSERT_EQ(skip_list_delete(list, key, sizeof(key)), 0);
+    ASSERT_EQ(skip_list_delete(list, key, sizeof(key), 2), 0);
 
     /* verify deleted */
     uint8_t *retrieved = NULL;
@@ -1050,7 +1088,7 @@ void test_skip_list_delete_and_reinsert()
     if (retrieved) free(retrieved);
 
     /* re-insert with new value */
-    ASSERT_EQ(skip_list_put(list, key, sizeof(key), value2, sizeof(value2), -1), 0);
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value2, sizeof(value2), -1, 3, 0), 0);
 
     /* verify new value exists and not deleted */
     retrieved = NULL;
@@ -1075,8 +1113,8 @@ void test_skip_list_iterate_with_deletes()
         char key[32], value[64];
         snprintf(key, sizeof(key), "key_%03d", i);
         snprintf(value, sizeof(value), "value_%d", i);
-        ASSERT_EQ(skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                strlen(value) + 1, -1),
+        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                         strlen(value) + 1, -1, i + 1, 0),
                   0);
     }
 
@@ -1084,7 +1122,7 @@ void test_skip_list_iterate_with_deletes()
     {
         char key[32];
         snprintf(key, sizeof(key), "key_%03d", i);
-        ASSERT_EQ(skip_list_delete(list, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(skip_list_delete(list, (uint8_t *)key, strlen(key) + 1, 51 + i), 0);
     }
 
     /* iterate and count non-deleted entries */
@@ -1139,13 +1177,26 @@ void *lockfree_stress_writer(void *arg)
         snprintf(key_buf, sizeof(key_buf), "key%d", key_id);
         snprintf(value_buf, sizeof(value_buf), "t%d_v%d", ctx->thread_id, i);
 
-        int result = skip_list_put(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1,
-                                   (uint8_t *)value_buf, strlen(value_buf) + 1, -1);
+        /* retry loop: if write fails due to sequence conflict, get new seq and retry */
+        int result = -1;
+        int retry_count = 0;
+        while (result != 0 && retry_count < 100)
+        {
+            /* get next sequence number atomically */
+            uint64_t seq = atomic_fetch_add_explicit(ctx->shared_seq, 1, memory_order_relaxed) + 1;
+
+            result =
+                skip_list_put_with_seq(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1,
+                                       (uint8_t *)value_buf, strlen(value_buf) + 1, -1, seq, 0);
+            retry_count++;
+        }
 
         if (result != 0)
         {
-            printf(RED "ERROR: Thread %d failed to insert key %s at iteration %d\n" RESET,
-                   ctx->thread_id, key_buf, i);
+            printf(
+                RED
+                "ERROR: Thread %d failed to insert key %s at iteration %d after %d retries\n" RESET,
+                ctx->thread_id, key_buf, i, retry_count);
             return NULL;
         }
 
@@ -1153,6 +1204,126 @@ void *lockfree_stress_writer(void *arg)
     }
 
     return NULL;
+}
+
+void test_skip_list_concurrent_duplicate_keys()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+    ASSERT_TRUE(list != NULL);
+
+    const int num_writers = 8;
+    const int ops_per_thread = 5000;
+    const int num_unique_keys = 50; /* many threads writing to same keys */
+
+    pthread_t *writers = malloc(num_writers * sizeof(pthread_t));
+    concurrent_test_ctx_t *writer_ctx = malloc(num_writers * sizeof(concurrent_test_ctx_t));
+
+    /* shared atomic sequence counter for all threads */
+    _Atomic(uint64_t) shared_seq = 0;
+
+    printf(YELLOW
+           "  Testing concurrent duplicate key handling: %d threads, %d ops each, %d unique "
+           "keys\n" RESET,
+           num_writers, ops_per_thread, num_unique_keys);
+
+    /* create writer threads that will heavily contend on the same keys */
+    for (int i = 0; i < num_writers; i++)
+    {
+        writer_ctx[i].list = list;
+        writer_ctx[i].thread_id = i;
+        writer_ctx[i].num_ops = ops_per_thread;
+        writer_ctx[i].writes_completed = 0;
+        writer_ctx[i].shared_seq = &shared_seq;
+        pthread_create(&writers[i], NULL, lockfree_stress_writer, &writer_ctx[i]);
+    }
+
+    for (int i = 0; i < num_writers; i++)
+    {
+        pthread_join(writers[i], NULL);
+        printf(YELLOW "  Writer %d completed %d writes\n" RESET, i, writer_ctx[i].writes_completed);
+    }
+
+    int total_writes = 0;
+    for (int i = 0; i < num_writers; i++)
+    {
+        total_writes += writer_ctx[i].writes_completed;
+    }
+
+    printf(CYAN "  Total writes attempted: %d\n" RESET, total_writes);
+    ASSERT_EQ(total_writes, num_writers * ops_per_thread);
+
+    /* verify entry count is correct (should be <= 100 unique keys) */
+    int entry_count = skip_list_count_entries(list);
+    printf(CYAN "  Entry count in list: %d\n" RESET, entry_count);
+    ASSERT_TRUE(entry_count <= 100); /* we use key%100 in stress writer */
+    ASSERT_TRUE(entry_count > 0);
+
+    /* verify all keys are accessible and have valid data */
+    int keys_found = 0;
+    for (int i = 0; i < 100; i++)
+    {
+        char key_buf[32];
+        snprintf(key_buf, sizeof(key_buf), "key%d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+        time_t ttl;
+
+        int result = skip_list_get(list, (uint8_t *)key_buf, strlen(key_buf) + 1, &value,
+                                   &value_size, &ttl, &deleted);
+        if (result == 0 && value != NULL && !deleted)
+        {
+            keys_found++;
+            free(value);
+        }
+    }
+
+    printf(CYAN "  Keys found: %d\n" RESET, keys_found);
+    ASSERT_EQ(keys_found, entry_count); /* all entries should be findable */
+
+    /* verify no duplicate nodes exist by iterating */
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_TRUE(skip_list_cursor_init(&cursor, list) == 0);
+
+    int iterated = 0;
+    char *last_key = NULL;
+    if (skip_list_cursor_goto_first(cursor) == 0)
+    {
+        do
+        {
+            uint8_t *key, *value;
+            size_t key_size, value_size;
+            time_t ttl;
+            uint8_t deleted;
+
+            ASSERT_EQ(
+                skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+                0);
+
+            /* verify no duplicate keys in sequence */
+            if (last_key != NULL)
+            {
+                ASSERT_TRUE(strcmp(last_key, (char *)key) != 0); /* keys should be unique */
+                free(last_key);
+            }
+            last_key = malloc(key_size);
+            memcpy(last_key, key, key_size);
+
+            iterated++;
+        } while (skip_list_cursor_next(cursor) == 0);
+    }
+
+    if (last_key) free(last_key);
+
+    printf(CYAN "  Iterated entries: %d\n" RESET, iterated);
+    ASSERT_EQ(iterated, entry_count); /* iteration count should match entry count */
+
+    skip_list_cursor_free(cursor);
+    free(writers);
+    free(writer_ctx);
+    skip_list_free(list);
 }
 
 void test_skip_list_lockfree_stress()
@@ -1167,6 +1338,9 @@ void test_skip_list_lockfree_stress()
     pthread_t *writers = malloc(num_writers * sizeof(pthread_t));
     concurrent_test_ctx_t *writer_ctx = malloc(num_writers * sizeof(concurrent_test_ctx_t));
 
+    /* shared atomic sequence counter for all threads */
+    _Atomic(uint64_t) shared_seq = 0;
+
     printf(YELLOW "  Starting %d writer threads, %d ops each...\n" RESET, num_writers,
            ops_per_thread);
 
@@ -1179,6 +1353,7 @@ void test_skip_list_lockfree_stress()
         writer_ctx[i].thread_id = i;
         writer_ctx[i].num_ops = ops_per_thread;
         writer_ctx[i].writes_completed = 0;
+        writer_ctx[i].shared_seq = &shared_seq;
         pthread_create(&writers[i], NULL, lockfree_stress_writer, &writer_ctx[i]);
     }
 
@@ -1307,8 +1482,8 @@ void benchmark_skip_list_zipfian()
             unique_keys_accessed++;
         }
 
-        int put_result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                       strlen(value) + 1, -1);
+        int put_result = skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1,
+                                                (uint8_t *)value, strlen(value) + 1, -1, i + 1, 0);
         ASSERT_EQ(put_result, 0);
     }
 
@@ -1363,8 +1538,8 @@ void benchmark_skip_list_zipfian()
             char value[100];
             snprintf(value, sizeof(value), "updated_value_%d", i);
 
-            skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                          strlen(value) + 1, -1);
+            skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                   strlen(value) + 1, -1, num_ops + i + 1, 0);
             write_count++;
         }
     }
@@ -1434,8 +1609,8 @@ void test_skip_list_update_patterns()
         snprintf(key, sizeof(key), "update_key_%d", i);
         snprintf(value, sizeof(value), "version_1_value_%d", i);
 
-        result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                               strlen(value) + 1, -1);
+        result = skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                        strlen(value) + 1, -1, i + 1, 0);
         ASSERT_EQ(result, 0);
     }
 
@@ -1453,8 +1628,8 @@ void test_skip_list_update_patterns()
             snprintf(key, sizeof(key), "update_key_%d", i);
             snprintf(value, sizeof(value), "version_%d_value_%d", version, i);
 
-            result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                   strlen(value) + 1, -1);
+            result = skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                            strlen(value) + 1, -1, (version - 1) * 50 + i + 1, 0);
             ASSERT_EQ(result, 0);
         }
 
@@ -1517,8 +1692,9 @@ static void test_skip_list_large_value_updates(void)
             snprintf(large_value, sizeof(large_value), "large_version_%d_value_%d_padding", version,
                      i);
 
-            result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)large_value,
-                                   strlen(large_value) + 1, -1);
+            result = skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1,
+                                            (uint8_t *)large_value, strlen(large_value) + 1, -1,
+                                            (version - 1) * num_keys + i + 1, 0);
             ASSERT_EQ(result, 0);
         }
 
@@ -1585,8 +1761,8 @@ void benchmark_skip_list_deletions()
         snprintf(key, sizeof(key), "key_%d", i);
         snprintf(value, sizeof(value), "value_%d", i);
 
-        result = skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                               strlen(value) + 1, -1);
+        result = skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                        strlen(value) + 1, -1, i + 1, 0);
         ASSERT_EQ(result, 0);
     }
 
@@ -1600,7 +1776,7 @@ void benchmark_skip_list_deletions()
     {
         char key[32];
         snprintf(key, sizeof(key), "key_%d", i);
-        skip_list_delete(list, (uint8_t *)key, strlen(key) + 1);
+        skip_list_delete(list, (uint8_t *)key, strlen(key) + 1, num_keys + i + 1);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -1646,8 +1822,8 @@ void benchmark_skip_list_deletions()
         char key[32], value[64];
         snprintf(key, sizeof(key), "anchor_%d", i);
         snprintf(value, sizeof(value), "value_%d", i);
-        skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value, strlen(value) + 1,
-                      -1);
+        skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                               strlen(value) + 1, -1, (i / 10) + 1, 0);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1656,7 +1832,7 @@ void benchmark_skip_list_deletions()
     {
         char key[32];
         snprintf(key, sizeof(key), "nonexist_%d", i);
-        skip_list_delete(list, (uint8_t *)key, strlen(key) + 1);
+        skip_list_delete(list, (uint8_t *)key, strlen(key) + 1, (tombstone_ops / 10) + i + 1);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -1683,8 +1859,8 @@ void benchmark_skip_list_deletions()
         snprintf(key, sizeof(key), "mixed_%d", i * 2);
         snprintf(value, sizeof(value), "value_%d", i * 2);
 
-        skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value, strlen(value) + 1,
-                      -1);
+        skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                               strlen(value) + 1, -1, i + 1, 0);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1693,7 +1869,7 @@ void benchmark_skip_list_deletions()
     {
         char key[32];
         snprintf(key, sizeof(key), "mixed_%d", i);
-        skip_list_delete(list, (uint8_t *)key, strlen(key) + 1);
+        skip_list_delete(list, (uint8_t *)key, strlen(key) + 1, (num_keys / 2) + i + 1);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -1717,9 +1893,9 @@ void test_skip_list_seek_for_prev_nonexistent()
         char key[32], value[32];
         snprintf(key, sizeof(key), "key_%03d", i);
         snprintf(value, sizeof(value), "value_%03d", i);
-        ASSERT_EQ(
-            skip_list_put(list, (uint8_t *)key, strlen(key), (uint8_t *)value, strlen(value), -1),
-            0);
+        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key), (uint8_t *)value,
+                                         strlen(value), -1, i + 1, 0),
+                  0);
     }
 
     skip_list_cursor_t *cursor = NULL;
@@ -1771,8 +1947,8 @@ void test_skip_list_reverse_comparator()
         char key[32], value[32];
         snprintf(key, sizeof(key), "key_%03d", i);
         snprintf(value, sizeof(value), "value_%03d", i);
-        ASSERT_EQ(skip_list_put(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                strlen(value) + 1, -1),
+        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                         strlen(value) + 1, -1, i + 1, 0),
                   0);
     }
 
@@ -1839,6 +2015,7 @@ int main(void)
     RUN_TEST(test_skip_list_duplicate_key_update, tests_passed);
     RUN_TEST(test_skip_list_update_patterns, tests_passed);
     RUN_TEST(test_skip_list_concurrent_read_write, tests_passed);
+    RUN_TEST(test_skip_list_concurrent_duplicate_keys, tests_passed);
     RUN_TEST(test_skip_list_lockfree_stress, tests_passed);
     RUN_TEST(test_skip_list_reverse_comparator, tests_passed);
 

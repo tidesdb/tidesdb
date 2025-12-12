@@ -44,17 +44,14 @@
 #define BLOCK_MANAGER_HEADER_SIZE 12
 
 /* block field sizes */
-/* block size field (uint64_t) */
-#define BLOCK_MANAGER_SIZE_FIELD_SIZE 8
-/* xxHash64 = 8 bytes */
-#define BLOCK_MANAGER_CHECKSUM_LENGTH 8
+/* block size field (uint32_t) - supports blocks up to 4GB */
+#define BLOCK_MANAGER_SIZE_FIELD_SIZE 4
+/* xxHash32 = 4 bytes (sufficient for block-level checksums) */
+#define BLOCK_MANAGER_CHECKSUM_LENGTH 4
 
-/* overflow offset field (uint64_t) */
-#define BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE 8
-#define BLOCK_MANAGER_BLOCK_HEADER_SIZE                              \
-    (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH + \
-     BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
-#define MAX_INLINE_BLOCK_SIZE (64 * 1024)
+/* block header is now just size + checksum (no overflow) */
+#define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
+    (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH)
 /* extra bytes for headers in stack buffers */
 #define BLOCK_MANAGER_STACK_BUFFER_OVERHEAD 64
 /* default file permissions (rw-r--r--) */

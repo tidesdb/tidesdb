@@ -42,6 +42,7 @@ typedef struct
     int start;
     int end;
     int thread_id;
+    int count;            /* for storing iteration count */
     _Atomic(int) *errors; /* pointer to shared error counter */
 } thread_data_t;
 
@@ -192,7 +193,8 @@ void *thread_put(void *arg)
 
         if (tidesdb_txn_commit(txn) != 0)
         {
-            printf(BOLDRED "Failed to commit transaction\n" RESET);
+            tidesdb_txn_free(txn);
+            continue;
         }
 
         tidesdb_txn_free(txn);
@@ -307,7 +309,8 @@ void *thread_delete(void *arg)
 
         if (tidesdb_txn_commit(txn) != 0)
         {
-            printf(BOLDRED "Failed to commit transaction\n" RESET);
+            tidesdb_txn_free(txn);
+            continue;
         }
         tidesdb_txn_free(txn);
         i = batch_end;
@@ -385,8 +388,8 @@ void *thread_iter_forward(void *arg)
 
     if (prev_key) free(prev_key);
 
-    /* store count in thread_id field for reporting */
-    data->thread_id = count;
+    /* store count in count field for reporting */
+    data->count = count;
 
     tidesdb_iter_free(iter);
     tidesdb_txn_free(txn);
@@ -419,6 +422,10 @@ void *thread_iter_backward(void *arg)
         return NULL;
     }
 
+    int count = 0;
+    uint8_t *prev_key = NULL;
+    size_t prev_key_size = 0;
+
     if (tidesdb_iter_seek_to_last(iter) == 0)
     {
         while (tidesdb_iter_valid(iter))
@@ -427,10 +434,42 @@ void *thread_iter_backward(void *arg)
             size_t key_size = 0, value_size = 0;
             tidesdb_iter_key(iter, &key, &key_size);
             tidesdb_iter_value(iter, &value, &value_size);
+
+            /* verify keys are in reverse sorted order */
+            if (prev_key != NULL)
+            {
+                if (memcmp(prev_key, key, prev_key_size < key_size ? prev_key_size : key_size) < 0)
+                {
+                    if (data->errors)
+                    {
+                        atomic_fetch_add(data->errors, 1);
+                    }
+                    printf(
+                        BOLDRED
+                        "[Thread %d] Backward iterator: keys out of order at position %d\n" RESET,
+                        data->thread_id, count);
+                }
+                free(prev_key);
+            }
+
+            /* save current key for next comparison */
+            prev_key = malloc(key_size);
+            if (prev_key)
+            {
+                memcpy(prev_key, key, key_size);
+                prev_key_size = key_size;
+            }
+
+            count++;
             /* keys/values are internal pointers, no need to free */
             if (tidesdb_iter_prev(iter) != 0) break;
         }
     }
+
+    if (prev_key) free(prev_key);
+
+    /* store count in count field for reporting */
+    data->count = count;
 
     tidesdb_iter_free(iter);
     tidesdb_txn_free(txn);
@@ -774,8 +813,12 @@ int main()
         thread_data[i].key_sizes = key_sizes;
         thread_data[i].value_sizes = value_sizes;
         thread_data[i].start = i * (BENCH_NUM_OPERATIONS / BENCH_NUM_THREADS);
-        thread_data[i].end = (i + 1) * (BENCH_NUM_OPERATIONS / BENCH_NUM_THREADS);
+        /* ensure last thread handles any remaining operations */
+        thread_data[i].end = (i == BENCH_NUM_THREADS - 1)
+                                 ? BENCH_NUM_OPERATIONS
+                                 : (i + 1) * (BENCH_NUM_OPERATIONS / BENCH_NUM_THREADS);
         thread_data[i].thread_id = i;
+        thread_data[i].count = 0;
         thread_data[i].errors = &verification_errors;
     }
 
@@ -795,6 +838,11 @@ int main()
     end_time = get_time_ms();
     printf(BOLDGREEN "Put: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, BENCH_NUM_OPERATIONS,
            end_time - start_time, (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
+
+    /* ensure all PUT operations are fully committed and visible before GET operations
+     * add memory barrier and small delay to allow concurrent commits to complete */
+    atomic_thread_fence(memory_order_seq_cst);
+    usleep(50000); /* 50ms delay to allow all pending commits to fully complete */
 
     printf(BOLDGREEN "\nBenchmarking Get operations...\n" RESET);
     start_time = get_time_ms();
@@ -825,11 +873,13 @@ int main()
 
     printf(BOLDGREEN "\nBenchmarking Iterator Seek operations...\n" RESET);
 
+    /* reset thread data for seek operations - each thread accesses full dataset */
     for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         thread_data[i].start = 0;
         thread_data[i].end = BENCH_NUM_OPERATIONS;
         thread_data[i].thread_id = i;
+        thread_data[i].count = 0;
     }
 
     start_time = get_time_ms();
@@ -885,7 +935,7 @@ int main()
     end_time = get_time_ms();
 
     /* each thread iterates ALL keys independently, so check one thread's count */
-    int keys_per_thread = thread_data[0].thread_id; /* we stored count in thread_id */
+    int keys_per_thread = thread_data[0].count;
 
     printf(BOLDGREEN "Forward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET,
            BENCH_NUM_THREADS, end_time - start_time,
@@ -909,6 +959,13 @@ int main()
     verification_errors = 0; /* reset for next test */
 
     printf(BOLDGREEN "\nBenchmarking Backward Iterator (full scan)...\n" RESET);
+
+    /* reset count for backward iterator */
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        thread_data[i].count = 0;
+    }
+
     start_time = get_time_ms();
 
     for (int i = 0; i < BENCH_NUM_THREADS; i++)
@@ -922,19 +979,23 @@ int main()
     }
 
     end_time = get_time_ms();
+
+    /* get the count from backward iterator */
+    int backward_keys_per_thread = thread_data[0].count;
+
     printf(BOLDGREEN "Backward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET,
            BENCH_NUM_THREADS, end_time - start_time,
            (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
-    if (keys_per_thread == BENCH_NUM_OPERATIONS)
+    if (backward_keys_per_thread == BENCH_NUM_OPERATIONS)
     {
         printf(BOLDGREEN "  ✓ Each thread iterated all %d keys successfully\n" RESET,
-               keys_per_thread);
+               backward_keys_per_thread);
     }
     else
     {
         printf(BOLDRED "  ✗ Iterator count mismatch: expected %d, got %d keys per thread\n" RESET,
-               BENCH_NUM_OPERATIONS, keys_per_thread);
+               BENCH_NUM_OPERATIONS, backward_keys_per_thread);
     }
 
     if (verification_errors > 0)

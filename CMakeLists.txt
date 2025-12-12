@@ -228,7 +228,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_CF_NAME "benchmark_cf")
     endif()
     if(NOT DEFINED BENCH_NUM_THREADS)
-        set(BENCH_NUM_THREADS 4)
+        set(BENCH_NUM_THREADS 8)
     endif()
     if(NOT DEFINED BENCH_KEY_PATTERN)
         set(BENCH_KEY_PATTERN "sequential")
@@ -236,18 +236,17 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # tidesdb config variables for benchmark
     if(NOT DEFINED BENCH_DB_DEBUG)
-        set(BENCH_DB_DEBUG 1)
+        set(BENCH_DB_DEBUG 0)
     endif()
     if(NOT DEFINED BENCH_DB_PATH)
         set(BENCH_DB_PATH "benchmark_db")
     endif()
     if(NOT DEFINED BENCH_DB_FLUSH_POOL_THREADS)
-        set(BENCH_DB_FLUSH_POOL_THREADS 2)
+        set(BENCH_DB_FLUSH_POOL_THREADS 1)
     endif()
     if(NOT DEFINED BENCH_DB_COMPACTION_POOL_THREADS)
         set(BENCH_DB_COMPACTION_POOL_THREADS 2)
     endif()
-        
 
     # column family configuration variables for benchmark
     if(NOT DEFINED BENCH_WRITE_BUFFER_SIZE)
@@ -260,7 +259,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_DIVIDING_LEVEL_OFFSET 2)
     endif()
     if(NOT DEFINED BENCH_MAX_LEVELS)
-        set(BENCH_MAX_LEVELS 7)
+        set(BENCH_MAX_LEVELS 3)
     endif()
     if(NOT DEFINED BENCH_SKIP_LIST_MAX_LEVEL)
         set(BENCH_SKIP_LIST_MAX_LEVEL 16)  
@@ -284,7 +283,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_ENABLE_BLOCK_INDEXES 1)
     endif()
     if(NOT DEFINED BENCH_BLOCK_INDEX_SAMPLING_COUNT)
-        set(BENCH_BLOCK_INDEX_SAMPLING_COUNT 1)
+        set(BENCH_BLOCK_INDEX_SAMPLING_COUNT 16)
     endif()
     if(NOT DEFINED BENCH_SYNC_MODE)
         set(BENCH_SYNC_MODE TDB_SYNC_NONE)
@@ -299,7 +298,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         math(EXPR BENCH_BLOCK_CACHE_SIZE 67108864)
     endif()
     if(NOT DEFINED BENCH_ISOLATION_LEVEL)
-        set(BENCH_ISOLATION_LEVEL TDB_ISOLATION_READ_UNCOMMITTED)
+        set(BENCH_ISOLATION_LEVEL TDB_ISOLATION_READ_COMMITTED)
     endif()
 
     add_executable(block_manager_tests test/block_manager__tests.c)

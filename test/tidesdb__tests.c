@@ -1234,7 +1234,6 @@ static void test_isolation_read_uncommitted(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "iso_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* Setup: commit initial value */
     tidesdb_txn_t *setup = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &setup), 0);
     uint8_t key[] = "test_key";
@@ -1243,11 +1242,11 @@ static void test_isolation_read_uncommitted(void)
     ASSERT_EQ(tidesdb_txn_commit(setup), 0);
     tidesdb_txn_free(setup);
 
-    /* Start READ_UNCOMMITTED transaction */
+    /* start READ_UNCOMMITTED transaction */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_UNCOMMITTED, &txn1), 0);
 
-    /* Another transaction updates value */
+    /* another transaction updates value */
     tidesdb_txn_t *txn2 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
     uint8_t value2[] = "value2";
@@ -1261,7 +1260,7 @@ static void test_isolation_read_uncommitted(void)
     int result = tidesdb_txn_get(txn1, cf, key, sizeof(key), &retrieved, &retrieved_size);
     ASSERT_EQ(result, 0);
     ASSERT_TRUE(retrieved != NULL);
-    /* Should see the latest committed value */
+    /* should see the latest committed value */
     ASSERT_EQ(memcmp(retrieved, value2, sizeof(value2)), 0);
     free(retrieved);
 
@@ -1280,7 +1279,6 @@ static void test_isolation_read_committed(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "iso_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* Setup: commit initial value */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     uint8_t key[] = "test_key";
@@ -1289,11 +1287,11 @@ static void test_isolation_read_committed(void)
     ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
     tidesdb_txn_free(txn1);
 
-    /* Start READ_COMMITTED transaction */
+    /* start READ_COMMITTED transaction */
     tidesdb_txn_t *txn2 = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &txn2), 0);
 
-    /* Read initial value */
+    /* read initial value */
     uint8_t *retrieved = NULL;
     size_t retrieved_size = 0;
     int result = tidesdb_txn_get(txn2, cf, key, sizeof(key), &retrieved, &retrieved_size);
@@ -1302,7 +1300,7 @@ static void test_isolation_read_committed(void)
     ASSERT_EQ(memcmp(retrieved, value1, sizeof(value1)), 0);
     free(retrieved);
 
-    /* Another transaction updates and commits */
+    /* another transaction updates and commits */
     tidesdb_txn_t *txn3 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn3), 0);
     uint8_t value2[] = "value2";
@@ -1315,7 +1313,7 @@ static void test_isolation_read_committed(void)
     result = tidesdb_txn_get(txn2, cf, key, sizeof(key), &retrieved, &retrieved_size);
     ASSERT_EQ(result, 0);
     ASSERT_TRUE(retrieved != NULL);
-    /* Verify we see the NEW value (non-repeatable read allowed) */
+    /* verify we see the NEW value (non-repeatable read allowed) */
     ASSERT_EQ(memcmp(retrieved, value2, sizeof(value2)), 0);
     free(retrieved);
 
@@ -1334,7 +1332,6 @@ static void test_isolation_serializable(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ssi_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* Setup: commit two keys */
     tidesdb_txn_t *setup = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &setup), 0);
     uint8_t key1[] = "x";
@@ -1345,10 +1342,10 @@ static void test_isolation_serializable(void)
     ASSERT_EQ(tidesdb_txn_commit(setup), 0);
     tidesdb_txn_free(setup);
 
-    /* Create dangerous structure with SERIALIZABLE transactions:
+    /* create dangerous structure with SERIALIZABLE transactions:
      * T1 reads X, writes Y
      * T2 reads Y, writes X
-     * This creates rw-antidependency cycle: T2 -> T1 -> T2 */
+     * this creates rw-antidependency cycle: T2 -> T1 -> T2 */
     tidesdb_txn_t *txn1 = NULL, *txn2 = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SERIALIZABLE, &txn1), 0);
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SERIALIZABLE, &txn2), 0);
@@ -1371,7 +1368,7 @@ static void test_isolation_serializable(void)
     /* T2 writes X (creates rw-dependency: T1 -> T2, forming cycle) */
     ASSERT_EQ(tidesdb_txn_put(txn2, cf, key1, sizeof(key1), value1, sizeof(value1), 0), 0);
 
-    /* Try to commit both - at least one must fail to prevent serialization anomaly */
+    /* try to commit both - at least one must fail to prevent serialization anomaly */
     int result1 = tidesdb_txn_commit(txn1);
     int result2 = tidesdb_txn_commit(txn2);
 
@@ -4550,25 +4547,24 @@ static void test_isolation_repeatable_read(void)
     uint8_t value1[] = "version_1";
     uint8_t value2[] = "version_2";
 
-    /* Setup: commit initial value */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
     ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
     tidesdb_txn_free(txn1);
 
-    /* Start REPEATABLE_READ transaction */
+    /* start REPEATABLE_READ transaction */
     tidesdb_txn_t *txn2 = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_REPEATABLE_READ, &txn2), 0);
 
-    /* Read initial value */
+    /* read initial value */
     uint8_t *read1 = NULL;
     size_t read1_size = 0;
     ASSERT_EQ(tidesdb_txn_get(txn2, cf, key, sizeof(key), &read1, &read1_size), 0);
     ASSERT_TRUE(strcmp((char *)read1, (char *)value1) == 0);
     free(read1);
 
-    /* Another transaction updates the value */
+    /* another transaction updates the value */
     tidesdb_txn_t *txn3 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn3), 0);
     ASSERT_EQ(tidesdb_txn_put(txn3, cf, key, sizeof(key), value2, sizeof(value2), 0), 0);
@@ -4582,7 +4578,7 @@ static void test_isolation_repeatable_read(void)
     ASSERT_TRUE(strcmp((char *)read2, (char *)value1) == 0);
     free(read2);
 
-    /* Try to commit - should fail with read-write conflict */
+    /* try to commit -- should fail with read-write conflict */
     int commit_result = tidesdb_txn_commit(txn2);
     ASSERT_EQ(commit_result, TDB_ERR_CONFLICT);
 
@@ -4605,26 +4601,25 @@ static void test_isolation_snapshot(void)
     uint8_t value2[] = "1100";
     uint8_t value3[] = "900";
 
-    /* Setup: commit initial value */
     tidesdb_txn_t *txn1 = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
     ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
     ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
     tidesdb_txn_free(txn1);
 
-    /* Start two SNAPSHOT transactions */
+    /* start two SNAPSHOT transactions */
     tidesdb_txn_t *txn2 = NULL, *txn3 = NULL;
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &txn2), 0);
     ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_SNAPSHOT, &txn3), 0);
 
-    /* Both try to update the same key (lost update scenario) */
+    /* both try to update the same key (lost update scenario) */
     ASSERT_EQ(tidesdb_txn_put(txn2, cf, key, sizeof(key), value2, sizeof(value2), 0), 0);
     ASSERT_EQ(tidesdb_txn_put(txn3, cf, key, sizeof(key), value3, sizeof(value3), 0), 0);
 
-    /* First commit should succeed */
+    /* first commit should succeed */
     ASSERT_EQ(tidesdb_txn_commit(txn2), 0);
 
-    /* Second commit should fail with write-write conflict (prevents lost update) */
+    /* second commit should fail with write-write conflict (prevents lost update) */
     ASSERT_EQ(tidesdb_txn_commit(txn3), TDB_ERR_CONFLICT);
 
     tidesdb_txn_free(txn2);
@@ -4633,7 +4628,6 @@ static void test_isolation_snapshot(void)
     cleanup_test_dir();
 }
 
-/* Alias for backwards compatibility */
 static void test_write_write_conflict(void)
 {
     test_isolation_snapshot();
@@ -7442,6 +7436,142 @@ static void test_concurrent_batched_random_keys(void)
     cleanup_test_dir();
 }
 
+static void test_deadlock_random_write_then_read(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.enable_debug_logging = 1;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 64 * 1024 * 1024; /* 64MB like benchmark */
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_ops = 1000; /* 100k ops to trigger flush */
+    uint8_t **keys = malloc(num_ops * sizeof(uint8_t *));
+    size_t *key_sizes = malloc(num_ops * sizeof(size_t));
+    uint8_t **values = malloc(num_ops * sizeof(uint8_t *));
+    size_t *value_sizes = malloc(num_ops * sizeof(size_t));
+
+    printf("Generating %d random key-value pairs...\n", num_ops);
+    srand(12345);
+    for (int i = 0; i < num_ops; i++)
+    {
+        key_sizes[i] = 16;
+        keys[i] = malloc(key_sizes[i]);
+        for (size_t j = 0; j < key_sizes[i]; j++)
+        {
+            keys[i][j] = rand() % 256;
+        }
+
+        value_sizes[i] = 100;
+        values[i] = malloc(value_sizes[i]);
+        for (size_t j = 0; j < value_sizes[i]; j++)
+        {
+            values[i][j] = rand() % 256;
+        }
+    }
+
+    printf("\n--- PHASE 1: Writing %d keys ---\n", num_ops);
+
+    int write_count = 0;
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, keys[i], key_sizes[i], values[i], value_sizes[i], 0), 0);
+
+        int commit_result = tidesdb_txn_commit(txn);
+        if (commit_result != 0)
+        {
+            printf("WARNING: Commit failed at operation %d (result=%d)\n", i, commit_result);
+        }
+        tidesdb_txn_free(txn);
+
+        write_count++;
+        if (write_count % 1000 == 0)
+        {
+            printf("  Written %d keys...\n", write_count);
+        }
+    }
+
+    printf("Completed %d writes\n", write_count);
+
+    printf("\n--- PHASE 1.5: Closing and reopening database ---\n");
+    printf("This forces all data to be flushed to SSTables...\n");
+    tidesdb_close(db);
+
+    printf("Reopening database...\n");
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+    printf("Database reopened, all data now in SSTables\n");
+
+    printf("\n--- PHASE 2: Reading %d keys from SSTables ---\n", num_ops);
+    int read_count = 0;
+    int read_success = 0;
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        uint8_t *value_out = NULL;
+        size_t value_len = 0;
+
+        int get_result = tidesdb_txn_get(txn, cf, keys[i], key_sizes[i], &value_out, &value_len);
+
+        if (get_result == 0)
+        {
+            ASSERT_EQ(value_len, value_sizes[i]);
+            ASSERT_TRUE(memcmp(value_out, values[i], value_len) == 0);
+            free(value_out);
+            read_success++;
+        }
+        else
+        {
+            printf("WARNING: Get failed at operation %d (result=%d)\n", i, get_result);
+        }
+
+        tidesdb_txn_free(txn);
+
+        read_count++;
+        if (read_count % 10000 == 0)
+        {
+            printf("  Read %d keys (success=%d)...\n", read_count, read_success);
+        }
+    }
+
+    printf("Completed %d reads (success=%d)\n", read_count, read_success);
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        free(keys[i]);
+        free(values[i]);
+    }
+    free(keys);
+    free(key_sizes);
+    free(values);
+    free(value_sizes);
+
+    printf("\n--- Closing database ---\n");
+    tidesdb_close(db);
+    cleanup_test_dir();
+    printf("=== Test completed successfully ===\n\n");
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -7587,6 +7717,7 @@ int main(void)
     RUN_TEST(test_iterator_no_bloom_no_indexes, tests_passed);
     RUN_TEST(test_concurrent_batched_transactions, tests_passed);
     RUN_TEST(test_concurrent_batched_random_keys, tests_passed);
+    RUN_TEST(test_deadlock_random_write_then_read, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

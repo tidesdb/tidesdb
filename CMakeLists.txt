@@ -228,7 +228,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_CF_NAME "benchmark_cf")
     endif()
     if(NOT DEFINED BENCH_NUM_THREADS)
-        set(BENCH_NUM_THREADS 8)
+        set(BENCH_NUM_THREADS 1)
     endif()
     if(NOT DEFINED BENCH_KEY_PATTERN)
         set(BENCH_KEY_PATTERN "sequential")

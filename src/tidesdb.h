@@ -29,7 +29,7 @@
 #include "skip_list.h"
 
 extern int _tidesdb_debug_enabled;
-#ifdef TDB_DEBUG_ENABLED
+// #ifdef TDB_DEBUG_ENABLED
 #if defined(_MSC_VER)
 #define TDB_DEBUG_LOG(fmt, ...)                                                               \
     do                                                                                        \
@@ -63,10 +63,10 @@ extern int _tidesdb_debug_enabled;
         }                                                                                     \
     } while (0)
 #endif
-#else
-/* No-op when debug logging is disabled at compile time */
-#define TDB_DEBUG_LOG(fmt, ...) ((void)0)
-#endif
+// #else
+// /* No-op when debug logging is disabled at compile time */
+// #define TDB_DEBUG_LOG(fmt, ...) ((void)0)
+// #endif
 
 /**
  * tidesdb_isolation_level_t

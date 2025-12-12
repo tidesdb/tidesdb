@@ -1176,7 +1176,6 @@ static tidesdb_klog_block_t *tidesdb_klog_block_create(void)
 {
     tidesdb_klog_block_t *block = calloc(1, sizeof(tidesdb_klog_block_t));
     if (!block) return NULL;
-    TDB_DEBUG_LOG("klog_block_create: allocated block %p", (void *)block);
 
     /* we pre-allocate for expected entries per block
      * with 64KB blocks and ~116 byte entries, expect ~560 entries
@@ -1212,8 +1211,6 @@ static tidesdb_klog_block_t *tidesdb_klog_block_create(void)
 static void tidesdb_klog_block_free(tidesdb_klog_block_t *block)
 {
     if (!block) return;
-    TDB_DEBUG_LOG("klog_block_free: freeing block %p (num_entries=%u)", (void *)block,
-                  block->num_entries);
 
     for (uint32_t i = 0; i < block->num_entries; i++)
     {
@@ -1448,7 +1445,6 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
      * to avoid leaking the pre-allocated arrays when we replace them */
     *block = calloc(1, sizeof(tidesdb_klog_block_t));
     if (!*block) return TDB_ERR_MEMORY;
-    TDB_DEBUG_LOG("klog_block_deserialize: allocated block %p", (void *)*block);
 
     const uint8_t *ptr = data;
 
@@ -3582,16 +3578,10 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
         int old_capacity = atomic_load_explicit(&level->sstables_capacity, memory_order_acquire);
         int old_num = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
-        TDB_DEBUG_LOG("tidesdb_level_add_sstable: SSTable %" PRIu64
-                      " to level %d: old_num=%d, old_capacity=%d, old_arr=%p",
-                      sst->id, level->level_num, old_num, old_capacity, (void *)old_arr);
 
         /* check if we need to grow the array */
         if (old_num >= old_capacity)
         {
-            TDB_DEBUG_LOG(
-                "tidesdb_level_add_sstable: RESIZE PATH - level %d needs resize (num=%d >= cap=%d)",
-                level->level_num, old_num, old_capacity);
             int new_capacity =
                 old_capacity == 0 ? TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY : old_capacity * 2;
             tidesdb_sstable_t **new_arr = malloc(new_capacity * sizeof(tidesdb_sstable_t *));
@@ -3621,10 +3611,6 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
                                           memory_order_relaxed);
 
                 /* free the old array now that new one is swapped in */
-                TDB_DEBUG_LOG(
-                    "tidesdb_level_add_sstable: Freeing old array %p (was capacity %d), new array "
-                    "%p (capacity %d) for level %d",
-                    (void *)old_arr, old_capacity, (void *)new_arr, new_capacity, level->level_num);
                 free(old_arr);
 
                 return TDB_SUCCESS;
@@ -3635,8 +3621,6 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
         else
         {
             /* no resize needed, just add to existing array */
-            TDB_DEBUG_LOG("tidesdb_level_add_sstable: NON-RESIZE PATH - level %d (num=%d < cap=%d)",
-                          level->level_num, old_num, old_capacity);
             /* atomically reserve a slot by incrementing count first */
             int expected = old_num;
 
@@ -10523,10 +10507,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 free(temp_value);
                 if (found_seq > key_read_seq)
                 {
-                    TDB_DEBUG_LOG(
-                        "Transaction %lu: Read-write conflict in active memtable (read_seq=%lu, "
-                        "found_seq=%lu)",
-                        txn->txn_id, key_read_seq, found_seq);
                     return TDB_ERR_CONFLICT;
                 }
             }
@@ -10545,10 +10525,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                     free(temp_value);
                     if (found_seq > key_read_seq)
                     {
-                        TDB_DEBUG_LOG(
-                            "Transaction %lu: Read-write conflict in immutable memtable "
-                            "(read_seq=%lu, found_seq=%lu)",
-                            txn->txn_id, key_read_seq, found_seq);
                         return TDB_ERR_CONFLICT;
                     }
                     break;
@@ -10579,10 +10555,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 free(temp_value);
                 if (found_seq > txn->snapshot_seq)
                 {
-                    TDB_DEBUG_LOG(
-                        "Transaction %lu: Write-write conflict in active memtable (snapshot=%lu, "
-                        "found_seq=%lu)",
-                        txn->txn_id, txn->snapshot_seq, found_seq);
                     return TDB_ERR_CONFLICT;
                 }
             }
@@ -10601,10 +10573,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                     free(temp_value);
                     if (found_seq > txn->snapshot_seq)
                     {
-                        TDB_DEBUG_LOG(
-                            "Transaction %lu: Write-write conflict in immutable memtable "
-                            "(snapshot=%lu, found_seq=%lu)",
-                            txn->txn_id, txn->snapshot_seq, found_seq);
                         return TDB_ERR_CONFLICT;
                     }
                     break;
@@ -10652,8 +10620,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
          */
         if (txn->has_rw_conflict_in && txn->has_rw_conflict_out)
         {
-            TDB_DEBUG_LOG("Transaction %lu: SSI dangerous structure detected (pivot transaction)",
-                          txn->txn_id);
             tidesdb_txn_remove_from_active_list(txn);
             return TDB_ERR_CONFLICT;
         }
@@ -10717,8 +10683,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
             if (has_overlap)
             {
-                TDB_DEBUG_LOG("Transaction %lu: SSI conflict with pivot transaction %lu",
-                              txn->txn_id, other->txn_id);
                 tidesdb_txn_remove_from_active_list(txn);
                 return TDB_ERR_CONFLICT;
             }
@@ -11026,8 +10990,6 @@ skip_ssi_check:
                                            op->value_size, op->ttl, txn->commit_seq, op->is_delete);
                 if (put_result != 0)
                 {
-                    TDB_DEBUG_LOG("Transaction %lu: Failed to write to memtable with seq=%lu",
-                                  txn->txn_id, txn->commit_seq);
                     free(seen_keys);
                     atomic_fetch_sub_explicit(&cf->pending_commits, 1, memory_order_release);
                     return TDB_ERR_IO;
@@ -11661,8 +11623,6 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 /* sanity check: prevent infinite loop in case of corruption */
                 if (blocks_scanned >= TDB_ITER_SEEK_MAX_BLOCKS_SCAN)
                 {
-                    TDB_DEBUG_LOG("Seek: exceeded max blocks to scan (%d), stopping",
-                                  TDB_ITER_SEEK_MAX_BLOCKS_SCAN);
                     break;
                 }
 
@@ -11677,7 +11637,6 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 block_manager_block_t *bmblock = block_manager_cursor_read(cursor);
                 if (!bmblock)
                 {
-                    TDB_DEBUG_LOG("Seek: failed to read block after %d blocks", blocks_scanned);
                     break;
                 }
                 blocks_scanned++;
@@ -11725,10 +11684,6 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                  * our target, the target cannot exist in this or any subsequent block. */
                 if (cmp_first > 0)
                 {
-                    TDB_DEBUG_LOG(
-                        "Seek: target not found, first key of block %d > target (scanned %d "
-                        "blocks)",
-                        blocks_scanned, blocks_scanned);
                     tidesdb_klog_block_free(kb);
                     source->source.sstable.current_block = NULL;
                     if (decompressed)

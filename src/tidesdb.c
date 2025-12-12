@@ -7998,6 +7998,16 @@ static void *tidesdb_flush_worker_thread(void *arg)
         skip_list_t *memtable = imm->memtable;
         block_manager_t *wal = imm->wal;
 
+        /* check again after dequeuing to handle race with close
+         * prevents use-after-free if CF is being freed during shutdown */
+        if (!atomic_load(&db->is_open))
+        {
+            TDB_DEBUG_LOG("Flush worker: database closing after dequeue, releasing work");
+            tidesdb_immutable_memtable_unref(imm);
+            free(work);
+            break;
+        }
+
         int space_check = tidesdb_check_disk_space(db, cf->directory, cf->config.min_disk_space);
         if (space_check <= 0)
         {
@@ -8287,6 +8297,15 @@ static void *tidesdb_compaction_worker_thread(void *arg)
         {
             free(work);
             continue;
+        }
+
+        /* check if database is closing before accessing CF
+         * prevents use-after-free if CF is being freed during shutdown */
+        if (!atomic_load(&db->is_open))
+        {
+            /* database is closing, skip this work and exit */
+            free(work);
+            break;
         }
 
         int space_check = tidesdb_check_disk_space(db, cf->directory, cf->config.min_disk_space);

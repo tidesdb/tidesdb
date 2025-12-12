@@ -231,7 +231,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_SYNC_INTERVAL_US            128000
 #define TDB_TXN_TIMEOUT_SECONDS                 30
 #define TDB_COMMIT_STATUS_BUFFER_SIZE           65536
-#define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE        (256 * 1024)
+#define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE        (4 * 1024 * 1024)
 #define TDB_WAL_GROUP_COMMIT_TIMEOUT_US         10
 
 /* flush and close retry configuration */
@@ -254,6 +254,14 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_BACKPRESSURE_DELAY_CRITICAL_US     10000
 #define TDB_BACKPRESSURE_DELAY_HIGH_US         5000
 #define TDB_BACKPRESSURE_DELAY_MODERATE_US     1000
+
+/* immutable queue backpressure configuration */
+#define TDB_BACKPRESSURE_IMMUTABLE_EMERGENCY          10
+#define TDB_BACKPRESSURE_IMMUTABLE_CRITICAL           6
+#define TDB_BACKPRESSURE_IMMUTABLE_MODERATE           3
+#define TDB_BACKPRESSURE_IMMUTABLE_EMERGENCY_DELAY_US 20000
+#define TDB_BACKPRESSURE_IMMUTABLE_CRITICAL_DELAY_US  5000
+#define TDB_BACKPRESSURE_IMMUTABLE_MODERATE_DELAY_US  1000
 
 /* sst cache retry configuration */
 #define TDB_SSTABLE_CACHE_MAX_RETRIES           100
@@ -860,6 +868,7 @@ struct tidesdb_txn_t
     int write_set_count;
     int write_set_capacity;
     void *write_set_hash; /* hash table for O(1) write set lookup (NULL if num_ops < 256) */
+    void *read_set_hash;  /* hash table for O(1) read set lookup (NULL if read_set_count < 256) */
     tidesdb_column_family_t **cfs;
     int num_cfs;
     int cf_capacity;

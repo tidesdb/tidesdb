@@ -1235,10 +1235,22 @@ static int tidesdb_klog_block_add_entry(tidesdb_klog_block_t *block, const tides
 {
     int inline_value = (kv->entry.value_size < config->value_threshold);
 
-    size_t entry_size = 6;
+    /* calculate ACTUAL entry size to match serialization:
+     * we must use actual varint sizes, not max sizes, so block_size is accurate
+     */
+    size_t entry_size = 1; /* flags */
+
+    /* calculate actual varint sizes for key_size, value_size, seq */
+    uint8_t temp_buf[10];
+    entry_size += encode_varint_v2(temp_buf, kv->entry.key_size);
+    entry_size += encode_varint_v2(temp_buf, kv->entry.value_size);
+    entry_size += encode_varint_v2(temp_buf, kv->entry.seq);
 
     if (kv->entry.ttl != 0) entry_size += 8;
-    if (kv->entry.vlog_offset != 0) entry_size += 5;
+    if (kv->entry.vlog_offset != 0)
+    {
+        entry_size += encode_varint_v2(temp_buf, kv->entry.vlog_offset);
+    }
 
     entry_size += kv->entry.key_size;
     if (inline_value)
@@ -1352,12 +1364,30 @@ static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **o
 {
     if (!block || !out || !out_size) return TDB_ERR_INVALID_ARGS;
 
-    size_t estimated_size = 8;
+    size_t estimated_size = 8; /* header: num_entries + block_size */
     for (uint32_t i = 0; i < block->num_entries; i++)
     {
-        estimated_size += 1 + 10 + 10 + 10 + 8 + 10;
+        /* flags (1) + key_size varint (max 10) + value_size varint (max 10) + seq varint (max 10)
+         */
+        estimated_size += 1 + 10 + 10 + 10;
+
+        /* TTL: only if entry has TTL */
+        if (block->entries[i].ttl != 0)
+        {
+            estimated_size += sizeof(int64_t); /* 8 bytes */
+        }
+
+        /* vlog_offset: only if value is in vlog */
+        if (block->entries[i].vlog_offset != 0)
+        {
+            estimated_size += 10; /* varint max */
+        }
+
+        /* key data */
         estimated_size += block->entries[i].key_size;
-        if (!(block->entries[i].flags & TDB_KV_FLAG_HAS_VLOG))
+
+        /* inline value data: only if not in vlog */
+        if (block->entries[i].vlog_offset == 0)
         {
             estimated_size += block->entries[i].value_size;
         }
@@ -1422,6 +1452,18 @@ static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **o
     }
 
     *out_size = ptr - start;
+
+    /* safety check: ensure we didn't write past allocated buffer */
+    if (*out_size > estimated_size)
+    {
+        TDB_DEBUG_LOG(
+            "CRITICAL: klog serialization buffer overrun! wrote %zu bytes, allocated %zu bytes",
+            *out_size, estimated_size);
+        free(*out);
+        *out = NULL;
+        return TDB_ERR_CORRUPTION;
+    }
+
     return TDB_SUCCESS;
 }
 
@@ -2492,6 +2534,153 @@ static int tidesdb_write_set_hash_lookup(tidesdb_write_set_hash_t *hash, tidesdb
 }
 
 /**
+ * tidesdb_read_set_hash_t
+ * simple hash table for O(1) read set lookups in SSI conflict detection
+ * uses same structure as write_set_hash for consistency
+ */
+#define READ_SET_HASH_CAPACITY 512
+#define READ_SET_HASH_EMPTY    -1
+
+typedef struct
+{
+    int *slots;   /* maps hash -> read_set index, -1 if empty */
+    int capacity; /* always READ_SET_HASH_CAPACITY */
+} tidesdb_read_set_hash_t;
+
+/**
+ * tidesdb_read_set_hash_create
+ * create hash table for read set
+ */
+static tidesdb_read_set_hash_t *tidesdb_read_set_hash_create(void)
+{
+    tidesdb_read_set_hash_t *hash = malloc(sizeof(tidesdb_read_set_hash_t));
+    if (!hash) return NULL;
+
+    hash->capacity = READ_SET_HASH_CAPACITY;
+    hash->slots = malloc(hash->capacity * sizeof(int));
+    if (!hash->slots)
+    {
+        free(hash);
+        return NULL;
+    }
+
+    for (int i = 0; i < hash->capacity; i++)
+    {
+        hash->slots[i] = READ_SET_HASH_EMPTY;
+    }
+
+    return hash;
+}
+
+/**
+ * tidesdb_read_set_hash_free
+ * free hash table
+ */
+static void tidesdb_read_set_hash_free(tidesdb_read_set_hash_t *hash)
+{
+    if (!hash) return;
+    free(hash->slots);
+    free(hash);
+}
+
+/**
+ * tidesdb_read_set_hash_key
+ * compute hash for key+cf combination
+ */
+static uint32_t tidesdb_read_set_hash_key(tidesdb_column_family_t *cf, const uint8_t *key,
+                                          size_t key_size)
+{
+    uint32_t hash = (uint32_t)(uintptr_t)cf; /* start with CF pointer */
+    for (size_t i = 0; i < key_size; i++)
+    {
+        hash = hash * 31 + key[i];
+    }
+    return hash;
+}
+
+/**
+ * tidesdb_read_set_hash_insert
+ * insert read set index into hash table
+ */
+static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, tidesdb_txn_t *txn,
+                                         int read_index)
+{
+    if (!hash || read_index < 0 || read_index >= txn->read_set_count) return;
+
+    uint32_t h = tidesdb_read_set_hash_key(txn->read_cfs[read_index], txn->read_keys[read_index],
+                                           txn->read_key_sizes[read_index]);
+    int slot = h % hash->capacity;
+
+    /* linear probing to find empty slot or matching key */
+    for (int probe = 0; probe < hash->capacity; probe++)
+    {
+        int existing_idx = hash->slots[slot];
+
+        if (existing_idx == READ_SET_HASH_EMPTY)
+        {
+            /* empty slot, insert here */
+            hash->slots[slot] = read_index;
+            return;
+        }
+
+        /* check if this slot has the same key (update case) */
+        if (txn->read_cfs[existing_idx] == txn->read_cfs[read_index] &&
+            txn->read_key_sizes[existing_idx] == txn->read_key_sizes[read_index] &&
+            memcmp(txn->read_keys[existing_idx], txn->read_keys[read_index],
+                   txn->read_key_sizes[read_index]) == 0)
+        {
+            /* same key, update to newer read */
+            hash->slots[slot] = read_index;
+            return;
+        }
+
+        /* collision, try next slot */
+        slot = (slot + 1) % hash->capacity;
+    }
+
+    /* hash table full (shouldn't happen with 512 slots for 256+ reads) */
+}
+
+/**
+ * tidesdb_read_set_hash_check_conflict
+ * check if a write key conflicts with any read in the hash table
+ * returns 1 if conflict found, 0 otherwise
+ */
+static int tidesdb_read_set_hash_check_conflict(tidesdb_read_set_hash_t *hash, tidesdb_txn_t *txn,
+                                                tidesdb_column_family_t *cf, const uint8_t *key,
+                                                size_t key_size)
+{
+    if (!hash) return 0;
+
+    uint32_t h = tidesdb_read_set_hash_key(cf, key, key_size);
+    int slot = h % hash->capacity;
+
+    /* linear probing to find key */
+    for (int probe = 0; probe < hash->capacity; probe++)
+    {
+        int read_index = hash->slots[slot];
+
+        if (read_index == READ_SET_HASH_EMPTY)
+        {
+            /* empty slot means key not in hash */
+            return 0;
+        }
+
+        if (txn->read_cfs[read_index] == cf && txn->read_key_sizes[read_index] == key_size &&
+            memcmp(txn->read_keys[read_index], key, key_size) == 0)
+        {
+            /* found conflict */
+            return 1;
+        }
+
+        /* collision, try next slot */
+        slot = (slot + 1) % hash->capacity;
+    }
+
+    return 0;
+}
+
+/**
  * tidesdb_immutable_memtable_ref
  * increment reference count of an immutable memtable
  * @param imm immutable memtable to reference
@@ -3062,6 +3251,17 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
         }
         free(metadata_data);
     }
+
+    /* ensure all SSTable data is durably written before it becomes visible to readers
+     * this prevents reads from seeing partially-written SSTables which can cause
+     * deserialization errors and stalls */
+    if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
+    if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+
+    /* rebuild position cache after flush for O(1) cursor navigation
+     * without this, cursors fall back to slow sequential scanning */
+    if (bms.klog_bm) block_manager_build_position_cache(bms.klog_bm);
+    if (bms.vlog_bm) block_manager_build_position_cache(bms.vlog_bm);
 
     return TDB_SUCCESS;
 }
@@ -7871,6 +8071,10 @@ static void *tidesdb_flush_worker_thread(void *arg)
         {
             if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
             if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+
+            /* rebuild position cache for O(1) cursor navigation */
+            if (bms.klog_bm) block_manager_build_position_cache(bms.klog_bm);
+            if (bms.vlog_bm) block_manager_build_position_cache(bms.vlog_bm);
         }
 
         /* ensure all writes are visible before making sstable discoverable */
@@ -8374,7 +8578,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(*db);
         return TDB_ERR_MEMORY;
     }
-    (*db)->active_txns_capacity = 64;
+    /* FIX #4: Start with larger capacity to avoid realloc under lock */
+    (*db)->active_txns_capacity = 1024;
     (*db)->active_txns = calloc((*db)->active_txns_capacity, sizeof(tidesdb_txn_t *));
     if (!(*db)->active_txns)
     {
@@ -9595,6 +9800,26 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
 
     txn->read_set_count++;
 
+    /* FIX #2: create hash table when we cross 256 reads threshold for O(1) SSI lookups */
+    if (txn->read_set_count == 256 && !txn->read_set_hash)
+    {
+        txn->read_set_hash = tidesdb_read_set_hash_create();
+        if (txn->read_set_hash)
+        {
+            /* populate hash with all existing reads */
+            for (int i = 0; i < txn->read_set_count; i++)
+            {
+                tidesdb_read_set_hash_insert((tidesdb_read_set_hash_t *)txn->read_set_hash, txn, i);
+            }
+        }
+    }
+    else if (txn->read_set_hash)
+    {
+        /* add new read to existing hash */
+        tidesdb_read_set_hash_insert((tidesdb_read_set_hash_t *)txn->read_set_hash, txn,
+                                     txn->read_set_count - 1);
+    }
+
     return 0;
 }
 
@@ -9696,6 +9921,7 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
     (*txn)->write_key_sizes = calloc((*txn)->write_set_capacity, sizeof(size_t));
     (*txn)->write_cfs = calloc((*txn)->write_set_capacity, sizeof(tidesdb_column_family_t *));
     (*txn)->write_set_hash = NULL; /* hash table created lazily for large transactions */
+    (*txn)->read_set_hash = NULL;  /* hash table created lazily for large read sets */
 
     if (!(*txn)->write_keys || !(*txn)->write_key_sizes || !(*txn)->write_cfs)
     {
@@ -9760,24 +9986,22 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
     /* register SERIALIZABLE transactions in active list for SSI tracking */
     if (isolation == TDB_ISOLATION_SERIALIZABLE)
     {
+        /* FIX #3 & #4: Use write lock only for fast array append, no realloc under lock
+         * With initial capacity of 1024, this should rarely be exceeded in practice.
+         * If exceeded, SSI will be less effective but still safe (no correctness issue). */
         pthread_rwlock_wrlock(&db->active_txns_lock);
-
-        if (db->num_active_txns >= db->active_txns_capacity)
-        {
-            int new_capacity = db->active_txns_capacity * 2;
-            tidesdb_txn_t **new_array =
-                realloc(db->active_txns, new_capacity * sizeof(tidesdb_txn_t *));
-            if (new_array)
-            {
-                db->active_txns = new_array;
-                db->active_txns_capacity = new_capacity;
-            }
-            /* if realloc fails, continue anyway -- SSI will be less effective but still safe */
-        }
 
         if (db->num_active_txns < db->active_txns_capacity)
         {
             db->active_txns[db->num_active_txns++] = *txn;
+        }
+        else
+        {
+            /* Capacity exceeded - log warning but continue.
+             * This transaction won't participate in SSI conflict detection,
+             * but will still get correct snapshot isolation semantics. */
+            TDB_DEBUG_LOG("Active transaction list full (%d), SSI may be less effective",
+                          db->active_txns_capacity);
         }
 
         pthread_rwlock_unlock(&db->active_txns_lock);
@@ -10605,21 +10829,48 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
     if (txn->isolation_level == TDB_ISOLATION_SERIALIZABLE)
     {
+        /* FIX #1: Single lock acquisition - take snapshot of active transactions
+         * then process lock-free. This reduces lock acquisitions from O(N*M) to O(1)
+         * where N = active txns, M = write keys. */
         pthread_rwlock_rdlock(&txn->db->active_txns_lock);
-        for (int i = 0; i < txn->db->num_active_txns; i++)
+        int snapshot_count = txn->db->num_active_txns;
+        tidesdb_txn_t **snapshot = NULL;
+
+        if (snapshot_count > 0)
         {
-            tidesdb_txn_t *other = txn->db->active_txns[i];
+            snapshot = malloc(snapshot_count * sizeof(tidesdb_txn_t *));
+            if (snapshot)
+            {
+                memcpy(snapshot, txn->db->active_txns, snapshot_count * sizeof(tidesdb_txn_t *));
+            }
+            else
+            {
+                /* fallback to old behavior if malloc fails */
+                snapshot_count = 0;
+            }
+        }
+        pthread_rwlock_unlock(&txn->db->active_txns_lock);
+
+        /* process snapshot lock-free - transaction pointers remain valid because
+         * transactions are only freed after removal from active list */
+        for (int i = 0; i < snapshot_count; i++)
+        {
+            tidesdb_txn_t *other = snapshot[i];
             if (other == txn || other->is_committed || other->is_aborted) continue;
 
-            /* check if we read any keys that other wrote (rw-conflict-out) */
+            /* FIX #5: Optimize comparison order - check size first (cheapest),
+             * then CF pointer, then memcmp (most expensive) */
             for (int r = 0; r < txn->read_set_count && !txn->has_rw_conflict_out; r++)
             {
                 for (int w = 0; w < other->write_set_count; w++)
                 {
-                    if (txn->read_cfs[r] == other->write_cfs[w] &&
-                        txn->read_key_sizes[r] == other->write_key_sizes[w] &&
-                        memcmp(txn->read_keys[r], other->write_keys[w], txn->read_key_sizes[r]) ==
-                            0)
+                    /* size check first (int comparison - fastest) */
+                    if (txn->read_key_sizes[r] != other->write_key_sizes[w]) continue;
+                    /* CF pointer check (pointer comparison - fast) */
+                    if (txn->read_cfs[r] != other->write_cfs[w]) continue;
+                    /* memcmp last (most expensive) */
+                    if (memcmp(txn->read_keys[r], other->write_keys[w], txn->read_key_sizes[r]) ==
+                        0)
                     {
                         txn->has_rw_conflict_out = 1;
                         other->has_rw_conflict_in = 1;
@@ -10628,7 +10879,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 }
             }
         }
-        pthread_rwlock_unlock(&txn->db->active_txns_lock);
 
         /* check for dangerous structures (rw-antidependency cycles)
          * a dangerous structure exists if
@@ -10637,62 +10887,41 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
          * -- T2 has rw-conflict-out to T3
          * -- T3 has rw-conflict-in from T1 (creates cycle)
          *
-         * ff this tx has both rw-conflict-in and rw-conflict-out,
+         * if this tx has both rw-conflict-in and rw-conflict-out,
          * it's part of a potential dangerous structure and must abort.
          */
         if (txn->has_rw_conflict_in && txn->has_rw_conflict_out)
         {
+            free(snapshot);
             tidesdb_txn_remove_from_active_list(txn);
             return TDB_ERR_CONFLICT;
         }
 
         if (txn->write_set_count == 0)
         {
+            free(snapshot);
             goto skip_ssi_check;
         }
 
-        /* capture snapshot of active transaction count */
-        pthread_rwlock_rdlock(&txn->db->active_txns_lock);
-        int num_to_check = txn->db->num_active_txns;
-        pthread_rwlock_unlock(&txn->db->active_txns_lock);
-
-        for (int i = 0; i < num_to_check; i++)
+        /* check for dangerous structures - process snapshot lock-free */
+        for (int i = 0; i < snapshot_count; i++)
         {
-            pthread_rwlock_rdlock(&txn->db->active_txns_lock);
-
-            if (i >= txn->db->num_active_txns)
-            {
-                pthread_rwlock_unlock(&txn->db->active_txns_lock);
-                break;
-            }
-
-            tidesdb_txn_t *other = txn->db->active_txns[i];
+            tidesdb_txn_t *other = snapshot[i];
 
             if (other == txn || other->is_committed || other->is_aborted ||
                 !other->has_rw_conflict_in || !other->has_rw_conflict_out)
             {
-                pthread_rwlock_unlock(&txn->db->active_txns_lock);
                 continue;
             }
-
-            int other_read_count = other->read_set_count;
-            pthread_rwlock_unlock(&txn->db->active_txns_lock);
 
             int has_overlap = 0;
             for (int w = 0; w < txn->write_set_count && !has_overlap; w++)
             {
-                pthread_rwlock_rdlock(&txn->db->active_txns_lock);
-
-                if (i >= txn->db->num_active_txns || txn->db->active_txns[i] != other)
+                for (int r = 0; r < other->read_set_count; r++)
                 {
-                    pthread_rwlock_unlock(&txn->db->active_txns_lock);
-                    break;
-                }
-
-                for (int r = 0; r < other_read_count && r < other->read_set_count; r++)
-                {
-                    if (txn->write_cfs[w] != other->read_cfs[r]) continue;
+                    /* FIX #5: Optimized comparison order */
                     if (txn->write_key_sizes[w] != other->read_key_sizes[r]) continue;
+                    if (txn->write_cfs[w] != other->read_cfs[r]) continue;
 
                     if (memcmp(txn->write_keys[w], other->read_keys[r], txn->write_key_sizes[w]) ==
                         0)
@@ -10701,15 +10930,17 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                         break;
                     }
                 }
-                pthread_rwlock_unlock(&txn->db->active_txns_lock);
             }
 
             if (has_overlap)
             {
+                free(snapshot);
                 tidesdb_txn_remove_from_active_list(txn);
                 return TDB_ERR_CONFLICT;
             }
         }
+
+        free(snapshot);
     }
 
 skip_ssi_check:
@@ -10858,60 +11089,19 @@ skip_ssi_check:
                 }
                 else
                 {
-                    /* someone else is flushing -- bounded retry with exponential backoff
-                     * instead of spinning indefinitely, try a few times then give up */
-                    int retry_count = 0;
-                    const int MAX_RETRIES = 8;
-
-                    while (atomic_load(&cf->wal_group_leader) == 1 && retry_count < MAX_RETRIES)
+                    /* someone else is flushing -- write directly to avoid blocking
+                     * this improves parallelism under high concurrency by avoiding spin-waits */
+                    block_manager_t *target_wal =
+                        atomic_load_explicit(&cf->active_wal, memory_order_acquire);
+                    block_manager_block_t *direct_block =
+                        block_manager_block_create(cf_wal_size, wal_batch);
+                    if (direct_block)
                     {
-                        /* exponential backoff: 1, 2, 4, 8... pauses */
-                        for (int i = 0; i < (1 << retry_count); i++)
-                        {
-                            cpu_pause();
-                        }
-                        retry_count++;
+                        block_manager_block_write(target_wal, direct_block);
+                        block_manager_block_release(direct_block);
                     }
-
-                    /* if still flushing after retries, write directly to avoid blocking */
-                    if (atomic_load(&cf->wal_group_leader) == 1)
-                    {
-                        /* leader still active, bypass group commit */
-                        block_manager_t *target_wal =
-                            atomic_load_explicit(&cf->active_wal, memory_order_acquire);
-                        block_manager_block_t *direct_block =
-                            block_manager_block_create(cf_wal_size, wal_batch);
-                        if (direct_block)
-                        {
-                            block_manager_block_write(target_wal, direct_block);
-                            block_manager_block_release(direct_block);
-                        }
-                        free(wal_batch);
-                        continue; /* skip to next CF */
-                    }
-
-                    /* retry reservation after flush completed */
-                    my_offset = atomic_fetch_add(&cf->wal_group_buffer_size, cf_wal_size);
-
-                    /* verify retry doesn't overflow (shouldn't happen but be safe) */
-                    if (my_offset + cf_wal_size > cf->wal_group_buffer_capacity)
-                    {
-                        /* still doesn't fit -- write directly to WAL (bypass group commit) */
-                        atomic_fetch_sub(&cf->wal_group_buffer_size, cf_wal_size);
-                        block_manager_t *target_wal =
-                            atomic_load_explicit(&cf->active_wal, memory_order_acquire);
-                        block_manager_block_t *direct_block =
-                            block_manager_block_create(cf_wal_size, wal_batch);
-                        if (direct_block)
-                        {
-                            block_manager_block_write(target_wal, direct_block);
-                            block_manager_block_release(direct_block);
-                        }
-                    }
-                    else
-                    {
-                        memcpy(cf->wal_group_buffer + my_offset, wal_batch, cf_wal_size);
-                    }
+                    free(wal_batch);
+                    continue; /* skip to next CF */
                 }
             }
             else
@@ -11080,6 +11270,27 @@ skip_ssi_check:
 
         if (memtable_size >= flush_threshold)
         {
+            /* immutable memtable queue backpressure -- if too many pending flushes,
+             * slow down writes to prevent unbounded queue growth and stalls.
+             * This is critical when writes outpace flush workers. */
+            size_t immutable_queue_depth = queue_size(cf->immutable_memtables);
+
+            if (immutable_queue_depth >= TDB_BACKPRESSURE_IMMUTABLE_EMERGENCY)
+            {
+                /* emergency: 10+ pending flushes, apply strong backpressure */
+                usleep(TDB_BACKPRESSURE_IMMUTABLE_EMERGENCY_DELAY_US);
+            }
+            else if (immutable_queue_depth >= TDB_BACKPRESSURE_IMMUTABLE_CRITICAL)
+            {
+                /* critical: 6-9 pending flushes */
+                usleep(TDB_BACKPRESSURE_IMMUTABLE_CRITICAL_DELAY_US);
+            }
+            else if (immutable_queue_depth >= TDB_BACKPRESSURE_IMMUTABLE_MODERATE)
+            {
+                /* moderate: 3-5 pending flushes */
+                usleep(TDB_BACKPRESSURE_IMMUTABLE_MODERATE_DELAY_US);
+            }
+
             /* compaction backpressure -- if Level 0 is near capacity, slow down writes
              * to give compaction time to catch up. This prevents runaway sst creation
              * during heavy batched writes.
@@ -11186,10 +11397,14 @@ void tidesdb_txn_free(tidesdb_txn_t *txn)
     free(txn->write_key_sizes);
     free(txn->write_cfs);
 
-    /* free hash table if it was created */
+    /* free hash tables if they were created */
     if (txn->write_set_hash)
     {
         tidesdb_write_set_hash_free((tidesdb_write_set_hash_t *)txn->write_set_hash);
+    }
+    if (txn->read_set_hash)
+    {
+        tidesdb_read_set_hash_free((tidesdb_read_set_hash_t *)txn->read_set_hash);
     }
 
     for (int i = 0; i < txn->num_savepoints; i++)

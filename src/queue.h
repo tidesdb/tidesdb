@@ -20,108 +20,61 @@
 #define __QUEUE_H__
 #include "compat.h"
 
-/* max spin iterations before yielding */
-#define MAX_SPIN_COUNT 100
-
-/**
- * tagged_ptr_t
- * tagged pointer to solve the aba problem in lock-free algorithms.
- * on 64-bit systems: uses upper 16 bits for tag (48-bit pointers are sufficient)
- * on 32-bit systems: uses separate pointer and counter fields (requires dwcas)
- * aligned to 8/16 bytes for atomic operations on x86/x64 and arm/arm64.
- */
-#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
-/* 64-bit: pack pointer and tag into single 64-bit value */
-#define QUEUE_TAG_BITS 16
-#define QUEUE_TAG_MASK ((uintptr_t)0xFFFF000000000000ULL)
-#define QUEUE_PTR_MASK ((uintptr_t)0x0000FFFFFFFFFFFFULL)
-
-typedef struct ATOMIC_ALIGN(8)
-{
-    uintptr_t value;
-} tagged_ptr_t;
-#else
-/* 32-bit: use separate pointer and counter
- * on 32-bit systems, we cannot steal bits from pointers because the full
- * 32-bit address space is needed. instead, we use a struct with separate
- * pointer (4 bytes) and counter (4 bytes) = 8 bytes total.
- * this requires 64-bit atomic cas (cmpxchg8b on x86-32) to atomically
- * update both fields. gcc/clang provide __sync_val_compare_and_swap for this.
- * the struct must be 8-byte aligned for atomic operations. */
-typedef struct ATOMIC_ALIGN(8)
-{
-    void *ptr;
-    uint32_t counter;
-} tagged_ptr_t;
-#endif
+/* node pool configuration */
+#define QUEUE_MAX_POOL_SIZE 64
 
 /**
  * queue_node_t
- * internal node structure for the lock-free queue.
+ * internal node structure for the queue
  * @param data pointer to user data
- * @param next tagged pointer to next node (includes aba counter)
- * aligned to 8 bytes for atomic operations on x86/x64 and arm/arm64.
+ * @param next pointer to next node
  */
-typedef struct ATOMIC_ALIGN(8) queue_node_t
+typedef struct queue_node_t
 {
     void *data;
-    _Atomic(tagged_ptr_t) next;
+    struct queue_node_t *next;
 } queue_node_t;
 
 /**
- * retired_node_t
- * node in the retired list for deferred reclamation
- */
-typedef struct retired_node_t
-{
-    queue_node_t *node;
-    uint64_t retire_epoch; /* epoch when node was retired */
-    struct retired_node_t *next;
-} retired_node_t;
-
-/**
  * queue_t
- * lock-free fifo queue implementation with epoch-based reclamation.
- * @param head tagged pointer to sentinel/first node (atomic)
- * @param tail tagged pointer to last node (atomic)
- * @param size current number of elements (atomic, approximate)
+ * thread-safe FIFO queue implementation with node pooling
+ * @param head pointer to first node (protected by lock for writes)
+ * @param atomic_head pointer to first node (atomic for lock-free reads)
+ * @param tail pointer to last node
+ * @param size current number of elements (atomic for lock-free reads)
  * @param shutdown has queue been shutdown?
- * @param waiter_count number of threads currently waiting
- * @param wait_lock mutex for blocking wait operations
- * @param not_empty condition variable for blocking waits
- * @param retired_head head of retired nodes list (deferred reclamation)
- * @param retired_lock mutex protecting retired list
- * @param global_epoch global epoch counter for reclamation
- * @param retired_count number of retired nodes pending reclamation
- * aligned to 8 bytes for atomic operations on x86/x64 and arm/arm64.
+ * @param waiter_count number of threads currently waiting in queue_dequeue_wait
+ * @param lock mutex for thread safety
+ * @param not_empty condition variable signaled when queue becomes non-empty
+ * @param node_pool free list of reusable nodes for performance
+ * @param pool_size current size of node pool
+ * @param max_pool_size maximum nodes to keep in pool
  */
-typedef struct ATOMIC_ALIGN(8)
+typedef struct
 {
-    _Atomic(tagged_ptr_t) head;
-    _Atomic(tagged_ptr_t) tail;
+    queue_node_t *head;
+    _Atomic(queue_node_t *) atomic_head;
+    queue_node_t *tail;
     _Atomic(size_t) size;
     _Atomic(int) shutdown;
-    _Atomic(int) waiter_count;
-    pthread_mutex_t wait_lock;
+    int waiter_count;
+    pthread_mutex_t lock;
     pthread_cond_t not_empty;
-    retired_node_t *retired_head;
-    pthread_mutex_t retired_lock;
-    _Atomic(uint64_t) global_epoch; /* global epoch counter */
-    _Atomic(size_t) retired_count;  /* number of retired nodes */
+    queue_node_t *node_pool;
+    size_t pool_size;
+    size_t max_pool_size;
 } queue_t;
 
 /**
  * queue_new
- * create a new lock-free queue.
- * initializes with a sentinel node for simplified enqueue/dequeue logic.
- * @return pointer to new queue, null on failure
+ * create a new queue
+ * @return pointer to new queue, NULL on failure
  */
 queue_t *queue_new(void);
 
 /**
  * queue_enqueue
- * add an item to the back of the queue (lock-free).
- * uses cas (compare-and-swap) operations for thread safety.
+ * add an item to the back of the queue
  * @param queue the queue
  * @param data pointer to data to enqueue
  * @return 0 on success, -1 on failure
@@ -130,17 +83,15 @@ int queue_enqueue(queue_t *queue, void *data);
 
 /**
  * queue_dequeue
- * remove and return item from front of queue (lock-free).
- * uses cas (compare-and-swap) operations for thread safety.
+ * remove and return item from front of queue
  * @param queue the queue
- * @return pointer to dequeued data, null if queue is empty
+ * @return pointer to dequeued data, NULL if queue is empty
  */
 void *queue_dequeue(queue_t *queue);
 
 /**
  * queue_dequeue_wait
- * remove and return item from front of queue, blocking until available.
- * uses condition variable for efficient waiting.
+ * remove and return item from front of queue, blocking until available
  * @param queue the queue
  * @return pointer to dequeued data, NULL if queue is destroyed or on error
  */
@@ -148,18 +99,15 @@ void *queue_dequeue_wait(queue_t *queue);
 
 /**
  * queue_peek
- * view item at front of queue without removing it.
- * in a lock-free queue, the peeked value may be dequeued
- * by another thread before caller can act on it.
+ * view item at front of queue without removing it
  * @param queue the queue
- * @return pointer to front data, null if queue is empty
+ * @return pointer to front data, NULL if queue is empty
  */
 void *queue_peek(queue_t *queue);
 
 /**
  * queue_size
- * get approximate number of items in queue.
- * in a concurrent environment, this is approximate.
+ * get current number of items in queue
  * @param queue the queue
  * @return number of items, 0 if queue is NULL or empty
  */
@@ -167,8 +115,7 @@ size_t queue_size(queue_t *queue);
 
 /**
  * queue_is_empty
- * check if queue is empty.
- * result may be stale in concurrent environment.
+ * check if queue is empty
  * @param queue the queue
  * @return 1 if empty, 0 if not empty, -1 on error
  */
@@ -176,8 +123,7 @@ int queue_is_empty(queue_t *queue);
 
 /**
  * queue_clear
- * remove all items from queue without freeing the data.
- * not lock-free, acquires wait_lock.
+ * remove all items from queue without freeing the data
  * @param queue the queue
  * @return 0 on success, -1 on error
  */
@@ -185,53 +131,37 @@ int queue_clear(queue_t *queue);
 
 /**
  * queue_foreach
- * iterate over all items in the queue and call function for each.
- * not lock-free, provides snapshot iteration.
- * items may be added/removed during iteration by other threads.
+ * iterate over all items in the queue and call function for each
+ * does not remove items from queue
  * @param queue the queue
- * @param fn callback function called for each item
- * @param context user-provided context passed to callback
+ * @param fn callback function called for each item (receives data pointer and user context)
+ * @param context user-provided context passed to callback function
  * @return number of items processed, -1 on error
  */
 int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *context);
 
 /**
  * queue_peek_at
- * peek at item at specific index without removing it.
- * not lock-free, index may be invalid by the time caller acts.
+ * peek at item at specific index without removing it
+ * index 0 is head (oldest), index size-1 is tail (newest)
  * @param queue the queue
- * @param index the index to peek at (0 = head)
- * @return pointer to data at index, NULL if index out of bounds
+ * @param index the index to peek at
+ * @return pointer to data at index, NULL if index out of bounds or error
  */
 void *queue_peek_at(queue_t *queue, size_t index);
 
 /**
- * queue_snapshot_with_refs
- * create a safe snapshot of queue items with reference counting.
- * takes references on all items atomically to prevent use-after-free.
- * caller must release references using the provided unref callback.
- * @param queue the queue
- * @param items output array of items (caller must free)
- * @param count output number of items
- * @param ref_fn callback to increment reference count (called for each item)
- * @return 0 on success, -1 on failure
- */
-int queue_snapshot_with_refs(queue_t *queue, void ***items, size_t *count,
-                             void (*ref_fn)(void *item));
-
-/**
  * queue_free
- * free the queue structure (does not free the data pointers).
- * wakes all waiting threads before destruction.
+ * free the queue structure (does not free the data pointers)
  * @param queue the queue to free
  */
 void queue_free(queue_t *queue);
 
 /**
  * queue_free_with_data
- * free the queue and all data using provided free function.
+ * free the queue and all data using provided free function
  * @param queue the queue to free
- * @param free_fn function to free each data element (can be NULL)
+ * @param free_fn function to free each data element (can be NULL to skip)
  */
 void queue_free_with_data(queue_t *queue, void (*free_fn)(void *));
 

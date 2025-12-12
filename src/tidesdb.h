@@ -235,14 +235,17 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_WAL_GROUP_COMMIT_TIMEOUT_US         10
 
 /* transaction optimization configuration */
-#define TDB_TXN_HASH_THRESHOLD          256  /* create hash table at this many ops/reads */
+#define TDB_TXN_WRITE_HASH_THRESHOLD    64   /* create write set hash table at this many ops */
+#define TDB_TXN_READ_HASH_THRESHOLD     64   /* create read set hash table at this many reads */
 #define TDB_TXN_SMALL_SCAN_LIMIT        64   /* scan last N ops for small txns */
 #define TDB_TXN_READ_SET_BATCH_GROW     256  /* grow read set by this amount */
 #define TDB_ACTIVE_TXN_INITIAL_CAPACITY 1024 /* initial capacity for active txn list */
-#define TDB_WRITE_SET_HASH_CAPACITY     512  /* hash table capacity for write set */
-#define TDB_READ_SET_HASH_CAPACITY      512  /* hash table capacity for read set */
+#define TDB_WRITE_SET_HASH_CAPACITY     2048 /* hash table capacity for write set (power of 2) */
+#define TDB_READ_SET_HASH_CAPACITY      2048 /* hash table capacity for read set (power of 2) */
 #define TDB_WRITE_SET_HASH_EMPTY        -1   /* empty slot marker */
 #define TDB_READ_SET_HASH_EMPTY         -1   /* empty slot marker */
+#define TDB_TXN_HASH_SEED               0x9e3779b9 /* xxhash seed for transaction hash tables */
+#define TDB_TXN_MAX_PROBE_LENGTH        32         /* max linear probe attempts before giving up */
 
 /* flush and close retry configuration */
 #define TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS         100

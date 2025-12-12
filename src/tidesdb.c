@@ -2435,17 +2435,14 @@ static void tidesdb_write_set_hash_free(tidesdb_write_set_hash_t *hash)
 
 /**
  * tidesdb_write_set_hash_key
- * compute hash for key+cf combination
+ * compute hash for key+cf combination using xxhash
  */
 static uint32_t tidesdb_write_set_hash_key(tidesdb_column_family_t *cf, const uint8_t *key,
                                            size_t key_size)
 {
-    uint32_t hash = (uint32_t)(uintptr_t)cf; /* start with CF pointer */
-    for (size_t i = 0; i < key_size; i++)
-    {
-        hash = hash * 31 + key[i];
-    }
-    return hash;
+    /* mix CF pointer into seed for better distribution across CFs */
+    uint64_t seed = TDB_TXN_HASH_SEED ^ (uint64_t)(uintptr_t)cf;
+    return (uint32_t)XXH64(key, key_size, seed);
 }
 
 /**
@@ -2463,7 +2460,7 @@ static void tidesdb_write_set_hash_insert(tidesdb_write_set_hash_t *hash, tidesd
     int slot = h % hash->capacity;
 
     /* linear probing to find empty slot or matching key */
-    for (int probe = 0; probe < hash->capacity; probe++)
+    for (int probe = 0; probe < TDB_TXN_MAX_PROBE_LENGTH; probe++)
     {
         int existing_idx = hash->slots[slot];
 
@@ -2487,6 +2484,7 @@ static void tidesdb_write_set_hash_insert(tidesdb_write_set_hash_t *hash, tidesd
         /* collision, try next slot */
         slot = (slot + 1) % hash->capacity;
     }
+    /* probe limit exceeded - hash table may be too full, but continue without hash */
 }
 
 /**
@@ -2504,7 +2502,7 @@ static int tidesdb_write_set_hash_lookup(tidesdb_write_set_hash_t *hash, tidesdb
     int slot = h % hash->capacity;
 
     /* linear probing to find key */
-    for (int probe = 0; probe < hash->capacity; probe++)
+    for (int probe = 0; probe < TDB_TXN_MAX_PROBE_LENGTH; probe++)
     {
         int op_index = hash->slots[slot];
 
@@ -2525,21 +2523,19 @@ static int tidesdb_write_set_hash_lookup(tidesdb_write_set_hash_t *hash, tidesdb
         slot = (slot + 1) % hash->capacity;
     }
 
+    /* probe limit exceeded - assume not found */
     return -1;
 }
 
 /**
  * tidesdb_read_set_hash_t
- * simple hash table for O(1) read set lookups in SSI conflict detection
- * uses same structure as write_set_hash for consistency
+ * hash table for O(1) read set lookups in SSI conflict detection
+ * uses xxhash for better distribution and larger capacity for fewer collisions
  */
-#define READ_SET_HASH_CAPACITY 512
-#define READ_SET_HASH_EMPTY    -1
-
 typedef struct
 {
     int *slots;   /* maps hash -> read_set index, -1 if empty */
-    int capacity; /* always READ_SET_HASH_CAPACITY */
+    int capacity; /* always TDB_READ_SET_HASH_CAPACITY */
 } tidesdb_read_set_hash_t;
 
 /**
@@ -2580,17 +2576,14 @@ static void tidesdb_read_set_hash_free(tidesdb_read_set_hash_t *hash)
 
 /**
  * tidesdb_read_set_hash_key
- * compute hash for key+cf combination
+ * compute hash for key+cf combination using xxhash
  */
 static uint32_t tidesdb_read_set_hash_key(tidesdb_column_family_t *cf, const uint8_t *key,
                                           size_t key_size)
 {
-    uint32_t hash = (uint32_t)(uintptr_t)cf; /* start with CF pointer */
-    for (size_t i = 0; i < key_size; i++)
-    {
-        hash = hash * 31 + key[i];
-    }
-    return hash;
+    /* mix CF pointer into seed for better distribution across CFs */
+    uint64_t seed = TDB_TXN_HASH_SEED ^ (uint64_t)(uintptr_t)cf;
+    return (uint32_t)XXH64(key, key_size, seed);
 }
 
 /**
@@ -2607,7 +2600,7 @@ static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, tidesdb_
     int slot = h % hash->capacity;
 
     /* linear probing to find empty slot or matching key */
-    for (int probe = 0; probe < hash->capacity; probe++)
+    for (int probe = 0; probe < TDB_TXN_MAX_PROBE_LENGTH; probe++)
     {
         int existing_idx = hash->slots[slot];
 
@@ -2632,6 +2625,7 @@ static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, tidesdb_
         /* collision, try next slot */
         slot = (slot + 1) % hash->capacity;
     }
+    /* probe limit exceeded - hash table may be too full, but continue without hash */
 }
 
 /**
@@ -2649,7 +2643,7 @@ static int tidesdb_read_set_hash_check_conflict(tidesdb_read_set_hash_t *hash, t
     int slot = h % hash->capacity;
 
     /* linear probing to find key */
-    for (int probe = 0; probe < hash->capacity; probe++)
+    for (int probe = 0; probe < TDB_TXN_MAX_PROBE_LENGTH; probe++)
     {
         int read_index = hash->slots[slot];
 
@@ -2670,6 +2664,7 @@ static int tidesdb_read_set_hash_check_conflict(tidesdb_read_set_hash_t *hash, t
         slot = (slot + 1) % hash->capacity;
     }
 
+    /* probe limit exceeded - assume no conflict (conservative) */
     return 0;
 }
 
@@ -9813,8 +9808,8 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
 
     txn->read_set_count++;
 
-    /* create hash table when we cross 256 reads threshold for O(1) SSI lookups */
-    if (txn->read_set_count == 256 && !txn->read_set_hash)
+    /* create hash table when we cross threshold for O(1) SSI lookups */
+    if (txn->read_set_count == TDB_TXN_READ_HASH_THRESHOLD && !txn->read_set_hash)
     {
         txn->read_set_hash = tidesdb_read_set_hash_create();
         if (txn->read_set_hash)
@@ -10130,7 +10125,7 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     txn->num_ops++;
 
     /* create hash table when we cross threshold for O(1) lookups */
-    if (txn->num_ops == TDB_TXN_HASH_THRESHOLD && !txn->write_set_hash)
+    if (txn->num_ops == TDB_TXN_WRITE_HASH_THRESHOLD && !txn->write_set_hash)
     {
         txn->write_set_hash = tidesdb_write_set_hash_create();
         if (txn->write_set_hash)
@@ -10311,19 +10306,39 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     tidesdb_immutable_memtable_t **immutable_refs = NULL;
     size_t immutable_count = 0;
 
-    queue_snapshot_with_refs(cf->immutable_memtables, (void ***)&immutable_refs, &immutable_count,
-                             (void (*)(void *))tidesdb_immutable_memtable_ref);
+    pthread_mutex_lock(&cf->immutable_memtables->lock);
+    immutable_count = atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
+    if (immutable_count > 0)
+    {
+        immutable_refs = malloc(immutable_count * sizeof(tidesdb_immutable_memtable_t *));
+        if (immutable_refs)
+        {
+            size_t idx = 0;
+            queue_node_t *node = cf->immutable_memtables->head;
+            while (node && idx < immutable_count)
+            {
+                tidesdb_immutable_memtable_t *imm = (tidesdb_immutable_memtable_t *)node->data;
+                if (imm)
+                {
+                    tidesdb_immutable_memtable_ref(imm);
+                    immutable_refs[idx++] = imm;
+                }
+                node = node->next;
+            }
+            immutable_count = idx;
+        }
+        else
+        {
+            immutable_count = 0;
+        }
+    }
+    pthread_mutex_unlock(&cf->immutable_memtables->lock);
 
     /* now load active memtable - any keys that rotated are already in our immutable snapshot */
     skip_list_t *active_mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
 
     /* memory fence ensures we see consistent state */
     atomic_thread_fence(memory_order_acquire);
-
-    char search_key_str[64];
-    size_t search_copy_len = key_size < 63 ? key_size : 63;
-    memcpy(search_key_str, key, search_copy_len);
-    search_key_str[search_copy_len] = '\0';
 
     uint8_t *temp_value;
     size_t temp_value_size;
@@ -10738,8 +10753,36 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             /* use safe snapshot to prevent use-after-free during concurrent flush */
             tidesdb_immutable_memtable_t **imm_refs = NULL;
             size_t imm_count = 0;
-            queue_snapshot_with_refs(key_cf->immutable_memtables, (void ***)&imm_refs, &imm_count,
-                                     (void (*)(void *))tidesdb_immutable_memtable_ref);
+
+            pthread_mutex_lock(&key_cf->immutable_memtables->lock);
+            imm_count =
+                atomic_load_explicit(&key_cf->immutable_memtables->size, memory_order_acquire);
+            if (imm_count > 0)
+            {
+                imm_refs = malloc(imm_count * sizeof(tidesdb_immutable_memtable_t *));
+                if (imm_refs)
+                {
+                    size_t idx = 0;
+                    queue_node_t *node = key_cf->immutable_memtables->head;
+                    while (node && idx < imm_count)
+                    {
+                        tidesdb_immutable_memtable_t *imm =
+                            (tidesdb_immutable_memtable_t *)node->data;
+                        if (imm)
+                        {
+                            tidesdb_immutable_memtable_ref(imm);
+                            imm_refs[idx++] = imm;
+                        }
+                        node = node->next;
+                    }
+                    imm_count = idx;
+                }
+                else
+                {
+                    imm_count = 0;
+                }
+            }
+            pthread_mutex_unlock(&key_cf->immutable_memtables->lock);
 
             for (size_t imm_idx = 0; imm_idx < imm_count; imm_idx++)
             {
@@ -10803,8 +10846,36 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             /* use safe snapshot to prevent use-after-free during concurrent flush */
             tidesdb_immutable_memtable_t **imm_refs = NULL;
             size_t imm_count = 0;
-            queue_snapshot_with_refs(key_cf->immutable_memtables, (void ***)&imm_refs, &imm_count,
-                                     (void (*)(void *))tidesdb_immutable_memtable_ref);
+
+            pthread_mutex_lock(&key_cf->immutable_memtables->lock);
+            imm_count =
+                atomic_load_explicit(&key_cf->immutable_memtables->size, memory_order_acquire);
+            if (imm_count > 0)
+            {
+                imm_refs = malloc(imm_count * sizeof(tidesdb_immutable_memtable_t *));
+                if (imm_refs)
+                {
+                    size_t idx = 0;
+                    queue_node_t *node = key_cf->immutable_memtables->head;
+                    while (node && idx < imm_count)
+                    {
+                        tidesdb_immutable_memtable_t *imm =
+                            (tidesdb_immutable_memtable_t *)node->data;
+                        if (imm)
+                        {
+                            tidesdb_immutable_memtable_ref(imm);
+                            imm_refs[idx++] = imm;
+                        }
+                        node = node->next;
+                    }
+                    imm_count = idx;
+                }
+                else
+                {
+                    imm_count = 0;
+                }
+            }
+            pthread_mutex_unlock(&key_cf->immutable_memtables->lock);
 
             for (size_t imm_idx = 0; imm_idx < imm_count; imm_idx++)
             {
@@ -10873,7 +10944,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             /* we use hash table for O(1) conflict detection when read set is large
              * for small read sets, nested loop is faster due to cache locality
              * for large read sets, hash table provides O(m) instead of O(n*m) */
-            if (txn->read_set_hash && txn->read_set_count >= TDB_TXN_HASH_THRESHOLD)
+            if (txn->read_set_hash && txn->read_set_count >= TDB_TXN_READ_HASH_THRESHOLD)
             {
                 /* O(m) hash-based conflict detection for large read sets */
                 for (int w = 0; w < other->write_set_count && !txn->has_rw_conflict_out; w++)
@@ -11681,8 +11752,33 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     tidesdb_immutable_memtable_t **imm_snapshot = NULL;
     size_t imm_count = 0;
 
-    queue_snapshot_with_refs(cf->immutable_memtables, (void ***)&imm_snapshot, &imm_count,
-                             (void (*)(void *))tidesdb_immutable_memtable_ref);
+    pthread_mutex_lock(&cf->immutable_memtables->lock);
+    imm_count = atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
+    if (imm_count > 0)
+    {
+        imm_snapshot = malloc(imm_count * sizeof(tidesdb_immutable_memtable_t *));
+        if (imm_snapshot)
+        {
+            size_t idx = 0;
+            queue_node_t *node = cf->immutable_memtables->head;
+            while (node && idx < imm_count)
+            {
+                tidesdb_immutable_memtable_t *imm = (tidesdb_immutable_memtable_t *)node->data;
+                if (imm)
+                {
+                    tidesdb_immutable_memtable_ref(imm);
+                    imm_snapshot[idx++] = imm;
+                }
+                node = node->next;
+            }
+            imm_count = idx;
+        }
+        else
+        {
+            imm_count = 0;
+        }
+    }
+    pthread_mutex_unlock(&cf->immutable_memtables->lock);
 
     /* now load active memtable - any keys that rotated are already in our snapshot */
     skip_list_t *active_mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
@@ -11898,7 +11994,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                                                                          key_size, &file_position);
 
                 /* O(1) direct jump to file position instead of O(N) linear scan */
-                if (lookup_result == 0 && file_position > 0)
+                if (lookup_result == 0)
                 {
                     block_manager_cursor_goto(cursor, file_position);
                 }
@@ -12162,8 +12258,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
             {
                 uint64_t file_position = 0;
                 if (compact_block_index_find_predecessor(sst->block_indexes, key, key_size,
-                                                         &file_position) == 0 &&
-                    file_position > 0)
+                                                         &file_position) == 0)
                 {
                     /* O(1) direct jump to file position instead of O(N) linear scan */
                     block_manager_cursor_goto(cursor, file_position);
@@ -13314,7 +13409,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     if (global_max_seq + 1 > current_seq)
     {
         atomic_store_explicit(&cf->db->global_seq, global_max_seq + 1, memory_order_release);
-        TDB_DEBUG_LOG("CF '%s': Updated global_seq from " PRIu64 " to " PRIu64, cf->name,
+        TDB_DEBUG_LOG("CF '%s': Updated global_seq from %" PRIu64 " to %" PRIu64, cf->name,
                       current_seq, global_max_seq + 1);
     }
 

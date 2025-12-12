@@ -676,8 +676,8 @@ static int tidesdb_check_disk_space(tidesdb_t *db, const char *path, uint64_t mi
 
 /**
  * tidesdb_validate_kv_size
- * Validates that a key-value pair size does not exceed memory limits
- * Maximum allowed size is max(available_memory * TDB_MEMORY_PERCENTAGE, TDB_MIN_KEY_VALUE_SIZE)
+ * validates that a key-value pair size does not exceed memory limits
+ * maximum allowed size is max(available_memory * TDB_MEMORY_PERCENTAGE, TDB_MIN_KEY_VALUE_SIZE)
  * @param db database handle
  * @param key_size size of key in bytes
  * @param value_size size of value in bytes
@@ -1235,7 +1235,7 @@ static int tidesdb_klog_block_add_entry(tidesdb_klog_block_t *block, const tides
 {
     int inline_value = (kv->entry.value_size < config->value_threshold);
 
-    /* calculate ACTUAL entry size to match serialization:
+    /** calculate actual entry size to match serialization:
      * we must use actual varint sizes, not max sizes, so block_size is accurate
      */
     size_t entry_size = 1; /* flags */
@@ -1340,12 +1340,12 @@ static int tidesdb_klog_block_add_entry(tidesdb_klog_block_t *block, const tides
  * @param max_size maximum size of block
  * @return 1 if block is full, 0 otherwise
  *
- * Note: We use 2x max_size threshold because blocks are compressed before writing.
+ * we use 2x max_size threshold because blocks are compressed before writing.
  * ZSTD typically achieves 2-4x compression on structured data, so filling to 2x
  * the target size ensures blocks are well-utilized after compression.
  *
- * Example: 64KB target → fill to 128KB uncompressed → compresses to ~40-60KB
- * This maximizes block density while staying under the target after compression.
+ * 64KB target -> fill to 128KB uncompressed -> compresses to ~40-60KB
+ * this maximizes block density while staying under the target after compression.
  */
 static int tidesdb_klog_block_is_full(tidesdb_klog_block_t *block, size_t max_size)
 {
@@ -1453,7 +1453,6 @@ static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **o
 
     *out_size = ptr - start;
 
-    /* safety check: ensure we didn't write past allocated buffer */
     if (*out_size > estimated_size)
     {
         TDB_DEBUG_LOG(
@@ -1743,7 +1742,7 @@ static int tidesdb_vlog_block_add_value(tidesdb_vlog_block_t *block, const uint8
  * @param max_size maximum size of block
  * @return 1 if block is full, 0 otherwise
  *
- * Note: Use 2x threshold to account for compression (same as klog blocks)
+ * we use 2x threshold to account for compression (same as klog blocks)
  */
 static int tidesdb_vlog_block_is_full(tidesdb_vlog_block_t *block, size_t max_size)
 {
@@ -2150,7 +2149,7 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
     if (!cached)
     {
         /* cache miss -- must add to cache to respect FD limits.
-         * If cache is full and cannot evict (all entries protected by hazard pointers),
+         * if cache is full and cannot evict (all entries protected by hazard pointers),
          * we wait and retry to enforce TDB_DEFAULT_MAX_OPEN_SSTABLES limit. */
 
         int retry_count = 0;
@@ -2390,16 +2389,19 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
  * tidesdb_write_set_hash_t
  * simple hash table for O(1) write set lookups in large transactions
  * uses open addressing with linear probing for cache locality
+ * @param slots maps hash -> ops index, -1 if empty
+ * @param capacity always TDB_WRITE_SET_HASH_CAPACITY
  */
 typedef struct
 {
-    int *slots;   /* maps hash -> ops index, -1 if empty */
-    int capacity; /* always TDB_WRITE_SET_HASH_CAPACITY */
+    int *slots;
+    int capacity;
 } tidesdb_write_set_hash_t;
 
 /**
  * tidesdb_write_set_hash_create
  * create hash table for write set
+ * @return hash table on success, NULL on failure
  */
 static tidesdb_write_set_hash_t *tidesdb_write_set_hash_create(void)
 {
@@ -2436,6 +2438,10 @@ static void tidesdb_write_set_hash_free(tidesdb_write_set_hash_t *hash)
 /**
  * tidesdb_write_set_hash_key
  * compute hash for key+cf combination using xxhash
+ * @param cf column family
+ * @param key key
+ * @param key_size key size
+ * @return hash value
  */
 static uint32_t tidesdb_write_set_hash_key(tidesdb_column_family_t *cf, const uint8_t *key,
                                            size_t key_size)
@@ -2449,6 +2455,9 @@ static uint32_t tidesdb_write_set_hash_key(tidesdb_column_family_t *cf, const ui
  * tidesdb_write_set_hash_insert
  * insert operation index into hash table
  * overwrites existing entry for same key (keeps newest)
+ * @param hash hash table
+ * @param txn transaction
+ * @param op_index operation index
  */
 static void tidesdb_write_set_hash_insert(tidesdb_write_set_hash_t *hash, tidesdb_txn_t *txn,
                                           int op_index)
@@ -2490,7 +2499,12 @@ static void tidesdb_write_set_hash_insert(tidesdb_write_set_hash_t *hash, tidesd
 /**
  * tidesdb_write_set_hash_lookup
  * find operation index for given key+cf
- * returns -1 if not found
+ * @param hash hash table
+ * @param txn transaction
+ * @param cf column family
+ * @param key key
+ * @param key_size key size
+ * @return operation index if found, -1 if not found
  */
 static int tidesdb_write_set_hash_lookup(tidesdb_write_set_hash_t *hash, tidesdb_txn_t *txn,
                                          tidesdb_column_family_t *cf, const uint8_t *key,
@@ -2531,11 +2545,13 @@ static int tidesdb_write_set_hash_lookup(tidesdb_write_set_hash_t *hash, tidesdb
  * tidesdb_read_set_hash_t
  * hash table for O(1) read set lookups in SSI conflict detection
  * uses xxhash for better distribution and larger capacity for fewer collisions
+ * @param slots maps hash -> read_set index, -1 if empty
+ * @param capacity always TDB_READ_SET_HASH_CAPACITY
  */
 typedef struct
 {
-    int *slots;   /* maps hash -> read_set index, -1 if empty */
-    int capacity; /* always TDB_READ_SET_HASH_CAPACITY */
+    int *slots;
+    int capacity;
 } tidesdb_read_set_hash_t;
 
 /**
@@ -2566,6 +2582,7 @@ static tidesdb_read_set_hash_t *tidesdb_read_set_hash_create(void)
 /**
  * tidesdb_read_set_hash_free
  * free hash table
+ * @param hash hash table to free
  */
 static void tidesdb_read_set_hash_free(tidesdb_read_set_hash_t *hash)
 {
@@ -2577,6 +2594,10 @@ static void tidesdb_read_set_hash_free(tidesdb_read_set_hash_t *hash)
 /**
  * tidesdb_read_set_hash_key
  * compute hash for key+cf combination using xxhash
+ * @param cf column family
+ * @param key key
+ * @param key_size key size
+ * @return hash value
  */
 static uint32_t tidesdb_read_set_hash_key(tidesdb_column_family_t *cf, const uint8_t *key,
                                           size_t key_size)
@@ -2589,6 +2610,9 @@ static uint32_t tidesdb_read_set_hash_key(tidesdb_column_family_t *cf, const uin
 /**
  * tidesdb_read_set_hash_insert
  * insert read set index into hash table
+ * @param hash hash table
+ * @param txn transaction
+ * @param read_index read set index
  */
 static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, tidesdb_txn_t *txn,
                                          int read_index)
@@ -2631,7 +2655,12 @@ static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, tidesdb_
 /**
  * tidesdb_read_set_hash_check_conflict
  * check if a write key conflicts with any read in the hash table
- * returns 1 if conflict found, 0 otherwise
+ * @param hash hash table
+ * @param txn transaction
+ * @param cf column family
+ * @param key key
+ * @param key_size key size
+ * @return 1 if conflict found, 0 otherwise
  */
 static int tidesdb_read_set_hash_check_conflict(tidesdb_read_set_hash_t *hash, tidesdb_txn_t *txn,
                                                 tidesdb_column_family_t *cf, const uint8_t *key,
@@ -2921,7 +2950,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
             /* check if this is the first entry in a new block */
             int is_first_entry_in_block = (current_klog_block->num_entries == 0);
 
-            /* add entry to block FIRST */
+            /* add entry to block first */
             tidesdb_klog_block_add_entry(current_klog_block, kv, sst->db, sst->config);
 
             /* track first key of block */
@@ -4963,9 +4992,9 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
 static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capacity, size_t ratio)
 {
     /*** initial capacity formula: C_i = base * T^(i-1) for level i
-     * L1: base * T^0 = base
-     * L2: base * T^1 = base * T
-     * L3: base * T^2 = base * T^2
+     * l1: base * T^0 = base
+     * l2: base * T^1 = base * T
+     * l3: base * T^2 = base * T^2
      * will be adjusted by DCA once data is written
      * uses overflow checking to prevent wraparound */
     size_t capacity = base_capacity;
@@ -10077,7 +10106,6 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
 
 /**
  * tidesdb_txn_add_cf_internal
- *
  * internal helper to add a CF to transaction and take snapshot
  * @param txn
  * @param cf
@@ -10262,10 +10290,14 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     }
     else if (txn->isolation_level == TDB_ISOLATION_READ_COMMITTED)
     {
-        /* refresh snapshot to see latest committed data */
+        /* refresh snapshot to see latest committed data
+         * READ_COMMITTED doesn't need visibility callback because:
+         * 1. it refreshes snapshot on each read to see all data up to current global_seq
+         * 2. commit status buffer is circular and can have stale entries after recovery
+         * 3. any data in memtable with seq <= snapshot_seq is considered visible */
         uint64_t current_seq = atomic_load_explicit(&txn->db->global_seq, memory_order_acquire);
         snapshot_seq = (current_seq > 0) ? current_seq - 1 : 0;
-        visibility_check = tidesdb_visibility_check_callback;
+        visibility_check = NULL; /* no visibility check needed for READ_COMMITTED */
     }
     else
     {
@@ -13544,7 +13576,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
             {
                 /* try to load persisted config from disk */
                 tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
-                char config_path[MAX_FILE_PATH_LENGTH];
+                char config_path[TDB_MAX_PATH_LEN];
                 snprintf(
                     config_path, sizeof(config_path),
                     "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
@@ -13922,7 +13954,7 @@ static tidesdb_block_index_t *compact_block_index_create(uint32_t initial_capaci
 
 /**
  * encode_varint
- * Encode varint for block index (value, buffer) signature
+ * encode varint for block index (value, buffer) signature
  * @param value the value to encode
  * @param buffer the buffer to write to
  * @return number of bytes written
@@ -13941,7 +13973,7 @@ static inline size_t encode_varint(uint64_t value, uint8_t *buffer)
 
 /**
  * decode_varint
- * Decode varint for block index (buffer, bytes_read) signature
+ * decode varint for block index (buffer, bytes_read) signature
  * @param buffer the buffer to read from
  * @param bytes_read output parameter for bytes consumed
  * @return the decoded value
@@ -14167,12 +14199,12 @@ static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *
  * compact_block_index_find_predecessor
  * finds the block that should contain the given key using binary search
  *
- * Algorithm:
- * 1. Early exit if key < first block's min_key (return first block)
- * 2. Binary search for rightmost block where min_key <= search_key <= max_key
- * 3. If no exact range match, fallback to last block where min_key <= search_key
+ * algorithm:
+ * 1. early exit if key < first block's min_key (return first block)
+ * 2. binary search for rightmost block where min_key <= search_key <= max_key
+ * 3. if no exact range match, fallback to last block where min_key <= search_key
  *
- * This ensures we always start searching from the correct block, avoiding
+ * this ensures we always start searching from the correct block, avoiding
  * false negatives when keys fall between indexed blocks or at block boundaries.
  *
  * @param index the block index to search

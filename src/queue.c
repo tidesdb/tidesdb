@@ -21,6 +21,43 @@
 #include <sched.h>
 
 /**
+ * aligned_malloc
+ * allocate memory with specified alignment.
+ * @param size size of memory to allocate
+ * @param alignment alignment requirement (must be power of 2)
+ * @return pointer to aligned memory, NULL on failure
+ */
+static inline void *aligned_malloc(size_t size, size_t alignment)
+{
+#if defined(_WIN32)
+    return _aligned_malloc(size, alignment);
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+    /* C11 aligned_alloc requires size to be multiple of alignment */
+    size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
+    return aligned_alloc(alignment, aligned_size);
+#else
+    /* POSIX posix_memalign */
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
+    return ptr;
+#endif
+}
+
+/**
+ * aligned_free
+ * free memory allocated with aligned_malloc.
+ * @param ptr pointer to free
+ */
+static inline void aligned_free(void *ptr)
+{
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+/**
  * make_tagged_ptr
  * create a tagged pointer combining a raw pointer and version tag.
  * @param ptr the raw pointer
@@ -109,14 +146,14 @@ static inline void backoff(int iteration)
 
 queue_t *queue_new(void)
 {
-    queue_t *queue = (queue_t *)malloc(sizeof(queue_t));
+    queue_t *queue = (queue_t *)aligned_malloc(sizeof(queue_t), 8);
     if (queue == NULL) return NULL;
 
     /* create sentinel (dummy) node */
-    queue_node_t *sentinel = (queue_node_t *)malloc(sizeof(queue_node_t));
+    queue_node_t *sentinel = (queue_node_t *)aligned_malloc(sizeof(queue_node_t), 8);
     if (sentinel == NULL)
     {
-        free(queue);
+        aligned_free(queue);
         return NULL;
     }
 
@@ -132,16 +169,16 @@ queue_t *queue_new(void)
 
     if (pthread_mutex_init(&queue->wait_lock, NULL) != 0)
     {
-        free(sentinel);
-        free(queue);
+        aligned_free(sentinel);
+        aligned_free(queue);
         return NULL;
     }
 
     if (pthread_cond_init(&queue->not_empty, NULL) != 0)
     {
         pthread_mutex_destroy(&queue->wait_lock);
-        free(sentinel);
-        free(queue);
+        aligned_free(sentinel);
+        aligned_free(queue);
         return NULL;
     }
 
@@ -152,7 +189,7 @@ int queue_enqueue(queue_t *queue, void *data)
 {
     if (queue == NULL) return -1;
 
-    queue_node_t *node = (queue_node_t *)malloc(sizeof(queue_node_t));
+    queue_node_t *node = (queue_node_t *)aligned_malloc(sizeof(queue_node_t), 8);
     if (node == NULL) return -1;
 
     node->data = data;
@@ -263,7 +300,7 @@ void *queue_dequeue(queue_t *queue)
             if (atomic_cas_tagged_ptr(&queue->head, &head, new_head))
             {
                 /* dequeue successful, free the old sentinel */
-                free(head_ptr);
+                aligned_free(head_ptr);
                 atomic_fetch_sub(&queue->size, 1);
                 return data;
             }
@@ -494,14 +531,14 @@ void queue_free(queue_t *queue)
     {
         tagged_ptr_t next_tagged = atomic_load(&current->next);
         queue_node_t *next = get_ptr(next_tagged);
-        free(current);
+        aligned_free(current);
         current = next;
     }
 
     pthread_mutex_destroy(&queue->wait_lock);
     pthread_cond_destroy(&queue->not_empty);
 
-    free(queue);
+    aligned_free(queue);
 }
 
 void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
@@ -535,7 +572,7 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
             free_fn(current->data);
         }
 
-        free(current);
+        aligned_free(current);
         current = next;
         is_sentinel = 0;
     }
@@ -543,5 +580,5 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     pthread_mutex_destroy(&queue->wait_lock);
     pthread_cond_destroy(&queue->not_empty);
 
-    free(queue);
+    aligned_free(queue);
 }

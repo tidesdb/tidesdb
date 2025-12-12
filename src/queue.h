@@ -43,8 +43,9 @@
  * tagged_ptr_t
  * tagged pointer to solve the ABA problem in lock-free algorithms.
  * combines a pointer with a version counter.
+ * aligned to 8 bytes for atomic operations (required on x86).
  */
-typedef struct
+typedef struct ATOMIC_ALIGN(8)
 {
     uintptr_t value;
 } tagged_ptr_t;
@@ -54,8 +55,9 @@ typedef struct
  * internal node structure for the lock-free queue.
  * @param data pointer to user data
  * @param next tagged pointer to next node (includes ABA counter)
+ * aligned to 8 bytes for atomic operations on x86.
  */
-typedef struct queue_node_t
+typedef struct ATOMIC_ALIGN(8) queue_node_t
 {
     void *data;
     _Atomic(tagged_ptr_t) next;
@@ -71,8 +73,9 @@ typedef struct queue_node_t
  * @param waiter_count number of threads currently waiting
  * @param wait_lock mutex for blocking wait operations
  * @param not_empty condition variable for blocking waits
+ * aligned to 8 bytes for atomic operations on x86.
  */
-typedef struct
+typedef struct ATOMIC_ALIGN(8)
 {
     _Atomic(tagged_ptr_t) head;
     _Atomic(tagged_ptr_t) tail;

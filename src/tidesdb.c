@@ -3443,8 +3443,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             if (need_free_decompressed) free(decompressed);
             block_manager_block_release(block);
 
-            block_num++; /* increment block counter to prevent infinite loop */
-
+            block_num++;
             if (block_manager_cursor_next(klog_cursor) != 0) break;
             continue;
         }
@@ -5878,6 +5877,9 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     {
         TDB_DEBUG_LOG("Full preemptive merge: Skipping empty SSTable %" PRIu64 " (0 entries)",
                       sst_id);
+        /* free bloom filter and block indexes that were allocated but never used */
+        if (bloom) bloom_filter_free(bloom);
+        if (block_indexes) compact_block_index_free(block_indexes);
         /* delete the empty sstable files */
         remove(new_sst->klog_path);
         remove(new_sst->vlog_path);
@@ -5988,9 +5990,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         tidesdb_sstable_t *sst = next_level_ssts[i];
         if (sst)
         {
-            TDB_DEBUG_LOG("Dividing merge: next_level SSTable %" PRIu64 " min=%s max=%s", sst->id,
-                          sst->min_key ? (char *)sst->min_key : "NULL",
-                          sst->max_key ? (char *)sst->max_key : "NULL");
+            TDB_DEBUG_LOG("Dividing merge: next_level SSTable %" PRIu64
+                          " (min_key_size=%zu, max_key_size=%zu)",
+                          sst->id, sst->min_key_size, sst->max_key_size);
         }
     }
 
@@ -6015,9 +6017,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             if (!sst) continue;
 
             TDB_DEBUG_LOG("Dividing merge: collecting SSTable %" PRIu64
-                          " from L%d (min=%s, max=%s)",
-                          sst->id, level, sst->min_key ? (char *)sst->min_key : "NULL",
-                          sst->max_key ? (char *)sst->max_key : "NULL");
+                          " from L%d (min_key_size=%zu, max_key_size=%zu)",
+                          sst->id, level, sst->min_key_size, sst->max_key_size);
             tidesdb_sstable_ref(sst);
             queue_enqueue(sstables_to_delete, sst);
         }
@@ -6086,9 +6087,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         uint8_t *range_end = (partition < num_boundaries) ? file_boundaries[partition] : NULL;
         size_t range_end_size = (partition < num_boundaries) ? boundary_sizes[partition] : 0;
 
-        TDB_DEBUG_LOG("Dividing merge partition %d: range [%s, %s)", partition,
-                      range_start ? (char *)range_start : "NULL",
-                      range_end ? (char *)range_end : "NULL");
+        TDB_DEBUG_LOG("Dividing merge partition %d: range [start_size=%zu, end_size=%zu)",
+                      partition, range_start_size, range_end_size);
 
         /* add only overlapping sstables to this partition's heap */
         uint64_t partition_estimated_entries = 0;
@@ -6117,9 +6117,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             if (overlaps)
             {
                 TDB_DEBUG_LOG("Dividing merge partition %d: SSTable %" PRIu64
-                              " overlaps (min=%s, max=%s)",
-                              partition, sst->id, sst->min_key ? (char *)sst->min_key : "NULL",
-                              sst->max_key ? (char *)sst->max_key : "NULL");
+                              " overlaps (min_key_size=%zu, max_key_size=%zu)",
+                              partition, sst->id, sst->min_key_size, sst->max_key_size);
                 tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(cf->db, sst);
                 if (source)
                 {
@@ -7384,6 +7383,9 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 TDB_DEBUG_LOG(
                     "Partitioned merge partition %d: No entries, skipping SSTable creation",
                     partition);
+                /* free bloom filter and block indexes that were allocated but never used */
+                if (bloom) bloom_filter_free(bloom);
+                if (block_indexes) compact_block_index_free(block_indexes);
                 /* delete the empty sstable files */
                 remove(new_sst->klog_path);
                 remove(new_sst->vlog_path);

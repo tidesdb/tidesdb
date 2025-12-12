@@ -231,7 +231,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_NUM_THREADS 8)
     endif()
     if(NOT DEFINED BENCH_KEY_PATTERN)
-        set(BENCH_KEY_PATTERN "sequential")
+        set(BENCH_KEY_PATTERN "random")
     endif()
 
     # tidesdb config variables for benchmark
@@ -250,7 +250,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # column family configuration variables for benchmark
     if(NOT DEFINED BENCH_WRITE_BUFFER_SIZE)
-        math(EXPR BENCH_WRITE_BUFFER_SIZE 67108864) 
+        math(EXPR BENCH_WRITE_BUFFER_SIZE 67108864)
     endif()
     if(NOT DEFINED BENCH_LEVEL_RATIO)
         set(BENCH_LEVEL_RATIO 10)

@@ -3221,9 +3221,25 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
         sst->bloom_filter = bloom;
     }
 
-    /* get file sizes before writing metadata */
-    block_manager_get_size(bms.klog_bm, &sst->klog_size);
-    block_manager_get_size(bms.vlog_bm, &sst->vlog_size);
+    /* we need to write metadata in two passes to avoid size mismatch
+     * pass 1 -- get current file sizes and serialize metadata with those sizes
+     * pass 2 -- write the metadata block (which increases file size)
+     * pass 3 -- update sst struct with final sizes for in-memory consistency
+     *
+     * the metadata will contain pre-metadata sizes, but that's ok because
+     * -- klog_data_end_offset marks where data blocks end
+     * -- recovery uses actual file sizes, not metadata sizes
+     * -- the sizes in metadata are primarily for validation/debugging
+     */
+
+    uint64_t klog_size_before_metadata;
+    uint64_t vlog_size_before_metadata;
+    block_manager_get_size(bms.klog_bm, &klog_size_before_metadata);
+    block_manager_get_size(bms.vlog_bm, &vlog_size_before_metadata);
+
+    /* temporarily set sizes for metadata serialization */
+    sst->klog_size = klog_size_before_metadata;
+    sst->vlog_size = vlog_size_before_metadata;
 
     /* write metadata block as the last block */
     uint8_t *metadata_data = NULL;
@@ -3239,6 +3255,11 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
         }
         free(metadata_data);
     }
+
+    /* get final file sizes AFTER writing metadata block
+     * this ensures in-memory sst struct has correct sizes */
+    block_manager_get_size(bms.klog_bm, &sst->klog_size);
+    block_manager_get_size(bms.vlog_bm, &sst->vlog_size);
 
     /* ensure all SSTable data is durably written before it becomes visible to readers
      * this prevents reads from seeing partially-written SSTables which can cause
@@ -3422,7 +3443,8 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             if (need_free_decompressed) free(decompressed);
             block_manager_block_release(block);
 
-            block_num++;
+            block_num++; /* increment block counter to prevent infinite loop */
+
             if (block_manager_cursor_next(klog_cursor) != 0) break;
             continue;
         }
@@ -5768,6 +5790,16 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         new_sst->bloom_filter = bloom;
     }
 
+    /* get file sizes before metadata write for serialization */
+    uint64_t klog_size_before_metadata;
+    uint64_t vlog_size_before_metadata;
+    block_manager_get_size(klog_bm, &klog_size_before_metadata);
+    block_manager_get_size(vlog_bm, &vlog_size_before_metadata);
+
+    /* temporarily set sizes for metadata serialization */
+    new_sst->klog_size = klog_size_before_metadata;
+    new_sst->vlog_size = vlog_size_before_metadata;
+
     /* write metadata block as the last block -- only if we have entries */
     uint8_t *metadata_data = NULL;
     size_t metadata_size = 0;
@@ -5784,6 +5816,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         free(metadata_data);
     }
 
+    /* get final file sizes after metadata write */
     block_manager_get_size(klog_bm, &new_sst->klog_size);
     block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
@@ -6535,6 +6568,16 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             }
         }
 
+        /* get file sizes before metadata write for serialization */
+        uint64_t klog_size_before_metadata;
+        uint64_t vlog_size_before_metadata;
+        block_manager_get_size(klog_bm, &klog_size_before_metadata);
+        block_manager_get_size(vlog_bm, &vlog_size_before_metadata);
+
+        /* temporarily set sizes for metadata serialization */
+        new_sst->klog_size = klog_size_before_metadata;
+        new_sst->vlog_size = vlog_size_before_metadata;
+
         /* write metadata block as the last block -- only if we have entries */
         uint8_t *metadata_data = NULL;
         size_t metadata_size = 0;
@@ -6551,6 +6594,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             free(metadata_data);
         }
 
+        /* get final file sizes after metadata write */
         block_manager_get_size(klog_bm, &new_sst->klog_size);
         block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
@@ -7258,6 +7302,16 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
             new_sst->bloom_filter = bloom;
 
+            /* get file sizes before metadata write for serialization */
+            uint64_t klog_size_before_metadata;
+            uint64_t vlog_size_before_metadata;
+            block_manager_get_size(klog_bm, &klog_size_before_metadata);
+            block_manager_get_size(vlog_bm, &vlog_size_before_metadata);
+
+            /* temporarily set sizes for metadata serialization */
+            new_sst->klog_size = klog_size_before_metadata;
+            new_sst->vlog_size = vlog_size_before_metadata;
+
             /* write metadata block as the last block -- only if we have entries */
             uint8_t *metadata_data = NULL;
             size_t metadata_size = 0;
@@ -7274,6 +7328,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 free(metadata_data);
             }
 
+            /* get final file sizes after metadata write */
             block_manager_get_size(klog_bm, &new_sst->klog_size);
             block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
@@ -7992,16 +8047,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
         tidesdb_immutable_memtable_t *imm = work->imm;
         skip_list_t *memtable = imm->memtable;
         block_manager_t *wal = imm->wal;
-
-        /* check again after dequeuing to handle race with close
-         * prevents use-after-free if CF is being freed during shutdown */
-        if (!atomic_load(&db->is_open))
-        {
-            TDB_DEBUG_LOG("Flush worker: database closing after dequeue, releasing work");
-            tidesdb_immutable_memtable_unref(imm);
-            free(work);
-            break;
-        }
 
         int space_check = tidesdb_check_disk_space(db, cf->directory, cf->config.min_disk_space);
         if (space_check <= 0)

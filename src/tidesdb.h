@@ -234,6 +234,16 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE        (4 * 1024 * 1024)
 #define TDB_WAL_GROUP_COMMIT_TIMEOUT_US         10
 
+/* transaction optimization configuration */
+#define TDB_TXN_HASH_THRESHOLD          256  /* create hash table at this many ops/reads */
+#define TDB_TXN_SMALL_SCAN_LIMIT        64   /* scan last N ops for small txns */
+#define TDB_TXN_READ_SET_BATCH_GROW     256  /* grow read set by this amount */
+#define TDB_ACTIVE_TXN_INITIAL_CAPACITY 1024 /* initial capacity for active txn list */
+#define TDB_WRITE_SET_HASH_CAPACITY     512  /* hash table capacity for write set */
+#define TDB_READ_SET_HASH_CAPACITY      512  /* hash table capacity for read set */
+#define TDB_WRITE_SET_HASH_EMPTY        -1   /* empty slot marker */
+#define TDB_READ_SET_HASH_EMPTY         -1   /* empty slot marker */
+
 /* flush and close retry configuration */
 #define TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS         100
 #define TDB_FLUSH_ENQUEUE_BACKOFF_US           10000

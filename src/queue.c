@@ -121,7 +121,13 @@ static inline uintptr_t get_tag(tagged_ptr_t tp)
  */
 static inline int tagged_ptr_equals(tagged_ptr_t a, tagged_ptr_t b)
 {
+#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
+    /* 64-bit: compare single value field */
     return a.value == b.value;
+#else
+    /* 32-bit: compare both ptr and counter fields */
+    return a.ptr == b.ptr && a.counter == b.counter;
+#endif
 }
 
 /**

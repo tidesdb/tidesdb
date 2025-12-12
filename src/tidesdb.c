@@ -2391,13 +2391,10 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
  * simple hash table for O(1) write set lookups in large transactions
  * uses open addressing with linear probing for cache locality
  */
-#define WRITE_SET_HASH_CAPACITY 512
-#define WRITE_SET_HASH_EMPTY    -1
-
 typedef struct
 {
     int *slots;   /* maps hash -> ops index, -1 if empty */
-    int capacity; /* always WRITE_SET_HASH_CAPACITY */
+    int capacity; /* always TDB_WRITE_SET_HASH_CAPACITY */
 } tidesdb_write_set_hash_t;
 
 /**
@@ -2409,7 +2406,7 @@ static tidesdb_write_set_hash_t *tidesdb_write_set_hash_create(void)
     tidesdb_write_set_hash_t *hash = malloc(sizeof(tidesdb_write_set_hash_t));
     if (!hash) return NULL;
 
-    hash->capacity = WRITE_SET_HASH_CAPACITY;
+    hash->capacity = TDB_WRITE_SET_HASH_CAPACITY;
     hash->slots = malloc(hash->capacity * sizeof(int));
     if (!hash->slots)
     {
@@ -2419,7 +2416,7 @@ static tidesdb_write_set_hash_t *tidesdb_write_set_hash_create(void)
 
     for (int i = 0; i < hash->capacity; i++)
     {
-        hash->slots[i] = WRITE_SET_HASH_EMPTY;
+        hash->slots[i] = TDB_WRITE_SET_HASH_EMPTY;
     }
 
     return hash;
@@ -2470,7 +2467,7 @@ static void tidesdb_write_set_hash_insert(tidesdb_write_set_hash_t *hash, tidesd
     {
         int existing_idx = hash->slots[slot];
 
-        if (existing_idx == WRITE_SET_HASH_EMPTY)
+        if (existing_idx == TDB_WRITE_SET_HASH_EMPTY)
         {
             /* empty slot, insert here */
             hash->slots[slot] = op_index;
@@ -2490,8 +2487,6 @@ static void tidesdb_write_set_hash_insert(tidesdb_write_set_hash_t *hash, tidesd
         /* collision, try next slot */
         slot = (slot + 1) % hash->capacity;
     }
-
-    /* hash table full (shouldn't happen with 512 slots for 256+ ops) */
 }
 
 /**
@@ -2513,7 +2508,7 @@ static int tidesdb_write_set_hash_lookup(tidesdb_write_set_hash_t *hash, tidesdb
     {
         int op_index = hash->slots[slot];
 
-        if (op_index == WRITE_SET_HASH_EMPTY)
+        if (op_index == TDB_WRITE_SET_HASH_EMPTY)
         {
             /* empty slot means key not in hash */
             return -1;
@@ -2556,7 +2551,7 @@ static tidesdb_read_set_hash_t *tidesdb_read_set_hash_create(void)
     tidesdb_read_set_hash_t *hash = malloc(sizeof(tidesdb_read_set_hash_t));
     if (!hash) return NULL;
 
-    hash->capacity = READ_SET_HASH_CAPACITY;
+    hash->capacity = TDB_READ_SET_HASH_CAPACITY;
     hash->slots = malloc(hash->capacity * sizeof(int));
     if (!hash->slots)
     {
@@ -2566,7 +2561,7 @@ static tidesdb_read_set_hash_t *tidesdb_read_set_hash_create(void)
 
     for (int i = 0; i < hash->capacity; i++)
     {
-        hash->slots[i] = READ_SET_HASH_EMPTY;
+        hash->slots[i] = TDB_READ_SET_HASH_EMPTY;
     }
 
     return hash;
@@ -2616,7 +2611,7 @@ static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, tidesdb_
     {
         int existing_idx = hash->slots[slot];
 
-        if (existing_idx == READ_SET_HASH_EMPTY)
+        if (existing_idx == TDB_READ_SET_HASH_EMPTY)
         {
             /* empty slot, insert here */
             hash->slots[slot] = read_index;
@@ -2637,8 +2632,6 @@ static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, tidesdb_
         /* collision, try next slot */
         slot = (slot + 1) % hash->capacity;
     }
-
-    /* hash table full (shouldn't happen with 512 slots for 256+ reads) */
 }
 
 /**
@@ -2660,7 +2653,7 @@ static int tidesdb_read_set_hash_check_conflict(tidesdb_read_set_hash_t *hash, t
     {
         int read_index = hash->slots[slot];
 
-        if (read_index == READ_SET_HASH_EMPTY)
+        if (read_index == TDB_READ_SET_HASH_EMPTY)
         {
             /* empty slot means key not in hash */
             return 0;
@@ -6045,7 +6038,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
     /* estimate entries per partition (divide total by number of partitions) */
     uint64_t partition_estimated_entries = total_estimated_entries / num_partitions;
-    if (partition_estimated_entries < 100) partition_estimated_entries = 100;
+    if (partition_estimated_entries < TDB_MERGE_MIN_ESTIMATED_ENTRIES)
+        partition_estimated_entries = TDB_MERGE_MIN_ESTIMATED_ENTRIES;
 
     for (int partition = 0; partition < num_partitions; partition++)
     {
@@ -6120,7 +6114,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             }
         }
 
-        if (partition_estimated_entries < 100) partition_estimated_entries = 100;
+        if (partition_estimated_entries < TDB_MERGE_MIN_ESTIMATED_ENTRIES)
+            partition_estimated_entries = TDB_MERGE_MIN_ESTIMATED_ENTRIES;
 
         if (tidesdb_merge_heap_empty(partition_heap))
         {
@@ -6822,7 +6817,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             }
         }
 
-        /* use a minimum of 100 entries to avoid degenerate bloom filters */
         if (estimated_entries < TDB_MERGE_MIN_ESTIMATED_ENTRIES)
             estimated_entries = TDB_MERGE_MIN_ESTIMATED_ENTRIES;
 
@@ -8578,8 +8572,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(*db);
         return TDB_ERR_MEMORY;
     }
-    /* FIX #4: Start with larger capacity to avoid realloc under lock */
-    (*db)->active_txns_capacity = 1024;
+    /* start with larger capacity to avoid realloc under lock */
+    (*db)->active_txns_capacity = TDB_ACTIVE_TXN_INITIAL_CAPACITY;
     (*db)->active_txns = calloc((*db)->active_txns_capacity, sizeof(tidesdb_txn_t *));
     if (!(*db)->active_txns)
     {
@@ -9749,9 +9743,9 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
         /* batch allocation: grow by larger chunks for iterators
          * reduces realloc overhead when scanning many keys */
         int new_cap = txn->read_set_capacity * 2;
-        if (new_cap < txn->read_set_capacity + 256)
+        if (new_cap < txn->read_set_capacity + TDB_TXN_READ_SET_BATCH_GROW)
         {
-            new_cap = txn->read_set_capacity + 256;
+            new_cap = txn->read_set_capacity + TDB_TXN_READ_SET_BATCH_GROW;
         }
 
         uint8_t **new_keys = realloc(txn->read_keys, new_cap * sizeof(uint8_t *));
@@ -9800,7 +9794,7 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
 
     txn->read_set_count++;
 
-    /* FIX #2: create hash table when we cross 256 reads threshold for O(1) SSI lookups */
+    /* create hash table when we cross 256 reads threshold for O(1) SSI lookups */
     if (txn->read_set_count == 256 && !txn->read_set_hash)
     {
         txn->read_set_hash = tidesdb_read_set_hash_create();
@@ -9986,9 +9980,6 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
     /* register SERIALIZABLE transactions in active list for SSI tracking */
     if (isolation == TDB_ISOLATION_SERIALIZABLE)
     {
-        /* FIX #3 & #4: Use write lock only for fast array append, no realloc under lock
-         * With initial capacity of 1024, this should rarely be exceeded in practice.
-         * If exceeded, SSI will be less effective but still safe (no correctness issue). */
         pthread_rwlock_wrlock(&db->active_txns_lock);
 
         if (db->num_active_txns < db->active_txns_capacity)
@@ -10119,8 +10110,8 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     txn->num_ops++;
 
-    /* create hash table when we cross 256 ops threshold for O(1) lookups */
-    if (txn->num_ops == 256 && !txn->write_set_hash)
+    /* create hash table when we cross threshold for O(1) lookups */
+    if (txn->num_ops == TDB_TXN_HASH_THRESHOLD && !txn->write_set_hash)
     {
         txn->write_set_hash = tidesdb_write_set_hash_create();
         if (txn->write_set_hash)
@@ -10211,9 +10202,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     /* check write set first (read your own writes)
      * use optimized search strategy based on transaction size:
-     * -- small txns (<64 ops) -- linear scan from end (cache-friendly, low overhead)
-     * -- medium txns (64-256 ops) -- linear scan with early termination per CF
-     * -- large txns (>=256 ops) -- O(1) hash table lookup
+     * -- small txns -- linear scan from end (cache-friendly, low overhead)
+     * -- medium txns -- linear scan with early termination per CF
+     * -- large txns -- O(1) hash table lookup
      *
      * search in reverse order (newest first) to find most recent write */
 
@@ -10240,10 +10231,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     }
     else
     {
-        /** for small transactions, scan last 64 ops only
+        /** for small transactions, scan last N ops only
          * this handles 99% of cases with minimal overhead */
         int scan_start = txn->num_ops - 1;
-        int scan_end = (txn->num_ops > 64) ? (txn->num_ops - 64) : 0;
+        int scan_end = (txn->num_ops > TDB_TXN_SMALL_SCAN_LIMIT)
+                           ? (txn->num_ops - TDB_TXN_SMALL_SCAN_LIMIT)
+                           : 0;
 
         for (int i = scan_start; i >= scan_end; i--)
         {
@@ -10829,8 +10822,8 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
     if (txn->isolation_level == TDB_ISOLATION_SERIALIZABLE)
     {
-        /* FIX #1: Single lock acquisition - take snapshot of active transactions
-         * then process lock-free. This reduces lock acquisitions from O(N*M) to O(1)
+        /* single lock acquisition -- take snapshot of active transactions
+         * then process lock-free. this reduces lock acquisitions from O(N*M) to O(1)
          * where N = active txns, M = write keys. */
         pthread_rwlock_rdlock(&txn->db->active_txns_lock);
         int snapshot_count = txn->db->num_active_txns;
@@ -10858,23 +10851,43 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             tidesdb_txn_t *other = snapshot[i];
             if (other == txn || other->is_committed || other->is_aborted) continue;
 
-            /* FIX #5: Optimize comparison order - check size first (cheapest),
-             * then CF pointer, then memcmp (most expensive) */
-            for (int r = 0; r < txn->read_set_count && !txn->has_rw_conflict_out; r++)
+            /* we use hash table for O(1) conflict detection when read set is large
+             * for small read sets, nested loop is faster due to cache locality
+             * for large read sets, hash table provides O(m) instead of O(n*m) */
+            if (txn->read_set_hash && txn->read_set_count >= TDB_TXN_HASH_THRESHOLD)
             {
-                for (int w = 0; w < other->write_set_count; w++)
+                /* O(m) hash-based conflict detection for large read sets */
+                for (int w = 0; w < other->write_set_count && !txn->has_rw_conflict_out; w++)
                 {
-                    /* size check first (int comparison - fastest) */
-                    if (txn->read_key_sizes[r] != other->write_key_sizes[w]) continue;
-                    /* CF pointer check (pointer comparison - fast) */
-                    if (txn->read_cfs[r] != other->write_cfs[w]) continue;
-                    /* memcmp last (most expensive) */
-                    if (memcmp(txn->read_keys[r], other->write_keys[w], txn->read_key_sizes[r]) ==
-                        0)
+                    if (tidesdb_read_set_hash_check_conflict(
+                            (tidesdb_read_set_hash_t *)txn->read_set_hash, txn, other->write_cfs[w],
+                            other->write_keys[w], other->write_key_sizes[w]))
                     {
                         txn->has_rw_conflict_out = 1;
                         other->has_rw_conflict_in = 1;
                         break;
+                    }
+                }
+            }
+            else
+            {
+                /* O(n*m) nested loop for small read sets - better cache locality */
+                for (int r = 0; r < txn->read_set_count && !txn->has_rw_conflict_out; r++)
+                {
+                    for (int w = 0; w < other->write_set_count; w++)
+                    {
+                        /* size check first (int comparison - fastest) */
+                        if (txn->read_key_sizes[r] != other->write_key_sizes[w]) continue;
+                        /* CF pointer check (pointer comparison - fast) */
+                        if (txn->read_cfs[r] != other->write_cfs[w]) continue;
+                        /* memcmp last (most expensive) */
+                        if (memcmp(txn->read_keys[r], other->write_keys[w],
+                                   txn->read_key_sizes[r]) == 0)
+                        {
+                            txn->has_rw_conflict_out = 1;
+                            other->has_rw_conflict_in = 1;
+                            break;
+                        }
                     }
                 }
             }
@@ -10919,7 +10932,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             {
                 for (int r = 0; r < other->read_set_count; r++)
                 {
-                    /* FIX #5: Optimized comparison order */
+                    /* optimized comparison order */
                     if (txn->write_key_sizes[w] != other->read_key_sizes[r]) continue;
                     if (txn->write_cfs[w] != other->read_cfs[r]) continue;
 
@@ -13282,8 +13295,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     if (global_max_seq + 1 > current_seq)
     {
         atomic_store_explicit(&cf->db->global_seq, global_max_seq + 1, memory_order_release);
-        TDB_DEBUG_LOG("CF '%s': Updated global_seq from %lu to %lu", cf->name, current_seq,
-                      global_max_seq + 1);
+        TDB_DEBUG_LOG("CF '%s': Updated global_seq from " PRIu64 " to " PRIu64, cf->name,
+                      current_seq, global_max_seq + 1);
     }
 
     /* we mark all recovered sequences as committed in the status tracker

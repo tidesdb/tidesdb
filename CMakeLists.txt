@@ -235,8 +235,8 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     endif()
 
     # tidesdb config variables for benchmark
-    if(NOT DEFINED BENCH_DB_DEBUG_LEVEL)
-        set(BENCH_DB_DEBUG_LEVEL TDB_LOG_DEBUG)
+    if(NOT DEFINED BENCH_DB_LOG_LEVEL)
+        set(BENCH_DB_LOG_LEVEL TDB_LOG_DEBUG)
     endif()
     if(NOT DEFINED BENCH_DB_PATH)
         set(BENCH_DB_PATH "benchmark_db")
@@ -324,7 +324,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         BENCH_VALUE_SIZE=${BENCH_VALUE_SIZE}
         BENCH_CF_NAME=\"${BENCH_CF_NAME}\"
         BENCH_NUM_THREADS=${BENCH_NUM_THREADS}
-        BENCH_DB_DEBUG_LEVEL=${BENCH_DB_DEBUG_LEVEL}
+        BENCH_DB_LOG_LEVEL=${BENCH_DB_LOG_LEVEL}
         BENCH_DB_PATH=\"${BENCH_DB_PATH}\"
         BENCH_KEY_PATTERN=\"${BENCH_KEY_PATTERN}\"
         BENCH_WRITE_BUFFER_SIZE=${BENCH_WRITE_BUFFER_SIZE}

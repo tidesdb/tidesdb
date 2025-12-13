@@ -592,6 +592,23 @@ char *get_isolation_level_name(int isolation_level)
     }
 }
 
+char *get_log_level_name(int log_level)
+{
+    switch (log_level)
+    {
+        case TDB_LOG_DEBUG:
+            return "DEBUG";
+        case TDB_LOG_INFO:
+            return "INFO";
+        case TDB_LOG_WARN:
+            return "WARN";
+        case TDB_LOG_ERROR:
+            return "ERROR";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 int main()
 {
     remove_directory(BENCH_DB_PATH);
@@ -608,9 +625,8 @@ int main()
     printf("  Value Size: %d bytes\n", BENCH_VALUE_SIZE);
     printf("  Threads: %d\n", BENCH_NUM_THREADS);
     printf("  Key Pattern: %s\n", BENCH_KEY_PATTERN);
-    printf("  DB Debug Logging: %s\n",
-           BENCH_DB_DEBUG_LEVEL == TDB_LOG_DEBUG ? "enabled" : "disabled")
-        printf("  DB Flush Pool Threads: %d\n", BENCH_DB_FLUSH_POOL_THREADS);
+    printf("  DB Debug Logging: %s\n", get_log_level_name(BENCH_DB_LOG_LEVEL));
+    printf("  DB Flush Pool Threads: %d\n", BENCH_DB_FLUSH_POOL_THREADS);
     printf("  DB Compaction Pool Threads: %d\n", BENCH_DB_COMPACTION_POOL_THREADS);
     printf("  DB Block Cache Size: %d\n", BENCH_BLOCK_CACHE_SIZE);
 
@@ -724,7 +740,7 @@ int main()
     }
 
     tidesdb_config_t config = {.db_path = BENCH_DB_PATH,
-                               .enable_debug_logging = BENCH_DB_DEBUG_LEVEL,
+                               .log_level = BENCH_DB_LOG_LEVEL,
                                .num_flush_threads = BENCH_DB_FLUSH_POOL_THREADS,
                                .num_compaction_threads = BENCH_DB_COMPACTION_POOL_THREADS,
                                .block_cache_size = BENCH_BLOCK_CACHE_SIZE,

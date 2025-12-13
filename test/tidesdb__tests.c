@@ -1368,7 +1368,7 @@ static void test_isolation_serializable(void)
     /* T2 writes X (creates rw-dependency: T1 -> T2, forming cycle) */
     ASSERT_EQ(tidesdb_txn_put(txn2, cf, key1, sizeof(key1), value1, sizeof(value1), 0), 0);
 
-    /* try to commit both - at least one must fail to prevent serialization anomaly */
+    /* try to commit both -- at least one must fail to prevent serialization anomaly */
     int result1 = tidesdb_txn_commit(txn1);
     int result2 = tidesdb_txn_commit(txn2);
 
@@ -6520,16 +6520,16 @@ static void test_large_value_iteration(void)
 
     while (tidesdb_iter_valid(iter))
     {
-        uint8_t *key = NULL;
-        size_t key_size = 0;
-        uint8_t *value = NULL;
-        size_t value_size = 0;
+        uint8_t *iter_key = NULL;
+        size_t iter_key_size = 0;
+        uint8_t *iter_value = NULL;
+        size_t iter_value_size = 0;
 
-        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), TDB_SUCCESS);
-        ASSERT_EQ(tidesdb_iter_value(iter, &value, &value_size), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_iter_key(iter, &iter_key, &iter_key_size), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_iter_value(iter, &iter_value, &iter_value_size), TDB_SUCCESS);
 
-        ASSERT_EQ(key_size, (size_t)TEST_KEY_SIZE);
-        ASSERT_EQ(value_size, (size_t)TEST_VALUE_SIZE);
+        ASSERT_EQ(iter_key_size, (size_t)TEST_KEY_SIZE);
+        ASSERT_EQ(iter_value_size, (size_t)TEST_VALUE_SIZE);
 
         count++;
 
@@ -6808,17 +6808,17 @@ static void test_multi_cf_wal_recovery(void)
         tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
         cf_config.compression_algorithm = NO_COMPRESSION;
 
-        /* create first CF - will have WAL-only data */
+        /* create first CF -- will have WAL-only data */
         ASSERT_EQ(tidesdb_create_column_family(db, "wal_cf", &cf_config), 0);
         tidesdb_column_family_t *wal_cf = tidesdb_get_column_family(db, "wal_cf");
         ASSERT_TRUE(wal_cf != NULL);
 
-        /* create second CF - will have flushed data */
+        /* create second CF -- will have flushed data */
         ASSERT_EQ(tidesdb_create_column_family(db, "flushed_cf", &cf_config), 0);
         tidesdb_column_family_t *flushed_cf = tidesdb_get_column_family(db, "flushed_cf");
         ASSERT_TRUE(flushed_cf != NULL);
 
-        /* write keys to wal_cf (no flush - stays in WAL) */
+        /* write keys to wal_cf (no flush -- stays in WAL) */
         for (int i = 0; i < NUM_WAL_KEYS; i++)
         {
             tidesdb_txn_t *txn = NULL;
@@ -6882,7 +6882,7 @@ static void test_multi_cf_wal_recovery(void)
 
         tidesdb_txn_free(txn);
 
-        /* close database - WAL should persist wal_cf data */
+        /* close database -- WAL should persist wal_cf data */
         ASSERT_EQ(tidesdb_close(db), 0);
     }
 

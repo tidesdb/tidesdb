@@ -1527,7 +1527,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         (*block)->entries[i].flags = flags & ~TDB_KV_FLAG_DELTA_SEQ;
 
         uint64_t key_size_u64;
-        int bytes_read = decode_varint_v2(ptr, &key_size_u64, remaining);
+        int bytes_read = (int)decode_varint_v2(ptr, &key_size_u64, remaining);
         if (bytes_read < 0 || key_size_u64 > UINT32_MAX)
         {
             TDB_DEBUG_LOG("Invalid key_size varint at entry %u", i);
@@ -1540,7 +1540,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         (*block)->entries[i].key_size = (uint32_t)key_size_u64;
 
         uint64_t value_size_u64;
-        bytes_read = decode_varint_v2(ptr, &value_size_u64, remaining);
+        bytes_read = (int)decode_varint_v2(ptr, &value_size_u64, remaining);
         if (bytes_read < 0 || value_size_u64 > UINT32_MAX)
         {
             TDB_DEBUG_LOG("Invalid value_size varint at entry %u", i);
@@ -1553,7 +1553,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         (*block)->entries[i].value_size = (uint32_t)value_size_u64;
 
         uint64_t seq_value;
-        bytes_read = decode_varint_v2(ptr, &seq_value, remaining);
+        bytes_read = (int)decode_varint_v2(ptr, &seq_value, remaining);
         if (bytes_read < 0)
         {
             TDB_DEBUG_LOG("Invalid seq varint at entry %u", i);
@@ -1595,7 +1595,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         if (flags & TDB_KV_FLAG_HAS_VLOG)
         {
             uint64_t vlog_offset;
-            bytes_read = decode_varint_v2(ptr, &vlog_offset, remaining);
+            bytes_read = (int)decode_varint_v2(ptr, &vlog_offset, remaining);
             if (bytes_read < 0)
             {
                 TDB_DEBUG_LOG("Invalid vlog_offset varint at entry %u", i);
@@ -6120,9 +6120,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                       partition, range_start_size, range_end_size);
 
         /* add only overlapping sstables to this partition's heap */
-        uint64_t partition_estimated_entries = 0;
-        size_t num_sstables_to_merge = queue_size(sstables_to_delete);
-        for (size_t i = 0; i < num_sstables_to_merge; i++)
+        uint64_t partition_entries = 0;
+        size_t num_sstables_in_partition = queue_size(sstables_to_delete);
+        for (size_t i = 0; i < num_sstables_in_partition; i++)
         {
             tidesdb_sstable_t *sst = queue_peek_at(sstables_to_delete, i);
             if (!sst) continue;
@@ -6155,7 +6155,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                     {
                         if (tidesdb_merge_heap_add_source(partition_heap, source) == TDB_SUCCESS)
                         {
-                            partition_estimated_entries += sst->num_entries;
+                            partition_entries += sst->num_entries;
                         }
                         else
                         {
@@ -6240,12 +6240,12 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         if (cf->config.enable_bloom_filter)
         {
-            if (bloom_filter_new(&bloom, cf->config.bloom_fpr, partition_estimated_entries) == 0)
+            if (bloom_filter_new(&bloom, cf->config.bloom_fpr, partition_entries) == 0)
             {
                 TDB_DEBUG_LOG(
                     "Dividing merge partition %d: Bloom filter created (estimated entries: %" PRIu64
                     ")",
-                    partition, partition_estimated_entries);
+                    partition, partition_entries);
             }
             else
             {
@@ -6257,9 +6257,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         if (cf->config.enable_block_indexes)
         {
-            block_indexes = compact_block_index_create(partition_estimated_entries,
-                                                       cf->config.block_index_prefix_len,
-                                                       comparator_fn, comparator_ctx);
+            block_indexes =
+                compact_block_index_create(partition_entries, cf->config.block_index_prefix_len,
+                                           comparator_fn, comparator_ctx);
         }
 
         /* process entries from partition-specific heap -- all keys are guaranteed to be in range */
@@ -7859,7 +7859,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             remaining--;
 
             uint64_t key_size_u64;
-            int bytes_read = decode_varint_v2(ptr, &key_size_u64, remaining);
+            int bytes_read = (int)decode_varint_v2(ptr, &key_size_u64, remaining);
             if (bytes_read < 0 || key_size_u64 > UINT32_MAX)
             {
                 block_manager_block_release(block);
@@ -7870,7 +7870,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             entry.key_size = (uint32_t)key_size_u64;
 
             uint64_t value_size_u64;
-            bytes_read = decode_varint_v2(ptr, &value_size_u64, remaining);
+            bytes_read = (int)decode_varint_v2(ptr, &value_size_u64, remaining);
             if (bytes_read < 0 || value_size_u64 > UINT32_MAX)
             {
                 block_manager_block_release(block);
@@ -7881,7 +7881,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             entry.value_size = (uint32_t)value_size_u64;
 
             uint64_t seq_value;
-            bytes_read = decode_varint_v2(ptr, &seq_value, remaining);
+            bytes_read = (int)decode_varint_v2(ptr, &seq_value, remaining);
             if (bytes_read < 0)
             {
                 block_manager_block_release(block);
@@ -13581,9 +13581,20 @@ static int tidesdb_recover_database(tidesdb_t *db)
             {
                 /* try to load persisted config from disk */
                 tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
+
+                /* ensure we have room for full_path + "/" + "config.ini" + null terminator */
+                size_t full_path_len = strlen(full_path);
+                if (full_path_len + 1 +
+                        strlen(TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT) >=
+                    TDB_MAX_PATH_LEN)
+                {
+                    TDB_DEBUG_LOG("CF '%s': Config path too long, using defaults", entry->d_name);
+                    goto create_cf_with_config;
+                }
+
                 char config_path[TDB_MAX_PATH_LEN];
                 snprintf(
-                    config_path, sizeof(config_path),
+                    config_path, TDB_MAX_PATH_LEN,
                     "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
                     full_path);
 
@@ -13600,6 +13611,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
                     TDB_DEBUG_LOG("CF '%s': No saved config found, using defaults", entry->d_name);
                 }
 
+            create_cf_with_config:
                 int create_result = tidesdb_create_column_family(db, entry->d_name, &config);
 
                 if (create_result == TDB_SUCCESS)

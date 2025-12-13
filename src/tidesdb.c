@@ -6328,7 +6328,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         if (sst)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO,
-                          "next_level SSTable %" PRIu64 " (min_key_size=%u, max_key_size=%u)",
+                          "next_level SSTable %" PRIu64 " (min_key_size=%zu, max_key_size=%zu)",
                           sst->id, sst->min_key_size, sst->max_key_size);
         }
     }
@@ -6394,7 +6394,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO,
                               "collecting SSTable %" PRIu64
-                              " from L%d (min_key_size=%u, max_key_size=%u)",
+                              " from L%d (min_key_size=%zu, max_key_size=%zu)",
                               sst->id, level, sst->min_key_size, sst->max_key_size);
                 tidesdb_sstable_ref(sst);
                 queue_enqueue(sstables_to_delete, sst);
@@ -6510,7 +6510,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO,
                               "partition %d: SSTable %" PRIu64
-                              " overlaps (min_key_size=%u, max_key_size=%u)",
+                              " overlaps (min_key_size=%zu, max_key_size=%zu)",
                               partition, sst->id, sst->min_key_size, sst->max_key_size);
                 tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(cf->db, sst);
                 if (source)
@@ -9517,9 +9517,8 @@ int tidesdb_close(tidesdb_t *db)
                 /* retry flush with backoff to prevent data loss */
                 int flush_result = TDB_ERR_UNKNOWN;
                 int retry_count = 0;
-                const int max_retries = 5;
 
-                while (retry_count < max_retries)
+                while (retry_count < TDB_MAX_FFLUSH_RETRY_ATTEMPTS)
                 {
                     flush_result = tidesdb_flush_memtable_internal(cf, 0, 1); /* force flush */
                     if (flush_result == TDB_SUCCESS)
@@ -9530,15 +9529,15 @@ int tidesdb_close(tidesdb_t *db)
                     }
 
                     retry_count++;
-                    if (retry_count < max_retries)
+                    if (retry_count < TDB_MAX_FFLUSH_RETRY_ATTEMPTS)
                     {
                         TDB_DEBUG_LOG(
                             TDB_LOG_ERROR,
                             "CF '%s' flush before close failed (attempt %d/%d, error %d), "
                             "retrying",
-                            cf->name, retry_count, max_retries, flush_result);
+                            cf->name, retry_count, TDB_MAX_FFLUSH_RETRY_ATTEMPTS, flush_result);
                         usleep(100000 *
-                               retry_count); /* exponential backoff: 100ms, 200ms, 300ms... */
+                               retry_count); /* i.e exponential backoff: 100ms, 200ms, 300ms... */
                     }
                 }
 
@@ -9548,7 +9547,7 @@ int tidesdb_close(tidesdb_t *db)
                                   "CF '%s' flush before close failed after %d attempts (error "
                                   "%d). "
                                   "Data is persisted in WAL and will be recovered on next open.",
-                                  cf->name, max_retries, flush_result);
+                                  cf->name, TDB_MAX_FFLUSH_RETRY_ATTEMPTS, flush_result);
                 }
             }
         }

@@ -298,6 +298,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_CLOSE_FLUSH_WAIT_MAX_MS            10000
 #define TDB_OPENING_BACKOFF_MS                 1000
 #define TDB_OPENING_WAIT_MAX_MS                100
+#define TDB_MAX_FFLUSH_RETRY_ATTEMPTS          5
 
 /* backpressure configuration */
 #define TDB_BACKPRESSURE_THRESHOLD_L0_FULL     100

@@ -5258,12 +5258,36 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         return TDB_ERR_MEMORY;
     }
 
-    /* count total sstables first */
+    /* snapshot sst IDs to prevent race with flush workers */
+    queue_t *sstable_ids_snapshot = queue_new();
+    if (!sstable_ids_snapshot)
+    {
+        tidesdb_merge_heap_free(heap);
+        queue_free(sstables_to_delete);
+        return TDB_ERR_MEMORY;
+    }
+
+    /* snapshot sst IDs atomically */
     int total_ssts = 0;
     for (int level = start_level; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = cf->levels[level];
-        total_ssts += lvl->num_sstables;
+        int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+
+        for (int i = 0; i < num_ssts; i++)
+        {
+            tidesdb_sstable_t *sst = sstables[i];
+            if (!sst) continue;
+
+            uint64_t *id_copy = malloc(sizeof(uint64_t));
+            if (id_copy)
+            {
+                *id_copy = sst->id;
+                queue_enqueue(sstable_ids_snapshot, id_copy);
+                total_ssts++;
+            }
+        }
     }
 
     /* if no sstables to merge, return early */
@@ -5272,6 +5296,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         TDB_DEBUG_LOG("Full preemptive merge: No SSTables to merge, skipping");
         tidesdb_merge_heap_free(heap);
         queue_free(sstables_to_delete);
+        queue_free(sstable_ids_snapshot);
         return TDB_SUCCESS;
     }
 
@@ -5279,12 +5304,18 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     tidesdb_sstable_t **ssts_array = malloc(total_ssts * sizeof(tidesdb_sstable_t *));
     if (!ssts_array)
     {
+        while (queue_size(sstable_ids_snapshot) > 0)
+        {
+            uint64_t *id_ptr = (uint64_t *)queue_dequeue(sstable_ids_snapshot);
+            free(id_ptr);
+        }
         tidesdb_merge_heap_free(heap);
         queue_free(sstables_to_delete);
+        queue_free(sstable_ids_snapshot);
         return TDB_ERR_MEMORY;
     }
 
-    /* collect sstable pointers and take references */
+    /* collect sstable pointers matching snapshot (with references) */
     int sst_idx = 0;
     for (int level = start_level; level <= target_level; level++)
     {
@@ -5297,8 +5328,24 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             tidesdb_sstable_t *sst = sstables[i];
             if (!sst) continue;
 
-            tidesdb_sstable_ref(sst); /* take reference on sstable */
-            ssts_array[sst_idx++] = sst;
+            /* only collect if this sst was in our snapshot */
+            int in_snapshot = 0;
+            size_t snapshot_size = queue_size(sstable_ids_snapshot);
+            for (size_t j = 0; j < snapshot_size; j++)
+            {
+                uint64_t *id_ptr = (uint64_t *)queue_peek_at(sstable_ids_snapshot, j);
+                if (id_ptr && *id_ptr == sst->id)
+                {
+                    in_snapshot = 1;
+                    break;
+                }
+            }
+
+            if (in_snapshot)
+            {
+                tidesdb_sstable_ref(sst); /* take reference on sstable */
+                ssts_array[sst_idx++] = sst;
+            }
         }
     }
 
@@ -5344,6 +5391,12 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             if (sst) tidesdb_sstable_unref(cf->db, sst);
         }
         queue_free(sstables_to_delete);
+        while (queue_size(sstable_ids_snapshot) > 0)
+        {
+            uint64_t *id_ptr = (uint64_t *)queue_dequeue(sstable_ids_snapshot);
+            free(id_ptr);
+        }
+        queue_free(sstable_ids_snapshot);
         return TDB_ERR_MEMORY;
     }
 
@@ -5362,6 +5415,12 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             if (sst) tidesdb_sstable_unref(cf->db, sst);
         }
         queue_free(sstables_to_delete);
+        while (queue_size(sstable_ids_snapshot) > 0)
+        {
+            uint64_t *id_ptr = (uint64_t *)queue_dequeue(sstable_ids_snapshot);
+            free(id_ptr);
+        }
+        queue_free(sstable_ids_snapshot);
         return TDB_ERR_IO;
     }
 
@@ -5377,6 +5436,12 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             if (sst) tidesdb_sstable_unref(cf->db, sst);
         }
         queue_free(sstables_to_delete);
+        while (queue_size(sstable_ids_snapshot) > 0)
+        {
+            uint64_t *id_ptr = (uint64_t *)queue_dequeue(sstable_ids_snapshot);
+            free(id_ptr);
+        }
+        queue_free(sstable_ids_snapshot);
         return TDB_ERR_IO;
     }
 
@@ -5954,6 +6019,14 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     queue_free(sstables_to_delete);
 
+    /* cleanup snapshot IDs */
+    while (queue_size(sstable_ids_snapshot) > 0)
+    {
+        uint64_t *id_ptr = (uint64_t *)queue_dequeue(sstable_ids_snapshot);
+        free(id_ptr);
+    }
+    queue_free(sstable_ids_snapshot);
+
     TDB_DEBUG_LOG("Full preemptive merge complete: CF '%s', created SSTable %" PRIu64
                   " with %" PRIu64 " entries, %" PRIu64 " klog blocks, %" PRIu64 " vlog blocks",
                   cf->name, sst_id, num_entries, num_klog_blocks, num_vlog_blocks);
@@ -6030,8 +6103,32 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
 
     queue_t *sstables_to_delete = queue_new();
+    queue_t *sstable_ids_snapshot = queue_new(); /* track IDs being compacted */
 
-    /* collect all sstables to delete (take references) */
+    /* snapshot sst IDs atomically to prevent race with flush workers */
+    TDB_DEBUG_LOG("Dividing merge: snapshotting SSTable IDs from levels 0-%d", target_level);
+    for (int level = 0; level <= target_level; level++)
+    {
+        tidesdb_level_t *lvl = cf->levels[level];
+        int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+
+        for (int i = 0; i < num_ssts; i++)
+        {
+            tidesdb_sstable_t *sst = sstables[i];
+            if (!sst) continue;
+
+            /* store SSTable ID in snapshot */
+            uint64_t *id_copy = malloc(sizeof(uint64_t));
+            if (id_copy)
+            {
+                *id_copy = sst->id;
+                queue_enqueue(sstable_ids_snapshot, id_copy);
+            }
+        }
+    }
+
+    /* collect ssts matching the snapshot (with references) */
     TDB_DEBUG_LOG("Dividing merge: collecting SSTables from levels 0-%d", target_level);
     for (int level = 0; level <= target_level; level++)
     {
@@ -6045,11 +6142,33 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             tidesdb_sstable_t *sst = sstables[i];
             if (!sst) continue;
 
-            TDB_DEBUG_LOG("Dividing merge: collecting SSTable %" PRIu64
-                          " from L%d (min_key_size=%zu, max_key_size=%zu)",
-                          sst->id, level, sst->min_key_size, sst->max_key_size);
-            tidesdb_sstable_ref(sst);
-            queue_enqueue(sstables_to_delete, sst);
+            /* only collect if this sst was in our snapshot */
+            int in_snapshot = 0;
+            size_t snapshot_size = queue_size(sstable_ids_snapshot);
+            for (size_t j = 0; j < snapshot_size; j++)
+            {
+                uint64_t *id_ptr = (uint64_t *)queue_peek_at(sstable_ids_snapshot, j);
+                if (id_ptr && *id_ptr == sst->id)
+                {
+                    in_snapshot = 1;
+                    break;
+                }
+            }
+
+            if (in_snapshot)
+            {
+                TDB_DEBUG_LOG("Dividing merge: collecting SSTable %" PRIu64
+                              " from L%d (min_key_size=%zu, max_key_size=%zu)",
+                              sst->id, level, sst->min_key_size, sst->max_key_size);
+                tidesdb_sstable_ref(sst);
+                queue_enqueue(sstables_to_delete, sst);
+            }
+            else
+            {
+                TDB_DEBUG_LOG("Dividing merge: skipping SSTable %" PRIu64
+                              " from L%d (added after snapshot)",
+                              sst->id, level);
+            }
         }
     }
 
@@ -6076,6 +6195,14 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             if (sst) tidesdb_sstable_unref(cf->db, sst);
         }
         queue_free(sstables_to_delete);
+
+        /* cleanup snapshot IDs */
+        while (queue_size(sstable_ids_snapshot) > 0)
+        {
+            uint64_t *id_ptr = (uint64_t *)queue_dequeue(sstable_ids_snapshot);
+            free(id_ptr);
+        }
+        queue_free(sstable_ids_snapshot);
 
         return result;
     }
@@ -6717,6 +6844,14 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
     queue_free(sstables_to_delete);
 
+    /* cleanup snapshot IDs */
+    while (queue_size(sstable_ids_snapshot) > 0)
+    {
+        uint64_t *id_ptr = (uint64_t *)queue_dequeue(sstable_ids_snapshot);
+        free(id_ptr);
+    }
+    queue_free(sstable_ids_snapshot);
+
     TDB_DEBUG_LOG("Completed dividing merge for CF '%s'", cf->name);
     return TDB_SUCCESS;
 }
@@ -6763,9 +6898,11 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         return tidesdb_full_preemptive_merge(cf, start_idx, end_idx);
     }
 
-    /* now collect sstables to delete after merge completes */
+    /* snapshot sst IDs to prevent race with flush workers */
+    queue_t *sstable_ids_snapshot = queue_new();
     queue_t *sstables_to_delete = queue_new();
 
+    /* snapshot sst IDs atomically */
     for (int level_idx = start_idx; level_idx <= end_idx; level_idx++)
     {
         tidesdb_level_t *lvl = cf->levels[level_idx];
@@ -6776,8 +6913,44 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         {
             if (!sstables[i]) continue;
 
-            tidesdb_sstable_ref(sstables[i]);
-            queue_enqueue(sstables_to_delete, sstables[i]);
+            uint64_t *id_copy = malloc(sizeof(uint64_t));
+            if (id_copy)
+            {
+                *id_copy = sstables[i]->id;
+                queue_enqueue(sstable_ids_snapshot, id_copy);
+            }
+        }
+    }
+
+    /* collect sstables matching snapshot (with references) */
+    for (int level_idx = start_idx; level_idx <= end_idx; level_idx++)
+    {
+        tidesdb_level_t *lvl = cf->levels[level_idx];
+        int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+
+        for (int i = 0; i < num_ssts; i++)
+        {
+            if (!sstables[i]) continue;
+
+            /* only collect if this sst was in our snapshot */
+            int in_snapshot = 0;
+            size_t snapshot_size = queue_size(sstable_ids_snapshot);
+            for (size_t j = 0; j < snapshot_size; j++)
+            {
+                uint64_t *id_ptr = (uint64_t *)queue_peek_at(sstable_ids_snapshot, j);
+                if (id_ptr && *id_ptr == sstables[i]->id)
+                {
+                    in_snapshot = 1;
+                    break;
+                }
+            }
+
+            if (in_snapshot)
+            {
+                tidesdb_sstable_ref(sstables[i]);
+                queue_enqueue(sstables_to_delete, sstables[i]);
+            }
         }
     }
 
@@ -7451,6 +7624,14 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     }
 
     queue_free(sstables_to_delete);
+
+    /* cleanup snapshot IDs */
+    while (queue_size(sstable_ids_snapshot) > 0)
+    {
+        uint64_t *id_ptr = (uint64_t *)queue_dequeue(sstable_ids_snapshot);
+        free(id_ptr);
+    }
+    queue_free(sstable_ids_snapshot);
 
     for (int i = 0; i < num_partitions; i++)
     {

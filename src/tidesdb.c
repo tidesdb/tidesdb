@@ -6595,13 +6595,13 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                         }
                     }
 
-                    block_manager_block_t *klog_block =
+                    block_manager_block_t *klog_bm_block =
                         block_manager_block_create(final_klog_size, final_klog_data);
-                    if (klog_block)
+                    if (klog_bm_block)
                     {
                         uint64_t block_file_position = atomic_load(&klog_bm->current_file_size);
-                        block_manager_block_write(klog_bm, klog_block);
-                        block_manager_block_release(klog_block);
+                        block_manager_block_write(klog_bm, klog_bm_block);
+                        block_manager_block_release(klog_bm_block);
 
                         if (block_indexes && block_first_key && block_last_key)
                         {

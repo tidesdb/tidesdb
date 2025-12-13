@@ -31,6 +31,7 @@ typedef struct
 static void test_evict_callback(const char *key, void *value, void *user_data)
 {
     (void)key;
+    (void)value;
     int *evict_count = (int *)user_data;
     if (evict_count) (*evict_count)++;
 }
@@ -305,6 +306,14 @@ void test_lru_cache_ttl(void)
     lru_cache_free(cache);
 }
 
+static void *test_copy_fn(void *value)
+{
+    int *original = (int *)value;
+    int *copy = malloc(sizeof(int));
+    if (copy) *copy = *original;
+    return copy;
+}
+
 void test_lru_cache_get_copy(void)
 {
     lru_cache_t *cache = lru_cache_new(5, 0, 3, 0);
@@ -313,24 +322,31 @@ void test_lru_cache_get_copy(void)
     int data1 = 100;
     lru_cache_put(cache, "key1", &data1, NULL, NULL);
 
-    void *copy_fn(void *value)
-    {
-        int *original = (int *)value;
-        int *copy = malloc(sizeof(int));
-        if (copy) *copy = *original;
-        return copy;
-    }
-
-    int *copy = (int *)lru_cache_get_copy(cache, "key1", copy_fn);
+    int *copy = (int *)lru_cache_get_copy(cache, "key1", test_copy_fn);
     ASSERT_TRUE(copy != NULL);
     ASSERT_EQ(*copy, 100);
     ASSERT_TRUE(copy != &data1);
     free(copy);
 
-    copy = (int *)lru_cache_get_copy(cache, "nonexistent", copy_fn);
+    copy = (int *)lru_cache_get_copy(cache, "nonexistent", test_copy_fn);
     ASSERT_TRUE(copy == NULL);
 
     lru_cache_free(cache);
+}
+
+typedef struct
+{
+    int count;
+    int sum;
+} foreach_ctx_t;
+
+static int test_count_callback(const char *key, void *value, void *user_data)
+{
+    (void)key;
+    foreach_ctx_t *ctx = (foreach_ctx_t *)user_data;
+    ctx->count++;
+    ctx->sum += *(int *)value;
+    return 0;
 }
 
 void test_lru_cache_foreach(void)
@@ -347,28 +363,22 @@ void test_lru_cache_foreach(void)
     lru_cache_get(cache, "key1");
     lru_cache_get(cache, "key1");
 
-    typedef struct
-    {
-        int count;
-        int sum;
-    } foreach_ctx_t;
-
-    int count_callback(const char *key, void *value, void *user_data)
-    {
-        (void)key;
-        foreach_ctx_t *ctx = (foreach_ctx_t *)user_data;
-        ctx->count++;
-        ctx->sum += *(int *)value;
-        return 0;
-    }
-
     foreach_ctx_t ctx = {0, 0};
-    size_t visited = lru_cache_foreach(cache, count_callback, &ctx);
+    size_t visited = lru_cache_foreach(cache, test_count_callback, &ctx);
     ASSERT_EQ(visited, 3);
     ASSERT_EQ(ctx.count, 3);
     ASSERT_EQ(ctx.sum, 60); /* 10 + 20 + 30 */
 
     lru_cache_free(cache);
+}
+
+static int test_stop_callback(const char *key, void *value, void *user_data)
+{
+    (void)key;
+    (void)value;
+    int *count = (int *)user_data;
+    (*count)++;
+    return (*count >= 2) ? 1 : 0;
 }
 
 void test_lru_cache_foreach_early_stop(void)
@@ -381,17 +391,8 @@ void test_lru_cache_foreach_early_stop(void)
     lru_cache_put(cache, "key2", &data[1], NULL, NULL);
     lru_cache_put(cache, "key3", &data[2], NULL, NULL);
 
-    int stop_callback(const char *key, void *value, void *user_data)
-    {
-        (void)key;
-        (void)value;
-        int *count = (int *)user_data;
-        (*count)++;
-        return (*count >= 2) ? 1 : 0;
-    }
-
     int count = 0;
-    size_t visited = lru_cache_foreach(cache, stop_callback, &count);
+    size_t visited = lru_cache_foreach(cache, test_stop_callback, &count);
     ASSERT_EQ(visited, 2);
     ASSERT_EQ(count, 2);
 
@@ -687,8 +688,8 @@ void benchmark_lru_cache_lookups(void)
     size_t lru_size, lfu_size;
     uint64_t hits, misses;
     lru_cache_stats(cache, &lru_size, &lfu_size, &hits, &misses);
-    printf(BOLDWHITE "Hits: %lu, Misses: %lu, Hit rate: %.2f%%\n" RESET, hits, misses,
-           (double)hits / (hits + misses) * 100.0);
+    printf(BOLDWHITE "Hits: %" PRIu64 ", Misses: %" PRIu64 ", Hit rate: %.2f%%\n" RESET, hits,
+           misses, (double)hits / (hits + misses) * 100.0);
 
     free(data);
     lru_cache_free(cache);
@@ -731,7 +732,7 @@ void benchmark_lru_lfu_promotion(void)
     uint64_t hits, misses;
     lru_cache_stats(cache, &lru_size, &lfu_size, &hits, &misses);
     printf(BOLDWHITE "LRU size: %zu, LFU size: %zu\n" RESET, lru_size, lfu_size);
-    printf(BOLDWHITE "Hits: %lu, Misses: %lu\n" RESET, hits, misses);
+    printf(BOLDWHITE "Hits: %" PRIu64 ", Misses: %" PRIu64 "\n" RESET, hits, misses);
 
     free(data);
     lru_cache_free(cache);

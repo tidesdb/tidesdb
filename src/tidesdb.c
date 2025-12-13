@@ -64,7 +64,7 @@ static void tidesdb_commit_status_destroy(tidesdb_commit_status_t *cs)
 {
     if (!cs) return;
     pthread_mutex_destroy(&cs->lock);
-    free(cs->status);
+    free((void *)cs->status); /* cast to void* to avoid MSVC _Atomic qualifier warning */
     free(cs);
 }
 
@@ -1531,7 +1531,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         (*block)->entries[i].flags = flags & ~TDB_KV_FLAG_DELTA_SEQ;
 
         uint64_t key_size_u64;
-        int bytes_read = (int)decode_varint_v2(ptr, &key_size_u64, remaining);
+        int bytes_read = decode_varint_v2(ptr, &key_size_u64, (int)remaining);
         if (bytes_read < 0 || key_size_u64 > UINT32_MAX)
         {
             TDB_DEBUG_LOG("Invalid key_size varint at entry %u", i);
@@ -1544,7 +1544,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         (*block)->entries[i].key_size = (uint32_t)key_size_u64;
 
         uint64_t value_size_u64;
-        bytes_read = (int)decode_varint_v2(ptr, &value_size_u64, remaining);
+        bytes_read = decode_varint_v2(ptr, &value_size_u64, (int)remaining);
         if (bytes_read < 0 || value_size_u64 > UINT32_MAX)
         {
             TDB_DEBUG_LOG("Invalid value_size varint at entry %u", i);
@@ -1557,7 +1557,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         (*block)->entries[i].value_size = (uint32_t)value_size_u64;
 
         uint64_t seq_value;
-        bytes_read = (int)decode_varint_v2(ptr, &seq_value, remaining);
+        bytes_read = decode_varint_v2(ptr, &seq_value, (int)remaining);
         if (bytes_read < 0)
         {
             TDB_DEBUG_LOG("Invalid seq varint at entry %u", i);
@@ -1599,7 +1599,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         if (flags & TDB_KV_FLAG_HAS_VLOG)
         {
             uint64_t vlog_offset;
-            bytes_read = (int)decode_varint_v2(ptr, &vlog_offset, remaining);
+            bytes_read = decode_varint_v2(ptr, &vlog_offset, (int)remaining);
             if (bytes_read < 0)
             {
                 TDB_DEBUG_LOG("Invalid vlog_offset varint at entry %u", i);
@@ -8163,7 +8163,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             remaining--;
 
             uint64_t key_size_u64;
-            int bytes_read = (int)decode_varint_v2(ptr, &key_size_u64, remaining);
+            int bytes_read = decode_varint_v2(ptr, &key_size_u64, (int)remaining);
             if (bytes_read < 0 || key_size_u64 > UINT32_MAX)
             {
                 block_manager_block_release(block);
@@ -8174,7 +8174,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             entry.key_size = (uint32_t)key_size_u64;
 
             uint64_t value_size_u64;
-            bytes_read = (int)decode_varint_v2(ptr, &value_size_u64, remaining);
+            bytes_read = decode_varint_v2(ptr, &value_size_u64, (int)remaining);
             if (bytes_read < 0 || value_size_u64 > UINT32_MAX)
             {
                 block_manager_block_release(block);
@@ -8185,7 +8185,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             entry.value_size = (uint32_t)value_size_u64;
 
             uint64_t seq_value;
-            bytes_read = (int)decode_varint_v2(ptr, &seq_value, remaining);
+            bytes_read = decode_varint_v2(ptr, &seq_value, (int)remaining);
             if (bytes_read < 0)
             {
                 block_manager_block_release(block);

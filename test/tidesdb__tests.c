@@ -7665,29 +7665,29 @@ void test_concurrent_read_close_race(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
     ASSERT_TRUE(cf != NULL);
 
-    const int NUM_KEYS = 10000;
-    const int NUM_THREADS = 8;
-    const int KEY_SIZE = 16;
-    const int VALUE_SIZE = 100;
+#define TEST_NUM_KEYS    10000
+#define TEST_NUM_THREADS 8
+#define TEST_KEY_SIZE    16
+#define TEST_VALUE_SIZE  100
 
-    printf("Writing %d keys with %d threads\n", NUM_KEYS, NUM_THREADS);
+    printf("Writing %d keys with %d threads\n", TEST_NUM_KEYS, TEST_NUM_THREADS);
 
     /* write data in batches */
-    for (int i = 0; i < NUM_KEYS; i += 100)
+    for (int i = 0; i < TEST_NUM_KEYS; i += 100)
     {
         tidesdb_txn_t *txn = NULL;
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
-        for (int j = 0; j < 100 && (i + j) < NUM_KEYS; j++)
+        for (int j = 0; j < 100 && (i + j) < TEST_NUM_KEYS; j++)
         {
-            char key[KEY_SIZE];
-            char value[VALUE_SIZE];
-            snprintf(key, KEY_SIZE, "key_%08d", i + j);
-            memset(value, 'A' + ((i + j) % 26), VALUE_SIZE);
+            char key[TEST_KEY_SIZE];
+            char value[TEST_VALUE_SIZE];
+            snprintf(key, TEST_KEY_SIZE, "key_%08d", i + j);
+            memset(value, 'A' + ((i + j) % 26), TEST_VALUE_SIZE);
 
-            ASSERT_EQ(
-                tidesdb_txn_put(txn, cf, (uint8_t *)key, KEY_SIZE, (uint8_t *)value, VALUE_SIZE, 0),
-                0);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, TEST_KEY_SIZE, (uint8_t *)value,
+                                      TEST_VALUE_SIZE, 0),
+                      0);
         }
 
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
@@ -7704,23 +7704,23 @@ void test_concurrent_read_close_race(void)
     cf = tidesdb_get_column_family(db, "test_cf");
     ASSERT_TRUE(cf != NULL);
 
-    printf("Starting %d concurrent read threads\n", NUM_THREADS);
+    printf("Starting %d concurrent read threads\n", TEST_NUM_THREADS);
 
     _Atomic(int) success_count = 0;
     _Atomic(int) failure_count = 0;
     _Atomic(int) should_stop = 0;
 
-    pthread_t threads[NUM_THREADS];
-    read_thread_data_t thread_data[NUM_THREADS];
+    pthread_t threads[TEST_NUM_THREADS];
+    read_thread_data_t thread_data[TEST_NUM_THREADS];
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < TEST_NUM_THREADS; i++)
     {
         thread_data[i].db = db;
         thread_data[i].cf = cf;
         thread_data[i].thread_id = i;
-        thread_data[i].num_keys = NUM_KEYS;
-        thread_data[i].key_size = KEY_SIZE;
-        thread_data[i].value_size = VALUE_SIZE;
+        thread_data[i].num_keys = TEST_NUM_KEYS;
+        thread_data[i].key_size = TEST_KEY_SIZE;
+        thread_data[i].value_size = TEST_VALUE_SIZE;
         thread_data[i].success_count = &success_count;
         thread_data[i].failure_count = &failure_count;
         thread_data[i].should_stop = &should_stop;
@@ -7739,7 +7739,7 @@ void test_concurrent_read_close_race(void)
     atomic_store(&should_stop, 1);
 
     printf("Waiting for read threads to finish...\n");
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < TEST_NUM_THREADS; i++)
     {
         pthread_join(threads[i], NULL);
     }
@@ -7750,6 +7750,11 @@ void test_concurrent_read_close_race(void)
     printf("Read results: success=%d, failure=%d\n", final_success, final_failure);
 
     cleanup_test_dir();
+
+#undef TEST_NUM_KEYS
+#undef TEST_NUM_THREADS
+#undef TEST_KEY_SIZE
+#undef TEST_VALUE_SIZE
 }
 
 int main(void)

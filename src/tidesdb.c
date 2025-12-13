@@ -418,7 +418,7 @@ static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *dat
 static void tidesdb_sstable_ref(tidesdb_sstable_t *sst);
 static void tidesdb_sstable_unref(tidesdb_t *db, tidesdb_sstable_t *sst);
 static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t *sst,
-                                               skip_list_t *memtable);
+                                               skip_list_t *memtable, tidesdb_column_family_t *cf);
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
                                size_t key_size, tidesdb_kv_pair_t **kv);
 static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst);
@@ -2760,10 +2760,11 @@ static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm)
  * @param db database instance
  * @param sst sstable to write to
  * @param memtable memtable to write from
+ * @param cf column family
  * @return 0 on success, -1 on error
  */
 static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t *sst,
-                                               skip_list_t *memtable)
+                                               skip_list_t *memtable, tidesdb_column_family_t *cf)
 {
     int num_entries = skip_list_count_entries(memtable);
     TDB_DEBUG_LOG("SSTable %" PRIu64 ": Writing from memtable (%d entries)", sst->id, num_entries);
@@ -3326,8 +3327,11 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     /* ensure all sst data is durably written before it becomes visible to readers
      * this prevents reads from seeing partially-written ssts which can cause
      * deserialization errors and stalls */
-    if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
-    if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+    if (cf->config.sync_mode == TDB_SYNC_FULL || cf->config.sync_mode == TDB_SYNC_INTERVAL)
+    {
+        if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
+        if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+    }
 
     /* rebuild position cache after flush for O(1) cursor navigation
      * without this, cursors fall back to slow sequential scanning */
@@ -5978,8 +5982,11 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     /* we lways sync compacted sstable files regardless of sync_mode
      * new sstable durability is required before we can delete old sstables */
-    block_manager_escalate_fsync(klog_bm);
-    block_manager_escalate_fsync(vlog_bm);
+    if (cf->config.sync_mode == TDB_SYNC_FULL || cf->config.sync_mode == TDB_SYNC_INTERVAL)
+    {
+        block_manager_escalate_fsync(klog_bm);
+        block_manager_escalate_fsync(vlog_bm);
+    }
 
     block_manager_close(klog_bm);
     block_manager_close(vlog_bm);
@@ -8419,7 +8426,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             continue;
         }
 
-        int write_result = tidesdb_sstable_write_from_memtable(db, sst, memtable);
+        int write_result = tidesdb_sstable_write_from_memtable(db, sst, memtable, cf);
         if (write_result != TDB_SUCCESS)
         {
             TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64 " write FAILED (error: %d), will retry",
@@ -8450,8 +8457,11 @@ static void *tidesdb_flush_worker_thread(void *arg)
         tidesdb_block_managers_t bms;
         if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
         {
-            if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
-            if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+            if (cf->config.sync_mode == TDB_SYNC_FULL || cf->config.sync_mode == TDB_SYNC_INTERVAL)
+            {
+                if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
+                if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+            }
 
             /* rebuild position cache for O(1) cursor navigation */
             if (bms.klog_bm) block_manager_build_position_cache(bms.klog_bm);
@@ -8760,7 +8770,9 @@ static void *tidesdb_sync_worker_thread(void *arg)
                 block_manager_t *wal = atomic_load(&cf->active_wal);
                 if (wal)
                 {
-                    block_manager_escalate_fsync(wal);
+                    if (cf->config.sync_mode == TDB_SYNC_FULL ||
+                        cf->config.sync_mode == TDB_SYNC_INTERVAL)
+                        block_manager_escalate_fsync(wal);
                 }
             }
         }
@@ -9033,12 +9045,28 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(*db);
         return TDB_ERR_MEMORY;
     }
+    TDB_DEBUG_LOG("SSTable cache created: LRU capacity=%zu, LFU capacity=%zu, total=%zu",
+                  sstable_lru_cap, sstable_lfu_cap, sstable_lru_cap + sstable_lfu_cap);
 
     if (config->block_cache_size > 0)
     {
-        /* convert block_cache_size (bytes) to capacity (number of entries)
-         * assume average block size of 64KB for estimation */
-        size_t block_cache_capacity = config->block_cache_size / (64 * 1024);
+        /* convert block_cache_size (bytes) to capacity (number of block entries)
+         *
+         * block_cache_size represents the memory budget for actual block data
+         * (not including cache metadata overhead)
+         *
+         * since column families don't exist yet at open time, we use default block sizes:
+         * - klog blocks: TDB_DEFAULT_KLOG_BLOCK_SIZE = 64KB (keys + metadata)
+         * - vlog blocks: TDB_DEFAULT_VLOG_BLOCK_SIZE = 4KB (large values)
+         *
+         * weighted average assumes 70% klog, 30% vlog distribution:
+         * avg = (0.7 × 64KB) + (0.3 × 4KB) = 44.8KB + 1.2KB = 46KB
+         *
+         * capacity = block_cache_size / avg_block_size
+         * example: 64MB / 46KB ≈ 1,424 blocks */
+        size_t avg_block_size =
+            (TDB_DEFAULT_KLOG_BLOCK_SIZE * 7 + TDB_DEFAULT_VLOG_BLOCK_SIZE * 3) / 10;
+        size_t block_cache_capacity = config->block_cache_size / avg_block_size;
         if (block_cache_capacity < 100) block_cache_capacity = 100; /* minimum capacity */
 
         /* create hybrid LRU/LFU cache for blocks
@@ -9059,6 +9087,15 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free(*db);
             return TDB_ERR_MEMORY;
         }
+        TDB_DEBUG_LOG(
+            "Block cache created: LRU capacity=%zu, LFU capacity=%zu, total=%zu (%.2f MB)",
+            block_lru_cap, block_lfu_cap, block_lru_cap + block_lfu_cap,
+            (double)config->block_cache_size / (1024 * 1024));
+    }
+    else
+    {
+        (*db)->block_cache = NULL;
+        TDB_DEBUG_LOG("Block cache disabled (block_cache_size=0)");
     }
 
     tidesdb_recover_database(*db);
@@ -9230,8 +9267,12 @@ int tidesdb_close(tidesdb_t *db)
                     atomic_load_explicit(&cf->active_wal, memory_order_acquire);
                 if (active_wal)
                 {
-                    block_manager_escalate_fsync(active_wal);
-                    TDB_DEBUG_LOG("CF '%s': WAL synced before close", cf->name);
+                    if (cf->config.sync_mode == TDB_SYNC_FULL ||
+                        cf->config.sync_mode == TDB_SYNC_INTERVAL)
+                    {
+                        block_manager_escalate_fsync(active_wal);
+                        TDB_DEBUG_LOG("CF '%s': WAL synced before close", cf->name);
+                    }
                 }
 
                 /* retry flush with backoff to prevent data loss */

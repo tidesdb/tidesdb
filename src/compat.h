@@ -708,6 +708,19 @@ static inline FILE *tdb_fopen(const char *filename, const char *mode)
 }
 #define fopen tdb_fopen
 
+/* fileno for windows */
+/*
+ * tdb_fileno
+ * portable file descriptor extraction from FILE*
+ * @param stream the FILE* to get descriptor from
+ * @return file descriptor, or -1 on failure
+ */
+static inline int tdb_fileno(FILE *stream)
+{
+    if (!stream) return -1;
+    return _fileno(stream);
+}
+
 /* fsync for windows */
 /*
  * fsync
@@ -2228,5 +2241,21 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
     /* perform the rename */
     return rename(old_path, new_path);
 }
+
+#else /* POSIX systems */
+
+/**
+ * tdb_fileno
+ * portable file descriptor extraction from FILE*
+ * @param stream the FILE* to get descriptor from
+ * @return file descriptor, or -1 on failure
+ */
+static inline int tdb_fileno(FILE *stream)
+{
+    if (!stream) return -1;
+    return fileno(stream);
+}
+
+#endif /* _WIN32 || __MINGW32__ || __MINGW64__ */
 
 #endif /* __COMPAT_H__ */

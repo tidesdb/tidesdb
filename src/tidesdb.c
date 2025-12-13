@@ -600,17 +600,17 @@ static int tidesdb_get_cf_name_from_path(const char *path, char *cf_name_out)
  * tidesdb_cached_block_read
  * reads a block from cache or disk
  * @param db the database
+ * @param sst the sstable (for compression config)
  * @param cf_name column family name
- * @param sstable_id sstable id
  * @param block_type 'k' for klog, 'v' for vlog
  * @param cursor the block manager cursor
  * @return the block if successful, NULL otherwise (caller must release)
  */
-static block_manager_block_t *tidesdb_cached_block_read(tidesdb_t *db, const char *cf_name,
-                                                        uint64_t sstable_id, char block_type,
+static block_manager_block_t *tidesdb_cached_block_read(tidesdb_t *db, tidesdb_sstable_t *sst,
+                                                        const char *cf_name, char block_type,
                                                         block_manager_cursor_t *cursor)
 {
-    if (!db || !cf_name || !cursor) return NULL;
+    if (!db || !sst || !cf_name || !cursor) return NULL;
 
     uint64_t offset = cursor->current_pos;
 
@@ -618,27 +618,55 @@ static block_manager_block_t *tidesdb_cached_block_read(tidesdb_t *db, const cha
     if (db->block_cache)
     {
         char cache_key[TDB_CACHE_KEY_SIZE];
-        size_t key_len =
-            tidesdb_block_cache_key(cf_name, sstable_id, block_type, offset, cache_key);
+        size_t key_len = tidesdb_block_cache_key(cf_name, sst->id, block_type, offset, cache_key);
 
         block_manager_block_t *cached_block = (block_manager_block_t *)lru_cache_get_copy_n(
             db->block_cache, cache_key, key_len, tidesdb_block_acquire_copy_fn);
 
         if (cached_block)
         {
-            /* cache hit -- reference already acquired */
+            /* cache hit -- block is already decompressed, reference already acquired */
+            static _Atomic(uint64_t) cache_hits = 0;
+            uint64_t hit_count = atomic_fetch_add(&cache_hits, 1);
+            if (hit_count % 1000 == 0)
+            {
+                TDB_DEBUG_LOG("Block cache HIT #%" PRIu64 ": key=%s", hit_count, cache_key);
+            }
             return cached_block;
+        }
+
+        static _Atomic(uint64_t) cache_misses = 0;
+        uint64_t miss_count = atomic_fetch_add(&cache_misses, 1);
+        if (miss_count % 1000 == 0)
+        {
+            TDB_DEBUG_LOG("Block cache MISS #%" PRIu64 ": key=%s", miss_count, cache_key);
         }
     }
 
     block_manager_block_t *block = block_manager_cursor_read(cursor);
     if (!block) return NULL;
 
-    /* try to cache the block for future reads */
+    /* decompress block immediately after reading from disk, before caching
+     * this ensures the cache stores decompressed blocks for fast access */
+    if (sst->config && sst->config->compression_algorithm != NO_COMPRESSION)
+    {
+        size_t decompressed_size;
+        uint8_t *decompressed = decompress_data(block->data, block->size, &decompressed_size,
+                                                sst->config->compression_algorithm);
+        if (decompressed)
+        {
+            /* replace compressed data with decompressed data in the block */
+            free(block->data);
+            block->data = decompressed;
+            block->size = decompressed_size;
+        }
+    }
+
+    /* try to cache the decompressed block for future reads */
     if (db->block_cache)
     {
         char cache_key[TDB_CACHE_KEY_SIZE];
-        tidesdb_block_cache_key(cf_name, sstable_id, block_type, offset, cache_key);
+        tidesdb_block_cache_key(cf_name, sst->id, block_type, offset, cache_key);
 
         /* acquire reference for cache before inserting */
         if (block_manager_block_acquire(block))
@@ -653,12 +681,12 @@ static block_manager_block_t *tidesdb_cached_block_read(tidesdb_t *db, const cha
             }
             else
             {
-                /* insertion succeeded, cache now owns a reference */
+                /* insertion succeeded, cache now owns a reference to decompressed block */
             }
         }
     }
 
-    /* return block to caller (caller has initial reference) */
+    /* return decompressed block to caller (caller has initial reference) */
     return block;
 }
 
@@ -3071,6 +3099,12 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                             /* sample every Nth block (ratio validated to be >= 1) */
                             if (klog_block_num % sst->config->index_sample_ratio == 0)
                             {
+                                if (klog_block_num < 5 || klog_block_num % 100 == 0)
+                                {
+                                    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Adding block %" PRIu64
+                                                  " to index, file_pos=%" PRIu64,
+                                                  sst->id, klog_block_num, block_file_position);
+                                }
                                 compact_block_index_add(block_indexes, block_first_key,
                                                         block_first_key_size, block_last_key,
                                                         block_last_key_size, block_file_position);
@@ -3258,9 +3292,17 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
         /* we assign the built index to the sst */
         sst->block_indexes = block_indexes;
 
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block indexes built - %u samples, %" PRIu64
-                      " total blocks",
-                      sst->id, sst->block_indexes->count, klog_block_num);
+        TDB_DEBUG_LOG("SSTable " TDB_U64_FMT ": Block indexes built - %" PRIu32
+                      " samples, " TDB_U64_FMT " total blocks",
+                      TDB_U64_CAST(sst->id), sst->block_indexes->count,
+                      TDB_U64_CAST(klog_block_num));
+        /* log first few index entries for debugging */
+        for (uint32_t i = 0; i < sst->block_indexes->count && i < 5; i++)
+        {
+            TDB_DEBUG_LOG("SSTable " TDB_U64_FMT ": Index entry %u: file_pos=" TDB_U64_FMT,
+                          TDB_U64_CAST(sst->id), i,
+                          TDB_U64_CAST(sst->block_indexes->file_positions[i]));
+        }
         size_t index_size;
         uint8_t *index_data = compact_block_index_serialize(sst->block_indexes, &index_size);
         if (index_data)
@@ -3382,6 +3424,15 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
                                size_t key_size, tidesdb_kv_pair_t **kv)
 {
+    static _Atomic(uint64_t) sst_get_count = 0;
+    uint64_t this_get = atomic_fetch_add(&sst_get_count, 1);
+    if (this_get % 1000 == 0)
+    {
+        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": SSTable %" PRIu64
+                      ", num_klog_blocks=%" PRIu64,
+                      this_get, sst->id, sst->num_klog_blocks);
+    }
+
     /* ensure sstable is open through cache */
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
@@ -3442,10 +3493,26 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     uint64_t start_file_position = 0;
     if (sst->block_indexes)
     {
-        if (compact_block_index_find_predecessor(sst->block_indexes, key, key_size,
-                                                 &start_file_position) != 0)
+        int index_result = compact_block_index_find_predecessor(sst->block_indexes, key, key_size,
+                                                                &start_file_position);
+        if (this_get % 1000 == 0)
+        {
+            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                          ": Block index lookup result=%d, start_pos=%" PRIu64
+                          ", index_count=%" PRIu64,
+                          this_get, index_result, start_file_position,
+                          sst->block_indexes ? sst->block_indexes->count : 0);
+        }
+        if (index_result != 0)
         {
             start_file_position = 0;
+        }
+    }
+    else
+    {
+        if (this_get % 1000 == 0)
+        {
+            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": NO block indexes available", this_get);
         }
     }
 
@@ -3458,12 +3525,14 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         return TDB_ERR_IO;
     }
 
-    block_manager_cursor_goto_first(klog_cursor);
-
-    /* jump to start_file_position if index provided a hint */
+    /* use block index hint to jump directly to the right block, or start at beginning */
     if (start_file_position > 0)
     {
         block_manager_cursor_goto(klog_cursor, start_file_position);
+    }
+    else
+    {
+        block_manager_cursor_goto_first(klog_cursor);
     }
 
     /* check if we're already past data blocks after navigation */
@@ -3486,6 +3555,12 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     while (block_num < sst->num_klog_blocks)
     {
+        if (this_get % 1000 == 0 && block_num % 100 == 0)
+        {
+            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Reading block %" PRIu64 " of %" PRIu64,
+                          this_get, block_num, sst->num_klog_blocks);
+        }
+
         /* check if cursor is past data end offset (into auxiliary structures) */
         if (sst->klog_data_end_offset > 0 && klog_cursor->current_pos >= sst->klog_data_end_offset)
         {
@@ -3494,42 +3569,37 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         }
 
         block_manager_block_t *block =
-            tidesdb_cached_block_read(db, cf_name, sst->id, 'k', klog_cursor);
+            tidesdb_cached_block_read(db, sst, cf_name, 'k', klog_cursor);
+
+        if (this_get % 1000 == 0 && block_num % 100 == 0)
+        {
+            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Block %" PRIu64 " read %s", this_get,
+                          block_num, block ? "SUCCESS" : "FAILED");
+        }
+
         if (!block)
         {
             TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to read block %" PRIu64, sst->id, block_num);
             break;
         }
 
+        /* block is already decompressed by tidesdb_cached_block_read */
         uint8_t *data = block->data;
         size_t data_size = block->size;
-        uint8_t *decompressed = NULL;
-        int need_free_decompressed = 0;
-
-        if (sst->config->compression_algorithm != NO_COMPRESSION)
-        {
-            size_t decompressed_size;
-            decompressed = decompress_data(block->data, block->size, &decompressed_size,
-                                           sst->config->compression_algorithm);
-            if (decompressed)
-            {
-                data = decompressed;
-                data_size = decompressed_size;
-                need_free_decompressed = 1;
-            }
-            else
-            {
-                TDB_DEBUG_LOG("SSTable " TDB_U64_FMT " decompression FAILED (returned NULL)",
-                              TDB_U64_CAST(sst->id));
-            }
-        }
 
         tidesdb_klog_block_t *klog_block = NULL;
         int deser_result = tidesdb_klog_block_deserialize(data, data_size, &klog_block);
 
+        if (this_get % 1000 == 0 && block_num % 100 == 0)
+        {
+            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Block %" PRIu64
+                          " deserialized, result=%d, entries=%u",
+                          this_get, block_num, deser_result,
+                          klog_block ? klog_block->num_entries : 0);
+        }
+
         if (deser_result != 0)
         {
-            if (need_free_decompressed) free(decompressed);
             block_manager_block_release(block);
 
             block_num++;
@@ -3539,72 +3609,188 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         if (klog_block && klog_block->num_entries > 0)
         {
-            /* reuse comparator_fn and comparator_ctx from function scope */
+            /* binary search entries in this block (entries are sorted by key) */
+            int32_t left = 0;
+            int32_t right = (int32_t)klog_block->num_entries - 1;
+            int32_t found_idx = -1;
+            uint32_t comparisons = 0;
 
-            /* search entries in this block */
-            for (uint32_t i = 0; i < klog_block->num_entries; i++)
+            while (left <= right)
             {
-                int cmp = comparator_fn(key, key_size, klog_block->keys[i],
-                                        klog_block->entries[i].key_size, comparator_ctx);
+                int32_t mid = left + (right - left) / 2;
+                comparisons++;
+
+                int cmp = comparator_fn(key, key_size, klog_block->keys[mid],
+                                        klog_block->entries[mid].key_size, comparator_ctx);
+
+                if (this_get % 1000 == 0 && comparisons == 1)
+                {
+                    TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                  ": Binary search in block with %u entries, first cmp=%d",
+                                  this_get, klog_block->num_entries, cmp);
+                }
 
                 if (cmp == 0)
                 {
-                    /* found! */
-
-                    *kv = tidesdb_kv_pair_create(
-                        klog_block->keys[i], klog_block->entries[i].key_size, NULL, 0,
-                        klog_block->entries[i].ttl, klog_block->entries[i].seq,
-                        klog_block->entries[i].flags & TDB_KV_FLAG_TOMBSTONE);
-
-                    if (*kv)
-                    {
-                        (*kv)->entry = klog_block->entries[i];
-
-                        /* get value (inline or from vlog) */
-                        if (klog_block->entries[i].vlog_offset == 0)
-                        {
-                            if (klog_block->inline_values[i])
-                            {
-                                (*kv)->value = malloc(klog_block->entries[i].value_size);
-                                if ((*kv)->value)
-                                {
-                                    memcpy((*kv)->value, klog_block->inline_values[i],
-                                           klog_block->entries[i].value_size);
-                                }
-                            }
-                        }
-                        else
-                        {
-                            tidesdb_vlog_read_value(db, sst, klog_block->entries[i].vlog_offset,
-                                                    klog_block->entries[i].value_size,
-                                                    &(*kv)->value);
-                        }
-
-                        result = TDB_SUCCESS;
-                    }
-
-                    tidesdb_klog_block_free(klog_block);
-                    if (need_free_decompressed) free(decompressed);
-                    block_manager_block_release(block);
-                    goto cleanup;
+                    found_idx = mid;
+                    break;
                 }
-                if (cmp < 0)
+                else if (cmp < 0)
                 {
-                    /* passed the key */
-                    tidesdb_klog_block_free(klog_block);
-                    if (need_free_decompressed) free(decompressed);
-                    block_manager_block_release(block);
-                    goto cleanup;
+                    right = mid - 1;
+                }
+                else
+                {
+                    left = mid + 1;
                 }
             }
 
-            tidesdb_klog_block_free(klog_block);
-        }
+            if (this_get % 1000 == 0)
+            {
+                TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                              ": Binary search complete, comparisons=%u, found=%d",
+                              this_get, comparisons, found_idx >= 0);
+            }
 
-        if (need_free_decompressed) free(decompressed);
+            if (found_idx >= 0)
+            {
+                /* found! */
+                uint32_t i = (uint32_t)found_idx;
+
+                *kv = tidesdb_kv_pair_create(klog_block->keys[i], klog_block->entries[i].key_size,
+                                             NULL, 0, klog_block->entries[i].ttl,
+                                             klog_block->entries[i].seq,
+                                             klog_block->entries[i].flags & TDB_KV_FLAG_TOMBSTONE);
+
+                if (this_get % 1000 == 0)
+                {
+                    TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": kv_pair_create returned %p",
+                                  this_get, (void *)*kv);
+                }
+
+                if (*kv)
+                {
+                    (*kv)->entry = klog_block->entries[i];
+
+                    if (this_get % 1000 == 0)
+                    {
+                        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                      ": Entry copied, vlog_offset=%" PRIu64,
+                                      this_get, klog_block->entries[i].vlog_offset);
+                    }
+
+                    /* get value (inline or from vlog) */
+                    if (klog_block->entries[i].vlog_offset == 0)
+                    {
+                        if (this_get % 1000 == 0)
+                        {
+                            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                          ": Inline value, ptr=%p, value_size=%zu",
+                                          this_get, (void *)klog_block->inline_values[i],
+                                          klog_block->entries[i].value_size);
+                        }
+
+                        if (klog_block->inline_values[i])
+                        {
+                            if (this_get % 1000 == 0)
+                            {
+                                TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                              ": About to malloc %zu bytes for value",
+                                              this_get, klog_block->entries[i].value_size);
+                            }
+
+                            (*kv)->value = malloc(klog_block->entries[i].value_size);
+
+                            if (this_get % 1000 == 0)
+                            {
+                                TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                              ": malloc returned %p, about to memcpy",
+                                              this_get, (void *)(*kv)->value);
+                            }
+
+                            if ((*kv)->value)
+                            {
+                                memcpy((*kv)->value, klog_block->inline_values[i],
+                                       klog_block->entries[i].value_size);
+
+                                if (this_get % 1000 == 0)
+                                {
+                                    TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                                  ": memcpy complete",
+                                                  this_get);
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (this_get % 1000 == 0)
+                        {
+                            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                          ": Reading value from vlog, offset=%" PRIu64 ", size=%zu",
+                                          this_get, klog_block->entries[i].vlog_offset,
+                                          klog_block->entries[i].value_size);
+                        }
+
+                        tidesdb_vlog_read_value(db, sst, klog_block->entries[i].vlog_offset,
+                                                klog_block->entries[i].value_size, &(*kv)->value);
+
+                        if (this_get % 1000 == 0)
+                        {
+                            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                          ": Vlog read complete, value=%p",
+                                          this_get, (void *)(*kv)->value);
+                        }
+                    }
+
+                    result = TDB_SUCCESS;
+
+                    if (this_get % 1000 == 0)
+                    {
+                        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                      ": Key found, cleaning up and returning",
+                                      this_get);
+                    }
+
+                    if (this_get % 1000 == 0)
+                    {
+                        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Freeing klog_block",
+                                      this_get);
+                    }
+                    tidesdb_klog_block_free(klog_block);
+
+                    if (this_get % 1000 == 0)
+                    {
+                        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Releasing block",
+                                      this_get);
+                    }
+                    block_manager_block_release(block);
+
+                    if (this_get % 1000 == 0)
+                    {
+                        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Going to cleanup",
+                                      this_get);
+                    }
+
+                    goto cleanup;
+                }
+            }
+        }
+        /* key not found in this block, continue to next block */
+
+        tidesdb_klog_block_free(klog_block);
+
+        /* cleanup block resources before moving to next */
         block_manager_block_release(block);
 
-        block_num++; /* increment after processing block */
+        if (this_get % 1000 == 0 && block_num % 100 == 0)
+        {
+            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Block %" PRIu64
+                          " processed, moving to next",
+                          this_get, block_num);
+        }
+
+        block_num++;
 
         if (block_manager_cursor_next(klog_cursor) != 0)
         {
@@ -4565,8 +4751,8 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
             return NULL;
         }
 
-        block_manager_block_t *block = tidesdb_cached_block_read(
-            db, cf_name, sst->id, 'k', source->source.sstable.klog_cursor);
+        block_manager_block_t *block =
+            tidesdb_cached_block_read(db, sst, cf_name, 'k', source->source.sstable.klog_cursor);
         if (!block)
         {
             /* no block available */
@@ -4577,33 +4763,9 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
             return NULL;
         }
 
-        /* block is owned by us, decompress it */
+        /* block is already decompressed by tidesdb_cached_block_read */
         uint8_t *data = block->data;
         size_t data_size = block->size;
-        uint8_t *decompressed = NULL;
-
-        if (source->config->compression_algorithm != NO_COMPRESSION)
-        {
-            size_t decompressed_size;
-            decompressed = decompress_data(block->data, block->size, &decompressed_size,
-                                           source->config->compression_algorithm);
-            if (decompressed)
-            {
-                data = decompressed;
-                data_size = decompressed_size;
-                /* keep decompressed buffer, deserialized pointers reference it */
-                source->source.sstable.decompressed_data = decompressed;
-            }
-            else
-            {
-                /* decompression failed (corrupted block), clean up and return NULL */
-                block_manager_block_release(block);
-                tidesdb_sstable_unref(db, sst);
-                block_manager_cursor_free(source->source.sstable.klog_cursor);
-                free(source);
-                return NULL;
-            }
-        }
 
         if (tidesdb_klog_block_deserialize(data, data_size,
                                            &source->source.sstable.current_block) == 0)
@@ -4641,7 +4803,6 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
         }
 
         /* deserialization failed or empty block, clean up and return NULL */
-        if (decompressed) free(decompressed);
         block_manager_block_release(block);
         tidesdb_sstable_unref(db, sst);
         block_manager_cursor_free(source->source.sstable.klog_cursor);
@@ -10630,8 +10791,25 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
 {
     if (!db || !txn) return TDB_ERR_INVALID_ARGS;
 
+    static _Atomic(uint64_t) txn_begin_count = 0;
+    uint64_t this_txn = atomic_fetch_add(&txn_begin_count, 1);
+    if (this_txn % 100000 == 0)
+    {
+        TDB_DEBUG_LOG("TXN_BEGIN #%" PRIu64 " starting, is_open=%d", this_txn,
+                      atomic_load(&db->is_open));
+    }
+
     int wait_result = wait_for_open(db);
-    if (wait_result != TDB_SUCCESS) return wait_result;
+    if (wait_result != TDB_SUCCESS)
+    {
+        TDB_DEBUG_LOG("TXN_BEGIN #%" PRIu64 " failed wait_for_open: %d", this_txn, wait_result);
+        return wait_result;
+    }
+
+    if (this_txn % 100000 == 0)
+    {
+        TDB_DEBUG_LOG("TXN_BEGIN #%" PRIu64 " passed wait_for_open", this_txn);
+    }
 
     if (isolation < TDB_ISOLATION_READ_UNCOMMITTED || isolation > TDB_ISOLATION_SERIALIZABLE)
     {
@@ -11167,6 +11345,14 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
+    static _Atomic(uint64_t) sstable_search_count = 0;
+    uint64_t this_search = atomic_fetch_add(&sstable_search_count, 1);
+    if (this_search % 10000 == 0)
+    {
+        TDB_DEBUG_LOG("GET #%" PRIu64 ": Starting SSTable search, num_levels=%d", this_search,
+                      num_levels);
+    }
+
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
     tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
@@ -11183,6 +11369,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         tidesdb_level_t *level = cf->levels[level_num];
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
+
+        if (this_search % 10000 == 0 && num_ssts > 0)
+        {
+            TDB_DEBUG_LOG("GET #%" PRIu64 ": Searching level %d, num_ssts=%d", this_search,
+                          level_num, num_ssts);
+        }
 
         for (int j = 0; j < num_ssts; j++)
         {
@@ -11214,6 +11406,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             /* take ref only for ssts we will actually read */
             tidesdb_sstable_ref(sst);
 
+            if (this_search % 10000 == 0)
+            {
+                TDB_DEBUG_LOG("GET #%" PRIu64 ": Reading SSTable %" PRIu64 " at level %d",
+                              this_search, sst->id, level_num);
+            }
+
             tidesdb_kv_pair_t *candidate_kv = NULL;
             if (tidesdb_sstable_get(cf->db, sst, key, key_size, &candidate_kv) == TDB_SUCCESS &&
                 candidate_kv)
@@ -11231,7 +11429,22 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     /* L0 hit -- stop immediately, no need to check deeper levels */
                     if (level_num == 0)
                     {
+                        if (this_search % 10000 == 0)
+                        {
+                            TDB_DEBUG_LOG("GET #%" PRIu64
+                                          ": L0 hit, about to unref SSTable %" PRIu64,
+                                          this_search, sst->id);
+                        }
+
                         tidesdb_sstable_unref(cf->db, sst);
+
+                        if (this_search % 10000 == 0)
+                        {
+                            TDB_DEBUG_LOG("GET #%" PRIu64
+                                          ": unref complete, going to check_found_result",
+                                          this_search);
+                        }
+
                         goto check_found_result;
                     }
                 }
@@ -14481,7 +14694,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
 
     /* fsync config file to ensure it's persisted */
     fflush(fp);
-    int fd = fileno(fp);
+    int fd = tdb_fileno(fp);
     if (fd >= 0)
     {
         fsync(fd);

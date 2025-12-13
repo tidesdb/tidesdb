@@ -291,7 +291,11 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
 
     /* fsync before close */
     fflush(f);
-    fsync(fileno(f));
+    int fd = tdb_fileno(f);
+    if (fd >= 0)
+    {
+        fsync(fd);
+    }
     fclose(f);
 
     /* atomic rename using compat abstraction */

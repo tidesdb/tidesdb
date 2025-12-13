@@ -970,7 +970,7 @@ typedef struct
  * @param heap merge heap
  * @param current current key-value pair
  * @param valid validity flag
- * @param direction direction of iteration (1=forward, -1=backward)
+ * @param direction direction of iteration (1=forward, -n=backward)
  * @param snapshot_time snapshot time for ttl checks
  * @param cf_snapshot snapshot sequence for visibility checks
  */
@@ -1020,9 +1020,9 @@ tidesdb_config_t tidesdb_default_config(void);
 
 /**
  * tidesdb_open
- * opens a database
- * @param config configuration for database
- * @param db pointer to database handle
+ * opens an existing database or creates a new one
+ * @param config database configuration
+ * @param db output parameter for database handle
  * @return 0 on success, -n on failure
  */
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
@@ -1030,13 +1030,31 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
 /**
  * tidesdb_register_comparator
  * registers a custom comparator function
- * must be called before creating column families that use this comparator
+ *
+ * when tidesdb_open() is called, it automatically recovers all column families
+ * from disk. If a recovered CF uses a custom comparator that is not registered,
+ * the recovery will FAIL with TDB_ERR_NOT_FOUND to prevent data corruption.
+ *
+ * current limitation -- comparators cannot be registered before tidesdb_open()
+ * because the db handle doesn't exist yet. This means:
+ *
+ * - on first database creation: use default "memcmp" comparator, or don't
+ *   create CFs during initial open
+ * - on subsequent opens -- tidesdb_open() will fail if CFs need unregistered
+ *   comparators. This is intentional to prevent silent data corruption.
+ *
+ * workaround -- register comparators before creating CFs:
+ *   tidesdb_t *db;
+ *   tidesdb_open(&config, &db);  // Opens empty database
+ *   tidesdb_register_comparator(db, "my_cmp", my_fn, "ctx", ctx);
+ *   tidesdb_create_column_family(db, "my_cf", &cf_config);  // Now safe
+ *
  * @param db database handle
- * @param name unique name for the comparator
+ * @param name unique name for the comparator (max 63 chars)
  * @param fn comparator function pointer
- * @param ctx_str optional context string (for serialization, can be NULL or empty)
+ * @param ctx_str optional context string for serialization (can be NULL)
  * @param ctx optional runtime context pointer (can be NULL)
- * @return 0 on success, -1 on failure (duplicate name, invalid args, etc.)
+ * @return 0 on success, -n on failure (duplicate name, invalid args, etc.)
  */
 int tidesdb_register_comparator(tidesdb_t *db, const char *name, skip_list_comparator_fn fn,
                                 const char *ctx_str, void *ctx);
@@ -1048,7 +1066,7 @@ int tidesdb_register_comparator(tidesdb_t *db, const char *name, skip_list_compa
  * @param name comparator name
  * @param fn output parameter for comparator function (can be NULL)
  * @param ctx output parameter for runtime context pointer (can be NULL)
- * @return 0 on success, -1 if not found
+ * @return 0 on success, -n if not found
  */
 int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator_fn *fn,
                            void **ctx);
@@ -1057,6 +1075,7 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator
  * tidesdb_close
  * closes a database
  * @param db database handle
+ * @return 0 on success, -n on failure
  */
 int tidesdb_close(tidesdb_t *db);
 

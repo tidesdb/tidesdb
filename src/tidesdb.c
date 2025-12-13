@@ -358,6 +358,23 @@ static inline int decode_varint_v2(const uint8_t *buf, uint64_t *value, int max_
     return -1; /* incomplete varint */
 }
 
+/**
+ * varint_size
+ * calculate exact size of varint encoding for a value
+ * @param value value to encode
+ * @return number of bytes needed
+ */
+static inline size_t varint_size(uint64_t value)
+{
+    size_t size = 1;
+    while (value >= 0x80)
+    {
+        size++;
+        value >>= 7;
+    }
+    return size;
+}
+
 /** forward declarations */
 static tidesdb_klog_block_t *tidesdb_klog_block_create(void);
 static void tidesdb_klog_block_free(tidesdb_klog_block_t *block);
@@ -945,9 +962,25 @@ static int tidesdb_resolve_comparator(tidesdb_t *db, const tidesdb_column_family
         return 0;
     }
 
+    /* if we reach here, cached comparator is NULL but we need to resolve it */
+    int has_custom_comparator =
+        (config->comparator_name[0] != '\0' && strcmp(config->comparator_name, "memcmp") != 0);
+
     if (tidesdb_get_comparator(db, config->comparator_name, fn, ctx) != TDB_SUCCESS)
     {
-        /* comparator not found, use default */
+        if (has_custom_comparator)
+        {
+            /* custom comparator specified but not in registry and not cached!
+             * this should never happen if CF creation validated properly.
+             * */
+            TDB_DEBUG_LOG(
+                "FATAL: Comparator '%s' not found in registry and not cached. "
+                "This indicates a critical bug in CF creation/recovery.",
+                config->comparator_name);
+            return -1;
+        }
+
+        /* no comparator specified or explicitly requested memcmp, use default */
         *fn = tidesdb_comparator_memcmp;
         if (ctx) *ctx = NULL;
         return -1;
@@ -7388,18 +7421,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 /* flush klog block if full */
                 if (tidesdb_klog_block_is_full(klog_block, cf->config.klog_block_size))
                 {
-                    /* add completed block to index before writing */
-                    if (block_indexes && block_first_key && block_last_key)
-                    {
-                        /* sample every Nth block (ratio validated to be >= 1) */
-                        if (klog_block_num % cf->config.index_sample_ratio == 0)
-                        {
-                            compact_block_index_add(block_indexes, block_first_key,
-                                                    block_first_key_size, block_last_key,
-                                                    block_last_key_size, klog_block_num);
-                        }
-                    }
-
                     uint8_t *klog_data;
                     size_t klog_size;
                     if (tidesdb_klog_block_serialize(klog_block, &klog_data, &klog_size) == 0)
@@ -7425,9 +7446,24 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                             block_manager_block_create(final_size, final_data);
                         if (block)
                         {
-                            int64_t offset = block_manager_block_write(klog_bm, block);
-                            (void)offset; /* unused but kept for debugging */
+                            /* capture file position before writing the block */
+                            uint64_t block_file_position = atomic_load(&klog_bm->current_file_size);
+
+                            block_manager_block_write(klog_bm, block);
                             block_manager_block_release(block);
+
+                            /* add completed block to index after writing with file position */
+                            if (block_indexes && block_first_key && block_last_key)
+                            {
+                                /* sample every Nth block (ratio validated to be >= 1) */
+                                if (klog_block_num % cf->config.index_sample_ratio == 0)
+                                {
+                                    compact_block_index_add(
+                                        block_indexes, block_first_key, block_first_key_size,
+                                        block_last_key, block_last_key_size, block_file_position);
+                                }
+                            }
+
                             klog_block_num++;
                         }
                         free(final_data);
@@ -7487,18 +7523,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             /* write remaining block */
             if (klog_block->num_entries > 0)
             {
-                /* add final block to index */
-                if (block_indexes && block_first_key && block_last_key)
-                {
-                    /* sample every Nth block (ratio validated to be >= 1) */
-                    if (klog_block_num % cf->config.index_sample_ratio == 0)
-                    {
-                        compact_block_index_add(block_indexes, block_first_key,
-                                                block_first_key_size, block_last_key,
-                                                block_last_key_size, klog_block_num);
-                    }
-                }
-
                 uint8_t *klog_data;
                 size_t klog_size;
                 if (tidesdb_klog_block_serialize(klog_block, &klog_data, &klog_size) == 0)
@@ -7523,8 +7547,24 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                         block_manager_block_create(final_size, final_data);
                     if (block)
                     {
+                        /* capture file position before writing the block */
+                        uint64_t block_file_position = atomic_load(&klog_bm->current_file_size);
+
                         block_manager_block_write(klog_bm, block);
                         block_manager_block_release(block);
+
+                        /* add final block to index after writing with file position */
+                        if (block_indexes && block_first_key && block_last_key)
+                        {
+                            /* sample every Nth block (ratio validated to be >= 1) */
+                            if (klog_block_num % cf->config.index_sample_ratio == 0)
+                            {
+                                compact_block_index_add(block_indexes, block_first_key,
+                                                        block_first_key_size, block_last_key,
+                                                        block_last_key_size, block_file_position);
+                            }
+                        }
+
                         klog_block_num++;
                     }
                     free(final_data);
@@ -9596,10 +9636,30 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
+
+    /* check if a custom comparator is specified */
+    int has_custom_comparator =
+        (config->comparator_name[0] != '\0' && strcmp(config->comparator_name, "memcmp") != 0);
+
     if (tidesdb_get_comparator(db, config->comparator_name, &comparator_fn, &comparator_ctx) !=
         TDB_SUCCESS)
     {
-        /* comparator not found, use default memcmp */
+        if (has_custom_comparator)
+        {
+            /* custom comparator specified but not registered!
+             * this would cause data corruption if we fall back to memcmp.
+             * user must register comparator before creating/opening CF. */
+            TDB_DEBUG_LOG(
+                "FATAL: Column family '%s' requires comparator '%s' but it is not registered. "
+                "Register comparator with tidesdb_register_comparator() before opening database.",
+                name, config->comparator_name);
+            free(cf->directory);
+            free(cf->name);
+            free(cf);
+            return TDB_ERR_NOT_FOUND;
+        }
+
+        /* no comparator specified or explicitly requested memcmp, use default */
         comparator_fn = tidesdb_comparator_memcmp;
         comparator_ctx = NULL;
     }
@@ -11470,11 +11530,15 @@ skip_ssi_check:
             if (op->cf == cf)
             {
                 cf_op_count++;
+                /* flags byte */
                 cf_wal_size += 1;
-                cf_wal_size += (op->key_size < 128) ? 1 : 5;
-                cf_wal_size += (op->value_size < 128) ? 1 : (op->value_size < 16384) ? 2 : 5;
-                cf_wal_size += 10;
+                /* exact varint sizes for key_size, value_size, and sequence */
+                cf_wal_size += varint_size(op->key_size);
+                cf_wal_size += varint_size(op->value_size);
+                cf_wal_size += varint_size(txn->commit_seq);
+                /* TTL: 8 bytes if present */
                 if (op->ttl != 0) cf_wal_size += 8;
+                /* key and value data */
                 cf_wal_size += op->key_size;
                 if (op->value_size > 0) cf_wal_size += op->value_size;
             }

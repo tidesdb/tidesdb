@@ -2172,4 +2172,32 @@ static inline int remove_directory(const char *path)
     return -1; /* failed after all retries */
 }
 
+/**
+ * tdb_sync_directory
+ * syncs a directory to ensure directory entries (new files/subdirs) are persisted
+ * on POSIX systems, directory entries must be explicitly synced after mkdir/file creation
+ * on Windows, directory entries are immediately durable, so this is a no-op
+ * @param dir_path path to the directory to sync
+ * @return 0 on success, -1 on error (errors are non-fatal, just logged)
+ */
+static inline int tdb_sync_directory(const char *dir_path)
+{
+#ifdef _WIN32
+    /* Windows -- directory entries are immediately durable, no sync needed */
+    (void)dir_path;
+    return 0;
+#else
+    /* POSIX -- must fsync directory to persist directory entries */
+    int fd = open(dir_path, O_RDONLY);
+    if (fd < 0)
+    {
+        /* non-fatal -- directory might not support fsync (e.g., some network filesystems) */
+        return -1;
+    }
+    int result = fsync(fd);
+    close(fd);
+    return result;
+#endif
+}
+
 #endif /* __COMPAT_H__ */

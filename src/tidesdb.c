@@ -8417,13 +8417,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
     while (1)
     {
-        /* check if database is closing before blocking on queue */
-        if (!atomic_load(&db->is_open))
-        {
-            TDB_DEBUG_LOG("Flush worker: database closing, exiting loop");
-            break;
-        }
-
         TDB_DEBUG_LOG("Flush worker: waiting for work (queue size: %zu)",
                       queue_size(db->flush_queue));
         /* wait for work (blocking dequeue) */
@@ -8737,15 +8730,6 @@ static void *tidesdb_compaction_worker_thread(void *arg)
             continue;
         }
 
-        /* check if database is closing before accessing CF
-         * prevents use-after-free if CF is being freed during shutdown */
-        if (!atomic_load(&db->is_open))
-        {
-            /* database is closing, skip this work and exit */
-            free(work);
-            break;
-        }
-
         int space_check = tidesdb_check_disk_space(db, cf->directory, cf->config.min_disk_space);
         if (space_check <= 0)
         {
@@ -9050,10 +9034,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->num_active_txns = 0;
     atomic_init(&(*db)->active_txn_count, 0); /* initialize transaction counter */
 
-    /* initialize is_open to 0 -- will be set to 1 after recovery and worker startup
-     * this prevents transactions from starting before database is fully initialized */
-    atomic_init(&(*db)->is_open, 0);
-
     uint64_t initial_space = 0;
     if (tdb_get_available_disk_space((*db)->db_path, &initial_space) == 0)
     {
@@ -9268,10 +9248,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         atomic_store(&(*db)->sync_thread_active, 0);
     }
 
-    /* now that recovery is complete and all worker threads are running,
-     * mark database as open to allow transactions to proceed
-     * this ensures database is fully initialized before any operations */
-    atomic_store_explicit(&(*db)->is_open, 1, memory_order_release);
     TDB_DEBUG_LOG("Database is now open and ready for operations");
 
     return TDB_SUCCESS;
@@ -9280,7 +9256,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 int tidesdb_close(tidesdb_t *db)
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
-    if (!atomic_load_explicit(&db->is_open, memory_order_acquire)) return TDB_ERR_INVALID_ARGS;
 
     TDB_DEBUG_LOG("Closing TidesDB at path: %s", db->db_path);
 
@@ -9368,12 +9343,6 @@ int tidesdb_close(tidesdb_t *db)
     pthread_rwlock_unlock(&db->cf_list_lock);
     TDB_DEBUG_LOG("All memtables flushed");
 
-    /* set is_open to 0 before waiting for transactions
-     * this causes new transaction attempts to fail immediately,
-     * allowing active threads to exit faster */
-    atomic_store_explicit(&db->is_open, 0, memory_order_release);
-
-    /* handle active transactions based on config */
     int final_active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
 
     if (db->config.wait_for_txns_on_close)
@@ -9405,9 +9374,6 @@ int tidesdb_close(tidesdb_t *db)
         {
             TDB_DEBUG_LOG("ERROR: Cannot close database - %d transactions still active after %dms",
                           final_active_count, TDB_CLOSE_TXN_WAIT_MAX_MS);
-            TDB_DEBUG_LOG("Database is in inconsistent state - is_open=0 but resources not freed");
-            /* restore is_open flag since we're aborting the close */
-            atomic_store_explicit(&db->is_open, 1, memory_order_release);
             return TDB_ERR_UNKNOWN;
         }
     }
@@ -9589,9 +9555,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 {
     if (!db || !name || !config) return TDB_ERR_INVALID_ARGS;
 
-    /* note: no is_open check here because this function is called during recovery
-     * when is_open is still 0. transaction operations have their own is_open checks. */
-
     /* validate sync configuration */
     if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us == 0)
     {
@@ -9639,6 +9602,11 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             free(cf);
             return TDB_ERR_IO;
         }
+
+        /* sync parent directory to ensure directory entry is persisted
+         * without this, the directory might not survive a crash/close
+         * uses cross-platform tdb_sync_directory (no-op on Windows, fsync on POSIX) */
+        tdb_sync_directory(db->db_path);
     }
 
     cf->directory = tdb_strdup(dir_path);
@@ -9931,7 +9899,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 {
     if (!db || !name) return TDB_ERR_INVALID_ARGS;
-    if (!atomic_load_explicit(&db->is_open, memory_order_acquire)) return TDB_ERR_INVALID_ARGS;
 
     TDB_DEBUG_LOG("Dropping column family: %s", name);
 
@@ -9979,7 +9946,6 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *name)
 {
     if (!db || !name) return NULL;
-    if (!atomic_load_explicit(&db->is_open, memory_order_acquire)) return NULL;
 
     pthread_rwlock_rdlock(&db->cf_list_lock);
     tidesdb_column_family_t *result = NULL;
@@ -10434,7 +10400,7 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
                                      tidesdb_txn_t **txn)
 {
     if (!db || !txn) return TDB_ERR_INVALID_ARGS;
-    if (!atomic_load_explicit(&db->is_open, memory_order_acquire)) return TDB_ERR_INVALID_ARGS;
+
     if (isolation < TDB_ISOLATION_READ_UNCOMMITTED || isolation > TDB_ISOLATION_SERIALIZABLE)
     {
         return TDB_ERR_INVALID_ARGS;
@@ -10612,11 +10578,8 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 {
     if (!txn || !cf || !key || key_size == 0 || !value) return TDB_ERR_INVALID_ARGS;
 
-    /* check if database is still open to prevent use-after-free during close */
-    if (!txn->db || !atomic_load_explicit(&txn->db->is_open, memory_order_acquire))
-    {
-        return TDB_ERR_INVALID_DB;
-    }
+    /* wait for database to finish opening, or fail if shutting down */
+    if (!txn->db) return TDB_ERR_INVALID_ARGS;
 
     /* validate key-value size against memory limits */
     int size_check = tidesdb_validate_kv_size(txn->db, key_size, value_size);
@@ -10709,11 +10672,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 {
     if (!txn || !cf || !key || key_size == 0 || !value || !value_size) return TDB_ERR_INVALID_ARGS;
 
-    /* check if database is still open to prevent use-after-free during close */
-    if (!txn->db || !atomic_load_explicit(&txn->db->is_open, memory_order_acquire))
-    {
-        return TDB_ERR_INVALID_DB;
-    }
+    /* wait for database to finish opening, or fail if shutting down */
+    if (!txn->db) return TDB_ERR_INVALID_ARGS;
 
     /* add CF to transaction if not already added */
     int cf_index = tidesdb_txn_add_cf_internal(txn, cf);
@@ -11091,11 +11051,9 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const ui
 {
     if (!txn || !cf || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
-    /* check if database is still open to prevent use-after-free during close */
-    if (!txn->db || !atomic_load_explicit(&txn->db->is_open, memory_order_acquire))
-    {
-        return TDB_ERR_INVALID_DB;
-    }
+    /* wait for database to finish opening, or fail if shutting down */
+    if (!txn->db) return TDB_ERR_INVALID_ARGS;
+
     if (txn->is_committed || txn->is_aborted) return TDB_ERR_INVALID_ARGS;
 
     /* add CF to transaction if not already added */
@@ -13810,8 +13768,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     {
         size_t imm_count = queue_size(cf->immutable_memtables);
 
-        /* skip lists are ordered by seq, so just check the last entry
-         * this changes O(N) full scan to O(1) lookup */
+        /* IMPORTANT: skip lists are ordered by KEY, not by sequence!
+         * we must scan all entries to find the maximum sequence number */
         for (size_t i = 0; i < imm_count; i++)
         {
             tidesdb_immutable_memtable_t *imm = queue_peek_at(cf->immutable_memtables, i);
@@ -13820,23 +13778,27 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                 skip_list_cursor_t *cursor;
                 if (skip_list_cursor_init(&cursor, imm->memtable) == 0)
                 {
-                    /* jump directly to last entry (highest seq) */
-                    if (skip_list_cursor_goto_last(cursor) == 0)
+                    /* scan all entries to find max sequence */
+                    if (skip_list_cursor_goto_first(cursor) == 0)
                     {
-                        uint8_t *key, *value;
-                        size_t key_size, value_size;
-                        time_t ttl;
-                        uint8_t deleted;
-                        uint64_t seq;
-
-                        if (skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value,
-                                                          &value_size, &ttl, &deleted, &seq) == 0)
+                        do
                         {
-                            if (seq > global_max_seq)
+                            uint8_t *key, *value;
+                            size_t key_size, value_size;
+                            time_t ttl;
+                            uint8_t deleted;
+                            uint64_t seq;
+
+                            if (skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value,
+                                                              &value_size, &ttl, &deleted,
+                                                              &seq) == 0)
                             {
-                                global_max_seq = seq;
+                                if (seq > global_max_seq)
+                                {
+                                    global_max_seq = seq;
+                                }
                             }
-                        }
+                        } while (skip_list_cursor_next(cursor) == 0);
                     }
                     skip_list_cursor_free(cursor);
                 }
@@ -13910,6 +13872,8 @@ static int tidesdb_recover_database(tidesdb_t *db)
         {
             continue;
         }
+
+        TDB_DEBUG_LOG("Recovery: examining entry '%s'", entry->d_name);
 
         char full_path[MAX_FILE_PATH_LENGTH];
         snprintf(full_path, sizeof(full_path), "%s%s%s", db->db_path, PATH_SEPARATOR,
@@ -14240,7 +14204,30 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
         fprintf(fp, "comparator_ctx_str = %s\n", config->comparator_ctx_str);
     }
 
+    /* fsync config file to ensure it's persisted */
+    fflush(fp);
+    int fd = fileno(fp);
+    if (fd >= 0)
+    {
+        fsync(fd);
+    }
     fclose(fp);
+
+    /* sync parent directory to ensure file entry is persisted
+     * uses cross-platform tdb_sync_directory (no-op on Windows, fsync on POSIX) */
+    char *last_sep = strrchr(ini_file, PATH_SEPARATOR[0]);
+    if (last_sep)
+    {
+        char parent_dir[TDB_MAX_PATH_LEN];
+        size_t parent_len = last_sep - ini_file;
+        if (parent_len < TDB_MAX_PATH_LEN)
+        {
+            memcpy(parent_dir, ini_file, parent_len);
+            parent_dir[parent_len] = '\0';
+            tdb_sync_directory(parent_dir);
+        }
+    }
+
     return TDB_SUCCESS;
 }
 

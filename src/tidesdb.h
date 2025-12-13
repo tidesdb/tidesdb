@@ -230,11 +230,9 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      (1024 * 64)
 #define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_SYNC_INTERVAL_US            128000
-#define TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE      0
-#define TDB_TXN_TIMEOUT_SECONDS                 30
+#define TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE      1
 #define TDB_COMMIT_STATUS_BUFFER_SIZE           65536
 #define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE        (4 * 1024 * 1024)
-#define TDB_WAL_GROUP_COMMIT_TIMEOUT_US         10
 
 /* transaction optimization configuration */
 /* create write set hash table at this many ops */
@@ -268,10 +266,10 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_CLOSE_FLUSH_WAIT_SLEEP_US          10000
 #define TDB_CLOSE_QUEUE_DRAIN_MAX_ATTEMPTS     100
 #define TDB_CLOSE_QUEUE_DRAIN_SLEEP_US         10000
-#define TDB_CLOSE_TXN_WAIT_MAX_MS              5000 /* max time to wait for active transactions */
-#define TDB_CLOSE_TXN_WAIT_SLEEP_US            1000 /* 1ms sleep between transaction checks */
+#define TDB_CLOSE_TXN_WAIT_SLEEP_US            1000
 #define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US     10000
 #define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS 100
+#define TDB_CLOSE_TXN_WAIT_MAX_MS              5000
 
 /* backpressure configuration */
 #define TDB_BACKPRESSURE_THRESHOLD_L0_FULL     100
@@ -752,7 +750,6 @@ struct tidesdb_compaction_work_t
  * @param sync_lock mutex for sync operations
  * @param sstable_cache lru cache for sstable file handles
  * @param block_cache lru cache for sstable blocks
- * @param is_open atomic flag to indicate if database is open
  * @param next_txn_id global transaction id counter
  * @param global_seq global sequence counter for snapshots and commits
  * @param commit_status tracks which sequences are committed
@@ -788,8 +785,6 @@ struct tidesdb_t
     pthread_mutex_t sync_lock;
     lru_cache_t *sstable_cache;
     lru_cache_t *block_cache;
-    _Atomic(int) is_open;
-
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
     tidesdb_commit_status_t *commit_status;

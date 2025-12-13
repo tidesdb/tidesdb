@@ -20,8 +20,8 @@
 
 #include "xxhash.h"
 
-/* global debug flag definition */
-int _tidesdb_debug_enabled = 0;
+/* global log level definition */
+int _tidesdb_log_level = TDB_LOG_DEBUG; /* default to DEBUG level */
 
 /**
  * tidesdb_commit_status_create
@@ -725,7 +725,8 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, size_t key_size, size_t value
 
     if (total_size > max_allowed_size)
     {
-        TDB_DEBUG_LOG("Key-value pair size (%zu bytes) exceeds memory limit (%" PRIu64
+        TDB_DEBUG_LOG(TDB_LOG_FATAL,
+                      "Key-value pair size (%zu bytes) exceeds memory limit (%" PRIu64
                       " bytes, based on available memory: %" PRIu64 " bytes)",
                       total_size, max_allowed_size, (uint64_t)db->available_memory);
         return TDB_ERR_MEMORY_LIMIT;
@@ -851,7 +852,8 @@ static int sstable_metadata_deserialize(const uint8_t *data, size_t data_size,
 
     if (magic != SSTABLE_METADATA_MAGIC)
     {
-        TDB_DEBUG_LOG("SSTable metadata: Invalid magic 0x%08x (expected 0x%08x)", magic,
+        TDB_DEBUG_LOG(TDB_LOG_FATAL,
+                      "SSTable metadata has an invalid magic 0x%08x (expected 0x%08x)", magic,
                       SSTABLE_METADATA_MAGIC);
         return -1;
     }
@@ -885,8 +887,8 @@ static int sstable_metadata_deserialize(const uint8_t *data, size_t data_size,
     size_t expected_size = 92 + min_key_size + max_key_size;
     if (data_size != expected_size)
     {
-        TDB_DEBUG_LOG("SSTable metadata: Size mismatch (expected: %zu, got: %zu)", expected_size,
-                      data_size);
+        TDB_DEBUG_LOG(TDB_LOG_FATAL, "SSTable metadata size mismatch (expected: %zu, got: %zu)",
+                      expected_size, data_size);
         return -1;
     }
 
@@ -901,7 +903,8 @@ static int sstable_metadata_deserialize(const uint8_t *data, size_t data_size,
 
     if (computed_checksum != stored_checksum)
     {
-        TDB_DEBUG_LOG("SSTable metadata: Checksum mismatch (expected: %" PRIu64 ", got: %" PRIu64
+        TDB_DEBUG_LOG(TDB_LOG_FATAL,
+                      "SSTable metadata checksum mismatch (expected: %" PRIu64 ", got: %" PRIu64
                       ")",
                       stored_checksum, computed_checksum);
         return -1;
@@ -980,10 +983,8 @@ static int tidesdb_resolve_comparator(tidesdb_t *db, const tidesdb_column_family
             /* custom comparator specified but not in registry and not cached!
              * this should never happen if CF creation validated properly.
              * */
-            TDB_DEBUG_LOG(
-                "FATAL: Comparator '%s' not found in registry and not cached. "
-                "This indicates a critical bug in CF creation/recovery.",
-                config->comparator_name);
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Comparator '%s' not found in registry and not cached. ",
+                          config->comparator_name);
             return -1;
         }
 
@@ -1122,7 +1123,7 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
 tidesdb_config_t tidesdb_default_config(void)
 {
     tidesdb_config_t config = {.db_path = "./tidesdb",
-                               .enable_debug_logging = 0,
+                               .log_level = TDB_LOG_INFO,
                                .num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE,
                                .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
                                .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
@@ -1502,9 +1503,9 @@ static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **o
 
     if (*out_size > estimated_size)
     {
-        TDB_DEBUG_LOG(
-            "CRITICAL: klog serialization buffer overrun! wrote %zu bytes, allocated %zu bytes",
-            *out_size, estimated_size);
+        TDB_DEBUG_LOG(TDB_LOG_FATAL,
+                      "klog serialization buffer overrun! wrote %zu bytes, allocated %zu bytes",
+                      *out_size, estimated_size);
         free(*out);
         *out = NULL;
         return TDB_ERR_CORRUPTION;
@@ -1563,7 +1564,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
     {
         if (remaining < 1)
         {
-            TDB_DEBUG_LOG("Entry exceeds bounds at entry %u", i);
+            TDB_DEBUG_LOG(TDB_LOG_FATAL, "Entry exceeds bounds at entry %u", i);
             tidesdb_klog_block_free(*block);
             *block = NULL;
             return TDB_ERR_CORRUPTION;
@@ -1577,7 +1578,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         int bytes_read = decode_varint_v2(ptr, &key_size_u64, (int)remaining);
         if (bytes_read < 0 || key_size_u64 > UINT32_MAX)
         {
-            TDB_DEBUG_LOG("Invalid key_size varint at entry %u", i);
+            TDB_DEBUG_LOG(TDB_LOG_FATAL, "Invalid key_size varint at entry %u", i);
             tidesdb_klog_block_free(*block);
             *block = NULL;
             return TDB_ERR_CORRUPTION;
@@ -1590,7 +1591,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         bytes_read = decode_varint_v2(ptr, &value_size_u64, (int)remaining);
         if (bytes_read < 0 || value_size_u64 > UINT32_MAX)
         {
-            TDB_DEBUG_LOG("Invalid value_size varint at entry %u", i);
+            TDB_DEBUG_LOG(TDB_LOG_FATAL, "Invalid value_size varint at entry %u", i);
             tidesdb_klog_block_free(*block);
             *block = NULL;
             return TDB_ERR_CORRUPTION;
@@ -1603,7 +1604,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         bytes_read = decode_varint_v2(ptr, &seq_value, (int)remaining);
         if (bytes_read < 0)
         {
-            TDB_DEBUG_LOG("Invalid seq varint at entry %u", i);
+            TDB_DEBUG_LOG(TDB_LOG_FATAL, "Invalid seq varint at entry %u", i);
             tidesdb_klog_block_free(*block);
             *block = NULL;
             return TDB_ERR_CORRUPTION;
@@ -1625,7 +1626,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         {
             if (remaining < sizeof(int64_t))
             {
-                TDB_DEBUG_LOG("TTL exceeds bounds at entry %u", i);
+                TDB_DEBUG_LOG(TDB_LOG_FATAL, "TTL exceeds bounds at entry %u", i);
                 tidesdb_klog_block_free(*block);
                 *block = NULL;
                 return TDB_ERR_CORRUPTION;
@@ -1645,7 +1646,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
             bytes_read = decode_varint_v2(ptr, &vlog_offset, (int)remaining);
             if (bytes_read < 0)
             {
-                TDB_DEBUG_LOG("Invalid vlog_offset varint at entry %u", i);
+                TDB_DEBUG_LOG(TDB_LOG_FATAL, "Invalid vlog_offset varint at entry %u", i);
                 tidesdb_klog_block_free(*block);
                 *block = NULL;
                 return TDB_ERR_CORRUPTION;
@@ -1661,7 +1662,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 
         if (remaining < (*block)->entries[i].key_size)
         {
-            TDB_DEBUG_LOG("Key data exceeds bounds at entry %u", i);
+            TDB_DEBUG_LOG(TDB_LOG_FATAL, "Key data exceeds bounds at entry %u", i);
             tidesdb_klog_block_free(*block);
             *block = NULL;
             return TDB_ERR_CORRUPTION;
@@ -1682,7 +1683,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         {
             if (remaining < (*block)->entries[i].value_size)
             {
-                TDB_DEBUG_LOG("Inline value exceeds bounds at entry %u", i);
+                TDB_DEBUG_LOG(TDB_LOG_FATAL, "Inline value exceeds bounds at entry %u", i);
                 tidesdb_klog_block_free(*block);
                 *block = NULL;
                 return TDB_ERR_CORRUPTION;
@@ -1991,7 +1992,8 @@ static int tidesdb_vlog_read_value(tidesdb_t *db, tidesdb_sstable_t *sst, uint64
             /* validate value size matches expected */
             if (value_size > 0 && vlog_block->value_sizes[i] != value_size)
             {
-                TDB_DEBUG_LOG("Value size mismatch at entry %d (expected %zu, got %u)", i,
+                TDB_DEBUG_LOG(TDB_LOG_FATAL,
+                              "Value size mismatch at entry %d (expected %zu, got %u)", i,
                               value_size, vlog_block->value_sizes[i]);
                 free(*value);
                 *value = NULL;
@@ -2225,14 +2227,16 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
             /* check if we're in a potential deadlock situation */
             if (retry_count > TDB_SSTABLE_CACHE_FAST_RETRY_THRESHOLD)
             {
-                TDB_DEBUG_LOG("SSTable %" PRIu64 ": Cache contention detected (retry %d/%d)",
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "SSTable %" PRIu64 " cache contention detected (retry %d/%d)",
                               sst->id, retry_count, TDB_SSTABLE_CACHE_MAX_RETRIES);
             }
 
             /* log cache pressure on first retry and periodically */
             if (retry_count == 0 || retry_count % TDB_SSTABLE_CACHE_RETRY_LOG_INTERVAL == 0)
             {
-                TDB_DEBUG_LOG("SSTable %" PRIu64 ": cache full (retry %d), waiting for eviction",
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "SSTable %" PRIu64 " cache full (retry %d), waiting for eviction",
                               sst->id, retry_count);
             }
 
@@ -2258,8 +2262,9 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
             /* failed to add to cache after max retries.
              * this can happen if all cache entries are protected by hazard pointers.
              * we will proceed without caching to avoid deadlock, but log a warning. */
-            TDB_DEBUG_LOG("SSTable %" PRIu64
-                          ": WARNING - cache_put failed after %d retries, proceeding without cache",
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "SSTable %" PRIu64
+                          " - cache put failed after %d retries, proceeding without cache",
                           sst->id, TDB_SSTABLE_CACHE_MAX_RETRIES);
             /* dont return error -- continue to open block managers below */
         }
@@ -2809,19 +2814,21 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 {
     (void)cf; /* unused parameter */
     int num_entries = skip_list_count_entries(memtable);
-    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Writing from memtable (%d entries)", sst->id, num_entries);
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "SSTable %" PRIu64 " writing from memtable (sorted run to disk) (%d entries)",
+                  sst->id, num_entries);
 
     /* ensure sstable is in cache and get block managers */
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to ensure open", sst->id);
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to ensure open", sst->id);
         return TDB_ERR_IO;
     }
 
     tidesdb_block_managers_t bms;
     if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to get block managers", sst->id);
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to get block managers", sst->id);
         return TDB_ERR_IO;
     }
 
@@ -2833,15 +2840,17 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     {
         if (bloom_filter_new(&bloom, sst->config->bloom_fpr, num_entries) != 0)
         {
-            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to create bloom filter", sst->id);
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to create bloom filter",
+                          sst->id);
             return TDB_ERR_MEMORY;
         }
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter created (fpr: %.4f, entries: %d)", sst->id,
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "SSTable %" PRIu64 " bloom filter created (fpr: %.4f, entries: %d)", sst->id,
                       sst->config->bloom_fpr, num_entries);
     }
     else
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Bloom filter disabled", sst->id);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable %" PRIu64 " bloom filter disabled", sst->id);
     }
 
     if (sst->config->enable_block_indexes)
@@ -2856,16 +2865,17 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
             initial_capacity, sst->config->block_index_prefix_len, comparator_fn, comparator_ctx);
         if (!block_indexes)
         {
-            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to create block indexes", sst->id);
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to create block indexes",
+                          sst->id);
             if (bloom) bloom_filter_free(bloom);
             return TDB_ERR_MEMORY;
         }
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block indexes enabled (sample ratio: %d)", sst->id,
-                      sst->config->index_sample_ratio);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable %" PRIu64 " block indexes enabled (sample ratio: %d)",
+                      sst->id, sst->config->index_sample_ratio);
     }
     else
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block indexes disabled", sst->id);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable %" PRIu64 " block indexes disabled", sst->id);
     }
 
     /* init blocks */
@@ -2920,9 +2930,10 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
             if (skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
                                               &deleted, &seq) != 0)
             {
-                TDB_DEBUG_LOG(
-                    "WARNING: Skipping entry during flush - cursor read failed (entry %" PRIu64 ")",
-                    entry_count);
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "Skipping entry during flush - cursor read failed (entry %" PRIu64
+                              ")",
+                              entry_count);
                 continue;
             }
 
@@ -3048,7 +3059,8 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                             /* compression failed -- this is fatal since config says we're
                              * compressed
                              */
-                            TDB_DEBUG_LOG("SSTable %" PRIu64 ": klog compression FAILED!", sst->id);
+                            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                          "SSTable %" PRIu64 " klog compression failed!", sst->id);
                             free(klog_data);
                             tidesdb_klog_block_free(current_klog_block);
                             tidesdb_vlog_block_free(current_vlog_block);
@@ -3077,12 +3089,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                             /* sample every Nth block (ratio validated to be >= 1) */
                             if (klog_block_num % sst->config->index_sample_ratio == 0)
                             {
-                                if (klog_block_num < 5 || klog_block_num % 100 == 0)
-                                {
-                                    TDB_DEBUG_LOG("SSTable %" PRIu64 ": Adding block %" PRIu64
-                                                  " to index, file_pos=%" PRIu64,
-                                                  sst->id, klog_block_num, block_file_position);
-                                }
                                 compact_block_index_add(block_indexes, block_first_key,
                                                         block_first_key_size, block_last_key,
                                                         block_last_key_size, block_file_position);
@@ -3165,7 +3171,8 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                 }
                 else
                 {
-                    TDB_DEBUG_LOG("SSTable %" PRIu64 ": final klog compression FAILED!", sst->id);
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "SSTable %" PRIu64 " final klog compression failed!", sst->id);
                     free(klog_data);
                     tidesdb_klog_block_free(current_klog_block);
                     tidesdb_vlog_block_free(current_vlog_block);
@@ -3270,23 +3277,18 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
         /* we assign the built index to the sst */
         sst->block_indexes = block_indexes;
 
-        TDB_DEBUG_LOG("SSTable " TDB_U64_FMT ": Block indexes built - %" PRIu32
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "SSTable " TDB_U64_FMT " block indexes built - %" PRIu32
                       " samples, " TDB_U64_FMT " total blocks",
                       TDB_U64_CAST(sst->id), sst->block_indexes->count,
                       TDB_U64_CAST(klog_block_num));
-        /* log first few index entries for debugging */
-        for (uint32_t i = 0; i < sst->block_indexes->count && i < 5; i++)
-        {
-            TDB_DEBUG_LOG("SSTable " TDB_U64_FMT ": Index entry %u: file_pos=" TDB_U64_FMT,
-                          TDB_U64_CAST(sst->id), i,
-                          TDB_U64_CAST(sst->block_indexes->file_positions[i]));
-        }
+
         size_t index_size;
         uint8_t *index_data = compact_block_index_serialize(sst->block_indexes, &index_size);
         if (index_data)
         {
-            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Block indexes serialized to %zu bytes", sst->id,
-                          index_size);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable %" PRIu64 " block indexes serialized to %zu bytes",
+                          sst->id, index_size);
             block_manager_block_t *index_block = block_manager_block_create(index_size, index_data);
             if (index_block)
             {
@@ -3402,40 +3404,32 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
                                size_t key_size, tidesdb_kv_pair_t **kv)
 {
-    static _Atomic(uint64_t) sst_get_count = 0;
-    uint64_t this_get = atomic_fetch_add(&sst_get_count, 1);
-    if (this_get % 1000 == 0)
-    {
-        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": SSTable %" PRIu64
-                      ", num_klog_blocks=%" PRIu64,
-                      this_get, sst->id, sst->num_klog_blocks);
-    }
-
     /* check cache first for this entry */
     if (db->block_cache)
     {
         char cf_name[TDB_CACHE_KEY_SIZE];
         if (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) == 0)
         {
-            if (this_get % 1000 == 0)
-            {
-                TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                              ": Checking cache for cf=%s, sst=%" PRIu64,
-                              this_get, cf_name, sst->id);
-            }
-
             tidesdb_cached_entry_t *cached =
                 tidesdb_cache_entry_get(db, cf_name, sst->id, key, key_size);
             if (cached)
             {
-                if (this_get % 1000 == 0)
+                /* cache hit -- check tombstone flag */
+                if (cached->flags & TDB_KV_FLAG_TOMBSTONE)
                 {
-                    TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                  ": CACHE HIT! Returning cached entry",
-                                  this_get);
+                    free(cached);
+                    return TDB_ERR_NOT_FOUND;
                 }
 
-                /* cache hit - reconstruct kv_pair from cached entry */
+                /* check TTL expiration */
+                if (cached->ttl > 0 && cached->ttl <= time(NULL))
+                {
+                    /* TTL expired -- treat as not found */
+                    free(cached);
+                    return TDB_ERR_NOT_FOUND;
+                }
+
+                /* valid entry -- reconstruct kv_pair from cached entry */
                 *kv = tidesdb_kv_pair_create(cached->data, cached->key_size,
                                              cached->data + cached->key_size,
                                              (cached->vlog_offset == 0) ? cached->value_size : 0,
@@ -3457,34 +3451,21 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                 free(cached);
                 return (*kv) ? TDB_SUCCESS : TDB_ERR_MEMORY;
             }
-            else if (this_get % 1000 == 0)
-            {
-                TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Cache miss, reading from disk",
-                              this_get);
-            }
         }
-        else if (this_get % 1000 == 0)
-        {
-            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Failed to get CF name from path: %s",
-                          this_get, sst->klog_path);
-        }
-    }
-    else if (this_get % 1000 == 0)
-    {
-        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": block_cache is NULL!", this_get);
     }
 
     /* ensure sstable is open through cache */
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
-        TDB_DEBUG_LOG("SSTable " TDB_U64_FMT " ensure_open FAILED", TDB_U64_CAST(sst->id));
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable " TDB_U64_FMT " ensure_open failed",
+                      TDB_U64_CAST(sst->id));
         return TDB_ERR_IO;
     }
 
     tidesdb_block_managers_t bms;
     if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": get_block_managers FAILED", sst->id);
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " get_block_managers failed", sst->id);
         return TDB_ERR_IO;
     }
 
@@ -3536,24 +3517,10 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     {
         int index_result = compact_block_index_find_predecessor(sst->block_indexes, key, key_size,
                                                                 &start_file_position);
-        if (this_get % 1000 == 0)
-        {
-            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                          ": Block index lookup result=%d, start_pos=%" PRIu64
-                          ", index_count=%" PRIu64,
-                          this_get, index_result, start_file_position,
-                          sst->block_indexes ? sst->block_indexes->count : 0);
-        }
+
         if (index_result != 0)
         {
             start_file_position = 0;
-        }
-    }
-    else
-    {
-        if (this_get % 1000 == 0)
-        {
-            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": NO block indexes available", this_get);
         }
     }
 
@@ -3562,7 +3529,8 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     if (block_manager_cursor_init(&klog_cursor, bms.klog_bm) != 0)
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": FAILED to initialize klog cursor", sst->id);
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to initialize klog cursor",
+                      sst->id);
         return TDB_ERR_IO;
     }
 
@@ -3596,12 +3564,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     while (block_num < sst->num_klog_blocks)
     {
-        if (this_get % 1000 == 0 && block_num % 100 == 0)
-        {
-            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Reading block %" PRIu64 " of %" PRIu64,
-                          this_get, block_num, sst->num_klog_blocks);
-        }
-
         /* check if cursor is past data end offset (into auxiliary structures) */
         if (sst->klog_data_end_offset > 0 && klog_cursor->current_pos >= sst->klog_data_end_offset)
         {
@@ -3611,15 +3573,10 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         block_manager_block_t *block = tidesdb_read_block(db, sst, klog_cursor);
 
-        if (this_get % 1000 == 0 && block_num % 100 == 0)
-        {
-            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Block %" PRIu64 " read %s", this_get,
-                          block_num, block ? "SUCCESS" : "FAILED");
-        }
-
         if (!block)
         {
-            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to read block %" PRIu64, sst->id, block_num);
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to read block %" PRIu64,
+                          sst->id, block_num);
             break;
         }
 
@@ -3629,14 +3586,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         tidesdb_klog_block_t *klog_block = NULL;
         int deser_result = tidesdb_klog_block_deserialize(data, data_size, &klog_block);
-
-        if (this_get % 1000 == 0 && block_num % 100 == 0)
-        {
-            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Block %" PRIu64
-                          " deserialized, result=%d, entries=%u",
-                          this_get, block_num, deser_result,
-                          klog_block ? klog_block->num_entries : 0);
-        }
 
         if (deser_result != 0)
         {
@@ -3663,13 +3612,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                 int cmp = comparator_fn(key, key_size, klog_block->keys[mid],
                                         klog_block->entries[mid].key_size, comparator_ctx);
 
-                if (this_get % 1000 == 0 && comparisons == 1)
-                {
-                    TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                  ": Binary search in block with %u entries, first cmp=%d",
-                                  this_get, klog_block->num_entries, cmp);
-                }
-
                 if (cmp == 0)
                 {
                     found_idx = mid;
@@ -3685,13 +3627,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                 }
             }
 
-            if (this_get % 1000 == 0)
-            {
-                TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                              ": Binary search complete, comparisons=%u, found=%d",
-                              this_get, comparisons, found_idx >= 0);
-            }
-
             if (found_idx >= 0)
             {
                 /* found! */
@@ -3702,85 +3637,28 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                                              klog_block->entries[i].seq,
                                              klog_block->entries[i].flags & TDB_KV_FLAG_TOMBSTONE);
 
-                if (this_get % 1000 == 0)
-                {
-                    TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": kv_pair_create returned %p",
-                                  this_get, (void *)*kv);
-                }
-
                 if (*kv)
                 {
                     (*kv)->entry = klog_block->entries[i];
 
-                    if (this_get % 1000 == 0)
-                    {
-                        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                      ": Entry copied, vlog_offset=%" PRIu64,
-                                      this_get, klog_block->entries[i].vlog_offset);
-                    }
-
                     /* get value (inline or from vlog) */
                     if (klog_block->entries[i].vlog_offset == 0)
                     {
-                        if (this_get % 1000 == 0)
-                        {
-                            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                          ": Inline value, ptr=%p, value_size=%zu",
-                                          this_get, (void *)klog_block->inline_values[i],
-                                          klog_block->entries[i].value_size);
-                        }
-
                         if (klog_block->inline_values[i])
                         {
-                            if (this_get % 1000 == 0)
-                            {
-                                TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                              ": About to malloc %zu bytes for value",
-                                              this_get, klog_block->entries[i].value_size);
-                            }
-
                             (*kv)->value = malloc(klog_block->entries[i].value_size);
-
-                            if (this_get % 1000 == 0)
-                            {
-                                TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                              ": malloc returned %p, about to memcpy",
-                                              this_get, (void *)(*kv)->value);
-                            }
 
                             if ((*kv)->value)
                             {
                                 memcpy((*kv)->value, klog_block->inline_values[i],
                                        klog_block->entries[i].value_size);
-
-                                if (this_get % 1000 == 0)
-                                {
-                                    TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                                  ": memcpy complete",
-                                                  this_get);
-                                }
                             }
                         }
                     }
                     else
                     {
-                        if (this_get % 1000 == 0)
-                        {
-                            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                          ": Reading value from vlog, offset=%" PRIu64 ", size=%zu",
-                                          this_get, klog_block->entries[i].vlog_offset,
-                                          klog_block->entries[i].value_size);
-                        }
-
                         tidesdb_vlog_read_value(db, sst, klog_block->entries[i].vlog_offset,
                                                 klog_block->entries[i].value_size, &(*kv)->value);
-
-                        if (this_get % 1000 == 0)
-                        {
-                            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                          ": Vlog read complete, value=%p",
-                                          this_get, (void *)(*kv)->value);
-                        }
                     }
 
                     result = TDB_SUCCESS;
@@ -3818,48 +3696,17 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                                            klog_block->inline_values[i], inline_value_size);
                                 }
 
-                                int cache_result = tidesdb_cache_entry_put(
-                                    db, cf_name, sst->id, key, key_size, cache_entry);
-
-                                if (this_get % 1000 == 0)
-                                {
-                                    TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                                  ": Cached entry for cf=%s, sst=%" PRIu64
-                                                  ", result=%d",
-                                                  this_get, cf_name, sst->id, cache_result);
-                                }
+                                (void)tidesdb_cache_entry_put(db, cf_name, sst->id, key, key_size,
+                                                              cache_entry);
 
                                 free(cache_entry);
                             }
                         }
                     }
 
-                    if (this_get % 1000 == 0)
-                    {
-                        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
-                                      ": Key found, cleaning up and returning",
-                                      this_get);
-                    }
-
-                    if (this_get % 1000 == 0)
-                    {
-                        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Freeing klog_block",
-                                      this_get);
-                    }
                     tidesdb_klog_block_free(klog_block);
 
-                    if (this_get % 1000 == 0)
-                    {
-                        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Releasing block",
-                                      this_get);
-                    }
                     block_manager_block_release(block);
-
-                    if (this_get % 1000 == 0)
-                    {
-                        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Going to cleanup",
-                                      this_get);
-                    }
 
                     goto cleanup;
                 }
@@ -3871,13 +3718,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         /* cleanup block resources before moving to next */
         block_manager_block_release(block);
-
-        if (this_get % 1000 == 0 && block_num % 100 == 0)
-        {
-            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Block %" PRIu64
-                          " processed, moving to next",
-                          this_get, block_num);
-        }
 
         block_num++;
 
@@ -3909,7 +3749,8 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
     if (block_manager_open(&klog_bm, sst->klog_path, convert_sync_mode(sst->config->sync_mode)) !=
         0)
     {
-        TDB_DEBUG_LOG("Failed to open klog file: %s (may be leftover from incomplete cleanup)",
+        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                      "Failed to open klog file %s (may be leftover from incomplete cleanup)",
                       sst->klog_path);
         return -1;
     }
@@ -3917,7 +3758,8 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
     if (block_manager_open(&vlog_bm, sst->vlog_path, convert_sync_mode(sst->config->sync_mode)) !=
         0)
     {
-        TDB_DEBUG_LOG("Failed to open vlog file: %s (may be leftover from incomplete cleanup)",
+        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                      "Failed to open vlog file %s (may be leftover from incomplete cleanup)",
                       sst->vlog_path);
         block_manager_close(klog_bm);
         return -1;
@@ -3929,7 +3771,8 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
     /* check for empty or corrupted files */
     if (sst->klog_size == 0)
     {
-        TDB_DEBUG_LOG("Empty klog file: %s (corrupted or incomplete SSTable)", sst->klog_path);
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Empty klog file %s (corrupted or incomplete SSTable)",
+                      sst->klog_path);
         block_manager_close(klog_bm);
         block_manager_close(vlog_bm);
         return TDB_ERR_CORRUPTION;
@@ -3965,7 +3808,7 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
     /* if metadata was found but corrupted, or if no metadata block exists, fail immediately */
     if (metadata_corrupt)
     {
-        TDB_DEBUG_LOG("SSTable metadata corrupted: %s", sst->klog_path);
+        TDB_DEBUG_LOG(TDB_LOG_FATAL, "SSTable metadata corrupted for %s", sst->klog_path);
         block_manager_close(klog_bm);
         block_manager_close(vlog_bm);
         return TDB_ERR_CORRUPTION;
@@ -3985,7 +3828,7 @@ load_bloom_and_index:
     {
         if (block_manager_build_position_cache(klog_bm) != 0)
         {
-            TDB_DEBUG_LOG("Failed to build position cache for %s", sst->klog_path);
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to build position cache for %s", sst->klog_path);
             block_manager_close(klog_bm);
             block_manager_close(vlog_bm);
             return TDB_ERR_IO;
@@ -3997,7 +3840,8 @@ load_bloom_and_index:
      * (likely from interrupted write before fsync completed) */
     if ((uint64_t)(klog_bm->block_count - SSTABLE_INTERNAL_BLOCKS) != sst->num_klog_blocks)
     {
-        TDB_DEBUG_LOG("SSTable %s: Block count mismatch (file has %" PRIu64
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "SSTable %s block count mismatch (file has %" PRIu64
                       " blocks, metadata says %" PRIu64 ") - corrupted or incomplete write",
                       sst->klog_path, (uint64_t)(klog_bm->block_count - SSTABLE_INTERNAL_BLOCKS),
                       sst->num_klog_blocks);
@@ -4079,7 +3923,7 @@ load_bloom_and_index:
  */
 static tidesdb_level_t *tidesdb_level_create(int level_num, size_t capacity)
 {
-    TDB_DEBUG_LOG("Creating level %d with capacity %zu", level_num, capacity);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Creating level %d with capacity %zu", level_num, capacity);
 
     tidesdb_level_t *level = calloc(1, sizeof(tidesdb_level_t));
     if (!level) return NULL;
@@ -4096,13 +3940,12 @@ static tidesdb_level_t *tidesdb_level_create(int level_num, size_t capacity)
         return NULL;
     }
 
-    TDB_DEBUG_LOG("tidesdb_level_create: Allocated sstables array %p for level %d (capacity %d)",
-                  (void *)sstables, level_num, TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY);
-
     atomic_init(&level->sstables, sstables);
     atomic_init(&level->num_sstables, 0);
     atomic_init(&level->sstables_capacity, TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY);
     atomic_init(&level->num_boundaries, 0);
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Level %d created with capacity %zu", level_num, capacity);
 
     return level;
 }
@@ -5068,10 +4911,10 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
 
                     if (deserialize_result != 0)
                     {
-                        TDB_DEBUG_LOG(
-                            "Merge source advance: klog block deserialization failed (error=%d), "
-                            "aborting source for SSTable %" PRIu64,
-                            deserialize_result, source->source.sstable.sst->id);
+                        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                      "klog block deserialization failed (error=%d), "
+                                      "aborting source for SSTable %" PRIu64,
+                                      deserialize_result, source->source.sstable.sst->id);
                         if (decompressed)
                         {
                             free(decompressed);
@@ -5256,10 +5099,10 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
 
                 if (deserialize_result != 0)
                 {
-                    TDB_DEBUG_LOG(
-                        "Merge source retreat: klog block deserialization failed (error=%d), "
-                        "aborting source for SSTable %" PRIu64,
-                        deserialize_result, source->source.sstable.sst->id);
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "klog block deserialization failed (error=%d), "
+                                  "aborting source for SSTable %" PRIu64,
+                                  deserialize_result, source->source.sstable.sst->id);
                     if (decompressed)
                     {
                         free(decompressed);
@@ -5350,6 +5193,7 @@ static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capaci
         {
             /* would overflow -- saturate at max_capacity */
             TDB_DEBUG_LOG(
+                TDB_LOG_WARN,
                 "Level capacity calculation would overflow at level %d, saturating at %zu",
                 level_num, max_capacity);
             return max_capacity;
@@ -5367,15 +5211,12 @@ static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capaci
  */
 static int tidesdb_add_level(tidesdb_column_family_t *cf)
 {
-    TDB_DEBUG_LOG("tidesdb_add_level called for CF '%s'", cf->name);
-    TDB_DEBUG_LOG("DCA: add_level starting");
-
     int old_num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
     /* check if we've hit max levels */
     if (old_num_levels >= TDB_MAX_LEVELS)
     {
-        TDB_DEBUG_LOG("DCA: Cannot add level - already at max (%d)", TDB_MAX_LEVELS);
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Cannot add level - already at max (%d)", TDB_MAX_LEVELS);
         return TDB_ERR_INVALID_ARGS;
     }
 
@@ -5412,31 +5253,30 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
      * largest to new largest during level addition. we intentionally do not do this
      * because it causes key loss and breaks the LSM-tree structure. instead, we let
      * normal compaction move data down, which is simpler and correct. */
-    TDB_DEBUG_LOG("DCA: Added empty level %d, old largest level %d keeps its data",
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Added empty level %d, old largest level %d keeps its data",
                   new_level->level_num, old_num_levels);
 
     /* atomically increment active level count -- this publishes the new level
      * release ordering ensures the new level is visible to other threads */
     atomic_store_explicit(&cf->num_active_levels, old_num_levels + 1, memory_order_release);
 
-    TDB_DEBUG_LOG("DCA: Published %d active levels", old_num_levels + 1);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Published %d active levels", old_num_levels + 1);
     for (int log_i = 0; log_i < old_num_levels + 1; log_i++)
     {
         tidesdb_level_t *log_lvl = cf->levels[log_i];
         if (log_lvl)
         {
             int log_num = atomic_load_explicit(&log_lvl->num_sstables, memory_order_acquire);
-            TDB_DEBUG_LOG("DCA: levels[%d]: level_num=%d, %d SSTables", log_i, log_lvl->level_num,
-                          log_num);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "levels[%d]: level_num=%d, %d SSTables", log_i,
+                          log_lvl->level_num, log_num);
         }
     }
 
     /* ensure level addition is visible to all threads */
     atomic_thread_fence(memory_order_release);
 
-    TDB_DEBUG_LOG("DCA: add_level complete");
-
-    TDB_DEBUG_LOG("Added level %d, now have %d levels", new_level->level_num, old_num_levels + 1);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Added level %d, now have %d levels", new_level->level_num,
+                  old_num_levels + 1);
 
     return TDB_SUCCESS;
 }
@@ -5449,15 +5289,14 @@ static int tidesdb_add_level(tidesdb_column_family_t *cf)
  */
 static int tidesdb_remove_level(tidesdb_column_family_t *cf)
 {
-    TDB_DEBUG_LOG("tidesdb_remove_level called for CF '%s'", cf->name);
-
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Attempting to remove level from CF '%s'", cf->name);
     int old_num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
     /* enforce minimum levels! never go below min_levels */
     if (old_num_levels <= cf->config.min_levels)
     {
-        TDB_DEBUG_LOG("tidesdb_remove_level: At minimum levels (%d <= %d), not removing",
-                      old_num_levels, cf->config.min_levels);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "At minimum levels (%d <= %d), not removing", old_num_levels,
+                      cf->config.min_levels);
         return TDB_SUCCESS; /* not an error, just at minimum */
     }
 
@@ -5467,7 +5306,7 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
     /* only remove level if it's completely empty */
     if (num_largest_ssts > 0)
     {
-        TDB_DEBUG_LOG("DCA: Cannot remove level %d - has %d SSTables", largest->level_num,
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Cannot remove level %d - has %d SSTables", largest->level_num,
                       num_largest_ssts);
         return TDB_SUCCESS;
     }
@@ -5489,12 +5328,12 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
         }
 
         atomic_store_explicit(&new_largest->capacity, new_largest_capacity, memory_order_release);
-        TDB_DEBUG_LOG("Updated new largest level %d capacity to %zu", new_largest->level_num,
-                      new_largest_capacity);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Updated new largest level %d capacity to %zu",
+                      new_largest->level_num, new_largest_capacity);
     }
 
     /* free the largest level struct */
-    TDB_DEBUG_LOG("DCA: Freeing removed level %d (num_sstables=%d, current_size=%zu)",
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Freeing removed level %d (num_sstables=%d, current_size=%zu)",
                   largest->level_num,
                   atomic_load_explicit(&largest->num_sstables, memory_order_acquire),
                   atomic_load_explicit(&largest->current_size, memory_order_relaxed));
@@ -5505,7 +5344,7 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
      * release ordering ensures the level removal is visible to other threads */
     atomic_store_explicit(&cf->num_active_levels, new_num_levels, memory_order_release);
 
-    TDB_DEBUG_LOG("Removed level, now have %d levels", new_num_levels);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Removed level, now have %d levels", new_num_levels);
 
     tidesdb_apply_dca(cf);
 
@@ -5580,8 +5419,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         return TDB_ERR_INVALID_ARGS;
     }
 
-    TDB_DEBUG_LOG("Starting full preemptive merge: CF '%s', levels %d->%d", cf->name, start_level,
-                  target_level + 1);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting full preemptive merge on CF '%s', levels %d->%d",
+                  cf->name, start_level, target_level + 1);
 
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
@@ -5636,7 +5475,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     /* if no sstables to merge, return early */
     if (total_ssts == 0)
     {
-        TDB_DEBUG_LOG("Full preemptive merge: No SSTables to merge, skipping");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "No SSTables to merge, skipping");
         tidesdb_merge_heap_free(heap);
         queue_free(sstables_to_delete);
         queue_free(sstable_ids_snapshot);
@@ -5823,19 +5662,18 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     {
         if (bloom_filter_new(&bloom, new_sst->config->bloom_fpr, estimated_entries) == 0)
         {
-            TDB_DEBUG_LOG("Full preemptive merge: Bloom filter created (estimated entries: %" PRIu64
-                          ")",
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Bloom filter created (estimated entries: %" PRIu64 ")",
                           estimated_entries);
         }
         else
         {
-            TDB_DEBUG_LOG("Full preemptive merge: Bloom filter creation failed");
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Bloom filter creation failed");
             bloom = NULL;
         }
     }
     else
     {
-        TDB_DEBUG_LOG("Full preemptive merge: Bloom filter disabled");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Bloom filter disabled");
     }
 
     if (new_sst->config->enable_block_indexes)
@@ -5845,16 +5683,16 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                                        comparator_fn, comparator_ctx);
         if (block_indexes)
         {
-            TDB_DEBUG_LOG("Full preemptive merge: Block indexes created");
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Block indexes created");
         }
         else
         {
-            TDB_DEBUG_LOG("Full preemptive merge: Block indexes builder creation failed");
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Block indexes builder creation failed");
         }
     }
     else
     {
-        TDB_DEBUG_LOG("Full preemptive merge: Block indexes disabled");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Block indexes disabled");
     }
 
     tidesdb_klog_block_t *current_klog_block = tidesdb_klog_block_create();
@@ -5883,8 +5721,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         /* if corruption detected, add to deletion queue */
         if (corrupted_sst)
         {
-            TDB_DEBUG_LOG("Full preemptive merge: Detected corrupted SSTable %" PRIu64
-                          ", marking for deletion",
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "Detected corrupted SSTable %" PRIu64 ", marking for deletion",
                           corrupted_sst->id);
             queue_enqueue(sstables_to_delete, corrupted_sst);
         }
@@ -6191,7 +6029,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             /* we assign the built index to the sstable */
             new_sst->block_indexes = block_indexes;
 
-            TDB_DEBUG_LOG("Full preemptive merge: Block index built with %u samples",
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Block index built with %u samples",
                           new_sst->block_indexes->count);
             size_t index_size;
             uint8_t *index_data =
@@ -6226,8 +6064,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
             if (bloom_data)
             {
-                TDB_DEBUG_LOG("Full preemptive merge: Bloom filter serialized to %zu bytes",
-                              bloom_size);
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Bloom filter serialized to %zu bytes", bloom_size);
                 block_manager_block_t *bloom_block =
                     block_manager_block_create(bloom_size, bloom_data);
                 if (bloom_block)
@@ -6239,7 +6076,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             }
             else
             {
-                TDB_DEBUG_LOG("Full preemptive merge: Bloom filter serialization failed");
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Bloom filter serialization failed");
             }
             new_sst->bloom_filter = bloom;
         }
@@ -6323,15 +6160,14 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
         if (target_idx < 0 || target_idx >= num_levels)
         {
-            TDB_DEBUG_LOG(
-                "Full preemptive merge: Target level %d not found (current_num_levels=%d)",
-                target_level_num, num_levels);
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Target level %d not found (current_num_levels=%d)",
+                          target_level_num, num_levels);
             tidesdb_sstable_unref(cf->db, new_sst);
         }
         else
         {
-            TDB_DEBUG_LOG("Full preemptive merge: Adding merged SSTable %" PRIu64
-                          " to level %d (array index %d)",
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "Adding merged SSTable %" PRIu64 " to level %d (array index %d)",
                           new_sst->id, cf->levels[target_idx]->level_num, target_idx);
             tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
 
@@ -6353,8 +6189,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     }
     else
     {
-        TDB_DEBUG_LOG("Full preemptive merge: Skipping empty SSTable %" PRIu64 " (0 entries)",
-                      sst_id);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Skipping empty SSTable %" PRIu64 " (0 entries)", sst_id);
         /* free bloom filter and block indexes that were allocated but never used */
         if (bloom) bloom_filter_free(bloom);
         if (block_indexes) compact_block_index_free(block_indexes);
@@ -6385,8 +6220,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             int result = tidesdb_level_remove_sstable(cf->db, lvl, sst);
             if (result == TDB_SUCCESS)
             {
-                TDB_DEBUG_LOG("Full preemptive merge: Removed SSTable %" PRIu64 " from level %d",
-                              sst->id, lvl->level_num);
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Removed SSTable %" PRIu64 " from level %d", sst->id,
+                              lvl->level_num);
                 removed = 1;
                 removed_level = lvl->level_num;
                 break; /* found and removed, no need to check other levels */
@@ -6405,8 +6240,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         }
         if (!removed)
         {
-            TDB_DEBUG_LOG("Full preemptive merge: WARNING - SSTable %" PRIu64
-                          " not found in any level!",
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "WARNING - SSTable %" PRIu64 " not found in any level!",
                           sst->id);
         }
 
@@ -6424,7 +6258,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     }
     queue_free(sstable_ids_snapshot);
 
-    TDB_DEBUG_LOG("Full preemptive merge complete: CF '%s', created SSTable %" PRIu64
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "Full preemptive merge completed for CF '%s', created SSTable %" PRIu64
                   " with %" PRIu64 " entries, %" PRIu64 " klog blocks, %" PRIu64 " vlog blocks",
                   cf->name, sst_id, num_entries, num_klog_blocks, num_vlog_blocks);
 
@@ -6447,11 +6282,13 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         return TDB_ERR_INVALID_ARGS;
     }
 
-    TDB_DEBUG_LOG("Starting dividing merge: CF '%s', target_level=%d", cf->name, target_level + 1);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting dividing merge for CF '%s', target_level=%d", cf->name,
+                  target_level + 1);
 
     if (target_level >= num_levels - 1)
     {
-        TDB_DEBUG_LOG("Target level %d is the largest level, need to add new level before merge",
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Target level %d is the largest level, need to add new level before merge",
                       target_level);
 
         /* ensure there's a level to merge into */
@@ -6460,13 +6297,14 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             int add_result = tidesdb_add_level(cf);
             if (add_result != TDB_SUCCESS)
             {
-                TDB_DEBUG_LOG("Failed to add level before merge, error: %d", add_result);
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to add level before merge, error: %d",
+                              add_result);
                 return add_result;
             }
 
             num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-            TDB_DEBUG_LOG("Added level, now have %d levels", num_levels);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Added level, now have %d levels", num_levels);
         }
 
         return tidesdb_full_preemptive_merge(cf, 0, target_level);
@@ -6480,7 +6318,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     tidesdb_level_update_boundaries(target, next_level);
 
     int next_level_num_ssts = atomic_load_explicit(&next_level->num_sstables, memory_order_acquire);
-    TDB_DEBUG_LOG("Dividing merge: next_level (L%d) has %d SSTables", next_level->level_num,
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "next_level (L%d) has %d SSTables", next_level->level_num,
                   next_level_num_ssts);
     tidesdb_sstable_t **next_level_ssts =
         atomic_load_explicit(&next_level->sstables, memory_order_acquire);
@@ -6489,8 +6327,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         tidesdb_sstable_t *sst = next_level_ssts[i];
         if (sst)
         {
-            TDB_DEBUG_LOG("Dividing merge: next_level SSTable %" PRIu64
-                          " (min_key_size=%zu, max_key_size=%zu)",
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "next_level SSTable %" PRIu64 " (min_key_size=%u, max_key_size=%u)",
                           sst->id, sst->min_key_size, sst->max_key_size);
         }
     }
@@ -6503,7 +6341,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     queue_t *sstable_ids_snapshot = queue_new(); /* track IDs being compacted */
 
     /* snapshot sst IDs atomically to prevent race with flush workers */
-    TDB_DEBUG_LOG("Dividing merge: snapshotting SSTable IDs from levels 0-%d", target_level);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "snapshotting SSTable IDs from levels 0-%d", target_level);
     for (int level = 0; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = cf->levels[level];
@@ -6526,14 +6364,14 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     }
 
     /* collect ssts matching the snapshot (with references) */
-    TDB_DEBUG_LOG("Dividing merge: collecting SSTables from levels 0-%d", target_level);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "collecting SSTables from levels 0-%d", target_level);
     for (int level = 0; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = cf->levels[level];
         int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
         tidesdb_sstable_t **sstables = atomic_load_explicit(&lvl->sstables, memory_order_acquire);
 
-        TDB_DEBUG_LOG("Dividing merge: L%d has %d SSTables", level, num_ssts);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "L%d has %d SSTables", level, num_ssts);
         for (int i = 0; i < num_ssts; i++)
         {
             tidesdb_sstable_t *sst = sstables[i];
@@ -6554,16 +6392,17 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
             if (in_snapshot)
             {
-                TDB_DEBUG_LOG("Dividing merge: collecting SSTable %" PRIu64
-                              " from L%d (min_key_size=%zu, max_key_size=%zu)",
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "collecting SSTable %" PRIu64
+                              " from L%d (min_key_size=%u, max_key_size=%u)",
                               sst->id, level, sst->min_key_size, sst->max_key_size);
                 tidesdb_sstable_ref(sst);
                 queue_enqueue(sstables_to_delete, sst);
             }
             else
             {
-                TDB_DEBUG_LOG("Dividing merge: skipping SSTable %" PRIu64
-                              " from L%d (added after snapshot)",
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "skipping SSTable %" PRIu64 " from L%d (added after snapshot)",
                               sst->id, level);
             }
         }
@@ -6630,7 +6469,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             tidesdb_merge_heap_create(comparator_fn, comparator_ctx);
         if (!partition_heap)
         {
-            TDB_DEBUG_LOG("Dividing merge: Failed to create heap for partition %d", partition);
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create heap for partition %d", partition);
             continue;
         }
 
@@ -6640,8 +6479,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         uint8_t *range_end = (partition < num_boundaries) ? file_boundaries[partition] : NULL;
         size_t range_end_size = (partition < num_boundaries) ? boundary_sizes[partition] : 0;
 
-        TDB_DEBUG_LOG("Dividing merge partition %d: range [start_size=%zu, end_size=%zu)",
-                      partition, range_start_size, range_end_size);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "partition %d: range [start_size=%zu, end_size=%zu)", partition,
+                      range_start_size, range_end_size);
 
         /* add only overlapping sstables to this partition's heap */
         uint64_t partition_entries = 0;
@@ -6669,8 +6508,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
             if (overlaps)
             {
-                TDB_DEBUG_LOG("Dividing merge partition %d: SSTable %" PRIu64
-                              " overlaps (min_key_size=%zu, max_key_size=%zu)",
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "partition %d: SSTable %" PRIu64
+                              " overlaps (min_key_size=%u, max_key_size=%u)",
                               partition, sst->id, sst->min_key_size, sst->max_key_size);
                 tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(cf->db, sst);
                 if (source)
@@ -6699,9 +6539,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         if (tidesdb_merge_heap_empty(partition_heap))
         {
-            TDB_DEBUG_LOG(
-                "Dividing merge partition %d: Skipping empty partition (no overlapping SSTables)",
-                partition);
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "partition %d: Skipping empty partition (no overlapping SSTables)",
+                          partition);
             tidesdb_merge_heap_free(partition_heap);
             continue;
         }
@@ -6766,14 +6606,13 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         {
             if (bloom_filter_new(&bloom, cf->config.bloom_fpr, partition_entries) == 0)
             {
-                TDB_DEBUG_LOG(
-                    "Dividing merge partition %d: Bloom filter created (estimated entries: %" PRIu64
-                    ")",
-                    partition, partition_entries);
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "partition %d: Bloom filter created (estimated entries: %" PRIu64 ")",
+                              partition, partition_entries);
             }
             else
             {
-                TDB_DEBUG_LOG("Dividing merge partition %d: Bloom filter creation failed",
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "partition %d: Bloom filter creation failed",
                               partition);
                 bloom = NULL;
             }
@@ -7189,7 +7028,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         atomic_thread_fence(memory_order_seq_cst);
 
         /* add to target level */
-        TDB_DEBUG_LOG("Dividing merge partition %d: Merged %" PRIu64 " entries", partition,
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "partition %d: Merged %" PRIu64 " entries", partition,
                       entry_count);
 
         if (entry_count > 0)
@@ -7212,18 +7051,18 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
             if (target_idx < 0 || target_idx >= current_num_levels)
             {
-                TDB_DEBUG_LOG(
-                    "Dividing merge partition %d: Target level %d not found "
-                    "(current_num_levels=%d)",
-                    partition, target_level_num, current_num_levels);
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "partition %d: Target level %d not found "
+                              "(current_num_levels=%d)",
+                              partition, target_level_num, current_num_levels);
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
             else
             {
-                TDB_DEBUG_LOG("Dividing merge partition %d: Adding merged SSTable %" PRIu64
-                              " to level %d (array index %d)",
-                              partition, new_sst->id, cf->levels[target_idx]->level_num,
-                              target_idx);
+                TDB_DEBUG_LOG(
+                    TDB_LOG_INFO,
+                    "partition %d: Adding merged SSTable %" PRIu64 " to level %d (array index %d)",
+                    partition, new_sst->id, cf->levels[target_idx]->level_num, target_idx);
                 tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
 
                 /* add new sstable to manifest */
@@ -7244,9 +7083,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         }
         else
         {
-            TDB_DEBUG_LOG("Dividing merge partition %d: Skipping empty SSTable %" PRIu64
-                          " (0 entries)",
-                          partition, new_sst->id);
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "partition %d: Skipping empty SSTable %" PRIu64 " (0 entries)", partition,
+                          new_sst->id);
 
             /* free bloom and block_indexes since they won't be freed by sstable_unref */
             if (bloom) bloom_filter_free(bloom);
@@ -7309,7 +7148,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     }
     queue_free(sstable_ids_snapshot);
 
-    TDB_DEBUG_LOG("Completed dividing merge for CF '%s'", cf->name);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Completed dividing merge for CF '%s'", cf->name);
     return TDB_SUCCESS;
 }
 
@@ -7334,7 +7173,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         return TDB_ERR_INVALID_ARGS;
     }
 
-    TDB_DEBUG_LOG("Starting partitioned merge: CF '%s', levels %d->%d (array indices %d->%d)",
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "Starting partitioned merge: CF '%s', levels %d->%d (array indices %d->%d)",
                   cf->name, start_level, end_level, start_idx, end_idx);
 
     tidesdb_level_t *largest = cf->levels[num_levels - 1];
@@ -7435,8 +7275,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     /* merge one partition at a time */
     for (int partition = 0; partition < num_partitions; partition++)
     {
-        TDB_DEBUG_LOG("Partitioned merge: Processing partition %d/%d", partition + 1,
-                      num_partitions);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Processing partition %d/%d", partition + 1, num_partitions);
 
         skip_list_comparator_fn comparator_fn = NULL;
         void *comparator_ctx = NULL;
@@ -7445,8 +7284,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         tidesdb_merge_heap_t *heap = tidesdb_merge_heap_create(comparator_fn, comparator_ctx);
         if (!heap)
         {
-            TDB_DEBUG_LOG("Partitioned merge: Failed to create merge heap for partition %d",
-                          partition);
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create merge heap for partition %d", partition);
             continue;
         }
 
@@ -7543,13 +7381,15 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 if (bloom_filter_new(&bloom, cf->config.bloom_fpr, estimated_entries) == 0)
                 {
                     TDB_DEBUG_LOG(
+                        TDB_LOG_INFO,
                         "Partitioned merge partition %d: Bloom filter created (estimated entries: "
                         "%" PRIu64 ")",
                         partition, estimated_entries);
                 }
                 else
                 {
-                    TDB_DEBUG_LOG("Partitioned merge partition %d: Bloom filter creation failed",
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "Partitioned merge partition %d: Bloom filter creation failed",
                                   partition);
                     bloom = NULL;
                 }
@@ -7965,7 +7805,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                     if (bloom_data)
                     {
                         TDB_DEBUG_LOG(
-                            "Partitioned merge partition %d: Bloom filter serialized to %zu bytes",
+                            TDB_LOG_INFO,
+                            "Partitioned merge partition %d bloom filter serialized to %zu bytes",
                             partition, bloom_size);
                         block_manager_block_t *bloom_block =
                             block_manager_block_create(bloom_size, bloom_data);
@@ -7979,7 +7820,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                     else
                     {
                         TDB_DEBUG_LOG(
-                            "Partitioned merge partition %d: Bloom filter serialization failed",
+                            TDB_LOG_ERROR,
+                            "Partitioned merge partition %d bloom filter serialization failed",
                             partition);
                     }
                 }
@@ -8057,10 +7899,10 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
                 if (target_idx < 0 || target_idx >= current_num_levels)
                 {
-                    TDB_DEBUG_LOG(
-                        "Partitioned merge partition %d: Target level %d not found "
-                        "(current_num_levels=%d), data would be lost!",
-                        partition, target_level_num, current_num_levels);
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "Partitioned merge partition %d, target level %d not found "
+                                  "(current_num_levels=%d), data would be lost!",
+                                  partition, target_level_num, current_num_levels);
                     tidesdb_sstable_unref(cf->db, new_sst);
                     tidesdb_merge_heap_free(heap);
                     continue;
@@ -8081,7 +7923,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 tidesdb_manifest_commit(cf->manifest, manifest_path);
                 pthread_rwlock_unlock(&cf->manifest_lock);
 
-                TDB_DEBUG_LOG("Partitioned merge partition %d complete: Created SSTable %" PRIu64
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "Partitioned merge partition %d complete, created SSTable %" PRIu64
                               " with %" PRIu64 " entries, %" PRIu64 " klog blocks, %" PRIu64
                               " vlog blocks",
                               partition, new_sst->id, new_sst->num_entries,
@@ -8092,7 +7935,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             else
             {
                 TDB_DEBUG_LOG(
-                    "Partitioned merge partition %d: No entries, skipping SSTable creation",
+                    TDB_LOG_INFO,
+                    "Partitioned merge partition %d no entries, skipping SSTable creation",
                     partition);
                 /* free bloom filter and block indexes that were allocated but never used */
                 if (bloom) bloom_filter_free(bloom);
@@ -8163,8 +8007,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
     free(boundaries);
     free(boundary_sizes);
 
-    TDB_DEBUG_LOG("Partitioned merge complete: CF '%s', processed %d partitions", cf->name,
-                  num_partitions);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Partitioned merge complete for CF '%s', processed %d partitions",
+                  cf->name, num_partitions);
 
     return TDB_SUCCESS;
 }
@@ -8218,17 +8062,16 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     /* load num_levels atomically */
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-    TDB_DEBUG_LOG("Triggering compaction for column family: %s (levels: %d)", cf->name, num_levels);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Triggering compaction for column family: %s (levels: %d)",
+                  cf->name, num_levels);
 
     /* calculate X (dividing level) */
     int X = num_levels - 1 - cf->config.dividing_level_offset;
     if (X < 1) X = 1;
 
-    TDB_DEBUG_LOG("Target compaction X %d", X);
-
     int target_lvl = X; /* default to X if no suitable level found */
 
-    TDB_DEBUG_LOG("Calculating target compaction level (X=%d)", X);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Calculating target compaction level (X=%d)", X);
 
     /* spooky algo 2 find smallest level q where C_q < Σ(N_i) for i=0 to q
      * this means we're looking for the first level that cannot accommodate the merge */
@@ -8249,28 +8092,28 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         {
             /* found smallest level that cannot accommodate -- this is our target */
             target_lvl = q;
-            TDB_DEBUG_LOG("Target level %d: capacity=%zu < cumulative_size=%zu", q,
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Target level %d capacity=%zu < cumulative_size=%zu", q,
                           level_q_capacity, cumulative_size);
             break;
         }
     }
 
-    TDB_DEBUG_LOG("Final target compaction level: %d", target_lvl);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Final target compaction level: %d", target_lvl);
 
     int result = TDB_SUCCESS;
     if (target_lvl < X)
     {
-        TDB_DEBUG_LOG("Full preemptive merge: levels 0 to %d", target_lvl);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Full preemptive merge levels 0 to %d", target_lvl);
         result = tidesdb_full_preemptive_merge(cf, 0, target_lvl - 1); /* convert to 0-indexed */
     }
     else if (target_lvl == X)
     {
-        TDB_DEBUG_LOG("Dividing merge at level %d", X);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Dividing merge at level %d", X);
         result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
     }
     else
     {
-        TDB_DEBUG_LOG("Warning: target_lvl > X, defaulting to dividing merge");
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "target_lvl > X, defaulting to dividing merge");
         result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
     }
 
@@ -8311,7 +8154,8 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
                 if (candidate_capacity < cumulative)
                 {
                     z = candidate_z;
-                    TDB_DEBUG_LOG("Partitioned merge target z=%d: capacity=%zu < cumulative=%zu",
+                    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                  "Partitioned merge target z=%d capacity=%zu < cumulative=%zu",
                                   candidate_z, candidate_capacity, cumulative);
                     break;
                 }
@@ -8338,8 +8182,8 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     /* perform partitioned merge if needed */
     if (need_partitioned_merge)
     {
-        TDB_DEBUG_LOG("Level %d is full, triggering partitioned preemptive merge", X);
-        TDB_DEBUG_LOG("Partitioned preemptive merge: levels %d to %d", X, z);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Level %d is full, triggering partitioned preemptive merge", X);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Partitioned preemptive merge levels %d to %d", X, z);
         result = tidesdb_partitioned_merge(cf, X, z);
 
         /* reload num_levels after merge */
@@ -8355,8 +8199,8 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     int just_added_level = 0;
     if (largest_size >= largest_capacity)
     {
-        TDB_DEBUG_LOG("Largest size: %zu Largest capacity %zu Number of levels %d", largest_size,
-                      largest_capacity, num_levels);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Largest size: %zu Largest capacity %zu Number of levels %d",
+                      largest_size, largest_capacity, num_levels);
         tidesdb_add_level(cf);
         just_added_level = 1; /* track that we just added a level */
         /* re-fetch num_levels after add_level */
@@ -8394,13 +8238,15 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 
         if (pending_flushes == 0 && level0_sstables == 0)
         {
-            TDB_DEBUG_LOG("Largest level is empty, removing level for CF '%s'", cf->name);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Largest level is empty, removing level for CF '%s'",
+                          cf->name);
             tidesdb_remove_level(cf);
             num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
         }
         else
         {
             TDB_DEBUG_LOG(
+                TDB_LOG_INFO,
                 "Largest level is empty but work pending (flushes: %zu, L0 sstables: %d), keeping "
                 "level for CF '%s'",
                 pending_flushes, level0_sstables, cf->name);
@@ -8508,10 +8354,11 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 
                         if (computed_checksum != peek_checksum)
                         {
-                            TDB_DEBUG_LOG(
-                                "CF '%s': Multi-CF metadata checksum mismatch (expected: %" PRIu64
-                                ", got: %" PRIu64 ") - skipping entry",
-                                cf->name, peek_checksum, computed_checksum);
+                            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                          "CF '%s' has a multi-CF metadata checksum mismatch "
+                                          "(expected: %" PRIu64 ", got: %" PRIu64
+                                          ") - skipping entry",
+                                          cf->name, peek_checksum, computed_checksum);
                             block_manager_block_release(block);
                             continue;
                         }
@@ -8519,7 +8366,8 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                     else
                     {
                         TDB_DEBUG_LOG(
-                            "CF '%s': Failed to allocate memory for checksum verification - "
+                            TDB_LOG_WARN,
+                            "CF '%s' has failed to allocate memory for checksum verification - "
                             "skipping entry",
                             cf->name);
                         block_manager_block_release(block);
@@ -8705,14 +8553,15 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
         if (immutable)
         {
             int refcount = atomic_load_explicit(&immutable->refcount, memory_order_acquire);
-            TDB_DEBUG_LOG("CF '%s': Cleaning immutable with refcount=%d", cf->name, refcount);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' is cleaning immutable with refcount=%d", cf->name,
+                          refcount);
             tidesdb_immutable_memtable_unref(immutable);
             immutable_count++;
         }
     }
     if (immutable_count > 0)
     {
-        TDB_DEBUG_LOG("CF '%s': Freed %d immutable memtables in CF cleanup", cf->name,
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' freed %d immutable memtables in CF cleanup", cf->name,
                       immutable_count);
     }
     queue_free(cf->immutable_memtables);
@@ -8759,11 +8608,11 @@ static void *tidesdb_flush_worker_thread(void *arg)
 {
     tidesdb_t *db = (tidesdb_t *)arg;
 
-    TDB_DEBUG_LOG("Flush worker thread started");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker thread started");
 
     while (1)
     {
-        TDB_DEBUG_LOG("Flush worker: waiting for work (queue size: %zu)",
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker is waiting for work (queue size: %zu)",
                       queue_size(db->flush_queue));
         /* wait for work (blocking dequeue) */
         tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue_wait(db->flush_queue);
@@ -8771,11 +8620,12 @@ static void *tidesdb_flush_worker_thread(void *arg)
         if (!work)
         {
             /* NULL sentinel signals shutdown */
-            TDB_DEBUG_LOG("Flush worker: received NULL work, exiting");
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker has received NULL work, exiting");
             break;
         }
 
-        TDB_DEBUG_LOG("Flush worker: received work for SSTable %" PRIu64, work->sst_id);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker has received work for SSTable %" PRIu64,
+                      work->sst_id);
 
         tidesdb_column_family_t *cf = work->cf;
         tidesdb_immutable_memtable_t *imm = work->imm;
@@ -8785,9 +8635,11 @@ static void *tidesdb_flush_worker_thread(void *arg)
         int space_check = tidesdb_check_disk_space(db, cf->directory, cf->config.min_disk_space);
         if (space_check <= 0)
         {
-            TDB_DEBUG_LOG("CF '%s': Insufficient disk space for flush (required: %" PRIu64
-                          " bytes)",
-                          cf->name, cf->config.min_disk_space);
+            TDB_DEBUG_LOG(
+                TDB_LOG_INFO,
+                "CF '%s' encountered insufficient disk space for flush (required: %" PRIu64
+                " bytes)",
+                cf->name, cf->config.min_disk_space);
 
             /* clear is_flushing to allow retries */
             atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
@@ -8806,7 +8658,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         tidesdb_sstable_t *sst = tidesdb_sstable_create(db, sst_path, work->sst_id, &cf->config);
         if (!sst)
         {
-            TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64 " creation FAILED", cf->name, work->sst_id);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' SSTable %" PRIu64 " creation failed", cf->name,
+                          work->sst_id);
 
             /* clear is_flushing to allow retries */
             atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
@@ -8819,7 +8672,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         int write_result = tidesdb_sstable_write_from_memtable(db, sst, memtable, cf);
         if (write_result != TDB_SUCCESS)
         {
-            TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64 " write FAILED (error: %d), will retry",
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' SSTable %" PRIu64 " write failed (error: %d), will retry",
                           cf->name, work->sst_id, write_result);
 
             tidesdb_sstable_unref(cf->db, sst);
@@ -8829,10 +8683,10 @@ static void *tidesdb_flush_worker_thread(void *arg)
             /* re-enqueue for retry (work still has valid imm reference) */
             if (queue_enqueue(cf->db->flush_queue, work) != 0)
             {
-                TDB_DEBUG_LOG(
-                    "CF '%s': CRITICAL - Failed to re-enqueue flush work for retry. "
-                    "WAL will be recovered on next open.",
-                    cf->name);
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' failed to re-enqueue flush work for retry. "
+                              "WAL will be recovered on next open.",
+                              cf->name);
 
                 tidesdb_immutable_memtable_unref(imm);
                 atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
@@ -8869,7 +8723,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
             {
                 if (existing_ssts[i] && existing_ssts[i]->max_seq >= sst->max_seq)
                 {
-                    TDB_DEBUG_LOG("WARNING: CF '%s': Flush ordering violation - SSTable %" PRIu64
+                    TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                  "CF '%s' flush ordering violation - SSTable %" PRIu64
                                   " (max_seq=%" PRIu64
                                   ") "
                                   "added after SSTable %" PRIu64 " (max_seq=%" PRIu64 ")",
@@ -8894,13 +8749,14 @@ static void *tidesdb_flush_worker_thread(void *arg)
         if (sst_cache_result < 0)
         {
             tidesdb_sstable_unref(cf->db, sst);
-            TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64 " cache add failed after flush", cf->name,
-                          work->sst_id);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' SSTable %" PRIu64 " cache add failed after flush",
+                          cf->name, work->sst_id);
         }
 
         atomic_thread_fence(memory_order_release);
 
-        TDB_DEBUG_LOG("CF '%s': Flushed SSTable %" PRIu64 " (max_seq=%" PRIu64
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "CF '%s' flushed SSTable %" PRIu64 " (max_seq=%" PRIu64
                       ") to level %d (array index 0)",
                       cf->name, work->sst_id, sst->max_seq, cf->levels[0]->level_num);
 
@@ -9018,7 +8874,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
             if (cleaned > 0)
             {
-                TDB_DEBUG_LOG("CF '%s': Cleaned up %d flushed immutable(s) with no active readers",
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' cleaned up %d flushed immutable(s) with no active readers",
                               cf->name, cleaned);
             }
         }
@@ -9041,7 +8898,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
             if (level0_size >= level0_capacity)
             {
                 TDB_DEBUG_LOG(
-                    "CF '%s': Level 0 full (size=%zu >= capacity=%zu), triggering compaction",
+                    TDB_LOG_INFO,
+                    "CF '%s' level 0 full (size=%zu >= capacity=%zu), triggering compaction",
                     cf->name, level0_size, level0_capacity);
                 tidesdb_compact(cf);
             }
@@ -9065,7 +8923,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 {
     tidesdb_t *db = (tidesdb_t *)arg;
 
-    TDB_DEBUG_LOG("Compaction worker thread started");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Compaction worker thread started");
 
     while (1)
     {
@@ -9090,26 +8948,31 @@ static void *tidesdb_compaction_worker_thread(void *arg)
         int space_check = tidesdb_check_disk_space(db, cf->directory, cf->config.min_disk_space);
         if (space_check <= 0)
         {
-            TDB_DEBUG_LOG("CF '%s': Insufficient disk space for compaction (required: %" PRIu64
-                          " bytes)",
-                          cf->name, cf->config.min_disk_space);
+            TDB_DEBUG_LOG(
+                TDB_LOG_WARN,
+                "CF '%s' encountered insufficient disk space for compaction (required: %" PRIu64
+                " bytes)",
+                cf->name, cf->config.min_disk_space);
             /* clear is_compacting flag so compaction can be retried later */
             atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
             free(work);
             continue;
         }
 
-        TDB_DEBUG_LOG("Compacting CF '%s'", cf->name);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Compacting CF '%s'", cf->name);
         int result = tidesdb_trigger_compaction(cf);
         if (result != TDB_SUCCESS)
         {
-            TDB_DEBUG_LOG("CF '%s': Compaction failed with error %d", cf->name, result);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' compaction failed with error %d", cf->name,
+                          result);
             /* is_compacting is cleared inside tidesdb_trigger_compaction on both success and
              * failure */
         }
 
         free(work);
     }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Compaction worker thread stopped");
 
     return NULL;
 }
@@ -9121,7 +8984,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 static void *tidesdb_sync_worker_thread(void *arg)
 {
     tidesdb_t *db = (tidesdb_t *)arg;
-    TDB_DEBUG_LOG("Sync worker thread started");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread started");
 
     while (atomic_load(&db->sync_thread_active))
     {
@@ -9169,7 +9032,7 @@ static void *tidesdb_sync_worker_thread(void *arg)
         pthread_rwlock_unlock(&db->cf_list_lock);
     }
 
-    TDB_DEBUG_LOG("Sync worker thread stopped");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread stopped");
     return NULL;
 }
 
@@ -9269,9 +9132,17 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     memcpy(&(*db)->config, config, sizeof(tidesdb_config_t));
 
-    _tidesdb_debug_enabled = config->enable_debug_logging;
-    TDB_DEBUG_LOG("Opening TidesDB: path=%s, debug=%s, workers=%d", config->db_path,
-                  config->enable_debug_logging ? "on" : "off", config->num_compaction_threads);
+    /* set log level from config */
+    _tidesdb_log_level = config->log_level;
+
+    const char *level_names[] = {"DEBUG", "INFO", "WARN", "ERROR", "FATAL", "NONE"};
+    const char *level_str =
+        (_tidesdb_log_level >= TDB_LOG_DEBUG && _tidesdb_log_level <= TDB_LOG_FATAL)
+            ? level_names[_tidesdb_log_level]
+            : (_tidesdb_log_level == TDB_LOG_NONE ? "NONE" : "UNKNOWN");
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Opening TidesDB with path=%s, log_level=%s, workers=%d",
+                  config->db_path, level_str, config->num_compaction_threads);
 
     mkdir((*db)->db_path, TDB_DIR_PERMISSIONS);
 
@@ -9396,13 +9267,14 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     if (tdb_get_available_disk_space((*db)->db_path, &initial_space) == 0)
     {
         atomic_init(&(*db)->cached_available_disk_space, initial_space);
-        TDB_DEBUG_LOG("Initial available disk space: %" PRIu64 " bytes", initial_space);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Initial available disk space is %" PRIu64 " bytes",
+                      initial_space);
     }
     else
     {
         /* failed to get disk space, set to 0 to trigger checks */
         atomic_init(&(*db)->cached_available_disk_space, 0);
-        TDB_DEBUG_LOG("Warning: Failed to get initial disk space");
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to get initial disk space");
     }
     atomic_init(&(*db)->last_disk_space_check, time(NULL));
 
@@ -9410,12 +9282,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->available_memory = get_available_memory();
     if ((*db)->total_memory > 0 && (*db)->available_memory > 0)
     {
-        TDB_DEBUG_LOG("System memory: total=%" PRIu64 " bytes, available=%" PRIu64 " bytes",
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "System memory is total=%" PRIu64 " bytes, available=%" PRIu64 " bytes",
                       (uint64_t)(*db)->total_memory, (uint64_t)(*db)->available_memory);
     }
     else
     {
-        TDB_DEBUG_LOG("Failed to get system memory information");
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to get system memory information");
         return TDB_ERR_MEMORY;
     }
 
@@ -9436,7 +9309,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(*db);
         return TDB_ERR_MEMORY;
     }
-    TDB_DEBUG_LOG("SSTable cache created: LRU capacity=%zu, LFU capacity=%zu, total=%zu",
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "SSTable cache created with LRU capacity=%zu, LFU capacity=%zu, total=%zu",
                   sstable_lru_cap, sstable_lfu_cap, sstable_lru_cap + sstable_lfu_cap);
 
     if (config->block_cache_size > 0)
@@ -9458,14 +9332,14 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free(*db);
             return TDB_ERR_MEMORY;
         }
-        TDB_DEBUG_LOG(
-            "Lock-free block cache created: max_bytes=%.2f MB (FIFO eviction, background thread)",
-            (double)config->block_cache_size / (1024 * 1024));
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Lock-free block cache created with max_bytes=%.2f MB (background thread)",
+                      (double)config->block_cache_size / (1024 * 1024));
     }
     else
     {
         (*db)->block_cache = NULL;
-        TDB_DEBUG_LOG("Block cache disabled (block_cache_size=0)");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Block cache disabled (block_cache_size=0)");
     }
 
     tidesdb_recover_database(*db);
@@ -9570,14 +9444,14 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         pthread_mutex_init(&(*db)->sync_lock, NULL);
         if (pthread_create(&(*db)->sync_thread, NULL, tidesdb_sync_worker_thread, *db) != 0)
         {
-            TDB_DEBUG_LOG("Failed to create sync worker thread");
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create sync worker thread");
             atomic_store(&(*db)->sync_thread_active, 0);
             pthread_mutex_destroy(&(*db)->sync_lock);
             /* non-fatal, continue without sync thread */
         }
         else
         {
-            TDB_DEBUG_LOG("Sync worker thread created");
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread created");
         }
     }
     else
@@ -9587,7 +9461,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     atomic_store(&(*db)->is_open, 1);
     atomic_store(&(*db)->is_recovering, 0);
-    TDB_DEBUG_LOG("Database is now open and ready for operations");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Database is now open and ready for operations");
 
     return TDB_SUCCESS;
 }
@@ -9596,9 +9470,9 @@ int tidesdb_close(tidesdb_t *db)
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
 
-    TDB_DEBUG_LOG("Closing TidesDB at path: %s", db->db_path);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Closing TidesDB at path: %s", db->db_path);
     atomic_store(&db->is_open, 0);
-    TDB_DEBUG_LOG("Flushing all active memtables before close");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Flushing all active memtables before close");
     pthread_rwlock_rdlock(&db->cf_list_lock);
     for (int i = 0; i < db->num_column_families; i++)
     {
@@ -9616,7 +9490,8 @@ int tidesdb_close(tidesdb_t *db)
                 if (wait_count % 10 == 0)
                 {
                     TDB_DEBUG_LOG(
-                        "CF '%s': Waiting for in-progress flush to complete (waited %dms)",
+                        TDB_LOG_INFO,
+                        "CF '%s' is waiting for in-progress flush to complete (waited %dms)",
                         cf->name, wait_count * 10);
                 }
             }
@@ -9627,7 +9502,8 @@ int tidesdb_close(tidesdb_t *db)
 
             if (entry_count > 0)
             {
-                TDB_DEBUG_LOG("CF '%s': Flushing %d entries before close", cf->name, entry_count);
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' is flushing %d entries before close", cf->name,
+                              entry_count);
 
                 /* ensure WAL is synced before attempting flush to prevent data loss */
                 block_manager_t *active_wal =
@@ -9635,7 +9511,7 @@ int tidesdb_close(tidesdb_t *db)
                 if (active_wal)
                 {
                     block_manager_escalate_fsync(active_wal);
-                    TDB_DEBUG_LOG("CF '%s': WAL synced before close", cf->name);
+                    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' WAL is now synced before close", cf->name);
                 }
 
                 /* retry flush with backoff to prevent data loss */
@@ -9648,7 +9524,8 @@ int tidesdb_close(tidesdb_t *db)
                     flush_result = tidesdb_flush_memtable_internal(cf, 0, 1); /* force flush */
                     if (flush_result == TDB_SUCCESS)
                     {
-                        TDB_DEBUG_LOG("CF '%s': Flush before close succeeded", cf->name);
+                        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' flush before close succeeded",
+                                      cf->name);
                         break;
                     }
 
@@ -9656,7 +9533,8 @@ int tidesdb_close(tidesdb_t *db)
                     if (retry_count < max_retries)
                     {
                         TDB_DEBUG_LOG(
-                            "CF '%s': Flush before close FAILED (attempt %d/%d, error %d), "
+                            TDB_LOG_ERROR,
+                            "CF '%s' flush before close failed (attempt %d/%d, error %d), "
                             "retrying",
                             cf->name, retry_count, max_retries, flush_result);
                         usleep(100000 *
@@ -9666,21 +9544,21 @@ int tidesdb_close(tidesdb_t *db)
 
                 if (flush_result != TDB_SUCCESS)
                 {
-                    TDB_DEBUG_LOG(
-                        "CF '%s': CRITICAL - Flush before close FAILED after %d attempts (error "
-                        "%d). "
-                        "Data is persisted in WAL and will be recovered on next open.",
-                        cf->name, max_retries, flush_result);
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "CF '%s' flush before close failed after %d attempts (error "
+                                  "%d). "
+                                  "Data is persisted in WAL and will be recovered on next open.",
+                                  cf->name, max_retries, flush_result);
                 }
             }
         }
     }
     pthread_rwlock_unlock(&db->cf_list_lock);
-    TDB_DEBUG_LOG("All memtables flushed");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "All memtables flushed");
 
     /* wait for enqueued flushes to complete before shutting down flush threads
      * this ensures data is written to sstables, not left in WAL */
-    TDB_DEBUG_LOG("Waiting for background flushes to complete");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for background flushes to complete");
     int flush_wait_count = 0;
     pthread_rwlock_rdlock(&db->cf_list_lock);
     while (flush_wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_MS)
@@ -9706,7 +9584,8 @@ int tidesdb_close(tidesdb_t *db)
 
         if (flush_wait_count % 100 == 0 && flush_wait_count > 0)
         {
-            TDB_DEBUG_LOG("Still waiting for background flushes (waited %dms)", flush_wait_count);
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Still waiting for background flushes (waited %dms)",
+                          flush_wait_count);
         }
 
         pthread_rwlock_unlock(&db->cf_list_lock);
@@ -9718,18 +9597,19 @@ int tidesdb_close(tidesdb_t *db)
 
     if (flush_wait_count >= TDB_CLOSE_FLUSH_WAIT_MAX_MS)
     {
-        TDB_DEBUG_LOG("WARNING: Background flushes did not complete within timeout");
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Background flushes did not complete within timeout");
     }
     else
     {
-        TDB_DEBUG_LOG("All background flushes completed");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed");
     }
 
     int final_active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
 
     if (db->config.wait_for_txns_on_close)
     {
-        TDB_DEBUG_LOG("Waiting for active transactions to complete (wait_for_txns_on_close=true)");
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Waiting for active transactions to complete (wait_for_txns_on_close=true)");
         int txn_wait_count = 0;
         while (txn_wait_count < TDB_CLOSE_TXN_WAIT_MAX_MS)
         {
@@ -9742,7 +9622,8 @@ int tidesdb_close(tidesdb_t *db)
 
             if (txn_wait_count % 100 == 0 && txn_wait_count > 0)
             {
-                TDB_DEBUG_LOG("Still waiting for %d active transactions (waited %dms)",
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "Still waiting for %d active transactions (waited %dms)",
                               active_count, txn_wait_count);
             }
 
@@ -9754,7 +9635,8 @@ int tidesdb_close(tidesdb_t *db)
 
         if (final_active_count > 0)
         {
-            TDB_DEBUG_LOG("ERROR: Cannot close database - %d transactions still active after %dms",
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "Cannot close database - %d transactions still active after %dms",
                           final_active_count, TDB_CLOSE_TXN_WAIT_MAX_MS);
             return TDB_ERR_UNKNOWN;
         }
@@ -9766,12 +9648,13 @@ int tidesdb_close(tidesdb_t *db)
          * this is the recommended behavior used by RocksDB, LevelDB, etc. */
         if (final_active_count > 0)
         {
-            TDB_DEBUG_LOG("Closing with %d active transactions - they will fail (fast-fail mode)",
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "Closing with %d active transactions - they will fail (fast-fail mode)",
                           final_active_count);
         }
     }
 
-    TDB_DEBUG_LOG("All active transactions completed");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "All active transactions completed");
 
     if (db->flush_queue)
     {
@@ -9785,7 +9668,8 @@ int tidesdb_close(tidesdb_t *db)
         pthread_cond_broadcast(&db->compaction_queue->not_empty);
     }
 
-    TDB_DEBUG_LOG("Waiting for %d flush threads to finish", db->config.num_flush_threads);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for %d flush threads to finish",
+                  db->config.num_flush_threads);
     if (db->flush_threads)
     {
         for (int i = 0; i < db->config.num_flush_threads; i++)
@@ -9794,29 +9678,30 @@ int tidesdb_close(tidesdb_t *db)
         }
         free(db->flush_threads);
     }
-    TDB_DEBUG_LOG("Flush threads finished");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush threads finished");
 
-    TDB_DEBUG_LOG("Waiting for %d compaction threads to finish", db->config.num_compaction_threads);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for %d compaction threads to finish",
+                  db->config.num_compaction_threads);
     if (db->compaction_threads)
     {
         for (int i = 0; i < db->config.num_compaction_threads; i++)
         {
-            TDB_DEBUG_LOG("Joining compaction thread %d", i);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Joining compaction thread %d", i);
             pthread_join(db->compaction_threads[i], NULL);
-            TDB_DEBUG_LOG("Compaction thread %d joined", i);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Compaction thread %d joined", i);
         }
         free(db->compaction_threads);
     }
-    TDB_DEBUG_LOG("Compaction threads finished");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Compaction threads finished");
 
     /* stop sync worker thread if running */
     if (atomic_load(&db->sync_thread_active))
     {
-        TDB_DEBUG_LOG("Stopping sync worker thread");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Stopping sync worker thread");
         atomic_store(&db->sync_thread_active, 0);
         pthread_join(db->sync_thread, NULL);
         pthread_mutex_destroy(&db->sync_lock);
-        TDB_DEBUG_LOG("Sync worker thread stopped");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread stopped");
     }
 
     /* drain and free any remaining work items before freeing queues */
@@ -9856,8 +9741,8 @@ int tidesdb_close(tidesdb_t *db)
         if (cf && cf->immutable_memtables)
         {
             int queue_count = (int)queue_size(cf->immutable_memtables);
-            TDB_DEBUG_LOG("CF '%s': %d immutables in queue before shutdown cleanup", cf->name,
-                          queue_count);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' %d immutables in queue before shutdown cleanup",
+                          cf->name, queue_count);
             int cleaned = 0;
             while (!queue_is_empty(cf->immutable_memtables))
             {
@@ -9866,16 +9751,17 @@ int tidesdb_close(tidesdb_t *db)
                 if (imm)
                 {
                     int refcount = atomic_load_explicit(&imm->refcount, memory_order_acquire);
-                    TDB_DEBUG_LOG("CF '%s': Dequeuing immutable with refcount=%d", cf->name,
-                                  refcount);
+                    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' dequeuing immutable with refcount=%d",
+                                  cf->name, refcount);
                     tidesdb_immutable_memtable_unref(imm);
                     cleaned++;
                 }
             }
             if (cleaned > 0)
             {
-                TDB_DEBUG_LOG("CF '%s': Cleaned up %d immutable memtables during shutdown",
-                              cf->name, cleaned);
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' cleaned up %d immutable memtables during shutdown", cf->name,
+                              cleaned);
             }
         }
     }
@@ -9896,17 +9782,19 @@ int tidesdb_close(tidesdb_t *db)
     pthread_mutex_destroy(&db->comparators_lock);
 
     free(db->db_path);
-    TDB_DEBUG_LOG("Freeing SSTable cache (size: %zu)", lru_cache_size(db->sstable_cache));
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Freeing SSTable cache (size: %zu)",
+                  lru_cache_size(db->sstable_cache));
     lru_cache_free(db->sstable_cache);
-    TDB_DEBUG_LOG("SSTable cache freed");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable cache freed");
 
     if (db->block_cache)
     {
         size_t entries, bytes;
         clock_cache_stats(db->block_cache, &entries, &bytes);
-        TDB_DEBUG_LOG("Freeing lock-free block cache (entries: %zu, bytes: %zu)", entries, bytes);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Freeing global block cache (entries: %zu, bytes: %zu)",
+                      entries, bytes);
         clock_cache_destroy(db->block_cache);
-        TDB_DEBUG_LOG("Block cache freed");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Block cache freed");
     }
 
     if (db->commit_status)
@@ -9951,11 +9839,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     /* validate sync configuration */
     if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us == 0)
     {
-        TDB_DEBUG_LOG("Invalid config: TDB_SYNC_INTERVAL requires sync_interval_us > 0");
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "Invalid config TDB_SYNC_INTERVAL requires sync_interval_us > 0");
         return TDB_ERR_INVALID_ARGS;
     }
 
-    TDB_DEBUG_LOG("Creating column family: %s", name);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Creating column family: %s", name);
 
     pthread_rwlock_rdlock(&db->cf_list_lock);
     for (int i = 0; i < db->num_column_families; i++)
@@ -9963,7 +9852,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         if (db->column_families[i] && strcmp(db->column_families[i]->name, name) == 0)
         {
             pthread_rwlock_unlock(&db->cf_list_lock);
-            TDB_DEBUG_LOG("Column family already exists: %s", name);
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Column family %s already exists", name);
             return TDB_ERR_EXISTS;
         }
     }
@@ -9972,7 +9861,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     tidesdb_column_family_t *cf = calloc(1, sizeof(tidesdb_column_family_t));
     if (!cf)
     {
-        TDB_DEBUG_LOG("Failed to allocate memory for column family structure");
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to allocate memory for column family structure");
         return TDB_ERR_MEMORY;
     }
 
@@ -10044,7 +9933,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
              * this would cause data corruption if we fall back to memcmp.
              * user must register comparator before creating/opening CF. */
             TDB_DEBUG_LOG(
-                "FATAL: Column family '%s' requires comparator '%s' but it is not registered. "
+                TDB_LOG_FATAL,
+                "Column family '%s' requires comparator '%s' but it is not registered. "
                 "Register comparator with tidesdb_register_comparator() before opening database.",
                 name, config->comparator_name);
             free(cf->directory);
@@ -10136,7 +10026,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     /* validate we dont exceed max levels */
     if (min_levels > TDB_MAX_LEVELS)
     {
-        TDB_DEBUG_LOG("Cannot create CF: requires %d levels but max is %d", min_levels,
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Cannot create CF requires %d levels but max is %d", min_levels,
                       TDB_MAX_LEVELS);
         block_manager_close(atomic_load(&cf->active_wal));
         queue_free(cf->immutable_memtables);
@@ -10178,7 +10068,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             free(cf);
             return TDB_ERR_MEMORY;
         }
-        TDB_DEBUG_LOG("Creating level %d with capacity %zu", i + 1, level_capacity);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Creating level %d with capacity %zu", i + 1, level_capacity);
     }
 
     /* initialize remaining slots to NULL */
@@ -10308,11 +10198,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     int save_result = tidesdb_cf_config_save_to_ini(config_path, name, config);
     if (save_result != TDB_SUCCESS)
     {
-        TDB_DEBUG_LOG("Warning: Failed to save CF config for '%s' (error: %d)", name, save_result);
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to save CF config for '%s' (error: %d)", name,
+                      save_result);
         /* non-fatal, continue */
     }
 
-    TDB_DEBUG_LOG("Created CF '%s' (total: %d)", name, db->num_column_families);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Created CF '%s' (total: %d)", name, db->num_column_families);
 
     return TDB_SUCCESS;
 }
@@ -10321,7 +10212,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 {
     if (!db || !name) return TDB_ERR_INVALID_ARGS;
 
-    TDB_DEBUG_LOG("Dropping column family: %s", name);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Dropping column family: %s", name);
 
     tidesdb_column_family_t *cf_to_drop = NULL;
 
@@ -10356,8 +10247,8 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     pthread_rwlock_unlock(&db->cf_list_lock);
 
     int result = remove_directory(cf_to_drop->directory);
-    TDB_DEBUG_LOG("Deleted column family directory: %s (result: %d)", cf_to_drop->directory,
-                  result);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Deleted column family directory: %s (result: %d)",
+                  cf_to_drop->directory, result);
 
     tidesdb_column_family_free(cf_to_drop);
 
@@ -10503,7 +10394,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
 
     if (current_entries == 0)
     {
-        TDB_DEBUG_LOG("CF '%s': Memtable is empty, skipping flush", cf->name);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' memtable is empty, skipping flush", cf->name);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_SUCCESS;
     }
@@ -10511,17 +10402,19 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     /* only check size threshold if not forcing flush */
     if (!force && current_size < cf->config.write_buffer_size)
     {
-        TDB_DEBUG_LOG("CF '%s': Memtable size %zu < threshold %zu and force=0, skipping flush",
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "CF '%s' memtable size %zu < threshold %zu and force=0, skipping flush",
                       cf->name, current_size, cf->config.write_buffer_size);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_SUCCESS;
     }
 
-    TDB_DEBUG_LOG(
-        "CF '%s': Flushing memtable (entries: %d, size: %zu bytes / %.2f MB, threshold: %zu bytes "
-        "/ %.2f MB)",
-        cf->name, current_entries, current_size, current_size / (1024.0 * 1024.0),
-        cf->config.write_buffer_size, cf->config.write_buffer_size / (1024.0 * 1024.0));
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "CF '%s' is flushing memtable (entries: %d, size: %zu bytes / %.2f MB, "
+                  "threshold: %zu bytes "
+                  "/ %.2f MB)",
+                  cf->name, current_entries, current_size, current_size / (1024.0 * 1024.0),
+                  cf->config.write_buffer_size, cf->config.write_buffer_size / (1024.0 * 1024.0));
 
     block_manager_t *old_wal = atomic_load_explicit(&cf->active_wal, memory_order_acquire);
     uint64_t sst_id = atomic_fetch_add(&cf->next_sstable_id, 1);
@@ -10547,7 +10440,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
                                       cf->config.skip_list_probability, comparator_fn,
                                       comparator_ctx) != 0)
     {
-        TDB_DEBUG_LOG("CF '%s': Failed to create new memtable", cf->name);
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to create new memtable", cf->name);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_ERR_MEMORY;
     }
@@ -10561,7 +10454,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
 
     if (block_manager_open(&new_wal, wal_path, convert_sync_mode(cf->config.sync_mode)) != 0)
     {
-        TDB_DEBUG_LOG("CF '%s': Failed to open new WAL: %s", cf->name, wal_path);
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to open new WAL: %s", cf->name, wal_path);
         skip_list_free(new_memtable);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_ERR_IO;
@@ -10570,7 +10463,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     tidesdb_immutable_memtable_t *immutable = malloc(sizeof(tidesdb_immutable_memtable_t));
     if (!immutable)
     {
-        TDB_DEBUG_LOG("CF '%s': Failed to allocate immutable memtable", cf->name);
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to allocate immutable memtable", cf->name);
         skip_list_free(new_memtable);
         block_manager_close(new_wal);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
@@ -10600,7 +10493,8 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     atomic_store_explicit(&cf->active_memtable, new_memtable, memory_order_release);
     atomic_store_explicit(&cf->active_wal, new_wal, memory_order_release);
 
-    TDB_DEBUG_LOG("CF '%s': Memtable swapped, allocating flush work for SSTable %" PRIu64, cf->name,
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "CF '%s' memtable swapped, allocating flush work for SSTable %" PRIu64, cf->name,
                   sst_id);
 
     tidesdb_flush_work_t *work = malloc(sizeof(tidesdb_flush_work_t));
@@ -10620,7 +10514,9 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     tidesdb_immutable_memtable_ref(immutable);
 
     size_t queue_size_before = queue_size(cf->db->flush_queue);
-    TDB_DEBUG_LOG("CF '%s': Enqueueing flush work for SSTable %" PRIu64 " (queue size before: %zu)",
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "CF '%s' is enqueueing flush work for SSTable %" PRIu64
+                  " (queue size before: %zu)",
                   cf->name, sst_id, queue_size_before);
 
     /* retry enqueue with backoff -- we must not lose this flush work
@@ -10631,22 +10527,23 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
         enqueue_attempts++;
         if (enqueue_attempts >= TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS)
         {
-            TDB_DEBUG_LOG(
-                "CF '%s': CRITICAL - Failed to enqueue flush work after %d attempts for SSTable "
-                "%" PRIu64,
-                cf->name, TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS, sst_id);
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "CF '%s' failed to enqueue flush work after %d attempts for SSTable "
+                          "%" PRIu64,
+                          cf->name, TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS, sst_id);
             tidesdb_immutable_memtable_unref(immutable); /* remove work ref */
             free(work);
             /* leave is_flushing set to prevent more flushes until this resolves */
             return TDB_ERR_MEMORY;
         }
-        TDB_DEBUG_LOG("CF '%s': Flush queue full, retry %d/%d for SSTable %" PRIu64, cf->name,
-                      enqueue_attempts, TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS, sst_id);
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' flush queue full, retry %d/%d for SSTable %" PRIu64,
+                      cf->name, enqueue_attempts, TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS, sst_id);
         usleep(TDB_FLUSH_ENQUEUE_BACKOFF_US);
     }
 
     size_t queue_size_after = queue_size(cf->db->flush_queue);
-    TDB_DEBUG_LOG("CF '%s': Successfully enqueued flush work for SSTable %" PRIu64
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "CF '%s' has successfully enqueued flush work for SSTable %" PRIu64
                   " (queue size after: %zu)",
                   cf->name, sst_id, queue_size_after);
 
@@ -10864,24 +10761,10 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
 {
     if (!db || !txn) return TDB_ERR_INVALID_ARGS;
 
-    static _Atomic(uint64_t) txn_begin_count = 0;
-    uint64_t this_txn = atomic_fetch_add(&txn_begin_count, 1);
-    if (this_txn % 100000 == 0)
-    {
-        TDB_DEBUG_LOG("TXN_BEGIN #%" PRIu64 " starting, is_open=%d", this_txn,
-                      atomic_load(&db->is_open));
-    }
-
     int wait_result = wait_for_open(db);
     if (wait_result != TDB_SUCCESS)
     {
-        TDB_DEBUG_LOG("TXN_BEGIN #%" PRIu64 " failed wait_for_open: %d", this_txn, wait_result);
         return wait_result;
-    }
-
-    if (this_txn % 100000 == 0)
-    {
-        TDB_DEBUG_LOG("TXN_BEGIN #%" PRIu64 " passed wait_for_open", this_txn);
     }
 
     if (isolation < TDB_ISOLATION_READ_UNCOMMITTED || isolation > TDB_ISOLATION_SERIALIZABLE)
@@ -11005,7 +10888,8 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
             /* capacity exceeded -- log warning but continue.
              * this transaction won't participate in SSI conflict detection,
              * but will still get correct snapshot isolation semantics. */
-            TDB_DEBUG_LOG("Active transaction list full (%d), SSI may be less effective",
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "Active transaction list full (%d), SSI may be less effective",
                           db->active_txns_capacity);
         }
 
@@ -11162,74 +11046,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     int cf_index = tidesdb_txn_add_cf_internal(txn, cf);
     if (cf_index < 0) return TDB_ERR_MEMORY;
 
-    /* check cache first (before everything else)
-     * use sst ID 0 to indicate memtable/uncommitted entries
-     * this gives us O(1) cache hits for hot keys */
-    if (txn->db->block_cache)
-    {
-        tidesdb_cached_entry_t *cached =
-            tidesdb_cache_entry_get(txn->db, cf->name, 0, key, key_size);
-        if (cached)
-        {
-            /* cache hit! check if deleted */
-            if (cached->flags & TDB_KV_FLAG_TOMBSTONE)
-            {
-                free(cached);
-                return TDB_ERR_NOT_FOUND;
-            }
-
-            /* check TTL */
-            if (cached->ttl == 0 || cached->ttl > time(NULL))
-            {
-                /* valid entry -- return it */
-                *value = malloc(cached->value_size);
-                if (!*value)
-                {
-                    free(cached);
-                    return TDB_ERR_MEMORY;
-                }
-                memcpy(*value, cached->data + cached->key_size, cached->value_size);
-                *value_size = cached->value_size;
-                free(cached);
-                return TDB_SUCCESS;
-            }
-
-            /* TTL expired -- fall through to normal path */
-            free(cached);
-        }
-    }
-
-    /* determine snapshot based on isolation level
-     * -- READ_UNCOMMITTED -- UINT64_MAX (see all versions, no visibility check)
-     * -- READ_COMMITTED -- refresh snapshot on each read (latest committed data)
-     * -- REPEATABLE_READ/SNAPSHOT/SERIALIZABLE -- use consistent snapshot from BEGIN */
-    uint64_t snapshot_seq;
-    skip_list_visibility_check_fn visibility_check;
-
-    if (txn->isolation_level == TDB_ISOLATION_READ_UNCOMMITTED)
-    {
-        snapshot_seq = UINT64_MAX;
-        visibility_check = NULL; /* no visibility check -- see everything */
-    }
-    else if (txn->isolation_level == TDB_ISOLATION_READ_COMMITTED)
-    {
-        /* refresh snapshot to see latest committed data
-         * READ_COMMITTED doesn't need visibility callback because:
-         * 1. it refreshes snapshot on each read to see all data up to current global_seq
-         * 2. commit status buffer is circular and can have stale entries after recovery
-         * 3. any data in memtable with seq <= snapshot_seq is considered visible */
-        uint64_t current_seq = atomic_load_explicit(&txn->db->global_seq, memory_order_acquire);
-        snapshot_seq = (current_seq > 0) ? current_seq - 1 : 0;
-        visibility_check = NULL; /* no visibility check needed for READ_COMMITTED */
-    }
-    else
-    {
-        /* REPEATABLE_READ, SNAPSHOT, SERIALIZABLE = consistent snapshot */
-        snapshot_seq = txn->snapshot_seq;
-        visibility_check = tidesdb_visibility_check_callback;
-    }
-
-    /* check write set first (read your own writes)
+    /* check write set FIRST (read your own writes)
+     * transaction must see its own uncommitted changes before checking cache/memtable
      * use search strategy based on transaction size:
      * -- small txns -- linear scan from end (cache-friendly, low overhead)
      * -- medium txns -- linear scan with early termination per CF
@@ -11311,6 +11129,101 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                 }
             }
         }
+    }
+
+    /* check cache for committed data (after write set check)
+     * use sst ID 0 to indicate memtable/uncommitted entries
+     * this gives us O(1) cache hits for hot keys
+     * must respect snapshot isolation for REPEATABLE_READ and above */
+    if (txn->db->block_cache)
+    {
+        tidesdb_cached_entry_t *cached =
+            tidesdb_cache_entry_get(txn->db, cf->name, 0, key, key_size);
+        if (cached)
+        {
+            /* for REPEATABLE_READ and stricter, check snapshot visibility */
+            int use_cache = 1;
+            if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
+            {
+                /* only use cache if entry is visible to our snapshot */
+                if (cached->seq > txn->snapshot_seq)
+                {
+                    use_cache = 0;
+                }
+            }
+            /* READ_UNCOMMITTED and READ_COMMITTED always use cache (latest committed) */
+
+            if (use_cache)
+            {
+                /* cache hit! check if deleted */
+                if (cached->flags & TDB_KV_FLAG_TOMBSTONE)
+                {
+                    /* track read even for tombstones (needed for SSI) */
+                    if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
+                    {
+                        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, cached->seq);
+                    }
+                    free(cached);
+                    return TDB_ERR_NOT_FOUND;
+                }
+
+                /* check TTL */
+                if (cached->ttl == 0 || cached->ttl > time(NULL))
+                {
+                    /* valid entry -- return it */
+                    *value = malloc(cached->value_size);
+                    if (!*value)
+                    {
+                        free(cached);
+                        return TDB_ERR_MEMORY;
+                    }
+                    memcpy(*value, cached->data + cached->key_size, cached->value_size);
+                    *value_size = cached->value_size;
+
+                    /* track read for SSI conflict detection (REPEATABLE_READ and above) */
+                    if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
+                    {
+                        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, cached->seq);
+                    }
+
+                    free(cached);
+                    return TDB_SUCCESS;
+                }
+            }
+
+            /* TTL expired or not visible to snapshot -- fall through to normal path */
+            free(cached);
+        }
+    }
+
+    /* determine snapshot based on isolation level
+     * -- READ_UNCOMMITTED -- UINT64_MAX (see all versions, no visibility check)
+     * -- READ_COMMITTED -- refresh snapshot on each read (latest committed data)
+     * -- REPEATABLE_READ/SNAPSHOT/SERIALIZABLE -- use consistent snapshot from BEGIN */
+    uint64_t snapshot_seq;
+    skip_list_visibility_check_fn visibility_check;
+
+    if (txn->isolation_level == TDB_ISOLATION_READ_UNCOMMITTED)
+    {
+        snapshot_seq = UINT64_MAX;
+        visibility_check = NULL; /* no visibility check -- see everything */
+    }
+    else if (txn->isolation_level == TDB_ISOLATION_READ_COMMITTED)
+    {
+        /* refresh snapshot to see latest committed data
+         * READ_COMMITTED doesn't need visibility callback because:
+         * 1. it refreshes snapshot on each read to see all data up to current global_seq
+         * 2. commit status buffer is circular and can have stale entries after recovery
+         * 3. any data in memtable with seq <= snapshot_seq is considered visible */
+        uint64_t current_seq = atomic_load_explicit(&txn->db->global_seq, memory_order_acquire);
+        snapshot_seq = (current_seq > 0) ? current_seq - 1 : 0;
+        visibility_check = NULL; /* no visibility check needed for READ_COMMITTED */
+    }
+    else
+    {
+        /* REPEATABLE_READ, SNAPSHOT, SERIALIZABLE = consistent snapshot */
+        snapshot_seq = txn->snapshot_seq;
+        visibility_check = tidesdb_visibility_check_callback;
     }
 
     /* atomically capture memtable snapshot to prevent race with flush
@@ -11455,14 +11368,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-    static _Atomic(uint64_t) sstable_search_count = 0;
-    uint64_t this_search = atomic_fetch_add(&sstable_search_count, 1);
-    if (this_search % 10000 == 0)
-    {
-        TDB_DEBUG_LOG("GET #%" PRIu64 ": Starting SSTable search, num_levels=%d", this_search,
-                      num_levels);
-    }
-
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
     tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
@@ -11479,12 +11384,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         tidesdb_level_t *level = cf->levels[level_num];
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
-
-        if (this_search % 10000 == 0 && num_ssts > 0)
-        {
-            TDB_DEBUG_LOG("GET #%" PRIu64 ": Searching level %d, num_ssts=%d", this_search,
-                          level_num, num_ssts);
-        }
 
         for (int j = 0; j < num_ssts; j++)
         {
@@ -11516,12 +11415,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             /* take ref only for ssts we will actually read */
             tidesdb_sstable_ref(sst);
 
-            if (this_search % 10000 == 0)
-            {
-                TDB_DEBUG_LOG("GET #%" PRIu64 ": Reading SSTable %" PRIu64 " at level %d",
-                              this_search, sst->id, level_num);
-            }
-
             tidesdb_kv_pair_t *candidate_kv = NULL;
             if (tidesdb_sstable_get(cf->db, sst, key, key_size, &candidate_kv) == TDB_SUCCESS &&
                 candidate_kv)
@@ -11539,21 +11432,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     /* L0 hit -- stop immediately, no need to check deeper levels */
                     if (level_num == 0)
                     {
-                        if (this_search % 10000 == 0)
-                        {
-                            TDB_DEBUG_LOG("GET #%" PRIu64
-                                          ": L0 hit, about to unref SSTable %" PRIu64,
-                                          this_search, sst->id);
-                        }
-
                         tidesdb_sstable_unref(cf->db, sst);
-
-                        if (this_search % 10000 == 0)
-                        {
-                            TDB_DEBUG_LOG("GET #%" PRIu64
-                                          ": unref complete, going to check_found_result",
-                                          this_search);
-                        }
 
                         goto check_found_result;
                     }
@@ -12299,8 +12178,9 @@ skip_ssi_check:
 
                 /* populate cache (write-through cache)
                  * use sst ID 0 to indicate memtable entries
-                 * this makes subsequent reads O(1) instead of O(log N) skip list lookup */
-                if (txn->db->block_cache && op->value_size > 0)
+                 * this makes subsequent reads O(1) instead of O(log N) skip list lookup
+                 * must cache deletes too, otherwise old values remain visible */
+                if (txn->db->block_cache)
                 {
                     /* create cached entry with single allocation */
                     size_t inline_value_size =
@@ -12319,7 +12199,10 @@ skip_ssi_check:
 
                         /* copy key and value into data buffer */
                         memcpy(cache_entry->data, op->key, op->key_size);
-                        memcpy(cache_entry->data + op->key_size, op->value, op->value_size);
+                        if (op->value_size > 0 && op->value)
+                        {
+                            memcpy(cache_entry->data + op->key_size, op->value, op->value_size);
+                        }
 
                         /* populate cache -- use sst ID 0 for memtable entries */
                         tidesdb_cache_entry_put(txn->db, cf->name, 0, op->key, op->key_size,
@@ -12408,7 +12291,8 @@ skip_ssi_check:
                     /* l0 is full, apply strong backpressure */
                     usleep(TDB_BACKPRESSURE_DELAY_EMERGENCY_US);
                     TDB_DEBUG_LOG(
-                        "CF '%s': Level 0 full (%d%%), applying emergency backpressure (50ms)",
+                        TDB_LOG_WARN,
+                        "CF '%s' level 0 full (%d%%), applying emergency backpressure (50ms)",
                         cf->name, utilization_pct);
                 }
                 else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L0_CRITICAL)
@@ -14095,7 +13979,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
         multi_cf_tracker_create(TDB_MULTI_CF_TRACKER_INITIAL_CAPACITY);
     if (!tracker)
     {
-        TDB_DEBUG_LOG("CF '%s': Failed to create multi-CF tracker, proceeding without validation",
+        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                      "CF '%s' failed to create multi-CF tracker, proceeding without validation",
                       cf->name);
     }
 
@@ -14135,7 +14020,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 
                 if (block_manager_open(&wal_bm, wal_path, BLOCK_MANAGER_SYNC_NONE) != 0)
                 {
-                    TDB_DEBUG_LOG("CF '%s': Failed to reopen WAL for flush tracking: %s", cf->name,
+                    TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                  "CF '%s' failed to reopen WAL for flush tracking: %s", cf->name,
                                   wal_path);
                     skip_list_free(recovered_memtable);
                     free(wal_path);
@@ -14153,7 +14039,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                     if (queue_enqueue(cf->immutable_memtables, imm) == 0)
                     {
                         TDB_DEBUG_LOG(
-                            "CF '%s': Queued recovered memtable for async flush (WAL: %s)",
+                            TDB_LOG_INFO,
+                            "CF '%s' has queued recovered memtable for async flush (WAL: %s)",
                             cf->name, wal_path);
 
                         tidesdb_flush_work_t *work = malloc(sizeof(tidesdb_flush_work_t));
@@ -14174,7 +14061,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                     }
                     else
                     {
-                        TDB_DEBUG_LOG("CF '%s': Failed to enqueue recovered memtable", cf->name);
+                        TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to enqueue recovered memtable",
+                                      cf->name);
                         tidesdb_immutable_memtable_unref(imm);
                     }
                 }
@@ -14187,8 +14075,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             else
             {
                 skip_list_free(recovered_memtable);
-                TDB_DEBUG_LOG("CF '%s': Empty recovered memtable, deleting WAL: %s", cf->name,
-                              wal_path);
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' empty recovered memtable, deleting WAL: %s",
+                              cf->name, wal_path);
                 unlink(wal_path);
             }
         }
@@ -14207,7 +14095,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
         multi_cf_tracker_free(tracker);
     }
 
-    TDB_DEBUG_LOG("Recovering SSTables from directory: %s", cf->directory);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Recovering SSTables from directory: %s", cf->directory);
     dir = opendir(cf->directory);
     if (!dir) return TDB_ERR_IO;
 
@@ -14215,7 +14103,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     {
         if (strstr(entry->d_name, ".klog") != NULL)
         {
-            TDB_DEBUG_LOG("Found .klog file: %s", entry->d_name);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Found .klog file: %s", entry->d_name);
             int level_num = 1;
             int partition_num = -1;
             unsigned long long sst_id_ull = 0;
@@ -14233,7 +14121,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                          "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d" TDB_LEVEL_PARTITION_PREFIX "%d",
                          cf->directory, level_num, partition_num);
                 parsed = 1;
-                TDB_DEBUG_LOG("Parsed partitioned SSTable: level=%d, partition=%d, id=%llu",
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "Parsed partitioned SSTable: level=%d, partition=%d, id=%llu",
                               level_num, partition_num, sst_id_ull);
             }
             /** try non-partitioned format:
@@ -14244,8 +14133,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                 snprintf(sst_base, sizeof(sst_base), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
                          cf->directory, level_num);
                 parsed = 1;
-                TDB_DEBUG_LOG("Parsed non-partitioned SSTable: level=%d, id=%llu", level_num,
-                              sst_id_ull);
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Parsed non-partitioned SSTable: level=%d, id=%llu",
+                              level_num, sst_id_ull);
             }
 
             if (parsed)
@@ -14261,7 +14150,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                 if (!in_manifest)
                 {
                     /* sstable not in manifest = incomplete/corrupted, delete it */
-                    TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64
+                    TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                  "CF '%s' SSTable %" PRIu64
                                   " at level %d not in manifest, deleting (incomplete write)",
                                   cf->name, sst_id, level_num);
 
@@ -14285,7 +14175,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                     tidesdb_sstable_create(cf->db, sst_base, sst_id, &cf->config);
                 if (sst)
                 {
-                    TDB_DEBUG_LOG("CF '%s': Recovering SSTable %" PRIu64 " at level %d", cf->name,
+                    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                  "CF '%s' is recovering SSTable %" PRIu64 " at level %d", cf->name,
                                   sst_id, level_num);
                     if (tidesdb_sstable_load(cf->db, sst) == TDB_SUCCESS)
                     {
@@ -14300,7 +14191,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                         if (sst_cache_result < 0)
                         {
                             tidesdb_sstable_unref(cf->db, sst);
-                            TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64 " cache add failed", cf->name,
+                            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                          "CF '%s' SSTable %" PRIu64 " cache add failed", cf->name,
                                           sst_id);
                         }
 
@@ -14331,7 +14223,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                         /* the sstable failed to load, likely corruption.
                          * we delete both klog and vlog files to prevent repeated recovery attempts
                          */
-                        TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64
+                        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                      "CF '%s' SSTable %" PRIu64
                                       " failed to load (corrupted), deleting files",
                                       cf->name, sst_id);
 
@@ -14357,7 +14250,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-    TDB_DEBUG_LOG("CF '%s': Scanning sources for max_seq", cf->name);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' is scanning sources for max_seq", cf->name);
 
     for (int level_idx = 0; level_idx < num_levels; level_idx++)
     {
@@ -14427,8 +14320,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     if (global_max_seq + 1 > current_seq)
     {
         atomic_store_explicit(&cf->db->global_seq, global_max_seq + 1, memory_order_release);
-        TDB_DEBUG_LOG("CF '%s': Updated global_seq from %" PRIu64 " to %" PRIu64, cf->name,
-                      current_seq, global_max_seq + 1);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' has updated global_seq from %" PRIu64 " to %" PRIu64,
+                      cf->name, current_seq, global_max_seq + 1);
     }
 
     /* we mark all recovered sequences as committed in the status tracker
@@ -14466,11 +14359,12 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     if (manifest_next_id > 0)
     {
         atomic_store(&cf->next_sstable_id, manifest_next_id);
-        TDB_DEBUG_LOG("CF '%s': Restored next_sstable_id=%" PRIu64 " from manifest", cf->name,
-                      manifest_next_id);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' restored next_sstable_id=%" PRIu64 " from manifest",
+                      cf->name, manifest_next_id);
     }
 
-    TDB_DEBUG_LOG("CF '%s': Recovery complete, global_max_seq=%" PRIu64, cf->name, global_max_seq);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' recovery is complete, global_max_seq=%" PRIu64, cf->name,
+                  global_max_seq);
 
     return TDB_SUCCESS;
 }
@@ -14485,12 +14379,12 @@ static int tidesdb_recover_database(tidesdb_t *db)
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
 
-    TDB_DEBUG_LOG("Starting database recovery from: %s", db->db_path);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting database recovery from: %s", db->db_path);
 
     DIR *dir = opendir(db->db_path);
     if (!dir)
     {
-        TDB_DEBUG_LOG("No existing database directory found (fresh start)");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "No existing database directory found (fresh start)");
         return TDB_SUCCESS; /* not an error, fresh database */
     }
 
@@ -14502,8 +14396,6 @@ static int tidesdb_recover_database(tidesdb_t *db)
             continue;
         }
 
-        TDB_DEBUG_LOG("Recovery: examining entry '%s'", entry->d_name);
-
         char full_path[MAX_FILE_PATH_LENGTH];
         snprintf(full_path, sizeof(full_path), "%s%s%s", db->db_path, PATH_SEPARATOR,
                  entry->d_name);
@@ -14511,7 +14403,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
         struct STAT_STRUCT st;
         if (STAT_FUNC(full_path, &st) == 0 && S_ISDIR(st.st_mode))
         {
-            TDB_DEBUG_LOG("Found CF directory: %s", entry->d_name);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Found CF directory: %s", entry->d_name);
             tidesdb_column_family_t *cf = tidesdb_get_column_family_internal(db, entry->d_name);
 
             if (!cf)
@@ -14525,7 +14417,8 @@ static int tidesdb_recover_database(tidesdb_t *db)
                         strlen(TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT) >=
                     TDB_MAX_PATH_LEN)
                 {
-                    TDB_DEBUG_LOG("CF '%s': Config path too long, using defaults", entry->d_name);
+                    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' config path too long, using defaults",
+                                  entry->d_name);
                     goto create_cf_with_config;
                 }
 
@@ -14538,14 +14431,15 @@ static int tidesdb_recover_database(tidesdb_t *db)
                 if (tidesdb_cf_config_load_from_ini(config_path, entry->d_name, &config) ==
                     TDB_SUCCESS)
                 {
-                    TDB_DEBUG_LOG(
-                        "CF '%s': Loaded config from disk (write_buffer_size=%zu, "
-                        "level_size_ratio=%zu)",
-                        entry->d_name, config.write_buffer_size, config.level_size_ratio);
+                    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                  "CF '%s' has loaded config from disk (write_buffer_size=%zu, "
+                                  "level_size_ratio=%zu)",
+                                  entry->d_name, config.write_buffer_size, config.level_size_ratio);
                 }
                 else
                 {
-                    TDB_DEBUG_LOG("CF '%s': No saved config found, using defaults", entry->d_name);
+                    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' has no saved config found, using defaults",
+                                  entry->d_name);
                 }
 
             create_cf_with_config:;
@@ -14559,29 +14453,31 @@ static int tidesdb_recover_database(tidesdb_t *db)
                 {
                     /* CF already exists in memory, try to get it again */
                     cf = tidesdb_get_column_family_internal(db, entry->d_name);
-                    TDB_DEBUG_LOG("CF already exists during recovery: %s", entry->d_name);
+                    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF already exists during recovery: %s",
+                                  entry->d_name);
                 }
                 else
                 {
-                    TDB_DEBUG_LOG("Failed to create CF during recovery: %s (error code: %d)",
+                    TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                  "Failed to create CF during recovery: %s (error code: %d)",
                                   entry->d_name, create_result);
                 }
             }
 
             if (cf)
             {
-                TDB_DEBUG_LOG("Recovering CF: %s", entry->d_name);
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Recovering CF: %s", entry->d_name);
                 tidesdb_recover_column_family(cf);
             }
             else
             {
-                TDB_DEBUG_LOG("Failed to get/create CF: %s", entry->d_name);
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to get/create CF: %s", entry->d_name);
             }
         }
     }
     closedir(dir);
 
-    TDB_DEBUG_LOG("Database recovery completed successfully");
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Database recovery completed successfully");
     return TDB_SUCCESS;
 }
 
@@ -15042,15 +14938,18 @@ static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *dat
 
     if (prefix_len < TDB_BLOCK_INDEX_PREFIX_MIN)
     {
-        TDB_DEBUG_LOG("Block index deserialization failed: invalid prefix_len=%u (must be %d-%d)",
-                      prefix_len, TDB_BLOCK_INDEX_PREFIX_MIN, TDB_BLOCK_INDEX_PREFIX_MAX);
+        TDB_DEBUG_LOG(
+            TDB_LOG_WARN,
+            "Block index deserialization failed with invalid prefix_len=%u (must be %d-%d)",
+            prefix_len, TDB_BLOCK_INDEX_PREFIX_MIN, TDB_BLOCK_INDEX_PREFIX_MAX);
         return NULL; /* invalid format */
     }
 
     /* validate count is reasonable (prevent integer overflow attacks) */
     if (count > TDB_BLOCK_INDEX_MAX_COUNT)
     {
-        TDB_DEBUG_LOG("Block index deserialization failed: unreasonable count=%u", count);
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Block index deserialization failed with unreasonable count=%u",
+                      count);
         return NULL;
     }
 

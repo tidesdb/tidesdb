@@ -1,4 +1,5 @@
 #include "clock_cache.h"
+
 #include "xxhash.h"
 
 static uint64_t hash_key(const char *key, size_t key_len)

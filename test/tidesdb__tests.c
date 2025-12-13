@@ -29,7 +29,6 @@ static tidesdb_t *create_test_db(void)
 
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
-    config.enable_debug_logging = 1;
 
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
@@ -1999,7 +1998,6 @@ static void test_sync_interval_mode(void)
     {
         tidesdb_config_t config = tidesdb_default_config();
         config.db_path = TEST_DB_PATH;
-        config.enable_debug_logging = 1;
 
         tidesdb_t *db = NULL;
         ASSERT_EQ(tidesdb_open(&config, &db), 0);
@@ -4958,7 +4956,6 @@ static void test_portability_workflow(void)
         tidesdb_config_t cfg = tidesdb_default_config();
         cfg.db_path = TEST_DB_PATH;
         cfg.num_flush_threads = 1;
-        cfg.enable_debug_logging = 1;
         cfg.num_compaction_threads = 1;
         cfg.block_cache_size = 0;
 
@@ -5003,7 +5000,6 @@ static void test_portability_workflow(void)
     {
         tidesdb_config_t cfg = tidesdb_default_config();
         cfg.db_path = TEST_DB_PATH;
-        cfg.enable_debug_logging = 1;
         cfg.num_flush_threads = 1;
         cfg.num_compaction_threads = 1;
         cfg.block_cache_size = 0;
@@ -6444,7 +6440,6 @@ static void test_large_value_iteration(void)
     tidesdb_config_t config = {.db_path = TEST_DB_PATH,
                                .num_flush_threads = 2,
                                .num_compaction_threads = 2,
-                               .enable_debug_logging = 1,
                                .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
                                .max_open_sstables = 256};
 
@@ -6889,7 +6884,6 @@ static void test_multi_cf_wal_recovery(void)
     {
         tidesdb_config_t config = tidesdb_default_config();
         config.db_path = TEST_DB_PATH;
-        config.enable_debug_logging = 1;
 
         tidesdb_t *db = NULL;
         ASSERT_EQ(tidesdb_open(&config, &db), 0);
@@ -7442,7 +7436,6 @@ static void test_deadlock_random_write_then_read(void)
 
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
-    config.enable_debug_logging = 1;
 
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
@@ -7647,7 +7640,6 @@ void test_concurrent_read_close_race(void)
     config.db_path = TEST_DB_PATH;
     config.num_flush_threads = 2;
     config.num_compaction_threads = 2;
-    config.enable_debug_logging = 1;
 
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);

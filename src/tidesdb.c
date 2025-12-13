@@ -496,60 +496,98 @@ static int wait_for_open(tidesdb_t *db);
  */
 
 /**
- * tidesdb_block_cache_key
- * generates a cache key for a block
+ * tidesdb_entry_cache_key
+ * generates a cache key for an entry
  * @param cf_name column family name
  * @param sstable_id sstable id
- * @param block_type block type ('k' for klog, 'v' for vlog)
- * @param offset block offset
- * @param key_buffer buffer to store the key (must be at least TDB_CACHE_KEY_SIZE bytes)
- * @return length of the generated key string (for optimization, avoids strlen in hot path)
+ * @param key entry key
+ * @param key_len entry key length
+ * @param key_buffer buffer to store the cache key
+ * @param buffer_size size of key_buffer
+ * @return length of the generated key
  */
-static size_t tidesdb_block_cache_key(const char *cf_name, uint64_t sstable_id, char block_type,
-                                      uint64_t offset, char *key_buffer)
+static size_t tidesdb_entry_cache_key(const char *cf_name, uint64_t sstable_id, const uint8_t *key,
+                                      size_t key_len, char *key_buffer, size_t buffer_size)
 {
-    int len = snprintf(key_buffer, TDB_CACHE_KEY_SIZE, "%s:%" PRIu64 ":%c:%" PRIu64, cf_name,
-                       sstable_id, block_type, offset);
-    return (len > 0 && len < TDB_CACHE_KEY_SIZE) ? (size_t)len : strlen(key_buffer);
+    /* format: "cf_name:sstable_id:" + raw key bytes */
+    int prefix_len = snprintf(key_buffer, buffer_size, "%s:%" PRIu64 ":", cf_name, sstable_id);
+    if (prefix_len < 0 || (size_t)prefix_len >= buffer_size) return 0;
+
+    size_t remaining = buffer_size - prefix_len;
+    size_t copy_len = (key_len < remaining) ? key_len : remaining;
+    memcpy(key_buffer + prefix_len, key, copy_len);
+
+    return prefix_len + copy_len;
 }
 
 /**
- * tidesdb_block_evict_callback
- * called when a block is evicted from the global cache
- * releases the block's reference
- * @param key the cache key
- * @param value the cached block
- * @param user_data unused
+ * tidesdb_cache_entry_put
+ * stores a deserialized entry in the cache
+ * @param db the database
+ * @param cf_name column family name
+ * @param sstable_id sstable id
+ * @param key entry key
+ * @param key_len entry key length
+ * @param entry the cached entry to store
+ * @return 0 on success, -1 on failure
  */
-static void tidesdb_block_evict_callback(const char *key, void *value, void *user_data)
+static int tidesdb_cache_entry_put(tidesdb_t *db, const char *cf_name, uint64_t sstable_id,
+                                   const uint8_t *key, size_t key_len,
+                                   const tidesdb_cached_entry_t *entry)
 {
-    (void)key;
-    (void)user_data;
-    block_manager_block_t *block = (block_manager_block_t *)value;
-    if (block)
-    {
-        block_manager_block_release(block);
-    }
+    if (!db || !db->block_cache || !cf_name || !key || !entry) return -1;
+
+    char cache_key[TDB_CACHE_KEY_SIZE];
+    size_t cache_key_len =
+        tidesdb_entry_cache_key(cf_name, sstable_id, key, key_len, cache_key, sizeof(cache_key));
+    if (cache_key_len == 0) return -1;
+
+    /* calculate total size: header + key + value (if inline) */
+    size_t inline_value_size = (entry->vlog_offset == 0) ? entry->value_size : 0;
+    size_t total_size = sizeof(tidesdb_cached_entry_t) + entry->key_size + inline_value_size;
+
+    /* serialize entry for cache */
+    uint8_t *payload = malloc(total_size);
+    if (!payload) return -1;
+
+    memcpy(payload, entry, sizeof(tidesdb_cached_entry_t));
+    memcpy(payload + sizeof(tidesdb_cached_entry_t), entry->data,
+           entry->key_size + inline_value_size);
+
+    int result = clock_cache_put(db->block_cache, cache_key, cache_key_len, payload, total_size);
+    free(payload);
+
+    return result;
 }
 
 /**
- * tidesdb_block_acquire_copy_fn
- * copy function for lru_cache_get_copy that acquires a block reference
- * this is called while the LRU entry reference is held, preventing eviction
- * @param value the cached block
- * @return the block if reference acquired, NULL otherwise
+ * tidesdb_cache_entry_get
+ * retrieves a deserialized entry from the cache
+ * @param db the database
+ * @param cf_name column family name
+ * @param sstable_id sstable id
+ * @param key entry key
+ * @param key_len entry key length
+ * @return the cached entry if found, NULL otherwise (caller must free)
  */
-static void *tidesdb_block_acquire_copy_fn(void *value)
+static tidesdb_cached_entry_t *tidesdb_cache_entry_get(tidesdb_t *db, const char *cf_name,
+                                                       uint64_t sstable_id, const uint8_t *key,
+                                                       size_t key_len)
 {
-    block_manager_block_t *block = (block_manager_block_t *)value;
-    if (!block) return NULL;
+    if (!db || !db->block_cache || !cf_name || !key) return NULL;
 
-    /* try to acquire reference while LRU entry is protected */
-    if (block_manager_block_acquire(block))
-    {
-        return block;
-    }
-    return NULL;
+    char cache_key[TDB_CACHE_KEY_SIZE];
+    size_t cache_key_len =
+        tidesdb_entry_cache_key(cf_name, sstable_id, key, key_len, cache_key, sizeof(cache_key));
+    if (cache_key_len == 0) return NULL;
+
+    size_t payload_len = 0;
+    uint8_t *payload = clock_cache_get(db->block_cache, cache_key, cache_key_len, &payload_len);
+    if (!payload) return NULL;
+
+    /* payload contains the full serialized entry */
+    tidesdb_cached_entry_t *entry = (tidesdb_cached_entry_t *)payload;
+    return entry;
 }
 
 /**
@@ -597,57 +635,22 @@ static int tidesdb_get_cf_name_from_path(const char *path, char *cf_name_out)
 }
 
 /**
- * tidesdb_cached_block_read
- * reads a block from cache or disk
+ * tidesdb_read_block
+ * reads and decompresses a block from disk
  * @param db the database
  * @param sst the sstable (for compression config)
- * @param cf_name column family name
- * @param block_type 'k' for klog, 'v' for vlog
  * @param cursor the block manager cursor
- * @return the block if successful, NULL otherwise (caller must release)
+ * @return the decompressed block if successful, NULL otherwise (caller must release)
  */
-static block_manager_block_t *tidesdb_cached_block_read(tidesdb_t *db, tidesdb_sstable_t *sst,
-                                                        const char *cf_name, char block_type,
-                                                        block_manager_cursor_t *cursor)
+static block_manager_block_t *tidesdb_read_block(tidesdb_t *db, tidesdb_sstable_t *sst,
+                                                 block_manager_cursor_t *cursor)
 {
-    if (!db || !sst || !cf_name || !cursor) return NULL;
-
-    uint64_t offset = cursor->current_pos;
-
-    /* check global cache first */
-    if (db->block_cache)
-    {
-        char cache_key[TDB_CACHE_KEY_SIZE];
-        size_t key_len = tidesdb_block_cache_key(cf_name, sst->id, block_type, offset, cache_key);
-
-        block_manager_block_t *cached_block = (block_manager_block_t *)lru_cache_get_copy_n(
-            db->block_cache, cache_key, key_len, tidesdb_block_acquire_copy_fn);
-
-        if (cached_block)
-        {
-            /* cache hit -- block is already decompressed, reference already acquired */
-            static _Atomic(uint64_t) cache_hits = 0;
-            uint64_t hit_count = atomic_fetch_add(&cache_hits, 1);
-            if (hit_count % 1000 == 0)
-            {
-                TDB_DEBUG_LOG("Block cache HIT #%" PRIu64 ": key=%s", hit_count, cache_key);
-            }
-            return cached_block;
-        }
-
-        static _Atomic(uint64_t) cache_misses = 0;
-        uint64_t miss_count = atomic_fetch_add(&cache_misses, 1);
-        if (miss_count % 1000 == 0)
-        {
-            TDB_DEBUG_LOG("Block cache MISS #%" PRIu64 ": key=%s", miss_count, cache_key);
-        }
-    }
+    if (!db || !sst || !cursor) return NULL;
 
     block_manager_block_t *block = block_manager_cursor_read(cursor);
     if (!block) return NULL;
 
-    /* decompress block immediately after reading from disk, before caching
-     * this ensures the cache stores decompressed blocks for fast access */
+    /* decompress block immediately after reading from disk */
     if (sst->config && sst->config->compression_algorithm != NO_COMPRESSION)
     {
         size_t decompressed_size;
@@ -662,31 +665,6 @@ static block_manager_block_t *tidesdb_cached_block_read(tidesdb_t *db, tidesdb_s
         }
     }
 
-    /* try to cache the decompressed block for future reads */
-    if (db->block_cache)
-    {
-        char cache_key[TDB_CACHE_KEY_SIZE];
-        tidesdb_block_cache_key(cf_name, sst->id, block_type, offset, cache_key);
-
-        /* acquire reference for cache before inserting */
-        if (block_manager_block_acquire(block))
-        {
-            int put_result = lru_cache_put(db->block_cache, cache_key, block,
-                                           tidesdb_block_evict_callback, NULL);
-            if (put_result < 0)
-            {
-                /* insertion failed -- lru_cache_put already called evict callback
-                 * which released the reference, so we must not release again
-                 * (that would cause double-release and free the block prematurely) */
-            }
-            else
-            {
-                /* insertion succeeded, cache now owns a reference to decompressed block */
-            }
-        }
-    }
-
-    /* return decompressed block to caller (caller has initial reference) */
     return block;
 }
 
@@ -3433,6 +3411,69 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                       this_get, sst->id, sst->num_klog_blocks);
     }
 
+    /* check cache first for this entry */
+    if (db->block_cache)
+    {
+        char cf_name[TDB_CACHE_KEY_SIZE];
+        if (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) == 0)
+        {
+            if (this_get % 1000 == 0)
+            {
+                TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                              ": Checking cache for cf=%s, sst=%" PRIu64,
+                              this_get, cf_name, sst->id);
+            }
+
+            tidesdb_cached_entry_t *cached =
+                tidesdb_cache_entry_get(db, cf_name, sst->id, key, key_size);
+            if (cached)
+            {
+                if (this_get % 1000 == 0)
+                {
+                    TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                  ": CACHE HIT! Returning cached entry",
+                                  this_get);
+                }
+
+                /* cache hit - reconstruct kv_pair from cached entry */
+                *kv = tidesdb_kv_pair_create(cached->data, cached->key_size,
+                                             cached->data + cached->key_size,
+                                             (cached->vlog_offset == 0) ? cached->value_size : 0,
+                                             cached->ttl, cached->seq, cached->flags);
+
+                /* if value is in vlog, read it */
+                if (cached->vlog_offset > 0 && *kv)
+                {
+                    uint8_t *vlog_value = NULL;
+                    if (tidesdb_vlog_read_value(db, sst, cached->vlog_offset, cached->value_size,
+                                                &vlog_value) == TDB_SUCCESS)
+                    {
+                        free((*kv)->value);
+                        (*kv)->value = vlog_value;
+                        (*kv)->entry.value_size = cached->value_size;
+                    }
+                }
+
+                free(cached);
+                return (*kv) ? TDB_SUCCESS : TDB_ERR_MEMORY;
+            }
+            else if (this_get % 1000 == 0)
+            {
+                TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Cache miss, reading from disk",
+                              this_get);
+            }
+        }
+        else if (this_get % 1000 == 0)
+        {
+            TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": Failed to get CF name from path: %s",
+                          this_get, sst->klog_path);
+        }
+    }
+    else if (this_get % 1000 == 0)
+    {
+        TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64 ": block_cache is NULL!", this_get);
+    }
+
     /* ensure sstable is open through cache */
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
@@ -3568,8 +3609,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             break;
         }
 
-        block_manager_block_t *block =
-            tidesdb_cached_block_read(db, sst, cf_name, 'k', klog_cursor);
+        block_manager_block_t *block = tidesdb_read_block(db, sst, klog_cursor);
 
         if (this_get % 1000 == 0 && block_num % 100 == 0)
         {
@@ -3583,7 +3623,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             break;
         }
 
-        /* block is already decompressed by tidesdb_cached_block_read */
+        /* block is already decompressed by tidesdb_read_block */
         uint8_t *data = block->data;
         size_t data_size = block->size;
 
@@ -3744,6 +3784,55 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                     }
 
                     result = TDB_SUCCESS;
+
+                    /* cache the entry for future reads */
+                    if (db->block_cache)
+                    {
+                        char cf_name[TDB_CACHE_KEY_SIZE];
+                        if (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) == 0)
+                        {
+                            /* create cached entry */
+                            size_t inline_value_size = (klog_block->entries[i].vlog_offset == 0)
+                                                           ? klog_block->entries[i].value_size
+                                                           : 0;
+                            size_t total_size = sizeof(tidesdb_cached_entry_t) +
+                                                klog_block->entries[i].key_size + inline_value_size;
+                            tidesdb_cached_entry_t *cache_entry = malloc(total_size);
+                            if (cache_entry)
+                            {
+                                cache_entry->flags = klog_block->entries[i].flags;
+                                cache_entry->key_size = klog_block->entries[i].key_size;
+                                cache_entry->value_size = klog_block->entries[i].value_size;
+                                cache_entry->ttl = klog_block->entries[i].ttl;
+                                cache_entry->seq = klog_block->entries[i].seq;
+                                cache_entry->vlog_offset = klog_block->entries[i].vlog_offset;
+
+                                /* copy key */
+                                memcpy(cache_entry->data, klog_block->keys[i],
+                                       klog_block->entries[i].key_size);
+
+                                /* copy inline value if present */
+                                if (inline_value_size > 0 && klog_block->inline_values[i])
+                                {
+                                    memcpy(cache_entry->data + klog_block->entries[i].key_size,
+                                           klog_block->inline_values[i], inline_value_size);
+                                }
+
+                                int cache_result = tidesdb_cache_entry_put(
+                                    db, cf_name, sst->id, key, key_size, cache_entry);
+
+                                if (this_get % 1000 == 0)
+                                {
+                                    TDB_DEBUG_LOG("tidesdb_sstable_get #%" PRIu64
+                                                  ": Cached entry for cf=%s, sst=%" PRIu64
+                                                  ", result=%d",
+                                                  this_get, cf_name, sst->id, cache_result);
+                                }
+
+                                free(cache_entry);
+                            }
+                        }
+                    }
 
                     if (this_get % 1000 == 0)
                     {
@@ -4752,7 +4841,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
         }
 
         block_manager_block_t *block =
-            tidesdb_cached_block_read(db, sst, cf_name, 'k', source->source.sstable.klog_cursor);
+            tidesdb_read_block(db, sst, source->source.sstable.klog_cursor);
         if (!block)
         {
             /* no block available */
@@ -4763,7 +4852,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
             return NULL;
         }
 
-        /* block is already decompressed by tidesdb_cached_block_read */
+        /* block is already decompressed by tidesdb_read_block */
         uint8_t *data = block->data;
         size_t data_size = block->size;
 
@@ -9262,7 +9351,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->commit_status = tidesdb_commit_status_create(TDB_COMMIT_STATUS_BUFFER_SIZE);
     if (!(*db)->commit_status)
     {
-        lru_cache_destroy((*db)->block_cache);
+        clock_cache_destroy((*db)->block_cache);
         lru_cache_destroy((*db)->sstable_cache);
         if ((*db)->flush_queue) queue_free((*db)->flush_queue);
         if ((*db)->compaction_queue) queue_free((*db)->compaction_queue);
@@ -9275,7 +9364,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     if (pthread_rwlock_init(&(*db)->active_txns_lock, NULL) != 0)
     {
         tidesdb_commit_status_destroy((*db)->commit_status);
-        lru_cache_destroy((*db)->block_cache);
+        clock_cache_destroy((*db)->block_cache);
         lru_cache_destroy((*db)->sstable_cache);
         if ((*db)->flush_queue) queue_free((*db)->flush_queue);
         if ((*db)->compaction_queue) queue_free((*db)->compaction_queue);
@@ -9291,7 +9380,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     {
         pthread_rwlock_destroy(&(*db)->active_txns_lock);
         tidesdb_commit_status_destroy((*db)->commit_status);
-        lru_cache_destroy((*db)->block_cache);
+        clock_cache_destroy((*db)->block_cache);
         lru_cache_destroy((*db)->sstable_cache);
         if ((*db)->flush_queue) queue_free((*db)->flush_queue);
         if ((*db)->compaction_queue) queue_free((*db)->compaction_queue);
@@ -9352,33 +9441,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     if (config->block_cache_size > 0)
     {
-        /* convert block_cache_size (bytes) to capacity (number of block entries)
-         *
-         * block_cache_size represents the memory budget for actual block data
-         * (not including cache metadata overhead)
-         *
-         * since column families don't exist yet at open time, we use default block sizes:
-         * -- klog blocks: TDB_DEFAULT_KLOG_BLOCK_SIZE = 64KB (keys + metadata)
-         * -- vlog blocks: TDB_DEFAULT_VLOG_BLOCK_SIZE = 4KB (large values)
-         *
-         * weighted average assumes 70% klog, 30% vlog distribution:
-         * avg = (0.7 × 64KB) + (0.3 × 4KB) = 44.8KB + 1.2KB = 46KB
-         *
-         * capacity = block_cache_size / avg_block_size
-         * example: 64MB / 46KB ≈ 1,424 blocks */
-        size_t avg_block_size =
-            (TDB_DEFAULT_KLOG_BLOCK_SIZE * 7 + TDB_DEFAULT_VLOG_BLOCK_SIZE * 3) / 10;
-        size_t block_cache_capacity = config->block_cache_size / avg_block_size;
-        if (block_cache_capacity < 100) block_cache_capacity = 100; /* minimum capacity */
+        /* create lock-free FIFO cache for deserialized entries
+         * stores individual entries (not entire blocks) for granular caching
+         * entries are already decompressed and deserialized
+         * uses background eviction thread for non-blocking writes */
+        cache_config_t cache_config = {.max_bytes = config->block_cache_size};
 
-        /* create hybrid LRU/LFU cache for blocks
-         * -- LRU capacity -- 80% of total (hot/recent blocks)
-         * -- LFU capacity -- 20% of total (warm/frequently accessed blocks)
-         * -- promotion threshold -- 2 accesses to promote to LFU
-         * -- TTL -- 60 seconds for LFU entries */
-        size_t block_lru_cap = (block_cache_capacity * 8) / 10;
-        size_t block_lfu_cap = block_cache_capacity - block_lru_cap;
-        (*db)->block_cache = lru_cache_new(block_lru_cap, block_lfu_cap, 2, 60);
+        (*db)->block_cache = clock_cache_create(&cache_config);
         if (!(*db)->block_cache)
         {
             lru_cache_free((*db)->sstable_cache);
@@ -9390,8 +9459,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             return TDB_ERR_MEMORY;
         }
         TDB_DEBUG_LOG(
-            "Block cache created: LRU capacity=%zu, LFU capacity=%zu, total=%zu (%.2f MB)",
-            block_lru_cap, block_lfu_cap, block_lru_cap + block_lfu_cap,
+            "Lock-free block cache created: max_bytes=%.2f MB (FIFO eviction, background thread)",
             (double)config->block_cache_size / (1024 * 1024));
     }
     else
@@ -9406,7 +9474,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->flush_threads = malloc(config->num_flush_threads * sizeof(pthread_t));
     if (!(*db)->flush_threads)
     {
-        lru_cache_free((*db)->block_cache);
+        clock_cache_destroy((*db)->block_cache);
         lru_cache_free((*db)->sstable_cache);
         queue_free((*db)->flush_queue);
         queue_free((*db)->compaction_queue);
@@ -9425,7 +9493,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                 pthread_join((*db)->flush_threads[j], NULL);
             }
             free((*db)->flush_threads);
-            lru_cache_free((*db)->block_cache);
+            clock_cache_destroy((*db)->block_cache);
             lru_cache_free((*db)->sstable_cache);
             queue_free((*db)->flush_queue);
             queue_free((*db)->compaction_queue);
@@ -9444,7 +9512,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             pthread_join((*db)->flush_threads[i], NULL);
         }
         free((*db)->flush_threads);
-        lru_cache_free((*db)->block_cache);
+        clock_cache_destroy((*db)->block_cache);
         lru_cache_free((*db)->sstable_cache);
         queue_free((*db)->flush_queue);
         queue_free((*db)->compaction_queue);
@@ -9470,7 +9538,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                 pthread_join((*db)->flush_threads[k], NULL);
             }
             free((*db)->flush_threads);
-            lru_cache_free((*db)->block_cache);
+            clock_cache_destroy((*db)->block_cache);
             lru_cache_free((*db)->sstable_cache);
             queue_free((*db)->flush_queue);
             queue_free((*db)->compaction_queue);
@@ -9832,9 +9900,14 @@ int tidesdb_close(tidesdb_t *db)
     lru_cache_free(db->sstable_cache);
     TDB_DEBUG_LOG("SSTable cache freed");
 
-    TDB_DEBUG_LOG("Freeing block cache (size: %zu)", lru_cache_size(db->block_cache));
-    lru_cache_free(db->block_cache);
-    TDB_DEBUG_LOG("Block cache freed");
+    if (db->block_cache)
+    {
+        size_t entries, bytes;
+        clock_cache_stats(db->block_cache, &entries, &bytes);
+        TDB_DEBUG_LOG("Freeing lock-free block cache (entries: %zu, bytes: %zu)", entries, bytes);
+        clock_cache_destroy(db->block_cache);
+        TDB_DEBUG_LOG("Block cache freed");
+    }
 
     if (db->commit_status)
     {
@@ -11089,6 +11162,43 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     int cf_index = tidesdb_txn_add_cf_internal(txn, cf);
     if (cf_index < 0) return TDB_ERR_MEMORY;
 
+    /* check cache first (before everything else)
+     * use sst ID 0 to indicate memtable/uncommitted entries
+     * this gives us O(1) cache hits for hot keys */
+    if (txn->db->block_cache)
+    {
+        tidesdb_cached_entry_t *cached =
+            tidesdb_cache_entry_get(txn->db, cf->name, 0, key, key_size);
+        if (cached)
+        {
+            /* cache hit! check if deleted */
+            if (cached->flags & TDB_KV_FLAG_TOMBSTONE)
+            {
+                free(cached);
+                return TDB_ERR_NOT_FOUND;
+            }
+
+            /* check TTL */
+            if (cached->ttl == 0 || cached->ttl > time(NULL))
+            {
+                /* valid entry -- return it */
+                *value = malloc(cached->value_size);
+                if (!*value)
+                {
+                    free(cached);
+                    return TDB_ERR_MEMORY;
+                }
+                memcpy(*value, cached->data + cached->key_size, cached->value_size);
+                *value_size = cached->value_size;
+                free(cached);
+                return TDB_SUCCESS;
+            }
+
+            /* TTL expired -- fall through to normal path */
+            free(cached);
+        }
+    }
+
     /* determine snapshot based on isolation level
      * -- READ_UNCOMMITTED -- UINT64_MAX (see all versions, no visibility check)
      * -- READ_COMMITTED -- refresh snapshot on each read (latest committed data)
@@ -12185,6 +12295,37 @@ skip_ssi_check:
                     /* error path -- use relaxed since we're aborting anyway */
                     atomic_fetch_sub_explicit(&cf->pending_commits, 1, memory_order_relaxed);
                     return TDB_ERR_IO;
+                }
+
+                /* populate cache (write-through cache)
+                 * use sst ID 0 to indicate memtable entries
+                 * this makes subsequent reads O(1) instead of O(log N) skip list lookup */
+                if (txn->db->block_cache && op->value_size > 0)
+                {
+                    /* create cached entry with single allocation */
+                    size_t inline_value_size =
+                        op->value_size; /* always inline for memtable entries */
+                    size_t total_size =
+                        sizeof(tidesdb_cached_entry_t) + op->key_size + inline_value_size;
+                    tidesdb_cached_entry_t *cache_entry = malloc(total_size);
+                    if (cache_entry)
+                    {
+                        cache_entry->flags = op->is_delete ? TDB_KV_FLAG_TOMBSTONE : 0;
+                        cache_entry->key_size = op->key_size;
+                        cache_entry->value_size = op->value_size;
+                        cache_entry->ttl = op->ttl;
+                        cache_entry->seq = txn->commit_seq;
+                        cache_entry->vlog_offset = 0; /* inline value */
+
+                        /* copy key and value into data buffer */
+                        memcpy(cache_entry->data, op->key, op->key_size);
+                        memcpy(cache_entry->data + op->key_size, op->value, op->value_size);
+
+                        /* populate cache -- use sst ID 0 for memtable entries */
+                        tidesdb_cache_entry_put(txn->db, cf->name, 0, op->key, op->key_size,
+                                                cache_entry);
+                        free(cache_entry);
+                    }
                 }
             }
             if (needs_free) free(seen_keys);

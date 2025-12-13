@@ -60,9 +60,9 @@ include_directories(external) # for external libraries linking internally
 
 # build as STATIC on Windows to avoid DLL export/import complexity in tests
 if(WIN32)
-    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/lru.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
+    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/clock_cache.c src/lru.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
 else()
-    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/lru.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
+    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/clock_cache.c src/lru.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
 endif()
 
 target_include_directories(tidesdb PRIVATE src)
@@ -309,6 +309,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(compress_tests test/compress__tests.c)
     add_executable(bloom_filter_tests test/bloom_filter__tests.c)
     add_executable(lru_tests test/lru__tests.c)
+    add_executable(clock_cache_tests test/clock_cache__tests.c)
     add_executable(manifest_tests test/manifest__tests.c)
     add_executable(queue_tests test/queue__tests.c)
     add_executable(buffer_tests test/buffer__tests.c)
@@ -349,7 +350,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     )
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests lru_tests queue_tests buffer_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests lru_tests queue_tests buffer_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -359,6 +360,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME compress_tests COMMAND compress_tests)
     add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
     add_test(NAME manifest_tests COMMAND manifest_tests)
+    add_test(NAME clock_cache_tests COMMAND clock_cache_tests)
     add_test(NAME lru_tests COMMAND lru_tests)
     add_test(NAME queue_tests COMMAND queue_tests)
     add_test(NAME buffer_tests COMMAND buffer_tests)

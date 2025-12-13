@@ -22,6 +22,7 @@
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "buffer.h"
+#include "clock_cache.h"
 #include "compress.h"
 #include "ini.h"
 #include "lru.h"
@@ -449,6 +450,29 @@ typedef struct
 } tidesdb_klog_entry_t;
 
 /**
+ * tidesdb_cached_entry_t
+ * cached entry structure for lock-free block cache
+ * stores deserialized, decompressed entry with key and value/vlog_offset
+ * @param flags entry flags (tombstone, ttl, vlog, delta_seq)
+ * @param key_size size of key in bytes
+ * @param value_size size of value in bytes (actual value size, not inline size)
+ * @param ttl time-to-live timestamp
+ * @param seq sequence number
+ * @param vlog_offset offset in vlog file (0 if inline, >0 if in vlog)
+ * @param data flexible array: [key_data][value_data if inline]
+ */
+typedef struct
+{
+    uint8_t flags;
+    uint32_t key_size;
+    uint32_t value_size;
+    int64_t ttl;
+    uint64_t seq;
+    uint64_t vlog_offset;
+    uint8_t data[]; /* key + value (if inline) */
+} tidesdb_cached_entry_t;
+
+/**
  * tidesdb_multi_cf_txn_metadata_t
  * metadata for multi-cf transaction entries
  * written before klog_entry when entry has multi-cf flag
@@ -799,7 +823,7 @@ struct tidesdb_t
     _Atomic(int) sync_thread_active;
     pthread_mutex_t sync_lock;
     lru_cache_t *sstable_cache;
-    lru_cache_t *block_cache;
+    clock_cache_t *block_cache; /* lock-free FIFO cache for deserialized entries */
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
     tidesdb_commit_status_t *commit_status;

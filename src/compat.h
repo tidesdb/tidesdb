@@ -1169,6 +1169,18 @@ static inline int sem_post(sem_t *sem)
 #include <sys/time.h>
 #include <unistd.h>
 
+/**
+ * tdb_fileno
+ * portable file descriptor extraction from FILE*
+ * @param stream the FILE* to get descriptor from
+ * @return file descriptor, or -1 on failure
+ */
+static inline int tdb_fileno(FILE *stream)
+{
+    if (!stream) return -1;
+    return fileno(stream);
+}
+
 /* sysinfo is Linux-specific, BSD uses sysctl */
 #if defined(__linux__)
 #include <sys/sysinfo.h>
@@ -2241,21 +2253,5 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
     /* perform the rename */
     return rename(old_path, new_path);
 }
-
-#else /* POSIX systems */
-
-/**
- * tdb_fileno
- * portable file descriptor extraction from FILE*
- * @param stream the FILE* to get descriptor from
- * @return file descriptor, or -1 on failure
- */
-static inline int tdb_fileno(FILE *stream)
-{
-    if (!stream) return -1;
-    return fileno(stream);
-}
-
-#endif /* _WIN32 || __MINGW32__ || __MINGW64__ */
 
 #endif /* __COMPAT_H__ */

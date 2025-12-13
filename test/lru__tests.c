@@ -506,8 +506,14 @@ void test_lru_cache_access_pattern(void)
     lru_cache_put(cache, "key2", &data[1], NULL, NULL);
     lru_cache_put(cache, "key3", &data[2], NULL, NULL);
 
-    lru_cache_get(cache, "key1");
+    /* access key1 multiple times to trigger adaptive reordering
+     * (reordering happens every 16 accesses for performance) */
+    for (int i = 0; i < 16; i++)
+    {
+        lru_cache_get(cache, "key1");
+    }
 
+    /* now key1 should be at front, so key2 (LRU) should be evicted */
     lru_cache_put(cache, "key4", &data[3], NULL, NULL);
 
     ASSERT_TRUE(lru_cache_get(cache, "key1") != NULL);

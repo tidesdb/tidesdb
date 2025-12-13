@@ -25,7 +25,7 @@ typedef struct cache_entry_t
 {
     char *key;
     void *value;
-    uint32_t access_count;
+    _Atomic(uint32_t) access_count;
     time_t expiry_time;
     lru_evict_callback_t evict_cb;
     void *user_data;
@@ -59,8 +59,8 @@ struct lru_cache_t
     hash_table_t *hash_table;
     uint32_t promotion_threshold;
     uint32_t ttl_seconds;
-    uint64_t hits;
-    uint64_t misses;
+    _Atomic(uint64_t) hits;
+    _Atomic(uint64_t) misses;
     pthread_rwlock_t lock;
 };
 
@@ -198,68 +198,103 @@ void *lru_cache_get(lru_cache_t *cache, const char *key)
 {
     if (!cache || !key) return NULL;
 
-    pthread_rwlock_wrlock(&cache->lock);
-
-    if (cache->ttl_seconds > 0)
-    {
-        expire_lfu_entries(cache);
-    }
+    /* first, try read-only lookup with read lock */
+    pthread_rwlock_rdlock(&cache->lock);
 
     cache_entry_t *entry = hash_table_find(cache->hash_table, key);
     if (!entry)
     {
-        cache->misses++;
+        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
         pthread_rwlock_unlock(&cache->lock);
         return NULL;
     }
 
-    cache->hits++;
+    /* cache hit - increment atomically */
+    atomic_fetch_add_explicit(&cache->hits, 1, memory_order_relaxed);
 
-    entry->access_count++;
+    /* increment access count atomically */
+    uint32_t new_access_count =
+        atomic_fetch_add_explicit(&entry->access_count, 1, memory_order_relaxed) + 1;
 
-    if (entry->access_count >= cache->promotion_threshold && cache->lfu_capacity > 0)
+    void *value = entry->value;
+
+    /* check if we need to modify structure (promotion or reordering) */
+    int needs_promotion =
+        (new_access_count >= cache->promotion_threshold && cache->lfu_capacity > 0);
+
+    /* adaptive reordering: only reorder occasionally to reduce lock contention
+     * reorder every ~16 accesses (when low 4 bits are 0) for hot entries
+     * this maintains approximate LRU behavior with much better concurrency */
+    int needs_reorder = (!needs_promotion && (new_access_count & 0xF) == 0);
+
+    pthread_rwlock_unlock(&cache->lock);
+
+    /* if structural changes needed, upgrade to write lock */
+    if (needs_promotion || needs_reorder)
     {
-        cache_entry_t *check = cache->lru_head;
-        while (check)
+        pthread_rwlock_wrlock(&cache->lock);
+
+        /* re-verify entry still exists (could have been evicted) */
+        cache_entry_t *recheck = hash_table_find(cache->hash_table, key);
+        if (recheck != entry)
         {
-            if (check == entry)
-            {
-                promote_to_lfu(cache, entry);
-                break;
-            }
-            check = check->next;
-        }
-    }
-    else
-    {
-        int in_lru = 0;
-        cache_entry_t *check = cache->lru_head;
-        while (check)
-        {
-            if (check == entry)
-            {
-                in_lru = 1;
-                break;
-            }
-            check = check->next;
+            /* entry was evicted, return value but don't modify structure */
+            pthread_rwlock_unlock(&cache->lock);
+            return value;
         }
 
-        if (in_lru)
+        if (cache->ttl_seconds > 0)
         {
-            list_remove(&cache->lru_head, &cache->lru_tail, entry);
-            list_push_front(&cache->lru_head, &cache->lru_tail, entry);
+            expire_lfu_entries(cache);
+        }
+
+        if (needs_promotion)
+        {
+            /* check if entry is in LRU (needs promotion) */
+            cache_entry_t *check = cache->lru_head;
+            while (check)
+            {
+                if (check == entry)
+                {
+                    promote_to_lfu(cache, entry);
+                    break;
+                }
+                check = check->next;
+            }
         }
         else
         {
-            if (cache->ttl_seconds > 0)
+            /* check if entry is in LRU (needs reordering) */
+            int in_lru = 0;
+            cache_entry_t *check = cache->lru_head;
+            while (check)
             {
-                entry->expiry_time = time(NULL) + cache->ttl_seconds;
+                if (check == entry)
+                {
+                    in_lru = 1;
+                    break;
+                }
+                check = check->next;
+            }
+
+            if (in_lru)
+            {
+                list_remove(&cache->lru_head, &cache->lru_tail, entry);
+                list_push_front(&cache->lru_head, &cache->lru_tail, entry);
+            }
+            else
+            {
+                /* in LFU, update expiry */
+                if (cache->ttl_seconds > 0)
+                {
+                    entry->expiry_time = time(NULL) + cache->ttl_seconds;
+                }
             }
         }
+
+        pthread_rwlock_unlock(&cache->lock);
     }
 
-    void *value = entry->value;
-    pthread_rwlock_unlock(&cache->lock);
     return value;
 }
 
@@ -267,68 +302,99 @@ void *lru_cache_get_n(lru_cache_t *cache, const char *key, size_t key_len)
 {
     if (!cache || !key) return NULL;
 
-    pthread_rwlock_wrlock(&cache->lock);
-
-    if (cache->ttl_seconds > 0)
-    {
-        expire_lfu_entries(cache);
-    }
+    /* first, try read-only lookup with read lock */
+    pthread_rwlock_rdlock(&cache->lock);
 
     cache_entry_t *entry = hash_table_find_n(cache->hash_table, key, key_len);
     if (!entry)
     {
-        cache->misses++;
+        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
         pthread_rwlock_unlock(&cache->lock);
         return NULL;
     }
 
-    cache->hits++;
+    /* cache hit - increment atomically */
+    atomic_fetch_add_explicit(&cache->hits, 1, memory_order_relaxed);
 
-    entry->access_count++;
+    /* increment access count atomically */
+    uint32_t new_access_count =
+        atomic_fetch_add_explicit(&entry->access_count, 1, memory_order_relaxed) + 1;
 
-    if (entry->access_count >= cache->promotion_threshold && cache->lfu_capacity > 0)
+    void *value = entry->value;
+
+    /* check if we need to modify structure (promotion or reordering) */
+    int needs_promotion =
+        (new_access_count >= cache->promotion_threshold && cache->lfu_capacity > 0);
+    int needs_reorder = !needs_promotion; /* might need to move to front of LRU */
+
+    pthread_rwlock_unlock(&cache->lock);
+
+    /* if structural changes needed, upgrade to write lock */
+    if (needs_promotion || needs_reorder)
     {
-        cache_entry_t *check = cache->lru_head;
-        while (check)
+        pthread_rwlock_wrlock(&cache->lock);
+
+        /* re-verify entry still exists (could have been evicted) */
+        cache_entry_t *recheck = hash_table_find_n(cache->hash_table, key, key_len);
+        if (recheck != entry)
         {
-            if (check == entry)
-            {
-                promote_to_lfu(cache, entry);
-                break;
-            }
-            check = check->next;
-        }
-    }
-    else
-    {
-        int in_lru = 0;
-        cache_entry_t *check = cache->lru_head;
-        while (check)
-        {
-            if (check == entry)
-            {
-                in_lru = 1;
-                break;
-            }
-            check = check->next;
+            /* entry was evicted, return value but don't modify structure */
+            pthread_rwlock_unlock(&cache->lock);
+            return value;
         }
 
-        if (in_lru)
+        if (cache->ttl_seconds > 0)
         {
-            list_remove(&cache->lru_head, &cache->lru_tail, entry);
-            list_push_front(&cache->lru_head, &cache->lru_tail, entry);
+            expire_lfu_entries(cache);
+        }
+
+        if (needs_promotion)
+        {
+            /* check if entry is in LRU (needs promotion) */
+            cache_entry_t *check = cache->lru_head;
+            while (check)
+            {
+                if (check == entry)
+                {
+                    promote_to_lfu(cache, entry);
+                    break;
+                }
+                check = check->next;
+            }
         }
         else
         {
-            if (cache->ttl_seconds > 0)
+            /* check if entry is in LRU (needs reordering) */
+            int in_lru = 0;
+            cache_entry_t *check = cache->lru_head;
+            while (check)
             {
-                entry->expiry_time = time(NULL) + cache->ttl_seconds;
+                if (check == entry)
+                {
+                    in_lru = 1;
+                    break;
+                }
+                check = check->next;
+            }
+
+            if (in_lru)
+            {
+                list_remove(&cache->lru_head, &cache->lru_tail, entry);
+                list_push_front(&cache->lru_head, &cache->lru_tail, entry);
+            }
+            else
+            {
+                /* in LFU, update expiry */
+                if (cache->ttl_seconds > 0)
+                {
+                    entry->expiry_time = time(NULL) + cache->ttl_seconds;
+                }
             }
         }
+
+        pthread_rwlock_unlock(&cache->lock);
     }
 
-    void *value = entry->value;
-    pthread_rwlock_unlock(&cache->lock);
     return value;
 }
 
@@ -336,42 +402,59 @@ void *lru_cache_get_copy(lru_cache_t *cache, const char *key, void *(*copy_fn)(v
 {
     if (!cache || !key || !copy_fn) return NULL;
 
-    pthread_rwlock_wrlock(&cache->lock);
-
-    if (cache->ttl_seconds > 0)
-    {
-        expire_lfu_entries(cache);
-    }
+    /* use read lock for lookup and copy */
+    pthread_rwlock_rdlock(&cache->lock);
 
     cache_entry_t *entry = hash_table_find(cache->hash_table, key);
     if (!entry)
     {
-        cache->misses++;
+        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
         pthread_rwlock_unlock(&cache->lock);
         return NULL;
     }
 
-    cache->hits++;
+    /* cache hit - increment atomically */
+    atomic_fetch_add_explicit(&cache->hits, 1, memory_order_relaxed);
 
+    /* call copy function while holding read lock (safe for refcount increment) */
     void *copy = copy_fn(entry->value);
 
-    entry->access_count++;
-
-    if (entry->access_count >= cache->promotion_threshold && cache->lfu_capacity > 0)
-    {
-        cache_entry_t *check = cache->lru_head;
-        while (check)
-        {
-            if (check == entry)
-            {
-                promote_to_lfu(cache, entry);
-                break;
-            }
-            check = check->next;
-        }
-    }
+    /* increment access count atomically */
+    uint32_t new_access_count =
+        atomic_fetch_add_explicit(&entry->access_count, 1, memory_order_relaxed) + 1;
 
     pthread_rwlock_unlock(&cache->lock);
+
+    /* check if promotion needed (rare case) */
+    if (new_access_count >= cache->promotion_threshold && cache->lfu_capacity > 0)
+    {
+        pthread_rwlock_wrlock(&cache->lock);
+
+        /* re-verify entry still exists */
+        cache_entry_t *recheck = hash_table_find(cache->hash_table, key);
+        if (recheck == entry)
+        {
+            if (cache->ttl_seconds > 0)
+            {
+                expire_lfu_entries(cache);
+            }
+
+            /* check if entry is in LRU (needs promotion) */
+            cache_entry_t *check = cache->lru_head;
+            while (check)
+            {
+                if (check == entry)
+                {
+                    promote_to_lfu(cache, entry);
+                    break;
+                }
+                check = check->next;
+            }
+        }
+
+        pthread_rwlock_unlock(&cache->lock);
+    }
+
     return copy;
 }
 
@@ -380,42 +463,59 @@ void *lru_cache_get_copy_n(lru_cache_t *cache, const char *key, size_t key_len,
 {
     if (!cache || !key || !copy_fn) return NULL;
 
-    pthread_rwlock_wrlock(&cache->lock);
-
-    if (cache->ttl_seconds > 0)
-    {
-        expire_lfu_entries(cache);
-    }
+    /* use read lock for lookup and copy */
+    pthread_rwlock_rdlock(&cache->lock);
 
     cache_entry_t *entry = hash_table_find_n(cache->hash_table, key, key_len);
     if (!entry)
     {
-        cache->misses++;
+        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
         pthread_rwlock_unlock(&cache->lock);
         return NULL;
     }
 
-    cache->hits++;
+    /* cache hit - increment atomically */
+    atomic_fetch_add_explicit(&cache->hits, 1, memory_order_relaxed);
 
+    /* call copy function while holding read lock (safe for refcount increment) */
     void *copy = copy_fn(entry->value);
 
-    entry->access_count++;
-
-    if (entry->access_count >= cache->promotion_threshold && cache->lfu_capacity > 0)
-    {
-        cache_entry_t *check = cache->lru_head;
-        while (check)
-        {
-            if (check == entry)
-            {
-                promote_to_lfu(cache, entry);
-                break;
-            }
-            check = check->next;
-        }
-    }
+    /* increment access count atomically */
+    uint32_t new_access_count =
+        atomic_fetch_add_explicit(&entry->access_count, 1, memory_order_relaxed) + 1;
 
     pthread_rwlock_unlock(&cache->lock);
+
+    /* check if promotion needed (rare case) */
+    if (new_access_count >= cache->promotion_threshold && cache->lfu_capacity > 0)
+    {
+        pthread_rwlock_wrlock(&cache->lock);
+
+        /* re-verify entry still exists */
+        cache_entry_t *recheck = hash_table_find_n(cache->hash_table, key, key_len);
+        if (recheck == entry)
+        {
+            if (cache->ttl_seconds > 0)
+            {
+                expire_lfu_entries(cache);
+            }
+
+            /* check if entry is in LRU (needs promotion) */
+            cache_entry_t *check = cache->lru_head;
+            while (check)
+            {
+                if (check == entry)
+                {
+                    promote_to_lfu(cache, entry);
+                    break;
+                }
+                check = check->next;
+            }
+        }
+
+        pthread_rwlock_unlock(&cache->lock);
+    }
+
     return copy;
 }
 

@@ -2801,6 +2801,7 @@ static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm)
 static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t *sst,
                                                skip_list_t *memtable, tidesdb_column_family_t *cf)
 {
+    (void)cf; /* unused parameter */
     int num_entries = skip_list_count_entries(memtable);
     TDB_DEBUG_LOG("SSTable %" PRIu64 ": Writing from memtable (%d entries)", sst->id, num_entries);
 
@@ -3719,12 +3720,12 @@ load_bloom_and_index:
     /* validate that the sstable has the expected number of blocks
      * if block count doesn't match metadata, the sst is corrupted
      * (likely from interrupted write before fsync completed) */
-    if (klog_bm->block_count - SSTABLE_INTERNAL_BLOCKS != sst->num_klog_blocks)
+    if ((uint64_t)(klog_bm->block_count - SSTABLE_INTERNAL_BLOCKS) != sst->num_klog_blocks)
     {
-        TDB_DEBUG_LOG(
-            "SSTable %s: Block count mismatch (file has %zu blocks, metadata says %" PRIu64
-            ") - corrupted or incomplete write",
-            sst->klog_path, klog_bm->block_count - SSTABLE_INTERNAL_BLOCKS, sst->num_klog_blocks);
+        TDB_DEBUG_LOG("SSTable %s: Block count mismatch (file has %" PRIu64
+                      " blocks, metadata says %" PRIu64 ") - corrupted or incomplete write",
+                      sst->klog_path, (uint64_t)(klog_bm->block_count - SSTABLE_INTERNAL_BLOCKS),
+                      sst->num_klog_blocks);
         block_manager_close(klog_bm);
         block_manager_close(vlog_bm);
         return TDB_ERR_CORRUPTION;
@@ -8615,7 +8616,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* commit sstable to manifest before deleting WAL
          * this ensures crash recovery knows which sstables are complete */
         pthread_rwlock_wrlock(&cf->manifest_lock);
-        tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries, sst->size);
+        tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries,
+                                     sst->klog_size + sst->vlog_size);
         char manifest_path[TDB_MAX_PATH_LEN];
         snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
                  TDB_COLUMN_FAMILY_MANIFEST_NAME);

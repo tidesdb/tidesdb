@@ -266,6 +266,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_CLOSE_FLUSH_WAIT_SLEEP_US          10000
 #define TDB_CLOSE_QUEUE_DRAIN_MAX_ATTEMPTS     100
 #define TDB_CLOSE_QUEUE_DRAIN_SLEEP_US         10000
+#define TDB_CLOSE_TXN_WAIT_MAX_MS              5000 /* max time to wait for active transactions */
+#define TDB_CLOSE_TXN_WAIT_SLEEP_US            1000 /* 1ms sleep between transaction checks */
 #define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US     10000
 #define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS 100
 
@@ -754,6 +756,7 @@ struct tidesdb_compaction_work_t
  * @param active_txns array of active serializable transactions
  * @param num_active_txns number of active transactions
  * @param active_txns_capacity capacity of active transactions array
+ * @param active_txn_count count of all active transactions (all isolation levels)
  * @param cached_available_disk_space cached available disk space in bytes
  * @param last_disk_space_check timestamp of last disk space check
  * @param available_memory available system memory in bytes
@@ -790,7 +793,7 @@ struct tidesdb_t
     tidesdb_txn_t **active_txns;
     int num_active_txns;
     int active_txns_capacity;
-
+    _Atomic(int) active_txn_count;
     _Atomic(uint64_t) cached_available_disk_space;
     _Atomic(time_t) last_disk_space_check;
     uint64_t available_memory;
@@ -856,6 +859,8 @@ typedef struct
  * @param write_cfs array of column families for each write key
  * @param write_set_count number of write keys
  * @param write_set_capacity capacity of write keys array
+ * @param write_set_hash hash table for O(1) write set lookup (NULL if num_ops < 256)
+ * @param read_set_hash hash table for O(1) read set lookup (NULL if read_set_count < 256)
  * @param cfs array of column families involved in transaction
  * @param num_cfs number of column families
  * @param cf_capacity capacity of column families array
@@ -891,8 +896,8 @@ struct tidesdb_txn_t
     tidesdb_column_family_t **write_cfs;
     int write_set_count;
     int write_set_capacity;
-    void *write_set_hash; /* hash table for O(1) write set lookup (NULL if num_ops < 256) */
-    void *read_set_hash;  /* hash table for O(1) read set lookup (NULL if read_set_count < 256) */
+    void *write_set_hash;
+    void *read_set_hash;
     tidesdb_column_family_t **cfs;
     int num_cfs;
     int cf_capacity;

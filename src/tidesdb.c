@@ -962,7 +962,7 @@ int tidesdb_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8
 
     size_t min_size = key1_size < key2_size ? key1_size : key2_size;
     int cmp = (min_size > 0) ? memcmp(key1, key2, min_size) : 0;
-    if (cmp != 0) return cmp;
+    if (cmp != 0) return cmp < 0 ? -1 : 1; /* normalize to -1 or 1 */
     if (key1_size < key2_size) return -1;
     if (key1_size > key2_size) return 1;
     return 0;
@@ -3198,6 +3198,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 
     sst->num_klog_blocks = klog_block_num;
     sst->num_vlog_blocks = vlog_block_num;
+
     sst->min_key = first_key;
     sst->min_key_size = first_key_size;
     sst->max_key = last_key;
@@ -3207,7 +3208,8 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     /* capture klog file offset where data blocks end (before writing index/bloom/metadata) */
     block_manager_get_size(bms.klog_bm, &sst->klog_data_end_offset);
 
-    /* build and write index */
+    /* write index block (always write, even if empty, to maintain consistent file structure)
+     * file structure: [data blocks] [index block] [bloom block] [metadata block] */
     if (block_indexes)
     {
         /* we assign the built index to the sst */
@@ -3231,8 +3233,22 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
             free(index_data);
         }
     }
+    else
+    {
+        /* write empty index block as placeholder (5 bytes: count=0 + prefix_len) */
+        uint8_t empty_index_data[5];
+        encode_uint32_le_compat(empty_index_data, 0);             /* count = 0 */
+        empty_index_data[4] = TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN; /* prefix_len */
+        block_manager_block_t *empty_index = block_manager_block_create(5, empty_index_data);
+        if (empty_index)
+        {
+            block_manager_block_write(bms.klog_bm, empty_index);
+            block_manager_block_release(empty_index);
+        }
+    }
 
-    /* write bloom filter */
+    /* write bloom filter block (always write, even if empty, to maintain consistent file structure)
+     */
     if (bloom)
     {
         size_t bloom_size;
@@ -3248,6 +3264,17 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
             free(bloom_data);
         }
         sst->bloom_filter = bloom;
+    }
+    else
+    {
+        /* write empty bloom block as placeholder (1 byte: size=0) */
+        uint8_t empty_bloom_data[1] = {0};
+        block_manager_block_t *empty_bloom = block_manager_block_create(1, empty_bloom_data);
+        if (empty_bloom)
+        {
+            block_manager_block_write(bms.klog_bm, empty_bloom);
+            block_manager_block_release(empty_bloom);
+        }
     }
 
     /* we need to write metadata in two passes to avoid size mismatch
@@ -3331,7 +3358,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     if (!sst->min_key || !sst->max_key)
     {
-        TDB_DEBUG_LOG("SSTable %" PRIu64 ": No min/max key, returning NOT_FOUND", sst->id);
         return TDB_ERR_NOT_FOUND;
     }
 
@@ -3360,8 +3386,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
          * cmp(key,min) >= 0 */
         if (min_cmp < 0 || max_cmp > 0)
         {
-            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Key out of range (reverse), returning NOT_FOUND",
-                          sst->id);
             return TDB_ERR_NOT_FOUND;
         }
     }
@@ -3370,8 +3394,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         /* normal order */
         if (min_cmp < 0 || max_cmp > 0)
         {
-            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Key out of range (normal), returning NOT_FOUND",
-                          sst->id);
             return TDB_ERR_NOT_FOUND;
         }
     }
@@ -3435,6 +3457,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             tidesdb_cached_block_read(db, cf_name, sst->id, 'k', klog_cursor);
         if (!block)
         {
+            TDB_DEBUG_LOG("SSTable %" PRIu64 ": Failed to read block %" PRIu64, sst->id, block_num);
             break;
         }
 
@@ -3466,9 +3489,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         if (deser_result != 0)
         {
-            TDB_DEBUG_LOG("SSTable %" PRIu64
-                          ": klog block deserialization failed (error=%d), skipping block %" PRIu64,
-                          sst->id, deser_result, block_num);
             if (need_free_decompressed) free(decompressed);
             block_manager_block_release(block);
 
@@ -3490,6 +3510,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                 if (cmp == 0)
                 {
                     /* found! */
+
                     *kv = tidesdb_kv_pair_create(
                         klog_block->keys[i], klog_block->entries[i].key_size, NULL, 0,
                         klog_block->entries[i].ttl, klog_block->entries[i].seq,
@@ -3527,7 +3548,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                     block_manager_block_release(block);
                     goto cleanup;
                 }
-                else if (cmp < 0)
+                if (cmp < 0)
                 {
                     /* passed the key */
                     tidesdb_klog_block_free(klog_block);
@@ -3660,9 +3681,14 @@ load_bloom_and_index:
             block_manager_block_t *bloom_block = block_manager_cursor_read(cursor);
             if (bloom_block)
             {
-                if (bloom_block->size > 0)
+                /* Only deserialize bloom filter if it was enabled in config */
+                if (bloom_block->size > 0 && sst->config && sst->config->enable_bloom_filter)
                 {
                     sst->bloom_filter = bloom_filter_deserialize(bloom_block->data);
+                }
+                else
+                {
+                    sst->bloom_filter = NULL;
                 }
                 block_manager_block_release(bloom_block);
             }
@@ -5838,49 +5864,78 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     block_manager_get_size(klog_bm, &new_sst->klog_data_end_offset);
 
-    /* only write auxiliary structures if we have entries */
-    if (new_sst->num_entries > 0 && block_indexes)
+    /* write auxiliary structures (always write, even if empty, to maintain consistent file
+     * structure) */
+    if (new_sst->num_entries > 0)
     {
-        /* we assign the built index to the sstable */
-        new_sst->block_indexes = block_indexes;
-
-        TDB_DEBUG_LOG("Full preemptive merge: Block index built with %u samples",
-                      new_sst->block_indexes->count);
-        size_t index_size;
-        uint8_t *index_data = compact_block_index_serialize(new_sst->block_indexes, &index_size);
-        if (index_data)
+        /* write index block */
+        if (block_indexes)
         {
-            block_manager_block_t *index_block = block_manager_block_create(index_size, index_data);
-            if (index_block)
-            {
-                block_manager_block_write(klog_bm, index_block);
-                block_manager_block_release(index_block);
-            }
-            free(index_data);
-        }
-    }
+            /* we assign the built index to the sstable */
+            new_sst->block_indexes = block_indexes;
 
-    if (new_sst->num_entries > 0 && bloom)
-    {
-        size_t bloom_size;
-        uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-        if (bloom_data)
-        {
-            TDB_DEBUG_LOG("Full preemptive merge: Bloom filter serialized to %zu bytes",
-                          bloom_size);
-            block_manager_block_t *bloom_block = block_manager_block_create(bloom_size, bloom_data);
-            if (bloom_block)
+            TDB_DEBUG_LOG("Full preemptive merge: Block index built with %u samples",
+                          new_sst->block_indexes->count);
+            size_t index_size;
+            uint8_t *index_data =
+                compact_block_index_serialize(new_sst->block_indexes, &index_size);
+            if (index_data)
             {
-                block_manager_block_write(klog_bm, bloom_block);
-                block_manager_block_release(bloom_block);
+                block_manager_block_t *index_block =
+                    block_manager_block_create(index_size, index_data);
+                if (index_block)
+                {
+                    block_manager_block_write(klog_bm, index_block);
+                    block_manager_block_release(index_block);
+                }
+                free(index_data);
             }
-            free(bloom_data);
         }
         else
         {
-            TDB_DEBUG_LOG("Full preemptive merge: Bloom filter serialization failed");
+            /* write empty index block as placeholder */
+            block_manager_block_t *empty_index = block_manager_block_create(0, NULL);
+            if (empty_index)
+            {
+                block_manager_block_write(klog_bm, empty_index);
+                block_manager_block_release(empty_index);
+            }
         }
-        new_sst->bloom_filter = bloom;
+
+        /* write bloom filter block */
+        if (bloom)
+        {
+            size_t bloom_size;
+            uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
+            if (bloom_data)
+            {
+                TDB_DEBUG_LOG("Full preemptive merge: Bloom filter serialized to %zu bytes",
+                              bloom_size);
+                block_manager_block_t *bloom_block =
+                    block_manager_block_create(bloom_size, bloom_data);
+                if (bloom_block)
+                {
+                    block_manager_block_write(klog_bm, bloom_block);
+                    block_manager_block_release(bloom_block);
+                }
+                free(bloom_data);
+            }
+            else
+            {
+                TDB_DEBUG_LOG("Full preemptive merge: Bloom filter serialization failed");
+            }
+            new_sst->bloom_filter = bloom;
+        }
+        else
+        {
+            /* write empty bloom block as placeholder */
+            block_manager_block_t *empty_bloom = block_manager_block_create(0, NULL);
+            if (empty_bloom)
+            {
+                block_manager_block_write(klog_bm, empty_bloom);
+                block_manager_block_release(empty_bloom);
+            }
+        }
     }
 
     /* get file sizes before metadata write for serialization */
@@ -6118,7 +6173,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             tidesdb_sstable_t *sst = sstables[i];
             if (!sst) continue;
 
-            /* store SSTable ID in snapshot */
+            /* store sst ID in snapshot */
             uint64_t *id_copy = malloc(sizeof(uint64_t));
             if (id_copy)
             {
@@ -6683,43 +6738,75 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         /* capture klog file offset where data blocks end (before writing index/bloom/metadata) */
         block_manager_get_size(klog_bm, &new_sst->klog_data_end_offset);
 
-        /* write index -- only if we have entries */
-        if (entry_count > 0 && block_indexes)
+        /* write auxiliary structures (always write, even if empty, to maintain consistent file
+         * structure) */
+        if (entry_count > 0)
         {
-            new_sst->block_indexes = block_indexes;
-
-            size_t index_size;
-            uint8_t *index_data =
-                compact_block_index_serialize(new_sst->block_indexes, &index_size);
-            if (index_data)
+            /* write index block */
+            if (block_indexes)
             {
-                block_manager_block_t *index_block =
-                    block_manager_block_create(index_size, index_data);
-                if (index_block)
+                new_sst->block_indexes = block_indexes;
+
+                size_t index_size;
+                uint8_t *index_data =
+                    compact_block_index_serialize(new_sst->block_indexes, &index_size);
+                if (index_data)
                 {
-                    block_manager_block_write(klog_bm, index_block);
-                    block_manager_block_release(index_block);
+                    block_manager_block_t *index_block =
+                        block_manager_block_create(index_size, index_data);
+                    if (index_block)
+                    {
+                        block_manager_block_write(klog_bm, index_block);
+                        block_manager_block_release(index_block);
+                    }
+                    free(index_data);
                 }
-                free(index_data);
             }
-        }
-
-        if (entry_count > 0 && bloom)
-        {
-            new_sst->bloom_filter = bloom;
-
-            size_t bloom_size;
-            uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-            if (bloom_data)
+            else
             {
-                block_manager_block_t *bloom_block =
-                    block_manager_block_create(bloom_size, bloom_data);
-                if (bloom_block)
+                /* write empty index block as placeholder (5 bytes: count=0 + prefix_len) */
+                uint8_t empty_index_data[5];
+                encode_uint32_le_compat(empty_index_data, 0);             /* count = 0 */
+                empty_index_data[4] = TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN; /* prefix_len */
+                block_manager_block_t *empty_index =
+                    block_manager_block_create(5, empty_index_data);
+                if (empty_index)
                 {
-                    block_manager_block_write(klog_bm, bloom_block);
-                    block_manager_block_release(bloom_block);
+                    block_manager_block_write(klog_bm, empty_index);
+                    block_manager_block_release(empty_index);
                 }
-                free(bloom_data);
+            }
+
+            /* write bloom filter block */
+            if (bloom)
+            {
+                new_sst->bloom_filter = bloom;
+
+                size_t bloom_size;
+                uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
+                if (bloom_data)
+                {
+                    block_manager_block_t *bloom_block =
+                        block_manager_block_create(bloom_size, bloom_data);
+                    if (bloom_block)
+                    {
+                        block_manager_block_write(klog_bm, bloom_block);
+                        block_manager_block_release(bloom_block);
+                    }
+                    free(bloom_data);
+                }
+            }
+            else
+            {
+                /* write empty bloom block as placeholder (1 byte: size=0) */
+                uint8_t empty_bloom_data[1] = {0};
+                block_manager_block_t *empty_bloom =
+                    block_manager_block_create(1, empty_bloom_data);
+                if (empty_bloom)
+                {
+                    block_manager_block_write(klog_bm, empty_bloom);
+                    block_manager_block_release(empty_bloom);
+                }
             }
         }
 
@@ -7454,50 +7541,82 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
              */
             block_manager_get_size(klog_bm, &new_sst->klog_data_end_offset);
 
-            /* write index -- only if we have entries */
-            if (entry_count > 0 && block_indexes)
+            /* write auxiliary structures (always write, even if empty, to maintain consistent file
+             * structure) */
+            if (entry_count > 0)
             {
-                new_sst->block_indexes = block_indexes;
-
-                size_t index_size;
-                uint8_t *index_data =
-                    compact_block_index_serialize(new_sst->block_indexes, &index_size);
-                if (index_data)
+                /* write index block */
+                if (block_indexes)
                 {
-                    block_manager_block_t *index_block =
-                        block_manager_block_create(index_size, index_data);
-                    if (index_block)
-                    {
-                        block_manager_block_write(klog_bm, index_block);
-                        block_manager_block_release(index_block);
-                    }
-                    free(index_data);
-                }
-            }
+                    new_sst->block_indexes = block_indexes;
 
-            if (entry_count > 0 && bloom)
-            {
-                size_t bloom_size;
-                uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
-                if (bloom_data)
-                {
-                    TDB_DEBUG_LOG(
-                        "Partitioned merge partition %d: Bloom filter serialized to %zu bytes",
-                        partition, bloom_size);
-                    block_manager_block_t *bloom_block =
-                        block_manager_block_create(bloom_size, bloom_data);
-                    if (bloom_block)
+                    size_t index_size;
+                    uint8_t *index_data =
+                        compact_block_index_serialize(new_sst->block_indexes, &index_size);
+                    if (index_data)
                     {
-                        block_manager_block_write(klog_bm, bloom_block);
-                        block_manager_block_release(bloom_block);
+                        block_manager_block_t *index_block =
+                            block_manager_block_create(index_size, index_data);
+                        if (index_block)
+                        {
+                            block_manager_block_write(klog_bm, index_block);
+                            block_manager_block_release(index_block);
+                        }
+                        free(index_data);
                     }
-                    free(bloom_data);
                 }
                 else
                 {
-                    TDB_DEBUG_LOG(
-                        "Partitioned merge partition %d: Bloom filter serialization failed",
-                        partition);
+                    /* write empty index block as placeholder (5 bytes: count=0 + prefix_len) */
+                    uint8_t empty_index_data[5];
+                    encode_uint32_le_compat(empty_index_data, 0);             /* count = 0 */
+                    empty_index_data[4] = TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN; /* prefix_len */
+                    block_manager_block_t *empty_index =
+                        block_manager_block_create(5, empty_index_data);
+                    if (empty_index)
+                    {
+                        block_manager_block_write(klog_bm, empty_index);
+                        block_manager_block_release(empty_index);
+                    }
+                }
+
+                /* write bloom filter block */
+                if (bloom)
+                {
+                    size_t bloom_size;
+                    uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
+                    if (bloom_data)
+                    {
+                        TDB_DEBUG_LOG(
+                            "Partitioned merge partition %d: Bloom filter serialized to %zu bytes",
+                            partition, bloom_size);
+                        block_manager_block_t *bloom_block =
+                            block_manager_block_create(bloom_size, bloom_data);
+                        if (bloom_block)
+                        {
+                            block_manager_block_write(klog_bm, bloom_block);
+                            block_manager_block_release(bloom_block);
+                        }
+                        free(bloom_data);
+                    }
+                    else
+                    {
+                        TDB_DEBUG_LOG(
+                            "Partitioned merge partition %d: Bloom filter serialization failed",
+                            partition);
+                    }
+                }
+                else
+                {
+                    /* write empty bloom block as placeholder (1 byte: size=0) */
+                    uint8_t empty_bloom_data[1] = {0};
+                    block_manager_block_t *empty_bloom =
+                        block_manager_block_create(1, empty_bloom_data);
+                    if (empty_bloom)
+                    {
+                        block_manager_block_write(klog_bm, empty_bloom);
+                        block_manager_block_release(empty_bloom);
+                    }
                 }
             }
 
@@ -8860,6 +8979,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_MEMORY;
     }
     (*db)->num_active_txns = 0;
+    atomic_init(&(*db)->active_txn_count, 0); /* initialize transaction counter */
 
     atomic_init(&(*db)->is_open, 1); /* set to 1 before starting workers */
 
@@ -9050,7 +9170,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 int tidesdb_close(tidesdb_t *db)
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
-    if (!db->is_open) return TDB_ERR_INVALID_ARGS;
+    if (!atomic_load_explicit(&db->is_open, memory_order_acquire)) return TDB_ERR_INVALID_ARGS;
 
     TDB_DEBUG_LOG("Closing TidesDB at path: %s", db->db_path);
 
@@ -9151,7 +9271,47 @@ int tidesdb_close(tidesdb_t *db)
         TDB_DEBUG_LOG("Flush queue drained (final size: %zu)", queue_size(db->flush_queue));
     }
 
-    atomic_store(&db->is_open, 0);
+    /* set is_open to 0 before waiting for transactions
+     * this causes new transaction attempts to fail immediately,
+     * allowing active threads to exit faster */
+    atomic_store_explicit(&db->is_open, 0, memory_order_release);
+
+    /* wait for all active transactions to complete before closing
+     * this prevents use-after-free when transactions access cf/sstable during close */
+    TDB_DEBUG_LOG("Waiting for active transactions to complete");
+    int txn_wait_count = 0;
+    while (txn_wait_count < TDB_CLOSE_TXN_WAIT_MAX_MS)
+    {
+        int active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
+
+        if (active_count == 0)
+        {
+            break;
+        }
+
+        if (txn_wait_count % 100 == 0 && txn_wait_count > 0)
+        {
+            TDB_DEBUG_LOG("Still waiting for %d active transactions (waited %dms)", active_count,
+                          txn_wait_count);
+        }
+
+        usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
+        txn_wait_count++;
+    }
+
+    int final_active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
+
+    if (final_active_count > 0)
+    {
+        TDB_DEBUG_LOG("ERROR: Cannot close database - %d transactions still active after %dms",
+                      final_active_count, TDB_CLOSE_TXN_WAIT_MAX_MS);
+        TDB_DEBUG_LOG("Database is in inconsistent state - is_open=0 but resources not freed");
+        /* restore is_open flag since we're aborting the close */
+        atomic_store_explicit(&db->is_open, 1, memory_order_release);
+        return TDB_ERR_UNKNOWN;
+    }
+
+    TDB_DEBUG_LOG("All active transactions completed");
 
     if (db->flush_queue)
     {
@@ -9316,6 +9476,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config)
 {
     if (!db || !name || !config) return TDB_ERR_INVALID_ARGS;
+    if (!atomic_load_explicit(&db->is_open, memory_order_acquire)) return TDB_ERR_INVALID_ARGS;
 
     /* validate sync configuration */
     if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us == 0)
@@ -9684,6 +9845,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
 tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *name)
 {
     if (!db || !name) return NULL;
+    if (!atomic_load_explicit(&db->is_open, memory_order_acquire)) return NULL;
 
     pthread_rwlock_rdlock(&db->cf_list_lock);
     tidesdb_column_family_t *result = NULL;
@@ -10138,6 +10300,7 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
                                      tidesdb_txn_t **txn)
 {
     if (!db || !txn) return TDB_ERR_INVALID_ARGS;
+    if (!atomic_load_explicit(&db->is_open, memory_order_acquire)) return TDB_ERR_INVALID_ARGS;
     if (isolation < TDB_ISOLATION_READ_UNCOMMITTED || isolation > TDB_ISOLATION_SERIALIZABLE)
     {
         return TDB_ERR_INVALID_ARGS;
@@ -10265,6 +10428,10 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
 
     (*txn)->has_rw_conflict_in = 0;
     (*txn)->has_rw_conflict_out = 0;
+
+    /* increment active transaction counter for ALL isolation levels
+     * this allows tidesdb_close to wait for all transactions to complete */
+    atomic_fetch_add_explicit(&db->active_txn_count, 1, memory_order_relaxed);
 
     /* register SERIALIZABLE transactions in active list for SSI tracking */
     if (isolation == TDB_ISOLATION_SERIALIZABLE)
@@ -11752,6 +11919,12 @@ int tidesdb_txn_rollback(tidesdb_txn_t *txn)
 void tidesdb_txn_free(tidesdb_txn_t *txn)
 {
     if (!txn) return;
+
+    /* decrement active transaction counter */
+    if (txn->db)
+    {
+        atomic_fetch_sub_explicit(&txn->db->active_txn_count, 1, memory_order_relaxed);
+    }
 
     for (int i = 0; i < txn->num_ops; i++)
     {

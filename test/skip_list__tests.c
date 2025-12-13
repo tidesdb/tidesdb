@@ -1460,7 +1460,7 @@ void benchmark_skip_list_zipfian()
     int unique_keys_accessed = 0;
 
     /* zipfian writes (hot keys get updated many times) */
-    printf(YELLOW "  Phase 1: Zipfian writes (%d ops, ~%d unique keys)...\n" RESET, num_ops,
+    printf(YELLOW "  Zipfian writes (%d ops, ~%d unique keys)...\n" RESET, num_ops,
            num_unique_keys);
 
     struct timespec start, end;
@@ -1503,7 +1503,7 @@ void benchmark_skip_list_zipfian()
     free(key_seen);
 
     /* mixed workload (50% read, 50% write) with zipfian distribution */
-    printf(YELLOW "  Phase 2: Zipfian mixed (50/50 read/write, %d ops)...\n" RESET, num_ops);
+    printf(YELLOW "  Zipfian mixed (50/50 read/write, %d ops)...\n" RESET, num_ops);
 
     zipf_state = 12345; /* reset for consistent distribution */
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1558,7 +1558,7 @@ void benchmark_skip_list_zipfian()
            write_count);
 
     /* pure reads (all hot keys) */
-    printf(YELLOW "  Phase 3: Zipfian reads only (%d ops)...\n" RESET, num_ops);
+    printf(YELLOW "  Zipfian reads only (%d ops)...\n" RESET, num_ops);
 
     zipf_state = 12345;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1769,7 +1769,7 @@ void benchmark_skip_list_deletions()
     printf(YELLOW "  Initial entry count: %d\n" RESET, skip_list_count_entries(list));
 
     /* benchmark delete existing keys */
-    printf(YELLOW "  Phase 1: Deleting existing keys (%d ops)...\n" RESET, num_keys);
+    printf(YELLOW "  Deleting existing keys (%d ops)...\n" RESET, num_keys);
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     for (int i = 0; i < num_keys; i++)
@@ -1812,7 +1812,7 @@ void benchmark_skip_list_deletions()
 
     /* benchmark delete non-existing keys (no-op, should be very fast) */
     const int tombstone_ops = 10000;
-    printf(YELLOW "  Phase 2: Deleting non-existing keys (%d ops)...\n" RESET, tombstone_ops);
+    printf(YELLOW "  Deleting non-existing keys (%d ops)...\n" RESET, tombstone_ops);
     result = skip_list_new(&list, 12, 0.25);
     ASSERT_EQ(result, 0);
 
@@ -1846,8 +1846,7 @@ void benchmark_skip_list_deletions()
     skip_list_free(list);
 
     /* benchmark mixed workload (50% existing, 50% non-existing) */
-    printf(YELLOW
-           "  Phase 3: Mixed deletions (50%% existing, 50%% non-existing, %d ops)...\n" RESET,
+    printf(YELLOW "  Mixed deletions (50%% existing, 50%% non-existing, %d ops)...\n" RESET,
            num_keys);
     result = skip_list_new(&list, 12, 0.25);
     ASSERT_EQ(result, 0);

@@ -3775,7 +3775,7 @@ static void test_multi_level_compaction_strategies(void)
     ASSERT_TRUE(cf != NULL);
 
     /* small dataset -- triggers full preemptive merge */
-    printf("Phase 1: Writing 50 keys (full preemptive merge)\n");
+    printf("Writing 50 keys (full preemptive merge)\n");
     for (int i = 0; i < 50; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -3803,10 +3803,10 @@ static void test_multi_level_compaction_strategies(void)
 
     int levels_phase1 = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-    printf("  Levels after phase 1: %d\n", levels_phase1);
+    printf("  Levels after  %d\n", levels_phase1);
 
     /* medium dataset -- triggers dividing merge */
-    printf("Phase 2: Writing 100 more keys (dividing merge)\n");
+    printf("Writing 100 more keys (dividing merge)\n");
     for (int i = 50; i < 150; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -3834,10 +3834,10 @@ static void test_multi_level_compaction_strategies(void)
 
     int levels_phase2 = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-    printf("  Levels after phase 2: %d\n", levels_phase2);
+    printf("  Levels after %d\n", levels_phase2);
 
     /* large dataset -- triggers partitioned merge */
-    printf("Phase 3: Writing 100 more keys (partitioned merge)\n");
+    printf("Writing 100 more keys (partitioned merge)\n");
     for (int i = 150; i < 250; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -3865,7 +3865,7 @@ static void test_multi_level_compaction_strategies(void)
 
     int final_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-    printf("  Levels after phase 3: %d\n", final_levels);
+    printf("  Levels after: %d\n", final_levels);
 
     /* verify all 250 keys */
     tidesdb_txn_t *txn = NULL;
@@ -7247,7 +7247,7 @@ static void test_concurrent_batched_transactions(void)
     int final_ops = atomic_load(&total_ops);
     int final_errors = atomic_load(&errors);
 
-    printf("  write phase complete: %d ops committed, %d errors\n", final_ops, final_errors);
+    printf("  write complete: %d ops committed, %d errors\n", final_ops, final_errors);
     ASSERT_EQ(final_errors, 0);
     ASSERT_EQ(final_ops, TOTAL_EXPECTED_KEYS);
 
@@ -7359,7 +7359,7 @@ static void test_concurrent_batched_random_keys(void)
     int final_ops = atomic_load(&total_ops);
     int final_errors = atomic_load(&errors);
 
-    printf("  write phase complete: %d ops committed, %d errors\n", final_ops, final_errors);
+    printf("  write complete: %d ops committed, %d errors\n", final_ops, final_errors);
     ASSERT_EQ(final_errors, 0);
     ASSERT_EQ(final_ops, TOTAL_EXPECTED_KEYS);
 
@@ -7481,7 +7481,7 @@ static void test_deadlock_random_write_then_read(void)
         }
     }
 
-    printf("\n--- PHASE 1: Writing %d keys ---\n", num_ops);
+    printf("\n--- Writing %d keys ---\n", num_ops);
 
     int write_count = 0;
 
@@ -7508,7 +7508,7 @@ static void test_deadlock_random_write_then_read(void)
 
     printf("Completed %d writes\n", write_count);
 
-    printf("\n--- PHASE 1.5: Closing and reopening database ---\n");
+    printf("\n--- Closing and reopening database ---\n");
     printf("This forces all data to be flushed to SSTables...\n");
     tidesdb_close(db);
 
@@ -7520,7 +7520,7 @@ static void test_deadlock_random_write_then_read(void)
     ASSERT_TRUE(cf != NULL);
     printf("Database reopened, all data now in SSTables\n");
 
-    printf("\n--- PHASE 2: Reading %d keys from SSTables ---\n", num_ops);
+    printf("\n--- Reading %d keys from SSTables ---\n", num_ops);
     int read_count = 0;
     int read_success = 0;
 
@@ -7571,6 +7571,181 @@ static void test_deadlock_random_write_then_read(void)
     tidesdb_close(db);
     cleanup_test_dir();
     printf("=== Test completed successfully ===\n\n");
+}
+
+void test_concurrent_read_close_race(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.num_flush_threads = 2;
+    config.num_compaction_threads = 2;
+    config.enable_debug_logging = 1;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024 * 1024; /* 1MB */
+    cf_config.min_levels = 3;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.bloom_fpr = 0.01;
+    cf_config.compression_algorithm = LZ4_COMPRESSION;
+    cf_config.enable_block_indexes = 1;
+    cf_config.sync_mode = TDB_SYNC_NONE;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int NUM_KEYS = 10000;
+    const int NUM_THREADS = 8;
+    const int KEY_SIZE = 16;
+    const int VALUE_SIZE = 100;
+
+    printf("Writing %d keys with %d threads\n", NUM_KEYS, NUM_THREADS);
+
+    /* write data in batches */
+    for (int i = 0; i < NUM_KEYS; i += 100)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        for (int j = 0; j < 100 && (i + j) < NUM_KEYS; j++)
+        {
+            char key[KEY_SIZE];
+            char value[VALUE_SIZE];
+            snprintf(key, KEY_SIZE, "key_%08d", i + j);
+            memset(value, 'A' + ((i + j) % 26), VALUE_SIZE);
+
+            ASSERT_EQ(
+                tidesdb_txn_put(txn, cf, (uint8_t *)key, KEY_SIZE, (uint8_t *)value, VALUE_SIZE, 0),
+                0);
+        }
+
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    printf("Closing database (forces flush to SSTables)\n");
+    tidesdb_close(db);
+
+    printf("Reopening database\n");
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    printf("Starting %d concurrent read threads\n", NUM_THREADS);
+
+    typedef struct
+    {
+        tidesdb_t *db;
+        tidesdb_column_family_t *cf;
+        int thread_id;
+        int num_keys;
+        int key_size;
+        int value_size;
+        _Atomic(int) *success_count;
+        _Atomic(int) *failure_count;
+    } read_thread_data_t;
+
+    _Atomic(int) success_count = 0;
+    _Atomic(int) failure_count = 0;
+    _Atomic(int) should_stop = 0;
+
+    pthread_t threads[NUM_THREADS];
+    read_thread_data_t thread_data[NUM_THREADS];
+
+    /* thread function for concurrent reads */
+    void *read_thread_fn(void *arg)
+    {
+        read_thread_data_t *data = (read_thread_data_t *)arg;
+
+        int iteration = 0;
+        while (!atomic_load(&should_stop))
+        {
+            /* read a random subset of keys to keep threads busy */
+            for (int i = 0; i < 100; i++)
+            {
+                if (atomic_load(&should_stop)) break;
+
+                tidesdb_txn_t *txn = NULL;
+                if (tidesdb_txn_begin(data->db, &txn) != 0)
+                {
+                    atomic_store(&should_stop, 1);
+                    break;
+                }
+
+                /* read a key based on thread_id and iteration to spread load */
+                int key_idx = ((data->thread_id * 1000) + (iteration * 100) + i) % data->num_keys;
+                char key[KEY_SIZE];
+                snprintf(key, KEY_SIZE, "key_%08d", key_idx);
+
+                uint8_t *value = NULL;
+                size_t value_size = 0;
+
+                int result =
+                    tidesdb_txn_get(txn, data->cf, (uint8_t *)key, KEY_SIZE, &value, &value_size);
+
+                if (result == 0)
+                {
+                    ASSERT_EQ(value_size, VALUE_SIZE);
+                    free(value);
+                    atomic_fetch_add(data->success_count, 1);
+                }
+                else
+                {
+                    atomic_fetch_add(data->failure_count, 1);
+                }
+
+                tidesdb_txn_free(txn);
+            }
+            iteration++;
+        }
+
+        return NULL;
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        thread_data[i].db = db;
+        thread_data[i].cf = cf;
+        thread_data[i].thread_id = i;
+        thread_data[i].num_keys = NUM_KEYS;
+        thread_data[i].key_size = KEY_SIZE;
+        thread_data[i].value_size = VALUE_SIZE;
+        thread_data[i].success_count = &success_count;
+        thread_data[i].failure_count = &failure_count;
+
+        ASSERT_EQ(pthread_create(&threads[i], NULL, read_thread_fn, &thread_data[i]), 0);
+    }
+
+    printf("Letting threads read for 100ms...\n");
+    usleep(100000); /* 100ms */
+
+    int reads_before_close = atomic_load(&success_count);
+    printf("Reads completed before close: %d\n", reads_before_close);
+
+    tidesdb_close(db);
+
+    atomic_store(&should_stop, 1);
+
+    printf("Waiting for read threads to finish...\n");
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    int final_success = atomic_load(&success_count);
+    int final_failure = atomic_load(&failure_count);
+
+    printf("Read results: success=%d, failure=%d\n", final_success, final_failure);
+
+    cleanup_test_dir();
 }
 
 int main(void)
@@ -7719,6 +7894,7 @@ int main(void)
     RUN_TEST(test_concurrent_batched_transactions, tests_passed);
     RUN_TEST(test_concurrent_batched_random_keys, tests_passed);
     RUN_TEST(test_deadlock_random_write_then_read, tests_passed);
+    RUN_TEST(test_concurrent_read_close_race, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

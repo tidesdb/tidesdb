@@ -10990,8 +10990,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
 
-        int level_has_candidate = 0;
-
         for (int j = 0; j < num_ssts; j++)
         {
             tidesdb_sstable_t *sst = sstables[j];
@@ -11021,7 +11019,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
             /* take ref only for ssts we will actually read */
             tidesdb_sstable_ref(sst);
-            level_has_candidate = 1;
 
             tidesdb_kv_pair_t *candidate_kv = NULL;
             if (tidesdb_sstable_get(cf->db, sst, key, key_size, &candidate_kv) == TDB_SUCCESS &&

@@ -157,7 +157,8 @@ typedef struct
 #define TDB_ERR_OVERFLOW     -9
 #define TDB_ERR_TOO_LARGE    -10
 #define TDB_ERR_MEMORY_LIMIT -11
-#define TDB_ERR_UNKNOWN      -12
+#define TDB_ERR_INVALID_DB   -12
+#define TDB_ERR_UNKNOWN      -13
 
 /**
  * tidesdb_sync_mode_t

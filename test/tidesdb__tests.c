@@ -7609,11 +7609,13 @@ static void *read_thread_fn(void *arg)
             int key_idx = ((data->thread_id * 1000) + (iteration * 100) + i) % data->num_keys;
             char key[16];
             snprintf(key, 16, "key_%08d", key_idx);
+            size_t key_len = strlen(key);
 
             uint8_t *value = NULL;
             size_t value_size = 0;
 
-            int result = tidesdb_txn_get(txn, data->cf, (uint8_t *)key, 16, &value, &value_size);
+            int result =
+                tidesdb_txn_get(txn, data->cf, (uint8_t *)key, key_len, &value, &value_size);
 
             if (result == 0)
             {
@@ -7685,7 +7687,8 @@ void test_concurrent_read_close_race(void)
             snprintf(key, TEST_KEY_SIZE, "key_%08d", i + j);
             memset(value, 'A' + ((i + j) % 26), TEST_VALUE_SIZE);
 
-            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, TEST_KEY_SIZE, (uint8_t *)value,
+            size_t key_len = strlen(key);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, key_len, (uint8_t *)value,
                                       TEST_VALUE_SIZE, 0),
                       0);
         }

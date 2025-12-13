@@ -482,15 +482,17 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst);
  * generates a cache key for a block
  * @param cf_name column family name
  * @param sstable_id sstable id
- * @param block_type 'k' for klog, 'v' for vlog
+ * @param block_type block type ('k' for klog, 'v' for vlog)
  * @param offset block offset
  * @param key_buffer buffer to store the key (must be at least TDB_CACHE_KEY_SIZE bytes)
+ * @return length of the generated key string (for optimization, avoids strlen in hot path)
  */
-static void tidesdb_block_cache_key(const char *cf_name, uint64_t sstable_id, char block_type,
-                                    uint64_t offset, char *key_buffer)
+static size_t tidesdb_block_cache_key(const char *cf_name, uint64_t sstable_id, char block_type,
+                                      uint64_t offset, char *key_buffer)
 {
-    snprintf(key_buffer, TDB_CACHE_KEY_SIZE, "%s:%" PRIu64 ":%c:%" PRIu64, cf_name, sstable_id,
-             block_type, offset);
+    int len = snprintf(key_buffer, TDB_CACHE_KEY_SIZE, "%s:%" PRIu64 ":%c:%" PRIu64, cf_name,
+                       sstable_id, block_type, offset);
+    return (len > 0 && len < TDB_CACHE_KEY_SIZE) ? (size_t)len : strlen(key_buffer);
 }
 
 /**
@@ -598,11 +600,11 @@ static block_manager_block_t *tidesdb_cached_block_read(tidesdb_t *db, const cha
     if (db->block_cache)
     {
         char cache_key[TDB_CACHE_KEY_SIZE];
-        tidesdb_block_cache_key(cf_name, sstable_id, block_type, offset, cache_key);
+        size_t key_len =
+            tidesdb_block_cache_key(cf_name, sstable_id, block_type, offset, cache_key);
 
-        /* use get_copy with acquire function to atomically get and acquire reference */
-        block_manager_block_t *cached_block = (block_manager_block_t *)lru_cache_get_copy(
-            db->block_cache, cache_key, tidesdb_block_acquire_copy_fn);
+        block_manager_block_t *cached_block = (block_manager_block_t *)lru_cache_get_copy_n(
+            db->block_cache, cache_key, key_len, tidesdb_block_acquire_copy_fn);
 
         if (cached_block)
         {
@@ -9014,7 +9016,14 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_MEMORY;
     }
 
-    (*db)->sstable_cache = lru_cache_new(config->max_open_sstables);
+    /* create hybrid LRU/LFU cache for ssts
+     * - LRU capacity -- 70% of total (hot/recent ssts)
+     * - LFU capacity -- 30% of total (warm/frequently accessed ssts)
+     * - promotion threshold -- 3 accesses to promote to LFU
+     * - TTL -- 300 seconds (5 minutes) for LFU entries */
+    size_t sstable_lru_cap = (config->max_open_sstables * 7) / 10;
+    size_t sstable_lfu_cap = config->max_open_sstables - sstable_lru_cap;
+    (*db)->sstable_cache = lru_cache_new(sstable_lru_cap, sstable_lfu_cap, 3, 300);
     if (!(*db)->sstable_cache)
     {
         queue_free((*db)->flush_queue);
@@ -9032,7 +9041,14 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         size_t block_cache_capacity = config->block_cache_size / (64 * 1024);
         if (block_cache_capacity < 100) block_cache_capacity = 100; /* minimum capacity */
 
-        (*db)->block_cache = lru_cache_new(block_cache_capacity);
+        /* create hybrid LRU/LFU cache for blocks
+         * - LRU capacity -- 80% of total (hot/recent blocks)
+         * - LFU capacity -- 20% of total (warm/frequently accessed blocks)
+         * - promotion threshold -- 2 accesses to promote to LFU
+         * - TTL -- 60 seconds for LFU entries */
+        size_t block_lru_cap = (block_cache_capacity * 8) / 10;
+        size_t block_lfu_cap = block_cache_capacity - block_lru_cap;
+        (*db)->block_cache = lru_cache_new(block_lru_cap, block_lfu_cap, 2, 60);
         if (!(*db)->block_cache)
         {
             lru_cache_free((*db)->sstable_cache);
@@ -10664,7 +10680,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     }
 
     /* check write set first (read your own writes)
-     * use optimized search strategy based on transaction size:
+     * use search strategy based on transaction size:
      * -- small txns -- linear scan from end (cache-friendly, low overhead)
      * -- medium txns -- linear scan with early termination per CF
      * -- large txns -- O(1) hash table lookup
@@ -11471,7 +11487,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             {
                 for (int r = 0; r < other->read_set_count; r++)
                 {
-                    /* optimized comparison order */
                     if (txn->write_key_sizes[w] != other->read_key_sizes[r]) continue;
                     if (txn->write_cfs[w] != other->read_cfs[r]) continue;
 

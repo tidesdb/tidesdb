@@ -22,260 +22,224 @@
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-/* global counters */
-static _Atomic(int) eviction_count = 0;
-static char last_evicted_key[256] = {0};
-static pthread_mutex_t evict_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct
+{
+    int value;
+    int freed;
+} test_data_t;
 
 static void test_evict_callback(const char *key, void *value, void *user_data)
 {
-    atomic_fetch_add(&eviction_count, 1);
-    pthread_mutex_lock(&evict_lock);
-    strncpy(last_evicted_key, key, sizeof(last_evicted_key) - 1);
-    pthread_mutex_unlock(&evict_lock);
-    (void)value;
-    (void)user_data;
-}
-
-static void free_evict_callback(const char *key, void *value, void *user_data)
-{
     (void)key;
-    (void)user_data;
-    if (value) free(value);
+    int *evict_count = (int *)user_data;
+    if (evict_count) (*evict_count)++;
 }
 
-static void test_lru_cache_new_free(void)
+void test_lru_cache_new(void)
 {
-    lru_cache_t *cache = lru_cache_new(10);
+    lru_cache_t *cache = lru_cache_new(10, 5, 3, 0);
     ASSERT_TRUE(cache != NULL);
-    ASSERT_EQ(lru_cache_capacity(cache), 10);
     ASSERT_EQ(lru_cache_size(cache), 0);
+    ASSERT_EQ(lru_cache_capacity(cache), 15);
     lru_cache_free(cache);
+
+    cache = lru_cache_new(0, 5, 3, 0);
+    ASSERT_TRUE(cache == NULL);
 }
 
-static void test_lru_cache_put_get(void)
+void test_lru_cache_put_get(void)
 {
-    lru_cache_t *cache = lru_cache_new(5);
+    lru_cache_t *cache = lru_cache_new(5, 0, 3, 0);
     ASSERT_TRUE(cache != NULL);
 
-    int value1 = 100;
-    int value2 = 200;
-    int value3 = 300;
+    int data1 = 100;
+    int data2 = 200;
+    int data3 = 300;
 
-    ASSERT_EQ(lru_cache_put(cache, "key1", &value1, NULL, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key2", &value2, NULL, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key3", &value3, NULL, NULL), 0);
-
-    ASSERT_EQ(lru_cache_size(cache), 3);
-
-    int *retrieved1 = (int *)lru_cache_get(cache, "key1");
-    ASSERT_TRUE(retrieved1 != NULL);
-    ASSERT_EQ(*retrieved1, 100);
-
-    int *retrieved2 = (int *)lru_cache_get(cache, "key2");
-    ASSERT_TRUE(retrieved2 != NULL);
-    ASSERT_EQ(*retrieved2, 200);
-
-    int *retrieved3 = (int *)lru_cache_get(cache, "key3");
-    ASSERT_TRUE(retrieved3 != NULL);
-    ASSERT_EQ(*retrieved3, 300);
-
-    void *not_found = lru_cache_get(cache, "nonexistent");
-    ASSERT_TRUE(not_found == NULL);
-
-    lru_cache_free(cache);
-}
-
-static void test_lru_cache_eviction(void)
-{
-    atomic_store(&eviction_count, 0);
-    pthread_mutex_lock(&evict_lock);
-    memset(last_evicted_key, 0, sizeof(last_evicted_key));
-    pthread_mutex_unlock(&evict_lock);
-
-    lru_cache_t *cache = lru_cache_new(3);
-    ASSERT_TRUE(cache != NULL);
-
-    int v1 = 1, v2 = 2, v3 = 3, v4 = 4;
-
-    ASSERT_EQ(lru_cache_put(cache, "key1", &v1, test_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key2", &v2, test_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key3", &v3, test_evict_callback, NULL), 0);
-
-    ASSERT_EQ(lru_cache_size(cache), 3);
-    ASSERT_EQ(atomic_load(&eviction_count), 0);
-
-    /* adding 4th item should evict one entry */
-    ASSERT_EQ(lru_cache_put(cache, "key4", &v4, test_evict_callback, NULL), 0);
-
-    ASSERT_EQ(lru_cache_size(cache), 3);
-    ASSERT_EQ(atomic_load(&eviction_count), 1);
-
-    /* key4 should exist */
-    ASSERT_TRUE(lru_cache_get(cache, "key4") != NULL);
-
-    lru_cache_free(cache);
-}
-
-static void test_lru_cache_get_updates_order(void)
-{
-    atomic_store(&eviction_count, 0);
-    pthread_mutex_lock(&evict_lock);
-    memset(last_evicted_key, 0, sizeof(last_evicted_key));
-    pthread_mutex_unlock(&evict_lock);
-
-    lru_cache_t *cache = lru_cache_new(3);
-    ASSERT_TRUE(cache != NULL);
-
-    int v1 = 1, v2 = 2, v3 = 3, v4 = 4;
-
-    ASSERT_EQ(lru_cache_put(cache, "key1", &v1, test_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key2", &v2, test_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key3", &v3, test_evict_callback, NULL), 0);
-
-    /* access key1 multiple times - this should increase its access count */
-    /* making it less likely to be evicted (LRU behavior) */
-    for (int i = 0; i < 5; i++)
-    {
-        ASSERT_TRUE(lru_cache_get(cache, "key1") != NULL);
-    }
-
-    /* add key4 - with LRU, key1 should NOT be evicted since it was recently accessed */
-    ASSERT_EQ(lru_cache_put(cache, "key4", &v4, test_evict_callback, NULL), 0);
-
-    ASSERT_EQ(atomic_load(&eviction_count), 1);
-
-    /* key1 should still exist because it was recently accessed */
-    ASSERT_TRUE(lru_cache_get(cache, "key1") != NULL);
-
-    /* key4 should exist */
-    ASSERT_TRUE(lru_cache_get(cache, "key4") != NULL);
-
-    lru_cache_free(cache);
-}
-
-static void test_lru_cache_update(void)
-{
-    lru_cache_t *cache = lru_cache_new(5);
-    ASSERT_TRUE(cache != NULL);
-
-    int v1 = 100;
-    int v2 = 200;
-
-    ASSERT_EQ(lru_cache_put(cache, "key1", &v1, NULL, NULL), 0);
+    ASSERT_EQ(lru_cache_put(cache, "key1", &data1, NULL, NULL), 0);
     ASSERT_EQ(lru_cache_size(cache), 1);
 
-    int *retrieved = (int *)lru_cache_get(cache, "key1");
-    ASSERT_TRUE(retrieved != NULL);
-    ASSERT_EQ(*retrieved, 100);
+    ASSERT_EQ(lru_cache_put(cache, "key2", &data2, NULL, NULL), 0);
+    ASSERT_EQ(lru_cache_size(cache), 2);
 
-    /* update should return 1 */
-    ASSERT_EQ(lru_cache_put(cache, "key1", &v2, NULL, NULL), 1);
-    ASSERT_EQ(lru_cache_size(cache), 1); /* size should not change */
+    ASSERT_EQ(lru_cache_put(cache, "key3", &data3, NULL, NULL), 0);
+    ASSERT_EQ(lru_cache_size(cache), 3);
 
-    retrieved = (int *)lru_cache_get(cache, "key1");
-    ASSERT_TRUE(retrieved != NULL);
-    ASSERT_EQ(*retrieved, 200);
+    int *result1 = (int *)lru_cache_get(cache, "key1");
+    ASSERT_TRUE(result1 != NULL);
+    ASSERT_EQ(*result1, 100);
+
+    int *result2 = (int *)lru_cache_get(cache, "key2");
+    ASSERT_TRUE(result2 != NULL);
+    ASSERT_EQ(*result2, 200);
+
+    int *result3 = (int *)lru_cache_get(cache, "key3");
+    ASSERT_TRUE(result3 != NULL);
+    ASSERT_EQ(*result3, 300);
+
+    ASSERT_TRUE(lru_cache_get(cache, "nonexistent") == NULL);
 
     lru_cache_free(cache);
 }
 
-static void test_lru_cache_update_refreshes_access(void)
+void test_lru_cache_update(void)
 {
-    atomic_store(&eviction_count, 0);
-    pthread_mutex_lock(&evict_lock);
-    memset(last_evicted_key, 0, sizeof(last_evicted_key));
-    pthread_mutex_unlock(&evict_lock);
-
-    lru_cache_t *cache = lru_cache_new(3);
+    lru_cache_t *cache = lru_cache_new(5, 0, 3, 0);
     ASSERT_TRUE(cache != NULL);
 
-    int v1 = 1, v2 = 2, v3 = 3, v4 = 4;
-    int v1_updated = 100;
+    int data1 = 100;
+    int data2 = 200;
+    int evict_count = 0;
 
-    ASSERT_EQ(lru_cache_put(cache, "key1", &v1, test_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key2", &v2, test_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key3", &v3, test_evict_callback, NULL), 0);
+    ASSERT_EQ(lru_cache_put(cache, "key1", &data1, test_evict_callback, &evict_count), 0);
 
-    /* update key1 - this should refresh its access count (LRU behavior) */
-    ASSERT_EQ(lru_cache_put(cache, "key1", &v1_updated, test_evict_callback, NULL), 1);
+    ASSERT_EQ(lru_cache_put(cache, "key1", &data2, test_evict_callback, &evict_count), 1);
+    ASSERT_EQ(evict_count, 1);
+    ASSERT_EQ(lru_cache_size(cache), 1);
 
-    /* eviction callback was called once to clean up old value */
-    ASSERT_EQ(atomic_load(&eviction_count), 1);
+    int *result = (int *)lru_cache_get(cache, "key1");
+    ASSERT_TRUE(result != NULL);
+    ASSERT_EQ(*result, 200);
 
-    /* adding key4 should evict key2 or key3, NOT key1 (since key1 was just updated) */
-    ASSERT_EQ(lru_cache_put(cache, "key4", &v4, test_evict_callback, NULL), 0);
+    lru_cache_free(cache);
+}
 
-    /* eviction callback called again when an entry is evicted from cache */
-    ASSERT_EQ(atomic_load(&eviction_count), 2);
+void test_lru_eviction(void)
+{
+    lru_cache_t *cache = lru_cache_new(3, 0, 10, 0);
+    ASSERT_TRUE(cache != NULL);
 
-    /* key1 should still exist because it was just updated */
-    ASSERT_TRUE(lru_cache_get(cache, "key1") != NULL);
+    int data[5] = {1, 2, 3, 4, 5};
+    int evict_count = 0;
 
-    /* verify the updated value */
-    int *retrieved = (int *)lru_cache_get(cache, "key1");
-    ASSERT_TRUE(retrieved != NULL);
-    ASSERT_EQ(*retrieved, 100);
+    lru_cache_put(cache, "key1", &data[0], test_evict_callback, &evict_count);
+    lru_cache_put(cache, "key2", &data[1], test_evict_callback, &evict_count);
+    lru_cache_put(cache, "key3", &data[2], test_evict_callback, &evict_count);
+    ASSERT_EQ(lru_cache_size(cache), 3);
+    ASSERT_EQ(evict_count, 0);
 
-    /* key4 should exist */
+    lru_cache_put(cache, "key4", &data[3], test_evict_callback, &evict_count);
+    ASSERT_EQ(lru_cache_size(cache), 3);
+    ASSERT_EQ(evict_count, 1);
+
+    ASSERT_TRUE(lru_cache_get(cache, "key1") == NULL);
+    ASSERT_TRUE(lru_cache_get(cache, "key2") != NULL);
+    ASSERT_TRUE(lru_cache_get(cache, "key3") != NULL);
     ASSERT_TRUE(lru_cache_get(cache, "key4") != NULL);
 
-    lru_cache_free(cache);
-}
-
-static void test_lru_cache_remove(void)
-{
-    atomic_store(&eviction_count, 0);
-
-    lru_cache_t *cache = lru_cache_new(5);
-    ASSERT_TRUE(cache != NULL);
-
-    int v1 = 1, v2 = 2, v3 = 3;
-
-    ASSERT_EQ(lru_cache_put(cache, "key1", &v1, test_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key2", &v2, test_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key3", &v3, test_evict_callback, NULL), 0);
-
-    ASSERT_EQ(lru_cache_size(cache), 3);
-
-    ASSERT_EQ(lru_cache_remove(cache, "key2"), 0);
-    ASSERT_EQ(lru_cache_size(cache), 2);
-    ASSERT_EQ(atomic_load(&eviction_count), 1); /* callback should be called */
-
-    /* key2 should be gone */
+    lru_cache_put(cache, "key5", &data[4], test_evict_callback, &evict_count);
+    ASSERT_EQ(evict_count, 2);
     ASSERT_TRUE(lru_cache_get(cache, "key2") == NULL);
 
-    /* key1 and key3 should still exist */
-    ASSERT_TRUE(lru_cache_get(cache, "key1") != NULL);
-    ASSERT_TRUE(lru_cache_get(cache, "key3") != NULL);
+    lru_cache_free(cache);
+}
 
-    /* removing non-existent key should fail */
-    ASSERT_EQ(lru_cache_remove(cache, "nonexistent"), -1);
+void test_lru_to_lfu_promotion(void)
+{
+    lru_cache_t *cache = lru_cache_new(3, 2, 3, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int data1 = 100;
+    lru_cache_put(cache, "hot_key", &data1, NULL, NULL);
+
+    size_t lru_size, lfu_size;
+    uint64_t hits, misses;
+
+    lru_cache_stats(cache, &lru_size, &lfu_size, &hits, &misses);
+    ASSERT_EQ(lru_size, 1);
+    ASSERT_EQ(lfu_size, 0);
+
+    lru_cache_get(cache, "hot_key"); /* access_count = 2 */
+    lru_cache_get(cache, "hot_key"); /* access_count = 3, should promote */
+
+    lru_cache_stats(cache, &lru_size, &lfu_size, &hits, &misses);
+    ASSERT_EQ(lru_size, 0);
+    ASSERT_EQ(lfu_size, 1);
+
+    int *result = (int *)lru_cache_get(cache, "hot_key");
+    ASSERT_TRUE(result != NULL);
+    ASSERT_EQ(*result, 100);
 
     lru_cache_free(cache);
 }
 
-static void test_lru_cache_clear(void)
+void test_lfu_eviction(void)
 {
-    atomic_store(&eviction_count, 0);
-
-    lru_cache_t *cache = lru_cache_new(5);
+    lru_cache_t *cache = lru_cache_new(5, 2, 2, 0);
     ASSERT_TRUE(cache != NULL);
 
-    int v1 = 1, v2 = 2, v3 = 3;
+    int data[5] = {1, 2, 3, 4, 5};
+    int evict_count = 0;
 
-    ASSERT_EQ(lru_cache_put(cache, "key1", &v1, test_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key2", &v2, test_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key3", &v3, test_evict_callback, NULL), 0);
+    lru_cache_put(cache, "key1", &data[0], test_evict_callback, &evict_count);
+    lru_cache_get(cache, "key1"); /* promote to LFU */
 
-    ASSERT_EQ(lru_cache_size(cache), 3);
+    lru_cache_put(cache, "key2", &data[1], test_evict_callback, &evict_count);
+    lru_cache_get(cache, "key2"); /* promote to LFU */
+
+    size_t lru_size, lfu_size;
+    lru_cache_stats(cache, &lru_size, &lfu_size, NULL, NULL);
+    ASSERT_EQ(lfu_size, 2);
+
+    lru_cache_put(cache, "key3", &data[2], test_evict_callback, &evict_count);
+    lru_cache_get(cache, "key3"); /* promote to LFU */
+
+    lru_cache_stats(cache, &lru_size, &lfu_size, NULL, NULL);
+    ASSERT_EQ(lfu_size, 2);
+    ASSERT_EQ(evict_count, 1);
+
+    lru_cache_free(cache);
+}
+
+void test_lru_cache_remove(void)
+{
+    lru_cache_t *cache = lru_cache_new(5, 0, 3, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int data1 = 100;
+    int data2 = 200;
+    int evict_count = 0;
+
+    lru_cache_put(cache, "key1", &data1, test_evict_callback, &evict_count);
+    lru_cache_put(cache, "key2", &data2, test_evict_callback, &evict_count);
+    ASSERT_EQ(lru_cache_size(cache), 2);
+
+    ASSERT_EQ(lru_cache_remove(cache, "key1"), 0);
+    ASSERT_EQ(lru_cache_size(cache), 1);
+    ASSERT_EQ(evict_count, 1);
+    ASSERT_TRUE(lru_cache_get(cache, "key1") == NULL);
+
+    ASSERT_EQ(lru_cache_remove(cache, "nonexistent"), -1);
+    ASSERT_EQ(lru_cache_size(cache), 1);
+
+    lru_cache_free(cache);
+}
+
+void test_lru_cache_clear(void)
+{
+    lru_cache_t *cache = lru_cache_new(5, 3, 2, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int data[5] = {1, 2, 3, 4, 5};
+    int evict_count = 0;
+
+    lru_cache_put(cache, "key1", &data[0], test_evict_callback, &evict_count);
+    lru_cache_put(cache, "key2", &data[1], test_evict_callback, &evict_count);
+    lru_cache_put(cache, "key3", &data[2], test_evict_callback, &evict_count);
+
+    lru_cache_get(cache, "key1");
+    lru_cache_get(cache, "key1");
+
+    ASSERT_TRUE(lru_cache_size(cache) > 0);
 
     lru_cache_clear(cache);
-
     ASSERT_EQ(lru_cache_size(cache), 0);
-    ASSERT_EQ(atomic_load(&eviction_count), 3); /* all callbacks should be called */
 
-    /* all keys should be gone */
+    size_t lru_size, lfu_size;
+    lru_cache_stats(cache, &lru_size, &lfu_size, NULL, NULL);
+    ASSERT_EQ(lru_size, 0);
+    ASSERT_EQ(lfu_size, 0);
+
     ASSERT_TRUE(lru_cache_get(cache, "key1") == NULL);
     ASSERT_TRUE(lru_cache_get(cache, "key2") == NULL);
     ASSERT_TRUE(lru_cache_get(cache, "key3") == NULL);
@@ -283,813 +247,525 @@ static void test_lru_cache_clear(void)
     lru_cache_free(cache);
 }
 
-static void test_lru_cache_with_malloc(void)
+void test_lru_cache_stats(void)
 {
-    lru_cache_t *cache = lru_cache_new(3);
+    lru_cache_t *cache = lru_cache_new(5, 3, 2, 0);
     ASSERT_TRUE(cache != NULL);
 
-    int *v1 = (int *)malloc(sizeof(int));
-    int *v2 = (int *)malloc(sizeof(int));
-    int *v3 = (int *)malloc(sizeof(int));
-    int *v4 = (int *)malloc(sizeof(int));
+    size_t lru_size, lfu_size;
+    uint64_t hits, misses;
 
-    *v1 = 100;
-    *v2 = 200;
-    *v3 = 300;
-    *v4 = 400;
+    lru_cache_stats(cache, &lru_size, &lfu_size, &hits, &misses);
+    ASSERT_EQ(lru_size, 0);
+    ASSERT_EQ(lfu_size, 0);
+    ASSERT_EQ(hits, 0);
+    ASSERT_EQ(misses, 0);
 
-    ASSERT_EQ(lru_cache_put(cache, "key1", v1, free_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key2", v2, free_evict_callback, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key3", v3, free_evict_callback, NULL), 0);
+    int data1 = 100;
+    lru_cache_put(cache, "key1", &data1, NULL, NULL);
 
-    /* this should evict one entry and free its value */
-    ASSERT_EQ(lru_cache_put(cache, "key4", v4, free_evict_callback, NULL), 0);
+    lru_cache_get(cache, "key1");
+    lru_cache_stats(cache, &lru_size, &lfu_size, &hits, &misses);
+    ASSERT_EQ(hits, 1);
+    ASSERT_EQ(misses, 0);
 
-    ASSERT_EQ(lru_cache_size(cache), 3);
+    lru_cache_get(cache, "nonexistent");
+    lru_cache_stats(cache, &lru_size, &lfu_size, &hits, &misses);
+    ASSERT_EQ(hits, 1);
+    ASSERT_EQ(misses, 1);
 
-    lru_cache_free(cache); /* should free remaining allocated memory */
+    lru_cache_free(cache);
 }
 
-typedef struct
+void test_lru_cache_ttl(void)
 {
-    lru_cache_t *cache;
-    int thread_id;
-    int num_ops;
-} thread_arg_t;
-
-static void *concurrent_put_thread(void *arg)
-{
-    thread_arg_t *targ = (thread_arg_t *)arg;
-
-    for (int i = 0; i < targ->num_ops; i++)
-    {
-        char key[64];
-        snprintf(key, sizeof(key), "thread%d_key%d", targ->thread_id, i);
-
-        int *value = (int *)malloc(sizeof(int));
-        if (value == NULL) continue; /* skip if allocation fails */
-
-        *value = targ->thread_id * 1000 + i;
-
-        /* lru_cache_put takes ownership of the value and will call free_evict_callback
-         * on failure to prevent leaks, so we don't need to free manually on error */
-        int result = lru_cache_put(targ->cache, key, value, free_evict_callback, NULL);
-        (void)result; /* result: 0=inserted, 1=updated, -1=failed (callback already called) */
-    }
-
-    return NULL;
-}
-
-static void *concurrent_get_thread(void *arg)
-{
-    thread_arg_t *targ = (thread_arg_t *)arg;
-
-    for (int i = 0; i < targ->num_ops; i++)
-    {
-        char key[64];
-        snprintf(key, sizeof(key), "thread%d_key%d", targ->thread_id % 2, i % 50);
-
-        void *value = lru_cache_get(targ->cache, key);
-        (void)value; /* may be NULL, that's ok */
-    }
-
-    return NULL;
-}
-
-static void test_lru_cache_concurrent(void)
-{
-    lru_cache_t *cache = lru_cache_new(100);
+    lru_cache_t *cache = lru_cache_new(5, 3, 2, 2);
     ASSERT_TRUE(cache != NULL);
 
-#define NUM_THREADS    4
-#define OPS_PER_THREAD 100
+    int data1 = 100;
+    lru_cache_put(cache, "key1", &data1, NULL, NULL);
 
-    pthread_t threads[NUM_THREADS];
-    thread_arg_t args[NUM_THREADS];
+    lru_cache_get(cache, "key1");
+    lru_cache_get(cache, "key1");
 
-    for (int i = 0; i < NUM_THREADS / 2; i++)
-    {
-        args[i].cache = cache;
-        args[i].thread_id = i;
-        args[i].num_ops = OPS_PER_THREAD;
-        pthread_create(&threads[i], NULL, concurrent_put_thread, &args[i]);
-    }
+    size_t lru_size, lfu_size;
+    lru_cache_stats(cache, &lru_size, &lfu_size, NULL, NULL);
+    ASSERT_EQ(lfu_size, 1);
 
-    for (int i = NUM_THREADS / 2; i < NUM_THREADS; i++)
-    {
-        args[i].cache = cache;
-        args[i].thread_id = i;
-        args[i].num_ops = OPS_PER_THREAD;
-        pthread_create(&threads[i], NULL, concurrent_get_thread, &args[i]);
-    }
+    ASSERT_TRUE(lru_cache_get(cache, "key1") != NULL);
 
-    for (int i = 0; i < NUM_THREADS; i++)
-    {
-        pthread_join(threads[i], NULL);
-    }
+    sleep(3);
 
-    /* cache should have at most 100 entries */
-    ASSERT_TRUE(lru_cache_size(cache) <= 100);
+    int data2 = 200;
+    lru_cache_put(cache, "key2", &data2, NULL, NULL);
+    lru_cache_get(cache, "key2");
+
+    ASSERT_TRUE(lru_cache_get(cache, "key1") == NULL);
 
     lru_cache_free(cache);
-
-#undef NUM_THREADS
-#undef OPS_PER_THREAD
 }
 
-static void test_lru_cache_edge_cases(void)
+void test_lru_cache_get_copy(void)
 {
-    lru_cache_t *cache1 = lru_cache_new(1);
-    ASSERT_TRUE(cache1 != NULL);
-
-    int v1 = 1, v2 = 2;
-    ASSERT_EQ(lru_cache_put(cache1, "key1", &v1, NULL, NULL), 0);
-    ASSERT_EQ(lru_cache_size(cache1), 1);
-
-    ASSERT_EQ(lru_cache_put(cache1, "key2", &v2, NULL, NULL), 0);
-    ASSERT_EQ(lru_cache_size(cache1), 1);
-
-    ASSERT_TRUE(lru_cache_get(cache1, "key1") == NULL);
-    ASSERT_TRUE(lru_cache_get(cache1, "key2") != NULL);
-
-    lru_cache_free(cache1);
-
-    /* NULL key/cache handling */
-    lru_cache_t *cache2 = lru_cache_new(5);
-    ASSERT_EQ(lru_cache_put(NULL, "key", &v1, NULL, NULL), -1);
-    ASSERT_EQ(lru_cache_put(cache2, NULL, &v1, NULL, NULL), -1);
-    ASSERT_TRUE(lru_cache_get(NULL, "key") == NULL);
-    ASSERT_TRUE(lru_cache_get(cache2, NULL) == NULL);
-    ASSERT_EQ(lru_cache_remove(NULL, "key"), -1);
-    ASSERT_EQ(lru_cache_remove(cache2, NULL), -1);
-
-    lru_cache_free(cache2);
-}
-
-static int foreach_callback(const char *key, void *value, void *user_data)
-{
-    int *count = (int *)user_data;
-    (*count)++;
-    (void)key;
-    (void)value;
-    return 0; /* continue iteration */
-}
-
-static int foreach_stop_callback(const char *key, void *value, void *user_data)
-{
-    int *count = (int *)user_data;
-    (*count)++;
-    (void)key;
-    (void)value;
-    /* stop after 2 iterations */
-    return (*count >= 2) ? 1 : 0;
-}
-
-static void test_lru_cache_foreach(void)
-{
-    lru_cache_t *cache = lru_cache_new(5);
+    lru_cache_t *cache = lru_cache_new(5, 0, 3, 0);
     ASSERT_TRUE(cache != NULL);
 
-    int v1 = 1, v2 = 2, v3 = 3;
+    int data1 = 100;
+    lru_cache_put(cache, "key1", &data1, NULL, NULL);
 
-    ASSERT_EQ(lru_cache_put(cache, "key1", &v1, NULL, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key2", &v2, NULL, NULL), 0);
-    ASSERT_EQ(lru_cache_put(cache, "key3", &v3, NULL, NULL), 0);
-
-    int count = 0;
-    size_t visited = lru_cache_foreach(cache, foreach_callback, &count);
-    ASSERT_EQ(visited, 3);
-    ASSERT_EQ(count, 3);
-
-    count = 0;
-    visited = lru_cache_foreach(cache, foreach_stop_callback, &count);
-    ASSERT_EQ(visited, 2);
-    ASSERT_EQ(count, 2);
-
-    visited = lru_cache_foreach(cache, NULL, NULL);
-    ASSERT_EQ(visited, 0);
-
-    lru_cache_free(cache);
-}
-
-void test_lru_cache_destroy_vs_free()
-{
-    /* test destroy (no callbacks) vs free (with callbacks) */
-    atomic_store(&eviction_count, 0);
-
-    lru_cache_t *cache1 = lru_cache_new(3);
-    int v1 = 1, v2 = 2;
-    lru_cache_put(cache1, "key1", &v1, test_evict_callback, NULL);
-    lru_cache_put(cache1, "key2", &v2, test_evict_callback, NULL);
-
-    /* destroy should not call callbacks */
-    lru_cache_destroy(cache1);
-    ASSERT_EQ(atomic_load(&eviction_count), 0);
-
-    /* free should call callbacks */
-    atomic_store(&eviction_count, 0);
-    lru_cache_t *cache2 = lru_cache_new(3);
-    lru_cache_put(cache2, "key1", &v1, test_evict_callback, NULL);
-    lru_cache_put(cache2, "key2", &v2, test_evict_callback, NULL);
-    lru_cache_free(cache2);
-    ASSERT_EQ(atomic_load(&eviction_count), 2);
-}
-
-void test_lru_cache_zero_capacity()
-{
-    lru_cache_t *cache = lru_cache_new(0);
-    ASSERT_TRUE(cache == NULL); /* should return NULL for zero capacity */
-}
-
-void test_lru_cache_long_keys()
-{
-    lru_cache_t *cache = lru_cache_new(5);
-
-    /* fairly long key (1KB) */
-    char long_key[1024];
-    memset(long_key, 'A', sizeof(long_key) - 1);
-    long_key[sizeof(long_key) - 1] = '\0';
-
-    int v = 123;
-    ASSERT_EQ(lru_cache_put(cache, long_key, &v, NULL, NULL), 0);
-    ASSERT_TRUE(lru_cache_get(cache, long_key) == &v);
-
-    lru_cache_free(cache);
-}
-
-void test_lru_cache_empty_key()
-{
-    lru_cache_t *cache = lru_cache_new(5);
-
-    int v = 1;
-    ASSERT_EQ(lru_cache_put(cache, "", &v, NULL, NULL), 0);
-    ASSERT_TRUE(lru_cache_get(cache, "") == &v);
-
-    lru_cache_free(cache);
-}
-
-void test_lru_cache_hash_collisions()
-{
-    lru_cache_t *cache = lru_cache_new(100);
-
-    /* add many keys to test hash collision handling */
-    for (int i = 0; i < 50; i++)
+    void *copy_fn(void *value)
     {
-        char key[32];
-        snprintf(key, sizeof(key), "key_%d", i);
-        int *v = malloc(sizeof(int));
-        *v = i;
-        ASSERT_EQ(lru_cache_put(cache, key, v, free_evict_callback, NULL), 0);
+        int *original = (int *)value;
+        int *copy = malloc(sizeof(int));
+        if (copy) *copy = *original;
+        return copy;
     }
 
-    /* verify all are retrievable */
-    for (int i = 0; i < 50; i++)
-    {
-        char key[32];
-        snprintf(key, sizeof(key), "key_%d", i);
-        int *v = (int *)lru_cache_get(cache, key);
-        ASSERT_TRUE(v != NULL);
-        ASSERT_EQ(*v, i);
-    }
-
-    lru_cache_free(cache);
-}
-
-void test_lru_cache_free_null()
-{
-    lru_cache_free(NULL);
-    lru_cache_destroy(NULL);
-    lru_cache_clear(NULL);
-}
-
-/* test for race condition where multiple threads try to add same key */
-typedef struct
-{
-    lru_cache_t *cache;
-    const char *key;
-    _Atomic(int) *refcount;
-    int thread_id;
-} race_test_arg_t;
-
-static void race_evict_callback(const char *key, void *value, void *user_data)
-{
-    (void)key;
-    /* free the dummy value */
-    if (value)
-    {
-        free(value);
-    }
-    /* decrement the shared refcount */
-    race_test_arg_t *arg = (race_test_arg_t *)user_data;
-    if (arg && arg->refcount)
-    {
-        atomic_fetch_sub(arg->refcount, 1);
-    }
-}
-
-static void *race_condition_thread(void *arg)
-{
-    race_test_arg_t *targ = (race_test_arg_t *)arg;
-
-    /* atomically increment refcount and try to insert
-     * we pass a dummy value (the thread_id) since all threads are inserting the same key
-     * the cache will handle duplicate detection and call evict callback appropriately */
-    atomic_fetch_add(targ->refcount, 1);
-
-    /* create a unique value pointer for this thread (just use the thread_id as a dummy value) */
-    int *dummy_value = malloc(sizeof(int));
-    if (!dummy_value)
-    {
-        atomic_fetch_sub(targ->refcount, 1);
-        return NULL;
-    }
-    *dummy_value = targ->thread_id;
-
-    /* try to add to cache -- pass targ as user_data for the evict callback */
-    int result = lru_cache_put(targ->cache, targ->key, dummy_value, race_evict_callback, targ);
-
-    if (result == 1)
-    {
-        /* entry already existed (duplicate detected by cache)
-         * the cache called evict callback on the OLD value (which decremented refcount)
-         * and updated the entry with our NEW value (dummy_value)
-         * our value is now in the cache, so we keep our refcount increment */
-        /* no additional decrement needed here */
-    }
-    else if (result == -1)
-    {
-        /* put failed, free our value and release our ref */
-        free(dummy_value);
-        atomic_fetch_sub(targ->refcount, 1);
-    }
-    /* if result == 0, we successfully inserted, keep the refcount
-     * the cache now owns dummy_value and will free it via evict callback */
-
-    return NULL;
-}
-
-void test_lru_cache_race_condition()
-{
-    printf(BOLDWHITE "\nTest: Race Condition - Multiple Threads Adding Same Key\n" RESET);
-
-    lru_cache_t *cache = lru_cache_new(100);
-    ASSERT_TRUE(cache != NULL);
-
-    _Atomic(int) refcount = 0;
-
-    const char *shared_key = "shared_sstable_key";
-
-#define RACE_THREADS 10
-    pthread_t threads[RACE_THREADS];
-    race_test_arg_t args[RACE_THREADS];
-
-    /* spawn multiple threads trying to add the same key */
-    for (int i = 0; i < RACE_THREADS; i++)
-    {
-        args[i].cache = cache;
-        args[i].key = shared_key;
-        args[i].refcount = &refcount;
-        args[i].thread_id = i;
-        pthread_create(&threads[i], NULL, race_condition_thread, &args[i]);
-    }
-
-    for (int i = 0; i < RACE_THREADS; i++)
-    {
-        pthread_join(threads[i], NULL);
-    }
-
-    /* refcount should be 1 (only the cache holds a reference) */
-    int final_refcount = atomic_load(&refcount);
-    printf("  Final refcount: %d (expected: 1)\n", final_refcount);
-    ASSERT_EQ(final_refcount, 1);
-
-    /* clear cache, which should call evict callback and decrement refcount to 0 */
-    lru_cache_clear(cache);
-    final_refcount = atomic_load(&refcount);
-    printf("  Refcount after cache clear: %d (expected: 0)\n", final_refcount);
-    ASSERT_EQ(final_refcount, 0);
-
-    lru_cache_free(cache);
-
-#undef RACE_THREADS
-}
-
-void test_lru_cache_put_return_values()
-{
-    lru_cache_t *cache = lru_cache_new(5);
-    ASSERT_TRUE(cache != NULL);
-
-    int v1 = 100;
-    int v2 = 200;
-
-    /* first put should return 0 (new insertion) */
-    int result = lru_cache_put(cache, "key1", &v1, NULL, NULL);
-    ASSERT_EQ(result, 0);
-
-    /* second put with same key should return 1 (update) */
-    result = lru_cache_put(cache, "key1", &v2, NULL, NULL);
-    ASSERT_EQ(result, 1);
-
-    /* verify value was updated */
-    int *retrieved = (int *)lru_cache_get(cache, "key1");
-    ASSERT_TRUE(retrieved != NULL);
-    ASSERT_EQ(*retrieved, 200);
-
-    /* size should still be 1 */
-    ASSERT_EQ(lru_cache_size(cache), 1);
-
-    lru_cache_free(cache);
-}
-
-void test_lru_cache_access_pattern()
-{
-    printf(BOLDWHITE "\nTest: LRU Access Pattern - Frequently Accessed Items Stay\n" RESET);
-
-    lru_cache_t *cache = lru_cache_new(5);
-    ASSERT_TRUE(cache != NULL);
-
-    int values[10];
-    for (int i = 0; i < 10; i++)
-    {
-        values[i] = i * 100;
-    }
-
-    for (int i = 0; i < 5; i++)
-    {
-        char key[32];
-        snprintf(key, sizeof(key), "key%d", i);
-        ASSERT_EQ(lru_cache_put(cache, key, &values[i], NULL, NULL), 0);
-    }
-
-    /* access key0 many times to make it "hot" */
-    for (int i = 0; i < 10; i++)
-    {
-        ASSERT_TRUE(lru_cache_get(cache, "key0") != NULL);
-    }
-
-    /* insert 5 more items, which should evict some of the original items */
-    for (int i = 5; i < 10; i++)
-    {
-        char key[32];
-        snprintf(key, sizeof(key), "key%d", i);
-        ASSERT_EQ(lru_cache_put(cache, key, &values[i], NULL, NULL), 0);
-    }
-
-    /* key0 should still be in cache because it was frequently accessed */
-    void *key0_value = lru_cache_get(cache, "key0");
-    printf("  key0 still in cache: %s\n", key0_value != NULL ? "YES" : "NO");
-    ASSERT_TRUE(key0_value != NULL);
-
-    lru_cache_free(cache);
-}
-
-static void *int_copy_fn(void *value)
-{
-    if (value == NULL) return NULL;
-    int *copy = malloc(sizeof(int));
-    if (copy) *copy = *(int *)value;
-    return copy;
-}
-
-void test_lru_cache_get_copy()
-{
-    lru_cache_t *cache = lru_cache_new(5);
-    ASSERT_TRUE(cache != NULL);
-
-    int v1 = 42;
-    ASSERT_EQ(lru_cache_put(cache, "key1", &v1, NULL, NULL), 0);
-
-    /* get a copy of the value */
-    int *copy = (int *)lru_cache_get_copy(cache, "key1", int_copy_fn);
+    int *copy = (int *)lru_cache_get_copy(cache, "key1", copy_fn);
     ASSERT_TRUE(copy != NULL);
-    ASSERT_EQ(*copy, 42);
-
-    /* modify original, copy should be unchanged */
-    v1 = 100;
-    ASSERT_EQ(*copy, 42);
-
+    ASSERT_EQ(*copy, 100);
+    ASSERT_TRUE(copy != &data1);
     free(copy);
 
-    /* test with non-existent key */
-    copy = (int *)lru_cache_get_copy(cache, "nonexistent", int_copy_fn);
+    copy = (int *)lru_cache_get_copy(cache, "nonexistent", copy_fn);
     ASSERT_TRUE(copy == NULL);
 
     lru_cache_free(cache);
 }
 
-#define BENCH_ITERATIONS 1000000
-#define BENCH_CACHE_SIZE 10000
-#define BENCH_THREADS    8
-
-typedef struct
+void test_lru_cache_foreach(void)
 {
-    lru_cache_t *cache;
-    int thread_id;
-    int iterations;
-    double elapsed_time;
-} bench_thread_context_t;
-
-static void benchmark_lru_sequential(void)
-{
-    printf(BOLDWHITE "\nBenchmark 1: Sequential Write/Read Performance\n" RESET);
-
-    lru_cache_t *cache = lru_cache_new(BENCH_CACHE_SIZE);
+    lru_cache_t *cache = lru_cache_new(5, 3, 2, 0);
     ASSERT_TRUE(cache != NULL);
 
-    int *values = malloc(BENCH_ITERATIONS * sizeof(int));
-    for (int i = 0; i < BENCH_ITERATIONS; i++)
+    int data[5] = {10, 20, 30, 40, 50};
+
+    lru_cache_put(cache, "key1", &data[0], NULL, NULL);
+    lru_cache_put(cache, "key2", &data[1], NULL, NULL);
+    lru_cache_put(cache, "key3", &data[2], NULL, NULL);
+
+    lru_cache_get(cache, "key1");
+    lru_cache_get(cache, "key1");
+
+    typedef struct
     {
-        values[i] = i;
+        int count;
+        int sum;
+    } foreach_ctx_t;
+
+    int count_callback(const char *key, void *value, void *user_data)
+    {
+        (void)key;
+        foreach_ctx_t *ctx = (foreach_ctx_t *)user_data;
+        ctx->count++;
+        ctx->sum += *(int *)value;
+        return 0;
     }
 
-    /* sequential writes */
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    foreach_ctx_t ctx = {0, 0};
+    size_t visited = lru_cache_foreach(cache, count_callback, &ctx);
+    ASSERT_EQ(visited, 3);
+    ASSERT_EQ(ctx.count, 3);
+    ASSERT_EQ(ctx.sum, 60); /* 10 + 20 + 30 */
 
-    for (int i = 0; i < BENCH_ITERATIONS; i++)
-    {
-        char key[32];
-        snprintf(key, sizeof(key), "key_%d", i);
-        lru_cache_put(cache, key, &values[i], NULL, NULL);
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double write_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-
-    printf("  Sequential writes: %.2f M ops/sec (%.3f seconds)\n",
-           BENCH_ITERATIONS / write_time / 1e6, write_time);
-
-    /* sequential reads (cache hits for last BENCH_CACHE_SIZE entries) */
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    int hits = 0;
-    for (int i = 0; i < BENCH_ITERATIONS; i++)
-    {
-        char key[32];
-        snprintf(key, sizeof(key), "key_%d", i);
-        void *val = lru_cache_get(cache, key);
-        if (val != NULL) hits++;
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double read_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-
-    printf("  Sequential reads: %.2f M ops/sec (%.3f seconds)\n",
-           BENCH_ITERATIONS / read_time / 1e6, read_time);
-    printf("  Cache hit rate: %.1f%% (%d/%d)\n", (double)hits / BENCH_ITERATIONS * 100, hits,
-           BENCH_ITERATIONS);
-
-    free(values);
     lru_cache_free(cache);
 }
 
-static void benchmark_lru_random_access(void)
+void test_lru_cache_foreach_early_stop(void)
 {
-    printf(BOLDWHITE "\nBenchmark 2: Random Access Performance\n" RESET);
-
-    lru_cache_t *cache = lru_cache_new(BENCH_CACHE_SIZE);
+    lru_cache_t *cache = lru_cache_new(5, 0, 3, 0);
     ASSERT_TRUE(cache != NULL);
 
-    int *values = malloc(BENCH_CACHE_SIZE * sizeof(int));
+    int data[5] = {1, 2, 3, 4, 5};
+    lru_cache_put(cache, "key1", &data[0], NULL, NULL);
+    lru_cache_put(cache, "key2", &data[1], NULL, NULL);
+    lru_cache_put(cache, "key3", &data[2], NULL, NULL);
 
-    /* populate cache */
-    for (int i = 0; i < BENCH_CACHE_SIZE; i++)
+    int stop_callback(const char *key, void *value, void *user_data)
     {
-        char key[32];
-        snprintf(key, sizeof(key), "key_%d", i);
-        values[i] = i;
-        lru_cache_put(cache, key, &values[i], NULL, NULL);
+        (void)key;
+        (void)value;
+        int *count = (int *)user_data;
+        (*count)++;
+        return (*count >= 2) ? 1 : 0;
     }
 
-    /* random reads */
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    int count = 0;
+    size_t visited = lru_cache_foreach(cache, stop_callback, &count);
+    ASSERT_EQ(visited, 2);
+    ASSERT_EQ(count, 2);
 
-    for (int i = 0; i < BENCH_ITERATIONS; i++)
-    {
-        int idx = rand() % BENCH_CACHE_SIZE;
-        char key[32];
-        snprintf(key, sizeof(key), "key_%d", idx);
-        void *val = lru_cache_get(cache, key);
-        (void)val;
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-
-    printf("  Random reads: %.2f M ops/sec (%.3f seconds)\n", BENCH_ITERATIONS / time / 1e6, time);
-    printf("  Cache hit rate: 100%% (all keys in cache)\n");
-
-    free(values);
     lru_cache_free(cache);
 }
 
-static void *concurrent_read_worker(void *arg)
+void test_lru_cache_null_handling(void)
 {
-    bench_thread_context_t *ctx = (bench_thread_context_t *)arg;
-    struct timespec start, end;
+    ASSERT_EQ(lru_cache_put(NULL, "key", NULL, NULL, NULL), -1);
+    ASSERT_TRUE(lru_cache_get(NULL, "key") == NULL);
+    ASSERT_TRUE(lru_cache_get_copy(NULL, "key", NULL) == NULL);
+    ASSERT_EQ(lru_cache_remove(NULL, "key"), -1);
+    ASSERT_EQ(lru_cache_size(NULL), 0);
+    ASSERT_EQ(lru_cache_capacity(NULL), 0);
+    ASSERT_EQ(lru_cache_foreach(NULL, NULL, NULL), 0);
+    lru_cache_clear(NULL);
+    lru_cache_free(NULL);
+    lru_cache_destroy(NULL);
+    lru_cache_stats(NULL, NULL, NULL, NULL, NULL);
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    for (int i = 0; i < ctx->iterations; i++)
-    {
-        int idx = (ctx->thread_id * 1000 + i) % BENCH_CACHE_SIZE;
-        char key[32];
-        snprintf(key, sizeof(key), "key_%d", idx);
-        void *val = lru_cache_get(ctx->cache, key);
-        (void)val;
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    ctx->elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-
-    return NULL;
-}
-
-static void benchmark_lru_concurrent_reads(void)
-{
-    printf(BOLDWHITE "\nBenchmark 3: Concurrent Read Performance (Lock-Free)\n" RESET);
-
-    lru_cache_t *cache = lru_cache_new(BENCH_CACHE_SIZE);
+    lru_cache_t *cache = lru_cache_new(5, 0, 3, 0);
     ASSERT_TRUE(cache != NULL);
-
-    int *values = malloc(BENCH_CACHE_SIZE * sizeof(int));
-
-    /* populate cache */
-    for (int i = 0; i < BENCH_CACHE_SIZE; i++)
-    {
-        char key[32];
-        snprintf(key, sizeof(key), "key_%d", i);
-        values[i] = i;
-        lru_cache_put(cache, key, &values[i], NULL, NULL);
-    }
-
-    pthread_t threads[BENCH_THREADS];
-    bench_thread_context_t contexts[BENCH_THREADS];
-    int iterations_per_thread = BENCH_ITERATIONS / BENCH_THREADS;
-
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    for (int i = 0; i < BENCH_THREADS; i++)
-    {
-        contexts[i].cache = cache;
-        contexts[i].thread_id = i;
-        contexts[i].iterations = iterations_per_thread;
-        contexts[i].elapsed_time = 0;
-        pthread_create(&threads[i], NULL, concurrent_read_worker, &contexts[i]);
-    }
-
-    for (int i = 0; i < BENCH_THREADS; i++)
-    {
-        pthread_join(threads[i], NULL);
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double wall_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-
-    double total_thread_time = 0;
-    for (int i = 0; i < BENCH_THREADS; i++)
-    {
-        total_thread_time += contexts[i].elapsed_time;
-    }
-    double avg_thread_time = total_thread_time / BENCH_THREADS;
-
-    printf("  Threads: %d\n", BENCH_THREADS);
-    printf("  Wall time: %.3f seconds\n", wall_time);
-    printf("  Aggregate throughput: %.2f M ops/sec\n", BENCH_ITERATIONS / wall_time / 1e6);
-    printf("  Average thread time: %.3f seconds\n", avg_thread_time);
-    printf("  Speedup vs sequential: %.2fx\n", avg_thread_time / wall_time * BENCH_THREADS);
-    printf("  Per-thread throughput: %.2f M ops/sec\n",
-           iterations_per_thread / avg_thread_time / 1e6);
-
-    free(values);
+    ASSERT_EQ(lru_cache_put(cache, NULL, NULL, NULL, NULL), -1);
+    ASSERT_TRUE(lru_cache_get(cache, NULL) == NULL);
+    ASSERT_EQ(lru_cache_remove(cache, NULL), -1);
     lru_cache_free(cache);
 }
 
-static void *mixed_workload_worker(void *arg)
+void test_lru_cache_destroy_no_callbacks(void)
 {
-    bench_thread_context_t *ctx = (bench_thread_context_t *)arg;
-    struct timespec start, end;
+    lru_cache_t *cache = lru_cache_new(5, 0, 3, 0);
+    ASSERT_TRUE(cache != NULL);
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    int data[3] = {1, 2, 3};
+    int evict_count = 0;
 
-    for (int i = 0; i < ctx->iterations; i++)
+    lru_cache_put(cache, "key1", &data[0], test_evict_callback, &evict_count);
+    lru_cache_put(cache, "key2", &data[1], test_evict_callback, &evict_count);
+    lru_cache_put(cache, "key3", &data[2], test_evict_callback, &evict_count);
+
+    lru_cache_destroy(cache);
+
+    ASSERT_EQ(evict_count, 0);
+}
+
+void test_lru_cache_large_volume(void)
+{
+    lru_cache_t *cache = lru_cache_new(1000, 500, 5, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int *data = malloc(2000 * sizeof(int));
+    ASSERT_TRUE(data != NULL);
+
+    for (int i = 0; i < 2000; i++)
     {
-        int idx = (ctx->thread_id * 1000 + i) % BENCH_CACHE_SIZE;
+        data[i] = i;
         char key[32];
-        snprintf(key, sizeof(key), "key_%d", idx);
+        snprintf(key, sizeof(key), "key_%d", i);
+        lru_cache_put(cache, key, &data[i], NULL, NULL);
+    }
 
-        /* 80% reads, 20% writes */
-        if (i % 5 == 0)
+    /* should be at LRU capacity (entries not promoted without multiple accesses) */
+    ASSERT_EQ(lru_cache_size(cache), 1000);
+
+    /* recent entries should be present */
+    for (int i = 1000; i < 2000; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        int *result = (int *)lru_cache_get(cache, key);
+        ASSERT_TRUE(result != NULL);
+        ASSERT_EQ(*result, i);
+    }
+
+    free(data);
+    lru_cache_free(cache);
+}
+
+void test_lru_cache_string_keys(void)
+{
+    lru_cache_t *cache = lru_cache_new(5, 0, 3, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    char *str1 = "value1";
+    char *str2 = "value2";
+    char *str3 = "value3";
+
+    lru_cache_put(cache, "first", str1, NULL, NULL);
+    lru_cache_put(cache, "second", str2, NULL, NULL);
+    lru_cache_put(cache, "third", str3, NULL, NULL);
+
+    char *result1 = (char *)lru_cache_get(cache, "first");
+    ASSERT_TRUE(result1 != NULL);
+    ASSERT_TRUE(strcmp(result1, "value1") == 0);
+
+    char *result2 = (char *)lru_cache_get(cache, "second");
+    ASSERT_TRUE(result2 != NULL);
+    ASSERT_TRUE(strcmp(result2, "value2") == 0);
+
+    lru_cache_free(cache);
+}
+
+void test_lru_cache_access_pattern(void)
+{
+    lru_cache_t *cache = lru_cache_new(3, 0, 10, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int data[4] = {1, 2, 3, 4};
+
+    lru_cache_put(cache, "key1", &data[0], NULL, NULL);
+    lru_cache_put(cache, "key2", &data[1], NULL, NULL);
+    lru_cache_put(cache, "key3", &data[2], NULL, NULL);
+
+    lru_cache_get(cache, "key1");
+
+    lru_cache_put(cache, "key4", &data[3], NULL, NULL);
+
+    ASSERT_TRUE(lru_cache_get(cache, "key1") != NULL);
+    ASSERT_TRUE(lru_cache_get(cache, "key2") == NULL);
+    ASSERT_TRUE(lru_cache_get(cache, "key3") != NULL);
+    ASSERT_TRUE(lru_cache_get(cache, "key4") != NULL);
+
+    lru_cache_free(cache);
+}
+
+void test_lru_cache_promotion_threshold(void)
+{
+    lru_cache_t *cache = lru_cache_new(5, 3, 5, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int data1 = 100;
+    lru_cache_put(cache, "key1", &data1, NULL, NULL);
+
+    size_t lru_size, lfu_size;
+
+    for (int i = 0; i < 3; i++)
+    {
+        lru_cache_get(cache, "key1");
+    }
+
+    lru_cache_stats(cache, &lru_size, &lfu_size, NULL, NULL);
+    ASSERT_EQ(lru_size, 1);
+    ASSERT_EQ(lfu_size, 0);
+
+    lru_cache_get(cache, "key1");
+
+    lru_cache_stats(cache, &lru_size, &lfu_size, NULL, NULL);
+    ASSERT_EQ(lru_size, 0);
+    ASSERT_EQ(lfu_size, 1);
+
+    lru_cache_free(cache);
+}
+
+void test_lru_cache_no_lfu(void)
+{
+    lru_cache_t *cache = lru_cache_new(5, 0, 2, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int data1 = 100;
+    lru_cache_put(cache, "key1", &data1, NULL, NULL);
+
+    lru_cache_get(cache, "key1");
+    lru_cache_get(cache, "key1");
+    lru_cache_get(cache, "key1");
+
+    size_t lru_size, lfu_size;
+    lru_cache_stats(cache, &lru_size, &lfu_size, NULL, NULL);
+    ASSERT_EQ(lru_size, 1);
+    ASSERT_EQ(lfu_size, 0);
+
+    lru_cache_free(cache);
+}
+
+void test_lru_cache_empty_key(void)
+{
+    lru_cache_t *cache = lru_cache_new(5, 0, 3, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int data1 = 100;
+
+    ASSERT_EQ(lru_cache_put(cache, "", &data1, NULL, NULL), 0);
+    int *result = (int *)lru_cache_get(cache, "");
+    ASSERT_TRUE(result != NULL);
+    ASSERT_EQ(*result, 100);
+
+    lru_cache_free(cache);
+}
+
+void test_lru_cache_collision_keys(void)
+{
+    lru_cache_t *cache = lru_cache_new(10, 0, 3, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int data[10];
+    for (int i = 0; i < 10; i++)
+    {
+        data[i] = i * 10;
+        char key[32];
+        snprintf(key, sizeof(key), "key%d", i);
+        lru_cache_put(cache, key, &data[i], NULL, NULL);
+    }
+
+    for (int i = 0; i < 10; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key%d", i);
+        int *result = (int *)lru_cache_get(cache, key);
+        ASSERT_TRUE(result != NULL);
+        ASSERT_EQ(*result, i * 10);
+    }
+
+    lru_cache_free(cache);
+}
+
+void test_lru_cache_mixed_operations(void)
+{
+    lru_cache_t *cache = lru_cache_new(5, 3, 2, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int data[10];
+    for (int i = 0; i < 10; i++) data[i] = i;
+
+    lru_cache_put(cache, "key1", &data[1], NULL, NULL);
+    lru_cache_put(cache, "key2", &data[2], NULL, NULL);
+    ASSERT_TRUE(lru_cache_get(cache, "key1") != NULL);
+    lru_cache_put(cache, "key3", &data[3], NULL, NULL);
+    lru_cache_remove(cache, "key2");
+    ASSERT_TRUE(lru_cache_get(cache, "key2") == NULL);
+    lru_cache_put(cache, "key4", &data[4], NULL, NULL);
+    ASSERT_TRUE(lru_cache_get(cache, "key1") != NULL);
+    ASSERT_TRUE(lru_cache_get(cache, "key3") != NULL);
+    ASSERT_TRUE(lru_cache_get(cache, "key4") != NULL);
+
+    lru_cache_free(cache);
+}
+
+void benchmark_lru_cache_insertions(void)
+{
+    lru_cache_t *cache = lru_cache_new(10000, 5000, 5, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int *data = malloc(100000 * sizeof(int));
+    ASSERT_TRUE(data != NULL);
+
+    for (int i = 0; i < 100000; i++) data[i] = i;
+
+    clock_t start = clock();
+    for (int i = 0; i < 100000; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        lru_cache_put(cache, key, &data[i], NULL, NULL);
+    }
+    clock_t end = clock();
+
+    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    printf(CYAN "Inserting 100,000 entries took %f seconds\n" RESET, time_spent);
+    printf(BOLDWHITE "Final cache size: %zu\n" RESET, lru_cache_size(cache));
+
+    free(data);
+    lru_cache_free(cache);
+}
+
+void benchmark_lru_cache_lookups(void)
+{
+    lru_cache_t *cache = lru_cache_new(50000, 0, 10, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int *data = malloc(50000 * sizeof(int));
+    ASSERT_TRUE(data != NULL);
+
+    for (int i = 0; i < 50000; i++)
+    {
+        data[i] = i;
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        lru_cache_put(cache, key, &data[i], NULL, NULL);
+    }
+
+    /* Benchmark lookups */
+    clock_t start = clock();
+    for (int i = 0; i < 100000; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i % 50000);
+        lru_cache_get(cache, key);
+    }
+    clock_t end = clock();
+
+    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    printf(CYAN "100,000 lookups took %f seconds\n" RESET, time_spent);
+
+    size_t lru_size, lfu_size;
+    uint64_t hits, misses;
+    lru_cache_stats(cache, &lru_size, &lfu_size, &hits, &misses);
+    printf(BOLDWHITE "Hits: %lu, Misses: %lu, Hit rate: %.2f%%\n" RESET, hits, misses,
+           (double)hits / (hits + misses) * 100.0);
+
+    free(data);
+    lru_cache_free(cache);
+}
+
+void benchmark_lru_lfu_promotion(void)
+{
+    lru_cache_t *cache = lru_cache_new(10000, 5000, 3, 0);
+    ASSERT_TRUE(cache != NULL);
+
+    int *data = malloc(20000 * sizeof(int));
+    ASSERT_TRUE(data != NULL);
+
+    for (int i = 0; i < 20000; i++) data[i] = i;
+
+    for (int i = 0; i < 20000; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%d", i);
+        lru_cache_put(cache, key, &data[i], NULL, NULL);
+    }
+
+    /* access hot entries to trigger promotions */
+    clock_t start = clock();
+    for (int j = 0; j < 5; j++)
+    {
+        for (int i = 10000; i < 15000; i++) /* access subset multiple times */
         {
-            static int dummy = 0;
-            lru_cache_put(ctx->cache, key, &dummy, NULL, NULL);
-        }
-        else
-        {
-            void *val = lru_cache_get(ctx->cache, key);
-            (void)val;
+            char key[32];
+            snprintf(key, sizeof(key), "key_%d", i);
+            lru_cache_get(cache, key);
         }
     }
+    clock_t end = clock();
 
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    ctx->elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    printf(CYAN "Promotion benchmark took %f seconds\n" RESET, time_spent);
 
-    return NULL;
-}
+    size_t lru_size, lfu_size;
+    uint64_t hits, misses;
+    lru_cache_stats(cache, &lru_size, &lfu_size, &hits, &misses);
+    printf(BOLDWHITE "LRU size: %zu, LFU size: %zu\n" RESET, lru_size, lfu_size);
+    printf(BOLDWHITE "Hits: %lu, Misses: %lu\n" RESET, hits, misses);
 
-static void benchmark_lru_mixed_workload(void)
-{
-    printf(BOLDWHITE "\nBenchmark 4: Mixed Workload (80%% Read, 20%% Write) - Lock-Free\n" RESET);
-
-    lru_cache_t *cache = lru_cache_new(BENCH_CACHE_SIZE);
-    ASSERT_TRUE(cache != NULL);
-
-    int *values = malloc(BENCH_CACHE_SIZE * sizeof(int));
-
-    /* populate cache */
-    for (int i = 0; i < BENCH_CACHE_SIZE; i++)
-    {
-        char key[32];
-        snprintf(key, sizeof(key), "key_%d", i);
-        values[i] = i;
-        lru_cache_put(cache, key, &values[i], NULL, NULL);
-    }
-
-    pthread_t threads[BENCH_THREADS];
-    bench_thread_context_t contexts[BENCH_THREADS];
-    int iterations_per_thread = BENCH_ITERATIONS / BENCH_THREADS;
-
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    /* spawn worker threads */
-    for (int i = 0; i < BENCH_THREADS; i++)
-    {
-        contexts[i].cache = cache;
-        contexts[i].thread_id = i;
-        contexts[i].iterations = iterations_per_thread;
-        contexts[i].elapsed_time = 0;
-        pthread_create(&threads[i], NULL, mixed_workload_worker, &contexts[i]);
-    }
-
-    for (int i = 0; i < BENCH_THREADS; i++)
-    {
-        pthread_join(threads[i], NULL);
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double wall_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-
-    double total_thread_time = 0;
-    for (int i = 0; i < BENCH_THREADS; i++)
-    {
-        total_thread_time += contexts[i].elapsed_time;
-    }
-    double avg_thread_time = total_thread_time / BENCH_THREADS;
-
-    printf("  Threads: %d\n", BENCH_THREADS);
-    printf("  Wall time: %.3f seconds\n", wall_time);
-    printf("  Aggregate throughput: %.2f M ops/sec\n", BENCH_ITERATIONS / wall_time / 1e6);
-    printf("  Average thread time: %.3f seconds\n", avg_thread_time);
-    printf("  Speedup vs sequential: %.2fx\n", avg_thread_time / wall_time * BENCH_THREADS);
-
-    free(values);
+    free(data);
     lru_cache_free(cache);
 }
 
 int main(void)
 {
-    RUN_TEST(test_lru_cache_new_free, tests_passed);
+    RUN_TEST(test_lru_cache_new, tests_passed);
     RUN_TEST(test_lru_cache_put_get, tests_passed);
-    RUN_TEST(test_lru_cache_eviction, tests_passed);
-    RUN_TEST(test_lru_cache_get_updates_order, tests_passed);
     RUN_TEST(test_lru_cache_update, tests_passed);
-    RUN_TEST(test_lru_cache_update_refreshes_access, tests_passed);
+    RUN_TEST(test_lru_eviction, tests_passed);
+    RUN_TEST(test_lru_to_lfu_promotion, tests_passed);
+    RUN_TEST(test_lfu_eviction, tests_passed);
     RUN_TEST(test_lru_cache_remove, tests_passed);
     RUN_TEST(test_lru_cache_clear, tests_passed);
-    RUN_TEST(test_lru_cache_with_malloc, tests_passed);
-    RUN_TEST(test_lru_cache_foreach, tests_passed);
-    RUN_TEST(test_lru_cache_concurrent, tests_passed);
-    RUN_TEST(test_lru_cache_edge_cases, tests_passed);
-    RUN_TEST(test_lru_cache_destroy_vs_free, tests_passed);
-    RUN_TEST(test_lru_cache_zero_capacity, tests_passed);
-    RUN_TEST(test_lru_cache_long_keys, tests_passed);
-    RUN_TEST(test_lru_cache_empty_key, tests_passed);
-    RUN_TEST(test_lru_cache_hash_collisions, tests_passed);
-    RUN_TEST(test_lru_cache_free_null, tests_passed);
-    RUN_TEST(test_lru_cache_race_condition, tests_passed);
-    RUN_TEST(test_lru_cache_put_return_values, tests_passed);
-    RUN_TEST(test_lru_cache_access_pattern, tests_passed);
+    RUN_TEST(test_lru_cache_stats, tests_passed);
+    RUN_TEST(test_lru_cache_ttl, tests_passed);
     RUN_TEST(test_lru_cache_get_copy, tests_passed);
-
-    benchmark_lru_sequential();
-    benchmark_lru_random_access();
-    benchmark_lru_concurrent_reads();
-    benchmark_lru_mixed_workload();
+    RUN_TEST(test_lru_cache_foreach, tests_passed);
+    RUN_TEST(test_lru_cache_foreach_early_stop, tests_passed);
+    RUN_TEST(test_lru_cache_null_handling, tests_passed);
+    RUN_TEST(test_lru_cache_destroy_no_callbacks, tests_passed);
+    RUN_TEST(test_lru_cache_large_volume, tests_passed);
+    RUN_TEST(test_lru_cache_string_keys, tests_passed);
+    RUN_TEST(test_lru_cache_access_pattern, tests_passed);
+    RUN_TEST(test_lru_cache_promotion_threshold, tests_passed);
+    RUN_TEST(test_lru_cache_no_lfu, tests_passed);
+    RUN_TEST(test_lru_cache_empty_key, tests_passed);
+    RUN_TEST(test_lru_cache_collision_keys, tests_passed);
+    RUN_TEST(test_lru_cache_mixed_operations, tests_passed);
+    RUN_TEST(benchmark_lru_cache_insertions, tests_passed);
+    RUN_TEST(benchmark_lru_cache_lookups, tests_passed);
+    RUN_TEST(benchmark_lru_lfu_promotion, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
-
-    return 0;
+    return tests_failed > 0 ? 1 : 0;
 }

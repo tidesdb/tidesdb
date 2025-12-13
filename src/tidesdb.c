@@ -3602,12 +3602,10 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             int32_t left = 0;
             int32_t right = (int32_t)klog_block->num_entries - 1;
             int32_t found_idx = -1;
-            uint32_t comparisons = 0;
 
             while (left <= right)
             {
                 int32_t mid = left + (right - left) / 2;
-                comparisons++;
 
                 int cmp = comparator_fn(key, key_size, klog_block->keys[mid],
                                         klog_block->entries[mid].key_size, comparator_ctx);

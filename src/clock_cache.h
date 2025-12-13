@@ -77,9 +77,14 @@ struct clock_cache_entry_t
  */
 struct clock_cache_hash_bucket_t
 {
-    _Atomic(uint32_t) head_slot_id;
+    _Atomic uint32_t head_slot_id;
     uint8_t _padding[60];
-} __attribute__((aligned(64)));
+}
+#if defined(_MSC_VER)
+;
+#else
+__attribute__((aligned(64)));
+#endif
 
 /**
  * clock_cache_entry_pool_node_t
@@ -105,12 +110,12 @@ typedef struct clock_cache_entry_pool_node_t
  */
 typedef struct
 {
-    _Atomic(clock_cache_entry_pool_node_t *) free_list;
+    _Atomic clock_cache_entry_pool_node_t *free_list;
     size_t node_size;
     size_t max_nodes;
-    _Atomic(size_t) allocated_nodes;
-    _Atomic(size_t) pool_hits;
-    _Atomic(size_t) pool_misses;
+    _Atomic size_t allocated_nodes;
+    _Atomic size_t pool_hits;
+    _Atomic size_t pool_misses;
 } clock_cache_entry_pool_t;
 
 /**
@@ -122,9 +127,14 @@ typedef struct
  */
 typedef struct
 {
-    _Atomic(clock_cache_entry_t *) entry;
+    _Atomic clock_cache_entry_t *entry;
     uint8_t _padding[56];
-} __attribute__((aligned(64))) clock_cache_slot_t;
+}
+#if defined(_MSC_VER)
+clock_cache_slot_t;
+#else
+__attribute__((aligned(64))) clock_cache_slot_t;
+#endif
 
 /**
  * clock_cache_t
@@ -150,17 +160,17 @@ struct clock_cache_t
 {
     clock_cache_slot_t *slots;
     uint32_t num_slots;
-    _Atomic(uint32_t) next_slot;
-    _Atomic(uint32_t) active_slots;
-    _Atomic(uint32_t) clock_hand;
+    _Atomic uint32_t next_slot;
+    _Atomic uint32_t active_slots;
+    _Atomic uint32_t clock_hand;
 
     clock_cache_hash_bucket_t *hash_table;
     uint32_t num_buckets;
     size_t max_bytes;
-    _Atomic(size_t) current_bytes;
+    _Atomic size_t current_bytes;
     clock_cache_entry_pool_t *entry_pool;
     pthread_t eviction_thread;
-    _Atomic(uint32_t) eviction_state;
+    _Atomic uint32_t eviction_state;
     uint32_t eviction_interval_ms;
     uint32_t max_backoff_ms;
     float eviction_threshold;

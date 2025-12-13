@@ -23,6 +23,7 @@
 #include "bloom_filter.h"
 #include "buffer.h"
 #include "clock_cache.h"
+#include "compat.h"
 #include "compress.h"
 #include "ini.h"
 #include "lru.h"

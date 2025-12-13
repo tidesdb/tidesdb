@@ -16,7 +16,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <assert.h>
 
 #include "../src/tidesdb.h"
 #include "test_utils.h"

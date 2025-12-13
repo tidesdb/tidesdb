@@ -3359,14 +3359,8 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     block_manager_get_size(bms.klog_bm, &sst->klog_size);
     block_manager_get_size(bms.vlog_bm, &sst->vlog_size);
 
-    /* ensure all sst data is durably written before it becomes visible to readers
-     * this prevents reads from seeing partially-written ssts which can cause
-     * deserialization errors and stalls */
-    if (cf->config.sync_mode == TDB_SYNC_FULL || cf->config.sync_mode == TDB_SYNC_INTERVAL)
-    {
-        if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
-        if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
-    }
+    if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
+    if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
 
     /* rebuild position cache after flush for O(1) cursor navigation
      * without this, cursors fall back to slow sequential scanning */
@@ -3722,6 +3716,20 @@ load_bloom_and_index:
         }
     }
 
+    /* validate that the sstable has the expected number of blocks
+     * if block count doesn't match metadata, the sst is corrupted
+     * (likely from interrupted write before fsync completed) */
+    if (klog_bm->block_count - SSTABLE_INTERNAL_BLOCKS != sst->num_klog_blocks)
+    {
+        TDB_DEBUG_LOG(
+            "SSTable %s: Block count mismatch (file has %zu blocks, metadata says %" PRIu64
+            ") - corrupted or incomplete write",
+            sst->klog_path, klog_bm->block_count - SSTABLE_INTERNAL_BLOCKS, sst->num_klog_blocks);
+        block_manager_close(klog_bm);
+        block_manager_close(vlog_bm);
+        return TDB_ERR_CORRUPTION;
+    }
+
     block_manager_cursor_t *cursor;
     if (block_manager_cursor_init(&cursor, klog_bm) != 0)
     {
@@ -3930,35 +3938,29 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
                 continue;
             }
 
-            /* try to atomically reserve slot by incrementing count */
+            /* write sst pointer to array first, before incrementing count
+             * this prevents readers from seeing incremented count while slot is unpopulated */
+            old_arr[old_num] = sst;
+
+            /* ensure write is visible before count increment */
+            atomic_thread_fence(memory_order_release);
+
+            /* now atomically increment count to publish the new sst */
             if (atomic_compare_exchange_strong_explicit(&level->num_sstables, &expected,
                                                         old_num + 1, memory_order_release,
                                                         memory_order_acquire))
             {
-                /* success! we reserved slot at index old_num */
-                /* verify array pointer hasn't changed (another thread might have resized) */
-                tidesdb_sstable_t **current_arr =
-                    atomic_load_explicit(&level->sstables, memory_order_acquire);
-                if (current_arr != old_arr)
-                {
-                    /* array was resized, write to the NEW array at our reserved index */
-                    current_arr[old_num] = sst;
-                    atomic_thread_fence(memory_order_release);
-                    atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
-                                              memory_order_relaxed);
-                    return TDB_SUCCESS;
-                }
-
-                /* array is still valid, write to our reserved slot */
-                old_arr[old_num] = sst;
-
-                /* ensure write is visible */
-                atomic_thread_fence(memory_order_release);
-
-                /* update size */
+                /* success! sst is now visible to readers */
                 atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                           memory_order_relaxed);
                 return TDB_SUCCESS;
+            }
+            else
+            {
+                /* CAS failed -- another thread modified count
+                 * clear the slot we wrote to and retry */
+                old_arr[old_num] = NULL;
+                atomic_thread_fence(memory_order_release);
             }
             /* CAS failed, another thread modified count, retry */
         }
@@ -4590,6 +4592,15 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
                 data_size = decompressed_size;
                 /* keep decompressed buffer, deserialized pointers reference it */
                 source->source.sstable.decompressed_data = decompressed;
+            }
+            else
+            {
+                /* decompression failed (corrupted block), clean up and return NULL */
+                block_manager_block_release(block);
+                tidesdb_sstable_unref(db, sst);
+                block_manager_cursor_free(source->source.sstable.klog_cursor);
+                free(source);
+                return NULL;
             }
         }
 
@@ -6025,13 +6036,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     tidesdb_merge_heap_free(heap);
 
-    /* we lways sync compacted sstable files regardless of sync_mode
-     * new sstable durability is required before we can delete old sstables */
-    if (cf->config.sync_mode == TDB_SYNC_FULL || cf->config.sync_mode == TDB_SYNC_INTERVAL)
-    {
-        block_manager_escalate_fsync(klog_bm);
-        block_manager_escalate_fsync(vlog_bm);
-    }
+    block_manager_escalate_fsync(klog_bm);
+    block_manager_escalate_fsync(vlog_bm);
 
     block_manager_close(klog_bm);
     block_manager_close(vlog_bm);
@@ -6107,6 +6113,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
         /* find which level this sst belongs to and remove it -- break on first success */
         int removed = 0;
+        int removed_level = -1;
         for (int level = start_level; level <= target_level && level < num_levels; level++)
         {
             tidesdb_level_t *lvl = cf->levels[level];
@@ -6116,8 +6123,20 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                 TDB_DEBUG_LOG("Full preemptive merge: Removed SSTable %" PRIu64 " from level %d",
                               sst->id, lvl->level_num);
                 removed = 1;
+                removed_level = lvl->level_num;
                 break; /* found and removed, no need to check other levels */
             }
+        }
+        if (removed)
+        {
+            /* remove from manifest */
+            pthread_rwlock_wrlock(&cf->manifest_lock);
+            tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
+            char manifest_path[TDB_MAX_PATH_LEN];
+            snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
+                     TDB_COLUMN_FAMILY_MANIFEST_NAME);
+            tidesdb_manifest_commit(cf->manifest, manifest_path);
+            pthread_rwlock_unlock(&cf->manifest_lock);
         }
         if (!removed)
         {
@@ -6973,13 +6992,27 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
             /* try to remove from each level -- break on first success since each sst is only in one
              * level */
+            int removed_level = -1;
             for (int level = 0; level <= target_level && level < current_num_levels; level++)
             {
                 int result = tidesdb_level_remove_sstable(cf->db, cf->levels[level], sst);
                 if (result == TDB_SUCCESS)
                 {
+                    removed_level = cf->levels[level]->level_num;
                     break; /* found and removed, no need to check other levels */
                 }
+            }
+
+            /* remove from manifest if successfully removed from level */
+            if (removed_level != -1)
+            {
+                pthread_rwlock_wrlock(&cf->manifest_lock);
+                tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
+                char manifest_path[TDB_MAX_PATH_LEN];
+                snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s",
+                         cf->directory, TDB_COLUMN_FAMILY_MANIFEST_NAME);
+                tidesdb_manifest_commit(cf->manifest, manifest_path);
+                pthread_rwlock_unlock(&cf->manifest_lock);
             }
 
             /* release the reference we took when collecting sstables */
@@ -7794,13 +7827,27 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
         /* try to remove from each level -- break on first success since each sst is only in one
          * level */
+        int removed_level = -1;
         for (int level_idx = start_idx; level_idx <= end_idx; level_idx++)
         {
             int result = tidesdb_level_remove_sstable(cf->db, cf->levels[level_idx], sst);
             if (result == TDB_SUCCESS)
             {
+                removed_level = cf->levels[level_idx]->level_num;
                 break; /* found and removed, no need to check other levels */
             }
+        }
+
+        /* remove from manifest if successfully removed from level */
+        if (removed_level != -1)
+        {
+            pthread_rwlock_wrlock(&cf->manifest_lock);
+            tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
+            char manifest_path[TDB_MAX_PATH_LEN];
+            snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
+                     TDB_COLUMN_FAMILY_MANIFEST_NAME);
+            tidesdb_manifest_commit(cf->manifest, manifest_path);
+            pthread_rwlock_unlock(&cf->manifest_lock);
         }
 
         /* release the reference we took when collecting sstables */
@@ -8401,6 +8448,12 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
         cf->wal_group_buffer = NULL;
     }
 
+    if (cf->manifest)
+    {
+        pthread_rwlock_destroy(&cf->manifest_lock);
+        tidesdb_manifest_free(cf->manifest);
+    }
+
     free(cf->name);
     free(cf->directory);
     free(cf);
@@ -8502,11 +8555,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         tidesdb_block_managers_t bms;
         if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
         {
-            if (cf->config.sync_mode == TDB_SYNC_FULL || cf->config.sync_mode == TDB_SYNC_INTERVAL)
-            {
-                if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
-                if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
-            }
+            if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
+            if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
 
             /* rebuild position cache for O(1) cursor navigation */
             if (bms.klog_bm) block_manager_build_position_cache(bms.klog_bm);
@@ -8562,9 +8612,20 @@ static void *tidesdb_flush_worker_thread(void *arg)
                       ") to level %d (array index 0)",
                       cf->name, work->sst_id, sst->max_seq, cf->levels[0]->level_num);
 
+        /* commit sstable to manifest before deleting WAL
+         * this ensures crash recovery knows which sstables are complete */
+        pthread_rwlock_wrlock(&cf->manifest_lock);
+        tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries, sst->size);
+        char manifest_path[TDB_MAX_PATH_LEN];
+        snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
+                 TDB_COLUMN_FAMILY_MANIFEST_NAME);
+        tidesdb_manifest_commit(cf->manifest, manifest_path);
+        pthread_rwlock_unlock(&cf->manifest_lock);
+
         /* release our reference -- the level now owns it */
         tidesdb_sstable_unref(cf->db, sst);
 
+        /* safe to delete WAL -- sstable is committed to manifest */
         if (wal)
         {
             char *wal_path_to_delete = tdb_strdup(wal->file_path);
@@ -8806,9 +8867,7 @@ static void *tidesdb_sync_worker_thread(void *arg)
                 block_manager_t *wal = atomic_load(&cf->active_wal);
                 if (wal)
                 {
-                    if (cf->config.sync_mode == TDB_SYNC_FULL ||
-                        cf->config.sync_mode == TDB_SYNC_INTERVAL)
-                        block_manager_escalate_fsync(wal);
+                    block_manager_escalate_fsync(wal);
                 }
             }
         }
@@ -9301,12 +9360,8 @@ int tidesdb_close(tidesdb_t *db)
                     atomic_load_explicit(&cf->active_wal, memory_order_acquire);
                 if (active_wal)
                 {
-                    if (cf->config.sync_mode == TDB_SYNC_FULL ||
-                        cf->config.sync_mode == TDB_SYNC_INTERVAL)
-                    {
-                        block_manager_escalate_fsync(active_wal);
-                        TDB_DEBUG_LOG("CF '%s': WAL synced before close", cf->name);
-                    }
+                    block_manager_escalate_fsync(active_wal);
+                    TDB_DEBUG_LOG("CF '%s': WAL synced before close", cf->name);
                 }
 
                 /* retry flush with backoff to prevent data loss */
@@ -9888,6 +9943,34 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     cf->wal_group_buffer_capacity = TDB_WAL_GROUP_COMMIT_BUFFER_SIZE;
     atomic_init(&cf->wal_group_leader, 0);
     atomic_init(&cf->wal_group_waiters, 0);
+
+    /* initialize manifest for tracking sstable state */
+    char manifest_path[TDB_MAX_PATH_LEN];
+    snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
+             TDB_COLUMN_FAMILY_MANIFEST_NAME);
+    cf->manifest = tidesdb_manifest_load(manifest_path);
+    if (!cf->manifest)
+    {
+        /* cleanup all created levels */
+        for (int cleanup_idx = 0; cleanup_idx < min_levels; cleanup_idx++)
+        {
+            if (cf->levels[cleanup_idx])
+            {
+                tidesdb_level_free(db, cf->levels[cleanup_idx]);
+            }
+        }
+        free(cf->wal_group_buffer);
+        pthread_mutex_destroy(&cf->wal_group_commit_lock);
+        pthread_cond_destroy(&cf->wal_group_commit_cond);
+        block_manager_close(atomic_load(&cf->active_wal));
+        queue_free(cf->immutable_memtables);
+        skip_list_free(atomic_load(&cf->active_memtable));
+        free(cf->directory);
+        free(cf->name);
+        free(cf);
+        return TDB_ERR_MEMORY;
+    }
+    pthread_rwlock_init(&cf->manifest_lock, NULL);
 
     if (buffer_new_with_eviction(&cf->active_txn_buffer, TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE,
                                  txn_entry_evict, NULL) != 0)
@@ -13769,6 +13852,29 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             if (parsed)
             {
                 uint64_t sst_id = (uint64_t)sst_id_ull;
+
+                /* check manifest to see if this sstable is complete
+                 * only load sstables that are in the manifest */
+                pthread_rwlock_rdlock(&cf->manifest_lock);
+                int in_manifest = tidesdb_manifest_has_sstable(cf->manifest, level_num, sst_id);
+                pthread_rwlock_unlock(&cf->manifest_lock);
+
+                if (!in_manifest)
+                {
+                    /* sstable not in manifest = incomplete/corrupted, delete it */
+                    TDB_DEBUG_LOG("CF '%s': SSTable %" PRIu64
+                                  " at level %d not in manifest, deleting (incomplete write)",
+                                  cf->name, sst_id, level_num);
+
+                    char klog_path[TDB_MAX_PATH_LEN];
+                    char vlog_path[TDB_MAX_PATH_LEN];
+                    snprintf(klog_path, sizeof(klog_path), "%s_%" PRIu64 ".klog", sst_base, sst_id);
+                    snprintf(vlog_path, sizeof(vlog_path), "%s_%" PRIu64 ".vlog", sst_base, sst_id);
+                    unlink(klog_path);
+                    unlink(vlog_path);
+                    continue;
+                }
+
                 tidesdb_sstable_t *sst =
                     tidesdb_sstable_create(cf->db, sst_base, sst_id, &cf->config);
                 if (sst)

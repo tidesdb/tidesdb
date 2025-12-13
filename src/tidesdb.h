@@ -25,6 +25,7 @@
 #include "compress.h"
 #include "ini.h"
 #include "lru.h"
+#include "manifest.h"
 #include "queue.h"
 #include "skip_list.h"
 
@@ -183,17 +184,19 @@ typedef enum
 typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                      size_t key2_size, void *ctx);
 
-#define TDB_WAL_PREFIX                "wal_"
-#define TDB_WAL_EXT                   ".log"
-#define TDB_COLUMN_FAMILY_CONFIG_NAME "config"
-#define TDB_COLUMN_FAMILY_CONFIG_EXT  ".ini"
-#define TDB_LEVEL_PREFIX              "L"
-#define TDB_LEVEL_PARTITION_PREFIX    "P"
-#define TDB_SSTABLE_KLOG_EXT          ".klog"
-#define TDB_SSTABLE_VLOG_EXT          ".vlog"
-#define TDB_SSTABLE_CACHE_PREFIX      "sst_"
-#define TDB_CACHE_KEY_SIZE            256
-#define SSTABLE_METADATA_MAGIC        0x5353544D
+#define TDB_WAL_PREFIX                  "wal_"
+#define TDB_WAL_EXT                     ".log"
+#define TDB_COLUMN_FAMILY_CONFIG_NAME   "config"
+#define TDB_COLUMN_FAMILY_MANIFEST_NAME "manifest"
+#define TDB_COLUMN_FAMILY_CONFIG_EXT    ".ini"
+#define TDB_LEVEL_PREFIX                "L"
+#define TDB_LEVEL_PARTITION_PREFIX      "P"
+#define TDB_SSTABLE_KLOG_EXT            ".klog"
+#define TDB_SSTABLE_VLOG_EXT            ".vlog"
+#define TDB_SSTABLE_CACHE_PREFIX        "sst_"
+#define TDB_CACHE_KEY_SIZE              256
+#define SSTABLE_METADATA_MAGIC          0x5353544D
+#define SSTABLE_INTERNAL_BLOCKS         3
 
 #define TDB_STACK_SSTS          64
 #define TDB_ITER_STACK_KEY_SIZE 256
@@ -673,6 +676,8 @@ typedef struct
  * @param wal_group_buffer_capacity total capacity of buffer
  * @param wal_group_leader atomic flag indicating a thread is leading group commit
  * @param wal_group_waiters number of threads waiting for group commit
+ * @param manifest manifest for column family
+ * @param manifest_lock mutex for manifest operations
  * @param db parent database reference
  */
 struct tidesdb_column_family_t
@@ -700,6 +705,9 @@ struct tidesdb_column_family_t
     size_t wal_group_buffer_capacity;
     _Atomic(int) wal_group_leader;
     _Atomic(int) wal_group_waiters;
+
+    tidesdb_manifest_t *manifest;
+    pthread_rwlock_t manifest_lock;
 
     tidesdb_t *db;
 };

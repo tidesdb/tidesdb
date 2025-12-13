@@ -3714,15 +3714,12 @@ load_bloom_and_index:
                         sst->block_indexes =
                             compact_block_index_deserialize(index_block->data, index_block->size);
 
-                        /* we set comparator after deserialization */
+                        /* use cached comparator from config (already resolved during CF creation)
+                         * this avoids hash table lookup for every sst during recovery */
                         if (sst->block_indexes)
                         {
-                            skip_list_comparator_fn comparator_fn = NULL;
-                            void *comparator_ctx = NULL;
-                            tidesdb_resolve_comparator(db, sst->config, &comparator_fn,
-                                                       &comparator_ctx);
-                            sst->block_indexes->comparator = comparator_fn;
-                            sst->block_indexes->comparator_ctx = comparator_ctx;
+                            sst->block_indexes->comparator = sst->config->comparator_fn_cached;
+                            sst->block_indexes->comparator_ctx = sst->config->comparator_ctx_cached;
                         }
                     }
                     block_manager_block_release(index_block);
@@ -11652,7 +11649,8 @@ skip_ssi_check:
 
         skip_list_t *memtable = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
 
-#define TXN_KEY_HASH_SIZE 1024
+#define TXN_KEY_HASH_SIZE   1024
+#define TXN_STACK_HASH_SIZE 256
         typedef struct
         {
             uint8_t *key;
@@ -11660,39 +11658,29 @@ skip_ssi_check:
             tidesdb_column_family_t *cf;
         } seen_key_t;
 
-        seen_key_t *seen_keys = calloc(TXN_KEY_HASH_SIZE, sizeof(seen_key_t));
-        if (!seen_keys)
+        /* use stack allocation for small transactions to avoid malloc failure path
+         * this ensures O(N) dedup even under memory pressure */
+        seen_key_t stack_hash[TXN_STACK_HASH_SIZE];
+        memset(stack_hash, 0, sizeof(stack_hash));
+
+        seen_key_t *seen_keys = stack_hash;
+        int hash_size = TXN_STACK_HASH_SIZE;
+        int needs_free = 0;
+
+        /* for large transactions, try heap allocation for better hash distribution */
+        if (txn->num_ops > TXN_STACK_HASH_SIZE)
         {
-            for (int i = 0; i < txn->num_ops; i++)
+            seen_key_t *heap_hash = calloc(TXN_KEY_HASH_SIZE, sizeof(seen_key_t));
+            if (heap_hash)
             {
-                tidesdb_txn_op_t *op = &txn->ops[i];
-                if (op->cf != cf) continue;
-
-                int is_superseded = 0;
-                for (int j = i + 1; j < txn->num_ops; j++)
-                {
-                    tidesdb_txn_op_t *later_op = &txn->ops[j];
-                    if (later_op->cf == cf && later_op->key_size == op->key_size &&
-                        memcmp(later_op->key, op->key, op->key_size) == 0)
-                    {
-                        is_superseded = 1;
-                        break;
-                    }
-                }
-                if (is_superseded) continue;
-
-                int put_result =
-                    skip_list_put_with_seq(memtable, op->key, op->key_size, op->value,
-                                           op->value_size, op->ttl, txn->commit_seq, op->is_delete);
-                if (put_result != 0)
-                {
-                    /* error path -- use relaxed since we're aborting anyway */
-                    atomic_fetch_sub_explicit(&cf->pending_commits, 1, memory_order_relaxed);
-                    return TDB_ERR_IO;
-                }
+                seen_keys = heap_hash;
+                hash_size = TXN_KEY_HASH_SIZE;
+                needs_free = 1;
             }
+            /* else fall back to stack hash -- still O(N) with more collisions */
         }
-        else
+
+        /* always use hash-based dedup (O(N)) -- no O(N²) fallback */
         {
             for (int i = txn->num_ops - 1; i >= 0; i--)
             {
@@ -11702,12 +11690,12 @@ skip_ssi_check:
                 uint32_t hash = 0;
                 for (size_t b = 0; b < op->key_size; b++)
                 {
-                    hash = (hash * 31 + op->key[b]) % TXN_KEY_HASH_SIZE;
+                    hash = hash * 31 + op->key[b];
                 }
 
-                int slot = hash;
+                int slot = hash % hash_size;
                 int found = 0;
-                for (int probe = 0; probe < TXN_KEY_HASH_SIZE; probe++)
+                for (int probe = 0; probe < hash_size; probe++)
                 {
                     if (seen_keys[slot].key == NULL)
                     {
@@ -11722,7 +11710,7 @@ skip_ssi_check:
                         found = 1;
                         break;
                     }
-                    slot = (slot + 1) % TXN_KEY_HASH_SIZE;
+                    slot = (slot + 1) % hash_size;
                 }
 
                 if (found) continue;
@@ -11732,13 +11720,13 @@ skip_ssi_check:
                                            op->value_size, op->ttl, txn->commit_seq, op->is_delete);
                 if (put_result != 0)
                 {
-                    free(seen_keys);
+                    if (needs_free) free(seen_keys);
                     /* error path -- use relaxed since we're aborting anyway */
                     atomic_fetch_sub_explicit(&cf->pending_commits, 1, memory_order_relaxed);
                     return TDB_ERR_IO;
                 }
             }
-            free(seen_keys);
+            if (needs_free) free(seen_keys);
         }
 
         atomic_thread_fence(memory_order_seq_cst);
@@ -13764,6 +13752,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     {
         size_t imm_count = queue_size(cf->immutable_memtables);
 
+        /* skip lists are ordered by seq, so just check the last entry
+         * this changes O(N) full scan to O(1) lookup */
         for (size_t i = 0; i < imm_count; i++)
         {
             tidesdb_immutable_memtable_t *imm = queue_peek_at(cf->immutable_memtables, i);
@@ -13772,26 +13762,23 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                 skip_list_cursor_t *cursor;
                 if (skip_list_cursor_init(&cursor, imm->memtable) == 0)
                 {
-                    if (skip_list_cursor_goto_first(cursor) == 0)
+                    /* jump directly to last entry (highest seq) */
+                    if (skip_list_cursor_goto_last(cursor) == 0)
                     {
-                        do
-                        {
-                            uint8_t *key, *value;
-                            size_t key_size, value_size;
-                            time_t ttl;
-                            uint8_t deleted;
-                            uint64_t seq;
+                        uint8_t *key, *value;
+                        size_t key_size, value_size;
+                        time_t ttl;
+                        uint8_t deleted;
+                        uint64_t seq;
 
-                            if (skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value,
-                                                              &value_size, &ttl, &deleted,
-                                                              &seq) == 0)
+                        if (skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value,
+                                                          &value_size, &ttl, &deleted, &seq) == 0)
+                        {
+                            if (seq > global_max_seq)
                             {
-                                if (seq > global_max_seq)
-                                {
-                                    global_max_seq = seq;
-                                }
+                                global_max_seq = seq;
                             }
-                        } while (skip_list_cursor_next(cursor) == 0);
+                        }
                     }
                     skip_list_cursor_free(cursor);
                 }

@@ -229,6 +229,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      (1024 * 64)
 #define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_SYNC_INTERVAL_US            128000
+#define TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE      0
 #define TDB_TXN_TIMEOUT_SECONDS                 30
 #define TDB_COMMIT_STATUS_BUFFER_SIZE           65536
 #define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE        (4 * 1024 * 1024)
@@ -408,6 +409,8 @@ typedef struct
  * @param enable_debug_logging enable debug logging
  * @param block_cache_size size of block cache in bytes
  * @param max_open_sstables maximum number of open sstables
+ * @param wait_for_txns_on_close if true, wait up to defined time for active transactions on close
+ *                                if false (default), close immediately and fail active transactions
  */
 typedef struct
 {
@@ -417,6 +420,7 @@ typedef struct
     int enable_debug_logging;
     size_t block_cache_size;
     size_t max_open_sstables;
+    int wait_for_txns_on_close;
 } tidesdb_config_t;
 
 /**
@@ -1074,6 +1078,17 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator
 /**
  * tidesdb_close
  * closes a database
+ *
+ * behavior depends on config.wait_for_txns_on_close:
+ * - false (default) -- proceeds immediately with close. active transactions will fail
+ *   on next operation with TDB_ERR_INVALID_DB. this is the recommended behavior
+ *   used by RocksDB, LevelDB, etc. Close completes in < N-ms.
+ * - true -- waits up to n seconds for active transactions to complete. If timeout
+ *   expires, aborts close and returns TDB_ERR_UNKNOWN. This is legacy behavior
+ *   that can cause unpredictable latency and potential deadlocks.
+ *
+ * applications should finish all transactions before calling close.
+ *
  * @param db database handle
  * @return 0 on success, -n on failure
  */

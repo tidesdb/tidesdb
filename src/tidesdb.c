@@ -1119,6 +1119,7 @@ tidesdb_config_t tidesdb_default_config(void)
                                .num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE,
                                .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
                                .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
+                               .wait_for_txns_on_close = TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE,
                                .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES};
     return config;
 }
@@ -9357,39 +9358,54 @@ int tidesdb_close(tidesdb_t *db)
      * allowing active threads to exit faster */
     atomic_store_explicit(&db->is_open, 0, memory_order_release);
 
-    /* wait for all active transactions to complete before closing
-     * this prevents use-after-free when transactions access cf/sstable during close */
-    TDB_DEBUG_LOG("Waiting for active transactions to complete");
-    int txn_wait_count = 0;
-    while (txn_wait_count < TDB_CLOSE_TXN_WAIT_MAX_MS)
-    {
-        int active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
-
-        if (active_count == 0)
-        {
-            break;
-        }
-
-        if (txn_wait_count % 100 == 0 && txn_wait_count > 0)
-        {
-            TDB_DEBUG_LOG("Still waiting for %d active transactions (waited %dms)", active_count,
-                          txn_wait_count);
-        }
-
-        usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
-        txn_wait_count++;
-    }
-
+    /* handle active transactions based on config */
     int final_active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
 
-    if (final_active_count > 0)
+    if (db->config.wait_for_txns_on_close)
     {
-        TDB_DEBUG_LOG("ERROR: Cannot close database - %d transactions still active after %dms",
-                      final_active_count, TDB_CLOSE_TXN_WAIT_MAX_MS);
-        TDB_DEBUG_LOG("Database is in inconsistent state - is_open=0 but resources not freed");
-        /* restore is_open flag since we're aborting the close */
-        atomic_store_explicit(&db->is_open, 1, memory_order_release);
-        return TDB_ERR_UNKNOWN;
+        TDB_DEBUG_LOG("Waiting for active transactions to complete (wait_for_txns_on_close=true)");
+        int txn_wait_count = 0;
+        while (txn_wait_count < TDB_CLOSE_TXN_WAIT_MAX_MS)
+        {
+            int active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
+
+            if (active_count == 0)
+            {
+                break;
+            }
+
+            if (txn_wait_count % 100 == 0 && txn_wait_count > 0)
+            {
+                TDB_DEBUG_LOG("Still waiting for %d active transactions (waited %dms)",
+                              active_count, txn_wait_count);
+            }
+
+            usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
+            txn_wait_count++;
+        }
+
+        final_active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
+
+        if (final_active_count > 0)
+        {
+            TDB_DEBUG_LOG("ERROR: Cannot close database - %d transactions still active after %dms",
+                          final_active_count, TDB_CLOSE_TXN_WAIT_MAX_MS);
+            TDB_DEBUG_LOG("Database is in inconsistent state - is_open=0 but resources not freed");
+            /* restore is_open flag since we're aborting the close */
+            atomic_store_explicit(&db->is_open, 1, memory_order_release);
+            return TDB_ERR_UNKNOWN;
+        }
+    }
+    else
+    {
+        /* proceed immediately with close
+         * active transactions will fail on next operation with TDB_ERR_INVALID_DB
+         * this is the recommended behavior used by RocksDB, LevelDB, etc. */
+        if (final_active_count > 0)
+        {
+            TDB_DEBUG_LOG("Closing with %d active transactions - they will fail (fast-fail mode)",
+                          final_active_count);
+        }
     }
 
     TDB_DEBUG_LOG("All active transactions completed");

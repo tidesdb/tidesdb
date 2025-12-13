@@ -13611,7 +13611,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
                     TDB_DEBUG_LOG("CF '%s': No saved config found, using defaults", entry->d_name);
                 }
 
-            create_cf_with_config:
+            create_cf_with_config:;
                 int create_result = tidesdb_create_column_family(db, entry->d_name, &config);
 
                 if (create_result == TDB_SUCCESS)

@@ -854,11 +854,6 @@ typedef struct
  * @param read_cfs array of column families for each read key
  * @param read_set_count number of read keys
  * @param read_set_capacity capacity of read keys array
- * @param write_keys array of write keys for conflict detection
- * @param write_key_sizes array of write key sizes
- * @param write_cfs array of column families for each write key
- * @param write_set_count number of write keys
- * @param write_set_capacity capacity of write keys array
  * @param write_set_hash hash table for O(1) write set lookup (NULL if num_ops < 256)
  * @param read_set_hash hash table for O(1) read set lookup (NULL if read_set_count < 256)
  * @param cfs array of column families involved in transaction
@@ -891,11 +886,6 @@ struct tidesdb_txn_t
     tidesdb_column_family_t **read_cfs;
     int read_set_count;
     int read_set_capacity;
-    uint8_t **write_keys;
-    size_t *write_key_sizes;
-    tidesdb_column_family_t **write_cfs;
-    int write_set_count;
-    int write_set_capacity;
     void *write_set_hash;
     void *read_set_hash;
     tidesdb_column_family_t **cfs;

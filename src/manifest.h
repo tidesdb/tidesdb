@@ -21,6 +21,7 @@
 
 #define MANIFEST_INITIAL_CAPACITY 64
 #define MANIFEST_VERSION          1
+#define MANIFEST_PATH_LEN         4096
 
 #include "compat.h"
 

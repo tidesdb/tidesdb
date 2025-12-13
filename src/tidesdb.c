@@ -6084,6 +6084,18 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                           " to level %d (array index %d)",
                           new_sst->id, cf->levels[target_idx]->level_num, target_idx);
             tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
+
+            /* add new sstable to manifest */
+            pthread_rwlock_wrlock(&cf->manifest_lock);
+            tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
+                                         new_sst->id, new_sst->num_entries,
+                                         new_sst->klog_size + new_sst->vlog_size);
+            char manifest_path[TDB_MAX_PATH_LEN];
+            snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
+                     TDB_COLUMN_FAMILY_MANIFEST_NAME);
+            tidesdb_manifest_commit(cf->manifest, manifest_path);
+            pthread_rwlock_unlock(&cf->manifest_lock);
+
             tidesdb_sstable_unref(cf->db, new_sst);
         }
     }
@@ -6961,6 +6973,18 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                               partition, new_sst->id, cf->levels[target_idx]->level_num,
                               target_idx);
                 tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
+
+                /* add new sstable to manifest */
+                pthread_rwlock_wrlock(&cf->manifest_lock);
+                tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
+                                             new_sst->id, new_sst->num_entries,
+                                             new_sst->klog_size + new_sst->vlog_size);
+                char manifest_path[TDB_MAX_PATH_LEN];
+                snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s",
+                         cf->directory, TDB_COLUMN_FAMILY_MANIFEST_NAME);
+                tidesdb_manifest_commit(cf->manifest, manifest_path);
+                pthread_rwlock_unlock(&cf->manifest_lock);
+
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
         }
@@ -7789,6 +7813,17 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 }
 
                 tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
+
+                /* add new sstable to manifest */
+                pthread_rwlock_wrlock(&cf->manifest_lock);
+                tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
+                                             new_sst->id, new_sst->num_entries,
+                                             new_sst->klog_size + new_sst->vlog_size);
+                char manifest_path[TDB_MAX_PATH_LEN];
+                snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s",
+                         cf->directory, TDB_COLUMN_FAMILY_MANIFEST_NAME);
+                tidesdb_manifest_commit(cf->manifest, manifest_path);
+                pthread_rwlock_unlock(&cf->manifest_lock);
 
                 TDB_DEBUG_LOG("Partitioned merge partition %d complete: Created SSTable %" PRIu64
                               " with %" PRIu64 " entries, %" PRIu64 " klog blocks, %" PRIu64

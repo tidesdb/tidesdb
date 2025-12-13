@@ -18,6 +18,7 @@
  */
 
 #include "../src/manifest.h"
+#include "../src/tidesdb.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
@@ -352,6 +353,45 @@ void test_manifest_persistence_cycle()
     remove(TEST_MANIFEST_PATH);
 }
 
+void test_manifest_auto_compaction()
+{
+    /* create a test directory and manifest */
+    mkdir("./test_manifest_dir", TDB_DIR_PERMISSIONS);
+
+    tidesdb_manifest_t *m1 = tidesdb_manifest_create();
+
+    /* add entries for SSTables */
+    tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536);
+    tidesdb_manifest_add_sstable(m1, 1, 101, 1500, 98304);
+    tidesdb_manifest_add_sstable(m1, 2, 200, 2000, 131072);
+
+    /* create actual SSTable files for some entries */
+    FILE *f1 = fopen("./test_manifest_dir/L1_100.klog", "w");
+    fclose(f1);
+    FILE *f2 = fopen("./test_manifest_dir/L2_200.klog", "w");
+    fclose(f2);
+    /* intentionally don't create L1_101.klog - it's a stale entry */
+
+    /* commit manifest */
+    ASSERT_EQ(tidesdb_manifest_commit(m1, "./test_manifest_dir/manifest"), 0);
+    tidesdb_manifest_free(m1);
+
+    /* load manifest - should auto-compact and remove stale entry */
+    tidesdb_manifest_t *m2 = tidesdb_manifest_load("./test_manifest_dir/manifest");
+    ASSERT_TRUE(m2 != NULL);
+
+    /* should only have 2 entries now (101 was removed) */
+    ASSERT_EQ(m2->num_entries, 2);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 1, 100));
+    ASSERT_FALSE(tidesdb_manifest_has_sstable(m2, 1, 101)); /* removed */
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 2, 200));
+
+    tidesdb_manifest_free(m2);
+
+    /* cleanup */
+    remove_directory("./test_manifest_dir");
+}
+
 int main()
 {
     printf("\n" BOLDCYAN "Running Manifest Tests...\n" RESET);
@@ -368,6 +408,7 @@ int main()
     RUN_TEST(test_manifest_atomic_commit, tests_passed);
     RUN_TEST(test_manifest_multiple_levels, tests_passed);
     RUN_TEST(test_manifest_persistence_cycle, tests_passed);
+    RUN_TEST(test_manifest_auto_compaction, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

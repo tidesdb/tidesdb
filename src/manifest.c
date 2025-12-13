@@ -91,6 +91,98 @@ tidesdb_manifest_t *tidesdb_manifest_load(const char *path)
     }
 
     fclose(f);
+
+    /* compact manifest -- remove entries for sstables that no longer exist on disk
+     * this prevents manifest from growing indefinitely with stale entries
+     * only run if manifest is in a real directory (not current dir)
+     * skip for test manifests in current directory */
+    char dir_path[MANIFEST_PATH_LEN];
+    const char *last_sep = strrchr(path, '/');
+    if (!last_sep) last_sep = strrchr(path, '\\');
+
+    /* only compact if manifest is in a real subdirectory (not . or ./) */
+    if (last_sep && (last_sep - path) > 0)
+    {
+        size_t dir_len = last_sep - path;
+        if (dir_len < sizeof(dir_path) && dir_len > 1) /* skip "." */
+        {
+            memcpy(dir_path, path, dir_len);
+            dir_path[dir_len] = '\0';
+
+            /* verify each sstable exists, remove if not */
+            int i = 0;
+            int removed_count = 0;
+            while (i < manifest->num_entries)
+            {
+                tidesdb_manifest_entry_t *entry = &manifest->entries[i];
+
+                /* check both partitioned and non-partitioned formats
+                 * we don't know which format was used, so try both */
+                int exists = 0;
+                struct stat st;
+
+                /* ensure we have room for path + filename (conservative estimate: 100 bytes) */
+                if (dir_len + 100 >= MANIFEST_PATH_LEN)
+                {
+                    /* path too long, skip this entry */
+                    i++;
+                    continue;
+                }
+
+                /* try non-partitioned format: L{level}_{id}.klog */
+                char klog_path[MANIFEST_PATH_LEN];
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
+                (void)snprintf(klog_path, sizeof(klog_path), "%s/L%d_%" PRIu64 ".klog", dir_path,
+                               entry->level, entry->id);
+                if (stat(klog_path, &st) == 0)
+                {
+                    exists = 1;
+                }
+                else
+                {
+                    /* try partitioned formats: L{level}P{partition}_{id}.klog
+                     * check common partition numbers (0-15 should cover most cases) */
+                    for (int p = 0; p < 16 && !exists; p++)
+                    {
+                        (void)snprintf(klog_path, sizeof(klog_path), "%s/L%dP%d_%" PRIu64 ".klog",
+                                       dir_path, entry->level, p, entry->id);
+                        if (stat(klog_path, &st) == 0)
+                        {
+                            exists = 1;
+                            break;
+                        }
+                    }
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
+                }
+
+                if (!exists)
+                {
+                    /* file doesn't exist in any format, remove from manifest */
+                    memmove(&manifest->entries[i], &manifest->entries[i + 1],
+                            sizeof(tidesdb_manifest_entry_t) * (manifest->num_entries - i - 1));
+                    manifest->num_entries--;
+                    removed_count++;
+                    /* don't increment i, check the same position again */
+                }
+                else
+                {
+                    i++;
+                }
+            }
+
+            /* if we removed any entries, commit the compacted manifest */
+            if (removed_count > 0)
+            {
+                tidesdb_manifest_commit(manifest, path);
+            }
+        }
+    }
+
     return manifest;
 }
 
@@ -177,7 +269,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     if (!manifest || !path) return -1;
 
     /* write to temp file */
-    char temp_path[1024];
+    char temp_path[MANIFEST_PATH_LEN];
     snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
 
     FILE *f = fopen(temp_path, "w");

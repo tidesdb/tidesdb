@@ -7737,8 +7737,6 @@ void test_concurrent_read_close_race(void)
     int reads_before_close = atomic_load(&success_count);
     printf("Reads completed before close: %d\n", reads_before_close);
 
-    tidesdb_close(db);
-
     atomic_store(&should_stop, 1);
 
     printf("Waiting for read threads to finish...\n");
@@ -7751,7 +7749,7 @@ void test_concurrent_read_close_race(void)
     int final_failure = atomic_load(&failure_count);
 
     printf("Read results: success=%d, failure=%d\n", final_success, final_failure);
-
+    tidesdb_close(db);
     cleanup_test_dir();
 
 #undef TEST_NUM_KEYS

@@ -270,6 +270,9 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US     10000
 #define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS 100
 #define TDB_CLOSE_TXN_WAIT_MAX_MS              5000
+#define TDB_CLOSE_FLUSH_WAIT_MAX_MS            10000
+#define TDB_OPENING_BACKOFF_MS                 1000
+#define TDB_OPENING_WAIT_MAX_MS                100
 
 /* backpressure configuration */
 #define TDB_BACKPRESSURE_THRESHOLD_L0_FULL     100
@@ -737,6 +740,8 @@ struct tidesdb_compaction_work_t
  * @param column_families array of column families
  * @param num_column_families number of column families
  * @param cf_capacity capacity of column families array
+ * @param is_open atomic flag indicating database is fully open and ready for operations
+ * @param is_recovering flag to determine if system is recovering
  * @param comparators array of registered comparators
  * @param num_comparators number of registered comparators
  * @param comparators_capacity capacity of comparators array
@@ -772,6 +777,8 @@ struct tidesdb_t
     tidesdb_column_family_t **column_families;
     int num_column_families;
     int cf_capacity;
+    _Atomic(int) is_open;
+    _Atomic(int) is_recovering;
     tidesdb_comparator_entry_t *comparators;
     int num_comparators;
     int comparators_capacity;

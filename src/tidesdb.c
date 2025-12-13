@@ -487,6 +487,7 @@ static tidesdb_kv_pair_t *tidesdb_kv_pair_clone(const tidesdb_kv_pair_t *kv);
 static int tidesdb_iter_kv_visible(tidesdb_iter_t *iter, tidesdb_kv_pair_t *kv);
 static void tidesdb_sstable_cache_evict_cb(const char *key, void *value, void *user_data);
 static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst);
+static int wait_for_open(tidesdb_t *db);
 
 /**
  *** block cache helper functions
@@ -8931,6 +8932,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->column_families = cfs;
     (*db)->num_column_families = 0;
 
+    atomic_init(&(*db)->is_open, 0);
+    atomic_init(&(*db)->is_recovering, 1);
+
     if (pthread_rwlock_init(&(*db)->cf_list_lock, NULL) != 0)
     {
         free(cfs);
@@ -9248,6 +9252,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         atomic_store(&(*db)->sync_thread_active, 0);
     }
 
+    atomic_store(&(*db)->is_open, 1);
+    atomic_store(&(*db)->is_recovering, 0);
     TDB_DEBUG_LOG("Database is now open and ready for operations");
 
     return TDB_SUCCESS;
@@ -9258,7 +9264,7 @@ int tidesdb_close(tidesdb_t *db)
     if (!db) return TDB_ERR_INVALID_ARGS;
 
     TDB_DEBUG_LOG("Closing TidesDB at path: %s", db->db_path);
-
+    atomic_store(&db->is_open, 0);
     TDB_DEBUG_LOG("Flushing all active memtables before close");
     pthread_rwlock_rdlock(&db->cf_list_lock);
     for (int i = 0; i < db->num_column_families; i++)
@@ -9342,6 +9348,53 @@ int tidesdb_close(tidesdb_t *db)
     }
     pthread_rwlock_unlock(&db->cf_list_lock);
     TDB_DEBUG_LOG("All memtables flushed");
+
+    /* wait for enqueued flushes to complete before shutting down flush threads
+     * this ensures data is written to sstables, not left in WAL */
+    TDB_DEBUG_LOG("Waiting for background flushes to complete");
+    int flush_wait_count = 0;
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    while (flush_wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_MS)
+    {
+        int any_flushing = 0;
+        for (int i = 0; i < db->num_column_families; i++)
+        {
+            if (db->column_families[i])
+            {
+                if (atomic_load_explicit(&db->column_families[i]->is_flushing,
+                                         memory_order_acquire))
+                {
+                    any_flushing = 1;
+                    break;
+                }
+            }
+        }
+
+        if (!any_flushing)
+        {
+            break;
+        }
+
+        if (flush_wait_count % 100 == 0 && flush_wait_count > 0)
+        {
+            TDB_DEBUG_LOG("Still waiting for background flushes (waited %dms)", flush_wait_count);
+        }
+
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
+        flush_wait_count++;
+        pthread_rwlock_rdlock(&db->cf_list_lock);
+    }
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    if (flush_wait_count >= TDB_CLOSE_FLUSH_WAIT_MAX_MS)
+    {
+        TDB_DEBUG_LOG("WARNING: Background flushes did not complete within timeout");
+    }
+    else
+    {
+        TDB_DEBUG_LOG("All background flushes completed");
+    }
 
     int final_active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
 
@@ -9554,6 +9607,12 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config)
 {
     if (!db || !name || !config) return TDB_ERR_INVALID_ARGS;
+
+    if (!atomic_load(&db->is_recovering))
+    {
+        int wait_result = wait_for_open(db);
+        if (wait_result != TDB_SUCCESS) return wait_result;
+    }
 
     /* validate sync configuration */
     if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us == 0)
@@ -9943,9 +10002,27 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     return TDB_SUCCESS;
 }
 
+static tidesdb_column_family_t *tidesdb_get_column_family_internal(tidesdb_t *db, const char *name)
+{
+    if (!db || !name) return NULL;
+    tidesdb_column_family_t *result = NULL;
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        if (db->column_families[i] && strcmp(db->column_families[i]->name, name) == 0)
+        {
+            result = db->column_families[i];
+            break;
+        }
+    }
+    return result;
+}
+
 tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *name)
 {
     if (!db || !name) return NULL;
+
+    int wait_result = wait_for_open(db);
+    if (wait_result != TDB_SUCCESS) return NULL;
 
     pthread_rwlock_rdlock(&db->cf_list_lock);
     tidesdb_column_family_t *result = NULL;
@@ -9961,6 +10038,30 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
 
     pthread_rwlock_unlock(&db->cf_list_lock);
     return result;
+}
+
+static int wait_for_open(tidesdb_t *db)
+{
+    /* wait for database to open, but timeout if it's closing
+     * this prevents threads from hanging forever when database is being closed */
+    int wait_count = 0;
+
+    while (!atomic_load(&db->is_open))
+    {
+        if (wait_count >= TDB_OPENING_WAIT_MAX_MS)
+        {
+            /* database is not open and hasn't opened after timeout
+             * it's likely closing or closed */
+            return TDB_ERR_INVALID_DB;
+        }
+
+        /* spin-wait with small sleep to avoid busy loop
+         * use same interval as transaction wait for consistency */
+        usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
+        wait_count++;
+    }
+
+    return TDB_SUCCESS;
 }
 
 int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
@@ -10400,6 +10501,9 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
                                      tidesdb_txn_t **txn)
 {
     if (!db || !txn) return TDB_ERR_INVALID_ARGS;
+
+    int wait_result = wait_for_open(db);
+    if (wait_result != TDB_SUCCESS) return wait_result;
 
     if (isolation < TDB_ISOLATION_READ_UNCOMMITTED || isolation > TDB_ISOLATION_SERIALIZABLE)
     {
@@ -10883,7 +10987,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     }
 
     /* now search immutable memtables safely with references held
-     * search in REVERSE order (newest first) to find most recent version */
+     * search in reverse order (newest first) to find most recent version */
     int result = TDB_ERR_UNKNOWN; /* used for cleanup label */
     if (immutable_refs && immutable_count > 0)
     {
@@ -11802,7 +11906,7 @@ skip_ssi_check:
             /* compaction backpressure -- if Level 0 is near capacity, slow down writes
              * to give compaction time to catch up. This prevents runaway sst creation
              * during heavy batched writes.
-             *
+             * i.e
              *   -- 90-95% full -- 1ms delay (gentle slowdown)
              *   -- 95-98% full -- 5ms delay (moderate slowdown)
              *   -- 98-100% full -- 10ms delay (aggressive slowdown)
@@ -13883,7 +13987,7 @@ static int tidesdb_recover_database(tidesdb_t *db)
         if (STAT_FUNC(full_path, &st) == 0 && S_ISDIR(st.st_mode))
         {
             TDB_DEBUG_LOG("Found CF directory: %s", entry->d_name);
-            tidesdb_column_family_t *cf = tidesdb_get_column_family(db, entry->d_name);
+            tidesdb_column_family_t *cf = tidesdb_get_column_family_internal(db, entry->d_name);
 
             if (!cf)
             {
@@ -13924,12 +14028,12 @@ static int tidesdb_recover_database(tidesdb_t *db)
 
                 if (create_result == TDB_SUCCESS)
                 {
-                    cf = tidesdb_get_column_family(db, entry->d_name);
+                    cf = tidesdb_get_column_family_internal(db, entry->d_name);
                 }
                 else if (create_result == TDB_ERR_EXISTS)
                 {
                     /* CF already exists in memory, try to get it again */
-                    cf = tidesdb_get_column_family(db, entry->d_name);
+                    cf = tidesdb_get_column_family_internal(db, entry->d_name);
                     TDB_DEBUG_LOG("CF already exists during recovery: %s", entry->d_name);
                 }
                 else

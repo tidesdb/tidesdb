@@ -10792,7 +10792,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
      * we must load immutables before active memtable to avoid missing keys
      * during memtable rotation (when active becomes immutable) */
 
-    /* LOCK-FREE snapshot using queue's atomic_head and atomic size
+    /* lock free snapshot using queue's atomic_head and atomic size
      * queue_peek_at() uses atomic loads without mutex, eliminating contention */
     tidesdb_immutable_memtable_t **immutable_refs = NULL;
     size_t immutable_count = 0;
@@ -10930,63 +10930,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-    /* collect sstable pointers with references held */
-    typedef struct
-    {
-        tidesdb_sstable_t *sst;
-        int level;
-        int index;
-    } sst_ref_t;
-
-    sst_ref_t stack_ssts[TDB_STACK_SSTS];
-    sst_ref_t *ssts_array = stack_ssts;
-    int ssts_capacity = TDB_STACK_SSTS;
-    int sst_count = 0;
-
-    /* iterate through levels and take refs immediately to minimize race window */
-    for (int i = 0; i < num_levels; i++)
-    {
-        tidesdb_level_t *level = cf->levels[i];
-
-        int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
-        tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
-
-        for (int j = 0; j < num_ssts; j++)
-        {
-            tidesdb_sstable_t *sst = sstables[j];
-            if (!sst) continue;
-
-            /* expand array if needed */
-            if (sst_count >= ssts_capacity)
-            {
-                int new_capacity = ssts_capacity * 2;
-                sst_ref_t *new_array = malloc(new_capacity * sizeof(sst_ref_t));
-                if (!new_array)
-                {
-                    /* cleanup refs taken so far */
-                    for (int k = 0; k < sst_count; k++)
-                    {
-                        tidesdb_sstable_unref(cf->db, ssts_array[k].sst);
-                    }
-                    if (ssts_array != stack_ssts) free(ssts_array);
-
-                    return TDB_ERR_MEMORY;
-                }
-                memcpy(new_array, ssts_array, sst_count * sizeof(sst_ref_t));
-                if (ssts_array != stack_ssts) free(ssts_array);
-                ssts_array = new_array;
-                ssts_capacity = new_capacity;
-            }
-
-            /* acquire reference to protect against concurrent deletion */
-            tidesdb_sstable_ref(sst);
-            ssts_array[sst_count].sst = sst;
-            ssts_array[sst_count].level = i;
-            ssts_array[sst_count].index = j;
-            sst_count++;
-        }
-    }
-
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
     tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
@@ -10995,13 +10938,23 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     uint64_t best_seq = UINT64_MAX;
     int found_any = 0;
 
-    if (ssts_array)
+    /* search level-by-level with early termination
+     * for non-existent keys, this avoids checking all ssts in all levels
+     * for existing keys in L0, this stops immediately without checking deeper levels */
+    for (int level_num = 0; level_num < num_levels; level_num++)
     {
-        for (int idx = 0; idx < sst_count; idx++)
-        {
-            tidesdb_sstable_t *sst = ssts_array[idx].sst;
-            int level = ssts_array[idx].level;
+        tidesdb_level_t *level = cf->levels[level_num];
+        int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
 
+        int level_has_candidate = 0;
+
+        for (int j = 0; j < num_ssts; j++)
+        {
+            tidesdb_sstable_t *sst = sstables[j];
+            if (!sst) continue;
+
+            /* range check -- skip SSTabsstsles that don't overlap key */
             if (sst->min_key && sst->max_key)
             {
                 int min_max_cmp = comparator_fn(sst->min_key, sst->min_key_size, sst->max_key,
@@ -11014,24 +10967,18 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
                 int out_of_range =
                     is_reverse ? (cmp_min > 0 || cmp_max < 0) : (cmp_min < 0 || cmp_max > 0);
-                if (out_of_range)
-                {
-                    tidesdb_sstable_unref(cf->db, sst);
-                    continue;
-                }
+                if (out_of_range) continue;
             }
 
-            /* check bloom filter before expensive sst read
-             * bloom filters have no false negatives, so if it says key is not present,
-             * we can safely skip this sst without risk of missing data */
+            /* bloom filter check - skip if definitely not present */
             if (sst->bloom_filter)
             {
-                if (!bloom_filter_contains(sst->bloom_filter, key, key_size))
-                {
-                    tidesdb_sstable_unref(cf->db, sst);
-                    continue;
-                }
+                if (!bloom_filter_contains(sst->bloom_filter, key, key_size)) continue;
             }
+
+            /* take ref only for ssts we will actually read */
+            tidesdb_sstable_ref(sst);
+            level_has_candidate = 1;
 
             tidesdb_kv_pair_t *candidate_kv = NULL;
             if (tidesdb_sstable_get(cf->db, sst, key, key_size, &candidate_kv) == TDB_SUCCESS &&
@@ -11040,7 +10987,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                 uint64_t candidate_seq = candidate_kv->entry.seq;
                 int accept = (snapshot_seq == UINT64_MAX) ? 1 : (candidate_seq <= snapshot_seq);
 
-                /* keep the version with highest sequence number (or first if no best yet) */
                 if (accept && (best_seq == UINT64_MAX || candidate_seq > best_seq))
                 {
                     if (best_kv) tidesdb_kv_pair_free(best_kv);
@@ -11048,15 +10994,10 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     best_seq = candidate_seq;
                     found_any = 1;
 
-                    if (level == 0)
+                    /* L0 hit -- stop immediately, no need to check deeper levels */
+                    if (level_num == 0)
                     {
                         tidesdb_sstable_unref(cf->db, sst);
-                        /* release remaining references */
-                        for (int k = idx + 1; k < sst_count; k++)
-                        {
-                            tidesdb_sstable_unref(cf->db, ssts_array[k].sst);
-                        }
-                        if (ssts_array != stack_ssts) free(ssts_array);
                         goto check_found_result;
                     }
                 }
@@ -11069,7 +11010,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             tidesdb_sstable_unref(cf->db, sst);
         }
 
-        if (ssts_array != stack_ssts) free(ssts_array);
+        /* early termination -- if we found key in this level, stop searching deeper
+         * this is safe because newer versions are always in shallower levels */
+        if (found_any && level_num == 0)
+        {
+            break;
+        }
     }
 
 check_found_result:
@@ -11177,7 +11123,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
      **/
 
     /* conflict detection based on isolation level
-     * -- READ_UNCOMMITTED:-- no conflict detection
+     * -- READ_UNCOMMITTED -- no conflict detection
      * -- READ_COMMITTED -- no conflict detection (each read sees latest committed)
      * -- REPEATABLE_READ -- read-write conflict detection only
      * -- SNAPSHOT -- read-write + write-write conflict detection
@@ -11211,7 +11157,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
 
             /* use safe snapshot to prevent use-after-free during concurrent flush */
-            /* LOCK-FREE immutable snapshot for conflict detection */
+            /* lock free immutable snapshot for conflict detection */
             tidesdb_immutable_memtable_t **imm_refs = NULL;
             size_t imm_count = 0;
 
@@ -11304,7 +11250,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
 
             /* use safe snapshot to prevent use-after-free during concurrent flush */
-            /* LOCK-FREE immutable snapshot for conflict detection */
+            /* lock free immutable snapshot for conflict detection */
             tidesdb_immutable_memtable_t **imm_refs = NULL;
             size_t imm_count = 0;
 
@@ -12197,7 +12143,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         return TDB_ERR_MEMORY;
     }
 
-    /* LOCK-FREE memtable snapshot to prevent race with flush
+    /* lock free memtable snapshot to prevent race with flush
      *  load immutables before active memtable to avoid missing keys */
     tidesdb_immutable_memtable_t **imm_snapshot = NULL;
     size_t imm_count = 0;

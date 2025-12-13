@@ -214,7 +214,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 /* default configuration values */
 #define TDB_DEFAULT_WRITE_BUFFER_SIZE           (64 * 1024 * 1024)
 #define TDB_DEFAULT_LEVEL_SIZE_RATIO            10
-#define TDB_DEFAULT_MIN_LEVELS                  3
+#define TDB_DEFAULT_MIN_LEVELS                  5
 #define TDB_DEFAULT_DIVIDING_LEVEL_OFFSET       2
 #define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2

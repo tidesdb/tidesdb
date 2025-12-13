@@ -3707,7 +3707,20 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
 load_bloom_and_index:
     /* load bloom filter and index from last blocks */
     /* [klog blocks...] [index block] [bloom filter block] [metadata block] */
-    ;
+
+    /* ensure position cache is built for O(1) cursor navigation
+     * without cache, cursor_prev does O(n) scan which can hang on large files */
+    if (klog_bm->block_count == 0)
+    {
+        if (block_manager_build_position_cache(klog_bm) != 0)
+        {
+            TDB_DEBUG_LOG("Failed to build position cache for %s", sst->klog_path);
+            block_manager_close(klog_bm);
+            block_manager_close(vlog_bm);
+            return TDB_ERR_IO;
+        }
+    }
+
     block_manager_cursor_t *cursor;
     if (block_manager_cursor_init(&cursor, klog_bm) != 0)
     {
@@ -5257,7 +5270,7 @@ static int tidesdb_apply_dca(tidesdb_column_family_t *cf)
     /* update capacities C_i = N_L / T^(L-i)
      * paper uses 1-based level numbering (level 1, 2, 3...)
      * we use 0-based array indexing (levels[0], levels[1], levels[2]...)
-     * so we adjust: for array index i, the level number is i+1
+     * so we adjust -- for array index i, the level number is i+1
      * formula becomes: C[i] = N_L / T^(L-(i+1)) = N_L / T^(L-1-i) */
     for (int i = 0; i < num_levels - 1; i++)
     {
@@ -9037,7 +9050,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->num_active_txns = 0;
     atomic_init(&(*db)->active_txn_count, 0); /* initialize transaction counter */
 
-    atomic_init(&(*db)->is_open, 1); /* set to 1 before starting workers */
+    /* initialize is_open to 0 -- will be set to 1 after recovery and worker startup
+     * this prevents transactions from starting before database is fully initialized */
+    atomic_init(&(*db)->is_open, 0);
 
     uint64_t initial_space = 0;
     if (tdb_get_available_disk_space((*db)->db_path, &initial_space) == 0)
@@ -9067,10 +9082,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     }
 
     /* create hybrid LRU/LFU cache for ssts
-     * - LRU capacity -- 70% of total (hot/recent ssts)
-     * - LFU capacity -- 30% of total (warm/frequently accessed ssts)
-     * - promotion threshold -- 3 accesses to promote to LFU
-     * - TTL -- 300 seconds (5 minutes) for LFU entries */
+     * -- LRU capacity -- 70% of total (hot/recent ssts)
+     * -- LFU capacity -- 30% of total (warm/frequently accessed ssts)
+     * -- promotion threshold -- 3 accesses to promote to LFU
+     * -- TTL -- 300 seconds (5 minutes) for LFU entries */
     size_t sstable_lru_cap = (config->max_open_sstables * 7) / 10;
     size_t sstable_lfu_cap = config->max_open_sstables - sstable_lru_cap;
     (*db)->sstable_cache = lru_cache_new(sstable_lru_cap, sstable_lfu_cap, 3, 300);
@@ -9094,8 +9109,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
          * (not including cache metadata overhead)
          *
          * since column families don't exist yet at open time, we use default block sizes:
-         * - klog blocks: TDB_DEFAULT_KLOG_BLOCK_SIZE = 64KB (keys + metadata)
-         * - vlog blocks: TDB_DEFAULT_VLOG_BLOCK_SIZE = 4KB (large values)
+         * -- klog blocks: TDB_DEFAULT_KLOG_BLOCK_SIZE = 64KB (keys + metadata)
+         * -- vlog blocks: TDB_DEFAULT_VLOG_BLOCK_SIZE = 4KB (large values)
          *
          * weighted average assumes 70% klog, 30% vlog distribution:
          * avg = (0.7 × 64KB) + (0.3 × 4KB) = 44.8KB + 1.2KB = 46KB
@@ -9108,10 +9123,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         if (block_cache_capacity < 100) block_cache_capacity = 100; /* minimum capacity */
 
         /* create hybrid LRU/LFU cache for blocks
-         * - LRU capacity -- 80% of total (hot/recent blocks)
-         * - LFU capacity -- 20% of total (warm/frequently accessed blocks)
-         * - promotion threshold -- 2 accesses to promote to LFU
-         * - TTL -- 60 seconds for LFU entries */
+         * -- LRU capacity -- 80% of total (hot/recent blocks)
+         * -- LFU capacity -- 20% of total (warm/frequently accessed blocks)
+         * -- promotion threshold -- 2 accesses to promote to LFU
+         * -- TTL -- 60 seconds for LFU entries */
         size_t block_lru_cap = (block_cache_capacity * 8) / 10;
         size_t block_lfu_cap = block_cache_capacity - block_lru_cap;
         (*db)->block_cache = lru_cache_new(block_lru_cap, block_lfu_cap, 2, 60);
@@ -9253,10 +9268,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         atomic_store(&(*db)->sync_thread_active, 0);
     }
 
-    /* database is already marked as open (set before worker thread creation)
-     * recovery has queued all immutable memtables and flush work
-     * workers are now running and will process the queued work
-     * data in immutable memtables is immediately readable */
+    /* now that recovery is complete and all worker threads are running,
+     * mark database as open to allow transactions to proceed
+     * this ensures database is fully initialized before any operations */
+    atomic_store_explicit(&(*db)->is_open, 1, memory_order_release);
     TDB_DEBUG_LOG("Database is now open and ready for operations");
 
     return TDB_SUCCESS;
@@ -10595,6 +10610,12 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 {
     if (!txn || !cf || !key || key_size == 0 || !value) return TDB_ERR_INVALID_ARGS;
 
+    /* check if database is still open to prevent use-after-free during close */
+    if (!txn->db || !atomic_load_explicit(&txn->db->is_open, memory_order_acquire))
+    {
+        return TDB_ERR_INVALID_DB;
+    }
+
     /* validate key-value size against memory limits */
     int size_check = tidesdb_validate_kv_size(txn->db, key_size, value_size);
     if (size_check != 0) return size_check;
@@ -10685,6 +10706,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     size_t key_size, uint8_t **value, size_t *value_size)
 {
     if (!txn || !cf || !key || key_size == 0 || !value || !value_size) return TDB_ERR_INVALID_ARGS;
+
+    /* check if database is still open to prevent use-after-free during close */
+    if (!txn->db || !atomic_load_explicit(&txn->db->is_open, memory_order_acquire))
+    {
+        return TDB_ERR_INVALID_DB;
+    }
 
     /* add CF to transaction if not already added */
     int cf_index = tidesdb_txn_add_cf_internal(txn, cf);
@@ -10986,7 +11013,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                 if (out_of_range) continue;
             }
 
-            /* bloom filter check - skip if definitely not present */
+            /* bloom filter check -- skip if definitely not present */
             if (sst->bloom_filter)
             {
                 if (!bloom_filter_contains(sst->bloom_filter, key, key_size)) continue;
@@ -11064,6 +11091,12 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const ui
                        size_t key_size)
 {
     if (!txn || !cf || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
+
+    /* check if database is still open to prevent use-after-free during close */
+    if (!txn->db || !atomic_load_explicit(&txn->db->is_open, memory_order_acquire))
+    {
+        return TDB_ERR_INVALID_DB;
+    }
     if (txn->is_committed || txn->is_aborted) return TDB_ERR_INVALID_ARGS;
 
     /* add CF to transaction if not already added */

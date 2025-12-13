@@ -7573,6 +7573,71 @@ static void test_deadlock_random_write_then_read(void)
     printf("=== Test completed successfully ===\n\n");
 }
 
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int thread_id;
+    int num_keys;
+    int key_size;
+    int value_size;
+    _Atomic(int) *success_count;
+    _Atomic(int) *failure_count;
+    _Atomic(int) *should_stop;
+} read_thread_data_t;
+
+static void *read_thread_fn(void *arg)
+{
+    read_thread_data_t *data = (read_thread_data_t *)arg;
+
+    int iteration = 0;
+    while (!atomic_load(data->should_stop))
+    {
+        /* read a random subset of keys to keep threads busy */
+        for (int i = 0; i < 100; i++)
+        {
+            if (atomic_load(data->should_stop)) break;
+
+            tidesdb_txn_t *txn = NULL;
+            if (tidesdb_txn_begin(data->db, &txn) != 0)
+            {
+                atomic_store(data->should_stop, 1);
+                break;
+            }
+
+            /* read a key based on thread_id and iteration to spread load */
+            int key_idx = ((data->thread_id * 1000) + (iteration * 100) + i) % data->num_keys;
+            char key[16];
+            snprintf(key, 16, "key_%08d", key_idx);
+
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+
+            int result = tidesdb_txn_get(txn, data->cf, (uint8_t *)key, 16, &value, &value_size);
+
+            if (result == 0)
+            {
+                if (value_size != (size_t)data->value_size)
+                {
+                    printf("ERROR: Expected value_size=%d, got %zu\n", data->value_size,
+                           value_size);
+                }
+                free(value);
+                atomic_fetch_add(data->success_count, 1);
+            }
+            else
+            {
+                atomic_fetch_add(data->failure_count, 1);
+            }
+
+            tidesdb_txn_free(txn);
+        }
+        iteration++;
+    }
+
+    return NULL;
+}
+
 void test_concurrent_read_close_race(void)
 {
     cleanup_test_dir();
@@ -7641,74 +7706,12 @@ void test_concurrent_read_close_race(void)
 
     printf("Starting %d concurrent read threads\n", NUM_THREADS);
 
-    typedef struct
-    {
-        tidesdb_t *db;
-        tidesdb_column_family_t *cf;
-        int thread_id;
-        int num_keys;
-        int key_size;
-        int value_size;
-        _Atomic(int) *success_count;
-        _Atomic(int) *failure_count;
-    } read_thread_data_t;
-
     _Atomic(int) success_count = 0;
     _Atomic(int) failure_count = 0;
     _Atomic(int) should_stop = 0;
 
     pthread_t threads[NUM_THREADS];
     read_thread_data_t thread_data[NUM_THREADS];
-
-    /* thread function for concurrent reads */
-    void *read_thread_fn(void *arg)
-    {
-        read_thread_data_t *data = (read_thread_data_t *)arg;
-
-        int iteration = 0;
-        while (!atomic_load(&should_stop))
-        {
-            /* read a random subset of keys to keep threads busy */
-            for (int i = 0; i < 100; i++)
-            {
-                if (atomic_load(&should_stop)) break;
-
-                tidesdb_txn_t *txn = NULL;
-                if (tidesdb_txn_begin(data->db, &txn) != 0)
-                {
-                    atomic_store(&should_stop, 1);
-                    break;
-                }
-
-                /* read a key based on thread_id and iteration to spread load */
-                int key_idx = ((data->thread_id * 1000) + (iteration * 100) + i) % data->num_keys;
-                char key[KEY_SIZE];
-                snprintf(key, KEY_SIZE, "key_%08d", key_idx);
-
-                uint8_t *value = NULL;
-                size_t value_size = 0;
-
-                int result =
-                    tidesdb_txn_get(txn, data->cf, (uint8_t *)key, KEY_SIZE, &value, &value_size);
-
-                if (result == 0)
-                {
-                    ASSERT_EQ(value_size, VALUE_SIZE);
-                    free(value);
-                    atomic_fetch_add(data->success_count, 1);
-                }
-                else
-                {
-                    atomic_fetch_add(data->failure_count, 1);
-                }
-
-                tidesdb_txn_free(txn);
-            }
-            iteration++;
-        }
-
-        return NULL;
-    }
 
     for (int i = 0; i < NUM_THREADS; i++)
     {
@@ -7720,6 +7723,7 @@ void test_concurrent_read_close_race(void)
         thread_data[i].value_size = VALUE_SIZE;
         thread_data[i].success_count = &success_count;
         thread_data[i].failure_count = &failure_count;
+        thread_data[i].should_stop = &should_stop;
 
         ASSERT_EQ(pthread_create(&threads[i], NULL, read_thread_fn, &thread_data[i]), 0);
     }

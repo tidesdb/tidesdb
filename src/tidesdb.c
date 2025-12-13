@@ -627,10 +627,14 @@ static block_manager_block_t *tidesdb_cached_block_read(tidesdb_t *db, const cha
                                            tidesdb_block_evict_callback, NULL);
             if (put_result < 0)
             {
-                /* insertion failed, release the extra reference */
-                block_manager_block_release(block);
+                /* insertion failed -- lru_cache_put already called evict callback
+                 * which released the reference, so we must not release again
+                 * (that would cause double-release and free the block prematurely) */
             }
-            /* if put_result >= 0, cache now owns a reference */
+            else
+            {
+                /* insertion succeeded, cache now owns a reference */
+            }
         }
     }
 

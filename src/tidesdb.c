@@ -6090,6 +6090,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                          new_sst->id, new_sst->num_entries,
                                          new_sst->klog_size + new_sst->vlog_size);
+            /* update sequence to track next_sstable_id */
+            tidesdb_manifest_update_sequence(cf->manifest, atomic_load(&cf->next_sstable_id));
             char manifest_path[TDB_MAX_PATH_LEN];
             snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
                      TDB_COLUMN_FAMILY_MANIFEST_NAME);
@@ -6979,6 +6981,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
                                              new_sst->klog_size + new_sst->vlog_size);
+                /* update sequence to track next_sstable_id */
+                tidesdb_manifest_update_sequence(cf->manifest, atomic_load(&cf->next_sstable_id));
                 char manifest_path[TDB_MAX_PATH_LEN];
                 snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s",
                          cf->directory, TDB_COLUMN_FAMILY_MANIFEST_NAME);
@@ -7819,6 +7823,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
                                              new_sst->klog_size + new_sst->vlog_size);
+                /* update sequence to track next_sstable_id */
+                tidesdb_manifest_update_sequence(cf->manifest, atomic_load(&cf->next_sstable_id));
                 char manifest_path[TDB_MAX_PATH_LEN];
                 snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s",
                          cf->directory, TDB_COLUMN_FAMILY_MANIFEST_NAME);
@@ -8653,6 +8659,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         pthread_rwlock_wrlock(&cf->manifest_lock);
         tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries,
                                      sst->klog_size + sst->vlog_size);
+        /* update sequence to track next_sstable_id for recovery */
+        tidesdb_manifest_update_sequence(cf->manifest, atomic_load(&cf->next_sstable_id));
         char manifest_path[TDB_MAX_PATH_LEN];
         snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
                  TDB_COLUMN_FAMILY_MANIFEST_NAME);
@@ -13905,8 +13913,15 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 
                     char klog_path[TDB_MAX_PATH_LEN];
                     char vlog_path[TDB_MAX_PATH_LEN];
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
                     snprintf(klog_path, sizeof(klog_path), "%s_%" PRIu64 ".klog", sst_base, sst_id);
                     snprintf(vlog_path, sizeof(vlog_path), "%s_%" PRIu64 ".vlog", sst_base, sst_id);
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
                     unlink(klog_path);
                     unlink(vlog_path);
                     continue;
@@ -14086,6 +14101,19 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
         }
 
         pthread_mutex_unlock(&cs->lock);
+    }
+
+    /* restore next_sstable_id from manifest to prevent ID collisions
+     * manifest sequence field tracks the next available sstable ID */
+    pthread_rwlock_rdlock(&cf->manifest_lock);
+    uint64_t manifest_next_id = cf->manifest->sequence;
+    pthread_rwlock_unlock(&cf->manifest_lock);
+
+    if (manifest_next_id > 0)
+    {
+        atomic_store(&cf->next_sstable_id, manifest_next_id);
+        TDB_DEBUG_LOG("CF '%s': Restored next_sstable_id=%" PRIu64 " from manifest", cf->name,
+                      manifest_next_id);
     }
 
     TDB_DEBUG_LOG("CF '%s': Recovery complete, global_max_seq=%" PRIu64, cf->name, global_max_seq);

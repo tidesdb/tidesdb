@@ -2200,4 +2200,33 @@ static inline int tdb_sync_directory(const char *dir_path)
 #endif
 }
 
+/**
+ * atomic_rename_file
+ * atomically renames a file from old_path to new_path
+ * on POSIX systems, rename() is atomic and replaces existing files
+ * on windows, rename() fails if target exists, so we remove it first
+ * @param old_path the current path of the file
+ * @param new_path the new path for the file
+ * @return 0 on success, -1 on failure
+ */
+static inline int atomic_rename_file(const char *old_path, const char *new_path)
+{
+    if (!old_path || !new_path) return -1;
+
+#ifdef _WIN32
+    /* on windows, rename() fails if target exists, so we remove it first
+     * this is not perfectly atomic but is the best we can do on Windows */
+    if (access(new_path, F_OK) == 0)
+    {
+        if (remove(new_path) != 0)
+        {
+            return -1;
+        }
+    }
+#endif
+
+    /* perform the rename */
+    return rename(old_path, new_path);
+}
+
 #endif /* __COMPAT_H__ */

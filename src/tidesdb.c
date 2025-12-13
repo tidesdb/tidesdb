@@ -9588,7 +9588,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config)
 {
     if (!db || !name || !config) return TDB_ERR_INVALID_ARGS;
-    if (!atomic_load_explicit(&db->is_open, memory_order_acquire)) return TDB_ERR_INVALID_ARGS;
+
+    /* note: no is_open check here because this function is called during recovery
+     * when is_open is still 0. transaction operations have their own is_open checks. */
 
     /* validate sync configuration */
     if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us == 0)

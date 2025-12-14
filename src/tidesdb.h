@@ -26,7 +26,6 @@
 #include "compat.h"
 #include "compress.h"
 #include "ini.h"
-#include "lru.h"
 #include "manifest.h"
 #include "queue.h"
 #include "skip_list.h"
@@ -319,13 +318,9 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_BACKPRESSURE_IMMUTABLE_CRITICAL_DELAY_US  5000
 #define TDB_BACKPRESSURE_IMMUTABLE_MODERATE_DELAY_US  1000
 
-/* sst cache retry configuration */
-#define TDB_SSTABLE_CACHE_MAX_RETRIES           100
-#define TDB_SSTABLE_CACHE_FAST_RETRY_THRESHOLD  10
-#define TDB_SSTABLE_CACHE_MED_RETRY_THRESHOLD   50
-#define TDB_SSTABLE_CACHE_SHORT_SLEEP_US        100
-#define TDB_SSTABLE_CACHE_LONG_SLEEP_US         1000
-#define TDB_SSTABLE_CACHE_RETRY_LOG_INTERVAL    10
+/* sstable reaper thread configuration */
+#define TDB_SSTABLE_REAPER_SLEEP_US             9600000
+#define TDB_SSTABLE_REAPER_EVICT_RATIO          0.5
 #define TDB_MAX_TXN_CFS                         10000
 #define TDB_MAX_PATH_LEN                        4096
 #define TDB_MAX_TXN_OPS                         100000
@@ -621,6 +616,7 @@ typedef struct
  * @param vlog_bm block manager for vlog
  * @param config column family configuration
  * @param marked_for_deletion atomic flag indicating if sstable is marked for deletion
+ * @param last_access_time last access time for lru eviction
  * @param db database handle (for resolving comparators from registry)
  */
 struct tidesdb_sstable_t
@@ -646,6 +642,7 @@ struct tidesdb_sstable_t
     block_manager_t *vlog_bm;
     tidesdb_column_family_config_t *config;
     _Atomic(int) marked_for_deletion;
+    _Atomic(time_t) last_access_time;
     tidesdb_t *db;
 };
 
@@ -753,10 +750,8 @@ struct tidesdb_column_family_t
     size_t wal_group_buffer_capacity;
     _Atomic(int) wal_group_leader;
     _Atomic(int) wal_group_waiters;
-
     tidesdb_manifest_t *manifest;
     pthread_rwlock_t manifest_lock;
-
     tidesdb_t *db;
 };
 
@@ -808,9 +803,10 @@ struct tidesdb_compaction_work_t
  * @param compaction_queue queue of compaction work items
  * @param sync_thread background thread for interval syncing
  * @param sync_thread_active atomic flag indicating if sync thread is active
- * @param sync_lock mutex for sync operations
- * @param sstable_cache lru cache for sstable file handles
- * @param block_cache lru cache for sstable blocks
+ * @param reaper_thread background thread for evicting most un-accessed sstables
+ * @param reaper_thread_active atomic flag indicating if reaper thread is active
+ * @param clock_cache clock cache for hot keys
+ * @param num_open_sstables global counter for open sstables
  * @param next_txn_id global transaction id counter
  * @param global_seq global sequence counter for snapshots and commits
  * @param commit_status tracks which sequences are committed
@@ -845,9 +841,10 @@ struct tidesdb_t
     queue_t *compaction_queue;
     pthread_t sync_thread;
     _Atomic(int) sync_thread_active;
-    pthread_mutex_t sync_lock;
-    lru_cache_t *sstable_cache;
-    clock_cache_t *block_cache; /* lock-free FIFO cache for deserialized entries */
+    pthread_t sstable_reaper_thread;
+    _Atomic(int) sstable_reaper_active;
+    clock_cache_t *clock_cache;
+    _Atomic(int) num_open_sstables;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
     tidesdb_commit_status_t *commit_status;

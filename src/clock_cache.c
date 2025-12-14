@@ -296,7 +296,11 @@ static size_t _clock_evict(clock_cache_t *cache, clock_cache_partition_t *partit
 
     /* start from thread-local position to reduce contention on clock_hand */
     static __thread size_t thread_hand = 0;
-    if (thread_hand == 0) thread_hand = (size_t)pthread_self();
+    if (thread_hand == 0)
+    {
+        thread_hand = (size_t)TDB_THREAD_ID();
+        if (thread_hand == 0) thread_hand = 1; /* ensure non-zero */
+    }
     size_t start_pos = thread_hand % partition->num_slots;
 
     while (iterations < max_iterations)

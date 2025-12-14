@@ -3664,8 +3664,8 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                     /* cache the entry for future reads */
                     if (db->block_cache)
                     {
-                        char cf_name[TDB_CACHE_KEY_SIZE];
-                        if (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) == 0)
+                        char cache_cf_name[TDB_CACHE_KEY_SIZE];
+                        if (tidesdb_get_cf_name_from_path(sst->klog_path, cache_cf_name) == 0)
                         {
                             /* create cached entry */
                             size_t inline_value_size = (klog_block->entries[i].vlog_offset == 0)
@@ -3694,8 +3694,8 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                                            klog_block->inline_values[i], inline_value_size);
                                 }
 
-                                (void)tidesdb_cache_entry_put(db, cf_name, sst->id, key, key_size,
-                                                              cache_entry);
+                                (void)tidesdb_cache_entry_put(db, cache_cf_name, sst->id, key,
+                                                              key_size, cache_entry);
 
                                 free(cache_entry);
                             }
@@ -11565,10 +11565,10 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     /* we check read-write conflicts (REPEATABLE_READ and above) */
     if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
     {
-        for (int i = 0; i < txn->read_set_count; i++)
+        for (int read_idx = 0; read_idx < txn->read_set_count; read_idx++)
         {
-            tidesdb_column_family_t *key_cf = txn->read_cfs[i];
-            uint64_t key_read_seq = txn->read_seqs[i];
+            tidesdb_column_family_t *key_cf = txn->read_cfs[read_idx];
+            uint64_t key_read_seq = txn->read_seqs[read_idx];
             uint64_t found_seq = 0;
 
             skip_list_t *active_mt =
@@ -11578,9 +11578,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             time_t ttl;
             uint8_t deleted;
 
-            if (skip_list_get_with_seq(active_mt, txn->read_keys[i], txn->read_key_sizes[i],
-                                       &temp_value, &temp_value_size, &ttl, &deleted, &found_seq,
-                                       UINT64_MAX, NULL, NULL) == 0)
+            if (skip_list_get_with_seq(active_mt, txn->read_keys[read_idx],
+                                       txn->read_key_sizes[read_idx], &temp_value, &temp_value_size,
+                                       &ttl, &deleted, &found_seq, UINT64_MAX, NULL, NULL) == 0)
             {
                 free(temp_value);
                 if (found_seq > key_read_seq)
@@ -11602,11 +11602,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 if (imm_refs)
                 {
                     size_t idx = 0;
-                    for (size_t i = 0; i < imm_count; i++)
+                    for (size_t imm_ref_idx = 0; imm_ref_idx < imm_count; imm_ref_idx++)
                     {
                         tidesdb_immutable_memtable_t *imm =
                             (tidesdb_immutable_memtable_t *)queue_peek_at(
-                                key_cf->immutable_memtables, i);
+                                key_cf->immutable_memtables, imm_ref_idx);
                         if (imm)
                         {
                             tidesdb_immutable_memtable_ref(imm);
@@ -11626,9 +11626,10 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 tidesdb_immutable_memtable_t *imm = imm_refs[imm_idx];
                 if (!imm || !imm->memtable) continue;
 
-                if (skip_list_get_with_seq(imm->memtable, txn->read_keys[i], txn->read_key_sizes[i],
-                                           &temp_value, &temp_value_size, &ttl, &deleted,
-                                           &found_seq, UINT64_MAX, NULL, NULL) == 0)
+                if (skip_list_get_with_seq(imm->memtable, txn->read_keys[read_idx],
+                                           txn->read_key_sizes[read_idx], &temp_value,
+                                           &temp_value_size, &ttl, &deleted, &found_seq, UINT64_MAX,
+                                           NULL, NULL) == 0)
                 {
                     free(temp_value);
                     if (found_seq > key_read_seq)
@@ -11658,9 +11659,9 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
     if (txn->isolation_level >= TDB_ISOLATION_SNAPSHOT)
     {
         /* iterate through all write operations in txn->ops[] */
-        for (int i = 0; i < txn->num_ops; i++)
+        for (int write_idx = 0; write_idx < txn->num_ops; write_idx++)
         {
-            tidesdb_txn_op_t *op = &txn->ops[i];
+            tidesdb_txn_op_t *op = &txn->ops[write_idx];
             tidesdb_column_family_t *key_cf = op->cf;
             uint64_t found_seq = 0;
 
@@ -11695,11 +11696,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 if (imm_refs)
                 {
                     size_t idx = 0;
-                    for (size_t i = 0; i < imm_count; i++)
+                    for (size_t imm_ref_idx = 0; imm_ref_idx < imm_count; imm_ref_idx++)
                     {
                         tidesdb_immutable_memtable_t *imm =
                             (tidesdb_immutable_memtable_t *)queue_peek_at(
-                                key_cf->immutable_memtables, i);
+                                key_cf->immutable_memtables, imm_ref_idx);
                         if (imm)
                         {
                             tidesdb_immutable_memtable_ref(imm);
@@ -12184,8 +12185,8 @@ skip_ssi_check:
                     if (cache_entry)
                     {
                         cache_entry->flags = op->is_delete ? TDB_KV_FLAG_TOMBSTONE : 0;
-                        cache_entry->key_size = op->key_size;
-                        cache_entry->value_size = op->value_size;
+                        cache_entry->key_size = (uint32_t)op->key_size;
+                        cache_entry->value_size = (uint32_t)op->value_size;
                         cache_entry->ttl = op->ttl;
                         cache_entry->seq = txn->commit_seq;
                         cache_entry->vlog_offset = 0; /* inline value */
@@ -14416,10 +14417,17 @@ static int tidesdb_recover_database(tidesdb_t *db)
                 }
 
                 char config_path[TDB_MAX_PATH_LEN];
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
                 snprintf(
                     config_path, TDB_MAX_PATH_LEN,
                     "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
                     full_path);
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
 
                 if (tidesdb_cf_config_load_from_ini(config_path, entry->d_name, &config) ==
                     TDB_SUCCESS)

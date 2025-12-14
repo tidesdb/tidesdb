@@ -708,19 +708,6 @@ static inline FILE *tdb_fopen(const char *filename, const char *mode)
 }
 #define fopen tdb_fopen
 
-/* fileno for windows */
-/*
- * tdb_fileno
- * portable file descriptor extraction from FILE*
- * @param stream the FILE* to get descriptor from
- * @return file descriptor, or -1 on failure
- */
-static inline int tdb_fileno(FILE *stream)
-{
-    if (!stream) return -1;
-    return _fileno(stream);
-}
-
 /* fsync for windows */
 /*
  * fsync
@@ -899,6 +886,19 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     return (ssize_t)bytes_written;
 }
 #endif /* _MSC_VER */
+
+/* fileno for all Windows (MSVC and MinGW) */
+/*
+ * tdb_fileno
+ * portable file descriptor extraction from FILE*
+ * @param stream the FILE* to get descriptor from
+ * @return file descriptor, or -1 on failure
+ */
+static inline int tdb_fileno(FILE *stream)
+{
+    if (!stream) return -1;
+    return _fileno(stream);
+}
 
 #if defined(__MINGW32__) || defined(__MINGW64__)
 /* mingw provides semaphore.h for POSIX semaphores */

@@ -488,8 +488,9 @@ void benchmark_concurrent_puts(void)
 
     const int num_threads = 8;
     const int ops_per_thread = 10000;
-    pthread_t threads[num_threads];
-    thread_args_t args[num_threads];
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    thread_args_t *args = malloc(num_threads * sizeof(thread_args_t));
+    ASSERT_TRUE(threads != NULL && args != NULL);
 
     clock_t start = clock();
     for (int i = 0; i < num_threads; i++)
@@ -501,6 +502,8 @@ void benchmark_concurrent_puts(void)
     }
 
     for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
+    free(threads);
+    free(args);
     clock_t end = clock();
 
     double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
@@ -534,8 +537,9 @@ void benchmark_concurrent_gets(void)
 
     const int num_threads = 8;
     const int ops_per_thread = 50000;
-    pthread_t threads[num_threads];
-    thread_args_t args[num_threads];
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    thread_args_t *args = malloc(num_threads * sizeof(thread_args_t));
+    ASSERT_TRUE(threads != NULL && args != NULL);
 
     clock_t start = clock();
     for (int i = 0; i < num_threads; i++)
@@ -547,6 +551,8 @@ void benchmark_concurrent_gets(void)
     }
 
     for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
+    free(threads);
+    free(args);
     clock_t end = clock();
 
     double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
@@ -566,8 +572,9 @@ void benchmark_concurrent_mixed(void)
 
     const int num_threads = 8;
     const int ops_per_thread = 5000;
-    pthread_t threads[num_threads];
-    thread_args_t args[num_threads];
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    thread_args_t *args = malloc(num_threads * sizeof(thread_args_t));
+    ASSERT_TRUE(threads != NULL && args != NULL);
 
     clock_t start = clock();
     for (int i = 0; i < num_threads; i++)
@@ -579,6 +586,8 @@ void benchmark_concurrent_mixed(void)
     }
 
     for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
+    free(threads);
+    free(args);
     clock_t end = clock();
 
     double time_spent = (double)(end - start) / CLOCKS_PER_SEC;

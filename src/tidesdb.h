@@ -319,8 +319,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_BACKPRESSURE_IMMUTABLE_MODERATE_DELAY_US  1000
 
 /* sstable reaper thread configuration */
-#define TDB_SSTABLE_REAPER_SLEEP_US             9600000
-#define TDB_SSTABLE_REAPER_EVICT_RATIO          0.5
+#define TDB_SSTABLE_REAPER_SLEEP_US             100000
+#define TDB_SSTABLE_REAPER_EVICT_RATIO          0.25
 #define TDB_MAX_TXN_CFS                         10000
 #define TDB_MAX_PATH_LEN                        4096
 #define TDB_MAX_TXN_OPS                         100000
@@ -488,7 +488,11 @@ typedef struct
     int64_t ttl;
     uint64_t seq;
     uint64_t vlog_offset;
+#ifdef _MSC_VER
+    uint8_t data[1]; /* key + value (if inline) - MSVC requires size 1 */
+#else
     uint8_t data[]; /* key + value (if inline) */
+#endif
 } tidesdb_cached_entry_t;
 
 /**

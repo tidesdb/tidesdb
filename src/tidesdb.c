@@ -8958,7 +8958,7 @@ static void *tidesdb_sync_worker_thread(void *arg)
 /**
  * tidesdb_sstable_reaper_thread
  * background thread that closes unused sstable files when limits are reached
- * evicts 50% of oldest ssts (by last_access_time) when num_open_sstables >= max
+ * evicts 25% of oldest ssts (by last_access_time) when num_open_sstables >= max
  */
 static void *tidesdb_sstable_reaper_thread(void *arg)
 {
@@ -8970,7 +8970,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         usleep(TDB_SSTABLE_REAPER_SLEEP_US);
 
         int current_open = atomic_load(&db->num_open_sstables);
-        int max_open = db->config.max_open_sstables;
+        int max_open = (int)db->config.max_open_sstables;
 
         if (current_open < max_open)
         {

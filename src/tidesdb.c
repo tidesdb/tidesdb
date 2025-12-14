@@ -499,7 +499,7 @@ static int wait_for_open(tidesdb_t *db);
  * tidesdb_entry_cache_key
  * generates a cache key for an entry
  * @param cf_name column family name
- * @param sstable_id sstable id
+ * @param sstable_id sstable id (unused, kept for API compatibility)
  * @param key entry key
  * @param key_len entry key length
  * @param key_buffer buffer to store the cache key
@@ -509,8 +509,14 @@ static int wait_for_open(tidesdb_t *db);
 static size_t tidesdb_entry_cache_key(const char *cf_name, uint64_t sstable_id, const uint8_t *key,
                                       size_t key_len, char *key_buffer, size_t buffer_size)
 {
-    /* format: "cf_name:sstable_id:" + raw key bytes */
-    int prefix_len = snprintf(key_buffer, buffer_size, "%s:%" PRIu64 ":", cf_name, sstable_id);
+    (void)sstable_id; /* unused -- sst ID is irrelevant for cache key. can be used later though! */
+
+    /* format is "cf_name:" + raw key bytes
+     * sstable ID is not included because
+     * -- keys are unique within a column family
+     * -- compaction changes sstable IDs but not key/value data
+     * -- simpler cache semantics (CF-scoped key-value store) */
+    int prefix_len = snprintf(key_buffer, buffer_size, "%s:", cf_name);
     if (prefix_len < 0 || (size_t)prefix_len >= buffer_size) return 0;
 
     size_t remaining = buffer_size - prefix_len;
@@ -3410,8 +3416,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         char cf_name[TDB_CACHE_KEY_SIZE];
         if (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) == 0)
         {
-            tidesdb_cached_entry_t *cached =
-                tidesdb_cache_entry_get(db, cf_name, sst->id, key, key_size);
+            tidesdb_cached_entry_t *cached = tidesdb_cache_entry_get(db, cf_name, 0, key, key_size);
             if (cached)
             {
                 /* cache hit -- check tombstone flag */
@@ -3694,8 +3699,8 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                                            klog_block->inline_values[i], inline_value_size);
                                 }
 
-                                (void)tidesdb_cache_entry_put(db, cache_cf_name, sst->id, key,
-                                                              key_size, cache_entry);
+                                (void)tidesdb_cache_entry_put(db, cache_cf_name, 0, key, key_size,
+                                                              cache_entry);
 
                                 free(cache_entry);
                             }
@@ -8506,6 +8511,35 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                     skip_list_put_with_seq(*memtable, key, entry.key_size, value, entry.value_size,
                                            entry.ttl, entry.seq, 0);
                 }
+
+                /* warm cache during recovery (if enabled)
+                 * this gives us a hot cache on restart for recently written keys
+                 * only cache non-tombstone entries with valid values */
+                if (cf->db->block_cache && !(entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
+                    entry.value_size > 0)
+                {
+                    size_t total_size =
+                        sizeof(tidesdb_cached_entry_t) + entry.key_size + entry.value_size;
+                    tidesdb_cached_entry_t *cache_entry = malloc(total_size);
+                    if (cache_entry)
+                    {
+                        cache_entry->flags = entry.flags;
+                        cache_entry->key_size = (uint32_t)entry.key_size;
+                        cache_entry->value_size = (uint32_t)entry.value_size;
+                        cache_entry->ttl = entry.ttl;
+                        cache_entry->seq = entry.seq;
+                        cache_entry->vlog_offset = 0; /* inline value */
+
+                        /* copy key and value */
+                        memcpy(cache_entry->data, key, entry.key_size);
+                        memcpy(cache_entry->data + entry.key_size, value, entry.value_size);
+
+                        /* populate cache */
+                        (void)tidesdb_cache_entry_put(cf->db, cf->name, 0, key, entry.key_size,
+                                                      cache_entry);
+                        free(cache_entry);
+                    }
+                }
             }
 
             if (expected_cfs)
@@ -11124,71 +11158,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         }
     }
 
-    /* check cache for committed data (after write set check)
-     * use sst ID 0 to indicate memtable/uncommitted entries
-     * this gives us O(1) cache hits for hot keys
-     * must respect snapshot isolation for REPEATABLE_READ and above */
-    if (txn->db->block_cache)
-    {
-        tidesdb_cached_entry_t *cached =
-            tidesdb_cache_entry_get(txn->db, cf->name, 0, key, key_size);
-        if (cached)
-        {
-            /* for REPEATABLE_READ and stricter, check snapshot visibility */
-            int use_cache = 1;
-            if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
-            {
-                /* only use cache if entry is visible to our snapshot */
-                if (cached->seq > txn->snapshot_seq)
-                {
-                    use_cache = 0;
-                }
-            }
-            /* READ_UNCOMMITTED and READ_COMMITTED always use cache (latest committed) */
-
-            if (use_cache)
-            {
-                /* cache hit! check if deleted */
-                if (cached->flags & TDB_KV_FLAG_TOMBSTONE)
-                {
-                    /* track read even for tombstones (needed for SSI) */
-                    if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
-                    {
-                        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, cached->seq);
-                    }
-                    free(cached);
-                    return TDB_ERR_NOT_FOUND;
-                }
-
-                /* check TTL */
-                if (cached->ttl == 0 || cached->ttl > time(NULL))
-                {
-                    /* valid entry -- return it */
-                    *value = malloc(cached->value_size);
-                    if (!*value)
-                    {
-                        free(cached);
-                        return TDB_ERR_MEMORY;
-                    }
-                    memcpy(*value, cached->data + cached->key_size, cached->value_size);
-                    *value_size = cached->value_size;
-
-                    /* track read for SSI conflict detection (REPEATABLE_READ and above) */
-                    if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
-                    {
-                        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, cached->seq);
-                    }
-
-                    free(cached);
-                    return TDB_SUCCESS;
-                }
-            }
-
-            /* TTL expired or not visible to snapshot -- fall through to normal path */
-            free(cached);
-        }
-    }
-
     /* determine snapshot based on isolation level
      * -- READ_UNCOMMITTED -- UINT64_MAX (see all versions, no visibility check)
      * -- READ_COMMITTED -- refresh snapshot on each read (latest committed data)
@@ -11357,6 +11326,70 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
         /* if we jumped here from immutable search, return the result */
         if (result != TDB_ERR_UNKNOWN) return result;
+    }
+
+    /* check cache for sst data (after memtables, before disk reads)
+     * cache is CF-scoped (sst ID is irrelevant)
+     * this gives us O(1) cache hits for hot sst keys
+     * memtables always take priority to ensure latest data is read */
+    if (txn->db->block_cache)
+    {
+        tidesdb_cached_entry_t *cached =
+            tidesdb_cache_entry_get(txn->db, cf->name, 0, key, key_size);
+        if (cached)
+        {
+            /* check snapshot visibility */
+            int use_cache = 1;
+            if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
+            {
+                /* only use cache if entry is visible to our snapshot */
+                if (cached->seq > txn->snapshot_seq)
+                {
+                    use_cache = 0;
+                }
+            }
+
+            if (use_cache)
+            {
+                /* cache hit! check if deleted */
+                if (cached->flags & TDB_KV_FLAG_TOMBSTONE)
+                {
+                    /* track read even for tombstones (needed for SSI) */
+                    if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
+                    {
+                        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, cached->seq);
+                    }
+                    free(cached);
+                    return TDB_ERR_NOT_FOUND;
+                }
+
+                /* check TTL */
+                if (cached->ttl == 0 || cached->ttl > time(NULL))
+                {
+                    /* valid entry -- return it */
+                    *value = malloc(cached->value_size);
+                    if (!*value)
+                    {
+                        free(cached);
+                        return TDB_ERR_MEMORY;
+                    }
+                    memcpy(*value, cached->data + cached->key_size, cached->value_size);
+                    *value_size = cached->value_size;
+
+                    /* track read for SSI conflict detection (REPEATABLE_READ and above) */
+                    if (txn->isolation_level >= TDB_ISOLATION_REPEATABLE_READ)
+                    {
+                        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, cached->seq);
+                    }
+
+                    free(cached);
+                    return TDB_SUCCESS;
+                }
+            }
+
+            /* TTL expired or not visible to snapshot -- fall through to sst search */
+            free(cached);
+        }
     }
 
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
@@ -12170,40 +12203,13 @@ skip_ssi_check:
                     return TDB_ERR_IO;
                 }
 
-                /* populate cache (write-through cache)
-                 * use sst ID 0 to indicate memtable entries
-                 * this makes subsequent reads O(1) instead of O(log N) skip list lookup
-                 * must cache deletes too, otherwise old values remain visible */
-                if (txn->db->block_cache)
-                {
-                    /* create cached entry with single allocation */
-                    size_t inline_value_size =
-                        op->value_size; /* always inline for memtable entries */
-                    size_t total_size =
-                        sizeof(tidesdb_cached_entry_t) + op->key_size + inline_value_size;
-                    tidesdb_cached_entry_t *cache_entry = malloc(total_size);
-                    if (cache_entry)
-                    {
-                        cache_entry->flags = op->is_delete ? TDB_KV_FLAG_TOMBSTONE : 0;
-                        cache_entry->key_size = (uint32_t)op->key_size;
-                        cache_entry->value_size = (uint32_t)op->value_size;
-                        cache_entry->ttl = op->ttl;
-                        cache_entry->seq = txn->commit_seq;
-                        cache_entry->vlog_offset = 0; /* inline value */
-
-                        /* copy key and value into data buffer */
-                        memcpy(cache_entry->data, op->key, op->key_size);
-                        if (op->value_size > 0 && op->value)
-                        {
-                            memcpy(cache_entry->data + op->key_size, op->value, op->value_size);
-                        }
-
-                        /* populate cache -- use sst ID 0 for memtable entries */
-                        tidesdb_cache_entry_put(txn->db, cf->name, 0, op->key, op->key_size,
-                                                cache_entry);
-                        free(cache_entry);
-                    }
-                }
+                /* we intentionally do not populate cache on writes.
+                 * cache is read-optimized for hot keys only and concurrency
+                 * populating on writes
+                 * -- pollutes cache with potentially cold/write-once keys
+                 * -- hurts write performance with serialization overhead
+                 * -- prevents natural read-based cache warming
+                 * cache will be populated on first read via tidesdb_sstable_get */
             }
             if (needs_free) free(seen_keys);
         }

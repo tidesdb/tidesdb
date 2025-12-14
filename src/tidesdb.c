@@ -490,8 +490,8 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst);
 static int wait_for_open(tidesdb_t *db);
 
 /**
- *** block cache helper functions
- * global block cache format: "cf_name:sstable_id:block_type:offset"
+ *** clock cache helper functions
+ * global clock cache format: "cf_name:sstable_id:block_type:offset"
  * where block_type is 'k' for klog or 'v' for vlog
  */
 
@@ -1126,7 +1126,7 @@ tidesdb_config_t tidesdb_default_config(void)
                                .log_level = TDB_LOG_INFO,
                                .num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE,
                                .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
-                               .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
+                               .clock_cache_size = TDB_DEFAULT_CLOCK_CACHE_SIZE,
                                .wait_for_txns_on_close = TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE,
                                .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES};
     return config;
@@ -9311,13 +9311,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                   "SSTable cache created with LRU capacity=%zu, LFU capacity=%zu, total=%zu",
                   sstable_lru_cap, sstable_lfu_cap, sstable_lru_cap + sstable_lfu_cap);
 
-    if (config->block_cache_size > 0)
+    if (config->clock_cache_size > 0)
     {
-        /* create lock-free FIFO cache for deserialized entries
-         * stores individual entries (not entire blocks) for granular caching
-         * entries are already decompressed and deserialized
-         * uses background eviction thread for non-blocking writes */
-        cache_config_t cache_config = {.max_bytes = config->block_cache_size};
+        cache_config_t cache_config;
+        clock_cache_compute_config(config->clock_cache_size, &cache_config);
 
         (*db)->block_cache = clock_cache_create(&cache_config);
         if (!(*db)->block_cache)
@@ -9330,14 +9327,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free(*db);
             return TDB_ERR_MEMORY;
         }
-        TDB_DEBUG_LOG(TDB_LOG_INFO,
-                      "Lock-free block cache created with max_bytes=%.2f MB (background thread)",
-                      (double)config->block_cache_size / (1024 * 1024));
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Clock cache created with max_bytes=%.2f MB",
+                      (double)config->clock_cache_size / (1024 * 1024));
     }
     else
     {
         (*db)->block_cache = NULL;
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Block cache disabled (block_cache_size=0)");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Clock cache disabled (clock_cache_size=0)");
     }
 
     tidesdb_recover_database(*db);
@@ -9786,12 +9782,12 @@ int tidesdb_close(tidesdb_t *db)
 
     if (db->block_cache)
     {
-        size_t entries, bytes;
-        clock_cache_stats(db->block_cache, &entries, &bytes);
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Freeing global block cache (entries: %zu, bytes: %zu)",
-                      entries, bytes);
+        clock_cache_stats_t stats;
+        clock_cache_get_stats(db->block_cache, &stats);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Freeing clock cache (bytes: %zu, entries: %zu)",
+                      stats.total_bytes, stats.total_entries);
         clock_cache_destroy(db->block_cache);
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Block cache freed");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Clock cache freed");
     }
 
     if (db->commit_status)

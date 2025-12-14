@@ -1,466 +1,590 @@
+/**
+ *
+ * Copyright (C) TidesDB
+ *
+ * Original Author: Alex Gaetano Padula
+ *
+ * Licensed under the Mozilla Public License, v. 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.mozilla.org/en-US/MPL/2.0/
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #include "clock_cache.h"
 
-#include "xxhash.h"
+#include "../external/xxhash.h"
 
-static uint64_t hash_key(const char *key, size_t key_len)
+/**
+ * _entry_size
+ * compute total entry size
+ * @param key_len key length
+ * @param payload_len payload length
+ * @return total entry size
+ */
+static inline size_t _entry_size(size_t key_len, size_t payload_len)
 {
-    return XXH64(key, key_len, 0);
+    return key_len + payload_len + sizeof(clock_cache_entry_t);
 }
 
 /**
- * calculate_bucket_count
- * calculate optimal bucket count based on cache size
- * @param max_bytes maximum cache size in bytes
- * @return number of hash buckets
+ * _hash_to_partition
+ * hash key to partition index
+ * @param cache the cache
+ * @param key the key
+ * @param key_len the key length
+ * @return partition index
  */
-static uint32_t calculate_bucket_count(size_t max_bytes)
+static inline size_t _hash_to_partition(clock_cache_t *cache, const char *key, size_t key_len)
 {
-    /* estimate maximum entries based on conservative average entry size */
-    size_t estimated_max_entries = max_bytes / CACHE_ESTIMATED_ENTRY_SIZE;
-
-    /* calculate target buckets for desired load factor */
-    /* load_factor = entries / buckets, so buckets = entries / load_factor */
-    size_t target_buckets = (size_t)((double)estimated_max_entries / CACHE_TARGET_LOAD_FACTOR);
-
-    /* round up to next power of 2 for fast modulo using bitwise AND
-     * power-of-2 allows -- hash % buckets = hash & (buckets - 1) */
-    uint32_t buckets = CACHE_MIN_HASH_BUCKETS;
-    while (buckets < target_buckets && buckets < CACHE_MAX_HASH_BUCKETS)
-    {
-        buckets <<= 1; /* multiply by 2 */
-    }
-
-    /* clamp to max if we exceeded it */
-    if (buckets > CACHE_MAX_HASH_BUCKETS)
-    {
-        buckets = CACHE_MAX_HASH_BUCKETS;
-    }
-
-    return buckets;
+    uint64_t hash = XXH3_64bits(key, key_len);
+    return (size_t)(hash & cache->partition_mask);
 }
 
 /**
- * cache_entry_pool_create
- * create memory pool for cache entries
- * @param node_size size of each pool node
- * @param max_nodes maximum pool size
- * @return pointer to memory pool or NULL on failure
+ * _compute_hash
+ * compute full hash for key
+ * @param key the key
+ * @param key_len the key length
+ * @return hash
  */
-static clock_cache_entry_pool_t *cache_entry_pool_create(size_t node_size, size_t max_nodes)
+static inline uint64_t _compute_hash(const char *key, size_t key_len)
 {
-    clock_cache_entry_pool_t *pool = malloc(sizeof(clock_cache_entry_pool_t));
-    if (!pool) return NULL;
-
-    pool->node_size = node_size;
-    pool->max_nodes = max_nodes;
-    atomic_init(&pool->free_list, NULL);
-    atomic_init(&pool->allocated_nodes, 0);
-    atomic_init(&pool->pool_hits, 0);
-    atomic_init(&pool->pool_misses, 0);
-
-    return pool;
+    return XXH3_64bits(key, key_len);
 }
 
 /**
- * cache_entry_pool_alloc
- * allocate entry from pool (lock-free)
- * @param pool pointer to memory pool
- * @return pointer to allocated entry or NULL on failure
+ * _hash_table_insert
+ * insert slot into hash index with linear probing
+ * @param partition the partition
+ * @param hash the hash
+ * @param slot_idx the slot index
  */
-static void *cache_entry_pool_alloc(clock_cache_entry_pool_t *pool)
+static void _hash_table_insert(clock_cache_partition_t *partition, uint64_t hash, size_t slot_idx)
 {
-    if (!pool) return NULL;
+    clock_cache_entry_t *slot = &partition->slots[slot_idx];
 
-    /* try to pop from free list (lock-free) */
-    clock_cache_entry_pool_node_t *node;
-    do
+    /* we store hash in entry for verification */
+    atomic_store_explicit(&slot->cached_hash, hash, memory_order_release);
+
+    /* we insert into hash index with linear probing */
+    size_t idx = hash & partition->hash_mask;
+    size_t max_probe = (partition->hash_index_size < CLOCK_CACHE_MAX_HASH_PROBE)
+                           ? partition->hash_index_size
+                           : CLOCK_CACHE_MAX_HASH_PROBE;
+    for (size_t probe = 0; probe < max_probe; probe++)
     {
-        node = atomic_load_explicit(&pool->free_list, memory_order_acquire);
-        if (node == NULL)
+        size_t pos = (idx + probe) & partition->hash_mask;
+        int32_t expected = -1;
+
+        /* we try to claim this hash index slot */
+        if (atomic_compare_exchange_strong(&partition->hash_index[pos], &expected,
+                                           (int32_t)slot_idx))
         {
-            size_t current = atomic_load_explicit(&pool->allocated_nodes, memory_order_acquire);
-            if (current >= pool->max_nodes)
-            {
-                atomic_fetch_add_explicit(&pool->pool_misses, 1, memory_order_relaxed);
-                return malloc(pool->node_size);
-            }
-
-            node = malloc(sizeof(clock_cache_entry_pool_node_t) + pool->node_size);
-            if (!node)
-            {
-                atomic_fetch_add_explicit(&pool->pool_misses, 1, memory_order_relaxed);
-                return NULL;
-            }
-
-            atomic_fetch_add_explicit(&pool->allocated_nodes, 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&pool->pool_hits, 1, memory_order_relaxed);
-            return node->data;
+            return;
         }
-    } while (!atomic_compare_exchange_weak_explicit(&pool->free_list, &node, node->next,
-                                                    memory_order_release, memory_order_acquire));
 
-    /* successfully popped from free list */
-    atomic_fetch_add_explicit(&pool->pool_hits, 1, memory_order_relaxed);
-    return node->data;
-}
-
-/**
- * cache_entry_pool_free
- * return entry to pool (lock-free)
- * @param pool pointer to memory pool
- * @param ptr pointer to entry data
- */
-static void cache_entry_pool_free(clock_cache_entry_pool_t *pool, void *ptr)
-{
-    if (!pool || !ptr) return;
-
-    /* get node pointer from data pointer */
-    clock_cache_entry_pool_node_t *node =
-        (clock_cache_entry_pool_node_t *)((uint8_t *)ptr -
-                                          offsetof(clock_cache_entry_pool_node_t, data));
-
-    /* push to free list (lock-free) */
-    clock_cache_entry_pool_node_t *old_head;
-    do
-    {
-        old_head = atomic_load_explicit(&pool->free_list, memory_order_acquire);
-        node->next = old_head;
-    } while (!atomic_compare_exchange_weak_explicit(&pool->free_list, &old_head, node,
-                                                    memory_order_release, memory_order_acquire));
-}
-
-/**
- * cache_entry_pool_destroy
- * destroy memory pool
- * @param pool pointer to memory pool
- */
-static void cache_entry_pool_destroy(clock_cache_entry_pool_t *pool)
-{
-    if (!pool) return;
-
-    /* free all nodes in free list */
-    clock_cache_entry_pool_node_t *node =
-        atomic_load_explicit(&pool->free_list, memory_order_acquire);
-    while (node)
-    {
-        clock_cache_entry_pool_node_t *next = node->next;
-        free(node);
-        node = next;
-    }
-
-    free(pool);
-}
-
-/**
- * is_power_of_2
- * check if a number is power of 2
- * @param n number to check
- * @return 1 if power of 2, 0 otherwise
- */
-static inline int is_power_of_2(uint32_t n)
-{
-    return n > 0 && (n & (n - 1)) == 0;
-}
-
-/**
- * hash_to_bucket
- * hash mixing function for better bucket distribution
- * @param hash hash value of the key
- * @param num_buckets number of hash buckets
- * @return bucket index
- */
-static inline uint32_t hash_to_bucket(uint64_t hash, uint32_t num_buckets)
-{
-    /* fibonacci hashing for better distribution */
-    /* multiply by golden ratio and shift to get upper bits */
-    uint64_t mixed = hash * 11400714819323198485ULL;
-    uint32_t h = (uint32_t)(mixed >> 32);
-
-    if (is_power_of_2(num_buckets))
-    {
-        return h & (num_buckets - 1);
-    }
-    else
-    {
-        return h % num_buckets;
-    }
-}
-
-/**
- * cache_entry_evict
- * eviction callback for buffer -- returns entry to pool or frees it
- * @param data pointer to entry data
- * @param ctx pointer to cache context
- */
-static void cache_entry_evict(void *data, void *ctx)
-{
-    if (data == NULL) return;
-
-    clock_cache_entry_t *entry = (clock_cache_entry_t *)data;
-    clock_cache_t *cache = (clock_cache_t *)ctx;
-
-    /* update current bytes */
-    size_t entry_size = sizeof(clock_cache_entry_t) + entry->key_len + entry->payload_len;
-    atomic_fetch_sub_explicit(&cache->current_bytes, entry_size, memory_order_relaxed);
-
-    /* check allocation source using flag (safe - no memory access issues) */
-    if (entry->from_pool && cache->entry_pool)
-    {
-        /* return to pool (lock-free, ~3ns) */
-        cache_entry_pool_free(cache->entry_pool, entry);
-    }
-    else
-    {
-        /* was allocated with malloc, free it */
-        free(entry);
-    }
-}
-
-static void *eviction_thread_func(void *arg)
-{
-    clock_cache_t *cache = (clock_cache_t *)arg;
-    uint32_t backoff_ms = cache->eviction_interval_ms;
-
-    while (atomic_load_explicit(&cache->eviction_state, memory_order_acquire) ==
-           CACHE_EVICTION_RUNNING)
-    {
-        /* check if eviction is needed */
-        size_t current = atomic_load_explicit(&cache->current_bytes, memory_order_acquire);
-        float fill_ratio = (float)current / (float)cache->max_bytes;
-
-        if (fill_ratio >= cache->eviction_threshold)
+        /* we check if this slot already points to our entry (reuse case) */
+        int32_t current = atomic_load_explicit(&partition->hash_index[pos], memory_order_relaxed);
+        if (current == (int32_t)slot_idx)
         {
-            /* CLOCK EVICTION -- sweep through slots using clock hand
-             * if ref_bit == 0
-                evict the entry
-             * if ref_bit == 1
-                give second chance (set to 0) and continue
-             * this is O(n) worst case but typically much faster */
-
-            size_t target_bytes = (size_t)(cache->max_bytes * cache->eviction_target);
-            uint32_t evicted_count = 0;
-            uint32_t max_sweeps = cache->num_slots * 2; /* prevent infinite loop */
-            uint32_t sweeps = 0;
-
-            while (sweeps < max_sweeps)
-            {
-                /* check if we've evicted enough */
-                current = atomic_load_explicit(&cache->current_bytes, memory_order_acquire);
-                if (current <= target_bytes) break;
-
-                /* advance clock hand */
-                uint32_t slot_id =
-                    atomic_fetch_add_explicit(&cache->clock_hand, 1, memory_order_relaxed) %
-                    cache->num_slots;
-                sweeps++;
-
-                /* get entry at this slot */
-                clock_cache_entry_t *entry =
-                    atomic_load_explicit(&cache->slots[slot_id].entry, memory_order_acquire);
-                if (entry == NULL) continue; /* empty slot */
-
-                /* check reference bit */
-                uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
-
-                if (ref == 0)
-                {
-                    /* ref_bit is 0 -- evict this entry */
-                    uint32_t bucket_idx = hash_to_bucket(entry->hash, cache->num_buckets);
-                    clock_cache_hash_bucket_t *bucket = &cache->hash_table[bucket_idx];
-
-                    /* remove from hash chain */
-                    uint32_t current_slot =
-                        atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-                    uint32_t prev_slot = CACHE_INVALID_SLOT_ID;
-
-                    while (current_slot != CACHE_INVALID_SLOT_ID)
-                    {
-                        if (current_slot == slot_id)
-                        {
-                            /* found it -- update chain */
-                            uint32_t next =
-                                atomic_load_explicit(&entry->next_in_bucket, memory_order_acquire);
-
-                            if (prev_slot == CACHE_INVALID_SLOT_ID)
-                            {
-                                /* update bucket head */
-                                atomic_store_explicit(&bucket->head_slot_id, next,
-                                                      memory_order_release);
-                            }
-                            else
-                            {
-                                /* update previous entry */
-                                clock_cache_entry_t *prev_entry = atomic_load_explicit(
-                                    &cache->slots[prev_slot].entry, memory_order_acquire);
-                                if (prev_entry != NULL)
-                                {
-                                    atomic_store_explicit(&prev_entry->next_in_bucket, next,
-                                                          memory_order_release);
-                                }
-                            }
-                            break;
-                        }
-
-                        clock_cache_entry_t *chain_entry = atomic_load_explicit(
-                            &cache->slots[current_slot].entry, memory_order_acquire);
-                        if (chain_entry != NULL)
-                        {
-                            prev_slot = current_slot;
-                            current_slot = atomic_load_explicit(&chain_entry->next_in_bucket,
-                                                                memory_order_acquire);
-                        }
-                        else
-                        {
-                            break;
-                        }
-                    }
-
-                    /* evict entry and free slot */
-                    cache_entry_evict(entry, cache);
-                    atomic_store_explicit(&cache->slots[slot_id].entry, NULL, memory_order_release);
-                    atomic_fetch_sub_explicit(&cache->active_slots, 1, memory_order_relaxed);
-                    evicted_count++;
-                }
-                else
-                {
-                    /* ref_bit is 1 - give second chance, clear the bit */
-                    atomic_store_explicit(&entry->ref_bit, 0, memory_order_relaxed);
-                }
-            }
-
-            /* reset backoff after successful eviction */
-            backoff_ms = cache->eviction_interval_ms;
+            return; /* already indexed */
         }
-        else
+    }
+}
+
+/**
+ * _hash_table_remove
+ * remove slot from hash index
+ * @param partition the partition
+ * @param hash the hash
+ * @param slot_idx the slot index
+ */
+static void _hash_table_remove(clock_cache_partition_t *partition, uint64_t hash, size_t slot_idx)
+{
+    /* gotta find and clear this slot from hash index */
+    size_t idx = hash & partition->hash_mask;
+    for (size_t probe = 0; probe < partition->hash_index_size; probe++)
+    {
+        size_t pos = (idx + probe) & partition->hash_mask;
+        int32_t current = atomic_load_explicit(&partition->hash_index[pos], memory_order_acquire);
+
+        if (current == (int32_t)slot_idx)
         {
-            /* no eviction needed -- increase backoff */
-            backoff_ms = backoff_ms * 2;
-            if (backoff_ms > cache->max_backoff_ms)
+            /* clear this index entry */
+            atomic_store_explicit(&partition->hash_index[pos], -1, memory_order_release);
+            return;
+        }
+
+        if (current == -1)
+        {
+            /* empty slot, entry not in index */
+            return;
+        }
+    }
+}
+
+/**
+ * _find_entry
+ * find entry using hash index for O(1) lookup
+ * @param partition the partition
+ * @param key the key
+ * @param key_len the key length
+ * @param out_index output parameter for index
+ * @return the entry or NULL if not found
+ */
+static clock_cache_entry_t *_find_entry(clock_cache_partition_t *partition, const char *key,
+                                        size_t key_len, size_t *out_index)
+{
+    uint64_t target_hash = _compute_hash(key, key_len);
+    size_t idx = target_hash & partition->hash_mask;
+    size_t max_probe = (partition->hash_index_size < CLOCK_CACHE_MAX_HASH_PROBE)
+                           ? partition->hash_index_size
+                           : CLOCK_CACHE_MAX_HASH_PROBE;
+    for (size_t probe = 0; probe < max_probe; probe++)
+    {
+        size_t pos = (idx + probe) & partition->hash_mask;
+        int32_t slot_idx = atomic_load_explicit(&partition->hash_index[pos], memory_order_relaxed);
+
+        if (slot_idx == -1)
+        {
+            /* empty slot in index, entry not found */
+            return NULL;
+        }
+
+        clock_cache_entry_t *entry = &partition->slots[slot_idx];
+
+        /* we check state first -- relaxed is fine, we validate later */
+        uint8_t state = atomic_load_explicit(&entry->state, memory_order_relaxed);
+        if (state != ENTRY_VALID) continue;
+
+        /* we check cached hash matches -- relaxed */
+        uint64_t entry_hash = atomic_load_explicit(&entry->cached_hash, memory_order_relaxed);
+        if (entry_hash != target_hash) continue;
+
+        /* we load key length -- relaxed */
+        size_t entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_relaxed);
+        if (entry_key_len != key_len) continue;
+
+        /* now key pointer with acquire for final validation */
+        char *entry_key_ptr = atomic_load_explicit(&entry->key, memory_order_acquire);
+        if (!entry_key_ptr) continue;
+
+        if (memcmp(entry_key_ptr, key, key_len) == 0)
+        {
+            /* state didn't change during comparison? */
+            uint8_t state_after = atomic_load_explicit(&entry->state, memory_order_acquire);
+            char *key_after = atomic_load_explicit(&entry->key, memory_order_acquire);
+
+            if (state_after == ENTRY_VALID && key_after == entry_key_ptr)
             {
-                backoff_ms = cache->max_backoff_ms;
+                /* match confirmed and entry still valid */
+                if (out_index) *out_index = slot_idx;
+                return entry;
             }
         }
-        /* sleep with backoff */
-        usleep(backoff_ms * 1000);
+    }
+
+    /* if hash index lookup failed, we do linear scan of all slots */
+    /* this handles rare case where hash index was full during insert */
+
+    for (size_t i = 0; i < partition->num_slots; i++)
+    {
+        clock_cache_entry_t *entry = &partition->slots[i];
+
+        uint8_t state = atomic_load_explicit(&entry->state, memory_order_relaxed);
+        if (state != ENTRY_VALID) continue;
+
+        uint64_t entry_hash = atomic_load_explicit(&entry->cached_hash, memory_order_relaxed);
+        if (entry_hash != target_hash) continue;
+
+        size_t entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_relaxed);
+        if (entry_key_len != key_len) continue;
+
+        char *entry_key_ptr = atomic_load_explicit(&entry->key, memory_order_acquire);
+        if (!entry_key_ptr) continue;
+
+        if (memcmp(entry_key_ptr, key, key_len) == 0)
+        {
+            uint8_t state_after = atomic_load_explicit(&entry->state, memory_order_acquire);
+            char *key_after = atomic_load_explicit(&entry->key, memory_order_acquire);
+
+            if (state_after == ENTRY_VALID && key_after == entry_key_ptr)
+            {
+                if (out_index) *out_index = i;
+                return entry;
+            }
+        }
     }
 
     return NULL;
 }
 
-clock_cache_t *clock_cache_create(const cache_config_t *config)
+/**
+ * _free_entry
+ * free entry contents -- lock-free with atomic state transitions
+ * @param cache the cache
+ * @param partition the partition
+ * @param entry the entry
+ */
+static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition,
+                        clock_cache_entry_t *entry)
 {
-    if (config == NULL || config->max_bytes == 0) return NULL;
+    (void)cache;
 
-    clock_cache_t *cache = malloc(sizeof(clock_cache_t));
-    if (cache == NULL) return NULL;
-
-    /* set configuration */
-    cache->max_bytes = config->max_bytes;
-    atomic_init(&cache->current_bytes, 0);
-
-    /* calculate number of slots if not specified */
-    uint32_t num_slots = config->num_slots;
-    if (num_slots == 0)
+    /* try to claim entry for deletion using CAS */
+    uint8_t expected = ENTRY_VALID;
+    if (!atomic_compare_exchange_strong(&entry->state, &expected, ENTRY_DELETING))
     {
-        /* estimate -- assume average entry is 1KB, allocate 2x for overhead */
-        num_slots = (config->max_bytes / 1024) * 2;
-        if (num_slots < 256) num_slots = 256;
-        if (num_slots > 1000000) num_slots = 1000000;
+        /* someone else is deleting or entry is already empty */
+        return;
     }
 
-    cache->num_slots = num_slots;
-    cache->slots = calloc(num_slots, sizeof(clock_cache_slot_t));
-    if (cache->slots == NULL)
+    /* WE WON! we own this entry now, its our precious */
+
+    /* load pointers and sizes */
+    char *key = atomic_load_explicit(&entry->key, memory_order_acquire);
+    uint8_t *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
+    size_t klen = atomic_load_explicit(&entry->key_len, memory_order_acquire);
+
+    if (!key || !payload)
     {
-        free(cache);
-        return NULL;
+        /* invalid entry, just mark as empty */
+        atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
+        return;
     }
 
-    for (uint32_t i = 0; i < num_slots; i++)
-    {
-        atomic_init(&cache->slots[i].entry, NULL);
-    }
+    /* mark hash entry as deleted (tombstone) -- but keep back-pointer for reuse */
+    uint64_t hash = _compute_hash(key, klen);
+    size_t slot_idx = entry - partition->slots;
+    _hash_table_remove(partition, hash, slot_idx);
 
-    atomic_init(&cache->next_slot, 0);
-    atomic_init(&cache->active_slots, 0);
-    atomic_init(&cache->clock_hand, 0);
+    /* mem fence -- ensure all readers see deleted before we free */
+    atomic_thread_fence(memory_order_seq_cst);
 
-    /* create hash table with dynamic sizing */
-    if (config->num_buckets > 0)
-    {
-        /* user specified bucket count */
-        cache->num_buckets = config->num_buckets;
-    }
-    else if (CACHE_DEFAULT_HASH_BUCKETS > 0)
-    {
-        /* use configured default */
-        cache->num_buckets = CACHE_DEFAULT_HASH_BUCKETS;
-    }
-    else
-    {
-        /* auto-calculate based on cache size */
-        cache->num_buckets = calculate_bucket_count(config->max_bytes);
-    }
+    free(key);
+    free(payload);
 
-    cache->hash_table = calloc(cache->num_buckets, sizeof(clock_cache_hash_bucket_t));
-    if (cache->hash_table == NULL)
-    {
-        free(cache->slots);
-        free(cache);
-        return NULL;
-    }
+    /* clear pointers atomically -- but not hash_entry, we want to reuse it */
+    atomic_store_explicit(&entry->key, NULL, memory_order_release);
+    atomic_store_explicit(&entry->payload, NULL, memory_order_release);
+    atomic_store_explicit(&entry->key_len, 0, memory_order_release);
+    atomic_store_explicit(&entry->payload_len, 0, memory_order_release);
+    atomic_store_explicit(&entry->ref_bit, 0, memory_order_release);
+    /** hash_entry back-pointer is not cleared -- it stays for reuse */
 
-    /* initialize hash buckets */
-    for (uint32_t i = 0; i < cache->num_buckets; i++)
-    {
-        atomic_init(&cache->hash_table[i].head_slot_id, CACHE_INVALID_SLOT_ID);
-    }
+    /* transistion to empty state */
+    atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
+}
 
-    /* create memory pool for cache entries
-     * pool size = estimated max entries based on average entry size
-     * node size = max entry size (entry + max key + max value)
-     *
-     * only enable pool for caches >= 1MB
-     * small caches have too much overhead and the fixed node size causes issues */
-    if (config->max_bytes >= 1024 * 1024) /* 1 MB minimum */
-    {
-        size_t estimated_max_entries = config->max_bytes / CACHE_ESTIMATED_ENTRY_SIZE;
-        size_t max_pool_nodes = estimated_max_entries;
-        size_t max_node_size =
-            sizeof(clock_cache_entry_t) + 512 + 4096; /* entry + 512B key + 4KB value */
+/**
+ * _clock_evict
+ * clock eviction
+ * @param cache the cache
+ * @param partition the partition
+ * @return the slot index of the evicted entry
+ */
+static size_t _clock_evict(clock_cache_t *cache, clock_cache_partition_t *partition)
+{
+    size_t iterations = 0;
+    size_t max_iterations = partition->num_slots * 2;
 
-        cache->entry_pool = cache_entry_pool_create(max_node_size, max_pool_nodes);
-        if (cache->entry_pool == NULL)
+    /* start from thread-local position to reduce contention on clock_hand */
+    static __thread size_t thread_hand = 0;
+    if (thread_hand == 0) thread_hand = (size_t)pthread_self();
+    size_t start_pos = thread_hand % partition->num_slots;
+
+    while (iterations < max_iterations)
+    {
+        /* we use local counter with occasional sync to global clock_hand */
+        size_t hand = (start_pos + iterations) % partition->num_slots;
+        clock_cache_entry_t *entry = &partition->slots[hand];
+
+        /* we check state atomically */
+        uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
+
+        if (state == ENTRY_EMPTY)
         {
-            /* pool creation failed -- continue without pool (will use malloc) */
-            cache->entry_pool = NULL;
+            /* found empty slot -- update thread position for next time */
+            thread_hand = hand + 1;
+            return hand;
+        }
+
+        if (state == ENTRY_VALID)
+        {
+            /* we check reference bit */
+            uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
+
+            if (ref == 0)
+            {
+                /* found victim -- try to evict */
+                _free_entry(cache, partition, entry);
+
+                /* update thread position for next time */
+                thread_hand = hand + 1;
+                return hand;
+            }
+
+            /* clear reference bit atomically */
+            atomic_store_explicit(&entry->ref_bit, 0, memory_order_relaxed);
+        }
+
+        iterations++;
+    }
+
+    /* try to evict at current position as a fallback*/
+    size_t hand =
+        atomic_load_explicit(&partition->clock_hand, memory_order_acquire) % partition->num_slots;
+    clock_cache_entry_t *entry = &partition->slots[hand];
+    uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
+
+    if (state == ENTRY_VALID)
+    {
+        _free_entry(cache, partition, entry);
+    }
+
+    return hand;
+}
+
+/**
+ * _ensure_space
+ * ensure space in partition
+ * @param cache the cache
+ * @param partition the partition
+ * @param required_bytes the required bytes
+ * @return 0 on success, -1 on failure
+ */
+static int _ensure_space(clock_cache_t *cache, clock_cache_partition_t *partition,
+                         size_t required_bytes)
+{
+    /* is partition completely full? */
+    size_t occupied = 0;
+    for (size_t j = 0; j < partition->num_slots; j++)
+    {
+        uint8_t state = atomic_load_explicit(&partition->slots[j].state, memory_order_relaxed);
+        if (state == ENTRY_VALID || state == ENTRY_WRITING)
+        {
+            occupied++;
         }
     }
-    else
+
+    int should_check_bytes = (partition->num_slots <= CLOCK_CACHE_SMALL_PARTITION_SLOTS);
+
+    if (should_check_bytes)
     {
-        /* cache too small for pool -- use malloc */
-        cache->entry_pool = NULL;
+        /* compute total bytes across all partitions */
+        size_t total_bytes = 0;
+        for (size_t i = 0; i < cache->num_partitions; i++)
+        {
+            clock_cache_partition_t *p = &cache->partitions[i];
+            for (size_t j = 0; j < p->num_slots; j++)
+            {
+                uint8_t state = atomic_load_explicit(&p->slots[j].state, memory_order_relaxed);
+                if (state == ENTRY_VALID)
+                {
+                    size_t klen = atomic_load_explicit(&p->slots[j].key_len, memory_order_relaxed);
+                    size_t plen =
+                        atomic_load_explicit(&p->slots[j].payload_len, memory_order_relaxed);
+                    total_bytes += _entry_size(klen, plen);
+                }
+            }
+        }
+
+        /* evict if we would exceed byte limit */
+        while (total_bytes + required_bytes > cache->max_bytes)
+        {
+            /* find a partition with entries to evict */
+            clock_cache_partition_t *evict_partition = NULL;
+            for (size_t i = 0; i < cache->num_partitions; i++)
+            {
+                clock_cache_partition_t *p = &cache->partitions[i];
+                for (size_t j = 0; j < p->num_slots; j++)
+                {
+                    uint8_t state = atomic_load_explicit(&p->slots[j].state, memory_order_relaxed);
+                    if (state == ENTRY_VALID)
+                    {
+                        evict_partition = p;
+                        goto found_partition;
+                    }
+                }
+            }
+        found_partition:
+
+            if (!evict_partition) break;
+
+            _clock_evict(cache, evict_partition);
+
+            /* recompute total_bytes */
+            total_bytes = 0;
+            for (size_t i = 0; i < cache->num_partitions; i++)
+            {
+                clock_cache_partition_t *p = &cache->partitions[i];
+                for (size_t j = 0; j < p->num_slots; j++)
+                {
+                    uint8_t state = atomic_load_explicit(&p->slots[j].state, memory_order_relaxed);
+                    if (state == ENTRY_VALID)
+                    {
+                        size_t klen =
+                            atomic_load_explicit(&p->slots[j].key_len, memory_order_relaxed);
+                        size_t plen =
+                            atomic_load_explicit(&p->slots[j].payload_len, memory_order_relaxed);
+                        total_bytes += _entry_size(klen, plen);
+                    }
+                }
+            }
+        }
     }
 
-    cache->eviction_interval_ms = config->eviction_interval_ms > 0
-                                      ? config->eviction_interval_ms
-                                      : CACHE_DEFAULT_EVICTION_INTERVAL_MS;
-    cache->max_backoff_ms =
-        config->max_backoff_ms > 0 ? config->max_backoff_ms : CACHE_DEFAULT_MAX_BACKOFF_MS;
-    cache->eviction_threshold = config->eviction_threshold > 0 ? config->eviction_threshold
-                                                               : CACHE_DEFAULT_EVICTION_THRESHOLD;
-    cache->eviction_target =
-        config->eviction_target > 0 ? config->eviction_target : CACHE_DEFAULT_EVICTION_TARGET;
-
-    /* start eviction thread */
-    atomic_init(&cache->eviction_state, CACHE_EVICTION_RUNNING);
-    if (pthread_create(&cache->eviction_thread, NULL, eviction_thread_func, cache) != 0)
+    /* also evict if partition is completely full */
+    if (occupied >= partition->num_slots)
     {
-        free(cache->hash_table);
-        free(cache->slots);
-        if (cache->entry_pool) cache_entry_pool_destroy(cache->entry_pool);
+        _clock_evict(cache, partition);
+    }
+
+    return 0;
+}
+
+void clock_cache_compute_config(size_t max_bytes, cache_config_t *config)
+{
+    if (!config) return;
+
+    /* CPU count for partition sizing */
+    int num_cpus = tdb_get_cpu_count();
+
+    /* heuristic is 1-2 partitions per CPU core, capped at 128 */
+    size_t num_partitions = (size_t)num_cpus * CLOCK_CACHE_PARTITIONS_PER_CPU;
+    if (num_partitions < CLOCK_CACHE_MIN_PARTITIONS) num_partitions = CLOCK_CACHE_MIN_PARTITIONS;
+    if (num_partitions > CLOCK_CACHE_MAX_PARTITIONS) num_partitions = CLOCK_CACHE_MAX_PARTITIONS;
+
+    /* we round up to next power of 2 for efficient masking */
+    size_t p = 1;
+    while (p < num_partitions) p <<= 1;
+    num_partitions = p;
+
+    /* estimate average entry size is ~100 bytes (key + payload + overhead) */
+    const size_t avg_entry_size = CLOCK_CACHE_AVG_ENTRY_SIZE;
+    size_t total_entries = max_bytes / avg_entry_size;
+    if (total_entries < num_partitions) total_entries = num_partitions;
+
+    /* distribute entries across partitions */
+    size_t slots_per_partition = total_entries / num_partitions;
+
+    /* Clamp to reasonable range: 64-2048 slots per partition */
+    if (slots_per_partition < CLOCK_CACHE_MIN_SLOTS_PER_PARTITION)
+        slots_per_partition = CLOCK_CACHE_MIN_SLOTS_PER_PARTITION;
+    if (slots_per_partition > CLOCK_CACHE_MAX_SLOTS_PER_PARTITION)
+        slots_per_partition = CLOCK_CACHE_MAX_SLOTS_PER_PARTITION;
+
+    /* Round up to next power of 2 for better memory alignment */
+    size_t s = CLOCK_CACHE_MIN_SLOTS_PER_PARTITION;
+    while (s < slots_per_partition) s <<= 1;
+    slots_per_partition = s;
+
+    config->max_bytes = max_bytes;
+    config->num_partitions = num_partitions;
+    config->slots_per_partition = slots_per_partition;
+}
+
+clock_cache_t *clock_cache_create(const cache_config_t *config)
+{
+    if (!config || config->num_partitions == 0 || config->slots_per_partition == 0)
+    {
+        return NULL;
+    }
+
+    clock_cache_t *cache = (clock_cache_t *)calloc(1, sizeof(clock_cache_t));
+    if (!cache) return NULL;
+
+    cache->num_partitions = config->num_partitions;
+    cache->max_bytes = config->max_bytes;
+    cache->partition_mask = config->num_partitions - 1; /* assumes power of 2 */
+    atomic_store_explicit(&cache->total_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&cache->hits, 0, memory_order_relaxed);
+    atomic_store_explicit(&cache->misses, 0, memory_order_relaxed);
+    atomic_store_explicit(&cache->shutdown, 0, memory_order_relaxed);
+
+    cache->partitions =
+        (clock_cache_partition_t *)calloc(config->num_partitions, sizeof(clock_cache_partition_t));
+    if (!cache->partitions)
+    {
         free(cache);
         return NULL;
+    }
+
+    for (size_t i = 0; i < config->num_partitions; i++)
+    {
+        clock_cache_partition_t *partition = &cache->partitions[i];
+        partition->num_slots = config->slots_per_partition;
+        atomic_store_explicit(&partition->clock_hand, 0, memory_order_relaxed);
+        atomic_store_explicit(&partition->occupied_count, 0, memory_order_relaxed);
+        atomic_store_explicit(&partition->bytes_used, 0, memory_order_relaxed);
+
+        /* calculate hash index size (2x slots for low collision rate) */
+        partition->hash_index_size =
+            config->slots_per_partition * CLOCK_CACHE_HASH_INDEX_MULTIPLIER;
+        /* round up to next power of 2 */
+        size_t size = 1;
+        while (size < partition->hash_index_size) size <<= 1;
+        partition->hash_index_size = size;
+        partition->hash_mask = size - 1;
+
+        partition->slots =
+            (clock_cache_entry_t *)calloc(config->slots_per_partition, sizeof(clock_cache_entry_t));
+        if (!partition->slots)
+        {
+            for (size_t j = 0; j < i; j++)
+            {
+                free(cache->partitions[j].slots);
+            }
+            free(cache->partitions);
+            free(cache);
+            return NULL;
+        }
+
+        partition->hash_index =
+            (_Atomic(int32_t) *)calloc(partition->hash_index_size, sizeof(_Atomic(int32_t)));
+        if (!partition->hash_index)
+        {
+            free(partition->slots);
+            for (size_t j = 0; j < i; j++)
+            {
+                free(cache->partitions[j].hash_index);
+                free(cache->partitions[j].slots);
+            }
+            free(cache->partitions);
+            free(cache);
+            return NULL;
+        }
+
+        /* initialize hash index to -1 (empty) */
+        for (size_t j = 0; j < partition->hash_index_size; j++)
+        {
+            atomic_store_explicit(&partition->hash_index[j], -1, memory_order_relaxed);
+        }
+
+        /* initialize all entry states to EMPTY */
+        for (size_t j = 0; j < partition->num_slots; j++)
+        {
+            atomic_store_explicit(&partition->slots[j].state, ENTRY_EMPTY, memory_order_relaxed);
+            atomic_store_explicit(&partition->slots[j].key, NULL, memory_order_relaxed);
+            atomic_store_explicit(&partition->slots[j].payload, NULL, memory_order_relaxed);
+            atomic_store_explicit(&partition->slots[j].key_len, 0, memory_order_relaxed);
+            atomic_store_explicit(&partition->slots[j].payload_len, 0, memory_order_relaxed);
+            atomic_store_explicit(&partition->slots[j].ref_bit, 0, memory_order_relaxed);
+            atomic_store_explicit(&partition->slots[j].cached_hash, 0, memory_order_relaxed);
+        }
+
+        /* link partitions */
+        if (i > 0)
+        {
+            cache->partitions[i - 1].next = partition;
+        }
+        partition->next = NULL;
     }
 
     return cache;
@@ -468,555 +592,251 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
 
 void clock_cache_destroy(clock_cache_t *cache)
 {
-    if (cache == NULL) return;
+    if (!cache) return;
 
-    atomic_store_explicit(&cache->eviction_state, CACHE_EVICTION_STOPPED, memory_order_release);
-    pthread_join(cache->eviction_thread, NULL);
+    /* set shutdown flag to prevent new operations */
+    atomic_store_explicit(&cache->shutdown, 1, memory_order_release);
 
-    free(cache->hash_table);
+    /* mem fence, ensure all threads see shutdown flag */
+    atomic_thread_fence(memory_order_seq_cst);
 
-    for (uint32_t i = 0; i < cache->num_slots; i++)
+    for (size_t i = 0; i < cache->num_partitions; i++)
     {
-        clock_cache_entry_t *entry =
-            atomic_load_explicit(&cache->slots[i].entry, memory_order_acquire);
-        if (entry != NULL)
+        clock_cache_partition_t *partition = &cache->partitions[i];
+
+        /* we mark all entries as deleting first to stop new accesses */
+        for (size_t j = 0; j < partition->num_slots; j++)
         {
-            cache_entry_evict(entry, cache);
+            uint8_t state = atomic_load_explicit(&partition->slots[j].state, memory_order_acquire);
+            if (state == ENTRY_VALID || state == ENTRY_WRITING)
+            {
+                atomic_store_explicit(&partition->slots[j].state, ENTRY_DELETING,
+                                      memory_order_release);
+            }
         }
+
+        /* mem fence -- ensure all readers see DELETING state */
+        atomic_thread_fence(memory_order_seq_cst);
+
+        for (size_t j = 0; j < partition->num_slots; j++)
+        {
+            char *key = atomic_load_explicit(&partition->slots[j].key, memory_order_acquire);
+            uint8_t *payload =
+                atomic_load_explicit(&partition->slots[j].payload, memory_order_acquire);
+            if (key) free(key);
+            if (payload) free(payload);
+        }
+
+        free(partition->hash_index);
+        free(partition->slots);
     }
 
-    free(cache->slots);
-
-    if (cache->entry_pool)
-    {
-        cache_entry_pool_destroy(cache->entry_pool);
-    }
-
+    free(cache->partitions);
     free(cache);
+    cache = NULL;
 }
 
 int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const uint8_t *payload,
                     size_t payload_len)
 {
-    if (cache == NULL || key == NULL || key_len == 0 || payload == NULL) return -1;
+    if (!cache || !key || key_len == 0 || !payload) return -1;
 
-    uint64_t hash = hash_key(key, key_len);
-    uint32_t bucket_idx = hash_to_bucket(hash, cache->num_buckets);
-    clock_cache_hash_bucket_t *bucket = &cache->hash_table[bucket_idx];
+    if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return -1;
 
-    uint32_t current_slot = atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-    while (current_slot != CACHE_INVALID_SLOT_ID)
+    size_t partition_idx = _hash_to_partition(cache, key, key_len);
+    clock_cache_partition_t *partition = &cache->partitions[partition_idx];
+    uint64_t hash = _compute_hash(key, key_len);
+    size_t entry_bytes = _entry_size(key_len, payload_len);
+
+    /* try to find and invalidate existing entry (best-effort update) */
+    clock_cache_entry_t *old_entry = _find_entry(partition, key, key_len, NULL);
+    if (old_entry)
     {
-        if (current_slot >= cache->num_slots) break;
+        /* mark old entry as deleted to avoid duplicates */
+        _free_entry(cache, partition, old_entry);
+    }
 
-        clock_cache_entry_t *entry =
-            atomic_load_explicit(&cache->slots[current_slot].entry, memory_order_acquire);
-        if (entry != NULL)
+    if (partition->num_slots <= CLOCK_CACHE_SMALL_PARTITION_SLOTS)
+    {
+        _ensure_space(cache, partition, entry_bytes);
+    }
+
+    clock_cache_entry_t *entry = NULL;
+    size_t slot_idx = 0;
+    int max_retries = CLOCK_CACHE_MAX_PUT_RETRIES;
+
+    for (int retry = 0; retry < max_retries; retry++)
+    {
+        slot_idx = _clock_evict(cache, partition);
+        entry = &partition->slots[slot_idx];
+
+        /* we try to claim slot with CAS, EMPTY --> WRITING */
+        uint8_t expected = ENTRY_EMPTY;
+        if (atomic_compare_exchange_strong(&entry->state, &expected, ENTRY_WRITING))
         {
-            if (entry->hash == hash && entry->key_len == key_len &&
-                memcmp(entry->key, key, key_len) == 0)
-            {
-                /* key exists -- check if we can update in place */
-                if (entry->payload_len == payload_len)
-                {
-                    /* same size -- update in place */
-                    memcpy(entry->payload, payload, payload_len);
-                    atomic_store_explicit(&entry->ref_bit, 1,
-                                          memory_order_relaxed); /* CLOCK -- mark as accessed */
-                    return 0;
-                }
-                else
-                {
-                    /* different size -- need to delete and re-insert */
-                    /* remove from hash chain first */
-                    uint32_t next =
-                        atomic_load_explicit(&entry->next_in_bucket, memory_order_acquire);
-
-                    /* find and remove from chain */
-                    uint32_t prev_slot = CACHE_INVALID_SLOT_ID;
-                    uint32_t scan_slot =
-                        atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-
-                    while (scan_slot != CACHE_INVALID_SLOT_ID)
-                    {
-                        if (scan_slot == current_slot)
-                        {
-                            if (prev_slot == CACHE_INVALID_SLOT_ID)
-                            {
-                                /* update bucket head */
-                                uint32_t expected = current_slot;
-                                atomic_compare_exchange_strong_explicit(
-                                    &bucket->head_slot_id, &expected, next, memory_order_release,
-                                    memory_order_relaxed);
-                            }
-                            else
-                            {
-                                /* update previous entry */
-                                clock_cache_entry_t *prev_entry = atomic_load_explicit(
-                                    &cache->slots[prev_slot].entry, memory_order_acquire);
-                                if (prev_entry != NULL)
-                                {
-                                    atomic_store_explicit(&prev_entry->next_in_bucket, next,
-                                                          memory_order_release);
-                                }
-                            }
-                            break;
-                        }
-
-                        clock_cache_entry_t *scan_entry = atomic_load_explicit(
-                            &cache->slots[scan_slot].entry, memory_order_acquire);
-                        if (scan_entry != NULL)
-                        {
-                            prev_slot = scan_slot;
-                            scan_slot = atomic_load_explicit(&scan_entry->next_in_bucket,
-                                                             memory_order_acquire);
-                        }
-                        else
-                            break;
-                    }
-
-                    /* evict old entry and free slot */
-                    cache_entry_evict(entry, cache);
-                    atomic_store_explicit(&cache->slots[current_slot].entry, NULL,
-                                          memory_order_release);
-                    atomic_fetch_sub_explicit(&cache->active_slots, 1, memory_order_relaxed);
-
-                    /* fall through to create new entry below */
-                    break;
-                }
-            }
-
-            current_slot = atomic_load_explicit(&entry->next_in_bucket, memory_order_acquire);
-        }
-        else
-        {
+            /* got it */
             break;
         }
+
+        /* someone else claimed it, try again */
+        entry = NULL;
     }
 
-    /* create new entry with single allocation (entry + key + payload)
-     * use memory pool to avoid malloc overhead */
-    size_t total_size = sizeof(clock_cache_entry_t) + key_len + payload_len;
-    clock_cache_entry_t *entry;
-    uint8_t from_pool = 0;
-
-    if (cache->entry_pool && total_size <= cache->entry_pool->node_size)
+    if (!entry)
     {
-        /* allocate from pool (lock-free, ~5ns) */
-        entry = (clock_cache_entry_t *)cache_entry_pool_alloc(cache->entry_pool);
-        from_pool = 1;
-    }
-    else
-    {
-        /* fall back to malloc (~50ns) */
-        entry = malloc(total_size);
-        from_pool = 0;
-    }
-
-    if (entry == NULL) return -1;
-
-    /* key and payload are stored immediately after the entry struct */
-    entry->key = (uint8_t *)(entry + 1);
-    entry->payload = entry->key + key_len;
-
-    memcpy(entry->key, key, key_len);
-    entry->key_len = key_len;
-
-    memcpy(entry->payload, payload, payload_len);
-    entry->payload_len = payload_len;
-
-    entry->hash = hash;
-    atomic_init(&entry->next_in_bucket, CACHE_INVALID_SLOT_ID);
-    atomic_init(&entry->ref_bit, 1); /* CLOCK -- mark as recently accessed */
-    entry->from_pool = from_pool;    /* track allocation source */
-
-    uint32_t slot_id = CACHE_INVALID_SLOT_ID;
-    uint32_t attempts = 0;
-    uint32_t start_slot =
-        atomic_fetch_add_explicit(&cache->next_slot, 1, memory_order_relaxed) % cache->num_slots;
-
-    for (uint32_t i = 0; i < cache->num_slots && attempts < cache->num_slots; i++)
-    {
-        uint32_t try_slot = (start_slot + i) % cache->num_slots;
-        clock_cache_entry_t *expected = NULL;
-
-        /* we try to claim this slot with CAS */
-        if (atomic_compare_exchange_weak_explicit(&cache->slots[try_slot].entry, &expected, entry,
-                                                  memory_order_release, memory_order_relaxed))
-        {
-            slot_id = try_slot;
-            atomic_fetch_add_explicit(&cache->active_slots, 1, memory_order_relaxed);
-            break;
-        }
-        attempts++;
-    }
-
-    if (slot_id == CACHE_INVALID_SLOT_ID)
-    {
-        /* cache full - cleanup */
-        if (from_pool && cache->entry_pool)
-            cache_entry_pool_free(cache->entry_pool, entry);
-        else
-            free(entry);
+        /* failed to claim slot after retries */
         return -1;
     }
 
-    /* add to hash chain with limited retries and adaptive backoff
-     * this reduces CAS contention by failing fast and using randomized delays */
-    uint32_t old_head;
-    uint32_t backoff = CACHE_INITIAL_BACKOFF;
-    uint32_t max_retries = CACHE_MAX_INSERT_RETRIES;
-    uint32_t retry_count = 0;
+    /* we own the slot now, allocate and fill */
+    char *new_key = (char *)malloc(key_len);
+    uint8_t *new_payload = (uint8_t *)malloc(payload_len);
 
-    /* fast path -- try to claim empty bucket first (common case) */
-    old_head = CACHE_INVALID_SLOT_ID;
-    if (atomic_compare_exchange_strong_explicit(&bucket->head_slot_id, &old_head, slot_id,
-                                                memory_order_release, memory_order_relaxed))
+    if (!new_key || !new_payload)
     {
-        /* success! empty bucket claimed */
-        atomic_store_explicit(&entry->next_in_bucket, CACHE_INVALID_SLOT_ID, memory_order_relaxed);
-        goto insert_success;
+        free(new_key);
+        free(new_payload);
+        atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
+        return -1;
     }
 
-    /* slow path -- bucket has entries, need to prepend with CAS */
-    while (retry_count < max_retries)
-    {
-        old_head = atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-        atomic_store_explicit(&entry->next_in_bucket, old_head, memory_order_relaxed);
+    memcpy(new_key, key, key_len);
+    memcpy(new_payload, payload, payload_len);
 
-        if (atomic_compare_exchange_weak_explicit(&bucket->head_slot_id, &old_head, slot_id,
-                                                  memory_order_release, memory_order_relaxed))
-        {
-            goto insert_success;
-        }
+    atomic_store_explicit(&entry->key, new_key, memory_order_release);
+    atomic_store_explicit(&entry->payload, new_payload, memory_order_release);
+    atomic_store_explicit(&entry->key_len, key_len, memory_order_release);
+    atomic_store_explicit(&entry->payload_len, payload_len, memory_order_release);
+    atomic_store_explicit(&entry->ref_bit, 1, memory_order_release);
 
-        /* CAS failed -- adaptive backoff with randomization to reduce thundering herd */
-        retry_count++;
+    /* transition to valid, entry is now visible */
+    atomic_store_explicit(&entry->state, ENTRY_VALID, memory_order_release);
 
-        if (retry_count < CACHE_LOW_CONTENTION_THRESHOLD)
-        {
-            /* first few retries -- just pause */
-            for (uint32_t i = 0; i < backoff; i++) cpu_pause();
-            backoff = backoff * 2;
-        }
-        else if (retry_count < CACHE_MED_CONTENTION_THRESHOLD)
-        {
-            /* medium contention -- exponential backoff with jitter */
-            uint32_t jitter = (uint32_t)rand() % backoff;
-            for (uint32_t i = 0; i < (backoff + jitter); i++) cpu_pause();
-            backoff = backoff * 2;
-            if (backoff > CACHE_MAX_BACKOFF_PAUSES) backoff = CACHE_MAX_BACKOFF_PAUSES;
-        }
-        else
-        {
-            /* contention is wee bit high, yield to other threads */
-            usleep(CACHE_HIGH_CONTENTION_SLEEP_US);
-        }
-    }
-
-    /* failed after max retries -- this shouldnt happen often
-     * fall back is to insert at a different position in the chain (append instead of prepend) */
-    old_head = atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-    if (old_head != CACHE_INVALID_SLOT_ID && old_head < cache->num_slots)
-    {
-        /* try to append to the end of the first entry's chain */
-        clock_cache_entry_t *first_entry =
-            atomic_load_explicit(&cache->slots[old_head].entry, memory_order_acquire);
-        if (first_entry != NULL)
-        {
-            atomic_store_explicit(&entry->next_in_bucket, CACHE_INVALID_SLOT_ID,
-                                  memory_order_relaxed);
-
-            /* try to append */
-            uint32_t expected_next = CACHE_INVALID_SLOT_ID;
-            if (atomic_compare_exchange_strong_explicit(&first_entry->next_in_bucket,
-                                                        &expected_next, slot_id,
-                                                        memory_order_release, memory_order_relaxed))
-            {
-                goto insert_success;
-            }
-        }
-    }
-
-    /*just prepend with strong CAS (blocking) */
-    do
-    {
-        old_head = atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-        atomic_store_explicit(&entry->next_in_bucket, old_head, memory_order_relaxed);
-    } while (!atomic_compare_exchange_strong_explicit(&bucket->head_slot_id, &old_head, slot_id,
-                                                      memory_order_release, memory_order_relaxed));
-
-insert_success:
-
-    /* update size tracking */
-    size_t entry_size = sizeof(clock_cache_entry_t) + key_len + payload_len;
-    atomic_fetch_add_explicit(&cache->current_bytes, entry_size, memory_order_relaxed);
+    /* add to hash index after entry is valid */
+    _hash_table_insert(partition, hash, slot_idx);
 
     return 0;
 }
 
 uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, size_t *payload_len)
 {
-    if (cache == NULL || key == NULL || key_len == 0 || payload_len == NULL) return NULL;
+    if (!cache || !key || key_len == 0) return NULL;
 
-    uint64_t hash = hash_key(key, key_len);
-    uint32_t bucket_idx = hash_to_bucket(hash, cache->num_buckets);
-    clock_cache_hash_bucket_t *bucket = &cache->hash_table[bucket_idx];
+    if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return NULL;
 
-    uint32_t current_slot = atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-    while (current_slot != CACHE_INVALID_SLOT_ID)
+    size_t partition_idx = _hash_to_partition(cache, key, key_len);
+    clock_cache_partition_t *partition = &cache->partitions[partition_idx];
+
+    clock_cache_entry_t *entry = _find_entry(partition, key, key_len, NULL);
+
+    if (!entry)
     {
-        if (current_slot >= cache->num_slots) break;
-
-        clock_cache_entry_t *entry =
-            atomic_load_explicit(&cache->slots[current_slot].entry, memory_order_acquire);
-        if (entry != NULL)
-        {
-            /* prefetch next entry in chain to hide memory latency */
-            uint32_t next_slot = atomic_load_explicit(&entry->next_in_bucket, memory_order_relaxed);
-            if (next_slot != CACHE_INVALID_SLOT_ID && next_slot < cache->num_slots)
-            {
-                __builtin_prefetch(&cache->slots[next_slot], 0, 1); /* prefetch for read */
-            }
-
-            if (entry->hash == hash && entry->key_len == key_len &&
-                memcmp(entry->key, key, key_len) == 0)
-            {
-                /* found -- mark as recently accessed (CLOCK) */
-                atomic_store_explicit(&entry->ref_bit, 1, memory_order_relaxed);
-
-                /* copy payload */
-                uint8_t *result = malloc(entry->payload_len);
-                if (result == NULL) return NULL;
-                memcpy(result, entry->payload, entry->payload_len);
-                *payload_len = entry->payload_len;
-
-                return result;
-            }
-
-            current_slot = atomic_load_explicit(&entry->next_in_bucket, memory_order_acquire);
-        }
-        else
-        {
-            break;
-        }
+        return NULL;
     }
 
-    return NULL;
+    uint8_t *entry_payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
+    size_t entry_payload_len = atomic_load_explicit(&entry->payload_len, memory_order_acquire);
+
+    if (!entry_payload || entry_payload_len == 0)
+    {
+        return NULL;
+    }
+
+    uint8_t *result = (uint8_t *)malloc(entry_payload_len);
+    if (!result) return NULL;
+
+    memcpy(result, entry_payload, entry_payload_len);
+
+    /* state didnt change during copy? */
+    uint8_t final_state = atomic_load_explicit(&entry->state, memory_order_acquire);
+    if (final_state != ENTRY_VALID)
+    {
+        /* state changed, entry being deleted */
+        free(result);
+        return NULL;
+    }
+
+    if (payload_len) *payload_len = entry_payload_len;
+
+    /* set reference bit atomically */
+    atomic_store_explicit(&entry->ref_bit, 1, memory_order_relaxed);
+
+    /* skip global hit counter -- too much contention */
+    return result;
 }
 
 int clock_cache_delete(clock_cache_t *cache, const char *key, size_t key_len)
 {
-    if (cache == NULL || key == NULL || key_len == 0) return -1;
+    if (!cache || !key || key_len == 0) return -1;
 
-    uint64_t hash = hash_key(key, key_len);
-    uint32_t bucket_idx = hash_to_bucket(hash, cache->num_buckets);
-    clock_cache_hash_bucket_t *bucket = &cache->hash_table[bucket_idx];
+    if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return -1;
 
-    /* search for the entry in the hash chain */
-    uint32_t current_slot = atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-    uint32_t prev_slot = CACHE_INVALID_SLOT_ID;
+    size_t partition_idx = _hash_to_partition(cache, key, key_len);
+    clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
-    while (current_slot != CACHE_INVALID_SLOT_ID)
+    clock_cache_entry_t *entry = _find_entry(partition, key, key_len, NULL);
+
+    if (!entry)
     {
-        if (current_slot >= cache->num_slots) break;
-
-        clock_cache_entry_t *entry =
-            atomic_load_explicit(&cache->slots[current_slot].entry, memory_order_acquire);
-        if (entry != NULL)
-        {
-            if (entry->hash == hash && entry->key_len == key_len &&
-                memcmp(entry->key, key, key_len) == 0)
-            {
-                /* found -- remove from chain using CAS */
-                uint32_t next = atomic_load_explicit(&entry->next_in_bucket, memory_order_acquire);
-
-                if (prev_slot == CACHE_INVALID_SLOT_ID)
-                {
-                    /* removing head of chain -- use CAS on bucket head */
-                    uint32_t expected = current_slot;
-                    if (!atomic_compare_exchange_strong_explicit(&bucket->head_slot_id, &expected,
-                                                                 next, memory_order_release,
-                                                                 memory_order_relaxed))
-                    {
-                        /* CAS failed -- chain was modified -- retry from beginning */
-                        current_slot =
-                            atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-                        prev_slot = CACHE_INVALID_SLOT_ID;
-                        continue;
-                    }
-                }
-                else
-                {
-                    /* removing from middle/end -- update previous entry's next pointer */
-                    clock_cache_entry_t *prev_entry =
-                        atomic_load_explicit(&cache->slots[prev_slot].entry, memory_order_acquire);
-                    if (prev_entry != NULL)
-                    {
-                        uint32_t expected = current_slot;
-                        if (!atomic_compare_exchange_strong_explicit(
-                                &prev_entry->next_in_bucket, &expected, next, memory_order_release,
-                                memory_order_relaxed))
-                        {
-                            /* CAS failed -- chain was modified -- retry from beginning */
-                            current_slot =
-                                atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-                            prev_slot = CACHE_INVALID_SLOT_ID;
-                            continue;
-                        }
-                    }
-                    else
-                    {
-                        /* previous entry disappeared -- retry from beginning */
-                        current_slot =
-                            atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-                        prev_slot = CACHE_INVALID_SLOT_ID;
-                        continue;
-                    }
-                }
-
-                /* successfully removed from chain -- free slot */
-                cache_entry_evict(entry, cache);
-                atomic_store_explicit(&cache->slots[current_slot].entry, NULL,
-                                      memory_order_release);
-                atomic_fetch_sub_explicit(&cache->active_slots, 1, memory_order_relaxed);
-
-                return 0;
-            }
-
-            /* not a match -- continue to next */
-            prev_slot = current_slot;
-            current_slot = atomic_load_explicit(&entry->next_in_bucket, memory_order_acquire);
-        }
-        else
-        {
-            break;
-        }
+        return -1;
     }
 
-    return -1;
-}
-
-int clock_cache_exists(clock_cache_t *cache, const char *key, size_t key_len)
-{
-    if (cache == NULL || key == NULL || key_len == 0) return 0;
-
-    uint64_t hash = hash_key(key, key_len);
-    uint32_t bucket_idx = hash_to_bucket(hash, cache->num_buckets);
-    clock_cache_hash_bucket_t *bucket = &cache->hash_table[bucket_idx];
-
-    /* search hash chain */
-    uint32_t current_slot = atomic_load_explicit(&bucket->head_slot_id, memory_order_acquire);
-    while (current_slot != CACHE_INVALID_SLOT_ID)
-    {
-        if (current_slot >= cache->num_slots) break;
-
-        clock_cache_entry_t *entry =
-            atomic_load_explicit(&cache->slots[current_slot].entry, memory_order_acquire);
-        if (entry != NULL)
-        {
-            if (entry->hash == hash && entry->key_len == key_len &&
-                memcmp(entry->key, key, key_len) == 0)
-            {
-                return 1;
-            }
-
-            current_slot = atomic_load_explicit(&entry->next_in_bucket, memory_order_acquire);
-        }
-        else
-        {
-            break;
-        }
-    }
+    _free_entry(cache, partition, entry);
 
     return 0;
 }
 
 void clock_cache_clear(clock_cache_t *cache)
 {
-    if (cache == NULL) return;
+    if (!cache) return;
 
-    for (uint32_t i = 0; i < cache->num_buckets; i++)
+    for (size_t i = 0; i < cache->num_partitions; i++)
     {
-        atomic_store_explicit(&cache->hash_table[i].head_slot_id, CACHE_INVALID_SLOT_ID,
-                              memory_order_release);
-    }
+        clock_cache_partition_t *partition = &cache->partitions[i];
 
-    for (uint32_t i = 0; i < cache->num_slots; i++)
-    {
-        clock_cache_entry_t *entry =
-            atomic_load_explicit(&cache->slots[i].entry, memory_order_acquire);
-        if (entry != NULL)
+        for (size_t j = 0; j < partition->num_slots; j++)
         {
-            cache_entry_evict(entry, cache);
-            atomic_store_explicit(&cache->slots[i].entry, NULL, memory_order_release);
+            uint8_t state = atomic_load_explicit(&partition->slots[j].state, memory_order_acquire);
+            if (state == ENTRY_VALID)
+            {
+                _free_entry(cache, partition, &partition->slots[j]);
+            }
         }
     }
 
-    atomic_store_explicit(&cache->active_slots, 0, memory_order_release);
+    atomic_store_explicit(&cache->total_bytes, 0, memory_order_relaxed);
 }
 
-void clock_cache_stats(clock_cache_t *cache, size_t *total_entries, size_t *total_bytes)
+void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats)
 {
-    if (cache == NULL) return;
+    if (!cache || !stats) return;
 
-    if (total_entries != NULL)
+    size_t total_bytes = 0;
+    size_t total_entries = 0;
+    for (size_t i = 0; i < cache->num_partitions; i++)
     {
-        *total_entries = atomic_load_explicit(&cache->active_slots, memory_order_acquire);
+        clock_cache_partition_t *partition = &cache->partitions[i];
+        for (size_t j = 0; j < partition->num_slots; j++)
+        {
+            uint8_t state = atomic_load_explicit(&partition->slots[j].state, memory_order_relaxed);
+            if (state == ENTRY_VALID)
+            {
+                size_t klen =
+                    atomic_load_explicit(&partition->slots[j].key_len, memory_order_relaxed);
+                size_t plen =
+                    atomic_load_explicit(&partition->slots[j].payload_len, memory_order_relaxed);
+                total_bytes += _entry_size(klen, plen);
+                total_entries++;
+            }
+        }
     }
 
-    if (total_bytes != NULL)
-    {
-        *total_bytes = atomic_load_explicit(&cache->current_bytes, memory_order_acquire);
-    }
-}
+    stats->total_bytes = total_bytes;
+    stats->total_entries = total_entries;
+    stats->hits = atomic_load_explicit(&cache->hits, memory_order_relaxed);
+    stats->misses = atomic_load_explicit(&cache->misses, memory_order_relaxed);
+    stats->num_partitions = cache->num_partitions;
 
-void clock_cache_stats_detailed(clock_cache_t *cache, size_t *total_entries, size_t *total_bytes,
-                                uint32_t *num_buckets, float *load_factor)
-{
-    if (cache == NULL) return;
-
-    size_t entries = 0;
-    if (total_entries != NULL || load_factor != NULL)
-    {
-        entries = atomic_load_explicit(&cache->active_slots, memory_order_acquire);
-        if (total_entries != NULL) *total_entries = entries;
-    }
-
-    if (total_bytes != NULL)
-    {
-        *total_bytes = atomic_load_explicit(&cache->current_bytes, memory_order_acquire);
-    }
-
-    if (num_buckets != NULL)
-    {
-        *num_buckets = cache->num_buckets;
-    }
-
-    if (load_factor != NULL)
-    {
-        *load_factor = cache->num_buckets > 0 ? (float)entries / (float)cache->num_buckets : 0.0f;
-    }
-}
-
-void clock_cache_stats_pool(clock_cache_t *cache, size_t *pool_hits, size_t *pool_misses,
-                            size_t *pool_allocated, size_t *pool_max, float *pool_hit_rate)
-{
-    if (cache == NULL || cache->entry_pool == NULL) return;
-
-    size_t hits = atomic_load_explicit(&cache->entry_pool->pool_hits, memory_order_acquire);
-    size_t misses = atomic_load_explicit(&cache->entry_pool->pool_misses, memory_order_acquire);
-    size_t allocated =
-        atomic_load_explicit(&cache->entry_pool->allocated_nodes, memory_order_acquire);
-
-    if (pool_hits != NULL) *pool_hits = hits;
-    if (pool_misses != NULL) *pool_misses = misses;
-    if (pool_allocated != NULL) *pool_allocated = allocated;
-    if (pool_max != NULL) *pool_max = cache->entry_pool->max_nodes;
-
-    if (pool_hit_rate != NULL)
-    {
-        size_t total = hits + misses;
-        *pool_hit_rate = total > 0 ? (float)hits / (float)total : 0.0f;
-    }
+    uint64_t total_accesses = stats->hits + stats->misses;
+    stats->hit_rate = (total_accesses > 0) ? ((double)stats->hits / total_accesses) : 0.0;
 }

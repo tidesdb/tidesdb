@@ -1073,6 +1073,18 @@ static inline int fdatasync(int fd)
 /* pread and pwrite are available natively on macOS via unistd.h */
 /* no additional implementation needed using system pread/pwrite */
 
+/**
+ * tdb_fileno
+ * portable file descriptor extraction from FILE*
+ * @param stream the FILE* to get descriptor from
+ * @return file descriptor, or -1 on failure
+ */
+static inline int tdb_fileno(FILE *stream)
+{
+    if (!stream) return -1;
+    return fileno(stream);
+}
+
 /*
  * fdatasync
  * synchronizes file data to disk
@@ -2252,6 +2264,36 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
 
     /* perform the rename */
     return rename(old_path, new_path);
+}
+
+/**
+ * tdb_get_cpu_count
+ * gets the number of available CPU cores
+ * @return number of CPU cores, or 4 as fallback
+ */
+static inline int tdb_get_cpu_count(void)
+{
+#ifdef _WIN32
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    return (int)sysinfo.dwNumberOfProcessors;
+#elif defined(__APPLE__)
+    int count;
+    size_t count_len = sizeof(count);
+    if (sysctlbyname("hw.logicalcpu", &count, &count_len, NULL, 0) == 0)
+    {
+        return count;
+    }
+    return 4; /* fallback */
+#else
+    /* POSIX systems (Linux, BSD, etc.) */
+    long count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (count > 0)
+    {
+        return (int)count;
+    }
+    return 4; /* fallback */
+#endif
 }
 
 #endif /* __COMPAT_H__ */

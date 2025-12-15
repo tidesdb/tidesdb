@@ -22,7 +22,6 @@
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "buffer.h"
-#include "clock_cache.h"
 #include "compat.h"
 #include "compress.h"
 #include "ini.h"
@@ -150,6 +149,7 @@ typedef struct tidesdb_iter_t tidesdb_iter_t;
 typedef struct tidesdb_stats_t tidesdb_stats_t;
 typedef struct tidesdb_flush_work_t tidesdb_flush_work_t;
 typedef struct tidesdb_compaction_work_t tidesdb_compaction_work_t;
+typedef struct block_cache_t block_cache_t;
 
 /**
  * tidesdb_immutable_memtable_t
@@ -205,22 +205,22 @@ typedef enum
 typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                      size_t key2_size, void *ctx);
 
-#define TDB_WAL_PREFIX                  "wal_"
-#define TDB_WAL_EXT                     ".log"
-#define TDB_COLUMN_FAMILY_CONFIG_NAME   "config"
-#define TDB_COLUMN_FAMILY_MANIFEST_NAME "manifest"
-#define TDB_COLUMN_FAMILY_CONFIG_EXT    ".ini"
-#define TDB_LEVEL_PREFIX                "L"
-#define TDB_LEVEL_PARTITION_PREFIX      "P"
-#define TDB_SSTABLE_KLOG_EXT            ".klog"
-#define TDB_SSTABLE_VLOG_EXT            ".vlog"
-#define TDB_SSTABLE_CACHE_PREFIX        "sst_"
-#define TDB_CACHE_KEY_SIZE              256
-#define TDB_SSTABLE_METADATA_MAGIC      0x5353544D
-#define TDB_SSTABLE_INTERNAL_BLOCKS     3
-#define TDB_KLOG_BLOCK_SIZE             (64 * 1024)
-#define TDB_STACK_SSTS                  64
-#define TDB_ITER_STACK_KEY_SIZE         256
+#define TDB_WAL_PREFIX                     "wal_"
+#define TDB_WAL_EXT                        ".log"
+#define TDB_COLUMN_FAMILY_CONFIG_NAME      "config"
+#define TDB_COLUMN_FAMILY_MANIFEST_NAME    "manifest"
+#define TDB_COLUMN_FAMILY_CONFIG_EXT       ".ini"
+#define TDB_LEVEL_PREFIX                   "L"
+#define TDB_LEVEL_PARTITION_PREFIX         "P"
+#define TDB_SSTABLE_KLOG_EXT               ".klog"
+#define TDB_SSTABLE_VLOG_EXT               ".vlog"
+#define TDB_CACHE_KEY_SIZE                 12
+#define TDB_SSTABLE_METADATA_MAGIC         0x5353544D
+#define TDB_SSTABLE_INTERNAL_BLOCKS        3
+#define TDB_KLOG_BLOCK_SIZE                (64 * 1024)
+#define TDB_STACK_SSTS                     64
+#define TDB_ITER_STACK_KEY_SIZE            256
+#define TDB_SST__OPEN_SPIN_WAIT_ITERATIONS 10
 
 /* file system permissions */
 #define TDB_DIR_PERMISSIONS 0755
@@ -250,7 +250,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024)
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES           512
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      (1024 * 64)
-#define TDB_DEFAULT_CLOCK_CACHE_SIZE            (64 * 1024 * 1024)
+#define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_SYNC_INTERVAL_US            128000
 #define TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE      1
 #define TDB_COMMIT_STATUS_BUFFER_SIZE           65536
@@ -341,6 +341,22 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_MAX_LEVELS                          32
 #define TDB_DISK_SPACE_CHECK_INTERVAL_SECONDS   60
 #define NO_CF_SYNC_SLEEP_US                     100000
+
+/* cache optimization configuration */
+#define TDB_CACHE_PREFETCH_BLOCKS 2                  /* prefetch N adjacent blocks on cache miss */
+#define TDB_L1_CACHE_SIZE         (16 * 1024 * 1024) /* L1 cache for block indexes */
+
+/**
+ * tidesdb_block_cache_key_t
+ * compact binary cache key (12 bytes total)
+ * @param path_hash hash of klog_path (8 bytes) - unique across all CFs and SSTables
+ * @param block_position block position in file (4 bytes)
+ */
+typedef struct
+{
+    uint64_t path_hash;
+    uint32_t block_position;
+} __attribute__((packed)) tidesdb_block_cache_key_t;
 
 /* klog block configuration */
 #define TDB_KLOG_BLOCK_INITIAL_CAPACITY 512
@@ -436,7 +452,7 @@ typedef struct
  * @param num_compaction_threads number of compaction threads
  * @param log_level minimum log level to display (TDB_LOG_DEBUG, TDB_LOG_INFO, TDB_LOG_WARN,
  * TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE)
- * @param clock_cache_size size of clock cache in bytes for deserialized key value entries
+ * @param block_cache_size size of block clock cache in bytes for deserialized key value entries
  * @param max_open_sstables maximum number of open sstables
  * @param wait_for_txns_on_close if true, wait up to defined time for active transactions on close
  *                                if false (default), close immediately and fail active transactions
@@ -447,7 +463,7 @@ typedef struct
     int num_flush_threads;
     int num_compaction_threads;
     tidesdb_log_level_t log_level;
-    size_t clock_cache_size;
+    size_t block_cache_size;
     size_t max_open_sstables;
     int wait_for_txns_on_close;
 } tidesdb_config_t;
@@ -626,6 +642,7 @@ typedef struct
  * @param vlog_bm block manager for vlog
  * @param config column family configuration
  * @param marked_for_deletion atomic flag indicating if sstable is marked for deletion
+ * @param is_open atomic flag indicating if sstable is open
  * @param last_access_time last access time for lru eviction
  * @param db database handle (for resolving comparators from registry)
  */
@@ -652,6 +669,7 @@ struct tidesdb_sstable_t
     block_manager_t *vlog_bm;
     tidesdb_column_family_config_t *config;
     _Atomic(int) marked_for_deletion;
+    _Atomic(uint8_t) is_open;
     _Atomic(time_t) last_access_time;
     tidesdb_t *db;
 };
@@ -734,6 +752,7 @@ struct tidesdb_column_family_t
 {
     char *name;
     char *directory;
+    uint32_t cf_id; /* unique column family ID for compact cache keys */
     tidesdb_column_family_config_t config;
     _Atomic(skip_list_t *) active_memtable;
     _Atomic(uint64_t) memtable_id;
@@ -805,7 +824,7 @@ struct tidesdb_compaction_work_t
  * @param sync_thread_active atomic flag indicating if sync thread is active
  * @param reaper_thread background thread for evicting most un-accessed sstables
  * @param reaper_thread_active atomic flag indicating if reaper thread is active
- * @param clock_cache clock cache for hot keys
+ * @param block_cache clock block cache for hot keys
  * @param num_open_sstables global counter for open sstables
  * @param next_txn_id global transaction id counter
  * @param global_seq global sequence counter for snapshots and commits
@@ -843,7 +862,7 @@ struct tidesdb_t
     _Atomic(int) sync_thread_active;
     pthread_t sstable_reaper_thread;
     _Atomic(int) sstable_reaper_active;
-    clock_cache_t *clock_cache;
+    block_cache_t *block_cache;
     _Atomic(int) num_open_sstables;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;

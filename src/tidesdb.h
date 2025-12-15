@@ -188,6 +188,9 @@ typedef enum
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATOR_CTX  256
 
+/* file system permissions */
+#define TDB_DIR_PERMISSIONS 0755
+
 /**
  * tidesdb_comparator_fn
  * comparator function type for custom key ordering
@@ -457,7 +460,7 @@ struct tidesdb_level_t
  * @param sync_thread_active atomic flag indicating if sync thread is active
  * @param reaper_thread background thread for evicting most un-accessed sstables
  * @param reaper_thread_active atomic flag indicating if reaper thread is active
- * @param clock_cache clock cache for hot keys
+ * @param clock_cache clock cache for hot sstable blocks
  * @param num_open_sstables global counter for open sstables
  * @param next_txn_id global transaction id counter
  * @param global_seq global sequence counter for snapshots and commits

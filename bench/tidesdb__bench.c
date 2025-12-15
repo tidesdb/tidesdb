@@ -628,7 +628,7 @@ int main()
     printf("  DB Debug Logging: %s\n", get_log_level_name(BENCH_DB_LOG_LEVEL));
     printf("  DB Flush Pool Threads: %d\n", BENCH_DB_FLUSH_POOL_THREADS);
     printf("  DB Compaction Pool Threads: %d\n", BENCH_DB_COMPACTION_POOL_THREADS);
-    printf("  DB Block Clock Cache Size: %d\n", BENCH_BLOCK_CACHE_SIZE);
+    printf("  DB Block Cache Size: %d\n", BENCH_BLOCK_CACHE_SIZE);
 
     printf("\n" BOLDWHITE "Column Family Configuration:\n" RESET);
     printf("  Write Buffer Size: %zu bytes (%.2f MB)\n", (size_t)BENCH_WRITE_BUFFER_SIZE,

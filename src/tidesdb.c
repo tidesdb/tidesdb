@@ -75,9 +75,6 @@ typedef struct
 #define TDB_STACK_SSTS                  64
 #define TDB_ITER_STACK_KEY_SIZE         256
 
-/* file system permissions */
-#define TDB_DIR_PERMISSIONS 0755
-
 /* initial capacity values for dynamic arrays */
 #define TDB_INITIAL_MERGE_HEAP_CAPACITY    16
 #define TDB_INITIAL_CF_CAPACITY            16
@@ -12333,22 +12330,21 @@ skip_ssi_check:
 
             if (immutable_queue_depth >= TDB_BACKPRESSURE_IMMUTABLE_EMERGENCY)
             {
-                /* emergency: 10+ pending flushes, apply strong backpressure */
+                /* emergency 10+ pending flushes, apply strong backpressure */
                 usleep(TDB_BACKPRESSURE_IMMUTABLE_EMERGENCY_DELAY_US);
             }
             else if (immutable_queue_depth >= TDB_BACKPRESSURE_IMMUTABLE_CRITICAL)
             {
-                /* critical: 6-9 pending flushes */
+                /* critical 6-9 pending flushes */
                 usleep(TDB_BACKPRESSURE_IMMUTABLE_CRITICAL_DELAY_US);
             }
             else if (immutable_queue_depth >= TDB_BACKPRESSURE_IMMUTABLE_MODERATE)
             {
-                /* moderate: 3-5 pending flushes */
+                /* moderate 3-5 pending flushes */
                 usleep(TDB_BACKPRESSURE_IMMUTABLE_MODERATE_DELAY_US);
             }
 
             /* spooky-style file-count-based backpressure (β and γ triggers)
-             * based on "Spooky: Granular Space-Efficient Compaction for LSM-trees" (SIGMOD 2024)
              * file count is more critical than capacity for write amplification control */
             int num_l0_sstables =
                 atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);

@@ -702,6 +702,15 @@ void *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, siz
         return NULL;
     }
 
+    /* we check state BEFORE loading payload to prevent use-after-free
+     * if state is not ENTRY_VALID, another thread may be freeing the payload */
+    uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
+    if (state != ENTRY_VALID)
+    {
+        return NULL;
+    }
+
+    /* load payload pointer and length with acquire semantics */
     void *entry_payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
     size_t entry_payload_len = atomic_load_explicit(&entry->payload_len, memory_order_acquire);
 
@@ -710,16 +719,44 @@ void *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, siz
         return NULL;
     }
 
+    /* re-check state after loading payload pointer to prevent TOCTOU
+     * if state changed, payload may have been freed between our checks */
+    uint8_t state_after_load = atomic_load_explicit(&entry->state, memory_order_acquire);
+    if (state_after_load != ENTRY_VALID)
+    {
+        return NULL;
+    }
+
+    /* memory fence to synchronize with _free_entry's fence before free() */
+    atomic_thread_fence(memory_order_seq_cst);
+
+    /* final check to ensure payload pointer is still the same and state is still valid
+     * this protects against the race where _free_entry transitions to ENTRY_DELETING
+     * between our state check and the memcpy */
+    void *entry_payload_check = atomic_load_explicit(&entry->payload, memory_order_acquire);
+    uint8_t state_before_copy = atomic_load_explicit(&entry->state, memory_order_acquire);
+
+    if (state_before_copy != ENTRY_VALID || entry_payload_check != entry_payload)
+    {
+        /* entry is being deleted or payload changed, abort */
+        return NULL;
+    }
+
+    /* allocate result buffer */
     void *result = malloc(entry_payload_len);
     if (!result) return NULL;
 
+    /* copy data -- payload is protected by ENTRY_VALID state and fence */
     memcpy(result, entry_payload, entry_payload_len);
 
-    /* state didnt change during copy? */
+    /* final validation after copy to ensure entry wasn't deleted during memcpy
+     * if state changed or payload pointer changed, the data we copied may be invalid */
     uint8_t final_state = atomic_load_explicit(&entry->state, memory_order_acquire);
-    if (final_state != ENTRY_VALID)
+    void *final_payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
+
+    if (final_state != ENTRY_VALID || final_payload != entry_payload)
     {
-        /* state changed, entry being deleted */
+        /* state or payload changed during copy, discard result */
         free(result);
         return NULL;
     }

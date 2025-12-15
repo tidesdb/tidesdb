@@ -42,16 +42,41 @@ int bloom_filter_new(bloom_filter_t **bf, double p, int n)
      * m = -n * ln(p) / (ln(2)^2)
      *
      */
-    (*bf)->m = (unsigned int)ceil(-((double)n) * log(p) / (M_LN2 * M_LN2));
+    double m_double = ceil(-((double)n) * log(p) / (M_LN2 * M_LN2));
+
+    /* validate m is within valid range */
+    if (m_double <= 0.0 || m_double > (double)UINT32_MAX)
+    {
+        free(*bf);
+        return -1;
+    }
+
+    (*bf)->m = (unsigned int)m_double;
 
     /* calculate the number of hash functions (h) using the formula
      * h = (m / n) * ln(2)
      *
      */
-    (*bf)->h = (unsigned int)ceil(((double)(*bf)->m) / n * M_LN2);
+    double h_double = ceil(((double)(*bf)->m) / n * M_LN2);
+
+    /* validate h is reasonable (typically 1-20) */
+    if (h_double <= 0.0 || h_double > 100.0)
+    {
+        free(*bf);
+        return -1;
+    }
+
+    (*bf)->h = (unsigned int)h_double;
 
     /* calculate number of 64-bit words needed for packed bitset */
     (*bf)->size_in_words = ((*bf)->m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
+
+    /* validate size_in_words to prevent overflow */
+    if ((*bf)->size_in_words == 0 || (*bf)->size_in_words > UINT32_MAX / sizeof(uint64_t))
+    {
+        free(*bf);
+        return -1;
+    }
 
     /* alloc memory for the packed bitset and initialize it to 0 */
     (*bf)->bitset = calloc((size_t)(*bf)->size_in_words, sizeof(uint64_t));

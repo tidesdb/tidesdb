@@ -316,18 +316,25 @@ void test_bloom_filter_free_null()
 
 void test_bloom_filter_large_capacity_random_keys()
 {
-    /* this test mimics the benchmark scenario:
-     * - 2.9M entries like SSTable 4
-     * - 16-byte random keys
-     * - test with DIFFERENT random keys to verify FPR */
 
-    printf("\nTesting bloom filter with 2.9M entries and 16-byte random keys...\n");
-
-    int n = 2892624; /* exact size from SSTable 4 */
+    int n = 2892624;
     double p = 0.01;
-    bloom_filter_t *bf;
+    bloom_filter_t *bf = NULL;
+
+    printf("Creating bloom filter with n=%d, p=%.4f...\n", n, p);
     int result = bloom_filter_new(&bf, p, n);
+
+    if (result != 0)
+    {
+        printf("ERROR: bloom_filter_new failed with result=%d\n", result);
+    }
     ASSERT_EQ(result, 0);
+
+    if (bf == NULL)
+    {
+        printf("ERROR: bloom filter is NULL after creation!\n");
+        return;
+    }
 
     printf("Bloom filter created: m=%u bits, h=%u hashes, size=%u words\n", bf->m, bf->h,
            bf->size_in_words);

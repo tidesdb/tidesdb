@@ -5691,6 +5691,21 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     /* ensure all writes are visible before making sstable discoverable */
     atomic_thread_fence(memory_order_seq_cst);
 
+    /* close write handles before adding to level
+     * readers will reopen files on-demand through tidesdb_sstable_ensure_open
+     * this prevents file locking issues where readers try to open files
+     * that are still open for writing */
+    if (klog_bm)
+    {
+        block_manager_close(klog_bm);
+        new_sst->klog_bm = NULL;
+    }
+    if (vlog_bm)
+    {
+        block_manager_close(vlog_bm);
+        new_sst->vlog_bm = NULL;
+    }
+
     /* save metadata for logging before potentially freeing sstable */
     uint64_t sst_id = new_sst->id;
     uint64_t num_entries = new_sst->num_entries;
@@ -7307,11 +7322,17 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             block_manager_get_size(klog_bm, &new_sst->klog_size);
             block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
-            /* keep block managers open for immediate reads - reaper will close if needed */
-            new_sst->klog_bm = klog_bm;
-            new_sst->vlog_bm = vlog_bm;
-            atomic_store(&new_sst->last_access_time, time(NULL));
-            atomic_fetch_add(&cf->db->num_open_sstables, 1);
+            /* close write handles before adding to level */
+            if (klog_bm)
+            {
+                block_manager_close(klog_bm);
+                new_sst->klog_bm = NULL;
+            }
+            if (vlog_bm)
+            {
+                block_manager_close(vlog_bm);
+                new_sst->vlog_bm = NULL;
+            }
 
             /* ensure all writes are visible before making sstable discoverable */
             atomic_thread_fence(memory_order_seq_cst);
@@ -8218,6 +8239,44 @@ static void *tidesdb_flush_worker_thread(void *arg)
                       ") to level %d (array index 0)",
                       cf->name, work->sst_id, sst->max_seq, cf->levels[0]->level_num);
 
+        /*  check file count in addition to size
+         * cf->levels[0] (level_num=1) is TidesDB's first disk level, equivalent to
+         * RocksDB's rLevel 0 in the spooky paper. this is where memtable flushes land.
+         * files at this level have overlapping key ranges, so reads must check all files.
+         * trigger compaction at α=4 files to prevent read amplification. */
+        int num_l0_sstables =
+            atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
+        size_t level0_size =
+            atomic_load_explicit(&cf->levels[0]->current_size, memory_order_acquire);
+        size_t level0_capacity =
+            atomic_load_explicit(&cf->levels[0]->capacity, memory_order_acquire);
+
+        int should_compact = 0;
+        const char *trigger_reason = NULL;
+
+        /* file count trigger (Spooky α parameter) */
+        if (num_l0_sstables >= TDB_L0_FILE_NUM_COMPACTION_TRIGGER)
+        {
+            should_compact = 1;
+            trigger_reason = "file count";
+        }
+
+        else if (level0_size >= level0_capacity)
+        {
+            should_compact = 1;
+            trigger_reason = "size";
+        }
+
+        if (should_compact)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' level %d (first disk level) triggering compaction (%s): "
+                          "files=%d (trigger=%d), size=%zu (capacity=%zu)",
+                          cf->name, cf->levels[0]->level_num, trigger_reason, num_l0_sstables,
+                          TDB_L0_FILE_NUM_COMPACTION_TRIGGER, level0_size, level0_capacity);
+            tidesdb_compact(cf);
+        }
+
         /* commit sstable to manifest before deleting WAL
          * this ensures crash recovery knows which sstables are complete */
         pthread_rwlock_wrlock(&cf->manifest_lock);
@@ -8251,7 +8310,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* release the work item's reference now that flush is complete */
         tidesdb_immutable_memtable_unref(imm);
 
-        /* batched cleanup: only run every N flushes or when queue is large
+        /* batched cleanup only run every N flushes or when queue is large
          * this reduces overhead while preventing unbounded memory growth */
         int cleanup_threshold = 10;
         size_t max_queue_size = 20;
@@ -8342,26 +8401,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
          * this allows new flushes to be triggered */
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
 
-        /* load num_levels first to match store order */
-        int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-
-        if (num_levels > 0 && cf->levels[0])
-        {
-            size_t level0_size =
-                atomic_load_explicit(&cf->levels[0]->current_size, memory_order_acquire);
-            size_t level0_capacity =
-                atomic_load_explicit(&cf->levels[0]->capacity, memory_order_acquire);
-
-            /* trigger compaction if level 0 is at or above capacity */
-            if (level0_size >= level0_capacity)
-            {
-                TDB_DEBUG_LOG(
-                    TDB_LOG_INFO,
-                    "CF '%s' level 0 full (size=%zu >= capacity=%zu), triggering compaction",
-                    cf->name, level0_size, level0_capacity);
-                tidesdb_compact(cf);
-            }
-        }
+        /* compaction trigger moved earlier (right after flush) to use Spooky-style
+         * file count + size checking for better read performance */
 
         free(work);
     }

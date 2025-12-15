@@ -298,6 +298,15 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_OPENING_WAIT_MAX_MS                100
 #define TDB_MAX_FFLUSH_RETRY_ATTEMPTS          5
 
+/* spooky-style L0/L1 file count compaction triggers
+ * based on "Spooky: Granular Space-Efficient Compaction for LSM-trees" (SIGMOD 2024)
+ * α (alpha) -- trigger compaction when L0/L1 reaches this many files
+ * β (beta) -- slow down writes when L0/L1 reaches this many files
+ * γ (gamma) -- stop writes when L0/L1 reaches this many files (emergency) */
+#define TDB_L0_FILE_NUM_COMPACTION_TRIGGER 4  /* α -- compact at 4 files */
+#define TDB_L0_SLOWDOWN_WRITES_TRIGGER     20 /* β -- throttle at 20 files */
+#define TDB_L0_STOP_WRITES_TRIGGER         36 /* γ -- stall at 36 files */
+
 /* backpressure configuration */
 #define TDB_BACKPRESSURE_THRESHOLD_L0_FULL     100
 #define TDB_BACKPRESSURE_THRESHOLD_L0_CRITICAL 98

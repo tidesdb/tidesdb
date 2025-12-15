@@ -900,24 +900,6 @@ static inline int tdb_fileno(FILE *stream)
     return _fileno(stream);
 }
 
-/*
- * tdb_unlink
- * portable file deletion
- * @param path the file path to delete
- * @return 0 on success, -1 on failure
- */
-static inline int tdb_unlink(const char *path)
-{
-    if (!path) return -1;
-#ifdef _WIN32
-    /* clear read-only attribute that might prevent deletion */
-    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
-    return _unlink(path);
-#else
-    return unlink(path);
-#endif
-}
-
 #if defined(__MINGW32__) || defined(__MINGW64__)
 /* mingw provides semaphore.h for POSIX semaphores */
 #include <semaphore.h>
@@ -2076,6 +2058,24 @@ static inline int tdb_get_available_disk_space(const char *path, uint64_t *avail
 #include <sched.h>
 #define cpu_yield() sched_yield()
 #endif
+
+/*
+ * tdb_unlink
+ * portable file deletion
+ * @param path the file path to delete
+ * @return 0 on success, -1 on failure
+ */
+static inline int tdb_unlink(const char *path)
+{
+    if (!path) return -1;
+#ifdef _WIN32
+    /* clear read-only attribute that might prevent deletion */
+    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+    return _unlink(path);
+#else
+    return unlink(path);
+#endif
+}
 
 /**
  * is_directory_empty

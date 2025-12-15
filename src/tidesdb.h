@@ -22,6 +22,7 @@
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "buffer.h"
+#include "clock_cache.h"
 #include "compat.h"
 #include "compress.h"
 #include "ini.h"
@@ -34,13 +35,13 @@ typedef enum
 {
     TDB_LOG_DEBUG = 0, /* general debugging info (most verbose) */
     TDB_LOG_INFO = 1,  /* informational messages (default) */
-    TDB_LOG_WARN = 2,  /* warnings (e.g., "Retry attempt N", "Cache full") */
+    TDB_LOG_WARN = 2,  /* warnings (e.g., "Retry attempt N"..) */
     TDB_LOG_ERROR = 3, /* errors (e.g., "Failed to open file", "Invalid checksum") */
     TDB_LOG_FATAL = 4, /* fatal errors (e.g., "Corruption detected", "Out of memory") */
     TDB_LOG_NONE = 99  /* disable all logging */
 } tidesdb_log_level_t;
 
-extern int _tidesdb_log_level; /* minimum level to log (default: TDB_LOG_INFO) */
+extern int _tidesdb_log_level; /* minimum level to log (default is TDB_LOG_DEBUG) */
 
 #if defined(_MSC_VER)
 #define TDB_DEBUG_LOG(level, fmt, ...)                                                    \
@@ -139,34 +140,6 @@ typedef enum
     TDB_ISOLATION_SERIALIZABLE = 4
 } tidesdb_isolation_level_t;
 
-/* forward declarations */
-typedef struct tidesdb_t tidesdb_t;
-typedef struct tidesdb_column_family_t tidesdb_column_family_t;
-typedef struct tidesdb_level_t tidesdb_level_t;
-typedef struct tidesdb_sstable_t tidesdb_sstable_t;
-typedef struct tidesdb_txn_t tidesdb_txn_t;
-typedef struct tidesdb_iter_t tidesdb_iter_t;
-typedef struct tidesdb_stats_t tidesdb_stats_t;
-typedef struct tidesdb_flush_work_t tidesdb_flush_work_t;
-typedef struct tidesdb_compaction_work_t tidesdb_compaction_work_t;
-typedef struct block_cache_t block_cache_t;
-
-/**
- * tidesdb_immutable_memtable_t
- * an immutable memtable being flushed to disk
- * @param memtable the immutable memtable
- * @param wal associated write-ahead log
- * @param refcount reference count for safe concurrent access
- * @param flushed 1 if flushed to sstable, 0 otherwise
- */
-typedef struct
-{
-    skip_list_t *memtable;
-    block_manager_t *wal;
-    _Atomic(int) refcount;
-    _Atomic(int) flushed;
-} tidesdb_immutable_memtable_t;
-
 /* error codes */
 #define TDB_SUCCESS          0
 #define TDB_ERR_MEMORY       -1
@@ -193,49 +166,6 @@ typedef enum
     TDB_SYNC_INTERVAL,
 } tidesdb_sync_mode_t;
 
-/* kv pair flags */
-#define TDB_KV_FLAG_TOMBSTONE 0x01
-#define TDB_KV_FLAG_HAS_TTL   0x02
-#define TDB_KV_FLAG_HAS_VLOG  0x04
-#define TDB_KV_FLAG_DELTA_SEQ 0x08
-
-/* multi-cf transaction sequence flag */
-#define TDB_MULTI_CF_SEQ_FLAG (1ULL << 63)
-
-typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
-                                     size_t key2_size, void *ctx);
-
-#define TDB_WAL_PREFIX                     "wal_"
-#define TDB_WAL_EXT                        ".log"
-#define TDB_COLUMN_FAMILY_CONFIG_NAME      "config"
-#define TDB_COLUMN_FAMILY_MANIFEST_NAME    "manifest"
-#define TDB_COLUMN_FAMILY_CONFIG_EXT       ".ini"
-#define TDB_LEVEL_PREFIX                   "L"
-#define TDB_LEVEL_PARTITION_PREFIX         "P"
-#define TDB_SSTABLE_KLOG_EXT               ".klog"
-#define TDB_SSTABLE_VLOG_EXT               ".vlog"
-#define TDB_CACHE_KEY_SIZE                 12
-#define TDB_SSTABLE_METADATA_MAGIC         0x5353544D
-#define TDB_SSTABLE_INTERNAL_BLOCKS        3
-#define TDB_KLOG_BLOCK_SIZE                (64 * 1024)
-#define TDB_STACK_SSTS                     64
-#define TDB_ITER_STACK_KEY_SIZE            256
-#define TDB_SST__OPEN_SPIN_WAIT_ITERATIONS 10
-
-/* file system permissions */
-#define TDB_DIR_PERMISSIONS 0755
-
-/* initial capacity values for dynamic arrays */
-#define TDB_INITIAL_MERGE_HEAP_CAPACITY    16
-#define TDB_INITIAL_CF_CAPACITY            16
-#define TDB_INITIAL_COMPARATOR_CAPACITY    8
-#define TDB_INITIAL_TXN_OPS_CAPACITY       16
-#define TDB_INITIAL_TXN_READ_SET_CAPACITY  16
-#define TDB_INITIAL_TXN_WRITE_SET_CAPACITY 16
-#define TDB_INITIAL_TXN_CF_CAPACITY        4
-#define TDB_INITIAL_TXN_SAVEPOINT_CAPACITY 4
-#define TDB_INITIAL_BLOCK_INDEX_CAPACITY   16
-
 /* default configuration values */
 #define TDB_DEFAULT_WRITE_BUFFER_SIZE           (64 * 1024 * 1024)
 #define TDB_DEFAULT_LEVEL_SIZE_RATIO            10
@@ -245,157 +175,62 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2
 #define TDB_DEFAULT_BLOOM_FPR                   0.01
 #define TDB_DEFAULT_KLOG_VALUE_THRESHOLD        1024 * 4
-#define TDB_DEFAULT_INDEX_SAMPLE_RATIO          16
+#define TDB_DEFAULT_INDEX_SAMPLE_RATIO          1
 #define TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN      16
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024)
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES           512
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      (1024 * 64)
-#define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024)
+#define TDB_DEFAULT_CLOCK_CACHE_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_SYNC_INTERVAL_US            128000
 #define TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE      1
-#define TDB_COMMIT_STATUS_BUFFER_SIZE           65536
-#define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE        (4 * 1024 * 1024)
 
-/* transaction optimization configuration */
-/* create write set hash table at this many ops */
-#define TDB_TXN_WRITE_HASH_THRESHOLD 64
-/* create read set hash table at this many reads */
-#define TDB_TXN_READ_HASH_THRESHOLD 64
-/* scan last N ops for small txns */
-#define TDB_TXN_SMALL_SCAN_LIMIT 64
-/* grow read set by this amount */
-#define TDB_TXN_READ_SET_BATCH_GROW 256
-/* initial capacity for active txn list */
-#define TDB_ACTIVE_TXN_INITIAL_CAPACITY 1024
-/* hash table capacity for write set (power of 2) */
-#define TDB_WRITE_SET_HASH_CAPACITY 2048
-/* hash table capacity for read set (power of 2) */
-#define TDB_READ_SET_HASH_CAPACITY 2048
-/* empty slot marker for write set hash */
-#define TDB_WRITE_SET_HASH_EMPTY -1
-/* empty slot marker for read set hash */
-#define TDB_READ_SET_HASH_EMPTY -1
-/* xxhash seed for transaction hash tables */
-#define TDB_TXN_HASH_SEED 0x9e3779b9
-/* max linear probe attempts before giving up */
-#define TDB_TXN_MAX_PROBE_LENGTH 32
-
-/* flush and close retry configuration */
-#define TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS         100
-#define TDB_FLUSH_ENQUEUE_BACKOFF_US           10000
-#define TDB_FLUSH_RETRY_DELAY_US               100000
-#define TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS      100
-#define TDB_CLOSE_FLUSH_WAIT_SLEEP_US          10000
-#define TDB_CLOSE_QUEUE_DRAIN_MAX_ATTEMPTS     100
-#define TDB_CLOSE_QUEUE_DRAIN_SLEEP_US         10000
-#define TDB_CLOSE_TXN_WAIT_SLEEP_US            1000
-#define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US     10000
-#define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS 100
-#define TDB_CLOSE_TXN_WAIT_MAX_MS              5000
-#define TDB_CLOSE_FLUSH_WAIT_MAX_MS            10000
-#define TDB_OPENING_BACKOFF_MS                 1000
-#define TDB_OPENING_WAIT_MAX_MS                100
-#define TDB_MAX_FFLUSH_RETRY_ATTEMPTS          5
-
-/* spooky-style L0/L1 file count compaction triggers
- * based on "Spooky: Granular Space-Efficient Compaction for LSM-trees" (SIGMOD 2024)
- * α (alpha) -- trigger compaction when L0/L1 reaches this many files
- * β (beta) -- slow down writes when L0/L1 reaches this many files
- * γ (gamma) -- stop writes when L0/L1 reaches this many files (emergency) */
-#define TDB_L0_FILE_NUM_COMPACTION_TRIGGER 4      /* α -- compact at 4 files */
-#define TDB_L0_SLOWDOWN_WRITES_TRIGGER     20     /* β -- throttle at 20 files */
-#define TDB_L0_STOP_WRITES_TRIGGER         36     /* γ -- stall at 36 files */
-#define TDB_L0_SLOWDOWN_WRITES_DELAY_US    20000  /* β delay: 20ms throttle */
-#define TDB_L0_STOP_WRITES_DELAY_US        100000 /* γ delay: 100ms stall */
-
-/* backpressure configuration */
-#define TDB_BACKPRESSURE_THRESHOLD_L0_FULL     100
-#define TDB_BACKPRESSURE_THRESHOLD_L0_CRITICAL 98
-#define TDB_BACKPRESSURE_THRESHOLD_L0_HIGH     95
-#define TDB_BACKPRESSURE_THRESHOLD_L0_MODERATE 90
-#define TDB_BACKPRESSURE_DELAY_EMERGENCY_US    50000
-#define TDB_BACKPRESSURE_DELAY_CRITICAL_US     10000
-#define TDB_BACKPRESSURE_DELAY_HIGH_US         5000
-#define TDB_BACKPRESSURE_DELAY_MODERATE_US     1000
-
-/* immutable queue backpressure configuration */
-#define TDB_BACKPRESSURE_IMMUTABLE_EMERGENCY          10
-#define TDB_BACKPRESSURE_IMMUTABLE_CRITICAL           6
-#define TDB_BACKPRESSURE_IMMUTABLE_MODERATE           3
-#define TDB_BACKPRESSURE_IMMUTABLE_EMERGENCY_DELAY_US 20000
-#define TDB_BACKPRESSURE_IMMUTABLE_CRITICAL_DELAY_US  5000
-#define TDB_BACKPRESSURE_IMMUTABLE_MODERATE_DELAY_US  1000
-
-/* sstable reaper thread configuration */
-#define TDB_SSTABLE_REAPER_SLEEP_US             100000
-#define TDB_SSTABLE_REAPER_EVICT_RATIO          0.25
-#define TDB_MAX_TXN_CFS                         10000
-#define TDB_MAX_PATH_LEN                        4096
-#define TDB_MAX_TXN_OPS                         100000
-#define TDB_MAX_CF_NAME_LEN                     256
-#define TDB_MAX_COMPARATOR_NAME                 64
-#define TDB_MAX_COMPARATOR_CTX                  256
-#define TDB_MEMORY_PERCENTAGE                   0.6
-#define TDB_MIN_KEY_VALUE_SIZE                  (1024 * 1024)
-#define TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY 32
-#define TDB_MAX_LEVELS                          32
-#define TDB_DISK_SPACE_CHECK_INTERVAL_SECONDS   60
-#define NO_CF_SYNC_SLEEP_US                     100000
-
-/* cache optimization configuration */
-#define TDB_CACHE_PREFETCH_BLOCKS 2                  /* prefetch N adjacent blocks on cache miss */
-#define TDB_L1_CACHE_SIZE         (16 * 1024 * 1024) /* L1 cache for block indexes */
+/* configuration limits */
+#define TDB_MAX_COMPARATOR_NAME 64
+#define TDB_MAX_COMPARATOR_CTX  256
 
 /**
- * tidesdb_block_cache_key_t
- * compact binary cache key (12 bytes total)
- * @param path_hash hash of klog_path (8 bytes) - unique across all CFs and SSTables
- * @param block_position block position in file (4 bytes)
+ * tidesdb_comparator_fn
+ * comparator function type for custom key ordering
  */
-typedef struct
-{
-    uint64_t path_hash;
-    uint32_t block_position;
-} __attribute__((packed)) tidesdb_block_cache_key_t;
+typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
+                                     size_t key2_size, void *ctx);
 
-/* klog block configuration */
-#define TDB_KLOG_BLOCK_INITIAL_CAPACITY 512
+/* forward declarations for internal types */
+#define TDB_MAX_LEVELS 32
+typedef struct tidesdb_txn_op_t tidesdb_txn_op_t;
+typedef struct tidesdb_merge_heap_t tidesdb_merge_heap_t;
+typedef struct tidesdb_kv_pair_t tidesdb_kv_pair_t;
+typedef struct tidesdb_commit_status_t tidesdb_commit_status_t;
+typedef struct tidesdb_level_t tidesdb_level_t;
+typedef struct tidesdb_sstable_t tidesdb_sstable_t;
+typedef struct tidesdb_block_index_t tidesdb_block_index_t;
+/* tidesdb_manifest_t is defined in manifest.h */
 
-/* block index validation */
-#define TDB_BLOCK_INDEX_PREFIX_MIN 4
-#define TDB_BLOCK_INDEX_PREFIX_MAX 256
-#define TDB_BLOCK_INDEX_MAX_COUNT  1000000
-
-/* merge and serialization configuration */
-#define TDB_MERGE_MIN_ESTIMATED_ENTRIES 100
-#define TDB_KLOG_DELTA_SEQ_MAX_DIFF     1000000
-
-/* recovery configuration */
-#define TDB_MULTI_CF_TRACKER_INITIAL_CAPACITY 1024
-
-/* iterator seek configuration */
-/* max blocks to scan during seek (prevents infinite loops) */
-#define TDB_ITER_SEEK_MAX_BLOCKS_SCAN 100000
+/* forward declarations for main types to allow self-referential pointers */
+typedef struct tidesdb_t tidesdb_t;
+typedef struct tidesdb_column_family_t tidesdb_column_family_t;
+typedef struct tidesdb_txn_t tidesdb_txn_t;
+typedef struct tidesdb_iter_t tidesdb_iter_t;
+typedef struct tidesdb_stats_t tidesdb_stats_t;
 
 /**
  * tidesdb_column_family_config_t
  * configuration for a column family
- * @param write_buffer_size write buffer size for memtable flushes
- * @param level_size_ratio size ratio between levels (T)
- * @param min_levels minimum number of levels to maintain (DCA can expand beyond this)
- * @param dividing_level_offset X = L - dividing_level_offset
- * @param klog_value_threshold values >= this size go to vlog
+ * @param write_buffer_size size of write buffer
+ * @param level_size_ratio ratio of level sizes
+ * @param min_levels minimum number of levels
+ * @param dividing_level_offset offset for dividing level
+ * @param klog_value_threshold threshold for klog value
  * @param compression_algorithm compression algorithm
  * @param enable_bloom_filter enable bloom filter
  * @param bloom_fpr bloom filter false positive rate
  * @param enable_block_indexes enable block indexes
- * @param index_sample_ratio index every Nth block (1 = all blocks, 10 = every 10th block, etc)
- * @param block_index_prefix_len length of key prefix stored in block index (bytes)
+ * @param index_sample_ratio index sample ratio
+ * @param block_index_prefix_len block index prefix length
  * @param sync_mode sync mode
- * @param sync_interval_us sync interval in microseconds (only used if sync_mode ==
- * TDB_SYNC_INTERVAL)
- * @param comparator_name name of registered comparator
- * @param comparator_ctx_str optional context string for comparator
+ * @param sync_interval_us sync interval in microseconds
+ * @param comparator_name name of comparator
+ * @param comparator_ctx_str comparator context string
  * @param comparator_fn_cached cached comparator function
  * @param comparator_ctx_cached cached comparator context
  * @param skip_list_max_level skip list max level
@@ -403,7 +238,7 @@ typedef struct
  * @param default_isolation_level default isolation level
  * @param min_disk_space minimum free disk space required (bytes)
  */
-typedef struct
+typedef struct tidesdb_column_family_config_t
 {
     size_t write_buffer_size;
     size_t level_size_ratio;
@@ -436,7 +271,7 @@ typedef struct
  * @param ctx_str optional context string (for serialization)
  * @param ctx runtime context pointer (reconstructed from ctx_str or set at registration)
  */
-typedef struct
+typedef struct tidesdb_comparator_entry_t
 {
     char name[TDB_MAX_COMPARATOR_NAME];
     tidesdb_comparator_fn fn;
@@ -452,275 +287,21 @@ typedef struct
  * @param num_compaction_threads number of compaction threads
  * @param log_level minimum log level to display (TDB_LOG_DEBUG, TDB_LOG_INFO, TDB_LOG_WARN,
  * TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE)
- * @param block_cache_size size of block clock cache in bytes for deserialized key value entries
+ * @param clock_cache_size size of clock cache in bytes for deserialized key value entries
  * @param max_open_sstables maximum number of open sstables
  * @param wait_for_txns_on_close if true, wait up to defined time for active transactions on close
  *                                if false (default), close immediately and fail active transactions
  */
-typedef struct
+typedef struct tidesdb_config_t
 {
     char *db_path;
     int num_flush_threads;
     int num_compaction_threads;
     tidesdb_log_level_t log_level;
-    size_t block_cache_size;
+    size_t clock_cache_size;
     size_t max_open_sstables;
     int wait_for_txns_on_close;
 } tidesdb_config_t;
-
-/**
- * tidesdb_klog_entry_t
- * entry in klog block
- * @param flags entry flags (tombstone, ttl, vlog, delta_seq)
- * @param key_size size of key in bytes
- * @param value_size size of value in bytes
- * @param ttl time-to-live timestamp
- * @param seq sequence number
- * @param vlog_offset offset in vlog file (0 if inline)
- */
-typedef struct
-{
-    uint8_t flags;
-    uint32_t key_size;
-    uint32_t value_size;
-    int64_t ttl;
-    uint64_t seq;
-    uint64_t vlog_offset;
-} tidesdb_klog_entry_t;
-
-/**
- * tidesdb_cached_entry_t
- * cached entry structure for lock-free block cache
- * stores deserialized, decompressed entry with key and value/vlog_offset
- * @param flags entry flags (tombstone, ttl, vlog, delta_seq)
- * @param key_size size of key in bytes
- * @param value_size size of value in bytes (actual value size, not inline size)
- * @param ttl time-to-live timestamp
- * @param seq sequence number
- * @param vlog_offset offset in vlog file (0 if inline, >0 if in vlog)
- * @param data flexible array: [key_data][value_data if inline]
- */
-typedef struct
-{
-    uint8_t flags;
-    uint32_t key_size;
-    uint32_t value_size;
-    int64_t ttl;
-    uint64_t seq;
-    uint64_t vlog_offset;
-#ifdef _MSC_VER
-    uint8_t data[1]; /* key + value (if inline) -- MSVC requires size 1 */
-#else
-    uint8_t data[]; /* key + value (if inline) */
-#endif
-} tidesdb_cached_entry_t;
-
-/**
- * tidesdb_multi_cf_txn_metadata_t
- * metadata for multi-cf transaction entries
- * written before klog_entry when entry has multi-cf flag
- * @param num_participant_cfs number of column families in transaction
- * @param checksum xxhash64 checksum of num_participant_cfs + cf_names
- * followed by: char cf_names[num_participant_cfs][TDB_MAX_CF_NAME_LEN] (null-terminated cf names)
- */
-#pragma pack(push, 1)
-typedef struct
-{
-    uint8_t num_participant_cfs;
-    uint64_t checksum;
-} tidesdb_multi_cf_txn_metadata_t;
-#pragma pack(pop)
-
-/**
- * tidesdb_klog_block_t
- * a block in the klog containing multiple key entries
- * @param num_entries number of entries in this block
- * @param block_size total size of this block
- * @param capacity allocated capacity for arrays (to prevent buffer overflow)
- * @param is_arena_allocated 1 if arena-allocated (deserialized), 0 if separate mallocs (created)
- * @param entries array of entries
- * @param keys array of key data
- * @param inline_values array of inline values (null if in vlog)
- * @param max_key maximum key in this block (for seek optimization)
- * @param max_key_size size of maximum key
- */
-typedef struct
-{
-    uint32_t num_entries;
-    uint32_t block_size;
-    uint32_t capacity;
-    uint8_t is_arena_allocated;
-    tidesdb_klog_entry_t *entries;
-    uint8_t **keys;
-    uint8_t **inline_values;
-    uint8_t *max_key;
-    size_t max_key_size;
-} tidesdb_klog_block_t;
-
-/**
- * tidesdb_block_index_t
- * sparse block index with fixed-length min/max key prefixes per block
- * stores range boundaries for efficient range queries and prefix scans
- *
- * the index uses binary search to find blocks where min_key <= search_key <= max_key.
- * this ensures accurate block positioning for point lookups and range scans.
- * file positions are delta-encoded and varint-compressed for space efficiency.
- *
- * @param min_key_prefixes fixed-length prefixes of minimum key in each block
- * @param max_key_prefixes fixed-length prefixes of maximum key in each block
- * @param file_positions file position (byte offset) for each indexed block (sorted)
- * @param count number of indexed blocks
- * @param capacity allocated capacity
- * @param prefix_len fixed length of each prefix
- * @param comparator comparator function for key ordering
- * @param comparator_ctx comparator context
- */
-typedef struct
-{
-    uint8_t *min_key_prefixes;
-    uint8_t *max_key_prefixes;
-    uint64_t *file_positions;
-    uint32_t count;
-    uint32_t capacity;
-    uint8_t prefix_len;
-    tidesdb_comparator_fn comparator;
-    void *comparator_ctx;
-} tidesdb_block_index_t;
-
-/**
- * tidesdb_vlog_block_t
- * a block in the vlog containing multiple values
- * @param num_values number of values in this block
- * @param block_size total size of this block
- * @param value_sizes array of value sizes
- * @param values array of value data
- */
-typedef struct
-{
-    uint32_t num_values;
-    uint32_t block_size;
-    uint32_t *value_sizes;
-    uint8_t **values;
-} tidesdb_vlog_block_t;
-
-/**
- * tidesdb_kv_pair_t
- * in-memory key-value pair
- * @param entry klog entry
- * @param key key data
- * @param value value data
- */
-typedef struct
-{
-    tidesdb_klog_entry_t entry;
-    uint8_t *key;
-    uint8_t *value;
-} tidesdb_kv_pair_t;
-
-/**
- * tidesdb_sstable_t
- * an immutable sorted string table on disk
- * consists of two files: .klog (keys + metadata) and .vlog (large values)
- * @param id unique identifier
- * @param klog_path path to .klog file
- * @param vlog_path path to .vlog file
- * @param min_key minimum key in this sstable
- * @param min_key_size size of minimum key
- * @param max_key maximum key in this sstable
- * @param max_key_size size of maximum key
- * @param num_entries total number of keys
- * @param num_klog_blocks number of klog blocks
- * @param num_vlog_blocks number of vlog blocks
- * @param klog_data_end_offset file offset where data blocks end (before index/bloom/metadata)
- * @param klog_size size of klog file
- * @param vlog_size size of vlog file
- * @param max_seq maximum sequence number in this sstable
- * @param bloom_filter bloom filter for fast lookups
- * @param block_indexes compact block indexes fast lookups and positioning
- * @param refcount reference count
- * @param klog_bm block manager for klog
- * @param vlog_bm block manager for vlog
- * @param config column family configuration
- * @param marked_for_deletion atomic flag indicating if sstable is marked for deletion
- * @param is_open atomic flag indicating if sstable is open
- * @param last_access_time last access time for lru eviction
- * @param db database handle (for resolving comparators from registry)
- */
-struct tidesdb_sstable_t
-{
-    uint64_t id;
-    char *klog_path;
-    char *vlog_path;
-    uint8_t *min_key;
-    size_t min_key_size;
-    uint8_t *max_key;
-    size_t max_key_size;
-    uint64_t num_entries;
-    uint64_t num_klog_blocks;
-    uint64_t num_vlog_blocks;
-    uint64_t klog_data_end_offset;
-    uint64_t klog_size;
-    uint64_t vlog_size;
-    uint64_t max_seq;
-    bloom_filter_t *bloom_filter;
-    tidesdb_block_index_t *block_indexes;
-    _Atomic(int) refcount;
-    block_manager_t *klog_bm;
-    block_manager_t *vlog_bm;
-    tidesdb_column_family_config_t *config;
-    _Atomic(int) marked_for_deletion;
-    _Atomic(uint8_t) is_open;
-    _Atomic(time_t) last_access_time;
-    tidesdb_t *db;
-};
-
-/**
- * tidesdb_level_t
- * a level in the lsm tree
- * @param level_num level number
- * @param capacity capacity of level in bytes
- * @param current_size current size of level in bytes
- * @param sstables array of sstable pointers (copy-on-write)
- * @param num_sstables number of sstables in array
- * @param sstables_capacity capacity of sstables array
- * @param file_boundaries file boundaries for partitioning
- * @param boundary_sizes sizes of boundary keys
- * @param num_boundaries number of boundaries
- */
-struct tidesdb_level_t
-{
-    int level_num;
-    _Atomic(size_t) capacity;
-    _Atomic(size_t) current_size;
-    _Atomic(tidesdb_sstable_t **) sstables;
-    _Atomic(int) num_sstables;
-    _Atomic(int) sstables_capacity;
-    _Atomic(uint8_t **) file_boundaries;
-    _Atomic(size_t *) boundary_sizes;
-    _Atomic(int) num_boundaries;
-};
-
-/**
- * tidesdb_commit_status_t
- * tracks commit status of transactions for visibility determination
- * uses a circular buffer to track recent commit sequences
- * all operations are lock-free using atomics and CAS
- * @param status array of commit statuses (0=in-progress, 1=committed, 2=aborted)
- * @param min_seq minimum sequence number tracked in this buffer
- * @param max_seq maximum sequence number tracked in this buffer
- * @param capacity size of the status array
- */
-#define TDB_COMMIT_STATUS_IN_PROGRESS 0
-#define TDB_COMMIT_STATUS_COMMITTED   1
-#define TDB_COMMIT_STATUS_ABORTED     2
-
-typedef struct
-{
-    _Atomic(uint8_t) *status;
-    _Atomic(uint64_t) min_seq;
-    _Atomic(uint64_t) max_seq;
-    size_t capacity;
-} tidesdb_commit_status_t;
 
 /**
  * tidesdb_column_family_t
@@ -752,7 +333,6 @@ struct tidesdb_column_family_t
 {
     char *name;
     char *directory;
-    uint32_t cf_id; /* unique column family ID for compact cache keys */
     tidesdb_column_family_config_t config;
     _Atomic(skip_list_t *) active_memtable;
     _Atomic(uint64_t) memtable_id;
@@ -776,31 +356,84 @@ struct tidesdb_column_family_t
 };
 
 /**
- * tidesdb_flush_work_t
- * work item for flush thread pool
- * @param cf column family
- * @param imm immutable memtable wrapper (holds refcount)
- * @param sst_id sstable id
+ * tidesdb_sstable_t
+ * an immutable sorted string table on disk
+ * consists of two files: .klog (keys + metadata) and .vlog (large values)
+ * @param id unique identifier
+ * @param klog_path path to .klog file
+ * @param vlog_path path to .vlog file
+ * @param min_key minimum key in this sstable
+ * @param min_key_size size of minimum key
+ * @param max_key maximum key in this sstable
+ * @param max_key_size size of maximum key
+ * @param num_entries total number of keys
+ * @param num_klog_blocks number of blocks in klog
+ * @param num_vlog_blocks number of blocks in vlog
+ * @param klog_data_end_offset offset where data ends in klog (before footer)
+ * @param klog_size total size of klog file
+ * @param vlog_size total size of vlog file
+ * @param max_seq maximum sequence number in this sstable
+ * @param bloom_filter bloom filter for key existence checks
+ * @param block_indexes block indexes for fast key lookup
+ * @param refcount reference count for safe concurrent access
+ * @param klog_bm klog block manager
+ * @param vlog_bm vlog block manager
+ * @param config column family configuration
+ * @param marked_for_deletion flag indicating sstable is marked for deletion
+ * @param last_access_time last access time for lru eviction
+ * @param db database handle (for resolving comparators from registry)
  */
-struct tidesdb_flush_work_t
+struct tidesdb_sstable_t
 {
-    tidesdb_column_family_t *cf;
-    tidesdb_immutable_memtable_t *imm;
-    uint64_t sst_id;
+    uint64_t id;
+    char *klog_path;
+    char *vlog_path;
+    uint8_t *min_key;
+    size_t min_key_size;
+    uint8_t *max_key;
+    size_t max_key_size;
+    uint64_t num_entries;
+    uint64_t num_klog_blocks;
+    uint64_t num_vlog_blocks;
+    uint64_t klog_data_end_offset;
+    uint64_t klog_size;
+    uint64_t vlog_size;
+    uint64_t max_seq;
+    bloom_filter_t *bloom_filter;
+    tidesdb_block_index_t *block_indexes;
+    _Atomic(int) refcount;
+    block_manager_t *klog_bm;
+    block_manager_t *vlog_bm;
+    tidesdb_column_family_config_t *config;
+    _Atomic(int) marked_for_deletion;
+    _Atomic(time_t) last_access_time;
+    tidesdb_t *db;
 };
 
 /**
- * tidesdb_compaction_work_t
- * work item for compaction thread pool
- * @param cf column family
- * @param start_level starting level
- * @param target_level target level
+ * tidesdb_level_t
+ * a level in the lsm tree
+ * @param level_num level number
+ * @param capacity capacity of level in bytes
+ * @param current_size current size of level in bytes
+ * @param sstables array of sstable pointers (copy-on-write)
+ * @param num_sstables number of sstables in array
+ * @param sstables_capacity capacity of sstables array
+ * @param file_boundaries file boundaries for partitioning
+ * @param boundary_sizes sizes of boundary keys
+ * @param num_boundaries number of boundaries
  */
-struct tidesdb_compaction_work_t
+struct tidesdb_level_t
 {
-    tidesdb_column_family_t *cf;
-    int start_level;
-    int target_level;
+    int level_num;
+    _Atomic(size_t) capacity;
+    _Atomic(size_t) current_size;
+    _Atomic(tidesdb_sstable_t **) sstables;
+    _Atomic(int) num_sstables;
+    _Atomic(int) sstables_capacity;
+    _Atomic(uint8_t **) file_boundaries;
+    _Atomic(size_t *) boundary_sizes;
+    _Atomic(int) num_boundaries;
 };
 
 /**
@@ -824,7 +457,7 @@ struct tidesdb_compaction_work_t
  * @param sync_thread_active atomic flag indicating if sync thread is active
  * @param reaper_thread background thread for evicting most un-accessed sstables
  * @param reaper_thread_active atomic flag indicating if reaper thread is active
- * @param block_cache clock block cache for hot keys
+ * @param clock_cache clock cache for hot keys
  * @param num_open_sstables global counter for open sstables
  * @param next_txn_id global transaction id counter
  * @param global_seq global sequence counter for snapshots and commits
@@ -862,7 +495,7 @@ struct tidesdb_t
     _Atomic(int) sync_thread_active;
     pthread_t sstable_reaper_thread;
     _Atomic(int) sstable_reaper_active;
-    block_cache_t *block_cache;
+    clock_cache_t *clock_cache;
     _Atomic(int) num_open_sstables;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
@@ -880,28 +513,6 @@ struct tidesdb_t
     uint64_t total_memory;
     pthread_rwlock_t cf_list_lock;
 };
-
-/**
- * tidesdb_txn_op_t
- * operation structure for transactions
- * @param key key
- * @param key_size key size
- * @param value value
- * @param value_size value size
- * @param ttl time-to-live
- * @param is_delete delete flag
- * @param cf column family (for multi-cf transactions)
- */
-typedef struct
-{
-    uint8_t *key;
-    size_t key_size;
-    uint8_t *value;
-    size_t value_size;
-    time_t ttl;
-    int is_delete;
-    tidesdb_column_family_t *cf;
-} tidesdb_txn_op_t;
 
 /**
  * tidesdb_txn_t
@@ -953,7 +564,6 @@ struct tidesdb_txn_t
 {
     tidesdb_t *db;
     uint64_t txn_id;
-
     uint64_t snapshot_seq;
     uint64_t commit_seq;
     tidesdb_txn_op_t *ops;
@@ -980,65 +590,6 @@ struct tidesdb_txn_t
     int has_rw_conflict_in;
     int has_rw_conflict_out;
 };
-
-/**
- * tidesdb_merge_source_t
- * is a source for merging (memtable or sstable)
- * @param type type of source (memtable or sstable)
- * @param source union of memtable or sstable source
- * @param current_kv current key-value pair
- * @param config column family configuration
- */
-typedef struct
-{
-    enum
-    {
-        MERGE_SOURCE_MEMTABLE,
-        MERGE_SOURCE_SSTABLE
-    } type;
-
-    union
-    {
-        struct
-        {
-            skip_list_cursor_t *cursor;
-            tidesdb_immutable_memtable_t *imm;
-        } memtable;
-
-        struct
-        {
-            tidesdb_t *db;
-            tidesdb_sstable_t *sst;
-            block_manager_cursor_t *klog_cursor;
-            block_manager_cursor_t *vlog_cursor;
-            tidesdb_klog_block_t *current_block;
-            block_manager_block_t *current_block_data;
-            uint8_t *decompressed_data;
-            int current_entry_idx;
-        } sstable;
-    } source;
-
-    tidesdb_kv_pair_t *current_kv;
-    tidesdb_column_family_config_t *config;
-} tidesdb_merge_source_t;
-
-/**
- * tidesdb_merge_heap_t
- * min-heap for efficient multi-way merge
- * @param sources array of merge sources
- * @param num_sources number of sources
- * @param capacity capacity of sources array
- * @param comparator comparator function for sorting
- * @param comparator_ctx comparator context
- */
-typedef struct
-{
-    tidesdb_merge_source_t **sources;
-    int num_sources;
-    int capacity;
-    skip_list_comparator_fn comparator;
-    void *comparator_ctx;
-} tidesdb_merge_heap_t;
 
 /**
  * tidesdb_iter_t
@@ -1073,14 +624,14 @@ struct tidesdb_iter_t
  * @param level_num_sstables number of sstables in each level
  * @param config column family configuration
  */
-typedef struct tidesdb_stats_t
+struct tidesdb_stats_t
 {
     int num_levels;
     size_t memtable_size;
     size_t *level_sizes;
     int *level_num_sstables;
     tidesdb_column_family_config_t *config;
-} tidesdb_stats_t;
+};
 
 /**
  * tidesdb_default_column_family_config

@@ -5,8 +5,8 @@ set(CMAKE_C_STANDARD 11)
 set(PROJECT_VERSION 6.0.0)
 
 configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h"
 )
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
@@ -60,9 +60,9 @@ include_directories(external) # for external libraries linking internally
 
 # build as STATIC on Windows to avoid DLL export/import complexity in tests
 if(WIN32)
-    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
+    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/clock_cache.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
 else()
-    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
+    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/clock_cache.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
 endif()
 
 target_include_directories(tidesdb PRIVATE src)
@@ -104,7 +104,7 @@ if(APPLE)
             target_link_directories(tidesdb PUBLIC ${HOMEBREW_PREFIX}/lib)
         else()
             message(WARNING "Homebrew not found at ${HOMEBREW_PREFIX}, relying on system paths. "
-                           "If using MacPorts, pkgsrc, or Fink, specify -DMACOS_DEPENDENCY_PREFIX=/path or -DUSE_HOMEBREW=OFF")
+                    "If using MacPorts, pkgsrc, or Fink, specify -DMACOS_DEPENDENCY_PREFIX=/path or -DUSE_HOMEBREW=OFF")
         endif()
     else()
         message(STATUS "Using system default paths on macOS (USE_HOMEBREW=OFF)")
@@ -262,10 +262,10 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_MAX_LEVELS 3)
     endif()
     if(NOT DEFINED BENCH_SKIP_LIST_MAX_LEVEL)
-        set(BENCH_SKIP_LIST_MAX_LEVEL 16)  
+        set(BENCH_SKIP_LIST_MAX_LEVEL 16)
     endif()
     if(NOT DEFINED BENCH_SKIP_LIST_PROBABILITY)
-        set(BENCH_SKIP_LIST_PROBABILITY 0.25) 
+        set(BENCH_SKIP_LIST_PROBABILITY 0.25)
     endif()
     if(NOT DEFINED BENCH_ENABLE_COMPRESSION)
         set(BENCH_ENABLE_COMPRESSION 1)
@@ -285,7 +285,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_BLOCK_INDEX_SAMPLING_COUNT)
         set(BENCH_BLOCK_INDEX_SAMPLING_COUNT 16)
     endif()
-   if(NOT DEFINED BENCH_BLOCK_INDEX_PREFIX_LEN)
+    if(NOT DEFINED BENCH_BLOCK_INDEX_PREFIX_LEN)
         set(BENCH_BLOCK_INDEX_PREFIX_LEN 16)
     endif()
     if(NOT DEFINED BENCH_SYNC_MODE)
@@ -308,6 +308,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(skip_list_tests test/skip_list__tests.c)
     add_executable(compress_tests test/compress__tests.c)
     add_executable(bloom_filter_tests test/bloom_filter__tests.c)
+    add_executable(clock_cache_tests test/clock_cache__tests.c)
     add_executable(manifest_tests test/manifest__tests.c)
     add_executable(queue_tests test/queue__tests.c)
     add_executable(buffer_tests test/buffer__tests.c)
@@ -316,39 +317,39 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # pass benchmark configuration as compile definitions
     target_compile_definitions(tidesdb_bench PRIVATE
-        BENCH_NUM_OPERATIONS=${BENCH_NUM_OPERATIONS}
-        BENCH_NUM_SEEK_OPS=${BENCH_NUM_SEEK_OPS}
-        BENCH_KEY_SIZE=${BENCH_KEY_SIZE}
-        BENCH_VALUE_SIZE=${BENCH_VALUE_SIZE}
-        BENCH_CF_NAME=\"${BENCH_CF_NAME}\"
-        BENCH_NUM_THREADS=${BENCH_NUM_THREADS}
-        BENCH_DB_LOG_LEVEL=${BENCH_DB_LOG_LEVEL}
-        BENCH_DB_PATH=\"${BENCH_DB_PATH}\"
-        BENCH_KEY_PATTERN=\"${BENCH_KEY_PATTERN}\"
-        BENCH_WRITE_BUFFER_SIZE=${BENCH_WRITE_BUFFER_SIZE}
-        BENCH_LEVEL_RATIO=${BENCH_LEVEL_RATIO}
-        BENCH_DIVIDING_LEVEL_OFFSET=${BENCH_DIVIDING_LEVEL_OFFSET}
-        BENCH_MIN_LEVELS=${BENCH_MAX_LEVELS}
-        BENCH_SKIP_LIST_MAX_LEVEL=${BENCH_SKIP_LIST_MAX_LEVEL}
-        BENCH_SKIP_LIST_PROBABILITY=${BENCH_SKIP_LIST_PROBABILITY}
-        BENCH_ENABLE_COMPRESSION=${BENCH_ENABLE_COMPRESSION}
-        BENCH_COMPRESSION_ALGORITHM=${BENCH_COMPRESSION_ALGORITHM}
-        BENCH_ENABLE_BLOOM_FILTER=${BENCH_ENABLE_BLOOM_FILTER}
-        BENCH_BLOOM_FILTER_FP_RATE=${BENCH_BLOOM_FILTER_FP_RATE}
-        BENCH_ENABLE_BLOCK_INDEXES=${BENCH_ENABLE_BLOCK_INDEXES}
-        BENCH_BLOCK_INDEX_SAMPLING_COUNT=${BENCH_BLOCK_INDEX_SAMPLING_COUNT}
-        BENCH_BLOCK_INDEX_PREFIX_LEN=${BENCH_BLOCK_INDEX_PREFIX_LEN}
-        BENCH_SYNC_MODE=${BENCH_SYNC_MODE}
-        BENCH_SYNC_INTERVAL_US=${BENCH_SYNC_INTERVAL_US}
-        BENCH_COMPARATOR_NAME=\"${BENCH_COMPARATOR_NAME}\"
-        BENCH_CLOCK_CACHE_SIZE=${BENCH_CLOCK_CACHE_SIZE}
-        BENCH_DB_FLUSH_POOL_THREADS=${BENCH_DB_FLUSH_POOL_THREADS}
-        BENCH_DB_COMPACTION_POOL_THREADS=${BENCH_DB_COMPACTION_POOL_THREADS}
-        BENCH_ISOLATION_LEVEL=${BENCH_ISOLATION_LEVEL}
+            BENCH_NUM_OPERATIONS=${BENCH_NUM_OPERATIONS}
+            BENCH_NUM_SEEK_OPS=${BENCH_NUM_SEEK_OPS}
+            BENCH_KEY_SIZE=${BENCH_KEY_SIZE}
+            BENCH_VALUE_SIZE=${BENCH_VALUE_SIZE}
+            BENCH_CF_NAME=\"${BENCH_CF_NAME}\"
+            BENCH_NUM_THREADS=${BENCH_NUM_THREADS}
+            BENCH_DB_LOG_LEVEL=${BENCH_DB_LOG_LEVEL}
+            BENCH_DB_PATH=\"${BENCH_DB_PATH}\"
+            BENCH_KEY_PATTERN=\"${BENCH_KEY_PATTERN}\"
+            BENCH_WRITE_BUFFER_SIZE=${BENCH_WRITE_BUFFER_SIZE}
+            BENCH_LEVEL_RATIO=${BENCH_LEVEL_RATIO}
+            BENCH_DIVIDING_LEVEL_OFFSET=${BENCH_DIVIDING_LEVEL_OFFSET}
+            BENCH_MIN_LEVELS=${BENCH_MAX_LEVELS}
+            BENCH_SKIP_LIST_MAX_LEVEL=${BENCH_SKIP_LIST_MAX_LEVEL}
+            BENCH_SKIP_LIST_PROBABILITY=${BENCH_SKIP_LIST_PROBABILITY}
+            BENCH_ENABLE_COMPRESSION=${BENCH_ENABLE_COMPRESSION}
+            BENCH_COMPRESSION_ALGORITHM=${BENCH_COMPRESSION_ALGORITHM}
+            BENCH_ENABLE_BLOOM_FILTER=${BENCH_ENABLE_BLOOM_FILTER}
+            BENCH_BLOOM_FILTER_FP_RATE=${BENCH_BLOOM_FILTER_FP_RATE}
+            BENCH_ENABLE_BLOCK_INDEXES=${BENCH_ENABLE_BLOCK_INDEXES}
+            BENCH_BLOCK_INDEX_SAMPLING_COUNT=${BENCH_BLOCK_INDEX_SAMPLING_COUNT}
+            BENCH_BLOCK_INDEX_PREFIX_LEN=${BENCH_BLOCK_INDEX_PREFIX_LEN}
+            BENCH_SYNC_MODE=${BENCH_SYNC_MODE}
+            BENCH_SYNC_INTERVAL_US=${BENCH_SYNC_INTERVAL_US}
+            BENCH_COMPARATOR_NAME=\"${BENCH_COMPARATOR_NAME}\"
+            BENCH_CLOCK_CACHE_SIZE=${BENCH_CLOCK_CACHE_SIZE}
+            BENCH_DB_FLUSH_POOL_THREADS=${BENCH_DB_FLUSH_POOL_THREADS}
+            BENCH_DB_COMPACTION_POOL_THREADS=${BENCH_DB_COMPACTION_POOL_THREADS}
+            BENCH_ISOLATION_LEVEL=${BENCH_ISOLATION_LEVEL}
     )
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests queue_tests buffer_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests buffer_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -358,6 +359,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME compress_tests COMMAND compress_tests)
     add_test(NAME bloom_filter_tests COMMAND bloom_filter_tests)
     add_test(NAME manifest_tests COMMAND manifest_tests)
+    add_test(NAME clock_cache_tests COMMAND clock_cache_tests)
     add_test(NAME queue_tests COMMAND queue_tests)
     add_test(NAME buffer_tests COMMAND buffer_tests)
     add_test(NAME tidesdb_tests COMMAND tidesdb_tests)

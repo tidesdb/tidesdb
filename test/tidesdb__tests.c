@@ -4959,7 +4959,7 @@ static void test_portability_workflow(void)
         cfg.db_path = TEST_DB_PATH;
         cfg.num_flush_threads = 1;
         cfg.num_compaction_threads = 1;
-        cfg.block_cache_size = 0;
+        cfg.clock_cache_size = 0;
 
         tidesdb_t *db = NULL;
         ASSERT_EQ(tidesdb_open(&cfg, &db), 0);
@@ -4968,7 +4968,7 @@ static void test_portability_workflow(void)
         cf_cfg.write_buffer_size = 1024;
         cf_cfg.enable_bloom_filter = 1;
         cf_cfg.enable_block_indexes = 1;
-        cfg.block_cache_size = 0;
+        cfg.clock_cache_size = 0;
 
         ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_cfg), 0);
         tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
@@ -5004,7 +5004,7 @@ static void test_portability_workflow(void)
         cfg.db_path = TEST_DB_PATH;
         cfg.num_flush_threads = 1;
         cfg.num_compaction_threads = 1;
-        cfg.block_cache_size = 0;
+        cfg.clock_cache_size = 0;
 
         tidesdb_t *db = NULL;
         ASSERT_EQ(tidesdb_open(&cfg, &db), 0);
@@ -5865,7 +5865,7 @@ typedef struct
     int compression_algo;
     int num_sstables;
     int keys_per_sstable;
-    int block_cache_size;
+    int clock_cache_size;
     tidesdb_comparator_fn comparator;
 } sim_test_config_t;
 
@@ -5878,7 +5878,7 @@ static void run_sstable_simulation(sim_test_config_t *config)
     cleanup_test_dir();
     tidesdb_t *db = create_test_db();
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    db->config.block_cache_size = config->block_cache_size;
+    db->config.clock_cache_size = config->clock_cache_size;
 
     /* apply configuration */
     cf_config.write_buffer_size = config->keys_per_sstable * 100; /* sized to flush at target */
@@ -6064,7 +6064,7 @@ static void test_many_sstables_with_bloom_filter(void)
                                 .enable_indexes = 0,
                                 .compression_algo = NO_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6076,7 +6076,7 @@ static void test_many_sstables_without_bloom_filter(void)
                                 .enable_indexes = 0,
                                 .compression_algo = NO_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6088,7 +6088,7 @@ static void test_many_sstables_with_block_indexes(void)
                                 .enable_indexes = 1,
                                 .compression_algo = NO_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6100,7 +6100,7 @@ static void test_many_sstables_with_lz4_compression(void)
                                 .enable_indexes = 0,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40};
     run_sstable_simulation(&config);
 }
@@ -6112,7 +6112,7 @@ static void test_many_sstables_with_zstd_compression(void)
                                 .enable_indexes = 0,
                                 .compression_algo = ZSTD_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40};
     run_sstable_simulation(&config);
 }
@@ -6125,7 +6125,7 @@ static void test_many_sstables_with_snappy_compression(void)
                                 .enable_indexes = 0,
                                 .compression_algo = SNAPPY_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40};
     run_sstable_simulation(&config);
 }
@@ -6138,7 +6138,7 @@ static void test_many_sstables_all_features_enabled(void)
                                 .enable_indexes = 1,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 25,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 60};
     run_sstable_simulation(&config);
 }
@@ -6150,7 +6150,7 @@ static void test_many_sstables_all_features_disabled(void)
                                 .enable_indexes = 0,
                                 .compression_algo = NO_COMPRESSION,
                                 .num_sstables = 25,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 60};
     run_sstable_simulation(&config);
 }
@@ -6162,7 +6162,7 @@ static void test_many_sstables_bloom_and_compression(void)
                                 .enable_indexes = 0,
                                 .compression_algo = ZSTD_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6174,7 +6174,7 @@ static void test_many_sstables_indexes_and_compression(void)
                                 .enable_indexes = 1,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6186,7 +6186,7 @@ static void test_many_sstables_with_bloom_filter_cached(void)
                                 .enable_indexes = 0,
                                 .compression_algo = NO_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 16 * 1024 * 1024, /* 16MB */
+                                .clock_cache_size = 16 * 1024 * 1024, /* 16MB */
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6198,7 +6198,7 @@ static void test_many_sstables_without_bloom_filter_cached(void)
                                 .enable_indexes = 0,
                                 .compression_algo = NO_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 16 * 1024 * 1024, /* 16MB */
+                                .clock_cache_size = 16 * 1024 * 1024, /* 16MB */
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6210,7 +6210,7 @@ static void test_many_sstables_with_block_indexes_cached(void)
                                 .enable_indexes = 1,
                                 .compression_algo = NO_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 16 * 1024 * 1024, /* 16MB */
+                                .clock_cache_size = 16 * 1024 * 1024, /* 16MB */
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6222,7 +6222,7 @@ static void test_many_sstables_with_lz4_compression_cached(void)
                                 .enable_indexes = 0,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 16 * 1024 * 1024, /* 16MB */
+                                .clock_cache_size = 16 * 1024 * 1024, /* 16MB */
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6234,7 +6234,7 @@ static void test_many_sstables_with_zstd_compression_cached(void)
                                 .enable_indexes = 0,
                                 .compression_algo = ZSTD_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 16 * 1024 * 1024, /* 16MB */
+                                .clock_cache_size = 16 * 1024 * 1024, /* 16MB */
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6247,7 +6247,7 @@ static void test_many_sstables_with_snappy_compression_cached(void)
                                 .enable_indexes = 0,
                                 .compression_algo = SNAPPY_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 16 * 1024 * 1024, /* 16MB */
+                                .clock_cache_size = 16 * 1024 * 1024, /* 16MB */
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6260,7 +6260,7 @@ static void test_many_sstables_all_features_enabled_cached(void)
                                 .enable_indexes = 1,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 25,
-                                .block_cache_size = 32 * 1024 * 1024, /* 32MB */
+                                .clock_cache_size = 32 * 1024 * 1024, /* 32MB */
                                 .keys_per_sstable = 60};
     run_sstable_simulation(&config);
 }
@@ -6272,7 +6272,7 @@ static void test_many_sstables_all_features_disabled_cached(void)
                                 .enable_indexes = 0,
                                 .compression_algo = NO_COMPRESSION,
                                 .num_sstables = 25,
-                                .block_cache_size = 8 * 1024 * 1024, /* 8MB */
+                                .clock_cache_size = 8 * 1024 * 1024, /* 8MB */
                                 .keys_per_sstable = 60};
     run_sstable_simulation(&config);
 }
@@ -6284,7 +6284,7 @@ static void test_many_sstables_bloom_and_compression_cached(void)
                                 .enable_indexes = 0,
                                 .compression_algo = ZSTD_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 24 * 1024 * 1024, /* 24MB */
+                                .clock_cache_size = 24 * 1024 * 1024, /* 24MB */
                                 .keys_per_sstable = 50};
     run_sstable_simulation(&config);
 }
@@ -6296,7 +6296,7 @@ static void test_many_sstables_read_uncommitted(void)
                                 .enable_indexes = 1,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40,
                                 .comparator = NULL};
     run_sstable_simulation(&config);
@@ -6309,7 +6309,7 @@ static void test_many_sstables_read_committed(void)
                                 .enable_indexes = 1,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40,
                                 .comparator = NULL};
     run_sstable_simulation(&config);
@@ -6322,7 +6322,7 @@ static void test_many_sstables_repeatable_read(void)
                                 .enable_indexes = 1,
                                 .compression_algo = ZSTD_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40,
                                 .comparator = NULL};
     run_sstable_simulation(&config);
@@ -6335,7 +6335,7 @@ static void test_many_sstables_serializable(void)
                                 .enable_indexes = 1,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40,
                                 .comparator = NULL};
     run_sstable_simulation(&config);
@@ -6348,7 +6348,7 @@ static void test_many_sstables_comparator_memcmp(void)
                                 .enable_indexes = 1,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40,
                                 .comparator = tidesdb_comparator_memcmp};
     run_sstable_simulation(&config);
@@ -6361,7 +6361,7 @@ static void test_many_sstables_comparator_lexicographic(void)
                                 .enable_indexes = 1,
                                 .compression_algo = ZSTD_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40,
                                 .comparator = tidesdb_comparator_lexicographic};
     run_sstable_simulation(&config);
@@ -6374,7 +6374,7 @@ static void test_many_sstables_comparator_reverse(void)
                                 .enable_indexes = 1,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40,
                                 .comparator = tidesdb_comparator_reverse_memcmp};
     run_sstable_simulation(&config);
@@ -6387,7 +6387,7 @@ static void test_many_sstables_comparator_case_insensitive(void)
                                 .enable_indexes = 1,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 0,
+                                .clock_cache_size = 0,
                                 .keys_per_sstable = 40,
                                 .comparator = tidesdb_comparator_case_insensitive};
     run_sstable_simulation(&config);
@@ -6400,7 +6400,7 @@ static void test_many_sstables_small_cache(void)
                                 .enable_indexes = 1,
                                 .compression_algo = LZ4_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 1024 * 1024, /* 1MB */
+                                .clock_cache_size = 1024 * 1024, /* 1MB */
                                 .keys_per_sstable = 50,
                                 .comparator = NULL};
     run_sstable_simulation(&config);
@@ -6413,7 +6413,7 @@ static void test_many_sstables_large_cache(void)
                                 .enable_indexes = 1,
                                 .compression_algo = ZSTD_COMPRESSION,
                                 .num_sstables = 20,
-                                .block_cache_size = 64 * 1024 * 1024, /* 64MB */
+                                .clock_cache_size = 64 * 1024 * 1024, /* 64MB */
                                 .keys_per_sstable = 50,
                                 .comparator = NULL};
     run_sstable_simulation(&config);
@@ -6426,7 +6426,7 @@ static void test_many_sstables_all_comparators(void)
                                 .enable_indexes = 1,
                                 .compression_algo = ZSTD_COMPRESSION,
                                 .num_sstables = 15,
-                                .block_cache_size = 32 * 1024 * 1024,
+                                .clock_cache_size = 32 * 1024 * 1024,
                                 .keys_per_sstable = 40,
                                 .comparator = tidesdb_comparator_lexicographic};
     run_sstable_simulation(&config);
@@ -6442,7 +6442,7 @@ static void test_large_value_iteration(void)
     tidesdb_config_t config = {.db_path = TEST_DB_PATH,
                                .num_flush_threads = 2,
                                .num_compaction_threads = 2,
-                               .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
+                               .clock_cache_size = TDB_DEFAULT_CLOCK_CACHE_SIZE,
                                .max_open_sstables = 256};
 
     ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);

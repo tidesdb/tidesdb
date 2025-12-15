@@ -329,7 +329,7 @@ void test_bloom_filter_large_capacity_random_keys()
     int result = bloom_filter_new(&bf, p, n);
     ASSERT_EQ(result, 0);
 
-    printf("Bloom filter created: m=%d bits, h=%d hashes, size=%d words\n", bf->m, bf->h,
+    printf("Bloom filter created: m=%u bits, h=%u hashes, size=%u words\n", bf->m, bf->h,
            bf->size_in_words);
 
     /* add 2.9M random 16-byte keys (simulating PUT phase) */
@@ -351,6 +351,31 @@ void test_bloom_filter_large_capacity_random_keys()
         }
     }
     printf("All %d keys added.\n", n);
+
+    /* sanity check: count how many bits are set in bloom filter */
+    unsigned int bits_set = 0;
+    for (unsigned int i = 0; i < bf->size_in_words; i++)
+    {
+        if (bf->bitset[i] != 0)
+        {
+            bits_set++;
+        }
+    }
+    printf("Sanity check: %u/%u words have non-zero bits\n", bits_set, bf->size_in_words);
+
+    /* verify we can find a key we just added */
+    srand(12345); /* same seed as add phase */
+    uint8_t test_key[16];
+    for (int j = 0; j < 16; j++)
+    {
+        test_key[j] = (uint8_t)(rand() % 256);
+    }
+    int found = bloom_filter_contains(bf, test_key, 16);
+    printf("Sanity check: first added key found = %d (should be 1)\n", found);
+    if (!found)
+    {
+        printf("ERROR: Bloom filter cannot find key that was just added!\n");
+    }
 
     /* now test with DIFFERENT random keys (simulating GET phase with non-existent keys) */
     printf("Testing with 100K DIFFERENT random keys...\n");

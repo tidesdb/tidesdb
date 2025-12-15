@@ -521,6 +521,7 @@ typedef struct
  * @param num_entries number of entries in this block
  * @param block_size total size of this block
  * @param capacity allocated capacity for arrays (to prevent buffer overflow)
+ * @param is_arena_allocated 1 if arena-allocated (deserialized), 0 if separate mallocs (created)
  * @param entries array of entries
  * @param keys array of key data
  * @param inline_values array of inline values (null if in vlog)
@@ -532,8 +533,7 @@ typedef struct
     uint32_t num_entries;
     uint32_t block_size;
     uint32_t capacity;
-    uint8_t is_arena_allocated; /* 1 if arena-allocated (deserialized), 0 if separate mallocs
-                                   (created) */
+    uint8_t is_arena_allocated;
     tidesdb_klog_entry_t *entries;
     uint8_t **keys;
     uint8_t **inline_values;

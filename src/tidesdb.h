@@ -180,7 +180,7 @@ typedef enum
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024)
 #define TDB_DEFAULT_MAX_OPEN_SSTABLES           512
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      (1024 * 64)
-#define TDB_DEFAULT_CLOCK_CACHE_SIZE            (64 * 1024 * 1024)
+#define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_SYNC_INTERVAL_US            128000
 #define TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE      1
 
@@ -290,7 +290,7 @@ typedef struct tidesdb_comparator_entry_t
  * @param num_compaction_threads number of compaction threads
  * @param log_level minimum log level to display (TDB_LOG_DEBUG, TDB_LOG_INFO, TDB_LOG_WARN,
  * TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE)
- * @param clock_cache_size size of clock cache in bytes for deserialized key value entries
+ * @param block_cache_size size of clock cache for hot sstable blocks
  * @param max_open_sstables maximum number of open sstables
  * @param wait_for_txns_on_close if true, wait up to defined time for active transactions on close
  *                                if false (default), close immediately and fail active transactions
@@ -301,7 +301,7 @@ typedef struct tidesdb_config_t
     int num_flush_threads;
     int num_compaction_threads;
     tidesdb_log_level_t log_level;
-    size_t clock_cache_size;
+    size_t block_cache_size;
     size_t max_open_sstables;
     int wait_for_txns_on_close;
 } tidesdb_config_t;

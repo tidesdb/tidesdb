@@ -1697,7 +1697,7 @@ tidesdb_config_t tidesdb_default_config(void)
                                .log_level = TDB_LOG_INFO,
                                .num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE,
                                .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
-                               .clock_cache_size = TDB_DEFAULT_CLOCK_CACHE_SIZE,
+                               .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
                                .wait_for_txns_on_close = TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE,
                                .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES};
     return config;
@@ -9460,10 +9460,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_MEMORY;
     }
 
-    if (config->clock_cache_size > 0)
+    if (config->block_cache_size > 0)
     {
         cache_config_t cache_config;
-        clock_cache_compute_config(config->clock_cache_size, &cache_config);
+        clock_cache_compute_config(config->block_cache_size, &cache_config);
 
         (*db)->clock_cache = clock_cache_create(&cache_config);
         if (!(*db)->clock_cache)
@@ -9475,13 +9475,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free(*db);
             return TDB_ERR_MEMORY;
         }
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Clock cache created with max_bytes=%.2f MB",
-                      (double)config->clock_cache_size / (1024 * 1024));
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Block clock cache created with max_bytes=%.2f MB",
+                      (double)config->block_cache_size / (1024 * 1024));
     }
     else
     {
         (*db)->clock_cache = NULL;
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Clock cache disabled (clock_cache_size=0)");
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Block clock cache disabled (block_cache_size=0)");
     }
 
     tidesdb_recover_database(*db);
@@ -11187,13 +11187,6 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8_t *key,
                     size_t key_size, uint8_t **value, size_t *value_size)
 {
-    static atomic_int get_counter = 0;
-    int get_num = atomic_fetch_add(&get_counter, 1);
-    if (get_num % 10000 == 0)
-    {
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "TXN GET #%d starting", get_num);
-    }
-
     if (!txn || !cf || !key || key_size == 0 || !value || !value_size) return TDB_ERR_INVALID_ARGS;
 
     /* wait for database to finish opening, or fail if shutting down */
@@ -13343,10 +13336,6 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                             {
                                 cached_block_position = ctx.best_block_position;
                                 cache_hit = 1;
-                                TDB_DEBUG_LOG(
-                                    TDB_LOG_DEBUG,
-                                    "Seek_for_prev cache hit: found block at position %" PRIu64,
-                                    cached_block_position);
                             }
                             free(ctx.best_block_data);
                         }

@@ -2106,6 +2106,8 @@ static void test_sync_interval_mode(void)
         tidesdb_close(db);
         cleanup_test_dir();
     }
+
+    cleanup_test_dir();
 }
 
 static void test_concurrent_writes(void)

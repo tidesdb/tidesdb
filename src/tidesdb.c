@@ -386,15 +386,6 @@ static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **o
 static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
                                           tidesdb_klog_block_t **block);
 
-static tidesdb_vlog_block_t *tidesdb_vlog_block_create(void);
-static void tidesdb_vlog_block_free(tidesdb_vlog_block_t *block);
-static int tidesdb_vlog_block_add_value(tidesdb_vlog_block_t *block, const uint8_t *value,
-                                        size_t value_size, uint64_t *offset_in_block);
-static int tidesdb_vlog_block_is_full(tidesdb_vlog_block_t *block, size_t max_size);
-static int tidesdb_vlog_block_serialize(tidesdb_vlog_block_t *block, uint8_t **out,
-                                        size_t *out_size);
-static int tidesdb_vlog_block_deserialize(const uint8_t *data, size_t data_size,
-                                          tidesdb_vlog_block_t **block);
 /**
  * tidesdb_block_managers_t
  * temporary structure to hold block manager pointers retrieved from cache
@@ -568,7 +559,7 @@ static int tidesdb_cache_entry_put(tidesdb_t *db, const char *cf_name, uint64_t 
  * @param sstable_id sstable id
  * @param key entry key
  * @param key_len entry key length
- * @return the cached entry if found, NULL otherwise (caller must free)
+ * @return the cached entry if found, NULL otherwise
  */
 static tidesdb_cached_entry_t *tidesdb_cache_entry_get(tidesdb_t *db, const char *cf_name,
                                                        uint64_t sstable_id, const uint8_t *key,
@@ -640,7 +631,7 @@ static int tidesdb_get_cf_name_from_path(const char *path, char *cf_name_out)
  * @param db the database
  * @param sst the sstable (for compression config)
  * @param cursor the block manager cursor
- * @return the decompressed block if successful, NULL otherwise (caller must release)
+ * @return the decompressed block if successful, NULL otherwise
  */
 static block_manager_block_t *tidesdb_read_block(tidesdb_t *db, tidesdb_sstable_t *sst,
                                                  block_manager_cursor_t *cursor)
@@ -684,7 +675,7 @@ static int tidesdb_check_disk_space(tidesdb_t *db, const char *path, uint64_t mi
     time_t now = time(NULL);
     time_t last_check = atomic_load_explicit(&db->last_disk_space_check, memory_order_relaxed);
 
-    if (now - last_check >= DISK_SPACE_CHECK_INTERVAL_SECONDS)
+    if (now - last_check >= TDB_DISK_SPACE_CHECK_INTERVAL_SECONDS)
     {
         uint64_t available;
         if (tdb_get_available_disk_space(path, &available) == 0)
@@ -786,7 +777,7 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
     uint8_t *ptr = data;
 
     /* serialize fields with explicit little-endian encoding */
-    encode_uint32_le_compat(ptr, SSTABLE_METADATA_MAGIC);
+    encode_uint32_le_compat(ptr, TDB_SSTABLE_METADATA_MAGIC);
     ptr += 4;
     encode_uint64_le_compat(ptr, sst->num_entries);
     ptr += 8;
@@ -850,11 +841,11 @@ static int sstable_metadata_deserialize(const uint8_t *data, size_t data_size,
     uint32_t magic = decode_uint32_le_compat(ptr);
     ptr += 4;
 
-    if (magic != SSTABLE_METADATA_MAGIC)
+    if (magic != TDB_SSTABLE_METADATA_MAGIC)
     {
         TDB_DEBUG_LOG(TDB_LOG_FATAL,
                       "SSTable metadata has an invalid magic 0x%08x (expected 0x%08x)", magic,
-                      SSTABLE_METADATA_MAGIC);
+                      TDB_SSTABLE_METADATA_MAGIC);
         return -1;
     }
 
@@ -1100,9 +1091,7 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .level_size_ratio = TDB_DEFAULT_LEVEL_SIZE_RATIO,
         .min_levels = TDB_DEFAULT_MIN_LEVELS,
         .dividing_level_offset = TDB_DEFAULT_DIVIDING_LEVEL_OFFSET,
-        .klog_block_size = TDB_DEFAULT_KLOG_BLOCK_SIZE,
-        .vlog_block_size = TDB_DEFAULT_VLOG_BLOCK_SIZE,
-        .value_threshold = TDB_DEFAULT_VALUE_THRESHOLD,
+        .klog_value_threshold = TDB_DEFAULT_KLOG_VALUE_THRESHOLD,
         .compression_algorithm = LZ4_COMPRESSION,
         .enable_bloom_filter = 1,
         .bloom_fpr = TDB_DEFAULT_BLOOM_FPR,
@@ -1281,7 +1270,7 @@ static void tidesdb_klog_block_free(tidesdb_klog_block_t *block)
 static int tidesdb_klog_block_add_entry(tidesdb_klog_block_t *block, const tidesdb_kv_pair_t *kv,
                                         tidesdb_t *db, tidesdb_column_family_config_t *config)
 {
-    int inline_value = (kv->entry.value_size < config->value_threshold);
+    int inline_value = (kv->entry.value_size < config->klog_value_threshold);
 
     /** calculate actual entry size to match serialization:
      * we must use actual varint sizes, not max sizes, so block_size is accurate
@@ -1720,187 +1709,6 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 }
 
 /**
- * tidesdb_vlog_block_create
- * create a new vlog block
- * @return new vlog block
- */
-static tidesdb_vlog_block_t *tidesdb_vlog_block_create(void)
-{
-    return calloc(1, sizeof(tidesdb_vlog_block_t));
-}
-
-/**
- * tidesdb_vlog_block_free
- * free a vlog block
- * @param block vlog block to free
- */
-static void tidesdb_vlog_block_free(tidesdb_vlog_block_t *block)
-{
-    if (!block) return;
-
-    for (uint32_t i = 0; i < block->num_values; i++)
-    {
-        free(block->values[i]);
-    }
-
-    free(block->value_sizes);
-    free(block->values);
-    free(block);
-}
-
-/**
- * tidesdb_vlog_block_add_value
- * add a value to a vlog block
- * @param block vlog block to add value to
- * @param value value to add
- * @param value_size size of value
- * @param offset_in_block offset of value in block
- * @return 0 on success, -1 on error
- */
-static int tidesdb_vlog_block_add_value(tidesdb_vlog_block_t *block, const uint8_t *value,
-                                        size_t value_size, uint64_t *offset_in_block)
-{
-    uint32_t new_count = block->num_values + 1;
-
-    uint32_t *new_sizes = realloc(block->value_sizes, new_count * sizeof(uint32_t));
-    if (!new_sizes) return TDB_ERR_MEMORY;
-    block->value_sizes = new_sizes;
-
-    uint8_t **new_values = realloc(block->values, new_count * sizeof(uint8_t *));
-    if (!new_values) return TDB_ERR_MEMORY;
-    block->values = new_values;
-
-    *offset_in_block = (sizeof(uint32_t) * 2) + block->block_size;
-
-    block->value_sizes[block->num_values] = (uint32_t)value_size;
-    block->values[block->num_values] = malloc(value_size);
-    if (!block->values[block->num_values]) return TDB_ERR_MEMORY;
-    memcpy(block->values[block->num_values], value, value_size);
-
-    block->num_values++;
-    block->block_size += (uint32_t)(sizeof(uint32_t) + value_size);
-
-    return TDB_SUCCESS;
-}
-
-/**
- * tidesdb_vlog_block_is_full
- * check if a vlog block is full
- * @param block vlog block to check
- * @param max_size maximum size of block
- * @return 1 if block is full, 0 otherwise
- *
- * we use 2x threshold to account for compression (same as klog blocks)
- */
-static int tidesdb_vlog_block_is_full(tidesdb_vlog_block_t *block, size_t max_size)
-{
-    return block->block_size >= (max_size * 2);
-}
-
-/**
- * tidesdb_vlog_block_serialize
- * serialize a vlog block
- * @param block vlog block to serialize
- * @param out output buffer
- * @param out_size output buffer size
- * @return 0 on success, -1 on error
- */
-static int tidesdb_vlog_block_serialize(tidesdb_vlog_block_t *block, uint8_t **out,
-                                        size_t *out_size)
-{
-    size_t total_size = sizeof(uint32_t) * 2;
-
-    for (uint32_t i = 0; i < block->num_values; i++)
-    {
-        total_size += sizeof(uint32_t) + block->value_sizes[i];
-    }
-
-    *out = malloc(total_size);
-    if (!*out) return TDB_ERR_MEMORY;
-
-    uint8_t *ptr = *out;
-
-    encode_uint32_le_compat(ptr, block->num_values);
-    ptr += sizeof(uint32_t);
-    encode_uint32_le_compat(ptr, block->block_size);
-    ptr += sizeof(uint32_t);
-
-    for (uint32_t i = 0; i < block->num_values; i++)
-    {
-        encode_uint32_le_compat(ptr, block->value_sizes[i]);
-        ptr += sizeof(uint32_t);
-
-        memcpy(ptr, block->values[i], block->value_sizes[i]);
-        ptr += block->value_sizes[i];
-    }
-
-    *out_size = ptr - *out;
-    return TDB_SUCCESS;
-}
-
-/**
- * tidesdb_vlog_block_deserialize
- * deserialize a vlog block
- * @param data input buffer
- * @param data_size input buffer size
- * @param block output vlog block
- * @return 0 on success, -1 on error
- */
-static int tidesdb_vlog_block_deserialize(const uint8_t *data, size_t data_size,
-                                          tidesdb_vlog_block_t **block)
-{
-    if (data_size < sizeof(uint32_t) * 2) return TDB_ERR_CORRUPTION;
-
-    *block = tidesdb_vlog_block_create();
-    if (!*block) return TDB_ERR_MEMORY;
-
-    const uint8_t *ptr = data;
-
-    (*block)->num_values = decode_uint32_le_compat(ptr);
-    ptr += sizeof(uint32_t);
-    (*block)->block_size = decode_uint32_le_compat(ptr);
-    ptr += sizeof(uint32_t);
-
-    (*block)->value_sizes = malloc((*block)->num_values * sizeof(uint32_t));
-    (*block)->values = malloc((*block)->num_values * sizeof(uint8_t *));
-
-    if (!(*block)->value_sizes || !(*block)->values)
-    {
-        tidesdb_vlog_block_free(*block);
-        return TDB_ERR_MEMORY;
-    }
-
-    for (uint32_t i = 0; i < (*block)->num_values; i++)
-    {
-        if (ptr + sizeof(uint32_t) > data + data_size)
-        {
-            tidesdb_vlog_block_free(*block);
-            return TDB_ERR_CORRUPTION;
-        }
-
-        (*block)->value_sizes[i] = decode_uint32_le_compat(ptr);
-        ptr += sizeof(uint32_t);
-
-        if (ptr + (*block)->value_sizes[i] > data + data_size)
-        {
-            tidesdb_vlog_block_free(*block);
-            return TDB_ERR_CORRUPTION;
-        }
-
-        (*block)->values[i] = malloc((*block)->value_sizes[i]);
-        if (!(*block)->values[i])
-        {
-            tidesdb_vlog_block_free(*block);
-            return TDB_ERR_MEMORY;
-        }
-        memcpy((*block)->values[i], ptr, (*block)->value_sizes[i]);
-        ptr += (*block)->value_sizes[i];
-    }
-
-    return TDB_SUCCESS;
-}
-
-/**
  * tidesdb_vlog_read_value
  * read a value from vlog
  * @param sst sstable containing vlog
@@ -1918,98 +1726,70 @@ static int tidesdb_vlog_read_value(tidesdb_t *db, tidesdb_sstable_t *sst, uint64
         return TDB_ERR_IO;
     }
 
-    /* calculate which vlog block contains this offset */
-    uint64_t block_num = vlog_offset / sst->config->vlog_block_size;
-    uint64_t offset_in_block = vlog_offset % sst->config->vlog_block_size;
+    /* vlog_offset is a direct file offset pointing to the vlog block containing the raw value */
 
-    block_manager_cursor_t *cursor;
-    if (block_manager_cursor_init(&cursor, bms.vlog_bm) != 0)
+    uint32_t block_size;
+    if (block_manager_get_block_size_at_offset(bms.vlog_bm, vlog_offset, &block_size) != 0)
     {
         return TDB_ERR_IO;
     }
 
-    if (block_manager_cursor_goto_first(cursor) != 0)
+    /* allocate buffer and read block data (skip header: size + checksum) */
+    uint8_t *block_data = malloc(block_size);
+    if (!block_data)
     {
-        block_manager_cursor_free(cursor);
+        return TDB_ERR_MEMORY;
+    }
+
+    uint64_t data_offset = vlog_offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    if (block_manager_read_at_offset(bms.vlog_bm, data_offset, block_size, block_data) != 0)
+    {
+        free(block_data);
         return TDB_ERR_IO;
     }
-
-    for (uint64_t i = 0; i < block_num && block_manager_cursor_has_next(cursor); i++)
-    {
-        block_manager_cursor_next(cursor);
-    }
-
-    block_manager_block_t *block = block_manager_cursor_read(cursor);
-    if (!block)
-    {
-        block_manager_cursor_free(cursor);
-        return TDB_ERR_IO;
-    }
-
-    /* block is now owned by us, no acquire needed */
-
-    uint8_t *data = block->data;
-    size_t data_size = block->size;
-    uint8_t *decompressed = NULL;
 
     if (sst->config->compression_algorithm != NO_COMPRESSION)
     {
         size_t decompressed_size;
-        decompressed = decompress_data(block->data, block->size, &decompressed_size,
-                                       sst->config->compression_algorithm);
+        uint8_t *decompressed = decompress_data(block_data, block_size, &decompressed_size,
+                                                sst->config->compression_algorithm);
         if (decompressed)
         {
-            data = decompressed;
-            data_size = decompressed_size;
-        }
-    }
+            free(block_data);
+            *value = decompressed;
 
-    tidesdb_vlog_block_t *vlog_block;
-    int result = tidesdb_vlog_block_deserialize(data, data_size, &vlog_block);
-
-    free(decompressed);
-    block_manager_block_release(block);
-    block_manager_cursor_free(cursor);
-
-    if (result != TDB_SUCCESS)
-    {
-        return result;
-    }
-
-    /* find value at offset */
-    uint64_t current_offset = sizeof(uint32_t) * 2; /* header */
-    for (uint32_t i = 0; i < vlog_block->num_values; i++)
-    {
-        if (current_offset == offset_in_block)
-        {
-            *value = malloc(vlog_block->value_sizes[i]);
-            if (!*value)
+            /* validate size if provided */
+            if (value_size > 0 && decompressed_size != value_size)
             {
-                tidesdb_vlog_block_free(vlog_block);
-                return TDB_ERR_MEMORY;
-            }
-
-            /* validate value size matches expected */
-            if (value_size > 0 && vlog_block->value_sizes[i] != value_size)
-            {
-                TDB_DEBUG_LOG(TDB_LOG_FATAL,
-                              "Value size mismatch at entry %d (expected %zu, got %u)", i,
-                              value_size, vlog_block->value_sizes[i]);
+                TDB_DEBUG_LOG(TDB_LOG_FATAL, "Value size mismatch (expected %zu, got %zu)",
+                              value_size, decompressed_size);
                 free(*value);
                 *value = NULL;
-                tidesdb_vlog_block_free(vlog_block);
                 return TDB_ERR_CORRUPTION;
             }
-
-            memcpy(*value, vlog_block->values[i], vlog_block->value_sizes[i]);
-            tidesdb_vlog_block_free(vlog_block);
             return TDB_SUCCESS;
         }
-        current_offset += sizeof(uint32_t) + vlog_block->value_sizes[i];
+        else
+        {
+            /* decompression failed */
+            free(block_data);
+            return TDB_ERR_CORRUPTION;
+        }
     }
 
-    tidesdb_vlog_block_free(vlog_block);
-    return TDB_ERR_NOT_FOUND;
+    *value = block_data;
+
+    /* validate size if provided */
+    if (value_size > 0 && block_size != value_size)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Value size mismatch (expected %zu, got %u)", value_size,
+                      block_size);
+        free(*value);
+        *value = NULL;
+        return TDB_ERR_CORRUPTION;
+    }
+
+    return TDB_SUCCESS;
 }
 
 /**
@@ -2027,110 +1807,10 @@ static int tidesdb_vlog_read_value_with_cursor(tidesdb_t *db, tidesdb_sstable_t 
                                                block_manager_cursor_t *cursor, uint64_t vlog_offset,
                                                size_t value_size, uint8_t **value)
 {
-    (void)db; /* unused but kept for API consistency */
-    if (!cursor) return TDB_ERR_INVALID_ARGS;
+    (void)cursor; /* cursor not needed with direct offset access */
 
-    /* calculate which vlog block contains this offset */
-    uint64_t block_num = vlog_offset / sst->config->vlog_block_size;
-    uint64_t offset_in_block = vlog_offset % sst->config->vlog_block_size;
-
-    /* use position cache for O(1) random access if available */
-    if (cursor->bm->block_count > 0 && cursor->bm->block_positions &&
-        !atomic_load(&cursor->bm->cache_rebuilding))
-    {
-        /* position cache available and not being rebuilt -- direct jump to block */
-        if (block_num >= (uint64_t)cursor->bm->block_count)
-        {
-            return TDB_ERR_IO; /* block number out of range */
-        }
-        cursor->block_index = (int)block_num;
-        cursor->current_pos = cursor->bm->block_positions[block_num];
-        cursor->current_block_size = cursor->bm->block_sizes[block_num];
-    }
-    else
-    {
-        /* no position cache -- fall back to sequential seek */
-        if (block_manager_cursor_goto_first(cursor) != 0)
-        {
-            return TDB_ERR_IO;
-        }
-
-        /* goto_first without cache positions at header (block_index=-1)
-         * so we need to advance to first block (block 0) first */
-        for (uint64_t i = 0; i <= block_num && block_manager_cursor_has_next(cursor); i++)
-        {
-            if (block_manager_cursor_next(cursor) != 0)
-            {
-                return TDB_ERR_IO;
-            }
-        }
-    }
-
-    block_manager_block_t *block = block_manager_cursor_read(cursor);
-    if (!block)
-    {
-        return TDB_ERR_IO;
-    }
-
-    /* block is now owned by us */
-    uint8_t *data = block->data;
-    size_t data_size = block->size;
-    uint8_t *decompressed = NULL;
-
-    if (sst->config->compression_algorithm != NO_COMPRESSION)
-    {
-        size_t decompressed_size;
-        decompressed = decompress_data(block->data, block->size, &decompressed_size,
-                                       sst->config->compression_algorithm);
-        if (decompressed)
-        {
-            data = decompressed;
-            data_size = decompressed_size;
-        }
-    }
-
-    tidesdb_vlog_block_t *vlog_block;
-    int result = tidesdb_vlog_block_deserialize(data, data_size, &vlog_block);
-
-    free(decompressed);
-    block_manager_block_release(block);
-
-    if (result != TDB_SUCCESS)
-    {
-        return result;
-    }
-
-    /* find value at offset */
-    uint64_t current_offset = sizeof(uint32_t) * 2; /* header */
-    for (uint32_t i = 0; i < vlog_block->num_values; i++)
-    {
-        if (current_offset == offset_in_block)
-        {
-            *value = malloc(vlog_block->value_sizes[i]);
-            if (!*value)
-            {
-                tidesdb_vlog_block_free(vlog_block);
-                return TDB_ERR_MEMORY;
-            }
-
-            /* validate value size matches expected */
-            if (value_size > 0 && vlog_block->value_sizes[i] != value_size)
-            {
-                free(*value);
-                *value = NULL;
-                tidesdb_vlog_block_free(vlog_block);
-                return TDB_ERR_CORRUPTION;
-            }
-
-            memcpy(*value, vlog_block->values[i], vlog_block->value_sizes[i]);
-            tidesdb_vlog_block_free(vlog_block);
-            return TDB_SUCCESS;
-        }
-        current_offset += sizeof(uint32_t) + vlog_block->value_sizes[i];
-    }
-
-    tidesdb_vlog_block_free(vlog_block);
-    return TDB_ERR_NOT_FOUND;
+    /* just delegate to the non-cursor version since we use direct offset access */
+    return tidesdb_vlog_read_value(db, sst, vlog_offset, value_size, value);
 }
 
 /**
@@ -2145,9 +1825,6 @@ static int tidesdb_sstable_get_block_managers(tidesdb_t *db, tidesdb_sstable_t *
                                               tidesdb_block_managers_t *bms)
 {
     if (!db || !sst || !bms) return TDB_ERR_IO;
-
-    /* caller must ensure sstable is open before calling this function
-     * (removed redundant ensure_open call that was causing deadlock) */
 
     /* get block managers directly from the sst */
     bms->klog_bm = sst->klog_bm;
@@ -2780,16 +2457,14 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
         TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable %" PRIu64 " block indexes disabled", sst->id);
     }
 
-    /* init blocks */
+    /* init klog block */
     tidesdb_klog_block_t *current_klog_block = tidesdb_klog_block_create();
-    tidesdb_vlog_block_t *current_vlog_block = tidesdb_vlog_block_create();
 
-    if (!current_klog_block || !current_vlog_block)
+    if (!current_klog_block)
     {
         if (bloom) bloom_filter_free(bloom);
         if (block_indexes) compact_block_index_free(block_indexes);
         tidesdb_klog_block_free(current_klog_block);
-        tidesdb_vlog_block_free(current_vlog_block);
         return TDB_ERR_MEMORY;
     }
 
@@ -2799,13 +2474,11 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
         if (bloom) bloom_filter_free(bloom);
         if (block_indexes) compact_block_index_free(block_indexes);
         tidesdb_klog_block_free(current_klog_block);
-        tidesdb_vlog_block_free(current_vlog_block);
         return TDB_ERR_MEMORY;
     }
 
     uint64_t klog_block_num = 0;
     uint64_t vlog_block_num = 0;
-    uint64_t current_vlog_file_offset = 0;
     uint8_t *first_key = NULL;
     size_t first_key_size = 0;
     uint8_t *last_key = NULL;
@@ -2843,70 +2516,51 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                 tidesdb_kv_pair_create(key, key_size, value, value_size, ttl, seq, deleted);
             if (!kv) continue;
 
-            /* handle large values  */
-            if (value_size >= sst->config->value_threshold && !deleted && value)
+            /* handle large values - write directly to vlog */
+            if (value_size >= sst->config->klog_value_threshold && !deleted && value)
             {
-                /* check if vlog block is full */
-                if (tidesdb_vlog_block_is_full(current_vlog_block, sst->config->vlog_block_size))
+                uint8_t *final_data = (uint8_t *)value;
+                size_t final_size = value_size;
+                uint8_t *compressed = NULL;
+
+                /* compress if configured */
+                if (sst->config->compression_algorithm != NO_COMPRESSION)
                 {
-                    /* serialize and write vlog block */
-                    uint8_t *vlog_data;
-                    size_t vlog_size;
-                    if (tidesdb_vlog_block_serialize(current_vlog_block, &vlog_data, &vlog_size) ==
-                        0)
+                    size_t compressed_size;
+                    compressed = compress_data(value, value_size, &compressed_size,
+                                               sst->config->compression_algorithm);
+                    if (compressed)
                     {
-                        uint8_t *final_vlog_data = vlog_data;
-                        size_t final_vlog_size = vlog_size;
-
-                        if (sst->config->compression_algorithm != NO_COMPRESSION)
-                        {
-                            size_t compressed_size;
-                            uint8_t *compressed =
-                                compress_data(vlog_data, vlog_size, &compressed_size,
-                                              sst->config->compression_algorithm);
-                            if (compressed)
-                            {
-                                free(vlog_data);
-                                final_vlog_data = compressed;
-                                final_vlog_size = compressed_size;
-                            }
-                            else
-                            {
-                                /* compression failed -- fatal error */
-                                free(vlog_data);
-                                tidesdb_klog_block_free(current_klog_block);
-                                tidesdb_vlog_block_free(current_vlog_block);
-                                skip_list_cursor_free(cursor);
-                                if (bloom) bloom_filter_free(bloom);
-                                if (block_indexes) compact_block_index_free(block_indexes);
-                                return TDB_ERR_CORRUPTION;
-                            }
-                        }
-
-                        block_manager_block_t *vlog_block =
-                            block_manager_block_create(final_vlog_size, final_vlog_data);
-                        if (vlog_block)
-                        {
-                            block_manager_block_write(bms.vlog_bm, vlog_block);
-                            block_manager_block_release(vlog_block);
-
-                            current_vlog_file_offset +=
-                                vlog_size; /* use uncompressed size for logical offset */
-                            vlog_block_num++;
-                        }
-                        free(final_vlog_data);
+                        final_data = compressed;
+                        final_size = compressed_size;
                     }
-
-                    tidesdb_vlog_block_free(current_vlog_block);
-                    current_vlog_block = tidesdb_vlog_block_create();
+                    else
+                    {
+                        /* compression failed -- fatal error */
+                        tidesdb_klog_block_free(current_klog_block);
+                        skip_list_cursor_free(cursor);
+                        if (bloom) bloom_filter_free(bloom);
+                        if (block_indexes) compact_block_index_free(block_indexes);
+                        return TDB_ERR_CORRUPTION;
+                    }
                 }
 
-                uint64_t offset_in_block;
-                if (tidesdb_vlog_block_add_value(current_vlog_block, value, value_size,
-                                                 &offset_in_block) == 0)
+                /* write value directly as a block */
+                block_manager_block_t *vlog_block =
+                    block_manager_block_create(final_size, final_data);
+                if (vlog_block)
                 {
-                    kv->entry.vlog_offset = current_vlog_file_offset + offset_in_block;
+                    /* capture the file offset where this block is written */
+                    int64_t block_offset = block_manager_block_write(bms.vlog_bm, vlog_block);
+                    if (block_offset >= 0)
+                    {
+                        kv->entry.vlog_offset = (uint64_t)block_offset;
+                        vlog_block_num++;
+                    }
+                    block_manager_block_release(vlog_block);
                 }
+
+                free(compressed);
             }
 
             /* check if this is the first entry in a new block */
@@ -2936,7 +2590,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                 block_last_key_size = key_size;
             }
 
-            if (tidesdb_klog_block_is_full(current_klog_block, sst->config->klog_block_size))
+            if (tidesdb_klog_block_is_full(current_klog_block, TDB_KLOG_BLOCK_SIZE))
             {
                 uint8_t *klog_data;
                 size_t klog_size;
@@ -2965,7 +2619,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                                           "SSTable %" PRIu64 " klog compression failed!", sst->id);
                             free(klog_data);
                             tidesdb_klog_block_free(current_klog_block);
-                            tidesdb_vlog_block_free(current_vlog_block);
                             skip_list_cursor_free(cursor);
                             if (bloom) bloom_filter_free(bloom);
                             if (block_indexes) compact_block_index_free(block_indexes);
@@ -3077,7 +2730,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                                   "SSTable %" PRIu64 " final klog compression failed!", sst->id);
                     free(klog_data);
                     tidesdb_klog_block_free(current_klog_block);
-                    tidesdb_vlog_block_free(current_vlog_block);
                     if (bloom) bloom_filter_free(bloom);
                     if (block_indexes) compact_block_index_free(block_indexes);
                     free(block_first_key);
@@ -3118,48 +2770,9 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     free(block_first_key);
     free(block_last_key);
 
-    if (current_vlog_block->num_values > 0)
-    {
-        uint8_t *vlog_data;
-        size_t vlog_size;
-        if (tidesdb_vlog_block_serialize(current_vlog_block, &vlog_data, &vlog_size) == 0)
-        {
-            if (sst->config->compression_algorithm != NO_COMPRESSION)
-            {
-                size_t compressed_size;
-                uint8_t *compressed = compress_data(vlog_data, vlog_size, &compressed_size,
-                                                    sst->config->compression_algorithm);
-                if (compressed)
-                {
-                    free(vlog_data);
-                    vlog_data = compressed;
-                    vlog_size = compressed_size;
-                }
-                else
-                {
-                    free(vlog_data);
-                    tidesdb_klog_block_free(current_klog_block);
-                    tidesdb_vlog_block_free(current_vlog_block);
-                    if (bloom) bloom_filter_free(bloom);
-                    if (block_indexes) compact_block_index_free(block_indexes);
-                    return TDB_ERR_CORRUPTION;
-                }
-            }
-
-            block_manager_block_t *vlog_block = block_manager_block_create(vlog_size, vlog_data);
-            if (vlog_block)
-            {
-                block_manager_block_write(bms.vlog_bm, vlog_block);
-                block_manager_block_release(vlog_block);
-                vlog_block_num++;
-            }
-            free(vlog_data);
-        }
-    }
-
     tidesdb_klog_block_free(current_klog_block);
-    tidesdb_vlog_block_free(current_vlog_block);
 
+    sst->num_entries = entry_count;
     sst->num_klog_blocks = klog_block_num;
     sst->num_vlog_blocks = vlog_block_num;
 
@@ -3173,7 +2786,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     block_manager_get_size(bms.klog_bm, &sst->klog_data_end_offset);
 
     /* write index block (always write, even if empty, to maintain consistent file structure)
-     * file structure: [data blocks] [index block] [bloom block] [metadata block] */
+     * file structure -- [data blocks] [index block] [bloom block] [metadata block] */
     if (block_indexes)
     {
         /* we assign the built index to the sst */
@@ -3286,11 +2899,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 
     if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
     if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
-
-    /* rebuild position cache after flush for O(1) cursor navigation
-     * without this, cursors fall back to slow sequential scanning */
-    if (bms.klog_bm) block_manager_build_position_cache(bms.klog_bm);
-    if (bms.vlog_bm) block_manager_build_position_cache(bms.vlog_bm);
 
     return TDB_SUCCESS;
 }
@@ -3651,6 +3259,14 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
         return -1;
     }
 
+    /* validate klog file (strict mode: reject any corruption) */
+    if (block_manager_validate_last_block(klog_bm, 1) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable klog file %s is corrupted", sst->klog_path);
+        block_manager_close(klog_bm);
+        return TDB_ERR_CORRUPTION;
+    }
+
     if (block_manager_open(&vlog_bm, sst->vlog_path, convert_sync_mode(sst->config->sync_mode)) !=
         0)
     {
@@ -3659,6 +3275,15 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
                       sst->vlog_path);
         block_manager_close(klog_bm);
         return -1;
+    }
+
+    /* validate vlog file (strict mode: reject any corruption) */
+    if (block_manager_validate_last_block(vlog_bm, 1) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable vlog file %s is corrupted", sst->vlog_path);
+        block_manager_close(klog_bm);
+        block_manager_close(vlog_bm);
+        return TDB_ERR_CORRUPTION;
     }
 
     block_manager_get_size(klog_bm, &sst->klog_size);
@@ -3717,34 +3342,6 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
 load_bloom_and_index:
     /* load bloom filter and index from last blocks */
     /* [klog blocks...] [index block] [bloom filter block] [metadata block] */
-
-    /* ensure position cache is built for O(1) cursor navigation
-     * without cache, cursor_prev does O(n) scan which can hang on large files */
-    if (klog_bm->block_count == 0)
-    {
-        if (block_manager_build_position_cache(klog_bm) != 0)
-        {
-            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to build position cache for %s", sst->klog_path);
-            block_manager_close(klog_bm);
-            block_manager_close(vlog_bm);
-            return TDB_ERR_IO;
-        }
-    }
-
-    /* validate that the sstable has the expected number of blocks
-     * if block count doesn't match metadata, the sst is corrupted
-     * (likely from interrupted write before fsync completed) */
-    if ((uint64_t)(klog_bm->block_count - SSTABLE_INTERNAL_BLOCKS) != sst->num_klog_blocks)
-    {
-        TDB_DEBUG_LOG(TDB_LOG_WARN,
-                      "SSTable %s block count mismatch (file has %" PRIu64
-                      " blocks, metadata says %" PRIu64 ") - corrupted or incomplete write",
-                      sst->klog_path, (uint64_t)(klog_bm->block_count - SSTABLE_INTERNAL_BLOCKS),
-                      sst->num_klog_blocks);
-        block_manager_close(klog_bm);
-        block_manager_close(vlog_bm);
-        return TDB_ERR_CORRUPTION;
-    }
 
     block_manager_cursor_t *cursor;
     if (block_manager_cursor_init(&cursor, klog_bm) != 0)
@@ -5429,21 +5026,38 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     {
         tidesdb_sstable_t *sst = ssts_array[i];
 
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "Creating merge source for SSTable %" PRIu64 " (num_klog_blocks=%" PRIu64
+                      ", klog_data_end_offset=%" PRIu64 ")",
+                      sst->id, sst->num_klog_blocks, sst->klog_data_end_offset);
+
         tidesdb_merge_source_t *source = tidesdb_merge_source_from_sstable(cf->db, sst);
         if (source)
         {
             if (source->current_kv)
             {
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Added merge source for SSTable %" PRIu64, sst->id);
                 if (tidesdb_merge_heap_add_source(heap, source) != TDB_SUCCESS)
                 {
                     /* failed to add source to heap, free it to prevent leak */
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "Failed to add merge source for SSTable %" PRIu64 " to heap",
+                                  sst->id);
                     tidesdb_merge_source_free(source);
                 }
             }
             else
             {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "Merge source for SSTable %" PRIu64 " has no current_kv, skipping",
+                              sst->id);
                 tidesdb_merge_source_free(source);
             }
+        }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create merge source for SSTable %" PRIu64,
+                          sst->id);
         }
 
         queue_enqueue(sstables_to_delete, sst); /* add to cleanup queue */
@@ -5590,11 +5204,9 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     }
 
     tidesdb_klog_block_t *current_klog_block = tidesdb_klog_block_create();
-    tidesdb_vlog_block_t *current_vlog_block = tidesdb_vlog_block_create();
 
     uint64_t klog_block_num = 0;
     uint64_t vlog_block_num = 0;
-    uint64_t current_vlog_file_offset = 0;
     uint64_t max_seq = 0;
 
     uint8_t *last_key = NULL;
@@ -5657,54 +5269,37 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             continue;
         }
 
-        if (kv->entry.value_size >= cf->config.value_threshold && kv->value)
+        if (kv->entry.value_size >= cf->config.klog_value_threshold && kv->value)
         {
-            if (tidesdb_vlog_block_is_full(current_vlog_block, cf->config.vlog_block_size))
+            /* write value directly to vlog */
+            uint8_t *final_data = kv->value;
+            size_t final_size = kv->entry.value_size;
+            uint8_t *compressed = NULL;
+
+            if (new_sst->config->compression_algorithm != NO_COMPRESSION)
             {
-                uint8_t *vlog_data;
-                size_t vlog_size;
-                if (tidesdb_vlog_block_serialize(current_vlog_block, &vlog_data, &vlog_size) == 0)
+                size_t compressed_size;
+                compressed = compress_data(kv->value, kv->entry.value_size, &compressed_size,
+                                           new_sst->config->compression_algorithm);
+                if (compressed)
                 {
-                    uint8_t *final_data = vlog_data;
-                    size_t final_size = vlog_size;
-
-                    if (new_sst->config->compression_algorithm != NO_COMPRESSION)
-                    {
-                        size_t compressed_size;
-                        uint8_t *compressed = compress_data(vlog_data, vlog_size, &compressed_size,
-                                                            new_sst->config->compression_algorithm);
-                        if (compressed)
-                        {
-                            free(vlog_data);
-                            final_data = compressed;
-                            final_size = compressed_size;
-                        }
-                    }
-
-                    block_manager_block_t *vlog_block =
-                        block_manager_block_create(final_size, final_data);
-                    if (vlog_block)
-                    {
-                        block_manager_block_write(vlog_bm, vlog_block);
-                        block_manager_block_release(vlog_block);
-                        current_vlog_file_offset += vlog_size;
-                        vlog_block_num++;
-                    }
-                    free(final_data);
+                    final_data = compressed;
+                    final_size = compressed_size;
                 }
-
-                tidesdb_vlog_block_free(current_vlog_block);
-                current_vlog_block = tidesdb_vlog_block_create();
             }
 
-            uint64_t offset_in_block;
-            if (tidesdb_vlog_block_add_value(current_vlog_block, kv->value, kv->entry.value_size,
-                                             &offset_in_block) == 0)
+            block_manager_block_t *vlog_block = block_manager_block_create(final_size, final_data);
+            if (vlog_block)
             {
-                kv->entry.vlog_offset =
-                    current_vlog_file_offset +
-                    offset_in_block; /* will be adjusted with file offset later */
+                int64_t block_offset = block_manager_block_write(vlog_bm, vlog_block);
+                if (block_offset >= 0)
+                {
+                    kv->entry.vlog_offset = (uint64_t)block_offset;
+                    vlog_block_num++;
+                }
+                block_manager_block_release(vlog_block);
             }
+            free(compressed);
         }
 
         /* check if this is the first entry in a new block */
@@ -5734,7 +5329,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             block_last_key_size = kv->entry.key_size;
         }
 
-        if (tidesdb_klog_block_is_full(current_klog_block, cf->config.klog_block_size))
+        if (tidesdb_klog_block_is_full(current_klog_block, TDB_KLOG_BLOCK_SIZE))
         {
             uint8_t *klog_data;
             size_t klog_size;
@@ -5875,38 +5470,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     free(block_first_key);
     free(block_last_key);
 
-    if (current_vlog_block->num_values > 0)
-    {
-        uint8_t *vlog_data;
-        size_t vlog_size;
-        if (tidesdb_vlog_block_serialize(current_vlog_block, &vlog_data, &vlog_size) == 0)
-        {
-            if (new_sst->config->compression_algorithm != NO_COMPRESSION)
-            {
-                size_t compressed_size;
-                uint8_t *compressed = compress_data(vlog_data, vlog_size, &compressed_size,
-                                                    new_sst->config->compression_algorithm);
-                if (compressed)
-                {
-                    free(vlog_data);
-                    vlog_data = compressed;
-                    vlog_size = compressed_size;
-                }
-            }
-
-            block_manager_block_t *vlog_block = block_manager_block_create(vlog_size, vlog_data);
-            if (vlog_block)
-            {
-                block_manager_block_write(vlog_bm, vlog_block);
-                block_manager_block_release(vlog_block);
-                vlog_block_num++;
-            }
-            free(vlog_data);
-        }
-    }
-
     tidesdb_klog_block_free(current_klog_block);
-    tidesdb_vlog_block_free(current_vlog_block);
 
     new_sst->num_klog_blocks = klog_block_num;
     new_sst->num_vlog_blocks = vlog_block_num;
@@ -6479,7 +6043,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         /* merge keys in this partition's range */
         tidesdb_klog_block_t *klog_block = tidesdb_klog_block_create();
-        tidesdb_vlog_block_t *vlog_block = tidesdb_vlog_block_create();
 
         uint64_t entry_count = 0;
         uint64_t klog_block_num = 0;
@@ -6583,41 +6146,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 bloom_filter_add(bloom, kv->key, kv->entry.key_size);
             }
 
-            /* handle large values in vlog */
-            if (kv->entry.value_size >= cf->config.value_threshold &&
-                !(kv->entry.flags & TDB_KV_FLAG_TOMBSTONE) && kv->value)
-            {
-                /* check if vlog block is full */
-                if (tidesdb_vlog_block_is_full(vlog_block, cf->config.vlog_block_size))
-                {
-                    /* serialize and write vlog block */
-                    uint8_t *vlog_data;
-                    size_t vlog_size;
-                    if (tidesdb_vlog_block_serialize(vlog_block, &vlog_data, &vlog_size) == 0)
-                    {
-                        block_manager_block_t *vblock =
-                            block_manager_block_create(vlog_size, vlog_data);
-                        if (vblock)
-                        {
-                            block_manager_block_write(vlog_bm, vblock);
-                            block_manager_block_release(vblock);
-                            vlog_block_num++;
-                        }
-                        free(vlog_data);
-                    }
-
-                    /* create new vlog block */
-                    tidesdb_vlog_block_free(vlog_block);
-                    vlog_block = tidesdb_vlog_block_create();
-                }
-
-                uint64_t offset_in_block;
-                tidesdb_vlog_block_add_value(vlog_block, kv->value, kv->entry.value_size,
-                                             &offset_in_block);
-                kv->entry.vlog_offset =
-                    offset_in_block; /* will be adjusted with file offset later */
-            }
-
             /* check if this is the first entry in a new block */
             int is_first_entry_in_block = (klog_block->num_entries == 0);
 
@@ -6645,7 +6173,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 block_last_key_size = kv->entry.key_size;
             }
 
-            if (tidesdb_klog_block_is_full(klog_block, cf->config.klog_block_size))
+            if (tidesdb_klog_block_is_full(klog_block, TDB_KLOG_BLOCK_SIZE))
             {
                 uint8_t *klog_data;
                 size_t klog_size;
@@ -6713,43 +6241,6 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         /* free partition heap */
         tidesdb_merge_heap_free(partition_heap);
-
-        /* write remaining vlog block if it has data */
-        if (vlog_block->num_values > 0)
-        {
-            uint8_t *vlog_data;
-            size_t vlog_size;
-            if (tidesdb_vlog_block_serialize(vlog_block, &vlog_data, &vlog_size) == 0)
-            {
-                uint8_t *final_vlog_data = vlog_data;
-                size_t final_vlog_size = vlog_size;
-
-                if (cf->config.compression_algorithm != NO_COMPRESSION)
-                {
-                    size_t compressed_size;
-                    uint8_t *compressed = compress_data(vlog_data, vlog_size, &compressed_size,
-                                                        cf->config.compression_algorithm);
-                    if (compressed)
-                    {
-                        free(vlog_data);
-                        final_vlog_data = compressed;
-                        final_vlog_size = compressed_size;
-                    }
-                }
-
-                block_manager_block_t *vblock =
-                    block_manager_block_create(final_vlog_size, final_vlog_data);
-                if (vblock)
-                {
-                    block_manager_block_write(vlog_bm, vblock);
-                    block_manager_block_release(vblock);
-                    vlog_block_num++;
-                }
-                free(final_vlog_data);
-            }
-        }
-
-        tidesdb_vlog_block_free(vlog_block);
 
         /* write remaining klog block if it has data */
         if (klog_block->num_entries > 0)
@@ -7305,9 +6796,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
             /* merge and write entries in partition range */
             tidesdb_klog_block_t *klog_block = tidesdb_klog_block_create();
-            tidesdb_vlog_block_t *vlog_block = tidesdb_vlog_block_create();
             uint64_t entry_count = 0;
-            uint64_t vlog_file_offset = 0;
             uint64_t klog_block_num = 0;
             uint64_t vlog_block_num = 0;
             uint64_t max_seq = 0;
@@ -7396,53 +6885,39 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                     last_key_size = kv->entry.key_size;
                 }
 
-                if (kv->entry.value_size >= cf->config.value_threshold && kv->value)
+                if (kv->entry.value_size >= cf->config.klog_value_threshold && kv->value)
                 {
-                    if (tidesdb_vlog_block_is_full(vlog_block, cf->config.vlog_block_size))
+                    /* write value directly to vlog */
+                    uint8_t *final_data = kv->value;
+                    size_t final_size = kv->entry.value_size;
+                    uint8_t *compressed = NULL;
+
+                    if (cf->config.compression_algorithm != NO_COMPRESSION)
                     {
-                        uint8_t *vlog_data;
-                        size_t vlog_size;
-                        if (tidesdb_vlog_block_serialize(vlog_block, &vlog_data, &vlog_size) == 0)
+                        size_t compressed_size;
+                        compressed =
+                            compress_data(kv->value, kv->entry.value_size, &compressed_size,
+                                          cf->config.compression_algorithm);
+                        if (compressed)
                         {
-                            uint8_t *final_data = vlog_data;
-                            size_t final_size = vlog_size;
-
-                            if (cf->config.compression_algorithm != NO_COMPRESSION)
-                            {
-                                size_t compressed_size;
-                                uint8_t *compressed =
-                                    compress_data(vlog_data, vlog_size, &compressed_size,
-                                                  cf->config.compression_algorithm);
-                                if (compressed)
-                                {
-                                    free(vlog_data);
-                                    final_data = compressed;
-                                    final_size = compressed_size;
-                                }
-                            }
-
-                            block_manager_block_t *vblock =
-                                block_manager_block_create(final_size, final_data);
-                            if (vblock)
-                            {
-                                block_manager_block_write(vlog_bm, vblock);
-                                block_manager_block_release(vblock);
-                                vlog_file_offset += vlog_size;
-                                vlog_block_num++;
-                            }
-                            free(final_data);
+                            final_data = compressed;
+                            final_size = compressed_size;
                         }
-
-                        tidesdb_vlog_block_free(vlog_block);
-                        vlog_block = tidesdb_vlog_block_create();
                     }
 
-                    uint64_t offset_in_block;
-                    tidesdb_vlog_block_add_value(vlog_block, kv->value, kv->entry.value_size,
-                                                 &offset_in_block);
-                    kv->entry.vlog_offset =
-                        vlog_file_offset +
-                        offset_in_block; /* will be adjusted with file offset later */
+                    block_manager_block_t *vblock =
+                        block_manager_block_create(final_size, final_data);
+                    if (vblock)
+                    {
+                        int64_t block_offset = block_manager_block_write(vlog_bm, vblock);
+                        if (block_offset >= 0)
+                        {
+                            kv->entry.vlog_offset = (uint64_t)block_offset;
+                            vlog_block_num++;
+                        }
+                        block_manager_block_release(vblock);
+                    }
+                    free(compressed);
                 }
 
                 if (bloom)
@@ -7486,7 +6961,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 entry_count++;
 
                 /* flush klog block if full */
-                if (tidesdb_klog_block_is_full(klog_block, cf->config.klog_block_size))
+                if (tidesdb_klog_block_is_full(klog_block, TDB_KLOG_BLOCK_SIZE))
                 {
                     uint8_t *klog_data;
                     size_t klog_size;
@@ -7550,42 +7025,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
             /* cleanup duplicate detection tracking */
             free(last_seen_key);
-
-            /* write remaining vlog block */
-            if (vlog_block->num_values > 0)
-            {
-                uint8_t *vlog_data;
-                size_t vlog_size;
-                if (tidesdb_vlog_block_serialize(vlog_block, &vlog_data, &vlog_size) == 0)
-                {
-                    uint8_t *final_data = vlog_data;
-                    size_t final_size = vlog_size;
-
-                    if (new_sst->config->compression_algorithm != NO_COMPRESSION)
-                    {
-                        size_t compressed_size;
-                        uint8_t *compressed = compress_data(vlog_data, vlog_size, &compressed_size,
-                                                            new_sst->config->compression_algorithm);
-                        if (compressed)
-                        {
-                            free(vlog_data);
-                            final_data = compressed;
-                            final_size = compressed_size;
-                        }
-                    }
-
-                    block_manager_block_t *vblock =
-                        block_manager_block_create(final_size, final_data);
-                    if (vblock)
-                    {
-                        block_manager_block_write(vlog_bm, vblock);
-                        block_manager_block_release(vblock);
-                        vlog_block_num++;
-                    }
-                    free(final_data);
-                }
-            }
-            tidesdb_vlog_block_free(vlog_block);
 
             /* write remaining block */
             if (klog_block->num_entries > 0)
@@ -8181,6 +7620,13 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
         return TDB_ERR_IO;
     }
 
+    /* validate and recover WAL file (permissive mode truncate partial writes) */
+    if (block_manager_validate_last_block(wal, 0) != 0)
+    {
+        block_manager_close(wal);
+        return TDB_ERR_IO;
+    }
+
     /* resolve comparator for recovered memtable */
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
@@ -8636,10 +8082,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
         {
             if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
             if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
-
-            /* rebuild position cache for O(1) cursor navigation */
-            if (bms.klog_bm) block_manager_build_position_cache(bms.klog_bm);
-            if (bms.vlog_bm) block_manager_build_position_cache(bms.vlog_bm);
         }
 
         /* ensure all writes are visible before making sstable discoverable */
@@ -9562,7 +9004,7 @@ int tidesdb_close(tidesdb_t *db)
                             "retrying",
                             cf->name, retry_count, TDB_MAX_FFLUSH_RETRY_ATTEMPTS, flush_result);
                         usleep(100000 *
-                               retry_count); /* i.e exponential backoff: 100ms, 200ms, 300ms... */
+                               retry_count); /* i.e exponential backoff 100ms, 200ms, 300ms... */
                     }
                 }
 
@@ -10071,7 +9513,8 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     for (int i = 0; i < min_levels; i++)
     {
         size_t level_capacity = base_capacity;
-        /* calculate capacity: C_i = write_buffer_size * T^i */
+        /* calculate capacity
+         * C_i = write_buffer_size * T^i */
         for (int j = 1; j <= i; j++)
         {
             level_capacity *= config->level_size_ratio;
@@ -10679,7 +10122,7 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
 
     if (txn->read_set_count >= txn->read_set_capacity)
     {
-        /* batch allocation: grow by larger chunks for iterators
+        /* batch allocation grow by larger chunks for iterators
          * reduces realloc overhead when scanning many keys */
         int new_cap = txn->read_set_capacity * 2;
         if (new_cap < txn->read_set_capacity + TDB_TXN_READ_SET_BATCH_GROW)
@@ -14085,6 +13528,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             }
             else
             {
+                /* empty recovered memtable ,safe to delete WAL since it contains no data */
                 skip_list_free(recovered_memtable);
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' empty recovered memtable, deleting WAL: %s",
                               cf->name, wal_path);
@@ -14572,17 +14016,9 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     {
         ctx->config->dividing_level_offset = atoi(value);
     }
-    else if (strcmp(name, "klog_block_size") == 0)
-    {
-        ctx->config->klog_block_size = (size_t)atoll(value);
-    }
-    else if (strcmp(name, "vlog_block_size") == 0)
-    {
-        ctx->config->vlog_block_size = (size_t)atoll(value);
-    }
     else if (strcmp(name, "value_threshold") == 0)
     {
-        ctx->config->value_threshold = (size_t)atoll(value);
+        ctx->config->klog_value_threshold = (size_t)atoll(value);
     }
     else if (strcmp(name, "compression_algorithm") == 0)
     {
@@ -14690,9 +14126,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     fprintf(fp, "level_size_ratio = %zu\n", config->level_size_ratio);
     fprintf(fp, "min_levels = %d\n", config->min_levels);
     fprintf(fp, "dividing_level_offset = %d\n", config->dividing_level_offset);
-    fprintf(fp, "klog_block_size = %zu\n", config->klog_block_size);
-    fprintf(fp, "vlog_block_size = %zu\n", config->vlog_block_size);
-    fprintf(fp, "value_threshold = %zu\n", config->value_threshold);
+    fprintf(fp, "value_threshold = %zu\n", config->klog_value_threshold);
 
     const char *compression_str = "NONE";
     switch (config->compression_algorithm)
@@ -14776,7 +14210,7 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
     cf->config.dividing_level_offset = new_config->dividing_level_offset;
     cf->config.sync_mode = new_config->sync_mode;
     cf->config.sync_interval_us = new_config->sync_interval_us;
-    cf->config.value_threshold = new_config->value_threshold;
+    cf->config.klog_value_threshold = new_config->klog_value_threshold;
     cf->config.default_isolation_level = new_config->default_isolation_level;
 
     if (persist_to_disk)
@@ -15011,7 +14445,7 @@ static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *dat
     index->count = count;
     index->capacity = count;
     index->prefix_len = prefix_len;
-    index->comparator = NULL; /* set by caller */
+    index->comparator = NULL;
     index->comparator_ctx = NULL;
 
     return index;

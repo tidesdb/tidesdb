@@ -217,11 +217,11 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_SSTABLE_VLOG_EXT            ".vlog"
 #define TDB_SSTABLE_CACHE_PREFIX        "sst_"
 #define TDB_CACHE_KEY_SIZE              256
-#define SSTABLE_METADATA_MAGIC          0x5353544D
-#define SSTABLE_INTERNAL_BLOCKS         3
-
-#define TDB_STACK_SSTS          64
-#define TDB_ITER_STACK_KEY_SIZE 256
+#define TDB_SSTABLE_METADATA_MAGIC      0x5353544D
+#define TDB_SSTABLE_INTERNAL_BLOCKS     3
+#define TDB_KLOG_BLOCK_SIZE             (64 * 1024)
+#define TDB_STACK_SSTS                  64
+#define TDB_ITER_STACK_KEY_SIZE         256
 
 /* file system permissions */
 #define TDB_DIR_PERMISSIONS 0755
@@ -245,9 +245,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2
 #define TDB_DEFAULT_BLOOM_FPR                   0.01
-#define TDB_DEFAULT_KLOG_BLOCK_SIZE             (64 * 1024)
-#define TDB_DEFAULT_VLOG_BLOCK_SIZE             (4 * 1024)
-#define TDB_DEFAULT_VALUE_THRESHOLD             512
+#define TDB_DEFAULT_KLOG_VALUE_THRESHOLD        1024 * 4
 #define TDB_DEFAULT_INDEX_SAMPLE_RATIO          16
 #define TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN      16
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024)
@@ -331,7 +329,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 #define TDB_MIN_KEY_VALUE_SIZE                  (1024 * 1024)
 #define TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY 32
 #define TDB_MAX_LEVELS                          32
-#define DISK_SPACE_CHECK_INTERVAL_SECONDS       60
+#define TDB_DISK_SPACE_CHECK_INTERVAL_SECONDS   60
 #define NO_CF_SYNC_SLEEP_US                     100000
 
 /* klog block configuration */
@@ -360,9 +358,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param level_size_ratio size ratio between levels (T)
  * @param min_levels minimum number of levels to maintain (DCA can expand beyond this)
  * @param dividing_level_offset X = L - dividing_level_offset
- * @param klog_block_size size of each klog block (holds multiple keys)
- * @param vlog_block_size size of each vlog block (holds multiple values)
- * @param value_threshold values >= this size go to vlog
+ * @param klog_value_threshold values >= this size go to vlog
  * @param compression_algorithm compression algorithm
  * @param enable_bloom_filter enable bloom filter
  * @param bloom_fpr bloom filter false positive rate
@@ -387,9 +383,7 @@ typedef struct
     size_t level_size_ratio;
     int min_levels;
     int dividing_level_offset;
-    size_t klog_block_size;
-    size_t vlog_block_size;
-    size_t value_threshold;
+    size_t klog_value_threshold;
     compression_algorithm compression_algorithm;
     int enable_bloom_filter;
     double bloom_fpr;

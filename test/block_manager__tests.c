@@ -615,8 +615,6 @@ void *writer_thread(void *arg)
 
         (void)pthread_mutex_unlock(&bm_mutex);
 
-        printf("Writer %d wrote block %d: %s\n", thread_id, i, data);
-
         (void)block_manager_block_free(block);
 
         usleep((unsigned int)(rand() % 10000)); /* NOLINT(cert-msc30-c,cert-msc50-cpp) */
@@ -698,8 +696,6 @@ void *reader_thread(void *arg)
 
         if (read_block != NULL)
         {
-            printf("Reader %d read: %.*s\n", thread_id, (int)read_block->size,
-                   (char *)read_block->data);
             (void)block_manager_block_free(read_block);
             read_count++;
         }
@@ -760,10 +756,8 @@ void test_block_manager_concurrent_rw()
     ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
 
     block_manager_block_t *block;
-    int block_index = 0;
     while ((block = block_manager_cursor_read(cursor)) != NULL)
     {
-        printf("Block %d: %.*s\n", block_index++, (int)block->size, (char *)block->data);
         (void)block_manager_block_free(block);
         if (block_manager_cursor_next(cursor) != 0) break;
     }
@@ -794,17 +788,19 @@ void test_block_manager_validate_last_block()
         (void)block_manager_block_free(block);
     }
 
+    /* ensure all writes are flushed to disk */
+    block_manager_escalate_fsync(bm);
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
     /* we now manually corrupt the file by appending just a size prefix without data */
     FILE *file = fopen("validate_test.db", "a+b");
     ASSERT_TRUE(file != NULL);
 
-    /* we append just a size prefix (8 bytes) without the actual data */
+    /* we append just a size prefix (4 bytes) without the actual data */
     /* must use little-endian encoding to match block manager's format */
-    uint64_t corrupt_size = 100; /* size that's larger than what we'll actually write */
-    uint8_t size_buf[8];
-    encode_uint64_le_compat(size_buf, corrupt_size);
+    uint32_t corrupt_size = 100; /* size that's larger than what we'll actually write */
+    uint8_t size_buf[4];
+    encode_uint32_le_compat(size_buf, corrupt_size);
     ASSERT_TRUE(fwrite(size_buf, sizeof(size_buf), 1, file) == 1);
 
     fclose(file);
@@ -815,8 +811,10 @@ void test_block_manager_validate_last_block()
     uint64_t corrupted_size = (uint64_t)st.st_size;
     printf("File size after corruption: %" PRIu64 " bytes\n", corrupted_size);
 
-    /* now reopen the block manager, which should validate and fix the last block */
+    /* now reopen the block manager and explicitly validate (permissive mode) */
     ASSERT_TRUE(block_manager_open(&bm, "validate_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+    ASSERT_TRUE(block_manager_validate_last_block(bm, 0) ==
+                0); /* permissive, truncate corruption */
 
     /* we get the file size after validation/repair */
     ASSERT_TRUE(stat("validate_test.db", &st) == 0);
@@ -857,9 +855,6 @@ void test_block_manager_validate_last_block()
 
     ASSERT_EQ(block_count, 3);
 
-    /* we verify there are no more blocks (the corrupted one was removed) */
-    printf("DEBUG: cursor->block_index = %d, bm->block_count = %d\n", cursor->block_index,
-           cursor->bm->block_count);
     int at_last = block_manager_cursor_at_last(cursor);
     printf("Cursor at last block: %d\n", at_last);
     ASSERT_EQ(at_last, 1); /* should be at the last block */
@@ -1213,9 +1208,6 @@ void test_block_manager_empty_block()
 
 void benchmark_block_manager_iteration(void)
 {
-    printf("\nBenchmark: Position Cache Impact on Iteration Performance\n");
-    printf("==========================================================\n");
-
     block_manager_t *bm = NULL;
     (void)remove("iteration_bench.db");
     ASSERT_TRUE(block_manager_open(&bm, "iteration_bench.db", BLOCK_MANAGER_SYNC_NONE) == 0);
@@ -1251,21 +1243,6 @@ void benchmark_block_manager_iteration(void)
         block_manager_close(bm);
         ASSERT_TRUE(block_manager_open(&bm, "iteration_bench.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
-        printf(YELLOW "  WITHOUT position cache:\n" RESET);
-
-        /* we ensure no cache exists */
-        if (bm->block_positions)
-        {
-            free(bm->block_positions);
-            bm->block_positions = NULL;
-        }
-        if (bm->block_sizes)
-        {
-            free(bm->block_sizes);
-            bm->block_sizes = NULL;
-        }
-        bm->block_count = 0;
-
         block_manager_cursor_t *cursor;
         ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
 
@@ -1292,50 +1269,6 @@ void benchmark_block_manager_iteration(void)
         printf("    Avg latency: %.2f μs/block\n", (elapsed_no_cache / blocks_read) * 1e6);
 
         block_manager_cursor_free(cursor);
-
-        printf(CYAN "  Building position cache...\n" RESET);
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        ASSERT_TRUE(block_manager_build_position_cache(bm) == 0);
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double cache_build_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        printf("    Cache build time: %.3f seconds\n", cache_build_time);
-        printf("    Cache entries: %d\n", bm->block_count);
-
-        printf(GREEN "  WITH position cache:\n" RESET);
-
-        ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
-
-        clock_gettime(CLOCK_MONOTONIC, &start);
-
-        blocks_read = 0;
-        ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
-        do
-        {
-            blocks_read++;
-        } while (block_manager_cursor_next(cursor) == 0);
-
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double elapsed_with_cache =
-            (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-
-        double throughput_with_cache = blocks_read / elapsed_with_cache;
-        double mb_per_sec_with_cache = (throughput_with_cache * block_size) / (1024.0 * 1024.0);
-
-        printf("    Blocks iterated: %d\n", blocks_read);
-        printf("    Time: %.3f seconds\n", elapsed_with_cache);
-        printf("    Throughput: %.2f blocks/sec\n", throughput_with_cache);
-        printf("    Throughput: %.2f MB/sec\n", mb_per_sec_with_cache);
-        printf("    Avg latency: %.2f μs/block\n", (elapsed_with_cache / blocks_read) * 1e6);
-
-        block_manager_cursor_free(cursor);
-
-        double speedup = elapsed_no_cache / elapsed_with_cache;
-        printf(BOLDWHITE "  Performance improvement:\n" RESET);
-        printf("    Speedup: " BOLDGREEN "%.2fx faster" RESET " with cache\n", speedup);
-        printf("    Time saved: %.3f seconds (%.1f%%)\n", elapsed_no_cache - elapsed_with_cache,
-               ((elapsed_no_cache - elapsed_with_cache) / elapsed_no_cache) * 100.0);
-        printf("    Cache overhead: %.3f seconds (%.1f%% of iteration time)\n", cache_build_time,
-               (cache_build_time / elapsed_with_cache) * 100.0);
     }
 
     block_manager_close(bm);
@@ -1411,6 +1344,51 @@ void benchmark_block_manager_parallel_write(void)
     (void)remove("test_parallel.db");
 }
 
+void test_block_manager_goto_last_after_reopen()
+{
+    /* write blocks, close, reopen, then goto_last - tests recovery scenario */
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, "test_reopen.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* write 5 blocks with different data */
+    for (int i = 0; i < 5; i++)
+    {
+        char data[32];
+        snprintf(data, sizeof(data), "block_%d_data", i);
+        block_manager_block_t *block =
+            block_manager_block_create(strlen(data) + 1, (uint8_t *)data);
+        ASSERT_TRUE(block != NULL);
+        ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
+        block_manager_block_free(block);
+    }
+
+    /* close and reopen */
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, "test_reopen.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* goto_last should work immediately after reopen */
+    block_manager_cursor_t *cursor;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_last(cursor) == 0);
+
+    /* read last block and verify it's block 4 */
+    block_manager_block_t *last_block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(last_block != NULL);
+    ASSERT_EQ(memcmp(last_block->data, "block_4_data", 13), 0);
+    block_manager_block_free(last_block);
+
+    /* verify we can navigate backwards */
+    ASSERT_TRUE(block_manager_cursor_prev(cursor) == 0);
+    block_manager_block_t *prev_block = block_manager_cursor_read(cursor);
+    ASSERT_TRUE(prev_block != NULL);
+    ASSERT_EQ(memcmp(prev_block->data, "block_3_data", 13), 0);
+    block_manager_block_free(prev_block);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove("test_reopen.db");
+}
+
 int main(void)
 {
     RUN_TEST(test_block_manager_open, tests_passed);
@@ -1424,6 +1402,7 @@ int main(void)
     RUN_TEST(test_block_manager_cursor_has_prev, tests_passed);
     RUN_TEST(test_block_manager_cursor, tests_passed);
     RUN_TEST(test_block_manager_cursor_goto_last, tests_passed);
+    RUN_TEST(test_block_manager_goto_last_after_reopen, tests_passed);
     RUN_TEST(test_block_manager_cursor_position_checks, tests_passed);
     RUN_TEST(test_block_manager_open_safety, tests_passed);
     RUN_TEST(test_block_manager_validate_last_block, tests_passed);

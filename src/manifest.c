@@ -303,7 +303,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     /* atomic rename using compat abstraction */
     if (atomic_rename_file(temp_path, path) != 0)
     {
-        unlink(temp_path);
+        tdb_unlink(temp_path);
         return -1;
     }
 

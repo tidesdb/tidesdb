@@ -175,13 +175,12 @@ typedef struct
 #define TDB_ERR_IO           -4
 #define TDB_ERR_CORRUPTION   -5
 #define TDB_ERR_EXISTS       -6
-#define TDB_ERR_LOCK         -7
-#define TDB_ERR_CONFLICT     -8
-#define TDB_ERR_OVERFLOW     -9
-#define TDB_ERR_TOO_LARGE    -10
-#define TDB_ERR_MEMORY_LIMIT -11
-#define TDB_ERR_INVALID_DB   -12
-#define TDB_ERR_UNKNOWN      -13
+#define TDB_ERR_CONFLICT     -7
+#define TDB_ERR_OVERFLOW     -8
+#define TDB_ERR_TOO_LARGE    -9
+#define TDB_ERR_MEMORY_LIMIT -10
+#define TDB_ERR_INVALID_DB   -11
+#define TDB_ERR_UNKNOWN      -12
 
 /**
  * tidesdb_sync_mode_t
@@ -303,9 +302,11 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * α (alpha) -- trigger compaction when L0/L1 reaches this many files
  * β (beta) -- slow down writes when L0/L1 reaches this many files
  * γ (gamma) -- stop writes when L0/L1 reaches this many files (emergency) */
-#define TDB_L0_FILE_NUM_COMPACTION_TRIGGER 4  /* α -- compact at 4 files */
-#define TDB_L0_SLOWDOWN_WRITES_TRIGGER     20 /* β -- throttle at 20 files */
-#define TDB_L0_STOP_WRITES_TRIGGER         36 /* γ -- stall at 36 files */
+#define TDB_L0_FILE_NUM_COMPACTION_TRIGGER 4      /* α -- compact at 4 files */
+#define TDB_L0_SLOWDOWN_WRITES_TRIGGER     20     /* β -- throttle at 20 files */
+#define TDB_L0_STOP_WRITES_TRIGGER         36     /* γ -- stall at 36 files */
+#define TDB_L0_SLOWDOWN_WRITES_DELAY_US    20000  /* β delay: 20ms throttle */
+#define TDB_L0_STOP_WRITES_DELAY_US        100000 /* γ delay: 100ms stall */
 
 /* backpressure configuration */
 #define TDB_BACKPRESSURE_THRESHOLD_L0_FULL     100
@@ -492,7 +493,7 @@ typedef struct
     uint64_t seq;
     uint64_t vlog_offset;
 #ifdef _MSC_VER
-    uint8_t data[1]; /* key + value (if inline) - MSVC requires size 1 */
+    uint8_t data[1]; /* key + value (if inline) -- MSVC requires size 1 */
 #else
     uint8_t data[]; /* key + value (if inline) */
 #endif
@@ -683,11 +684,11 @@ struct tidesdb_level_t
  * tidesdb_commit_status_t
  * tracks commit status of transactions for visibility determination
  * uses a circular buffer to track recent commit sequences
+ * all operations are lock-free using atomics and CAS
  * @param status array of commit statuses (0=in-progress, 1=committed, 2=aborted)
  * @param min_seq minimum sequence number tracked in this buffer
  * @param max_seq maximum sequence number tracked in this buffer
  * @param capacity size of the status array
- * @param lock mutex for updating commit status
  */
 #define TDB_COMMIT_STATUS_IN_PROGRESS 0
 #define TDB_COMMIT_STATUS_COMMITTED   1
@@ -699,7 +700,6 @@ typedef struct
     _Atomic(uint64_t) min_seq;
     _Atomic(uint64_t) max_seq;
     size_t capacity;
-    pthread_mutex_t lock;
 } tidesdb_commit_status_t;
 
 /**
@@ -721,15 +721,11 @@ typedef struct
  * @param is_compacting atomic flag indicating compaction is queued
  * @param is_flushing atomic flag indicating flush is queued
  * @param immutable_cleanup_counter counter for batched immutable cleanup
- * @param wal_group_commit_lock mutex for group commit coordination
- * @param wal_group_commit_cond condition variable for group commit
- * @param wal_group_buffer shared buffer for batching wal writes
- * @param wal_group_buffer_size current size of data in buffer
+ * @param wal_group_buffer shared buffer for batching wal writes (lock-free group commit)
+ * @param wal_group_buffer_size current size of data in buffer (atomic)
  * @param wal_group_buffer_capacity total capacity of buffer
- * @param wal_group_leader atomic flag indicating a thread is leading group commit
- * @param wal_group_waiters number of threads waiting for group commit
- * @param manifest manifest for column family
- * @param manifest_lock mutex for manifest operations
+ * @param wal_group_leader atomic flag indicating a thread is leading group commit (CAS)
+ * @param manifest manifest for column family (no lock needed - operations serialized)
  * @param db parent database reference
  */
 struct tidesdb_column_family_t
@@ -750,15 +746,11 @@ struct tidesdb_column_family_t
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
     _Atomic(int) immutable_cleanup_counter;
-    pthread_mutex_t wal_group_commit_lock;
-    pthread_cond_t wal_group_commit_cond;
     uint8_t *wal_group_buffer;
     _Atomic(size_t) wal_group_buffer_size;
     size_t wal_group_buffer_capacity;
     _Atomic(int) wal_group_leader;
-    _Atomic(int) wal_group_waiters;
     tidesdb_manifest_t *manifest;
-    pthread_rwlock_t manifest_lock;
     tidesdb_t *db;
 };
 
@@ -800,10 +792,9 @@ struct tidesdb_compaction_work_t
  * @param cf_capacity capacity of column families array
  * @param is_open atomic flag indicating database is fully open and ready for operations
  * @param is_recovering flag to determine if system is recovering
- * @param comparators array of registered comparators
- * @param num_comparators number of registered comparators
- * @param comparators_capacity capacity of comparators array
- * @param comparators_lock mutex for comparator registry
+ * @param comparators atomic pointer to comparators array (lock-free COW)
+ * @param num_comparators atomic count of registered comparators
+ * @param comparators_capacity atomic capacity of comparators array
  * @param flush_threads array of flush threads
  * @param flush_queue queue of flush work items
  * @param compaction_threads array of compaction threads
@@ -825,6 +816,7 @@ struct tidesdb_compaction_work_t
  * @param active_txn_count count of all active transactions (all isolation levels)
  * @param cached_available_disk_space cached available disk space in bytes
  * @param last_disk_space_check timestamp of last disk space check
+ * @param cached_current_time cached current time updated by reaper thread to avoid syscalls
  * @param available_memory available system memory in bytes
  * @param total_memory total system memory in bytes
  * @param cf_list_lock rwlock for cf list modifications
@@ -838,10 +830,9 @@ struct tidesdb_t
     int cf_capacity;
     _Atomic(int) is_open;
     _Atomic(int) is_recovering;
-    tidesdb_comparator_entry_t *comparators;
-    int num_comparators;
-    int comparators_capacity;
-    pthread_mutex_t comparators_lock;
+    _Atomic(tidesdb_comparator_entry_t *) comparators;
+    _Atomic(int) num_comparators;
+    _Atomic(int) comparators_capacity;
     pthread_t *flush_threads;
     queue_t *flush_queue;
     pthread_t *compaction_threads;
@@ -863,6 +854,7 @@ struct tidesdb_t
     _Atomic(int) active_txn_count;
     _Atomic(uint64_t) cached_available_disk_space;
     _Atomic(time_t) last_disk_space_check;
+    _Atomic(time_t) cached_current_time;
     uint64_t available_memory;
     uint64_t total_memory;
     pthread_rwlock_t cf_list_lock;
@@ -932,7 +924,6 @@ typedef struct
  * @param savepoints_capacity capacity of savepoints array
  * @param is_committed flag indicating if transaction is committed
  * @param is_aborted flag indicating if transaction is aborted
- * @param start_time transaction start time for timeout detection
  * @param isolation_level isolation level for this transaction
  * @param has_rw_conflict_in flag indicating rw-conflict-in (another txn read our writes)
  * @param has_rw_conflict_out flag indicating rw-conflict-out (we read another txn's writes)
@@ -964,7 +955,6 @@ struct tidesdb_txn_t
     int savepoints_capacity;
     int is_committed;
     int is_aborted;
-    time_t start_time;
     tidesdb_isolation_level_t isolation_level;
     int has_rw_conflict_in;
     int has_rw_conflict_out;

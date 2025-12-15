@@ -33,9 +33,9 @@
 typedef struct
 {
     uint64_t *bitset;
-    int m;
-    int h;
-    int size_in_words;
+    unsigned int m;
+    unsigned int h;
+    unsigned int size_in_words;
 } bloom_filter_t;
 
 /**

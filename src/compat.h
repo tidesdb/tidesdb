@@ -47,6 +47,15 @@
 #define tdb_strdup(s) strdup(s)
 #endif
 
+/* cross-platform fsync abstraction */
+#if defined(_WIN32)
+#include <io.h>
+#define tdb_fsync(fd) _commit(fd)
+#else
+#include <unistd.h>
+#define tdb_fsync(fd) fsync(fd)
+#endif
+
 /* cross-platform localtime abstraction */
 #if defined(_WIN32)
 /* (MSVC and MinGW) use localtime_s with reversed parameter order */

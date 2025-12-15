@@ -70,7 +70,7 @@ void bloom_filter_add(bloom_filter_t *bf, const uint8_t *entry, size_t size)
     for (int i = 0; i < bf->h; i++)
     {
         unsigned int hash = bloom_filter_hash(entry, size, i);
-        int index = (int)(hash % (unsigned int)bf->m);
+        size_t index = hash % (size_t)bf->m;
         BF_SET_BIT(bf->bitset, index);
     }
 }
@@ -82,7 +82,7 @@ int bloom_filter_contains(bloom_filter_t *bf, const uint8_t *entry, size_t size)
     for (int i = 0; i < bf->h; i++)
     {
         unsigned int hash = bloom_filter_hash(entry, size, i);
-        int index = (int)(hash % (unsigned int)bf->m);
+        size_t index = hash % (size_t)bf->m;
         if (!BF_GET_BIT(bf->bitset, index))
         {
             return 0; /* definitely not in set */

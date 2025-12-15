@@ -296,7 +296,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     int fd = tdb_fileno(f);
     if (fd >= 0)
     {
-        fsync(fd);
+        tdb_fsync(fd);
     }
     fclose(f);
 

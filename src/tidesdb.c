@@ -913,6 +913,15 @@ static int sstable_metadata_deserialize(const uint8_t *data, size_t data_size,
     /* restore compression algorithm from metadata */
     if (sst->config)
     {
+        /* validate compression algorithm value */
+        if (compression_algorithm != NO_COMPRESSION &&
+            compression_algorithm != SNAPPY_COMPRESSION &&
+            compression_algorithm != LZ4_COMPRESSION && compression_algorithm != ZSTD_COMPRESSION)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable metadata has invalid compression_algorithm: %u",
+                          compression_algorithm);
+            return -1;
+        }
         sst->config->compression_algorithm = compression_algorithm;
     }
 
@@ -3316,6 +3325,60 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
                     block_manager_block_release(metadata_block);
                     block_manager_cursor_free(metadata_cursor);
 
+                    /* validate metadata claims against actual file structure */
+                    if (sst->klog_data_end_offset > 0)
+                    {
+                        /* klog_data_end_offset must be within file bounds */
+                        if (sst->klog_data_end_offset > sst->klog_size)
+                        {
+                            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                          "SSTable %s metadata invalid: klog_data_end_offset "
+                                          "(%" PRIu64 ") > klog_size (%" PRIu64 ")",
+                                          sst->klog_path, sst->klog_data_end_offset,
+                                          sst->klog_size);
+                            block_manager_close(klog_bm);
+                            block_manager_close(vlog_bm);
+                            return TDB_ERR_CORRUPTION;
+                        }
+
+                        /* must have at least block manager header before data */
+                        if (sst->klog_data_end_offset < BLOCK_MANAGER_HEADER_SIZE)
+                        {
+                            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                          "SSTable %s metadata invalid: klog_data_end_offset "
+                                          "(%" PRIu64 ") < header size (%d)",
+                                          sst->klog_path, sst->klog_data_end_offset,
+                                          BLOCK_MANAGER_HEADER_SIZE);
+                            block_manager_close(klog_bm);
+                            block_manager_close(vlog_bm);
+                            return TDB_ERR_CORRUPTION;
+                        }
+                    }
+
+                    /* validate num_klog_blocks is reasonable */
+                    if (sst->num_klog_blocks > 0)
+                    {
+                        /* for sanity each block needs at least header + footer */
+                        uint64_t min_size_per_block =
+                            BLOCK_MANAGER_BLOCK_HEADER_SIZE + BLOCK_MANAGER_FOOTER_SIZE;
+                        uint64_t min_required_size =
+                            BLOCK_MANAGER_HEADER_SIZE + (sst->num_klog_blocks * min_size_per_block);
+
+                        if (sst->klog_data_end_offset > 0 &&
+                            sst->klog_data_end_offset < min_required_size)
+                        {
+                            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                          "SSTable %s metadata invalid: claims %" PRIu64
+                                          " blocks but klog_data_end_offset (%" PRIu64
+                                          ") too small (min %" PRIu64 ")",
+                                          sst->klog_path, sst->num_klog_blocks,
+                                          sst->klog_data_end_offset, min_required_size);
+                            block_manager_close(klog_bm);
+                            block_manager_close(vlog_bm);
+                            return TDB_ERR_CORRUPTION;
+                        }
+                    }
+
                     /* metadata loaded successfully, skip reading min/max from blocks */
                     goto load_bloom_and_index;
                 }
@@ -3339,7 +3402,7 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
     block_manager_close(vlog_bm);
     return TDB_ERR_CORRUPTION;
 
-load_bloom_and_index:
+load_bloom_and_index:; /* empty statement for C89/C90 compatibility */
     /* load bloom filter and index from last blocks */
     /* [klog blocks...] [index block] [bloom filter block] [metadata block] */
 
@@ -13429,6 +13492,59 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     }
     closedir(dir);
 
+    /* sort WAL files by ID to ensure correct recovery order
+     * WAL filenames are wal_<id>.log, so we can sort by extracting the numeric ID */
+    size_t wal_count = queue_size(wal_files);
+    if (wal_count > 1)
+    {
+        /* extract to array for sorting */
+        char **wal_array = malloc(wal_count * sizeof(char *));
+        if (wal_array)
+        {
+            for (size_t i = 0; i < wal_count; i++)
+            {
+                wal_array[i] = queue_dequeue(wal_files);
+            }
+
+            /* bubble sort by WAL ID (simple, works for small counts) */
+            for (size_t i = 0; i < wal_count - 1; i++)
+            {
+                for (size_t j = 0; j < wal_count - i - 1; j++)
+                {
+                    /* extract IDs from filenames */
+                    uint64_t id1 = 0, id2 = 0;
+                    const char *name1 = strrchr(wal_array[j], PATH_SEPARATOR[0]);
+                    const char *name2 = strrchr(wal_array[j + 1], PATH_SEPARATOR[0]);
+                    if (name1)
+                        name1++;
+                    else
+                        name1 = wal_array[j];
+                    if (name2)
+                        name2++;
+                    else
+                        name2 = wal_array[j + 1];
+
+                    sscanf(name1, "wal_%" PRIu64 ".log", &id1);
+                    sscanf(name2, "wal_%" PRIu64 ".log", &id2);
+
+                    if (id1 > id2)
+                    {
+                        char *temp = wal_array[j];
+                        wal_array[j] = wal_array[j + 1];
+                        wal_array[j + 1] = temp;
+                    }
+                }
+            }
+
+            /* re-enqueue in sorted order */
+            for (size_t i = 0; i < wal_count; i++)
+            {
+                queue_enqueue(wal_files, wal_array[i]);
+            }
+            free(wal_array);
+        }
+    }
+
     multi_cf_txn_tracker_t *tracker =
         multi_cf_tracker_create(TDB_MULTI_CF_TRACKER_INITIAL_CAPACITY);
     if (!tracker)
@@ -13716,7 +13832,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     {
         size_t imm_count = queue_size(cf->immutable_memtables);
 
-        /* IMPORTANT: skip lists are ordered by KEY, not by sequence!
+        /* skip lists are ordered by KEY, not by sequence!
          * we must scan all entries to find the maximum sequence number */
         for (size_t i = 0; i < imm_count; i++)
         {
@@ -13763,9 +13879,6 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                       cf->name, current_seq, global_max_seq + 1);
     }
 
-    /* we mark all recovered sequences as committed in the status tracker
-     * hold lock once and mark all sequences in batch
-     * reduces recovery time from O(N) mutex ops to O(1) */
     if (global_max_seq > 0)
     {
         tidesdb_commit_status_t *cs = cf->db->commit_status;

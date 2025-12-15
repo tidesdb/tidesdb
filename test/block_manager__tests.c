@@ -1346,7 +1346,6 @@ void benchmark_block_manager_parallel_write(void)
 
 void test_block_manager_goto_last_after_reopen()
 {
-    /* write blocks, close, reopen, then goto_last - tests recovery scenario */
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, "test_reopen.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
@@ -1361,8 +1360,6 @@ void test_block_manager_goto_last_after_reopen()
         ASSERT_TRUE(block_manager_block_write(bm, block) != -1);
         block_manager_block_free(block);
     }
-
-    /* close and reopen */
     ASSERT_TRUE(block_manager_close(bm) == 0);
     ASSERT_TRUE(block_manager_open(&bm, "test_reopen.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 

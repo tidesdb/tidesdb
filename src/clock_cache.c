@@ -844,3 +844,54 @@ void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats)
     uint64_t total_accesses = stats->hits + stats->misses;
     stats->hit_rate = (total_accesses > 0) ? ((double)stats->hits / total_accesses) : 0.0;
 }
+
+size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size_t prefix_len,
+                                  clock_cache_foreach_callback_t callback, void *user_data)
+{
+    if (!cache || !prefix || prefix_len == 0 || !callback) return 0;
+
+    size_t count = 0;
+
+    /* iterate over all partitions */
+    for (size_t p = 0; p < cache->num_partitions; p++)
+    {
+        clock_cache_partition_t *partition = &cache->partitions[p];
+
+        /* iterate over all slots in this partition */
+        for (size_t i = 0; i < partition->num_slots; i++)
+        {
+            clock_cache_entry_t *entry = &partition->slots[i];
+
+            /* check if entry is valid */
+            uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
+            if (state != ENTRY_VALID) continue;
+
+            /* get key atomically */
+            char *key = atomic_load_explicit(&entry->key, memory_order_acquire);
+            size_t key_len = atomic_load_explicit(&entry->key_len, memory_order_acquire);
+
+            if (!key || key_len < prefix_len) continue;
+
+            /* check prefix match */
+            if (memcmp(key, prefix, prefix_len) == 0)
+            {
+                /* get payload atomically */
+                uint8_t *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
+                size_t payload_len =
+                    atomic_load_explicit(&entry->payload_len, memory_order_acquire);
+
+                if (payload)
+                {
+                    /* call callback */
+                    int result = callback(key, key_len, payload, payload_len, user_data);
+                    count++;
+
+                    /* stop if callback returns non-zero */
+                    if (result != 0) return count;
+                }
+            }
+        }
+    }
+
+    return count;
+}

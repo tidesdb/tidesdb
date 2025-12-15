@@ -532,6 +532,8 @@ typedef struct
     uint32_t num_entries;
     uint32_t block_size;
     uint32_t capacity;
+    uint8_t is_arena_allocated; /* 1 if arena-allocated (deserialized), 0 if separate mallocs
+                                   (created) */
     tidesdb_klog_entry_t *entries;
     uint8_t **keys;
     uint8_t **inline_values;

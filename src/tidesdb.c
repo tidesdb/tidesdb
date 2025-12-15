@@ -1267,6 +1267,9 @@ static tidesdb_klog_block_t *tidesdb_klog_block_create(void)
     memset(block->keys, 0, initial_capacity * sizeof(uint8_t *));
     memset(block->inline_values, 0, initial_capacity * sizeof(uint8_t *));
 
+    /* mark as not arena-allocated (separate mallocs) */
+    block->is_arena_allocated = 0;
+
     return block;
 }
 
@@ -1279,20 +1282,28 @@ static void tidesdb_klog_block_free(tidesdb_klog_block_t *block)
 {
     if (!block) return;
 
-    /* use capacity instead of num_entries to free all allocated entries
-     * since num_entries may be 0 if deserialization failed partway through */
-    uint32_t entries_to_free = block->num_entries > 0 ? block->num_entries : block->capacity;
-    for (uint32_t i = 0; i < entries_to_free; i++)
+    if (block->is_arena_allocated)
     {
-        if (block->keys) free(block->keys[i]);
-        if (block->inline_values) free(block->inline_values[i]);
+        /* arena allocation: everything is in one contiguous block
+         * except max_key which is allocated separately during deserialization */
+        free(block->max_key);
+        /* free the entire arena (block itself is the start of the arena) */
+        free(block);
     }
-
-    free(block->entries);
-    free(block->keys);
-    free(block->inline_values);
-    free(block->max_key);
-    free(block);
+    else
+    {
+        /* separate allocations: free each component individually */
+        for (uint32_t i = 0; i < block->num_entries; i++)
+        {
+            free(block->keys[i]);
+            free(block->inline_values[i]);
+        }
+        free(block->entries);
+        free(block->keys);
+        free(block->inline_values);
+        free(block->max_key);
+        free(block);
+    }
 }
 
 /**
@@ -1552,11 +1563,9 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 {
     if (data_size < sizeof(uint32_t) * 2) return TDB_ERR_CORRUPTION;
 
-    /* allocate block struct directly without pre-allocated arrays
-     * to avoid leaking the pre-allocated arrays when we replace them */
-    *block = calloc(1, sizeof(tidesdb_klog_block_t));
-    if (!*block) return TDB_ERR_MEMORY;
-
+    /* use arena allocation: single malloc for entire block structure
+     * layout: block_struct | entries[] | keys[] | inline_values[] | key_data | value_data
+     * this reduces malloc calls from O(N) to O(1) per block */
     const uint8_t *ptr = data;
 
     uint32_t num_entries = decode_uint32_le_compat(ptr);
@@ -1564,20 +1573,95 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
     uint32_t block_size = decode_uint32_le_compat(ptr);
     ptr += sizeof(uint32_t);
 
-    /* allocate arrays with exact size needed */
-    (*block)->entries = malloc(num_entries * sizeof(tidesdb_klog_entry_t));
-    (*block)->keys = calloc(num_entries, sizeof(uint8_t *));
-    (*block)->inline_values = calloc(num_entries, sizeof(uint8_t *));
+    /* first pass: calculate total size needed for arena allocation */
+    size_t total_key_size = 0;
+    size_t total_value_size = 0;
+    const uint8_t *scan_ptr = ptr;
+    size_t scan_remaining = data_size - (scan_ptr - data);
 
-    if (!(*block)->entries || !(*block)->keys || !(*block)->inline_values)
+    for (uint32_t i = 0; i < num_entries; i++)
     {
-        if ((*block)->entries) free((*block)->entries);
-        if ((*block)->keys) free((*block)->keys);
-        if ((*block)->inline_values) free((*block)->inline_values);
-        free(*block);
-        *block = NULL;
-        return TDB_ERR_MEMORY;
+        if (scan_remaining < 1) return TDB_ERR_CORRUPTION;
+        uint8_t flags = *scan_ptr++;
+        scan_remaining--;
+
+        uint64_t key_size_u64, value_size_u64, seq_value;
+        int bytes_read;
+
+        bytes_read = decode_varint_v2(scan_ptr, &key_size_u64, (int)scan_remaining);
+        if (bytes_read < 0 || key_size_u64 > UINT32_MAX) return TDB_ERR_CORRUPTION;
+        scan_ptr += bytes_read;
+        scan_remaining -= bytes_read;
+        total_key_size += (size_t)key_size_u64;
+
+        bytes_read = decode_varint_v2(scan_ptr, &value_size_u64, (int)scan_remaining);
+        if (bytes_read < 0 || value_size_u64 > UINT32_MAX) return TDB_ERR_CORRUPTION;
+        scan_ptr += bytes_read;
+        scan_remaining -= bytes_read;
+
+        bytes_read = decode_varint_v2(scan_ptr, &seq_value, (int)scan_remaining);
+        if (bytes_read < 0) return TDB_ERR_CORRUPTION;
+        scan_ptr += bytes_read;
+        scan_remaining -= bytes_read;
+
+        if (flags & TDB_KV_FLAG_HAS_TTL)
+        {
+            if (scan_remaining < sizeof(int64_t)) return TDB_ERR_CORRUPTION;
+            scan_ptr += sizeof(int64_t);
+            scan_remaining -= sizeof(int64_t);
+        }
+
+        if (flags & TDB_KV_FLAG_HAS_VLOG)
+        {
+            uint64_t vlog_offset;
+            bytes_read = decode_varint_v2(scan_ptr, &vlog_offset, (int)scan_remaining);
+            if (bytes_read < 0) return TDB_ERR_CORRUPTION;
+            scan_ptr += bytes_read;
+            scan_remaining -= bytes_read;
+        }
+
+        if (scan_remaining < key_size_u64) return TDB_ERR_CORRUPTION;
+        scan_ptr += key_size_u64;
+        scan_remaining -= key_size_u64;
+
+        if (!(flags & TDB_KV_FLAG_HAS_VLOG) && value_size_u64 > 0)
+        {
+            if (scan_remaining < value_size_u64) return TDB_ERR_CORRUPTION;
+            scan_ptr += value_size_u64;
+            scan_remaining -= value_size_u64;
+            total_value_size += (size_t)value_size_u64;
+        }
     }
+
+    /* allocate arena: block + entries + key_ptrs + value_ptrs + key_data + value_data */
+    size_t arena_size = sizeof(tidesdb_klog_block_t) +
+                        (num_entries * sizeof(tidesdb_klog_entry_t)) +
+                        (num_entries * sizeof(uint8_t *)) + /* keys array */
+                        (num_entries * sizeof(uint8_t *)) + /* inline_values array */
+                        total_key_size + total_value_size;
+
+    uint8_t *arena = malloc(arena_size);
+    if (!arena) return TDB_ERR_MEMORY;
+
+    /* partition arena into sections */
+    *block = (tidesdb_klog_block_t *)arena;
+    memset(*block, 0, sizeof(tidesdb_klog_block_t));
+
+    /* mark as arena-allocated for proper cleanup */
+    (*block)->is_arena_allocated = 1;
+
+    uint8_t *arena_ptr = arena + sizeof(tidesdb_klog_block_t);
+    (*block)->entries = (tidesdb_klog_entry_t *)arena_ptr;
+    arena_ptr += num_entries * sizeof(tidesdb_klog_entry_t);
+
+    (*block)->keys = (uint8_t **)arena_ptr;
+    arena_ptr += num_entries * sizeof(uint8_t *);
+
+    (*block)->inline_values = (uint8_t **)arena_ptr;
+    arena_ptr += num_entries * sizeof(uint8_t *);
+
+    uint8_t *key_data_arena = arena_ptr;
+    uint8_t *value_data_arena = arena_ptr + total_key_size;
 
     (*block)->num_entries = 0;
     (*block)->block_size = block_size;
@@ -1585,6 +1669,8 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 
     uint64_t prev_seq = 0;
     size_t remaining = data_size - (ptr - data);
+    size_t key_offset = 0;
+    size_t value_offset = 0;
 
     for (uint32_t i = 0; i < num_entries; i++)
     {
@@ -1689,19 +1775,15 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         if (remaining < (*block)->entries[i].key_size)
         {
             TDB_DEBUG_LOG(TDB_LOG_FATAL, "Key data exceeds bounds at entry %u", i);
-            tidesdb_klog_block_free(*block);
+            free(arena);
             *block = NULL;
             return TDB_ERR_CORRUPTION;
         }
 
-        (*block)->keys[i] = malloc((*block)->entries[i].key_size);
-        if (!(*block)->keys[i])
-        {
-            tidesdb_klog_block_free(*block);
-            *block = NULL;
-            return TDB_ERR_MEMORY;
-        }
+        /* point into arena instead of malloc */
+        (*block)->keys[i] = key_data_arena + key_offset;
         memcpy((*block)->keys[i], ptr, (*block)->entries[i].key_size);
+        key_offset += (*block)->entries[i].key_size;
         ptr += (*block)->entries[i].key_size;
         remaining -= (*block)->entries[i].key_size;
 
@@ -1710,19 +1792,15 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
             if (remaining < (*block)->entries[i].value_size)
             {
                 TDB_DEBUG_LOG(TDB_LOG_FATAL, "Inline value exceeds bounds at entry %u", i);
-                tidesdb_klog_block_free(*block);
+                free(arena);
                 *block = NULL;
                 return TDB_ERR_CORRUPTION;
             }
 
-            (*block)->inline_values[i] = malloc((*block)->entries[i].value_size);
-            if (!(*block)->inline_values[i])
-            {
-                tidesdb_klog_block_free(*block);
-                *block = NULL;
-                return TDB_ERR_MEMORY;
-            }
+            /* point into arena instead of malloc */
+            (*block)->inline_values[i] = value_data_arena + value_offset;
             memcpy((*block)->inline_values[i], ptr, (*block)->entries[i].value_size);
+            value_offset += (*block)->entries[i].value_size;
             ptr += (*block)->entries[i].value_size;
             remaining -= (*block)->entries[i].value_size;
         }
@@ -14864,6 +14942,33 @@ static int compact_block_index_find_predecessor(const tidesdb_block_index_t *ind
 
     if (result >= 0)
     {
+        /* found a valid predecessor block
+         * now check if search_key is beyond this block's max_key
+         * if so, key definitely doesn't exist in this sst */
+        const uint8_t *result_max_prefix = index->max_key_prefixes + (result * index->prefix_len);
+        int cmp_result_max;
+        if (index->comparator)
+        {
+            cmp_result_max = index->comparator(search_prefix, index->prefix_len, result_max_prefix,
+                                               index->prefix_len, index->comparator_ctx);
+        }
+        else
+        {
+            cmp_result_max = memcmp(search_prefix, result_max_prefix, index->prefix_len);
+        }
+
+        /* if search_key > max_key of this block, key is beyond indexed range */
+        if (cmp_result_max > 0)
+        {
+            /* check if this is the last block, if so, key doesnt exist */
+            if (result == (int64_t)(index->count - 1))
+            {
+                return -1; /* key is beyond last block, doesn't exist */
+            }
+            /* otherwise, key might be in next block (gap between blocks)
+             * return this block's position and let sequential scan handle it */
+        }
+
         *file_position = index->file_positions[result];
         return 0;
     }

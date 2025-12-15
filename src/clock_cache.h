@@ -214,4 +214,21 @@ void clock_cache_clear(clock_cache_t *cache);
  */
 void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats);
 
+/**
+ * clock_cache_foreach_prefix
+ * iterate over all entries matching a key prefix
+ * @param cache the cache
+ * @param prefix the key prefix to match
+ * @param prefix_len the prefix length
+ * @param callback function to call for each matching entry (return 0 to continue, non-zero to stop)
+ * @param user_data user data passed to callback
+ * @return number of entries processed
+ */
+typedef int (*clock_cache_foreach_callback_t)(const char *key, size_t key_len,
+                                              const uint8_t *payload, size_t payload_len,
+                                              void *user_data);
+
+size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size_t prefix_len,
+                                  clock_cache_foreach_callback_t callback, void *user_data);
+
 #endif /* __CLOCK_CACHE_H__ */

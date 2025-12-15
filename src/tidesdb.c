@@ -654,6 +654,17 @@ static block_manager_block_t *tidesdb_read_block(tidesdb_t *db, tidesdb_sstable_
             block->data = decompressed;
             block->size = decompressed_size;
         }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "Decompression failed for SSTable %s (id=%" PRIu64
+                          ") "
+                          "compression=%u block_size=%zu",
+                          sst->klog_path ? sst->klog_path : "unknown", sst->id,
+                          (unsigned int)sst->config->compression_algorithm, (size_t)block->size);
+            block_manager_block_release(block);
+            return NULL;
+        }
     }
 
     return block;
@@ -708,7 +719,25 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, size_t key_size, size_t value
 {
     if (!db) return TDB_ERR_INVALID_ARGS;
 
+    /* enforce architectural limit! all sizes are uint32_t */
+    if (key_size > UINT32_MAX)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Key size (%zu bytes) exceeds UINT32_MAX", key_size);
+        return TDB_ERR_INVALID_ARGS;
+    }
+    if (value_size > UINT32_MAX)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Value size (%zu bytes) exceeds UINT32_MAX", value_size);
+        return TDB_ERR_INVALID_ARGS;
+    }
+
     size_t total_size = key_size + value_size;
+    if (total_size > UINT32_MAX)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Total key+value size (%zu bytes) exceeds UINT32_MAX",
+                      total_size);
+        return TDB_ERR_INVALID_ARGS;
+    }
 
     uint64_t memory_based_limit = (uint64_t)(db->available_memory * TDB_MEMORY_PERCENTAGE);
     uint64_t max_allowed_size =
@@ -915,7 +944,9 @@ static int sstable_metadata_deserialize(const uint8_t *data, size_t data_size,
     {
         /* validate compression algorithm value */
         if (compression_algorithm != NO_COMPRESSION &&
+#ifndef __sun
             compression_algorithm != SNAPPY_COMPRESSION &&
+#endif
             compression_algorithm != LZ4_COMPRESSION && compression_algorithm != ZSTD_COMPRESSION)
         {
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable metadata has invalid compression_algorithm: %u",
@@ -1254,10 +1285,13 @@ static void tidesdb_klog_block_free(tidesdb_klog_block_t *block)
 {
     if (!block) return;
 
-    for (uint32_t i = 0; i < block->num_entries; i++)
+    /* use capacity instead of num_entries to free all allocated entries
+     * since num_entries may be 0 if deserialization failed partway through */
+    uint32_t entries_to_free = block->num_entries > 0 ? block->num_entries : block->capacity;
+    for (uint32_t i = 0; i < entries_to_free; i++)
     {
-        free(block->keys[i]);
-        free(block->inline_values[i]);
+        if (block->keys) free(block->keys[i]);
+        if (block->inline_values) free(block->inline_values[i]);
     }
 
     free(block->entries);
@@ -13492,6 +13526,26 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     }
     closedir(dir);
 
+    /* restore next_sstable_id from manifest before WAL recovery
+     * to prevent id collisions when flushing recovered WALs */
+    char manifest_path[TDB_MAX_PATH_LEN];
+    snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
+             TDB_COLUMN_FAMILY_MANIFEST_NAME);
+    tidesdb_manifest_t *temp_manifest = tidesdb_manifest_load(manifest_path);
+    if (temp_manifest)
+    {
+        uint64_t manifest_next_id = temp_manifest->sequence;
+        if (manifest_next_id > 0)
+        {
+            atomic_store_explicit(&cf->next_sstable_id, manifest_next_id, memory_order_relaxed);
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' pre-loaded next_sstable_id=%" PRIu64
+                          " from manifest before WAL recovery",
+                          cf->name, manifest_next_id);
+        }
+        tidesdb_manifest_free(temp_manifest);
+    }
+
     /* sort WAL files by ID to ensure correct recovery order
      * WAL filenames are wal_<id>.log, so we can sort by extracting the numeric ID */
     size_t wal_count = queue_size(wal_files);
@@ -13506,7 +13560,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                 wal_array[i] = queue_dequeue(wal_files);
             }
 
-            /* bubble sort by WAL ID (simple, works for small counts) */
+            /* bubble sort by WAL ID */
             for (size_t i = 0; i < wal_count - 1; i++)
             {
                 for (size_t j = 0; j < wal_count - i - 1; j++)

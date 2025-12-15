@@ -2251,19 +2251,18 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
     if (!old_path || !new_path) return -1;
 
 #ifdef _WIN32
-    /* on windows, rename() fails if target exists, so we remove it first
-     * this is not perfectly atomic but is the best we can do on Windows */
-    if (access(new_path, F_OK) == 0)
+    /* use MoveFileEx with MOVEFILE_REPLACE_EXISTING for atomic rename on Windows
+     * this is truly atomic and replaces the target file if it exists */
+    if (!MoveFileEx(old_path, new_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
     {
-        if (remove(new_path) != 0)
-        {
-            return -1;
-        }
+        errno = GetLastError();
+        return -1;
     }
-#endif
-
-    /* perform the rename */
+    return 0;
+#else
+    /* POSIX rename() is atomic and replaces existing files */
     return rename(old_path, new_path);
+#endif
 }
 
 /**

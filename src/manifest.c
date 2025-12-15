@@ -135,9 +135,10 @@ tidesdb_manifest_t *tidesdb_manifest_load(const char *path)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 #endif
-                (void)snprintf(klog_path, sizeof(klog_path), "%s/L%d_%" PRIu64 ".klog", dir_path,
-                               entry->level, entry->id);
-                if (stat(klog_path, &st) == 0)
+                (void)snprintf(klog_path, sizeof(klog_path),
+                               "%s" PATH_SEPARATOR "L%d_%" PRIu64 ".klog", dir_path, entry->level,
+                               entry->id);
+                if (STAT_FUNC(klog_path, &st) == 0)
                 {
                     exists = 1;
                 }
@@ -147,9 +148,10 @@ tidesdb_manifest_t *tidesdb_manifest_load(const char *path)
                      * check common partition numbers (0-15 should cover most cases) */
                     for (int p = 0; p < 16 && !exists; p++)
                     {
-                        (void)snprintf(klog_path, sizeof(klog_path), "%s/L%dP%d_%" PRIu64 ".klog",
-                                       dir_path, entry->level, p, entry->id);
-                        if (stat(klog_path, &st) == 0)
+                        (void)snprintf(klog_path, sizeof(klog_path),
+                                       "%s" PATH_SEPARATOR "L%dP%d_%" PRIu64 ".klog", dir_path,
+                                       entry->level, p, entry->id);
+                        if (STAT_FUNC(klog_path, &st) == 0)
                         {
                             exists = 1;
                             break;

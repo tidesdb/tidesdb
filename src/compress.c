@@ -29,11 +29,23 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
         case SNAPPY_COMPRESSION:
         {
             *compressed_size = snappy_max_compressed_length(data_size);
-            compressed_data = malloc(*compressed_size);
+            size_t total_size = *compressed_size + sizeof(uint64_t);
+            compressed_data = malloc(total_size);
             if (!compressed_data) return NULL;
 
-            snappy_compress((const char *)data, data_size, (char *)compressed_data,
-                            compressed_size);
+            /* store original size as uint64_t for cross-architecture portability */
+            encode_uint64_le_compat(compressed_data, (uint64_t)data_size);
+
+            size_t actual_size = *compressed_size;
+            if (snappy_compress((const char *)data, data_size,
+                                (char *)(compressed_data + sizeof(uint64_t)),
+                                &actual_size) != SNAPPY_OK)
+            {
+                free(compressed_data);
+                return NULL;
+            }
+
+            *compressed_size = actual_size + sizeof(uint64_t);
             break;
         }
 #endif
@@ -95,14 +107,27 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
 #ifndef __sun
         case SNAPPY_COMPRESSION:
         {
-            if (snappy_uncompressed_length((const char *)data, data_size, decompressed_size) !=
-                SNAPPY_OK)
+            if (data_size < sizeof(uint64_t))
+            {
                 return NULL;
+            }
+
+            /* decode original size from uint64_t for cross-architecture portability */
+            uint64_t original_size = decode_uint64_le_compat(data);
+
+            /* block manager only supports uint32_t sizes */
+            if (original_size > UINT32_MAX)
+            {
+                return NULL;
+            }
+
+            *decompressed_size = (size_t)original_size;
 
             decompressed_data = malloc(*decompressed_size);
             if (!decompressed_data) return NULL;
 
-            if (snappy_uncompress((const char *)data, data_size, (char *)decompressed_data,
+            if (snappy_uncompress((const char *)(data + sizeof(uint64_t)),
+                                  data_size - sizeof(uint64_t), (char *)decompressed_data,
                                   decompressed_size) != SNAPPY_OK)
             {
                 free(decompressed_data);

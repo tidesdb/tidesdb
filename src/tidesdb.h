@@ -34,7 +34,7 @@
 typedef enum
 {
     TDB_LOG_DEBUG = 0, /* general debugging info (most verbose) */
-    TDB_LOG_INFO = 1,  /* informational messages (default) */
+    TDB_LOG_INFO = 1,  /* informational messages */
     TDB_LOG_WARN = 2,  /* warnings (e.g., "Retry attempt N"..) */
     TDB_LOG_ERROR = 3, /* errors (e.g., "Failed to open file", "Invalid checksum") */
     TDB_LOG_FATAL = 4, /* fatal errors (e.g., "Corruption detected", "Out of memory") */

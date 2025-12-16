@@ -235,8 +235,6 @@ static clock_cache_entry_t *_find_entry(clock_cache_partition_t *partition, cons
 static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition,
                         clock_cache_entry_t *entry)
 {
-    (void)cache;
-
     /* try to claim entry for deletion using CAS */
     uint8_t expected = ENTRY_VALID;
     if (!atomic_compare_exchange_strong(&entry->state, &expected, ENTRY_DELETING))
@@ -260,8 +258,9 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
 
     /* load pointers and sizes */
     char *key = atomic_load_explicit(&entry->key, memory_order_acquire);
-    uint8_t *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
+    void *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
     size_t klen = atomic_load_explicit(&entry->key_len, memory_order_acquire);
+    size_t plen = atomic_load_explicit(&entry->payload_len, memory_order_acquire);
 
     if (!key || !payload)
     {
@@ -290,6 +289,13 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
     /* mem fence -- ensure all readers see deleted before we free */
     atomic_thread_fence(memory_order_seq_cst);
 
+    /* call eviction callback if provided (for custom cleanup of pointed-to data) */
+    if (cache->evict_callback && payload)
+    {
+        cache->evict_callback(payload, plen);
+    }
+
+    /* always free key and payload wrapper (callback only frees pointed-to data) */
     free(key);
     free(payload);
 
@@ -389,7 +395,9 @@ static size_t _clock_evict(clock_cache_t *cache, clock_cache_partition_t *partit
 static int _ensure_space(clock_cache_t *cache, clock_cache_partition_t *partition,
                          size_t required_bytes)
 {
-    /* is partition completely full? */
+    (void)required_bytes;
+
+    /* count occupied slots in this partition only */
     size_t occupied = 0;
     for (size_t j = 0; j < partition->num_slots; j++)
     {
@@ -400,75 +408,9 @@ static int _ensure_space(clock_cache_t *cache, clock_cache_partition_t *partitio
         }
     }
 
-    int should_check_bytes = (partition->num_slots <= CLOCK_CACHE_SMALL_PARTITION_SLOTS);
-
-    if (should_check_bytes)
-    {
-        /* compute total bytes across all partitions */
-        size_t total_bytes = 0;
-        for (size_t i = 0; i < cache->num_partitions; i++)
-        {
-            clock_cache_partition_t *p = &cache->partitions[i];
-            for (size_t j = 0; j < p->num_slots; j++)
-            {
-                uint8_t state = atomic_load_explicit(&p->slots[j].state, memory_order_relaxed);
-                if (state == ENTRY_VALID)
-                {
-                    size_t klen = atomic_load_explicit(&p->slots[j].key_len, memory_order_relaxed);
-                    size_t plen =
-                        atomic_load_explicit(&p->slots[j].payload_len, memory_order_relaxed);
-                    total_bytes += _entry_size(klen, plen);
-                }
-            }
-        }
-
-        /* evict if we would exceed byte limit */
-        while (total_bytes + required_bytes > cache->max_bytes)
-        {
-            /* find a partition with entries to evict */
-            clock_cache_partition_t *evict_partition = NULL;
-            for (size_t i = 0; i < cache->num_partitions; i++)
-            {
-                clock_cache_partition_t *p = &cache->partitions[i];
-                for (size_t j = 0; j < p->num_slots; j++)
-                {
-                    uint8_t state = atomic_load_explicit(&p->slots[j].state, memory_order_relaxed);
-                    if (state == ENTRY_VALID)
-                    {
-                        evict_partition = p;
-                        goto found_partition;
-                    }
-                }
-            }
-        found_partition:
-
-            if (!evict_partition) break;
-
-            _clock_evict(cache, evict_partition);
-
-            /* recompute total_bytes */
-            total_bytes = 0;
-            for (size_t i = 0; i < cache->num_partitions; i++)
-            {
-                clock_cache_partition_t *p = &cache->partitions[i];
-                for (size_t j = 0; j < p->num_slots; j++)
-                {
-                    uint8_t state = atomic_load_explicit(&p->slots[j].state, memory_order_relaxed);
-                    if (state == ENTRY_VALID)
-                    {
-                        size_t klen =
-                            atomic_load_explicit(&p->slots[j].key_len, memory_order_relaxed);
-                        size_t plen =
-                            atomic_load_explicit(&p->slots[j].payload_len, memory_order_relaxed);
-                        total_bytes += _entry_size(klen, plen);
-                    }
-                }
-            }
-        }
-    }
-
-    /* also evict if partition is completely full */
-    if (occupied >= partition->num_slots)
+    /* if partition is getting full (>90%), evict one entry */
+    size_t threshold = (partition->num_slots * 9) / 10;
+    if (occupied >= threshold)
     {
         _clock_evict(cache, partition);
     }
@@ -515,6 +457,7 @@ void clock_cache_compute_config(size_t max_bytes, cache_config_t *config)
     config->max_bytes = max_bytes;
     config->num_partitions = num_partitions;
     config->slots_per_partition = slots_per_partition;
+    config->evict_callback = NULL; /* no callback by default */
 }
 
 clock_cache_t *clock_cache_create(const cache_config_t *config)
@@ -530,6 +473,7 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
     cache->num_partitions = config->num_partitions;
     cache->max_bytes = config->max_bytes;
     cache->partition_mask = config->num_partitions - 1; /* assumes power of 2 */
+    cache->evict_callback = config->evict_callback;     /* store eviction callback */
     atomic_store_explicit(&cache->total_bytes, 0, memory_order_relaxed);
     atomic_store_explicit(&cache->hits, 0, memory_order_relaxed);
     atomic_store_explicit(&cache->misses, 0, memory_order_relaxed);
@@ -648,8 +592,17 @@ void clock_cache_destroy(clock_cache_t *cache)
         for (size_t j = 0; j < partition->num_slots; j++)
         {
             char *key = atomic_load_explicit(&partition->slots[j].key, memory_order_acquire);
-            uint8_t *payload =
+            void *payload =
                 atomic_load_explicit(&partition->slots[j].payload, memory_order_acquire);
+            size_t payload_len =
+                atomic_load_explicit(&partition->slots[j].payload_len, memory_order_acquire);
+
+            /* call eviction callback if provided (for custom cleanup) */
+            if (payload && cache->evict_callback)
+            {
+                cache->evict_callback(payload, payload_len);
+            }
+
             if (key) free(key);
             if (payload) free(payload);
         }
@@ -663,7 +616,7 @@ void clock_cache_destroy(clock_cache_t *cache)
     cache = NULL;
 }
 
-int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const uint8_t *payload,
+int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const void *payload,
                     size_t payload_len)
 {
     if (!cache || !key || key_len == 0 || !payload) return -1;
@@ -683,10 +636,8 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
         _free_entry(cache, partition, old_entry);
     }
 
-    if (partition->num_slots <= CLOCK_CACHE_SMALL_PARTITION_SLOTS)
-    {
-        _ensure_space(cache, partition, entry_bytes);
-    }
+    /* always ensure space to enforce max_bytes limit */
+    _ensure_space(cache, partition, entry_bytes);
 
     clock_cache_entry_t *entry = NULL;
     size_t slot_idx = 0;
@@ -717,7 +668,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
 
     /* we own the slot now, allocate and fill */
     char *new_key = (char *)malloc(key_len);
-    uint8_t *new_payload = (uint8_t *)malloc(payload_len);
+    void *new_payload = malloc(payload_len);
 
     if (!new_key || !new_payload)
     {
@@ -758,6 +709,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, 
 
     if (!entry)
     {
+        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
         return NULL;
     }
 
@@ -795,7 +747,8 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, 
 
     if (payload_len) *payload_len = entry_payload_len;
 
-    /* skip global hit counter -- too much contention */
+    /* track cache hit */
+    atomic_fetch_add_explicit(&cache->hits, 1, memory_order_relaxed);
     return result;
 }
 

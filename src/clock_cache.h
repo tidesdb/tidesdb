@@ -7,17 +7,27 @@ typedef struct clock_cache_t clock_cache_t;
 typedef struct clock_cache_partition_t clock_cache_partition_t;
 
 /**
+ * clock_cache_evict_fn
+ * callback function for custom cleanup when cache entry is evicted
+ * @param payload pointer to the payload being evicted
+ * @param payload_len length of the payload
+ */
+typedef void (*clock_cache_evict_fn)(void *payload, size_t payload_len);
+
+/**
  * cache_config_t
  * configuration for cache creation
  * @param max_bytes maximum total bytes across all partitions
  * @param num_partitions number of partitions (power of 2 recommended)
  * @param slots_per_partition initial slots per partition
+ * @param evict_callback optional callback for custom cleanup on eviction (can be NULL)
  */
 typedef struct
 {
     size_t max_bytes;
     size_t num_partitions;
     size_t slots_per_partition;
+    clock_cache_evict_fn evict_callback;
 } cache_config_t;
 
 /**
@@ -35,7 +45,7 @@ typedef struct
 typedef struct
 {
     _Atomic(char *) key;
-    _Atomic(uint8_t *) payload;
+    _Atomic(void *) payload;
     atomic_size_t key_len;
     atomic_size_t payload_len;
     _Atomic(uint8_t) ref_bit;
@@ -118,6 +128,7 @@ struct clock_cache_t
     atomic_uint64_t hits;
     atomic_uint64_t misses;
     _Atomic(uint8_t) shutdown;
+    clock_cache_evict_fn evict_callback;
 };
 
 /**
@@ -170,11 +181,11 @@ void clock_cache_destroy(clock_cache_t *cache);
  * @param cache the cache
  * @param key the key
  * @param key_len the key length
- * @param payload the payload
+ * @param payload the payload (can be any pointer type)
  * @param payload_len the payload length
  * @return 0 on success, -1 on failure
  */
-int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const uint8_t *payload,
+int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const void *payload,
                     size_t payload_len);
 
 /**
@@ -184,7 +195,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
  * @param key the key
  * @param key_len the key length
  * @param payload_len output parameter for payload length
- * @return allocated payload (caller must free) or NULL if not found
+ * @return allocated payload copy (caller must free) or NULL if not found
  */
 uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len,
                          size_t *payload_len);
@@ -228,6 +239,16 @@ typedef int (*clock_cache_foreach_callback_t)(const char *key, size_t key_len,
                                               const uint8_t *payload, size_t payload_len,
                                               void *user_data);
 
+/**
+ * clock_cache_foreach_prefix
+ * iterate over all entries matching a key prefix
+ * @param cache the cache
+ * @param prefix the key prefix to match
+ * @param prefix_len the prefix length
+ * @param callback function to call for each matching entry (return 0 to continue, non-zero to stop)
+ * @param user_data user data passed to callback
+ * @return number of entries processed
+ */
 size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size_t prefix_len,
                                   clock_cache_foreach_callback_t callback, void *user_data);
 

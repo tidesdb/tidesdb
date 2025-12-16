@@ -617,7 +617,7 @@ int main()
 
     srand((unsigned int)time(NULL));
 
-    printf(BOLDCYAN "\n=== TidesDB Benchmark Configuration ===\n" RESET);
+    printf(BOLDCYAN "\n*=== TidesDB Benchmark Configuration ===*\n" RESET);
     printf(BOLDWHITE "Workload Settings:\n" RESET);
     printf("  Operations: %d\n", BENCH_NUM_OPERATIONS);
     printf("  Seek Operations: %d\n", BENCH_NUM_SEEK_OPS);
@@ -645,7 +645,7 @@ int main()
     printf("  Block Index Prefix Length: %d\n", BENCH_BLOCK_INDEX_PREFIX_LEN);
     printf("  Comparator: %s\n", BENCH_COMPARATOR_NAME);
     printf("  Isolation Level: %s\n", get_isolation_level_name(BENCH_ISOLATION_LEVEL));
-    printf("======================================\n\n" RESET);
+    printf("*======================================*\n\n" RESET);
 
     uint8_t **keys = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t *));
     if (keys == NULL)
@@ -854,12 +854,63 @@ int main()
     printf(BOLDGREEN "Put: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, BENCH_NUM_OPERATIONS,
            end_time - start_time, (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
-    /* ensure all PUT operations are fully committed and visible before GET operations
-     * add memory barrier and small delay to allow concurrent commits to complete */
-    atomic_thread_fence(memory_order_seq_cst);
-    usleep(50000); /* 50ms delay to allow all pending commits to fully complete */
+    /* close and reopen database to test cold cache performance */
+    printf(BOLDGREEN "\nClosing and reopening database to clear caches...\n" RESET);
+    if (tidesdb_close(tdb) != TDB_SUCCESS)
+    {
+        printf(BOLDRED "Failed to close database\n" RESET);
+        for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
+        {
+            free(keys[i]);
+            free(values[i]);
+        }
+        free(keys);
+        free(values);
+        free(key_sizes);
+        free(value_sizes);
+        return 1;
+    }
 
-    printf(BOLDGREEN "\nBenchmarking Get operations...\n" RESET);
+    if (tidesdb_open(&config, &tdb) != TDB_SUCCESS)
+    {
+        printf(BOLDRED "Failed to reopen database\n" RESET);
+        for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
+        {
+            free(keys[i]);
+            free(values[i]);
+        }
+        free(keys);
+        free(values);
+        free(key_sizes);
+        free(value_sizes);
+        return 1;
+    }
+
+    cf = tidesdb_get_column_family(tdb, BENCH_CF_NAME);
+    if (cf == NULL)
+    {
+        printf(BOLDRED "Failed to get column family after reopen\n" RESET);
+        for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
+        {
+            free(keys[i]);
+            free(values[i]);
+        }
+        free(keys);
+        free(values);
+        free(key_sizes);
+        free(value_sizes);
+        tidesdb_close(tdb);
+        return 1;
+    }
+
+    /* update thread data with new db and cf pointers */
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        thread_data[i].tdb = tdb;
+        thread_data[i].cf = cf;
+    }
+
+    printf(BOLDGREEN "\nBenchmarking Get operations (cold cache)...\n" RESET);
     start_time = get_time_ms();
 
     for (int i = 0; i < BENCH_NUM_THREADS; i++)
@@ -885,6 +936,11 @@ int main()
         printf(BOLDRED "  ✗ GET verification failed: %d errors\n" RESET, verification_errors);
     }
     verification_errors = 0; /* reset for next test */
+
+#ifdef TDB_ENABLE_READ_PROFILING
+    tidesdb_print_read_stats(tdb);
+    tidesdb_reset_read_stats(tdb);
+#endif
 
     printf(BOLDGREEN "\nBenchmarking Iterator Seek operations...\n" RESET);
 
@@ -914,6 +970,11 @@ int main()
            BENCH_NUM_SEEK_OPS, end_time - start_time,
            (BENCH_NUM_SEEK_OPS / (end_time - start_time)) * 1000);
 
+#ifdef TDB_ENABLE_READ_PROFILING
+    tidesdb_print_read_stats(tdb);
+    tidesdb_reset_read_stats(tdb);
+#endif
+
     printf(BOLDGREEN "\nBenchmarking Iterator Seek For Prev operations...\n" RESET);
 
     /* reuse same thread_data setup */
@@ -933,6 +994,11 @@ int main()
     printf(BOLDGREEN "Iterator Seek For Prev: %d operations in %.2f ms (%.2f ops/sec)\n" RESET,
            BENCH_NUM_SEEK_OPS, end_time - start_time,
            (BENCH_NUM_SEEK_OPS / (end_time - start_time)) * 1000);
+
+#ifdef TDB_ENABLE_READ_PROFILING
+    tidesdb_print_read_stats(tdb);
+    tidesdb_reset_read_stats(tdb);
+#endif
 
     printf(BOLDGREEN "\nBenchmarking Forward Iterator (full scan)...\n" RESET);
     start_time = get_time_ms();

@@ -6433,8 +6433,6 @@ static void test_many_sstables_all_comparators(void)
 
 static void test_large_value_iteration(void)
 {
-    printf(CYAN "\n=== Testing Large Value Iteration (256B keys, 4KB values) ===\n" RESET);
-
     cleanup_test_dir();
 
     tidesdb_t *db = NULL;
@@ -7700,7 +7698,6 @@ static void test_deadlock_random_write_then_read(void)
     printf("\n--- Closing database ---\n");
     tidesdb_close(db);
     cleanup_test_dir();
-    printf("=== Test completed successfully ===\n\n");
 }
 
 typedef struct

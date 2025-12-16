@@ -24,6 +24,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+/**
+ * tidesdb_manifest_add_sstable_unlocked
+ * adds an sstable to the manifest
+ * @param manifest manifest to add sstable to
+ * @param level level of sstable
+ * @param id id of sstable
+ * @param num_entries number of entries in sstable
+ * @param size_bytes size of sstable in bytes
+ * @return 0 on success, -1 on error
+ */
 static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, int level,
                                                  uint64_t id, uint64_t num_entries,
                                                  uint64_t size_bytes);

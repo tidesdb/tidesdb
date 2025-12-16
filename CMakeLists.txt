@@ -13,6 +13,11 @@ configure_file(
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
+option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" ON)
+
+if(ENABLE_READ_PROFILING)
+    add_compile_definitions(TDB_ENABLE_READ_PROFILING)
+endif()
 
 if(MINGW)
     add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)
@@ -213,7 +218,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # benchmark configuration variables (can be overridden at build time with -D flags)
     if(NOT DEFINED BENCH_NUM_OPERATIONS)
-        set(BENCH_NUM_OPERATIONS 10000000)
+        set(BENCH_NUM_OPERATIONS 100000)
     endif()
     if(NOT DEFINED BENCH_NUM_SEEK_OPS)
         set(BENCH_NUM_SEEK_OPS 100)
@@ -231,7 +236,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_NUM_THREADS 4)
     endif()
     if(NOT DEFINED BENCH_KEY_PATTERN)
-        set(BENCH_KEY_PATTERN "sequential")
+        set(BENCH_KEY_PATTERN "random")
     endif()
 
     # tidesdb config variables for benchmark
@@ -341,8 +346,16 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
             BENCH_BLOCK_INDEX_PREFIX_LEN=${BENCH_BLOCK_INDEX_PREFIX_LEN}
             BENCH_SYNC_MODE=${BENCH_SYNC_MODE}
             BENCH_SYNC_INTERVAL_US=${BENCH_SYNC_INTERVAL_US}
-            BENCH_COMPARATOR_NAME=\"${BENCH_COMPARATOR_NAME}\"
+            BENCH_COMPARATOR_NAME="${BENCH_COMPARATOR_NAME}"
             BENCH_BLOCK_CACHE_SIZE=${BENCH_BLOCK_CACHE_SIZE}
+    )
+
+    # enable read profiling if requested
+    if(ENABLE_READ_PROFILING)
+        target_compile_definitions(tidesdb_bench PRIVATE TDB_ENABLE_READ_PROFILING)
+    endif()
+
+    target_compile_definitions(tidesdb_bench PRIVATE
             BENCH_DB_FLUSH_POOL_THREADS=${BENCH_DB_FLUSH_POOL_THREADS}
             BENCH_DB_COMPACTION_POOL_THREADS=${BENCH_DB_COMPACTION_POOL_THREADS}
             BENCH_ISOLATION_LEVEL=${BENCH_ISOLATION_LEVEL}

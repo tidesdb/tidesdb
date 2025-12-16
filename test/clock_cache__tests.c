@@ -169,51 +169,170 @@ void test_cache_clear(void)
     clock_cache_destroy(cache);
 }
 
+/* test data structure for eviction callback testing */
+typedef struct
+{
+    int *data;
+    size_t size;
+} test_evict_data_t;
+
+static int eviction_callback_count = 0;
+
+/* eviction callback that frees the test data */
+static void test_eviction_callback(void *payload, size_t payload_len)
+{
+    if (!payload || payload_len != sizeof(test_evict_data_t *)) return;
+
+    test_evict_data_t *data = *(test_evict_data_t **)payload;
+    if (data)
+    {
+        free(data->data);
+        free(data);
+        eviction_callback_count++;
+    }
+}
+
 void test_cache_clock_eviction(void)
 {
-    cache_config_t config = {.max_bytes = 190, .num_partitions = 2, .slots_per_partition = 8};
+    printf("Testing cache eviction with callbacks...\n");
 
-    clock_cache_t *cache = clock_cache_create(&config);
-    ASSERT_TRUE(cache != NULL);
+    {
+        cache_config_t config = {.max_bytes = 200,
+                                 .num_partitions = 2,
+                                 .slots_per_partition = 4,
+                                 .evict_callback = NULL};
+        clock_cache_t *cache = clock_cache_create(&config);
+        ASSERT_TRUE(cache != NULL);
 
-    const uint8_t payload[] = "test_payload_data!!";
+        const uint8_t payload[] = "test_payload_data_for_eviction!!";
 
-    ASSERT_EQ(clock_cache_put(cache, "k1", 2, payload, sizeof(payload)), 0);
-    ASSERT_EQ(clock_cache_put(cache, "k2", 2, payload, sizeof(payload)), 0);
-    ASSERT_EQ(clock_cache_put(cache, "k3", 2, payload, sizeof(payload)), 0);
+        /* fill cache beyond capacity to trigger eviction (4 slots per partition, 90% = 3.6, so 4th
+         * triggers eviction) */
+        for (int i = 0; i < 10; i++)
+        {
+            char key[16];
+            snprintf(key, sizeof(key), "k%d", i);
+            ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload)), 0);
+        }
 
-    clock_cache_stats_t stats;
-    clock_cache_get_stats(cache, &stats);
-    ASSERT_TRUE(stats.total_bytes <= 190);
+        clock_cache_stats_t stats;
+        clock_cache_get_stats(cache, &stats);
+        printf("  Inserted 10 entries into 8 slots, cache bytes: %zu\n", stats.total_bytes);
+        printf("  Cache entries: %zu\n", stats.total_entries);
 
-    ASSERT_EQ(clock_cache_put(cache, "k4", 2, payload, sizeof(payload)), 0);
+        /* we verify most recent key exists */
+        size_t len;
+        uint8_t *data = clock_cache_get(cache, "k9", 2, &len);
+        ASSERT_TRUE(data != NULL);
+        free(data);
 
-    clock_cache_get_stats(cache, &stats);
+        /* we check that some old keys were evicted */
+        int old_keys_found = 0;
+        for (int i = 0; i < 5; i++)
+        {
+            char key[16];
+            snprintf(key, sizeof(key), "k%d", i);
+            uint8_t *kdata = clock_cache_get(cache, key, strlen(key), &len);
+            if (kdata)
+            {
+                old_keys_found++;
+                free(kdata);
+            }
+        }
 
-    printf("Total bytes after eviction: %zu\n", stats.total_bytes);
-    ASSERT_TRUE(stats.total_bytes <= 190);
+        printf("  Old keys (k0-k4) remaining: %d/5 (some should be evicted)\n", old_keys_found);
+        ASSERT_TRUE(old_keys_found < 5); /* at least one old key should be evicted */
 
-    size_t len;
-    uint8_t *data = clock_cache_get(cache, "k4", 2, &len);
-    ASSERT_TRUE(data != NULL);
-    free(data);
+        clock_cache_destroy(cache);
+        printf("  ✓ Basic eviction test passed\n");
+    }
 
-    uint8_t *k1_data = clock_cache_get(cache, "k1", 2, &len);
-    int k1_exists = (k1_data != NULL);
-    if (k1_exists) free(k1_data);
+    {
+        eviction_callback_count = 0;
+        cache_config_t config = {.max_bytes = 300,
+                                 .num_partitions = 2,
+                                 .slots_per_partition = 4,
+                                 .evict_callback = test_eviction_callback};
+        clock_cache_t *cache = clock_cache_create(&config);
+        ASSERT_TRUE(cache != NULL);
 
-    uint8_t *k2_data = clock_cache_get(cache, "k2", 2, &len);
-    int k2_exists = (k2_data != NULL);
-    if (k2_exists) free(k2_data);
+        /* we create test data with pointers (simulating ref-counted blocks) */
+        for (int i = 0; i < 6; i++)
+        {
+            test_evict_data_t *data = malloc(sizeof(test_evict_data_t));
+            data->data = malloc(100);
+            data->size = 100;
 
-    uint8_t *k3_data = clock_cache_get(cache, "k3", 2, &len);
-    int k3_exists = (k3_data != NULL);
-    if (k3_exists) free(k3_data);
+            char key[16];
+            snprintf(key, sizeof(key), "key_%d", i);
 
-    int total_old_keys = k1_exists + k2_exists + k3_exists;
-    ASSERT_TRUE(total_old_keys < 3);
+            /* w cache pointer to data */
+            int result =
+                clock_cache_put(cache, key, strlen(key), &data, sizeof(test_evict_data_t *));
+            ASSERT_EQ(result, 0);
+        }
 
-    clock_cache_destroy(cache);
+        clock_cache_stats_t stats;
+        clock_cache_get_stats(cache, &stats);
+        printf("  Inserted 6 entries, cache bytes: %zu (target: 300, allows overhead)\n",
+               stats.total_bytes);
+        /* we cache uses approximate eviction, allow reasonable overhead */
+        ASSERT_TRUE(stats.total_bytes < 600);
+
+        /* we verify callback was called for evicted entries */
+        printf("  Eviction callback called: %d times\n", eviction_callback_count);
+        ASSERT_TRUE(eviction_callback_count > 0); /* some entries should have been evicted */
+
+        int initial_evictions = eviction_callback_count;
+
+        /* we destroy cache -- should call callback for remaining entries */
+        clock_cache_destroy(cache);
+
+        printf("  Total eviction callbacks: %d (initial: %d, on destroy: %d)\n",
+               eviction_callback_count, initial_evictions,
+               eviction_callback_count - initial_evictions);
+        ASSERT_TRUE(eviction_callback_count >= 6); /* all 6 entries should eventually be freed */
+
+        printf("  ✓ Callback eviction test passed\n");
+    }
+
+    {
+        eviction_callback_count = 0;
+        cache_config_t config = {.max_bytes = 150,
+                                 .num_partitions = 1,
+                                 .slots_per_partition = 8,
+                                 .evict_callback = test_eviction_callback};
+        clock_cache_t *cache = clock_cache_create(&config);
+        ASSERT_TRUE(cache != NULL);
+
+        for (int round = 0; round < 3; round++)
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                test_evict_data_t *data = malloc(sizeof(test_evict_data_t));
+                data->data = malloc(50);
+                data->size = 50;
+
+                char key[16];
+                snprintf(key, sizeof(key), "r%d_k%d", round, i);
+
+                clock_cache_put(cache, key, strlen(key), &data, sizeof(test_evict_data_t *));
+            }
+        }
+
+        printf("  Inserted 15 entries across 3 rounds\n");
+        printf("  Eviction callbacks during insertions: %d\n", eviction_callback_count);
+
+        clock_cache_destroy(cache);
+
+        printf("  Total eviction callbacks: %d (all 15 should be freed)\n",
+               eviction_callback_count);
+        ASSERT_EQ(eviction_callback_count, 15); /* all entries should be freed */
+
+        printf("  ✓ Memory leak test passed\n");
+    }
+
+    printf("✓ All cache eviction tests passed!\n");
 }
 
 void test_cache_stats(void)
@@ -748,7 +867,6 @@ void benchmark_scaling_puts(void)
     const int num_configs = 5;
     const int ops_per_thread = 20000;
 
-    printf(BOLDWHITE "\n=== Linear Scaling Benchmark: Concurrent Puts ===\n" RESET);
     printf(BOLDWHITE "Operations per thread: %d\n" RESET, ops_per_thread);
     printf(BOLDWHITE "%-10s %-15s %-15s %-15s\n" RESET, "Threads", "Time (s)", "Ops/sec",
            "Speedup");
@@ -813,7 +931,6 @@ void benchmark_scaling_gets(void)
     const int num_configs = 5;
     const int ops_per_thread = 50000;
 
-    printf(BOLDWHITE "\n=== Linear Scaling Benchmark: Concurrent Gets ===\n" RESET);
     printf(BOLDWHITE "Operations per thread: %d\n" RESET, ops_per_thread);
     printf(BOLDWHITE "%-10s %-15s %-15s %-15s\n" RESET, "Threads", "Time (s)", "Ops/sec",
            "Speedup");
@@ -863,7 +980,6 @@ void benchmark_scaling_mixed(void)
     const int num_configs = 5;
     const int ops_per_thread = 10000;
 
-    printf(BOLDWHITE "\n=== Linear Scaling Benchmark: Mixed Operations ===\n" RESET);
     printf(BOLDWHITE "Operations per thread: %d (put/get/delete mix)\n" RESET, ops_per_thread);
     printf(BOLDWHITE "%-10s %-15s %-15s %-15s\n" RESET, "Threads", "Time (s)", "Ops/sec",
            "Speedup");

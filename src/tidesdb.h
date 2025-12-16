@@ -155,6 +155,29 @@ typedef enum
 #define TDB_ERR_INVALID_DB   -11
 #define TDB_ERR_UNKNOWN      -12
 
+#define TDB_VERSION_MAJOR 6
+#define TDB_VERSION_MINOR 0
+#define TDB_VERSION_PATCH 0
+
+/* Read profiling (enable with TDB_ENABLE_READ_PROFILING) */
+#ifdef TDB_ENABLE_READ_PROFILING
+typedef struct
+{
+    _Atomic(uint64_t) total_reads;
+    _Atomic(uint64_t) memtable_hits;
+    _Atomic(uint64_t) immutable_hits;
+    _Atomic(uint64_t) sstable_hits;
+    _Atomic(uint64_t) levels_searched;
+    _Atomic(uint64_t) sstables_checked;
+    _Atomic(uint64_t) bloom_checks;
+    _Atomic(uint64_t) bloom_hits;
+    _Atomic(uint64_t) blocks_read;
+    _Atomic(uint64_t) cache_block_hits;
+    _Atomic(uint64_t) cache_block_misses;
+    _Atomic(uint64_t) disk_reads;
+} tidesdb_read_stats_t;
+#endif
+
 /**
  * tidesdb_sync_mode_t
  * synchronization modes for write-ahead log
@@ -512,6 +535,9 @@ struct tidesdb_t
     uint64_t available_memory;
     uint64_t total_memory;
     pthread_rwlock_t cf_list_lock;
+#ifdef TDB_ENABLE_READ_PROFILING
+    tidesdb_read_stats_t read_stats;
+#endif
 };
 
 /**
@@ -699,6 +725,31 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator
  * @return 0 on success, -n on failure
  */
 int tidesdb_close(tidesdb_t *db);
+
+#ifdef TDB_ENABLE_READ_PROFILING
+/**
+ * tidesdb_get_read_stats
+ * gets read profiling statistics
+ * @param db the database
+ * @param stats output statistics structure
+ * @return TDB_SUCCESS on success, error code on failure
+ */
+int tidesdb_get_read_stats(tidesdb_t *db, tidesdb_read_stats_t *stats);
+
+/**
+ * tidesdb_print_read_stats
+ * prints read profiling statistics to stdout
+ * @param db the database
+ */
+void tidesdb_print_read_stats(tidesdb_t *db);
+
+/**
+ * tidesdb_reset_read_stats
+ * resets read profiling statistics
+ * @param db the database
+ */
+void tidesdb_reset_read_stats(tidesdb_t *db);
+#endif
 
 /**
  * tidesdb_create_column_family

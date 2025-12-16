@@ -9872,14 +9872,18 @@ int tidesdb_close(tidesdb_t *db)
 
     if (db->flush_queue)
     {
+        pthread_mutex_lock(&db->flush_queue->lock);
         atomic_store(&db->flush_queue->shutdown, 1);
         pthread_cond_broadcast(&db->flush_queue->not_empty);
+        pthread_mutex_unlock(&db->flush_queue->lock);
     }
 
     if (db->compaction_queue)
     {
+        pthread_mutex_lock(&db->compaction_queue->lock);
         atomic_store(&db->compaction_queue->shutdown, 1);
         pthread_cond_broadcast(&db->compaction_queue->not_empty);
+        pthread_mutex_unlock(&db->compaction_queue->lock);
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for %d flush threads to finish",

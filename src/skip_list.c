@@ -221,7 +221,7 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
     atomic_init(&new_list->total_size, 0);
     atomic_init(&new_list->entry_count, 0);
 
-    /* create sentinel nodes with no keys - they are identified by the sentinel flag */
+    /* create sentinel nodes with no keys -- they are identified by the sentinel flag */
     skip_list_node_t *header = skip_list_create_sentinel(max_level);
     skip_list_node_t *tail = skip_list_create_sentinel(max_level);
 
@@ -246,14 +246,45 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
     return 0;
 }
 
+/* fast thread-local RNG for skip list level selection
+ * uses xorshift64* algorithm */
+static inline uint64_t skip_list_xorshift64star(uint64_t *state)
+{
+    uint64_t x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
 int skip_list_random_level(skip_list_t *list)
 {
     if (list == NULL) return -1;
-    int level = 0;
-    while ((rand() / (float)RAND_MAX) < list->probability && level < list->max_level)
+
+    /* thread-local RNG state */
+    static _Thread_local uint64_t rng_state = 0;
+    if (rng_state == 0)
     {
+        /* initialize with thread ID + timestamp for uniqueness */
+        rng_state = (uint64_t)TDB_THREAD_ID() ^ (uint64_t)time(NULL);
+    }
+
+    /* convert probability to threshold for fast comparison
+     * probability range is (0.0, 1.0), we scale to [0, UINT64_MAX] */
+    uint64_t threshold = (uint64_t)(list->probability * (double)UINT64_MAX);
+
+    int level = 0;
+    uint64_t rnd;
+
+    /* keep generating levels while random value < threshold */
+    while (level < list->max_level)
+    {
+        rnd = skip_list_xorshift64star(&rng_state);
+        if (rnd >= threshold) break;
         level++;
     }
+
     return level;
 }
 
@@ -273,190 +304,6 @@ int skip_list_check_and_update_ttl(skip_list_t *list, skip_list_node_t *node)
     {
         return 1;
     }
-    return 0;
-}
-
-int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const uint8_t *value,
-                  size_t value_size, time_t ttl)
-{
-    if (list == NULL || key == NULL || key_size == 0 || value == NULL) return -1;
-
-    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
-    skip_list_node_t **update = malloc((list->max_level + 1) * sizeof(skip_list_node_t *));
-    if (!update) return -1;
-
-    /* initialize all update entries to header to handle concurrent level increases */
-    for (int i = 0; i <= list->max_level; i++)
-    {
-        update[i] = header;
-    }
-
-    skip_list_node_t *current = header;
-
-    for (int i = atomic_load_explicit(&list->level, memory_order_acquire); i >= 0; i--)
-    {
-        skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
-        while (next != NULL && !NODE_IS_SENTINEL(next))
-        {
-            int cmp = skip_list_compare_keys(list, next->key, next->key_size, key, key_size);
-            if (cmp >= 0) break;
-            current = next;
-            next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
-        }
-        update[i] = current;
-    }
-
-    skip_list_node_t *existing = atomic_load_explicit(&current->forward[0], memory_order_acquire);
-    if (existing != NULL && !NODE_IS_SENTINEL(existing))
-    {
-        int cmp = skip_list_compare_keys(list, existing->key, existing->key_size, key, key_size);
-        if (cmp == 0)
-        {
-            skip_list_version_t *new_version =
-                skip_list_create_version(value, value_size, ttl, 0, 0);
-            if (new_version == NULL)
-            {
-                free(update);
-                return -1;
-            }
-
-            skip_list_version_t *old_head;
-            do
-            {
-                old_head = atomic_load_explicit(&existing->versions, memory_order_acquire);
-                atomic_store_explicit(&new_version->next, old_head, memory_order_relaxed);
-            } while (!atomic_compare_exchange_weak_explicit(&existing->versions, &old_head,
-                                                            new_version, memory_order_release,
-                                                            memory_order_acquire));
-            /* update total_size: subtract old version size, add new version size
-             * this keeps total_size reflecting current data, not version history */
-            if (old_head && old_head->value_size > 0)
-            {
-                atomic_fetch_sub_explicit(&list->total_size, old_head->value_size,
-                                          memory_order_relaxed);
-            }
-            atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
-            free(update);
-            return 0;
-        }
-    }
-
-    int new_level = skip_list_random_level(list);
-    int current_level = atomic_load_explicit(&list->level, memory_order_acquire);
-
-    if (new_level > current_level)
-    {
-        for (int i = current_level + 1; i <= new_level; i++)
-        {
-            update[i] = header;
-        }
-        atomic_store_explicit(&list->level, new_level, memory_order_release);
-    }
-
-    skip_list_node_t *new_node =
-        skip_list_create_node(new_level, key, key_size, value, value_size, ttl, 0);
-    if (new_node == NULL)
-    {
-        free(update);
-        return -1;
-    }
-
-    /* track if we detected a duplicate during insertion */
-    int is_duplicate = 0;
-
-    for (int i = 0; i <= new_level; i++)
-    {
-        skip_list_node_t *next;
-        do
-        {
-            next = atomic_load_explicit(&update[i]->forward[i], memory_order_acquire);
-            atomic_store_explicit(&new_node->forward[i], next, memory_order_relaxed);
-        } while (!atomic_compare_exchange_weak_explicit(
-            &update[i]->forward[i], &next, new_node, memory_order_release, memory_order_acquire));
-
-        /* immediately after level 0 insertion, check if another thread inserted same key
-         * this is the earliest point we can detect the race condition */
-        if (i == 0 && next != NULL && !NODE_IS_SENTINEL(next))
-        {
-            int cmp = skip_list_compare_keys(list, next->key, next->key_size, key, key_size);
-            if (cmp == 0)
-            {
-                /* we lost the race! another thread inserted this key first
-                 * our node is now a duplicate, don't count it */
-                is_duplicate = 1;
-            }
-        }
-    }
-
-    /* after successful insertion, set new node's backward pointers */
-    for (int i = 0; i <= new_level; i++)
-    {
-        /* set new node's backward pointer to predecessor */
-        atomic_store_explicit(&BACKWARD_PTR(new_node, i, new_level), update[i],
-                              memory_order_release);
-
-        /* try to update successor's backward pointer using CAS */
-        skip_list_node_t *next = atomic_load_explicit(&new_node->forward[i], memory_order_acquire);
-        if (next != NULL && !NODE_IS_SENTINEL(next))
-        {
-            /* try to CAS the successor's backward pointer from update[i] to new_node */
-            skip_list_node_t *expected = update[i];
-            atomic_compare_exchange_strong_explicit(&BACKWARD_PTR(next, i, next->level), &expected,
-                                                    new_node, memory_order_release,
-                                                    memory_order_acquire);
-            /* if CAS fails, another thread updated it, which is fine */
-        }
-    }
-
-    size_t node_size = sizeof(skip_list_node_t) + key_size + value_size;
-    atomic_fetch_add(&list->total_size, node_size);
-
-    /* only increment entry count if this is a unique key
-     * duplicates were detected during the insertion loop above */
-    if (!is_duplicate)
-    {
-        atomic_fetch_add(&list->entry_count, 1);
-    }
-
-    free(update);
-    return 0;
-}
-
-int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size)
-{
-    if (list == NULL || key == NULL || key_size == 0) return -1;
-
-    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
-    skip_list_node_t *current = header;
-
-    for (int i = atomic_load_explicit(&list->level, memory_order_acquire); i >= 0; i--)
-    {
-        skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
-        while (next != NULL && !NODE_IS_SENTINEL(next))
-        {
-            int cmp = skip_list_compare_keys(list, next->key, next->key_size, key, key_size);
-            if (cmp >= 0) break;
-            current = next;
-            next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
-        }
-    }
-
-    skip_list_node_t *target = atomic_load_explicit(&current->forward[0], memory_order_acquire);
-    if (target == NULL || NODE_IS_SENTINEL(target)) return 0;
-
-    int cmp = skip_list_compare_keys(list, target->key, target->key_size, key, key_size);
-    if (cmp != 0) return 0;
-
-    skip_list_version_t *tombstone = skip_list_create_version(NULL, 0, -1, 1, 0);
-    if (tombstone == NULL) return -1;
-
-    skip_list_version_t *old_head;
-    do
-    {
-        old_head = atomic_load_explicit(&target->versions, memory_order_acquire);
-        atomic_store_explicit(&tombstone->next, old_head, memory_order_relaxed);
-    } while (!atomic_compare_exchange_weak_explicit(&target->versions, &old_head, tombstone,
-                                                    memory_order_release, memory_order_acquire));
     return 0;
 }
 
@@ -522,6 +369,69 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
         *value = NULL;
         *value_size = 0;
     }
+    return 0;
+}
+
+int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size, uint64_t seq)
+{
+    if (list == NULL || key == NULL || key_size == 0) return -1;
+
+    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
+    skip_list_node_t *current = header;
+
+    for (int i = atomic_load_explicit(&list->level, memory_order_acquire); i >= 0; i--)
+    {
+        skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        while (next != NULL && !NODE_IS_SENTINEL(next))
+        {
+            int cmp = skip_list_compare_keys(list, next->key, next->key_size, key, key_size);
+            if (cmp >= 0) break;
+            current = next;
+            next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        }
+    }
+
+    skip_list_node_t *target = atomic_load_explicit(&current->forward[0], memory_order_acquire);
+    if (target == NULL || NODE_IS_SENTINEL(target)) return 0;
+
+    int cmp = skip_list_compare_keys(list, target->key, target->key_size, key, key_size);
+    if (cmp != 0) return 0;
+
+    /* check if the sequence number is greater than the latest version */
+    skip_list_version_t *latest = atomic_load_explicit(&target->versions, memory_order_acquire);
+    if (latest != NULL)
+    {
+        uint64_t latest_seq = atomic_load_explicit(&latest->seq, memory_order_acquire);
+        if (seq <= latest_seq)
+        {
+            /* reject: sequence number must be strictly greater than existing versions */
+            return -1;
+        }
+    }
+
+    skip_list_version_t *tombstone = skip_list_create_version(NULL, 0, -1, 1, seq);
+    if (tombstone == NULL) return -1;
+
+    skip_list_version_t *old_head;
+    do
+    {
+        old_head = atomic_load_explicit(&target->versions, memory_order_acquire);
+
+        /* re-check sequence number in case another thread added a newer version */
+        if (old_head != NULL)
+        {
+            uint64_t old_seq = atomic_load_explicit(&old_head->seq, memory_order_acquire);
+            if (seq <= old_seq)
+            {
+                /* another thread added a newer version, reject */
+                skip_list_free_version(tombstone);
+                return -1;
+            }
+        }
+
+        atomic_store_explicit(&tombstone->next, old_head, memory_order_relaxed);
+    } while (!atomic_compare_exchange_weak_explicit(&target->versions, &old_head, tombstone,
+                                                    memory_order_release, memory_order_acquire));
     return 0;
 }
 
@@ -682,6 +592,16 @@ int skip_list_cursor_next(skip_list_cursor_t *cursor)
 
     cursor->current = atomic_load_explicit(&cursor->current->forward[0], memory_order_acquire);
     if (cursor->current == NULL || cursor->current == tail) return -1;
+
+    /* prefetch next node to hide memory latency during iteration */
+    skip_list_node_t *next =
+        atomic_load_explicit(&cursor->current->forward[0], memory_order_relaxed);
+    if (next && !NODE_IS_SENTINEL(next))
+    {
+        PREFETCH_READ(next);
+        PREFETCH_READ(next->key);
+    }
+
     return 0;
 }
 
@@ -843,6 +763,18 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor)
     return 0;
 }
 
+/**
+ * skip_list_cursor_seek
+ * positions cursor at the node before the first key >= target
+ * @param cursor the cursor to position
+ * @param key the target key to seek to
+ * @param key_size size of the target key
+ * @return 0 on success, -1 on failure
+ *
+ * after calling this function, cursor->current points to the predecessor node.
+ * callers must call skip_list_cursor_next() or similar to access the actual target key.
+ * this behavior allows efficient insertion and supports both exact matches and range queries.
+ */
 int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size)
 {
     if (cursor == NULL || key == NULL || key_size == 0) return -1;
@@ -864,7 +796,8 @@ int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t
         }
     }
 
-    /* position cursor at the node before target (original behavior) */
+    /* position cursor at the node before target
+     * caller must call skip_list_cursor_next() to access first key >= target */
     cursor->current = current;
     return 0;
 }
@@ -939,7 +872,95 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
         int cmp = skip_list_compare_keys(list, existing->key, existing->key_size, key, key_size);
         if (cmp == 0)
         {
-            /* key exists, we add new version to version chain */
+            /* key exists, check if sequence number is greater than latest version */
+            skip_list_version_t *latest =
+                atomic_load_explicit(&existing->versions, memory_order_acquire);
+            if (latest != NULL)
+            {
+                uint64_t latest_seq = atomic_load_explicit(&latest->seq, memory_order_acquire);
+                if (seq <= latest_seq)
+                {
+                    /* reject: sequence number must be strictly greater than existing versions */
+                    free(update);
+                    return -1;
+                }
+            }
+
+            /* add new version to version chain */
+            uint8_t flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
+            skip_list_version_t *new_version =
+                skip_list_create_version(value, value_size, ttl, flags, seq);
+            if (new_version == NULL)
+            {
+                free(update);
+                return -1;
+            }
+
+            /* CAS loop to insert new version at head of version chain */
+            skip_list_version_t *old_head =
+                atomic_load_explicit(&existing->versions, memory_order_acquire);
+
+            while (1)
+            {
+                /* we check sequence number -- must be greater than current head */
+                if (old_head != NULL)
+                {
+                    uint64_t old_seq = atomic_load_explicit(&old_head->seq, memory_order_acquire);
+                    if (seq <= old_seq)
+                    {
+                        /* another thread added a newer version, reject */
+                        skip_list_free_version(new_version);
+                        free(update);
+                        return -1;
+                    }
+                }
+
+                /* link new version to current head -- must be done on each iteration */
+                atomic_store_explicit(&new_version->next, old_head, memory_order_relaxed);
+
+                /* try to CAS -- if it fails, old_head is updated to current value */
+                if (atomic_compare_exchange_weak_explicit(&existing->versions, &old_head,
+                                                          new_version, memory_order_release,
+                                                          memory_order_acquire))
+                {
+                    break; /* success */
+                }
+                /* CAS failed -- old_head now contains the updated value, loop again */
+            }
+            /* update total_size: subtract old version size, add new version size
+             * this keeps total_size reflecting current data, not version history */
+            if (old_head && old_head->value_size > 0)
+            {
+                atomic_fetch_sub_explicit(&list->total_size, old_head->value_size,
+                                          memory_order_relaxed);
+            }
+            atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
+            free(update);
+            return 0; /* updated existing key, no entry_count change */
+        }
+    }
+
+    /* we re-check if key was inserted by another thread while we were preparing */
+    skip_list_node_t *recheck = atomic_load_explicit(&update[0]->forward[0], memory_order_acquire);
+    if (recheck != NULL && !NODE_IS_SENTINEL(recheck))
+    {
+        int cmp = skip_list_compare_keys(list, recheck->key, recheck->key_size, key, key_size);
+        if (cmp == 0)
+        {
+            /* another thread inserted this key! Check sequence number and add version */
+            skip_list_version_t *latest =
+                atomic_load_explicit(&recheck->versions, memory_order_acquire);
+            if (latest != NULL)
+            {
+                uint64_t latest_seq = atomic_load_explicit(&latest->seq, memory_order_acquire);
+                if (seq <= latest_seq)
+                {
+                    /* reject: sequence number must be strictly greater than existing versions */
+                    free(update);
+                    return -1;
+                }
+            }
+
             uint8_t flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
             skip_list_version_t *new_version =
                 skip_list_create_version(value, value_size, ttl, flags, seq);
@@ -952,13 +973,26 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
             skip_list_version_t *old_head;
             do
             {
-                old_head = atomic_load_explicit(&existing->versions, memory_order_acquire);
+                old_head = atomic_load_explicit(&recheck->versions, memory_order_acquire);
+
+                /* re-check sequence number in case another thread added a newer version */
+                if (old_head != NULL)
+                {
+                    uint64_t old_seq = atomic_load_explicit(&old_head->seq, memory_order_acquire);
+                    if (seq <= old_seq)
+                    {
+                        /* another thread added a newer version, reject */
+                        skip_list_free_version(new_version);
+                        free(update);
+                        return -1;
+                    }
+                }
+
                 atomic_store_explicit(&new_version->next, old_head, memory_order_relaxed);
-            } while (!atomic_compare_exchange_weak_explicit(&existing->versions, &old_head,
+            } while (!atomic_compare_exchange_weak_explicit(&recheck->versions, &old_head,
                                                             new_version, memory_order_release,
                                                             memory_order_acquire));
-            /* update total_size: subtract old version size, add new version size
-             * this keeps total_size reflecting current data, not version history */
+
             if (old_head && old_head->value_size > 0)
             {
                 atomic_fetch_sub_explicit(&list->total_size, old_head->value_size,
@@ -966,7 +1000,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
             }
             atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
             free(update);
-            return 0; /* updated existing key, no entry_count change */
+            return 0;
         }
     }
 
@@ -1022,11 +1056,175 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
         atomic_init(&BACKWARD_PTR(new_node, i, new_level), NULL);
     }
 
-    /* track if we detected a duplicate during insertion */
-    int is_duplicate = 0;
+    /* we inster at level 0 first with duplicate check in CAS loop */
+    skip_list_node_t *pred = update[0];
+    skip_list_node_t *next_at_0;
+    int cas_attempts = 0;
 
-    /* link node into skip list using CAS for lock-free insertion */
-    for (int i = 0; i <= new_level; i++)
+    while (1)
+    {
+        /* we load the next node from our current predecessor */
+        next_at_0 = atomic_load_explicit(&pred->forward[0], memory_order_acquire);
+
+        /* we check if the key already exists at this position */
+        if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0))
+        {
+            int cmp =
+                skip_list_compare_keys(list, next_at_0->key, next_at_0->key_size, key, key_size);
+            if (cmp == 0)
+            {
+                /* key exists, add version instead of creating new node */
+                skip_list_version_t *latest =
+                    atomic_load_explicit(&next_at_0->versions, memory_order_acquire);
+                if (latest != NULL)
+                {
+                    uint64_t latest_seq = atomic_load_explicit(&latest->seq, memory_order_acquire);
+                    if (seq <= latest_seq)
+                    {
+                        skip_list_free_node(new_node);
+                        free(update);
+                        return -1;
+                    }
+                }
+
+                uint8_t version_flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
+                skip_list_version_t *new_version =
+                    skip_list_create_version(value, value_size, ttl, version_flags, seq);
+                if (new_version != NULL)
+                {
+                    skip_list_version_t *old_head;
+                    do
+                    {
+                        old_head = atomic_load_explicit(&next_at_0->versions, memory_order_acquire);
+                        if (old_head != NULL)
+                        {
+                            uint64_t old_seq =
+                                atomic_load_explicit(&old_head->seq, memory_order_acquire);
+                            if (seq <= old_seq)
+                            {
+                                skip_list_free_version(new_version);
+                                skip_list_free_node(new_node);
+                                free(update);
+                                return -1;
+                            }
+                        }
+                        atomic_store_explicit(&new_version->next, old_head, memory_order_relaxed);
+                    } while (!atomic_compare_exchange_weak_explicit(
+                        &next_at_0->versions, &old_head, new_version, memory_order_release,
+                        memory_order_acquire));
+
+                    if (old_head && old_head->value_size > 0)
+                    {
+                        atomic_fetch_sub_explicit(&list->total_size, old_head->value_size,
+                                                  memory_order_relaxed);
+                    }
+                    atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
+                }
+
+                skip_list_free_node(new_node);
+                free(update);
+                return 0;
+            }
+            else if (cmp < 0)
+            {
+                /* next_at_0 < key, need to advance pred forward */
+                pred = next_at_0;
+                continue; /* retry with new pred */
+            }
+            /* else cmp > 0: next_at_0 > key, correct insertion point */
+        }
+
+        /* try to insert: pred -> new_node -> next_at_0 */
+        atomic_store_explicit(&new_node->forward[0], next_at_0, memory_order_relaxed);
+
+        if (atomic_compare_exchange_weak_explicit(&pred->forward[0], &next_at_0, new_node,
+                                                  memory_order_release, memory_order_acquire))
+        {
+            /* success! Update the update[] array for higher level insertions */
+            update[0] = pred;
+            break;
+        }
+
+        /* CAS failed -- next_at_0 now contains the current value of pred->forward[0]
+         * Check if a node was inserted that matches our key */
+        if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0))
+        {
+            int cmp =
+                skip_list_compare_keys(list, next_at_0->key, next_at_0->key_size, key, key_size);
+            if (cmp == 0)
+            {
+                /* another thread just inserted our key, add version to it */
+                skip_list_version_t *latest =
+                    atomic_load_explicit(&next_at_0->versions, memory_order_acquire);
+                if (latest != NULL)
+                {
+                    uint64_t latest_seq = atomic_load_explicit(&latest->seq, memory_order_acquire);
+                    if (seq <= latest_seq)
+                    {
+                        skip_list_free_node(new_node);
+                        free(update);
+                        return -1;
+                    }
+                }
+
+                uint8_t version_flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
+                skip_list_version_t *new_version =
+                    skip_list_create_version(value, value_size, ttl, version_flags, seq);
+                if (new_version != NULL)
+                {
+                    skip_list_version_t *old_head;
+                    do
+                    {
+                        old_head = atomic_load_explicit(&next_at_0->versions, memory_order_acquire);
+                        if (old_head != NULL)
+                        {
+                            uint64_t old_seq =
+                                atomic_load_explicit(&old_head->seq, memory_order_acquire);
+                            if (seq <= old_seq)
+                            {
+                                skip_list_free_version(new_version);
+                                skip_list_free_node(new_node);
+                                free(update);
+                                return -1;
+                            }
+                        }
+                        atomic_store_explicit(&new_version->next, old_head, memory_order_relaxed);
+                    } while (!atomic_compare_exchange_weak_explicit(
+                        &next_at_0->versions, &old_head, new_version, memory_order_release,
+                        memory_order_acquire));
+
+                    if (old_head && old_head->value_size > 0)
+                    {
+                        atomic_fetch_sub_explicit(&list->total_size, old_head->value_size,
+                                                  memory_order_relaxed);
+                    }
+                    atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
+                }
+
+                skip_list_free_node(new_node);
+                free(update);
+                return 0;
+            }
+            else if (cmp < 0)
+            {
+                /* next_at_0 < key, advance pred */
+                pred = next_at_0;
+            }
+            /* else cmp > 0: next_at_0 > key, retry CAS with same pred */
+        }
+
+        /* retry CAS */
+        cas_attempts++;
+        if (cas_attempts > 1000)
+        {
+            skip_list_free_node(new_node);
+            free(update);
+            return -1;
+        }
+    }
+
+    /* successfully inserted at level 0, now insert at higher levels */
+    for (int i = 1; i <= new_level; i++)
     {
         skip_list_node_t *next;
         do
@@ -1035,21 +1233,10 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
             atomic_store_explicit(&new_node->forward[i], next, memory_order_relaxed);
         } while (!atomic_compare_exchange_weak_explicit(
             &update[i]->forward[i], &next, new_node, memory_order_release, memory_order_acquire));
-
-        /* immediately after level 0 insertion, check if another thread inserted same key
-         * this is the earliest point we can detect the race condition */
-        if (i == 0 && next != NULL && !NODE_IS_SENTINEL(next))
-        {
-            int cmp = skip_list_compare_keys(list, next->key, next->key_size, key, key_size);
-            if (cmp == 0)
-            {
-                /* we lost the race! another thread inserted this key first
-                 * our node is now a duplicate, don't count it */
-                is_duplicate = 1;
-            }
-        }
     }
 
+    /* the re-check before insertion should have caught any duplicates
+     * if we reach here, we have a unique key -- complete normal insertion */
     /* set backward pointers after successful forward linking */
     for (int i = 0; i <= new_level; i++)
     {
@@ -1067,13 +1254,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     }
 
     atomic_fetch_add_explicit(&list->total_size, key_size + value_size, memory_order_relaxed);
-
-    /* only increment entry count if this is a unique key
-     * duplicates were detected during the insertion loop above */
-    if (!is_duplicate)
-    {
-        atomic_fetch_add_explicit(&list->entry_count, 1, memory_order_relaxed);
-    }
+    atomic_fetch_add_explicit(&list->entry_count, 1, memory_order_relaxed);
 
     free(update);
     return 0;
@@ -1081,7 +1262,8 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
 
 int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
                            size_t *value_size, time_t *ttl, uint8_t *deleted, uint64_t *seq,
-                           uint64_t snapshot_seq)
+                           uint64_t snapshot_seq, skip_list_visibility_check_fn visibility_check,
+                           void *visibility_ctx)
 {
     if (list == NULL || key == NULL || key_size == 0 || value == NULL || value_size == NULL)
         return -1;
@@ -1118,16 +1300,34 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     }
     else
     {
-        /* find version with seq <= snapshot_seq (snapshot isolation)
-         * snapshot_seq is commit_seq which represents the maximum committed sequence
-         * visible data has seq <= snapshot_seq (less than or equal) */
+        /**
+         * find the NEWEST committed version with seq <= snapshot_seq.
+         * version chain is ordered newest-to-oldest, so we return the first
+         * version that passes both checks. */
         while (version != NULL)
         {
             uint64_t version_seq = atomic_load_explicit(&version->seq, memory_order_acquire);
+
+            /* we check if version is within snapshot range */
             if (version_seq <= snapshot_seq)
             {
-                break;
+                /* if visibility check provided, verify this version is committed */
+                if (visibility_check != NULL)
+                {
+                    if (visibility_check(visibility_ctx, version_seq))
+                    {
+                        /* found the newest committed version within snapshot -- use it */
+                        break;
+                    }
+                    /* this version is not committed yet -- check older versions */
+                }
+                else
+                {
+                    /* no visibility check -- assume committed (for recovery, etc.) */
+                    break;
+                }
             }
+            /* nersion is too new or not committed -- check next (older) version */
             version = atomic_load_explicit(&version->next, memory_order_acquire);
         }
 

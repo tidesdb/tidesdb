@@ -56,11 +56,11 @@
     do                                                                \
     {                                                                 \
         printf("\n");                                                 \
-        printf("=======================================\n");          \
+        printf("*=======================================*\n");        \
         printf("Test Results:\n");                                    \
         printf("  " BOLDGREEN "PASSED: %d" RESET "\n", tests_passed); \
         printf("  " BOLDRED "FAILED: %d" RESET "\n", tests_failed);   \
-        printf("=======================================\n");          \
+        printf("*=======================================*\n");        \
     } while (0)
 
 #define REMOVE_DIR_RETRY_COUNT 5

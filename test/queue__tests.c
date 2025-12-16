@@ -689,6 +689,12 @@ int main(void)
     RUN_TEST(test_queue_null_handling, tests_passed);
     RUN_TEST(test_queue_peek_at, tests_passed);
     RUN_TEST(test_queue_free_with_waiting_threads, tests_passed);
+    RUN_TEST(test_queue_node_pool, tests_passed);
+    RUN_TEST(test_queue_multiple_waiters, tests_passed);
+    RUN_TEST(test_queue_enqueue_null_data, tests_passed);
+    RUN_TEST(test_queue_is_empty, tests_passed);
+    RUN_TEST(test_queue_peek_at_boundary, tests_passed);
+    RUN_TEST(test_queue_foreach_empty, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

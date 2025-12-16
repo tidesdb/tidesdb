@@ -384,7 +384,7 @@ jobs:
               tidesdb_config_t cfg = tidesdb_default_config();
               cfg.db_path = "./testdb";
               cfg.num_flush_threads = 1;
-              cfg.enable_debug_logging = 1;
+              cfg.log_level = TDB_LOG_DEBUG;
               cfg.num_compaction_threads = 1;
               if (tidesdb_open(&cfg, &db) != 0) return 1;
 
@@ -603,7 +603,7 @@ jobs:
               tidesdb_t *db;
               tidesdb_config_t cfg = tidesdb_default_config();
               cfg.db_path = "../testdb";
-              cfg.enable_debug_logging = 1;
+              cfg.log_level = TDB_LOG_DEBUG;
               cfg.num_flush_threads = 1;
               cfg.num_compaction_threads = 1;
               if (tidesdb_open(&cfg, &db) != 0) { fprintf(stderr, "Failed to open\n"); return 1; }

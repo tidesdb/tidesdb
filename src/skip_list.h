@@ -247,20 +247,6 @@ int skip_list_compare_keys(skip_list_t *list, const uint8_t *key1, size_t key1_s
                            const uint8_t *key2, size_t key2_size);
 
 /**
- * skip_list_put
- * inserts or updates a key-value pair
- * @param list skip list
- * @param key key data
- * @param key_size size of key
- * @param value value data
- * @param value_size size of value
- * @param ttl time-to-live (0 for no expiration)
- * @return 0 on success, -1 on failure
- */
-int skip_list_put(skip_list_t *list, const uint8_t *key, size_t key_size, const uint8_t *value,
-                  size_t value_size, time_t ttl);
-
-/**
  * skip_list_put_with_seq
  * inserts or updates a key-value pair with a specific sequence number
  * @param list skip list
@@ -279,13 +265,14 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
 
 /**
  * skip_list_delete
- * deletes a key (creates tombstone)
+ * deletes a key (creates tombstone) with a specific sequence number
  * @param list skip list
  * @param key key data
  * @param key_size size of key
- * @return 0 on success, -1 on failure
+ * @param seq sequence number for the deletion (must be greater than existing versions)
+ * @return 0 on success, -1 on failure (including if seq <= existing version seq)
  */
-int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size);
+int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size, uint64_t seq);
 
 /**
  * skip_list_get
@@ -303,6 +290,15 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
                   size_t *value_size, time_t *ttl, uint8_t *deleted);
 
 /**
+ * skip_list_visibility_check_fn
+ * Callback function to check if a sequence is visible
+ * @param opaque_ctx opaque context pointer (e.g., commit_status)
+ * @param seq sequence number to check
+ * @return 1 if visible, 0 if not
+ */
+typedef int (*skip_list_visibility_check_fn)(void *opaque_ctx, uint64_t seq);
+
+/**
  * skip_list_get_with_seq
  * retrieves a value by key with sequence number for MVCC snapshot reads
  * @param list skip list
@@ -314,11 +310,14 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
  * @param deleted pointer to deleted flag
  * @param seq pointer to sequence number (output)
  * @param snapshot_seq snapshot sequence number (0 = latest, >0 = read version <= snapshot_seq)
+ * @param visibility_check callback to check if a sequence is committed (NULL = skip check)
+ * @param visibility_ctx context for visibility check callback
  * @return 0 on success, -1 on failure
  */
 int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
                            size_t *value_size, time_t *ttl, uint8_t *deleted, uint64_t *seq,
-                           uint64_t snapshot_seq);
+                           uint64_t snapshot_seq, skip_list_visibility_check_fn visibility_check,
+                           void *visibility_ctx);
 
 /**
  * skip_list_cursor_init
@@ -434,11 +433,15 @@ int skip_list_cursor_goto_first(skip_list_cursor_t *cursor);
 
 /**
  * skip_list_cursor_seek
- * seeks cursor to first key >= target
- * @param cursor cursor
+ * positions cursor at the node before the first key >= target
+ * @param cursor cursor to position
  * @param key target key
  * @param key_size size of target key
  * @return 0 on success, -1 on failure
+ *
+ * after calling this function, cursor->current points to the predecessor node.
+ * callers must call skip_list_cursor_next() to access the actual first key >= target.
+ * this behavior allows efficient insertion and supports both exact matches and range queries.
  */
 int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size);
 

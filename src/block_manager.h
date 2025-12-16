@@ -29,7 +29,7 @@
 #define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF
 
 /* block manager version */
-#define BLOCK_MANAGER_VERSION 5
+#define BLOCK_MANAGER_VERSION 6
 
 /* header field sizes */
 /* magic number size in bytes */
@@ -41,24 +41,36 @@
 /* padding field size in bytes */
 #define BLOCK_MANAGER_PADDING_SIZE 4
 
-#define BLOCK_MANAGER_HEADER_SIZE 12
+#define BLOCK_MANAGER_HEADER_SIZE 8
 
 /* block field sizes */
-/* block size field (uint64_t) */
-#define BLOCK_MANAGER_SIZE_FIELD_SIZE 8
-/* xxHash64 = 8 bytes */
-#define BLOCK_MANAGER_CHECKSUM_LENGTH 8
+/* block size field (uint32_t) -- supports blocks up to 4GB */
+#define BLOCK_MANAGER_SIZE_FIELD_SIZE 4
+/* xxHash32 = 4 bytes (sufficient for block-level checksums) */
+#define BLOCK_MANAGER_CHECKSUM_LENGTH 4
 
-/* overflow offset field (uint64_t) */
-#define BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE 8
-#define BLOCK_MANAGER_BLOCK_HEADER_SIZE                              \
-    (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH + \
-     BLOCK_MANAGER_OVERFLOW_OFFSET_SIZE)
-#define MAX_INLINE_BLOCK_SIZE (32 * 1024)
+/* block header is now just size + checksum (no overflow) */
+#define BLOCK_MANAGER_BLOCK_HEADER_SIZE \
+    (BLOCK_MANAGER_SIZE_FIELD_SIZE + BLOCK_MANAGER_CHECKSUM_LENGTH)
+
+/* block footer for fast validation: size + magic */
+#define BLOCK_MANAGER_FOOTER_MAGIC 0x42445442 /* "BTDB" reversed */
+#define BLOCK_MANAGER_FOOTER_SIZE  8          /* 4-byte size + 4-byte magic */
 /* extra bytes for headers in stack buffers */
 #define BLOCK_MANAGER_STACK_BUFFER_OVERHEAD 64
 /* default file permissions (rw-r--r--) */
 #define BLOCK_MANAGER_FILE_MODE 0644
+
+/* batch reading block metadata */
+#define BLOCK_MANAGER_BATCH_READ_META_SIZE 4096
+
+/* position cache sizing constants */
+/* average block size estimate for initial capacity calculation */
+#define BLOCK_MANAGER_AVG_BLOCK_SIZE_ESTIMATE 160
+/* buffer for position cache initial capacity */
+#define BLOCK_MANAGER_POSITION_CACHE_BUFFER 100
+/* minimum position cache capacity */
+#define BLOCK_MANAGER_MIN_POSITION_CACHE_CAPACITY 1000
 
 typedef enum
 {
@@ -73,7 +85,6 @@ typedef enum
  * @param fd the file descriptor the block manager is managing
  * @param file_path the path of the file
  * @param sync_mode sync mode for this block manager
- * @param block_size the default block size for this block manager
  * @param current_file_size track file size in memory to avoid syscalls
  */
 typedef struct
@@ -81,7 +92,6 @@ typedef struct
     int fd;
     char file_path[MAX_FILE_PATH_LENGTH];
     block_manager_sync_mode_t sync_mode;
-    uint32_t block_size;
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
 } block_manager_t;
@@ -108,24 +118,14 @@ typedef struct
  * @param bm the block manager
  * @param current_pos the current position of the cursor
  * @param current_block_size the size of the current block
- * @param position_cache array of block positions
- * @param size_cache array of block sizes
- * @param cache_capacity allocated capacity
- * @param cache_size number of cached positions
- * @param cache_index current index in cache (-1 if not using cache)
+ * @param block_index current index in shared position cache (-1 if before first block)
  */
 typedef struct
 {
     block_manager_t *bm;
     uint64_t current_pos;
     uint64_t current_block_size;
-
-    /* position cache for O(1) backward navigation */
-    uint64_t *position_cache;
-    uint64_t *size_cache;
-    int cache_capacity;
-    int cache_size;
-    int cache_index;
+    int block_index;
 } block_manager_cursor_t;
 
 /**
@@ -358,32 +358,50 @@ int block_manager_cursor_at_first(block_manager_cursor_t *cursor);
 int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
 
 /**
- * block_manager_cursor_build_cache
- * builds a position cache for fast seeks when block index is enabled
- * @param cursor the cursor to build cache for
- * @param end_offset the end offset to cache up to
- * @return 0 if successful, -1 if not
- */
-int block_manager_cursor_build_cache(block_manager_cursor_t *cursor, uint64_t end_offset);
-
-/**
  * block_manager_validate_last_block
  * validates the integrity of the last block in a block manager file
- * returns 0 if the last block is valid, -1 if validation fails
+ * @param bm the block manager
+ * @param strict if 1, reject any corruption (for SSTables); if 0, truncate to last valid block (for
+ * WAL)
+ * @return 0 if valid or successfully recovered, -1 if validation fails
  *
- *** if the validation fails, the file is truncated to the last valid block.
+ * In strict mode -- any corruption returns -1, file is not modified
+ * In permissive mode -- truncates to last valid block on corruption
  */
-int block_manager_validate_last_block(block_manager_t *bm);
+int block_manager_validate_last_block(block_manager_t *bm, int strict);
 
 /**
  * convert_sync_mode
  * converts TidesDB sync mode enum values to block manager sync mode enum values
- * This function provides compatibility between the public TidesDB API (which uses
+ * this method provides compatibility between the public TidesDB API (which uses
  * TDB_SYNC_NONE/TDB_SYNC_FULL) and the internal block manager API (which uses
  * BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_TDB_SYNC_FULL)
  * @param tdb_sync_mode the TidesDB sync mode (TDB_SYNC_NONE=0, TDB_SYNC_FULL=1)
  * @return the corresponding block manager sync mode enum value
  */
 block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode);
+
+/**
+ * block_manager_get_block_size_at_offset
+ * reads the size of a block at a specific file offset
+ * useful for determining allocation size before reading block data
+ * @param bm the block manager to read from
+ * @param offset the file offset of the block (start of block header)
+ * @param size output parameter for block data size (not including header)
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_get_block_size_at_offset(block_manager_t *bm, uint64_t offset, uint32_t *size);
+
+/**
+ * block_manager_read_at_offset
+ * reads data at a specific file offset (not block-aligned)
+ * useful for reading values from vlog where offset points to data within a block
+ * @param bm the block manager to read from
+ * @param offset the file offset to read from (absolute position in file)
+ * @param size the number of bytes to read
+ * @param data output buffer (caller must allocate)
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_read_at_offset(block_manager_t *bm, uint64_t offset, size_t size, uint8_t *data);
 
 #endif /* __BLOCK_MANAGER_H__ */

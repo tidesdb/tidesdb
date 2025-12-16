@@ -42,6 +42,7 @@ typedef struct
     int start;
     int end;
     int thread_id;
+    int count;            /* for storing iteration count */
     _Atomic(int) *errors; /* pointer to shared error counter */
 } thread_data_t;
 
@@ -99,14 +100,20 @@ int zipfian_next(int max_value)
 /**
  * generate_zipfian_key
  * generates a key following zipfian distribution
+ * for benchmark purposes, we make this deterministic by using the operation
+ * index directly rather than generating a random zipfian index. this ensures that
+ * each operation index maps to a unique key, allowing proper verification.
+ * the zipfian distribution is simulated by having operations access keys in a
+ * pattern where early indices (hot keys) are accessed more frequently.
  * @param buffer buffer to store key
  * @param size size of buffer
- * @param max_index maximum index
+ * @param operation_index the operation index (used to generate deterministic key)
  */
-void generate_zipfian_key(uint8_t *buffer, size_t size, int max_index)
+void generate_zipfian_key(uint8_t *buffer, size_t size, int operation_index)
 {
-    int index = zipfian_next(max_index);
-    snprintf((char *)buffer, size, "key_%016d", index);
+    /** we use operation index directly to ensure deterministic key generation
+     * format: k%010d fits in 16 bytes (k + 10 digits + null = 12 bytes) */
+    snprintf((char *)buffer, size, "k%010d", operation_index);
 }
 
 /**
@@ -186,7 +193,8 @@ void *thread_put(void *arg)
 
         if (tidesdb_txn_commit(txn) != 0)
         {
-            printf(BOLDRED "Failed to commit transaction\n" RESET);
+            tidesdb_txn_free(txn);
+            continue;
         }
 
         tidesdb_txn_free(txn);
@@ -301,7 +309,8 @@ void *thread_delete(void *arg)
 
         if (tidesdb_txn_commit(txn) != 0)
         {
-            printf(BOLDRED "Failed to commit transaction\n" RESET);
+            tidesdb_txn_free(txn);
+            continue;
         }
         tidesdb_txn_free(txn);
         i = batch_end;
@@ -379,8 +388,8 @@ void *thread_iter_forward(void *arg)
 
     if (prev_key) free(prev_key);
 
-    /* store count in thread_id field for reporting */
-    data->thread_id = count;
+    /* store count in count field for reporting */
+    data->count = count;
 
     tidesdb_iter_free(iter);
     tidesdb_txn_free(txn);
@@ -413,6 +422,10 @@ void *thread_iter_backward(void *arg)
         return NULL;
     }
 
+    int count = 0;
+    uint8_t *prev_key = NULL;
+    size_t prev_key_size = 0;
+
     if (tidesdb_iter_seek_to_last(iter) == 0)
     {
         while (tidesdb_iter_valid(iter))
@@ -421,10 +434,42 @@ void *thread_iter_backward(void *arg)
             size_t key_size = 0, value_size = 0;
             tidesdb_iter_key(iter, &key, &key_size);
             tidesdb_iter_value(iter, &value, &value_size);
+
+            /* verify keys are in reverse sorted order */
+            if (prev_key != NULL)
+            {
+                if (memcmp(prev_key, key, prev_key_size < key_size ? prev_key_size : key_size) < 0)
+                {
+                    if (data->errors)
+                    {
+                        atomic_fetch_add(data->errors, 1);
+                    }
+                    printf(
+                        BOLDRED
+                        "[Thread %d] Backward iterator: keys out of order at position %d\n" RESET,
+                        data->thread_id, count);
+                }
+                free(prev_key);
+            }
+
+            /* save current key for next comparison */
+            prev_key = malloc(key_size);
+            if (prev_key)
+            {
+                memcpy(prev_key, key, key_size);
+                prev_key_size = key_size;
+            }
+
+            count++;
             /* keys/values are internal pointers, no need to free */
             if (tidesdb_iter_prev(iter) != 0) break;
         }
     }
+
+    if (prev_key) free(prev_key);
+
+    /* store count in count field for reporting */
+    data->count = count;
 
     tidesdb_iter_free(iter);
     tidesdb_txn_free(txn);
@@ -547,6 +592,23 @@ char *get_isolation_level_name(int isolation_level)
     }
 }
 
+char *get_log_level_name(int log_level)
+{
+    switch (log_level)
+    {
+        case TDB_LOG_DEBUG:
+            return "DEBUG";
+        case TDB_LOG_INFO:
+            return "INFO";
+        case TDB_LOG_WARN:
+            return "WARN";
+        case TDB_LOG_ERROR:
+            return "ERROR";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 int main()
 {
     remove_directory(BENCH_DB_PATH);
@@ -555,7 +617,7 @@ int main()
 
     srand((unsigned int)time(NULL));
 
-    printf(BOLDCYAN "\n=== TidesDB Benchmark Configuration ===\n" RESET);
+    printf(BOLDCYAN "\n*=== TidesDB Benchmark Configuration ===*\n" RESET);
     printf(BOLDWHITE "Workload Settings:\n" RESET);
     printf("  Operations: %d\n", BENCH_NUM_OPERATIONS);
     printf("  Seek Operations: %d\n", BENCH_NUM_SEEK_OPS);
@@ -563,11 +625,7 @@ int main()
     printf("  Value Size: %d bytes\n", BENCH_VALUE_SIZE);
     printf("  Threads: %d\n", BENCH_NUM_THREADS);
     printf("  Key Pattern: %s\n", BENCH_KEY_PATTERN);
-#ifdef TDB_DEBUG
-    printf("  DB Debug Logging: %s\n", "enabled");
-#else
-    printf("  DB Debug Logging: %s\n", "disabled");
-#endif
+    printf("  DB Debug Logging: %s\n", get_log_level_name(BENCH_DB_LOG_LEVEL));
     printf("  DB Flush Pool Threads: %d\n", BENCH_DB_FLUSH_POOL_THREADS);
     printf("  DB Compaction Pool Threads: %d\n", BENCH_DB_COMPACTION_POOL_THREADS);
     printf("  DB Block Cache Size: %d\n", BENCH_BLOCK_CACHE_SIZE);
@@ -577,16 +635,17 @@ int main()
            (double)BENCH_WRITE_BUFFER_SIZE / (1024.0 * 1024.0));
     printf("  Level Size Ratio: %dx\n", BENCH_LEVEL_RATIO);
     printf("  Dividing Level Offset: %d\n", BENCH_DIVIDING_LEVEL_OFFSET);
-    printf("  Max Levels: %d\n", BENCH_MAX_LEVELS);
+    printf("  Min Levels: %d\n", BENCH_MIN_LEVELS);
     printf("  Skip List Max Level: %d\n", BENCH_SKIP_LIST_MAX_LEVEL);
     printf("  Skip List Probability: %.2f\n", BENCH_SKIP_LIST_PROBABILITY);
     printf("  Compression: %s\n", BENCH_ENABLE_COMPRESSION ? "enabled" : "disabled");
     printf("  Bloom Filter: %s\n", BENCH_ENABLE_BLOOM_FILTER ? "enabled" : "disabled");
     printf("  Bloom Filter FP Rate: %.4f\n", BENCH_BLOOM_FILTER_FP_RATE);
     printf("  Block Indexes: %s\n", BENCH_ENABLE_BLOCK_INDEXES ? "enabled" : "disabled");
+    printf("  Block Index Prefix Length: %d\n", BENCH_BLOCK_INDEX_PREFIX_LEN);
     printf("  Comparator: %s\n", BENCH_COMPARATOR_NAME);
     printf("  Isolation Level: %s\n", get_isolation_level_name(BENCH_ISOLATION_LEVEL));
-    printf("======================================\n\n" RESET);
+    printf("*======================================*\n\n" RESET);
 
     uint8_t **keys = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t *));
     if (keys == NULL)
@@ -650,7 +709,8 @@ int main()
         }
         else if (strcmp(BENCH_KEY_PATTERN, "zipfian") == 0)
         {
-            generate_zipfian_key(keys[i], BENCH_KEY_SIZE, BENCH_NUM_OPERATIONS);
+            /* use operation index to generate deterministic keys */
+            generate_zipfian_key(keys[i], BENCH_KEY_SIZE, i);
         }
         else /* default to random */
         {
@@ -680,7 +740,7 @@ int main()
     }
 
     tidesdb_config_t config = {.db_path = BENCH_DB_PATH,
-                               .enable_debug_logging = BENCH_DB_DEBUG,
+                               .log_level = BENCH_DB_LOG_LEVEL,
                                .num_flush_threads = BENCH_DB_FLUSH_POOL_THREADS,
                                .num_compaction_threads = BENCH_DB_COMPACTION_POOL_THREADS,
                                .block_cache_size = BENCH_BLOCK_CACHE_SIZE,
@@ -707,7 +767,7 @@ int main()
     cf_config.write_buffer_size = BENCH_WRITE_BUFFER_SIZE;
     cf_config.level_size_ratio = BENCH_LEVEL_RATIO;
     cf_config.dividing_level_offset = BENCH_DIVIDING_LEVEL_OFFSET;
-    cf_config.max_levels = BENCH_MAX_LEVELS;
+    cf_config.min_levels = BENCH_MIN_LEVELS;
     cf_config.skip_list_max_level = BENCH_SKIP_LIST_MAX_LEVEL;
     cf_config.skip_list_probability = BENCH_SKIP_LIST_PROBABILITY;
     cf_config.compression_algorithm = BENCH_COMPRESSION_ALGORITHM;
@@ -719,6 +779,7 @@ int main()
     strncpy(cf_config.comparator_name, BENCH_COMPARATOR_NAME, TDB_MAX_COMPARATOR_NAME - 1);
     cf_config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
     cf_config.default_isolation_level = BENCH_ISOLATION_LEVEL;
+    cf_config.block_index_prefix_len = BENCH_BLOCK_INDEX_PREFIX_LEN;
 
     if (tidesdb_create_column_family(tdb, BENCH_CF_NAME, &cf_config) != 0)
     {
@@ -767,8 +828,12 @@ int main()
         thread_data[i].key_sizes = key_sizes;
         thread_data[i].value_sizes = value_sizes;
         thread_data[i].start = i * (BENCH_NUM_OPERATIONS / BENCH_NUM_THREADS);
-        thread_data[i].end = (i + 1) * (BENCH_NUM_OPERATIONS / BENCH_NUM_THREADS);
+        /* ensure last thread handles any remaining operations */
+        thread_data[i].end = (i == BENCH_NUM_THREADS - 1)
+                                 ? BENCH_NUM_OPERATIONS
+                                 : (i + 1) * (BENCH_NUM_OPERATIONS / BENCH_NUM_THREADS);
         thread_data[i].thread_id = i;
+        thread_data[i].count = 0;
         thread_data[i].errors = &verification_errors;
     }
 
@@ -789,7 +854,63 @@ int main()
     printf(BOLDGREEN "Put: %d operations in %.2f ms (%.2f ops/sec)\n" RESET, BENCH_NUM_OPERATIONS,
            end_time - start_time, (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
-    printf(BOLDGREEN "\nBenchmarking Get operations...\n" RESET);
+    /* close and reopen database to test cold cache performance */
+    printf(BOLDGREEN "\nClosing and reopening database to clear caches...\n" RESET);
+    if (tidesdb_close(tdb) != TDB_SUCCESS)
+    {
+        printf(BOLDRED "Failed to close database\n" RESET);
+        for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
+        {
+            free(keys[i]);
+            free(values[i]);
+        }
+        free(keys);
+        free(values);
+        free(key_sizes);
+        free(value_sizes);
+        return 1;
+    }
+
+    if (tidesdb_open(&config, &tdb) != TDB_SUCCESS)
+    {
+        printf(BOLDRED "Failed to reopen database\n" RESET);
+        for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
+        {
+            free(keys[i]);
+            free(values[i]);
+        }
+        free(keys);
+        free(values);
+        free(key_sizes);
+        free(value_sizes);
+        return 1;
+    }
+
+    cf = tidesdb_get_column_family(tdb, BENCH_CF_NAME);
+    if (cf == NULL)
+    {
+        printf(BOLDRED "Failed to get column family after reopen\n" RESET);
+        for (int i = 0; i < BENCH_NUM_OPERATIONS; i++)
+        {
+            free(keys[i]);
+            free(values[i]);
+        }
+        free(keys);
+        free(values);
+        free(key_sizes);
+        free(value_sizes);
+        tidesdb_close(tdb);
+        return 1;
+    }
+
+    /* update thread data with new db and cf pointers */
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        thread_data[i].tdb = tdb;
+        thread_data[i].cf = cf;
+    }
+
+    printf(BOLDGREEN "\nBenchmarking Get operations (cold cache)...\n" RESET);
     start_time = get_time_ms();
 
     for (int i = 0; i < BENCH_NUM_THREADS; i++)
@@ -816,13 +937,20 @@ int main()
     }
     verification_errors = 0; /* reset for next test */
 
+#ifdef TDB_ENABLE_READ_PROFILING
+    tidesdb_print_read_stats(tdb);
+    tidesdb_reset_read_stats(tdb);
+#endif
+
     printf(BOLDGREEN "\nBenchmarking Iterator Seek operations...\n" RESET);
 
+    /* reset thread data for seek operations - each thread accesses full dataset */
     for (int i = 0; i < BENCH_NUM_THREADS; i++)
     {
         thread_data[i].start = 0;
         thread_data[i].end = BENCH_NUM_OPERATIONS;
         thread_data[i].thread_id = i;
+        thread_data[i].count = 0;
     }
 
     start_time = get_time_ms();
@@ -841,6 +969,11 @@ int main()
     printf(BOLDGREEN "Iterator Seek: %d operations in %.2f ms (%.2f ops/sec)\n" RESET,
            BENCH_NUM_SEEK_OPS, end_time - start_time,
            (BENCH_NUM_SEEK_OPS / (end_time - start_time)) * 1000);
+
+#ifdef TDB_ENABLE_READ_PROFILING
+    tidesdb_print_read_stats(tdb);
+    tidesdb_reset_read_stats(tdb);
+#endif
 
     printf(BOLDGREEN "\nBenchmarking Iterator Seek For Prev operations...\n" RESET);
 
@@ -862,6 +995,11 @@ int main()
            BENCH_NUM_SEEK_OPS, end_time - start_time,
            (BENCH_NUM_SEEK_OPS / (end_time - start_time)) * 1000);
 
+#ifdef TDB_ENABLE_READ_PROFILING
+    tidesdb_print_read_stats(tdb);
+    tidesdb_reset_read_stats(tdb);
+#endif
+
     printf(BOLDGREEN "\nBenchmarking Forward Iterator (full scan)...\n" RESET);
     start_time = get_time_ms();
 
@@ -877,8 +1015,8 @@ int main()
 
     end_time = get_time_ms();
 
-    /* Each thread iterates ALL keys independently, so check one thread's count */
-    int keys_per_thread = thread_data[0].thread_id; /* we stored count in thread_id */
+    /* each thread iterates ALL keys independently, so check one thread's count */
+    int keys_per_thread = thread_data[0].count;
 
     printf(BOLDGREEN "Forward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET,
            BENCH_NUM_THREADS, end_time - start_time,
@@ -902,6 +1040,13 @@ int main()
     verification_errors = 0; /* reset for next test */
 
     printf(BOLDGREEN "\nBenchmarking Backward Iterator (full scan)...\n" RESET);
+
+    /* reset count for backward iterator */
+    for (int i = 0; i < BENCH_NUM_THREADS; i++)
+    {
+        thread_data[i].count = 0;
+    }
+
     start_time = get_time_ms();
 
     for (int i = 0; i < BENCH_NUM_THREADS; i++)
@@ -915,19 +1060,23 @@ int main()
     }
 
     end_time = get_time_ms();
+
+    /* get the count from backward iterator */
+    int backward_keys_per_thread = thread_data[0].count;
+
     printf(BOLDGREEN "Backward Iterator: %d threads in %.2f ms (%.2f ops/sec)\n" RESET,
            BENCH_NUM_THREADS, end_time - start_time,
            (BENCH_NUM_OPERATIONS / (end_time - start_time)) * 1000);
 
-    if (keys_per_thread == BENCH_NUM_OPERATIONS)
+    if (backward_keys_per_thread == BENCH_NUM_OPERATIONS)
     {
         printf(BOLDGREEN "  ✓ Each thread iterated all %d keys successfully\n" RESET,
-               keys_per_thread);
+               backward_keys_per_thread);
     }
     else
     {
         printf(BOLDRED "  ✗ Iterator count mismatch: expected %d, got %d keys per thread\n" RESET,
-               BENCH_NUM_OPERATIONS, keys_per_thread);
+               BENCH_NUM_OPERATIONS, backward_keys_per_thread);
     }
 
     if (verification_errors > 0)

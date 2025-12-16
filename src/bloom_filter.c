@@ -42,16 +42,41 @@ int bloom_filter_new(bloom_filter_t **bf, double p, int n)
      * m = -n * ln(p) / (ln(2)^2)
      *
      */
-    (*bf)->m = (int)ceil(-((double)n) * log(p) / (M_LN2 * M_LN2));
+    double m_double = ceil(-((double)n) * log(p) / (M_LN2 * M_LN2));
+
+    /* validate m is within valid range */
+    if (m_double <= 0.0 || m_double > (double)UINT32_MAX)
+    {
+        free(*bf);
+        return -1;
+    }
+
+    (*bf)->m = (unsigned int)m_double;
 
     /* calculate the number of hash functions (h) using the formula
      * h = (m / n) * ln(2)
      *
      */
-    (*bf)->h = (int)ceil(((double)(*bf)->m) / n * M_LN2);
+    double h_double = ceil(((double)(*bf)->m) / n * M_LN2);
+
+    /* validate h is reasonable (typically 1-20) */
+    if (h_double <= 0.0 || h_double > 100.0)
+    {
+        free(*bf);
+        return -1;
+    }
+
+    (*bf)->h = (unsigned int)h_double;
 
     /* calculate number of 64-bit words needed for packed bitset */
     (*bf)->size_in_words = ((*bf)->m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
+
+    /* validate size_in_words to prevent overflow */
+    if ((*bf)->size_in_words == 0 || (*bf)->size_in_words > UINT32_MAX / sizeof(uint64_t))
+    {
+        free(*bf);
+        return -1;
+    }
 
     /* alloc memory for the packed bitset and initialize it to 0 */
     (*bf)->bitset = calloc((size_t)(*bf)->size_in_words, sizeof(uint64_t));
@@ -67,10 +92,10 @@ int bloom_filter_new(bloom_filter_t **bf, double p, int n)
 void bloom_filter_add(bloom_filter_t *bf, const uint8_t *entry, size_t size)
 {
     /* add a key to the bloom filter using H hash functions */
-    for (int i = 0; i < bf->h; i++)
+    for (unsigned int i = 0; i < bf->h; i++)
     {
         unsigned int hash = bloom_filter_hash(entry, size, i);
-        int index = (int)(hash % (unsigned int)bf->m);
+        size_t index = hash % bf->m;
         BF_SET_BIT(bf->bitset, index);
     }
 }
@@ -79,10 +104,10 @@ int bloom_filter_contains(bloom_filter_t *bf, const uint8_t *entry, size_t size)
 {
     /* check if a key is in the bloom filter using H hash functions
      * early exit on first zero bit (likely case for negative lookups) */
-    for (int i = 0; i < bf->h; i++)
+    for (unsigned int i = 0; i < bf->h; i++)
     {
         unsigned int hash = bloom_filter_hash(entry, size, i);
-        int index = (int)(hash % (unsigned int)bf->m);
+        size_t index = hash % bf->m;
         if (!BF_GET_BIT(bf->bitset, index))
         {
             return 0; /* definitely not in set */
@@ -94,7 +119,7 @@ int bloom_filter_contains(bloom_filter_t *bf, const uint8_t *entry, size_t size)
 int bloom_filter_is_full(bloom_filter_t *bf)
 {
     /* check if all words are fully set (optimized for packed bits) */
-    for (int i = 0; i < bf->size_in_words - 1; i++)
+    for (unsigned int i = 0; i < bf->size_in_words - 1; i++)
     {
         if (bf->bitset[i] != UINT64_MAX)
         {
@@ -103,7 +128,7 @@ int bloom_filter_is_full(bloom_filter_t *bf)
     }
 
     /* check last word (may be partial) */
-    int remaining_bits = bf->m % BF_BITS_PER_WORD;
+    unsigned int remaining_bits = bf->m % BF_BITS_PER_WORD;
     if (remaining_bits == 0)
     {
         return (bf->bitset[bf->size_in_words - 1] == UINT64_MAX);
@@ -161,15 +186,15 @@ unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
 uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
 {
     /* count non-zero words for sparse encoding */
-    int non_zero_count = 0;
-    for (int i = 0; i < bf->size_in_words; i++)
+    unsigned int non_zero_count = 0;
+    for (unsigned int i = 0; i < bf->size_in_words; i++)
     {
         if (bf->bitset[i] != 0) non_zero_count++;
     }
 
     /* we allocate worst-case size
-     * - header: 3 varint32s (m, h, non_zero_count) = 15 bytes max
-     * - sparse data: each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
+     * -- header: 3 varint32s (m, h, non_zero_count) = 15 bytes max
+     * -- sparse data: each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
      */
     size_t max_size = 15 + non_zero_count * 15;
     uint8_t *buffer = malloc(max_size);
@@ -186,7 +211,7 @@ uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
     ptr = encode_varint32(ptr, (uint32_t)non_zero_count);
 
     /* write sparse bitset: only non-zero words with their indices */
-    for (int i = 0; i < bf->size_in_words; i++)
+    for (unsigned int i = 0; i < bf->size_in_words; i++)
     {
         if (bf->bitset[i] != 0)
         {
@@ -213,25 +238,25 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
     ptr = decode_varint32(ptr, &h_u32);
     ptr = decode_varint32(ptr, &non_zero_count);
 
-    int32_t m = (int32_t)m_u32;
-    int32_t h = (int32_t)h_u32;
+    unsigned int m = m_u32;
+    unsigned int h = h_u32;
 
     /* validate deserialized values */
-    if (m <= 0 || h <= 0)
+    if (m == 0 || h == 0)
     {
         return NULL;
     }
 
     /* check for potential integer overflow in size calculation */
-    if (m > INT32_MAX - BF_BITS_PER_WORD)
+    if (m > UINT32_MAX - BF_BITS_PER_WORD)
     {
         return NULL;
     }
 
-    int size_in_words = (m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
+    unsigned int size_in_words = (m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
 
     /* sanity check result */
-    if (size_in_words <= 0)
+    if (size_in_words == 0)
     {
         return NULL;
     }

@@ -22,6 +22,7 @@
 /* compat header for multi-platform support (Windows, POSIX, posix includes macOS) */
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -44,6 +45,15 @@
 #define tdb_strdup(s) _strdup(s)
 #else
 #define tdb_strdup(s) strdup(s)
+#endif
+
+/* cross-platform fsync abstraction */
+#if defined(_WIN32)
+#include <io.h>
+#define tdb_fsync(fd) _commit(fd)
+#else
+#include <unistd.h>
+#define tdb_fsync(fd) fsync(fd)
 #endif
 
 /* cross-platform localtime abstraction */
@@ -886,6 +896,34 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
 }
 #endif /* _MSC_VER */
 
+/* fileno for all Windows (MSVC and MinGW) */
+/*
+ * tdb_fileno
+ * portable file descriptor extraction from FILE*
+ * @param stream the FILE* to get descriptor from
+ * @return file descriptor, or -1 on failure
+ */
+static inline int tdb_fileno(FILE *stream)
+{
+    if (!stream) return -1;
+    return _fileno(stream);
+}
+
+#if defined(__MINGW32__) || defined(__MINGW64__)
+/* fopen for MinGW (uses standard fopen, not fopen_s) */
+/*
+ * tdb_fopen
+ * portable file opening wrapper
+ * @param filename the filename to open
+ * @param mode the mode to open the file in
+ * @return a pointer to the opened file, or NULL on failure
+ */
+static inline FILE *tdb_fopen(const char *filename, const char *mode)
+{
+    return fopen(filename, mode);
+}
+#endif
+
 #if defined(__MINGW32__) || defined(__MINGW64__)
 /* mingw provides semaphore.h for POSIX semaphores */
 #include <semaphore.h>
@@ -1037,7 +1075,6 @@ static inline int fdatasync(int fd)
 
 #elif defined(__APPLE__)
 #include <dirent.h>
-#include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <pthread.h>
@@ -1046,8 +1083,43 @@ static inline int fdatasync(int fd)
 #include <sys/time.h>
 #include <unistd.h>
 
+/* Grand Central Dispatch (dispatch/dispatch.h) is only available on macOS 10.6+
+ * For older macOS versions (e.g., 10.5 PPC64), use POSIX semaphores instead */
+#include <AvailabilityMacros.h>
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1060
+#define TDB_USE_DISPATCH_SEMAPHORE 1
+#include <dispatch/dispatch.h>
+#else
+#define TDB_USE_DISPATCH_SEMAPHORE 0
+#include <semaphore.h>
+#endif
+
 /* pread and pwrite are available natively on macOS via unistd.h */
 /* no additional implementation needed using system pread/pwrite */
+
+/**
+ * tdb_fopen
+ * portable file opening wrapper
+ * @param filename the filename to open
+ * @param mode the mode to open the file in
+ * @return a pointer to the opened file, or NULL on failure
+ */
+static inline FILE *tdb_fopen(const char *filename, const char *mode)
+{
+    return fopen(filename, mode);
+}
+
+/**
+ * tdb_fileno
+ * portable file descriptor extraction from FILE*
+ * @param stream the FILE* to get descriptor from
+ * @return file descriptor, or -1 on failure
+ */
+static inline int tdb_fileno(FILE *stream)
+{
+    if (!stream) return -1;
+    return fileno(stream);
+}
 
 /*
  * fdatasync
@@ -1071,7 +1143,8 @@ static inline int fdatasync(int fd)
 #endif
 }
 
-/* semaphore compatibility for macOS using Grand Central Dispatch
+#if TDB_USE_DISPATCH_SEMAPHORE
+/* semaphore compatibility for macOS 10.6+ using Grand Central Dispatch
  * macOS deprecated POSIX semaphores (sem_init, sem_destroy, etc.)
  * use dispatch_semaphore instead */
 typedef dispatch_semaphore_t sem_t;
@@ -1129,6 +1202,11 @@ static inline int sem_post(sem_t *sem)
     dispatch_semaphore_signal(*sem);
     return 0;
 }
+#else
+/* for macOS < 10.6 (e.g., 10.5 PPC64), use POSIX semaphores
+ * note: POSIX semaphores are deprecated on modern macOS but work on older versions */
+/* sem_t, sem_init, sem_destroy, sem_wait, sem_post are provided by semaphore.h */
+#endif
 
 #else /* posix systems */
 #include <dirent.h>
@@ -1138,6 +1216,29 @@ static inline int sem_post(sem_t *sem)
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+/*
+ * tdb_fopen
+ * @param filename the filename to open
+ * @param mode the mode to open the file in
+ * @return a pointer to the opened file, or NULL on failure
+ */
+static inline FILE *tdb_fopen(const char *filename, const char *mode)
+{
+    return fopen(filename, mode);
+}
+
+/**
+ * tdb_fileno
+ * portable file descriptor extraction from FILE*
+ * @param stream the FILE* to get descriptor from
+ * @return file descriptor, or -1 on failure
+ */
+static inline int tdb_fileno(FILE *stream)
+{
+    if (!stream) return -1;
+    return fileno(stream);
+}
 
 /* sysinfo is Linux-specific, BSD uses sysctl */
 #if defined(__linux__)
@@ -1196,16 +1297,43 @@ static inline size_t get_available_memory(void)
     vm_size_t page_size;
     mach_port_t mach_port;
     mach_msg_type_number_t count;
-    vm_statistics64_data_t vm_stats;
 
     mach_port = mach_host_self();
-    count = sizeof(vm_stats) / sizeof(natural_t);
+
+    /* use 32-bit vm statistics on PPC 32-bit regardless of OS version
+     * host_statistics64 is not available on PPC 32-bit even on 10.6+ */
+#if defined(__ppc__) || defined(__ppc)
+    /* PPC 32-bit always uses 32-bit vm statistics */
+    vm_statistics_data_t vm_stats;
+    count = HOST_VM_INFO_COUNT;
     if (host_page_size(mach_port, &page_size) == KERN_SUCCESS &&
-        host_statistics64(mach_port, HOST_VM_INFO, (host_info64_t)&vm_stats, &count) ==
-            KERN_SUCCESS)
+        host_statistics(mach_port, HOST_VM_INFO, (host_info_t)&vm_stats, &count) == KERN_SUCCESS)
     {
         return (size_t)(vm_stats.free_count * page_size);
     }
+#else
+    /* try 64-bit first (macOS 10.6+ on x86/x86_64/ARM), fall back to 32-bit */
+    vm_statistics64_data_t vm_stats64;
+    count = sizeof(vm_stats64) / sizeof(natural_t);
+    if (host_page_size(mach_port, &page_size) == KERN_SUCCESS &&
+        host_statistics64(mach_port, HOST_VM_INFO, (host_info64_t)&vm_stats64, &count) ==
+            KERN_SUCCESS)
+    {
+        return (size_t)(vm_stats64.free_count * page_size);
+    }
+    else
+    {
+        /* fallback to 32-bit for older systems or Rosetta edge cases */
+        vm_statistics_data_t vm_stats;
+        count = HOST_VM_INFO_COUNT;
+        if (host_page_size(mach_port, &page_size) == KERN_SUCCESS &&
+            host_statistics(mach_port, HOST_VM_INFO, (host_info_t)&vm_stats, &count) ==
+                KERN_SUCCESS)
+        {
+            return (size_t)(vm_stats.free_count * page_size);
+        }
+    }
+#endif
     return 0;
 #elif defined(__linux__)
     /* linux-specific sysinfo */
@@ -1344,6 +1472,29 @@ static inline time_t get_file_mod_time(const char *path)
 }
 
 /* cross-platform little-endian serialization functions */
+
+/*
+ * encode_uint16_le_compat
+ * encodes a uint16_t value in little-endian format
+ * @param buf buffer to store encoded value
+ * @param val value to encode
+ */
+static inline void encode_uint16_le_compat(uint8_t *buf, uint16_t val)
+{
+    buf[0] = (uint8_t)(val & 0xFF);
+    buf[1] = (uint8_t)((val >> 8) & 0xFF);
+}
+
+/*
+ * decode_uint16_le_compat
+ * decodes a uint16_t value in little-endian format
+ * @param buf buffer containing encoded value
+ * @return decoded value
+ */
+static inline uint16_t decode_uint16_le_compat(const uint8_t *buf)
+{
+    return ((uint16_t)buf[0]) | ((uint16_t)buf[1] << 8);
+}
 
 /*
  * encode_uint32_le_compat
@@ -1955,6 +2106,24 @@ static inline int tdb_get_available_disk_space(const char *path, uint64_t *avail
 #define cpu_yield() sched_yield()
 #endif
 
+/*
+ * tdb_unlink
+ * portable file deletion
+ * @param path the file path to delete
+ * @return 0 on success, -1 on failure
+ */
+static inline int tdb_unlink(const char *path)
+{
+    if (!path) return -1;
+#ifdef _WIN32
+    /* clear read-only attribute that might prevent deletion */
+    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+    return _unlink(path);
+#else
+    return unlink(path);
+#endif
+}
+
 /**
  * is_directory_empty
  * checks if a directory is empty (contains only . and ..)
@@ -2103,6 +2272,114 @@ static inline int remove_directory(const char *path)
     if (!dir) return 0; /* success */
     closedir(dir);
     return -1; /* failed after all retries */
+}
+
+/**
+ * tdb_sync_directory
+ * syncs a directory to ensure directory entries (new files/subdirs) are persisted
+ * on POSIX systems, directory entries must be explicitly synced after mkdir/file creation
+ * on Windows, directory entries are immediately durable, so this is a no-op
+ * @param dir_path path to the directory to sync
+ * @return 0 on success, -1 on error (errors are non-fatal, just logged)
+ */
+static inline int tdb_sync_directory(const char *dir_path)
+{
+#ifdef _WIN32
+    /* Windows -- directory entries are immediately durable, no sync needed */
+    (void)dir_path;
+    return 0;
+#else
+    /* POSIX -- must fsync directory to persist directory entries */
+    int fd = open(dir_path, O_RDONLY);
+    if (fd < 0)
+    {
+        /* non-fatal -- directory might not support fsync (e.g., some network filesystems) */
+        return -1;
+    }
+    int result = fsync(fd);
+    close(fd);
+    return result;
+#endif
+}
+
+/**
+ * atomic_rename_file
+ * atomically renames a file from old_path to new_path
+ * on POSIX systems, rename() is atomic and replaces existing files
+ * on windows, rename() fails if target exists, so we remove it first
+ * @param old_path the current path of the file
+ * @param new_path the new path for the file
+ * @return 0 on success, -1 on failure
+ */
+static inline int atomic_rename_file(const char *old_path, const char *new_path)
+{
+    if (!old_path || !new_path) return -1;
+
+#ifdef _WIN32
+    /* use MoveFileEx with MOVEFILE_REPLACE_EXISTING for atomic rename on Windows
+     * this is truly atomic and replaces the target file if it exists */
+    if (!MoveFileEx(old_path, new_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        errno = GetLastError();
+        return -1;
+    }
+
+    /* flush parent directory to ensure rename is durable
+     * extract directory from new_path */
+    char dir_path[4096];
+    const char *last_sep = strrchr(new_path, '\\');
+    if (!last_sep) last_sep = strrchr(new_path, '/');
+    if (last_sep && (size_t)(last_sep - new_path) < sizeof(dir_path) - 1)
+    {
+        size_t dir_len = last_sep - new_path;
+        memcpy(dir_path, new_path, dir_len);
+        dir_path[dir_len] = '\0';
+
+        /* open directory and flush */
+        HANDLE dir_handle = CreateFile(dir_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                       NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (dir_handle != INVALID_HANDLE_VALUE)
+        {
+            FlushFileBuffers(dir_handle);
+            CloseHandle(dir_handle);
+        }
+    }
+
+    return 0;
+#else
+    /* POSIX rename() is atomic and replaces existing files */
+    return rename(old_path, new_path);
+#endif
+}
+
+/**
+ * tdb_get_cpu_count
+ * gets the number of available CPU cores
+ * @return number of CPU cores, or 4 as fallback
+ */
+static inline int tdb_get_cpu_count(void)
+{
+#ifdef _WIN32
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    return (int)sysinfo.dwNumberOfProcessors;
+#elif defined(__APPLE__)
+    int count;
+    size_t count_len = sizeof(count);
+    if (sysctlbyname("hw.logicalcpu", &count, &count_len, NULL, 0) == 0)
+    {
+        return count;
+    }
+    return 4; /* fallback */
+#else
+    /* POSIX systems (Linux, BSD, etc.) */
+    long count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (count > 0)
+    {
+        return (int)count;
+    }
+    return 4; /* fallback */
+#endif
 }
 
 #endif /* __COMPAT_H__ */

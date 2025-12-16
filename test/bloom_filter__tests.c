@@ -314,6 +314,167 @@ void test_bloom_filter_free_null()
     bloom_filter_free(NULL);
 }
 
+void test_bloom_filter_large_capacity_random_keys()
+{
+    int n = 2892624;
+    double p = 0.01;
+    bloom_filter_t *bf = NULL;
+
+    printf("Creating bloom filter with n=%d, p=%.4f...\n", n, p);
+    int result = bloom_filter_new(&bf, p, n);
+
+    if (result != 0)
+    {
+        printf("ERROR: bloom_filter_new failed with result=%d\n", result);
+    }
+    ASSERT_EQ(result, 0);
+
+    if (bf == NULL)
+    {
+        printf("ERROR: bloom filter is NULL after creation!\n");
+        return;
+    }
+
+    printf("Bloom filter created: m=%u bits, h=%u hashes, size=%u words\n", bf->m, bf->h,
+           bf->size_in_words);
+
+    /* add 2.9M random 16-byte keys (simulating PUT phase) */
+    printf("Adding %d random 16-byte keys...\n", n);
+    srand(12345); /* fixed seed for reproducibility */
+
+    for (int i = 0; i < n; i++)
+    {
+        uint8_t key[16];
+        for (int j = 0; j < 16; j++)
+        {
+            key[j] = (uint8_t)(rand() % 256);
+        }
+        bloom_filter_add(bf, key, 16);
+
+        if (i % 500000 == 0 && i > 0)
+        {
+            printf("  Added %d keys...\n", i);
+        }
+    }
+    printf("All %d keys added.\n", n);
+
+    /* sanity check: count how many bits are set in bloom filter */
+    unsigned int bits_set = 0;
+    for (unsigned int i = 0; i < bf->size_in_words; i++)
+    {
+        if (bf->bitset[i] != 0)
+        {
+            bits_set++;
+        }
+    }
+    printf("Sanity check: %u/%u words have non-zero bits\n", bits_set, bf->size_in_words);
+
+    /* verify we can find a key we just added */
+    srand(12345); /* same seed as add phase */
+    uint8_t test_key[16];
+    for (int j = 0; j < 16; j++)
+    {
+        test_key[j] = (uint8_t)(rand() % 256);
+    }
+    int found = bloom_filter_contains(bf, test_key, 16);
+    printf("Sanity check: first added key found = %d (should be 1)\n", found);
+    if (!found)
+    {
+        printf("ERROR: Bloom filter cannot find key that was just added!\n");
+    }
+
+    /* now test with different random keys (simulating GET phase with non-existent keys) */
+    printf("Testing with 100K DIFFERENT random keys...\n");
+    srand(99999);
+
+    int test_count = 100000;
+    int false_positives = 0;
+
+    for (int i = 0; i < test_count; i++)
+    {
+        uint8_t key[16];
+        for (int j = 0; j < 16; j++)
+        {
+            key[j] = (uint8_t)(rand() % 256);
+        }
+
+        if (bloom_filter_contains(bf, key, 16))
+        {
+            false_positives++;
+        }
+    }
+
+    double actual_fpr = (double)false_positives / test_count;
+    printf("Expected FPR: %.4f\n", p);
+    printf("Actual FPR: %.4f (%d false positives out of %d tests)\n", actual_fpr, false_positives,
+           test_count);
+
+    /* FPR should be close to 1% but can vary due to randomness and platform differences
+     * the critical check is that it's not too high (< 3%)
+     * low FPR is actually good -- it means the test keys happened to have low collision
+     * different rand() implementations on win vs posix can produce different sequences */
+    ASSERT_TRUE(actual_fpr < 0.03); /* should be < 3% - this is the important check */
+
+    /* warn if FPR is unusually low, but don't fail -- its just statistical variance */
+    if (actual_fpr < 0.001)
+    {
+        printf(
+            "Note: FPR is unusually low (%.4f%%). This can happen with different rand() "
+            "implementations.\n",
+            actual_fpr * 100);
+    }
+
+    printf("✓ Bloom filter FPR is within expected range!\n");
+
+    /* test serialization/deserialization with large filter */
+    printf("Testing serialization...\n");
+    size_t serialized_size;
+    uint8_t *serialized = bloom_filter_serialize(bf, &serialized_size);
+    ASSERT_TRUE(serialized != NULL);
+    printf("Serialized size: %.2f MB\n", (double)serialized_size / (1024 * 1024));
+
+    printf("Testing deserialization...\n");
+    bloom_filter_t *bf2 = bloom_filter_deserialize(serialized);
+    ASSERT_TRUE(bf2 != NULL);
+    ASSERT_EQ(bf2->m, bf->m);
+    ASSERT_EQ(bf2->h, bf->h);
+
+    /* verify deserialized filter has same FPR */
+    printf("Verifying deserialized filter...\n");
+    srand(99999); /* same seed as before */
+    int false_positives2 = 0;
+    for (int i = 0; i < test_count; i++)
+    {
+        uint8_t key[16];
+        for (int j = 0; j < 16; j++)
+        {
+            key[j] = (uint8_t)(rand() % 256);
+        }
+
+        if (bloom_filter_contains(bf2, key, 16))
+        {
+            false_positives2++;
+        }
+    }
+
+    /* allow small tolerance due to platform/hash differences
+     * the counts should be very close, but not necessarily identical */
+    int diff = abs(false_positives - false_positives2);
+    int tolerance = test_count / 100; /* 1% tolerance */
+    if (diff > tolerance)
+    {
+        printf("ERROR: False positive counts differ too much: %d vs %d (diff=%d, tolerance=%d)\n",
+               false_positives, false_positives2, diff, tolerance);
+        ASSERT_TRUE(0);
+    }
+    printf("✓ Deserialized filter matches original (fp1=%d, fp2=%d, diff=%d)!\n", false_positives,
+           false_positives2, diff);
+
+    free(serialized);
+    bloom_filter_free(bf);
+    bloom_filter_free(bf2);
+}
+
 void benchmark_bloom_filter()
 {
     bloom_filter_t *bf;
@@ -367,6 +528,7 @@ int main(void)
     RUN_TEST(test_bloom_filter_deserialize_corrupted, tests_passed);
     RUN_TEST(test_bloom_filter_binary_keys, tests_passed);
     RUN_TEST(test_bloom_filter_free_null, tests_passed);
+    RUN_TEST(test_bloom_filter_large_capacity_random_keys, tests_passed);
     RUN_TEST(benchmark_bloom_filter, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

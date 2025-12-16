@@ -910,6 +910,21 @@ static inline int tdb_fileno(FILE *stream)
 }
 
 #if defined(__MINGW32__) || defined(__MINGW64__)
+/* fopen for MinGW (uses standard fopen, not fopen_s) */
+/*
+ * tdb_fopen
+ * portable file opening wrapper
+ * @param filename the filename to open
+ * @param mode the mode to open the file in
+ * @return a pointer to the opened file, or NULL on failure
+ */
+static inline FILE *tdb_fopen(const char *filename, const char *mode)
+{
+    return fopen(filename, mode);
+}
+#endif
+
+#if defined(__MINGW32__) || defined(__MINGW64__)
 /* mingw provides semaphore.h for POSIX semaphores */
 #include <semaphore.h>
 
@@ -1081,6 +1096,18 @@ static inline int fdatasync(int fd)
 
 /* pread and pwrite are available natively on macOS via unistd.h */
 /* no additional implementation needed using system pread/pwrite */
+
+/**
+ * tdb_fopen
+ * portable file opening wrapper
+ * @param filename the filename to open
+ * @param mode the mode to open the file in
+ * @return a pointer to the opened file, or NULL on failure
+ */
+static inline FILE *tdb_fopen(const char *filename, const char *mode)
+{
+    return fopen(filename, mode);
+}
 
 /**
  * tdb_fileno
@@ -2302,7 +2329,7 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
     char dir_path[4096];
     const char *last_sep = strrchr(new_path, '\\');
     if (!last_sep) last_sep = strrchr(new_path, '/');
-    if (last_sep && (last_sep - new_path) < sizeof(dir_path) - 1)
+    if (last_sep && (size_t)(last_sep - new_path) < sizeof(dir_path) - 1)
     {
         size_t dir_len = last_sep - new_path;
         memcpy(dir_path, new_path, dir_len);

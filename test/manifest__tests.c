@@ -367,11 +367,15 @@ void test_manifest_auto_compaction()
     fclose(f2);
     /* intentionally do't create L1_101.klog -- its a stale entry */
 
+    usleep(2000000);
+
     /* commit manifest */
     ASSERT_EQ(tidesdb_manifest_commit(
                   m1, "." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "manifest"),
               0);
     tidesdb_manifest_free(m1);
+
+    usleep(2000000);
 
     /* load manifest -- should auto-compact and remove stale entry */
     tidesdb_manifest_t *m2 =

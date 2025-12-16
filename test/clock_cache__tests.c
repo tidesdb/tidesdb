@@ -428,8 +428,10 @@ void test_concurrent_read_evict_race(void)
     const int num_writers = 1;
     const int total_threads = num_readers + num_writers;
 
-    pthread_t threads[total_threads];
-    race_test_args_t args[total_threads];
+/* use fixed size arrays for MSVC compatibility (no VLA support) */
+#define MAX_RACE_THREADS 2
+    pthread_t threads[MAX_RACE_THREADS];
+    race_test_args_t args[MAX_RACE_THREADS];
 
     /* start reader threads */
     for (int i = 0; i < num_readers; i++)

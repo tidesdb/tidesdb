@@ -947,7 +947,8 @@ static size_t tidesdb_block_cache_key(const char *cf_name, const char *klog_path
     filename = filename ? filename + 1 : klog_path;
 
     /* format: "cf_name:filename:block_position" */
-    int len = snprintf(key_buffer, buffer_size, "%s:%s:" PRIu64, cf_name, filename, block_position);
+    int len = snprintf(key_buffer, buffer_size, "%s:%s:%llu", cf_name, filename,
+                       (unsigned long long)block_position);
     if (len < 0 || (size_t)len >= buffer_size) return 0;
 
     return (size_t)len;

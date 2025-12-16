@@ -2285,6 +2285,28 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
         errno = GetLastError();
         return -1;
     }
+
+    /* flush parent directory to ensure rename is durable
+     * extract directory from new_path */
+    char dir_path[4096];
+    const char *last_sep = strrchr(new_path, '\\');
+    if (!last_sep) last_sep = strrchr(new_path, '/');
+    if (last_sep && (last_sep - new_path) < sizeof(dir_path) - 1)
+    {
+        size_t dir_len = last_sep - new_path;
+        memcpy(dir_path, new_path, dir_len);
+        dir_path[dir_len] = '\0';
+
+        /* open directory and flush */
+        HANDLE dir_handle = CreateFile(dir_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                       NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (dir_handle != INVALID_HANDLE_VALUE)
+        {
+            FlushFileBuffers(dir_handle);
+            CloseHandle(dir_handle);
+        }
+    }
+
     return 0;
 #else
     /* POSIX rename() is atomic and replaces existing files */

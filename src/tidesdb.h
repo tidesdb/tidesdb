@@ -662,25 +662,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
 /**
  * tidesdb_register_comparator
  * registers a custom comparator function
- *
- * when tidesdb_open() is called, it automatically recovers all column families
- * from disk. If a recovered CF uses a custom comparator that is not registered,
- * the recovery will FAIL with TDB_ERR_NOT_FOUND to prevent data corruption.
- *
- * current limitation -- comparators cannot be registered before tidesdb_open()
- * because the db handle doesn't exist yet. This means:
- *
- * - on first database creation: use default "memcmp" comparator, or don't
- *   create CFs during initial open
- * - on subsequent opens -- tidesdb_open() will fail if CFs need unregistered
- *   comparators. This is intentional to prevent silent data corruption.
- *
- * workaround -- register comparators before creating CFs:
- *   tidesdb_t *db;
- *   tidesdb_open(&config, &db);  // Opens empty database
- *   tidesdb_register_comparator(db, "my_cmp", my_fn, "ctx", ctx);
- *   tidesdb_create_column_family(db, "my_cf", &cf_config);  // Now safe
- *
  * @param db database handle
  * @param name unique name for the comparator (max 63 chars)
  * @param fn comparator function pointer

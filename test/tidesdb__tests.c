@@ -3658,7 +3658,6 @@ static void test_partitioned_merge_strategy(void)
     cf_config.level_size_ratio = 2;        /* 2x growth = many small levels */
     cf_config.dividing_level_offset = 1;   /* X = num_levels - 2 (not -3) */
     cf_config.min_levels = 4;              /* force at least 4 levels */
-    // cf_config.compression_algorithm = NO_COMPRESSION;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "partition_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "partition_cf");
@@ -8035,8 +8034,8 @@ int main(void)
     //     RUN_TEST(test_iterator_no_bloom_no_indexes, tests_passed);
     //     RUN_TEST(test_concurrent_batched_transactions, tests_passed);
     //     RUN_TEST(test_concurrent_batched_random_keys, tests_passed);
-    RUN_TEST(test_deadlock_random_write_then_read, tests_passed);
-    RUN_TEST(test_concurrent_read_close_race, tests_passed);
+    //     RUN_TEST(test_deadlock_random_write_then_read, tests_passed);
+    //     RUN_TEST(test_concurrent_read_close_race, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

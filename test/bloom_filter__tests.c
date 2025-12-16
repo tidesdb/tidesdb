@@ -383,9 +383,9 @@ void test_bloom_filter_large_capacity_random_keys()
         printf("ERROR: Bloom filter cannot find key that was just added!\n");
     }
 
-    /* now test with DIFFERENT random keys (simulating GET phase with non-existent keys) */
+    /* now test with different random keys (simulating GET phase with non-existent keys) */
     printf("Testing with 100K DIFFERENT random keys...\n");
-    srand(99999); /* DIFFERENT seed - these keys were NOT added */
+    srand(99999);
 
     int test_count = 100000;
     int false_positives = 0;

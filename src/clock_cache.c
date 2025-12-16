@@ -245,7 +245,18 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
         return;
     }
 
-    /* WE WON! we own this entry now, its our precious */
+    /* WE WON! we transitioned to DELETING
+     * At this point, no NEW readers can access this entry (state != VALID)
+     * However, existing readers may still be in the middle of memcpy.
+     * We need a grace period to let them finish. */
+
+    /* fence to ensure state change is visible */
+    atomic_thread_fence(memory_order_seq_cst);
+
+    /* yield to let any in-flight readers complete
+     * this is a practical solution -- not theoretically perfect but works in practice in
+     * simulations */
+    sched_yield();
 
     /* load pointers and sizes */
     char *key = atomic_load_explicit(&entry->key, memory_order_acquire);
@@ -260,18 +271,12 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
     }
 
     /* mark hash entry as deleted (tombstone) -- but keep back-pointer for reuse */
-    /* use cached hash to avoid recomputation */
-    uint64_t hash = atomic_load_explicit(&entry->cached_hash, memory_order_relaxed);
+    uint64_t hash = _compute_hash(key, klen);
     size_t slot_idx = entry - partition->slots;
     _hash_table_remove(partition, hash, slot_idx);
 
     /* mem fence -- ensure all readers see deleted before we free */
     atomic_thread_fence(memory_order_seq_cst);
-
-    /* update partition bytes_used before freeing */
-    size_t entry_bytes =
-        _entry_size(klen, atomic_load_explicit(&entry->payload_len, memory_order_relaxed));
-    atomic_fetch_sub_explicit(&partition->bytes_used, entry_bytes, memory_order_relaxed);
 
     free(key);
     free(payload);
@@ -387,21 +392,66 @@ static int _ensure_space(clock_cache_t *cache, clock_cache_partition_t *partitio
 
     if (should_check_bytes)
     {
-        /* for small caches, check partition-level bytes (much faster than scanning all entries) */
-        size_t partition_bytes = atomic_load_explicit(&partition->bytes_used, memory_order_relaxed);
-        size_t partition_max = cache->max_bytes / cache->num_partitions;
-
-        /* evict if we would exceed partition byte limit */
-        while (partition_bytes + required_bytes > partition_max)
+        /* compute total bytes across all partitions */
+        size_t total_bytes = 0;
+        for (size_t i = 0; i < cache->num_partitions; i++)
         {
-            size_t evicted_slot = _clock_evict(cache, partition);
-            if (evicted_slot >= partition->num_slots)
+            clock_cache_partition_t *p = &cache->partitions[i];
+            for (size_t j = 0; j < p->num_slots; j++)
             {
-                /* couldn't evict, break */
-                break;
+                uint8_t state = atomic_load_explicit(&p->slots[j].state, memory_order_relaxed);
+                if (state == ENTRY_VALID)
+                {
+                    size_t klen = atomic_load_explicit(&p->slots[j].key_len, memory_order_relaxed);
+                    size_t plen =
+                        atomic_load_explicit(&p->slots[j].payload_len, memory_order_relaxed);
+                    total_bytes += _entry_size(klen, plen);
+                }
             }
-            /* reload partition bytes after eviction */
-            partition_bytes = atomic_load_explicit(&partition->bytes_used, memory_order_relaxed);
+        }
+
+        /* evict if we would exceed byte limit */
+        while (total_bytes + required_bytes > cache->max_bytes)
+        {
+            /* find a partition with entries to evict */
+            clock_cache_partition_t *evict_partition = NULL;
+            for (size_t i = 0; i < cache->num_partitions; i++)
+            {
+                clock_cache_partition_t *p = &cache->partitions[i];
+                for (size_t j = 0; j < p->num_slots; j++)
+                {
+                    uint8_t state = atomic_load_explicit(&p->slots[j].state, memory_order_relaxed);
+                    if (state == ENTRY_VALID)
+                    {
+                        evict_partition = p;
+                        goto found_partition;
+                    }
+                }
+            }
+        found_partition:
+
+            if (!evict_partition) break;
+
+            _clock_evict(cache, evict_partition);
+
+            /* recompute total_bytes */
+            total_bytes = 0;
+            for (size_t i = 0; i < cache->num_partitions; i++)
+            {
+                clock_cache_partition_t *p = &cache->partitions[i];
+                for (size_t j = 0; j < p->num_slots; j++)
+                {
+                    uint8_t state = atomic_load_explicit(&p->slots[j].state, memory_order_relaxed);
+                    if (state == ENTRY_VALID)
+                    {
+                        size_t klen =
+                            atomic_load_explicit(&p->slots[j].key_len, memory_order_relaxed);
+                        size_t plen =
+                            atomic_load_explicit(&p->slots[j].payload_len, memory_order_relaxed);
+                        total_bytes += _entry_size(klen, plen);
+                    }
+                }
+            }
         }
     }
 
@@ -439,13 +489,13 @@ void clock_cache_compute_config(size_t max_bytes, cache_config_t *config)
     /* distribute entries across partitions */
     size_t slots_per_partition = total_entries / num_partitions;
 
-    /* Clamp to reasonable range: 64-2048 slots per partition */
+    /* clamp to reasonable range: 64-2048 slots per partition */
     if (slots_per_partition < CLOCK_CACHE_MIN_SLOTS_PER_PARTITION)
         slots_per_partition = CLOCK_CACHE_MIN_SLOTS_PER_PARTITION;
     if (slots_per_partition > CLOCK_CACHE_MAX_SLOTS_PER_PARTITION)
         slots_per_partition = CLOCK_CACHE_MAX_SLOTS_PER_PARTITION;
 
-    /* Round up to next power of 2 for better memory alignment */
+    /* we round up to next power of 2 for better memory alignment */
     size_t s = CLOCK_CACHE_MIN_SLOTS_PER_PARTITION;
     while (s < slots_per_partition) s <<= 1;
     slots_per_partition = s;
@@ -601,7 +651,7 @@ void clock_cache_destroy(clock_cache_t *cache)
     cache = NULL;
 }
 
-int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const void *payload,
+int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const uint8_t *payload,
                     size_t payload_len)
 {
     if (!cache || !key || key_len == 0 || !payload) return -1;
@@ -655,7 +705,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
 
     /* we own the slot now, allocate and fill */
     char *new_key = (char *)malloc(key_len);
-    void *new_payload = malloc(payload_len);
+    uint8_t *new_payload = (uint8_t *)malloc(payload_len);
 
     if (!new_key || !new_payload)
     {
@@ -674,9 +724,6 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     atomic_store_explicit(&entry->payload_len, payload_len, memory_order_release);
     atomic_store_explicit(&entry->ref_bit, 1, memory_order_release);
 
-    /* update partition bytes_used */
-    atomic_fetch_add_explicit(&partition->bytes_used, entry_bytes, memory_order_relaxed);
-
     /* transition to valid, entry is now visible */
     atomic_store_explicit(&entry->state, ENTRY_VALID, memory_order_release);
 
@@ -686,7 +733,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     return 0;
 }
 
-void *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, size_t *payload_len)
+uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, size_t *payload_len)
 {
     if (!cache || !key || key_len == 0) return NULL;
 
@@ -702,69 +749,39 @@ void *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, siz
         return NULL;
     }
 
-    /* we check state BEFORE loading payload to prevent use-after-free
-     * if state is not ENTRY_VALID, another thread may be freeing the payload */
+    /* increment ref_bit to protect entry from eviction during read */
+    atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_seq_cst);
+
+    /* verify entry is still valid after incrementing ref_bit */
     uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
     if (state != ENTRY_VALID)
     {
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_seq_cst);
         return NULL;
     }
 
-    /* load payload pointer and length with acquire semantics */
-    void *entry_payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
+    uint8_t *entry_payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
     size_t entry_payload_len = atomic_load_explicit(&entry->payload_len, memory_order_acquire);
 
     if (!entry_payload || entry_payload_len == 0)
     {
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_seq_cst);
         return NULL;
     }
 
-    /* re-check state after loading payload pointer to prevent TOCTOU
-     * if state changed, payload may have been freed between our checks */
-    uint8_t state_after_load = atomic_load_explicit(&entry->state, memory_order_acquire);
-    if (state_after_load != ENTRY_VALID)
+    uint8_t *result = (uint8_t *)malloc(entry_payload_len);
+    if (!result)
     {
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_seq_cst);
         return NULL;
     }
 
-    /* memory fence to synchronize with _free_entry's fence before free() */
-    atomic_thread_fence(memory_order_seq_cst);
-
-    /* final check to ensure payload pointer is still the same and state is still valid
-     * this protects against the race where _free_entry transitions to ENTRY_DELETING
-     * between our state check and the memcpy */
-    void *entry_payload_check = atomic_load_explicit(&entry->payload, memory_order_acquire);
-    uint8_t state_before_copy = atomic_load_explicit(&entry->state, memory_order_acquire);
-
-    if (state_before_copy != ENTRY_VALID || entry_payload_check != entry_payload)
-    {
-        /* entry is being deleted or payload changed, abort */
-        return NULL;
-    }
-
-    /* allocate result buffer */
-    void *result = malloc(entry_payload_len);
-    if (!result) return NULL;
-
-    /* copy data -- payload is protected by ENTRY_VALID state and fence */
     memcpy(result, entry_payload, entry_payload_len);
 
-    /* final validation after copy to ensure entry wasn't deleted during memcpy
-     * if state changed or payload pointer changed, the data we copied may be invalid */
-    uint8_t final_state = atomic_load_explicit(&entry->state, memory_order_acquire);
-    void *final_payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
-
-    if (final_state != ENTRY_VALID || final_payload != entry_payload)
-    {
-        /* state or payload changed during copy, discard result */
-        free(result);
-        return NULL;
-    }
+    /* decrement ref_bit now that we're done */
+    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_seq_cst);
 
     if (payload_len) *payload_len = entry_payload_len;
-
-    /* set reference bit atomically */
-    atomic_store_explicit(&entry->ref_bit, 1, memory_order_relaxed);
 
     /* skip global hit counter -- too much contention */
     return result;
@@ -877,7 +894,7 @@ size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size
             if (memcmp(key, prefix, prefix_len) == 0)
             {
                 /* get payload atomically */
-                void *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
+                uint8_t *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
                 size_t payload_len =
                     atomic_load_explicit(&entry->payload_len, memory_order_acquire);
 

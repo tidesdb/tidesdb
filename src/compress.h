@@ -27,7 +27,7 @@
 #include "compat.h"
 
 /* snappy, lz4, zstd supported to use for compression purposes */
-/* Note: snappy is not available on SunOS/OmniOS/Illumos */
+/* snappy is not available on SunOS/OmniOS/Illumos */
 typedef enum
 {
     NO_COMPRESSION = 0,

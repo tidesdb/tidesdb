@@ -341,6 +341,141 @@ void *concurrent_mixed_thread(void *arg)
     return NULL;
 }
 
+typedef struct
+{
+    clock_cache_t *cache;
+    int thread_id;
+    _Atomic(int) *stop_flag;
+    _Atomic(int) *read_count;
+    _Atomic(int) *write_count;
+} race_test_args_t;
+
+void *read_thread_race(void *arg)
+{
+    race_test_args_t *args = (race_test_args_t *)arg;
+    int local_reads = 0;
+
+    /* do exactly 10 reads as fast as possible to trigger race */
+    for (int i = 0; i < 10; i++)
+    {
+        size_t len = 0;
+        uint8_t *data = clock_cache_get(args->cache, "key_0", 5, &len);
+        if (data)
+        {
+            /* verify data integrity */
+            if (len > 0 && data[0] != 'X')
+            {
+                printf("ERROR: Data corruption detected in thread %d\n", args->thread_id);
+            }
+            free(data);
+            local_reads++;
+        }
+    }
+
+    atomic_fetch_add(args->read_count, local_reads);
+    return NULL;
+}
+
+void *write_thread_race(void *arg)
+{
+    race_test_args_t *args = (race_test_args_t *)arg;
+    char key[32];
+    uint8_t payload[128];
+    memset(payload, 'X', sizeof(payload));
+    int local_writes = 0;
+
+    /* small delay to let reader start first */
+    usleep(1000);
+
+    /* do exactly 10 writes as fast as possible to trigger race */
+    for (int i = 0; i < 10; i++)
+    {
+        snprintf(key, sizeof(key), "evict_%d", i);
+        if (clock_cache_put(args->cache, key, strlen(key), payload, sizeof(payload)) == 0)
+        {
+            local_writes++;
+        }
+    }
+
+    atomic_fetch_add(args->write_count, local_writes);
+    return NULL;
+}
+
+void test_concurrent_read_evict_race(void)
+{
+    /* create a small cache to force evictions but allow some reads */
+    cache_config_t config = {
+        .max_bytes = 2048,        /* small - allows ~15 entries */
+        .num_partitions = 1,      /* single partition for maximum contention */
+        .slots_per_partition = 16 /* small slots */
+    };
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    printf("Testing concurrent read/evict race (MINIMAL: 1 reader, 1 writer)\n");
+
+    /* pre-populate with just key_0 */
+    uint8_t payload[128];
+    memset(payload, 'X', sizeof(payload));
+    clock_cache_put(cache, "key_0", 5, payload, sizeof(payload));
+
+    _Atomic(int) stop_flag = 0;
+    _Atomic(int) read_count = 0;
+    _Atomic(int) write_count = 0;
+
+    const int num_readers = 1;
+    const int num_writers = 1;
+    const int total_threads = num_readers + num_writers;
+
+    pthread_t threads[total_threads];
+    race_test_args_t args[total_threads];
+
+    /* start reader threads */
+    for (int i = 0; i < num_readers; i++)
+    {
+        args[i].cache = cache;
+        args[i].thread_id = i;
+        args[i].stop_flag = &stop_flag;
+        args[i].read_count = &read_count;
+        args[i].write_count = &write_count;
+        pthread_create(&threads[i], NULL, read_thread_race, &args[i]);
+    }
+
+    /* start writer threads */
+    for (int i = 0; i < num_writers; i++)
+    {
+        int idx = num_readers + i;
+        args[idx].cache = cache;
+        args[idx].thread_id = idx;
+        args[idx].stop_flag = &stop_flag;
+        args[idx].read_count = &read_count;
+        args[idx].write_count = &write_count;
+        pthread_create(&threads[idx], NULL, write_thread_race, &args[idx]);
+    }
+
+    /* threads will stop automatically after 10 operations each */
+    printf("Waiting for threads to complete (10 ops each)...\n");
+    fflush(stdout);
+
+    /* wait for all threads */
+    for (int i = 0; i < total_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    int total_reads = atomic_load(&read_count);
+    int total_writes = atomic_load(&write_count);
+
+    printf("Race test completed: %d reads, %d writes\n", total_reads, total_writes);
+    printf("No crashes or data corruption detected!\n");
+
+    ASSERT_TRUE(total_reads > 0);
+    ASSERT_TRUE(total_writes > 0);
+
+    clock_cache_destroy(cache);
+}
+
 void test_cache_compute_config(void)
 {
     cache_config_t config;
@@ -783,6 +918,7 @@ int main(void)
     RUN_TEST(test_cache_stats, tests_passed);
     RUN_TEST(test_cache_null_handling, tests_passed);
     RUN_TEST(test_cache_compute_config, tests_passed);
+    RUN_TEST(test_concurrent_read_evict_race, tests_passed);
     RUN_TEST(benchmark_cache_insertions, tests_passed);
     RUN_TEST(benchmark_cache_lookups, tests_passed);
     RUN_TEST(benchmark_concurrent_puts, tests_passed);

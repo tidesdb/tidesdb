@@ -62,7 +62,7 @@ typedef struct
 #define TDB_WAL_PREFIX                  "wal_"
 #define TDB_WAL_EXT                     ".log"
 #define TDB_COLUMN_FAMILY_CONFIG_NAME   "config"
-#define TDB_COLUMN_FAMILY_MANIFEST_NAME "manifest"
+#define TDB_COLUMN_FAMILY_MANIFEST_NAME "MANIFEST"
 #define TDB_COLUMN_FAMILY_CONFIG_EXT    ".ini"
 #define TDB_LEVEL_PREFIX                "L"
 #define TDB_LEVEL_PARTITION_PREFIX      "P"
@@ -11999,12 +11999,21 @@ skip_ssi_check:
     tidesdb_commit_status_mark(txn->db->commit_status, txn->commit_seq,
                                TDB_COMMIT_STATUS_IN_PROGRESS);
 
+    /* for multi-CF transactions, add metadata size to each CF's WAL */
+    size_t multi_cf_metadata_size = 0;
+    if (txn->num_cfs > 1)
+    {
+        /* metadata: num_cfs (1 byte) + checksum (8 bytes) + CF names */
+        multi_cf_metadata_size =
+            sizeof(tidesdb_multi_cf_txn_metadata_t) + (txn->num_cfs * TDB_MAX_CF_NAME_LEN);
+    }
+
     for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
     {
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
 
         int cf_op_count = 0;
-        size_t cf_wal_size = 0;
+        size_t cf_wal_size = multi_cf_metadata_size; /* start with metadata size */
 
         for (int i = 0; i < txn->num_ops; i++)
         {
@@ -12033,6 +12042,51 @@ skip_ssi_check:
         if (!wal_batch) return TDB_ERR_MEMORY;
 
         uint8_t *wal_ptr = wal_batch;
+
+        /* write multi-CF metadata if this is a multi-CF transaction */
+        if (txn->num_cfs > 1)
+        {
+            /* write num_participant_cfs */
+            *wal_ptr++ = (uint8_t)txn->num_cfs;
+
+            /* prepare checksum data: num_cfs + all CF names */
+            size_t cf_names_size = txn->num_cfs * TDB_MAX_CF_NAME_LEN;
+            size_t checksum_data_size = sizeof(uint8_t) + cf_names_size;
+            uint8_t *checksum_data = malloc(checksum_data_size);
+            if (!checksum_data)
+            {
+                free(wal_batch);
+                return TDB_ERR_MEMORY;
+            }
+
+            checksum_data[0] = (uint8_t)txn->num_cfs;
+            uint8_t *name_ptr = checksum_data + 1;
+
+            /* copy all CF names into checksum data and WAL */
+            for (int i = 0; i < txn->num_cfs; i++)
+            {
+                memset(name_ptr, 0, TDB_MAX_CF_NAME_LEN);
+                strncpy((char *)name_ptr, txn->cfs[i]->name, TDB_MAX_CF_NAME_LEN - 1);
+                name_ptr += TDB_MAX_CF_NAME_LEN;
+            }
+
+            /* compute checksum */
+            uint64_t checksum = XXH64(checksum_data, checksum_data_size, 0);
+            free(checksum_data);
+
+            /* write checksum (8 bytes, little-endian) */
+            encode_uint64_le_compat(wal_ptr, checksum);
+            wal_ptr += sizeof(uint64_t);
+
+            /* write CF names */
+            for (int i = 0; i < txn->num_cfs; i++)
+            {
+                memset(wal_ptr, 0, TDB_MAX_CF_NAME_LEN);
+                strncpy((char *)wal_ptr, txn->cfs[i]->name, TDB_MAX_CF_NAME_LEN - 1);
+                wal_ptr += TDB_MAX_CF_NAME_LEN;
+            }
+        }
+
         for (int i = 0; i < txn->num_ops; i++)
         {
             tidesdb_txn_op_t *op = &txn->ops[i];

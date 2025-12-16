@@ -6792,6 +6792,144 @@ static void test_background_flush_multiple_immutable_memtables(void)
     cleanup_test_dir();
 }
 
+static void test_multi_cf_transaction_atomicity_recovery(void)
+{
+    cleanup_test_dir();
+    const int NUM_TRANSACTIONS = 5;
+    {
+        tidesdb_t *db = create_test_db();
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.compression_algorithm = NO_COMPRESSION;
+
+        /* create three column families */
+        ASSERT_EQ(tidesdb_create_column_family(db, "cf_alpha", &cf_config), 0);
+        ASSERT_EQ(tidesdb_create_column_family(db, "cf_beta", &cf_config), 0);
+        ASSERT_EQ(tidesdb_create_column_family(db, "cf_gamma", &cf_config), 0);
+
+        tidesdb_column_family_t *cf_alpha = tidesdb_get_column_family(db, "cf_alpha");
+        tidesdb_column_family_t *cf_beta = tidesdb_get_column_family(db, "cf_beta");
+        tidesdb_column_family_t *cf_gamma = tidesdb_get_column_family(db, "cf_gamma");
+        ASSERT_TRUE(cf_alpha != NULL);
+        ASSERT_TRUE(cf_beta != NULL);
+        ASSERT_TRUE(cf_gamma != NULL);
+
+        /* write multi-CF transactions touching all three CFs */
+        for (int i = 0; i < NUM_TRANSACTIONS; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+            char key_alpha[32], value_alpha[64];
+            char key_beta[32], value_beta[64];
+            char key_gamma[32], value_gamma[64];
+
+            snprintf(key_alpha, sizeof(key_alpha), "alpha_key_%03d", i);
+            snprintf(value_alpha, sizeof(value_alpha), "alpha_value_%03d", i);
+            snprintf(key_beta, sizeof(key_beta), "beta_key_%03d", i);
+            snprintf(value_beta, sizeof(value_beta), "beta_value_%03d", i);
+            snprintf(key_gamma, sizeof(key_gamma), "gamma_key_%03d", i);
+            snprintf(value_gamma, sizeof(value_gamma), "gamma_value_%03d", i);
+
+            /* write to all three CFs in same transaction */
+            ASSERT_EQ(tidesdb_txn_put(txn, cf_alpha, (uint8_t *)key_alpha, strlen(key_alpha) + 1,
+                                      (uint8_t *)value_alpha, strlen(value_alpha) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf_beta, (uint8_t *)key_beta, strlen(key_beta) + 1,
+                                      (uint8_t *)value_beta, strlen(value_beta) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf_gamma, (uint8_t *)key_gamma, strlen(key_gamma) + 1,
+                                      (uint8_t *)value_gamma, strlen(value_gamma) + 1, 0),
+                      0);
+
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+
+        /* close database (simulates crash - data only in WAL) */
+        tidesdb_close(db);
+    }
+
+    /* reopen and verify all transactions recovered atomically */
+    {
+        /* reopen existing database (don't create new one) */
+        tidesdb_config_t config = {.db_path = "./test_tidesdb",
+                                   .num_flush_threads = 2,
+                                   .num_compaction_threads = 2,
+                                   .log_level = TDB_LOG_INFO,
+                                   .block_cache_size = 64 * 1024 * 1024,
+                                   .max_open_sstables = 100,
+                                   .wait_for_txns_on_close = 1};
+
+        tidesdb_t *db = NULL;
+        int result = tidesdb_open(&config, &db);
+        ASSERT_EQ(result, 0);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_t *cf_alpha = tidesdb_get_column_family(db, "cf_alpha");
+        tidesdb_column_family_t *cf_beta = tidesdb_get_column_family(db, "cf_beta");
+        tidesdb_column_family_t *cf_gamma = tidesdb_get_column_family(db, "cf_gamma");
+        ASSERT_TRUE(cf_alpha != NULL);
+        ASSERT_TRUE(cf_beta != NULL);
+        ASSERT_TRUE(cf_gamma != NULL);
+
+        /* verify all transactions are present in all three CFs */
+        for (int i = 0; i < NUM_TRANSACTIONS; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+            char key_alpha[32], expected_value_alpha[64];
+            char key_beta[32], expected_value_beta[64];
+            char key_gamma[32], expected_value_gamma[64];
+
+            snprintf(key_alpha, sizeof(key_alpha), "alpha_key_%03d", i);
+            snprintf(expected_value_alpha, sizeof(expected_value_alpha), "alpha_value_%03d", i);
+            snprintf(key_beta, sizeof(key_beta), "beta_key_%03d", i);
+            snprintf(expected_value_beta, sizeof(expected_value_beta), "beta_value_%03d", i);
+            snprintf(key_gamma, sizeof(key_gamma), "gamma_key_%03d", i);
+            snprintf(expected_value_gamma, sizeof(expected_value_gamma), "gamma_value_%03d", i);
+
+            uint8_t *retrieved_value = NULL;
+            size_t retrieved_size = 0;
+
+            /* verify cf_alpha has the key */
+            ASSERT_EQ(tidesdb_txn_get(txn, cf_alpha, (uint8_t *)key_alpha, strlen(key_alpha) + 1,
+                                      &retrieved_value, &retrieved_size),
+                      0);
+            ASSERT_TRUE(retrieved_value != NULL);
+            ASSERT_EQ(retrieved_size, strlen(expected_value_alpha) + 1);
+            ASSERT_EQ(memcmp(retrieved_value, expected_value_alpha, retrieved_size), 0);
+            free(retrieved_value);
+            retrieved_value = NULL;
+
+            /* verify cf_beta has the key */
+            ASSERT_EQ(tidesdb_txn_get(txn, cf_beta, (uint8_t *)key_beta, strlen(key_beta) + 1,
+                                      &retrieved_value, &retrieved_size),
+                      0);
+            ASSERT_TRUE(retrieved_value != NULL);
+            ASSERT_EQ(retrieved_size, strlen(expected_value_beta) + 1);
+            ASSERT_EQ(memcmp(retrieved_value, expected_value_beta, retrieved_size), 0);
+            free(retrieved_value);
+            retrieved_value = NULL;
+
+            /* verify cf_gamma has the key */
+            ASSERT_EQ(tidesdb_txn_get(txn, cf_gamma, (uint8_t *)key_gamma, strlen(key_gamma) + 1,
+                                      &retrieved_value, &retrieved_size),
+                      0);
+            ASSERT_TRUE(retrieved_value != NULL);
+            ASSERT_EQ(retrieved_size, strlen(expected_value_gamma) + 1);
+            ASSERT_EQ(memcmp(retrieved_value, expected_value_gamma, retrieved_size), 0);
+            free(retrieved_value);
+
+            tidesdb_txn_free(txn);
+        }
+
+        tidesdb_close(db);
+    }
+
+    cleanup_test_dir();
+}
+
 static void test_multi_cf_wal_recovery(void)
 {
     cleanup_test_dir();
@@ -7766,6 +7904,7 @@ int main(void)
     RUN_TEST(test_persistence_and_recovery, tests_passed);
     RUN_TEST(test_multi_cf_wal_recovery, tests_passed);
     RUN_TEST(test_multi_cf_many_sstables_recovery, tests_passed);
+    RUN_TEST(test_multi_cf_transaction_atomicity_recovery, tests_passed);
     RUN_TEST(test_iterator_basic, tests_passed);
     RUN_TEST(test_stats, tests_passed);
     RUN_TEST(test_iterator_seek, tests_passed);

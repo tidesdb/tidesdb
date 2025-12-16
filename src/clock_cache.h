@@ -35,7 +35,7 @@ typedef struct
 typedef struct
 {
     _Atomic(char *) key;
-    _Atomic(void *) payload;
+    _Atomic(uint8_t *) payload;
     atomic_size_t key_len;
     atomic_size_t payload_len;
     _Atomic(uint8_t) ref_bit;
@@ -170,11 +170,11 @@ void clock_cache_destroy(clock_cache_t *cache);
  * @param cache the cache
  * @param key the key
  * @param key_len the key length
- * @param payload the payload (generic binary data)
+ * @param payload the payload
  * @param payload_len the payload length
  * @return 0 on success, -1 on failure
  */
-int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const void *payload,
+int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const uint8_t *payload,
                     size_t payload_len);
 
 /**
@@ -186,7 +186,8 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
  * @param payload_len output parameter for payload length
  * @return allocated payload (caller must free) or NULL if not found
  */
-void *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, size_t *payload_len);
+uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len,
+                         size_t *payload_len);
 
 /**
  * clock_cache_delete
@@ -223,8 +224,9 @@ void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats);
  * @param user_data user data passed to callback
  * @return number of entries processed
  */
-typedef int (*clock_cache_foreach_callback_t)(const char *key, size_t key_len, const void *payload,
-                                              size_t payload_len, void *user_data);
+typedef int (*clock_cache_foreach_callback_t)(const char *key, size_t key_len,
+                                              const uint8_t *payload, size_t payload_len,
+                                              void *user_data);
 
 size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size_t prefix_len,
                                   clock_cache_foreach_callback_t callback, void *user_data);

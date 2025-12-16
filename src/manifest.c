@@ -24,6 +24,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, int level,
+                                                 uint64_t id, uint64_t num_entries,
+                                                 uint64_t size_bytes);
+
 tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
 {
     if (!path) return NULL;
@@ -42,6 +46,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     manifest->capacity = MANIFEST_INITIAL_CAPACITY;
     manifest->sequence = 0;
     manifest->fp = NULL;
+    atomic_init(&manifest->active_ops, 0);
     strncpy(manifest->path, path, MANIFEST_PATH_LEN - 1);
     manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
 
@@ -98,7 +103,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
         if (sscanf(line, "%d,%" SCNu64 ",%" SCNu64 ",%" SCNu64, &level, &id, &num_entries,
                    &size_bytes) == 4)
         {
-            tidesdb_manifest_add_sstable(manifest, level, id, num_entries, size_bytes);
+            tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
         }
     }
 
@@ -108,12 +113,21 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     return manifest;
 }
 
-int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, int level, uint64_t id,
-                                 uint64_t num_entries, uint64_t size_bytes)
+/**
+ * tidesdb_manifest_add_sstable_unlocked
+ * adds an sstable to the manifest
+ * @param manifest manifest to add sstable to
+ * @param level level of sstable
+ * @param id id of sstable
+ * @param num_entries number of entries in sstable
+ * @param size_bytes size of sstable in bytes
+ * @return 0 on success, -1 on error
+ */
+static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, int level,
+                                                 uint64_t id, uint64_t num_entries,
+                                                 uint64_t size_bytes)
 {
     if (!manifest) return -1;
-
-    pthread_rwlock_wrlock(&manifest->lock);
 
     for (int i = 0; i < manifest->num_entries; i++)
     {
@@ -121,7 +135,6 @@ int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, int level, uint64
         {
             manifest->entries[i].num_entries = num_entries;
             manifest->entries[i].size_bytes = size_bytes;
-            pthread_rwlock_unlock(&manifest->lock);
             return 0;
         }
     }
@@ -133,7 +146,6 @@ int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, int level, uint64
             realloc(manifest->entries, sizeof(tidesdb_manifest_entry_t) * new_capacity);
         if (!new_entries)
         {
-            pthread_rwlock_unlock(&manifest->lock);
             return -1;
         }
 
@@ -147,14 +159,28 @@ int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, int level, uint64
     manifest->entries[manifest->num_entries].size_bytes = size_bytes;
     manifest->num_entries++;
 
-    pthread_rwlock_unlock(&manifest->lock);
     return 0;
+}
+
+int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, int level, uint64_t id,
+                                 uint64_t num_entries, uint64_t size_bytes)
+{
+    if (!manifest) return -1;
+
+    atomic_fetch_add(&manifest->active_ops, 1);
+    pthread_rwlock_wrlock(&manifest->lock);
+    int result =
+        tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
+    pthread_rwlock_unlock(&manifest->lock);
+    atomic_fetch_sub(&manifest->active_ops, 1);
+    return result;
 }
 
 int tidesdb_manifest_remove_sstable(tidesdb_manifest_t *manifest, int level, uint64_t id)
 {
     if (!manifest) return -1;
 
+    atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_wrlock(&manifest->lock);
 
     for (int i = 0; i < manifest->num_entries; i++)
@@ -165,11 +191,13 @@ int tidesdb_manifest_remove_sstable(tidesdb_manifest_t *manifest, int level, uin
                     sizeof(tidesdb_manifest_entry_t) * (manifest->num_entries - i - 1));
             manifest->num_entries--;
             pthread_rwlock_unlock(&manifest->lock);
+            atomic_fetch_sub(&manifest->active_ops, 1);
             return 0;
         }
     }
 
     pthread_rwlock_unlock(&manifest->lock);
+    atomic_fetch_sub(&manifest->active_ops, 1);
     return -1;
 }
 
@@ -177,6 +205,7 @@ int tidesdb_manifest_has_sstable(tidesdb_manifest_t *manifest, int level, uint64
 {
     if (!manifest) return 0;
 
+    atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_rdlock(&manifest->lock);
 
     for (int i = 0; i < manifest->num_entries; i++)
@@ -184,11 +213,13 @@ int tidesdb_manifest_has_sstable(tidesdb_manifest_t *manifest, int level, uint64
         if (manifest->entries[i].level == level && manifest->entries[i].id == id)
         {
             pthread_rwlock_unlock(&manifest->lock);
+            atomic_fetch_sub(&manifest->active_ops, 1);
             return 1;
         }
     }
 
     pthread_rwlock_unlock(&manifest->lock);
+    atomic_fetch_sub(&manifest->active_ops, 1);
     return 0;
 }
 
@@ -196,15 +227,18 @@ void tidesdb_manifest_update_sequence(tidesdb_manifest_t *manifest, uint64_t seq
 {
     if (!manifest) return;
 
+    atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_wrlock(&manifest->lock);
     manifest->sequence = sequence;
     pthread_rwlock_unlock(&manifest->lock);
+    atomic_fetch_sub(&manifest->active_ops, 1);
 }
 
 int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
 {
     if (!manifest || !path) return -1;
 
+    atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_wrlock(&manifest->lock);
 
     /* close existing file pointer if path changed */
@@ -228,6 +262,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     if (!fp)
     {
         pthread_rwlock_unlock(&manifest->lock);
+        atomic_fetch_sub(&manifest->active_ops, 1);
         return -1;
     }
 
@@ -245,6 +280,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     {
         fclose(fp);
         pthread_rwlock_unlock(&manifest->lock);
+        atomic_fetch_sub(&manifest->active_ops, 1);
         return -1;
     }
 
@@ -260,12 +296,21 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     manifest->fp = tdb_fopen(path, "r");
 
     pthread_rwlock_unlock(&manifest->lock);
+    atomic_fetch_sub(&manifest->active_ops, 1);
     return 0;
 }
 
 void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
 {
     if (!manifest) return;
+
+    /* wait for all active operations to complete before destroying */
+    int wait_count = 0;
+    while (atomic_load(&manifest->active_ops) > 0 && wait_count < MANIFEST_CLOSE_MAX_WAITS)
+    {
+        usleep(MANIFEST_CLOSE_WAIT_US);
+        wait_count++;
+    }
 
     if (manifest->fp)
     {

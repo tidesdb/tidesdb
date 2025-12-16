@@ -97,8 +97,8 @@ struct clock_cache_partition_t
  * -- hash table provides O(1) average-case lookups (with chaining for collisions)
  * -- CLOCK array enables efficient second-chance eviction without reordering
  * -- for high-performance workloads
- *    - use 64-128 partitions for 16+ threads to minimize lock contention
- *    - hash table size auto-scales to next power-of-2 >= slots_per_partition
+ *    -- use 64-128 partitions for 16+ threads to minimize lock contention
+ *    -- hash table size auto-scales to next power-of-2 >= slots_per_partition
  * @param partitions array of partitions
  * @param num_partitions number of partitions
  * @param partition_mask mask for fast modulo (num_partitions - 1)
@@ -106,7 +106,7 @@ struct clock_cache_partition_t
  * @param total_bytes total bytes across all partitions
  * @param hits cache hits
  * @param misses cache misses
- * @param shutdown shutdown flag - prevents new operations
+ * @param shutdown shutdown flag -- prevents new operations
  */
 struct clock_cache_t
 {

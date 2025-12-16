@@ -6844,7 +6844,7 @@ static void test_multi_cf_transaction_atomicity_recovery(void)
             tidesdb_txn_free(txn);
         }
 
-        /* close database (simulates crash - data only in WAL) */
+        /* close database (simulates crash -- data only in WAL) */
         tidesdb_close(db);
     }
 
@@ -7237,7 +7237,7 @@ static void test_multi_cf_many_sstables_recovery(void)
         }
         ASSERT_EQ(alpha_found_count, TOTAL_KEYS_PER_CF);
 
-        /* verify all keys from cf_beta across all SSTables */
+        /* verify all keys from cf_beta across all ssts */
         int beta_found_count = 0;
         for (int i = 0; i < TOTAL_KEYS_PER_CF; i++)
         {

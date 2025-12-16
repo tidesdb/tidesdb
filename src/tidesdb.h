@@ -328,7 +328,7 @@ typedef struct tidesdb_config_t
  * @param wal_group_buffer_size current size of data in buffer (atomic)
  * @param wal_group_buffer_capacity total capacity of buffer
  * @param wal_group_leader atomic flag indicating a thread is leading group commit (CAS)
- * @param manifest manifest for column family (no lock needed - operations serialized)
+ * @param manifest manifest for column family
  * @param db parent database reference
  */
 struct tidesdb_column_family_t
@@ -686,10 +686,10 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator
  * closes a database
  *
  * behavior depends on config.wait_for_txns_on_close:
- * - false (default) -- proceeds immediately with close. active transactions will fail
+ * -- false (default) -- proceeds immediately with close. active transactions will fail
  *   on next operation with TDB_ERR_INVALID_DB. this is the recommended behavior
  *   used by RocksDB, LevelDB, etc. Close completes in < N-ms.
- * - true -- waits up to n seconds for active transactions to complete. If timeout
+ * -- true -- waits up to n seconds for active transactions to complete. If timeout
  *   expires, aborts close and returns TDB_ERR_UNKNOWN. This is legacy behavior
  *   that can cause unpredictable latency and potential deadlocks.
  *

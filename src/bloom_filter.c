@@ -193,8 +193,8 @@ uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
     }
 
     /* we allocate worst-case size
-     * - header: 3 varint32s (m, h, non_zero_count) = 15 bytes max
-     * - sparse data: each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
+     * -- header: 3 varint32s (m, h, non_zero_count) = 15 bytes max
+     * -- sparse data: each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
      */
     size_t max_size = 15 + non_zero_count * 15;
     uint8_t *buffer = malloc(max_size);

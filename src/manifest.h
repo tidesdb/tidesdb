@@ -21,9 +21,12 @@
 
 #define MANIFEST_INITIAL_CAPACITY 64
 /* we align with tidesdb core major */
-#define MANIFEST_VERSION      6
-#define MANIFEST_PATH_LEN     4096
-#define MANIFEST_MAX_LINE_LEN 256
+#define MANIFEST_VERSION         6
+#define MANIFEST_PATH_LEN        4096
+#define MANIFEST_MAX_LINE_LEN    256
+#define MANIFEST_CLOSE_WAIT_US   100   /* microseconds to wait between checks */
+#define MANIFEST_CLOSE_MAX_WAITS 10000 /* max iterations (10000 × 100μs = 1 second) */
+#define MANIFEST_CLOSE_WAIT_US   100
 
 #include "compat.h"
 
@@ -53,6 +56,7 @@ typedef struct
  * @param path path to manifest file
  * @param fp file pointer (kept open for efficient commits)
  * @param lock reader-writer lock for thread safety
+ * @param active_ops count of active operations (for safe shutdown)
  */
 typedef struct
 {
@@ -63,6 +67,7 @@ typedef struct
     char path[MANIFEST_PATH_LEN];
     FILE *fp;
     pthread_rwlock_t lock;
+    _Atomic(int) active_ops;
 } tidesdb_manifest_t;
 
 /**

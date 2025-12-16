@@ -405,7 +405,7 @@ void test_concurrent_read_evict_race(void)
 {
     /* create a small cache to force evictions but allow some reads */
     cache_config_t config = {
-        .max_bytes = 2048,        /* small - allows ~15 entries */
+        .max_bytes = 2048,        /* small -- allows ~15 entries */
         .num_partitions = 1,      /* single partition for maximum contention */
         .slots_per_partition = 16 /* small slots */
     };

@@ -270,6 +270,18 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
         return;
     }
 
+    /* check if entry is being read (ref_bit > 1)
+     * CLOCK algorithm sets ref_bit=1 for recently accessed entries
+     * Readers increment it, so ref_bit > 1 means active readers */
+    atomic_thread_fence(memory_order_seq_cst);
+    uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_seq_cst);
+    if (ref > 1)
+    {
+        /* entry is being read by active readers, revert state and abort */
+        atomic_store_explicit(&entry->state, ENTRY_VALID, memory_order_release);
+        return;
+    }
+
     /* mark hash entry as deleted (tombstone) -- but keep back-pointer for reuse */
     uint64_t hash = _compute_hash(key, klen);
     size_t slot_idx = entry - partition->slots;

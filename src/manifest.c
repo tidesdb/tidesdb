@@ -58,6 +58,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
         /* file doesn't exist, return empty manifest */
         if (errno == ENOENT) return manifest;
         /* other error */
+        pthread_rwlock_destroy(&manifest->lock);
         free(manifest->entries);
         free(manifest);
         return NULL;
@@ -71,6 +72,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
         if (version != MANIFEST_VERSION)
         {
             fclose(fp);
+            pthread_rwlock_destroy(&manifest->lock);
             free(manifest->entries);
             free(manifest);
             return NULL;
@@ -119,6 +121,7 @@ int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, int level, uint64
         {
             manifest->entries[i].num_entries = num_entries;
             manifest->entries[i].size_bytes = size_bytes;
+            pthread_rwlock_unlock(&manifest->lock);
             return 0;
         }
     }
@@ -128,7 +131,11 @@ int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, int level, uint64
         int new_capacity = manifest->capacity * 2;
         tidesdb_manifest_entry_t *new_entries =
             realloc(manifest->entries, sizeof(tidesdb_manifest_entry_t) * new_capacity);
-        if (!new_entries) return -1;
+        if (!new_entries)
+        {
+            pthread_rwlock_unlock(&manifest->lock);
+            return -1;
+        }
 
         manifest->entries = new_entries;
         manifest->capacity = new_capacity;
@@ -218,7 +225,11 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
 
     /* open for writing (truncates file) */
     FILE *fp = tdb_fopen(path, "w");
-    if (!fp) return -1;
+    if (!fp)
+    {
+        pthread_rwlock_unlock(&manifest->lock);
+        return -1;
+    }
 
     fprintf(fp, "%d\n", MANIFEST_VERSION);
     fprintf(fp, "%" PRIu64 "\n", manifest->sequence);
@@ -233,6 +244,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     if (fflush(fp) != 0)
     {
         fclose(fp);
+        pthread_rwlock_unlock(&manifest->lock);
         return -1;
     }
 
@@ -264,5 +276,4 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
     pthread_rwlock_destroy(&manifest->lock);
     free(manifest->entries);
     free(manifest);
-    manifest = NULL;
 }

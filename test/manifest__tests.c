@@ -252,17 +252,12 @@ void test_manifest_atomic_commit()
     int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH);
     ASSERT_EQ(result, 0);
 
-    /* verify temp file was cleaned up */
-    char temp_path[1024];
-    snprintf(temp_path, sizeof(temp_path), "%s.tmp", TEST_MANIFEST_PATH);
-    FILE *temp_check = fopen(temp_path, "r");
-    ASSERT_TRUE(temp_check == NULL); /* temp file should not exist */
+    tidesdb_manifest_t *loaded = tidesdb_manifest_load(TEST_MANIFEST_PATH);
+    ASSERT_TRUE(loaded != NULL);
+    ASSERT_EQ(loaded->num_entries, 1);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(loaded, 1, 100));
 
-    /* verify actual file exists */
-    FILE *actual_check = fopen(TEST_MANIFEST_PATH, "r");
-    ASSERT_TRUE(actual_check != NULL);
-    fclose(actual_check);
-
+    tidesdb_manifest_free(loaded);
     tidesdb_manifest_free(manifest);
     remove(TEST_MANIFEST_PATH);
 }

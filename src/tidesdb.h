@@ -469,7 +469,6 @@ struct tidesdb_level_t
  * @param active_txns array of active serializable transactions
  * @param num_active_txns number of active transactions
  * @param active_txns_capacity capacity of active transactions array
- * @param active_txn_count count of all active transactions (all isolation levels)
  * @param cached_available_disk_space cached available disk space in bytes
  * @param last_disk_space_check timestamp of last disk space check
  * @param cached_current_time cached current time updated by reaper thread to avoid syscalls
@@ -507,7 +506,6 @@ struct tidesdb_t
     tidesdb_txn_t **active_txns;
     int num_active_txns;
     int active_txns_capacity;
-    _Atomic(int) active_txn_count;
     _Atomic(uint64_t) cached_available_disk_space;
     _Atomic(time_t) last_disk_space_check;
     _Atomic(time_t) cached_current_time;

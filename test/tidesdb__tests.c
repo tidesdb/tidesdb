@@ -6856,8 +6856,7 @@ static void test_multi_cf_transaction_atomicity_recovery(void)
                                    .num_compaction_threads = 2,
                                    .log_level = TDB_LOG_INFO,
                                    .block_cache_size = 64 * 1024 * 1024,
-                                   .max_open_sstables = 100,
-                                   .wait_for_txns_on_close = 1};
+                                   .max_open_sstables = 100};
 
         tidesdb_t *db = NULL;
         int result = tidesdb_open(&config, &db);

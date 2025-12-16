@@ -118,7 +118,6 @@ typedef struct
 #define TDB_CLOSE_TXN_WAIT_SLEEP_US            1000
 #define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US     10000
 #define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS 100
-#define TDB_CLOSE_TXN_WAIT_MAX_MS              5000
 #define TDB_CLOSE_FLUSH_WAIT_MAX_MS            10000
 #define TDB_OPENING_WAIT_MAX_MS                100
 #define TDB_MAX_FFLUSH_RETRY_ATTEMPTS          5
@@ -1699,7 +1698,6 @@ tidesdb_config_t tidesdb_default_config(void)
                                .num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE,
                                .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
                                .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
-                               .wait_for_txns_on_close = TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE,
                                .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES};
     return config;
 }
@@ -9416,7 +9414,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_MEMORY;
     }
     (*db)->num_active_txns = 0;
-    atomic_init(&(*db)->active_txn_count, 0); /* initialize transaction counter */
 
     uint64_t initial_space = 0;
     if (tdb_get_available_disk_space((*db)->db_path, &initial_space) == 0)
@@ -9742,57 +9739,8 @@ int tidesdb_close(tidesdb_t *db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed");
     }
 
-    int final_active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
+   
 
-    if (db->config.wait_for_txns_on_close)
-    {
-        TDB_DEBUG_LOG(TDB_LOG_INFO,
-                      "Waiting for active transactions to complete (wait_for_txns_on_close=true)");
-        int txn_wait_count = 0;
-        while (txn_wait_count < TDB_CLOSE_TXN_WAIT_MAX_MS)
-        {
-            int active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
-
-            if (active_count == 0)
-            {
-                break;
-            }
-
-            if (txn_wait_count % 100 == 0 && txn_wait_count > 0)
-            {
-                TDB_DEBUG_LOG(TDB_LOG_INFO,
-                              "Still waiting for %d active transactions (waited %dms)",
-                              active_count, txn_wait_count);
-            }
-
-            usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
-            txn_wait_count++;
-        }
-
-        final_active_count = atomic_load_explicit(&db->active_txn_count, memory_order_acquire);
-
-        if (final_active_count > 0)
-        {
-            TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                          "Cannot close database - %d transactions still active after %dms",
-                          final_active_count, TDB_CLOSE_TXN_WAIT_MAX_MS);
-            return TDB_ERR_UNKNOWN;
-        }
-    }
-    else
-    {
-        /* proceed immediately with close
-         * active transactions will fail on next operation with TDB_ERR_INVALID_DB
-         * this is the recommended behavior used by RocksDB, LevelDB, etc. */
-        if (final_active_count > 0)
-        {
-            TDB_DEBUG_LOG(TDB_LOG_INFO,
-                          "Closing with %d active transactions - they will fail (fast-fail mode)",
-                          final_active_count);
-        }
-    }
-
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "All active transactions completed");
 
     if (db->flush_queue)
     {
@@ -11007,9 +10955,6 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
     (*txn)->has_rw_conflict_in = 0;
     (*txn)->has_rw_conflict_out = 0;
 
-    /* increment active transaction counter for ALL isolation levels
-     * this allows tidesdb_close to wait for all transactions to complete */
-    atomic_fetch_add_explicit(&db->active_txn_count, 1, memory_order_relaxed);
 
     /* register SERIALIZABLE transactions in active list for SSI tracking */
     if (isolation == TDB_ISOLATION_SERIALIZABLE)
@@ -12482,12 +12427,6 @@ int tidesdb_txn_rollback(tidesdb_txn_t *txn)
 void tidesdb_txn_free(tidesdb_txn_t *txn)
 {
     if (!txn) return;
-
-    /* decrement active transaction counter */
-    if (txn->db)
-    {
-        atomic_fetch_sub_explicit(&txn->db->active_txn_count, 1, memory_order_relaxed);
-    }
 
     for (int i = 0; i < txn->num_ops; i++)
     {

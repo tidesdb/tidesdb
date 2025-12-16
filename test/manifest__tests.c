@@ -355,17 +355,17 @@ void test_manifest_auto_compaction()
 
     tidesdb_manifest_t *m1 = tidesdb_manifest_create();
 
-    /* add entries for SSTables */
+    /* add entries for ssts */
     tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536);
     tidesdb_manifest_add_sstable(m1, 1, 101, 1500, 98304);
     tidesdb_manifest_add_sstable(m1, 2, 200, 2000, 131072);
 
-    /* create actual SSTable files for some entries */
-    FILE *f1 = fopen("./test_manifest_dir/L1_100.klog", "w");
+    /* create actual sst files for some entries */
+    FILE *f1 = tdb_fopen("./test_manifest_dir/L1_100.klog", "w");
     fclose(f1);
-    FILE *f2 = fopen("./test_manifest_dir/L2_200.klog", "w");
+    FILE *f2 = tdb_fopen("./test_manifest_dir/L2_200.klog", "w");
     fclose(f2);
-    /* intentionally don't create L1_101.klog - it's a stale entry */
+    /* intentionally do't create L1_101.klog -- its a stale entry */
 
     /* commit manifest */
     ASSERT_EQ(tidesdb_manifest_commit(m1, "./test_manifest_dir/manifest"), 0);

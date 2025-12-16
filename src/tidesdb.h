@@ -180,7 +180,7 @@ typedef struct
 
 /**
  * tidesdb_sync_mode_t
- * synchronization modes for write-ahead log
+ * synchronization modes for write ahead logging mainly.  sstable writes are sync'ed on completion.
  */
 typedef enum
 {

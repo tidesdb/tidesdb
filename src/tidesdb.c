@@ -197,6 +197,9 @@ typedef struct
 #define TDB_COMMIT_STATUS_BUFFER_SIZE    65536
 #define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE (4 * 1024 * 1024)
 
+/* uint32_t max value */
+#define TDB_MAX_KEY_VALUE_SIZE UINT32_MAX
+
 /**
  * tidesdb_klog_entry_t
  * entry in klog block
@@ -1373,24 +1376,29 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, size_t key_size, size_t value
     if (!db) return TDB_ERR_INVALID_ARGS;
 
     /* enforce architectural limit! all sizes are uint32_t */
-    if (key_size > UINT32_MAX)
+    if (key_size > TDB_MAX_KEY_VALUE_SIZE)
     {
-        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Key size (%zu bytes) exceeds UINT32_MAX", key_size);
+        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Key size (%zu bytes) exceeds TDB_MAX_KEY_VALUE_SIZE",
+                      key_size);
         return TDB_ERR_INVALID_ARGS;
     }
-    if (value_size > UINT32_MAX)
+    if (value_size > TDB_MAX_KEY_VALUE_SIZE)
     {
-        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Value size (%zu bytes) exceeds UINT32_MAX", value_size);
+        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Value size (%zu bytes) exceeds TDB_MAX_KEY_VALUE_SIZE",
+                      value_size);
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    /* check for overflow before doing addition */
+    if (key_size > TDB_MAX_KEY_VALUE_SIZE - value_size)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_FATAL,
+                      "Total key+value size (key: %zu + value: %zu) exceeds TDB_MAX_KEY_VALUE_SIZE",
+                      key_size, value_size);
         return TDB_ERR_INVALID_ARGS;
     }
 
     size_t total_size = key_size + value_size;
-    if (total_size > UINT32_MAX)
-    {
-        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Total key+value size (%zu bytes) exceeds UINT32_MAX",
-                      total_size);
-        return TDB_ERR_INVALID_ARGS;
-    }
 
     uint64_t memory_based_limit = (uint64_t)(db->available_memory * TDB_MEMORY_PERCENTAGE);
     uint64_t max_allowed_size =

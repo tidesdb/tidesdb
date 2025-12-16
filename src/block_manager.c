@@ -66,7 +66,7 @@ static inline uint32_t compute_checksum(const void *data, size_t size)
 
 /**
  * verify_checksum
- * verify xxHash64 checksum
+ * verify xxHash32 checksum
  * @param data the data to verify the checksum for
  * @param size the size of the data
  * @param expected_checksum the expected checksum
@@ -234,6 +234,8 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
 
 int block_manager_close(block_manager_t *bm)
 {
+    if (!bm) return -1;
+
     if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
     {
         (void)fdatasync(bm->fd);
@@ -242,13 +244,17 @@ int block_manager_close(block_manager_t *bm)
     if (close(bm->fd) != 0) return -1;
 
     free(bm);
-    bm = NULL;
 
     return 0;
 }
 
 block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
 {
+    if (size > UINT32_MAX)
+    {
+        return NULL;
+    }
+
     block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
     if (!block) return NULL;
 
@@ -273,6 +279,11 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data)
 
 block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, void *data)
 {
+    if (size > UINT32_MAX)
+    {
+        return NULL;
+    }
+
     block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
     if (!block) return NULL;
 
@@ -284,7 +295,20 @@ block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, voi
 
 int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
 {
+    if (!bm || !block) return -1;
+
+    /* block size is stored as uint32_t, so enforce 4GB limit */
+    if (block->size > UINT32_MAX)
+    {
+        return -1;
+    }
+
     /* block format, [size][checksum][data][size][magic] */
+    /* check for overflow when computing total_size */
+    if (block->size > SIZE_MAX - BLOCK_MANAGER_BLOCK_HEADER_SIZE - BLOCK_MANAGER_FOOTER_SIZE)
+    {
+        return -1;
+    }
     size_t total_size = BLOCK_MANAGER_BLOCK_HEADER_SIZE + block->size + BLOCK_MANAGER_FOOTER_SIZE;
 
     /* atomically allocate space in file */
@@ -762,7 +786,7 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
 int block_manager_get_size(block_manager_t *bm, uint64_t *size)
 {
     if (!bm || !size) return -1;
-    *size = bm->current_file_size;
+    *size = atomic_load(&bm->current_file_size);
     return 0;
 }
 

@@ -21,11 +21,13 @@
 
 #define MANIFEST_INITIAL_CAPACITY 64
 /* we align with tidesdb core major */
-#define MANIFEST_VERSION         6
-#define MANIFEST_PATH_LEN        4096
-#define MANIFEST_MAX_LINE_LEN    256
-#define MANIFEST_CLOSE_WAIT_US   100   /* microseconds to wait between checks */
-#define MANIFEST_CLOSE_MAX_WAITS 10000 /* max iterations (10000 × 100μs = 1 second) */
+#define MANIFEST_VERSION      6
+#define MANIFEST_PATH_LEN     4096
+#define MANIFEST_MAX_LINE_LEN 256
+/* microseconds to wait between checks */
+#define MANIFEST_CLOSE_WAIT_US 100
+/* max iterations (10000 × 100μs = 1 second) */
+#define MANIFEST_CLOSE_MAX_WAITS 10000
 #define MANIFEST_CLOSE_WAIT_US   100
 
 #include "compat.h"

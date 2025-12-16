@@ -62,7 +62,7 @@ typedef struct
     uint64_t sequence;
     char path[MANIFEST_PATH_LEN];
     FILE *fp;
-    rwlock_t lock;
+    pthread_rwlock_t lock;
 } tidesdb_manifest_t;
 
 /**

@@ -190,7 +190,6 @@ void test_manifest_capacity_growth()
 
 void test_manifest_commit_and_load()
 {
-    /* create and populate manifest */
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
@@ -199,11 +198,9 @@ void test_manifest_commit_and_load()
     tidesdb_manifest_add_sstable(manifest, 1, 101, 1500, 98304);
     tidesdb_manifest_update_sequence(manifest, 54321);
 
-    /* commit to disk */
     int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH);
     ASSERT_EQ(result, 0);
 
-    /* free original manifest */
     tidesdb_manifest_close(manifest);
 
     /* load from disk */
@@ -251,13 +248,11 @@ void test_manifest_load_nonexistent()
 
 void test_manifest_atomic_commit()
 {
-    /* create manifest */
     tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
     tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
 
-    /* commit */
     int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH);
     ASSERT_EQ(result, 0);
 
@@ -360,7 +355,6 @@ void test_manifest_persistence_cycle()
 
 void test_manifest_auto_compaction()
 {
-    /* create a test directory and manifest */
     mkdir("." PATH_SEPARATOR "test_manifest_dir", TDB_DIR_PERMISSIONS);
 
     tidesdb_manifest_t *m1 =
@@ -397,7 +391,6 @@ void test_manifest_auto_compaction()
 
     tidesdb_manifest_close(m2);
 
-    /* cleanup */
     remove_directory("." PATH_SEPARATOR "test_manifest_dir");
 }
 

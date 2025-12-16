@@ -176,7 +176,7 @@ void test_buffer_eviction_callback(void)
     ASSERT_EQ(atomic_load(&eviction_count), 2);
     ASSERT_EQ(atomic_load(&eviction_sum), 30);
 
-    /* silent release should NOT trigger eviction */
+    /* silent release should not trigger eviction */
     ASSERT_EQ(buffer_release_silent(buffer, ids[2]), 0);
     ASSERT_EQ(atomic_load(&eviction_count), 2);
 

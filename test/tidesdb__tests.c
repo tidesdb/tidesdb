@@ -3416,7 +3416,7 @@ static void test_no_data_loss_across_operations(void)
     }
 
     tidesdb_flush_memtable(cf);
-    /* we do NOT wait -- reads should work immediately via immutable memtable search */
+    /* we do not wait -- reads should work immediately via immutable memtable search */
 
     /* verify all keys during/after flush */
     for (int i = 0; i < total_keys; i++)
@@ -4199,7 +4199,7 @@ void test_multi_cf_transaction_rollback(void)
                            &retrieved_size) == TDB_SUCCESS);
     free(retrieved_val);
 
-    /* rolled back data should NOT exist */
+    /* rolled back data should not exist */
     assert(tidesdb_txn_get(txn, cf1, (uint8_t *)key2, strlen(key2), &retrieved_val,
                            &retrieved_size) == TDB_ERR_NOT_FOUND);
     assert(tidesdb_txn_get(txn, cf2, (uint8_t *)key2, strlen(key2), &retrieved_val,

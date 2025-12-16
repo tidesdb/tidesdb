@@ -34,6 +34,7 @@ static int tests_failed = 0;
 static void test_compress_decompress_algorithm(compression_algorithm algo, const char *algo_name,
                                                uint8_t *data, size_t data_size)
 {
+    (void)algo_name; /* unused currently.. */
     size_t compressed_size;
     size_t decompressed_size;
     uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, algo);

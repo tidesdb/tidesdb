@@ -6293,10 +6293,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                                          new_sst->klog_size + new_sst->vlog_size);
             /* update sequence to track next_sstable_id for recovery */
             cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-            char manifest_path[TDB_MAX_PATH_LEN];
-            snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
-                     TDB_COLUMN_FAMILY_MANIFEST_NAME);
-            tidesdb_manifest_commit(cf->manifest, manifest_path);
+            /* manifest path is stored in cf->manifest->path */
+            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
 
             tidesdb_sstable_unref(cf->db, new_sst);
         }
@@ -6346,10 +6344,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             /* remove from manifest
              * no lock needed -- compaction is serialized per CF by is_compacting flag */
             tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
-            char manifest_path[TDB_MAX_PATH_LEN];
-            snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
-                     TDB_COLUMN_FAMILY_MANIFEST_NAME);
-            tidesdb_manifest_commit(cf->manifest, manifest_path);
+            /* manifest path is stored in cf->manifest->path */
+            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
         }
         if (!removed)
         {
@@ -7122,10 +7118,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                                              new_sst->klog_size + new_sst->vlog_size);
                 /* update sequence to track next_sstable_id */
                 cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-                char manifest_path[TDB_MAX_PATH_LEN];
-                snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s",
-                         cf->directory, TDB_COLUMN_FAMILY_MANIFEST_NAME);
-                tidesdb_manifest_commit(cf->manifest, manifest_path);
+                /* manifest path is stored in cf->manifest->path */
+                tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
 
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
@@ -7175,10 +7169,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             if (removed_level != -1)
             {
                 tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
-                char manifest_path[TDB_MAX_PATH_LEN];
-                snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s",
-                         cf->directory, TDB_COLUMN_FAMILY_MANIFEST_NAME);
-                tidesdb_manifest_commit(cf->manifest, manifest_path);
+                /* manifest path is stored in cf->manifest->path */
+                tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
             }
 
             /* release the reference we took when collecting sstables */
@@ -7924,10 +7916,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                                              new_sst->klog_size + new_sst->vlog_size);
                 /* update sequence to track next_sstable_id for recovery */
                 cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-                char manifest_path[TDB_MAX_PATH_LEN];
-                snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s",
-                         cf->directory, TDB_COLUMN_FAMILY_MANIFEST_NAME);
-                tidesdb_manifest_commit(cf->manifest, manifest_path);
+                /* manifest path is stored in cf->manifest->path */
+                tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
 
                 TDB_DEBUG_LOG(TDB_LOG_INFO,
                               "Partitioned merge partition %d complete, created SSTable %" PRIu64
@@ -7985,10 +7975,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         if (removed_level != -1)
         {
             tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
-            char manifest_path[TDB_MAX_PATH_LEN];
-            snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
-                     TDB_COLUMN_FAMILY_MANIFEST_NAME);
-            tidesdb_manifest_commit(cf->manifest, manifest_path);
+            /* manifest path is stored in cf->manifest->path */
+            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
         }
 
         /* release the reference we took when collecting sstables */
@@ -8815,10 +8803,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
                                      sst->klog_size + sst->vlog_size);
         /* update sequence to track next_sstable_id for recovery */
         cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-        char manifest_path[TDB_MAX_PATH_LEN];
-        snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
-                 TDB_COLUMN_FAMILY_MANIFEST_NAME);
-        tidesdb_manifest_commit(cf->manifest, manifest_path);
+        /* manifest path is stored in cf->manifest->path */
+        tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
 
         /* release our reference -- the level now owns it */
         tidesdb_sstable_unref(cf->db, sst);
@@ -14272,23 +14258,15 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     closedir(dir);
 
     /* restore next_sstable_id from manifest before WAL recovery
-     * to prevent id collisions when flushing recovered WALs */
-    char manifest_path[TDB_MAX_PATH_LEN];
-    snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
-             TDB_COLUMN_FAMILY_MANIFEST_NAME);
-    tidesdb_manifest_t *temp_manifest = tidesdb_manifest_load(manifest_path);
-    if (temp_manifest)
+     * to prevent id collisions when flushing recovered WALs
+     * manifest is already loaded in cf->manifest with block manager open */
+    if (cf->manifest && cf->manifest->sequence > 0)
     {
-        uint64_t manifest_next_id = temp_manifest->sequence;
-        if (manifest_next_id > 0)
-        {
-            atomic_store_explicit(&cf->next_sstable_id, manifest_next_id, memory_order_relaxed);
-            TDB_DEBUG_LOG(TDB_LOG_INFO,
-                          "CF '%s' pre-loaded next_sstable_id=%" PRIu64
-                          " from manifest before WAL recovery",
-                          cf->name, manifest_next_id);
-        }
-        tidesdb_manifest_free(temp_manifest);
+        atomic_store_explicit(&cf->next_sstable_id, cf->manifest->sequence, memory_order_relaxed);
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "CF '%s' pre-loaded next_sstable_id=%" PRIu64
+                      " from manifest before WAL recovery",
+                      cf->name, cf->manifest->sequence);
     }
 
     /* sort WAL files by ID to ensure correct recovery order

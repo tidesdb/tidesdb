@@ -21,9 +21,11 @@
 
 #define MANIFEST_INITIAL_CAPACITY 64
 /* we align with tidesdb core major */
-#define MANIFEST_VERSION  6
-#define MANIFEST_PATH_LEN 4096
+#define MANIFEST_VERSION     6
+#define MANIFEST_PATH_LEN    4096
+#define MANIFEST_TRUNCATE_AT 100 /* 100 blocks */
 
+#include "block_manager.h"
 #include "compat.h"
 
 /**
@@ -49,6 +51,9 @@ typedef struct
  * @param num_entries number of entries
  * @param capacity capacity of entries array
  * @param sequence current global sequence number
+ * @param bm block manager for manifest file (kept open for fast commits)
+ * @param path path to manifest file
+ * @param block_count number of blocks in manifest file (for compaction tracking)
  */
 typedef struct
 {
@@ -56,6 +61,9 @@ typedef struct
     int num_entries;
     int capacity;
     uint64_t sequence;
+    block_manager_t *bm;
+    char path[MANIFEST_PATH_LEN];
+    int block_count;
 } tidesdb_manifest_t;
 
 /**

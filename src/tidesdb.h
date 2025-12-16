@@ -207,7 +207,6 @@ typedef struct tidesdb_commit_status_t tidesdb_commit_status_t;
 typedef struct tidesdb_level_t tidesdb_level_t;
 typedef struct tidesdb_sstable_t tidesdb_sstable_t;
 typedef struct tidesdb_block_index_t tidesdb_block_index_t;
-/* tidesdb_manifest_t is defined in manifest.h */
 
 /* forward declarations for main types to allow self-referential pointers */
 typedef struct tidesdb_t tidesdb_t;

@@ -33,64 +33,125 @@ tidesdb_manifest_t *tidesdb_manifest_create(void)
     manifest->num_entries = 0;
     manifest->capacity = MANIFEST_INITIAL_CAPACITY;
     manifest->sequence = 0;
+    manifest->bm = NULL;
+    manifest->path[0] = '\0';
+    manifest->block_count = 0;
 
     return manifest;
 }
 
 tidesdb_manifest_t *tidesdb_manifest_load(const char *path)
 {
-    FILE *f = fopen(path, "r");
-    if (!f)
+    /* try to open block manager file */
+    block_manager_t *bm = NULL;
+    if (block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) != 0)
     {
         /* file doesn't exist, create new manifest */
         if (errno == ENOENT) return tidesdb_manifest_create();
         return NULL;
     }
 
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
-    if (!manifest)
+    /* validate last block (permissive mode: truncate to last valid block) */
+    if (block_manager_validate_last_block(bm, 0) != 0)
     {
-        fclose(f);
+        block_manager_close(bm);
         return NULL;
     }
 
-    char line[512];
-    int version = 0;
-
-    while (fgets(line, sizeof(line), f))
+    /* create cursor and go to last block (most recent manifest state) */
+    block_manager_cursor_t *cursor = NULL;
+    if (block_manager_cursor_init(&cursor, bm) != 0)
     {
-        /* skip comments and empty lines */
-        if (line[0] == '#' || line[0] == '\n') continue;
-
-        /* parse version */
-        if (sscanf(line, "VERSION %d", &version) == 1)
-        {
-            if (version != MANIFEST_VERSION)
-            {
-                fclose(f);
-                tidesdb_manifest_free(manifest);
-                return NULL;
-            }
-            continue;
-        }
-
-        /* parse sequence */
-        if (sscanf(line, "SEQUENCE %" SCNu64, &manifest->sequence) == 1)
-        {
-            continue;
-        }
-
-        /* parse sstable entry */
-        int level;
-        uint64_t id, num_entries, size_bytes;
-        if (sscanf(line, "SSTABLE %d %" SCNu64 " %" SCNu64 " %" SCNu64, &level, &id, &num_entries,
-                   &size_bytes) == 4)
-        {
-            tidesdb_manifest_add_sstable(manifest, level, id, num_entries, size_bytes);
-        }
+        block_manager_close(bm);
+        return NULL;
     }
 
-    fclose(f);
+    if (block_manager_cursor_goto_last(cursor) != 0)
+    {
+        /* empty file, create new manifest */
+        block_manager_cursor_free(cursor);
+        block_manager_close(bm);
+        return tidesdb_manifest_create();
+    }
+
+    /* read last block */
+    block_manager_block_t *block = block_manager_cursor_read(cursor);
+    block_manager_cursor_free(cursor);
+    block_manager_close(bm);
+
+    if (!block)
+    {
+        return NULL;
+    }
+
+    /* deserialize manifest from binary format */
+    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    if (!manifest)
+    {
+        block_manager_block_free(block);
+        return NULL;
+    }
+
+    uint8_t *ptr = (uint8_t *)block->data;
+    uint8_t *end = ptr + block->size;
+
+    /* read header */
+    if (ptr + 16 > end) /* need at least 16 bytes for header */
+    {
+        block_manager_block_free(block);
+        tidesdb_manifest_free(manifest);
+        return NULL;
+    }
+
+    uint32_t version;
+    memcpy(&version, ptr, 4);
+    ptr += 4;
+
+    if (version != MANIFEST_VERSION)
+    {
+        block_manager_block_free(block);
+        tidesdb_manifest_free(manifest);
+        return NULL;
+    }
+
+    memcpy(&manifest->sequence, ptr, 8);
+    ptr += 8;
+
+    uint32_t num_entries;
+    memcpy(&num_entries, ptr, 4);
+    ptr += 4;
+
+    /* read entries */
+    size_t entry_size = 4 + 8 + 8 + 8; /* 28 bytes per entry */
+    for (uint32_t i = 0; i < num_entries; i++)
+    {
+        if (ptr + entry_size > end)
+        {
+            block_manager_block_free(block);
+            tidesdb_manifest_free(manifest);
+            return NULL;
+        }
+
+        uint32_t level;
+        memcpy(&level, ptr, 4);
+        ptr += 4;
+
+        uint64_t id;
+        memcpy(&id, ptr, 8);
+        ptr += 8;
+
+        uint64_t entry_num_entries;
+        memcpy(&entry_num_entries, ptr, 8);
+        ptr += 8;
+
+        uint64_t size_bytes;
+        memcpy(&size_bytes, ptr, 8);
+        ptr += 8;
+
+        tidesdb_manifest_add_sstable(manifest, (int)level, id, entry_num_entries, size_bytes);
+    }
+
+    block_manager_block_free(block);
 
     /* compact manifest -- remove entries for sstables that no longer exist on disk
      * this prevents manifest from growing indefinitely with stale entries
@@ -270,63 +331,140 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
 {
     if (!manifest || !path) return -1;
 
-    /* write to temp file */
-    char temp_path[MANIFEST_PATH_LEN];
-    snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
+    /* serialize manifest to binary format:
+     * [version:4][sequence:8][num_entries:4][entries...]
+     * each entry: [level:4][id:8][num_entries:8][size_bytes:8] */
+    size_t entry_size = 4 + 8 + 8 + 8; /* 28 bytes per entry */
+    size_t total_size = 4 + 8 + 4 + (manifest->num_entries * entry_size);
 
-    FILE *f = fopen(temp_path, "w");
-    if (!f) return -1;
+    uint8_t *data = malloc(total_size);
+    if (!data) return -1;
+
+    uint8_t *ptr = data;
 
     /* write header */
-    fprintf(f, "# TidesDB Manifest\n");
-    fprintf(f, "VERSION %d\n", MANIFEST_VERSION);
-    fprintf(f, "SEQUENCE %" PRIu64 "\n", manifest->sequence);
-    fprintf(f, "# Format: SSTABLE <level> <id> <num_entries> <size_bytes>\n");
+    uint32_t version = MANIFEST_VERSION;
+    memcpy(ptr, &version, 4);
+    ptr += 4;
+
+    memcpy(ptr, &manifest->sequence, 8);
+    ptr += 8;
+
+    uint32_t num_entries = (uint32_t)manifest->num_entries;
+    memcpy(ptr, &num_entries, 4);
+    ptr += 4;
 
     /* write entries */
     for (int i = 0; i < manifest->num_entries; i++)
     {
-        fprintf(f, "SSTABLE %d %" PRIu64 " %" PRIu64 " %" PRIu64 "\n", manifest->entries[i].level,
-                manifest->entries[i].id, manifest->entries[i].num_entries,
-                manifest->entries[i].size_bytes);
+        uint32_t level = (uint32_t)manifest->entries[i].level;
+        memcpy(ptr, &level, 4);
+        ptr += 4;
+
+        memcpy(ptr, &manifest->entries[i].id, 8);
+        ptr += 8;
+
+        memcpy(ptr, &manifest->entries[i].num_entries, 8);
+        ptr += 8;
+
+        memcpy(ptr, &manifest->entries[i].size_bytes, 8);
+        ptr += 8;
     }
 
-    /* fsync before close */
-    fflush(f);
-    int fd = tdb_fileno(f);
-    if (fd >= 0)
-    {
-        tdb_fsync(fd);
-    }
-    fclose(f);
+    /* open or reuse block manager */
+    block_manager_t *bm = manifest->bm;
+    int need_close = 0;
 
-    /* atomic rename using compat abstraction */
-    if (atomic_rename_file(temp_path, path) != 0)
+    if (bm == NULL)
     {
-        tdb_unlink(temp_path);
+        /* first commit - open with SYNC_FULL */
+        if (block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_FULL) != 0)
+        {
+            free(data);
+            return -1;
+        }
+        manifest->block_count = block_manager_count_blocks(bm);
+        need_close = 1;
+    }
+    else
+    {
+        /* reopen temporarily with SYNC_FULL for this commit */
+        block_manager_close(manifest->bm);
+        manifest->bm = NULL;
+
+        if (block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_FULL) != 0)
+        {
+            free(data);
+            return -1;
+        }
+        need_close = 1;
+    }
+
+    /* compact if file has too many old blocks (>100)
+     * this prevents unbounded growth while amortizing compaction cost */
+    if (manifest->block_count > 100)
+    {
+        if (block_manager_truncate(bm) != 0)
+        {
+            if (need_close) block_manager_close(bm);
+            free(data);
+            return -1;
+        }
+        manifest->block_count = 0;
+    }
+
+    /* create block and append (COW: old blocks remain, new block is atomic)
+     * block_manager_block_create_from_buffer takes ownership of data */
+    block_manager_block_t *block = block_manager_block_create_from_buffer(total_size, data);
+    if (!block)
+    {
+        if (need_close) block_manager_close(bm);
+        free(data); /* only free on error before block creation */
         return -1;
     }
 
-    /* on windows, fsync the renamed file to ensure directory entry is durable
-     * on posix, this is redundant but harmless (directory fsync is better but this works)
-     * see https://github.com/untitaker/python-atomicwrites/issues/12 / evanjones.ca */
-    FILE *final_f = fopen(path, "r+");
-    if (final_f)
+    /* write block atomically with checksum */
+    int64_t offset = block_manager_block_write(bm, block);
+    block_manager_block_free(block); /* this frees data */
+
+    if (offset < 0)
     {
-        int final_fd = tdb_fileno(final_f);
-        if (final_fd >= 0)
-        {
-            tdb_fsync(final_fd);
-        }
-        fclose(final_f);
+        if (need_close) block_manager_close(bm);
+        /* data already freed by block_manager_block_free */
+        return -1;
     }
 
+    manifest->block_count++;
+
+    /* fsync is handled by block_manager with SYNC_FULL */
+    /* close and reopen with SYNC_NONE for future reads */
+    if (need_close)
+    {
+        block_manager_close(bm);
+
+        /* reopen for future use (SYNC_NONE for reads) */
+        strncpy(manifest->path, path, MANIFEST_PATH_LEN - 1);
+        manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
+
+        if (block_manager_open(&manifest->bm, path, BLOCK_MANAGER_SYNC_NONE) == 0)
+        {
+            /* already tracking block_count */
+        }
+    }
+
+    /* data already freed by block_manager_block_free */
     return 0;
 }
 
 void tidesdb_manifest_free(tidesdb_manifest_t *manifest)
 {
     if (!manifest) return;
+
+    if (manifest->bm)
+    {
+        block_manager_close(manifest->bm);
+        manifest->bm = NULL;
+    }
 
     free(manifest->entries);
     free(manifest);

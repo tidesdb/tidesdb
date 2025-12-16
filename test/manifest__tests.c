@@ -392,6 +392,47 @@ void test_manifest_auto_compaction()
     remove_directory("./test_manifest_dir");
 }
 
+void test_manifest_block_compaction()
+{
+    /* test that manifest compacts after >100 commits */
+    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    ASSERT_TRUE(manifest != NULL);
+
+    /* add initial entry */
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    tidesdb_manifest_update_sequence(manifest, 0);
+
+    /* commit 150 times to trigger compaction (threshold is 100) */
+    for (int i = 0; i < 150; i++)
+    {
+        tidesdb_manifest_update_sequence(manifest, i);
+        int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH);
+        ASSERT_EQ(result, 0);
+    }
+
+    /* verify manifest can still be loaded correctly */
+    tidesdb_manifest_t *loaded = tidesdb_manifest_load(TEST_MANIFEST_PATH);
+    ASSERT_TRUE(loaded != NULL);
+    ASSERT_EQ(loaded->num_entries, 1);
+    ASSERT_EQ(loaded->sequence, 149);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(loaded, 1, 100));
+
+    /* verify the file was compacted by checking block count
+     * after compaction, should have only 1 block (the current state) */
+    block_manager_t *bm = NULL;
+    if (block_manager_open(&bm, TEST_MANIFEST_PATH, BLOCK_MANAGER_SYNC_NONE) == 0)
+    {
+        int block_count = block_manager_count_blocks(bm);
+        /* should be compacted to 1 block after hitting 100+ blocks */
+        ASSERT_TRUE(block_count < 100);
+        block_manager_close(bm);
+    }
+
+    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_free(loaded);
+    remove(TEST_MANIFEST_PATH);
+}
+
 int main()
 {
     printf("\n" BOLDCYAN "Running Manifest Tests...\n" RESET);
@@ -409,6 +450,7 @@ int main()
     RUN_TEST(test_manifest_multiple_levels, tests_passed);
     RUN_TEST(test_manifest_persistence_cycle, tests_passed);
     RUN_TEST(test_manifest_auto_compaction, tests_passed);
+    RUN_TEST(test_manifest_block_compaction, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

@@ -28,19 +28,20 @@ static int tests_failed = 0;
 
 void test_manifest_create()
 {
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
     ASSERT_EQ(manifest->num_entries, 0);
     ASSERT_EQ(manifest->capacity, MANIFEST_INITIAL_CAPACITY);
     ASSERT_EQ(manifest->sequence, 0);
     ASSERT_TRUE(manifest->entries != NULL);
 
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(manifest);
+    remove(TEST_MANIFEST_PATH);
 }
 
 void test_manifest_add_sstable()
 {
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
     /* add first sstable */
@@ -64,12 +65,13 @@ void test_manifest_add_sstable()
     ASSERT_EQ(result, 0);
     ASSERT_EQ(manifest->num_entries, 3);
 
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(manifest);
+    remove(TEST_MANIFEST_PATH);
 }
 
 void test_manifest_update_existing_sstable()
 {
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
     /* add sstable */
@@ -82,12 +84,13 @@ void test_manifest_update_existing_sstable()
     ASSERT_EQ(manifest->entries[0].num_entries, 2000);  /* updated */
     ASSERT_EQ(manifest->entries[0].size_bytes, 131072); /* updated */
 
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(manifest);
+    remove(TEST_MANIFEST_PATH);
 }
 
 void test_manifest_has_sstable()
 {
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
     /* add some sstables */
@@ -105,12 +108,13 @@ void test_manifest_has_sstable()
     ASSERT_FALSE(tidesdb_manifest_has_sstable(manifest, 3, 100));
     ASSERT_FALSE(tidesdb_manifest_has_sstable(manifest, 2, 100));
 
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(manifest);
+    remove(TEST_MANIFEST_PATH);
 }
 
 void test_manifest_remove_sstable()
 {
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
     /* add sstables */
@@ -138,12 +142,13 @@ void test_manifest_remove_sstable()
     ASSERT_EQ(result, -1);
     ASSERT_EQ(manifest->num_entries, 1);
 
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(manifest);
+    remove(TEST_MANIFEST_PATH);
 }
 
 void test_manifest_update_sequence()
 {
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
     ASSERT_EQ(manifest->sequence, 0);
 
@@ -153,12 +158,13 @@ void test_manifest_update_sequence()
     tidesdb_manifest_update_sequence(manifest, 99999);
     ASSERT_EQ(manifest->sequence, 99999);
 
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(manifest);
+    remove(TEST_MANIFEST_PATH);
 }
 
 void test_manifest_capacity_growth()
 {
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
     ASSERT_EQ(manifest->capacity, MANIFEST_INITIAL_CAPACITY);
 
@@ -178,13 +184,14 @@ void test_manifest_capacity_growth()
         ASSERT_TRUE(tidesdb_manifest_has_sstable(manifest, 1, i));
     }
 
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(manifest);
+    remove(TEST_MANIFEST_PATH);
 }
 
 void test_manifest_commit_and_load()
 {
     /* create and populate manifest */
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
     tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
@@ -197,10 +204,10 @@ void test_manifest_commit_and_load()
     ASSERT_EQ(result, 0);
 
     /* free original manifest */
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(manifest);
 
     /* load from disk */
-    tidesdb_manifest_t *loaded = tidesdb_manifest_load(TEST_MANIFEST_PATH);
+    tidesdb_manifest_t *loaded = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(loaded != NULL);
     ASSERT_EQ(loaded->num_entries, 3);
     ASSERT_EQ(loaded->sequence, 54321);
@@ -225,25 +232,27 @@ void test_manifest_commit_and_load()
         }
     }
 
-    tidesdb_manifest_free(loaded);
+    tidesdb_manifest_close(loaded);
     remove(TEST_MANIFEST_PATH);
 }
 
 void test_manifest_load_nonexistent()
 {
     /* loading non-existent file should create new manifest */
-    tidesdb_manifest_t *manifest = tidesdb_manifest_load("." PATH_SEPARATOR "nonexistent_manifest");
+    const char *test_path = "nonexistent_manifest_test";
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(test_path);
     ASSERT_TRUE(manifest != NULL);
     ASSERT_EQ(manifest->num_entries, 0);
     ASSERT_EQ(manifest->sequence, 0);
 
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(manifest);
+    remove(test_path);
 }
 
 void test_manifest_atomic_commit()
 {
     /* create manifest */
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
     tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
@@ -252,19 +261,19 @@ void test_manifest_atomic_commit()
     int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH);
     ASSERT_EQ(result, 0);
 
-    tidesdb_manifest_t *loaded = tidesdb_manifest_load(TEST_MANIFEST_PATH);
+    tidesdb_manifest_t *loaded = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(loaded != NULL);
     ASSERT_EQ(loaded->num_entries, 1);
     ASSERT_TRUE(tidesdb_manifest_has_sstable(loaded, 1, 100));
 
-    tidesdb_manifest_free(loaded);
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(loaded);
+    tidesdb_manifest_close(manifest);
     remove(TEST_MANIFEST_PATH);
 }
 
 void test_manifest_multiple_levels()
 {
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_TRUE(manifest != NULL);
 
     /* add sstables across multiple levels */
@@ -311,7 +320,8 @@ void test_manifest_multiple_levels()
         }
     }
 
-    tidesdb_manifest_free(manifest);
+    tidesdb_manifest_close(manifest);
+    remove(TEST_MANIFEST_PATH);
 }
 
 void test_manifest_persistence_cycle()
@@ -319,31 +329,31 @@ void test_manifest_persistence_cycle()
     /* simulate a full lifecycle: create, add, commit, load, modify, commit, load */
 
     /* cycle 1: create and commit */
-    tidesdb_manifest_t *m1 = tidesdb_manifest_create();
+    tidesdb_manifest_t *m1 = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     tidesdb_manifest_add_sstable(m1, 1, 0, 100, 1024);
     tidesdb_manifest_add_sstable(m1, 1, 1, 200, 2048);
     tidesdb_manifest_update_sequence(m1, 1000);
     ASSERT_EQ(tidesdb_manifest_commit(m1, TEST_MANIFEST_PATH), 0);
-    tidesdb_manifest_free(m1);
+    tidesdb_manifest_close(m1);
 
     /* cycle 2: load, modify, commit */
-    tidesdb_manifest_t *m2 = tidesdb_manifest_load(TEST_MANIFEST_PATH);
+    tidesdb_manifest_t *m2 = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_EQ(m2->num_entries, 2);
     ASSERT_EQ(m2->sequence, 1000);
     tidesdb_manifest_add_sstable(m2, 2, 0, 300, 4096);
     tidesdb_manifest_remove_sstable(m2, 1, 0);
     tidesdb_manifest_update_sequence(m2, 2000);
     ASSERT_EQ(tidesdb_manifest_commit(m2, TEST_MANIFEST_PATH), 0);
-    tidesdb_manifest_free(m2);
+    tidesdb_manifest_close(m2);
 
     /* cycle 3: load and verify */
-    tidesdb_manifest_t *m3 = tidesdb_manifest_load(TEST_MANIFEST_PATH);
+    tidesdb_manifest_t *m3 = tidesdb_manifest_open(TEST_MANIFEST_PATH);
     ASSERT_EQ(m3->num_entries, 2);
     ASSERT_EQ(m3->sequence, 2000);
     ASSERT_FALSE(tidesdb_manifest_has_sstable(m3, 1, 0)); /* removed */
     ASSERT_TRUE(tidesdb_manifest_has_sstable(m3, 1, 1));  /* still there */
     ASSERT_TRUE(tidesdb_manifest_has_sstable(m3, 2, 0));  /* added */
-    tidesdb_manifest_free(m3);
+    tidesdb_manifest_close(m3);
 
     remove(TEST_MANIFEST_PATH);
 }
@@ -353,7 +363,8 @@ void test_manifest_auto_compaction()
     /* create a test directory and manifest */
     mkdir("." PATH_SEPARATOR "test_manifest_dir", TDB_DIR_PERMISSIONS);
 
-    tidesdb_manifest_t *m1 = tidesdb_manifest_create();
+    tidesdb_manifest_t *m1 =
+        tidesdb_manifest_open("." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "manifest");
 
     /* add entries for ssts */
     tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536);
@@ -365,74 +376,29 @@ void test_manifest_auto_compaction()
     fclose(f1);
     FILE *f2 = tdb_fopen("." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "L2_200.klog", "w");
     fclose(f2);
-    /* intentionally do't create L1_101.klog -- its a stale entry */
-
-    usleep(2000000);
+    /* intentionally don't create L1_101.klog -- its a stale entry */
 
     /* commit manifest */
     ASSERT_EQ(tidesdb_manifest_commit(
                   m1, "." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "manifest"),
               0);
-    tidesdb_manifest_free(m1);
+    tidesdb_manifest_close(m1);
 
-    usleep(2000000);
-
-    /* load manifest -- should auto-compact and remove stale entry */
+    /* load manifest */
     tidesdb_manifest_t *m2 =
-        tidesdb_manifest_load("." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "manifest");
+        tidesdb_manifest_open("." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "manifest");
     ASSERT_TRUE(m2 != NULL);
 
-    /* should only have 2 entries now (101 was removed) */
-    ASSERT_EQ(m2->num_entries, 2);
+    /* should have all 3 entries (no auto-compaction) */
+    ASSERT_EQ(m2->num_entries, 3);
     ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 1, 100));
-    ASSERT_FALSE(tidesdb_manifest_has_sstable(m2, 1, 101)); /* removed */
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 1, 101));
     ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 2, 200));
 
-    tidesdb_manifest_free(m2);
+    tidesdb_manifest_close(m2);
 
     /* cleanup */
     remove_directory("." PATH_SEPARATOR "test_manifest_dir");
-}
-
-void test_manifest_block_compaction()
-{
-    /* test that manifest compacts after >100 commits */
-    tidesdb_manifest_t *manifest = tidesdb_manifest_create();
-    ASSERT_TRUE(manifest != NULL);
-
-    /* add initial entry */
-    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
-    tidesdb_manifest_update_sequence(manifest, 0);
-
-    /* commit 150 times to trigger compaction (threshold is 100) */
-    for (int i = 0; i < 150; i++)
-    {
-        tidesdb_manifest_update_sequence(manifest, i);
-        int result = tidesdb_manifest_commit(manifest, TEST_MANIFEST_PATH);
-        ASSERT_EQ(result, 0);
-    }
-
-    /* verify manifest can still be loaded correctly */
-    tidesdb_manifest_t *loaded = tidesdb_manifest_load(TEST_MANIFEST_PATH);
-    ASSERT_TRUE(loaded != NULL);
-    ASSERT_EQ(loaded->num_entries, 1);
-    ASSERT_EQ(loaded->sequence, 149);
-    ASSERT_TRUE(tidesdb_manifest_has_sstable(loaded, 1, 100));
-
-    /* verify the file was compacted by checking block count
-     * after compaction, should have only 1 block (the current state) */
-    block_manager_t *bm = NULL;
-    if (block_manager_open(&bm, TEST_MANIFEST_PATH, BLOCK_MANAGER_SYNC_NONE) == 0)
-    {
-        int block_count = block_manager_count_blocks(bm);
-        /* should be compacted to 1 block after hitting 100+ blocks */
-        ASSERT_TRUE(block_count < 100);
-        block_manager_close(bm);
-    }
-
-    tidesdb_manifest_free(manifest);
-    tidesdb_manifest_free(loaded);
-    remove(TEST_MANIFEST_PATH);
 }
 
 int main()
@@ -450,7 +416,6 @@ int main()
     RUN_TEST(test_manifest_multiple_levels, tests_passed);
     RUN_TEST(test_manifest_persistence_cycle, tests_passed);
     RUN_TEST(test_manifest_auto_compaction, tests_passed);
-    RUN_TEST(test_manifest_block_compaction, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

@@ -8590,8 +8590,7 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
 
     if (cf->manifest)
     {
-        /* no manifest_lock to destroy -- operations are serialized by design */
-        tidesdb_manifest_free(cf->manifest);
+        tidesdb_manifest_close(cf->manifest);
     }
 
     free(cf->name);
@@ -10201,7 +10200,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     char manifest_path[TDB_MAX_PATH_LEN];
     snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
              TDB_COLUMN_FAMILY_MANIFEST_NAME);
-    cf->manifest = tidesdb_manifest_load(manifest_path);
+    cf->manifest = tidesdb_manifest_open(manifest_path);
     if (!cf->manifest)
     {
         /* cleanup all created levels */

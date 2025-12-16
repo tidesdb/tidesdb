@@ -13,7 +13,7 @@ configure_file(
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
-option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" ON)
+option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
 
 if(ENABLE_READ_PROFILING)
     add_compile_definitions(TDB_ENABLE_READ_PROFILING)
@@ -218,7 +218,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # benchmark configuration variables (can be overridden at build time with -D flags)
     if(NOT DEFINED BENCH_NUM_OPERATIONS)
-        set(BENCH_NUM_OPERATIONS 100000)
+        set(BENCH_NUM_OPERATIONS 10000000)
     endif()
     if(NOT DEFINED BENCH_NUM_SEEK_OPS)
         set(BENCH_NUM_SEEK_OPS 100)

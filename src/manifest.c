@@ -322,12 +322,18 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
         wait_count++;
     }
 
+    /* acquire write lock to ensure no operations are in progress
+     * this prevents destroying the lock while another thread holds it */
+    pthread_rwlock_wrlock(&manifest->lock);
+
     if (manifest->fp)
     {
         fclose(manifest->fp);
         manifest->fp = NULL;
     }
 
+    /* unlock before destroying */
+    pthread_rwlock_unlock(&manifest->lock);
     pthread_rwlock_destroy(&manifest->lock);
     free(manifest->entries);
     free(manifest);

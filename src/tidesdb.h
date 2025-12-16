@@ -159,7 +159,7 @@ typedef enum
 #define TDB_VERSION_MINOR 0
 #define TDB_VERSION_PATCH 0
 
-/* Read profiling (enable with TDB_ENABLE_READ_PROFILING) */
+/* read profiling (enable with TDB_ENABLE_READ_PROFILING) */
 #ifdef TDB_ENABLE_READ_PROFILING
 typedef struct
 {

@@ -307,6 +307,20 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
         return -1;
     }
 
+    /* on windows, fsync the renamed file to ensure directory entry is durable
+     * on posix, this is redundant but harmless (directory fsync is better but this works)
+     * see https://github.com/untitaker/python-atomicwrites/issues/12 / evanjones.ca */
+    FILE *final_f = fopen(path, "r+");
+    if (final_f)
+    {
+        int final_fd = tdb_fileno(final_f);
+        if (final_fd >= 0)
+        {
+            tdb_fsync(final_fd);
+        }
+        fclose(final_f);
+    }
+
     return 0;
 }
 

@@ -947,7 +947,7 @@ static size_t tidesdb_block_cache_key(const char *cf_name, const char *klog_path
     filename = filename ? filename + 1 : klog_path;
 
     /* format: "cf_name:filename:block_position" */
-    int len = snprintf(key_buffer, buffer_size, "%s:%s:%lu", cf_name, filename, block_position);
+    int len = snprintf(key_buffer, buffer_size, "%s:%s:" PRIu64, cf_name, filename, block_position);
     if (len < 0 || (size_t)len >= buffer_size) return 0;
 
     return (size_t)len;
@@ -1052,7 +1052,7 @@ typedef struct
  * @param user_data tidesdb_seek_cache_context_t*
  * @return 0 to continue, non-zero to stop
  */
-static int tidesdb_seek_cache_callback(const char *key, size_t key_len, const void *payload,
+static int tidesdb_seek_cache_callback(const char *key, size_t key_len, const uint8_t *payload,
                                        size_t payload_len, void *user_data)
 {
     (void)key_len;

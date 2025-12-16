@@ -9739,9 +9739,6 @@ int tidesdb_close(tidesdb_t *db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed");
     }
 
-   
-
-
     if (db->flush_queue)
     {
         atomic_store(&db->flush_queue->shutdown, 1);
@@ -10954,7 +10951,6 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
 
     (*txn)->has_rw_conflict_in = 0;
     (*txn)->has_rw_conflict_out = 0;
-
 
     /* register SERIALIZABLE transactions in active list for SSI tracking */
     if (isolation == TDB_ISOLATION_SERIALIZABLE)

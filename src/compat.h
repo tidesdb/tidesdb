@@ -1190,6 +1190,17 @@ static inline int sem_post(sem_t *sem)
 #include <sys/time.h>
 #include <unistd.h>
 
+/*
+ * tdb_fopen
+ * @param filename the filename to open
+ * @param mode the mode to open the file in
+ * @return a pointer to the opened file, or NULL on failure
+ */
+static inline FILE *tdb_fopen(const char *filename, const char *mode)
+{
+    return fopen(filename, mode);
+}
+
 /**
  * tdb_fileno
  * portable file descriptor extraction from FILE*

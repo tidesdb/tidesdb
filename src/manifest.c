@@ -159,7 +159,20 @@ tidesdb_manifest_t *tidesdb_manifest_load(const char *path)
      * skip for test manifests in current directory */
     char dir_path[MANIFEST_PATH_LEN];
     const char *last_sep = strrchr(path, '/');
-    if (!last_sep) last_sep = strrchr(path, '\\');
+    const char *last_sep_backslash = strrchr(path, '\\');
+
+    /* use whichever separator appears last in the path */
+    if (last_sep_backslash && (!last_sep || last_sep_backslash > last_sep))
+    {
+        last_sep = last_sep_backslash;
+    }
+
+    /* determine which separator to use based on what was found in the path */
+    const char *path_sep = PATH_SEPARATOR;
+    if (last_sep && *last_sep == '/')
+    {
+        path_sep = "/";
+    }
 
     /* only compact if manifest is in a real subdirectory (not . or ./) */
     if (last_sep && (last_sep - path) > 0)
@@ -196,9 +209,8 @@ tidesdb_manifest_t *tidesdb_manifest_load(const char *path)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 #endif
-                (void)snprintf(klog_path, sizeof(klog_path),
-                               "%s" PATH_SEPARATOR "L%d_%" PRIu64 ".klog", dir_path, entry->level,
-                               entry->id);
+                (void)snprintf(klog_path, sizeof(klog_path), "%s%sL%d_%" PRIu64 ".klog", dir_path,
+                               path_sep, entry->level, entry->id);
                 if (STAT_FUNC(klog_path, &st) == 0)
                 {
                     exists = 1;
@@ -209,9 +221,8 @@ tidesdb_manifest_t *tidesdb_manifest_load(const char *path)
                      * check common partition numbers (0-15 should cover most cases) */
                     for (int p = 0; p < 16 && !exists; p++)
                     {
-                        (void)snprintf(klog_path, sizeof(klog_path),
-                                       "%s" PATH_SEPARATOR "L%dP%d_%" PRIu64 ".klog", dir_path,
-                                       entry->level, p, entry->id);
+                        (void)snprintf(klog_path, sizeof(klog_path), "%s%sL%dP%d_%" PRIu64 ".klog",
+                                       dir_path, path_sep, entry->level, p, entry->id);
                         if (STAT_FUNC(klog_path, &st) == 0)
                         {
                             exists = 1;
@@ -225,7 +236,7 @@ tidesdb_manifest_t *tidesdb_manifest_load(const char *path)
 
                 if (!exists)
                 {
-                    /* file doesn't exist in any format, remove from manifest */
+                    /* file doesnt exist in any format, remove from manifest */
                     memmove(&manifest->entries[i], &manifest->entries[i + 1],
                             sizeof(tidesdb_manifest_entry_t) * (manifest->num_entries - i - 1));
                     manifest->num_entries--;
@@ -400,9 +411,9 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
         need_close = 1;
     }
 
-    /* compact if file has too many old blocks (>100)
+    /* compact if file has too many old blocks (>MANIFEST_TRUNCATE_AT)
      * this prevents unbounded growth while amortizing compaction cost */
-    if (manifest->block_count > 100)
+    if (manifest->block_count > MANIFEST_TRUNCATE_AT)
     {
         if (block_manager_truncate(bm) != 0)
         {

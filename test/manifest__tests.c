@@ -24,7 +24,7 @@
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-#define TEST_MANIFEST_PATH "./test_manifest"
+#define TEST_MANIFEST_PATH "." PATH_SEPARATOR "test_manifest"
 
 void test_manifest_create()
 {
@@ -232,7 +232,7 @@ void test_manifest_commit_and_load()
 void test_manifest_load_nonexistent()
 {
     /* loading non-existent file should create new manifest */
-    tidesdb_manifest_t *manifest = tidesdb_manifest_load("./nonexistent_manifest");
+    tidesdb_manifest_t *manifest = tidesdb_manifest_load("." PATH_SEPARATOR "nonexistent_manifest");
     ASSERT_TRUE(manifest != NULL);
     ASSERT_EQ(manifest->num_entries, 0);
     ASSERT_EQ(manifest->sequence, 0);
@@ -351,7 +351,7 @@ void test_manifest_persistence_cycle()
 void test_manifest_auto_compaction()
 {
     /* create a test directory and manifest */
-    mkdir("./test_manifest_dir", TDB_DIR_PERMISSIONS);
+    mkdir("." PATH_SEPARATOR "test_manifest_dir", TDB_DIR_PERMISSIONS);
 
     tidesdb_manifest_t *m1 = tidesdb_manifest_create();
 
@@ -361,18 +361,21 @@ void test_manifest_auto_compaction()
     tidesdb_manifest_add_sstable(m1, 2, 200, 2000, 131072);
 
     /* create actual sst files for some entries */
-    FILE *f1 = tdb_fopen("./test_manifest_dir/L1_100.klog", "w");
+    FILE *f1 = tdb_fopen("." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "L1_100.klog", "w");
     fclose(f1);
-    FILE *f2 = tdb_fopen("./test_manifest_dir/L2_200.klog", "w");
+    FILE *f2 = tdb_fopen("." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "L2_200.klog", "w");
     fclose(f2);
     /* intentionally do't create L1_101.klog -- its a stale entry */
 
     /* commit manifest */
-    ASSERT_EQ(tidesdb_manifest_commit(m1, "./test_manifest_dir/manifest"), 0);
+    ASSERT_EQ(tidesdb_manifest_commit(
+                  m1, "." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "manifest"),
+              0);
     tidesdb_manifest_free(m1);
 
-    /* load manifest - should auto-compact and remove stale entry */
-    tidesdb_manifest_t *m2 = tidesdb_manifest_load("./test_manifest_dir/manifest");
+    /* load manifest -- should auto-compact and remove stale entry */
+    tidesdb_manifest_t *m2 =
+        tidesdb_manifest_load("." PATH_SEPARATOR "test_manifest_dir" PATH_SEPARATOR "manifest");
     ASSERT_TRUE(m2 != NULL);
 
     /* should only have 2 entries now (101 was removed) */
@@ -384,7 +387,7 @@ void test_manifest_auto_compaction()
     tidesdb_manifest_free(m2);
 
     /* cleanup */
-    remove_directory("./test_manifest_dir");
+    remove_directory("." PATH_SEPARATOR "test_manifest_dir");
 }
 
 void test_manifest_block_compaction()
@@ -430,8 +433,6 @@ void test_manifest_block_compaction()
 
 int main()
 {
-    printf("\n" BOLDCYAN "Running Manifest Tests...\n" RESET);
-
     RUN_TEST(test_manifest_create, tests_passed);
     RUN_TEST(test_manifest_add_sstable, tests_passed);
     RUN_TEST(test_manifest_update_existing_sstable, tests_passed);

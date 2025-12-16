@@ -18,9 +18,6 @@
  */
 #include "tidesdb.h"
 
-#include <dirent.h>
-#include <errno.h>
-
 #include "xxhash.h"
 
 /* read profiling macros */

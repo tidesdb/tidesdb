@@ -524,7 +524,7 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
             free(partition->slots);
             for (size_t j = 0; j < i; j++)
             {
-                free(cache->partitions[j].hash_index);
+                free((void *)cache->partitions[j].hash_index);
                 free(cache->partitions[j].slots);
             }
             free(cache->partitions);
@@ -607,7 +607,7 @@ void clock_cache_destroy(clock_cache_t *cache)
             if (payload) free(payload);
         }
 
-        free(partition->hash_index);
+        free((void *)partition->hash_index);
         free(partition->slots);
     }
 

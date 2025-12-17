@@ -133,21 +133,21 @@ typedef struct
 #define TDB_MAX_FFLUSH_RETRY_ATTEMPTS          5
 #define TDB_FLUSH_RETRY_BACKOFF_US             100000
 
-/* spooky-style L0/L1 file count compaction triggers
- * α (alpha) -- trigger compaction when L0/L1 reaches this many files
- * β (beta) -- slow down writes when L0/L1 reaches this many files
- * γ (gamma) -- stop writes when L0/L1 reaches this many files (emergency) */
-#define TDB_L0_FILE_NUM_COMPACTION_TRIGGER 4      /* α -- compact at 4 files */
-#define TDB_L0_SLOWDOWN_WRITES_TRIGGER     20     /* β -- throttle at 20 files */
-#define TDB_L0_STOP_WRITES_TRIGGER         36     /* γ -- stall at 36 files */
-#define TDB_L0_SLOWDOWN_WRITES_DELAY_US    20000  /* β delay 20ms throttle */
-#define TDB_L0_STOP_WRITES_DELAY_US        100000 /* γ delay 100ms stall */
+/* spooky-style Level 1 file count compaction triggers
+ * α (alpha) -- trigger compaction when Level 1 reaches this many files
+ * β (beta) -- slow down writes when Level 1 reaches this many files
+ * γ (gamma) -- stop writes when Level 1 reaches this many files (emergency) */
+#define TDB_L1_FILE_NUM_COMPACTION_TRIGGER 4      /* α -- compact at 4 files */
+#define TDB_L1_SLOWDOWN_WRITES_TRIGGER     20     /* β -- throttle at 20 files */
+#define TDB_L1_STOP_WRITES_TRIGGER         36     /* γ -- stall at 36 files */
+#define TDB_L1_SLOWDOWN_WRITES_DELAY_US    20000  /* β delay 20ms throttle */
+#define TDB_L1_STOP_WRITES_DELAY_US        100000 /* γ delay 100ms stall */
 
 /* backpressure configuration */
-#define TDB_BACKPRESSURE_THRESHOLD_L0_FULL     100
-#define TDB_BACKPRESSURE_THRESHOLD_L0_CRITICAL 98
-#define TDB_BACKPRESSURE_THRESHOLD_L0_HIGH     95
-#define TDB_BACKPRESSURE_THRESHOLD_L0_MODERATE 90
+#define TDB_BACKPRESSURE_THRESHOLD_L1_FULL     100
+#define TDB_BACKPRESSURE_THRESHOLD_L1_CRITICAL 98
+#define TDB_BACKPRESSURE_THRESHOLD_L1_HIGH     95
+#define TDB_BACKPRESSURE_THRESHOLD_L1_MODERATE 90
 #define TDB_BACKPRESSURE_DELAY_EMERGENCY_US    50000
 #define TDB_BACKPRESSURE_DELAY_CRITICAL_US     10000
 #define TDB_BACKPRESSURE_DELAY_HIGH_US         5000
@@ -162,8 +162,14 @@ typedef struct
 #define TDB_BACKPRESSURE_IMMUTABLE_MODERATE_DELAY_US  1000
 
 /* sstable reaper thread configuration */
-#define TDB_SSTABLE_REAPER_SLEEP_US             100000
-#define TDB_SSTABLE_REAPER_EVICT_RATIO          0.25
+#define TDB_SSTABLE_REAPER_SLEEP_US    100000
+#define TDB_SSTABLE_REAPER_EVICT_RATIO 0.25
+
+/* time conversion constants for pthread_cond_timedwait */
+#define TDB_MICROSECONDS_PER_SECOND     1000000
+#define TDB_NANOSECONDS_PER_SECOND      1000000000
+#define TDB_NANOSECONDS_PER_MICROSECOND 1000
+
 #define TDB_MAX_TXN_CFS                         10000
 #define TDB_MAX_PATH_LEN                        4096
 #define TDB_MAX_TXN_OPS                         100000
@@ -5686,7 +5692,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting full preemptive merge on CF '%s', levels %d->%d",
-                  cf->name, start_level, target_level + 1);
+                  cf->name, start_level + 1, target_level + 1);
 
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
@@ -6424,14 +6430,18 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
 
             /* add new sstable to manifest
-             * no lock needed -- compaction is serialized per CF by is_compacting flag */
+             * manifest operations take internal locks for thread safety */
             tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                          new_sst->id, new_sst->num_entries,
                                          new_sst->klog_size + new_sst->vlog_size);
-            /* update sequence to track next_sstable_id for recovery */
-            cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-            /* manifest path is stored in cf->manifest->path */
-            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
+            int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            if (manifest_result != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "Failed to commit manifest for new SSTable %" PRIu64 " (error: %d)",
+                              new_sst->id, manifest_result);
+            }
 
             tidesdb_sstable_unref(cf->db, new_sst);
         }
@@ -6478,11 +6488,16 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         }
         if (removed)
         {
-            /* remove from manifest
-             * no lock needed -- compaction is serialized per CF by is_compacting flag */
+            /* remove from manifest - manifest operations take internal locks for thread safety */
             tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
-            /* manifest path is stored in cf->manifest->path */
-            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            if (manifest_result != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "Failed to commit manifest after removing SSTable %" PRIu64
+                              " (error: %d)",
+                              sst->id, manifest_result);
+            }
         }
         if (!removed)
         {
@@ -6535,7 +6550,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "Target level %d is the largest level, need to add new level before merge",
-                      target_level);
+                      target_level + 1);
 
         /* ensure there's a level to merge into */
         if (target_level + 1 >= num_levels)
@@ -6587,7 +6602,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     queue_t *sstable_ids_snapshot = queue_new(); /* track IDs being compacted */
 
     /* snapshot sst IDs atomically to prevent race with flush workers */
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "snapshotting SSTable IDs from levels 0-%d", target_level);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "snapshotting SSTable IDs from levels 1-%d", target_level + 1);
     for (int level = 0; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = cf->levels[level];
@@ -6610,7 +6625,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     }
 
     /* collect ssts matching the snapshot (with references) */
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "collecting SSTables from levels 0-%d", target_level);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "collecting SSTables from levels 1-%d", target_level + 1);
     for (int level = 0; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = cf->levels[level];
@@ -7248,15 +7263,19 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                     partition, new_sst->id, cf->levels[target_idx]->level_num, target_idx);
                 tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
 
-                /* add new sstable to manifest
-                 * no lock needed -- compaction is serialized per CF by is_compacting flag */
+                /* add new sstable to manifest -- manifest operations take internal locks */
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
                                              new_sst->klog_size + new_sst->vlog_size);
-                /* update sequence to track next_sstable_id */
-                cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-                /* manifest path is stored in cf->manifest->path */
-                tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
+                int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                if (manifest_result != 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "partition %d: Failed to commit manifest for SSTable %" PRIu64
+                                  " (error: %d)",
+                                  partition, new_sst->id, manifest_result);
+                }
 
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
@@ -7302,12 +7321,18 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             }
 
             /* remove from manifest if successfully removed from level
-             * no lock needed -- compaction is serialized per CF by is_compacting flag */
+             * manifest operations take internal locks for thread safety */
             if (removed_level != -1)
             {
                 tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
-                /* manifest path is stored in cf->manifest->path */
-                tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                if (manifest_result != 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "Failed to commit manifest after removing SSTable %" PRIu64
+                                  " (error: %d)",
+                                  sst->id, manifest_result);
+                }
             }
 
             /* release the reference we took when collecting sstables */
@@ -8046,15 +8071,19 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
                 tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
 
-                /* add new sstable to manifest
-                 * no lock needed -- compaction is serialized per CF by is_compacting flag */
+                /* add new sstable to manifest -- manifest operations take internal locks */
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
                                              new_sst->klog_size + new_sst->vlog_size);
-                /* update sequence to track next_sstable_id for recovery */
-                cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-                /* manifest path is stored in cf->manifest->path */
-                tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
+                int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                if (manifest_result != 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "Partitioned merge partition %d: Failed to commit manifest for "
+                                  "SSTable %" PRIu64 " (error: %d)",
+                                  partition, new_sst->id, manifest_result);
+                }
 
                 TDB_DEBUG_LOG(TDB_LOG_INFO,
                               "Partitioned merge partition %d complete, created SSTable %" PRIu64
@@ -8108,12 +8137,18 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         }
 
         /* remove from manifest if successfully removed from level
-         * no lock needed -- compaction is serialized per CF by is_compacting flag */
+         * manifest operations take internal locks for thread safety */
         if (removed_level != -1)
         {
             tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
-            /* manifest path is stored in cf->manifest->path */
-            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            if (manifest_result != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "Failed to commit manifest after removing SSTable %" PRIu64
+                              " (error: %d)",
+                              sst->id, manifest_result);
+            }
         }
 
         /* release the reference we took when collecting sstables */
@@ -8150,14 +8185,14 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
  * spooky implementation notes
  * -- we implement the generalized spooky algorithm (section 4.2 of the paper)
  * -- parameter X (dividing level) is configurable via dividing_level_offset
- * -- we perform full preemptive merge at levels 0 to X-1
+ * -- we perform full preemptive merge at levels 1 to X-1 (array indices 0 to X-2)
  * -- we perform dividing merge into level X (partitioned by largest level boundaries)
  * -- we perform partitioned preemptive merge at levels X to L when level X is full
  * -- we use spooky algo 2 to find target levels (smallest level that cannot accommodate)
  *
  * key differences from paper:
- * -- we use 0-based level indexing (paper uses 1-based)
- * -- level 0 is memtable in paper, but we treat it as first disk level
+ * -- we use 0-based array indexing (paper uses 1-based level numbering)
+ * -- level 0 is memtable in paper, but we treat level 1 (array index 0) as first disk level
  *
  * @param cf the column family
  * @return TDB_SUCCESS on success, error code on failure
@@ -8233,7 +8268,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     int result = TDB_SUCCESS;
     if (target_lvl < X)
     {
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Full preemptive merge levels 0 to %d", target_lvl);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Full preemptive merge levels 1 to %d", target_lvl);
         result = tidesdb_full_preemptive_merge(cf, 0, target_lvl - 1); /* convert to 0-indexed */
     }
     else if (target_lvl == X)
@@ -8362,12 +8397,12 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         size_t pending_flushes = queue_size(cf->immutable_memtables);
 
         /* levels array is fixed, access directly */
-        int level0_sstables =
+        int level1_sstables =
             (cf->levels[0] != NULL)
                 ? atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire)
                 : 0;
 
-        if (pending_flushes == 0 && level0_sstables == 0)
+        if (pending_flushes == 0 && level1_sstables == 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Largest level is empty, removing level for CF '%s'",
                           cf->name);
@@ -8378,9 +8413,9 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         {
             TDB_DEBUG_LOG(
                 TDB_LOG_INFO,
-                "Largest level is empty but work pending (flushes: %zu, L0 sstables: %d), keeping "
+                "Largest level is empty but work pending (flushes: %zu, L1 sstables: %d), keeping "
                 "level for CF '%s'",
-                pending_flushes, level0_sstables, cf->name);
+                pending_flushes, level1_sstables, cf->name);
         }
     }
 
@@ -8882,7 +8917,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             }
         }
 
-        /* add sstable to level 0 -- load levels atomically */
+        /* add sstable to Level 1 (array index 0) -- load levels atomically */
 
         /* levels array is fixed, access directly */
         tidesdb_level_add_sstable(cf->levels[0], sst);
@@ -8894,29 +8929,44 @@ static void *tidesdb_flush_worker_thread(void *arg)
                       ") to level %d (array index 0)",
                       cf->name, work->sst_id, sst->max_seq, cf->levels[0]->level_num);
 
+        /* commit sstable to manifest before deleting WAL and before triggering compaction
+         * this ensures crash recovery knows which sstables are complete
+         * we must commit manifest before triggering compaction to avoid deadlock
+         * where flush worker holds manifest lock while compaction worker waits for it */
+        tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries,
+                                     sst->klog_size + sst->vlog_size);
+        atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
+        int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+        if (manifest_result != 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "CF '%s' failed to commit manifest for SSTable %" PRIu64 " (error: %d)",
+                          cf->name, work->sst_id, manifest_result);
+        }
+
         /*  check file count in addition to size
          * cf->levels[0] (level_num=1) is TidesDB's first disk level, equivalent to
          * RocksDB's rLevel 0 in the spooky paper. this is where memtable flushes land.
          * files at this level have overlapping key ranges, so reads must check all files.
          * trigger compaction at α=4 files to prevent read amplification. */
-        int num_l0_sstables =
+        int num_l1_sstables =
             atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
-        size_t level0_size =
+        size_t level1_size =
             atomic_load_explicit(&cf->levels[0]->current_size, memory_order_acquire);
-        size_t level0_capacity =
+        size_t level1_capacity =
             atomic_load_explicit(&cf->levels[0]->capacity, memory_order_acquire);
 
         int should_compact = 0;
         const char *trigger_reason = NULL;
 
         /* file count trigger (Spooky α parameter) */
-        if (num_l0_sstables >= TDB_L0_FILE_NUM_COMPACTION_TRIGGER)
+        if (num_l1_sstables >= TDB_L1_FILE_NUM_COMPACTION_TRIGGER)
         {
             should_compact = 1;
             trigger_reason = "file count";
         }
 
-        else if (level0_size >= level0_capacity)
+        else if (level1_size >= level1_capacity)
         {
             should_compact = 1;
             trigger_reason = "size";
@@ -8927,20 +8977,10 @@ static void *tidesdb_flush_worker_thread(void *arg)
             TDB_DEBUG_LOG(TDB_LOG_INFO,
                           "CF '%s' level %d (first disk level) triggering compaction (%s): "
                           "files=%d (trigger=%d), size=%zu (capacity=%zu)",
-                          cf->name, cf->levels[0]->level_num, trigger_reason, num_l0_sstables,
-                          TDB_L0_FILE_NUM_COMPACTION_TRIGGER, level0_size, level0_capacity);
+                          cf->name, cf->levels[0]->level_num, trigger_reason, num_l1_sstables,
+                          TDB_L1_FILE_NUM_COMPACTION_TRIGGER, level1_size, level1_capacity);
             tidesdb_compact(cf);
         }
-
-        /* commit sstable to manifest before deleting WAL
-         * this ensures crash recovery knows which sstables are complete
-         * no lock needed -- flush is single-threaded per CF */
-        tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries,
-                                     sst->klog_size + sst->vlog_size);
-        /* update sequence to track next_sstable_id for recovery */
-        cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-        /* manifest path is stored in cf->manifest->path */
-        tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
 
         /* release our reference -- the level now owns it */
         tidesdb_sstable_unref(cf->db, sst);
@@ -9156,15 +9196,42 @@ static void *tidesdb_sync_worker_thread(void *arg)
         }
         pthread_rwlock_unlock(&db->cf_list_lock);
 
+        uint64_t sleep_us;
         if (min_interval == UINT64_MAX)
         {
             /* no CFs need interval syncing, sleep longer */
-            usleep(NO_CF_SYNC_SLEEP_US);
-            continue;
+            sleep_us = NO_CF_SYNC_SLEEP_US;
+        }
+        else
+        {
+            sleep_us = min_interval;
         }
 
-        /* sleep for the minimum interval */
-        usleep(min_interval);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += (sleep_us / TDB_MICROSECONDS_PER_SECOND);
+        ts.tv_nsec += (sleep_us % TDB_MICROSECONDS_PER_SECOND) * TDB_NANOSECONDS_PER_MICROSECOND;
+        if (ts.tv_nsec >= TDB_NANOSECONDS_PER_SECOND)
+        {
+            ts.tv_sec++;
+            ts.tv_nsec -= TDB_NANOSECONDS_PER_SECOND;
+        }
+
+        pthread_mutex_lock(&db->sync_thread_mutex);
+        pthread_cond_timedwait(&db->sync_thread_cond, &db->sync_thread_mutex, &ts);
+        pthread_mutex_unlock(&db->sync_thread_mutex);
+
+        /* check shutdown flag after wait to avoid lock contention during shutdown */
+        if (!atomic_load(&db->sync_thread_active))
+        {
+            break;
+        }
+
+        if (min_interval == UINT64_MAX)
+        {
+            /* no CFs needed syncing, skip sync phase */
+            continue;
+        }
 
         /* sync all CFs that need it */
         pthread_rwlock_rdlock(&db->cf_list_lock);
@@ -9188,9 +9255,34 @@ static void *tidesdb_sync_worker_thread(void *arg)
 }
 
 /**
+ * compare_sstable_candidates
+ * comparison function for sorting sstable candidates by last_access_time
+ * @param a pointer to first sstable candidate
+ * @param b pointer to second sstable candidate
+ * @return negative if a < b, positive if a > b, zero if equal
+ */
+static int compare_sstable_candidates(const void *a, const void *b)
+{
+    const time_t time_a = ((const struct {
+                              void *sst;
+                              time_t last_access;
+                          } *)a)
+                              ->last_access;
+    const time_t time_b = ((const struct {
+                              void *sst;
+                              time_t last_access;
+                          } *)b)
+                              ->last_access;
+    if (time_a < time_b) return -1;
+    if (time_a > time_b) return 1;
+    return 0;
+}
+
+/**
  * tidesdb_sstable_reaper_thread
  * background thread that closes unused sstable files when limits are reached
- * evicts 25% of oldest ssts (by last_access_time) when num_open_sstables >= max
+ * evicts TDB_SSTABLE_REAPER_EVICT_RATIO of oldest ssts (by last_access_time) when num_open_sstables
+ * >= max
  */
 static void *tidesdb_sstable_reaper_thread(void *arg)
 {
@@ -9201,7 +9293,25 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
     {
         atomic_store(&db->cached_current_time, time(NULL));
 
-        usleep(TDB_SSTABLE_REAPER_SLEEP_US);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += (TDB_SSTABLE_REAPER_SLEEP_US / TDB_MICROSECONDS_PER_SECOND);
+        ts.tv_nsec += (TDB_SSTABLE_REAPER_SLEEP_US % TDB_MICROSECONDS_PER_SECOND) *
+                      TDB_NANOSECONDS_PER_MICROSECOND;
+        if (ts.tv_nsec >= TDB_NANOSECONDS_PER_SECOND)
+        {
+            ts.tv_sec++;
+            ts.tv_nsec -= TDB_NANOSECONDS_PER_SECOND;
+        }
+
+        pthread_mutex_lock(&db->reaper_thread_mutex);
+        pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
+        pthread_mutex_unlock(&db->reaper_thread_mutex);
+
+        if (!atomic_load(&db->sstable_reaper_active))
+        {
+            break;
+        }
 
         int current_open = atomic_load(&db->num_open_sstables);
         int max_open = (int)db->config.max_open_sstables;
@@ -9230,6 +9340,12 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         int candidate_count = 0;
 
+        if (!atomic_load(&db->sstable_reaper_active))
+        {
+            free(candidates);
+            break;
+        }
+
         /* scan all column families for closeable ssts */
         pthread_rwlock_rdlock(&db->cf_list_lock);
         for (int i = 0; i < db->num_column_families; i++)
@@ -9252,9 +9368,11 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                     tidesdb_sstable_t *sst = ssts[j];
                     if (!sst) continue;
 
-                    /* only consider ssts that are open and not in use */
+                    /* only consider ssts that are open and not in use
+                     * increment refcount to prevent use-after-free if compaction frees this sst */
                     if (sst->klog_bm && sst->vlog_bm && atomic_load(&sst->refcount) == 1)
                     {
+                        atomic_fetch_add(&sst->refcount, 1);
                         candidates[candidate_count].sst = sst;
                         candidates[candidate_count].last_access =
                             atomic_load(&sst->last_access_time);
@@ -9265,6 +9383,13 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         }
         pthread_rwlock_unlock(&db->cf_list_lock);
 
+        /* check shutdown flag after releasing lock to exit promptly */
+        if (!atomic_load(&db->sstable_reaper_active))
+        {
+            free(candidates);
+            break;
+        }
+
         if (candidate_count == 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_WARN, "SSTable reaper: no closeable SSTables found");
@@ -9273,20 +9398,9 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         }
 
         /* sort by last_access_time (oldest first) */
-        for (int i = 0; i < candidate_count - 1; i++)
-        {
-            for (int j = i + 1; j < candidate_count; j++)
-            {
-                if (candidates[i].last_access > candidates[j].last_access)
-                {
-                    sstable_candidate_t temp = candidates[i];
-                    candidates[i] = candidates[j];
-                    candidates[j] = temp;
-                }
-            }
-        }
+        qsort(candidates, candidate_count, sizeof(sstable_candidate_t), compare_sstable_candidates);
 
-        /* close oldest 50% */
+        /* close oldest (TDB_SSTABLE_REAPER_EVICT_RATIO) */
         int to_close = (int)(candidate_count * TDB_SSTABLE_REAPER_EVICT_RATIO);
         if (to_close == 0 && candidate_count > 0) to_close = 1; /* close at least 1 */
 
@@ -9295,8 +9409,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         {
             tidesdb_sstable_t *sst = candidates[i].sst;
 
-            /* double-check refcount before closing */
-            if (atomic_load(&sst->refcount) == 1 && sst->klog_bm && sst->vlog_bm)
+            /* double-check refcount before closing (should be 2: our ref + base ref) */
+            if (atomic_load(&sst->refcount) == 2 && sst->klog_bm && sst->vlog_bm)
             {
                 block_manager_close(sst->klog_bm);
                 block_manager_close(sst->vlog_bm);
@@ -9309,6 +9423,12 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper: closed %d/%d SSTables, %d now open",
                       closed_count, to_close, atomic_load(&db->num_open_sstables));
+
+        /* release all candidate refcounts */
+        for (int i = 0; i < candidate_count; i++)
+        {
+            atomic_fetch_sub(&candidates[i].sst->refcount, 1);
+        }
 
         free(candidates);
     }
@@ -9699,6 +9819,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     }
     pthread_rwlock_unlock(&(*db)->cf_list_lock);
 
+    /* initialize sync thread synchronization primitives */
+    pthread_mutex_init(&(*db)->sync_thread_mutex, NULL);
+    pthread_cond_init(&(*db)->sync_thread_cond, NULL);
+
     if (needs_sync_thread)
     {
         atomic_store(&(*db)->sync_thread_active, 1);
@@ -9706,6 +9830,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         {
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create sync worker thread");
             atomic_store(&(*db)->sync_thread_active, 0);
+            pthread_mutex_destroy(&(*db)->sync_thread_mutex);
+            pthread_cond_destroy(&(*db)->sync_thread_cond);
             /* non-fatal, continue without sync thread */
         }
         else
@@ -9721,12 +9847,18 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     /* initialize cached time to avoid expensive time() syscalls in hot paths */
     atomic_store(&(*db)->cached_current_time, time(NULL));
 
+    /* initialize reaper thread synchronization primitives */
+    pthread_mutex_init(&(*db)->reaper_thread_mutex, NULL);
+    pthread_cond_init(&(*db)->reaper_thread_cond, NULL);
+
     atomic_store(&(*db)->sstable_reaper_active, 1);
     if (pthread_create(&(*db)->sstable_reaper_thread, NULL, tidesdb_sstable_reaper_thread, *db) !=
         0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create SSTable reaper thread");
         atomic_store(&(*db)->sstable_reaper_active, 0);
+        pthread_mutex_destroy(&(*db)->reaper_thread_mutex);
+        pthread_cond_destroy(&(*db)->reaper_thread_cond);
         /* non-fatal, continue without reaper thread */
     }
     else
@@ -9878,7 +10010,6 @@ int tidesdb_close(tidesdb_t *db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed");
     }
 
-    /* shutdown flush threads -- enqueue NULLs first to prevent BSD deadlock */
     if (db->flush_queue)
     {
         for (int i = 0; i < db->config.num_flush_threads; i++)
@@ -9938,8 +10069,17 @@ int tidesdb_close(tidesdb_t *db)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Stopping sync worker thread");
         atomic_store(&db->sync_thread_active, 0);
+
+        pthread_mutex_lock(&db->sync_thread_mutex);
+        pthread_cond_signal(&db->sync_thread_cond);
+        pthread_mutex_unlock(&db->sync_thread_mutex);
+
         pthread_join(db->sync_thread, NULL);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread stopped");
+
+        /* clean up synchronization primitives */
+        pthread_mutex_destroy(&db->sync_thread_mutex);
+        pthread_cond_destroy(&db->sync_thread_cond);
     }
 
     /* stop sstable file reaper thread if running */
@@ -9947,8 +10087,17 @@ int tidesdb_close(tidesdb_t *db)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Stopping SSTable reaper thread");
         atomic_store(&db->sstable_reaper_active, 0);
+
+        pthread_mutex_lock(&db->reaper_thread_mutex);
+        pthread_cond_signal(&db->reaper_thread_cond);
+        pthread_mutex_unlock(&db->reaper_thread_mutex);
+
         pthread_join(db->sstable_reaper_thread, NULL);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper thread stopped");
+
+        /* clean up synchronization primitives */
+        pthread_mutex_destroy(&db->reaper_thread_mutex);
+        pthread_cond_destroy(&db->reaper_thread_cond);
     }
 
     /* drain and free any remaining work items before freeing queues */
@@ -11552,7 +11701,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     /* search level-by-level with early termination
      * for non-existent keys, this avoids checking all ssts in all levels
-     * for existing keys in L0, this stops immediately without checking deeper levels */
+     * for existing keys in Level 1, this stops immediately without checking deeper levels */
     for (int level_num = 0; level_num < num_levels; level_num++)
     {
         PROFILE_INC(txn->db, levels_searched);
@@ -11617,7 +11766,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     found_any = 1;
                     PROFILE_INC(txn->db, sstable_hits);
 
-                    /* L0 hit -- stop immediately, no need to check deeper levels */
+                    /* Level 1 hit -- stop immediately, no need to check deeper levels */
                     if (level_num == 0)
                     {
                         tidesdb_sstable_unref(cf->db, sst);
@@ -12487,28 +12636,28 @@ skip_ssi_check:
 
             /* spooky-style file-count-based backpressure (β and γ triggers)
              * file count is more critical than capacity for write amplification control */
-            int num_l0_sstables =
+            int num_l1_sstables =
                 atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
 
-            if (num_l0_sstables >= TDB_L0_STOP_WRITES_TRIGGER)
+            if (num_l1_sstables >= TDB_L1_STOP_WRITES_TRIGGER)
             {
                 /* γ (gamma) -- emergency stop: 36+ files, stall writes completely */
-                usleep(TDB_L0_STOP_WRITES_DELAY_US);
+                usleep(TDB_L1_STOP_WRITES_DELAY_US);
                 TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                              "CF '%s' L0 file count critical (%d >= %d), stalling writes (%dms)",
-                              cf->name, num_l0_sstables, TDB_L0_STOP_WRITES_TRIGGER,
-                              TDB_L0_STOP_WRITES_DELAY_US / 1000);
+                              "CF '%s' L1 file count critical (%d >= %d), stalling writes (%dms)",
+                              cf->name, num_l1_sstables, TDB_L1_STOP_WRITES_TRIGGER,
+                              TDB_L1_STOP_WRITES_DELAY_US / 1000);
             }
-            else if (num_l0_sstables >= TDB_L0_SLOWDOWN_WRITES_TRIGGER)
+            else if (num_l1_sstables >= TDB_L1_SLOWDOWN_WRITES_TRIGGER)
             {
                 /* β (beta) -- slowdown: 20+ files, throttle writes */
-                usleep(TDB_L0_SLOWDOWN_WRITES_DELAY_US);
+                usleep(TDB_L1_SLOWDOWN_WRITES_DELAY_US);
                 TDB_DEBUG_LOG(TDB_LOG_WARN,
-                              "CF '%s' L0 file count high (%d >= %d), throttling writes (20ms)",
-                              cf->name, num_l0_sstables, TDB_L0_SLOWDOWN_WRITES_TRIGGER);
+                              "CF '%s' L1 file count high (%d >= %d), throttling writes (20ms)",
+                              cf->name, num_l1_sstables, TDB_L1_SLOWDOWN_WRITES_TRIGGER);
             }
 
-            /* capacity-based backpressure -- if Level 0 is near capacity, slow down writes
+            /* capacity-based backpressure -- if Level 1 is near capacity, slow down writes
              * to give compaction time to catch up. This prevents runaway sst creation
              * during heavy batched writes.
              * i.e
@@ -12517,33 +12666,33 @@ skip_ssi_check:
              *   -- 98-100% full -- 10ms delay (aggressive slowdown)
              *   -- >100% full -- 50ms delay (emergency brake)
              */
-            size_t level0_size =
+            size_t level1_size =
                 atomic_load_explicit(&cf->levels[0]->current_size, memory_order_relaxed);
-            size_t level0_capacity =
+            size_t level1_capacity =
                 atomic_load_explicit(&cf->levels[0]->capacity, memory_order_relaxed);
 
-            if (level0_capacity > 0)
+            if (level1_capacity > 0)
             {
-                int utilization_pct = (int)((level0_size * 100) / level0_capacity);
+                int utilization_pct = (int)((level1_size * 100) / level1_capacity);
 
-                if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L0_FULL)
+                if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L1_FULL)
                 {
-                    /* l0 is full, apply strong backpressure */
+                    /* Level 1 is full, apply strong backpressure */
                     usleep(TDB_BACKPRESSURE_DELAY_EMERGENCY_US);
                     TDB_DEBUG_LOG(TDB_LOG_WARN,
-                                  "CF '%s' level 0 capacity full (%d%%), applying emergency "
+                                  "CF '%s' Level 1 capacity full (%d%%), applying emergency "
                                   "backpressure (50ms)",
                                   cf->name, utilization_pct);
                 }
-                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L0_CRITICAL)
+                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L1_CRITICAL)
                 {
                     usleep(TDB_BACKPRESSURE_DELAY_CRITICAL_US);
                 }
-                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L0_HIGH)
+                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L1_HIGH)
                 {
                     usleep(TDB_BACKPRESSURE_DELAY_HIGH_US);
                 }
-                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L0_MODERATE)
+                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L1_MODERATE)
                 {
                     usleep(TDB_BACKPRESSURE_DELAY_MODERATE_US);
                 }
@@ -14361,13 +14510,14 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     /* restore next_sstable_id from manifest before WAL recovery
      * to prevent id collisions when flushing recovered WALs
      * manifest is already loaded in cf->manifest with block manager open */
-    if (cf->manifest && cf->manifest->sequence > 0)
+    uint64_t manifest_seq = atomic_load(&cf->manifest->sequence);
+    if (cf->manifest && manifest_seq > 0)
     {
-        atomic_store_explicit(&cf->next_sstable_id, cf->manifest->sequence, memory_order_relaxed);
+        atomic_store_explicit(&cf->next_sstable_id, manifest_seq, memory_order_relaxed);
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "CF '%s' pre-loaded next_sstable_id=%" PRIu64
                       " from manifest before WAL recovery",
-                      cf->name, cf->manifest->sequence);
+                      cf->name, manifest_seq);
     }
 
     /* sort WAL files by ID to ensure correct recovery order
@@ -14780,9 +14930,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     }
 
     /* restore next_sstable_id from manifest to prevent ID collisions
-     * manifest sequence field tracks the next available sstable ID
-     * no lock needed -- recovery is single-threaded */
-    uint64_t manifest_next_id = cf->manifest->sequence;
+     * manifest sequence field tracks the next available sstable ID */
+    uint64_t manifest_next_id = atomic_load(&cf->manifest->sequence);
 
     if (manifest_next_id > 0)
     {

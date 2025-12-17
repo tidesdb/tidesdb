@@ -248,8 +248,8 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
      * However, existing readers may still be in the middle of memcpy.
      * We need a grace period to let them finish. */
 
-    /* fence to ensure state change is visible */
-    atomic_thread_fence(memory_order_seq_cst);
+    /* fence to ensure state change is visible (acquire/release sufficient) */
+    atomic_thread_fence(memory_order_acq_rel);
 
     /* yield to let any in-flight readers complete
      * this is a practical solution -- not theoretically perfect but works in practice in
@@ -272,8 +272,8 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
     /* check if entry is being read (ref_bit > 1)
      * CLOCK algorithm sets ref_bit=1 for recently accessed entries
      * Readers increment it, so ref_bit > 1 means active readers */
-    atomic_thread_fence(memory_order_seq_cst);
-    uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_seq_cst);
+    atomic_thread_fence(memory_order_acq_rel);
+    uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
     if (ref > 1)
     {
         /* entry is being read by active readers, revert state and abort */
@@ -286,8 +286,8 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
     size_t slot_idx = entry - partition->slots;
     _hash_table_remove(partition, hash, slot_idx);
 
-    /* mem fence -- ensure all readers see deleted before we free */
-    atomic_thread_fence(memory_order_seq_cst);
+    /* mem fence -- ensure all readers see deleted before we free (acq_rel sufficient) */
+    atomic_thread_fence(memory_order_acq_rel);
 
     /* call eviction callback if provided (for custom cleanup of pointed-to data) */
     if (cache->evict_callback && payload)
@@ -307,6 +307,9 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
     atomic_store_explicit(&entry->ref_bit, 0, memory_order_release);
     /** hash_entry back-pointer is not cleared -- it stays for reuse */
 
+    /* decrement occupied count */
+    atomic_fetch_sub_explicit(&partition->occupied_count, 1, memory_order_relaxed);
+
     /* transistion to empty state */
     atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
 }
@@ -321,7 +324,7 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
 static size_t _clock_evict(clock_cache_t *cache, clock_cache_partition_t *partition)
 {
     size_t iterations = 0;
-    size_t max_iterations = partition->num_slots * 2;
+    size_t max_iterations = partition->num_slots; /* reduced from 2x to 1x for better concurrency */
 
     /* start from thread-local position to reduce contention on clock_hand */
     static THREAD_LOCAL size_t thread_hand = 0;
@@ -397,19 +400,12 @@ static int _ensure_space(clock_cache_t *cache, clock_cache_partition_t *partitio
 {
     (void)required_bytes;
 
-    /* count occupied slots in this partition only */
-    size_t occupied = 0;
-    for (size_t j = 0; j < partition->num_slots; j++)
-    {
-        uint8_t state = atomic_load_explicit(&partition->slots[j].state, memory_order_relaxed);
-        if (state == ENTRY_VALID || state == ENTRY_WRITING)
-        {
-            occupied++;
-        }
-    }
+    /* use cached occupied count instead of scanning all slots */
+    size_t occupied = atomic_load_explicit(&partition->occupied_count, memory_order_relaxed);
 
-    /* if partition is getting full (>90%), evict one entry */
-    size_t threshold = (partition->num_slots * 9) / 10;
+    /* if partition is getting full (>85%), evict one entry (reduced threshold for better memory
+     * utilization) */
+    size_t threshold = (partition->num_slots * 85) / 100;
     if (occupied >= threshold)
     {
         _clock_evict(cache, partition);
@@ -690,6 +686,9 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     /* transition to valid, entry is now visible */
     atomic_store_explicit(&entry->state, ENTRY_VALID, memory_order_release);
 
+    /* increment occupied count */
+    atomic_fetch_add_explicit(&partition->occupied_count, 1, memory_order_relaxed);
+
     /* add to hash index after entry is valid */
     _hash_table_insert(partition, hash, slot_idx);
 
@@ -714,13 +713,13 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, 
     }
 
     /* increment ref_bit to protect entry from eviction during read */
-    atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_seq_cst);
+    atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acquire);
 
     /* verify entry is still valid after incrementing ref_bit */
     uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
     if (state != ENTRY_VALID)
     {
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_seq_cst);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
         return NULL;
     }
 
@@ -729,21 +728,21 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, 
 
     if (!entry_payload || entry_payload_len == 0)
     {
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_seq_cst);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
         return NULL;
     }
 
     uint8_t *result = (uint8_t *)malloc(entry_payload_len);
     if (!result)
     {
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_seq_cst);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
         return NULL;
     }
 
     memcpy(result, entry_payload, entry_payload_len);
 
     /* decrement ref_bit now that we're done */
-    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_seq_cst);
+    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
 
     if (payload_len) *payload_len = entry_payload_len;
 

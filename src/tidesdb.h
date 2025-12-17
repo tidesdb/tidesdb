@@ -480,8 +480,12 @@ struct tidesdb_level_t
  * @param compaction_queue queue of compaction work items
  * @param sync_thread background thread for interval syncing
  * @param sync_thread_active atomic flag indicating if sync thread is active
+ * @param sync_thread_mutex mutex for sync thread
+ * @param sync_thread_cond condition variable for sync thread
  * @param reaper_thread background thread for evicting most un-accessed sstables
  * @param reaper_thread_active atomic flag indicating if reaper thread is active
+ * @param reaper_thread_mutex mutex for reaper thread
+ * @param reaper_thread_cond condition variable for reaper thread
  * @param clock_cache clock cache for hot sstable blocks
  * @param num_open_sstables global counter for open sstables
  * @param next_txn_id global transaction id counter
@@ -517,8 +521,12 @@ struct tidesdb_t
     queue_t *compaction_queue;
     pthread_t sync_thread;
     _Atomic(int) sync_thread_active;
+    pthread_mutex_t sync_thread_mutex;
+    pthread_cond_t sync_thread_cond;
     pthread_t sstable_reaper_thread;
     _Atomic(int) sstable_reaper_active;
+    pthread_mutex_t reaper_thread_mutex;
+    pthread_cond_t reaper_thread_cond;
     clock_cache_t *clock_cache;
     _Atomic(int) num_open_sstables;
     _Atomic(uint64_t) next_txn_id;

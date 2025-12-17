@@ -40,6 +40,8 @@ typedef struct skip_list_version_t skip_list_version_t;
 /* skip_list_node_t flag bits */
 #define SKIP_LIST_NODE_FLAG_SENTINEL 0x01 /* node is a sentinel (header or tail) */
 
+#define SKIP_LIST_MAX_CAS_ATTEMPTS 1000
+
 /* helper macros for flag access */
 #define VERSION_IS_DELETED(version) \
     (atomic_load_explicit(&(version)->flags, memory_order_acquire) & SKIP_LIST_FLAG_DELETED)

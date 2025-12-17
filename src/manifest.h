@@ -65,7 +65,7 @@ typedef struct
     tidesdb_manifest_entry_t *entries;
     int num_entries;
     int capacity;
-    uint64_t sequence;
+    _Atomic(uint64_t) sequence;
     char path[MANIFEST_PATH_LEN];
     FILE *fp;
     pthread_rwlock_t lock;

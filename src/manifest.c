@@ -54,7 +54,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
 
     manifest->num_entries = 0;
     manifest->capacity = MANIFEST_INITIAL_CAPACITY;
-    manifest->sequence = 0;
+    atomic_init(&manifest->sequence, 0);
     manifest->fp = NULL;
     atomic_init(&manifest->active_ops, 0);
     strncpy(manifest->path, path, MANIFEST_PATH_LEN - 1);
@@ -102,7 +102,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
 
     if (fgets(line, sizeof(line), fp))
     {
-        manifest->sequence = strtoull(line, NULL, 10);
+        atomic_store(&manifest->sequence, strtoull(line, NULL, 10));
     }
 
     while (fgets(line, sizeof(line), fp))
@@ -237,11 +237,8 @@ void tidesdb_manifest_update_sequence(tidesdb_manifest_t *manifest, uint64_t seq
 {
     if (!manifest) return;
 
-    atomic_fetch_add(&manifest->active_ops, 1);
-    pthread_rwlock_wrlock(&manifest->lock);
-    manifest->sequence = sequence;
-    pthread_rwlock_unlock(&manifest->lock);
-    atomic_fetch_sub(&manifest->active_ops, 1);
+    /* sequence is atomic, no lock needed for simple store */
+    atomic_store(&manifest->sequence, sequence);
 }
 
 int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
@@ -277,7 +274,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     }
 
     fprintf(fp, "%d\n", MANIFEST_VERSION);
-    fprintf(fp, "%" PRIu64 "\n", manifest->sequence);
+    fprintf(fp, "%" PRIu64 "\n", atomic_load(&manifest->sequence));
 
     for (int i = 0; i < manifest->num_entries; i++)
     {

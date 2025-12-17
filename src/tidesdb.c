@@ -6430,14 +6430,18 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
 
             /* add new sstable to manifest
-             * no lock needed -- compaction is serialized per CF by is_compacting flag */
+             * manifest operations take internal locks for thread safety */
             tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                          new_sst->id, new_sst->num_entries,
                                          new_sst->klog_size + new_sst->vlog_size);
-            /* update sequence to track next_sstable_id for recovery */
-            cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-            /* manifest path is stored in cf->manifest->path */
-            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
+            int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            if (manifest_result != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "Failed to commit manifest for new SSTable %" PRIu64 " (error: %d)",
+                              new_sst->id, manifest_result);
+            }
 
             tidesdb_sstable_unref(cf->db, new_sst);
         }
@@ -6484,11 +6488,16 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         }
         if (removed)
         {
-            /* remove from manifest
-             * no lock needed -- compaction is serialized per CF by is_compacting flag */
+            /* remove from manifest - manifest operations take internal locks for thread safety */
             tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
-            /* manifest path is stored in cf->manifest->path */
-            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            if (manifest_result != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "Failed to commit manifest after removing SSTable %" PRIu64
+                              " (error: %d)",
+                              sst->id, manifest_result);
+            }
         }
         if (!removed)
         {
@@ -7254,15 +7263,19 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                     partition, new_sst->id, cf->levels[target_idx]->level_num, target_idx);
                 tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
 
-                /* add new sstable to manifest
-                 * no lock needed -- compaction is serialized per CF by is_compacting flag */
+                /* add new sstable to manifest -- manifest operations take internal locks */
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
                                              new_sst->klog_size + new_sst->vlog_size);
-                /* update sequence to track next_sstable_id */
-                cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-                /* manifest path is stored in cf->manifest->path */
-                tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
+                int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                if (manifest_result != 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "partition %d: Failed to commit manifest for SSTable %" PRIu64
+                                  " (error: %d)",
+                                  partition, new_sst->id, manifest_result);
+                }
 
                 tidesdb_sstable_unref(cf->db, new_sst);
             }
@@ -7308,12 +7321,18 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             }
 
             /* remove from manifest if successfully removed from level
-             * no lock needed -- compaction is serialized per CF by is_compacting flag */
+             * manifest operations take internal locks for thread safety */
             if (removed_level != -1)
             {
                 tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
-                /* manifest path is stored in cf->manifest->path */
-                tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                if (manifest_result != 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "Failed to commit manifest after removing SSTable %" PRIu64
+                                  " (error: %d)",
+                                  sst->id, manifest_result);
+                }
             }
 
             /* release the reference we took when collecting sstables */
@@ -8052,15 +8071,19 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
                 tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
 
-                /* add new sstable to manifest
-                 * no lock needed -- compaction is serialized per CF by is_compacting flag */
+                /* add new sstable to manifest -- manifest operations take internal locks */
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
                                              new_sst->klog_size + new_sst->vlog_size);
-                /* update sequence to track next_sstable_id for recovery */
-                cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-                /* manifest path is stored in cf->manifest->path */
-                tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
+                int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+                if (manifest_result != 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "Partitioned merge partition %d: Failed to commit manifest for "
+                                  "SSTable %" PRIu64 " (error: %d)",
+                                  partition, new_sst->id, manifest_result);
+                }
 
                 TDB_DEBUG_LOG(TDB_LOG_INFO,
                               "Partitioned merge partition %d complete, created SSTable %" PRIu64
@@ -8114,12 +8137,18 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
         }
 
         /* remove from manifest if successfully removed from level
-         * no lock needed -- compaction is serialized per CF by is_compacting flag */
+         * manifest operations take internal locks for thread safety */
         if (removed_level != -1)
         {
             tidesdb_manifest_remove_sstable(cf->manifest, removed_level, sst->id);
-            /* manifest path is stored in cf->manifest->path */
-            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+            if (manifest_result != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "Failed to commit manifest after removing SSTable %" PRIu64
+                              " (error: %d)",
+                              sst->id, manifest_result);
+            }
         }
 
         /* release the reference we took when collecting sstables */
@@ -8900,6 +8929,21 @@ static void *tidesdb_flush_worker_thread(void *arg)
                       ") to level %d (array index 0)",
                       cf->name, work->sst_id, sst->max_seq, cf->levels[0]->level_num);
 
+        /* commit sstable to manifest before deleting WAL and before triggering compaction
+         * this ensures crash recovery knows which sstables are complete
+         * we must commit manifest before triggering compaction to avoid deadlock
+         * where flush worker holds manifest lock while compaction worker waits for it */
+        tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries,
+                                     sst->klog_size + sst->vlog_size);
+        atomic_store(&cf->manifest->sequence, atomic_load(&cf->next_sstable_id));
+        int manifest_result = tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+        if (manifest_result != 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "CF '%s' failed to commit manifest for SSTable %" PRIu64 " (error: %d)",
+                          cf->name, work->sst_id, manifest_result);
+        }
+
         /*  check file count in addition to size
          * cf->levels[0] (level_num=1) is TidesDB's first disk level, equivalent to
          * RocksDB's rLevel 0 in the spooky paper. this is where memtable flushes land.
@@ -8937,16 +8981,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
                           TDB_L1_FILE_NUM_COMPACTION_TRIGGER, level1_size, level1_capacity);
             tidesdb_compact(cf);
         }
-
-        /* commit sstable to manifest before deleting WAL
-         * this ensures crash recovery knows which sstables are complete
-         * no lock needed -- flush is single-threaded per CF */
-        tidesdb_manifest_add_sstable(cf->manifest, 1, work->sst_id, sst->num_entries,
-                                     sst->klog_size + sst->vlog_size);
-        /* update sequence to track next_sstable_id for recovery */
-        cf->manifest->sequence = atomic_load(&cf->next_sstable_id);
-        /* manifest path is stored in cf->manifest->path */
-        tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
 
         /* release our reference -- the level now owns it */
         tidesdb_sstable_unref(cf->db, sst);
@@ -14476,13 +14510,14 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     /* restore next_sstable_id from manifest before WAL recovery
      * to prevent id collisions when flushing recovered WALs
      * manifest is already loaded in cf->manifest with block manager open */
-    if (cf->manifest && cf->manifest->sequence > 0)
+    uint64_t manifest_seq = atomic_load(&cf->manifest->sequence);
+    if (cf->manifest && manifest_seq > 0)
     {
-        atomic_store_explicit(&cf->next_sstable_id, cf->manifest->sequence, memory_order_relaxed);
+        atomic_store_explicit(&cf->next_sstable_id, manifest_seq, memory_order_relaxed);
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "CF '%s' pre-loaded next_sstable_id=%" PRIu64
                       " from manifest before WAL recovery",
-                      cf->name, cf->manifest->sequence);
+                      cf->name, manifest_seq);
     }
 
     /* sort WAL files by ID to ensure correct recovery order
@@ -14895,9 +14930,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     }
 
     /* restore next_sstable_id from manifest to prevent ID collisions
-     * manifest sequence field tracks the next available sstable ID
-     * no lock needed -- recovery is single-threaded */
-    uint64_t manifest_next_id = cf->manifest->sequence;
+     * manifest sequence field tracks the next available sstable ID */
+    uint64_t manifest_next_id = atomic_load(&cf->manifest->sequence);
 
     if (manifest_next_id > 0)
     {

@@ -1185,7 +1185,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
 
         /* retry CAS */
         cas_attempts++;
-        if (cas_attempts > 1000)
+        if (cas_attempts > SKIP_LIST_MAX_CAS_ATTEMPTS)
         {
             skip_list_free_node(new_node);
             free(update);

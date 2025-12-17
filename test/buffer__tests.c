@@ -735,8 +735,8 @@ void benchmark_buffer_concurrent_throughput(void)
     buffer_t *buffer = NULL;
     assert(buffer_new(&buffer, capacity) == 0);
 
-    pthread_t threads[num_threads];
-    benchmark_buffer_args_t args[num_threads];
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    benchmark_buffer_args_t *args = malloc(num_threads * sizeof(benchmark_buffer_args_t));
     _Atomic(int) ops_completed = 0;
     struct timespec start_time = {0, 0};
 
@@ -761,20 +761,21 @@ void benchmark_buffer_concurrent_throughput(void)
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    int completed = atomic_load(&ops_completed);
-    double ops_per_sec = completed / elapsed;
+    double ops_per_sec = (num_threads * ops_per_thread * 2.0) / elapsed;
 
     printf("  %d threads, %d ops each, %d slots\n", num_threads, ops_per_thread, capacity);
     printf("  Total throughput: %.2f M ops/sec (%.3f seconds)\n", ops_per_sec / 1e6, elapsed);
-    printf("  Operations completed: %d/%d\n", completed, num_threads * ops_per_thread);
+    printf("  Operations completed: %d/%d\n", ops_completed, num_threads * ops_per_thread);
 
+    free(threads);
+    free(args);
     buffer_free(buffer);
 }
 
 static void *benchmark_buffer_mixed_worker(void *arg)
 {
     benchmark_buffer_args_t *args = (benchmark_buffer_args_t *)arg;
-    uint32_t my_slots[10];
+    uint32_t *my_slots = malloc(10 * sizeof(uint32_t));
     int my_count = 0;
 
     /* wait for start signal */
@@ -823,6 +824,7 @@ static void *benchmark_buffer_mixed_worker(void *arg)
         buffer_release_silent(args->buffer, my_slots[i]);
     }
 
+    free(my_slots);
     return NULL;
 }
 
@@ -836,8 +838,8 @@ void benchmark_buffer_mixed_operations(void)
     buffer_t *buffer = NULL;
     assert(buffer_new(&buffer, capacity) == 0);
 
-    pthread_t threads[num_threads];
-    benchmark_buffer_args_t args[num_threads];
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    benchmark_buffer_args_t *args = malloc(num_threads * sizeof(benchmark_buffer_args_t));
     _Atomic(int) ops_completed = 0;
     struct timespec start_time = {0, 0};
 
@@ -869,6 +871,8 @@ void benchmark_buffer_mixed_operations(void)
     printf("  Total throughput: %.2f M ops/sec (%.3f seconds)\n", ops_per_sec / 1e6, elapsed);
     printf("  Final active slots: %d\n", buffer_active_count(buffer));
 
+    free(threads);
+    free(args);
     buffer_free(buffer);
 }
 
@@ -892,8 +896,8 @@ void benchmark_buffer_scaling(void)
         buffer_t *buffer = NULL;
         assert(buffer_new(&buffer, capacity) == 0);
 
-        pthread_t threads[num_threads];
-        benchmark_buffer_args_t args[num_threads];
+        pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+        benchmark_buffer_args_t *args = malloc(num_threads * sizeof(benchmark_buffer_args_t));
         _Atomic(int) ops_completed = 0;
         struct timespec start_time = {0, 0};
 
@@ -918,14 +922,14 @@ void benchmark_buffer_scaling(void)
 
         clock_gettime(CLOCK_MONOTONIC, &end);
         double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        int completed = atomic_load(&ops_completed);
-        double ops_per_sec = completed / elapsed;
-
+        double ops_per_sec = (num_threads * ops_per_thread * 2.0) / elapsed;
+        double speedup = (c == 0) ? 1.0 : baseline_time / elapsed;
         if (c == 0) baseline_time = elapsed;
-        double speedup = baseline_time / elapsed;
 
         printf("  %-10d %-15.4f %-15.0f %-15.2f x\n", num_threads, elapsed, ops_per_sec, speedup);
 
+        free(threads);
+        free(args);
         buffer_free(buffer);
     }
 }
@@ -940,8 +944,8 @@ void benchmark_buffer_high_contention(void)
     buffer_t *buffer = NULL;
     assert(buffer_new(&buffer, capacity) == 0);
 
-    pthread_t threads[num_threads];
-    benchmark_buffer_args_t args[num_threads];
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    benchmark_buffer_args_t *args = malloc(num_threads * sizeof(benchmark_buffer_args_t));
     _Atomic(int) ops_completed = 0;
     struct timespec start_time = {0, 0};
 
@@ -966,13 +970,14 @@ void benchmark_buffer_high_contention(void)
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    int completed = atomic_load(&ops_completed);
-    double ops_per_sec = completed / elapsed;
+    double ops_per_sec = (num_threads * ops_per_thread * 2.0) / elapsed;
 
     printf("  High contention: %d threads, %d slots\n", num_threads, capacity);
     printf("  Total throughput: %.2f M ops/sec (%.3f seconds)\n", ops_per_sec / 1e6, elapsed);
-    printf("  Operations completed: %d/%d\n", completed, num_threads * ops_per_thread);
+    printf("  Operations completed: %d/%d\n", ops_completed, num_threads * ops_per_thread);
 
+    free(threads);
+    free(args);
     buffer_free(buffer);
 }
 

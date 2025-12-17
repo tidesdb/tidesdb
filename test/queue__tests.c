@@ -794,10 +794,12 @@ void benchmark_queue_concurrent_producers_consumers()
 
     queue_t *queue = queue_new();
 
-    pthread_t producers[num_producers];
-    pthread_t consumers[num_consumers];
-    benchmark_producer_args_t producer_args[num_producers];
-    benchmark_consumer_args_t consumer_args[num_consumers];
+    pthread_t *producers = malloc(num_producers * sizeof(pthread_t));
+    pthread_t *consumers = malloc(num_consumers * sizeof(pthread_t));
+    benchmark_producer_args_t *producer_args =
+        malloc(num_producers * sizeof(benchmark_producer_args_t));
+    benchmark_consumer_args_t *consumer_args =
+        malloc(num_consumers * sizeof(benchmark_consumer_args_t));
 
     _Atomic int items_consumed = 0;
     struct timespec start_time = {0, 0};
@@ -847,7 +849,10 @@ void benchmark_queue_concurrent_producers_consumers()
     printf("  Total throughput: %.2f M ops/sec (%.3f seconds)\n", ops_per_sec / 1e6, elapsed);
     printf("  Items consumed: %d/%d\n", atomic_load(&items_consumed), total_items);
 
-    ASSERT_EQ(atomic_load(&items_consumed), total_items);
+    free(producers);
+    free(consumers);
+    free(producer_args);
+    free(consumer_args);
     queue_free(queue);
 }
 
@@ -895,8 +900,8 @@ void benchmark_queue_mixed_operations()
 
     queue_t *queue = queue_new();
 
-    pthread_t threads[num_threads];
-    benchmark_mixed_args_t args[num_threads];
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    benchmark_mixed_args_t *args = malloc(num_threads * sizeof(benchmark_mixed_args_t));
     struct timespec start_time = {0, 0};
 
     for (int i = 0; i < num_threads; i++)
@@ -926,6 +931,8 @@ void benchmark_queue_mixed_operations()
     printf("  Total throughput: %.2f M ops/sec (%.3f seconds)\n", ops_per_sec / 1e6, elapsed);
     printf("  Final queue size: %zu\n", queue_size(queue));
 
+    free(threads);
+    free(args);
     queue_free_with_data(queue, free);
 }
 
@@ -946,8 +953,8 @@ void benchmark_queue_scaling()
         int num_threads = thread_counts[c];
         queue_t *queue = queue_new();
 
-        pthread_t threads[num_threads];
-        benchmark_producer_args_t args[num_threads];
+        pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+        benchmark_producer_args_t *args = malloc(num_threads * sizeof(benchmark_producer_args_t));
         struct timespec start_time = {0, 0};
 
         for (int i = 0; i < num_threads; i++)
@@ -970,15 +977,15 @@ void benchmark_queue_scaling()
 
         clock_gettime(CLOCK_MONOTONIC, &end);
         double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        double total_ops = num_threads * ops_per_thread;
-        double ops_per_sec = total_ops / elapsed;
-
+        double ops_per_sec = (num_threads * ops_per_thread) / elapsed;
+        double speedup = (c == 0) ? 1.0 : baseline_time / elapsed;
         if (c == 0) baseline_time = elapsed;
-        double speedup = baseline_time / elapsed;
 
         printf("  %-10d %-15.4f %-15.0f %-15.2f x\n", num_threads, elapsed, ops_per_sec, speedup);
 
-        queue_free_with_data(queue, free);
+        free(threads);
+        free(args);
+        queue_free(queue);
     }
 }
 

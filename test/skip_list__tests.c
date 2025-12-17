@@ -1934,8 +1934,6 @@ static int reverse_memcmp_comparator(const uint8_t *key1, size_t key1_size, cons
 
 void test_skip_list_reverse_comparator()
 {
-    printf("Running: test_skip_list_reverse_comparator...\n");
-
     skip_list_t *list = NULL;
     ASSERT_EQ(skip_list_new_with_comparator(&list, 12, 0.25, reverse_memcmp_comparator, NULL), 0);
     ASSERT_TRUE(list != NULL);

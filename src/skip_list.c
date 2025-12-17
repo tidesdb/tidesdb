@@ -1123,34 +1123,8 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
         if (atomic_compare_exchange_weak_explicit(&pred->forward[0], &next_at_0, new_node,
                                                   memory_order_release, memory_order_acquire))
         {
-            /* success! now we need to populate update[] for higher levels */
+            /* success! Update the update[] array for higher level insertions */
             update[0] = pred;
-
-            /* repopulate update[] array for levels 1..new_level by traversing from header */
-            if (new_level > 0)
-            {
-                skip_list_node_t *current = header;
-                for (int i = max_level; i >= 1; i--)
-                {
-                    if (i > new_level)
-                    {
-                        /* skip levels higher than new_level */
-                        continue;
-                    }
-
-                    skip_list_node_t *next =
-                        atomic_load_explicit(&current->forward[i], memory_order_acquire);
-                    while (next != NULL && !NODE_IS_SENTINEL(next))
-                    {
-                        int cmp = skip_list_compare_keys_inline(list, next->key, next->key_size,
-                                                                key, key_size);
-                        if (cmp >= 0) break;
-                        current = next;
-                        next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
-                    }
-                    update[i] = current;
-                }
-            }
             break;
         }
 

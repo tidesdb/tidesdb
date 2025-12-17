@@ -18,6 +18,15 @@
  */
 #include "buffer.h"
 
+/* branch prediction hints for hot paths */
+#if defined(__GNUC__) || defined(__clang__)
+#define BUFFER_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define BUFFER_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define BUFFER_LIKELY(x)   (x)
+#define BUFFER_UNLIKELY(x) (x)
+#endif
+
 int buffer_new(buffer_t **buffer, uint32_t capacity)
 {
     return buffer_new_with_eviction(buffer, capacity, NULL, NULL);
@@ -26,13 +35,13 @@ int buffer_new(buffer_t **buffer, uint32_t capacity)
 int buffer_new_with_eviction(buffer_t **buffer, uint32_t capacity, buffer_eviction_fn eviction_fn,
                              void *eviction_ctx)
 {
-    if (buffer == NULL || capacity == 0) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL || capacity == 0)) return -1;
 
     buffer_t *new_buffer = (buffer_t *)malloc(sizeof(buffer_t));
-    if (new_buffer == NULL) return -1;
+    if (BUFFER_UNLIKELY(new_buffer == NULL)) return -1;
 
     new_buffer->slots = (buffer_slot_t *)malloc(capacity * sizeof(buffer_slot_t));
-    if (new_buffer->slots == NULL)
+    if (BUFFER_UNLIKELY(new_buffer->slots == NULL))
     {
         free(new_buffer);
         return -1;
@@ -60,7 +69,7 @@ int buffer_new_with_eviction(buffer_t **buffer, uint32_t capacity, buffer_evicti
 
 int buffer_set_retry_params(buffer_t *buffer, uint32_t max_retries, uint32_t backoff_us)
 {
-    if (buffer == NULL) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
     buffer->max_retries = max_retries;
     buffer->backoff_us = backoff_us;
     return 0;
@@ -101,7 +110,7 @@ static int try_acquire_slot(buffer_t *buffer, uint32_t index, void *data, uint32
 
 int buffer_try_acquire(buffer_t *buffer, void *data, uint32_t *id)
 {
-    if (buffer == NULL || id == NULL) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL || id == NULL)) return -1;
 
     uint32_t capacity = buffer->capacity;
     uint32_t start = atomic_load_explicit(&buffer->hint_index, memory_order_relaxed) % capacity;
@@ -111,7 +120,7 @@ int buffer_try_acquire(buffer_t *buffer, void *data, uint32_t *id)
     {
         uint32_t index = (start + i) % capacity;
 
-        if (try_acquire_slot(buffer, index, data, id) == 0)
+        if (BUFFER_LIKELY(try_acquire_slot(buffer, index, data, id) == 0))
         {
             /* update hint to next slot for future searches */
             atomic_store_explicit(&buffer->hint_index, (index + 1) % capacity,
@@ -126,20 +135,20 @@ int buffer_try_acquire(buffer_t *buffer, void *data, uint32_t *id)
 
 int buffer_acquire(buffer_t *buffer, void *data, uint32_t *id)
 {
-    if (buffer == NULL || id == NULL) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL || id == NULL)) return -1;
 
     uint32_t retries = 0;
     uint32_t backoff = buffer->backoff_us;
 
     while (buffer->max_retries == 0 || retries < buffer->max_retries)
     {
-        if (buffer_try_acquire(buffer, data, id) == 0)
+        if (BUFFER_LIKELY(buffer_try_acquire(buffer, data, id) == 0))
         {
             return 0;
         }
 
         /* exponential backoff with cap */
-        if (backoff > 0)
+        if (BUFFER_LIKELY(backoff > 0))
         {
             if (backoff < BUFFER_ACQUIRE_BACKOFF)
             {
@@ -174,8 +183,8 @@ int buffer_acquire(buffer_t *buffer, void *data, uint32_t *id)
 
 int buffer_get(buffer_t *buffer, uint32_t id, void **data)
 {
-    if (buffer == NULL || data == NULL) return -1;
-    if (id >= buffer->capacity) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL || data == NULL)) return -1;
+    if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
 
     buffer_slot_t *slot = &buffer->slots[id];
     uint32_t state = atomic_load_explicit(&slot->state, memory_order_acquire);
@@ -190,17 +199,23 @@ int buffer_get(buffer_t *buffer, uint32_t id, void **data)
     return 0;
 }
 
-int buffer_release(buffer_t *buffer, uint32_t id)
+/**
+ * buffer_release_internal
+ * internal helper for release logic (bounds check must be done by caller)
+ * @param buffer the buffer
+ * @param id slot id
+ * @param call_eviction whether to call eviction callback
+ * @return 0 on success, -1 on failure
+ */
+static inline int buffer_release_internal(buffer_t *buffer, uint32_t id, int call_eviction)
 {
-    if (buffer == NULL) return -1;
-    if (id >= buffer->capacity) return -1;
-
     buffer_slot_t *slot = &buffer->slots[id];
 
     /* try to transition OCCUPIED -> RELEASING */
     uint32_t expected = BUFFER_SLOT_OCCUPIED;
-    if (!atomic_compare_exchange_strong_explicit(&slot->state, &expected, BUFFER_SLOT_RELEASING,
-                                                 memory_order_acquire, memory_order_relaxed))
+    if (BUFFER_UNLIKELY(
+            !atomic_compare_exchange_strong_explicit(&slot->state, &expected, BUFFER_SLOT_RELEASING,
+                                                     memory_order_acquire, memory_order_relaxed)))
     {
         return -1; /* slot not occupied or already being released */
     }
@@ -208,8 +223,8 @@ int buffer_release(buffer_t *buffer, uint32_t id)
     /* get data for eviction callback */
     void *data = atomic_load_explicit(&slot->data, memory_order_relaxed);
 
-    /* call eviction callback if set */
-    if (buffer->eviction_fn != NULL && data != NULL)
+    /* call eviction callback if requested and set */
+    if (call_eviction && BUFFER_UNLIKELY(buffer->eviction_fn != NULL && data != NULL))
     {
         buffer->eviction_fn(data, buffer->eviction_ctx);
     }
@@ -226,37 +241,26 @@ int buffer_release(buffer_t *buffer, uint32_t id)
     return 0;
 }
 
+int buffer_release(buffer_t *buffer, uint32_t id)
+{
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
+    if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
+
+    return buffer_release_internal(buffer, id, 1);
+}
+
 int buffer_release_silent(buffer_t *buffer, uint32_t id)
 {
-    if (buffer == NULL) return -1;
-    if (id >= buffer->capacity) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
+    if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
 
-    buffer_slot_t *slot = &buffer->slots[id];
-
-    /* try to transition OCCUPIED -> RELEASING */
-    uint32_t expected = BUFFER_SLOT_OCCUPIED;
-    if (!atomic_compare_exchange_strong_explicit(&slot->state, &expected, BUFFER_SLOT_RELEASING,
-                                                 memory_order_acquire, memory_order_relaxed))
-    {
-        return -1;
-    }
-
-    /* clear data without calling eviction */
-    atomic_store_explicit(&slot->data, NULL, memory_order_relaxed);
-
-    /* transition RELEASING -> FREE */
-    atomic_store_explicit(&slot->state, BUFFER_SLOT_FREE, memory_order_release);
-
-    /* update active count */
-    atomic_fetch_sub_explicit(&buffer->active_count, 1, memory_order_relaxed);
-
-    return 0;
+    return buffer_release_internal(buffer, id, 0);
 }
 
 int buffer_is_occupied(buffer_t *buffer, uint32_t id)
 {
-    if (buffer == NULL) return -1;
-    if (id >= buffer->capacity) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
+    if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
 
     uint32_t state = atomic_load_explicit(&buffer->slots[id].state, memory_order_acquire);
     return (state == BUFFER_SLOT_OCCUPIED) ? 1 : 0;
@@ -264,24 +268,26 @@ int buffer_is_occupied(buffer_t *buffer, uint32_t id)
 
 int buffer_active_count(buffer_t *buffer)
 {
-    if (buffer == NULL) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
     return (int)atomic_load_explicit(&buffer->active_count, memory_order_acquire);
 }
 
 int buffer_capacity(buffer_t *buffer)
 {
-    if (buffer == NULL) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
     return (int)buffer->capacity;
 }
 
 int buffer_clear(buffer_t *buffer)
 {
-    if (buffer == NULL) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
 
-    for (uint32_t i = 0; i < buffer->capacity; i++)
+    /* cache capacity and skip bounds checks in loop */
+    uint32_t capacity = buffer->capacity;
+    for (uint32_t i = 0; i < capacity; i++)
     {
-        /* try to release each occupied slot */
-        buffer_release(buffer, i);
+        /* use internal helper to skip redundant bounds checks */
+        buffer_release_internal(buffer, i, 1);
     }
 
     return 0;
@@ -289,7 +295,7 @@ int buffer_clear(buffer_t *buffer)
 
 void buffer_free(buffer_t *buffer)
 {
-    if (buffer == NULL) return;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return;
 
     /* release all occupied slots */
     buffer_clear(buffer);
@@ -302,15 +308,16 @@ void buffer_free(buffer_t *buffer)
 int buffer_foreach(buffer_t *buffer, void (*callback)(uint32_t id, void *data, void *ctx),
                    void *ctx)
 {
-    if (buffer == NULL || callback == NULL) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL || callback == NULL)) return -1;
 
     int count = 0;
-    for (uint32_t i = 0; i < buffer->capacity; i++)
+    uint32_t capacity = buffer->capacity; /* cache capacity */
+    for (uint32_t i = 0; i < capacity; i++)
     {
         buffer_slot_t *slot = &buffer->slots[i];
         uint32_t state = atomic_load_explicit(&slot->state, memory_order_acquire);
 
-        if (state == BUFFER_SLOT_OCCUPIED)
+        if (BUFFER_LIKELY(state == BUFFER_SLOT_OCCUPIED))
         {
             void *data = atomic_load_explicit(&slot->data, memory_order_acquire);
             callback(i, data, ctx);
@@ -323,8 +330,8 @@ int buffer_foreach(buffer_t *buffer, void (*callback)(uint32_t id, void *data, v
 
 int buffer_get_generation(buffer_t *buffer, uint32_t id, uint64_t *generation)
 {
-    if (buffer == NULL || generation == NULL) return -1;
-    if (id >= buffer->capacity) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL || generation == NULL)) return -1;
+    if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
 
     *generation = atomic_load_explicit(&buffer->slots[id].generation, memory_order_acquire);
     return 0;
@@ -332,15 +339,15 @@ int buffer_get_generation(buffer_t *buffer, uint32_t id, uint64_t *generation)
 
 int buffer_validate(buffer_t *buffer, uint32_t id, uint64_t expected_generation)
 {
-    if (buffer == NULL) return -1;
-    if (id >= buffer->capacity) return 0;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
+    if (BUFFER_UNLIKELY(id >= buffer->capacity)) return 0;
 
     buffer_slot_t *slot = &buffer->slots[id];
     uint32_t state = atomic_load_explicit(&slot->state, memory_order_acquire);
 
-    if (state != BUFFER_SLOT_OCCUPIED) return 0;
+    if (BUFFER_UNLIKELY(state != BUFFER_SLOT_OCCUPIED)) return 0;
 
-    if (expected_generation != 0)
+    if (BUFFER_LIKELY(expected_generation != 0))
     {
         uint64_t current_gen = atomic_load_explicit(&slot->generation, memory_order_acquire);
         if (current_gen != expected_generation) return 0;

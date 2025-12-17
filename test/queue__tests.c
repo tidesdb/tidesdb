@@ -673,6 +673,315 @@ void test_queue_foreach_empty()
     queue_free(queue);
 }
 
+void benchmark_queue_single_threaded()
+{
+    printf("\n");
+    queue_t *queue = queue_new();
+    const int num_ops = 1000000;
+
+    /* benchmark enqueue */
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        int *data = malloc(sizeof(int));
+        *data = i;
+        queue_enqueue(queue, data);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double enqueue_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double enqueue_ops_per_sec = num_ops / enqueue_time;
+
+    printf("  Enqueue %d items: %.2f M ops/sec (%.3f seconds)\n", num_ops,
+           enqueue_ops_per_sec / 1e6, enqueue_time);
+
+    /* benchmark dequeue */
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        int *data = (int *)queue_dequeue(queue);
+        if (data)
+        {
+            ASSERT_EQ(*data, i);
+            free(data);
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double dequeue_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double dequeue_ops_per_sec = num_ops / dequeue_time;
+
+    printf("  Dequeue %d items: %.2f M ops/sec (%.3f seconds)\n", num_ops,
+           dequeue_ops_per_sec / 1e6, dequeue_time);
+
+    ASSERT_EQ(queue_is_empty(queue), 1);
+    queue_free(queue);
+}
+
+typedef struct
+{
+    queue_t *queue;
+    int num_ops;
+    int thread_id;
+    struct timespec *start_time;
+} benchmark_producer_args_t;
+
+typedef struct
+{
+    queue_t *queue;
+    int expected_items;
+    _Atomic int *items_consumed;
+} benchmark_consumer_args_t;
+
+static void *benchmark_producer(void *arg)
+{
+    benchmark_producer_args_t *args = (benchmark_producer_args_t *)arg;
+
+    /* wait for all threads to be ready */
+    while (args->start_time->tv_sec == 0)
+    {
+        usleep(100);
+    }
+
+    for (int i = 0; i < args->num_ops; i++)
+    {
+        int *data = malloc(sizeof(int));
+        *data = args->thread_id * 1000000 + i;
+        queue_enqueue(args->queue, data);
+    }
+
+    return NULL;
+}
+
+static void *benchmark_consumer(void *arg)
+{
+    benchmark_consumer_args_t *args = (benchmark_consumer_args_t *)arg;
+
+    while (1)
+    {
+        int consumed = atomic_load(args->items_consumed);
+        if (consumed >= args->expected_items)
+        {
+            break;
+        }
+
+        int *data = (int *)queue_dequeue(args->queue);
+        if (data != NULL)
+        {
+            atomic_fetch_add(args->items_consumed, 1);
+            free(data);
+        }
+        else
+        {
+            /* queue empty, yield */
+            sched_yield();
+        }
+    }
+
+    return NULL;
+}
+
+void benchmark_queue_concurrent_producers_consumers()
+{
+    printf("\n");
+    const int num_producers = 4;
+    const int num_consumers = 4;
+    const int ops_per_producer = 100000;
+    const int total_items = num_producers * ops_per_producer;
+
+    queue_t *queue = queue_new();
+
+    pthread_t producers[num_producers];
+    pthread_t consumers[num_consumers];
+    benchmark_producer_args_t producer_args[num_producers];
+    benchmark_consumer_args_t consumer_args[num_consumers];
+
+    _Atomic int items_consumed = 0;
+    struct timespec start_time = {0, 0};
+
+    /* create producers */
+    for (int i = 0; i < num_producers; i++)
+    {
+        producer_args[i].queue = queue;
+        producer_args[i].num_ops = ops_per_producer;
+        producer_args[i].thread_id = i;
+        producer_args[i].start_time = &start_time;
+        pthread_create(&producers[i], NULL, benchmark_producer, &producer_args[i]);
+    }
+
+    /* create consumers */
+    for (int i = 0; i < num_consumers; i++)
+    {
+        consumer_args[i].queue = queue;
+        consumer_args[i].expected_items = total_items;
+        consumer_args[i].items_consumed = &items_consumed;
+        pthread_create(&consumers[i], NULL, benchmark_consumer, &consumer_args[i]);
+    }
+
+    /* start timing */
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    start_time = start; /* signal threads to start */
+
+    /* wait for all producers */
+    for (int i = 0; i < num_producers; i++)
+    {
+        pthread_join(producers[i], NULL);
+    }
+
+    /* wait for all consumers */
+    for (int i = 0; i < num_consumers; i++)
+    {
+        pthread_join(consumers[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double ops_per_sec = total_items / elapsed;
+
+    printf("  %d producers, %d consumers, %d items each\n", num_producers, num_consumers,
+           ops_per_producer);
+    printf("  Total throughput: %.2f M ops/sec (%.3f seconds)\n", ops_per_sec / 1e6, elapsed);
+    printf("  Items consumed: %d/%d\n", atomic_load(&items_consumed), total_items);
+
+    ASSERT_EQ(atomic_load(&items_consumed), total_items);
+    queue_free(queue);
+}
+
+typedef struct
+{
+    queue_t *queue;
+    int num_ops;
+    struct timespec *start_time;
+} benchmark_mixed_args_t;
+
+static void *benchmark_mixed_thread(void *arg)
+{
+    benchmark_mixed_args_t *args = (benchmark_mixed_args_t *)arg;
+
+    /* wait for start signal */
+    while (args->start_time->tv_sec == 0)
+    {
+        usleep(100);
+    }
+
+    for (int i = 0; i < args->num_ops; i++)
+    {
+        /* 50% enqueue, 50% dequeue */
+        if (i % 2 == 0)
+        {
+            int *data = malloc(sizeof(int));
+            *data = i;
+            queue_enqueue(args->queue, data);
+        }
+        else
+        {
+            int *data = (int *)queue_dequeue(args->queue);
+            if (data) free(data);
+        }
+    }
+
+    return NULL;
+}
+
+void benchmark_queue_mixed_operations()
+{
+    printf("\n");
+    const int num_threads = 8;
+    const int ops_per_thread = 50000;
+
+    queue_t *queue = queue_new();
+
+    pthread_t threads[num_threads];
+    benchmark_mixed_args_t args[num_threads];
+    struct timespec start_time = {0, 0};
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        args[i].queue = queue;
+        args[i].num_ops = ops_per_thread;
+        args[i].start_time = &start_time;
+        pthread_create(&threads[i], NULL, benchmark_mixed_thread, &args[i]);
+    }
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    start_time = start;
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double total_ops = num_threads * ops_per_thread;
+    double ops_per_sec = total_ops / elapsed;
+
+    printf("  %d threads, %d mixed ops each (50%% enqueue, 50%% dequeue)\n", num_threads,
+           ops_per_thread);
+    printf("  Total throughput: %.2f M ops/sec (%.3f seconds)\n", ops_per_sec / 1e6, elapsed);
+    printf("  Final queue size: %zu\n", queue_size(queue));
+
+    queue_free_with_data(queue, free);
+}
+
+void benchmark_queue_scaling()
+{
+    printf("\n");
+    const int ops_per_thread = 50000;
+    int thread_counts[] = {1, 2, 4, 8, 16};
+    int num_configs = sizeof(thread_counts) / sizeof(thread_counts[0]);
+
+    printf("  Operations per thread: %d (enqueue only)\n", ops_per_thread);
+    printf("  %-10s %-15s %-15s %-15s\n", "Threads", "Time (s)", "Ops/sec", "Speedup");
+
+    double baseline_time = 0.0;
+
+    for (int c = 0; c < num_configs; c++)
+    {
+        int num_threads = thread_counts[c];
+        queue_t *queue = queue_new();
+
+        pthread_t threads[num_threads];
+        benchmark_producer_args_t args[num_threads];
+        struct timespec start_time = {0, 0};
+
+        for (int i = 0; i < num_threads; i++)
+        {
+            args[i].queue = queue;
+            args[i].num_ops = ops_per_thread;
+            args[i].thread_id = i;
+            args[i].start_time = &start_time;
+            pthread_create(&threads[i], NULL, benchmark_producer, &args[i]);
+        }
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        start_time = start;
+
+        for (int i = 0; i < num_threads; i++)
+        {
+            pthread_join(threads[i], NULL);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        double total_ops = num_threads * ops_per_thread;
+        double ops_per_sec = total_ops / elapsed;
+
+        if (c == 0) baseline_time = elapsed;
+        double speedup = baseline_time / elapsed;
+
+        printf("  %-10d %-15.4f %-15.0f %-15.2f x\n", num_threads, elapsed, ops_per_sec, speedup);
+
+        queue_free_with_data(queue, free);
+    }
+}
+
 int main(void)
 {
     RUN_TEST(test_queue_new, tests_passed);
@@ -695,6 +1004,10 @@ int main(void)
     RUN_TEST(test_queue_is_empty, tests_passed);
     RUN_TEST(test_queue_peek_at_boundary, tests_passed);
     RUN_TEST(test_queue_foreach_empty, tests_passed);
+    RUN_TEST(benchmark_queue_single_threaded, tests_passed);
+    RUN_TEST(benchmark_queue_concurrent_producers_consumers, tests_passed);
+    RUN_TEST(benchmark_queue_mixed_operations, tests_passed);
+    RUN_TEST(benchmark_queue_scaling, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

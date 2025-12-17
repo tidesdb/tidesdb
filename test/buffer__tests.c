@@ -627,21 +627,23 @@ void test_buffer_stress(void)
     buffer_free(buffer);
 }
 
-void benchmark_buffer_sequential(void)
+void benchmark_buffer_single_threaded(void)
 {
+    printf("\n");
     buffer_t *buffer = NULL;
-    const int capacity = 10000;
-    const int ops = 1000000;
+    const int capacity = 1000;
+    const int num_ops = 1000000;
 
     assert(buffer_new(&buffer, capacity) == 0);
 
     uint32_t *ids = (uint32_t *)malloc(capacity * sizeof(uint32_t));
-
-    clock_t start = clock();
-
-    /* sequential acquire/release cycles */
     int idx = 0;
-    for (int i = 0; i < ops; i++)
+
+    /* benchmark acquire */
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < num_ops; i++)
     {
         int value = i;
         if (buffer_try_acquire(buffer, (void *)(intptr_t)value, &ids[idx]) == 0)
@@ -649,7 +651,7 @@ void benchmark_buffer_sequential(void)
             idx++;
             if (idx == capacity)
             {
-                /* release all */
+                /* release all to make room */
                 for (int j = 0; j < capacity; j++)
                 {
                     buffer_release_silent(buffer, ids[j]);
@@ -659,59 +661,318 @@ void benchmark_buffer_sequential(void)
         }
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double acquire_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double acquire_ops_per_sec = num_ops / acquire_time;
+
+    printf("  Acquire/Release %d items: %.2f M ops/sec (%.3f seconds)\n", num_ops,
+           acquire_ops_per_sec / 1e6, acquire_time);
+
+    /* cleanup remaining */
     for (int j = 0; j < idx; j++)
     {
         buffer_release_silent(buffer, ids[j]);
     }
 
-    clock_t end = clock();
-    double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
-
-    printf("Sequential acquire/release: %.2f M ops/sec (%.3f seconds)\n", ops / elapsed / 1000000.0,
-           elapsed);
-
     free(ids);
     buffer_free(buffer);
 }
 
-void benchmark_buffer_concurrent(void)
+typedef struct
 {
-    buffer_t *buffer = NULL;
-    const int capacity = 1000;
-    const int num_threads = 8;
-    const int ops_per_thread = 100000;
+    buffer_t *buffer;
+    int thread_id;
+    int num_ops;
+    struct timespec *start_time;
+    _Atomic(int) *ops_completed;
+} benchmark_buffer_args_t;
 
+static void *benchmark_buffer_worker(void *arg)
+{
+    benchmark_buffer_args_t *args = (benchmark_buffer_args_t *)arg;
+
+    /* wait for start signal */
+    while (args->start_time->tv_sec == 0)
+    {
+        usleep(100);
+    }
+
+    for (int i = 0; i < args->num_ops; i++)
+    {
+        int value = args->thread_id * 1000000 + i;
+        uint32_t id;
+
+        if (buffer_try_acquire(args->buffer, (void *)(intptr_t)value, &id) == 0)
+        {
+            /* verify */
+            void *data;
+            if (buffer_get(args->buffer, id, &data) == 0)
+            {
+                assert((intptr_t)data == value);
+            }
+
+            buffer_release_silent(args->buffer, id);
+            atomic_fetch_add(args->ops_completed, 1);
+        }
+        else
+        {
+            /* buffer full, retry with small delay */
+            cpu_pause();
+            i--; /* retry this operation */
+        }
+    }
+
+    return NULL;
+}
+
+void benchmark_buffer_concurrent_throughput(void)
+{
+    printf("\n");
+    const int num_threads = 8;
+    const int ops_per_thread = 50000;
+    const int capacity = 256;
+
+    buffer_t *buffer = NULL;
     assert(buffer_new(&buffer, capacity) == 0);
 
-    pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
-    stress_args_t *args = (stress_args_t *)malloc(num_threads * sizeof(stress_args_t));
-    _Atomic(int) total_acquired = 0;
-
-    clock_t start = clock();
+    pthread_t threads[num_threads];
+    benchmark_buffer_args_t args[num_threads];
+    _Atomic(int) ops_completed = 0;
+    struct timespec start_time = {0, 0};
 
     for (int i = 0; i < num_threads; i++)
     {
         args[i].buffer = buffer;
         args[i].thread_id = i;
-        args[i].iterations = ops_per_thread;
-        args[i].total_acquired = &total_acquired;
-        pthread_create(&threads[i], NULL, stress_worker, &args[i]);
+        args[i].num_ops = ops_per_thread;
+        args[i].start_time = &start_time;
+        args[i].ops_completed = &ops_completed;
+        pthread_create(&threads[i], NULL, benchmark_buffer_worker, &args[i]);
     }
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    start_time = start;
 
     for (int i = 0; i < num_threads; i++)
     {
         pthread_join(threads[i], NULL);
     }
 
-    clock_t end = clock();
-    double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
-    int acquired = atomic_load(&total_acquired);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    int completed = atomic_load(&ops_completed);
+    double ops_per_sec = completed / elapsed;
 
-    printf("Concurrent acquire/release (%d threads): %.2f M ops/sec (%.3f seconds)\n", num_threads,
-           acquired / elapsed / 1000000.0, elapsed);
+    printf("  %d threads, %d ops each, %d slots\n", num_threads, ops_per_thread, capacity);
+    printf("  Total throughput: %.2f M ops/sec (%.3f seconds)\n", ops_per_sec / 1e6, elapsed);
+    printf("  Operations completed: %d/%d\n", completed, num_threads * ops_per_thread);
 
-    free(threads);
-    free(args);
+    buffer_free(buffer);
+}
+
+static void *benchmark_buffer_mixed_worker(void *arg)
+{
+    benchmark_buffer_args_t *args = (benchmark_buffer_args_t *)arg;
+    uint32_t my_slots[10];
+    int my_count = 0;
+
+    /* wait for start signal */
+    while (args->start_time->tv_sec == 0)
+    {
+        usleep(100);
+    }
+
+    for (int i = 0; i < args->num_ops; i++)
+    {
+        int op = i % 3;
+
+        if (op == 0 && my_count < 10)
+        {
+            /* acquire */
+            int value = args->thread_id * 1000000 + i;
+            uint32_t id;
+            if (buffer_try_acquire(args->buffer, (void *)(intptr_t)value, &id) == 0)
+            {
+                my_slots[my_count++] = id;
+                atomic_fetch_add(args->ops_completed, 1);
+            }
+        }
+        else if (op == 1 && my_count > 0)
+        {
+            /* release */
+            int idx = my_count - 1;
+            buffer_release_silent(args->buffer, my_slots[idx]);
+            my_count--;
+            atomic_fetch_add(args->ops_completed, 1);
+        }
+        else if (my_count > 0)
+        {
+            /* get */
+            void *data;
+            if (buffer_get(args->buffer, my_slots[0], &data) == 0)
+            {
+                atomic_fetch_add(args->ops_completed, 1);
+            }
+        }
+    }
+
+    /* cleanup */
+    for (int i = 0; i < my_count; i++)
+    {
+        buffer_release_silent(args->buffer, my_slots[i]);
+    }
+
+    return NULL;
+}
+
+void benchmark_buffer_mixed_operations(void)
+{
+    printf("\n");
+    const int num_threads = 8;
+    const int ops_per_thread = 30000;
+    const int capacity = 128;
+
+    buffer_t *buffer = NULL;
+    assert(buffer_new(&buffer, capacity) == 0);
+
+    pthread_t threads[num_threads];
+    benchmark_buffer_args_t args[num_threads];
+    _Atomic(int) ops_completed = 0;
+    struct timespec start_time = {0, 0};
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        args[i].buffer = buffer;
+        args[i].thread_id = i;
+        args[i].num_ops = ops_per_thread;
+        args[i].start_time = &start_time;
+        args[i].ops_completed = &ops_completed;
+        pthread_create(&threads[i], NULL, benchmark_buffer_mixed_worker, &args[i]);
+    }
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    start_time = start;
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    int completed = atomic_load(&ops_completed);
+    double ops_per_sec = completed / elapsed;
+
+    printf("  %d threads, %d mixed ops each (acquire/release/get)\n", num_threads, ops_per_thread);
+    printf("  Total throughput: %.2f M ops/sec (%.3f seconds)\n", ops_per_sec / 1e6, elapsed);
+    printf("  Final active slots: %d\n", buffer_active_count(buffer));
+
+    buffer_free(buffer);
+}
+
+void benchmark_buffer_scaling(void)
+{
+    printf("\n");
+    const int ops_per_thread = 50000;
+    const int capacity = 512;
+    int thread_counts[] = {1, 2, 4, 8, 16};
+    int num_configs = sizeof(thread_counts) / sizeof(thread_counts[0]);
+
+    printf("  Operations per thread: %d (acquire/release cycles)\n", ops_per_thread);
+    printf("  Buffer capacity: %d slots\n", capacity);
+    printf("  %-10s %-15s %-15s %-15s\n", "Threads", "Time (s)", "Ops/sec", "Speedup");
+
+    double baseline_time = 0.0;
+
+    for (int c = 0; c < num_configs; c++)
+    {
+        int num_threads = thread_counts[c];
+        buffer_t *buffer = NULL;
+        assert(buffer_new(&buffer, capacity) == 0);
+
+        pthread_t threads[num_threads];
+        benchmark_buffer_args_t args[num_threads];
+        _Atomic(int) ops_completed = 0;
+        struct timespec start_time = {0, 0};
+
+        for (int i = 0; i < num_threads; i++)
+        {
+            args[i].buffer = buffer;
+            args[i].thread_id = i;
+            args[i].num_ops = ops_per_thread;
+            args[i].start_time = &start_time;
+            args[i].ops_completed = &ops_completed;
+            pthread_create(&threads[i], NULL, benchmark_buffer_worker, &args[i]);
+        }
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        start_time = start;
+
+        for (int i = 0; i < num_threads; i++)
+        {
+            pthread_join(threads[i], NULL);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        int completed = atomic_load(&ops_completed);
+        double ops_per_sec = completed / elapsed;
+
+        if (c == 0) baseline_time = elapsed;
+        double speedup = baseline_time / elapsed;
+
+        printf("  %-10d %-15.4f %-15.0f %-15.2f x\n", num_threads, elapsed, ops_per_sec, speedup);
+
+        buffer_free(buffer);
+    }
+}
+
+void benchmark_buffer_high_contention(void)
+{
+    printf("\n");
+    const int num_threads = 16;
+    const int ops_per_thread = 20000;
+    const int capacity = 32; /* small buffer for high contention */
+
+    buffer_t *buffer = NULL;
+    assert(buffer_new(&buffer, capacity) == 0);
+
+    pthread_t threads[num_threads];
+    benchmark_buffer_args_t args[num_threads];
+    _Atomic(int) ops_completed = 0;
+    struct timespec start_time = {0, 0};
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        args[i].buffer = buffer;
+        args[i].thread_id = i;
+        args[i].num_ops = ops_per_thread;
+        args[i].start_time = &start_time;
+        args[i].ops_completed = &ops_completed;
+        pthread_create(&threads[i], NULL, benchmark_buffer_worker, &args[i]);
+    }
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    start_time = start;
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    int completed = atomic_load(&ops_completed);
+    double ops_per_sec = completed / elapsed;
+
+    printf("  High contention: %d threads, %d slots\n", num_threads, capacity);
+    printf("  Total throughput: %.2f M ops/sec (%.3f seconds)\n", ops_per_sec / 1e6, elapsed);
+    printf("  Operations completed: %d/%d\n", completed, num_threads * ops_per_thread);
+
     buffer_free(buffer);
 }
 
@@ -820,8 +1081,11 @@ int main(void)
     RUN_TEST(test_buffer_eviction_with_malloc, tests_passed);
     RUN_TEST(test_buffer_struct_eviction, tests_passed);
     RUN_TEST(test_buffer_stress, tests_passed);
-    benchmark_buffer_sequential();
-    benchmark_buffer_concurrent();
+    RUN_TEST(benchmark_buffer_single_threaded, tests_passed);
+    RUN_TEST(benchmark_buffer_concurrent_throughput, tests_passed);
+    RUN_TEST(benchmark_buffer_mixed_operations, tests_passed);
+    RUN_TEST(benchmark_buffer_scaling, tests_passed);
+    RUN_TEST(benchmark_buffer_high_contention, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

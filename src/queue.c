@@ -20,8 +20,18 @@
 
 #include "compat.h"
 
+/* branch prediction hints for hot paths */
+#if defined(__GNUC__) || defined(__clang__)
+#define QUEUE_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define QUEUE_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define QUEUE_LIKELY(x)   (x)
+#define QUEUE_UNLIKELY(x) (x)
+#endif
+
 /**
  * queue_alloc_node
+ * allocate a node from pool or heap
  * @param queue the queue to allocate the node from
  * @return the allocated node, or NULL on failure
  */
@@ -29,7 +39,8 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
 {
     queue_node_t *node = NULL;
 
-    if (queue->node_pool)
+    /* check pool first (common case) */
+    if (QUEUE_LIKELY(queue->node_pool != NULL))
     {
         node = queue->node_pool;
         queue->node_pool = node->next;
@@ -45,12 +56,14 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
 
 /**
  * queue_free_node
+ * return node to pool or free it
  * @param queue the queue to return the node to
  * @param node the node to return
  */
 static inline void queue_free_node(queue_t *queue, queue_node_t *node)
 {
-    if (queue->pool_size < queue->max_pool_size)
+    /* optimization: pool not full is common case */
+    if (QUEUE_LIKELY(queue->pool_size < queue->max_pool_size))
     {
         /* return to pool */
         node->next = queue->node_pool;
@@ -61,7 +74,6 @@ static inline void queue_free_node(queue_t *queue, queue_node_t *node)
     {
         /* pool full, actually free */
         free(node);
-        node = NULL;
     }
 }
 
@@ -98,13 +110,13 @@ queue_t *queue_new(void)
 
 int queue_enqueue(queue_t *queue, void *data)
 {
-    if (queue == NULL) return -1;
+    if (QUEUE_UNLIKELY(queue == NULL)) return -1;
 
     pthread_mutex_lock(&queue->lock);
 
     /* allocate from pool (must be inside lock) */
     queue_node_t *node = queue_alloc_node(queue);
-    if (node == NULL)
+    if (QUEUE_UNLIKELY(node == NULL))
     {
         pthread_mutex_unlock(&queue->lock);
         return -1;
@@ -113,7 +125,8 @@ int queue_enqueue(queue_t *queue, void *data)
     node->data = data;
     node->next = NULL;
 
-    if (queue->tail == NULL)
+    /* empty queue is less common after startup */
+    if (QUEUE_UNLIKELY(queue->tail == NULL))
     {
         queue->head = node;
         atomic_store_explicit(&queue->atomic_head, node, memory_order_release);
@@ -121,7 +134,7 @@ int queue_enqueue(queue_t *queue, void *data)
     }
     else
     {
-        /* add to end */
+        /* add to end (common case) */
         queue->tail->next = node;
         queue->tail = node;
     }
@@ -136,16 +149,16 @@ int queue_enqueue(queue_t *queue, void *data)
     return 0;
 }
 
-void *queue_dequeue(queue_t *queue)
+/**
+ * queue_dequeue_internal
+ * internal helper for dequeue logic (lock must be held)
+ * @param queue the queue
+ * @return pointer to dequeued data, NULL if queue is empty
+ */
+static inline void *queue_dequeue_internal(queue_t *queue)
 {
-    if (queue == NULL) return NULL;
-
-    pthread_mutex_lock(&queue->lock);
-
-    if (queue->head == NULL)
+    if (QUEUE_UNLIKELY(queue->head == NULL))
     {
-        /* queue is empty */
-        pthread_mutex_unlock(&queue->lock);
         return NULL;
     }
 
@@ -154,9 +167,10 @@ void *queue_dequeue(queue_t *queue)
 
     queue->head = node->next;
     atomic_store_explicit(&queue->atomic_head, node->next, memory_order_release);
-    if (queue->head == NULL)
+
+    /* optimization: check if queue became empty */
+    if (QUEUE_UNLIKELY(queue->head == NULL))
     {
-        /* queue is now empty */
         queue->tail = NULL;
     }
 
@@ -165,6 +179,15 @@ void *queue_dequeue(queue_t *queue)
     /* return node to pool */
     queue_free_node(queue, node);
 
+    return data;
+}
+
+void *queue_dequeue(queue_t *queue)
+{
+    if (QUEUE_UNLIKELY(queue == NULL)) return NULL;
+
+    pthread_mutex_lock(&queue->lock);
+    void *data = queue_dequeue_internal(queue);
     pthread_mutex_unlock(&queue->lock);
 
     return data;
@@ -172,7 +195,7 @@ void *queue_dequeue(queue_t *queue)
 
 void *queue_dequeue_wait(queue_t *queue)
 {
-    if (queue == NULL) return NULL;
+    if (QUEUE_UNLIKELY(queue == NULL)) return NULL;
 
     pthread_mutex_lock(&queue->lock);
 
@@ -195,26 +218,14 @@ void *queue_dequeue_wait(queue_t *queue)
     }
 
     /* if shutdown and no data, return NULL */
-    if (queue->shutdown && queue->head == NULL)
+    if (QUEUE_UNLIKELY(queue->shutdown && queue->head == NULL))
     {
         pthread_mutex_unlock(&queue->lock);
         return NULL;
     }
 
-    queue_node_t *node = queue->head;
-    void *data = node->data;
-
-    queue->head = node->next;
-    atomic_store_explicit(&queue->atomic_head, node->next, memory_order_release);
-    if (queue->head == NULL)
-    {
-        queue->tail = NULL;
-    }
-
-    atomic_fetch_sub_explicit(&queue->size, 1, memory_order_relaxed);
-
-    /* return node to pool */
-    queue_free_node(queue, node);
+    /* use internal helper to avoid code duplication */
+    void *data = queue_dequeue_internal(queue);
 
     pthread_mutex_unlock(&queue->lock);
 
@@ -223,12 +234,12 @@ void *queue_dequeue_wait(queue_t *queue)
 
 void *queue_peek(queue_t *queue)
 {
-    if (queue == NULL) return NULL;
+    if (QUEUE_UNLIKELY(queue == NULL)) return NULL;
 
     pthread_mutex_lock(&queue->lock);
 
     void *data = NULL;
-    if (queue->head != NULL)
+    if (QUEUE_LIKELY(queue->head != NULL))
     {
         data = queue->head->data;
     }
@@ -254,20 +265,55 @@ int queue_is_empty(queue_t *queue)
 
 int queue_clear(queue_t *queue)
 {
-    if (queue == NULL) return -1;
+    if (QUEUE_UNLIKELY(queue == NULL)) return -1;
 
     pthread_mutex_lock(&queue->lock);
 
+    /* optimization: batch return nodes to pool for better cache locality */
     queue_node_t *current = queue->head;
+    queue_node_t *batch_head = NULL;
+    queue_node_t *batch_tail = NULL;
+    size_t batch_count = 0;
+
     while (current != NULL)
     {
         queue_node_t *next = current->next;
-        queue_free_node(queue, current); /* return to pool */
+
+        /* build batch list */
+        if (batch_count < queue->max_pool_size - queue->pool_size)
+        {
+            if (batch_head == NULL)
+            {
+                batch_head = current;
+                batch_tail = current;
+            }
+            else
+            {
+                batch_tail->next = current;
+                batch_tail = current;
+            }
+            batch_count++;
+        }
+        else
+        {
+            /* pool would be full, free directly */
+            free(current);
+        }
+
         current = next;
+    }
+
+    /* attach batch to pool in one operation */
+    if (batch_head != NULL)
+    {
+        batch_tail->next = queue->node_pool;
+        queue->node_pool = batch_head;
+        queue->pool_size += batch_count;
     }
 
     queue->head = NULL;
     queue->tail = NULL;
+    atomic_store_explicit(&queue->atomic_head, NULL, memory_order_release);
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
     pthread_mutex_unlock(&queue->lock);
@@ -277,13 +323,13 @@ int queue_clear(queue_t *queue)
 
 int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *context)
 {
-    if (queue == NULL || fn == NULL) return -1;
+    if (QUEUE_UNLIKELY(queue == NULL || fn == NULL)) return -1;
 
     pthread_mutex_lock(&queue->lock);
 
     int count = 0;
     queue_node_t *current = queue->head;
-    while (current != NULL)
+    while (QUEUE_LIKELY(current != NULL))
     {
         fn(current->data, context);
         count++;
@@ -297,21 +343,23 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
 
 void *queue_peek_at(queue_t *queue, size_t index)
 {
-    if (!queue) return NULL;
+    if (QUEUE_UNLIKELY(!queue)) return NULL;
 
+    /* optimization: early bounds check without lock */
     size_t size = atomic_load_explicit(&queue->size, memory_order_relaxed);
-    if (index >= size)
+    if (QUEUE_UNLIKELY(index >= size))
     {
         return NULL;
     }
 
+    /* lock-free traversal using atomic_head */
     queue_node_t *current = atomic_load_explicit(&queue->atomic_head, memory_order_acquire);
-    for (size_t i = 0; i < index && current; i++)
+    for (size_t i = 0; i < index && QUEUE_LIKELY(current != NULL); i++)
     {
         current = current->next;
     }
 
-    return current ? current->data : NULL;
+    return QUEUE_LIKELY(current != NULL) ? current->data : NULL;
 }
 
 void queue_free(queue_t *queue)

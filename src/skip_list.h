@@ -20,6 +20,15 @@
 #define __SKIP_LIST_H__
 #include "compat.h"
 
+/* branch prediction hints for hot paths */
+#if defined(__GNUC__) || defined(__clang__)
+#define SKIP_LIST_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define SKIP_LIST_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define SKIP_LIST_LIKELY(x)   (x)
+#define SKIP_LIST_UNLIKELY(x) (x)
+#endif
+
 /* forward declarations */
 typedef struct skip_list_node_t skip_list_node_t;
 typedef struct skip_list_t skip_list_t;

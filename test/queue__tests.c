@@ -985,7 +985,7 @@ void benchmark_queue_scaling()
 
         free(threads);
         free(args);
-        queue_free(queue);
+        queue_free_with_data(queue, free);
     }
 }
 

@@ -162,8 +162,14 @@ typedef struct
 #define TDB_BACKPRESSURE_IMMUTABLE_MODERATE_DELAY_US  1000
 
 /* sstable reaper thread configuration */
-#define TDB_SSTABLE_REAPER_SLEEP_US             100000
-#define TDB_SSTABLE_REAPER_EVICT_RATIO          0.25
+#define TDB_SSTABLE_REAPER_SLEEP_US    100000
+#define TDB_SSTABLE_REAPER_EVICT_RATIO 0.25
+
+/* time conversion constants for pthread_cond_timedwait */
+#define TDB_MICROSECONDS_PER_SECOND     1000000
+#define TDB_NANOSECONDS_PER_SECOND      1000000000
+#define TDB_NANOSECONDS_PER_MICROSECOND 1000
+
 #define TDB_MAX_TXN_CFS                         10000
 #define TDB_MAX_PATH_LEN                        4096
 #define TDB_MAX_TXN_OPS                         100000
@@ -9156,15 +9162,42 @@ static void *tidesdb_sync_worker_thread(void *arg)
         }
         pthread_rwlock_unlock(&db->cf_list_lock);
 
+        uint64_t sleep_us;
         if (min_interval == UINT64_MAX)
         {
             /* no CFs need interval syncing, sleep longer */
-            usleep(NO_CF_SYNC_SLEEP_US);
-            continue;
+            sleep_us = NO_CF_SYNC_SLEEP_US;
+        }
+        else
+        {
+            sleep_us = min_interval;
         }
 
-        /* sleep for the minimum interval */
-        usleep(min_interval);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += (sleep_us / TDB_MICROSECONDS_PER_SECOND);
+        ts.tv_nsec += (sleep_us % TDB_MICROSECONDS_PER_SECOND) * TDB_NANOSECONDS_PER_MICROSECOND;
+        if (ts.tv_nsec >= TDB_NANOSECONDS_PER_SECOND)
+        {
+            ts.tv_sec++;
+            ts.tv_nsec -= TDB_NANOSECONDS_PER_SECOND;
+        }
+
+        pthread_mutex_lock(&db->sync_thread_mutex);
+        pthread_cond_timedwait(&db->sync_thread_cond, &db->sync_thread_mutex, &ts);
+        pthread_mutex_unlock(&db->sync_thread_mutex);
+
+        /* check shutdown flag after wait to avoid lock contention during shutdown */
+        if (!atomic_load(&db->sync_thread_active))
+        {
+            break;
+        }
+
+        if (min_interval == UINT64_MAX)
+        {
+            /* no CFs needed syncing, skip sync phase */
+            continue;
+        }
 
         /* sync all CFs that need it */
         pthread_rwlock_rdlock(&db->cf_list_lock);
@@ -9228,12 +9261,13 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += (TDB_SSTABLE_REAPER_SLEEP_US / 1000000);
-        ts.tv_nsec += (TDB_SSTABLE_REAPER_SLEEP_US % 1000000) * 1000;
-        if (ts.tv_nsec >= 1000000000)
+        ts.tv_sec += (TDB_SSTABLE_REAPER_SLEEP_US / TDB_MICROSECONDS_PER_SECOND);
+        ts.tv_nsec += (TDB_SSTABLE_REAPER_SLEEP_US % TDB_MICROSECONDS_PER_SECOND) *
+                      TDB_NANOSECONDS_PER_MICROSECOND;
+        if (ts.tv_nsec >= TDB_NANOSECONDS_PER_SECOND)
         {
             ts.tv_sec++;
-            ts.tv_nsec -= 1000000000;
+            ts.tv_nsec -= TDB_NANOSECONDS_PER_SECOND;
         }
 
         pthread_mutex_lock(&db->reaper_thread_mutex);
@@ -9751,6 +9785,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     }
     pthread_rwlock_unlock(&(*db)->cf_list_lock);
 
+    /* initialize sync thread synchronization primitives */
+    pthread_mutex_init(&(*db)->sync_thread_mutex, NULL);
+    pthread_cond_init(&(*db)->sync_thread_cond, NULL);
+
     if (needs_sync_thread)
     {
         atomic_store(&(*db)->sync_thread_active, 1);
@@ -9758,6 +9796,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         {
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create sync worker thread");
             atomic_store(&(*db)->sync_thread_active, 0);
+            pthread_mutex_destroy(&(*db)->sync_thread_mutex);
+            pthread_cond_destroy(&(*db)->sync_thread_cond);
             /* non-fatal, continue without sync thread */
         }
         else
@@ -9995,8 +10035,17 @@ int tidesdb_close(tidesdb_t *db)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Stopping sync worker thread");
         atomic_store(&db->sync_thread_active, 0);
+
+        pthread_mutex_lock(&db->sync_thread_mutex);
+        pthread_cond_signal(&db->sync_thread_cond);
+        pthread_mutex_unlock(&db->sync_thread_mutex);
+
         pthread_join(db->sync_thread, NULL);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread stopped");
+
+        /* clean up synchronization primitives */
+        pthread_mutex_destroy(&db->sync_thread_mutex);
+        pthread_cond_destroy(&db->sync_thread_cond);
     }
 
     /* stop sstable file reaper thread if running */

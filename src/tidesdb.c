@@ -197,6 +197,9 @@ typedef struct
 #define TDB_COMMIT_STATUS_BUFFER_SIZE    65536
 #define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE (4 * 1024 * 1024)
 
+/* uint32_t max value */
+#define TDB_MAX_KEY_VALUE_SIZE UINT32_MAX
+
 /**
  * tidesdb_klog_entry_t
  * entry in klog block
@@ -1092,7 +1095,7 @@ static int tidesdb_cache_block_put(tidesdb_t *db, const char *cf_name, const cha
  * @param klog_path path to klog file
  * @param block_position position of block in file
  * @param rc_block_out output parameter for ref-counted block (caller must release!)
- * @return deserialized klog block if found, NULL otherwise (DO NOT FREE - call
+ * @return deserialized klog block if found, NULL otherwise (do not free, call
  * tidesdb_block_release on rc_block_out)
  */
 static tidesdb_klog_block_t *tidesdb_cache_block_get(tidesdb_t *db, const char *cf_name,
@@ -1373,24 +1376,29 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, size_t key_size, size_t value
     if (!db) return TDB_ERR_INVALID_ARGS;
 
     /* enforce architectural limit! all sizes are uint32_t */
-    if (key_size > UINT32_MAX)
+    if (key_size > TDB_MAX_KEY_VALUE_SIZE)
     {
-        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Key size (%zu bytes) exceeds UINT32_MAX", key_size);
+        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Key size (%zu bytes) exceeds TDB_MAX_KEY_VALUE_SIZE",
+                      key_size);
         return TDB_ERR_INVALID_ARGS;
     }
-    if (value_size > UINT32_MAX)
+    if (value_size > TDB_MAX_KEY_VALUE_SIZE)
     {
-        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Value size (%zu bytes) exceeds UINT32_MAX", value_size);
+        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Value size (%zu bytes) exceeds TDB_MAX_KEY_VALUE_SIZE",
+                      value_size);
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    /* check for overflow before doing addition */
+    if (key_size > TDB_MAX_KEY_VALUE_SIZE - value_size)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_FATAL,
+                      "Total key+value size (key: %zu + value: %zu) exceeds TDB_MAX_KEY_VALUE_SIZE",
+                      key_size, value_size);
         return TDB_ERR_INVALID_ARGS;
     }
 
     size_t total_size = key_size + value_size;
-    if (total_size > UINT32_MAX)
-    {
-        TDB_DEBUG_LOG(TDB_LOG_FATAL, "Total key+value size (%zu bytes) exceeds UINT32_MAX",
-                      total_size);
-        return TDB_ERR_INVALID_ARGS;
-    }
 
     uint64_t memory_based_limit = (uint64_t)(db->available_memory * TDB_MEMORY_PERCENTAGE);
     uint64_t max_allowed_size =
@@ -7048,12 +7056,12 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                     block_manager_block_create(final_klog_size, final_klog_data);
                 if (block)
                 {
-                    /* capture file position BEFORE writing the block */
+                    /* capture file position before writing the block */
                     uint64_t block_file_position = atomic_load(&klog_bm->current_file_size);
                     block_manager_block_write(klog_bm, block);
                     block_manager_block_release(block);
 
-                    /* add final block to index AFTER writing with correct file position */
+                    /* add final block to index after writing with correct file position */
                     if (block_indexes && block_first_key && block_last_key)
                     {
                         /* sample every Nth block (ratio validated to be >= 1) */
@@ -9870,8 +9878,15 @@ int tidesdb_close(tidesdb_t *db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed");
     }
 
+    /* shutdown flush threads -- enqueue NULLs first to prevent BSD deadlock */
     if (db->flush_queue)
     {
+        for (int i = 0; i < db->config.num_flush_threads; i++)
+        {
+            queue_enqueue(db->flush_queue, NULL);
+        }
+
+        /* now set shutdown and broadcast to wake any waiting threads */
         pthread_mutex_lock(&db->flush_queue->lock);
         atomic_store(&db->flush_queue->shutdown, 1);
         pthread_cond_broadcast(&db->flush_queue->not_empty);
@@ -9880,6 +9895,12 @@ int tidesdb_close(tidesdb_t *db)
 
     if (db->compaction_queue)
     {
+        for (int i = 0; i < db->config.num_compaction_threads; i++)
+        {
+            queue_enqueue(db->compaction_queue, NULL);
+        }
+
+        /* now set shutdown and broadcast to wake any waiting threads */
         pthread_mutex_lock(&db->compaction_queue->lock);
         atomic_store(&db->compaction_queue->shutdown, 1);
         pthread_cond_broadcast(&db->compaction_queue->not_empty);
@@ -14414,7 +14435,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     /* we scan all WALs to collect multi-CF transaction info */
     if (tracker)
     {
-        size_t wal_count = queue_size(wal_files);
+        wal_count = queue_size(wal_files);
         for (size_t i = 0; i < wal_count; i++)
         {
             char *wal_path = queue_peek_at(wal_files, i);

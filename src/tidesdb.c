@@ -133,21 +133,21 @@ typedef struct
 #define TDB_MAX_FFLUSH_RETRY_ATTEMPTS          5
 #define TDB_FLUSH_RETRY_BACKOFF_US             100000
 
-/* spooky-style L0/L1 file count compaction triggers
- * α (alpha) -- trigger compaction when L0/L1 reaches this many files
- * β (beta) -- slow down writes when L0/L1 reaches this many files
- * γ (gamma) -- stop writes when L0/L1 reaches this many files (emergency) */
-#define TDB_L0_FILE_NUM_COMPACTION_TRIGGER 4      /* α -- compact at 4 files */
-#define TDB_L0_SLOWDOWN_WRITES_TRIGGER     20     /* β -- throttle at 20 files */
-#define TDB_L0_STOP_WRITES_TRIGGER         36     /* γ -- stall at 36 files */
-#define TDB_L0_SLOWDOWN_WRITES_DELAY_US    20000  /* β delay 20ms throttle */
-#define TDB_L0_STOP_WRITES_DELAY_US        100000 /* γ delay 100ms stall */
+/* spooky-style Level 1 file count compaction triggers
+ * α (alpha) -- trigger compaction when Level 1 reaches this many files
+ * β (beta) -- slow down writes when Level 1 reaches this many files
+ * γ (gamma) -- stop writes when Level 1 reaches this many files (emergency) */
+#define TDB_L1_FILE_NUM_COMPACTION_TRIGGER 4      /* α -- compact at 4 files */
+#define TDB_L1_SLOWDOWN_WRITES_TRIGGER     20     /* β -- throttle at 20 files */
+#define TDB_L1_STOP_WRITES_TRIGGER         36     /* γ -- stall at 36 files */
+#define TDB_L1_SLOWDOWN_WRITES_DELAY_US    20000  /* β delay 20ms throttle */
+#define TDB_L1_STOP_WRITES_DELAY_US        100000 /* γ delay 100ms stall */
 
 /* backpressure configuration */
-#define TDB_BACKPRESSURE_THRESHOLD_L0_FULL     100
-#define TDB_BACKPRESSURE_THRESHOLD_L0_CRITICAL 98
-#define TDB_BACKPRESSURE_THRESHOLD_L0_HIGH     95
-#define TDB_BACKPRESSURE_THRESHOLD_L0_MODERATE 90
+#define TDB_BACKPRESSURE_THRESHOLD_L1_FULL     100
+#define TDB_BACKPRESSURE_THRESHOLD_L1_CRITICAL 98
+#define TDB_BACKPRESSURE_THRESHOLD_L1_HIGH     95
+#define TDB_BACKPRESSURE_THRESHOLD_L1_MODERATE 90
 #define TDB_BACKPRESSURE_DELAY_EMERGENCY_US    50000
 #define TDB_BACKPRESSURE_DELAY_CRITICAL_US     10000
 #define TDB_BACKPRESSURE_DELAY_HIGH_US         5000
@@ -5692,7 +5692,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting full preemptive merge on CF '%s', levels %d->%d",
-                  cf->name, start_level, target_level + 1);
+                  cf->name, start_level + 1, target_level + 1);
 
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
@@ -6541,7 +6541,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO,
                       "Target level %d is the largest level, need to add new level before merge",
-                      target_level);
+                      target_level + 1);
 
         /* ensure there's a level to merge into */
         if (target_level + 1 >= num_levels)
@@ -6593,7 +6593,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     queue_t *sstable_ids_snapshot = queue_new(); /* track IDs being compacted */
 
     /* snapshot sst IDs atomically to prevent race with flush workers */
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "snapshotting SSTable IDs from levels 0-%d", target_level);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "snapshotting SSTable IDs from levels 1-%d", target_level + 1);
     for (int level = 0; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = cf->levels[level];
@@ -6616,7 +6616,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
     }
 
     /* collect ssts matching the snapshot (with references) */
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "collecting SSTables from levels 0-%d", target_level);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "collecting SSTables from levels 1-%d", target_level + 1);
     for (int level = 0; level <= target_level; level++)
     {
         tidesdb_level_t *lvl = cf->levels[level];
@@ -8156,14 +8156,14 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
  * spooky implementation notes
  * -- we implement the generalized spooky algorithm (section 4.2 of the paper)
  * -- parameter X (dividing level) is configurable via dividing_level_offset
- * -- we perform full preemptive merge at levels 0 to X-1
+ * -- we perform full preemptive merge at levels 1 to X-1 (array indices 0 to X-2)
  * -- we perform dividing merge into level X (partitioned by largest level boundaries)
  * -- we perform partitioned preemptive merge at levels X to L when level X is full
  * -- we use spooky algo 2 to find target levels (smallest level that cannot accommodate)
  *
  * key differences from paper:
- * -- we use 0-based level indexing (paper uses 1-based)
- * -- level 0 is memtable in paper, but we treat it as first disk level
+ * -- we use 0-based array indexing (paper uses 1-based level numbering)
+ * -- level 0 is memtable in paper, but we treat level 1 (array index 0) as first disk level
  *
  * @param cf the column family
  * @return TDB_SUCCESS on success, error code on failure
@@ -8239,7 +8239,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     int result = TDB_SUCCESS;
     if (target_lvl < X)
     {
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "Full preemptive merge levels 0 to %d", target_lvl);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Full preemptive merge levels 1 to %d", target_lvl);
         result = tidesdb_full_preemptive_merge(cf, 0, target_lvl - 1); /* convert to 0-indexed */
     }
     else if (target_lvl == X)
@@ -8368,12 +8368,12 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         size_t pending_flushes = queue_size(cf->immutable_memtables);
 
         /* levels array is fixed, access directly */
-        int level0_sstables =
+        int level1_sstables =
             (cf->levels[0] != NULL)
                 ? atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire)
                 : 0;
 
-        if (pending_flushes == 0 && level0_sstables == 0)
+        if (pending_flushes == 0 && level1_sstables == 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Largest level is empty, removing level for CF '%s'",
                           cf->name);
@@ -8384,9 +8384,9 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         {
             TDB_DEBUG_LOG(
                 TDB_LOG_INFO,
-                "Largest level is empty but work pending (flushes: %zu, L0 sstables: %d), keeping "
+                "Largest level is empty but work pending (flushes: %zu, L1 sstables: %d), keeping "
                 "level for CF '%s'",
-                pending_flushes, level0_sstables, cf->name);
+                pending_flushes, level1_sstables, cf->name);
         }
     }
 
@@ -8888,7 +8888,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             }
         }
 
-        /* add sstable to level 0 -- load levels atomically */
+        /* add sstable to Level 1 (array index 0) -- load levels atomically */
 
         /* levels array is fixed, access directly */
         tidesdb_level_add_sstable(cf->levels[0], sst);
@@ -8905,24 +8905,24 @@ static void *tidesdb_flush_worker_thread(void *arg)
          * RocksDB's rLevel 0 in the spooky paper. this is where memtable flushes land.
          * files at this level have overlapping key ranges, so reads must check all files.
          * trigger compaction at α=4 files to prevent read amplification. */
-        int num_l0_sstables =
+        int num_l1_sstables =
             atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
-        size_t level0_size =
+        size_t level1_size =
             atomic_load_explicit(&cf->levels[0]->current_size, memory_order_acquire);
-        size_t level0_capacity =
+        size_t level1_capacity =
             atomic_load_explicit(&cf->levels[0]->capacity, memory_order_acquire);
 
         int should_compact = 0;
         const char *trigger_reason = NULL;
 
         /* file count trigger (Spooky α parameter) */
-        if (num_l0_sstables >= TDB_L0_FILE_NUM_COMPACTION_TRIGGER)
+        if (num_l1_sstables >= TDB_L1_FILE_NUM_COMPACTION_TRIGGER)
         {
             should_compact = 1;
             trigger_reason = "file count";
         }
 
-        else if (level0_size >= level0_capacity)
+        else if (level1_size >= level1_capacity)
         {
             should_compact = 1;
             trigger_reason = "size";
@@ -8933,8 +8933,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
             TDB_DEBUG_LOG(TDB_LOG_INFO,
                           "CF '%s' level %d (first disk level) triggering compaction (%s): "
                           "files=%d (trigger=%d), size=%zu (capacity=%zu)",
-                          cf->name, cf->levels[0]->level_num, trigger_reason, num_l0_sstables,
-                          TDB_L0_FILE_NUM_COMPACTION_TRIGGER, level0_size, level0_capacity);
+                          cf->name, cf->levels[0]->level_num, trigger_reason, num_l1_sstables,
+                          TDB_L1_FILE_NUM_COMPACTION_TRIGGER, level1_size, level1_capacity);
             tidesdb_compact(cf);
         }
 
@@ -11667,7 +11667,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     /* search level-by-level with early termination
      * for non-existent keys, this avoids checking all ssts in all levels
-     * for existing keys in L0, this stops immediately without checking deeper levels */
+     * for existing keys in Level 1, this stops immediately without checking deeper levels */
     for (int level_num = 0; level_num < num_levels; level_num++)
     {
         PROFILE_INC(txn->db, levels_searched);
@@ -11732,7 +11732,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     found_any = 1;
                     PROFILE_INC(txn->db, sstable_hits);
 
-                    /* L0 hit -- stop immediately, no need to check deeper levels */
+                    /* Level 1 hit -- stop immediately, no need to check deeper levels */
                     if (level_num == 0)
                     {
                         tidesdb_sstable_unref(cf->db, sst);
@@ -12602,28 +12602,28 @@ skip_ssi_check:
 
             /* spooky-style file-count-based backpressure (β and γ triggers)
              * file count is more critical than capacity for write amplification control */
-            int num_l0_sstables =
+            int num_l1_sstables =
                 atomic_load_explicit(&cf->levels[0]->num_sstables, memory_order_acquire);
 
-            if (num_l0_sstables >= TDB_L0_STOP_WRITES_TRIGGER)
+            if (num_l1_sstables >= TDB_L1_STOP_WRITES_TRIGGER)
             {
                 /* γ (gamma) -- emergency stop: 36+ files, stall writes completely */
-                usleep(TDB_L0_STOP_WRITES_DELAY_US);
+                usleep(TDB_L1_STOP_WRITES_DELAY_US);
                 TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                              "CF '%s' L0 file count critical (%d >= %d), stalling writes (%dms)",
-                              cf->name, num_l0_sstables, TDB_L0_STOP_WRITES_TRIGGER,
-                              TDB_L0_STOP_WRITES_DELAY_US / 1000);
+                              "CF '%s' L1 file count critical (%d >= %d), stalling writes (%dms)",
+                              cf->name, num_l1_sstables, TDB_L1_STOP_WRITES_TRIGGER,
+                              TDB_L1_STOP_WRITES_DELAY_US / 1000);
             }
-            else if (num_l0_sstables >= TDB_L0_SLOWDOWN_WRITES_TRIGGER)
+            else if (num_l1_sstables >= TDB_L1_SLOWDOWN_WRITES_TRIGGER)
             {
                 /* β (beta) -- slowdown: 20+ files, throttle writes */
-                usleep(TDB_L0_SLOWDOWN_WRITES_DELAY_US);
+                usleep(TDB_L1_SLOWDOWN_WRITES_DELAY_US);
                 TDB_DEBUG_LOG(TDB_LOG_WARN,
-                              "CF '%s' L0 file count high (%d >= %d), throttling writes (20ms)",
-                              cf->name, num_l0_sstables, TDB_L0_SLOWDOWN_WRITES_TRIGGER);
+                              "CF '%s' L1 file count high (%d >= %d), throttling writes (20ms)",
+                              cf->name, num_l1_sstables, TDB_L1_SLOWDOWN_WRITES_TRIGGER);
             }
 
-            /* capacity-based backpressure -- if Level 0 is near capacity, slow down writes
+            /* capacity-based backpressure -- if Level 1 is near capacity, slow down writes
              * to give compaction time to catch up. This prevents runaway sst creation
              * during heavy batched writes.
              * i.e
@@ -12632,33 +12632,33 @@ skip_ssi_check:
              *   -- 98-100% full -- 10ms delay (aggressive slowdown)
              *   -- >100% full -- 50ms delay (emergency brake)
              */
-            size_t level0_size =
+            size_t level1_size =
                 atomic_load_explicit(&cf->levels[0]->current_size, memory_order_relaxed);
-            size_t level0_capacity =
+            size_t level1_capacity =
                 atomic_load_explicit(&cf->levels[0]->capacity, memory_order_relaxed);
 
-            if (level0_capacity > 0)
+            if (level1_capacity > 0)
             {
-                int utilization_pct = (int)((level0_size * 100) / level0_capacity);
+                int utilization_pct = (int)((level1_size * 100) / level1_capacity);
 
-                if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L0_FULL)
+                if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L1_FULL)
                 {
-                    /* l0 is full, apply strong backpressure */
+                    /* Level 1 is full, apply strong backpressure */
                     usleep(TDB_BACKPRESSURE_DELAY_EMERGENCY_US);
                     TDB_DEBUG_LOG(TDB_LOG_WARN,
-                                  "CF '%s' level 0 capacity full (%d%%), applying emergency "
+                                  "CF '%s' Level 1 capacity full (%d%%), applying emergency "
                                   "backpressure (50ms)",
                                   cf->name, utilization_pct);
                 }
-                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L0_CRITICAL)
+                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L1_CRITICAL)
                 {
                     usleep(TDB_BACKPRESSURE_DELAY_CRITICAL_US);
                 }
-                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L0_HIGH)
+                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L1_HIGH)
                 {
                     usleep(TDB_BACKPRESSURE_DELAY_HIGH_US);
                 }
-                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L0_MODERATE)
+                else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L1_MODERATE)
                 {
                     usleep(TDB_BACKPRESSURE_DELAY_MODERATE_US);
                 }

@@ -529,9 +529,11 @@ int skip_list_clear(skip_list_t *list)
         current = next;
     }
 
-    for (int i = 0; i <= atomic_load_explicit(&list->level, memory_order_acquire); i++)
+    int max_level = list->max_level;
+    for (int i = 0; i <= max_level; i++)
     {
         atomic_store_explicit(&header->forward[i], tail, memory_order_release);
+        atomic_store_explicit(&BACKWARD_PTR(tail, i, max_level), header, memory_order_release);
     }
 
     atomic_store_explicit(&list->level, 0, memory_order_release);
@@ -912,8 +914,9 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     skip_list_node_t **update = malloc((list->max_level + 1) * sizeof(skip_list_node_t *));
     if (!update) return -1;
 
-    /* initialize only up to max_level, rest will be set if level increases */
-    for (int i = 0; i <= max_level; i++)
+    /* initialize all entries to header, not just up to current level
+     * this is critical because level can increase and we'll access higher indices */
+    for (int i = 0; i <= list->max_level; i++)
     {
         update[i] = header;
     }
@@ -1093,15 +1096,19 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                 uint8_t version_flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
                 skip_list_version_t *new_version =
                     skip_list_create_version(value, value_size, ttl, version_flags, seq);
-                if (new_version != NULL)
+                if (new_version == NULL)
                 {
-                    if (skip_list_insert_version_cas(&next_at_0->versions, new_version, seq, list,
-                                                     value_size) != 0)
-                    {
-                        skip_list_free_node(new_node);
-                        free(update);
-                        return -1;
-                    }
+                    skip_list_free_node(new_node);
+                    free(update);
+                    return -1;
+                }
+
+                if (skip_list_insert_version_cas(&next_at_0->versions, new_version, seq, list,
+                                                 value_size) != 0)
+                {
+                    skip_list_free_node(new_node);
+                    free(update);
+                    return -1;
                 }
 
                 skip_list_free_node(new_node);
@@ -1149,15 +1156,19 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                 uint8_t version_flags = deleted ? SKIP_LIST_FLAG_DELETED : 0;
                 skip_list_version_t *new_version =
                     skip_list_create_version(value, value_size, ttl, version_flags, seq);
-                if (new_version != NULL)
+                if (new_version == NULL)
                 {
-                    if (skip_list_insert_version_cas(&next_at_0->versions, new_version, seq, list,
-                                                     value_size) != 0)
-                    {
-                        skip_list_free_node(new_node);
-                        free(update);
-                        return -1;
-                    }
+                    skip_list_free_node(new_node);
+                    free(update);
+                    return -1;
+                }
+
+                if (skip_list_insert_version_cas(&next_at_0->versions, new_version, seq, list,
+                                                 value_size) != 0)
+                {
+                    skip_list_free_node(new_node);
+                    free(update);
+                    return -1;
                 }
 
                 skip_list_free_node(new_node);
@@ -1261,7 +1272,7 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     else
     {
         /**
-         * find the NEWEST committed version with seq <= snapshot_seq.
+         * find the newest committed version with seq <= snapshot_seq.
          * version chain is ordered newest-to-oldest, so we return the first
          * version that passes both checks. */
         while (version != NULL)

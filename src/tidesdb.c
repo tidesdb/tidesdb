@@ -9188,9 +9188,34 @@ static void *tidesdb_sync_worker_thread(void *arg)
 }
 
 /**
+ * compare_sstable_candidates
+ * comparison function for sorting sstable candidates by last_access_time
+ * @param a pointer to first sstable candidate
+ * @param b pointer to second sstable candidate
+ * @return negative if a < b, positive if a > b, zero if equal
+ */
+static int compare_sstable_candidates(const void *a, const void *b)
+{
+    const time_t time_a = ((const struct {
+                              void *sst;
+                              time_t last_access;
+                          } *)a)
+                              ->last_access;
+    const time_t time_b = ((const struct {
+                              void *sst;
+                              time_t last_access;
+                          } *)b)
+                              ->last_access;
+    if (time_a < time_b) return -1;
+    if (time_a > time_b) return 1;
+    return 0;
+}
+
+/**
  * tidesdb_sstable_reaper_thread
  * background thread that closes unused sstable files when limits are reached
- * evicts 25% of oldest ssts (by last_access_time) when num_open_sstables >= max
+ * evicts TDB_SSTABLE_REAPER_EVICT_RATIO of oldest ssts (by last_access_time) when num_open_sstables
+ * >= max
  */
 static void *tidesdb_sstable_reaper_thread(void *arg)
 {
@@ -9201,10 +9226,20 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
     {
         atomic_store(&db->cached_current_time, time(NULL));
 
-        usleep(TDB_SSTABLE_REAPER_SLEEP_US);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += (TDB_SSTABLE_REAPER_SLEEP_US / 1000000);
+        ts.tv_nsec += (TDB_SSTABLE_REAPER_SLEEP_US % 1000000) * 1000;
+        if (ts.tv_nsec >= 1000000000)
+        {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000;
+        }
 
-        /* check shutdown flag immediately after sleep to avoid lock contention during shutdown
-         * this prevents BSD deadlock where reaper holds cf_list_lock during shutdown */
+        pthread_mutex_lock(&db->reaper_thread_mutex);
+        pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
+        pthread_mutex_unlock(&db->reaper_thread_mutex);
+
         if (!atomic_load(&db->sstable_reaper_active))
         {
             break;
@@ -9237,8 +9272,6 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         int candidate_count = 0;
 
-        /* check shutdown flag before acquiring lock to prevent deadlock on BSD
-         * if shutdown is in progress, skip this iteration and exit cleanly */
         if (!atomic_load(&db->sstable_reaper_active))
         {
             free(candidates);
@@ -9267,9 +9300,11 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                     tidesdb_sstable_t *sst = ssts[j];
                     if (!sst) continue;
 
-                    /* only consider ssts that are open and not in use */
+                    /* only consider ssts that are open and not in use
+                     * increment refcount to prevent use-after-free if compaction frees this sst */
                     if (sst->klog_bm && sst->vlog_bm && atomic_load(&sst->refcount) == 1)
                     {
+                        atomic_fetch_add(&sst->refcount, 1);
                         candidates[candidate_count].sst = sst;
                         candidates[candidate_count].last_access =
                             atomic_load(&sst->last_access_time);
@@ -9295,20 +9330,9 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         }
 
         /* sort by last_access_time (oldest first) */
-        for (int i = 0; i < candidate_count - 1; i++)
-        {
-            for (int j = i + 1; j < candidate_count; j++)
-            {
-                if (candidates[i].last_access > candidates[j].last_access)
-                {
-                    sstable_candidate_t temp = candidates[i];
-                    candidates[i] = candidates[j];
-                    candidates[j] = temp;
-                }
-            }
-        }
+        qsort(candidates, candidate_count, sizeof(sstable_candidate_t), compare_sstable_candidates);
 
-        /* close oldest 50% */
+        /* close oldest (TDB_SSTABLE_REAPER_EVICT_RATIO) */
         int to_close = (int)(candidate_count * TDB_SSTABLE_REAPER_EVICT_RATIO);
         if (to_close == 0 && candidate_count > 0) to_close = 1; /* close at least 1 */
 
@@ -9317,8 +9341,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         {
             tidesdb_sstable_t *sst = candidates[i].sst;
 
-            /* double-check refcount before closing */
-            if (atomic_load(&sst->refcount) == 1 && sst->klog_bm && sst->vlog_bm)
+            /* double-check refcount before closing (should be 2: our ref + base ref) */
+            if (atomic_load(&sst->refcount) == 2 && sst->klog_bm && sst->vlog_bm)
             {
                 block_manager_close(sst->klog_bm);
                 block_manager_close(sst->vlog_bm);
@@ -9331,6 +9355,12 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper: closed %d/%d SSTables, %d now open",
                       closed_count, to_close, atomic_load(&db->num_open_sstables));
+
+        /* release all candidate refcounts */
+        for (int i = 0; i < candidate_count; i++)
+        {
+            atomic_fetch_sub(&candidates[i].sst->refcount, 1);
+        }
 
         free(candidates);
     }
@@ -9743,12 +9773,18 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     /* initialize cached time to avoid expensive time() syscalls in hot paths */
     atomic_store(&(*db)->cached_current_time, time(NULL));
 
+    /* initialize reaper thread synchronization primitives */
+    pthread_mutex_init(&(*db)->reaper_thread_mutex, NULL);
+    pthread_cond_init(&(*db)->reaper_thread_cond, NULL);
+
     atomic_store(&(*db)->sstable_reaper_active, 1);
     if (pthread_create(&(*db)->sstable_reaper_thread, NULL, tidesdb_sstable_reaper_thread, *db) !=
         0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create SSTable reaper thread");
         atomic_store(&(*db)->sstable_reaper_active, 0);
+        pthread_mutex_destroy(&(*db)->reaper_thread_mutex);
+        pthread_cond_destroy(&(*db)->reaper_thread_cond);
         /* non-fatal, continue without reaper thread */
     }
     else
@@ -9900,7 +9936,6 @@ int tidesdb_close(tidesdb_t *db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed");
     }
 
-    /* shutdown flush threads -- enqueue NULLs first to prevent BSD deadlock */
     if (db->flush_queue)
     {
         for (int i = 0; i < db->config.num_flush_threads; i++)
@@ -9969,8 +10004,17 @@ int tidesdb_close(tidesdb_t *db)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Stopping SSTable reaper thread");
         atomic_store(&db->sstable_reaper_active, 0);
+
+        pthread_mutex_lock(&db->reaper_thread_mutex);
+        pthread_cond_signal(&db->reaper_thread_cond);
+        pthread_mutex_unlock(&db->reaper_thread_mutex);
+
         pthread_join(db->sstable_reaper_thread, NULL);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper thread stopped");
+
+        /* clean up synchronization primitives */
+        pthread_mutex_destroy(&db->reaper_thread_mutex);
+        pthread_cond_destroy(&db->reaper_thread_cond);
     }
 
     /* drain and free any remaining work items before freeing queues */

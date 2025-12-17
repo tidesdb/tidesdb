@@ -9203,6 +9203,13 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         usleep(TDB_SSTABLE_REAPER_SLEEP_US);
 
+        /* check shutdown flag immediately after sleep to avoid lock contention during shutdown
+         * this prevents BSD deadlock where reaper holds cf_list_lock during shutdown */
+        if (!atomic_load(&db->sstable_reaper_active))
+        {
+            break;
+        }
+
         int current_open = atomic_load(&db->num_open_sstables);
         int max_open = (int)db->config.max_open_sstables;
 
@@ -9229,6 +9236,14 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         }
 
         int candidate_count = 0;
+
+        /* check shutdown flag before acquiring lock to prevent deadlock on BSD
+         * if shutdown is in progress, skip this iteration and exit cleanly */
+        if (!atomic_load(&db->sstable_reaper_active))
+        {
+            free(candidates);
+            break;
+        }
 
         /* scan all column families for closeable ssts */
         pthread_rwlock_rdlock(&db->cf_list_lock);
@@ -9264,6 +9279,13 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             }
         }
         pthread_rwlock_unlock(&db->cf_list_lock);
+
+        /* check shutdown flag after releasing lock to exit promptly */
+        if (!atomic_load(&db->sstable_reaper_active))
+        {
+            free(candidates);
+            break;
+        }
 
         if (candidate_count == 0)
         {

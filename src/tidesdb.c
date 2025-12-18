@@ -5027,11 +5027,16 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
 
             /* release previous block and decompressed data before moving to next */
             /* free current_block first since its pointers reference decompressed_data */
-            if (source->source.sstable.current_block)
+            if (source->source.sstable.current_rc_block)
+            {
+                tidesdb_block_release(source->source.sstable.current_rc_block);
+                source->source.sstable.current_rc_block = NULL;
+            }
+            else if (source->source.sstable.current_block)
             {
                 tidesdb_klog_block_free(source->source.sstable.current_block);
-                source->source.sstable.current_block = NULL;
             }
+            source->source.sstable.current_block = NULL;
             if (source->source.sstable.decompressed_data)
             {
                 free(source->source.sstable.decompressed_data);
@@ -5215,11 +5220,16 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
 
         /* release previous block and decompressed data before moving to prior block */
         /* free current_block first since its pointers reference decompressed_data */
-        if (source->source.sstable.current_block)
+        if (source->source.sstable.current_rc_block)
+        {
+            tidesdb_block_release(source->source.sstable.current_rc_block);
+            source->source.sstable.current_rc_block = NULL;
+        }
+        else if (source->source.sstable.current_block)
         {
             tidesdb_klog_block_free(source->source.sstable.current_block);
-            source->source.sstable.current_block = NULL;
         }
+        source->source.sstable.current_block = NULL;
         if (source->source.sstable.decompressed_data)
         {
             free(source->source.sstable.decompressed_data);
@@ -13344,6 +13354,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                         /* found target entry, store block and keep rc_block alive */
                         source->source.sstable.current_block_data = bmblock;
                         source->source.sstable.current_rc_block = rc_block;
+                        source->source.sstable.current_block = kb; /* points to rc_block->block */
                         source->source.sstable.current_entry_idx = result_idx;
 
                         uint8_t *value = kb->inline_values[result_idx];

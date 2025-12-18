@@ -8897,7 +8897,7 @@ static void test_extreme_key_skew(void)
         tidesdb_txn_free(txn);
     }
 
-    /* flush to SSTables */
+    /* flush to sstables at l1 */
     ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
     usleep(200000);
 

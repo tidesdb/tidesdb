@@ -30,6 +30,8 @@
  * @param start start index
  * @param end end index
  * @param thread_id thread id
+ * @param count number of operations
+ * @param errors pointer to shared error counter
  */
 typedef struct
 {
@@ -42,8 +44,8 @@ typedef struct
     int start;
     int end;
     int thread_id;
-    int count;            /* for storing iteration count */
-    _Atomic(int) *errors; /* pointer to shared error counter */
+    int count;
+    _Atomic(int) *errors;
 } thread_data_t;
 
 /**
@@ -573,6 +575,12 @@ void *thread_iter_seek_for_prev(void *arg)
     return NULL;
 }
 
+/**
+ * get_isolation_level_name
+ * gets the name of an isolation level
+ * @param isolation_level isolation level
+ * @return name of isolation level
+ */
 char *get_isolation_level_name(int isolation_level)
 {
     switch (isolation_level)
@@ -592,6 +600,12 @@ char *get_isolation_level_name(int isolation_level)
     }
 }
 
+/**
+ * get_log_level_name
+ * gets the name of a log level
+ * @param log_level log level
+ * @return name of log level
+ */
 char *get_log_level_name(int log_level)
 {
     switch (log_level)

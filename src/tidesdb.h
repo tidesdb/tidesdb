@@ -205,7 +205,6 @@ typedef enum
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      (1024 * 64)
 #define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_SYNC_INTERVAL_US            128000
-#define TDB_DEFAULT_WAIT_FOR_TXNS_ON_CLOSE      1
 
 /* configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64

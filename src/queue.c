@@ -413,6 +413,11 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
 
     pthread_mutex_lock(&queue->lock);
 
+    /* set shutdown flag first and wake all waiting threads */
+    queue->shutdown = 1;
+    pthread_cond_broadcast(&queue->not_empty);
+
+    /* free all queue nodes and their data */
     queue_node_t *current = queue->head;
     while (current != NULL)
     {
@@ -425,6 +430,7 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         current = next;
     }
 
+    /* free node pool */
     current = queue->node_pool;
     while (current != NULL)
     {
@@ -435,10 +441,14 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
 
     queue->head = NULL;
     queue->tail = NULL;
-    queue->size = 0;
+    queue->node_pool = NULL;
+    atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
-    queue->shutdown = 1;
-    pthread_cond_broadcast(&queue->not_empty);
+    /* wait for all waiting threads to exit before destroying primitives */
+    while (queue->waiter_count > 0)
+    {
+        pthread_cond_wait(&queue->not_empty, &queue->lock);
+    }
 
     pthread_mutex_unlock(&queue->lock);
 

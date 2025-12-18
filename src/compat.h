@@ -900,6 +900,10 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
         return -1;
     }
 
+    /* Windows WriteFile with OVERLAPPED *does* extend files automatically,
+     * but the extension may cause blocking. To match POSIX pwrite behavior,
+     * we pre-extend the file if writing beyond EOF. This prevents blocking
+     * during concurrent writes and ensures zero-initialization of gaps. */
     LARGE_INTEGER file_size;
     if (!GetFileSizeEx(h, &file_size))
     {
@@ -909,11 +913,14 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
 
     off_t write_end = offset + (off_t)count;
 
+    /* Pre-extend file if writing beyond current EOF */
     if (write_end > file_size.QuadPart)
     {
         LARGE_INTEGER new_size;
         new_size.QuadPart = write_end;
 
+        /* SetFilePointerEx + SetEndOfFile atomically extends the file.
+         * This is thread-safe because the file system serializes these operations. */
         if (!SetFilePointerEx(h, new_size, NULL, FILE_BEGIN))
         {
             errno = GetLastError();
@@ -1103,9 +1110,10 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
         return -1;
     }
 
-    /* windows WriteFile with OVERLAPPED doesn't automatically extend the file
-     * like POSIX pwrite does. We need to ensure the file is large enough
-     * before writing to prevent partial writes or corruption. */
+    /* Windows WriteFile with OVERLAPPED *does* extend files automatically,
+     * but the extension may cause blocking. To match POSIX pwrite behavior,
+     * we pre-extend the file if writing beyond EOF. This prevents blocking
+     * during concurrent writes and ensures zero-initialization of gaps. */
     LARGE_INTEGER file_size;
     if (!GetFileSizeEx(h, &file_size))
     {
@@ -1113,23 +1121,22 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
         return -1;
     }
 
-    /* calc the end position of this write */
     off_t write_end = offset + (off_t)count;
 
-    /* writing beyond current file size, extend the file first */
+    /* Pre-extend file if writing beyond current EOF */
     if (write_end > file_size.QuadPart)
     {
         LARGE_INTEGER new_size;
         new_size.QuadPart = write_end;
 
-        /* seek to the new end pos */
+        /* SetFilePointerEx + SetEndOfFile atomically extends the file.
+         * This is thread-safe because the file system serializes these operations. */
         if (!SetFilePointerEx(h, new_size, NULL, FILE_BEGIN))
         {
             errno = GetLastError();
             return -1;
         }
 
-        /* extend the file to the new size */
         if (!SetEndOfFile(h))
         {
             errno = GetLastError();

@@ -3081,6 +3081,10 @@ static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
      * this prevents new writes from interfering */
     size_t flush_size = atomic_exchange(&cf->wal_group_buffer_size, 0);
 
+    /* memory fence to ensure all memcpy operations from threads that reserved space
+     * before the exchange are visible to us before we flush */
+    atomic_thread_fence(memory_order_acquire);
+
     if (flush_size > 0)
     {
         /* clamp to capacity to prevent overflow */
@@ -10794,6 +10798,11 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     block_manager_t *old_wal = atomic_load_explicit(&cf->active_wal, memory_order_acquire);
     uint64_t sst_id = atomic_fetch_add(&cf->next_sstable_id, 1);
 
+    /** we flush group commit buffer before WAL rotation to prevent data loss
+     * any pending writes in the buffer must be written to the old WAL file
+     * before we rotate to a new WAL */
+    tidesdb_flush_wal_group_buffer(cf);
+
     /* if using TDB_SYNC_INTERVAL, sync the old WAL before rotation
      * this essentially ensures WAL durability before it becomes immutable */
     if (cf->config.sync_mode == TDB_SYNC_INTERVAL && old_wal)
@@ -12398,10 +12407,14 @@ skip_ssi_check:
                 int expected = 0;
                 if (atomic_compare_exchange_strong(&cf->wal_group_leader, &expected, 1))
                 {
-                    /* we won -- flush the buffer
-                     * capture actual buffer size, not just our offset
-                     * other threads may have written after us but before we became leader */
-                    size_t flush_size = atomic_load(&cf->wal_group_buffer_size);
+                    /* we won the leader election -- flush the buffer
+                     * atomically claim all data in the buffer by exchanging size with 0
+                     * this prevents new writes from interfering with our flush */
+                    size_t flush_size = atomic_exchange(&cf->wal_group_buffer_size, 0);
+
+                    /* memory fence to ensure all memcpy operations from threads that reserved space
+                     * before the exchange are visible to us before we flush */
+                    atomic_thread_fence(memory_order_acquire);
 
                     /* clamp to capacity to prevent overflow if multiple threads raced */
                     if (flush_size > cf->wal_group_buffer_capacity)
@@ -12423,7 +12436,8 @@ skip_ssi_check:
                         }
                     }
 
-                    /* reset buffer -- copy our data to start (now guaranteed to fit) */
+                    /* buffer is now empty -- copy our data to start (guaranteed to fit since we
+                     * triggered flush) */
                     memcpy(cf->wal_group_buffer, wal_batch, cf_wal_size);
                     atomic_store(&cf->wal_group_buffer_size, cf_wal_size);
                     atomic_store(&cf->wal_group_leader, 0);
@@ -14632,14 +14646,18 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
         }
     }
 
-    /* we recover from each WAL file, applying only complete transactions */
+    /* we recover from each WAL file, applying all transactions
+     * we pass NULL for tracker here because during per-CF recovery,
+     * the tracker only has information from this CF's WAL files.
+     * for multi-CF transactions, we cannot determine completeness from a single CF's perspective.
+     * since each CF is recovered independently, we must apply all entries from the WAL. */
     while (!queue_is_empty(wal_files))
     {
         char *wal_path = queue_dequeue(wal_files);
         if (!wal_path) continue;
 
         skip_list_t *recovered_memtable = NULL;
-        int recover_result = tidesdb_wal_recover(cf, wal_path, &recovered_memtable, tracker);
+        int recover_result = tidesdb_wal_recover(cf, wal_path, &recovered_memtable, NULL);
 
         if (recover_result == TDB_SUCCESS && recovered_memtable)
         {

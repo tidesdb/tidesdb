@@ -9930,7 +9930,7 @@ int tidesdb_close(tidesdb_t *db)
 
     if (db->flush_queue)
     {
-        /* set shutdown flag FIRST, before enqueueing NULLs
+        /* set shutdown flag first, before enqueueing NULLs
          * this ensures queue_dequeue_wait will return NULL even if
          * a thread enters the wait after we broadcast */
         pthread_mutex_lock(&db->flush_queue->lock);
@@ -9959,7 +9959,7 @@ int tidesdb_close(tidesdb_t *db)
 
     if (db->compaction_queue)
     {
-        /* set shutdown flag FIRST, before enqueueing NULLs
+        /* set shutdown flag first, before enqueueing NULLs
          * this ensures queue_dequeue_wait will return NULL even if
          * a thread enters the wait after we broadcast */
         pthread_mutex_lock(&db->compaction_queue->lock);

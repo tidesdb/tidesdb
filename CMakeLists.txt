@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 6.1.0)
+set(PROJECT_VERSION 6.1.1)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -10,7 +10,7 @@ configure_file(
 )
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
-option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
+option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
@@ -233,7 +233,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_CF_NAME "benchmark_cf")
     endif()
     if(NOT DEFINED BENCH_NUM_THREADS)
-        set(BENCH_NUM_THREADS 4)
+        set(BENCH_NUM_THREADS 8)
     endif()
     if(NOT DEFINED BENCH_KEY_PATTERN)
         set(BENCH_KEY_PATTERN "random")
@@ -267,7 +267,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_MIN_LEVELS 4)
     endif()
     if(NOT DEFINED BENCH_SKIP_LIST_MAX_LEVEL)
-        set(BENCH_SKIP_LIST_MAX_LEVEL 16)
+        set(BENCH_SKIP_LIST_MAX_LEVEL 12)
     endif()
     if(NOT DEFINED BENCH_SKIP_LIST_PROBABILITY)
         set(BENCH_SKIP_LIST_PROBABILITY 0.25)

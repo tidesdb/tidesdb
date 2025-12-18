@@ -128,7 +128,6 @@ typedef struct
 #define TDB_CLOSE_TXN_WAIT_SLEEP_US            1000
 #define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US     10000
 #define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS 100
-#define TDB_CLOSE_FLUSH_WAIT_MAX_MS            10000
 #define TDB_OPENING_WAIT_MAX_MS                100
 #define TDB_MAX_FFLUSH_RETRY_ATTEMPTS          5
 #define TDB_FLUSH_RETRY_BACKOFF_US             100000
@@ -146,7 +145,7 @@ typedef struct
 #define TDB_L1_STOP_WRITES_DELAY_US        100000 /* γ delay 100ms stall */
 
 /* backpressure configuration */
-#define TDB_BACKPRESSURE_THRESHOLD_L1_FULL     100
+#define TDB_BACKPRESSURE_THRESHOLD_L1_FULL     99
 #define TDB_BACKPRESSURE_THRESHOLD_L1_CRITICAL 98
 #define TDB_BACKPRESSURE_THRESHOLD_L1_HIGH     95
 #define TDB_BACKPRESSURE_THRESHOLD_L1_MODERATE 90
@@ -172,10 +171,12 @@ typedef struct
 #define TDB_NANOSECONDS_PER_SECOND      1000000000
 #define TDB_NANOSECONDS_PER_MICROSECOND 1000
 
-#define TDB_MAX_TXN_CFS                         10000
-#define TDB_MAX_PATH_LEN                        4096
-#define TDB_MAX_TXN_OPS                         100000
-#define TDB_MAX_CF_NAME_LEN                     256
+#define TDB_MAX_TXN_CFS  10000
+#define TDB_MAX_PATH_LEN 4096
+#define TDB_MAX_TXN_OPS  100000
+/* similar to relational database systems like oracle, where table and column names are limited to
+ * 128 characters */
+#define TDB_MAX_CF_NAME_LEN                     128
 #define TDB_MEMORY_PERCENTAGE                   0.6
 #define TDB_MIN_KEY_VALUE_SIZE                  (1024 * 1024)
 #define TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY 32
@@ -917,6 +918,7 @@ static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf);
 static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path,
                                skip_list_t **memtable, multi_cf_txn_tracker_t *tracker);
 static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capacity, size_t ratio);
+static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf);
 
 static int tidesdb_add_level(tidesdb_column_family_t *cf);
 static int tidesdb_remove_level(tidesdb_column_family_t *cf);
@@ -3061,6 +3063,43 @@ static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm)
                 skip_list_free(memtable_to_free);
             }
             pthread_attr_destroy(&attr);
+        }
+    }
+}
+
+/**
+ * tidesdb_flush_wal_group_buffer
+ * flush any pending data in the WAL group commit buffer to disk
+ * this must be called before WAL rotation to prevent data loss
+ * @param cf the column family
+ */
+static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
+{
+    if (!cf) return;
+
+    /* atomically capture current buffer size and reset to 0
+     * this prevents new writes from interfering */
+    size_t flush_size = atomic_exchange(&cf->wal_group_buffer_size, 0);
+
+    if (flush_size > 0)
+    {
+        /* clamp to capacity to prevent overflow */
+        if (flush_size > cf->wal_group_buffer_capacity)
+        {
+            flush_size = cf->wal_group_buffer_capacity;
+        }
+
+        block_manager_t *target_wal = atomic_load_explicit(&cf->active_wal, memory_order_acquire);
+        if (target_wal)
+        {
+            block_manager_block_t *group_block =
+                block_manager_block_create(flush_size, cf->wal_group_buffer);
+
+            if (group_block)
+            {
+                block_manager_append(target_wal, group_block);
+                block_manager_block_release(group_block);
+            }
         }
     }
 }
@@ -9830,6 +9869,11 @@ int tidesdb_close(tidesdb_t *db)
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' is flushing %d entries before close", cf->name,
                               entry_count);
 
+                /* flush group commit buffer before syncing WAL to prevent data loss
+                 * any pending writes in the buffer must be written to the WAL file
+                 * before we rotate the WAL during flush */
+                tidesdb_flush_wal_group_buffer(cf);
+
                 /* ensure WAL is synced before attempting flush to prevent data loss */
                 block_manager_t *active_wal =
                     atomic_load_explicit(&cf->active_wal, memory_order_acquire);
@@ -9881,11 +9925,13 @@ int tidesdb_close(tidesdb_t *db)
     TDB_DEBUG_LOG(TDB_LOG_INFO, "All memtables flushed");
 
     /* wait for enqueued flushes to complete before shutting down flush threads
-     * this ensures data is written to sstables, not left in WAL */
+     * this ensures data is written to sstables, not left in WAL
+     * we must wait indefinitely - terminating flush workers while they have
+     * active work causes data loss */
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for background flushes to complete");
     int flush_wait_count = 0;
     pthread_rwlock_rdlock(&db->cf_list_lock);
-    while (flush_wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_MS)
+    while (1)
     {
         int any_flushing = 0;
         for (int i = 0; i < db->num_column_families; i++)
@@ -9906,10 +9952,10 @@ int tidesdb_close(tidesdb_t *db)
             break;
         }
 
-        if (flush_wait_count % 100 == 0 && flush_wait_count > 0)
+        if (flush_wait_count % 1000 == 0 && flush_wait_count > 0)
         {
-            TDB_DEBUG_LOG(TDB_LOG_WARN, "Still waiting for background flushes (waited %dms)",
-                          flush_wait_count);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Still waiting for background flushes (waited %d seconds)",
+                          flush_wait_count / 1000);
         }
 
         pthread_rwlock_unlock(&db->cf_list_lock);
@@ -9918,15 +9964,7 @@ int tidesdb_close(tidesdb_t *db)
         pthread_rwlock_rdlock(&db->cf_list_lock);
     }
     pthread_rwlock_unlock(&db->cf_list_lock);
-
-    if (flush_wait_count >= TDB_CLOSE_FLUSH_WAIT_MAX_MS)
-    {
-        TDB_DEBUG_LOG(TDB_LOG_WARN, "Background flushes did not complete within timeout");
-    }
-    else
-    {
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed");
-    }
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed");
 
     if (db->flush_queue)
     {

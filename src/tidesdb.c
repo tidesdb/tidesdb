@@ -11653,6 +11653,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
          * seq <= global_seq. After recovery, global_seq is set to max_seq from ssts,
          * so we need snapshot_seq = global_seq to see all committed data. */
         uint64_t current_seq = atomic_load_explicit(&txn->db->global_seq, memory_order_acquire);
+        txn->snapshot_seq = current_seq; /* update transaction snapshot for debugging/visibility */
         snapshot_seq = current_seq;
         visibility_check = NULL; /* no visibility check needed for READ_COMMITTED */
     }
@@ -11712,7 +11713,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     int memtable_result = skip_list_get_with_seq(
         active_mt, key, key_size, &temp_value, &temp_value_size, &ttl, &deleted, &found_seq,
-        snapshot_seq, tidesdb_visibility_check_callback, txn->db->commit_status);
+        snapshot_seq, visibility_check, visibility_check ? txn->db->commit_status : NULL);
 
     if (memtable_result == 0)
     {
@@ -11729,7 +11730,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             return TDB_ERR_NOT_FOUND;
         }
 
-        if (ttl == 0 || ttl > atomic_load(&txn->db->cached_current_time))
+        if (ttl <= 0 || ttl > atomic_load(&txn->db->cached_current_time))
         {
             *value = temp_value;
             *value_size = temp_value_size;
@@ -11775,7 +11776,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                         goto cleanup_immutables;
                     }
 
-                    if (ttl == 0 || ttl > atomic_load(&txn->db->cached_current_time))
+                    if (ttl <= 0 || ttl > atomic_load(&txn->db->cached_current_time))
                     {
                         *value = temp_value;
                         *value_size = temp_value_size;

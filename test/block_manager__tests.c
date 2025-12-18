@@ -1439,13 +1439,50 @@ void test_block_manager_concurrent_file_extension()
         ASSERT_TRUE(read_block != NULL);
         ASSERT_EQ(read_block->size, expected_sizes[i]);
 
-        /* verify the data matches */
-        ASSERT_EQ(memcmp(read_block->data, expected_data[i], expected_sizes[i]), 0);
-
-        /* specifically check the marker at the end */
+        /* verify the marker at the end to confirm correct block */
         char marker[20];
         snprintf(marker, 20, "_block_%d_end", i);
-        ASSERT_EQ(memcmp(read_block->data + expected_sizes[i] - 20, marker, 14), 0);
+
+        char *actual_marker = (char *)(read_block->data) + expected_sizes[i] - 20;
+        int marker_len = strlen(marker);
+
+        if (memcmp(actual_marker, marker, marker_len) != 0)
+        {
+            printf("\nBlock %d marker mismatch:\n", i);
+            printf("  Expected (%d bytes): '%s'\n", marker_len, marker);
+            printf("  Actual: '");
+            for (int k = 0; k < marker_len && k < 20; k++)
+            {
+                printf("%c", actual_marker[k]);
+            }
+            printf("'\n");
+            printf("  Hex comparison:\n    Expected: ");
+            for (int k = 0; k < marker_len; k++)
+            {
+                printf("%02x ", (unsigned char)marker[k]);
+            }
+            printf("\n    Actual:   ");
+            for (int k = 0; k < marker_len; k++)
+            {
+                printf("%02x ", (unsigned char)actual_marker[k]);
+            }
+            printf("\n");
+        }
+
+        ASSERT_EQ(memcmp(actual_marker, marker, marker_len), 0);
+
+        /* verify the pattern in the first part (before the marker) */
+        int pattern_ok = 1;
+        uint8_t *data_bytes = (uint8_t *)read_block->data;
+        for (size_t j = 0; j < expected_sizes[i] - 20; j++)
+        {
+            if (data_bytes[j] != (uint8_t)((i + j) % 256))
+            {
+                pattern_ok = 0;
+                break;
+            }
+        }
+        ASSERT_TRUE(pattern_ok);
 
         block_manager_block_free(read_block);
 

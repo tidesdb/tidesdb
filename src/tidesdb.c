@@ -952,12 +952,15 @@ static int wait_for_open(tidesdb_t *db);
 /**
  * tidesdb_ref_counted_block_t
  * reference-counted wrapper for deserialized blocks (thread-safe shared access)
+ * @member block pointer to deserialized block
+ * @member ref_count number of active references
+ * @member block_memory memory footprint for accounting
  */
 struct tidesdb_ref_counted_block_t
 {
     tidesdb_klog_block_t *block;
-    atomic_int ref_count; /* number of active references */
-    size_t block_memory;  /* memory footprint for accounting */
+    atomic_int ref_count;
+    size_t block_memory;
 };
 
 /**
@@ -10596,11 +10599,12 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
 
 static int wait_for_open(tidesdb_t *db)
 {
-    /* wait for database to open, but timeout if it's closing
-     * this prevents threads from hanging forever when database is being closed */
+    /* wait for database to open and finish recovery, but timeout if its closing
+     * this prevents threads from hanging forever when database is being closed
+     * and prevents transactions from starting during recovery */
     int wait_count = 0;
 
-    while (!atomic_load(&db->is_open))
+    while (!atomic_load(&db->is_open) || atomic_load(&db->is_recovering))
     {
         if (wait_count >= TDB_OPENING_WAIT_MAX_MS)
         {

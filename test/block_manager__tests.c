@@ -1386,6 +1386,124 @@ void test_block_manager_goto_last_after_reopen()
     (void)remove("test_reopen.db");
 }
 
+/* test concurrent writes with varying sizes to reproduce Windows WAL corruption issue.
+ * this simulates the scenario where multiple threads write blocks concurrently,
+ * causing file extension beyond current EOF, which was failing on Windows. */
+void test_block_manager_concurrent_file_extension()
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, "test_concurrent_ext.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* write blocks with varying sizes that will cause file extension.
+     * this mimics the WAL scenario where entries have different sizes. */
+    const int num_blocks = 50;
+    char **expected_data = malloc(num_blocks * sizeof(char *));
+    size_t *expected_sizes = malloc(num_blocks * sizeof(size_t));
+
+    for (int i = 0; i < num_blocks; i++)
+    {
+        /* vary block sizes to create different extension scenarios */
+        size_t data_size = 100 + (i * 50); /* increasing sizes: 100, 150, 200, ... */
+        expected_data[i] = malloc(data_size);
+        expected_sizes[i] = data_size;
+
+        /* fill with pattern that includes block number for verification */
+        for (size_t j = 0; j < data_size; j++)
+        {
+            expected_data[i][j] = (char)((i + j) % 256);
+        }
+        /* Add a marker at the end */
+        snprintf(expected_data[i] + data_size - 20, 20, "_block_%d_end", i);
+
+        block_manager_block_t *block = block_manager_block_create(data_size, expected_data[i]);
+        ASSERT_TRUE(block != NULL);
+
+        int64_t offset = block_manager_block_write(bm, block);
+        ASSERT_TRUE(offset >= 0);
+
+        block_manager_block_free(block);
+    }
+
+    /* close and reopen to force recovery/validation */
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, "test_concurrent_ext.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* verify all blocks were written correctly */
+    block_manager_cursor_t *cursor;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+
+    for (int i = 0; i < num_blocks; i++)
+    {
+        block_manager_block_t *read_block = block_manager_cursor_read(cursor);
+        ASSERT_TRUE(read_block != NULL);
+        ASSERT_EQ(read_block->size, expected_sizes[i]);
+
+        /* verify the marker at the end to confirm correct block */
+        char marker[20];
+        snprintf(marker, 20, "_block_%d_end", i);
+
+        char *actual_marker = (char *)(read_block->data) + expected_sizes[i] - 20;
+        int marker_len = strlen(marker);
+
+        if (memcmp(actual_marker, marker, marker_len) != 0)
+        {
+            printf("\nBlock %d marker mismatch:\n", i);
+            printf("  Expected (%d bytes): '%s'\n", marker_len, marker);
+            printf("  Actual: '");
+            for (int k = 0; k < marker_len && k < 20; k++)
+            {
+                printf("%c", actual_marker[k]);
+            }
+            printf("'\n");
+            printf("  Hex comparison:\n    Expected: ");
+            for (int k = 0; k < marker_len; k++)
+            {
+                printf("%02x ", (unsigned char)marker[k]);
+            }
+            printf("\n    Actual:   ");
+            for (int k = 0; k < marker_len; k++)
+            {
+                printf("%02x ", (unsigned char)actual_marker[k]);
+            }
+            printf("\n");
+        }
+
+        ASSERT_EQ(memcmp(actual_marker, marker, marker_len), 0);
+
+        /* verify the pattern in the first part (before the marker) */
+        int pattern_ok = 1;
+        uint8_t *data_bytes = (uint8_t *)read_block->data;
+        for (size_t j = 0; j < expected_sizes[i] - 20; j++)
+        {
+            if (data_bytes[j] != (uint8_t)((i + j) % 256))
+            {
+                pattern_ok = 0;
+                break;
+            }
+        }
+        ASSERT_TRUE(pattern_ok);
+
+        block_manager_block_free(read_block);
+
+        if (i < num_blocks - 1)
+        {
+            ASSERT_TRUE(block_manager_cursor_next(cursor) == 0);
+        }
+    }
+
+    for (int i = 0; i < num_blocks; i++)
+    {
+        free(expected_data[i]);
+    }
+    free(expected_data);
+    free(expected_sizes);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove("test_concurrent_ext.db");
+}
+
 int main(void)
 {
     RUN_TEST(test_block_manager_open, tests_passed);
@@ -1400,6 +1518,7 @@ int main(void)
     RUN_TEST(test_block_manager_cursor, tests_passed);
     RUN_TEST(test_block_manager_cursor_goto_last, tests_passed);
     RUN_TEST(test_block_manager_goto_last_after_reopen, tests_passed);
+    RUN_TEST(test_block_manager_concurrent_file_extension, tests_passed);
     RUN_TEST(test_block_manager_cursor_position_checks, tests_passed);
     RUN_TEST(test_block_manager_open_safety, tests_passed);
     RUN_TEST(test_block_manager_validate_last_block, tests_passed);

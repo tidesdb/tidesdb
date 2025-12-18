@@ -350,6 +350,9 @@ typedef struct tidesdb_config_t
  * @param wal_group_buffer_size current size of data in buffer (atomic)
  * @param wal_group_buffer_capacity total capacity of buffer
  * @param wal_group_leader atomic flag indicating a thread is leading group commit (CAS)
+ * @param wal_group_generation generation counter to detect buffer flushes (prevents race
+ * conditions)
+ * @param wal_group_writers tracks threads currently writing to buffer
  * @param manifest manifest for column family
  * @param db parent database reference
  */
@@ -375,6 +378,8 @@ struct tidesdb_column_family_t
     _Atomic(size_t) wal_group_buffer_size;
     size_t wal_group_buffer_capacity;
     _Atomic(int) wal_group_leader;
+    _Atomic(uint64_t) wal_group_generation;
+    _Atomic(int) wal_group_writers;
     tidesdb_manifest_t *manifest;
     tidesdb_t *db;
 };

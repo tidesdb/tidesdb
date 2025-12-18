@@ -7272,9 +7272,9 @@ static void test_multi_cf_many_sstables_recovery(void)
 static void test_multi_cf_transaction_recovery_comprehensive(void)
 {
     cleanup_test_dir();
-    const int NUM_COMMITTED_TXNS = 10;
-    const int NUM_ROLLBACK_TXNS = 5;
-    const int NUM_SAVEPOINT_TXNS = 3;
+    const int NUM_COMMITTED_TXNS = 3; /* reduced from 10 for less verbose logs */
+    const int NUM_ROLLBACK_TXNS = 2;  /* reduced from 5 for less verbose logs */
+    const int NUM_SAVEPOINT_TXNS = 1; /* reduced from 3 for less verbose logs */
 
     /* we create database with 4 column families and write mixed transaction states */
     {

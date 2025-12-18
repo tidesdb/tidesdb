@@ -8770,7 +8770,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO,
-                  "CF '%s' WAL recovery completed: %d blocks, %d entries, memtable has %zu entries",
+                  "CF '%s' WAL recovery completed: %d blocks, %d entries, memtable has %d entries",
                   cf->name, block_count, entry_count, skip_list_count_entries(*memtable));
 
     block_manager_cursor_free(cursor);
@@ -14922,8 +14922,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 
         if (recover_result == TDB_SUCCESS && recovered_memtable)
         {
-            size_t recovered_entries = skip_list_count_entries(recovered_memtable);
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' recovered memtable from WAL: %s (%zu entries)",
+            int recovered_entries = skip_list_count_entries(recovered_memtable);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' recovered memtable from WAL: %s (%d entries)",
                           cf->name, wal_path, recovered_entries);
             if (recovered_entries > 0)
             {

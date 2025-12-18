@@ -922,6 +922,10 @@ int block_manager_validate_last_block(block_manager_t *bm, int strict)
     /* check if footer is valid */
     if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC)
     {
+        fprintf(stderr,
+                "[block_manager] File %s: invalid footer magic 0x%08x (expected 0x%08x), "
+                "file_size=%" PRIu64 "\n",
+                bm->file_path, footer_magic, BLOCK_MANAGER_FOOTER_MAGIC, file_size);
         if (strict)
         {
             /* strict mode: invalid footer magic = corruption, reject file */
@@ -929,6 +933,7 @@ int block_manager_validate_last_block(block_manager_t *bm, int strict)
         }
 
         /* permissive mode: corrupted footer, walk backward to find last valid block */
+        fprintf(stderr, "[block_manager] Permissive mode: scanning for last valid block\n");
         uint64_t scan_pos = BLOCK_MANAGER_HEADER_SIZE;
         uint64_t valid_size = BLOCK_MANAGER_HEADER_SIZE;
 
@@ -965,12 +970,19 @@ int block_manager_validate_last_block(block_manager_t *bm, int strict)
 
         if (valid_size != file_size)
         {
+            fprintf(stderr, "[block_manager] Truncating %s from %" PRIu64 " to %" PRIu64 " bytes\n",
+                    bm->file_path, file_size, valid_size);
             if (ftruncate(bm->fd, (off_t)valid_size) != 0) return -1;
             fdatasync(bm->fd);
             close(bm->fd);
             bm->fd = open(bm->file_path, O_RDWR | O_CREAT, 0644);
             if (bm->fd == -1) return -1;
             atomic_store(&bm->current_file_size, valid_size);
+            fprintf(stderr, "[block_manager] Truncation complete, file reopened\n");
+        }
+        else
+        {
+            fprintf(stderr, "[block_manager] No truncation needed, valid_size matches file_size\n");
         }
         return 0;
     }

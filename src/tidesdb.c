@@ -205,7 +205,7 @@ typedef struct
 #define TDB_ITER_SEEK_MAX_BLOCKS_SCAN 100000
 
 #define TDB_COMMIT_STATUS_BUFFER_SIZE    65536
-#define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE 4 * 1024 * 1024
+#define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE (4 * 1024 * 1024)
 
 /* WAL group buffer writer synchronization */
 #define TDB_WAL_GROUP_WRITER_WAIT_US         10
@@ -12447,8 +12447,8 @@ skip_ssi_check:
                     int wait_cycles = 0;
                     while (atomic_load(&cf->wal_group_writers) > 0)
                     {
-                        usleep(10);
-                        if (++wait_cycles > 1000) break; /* timeout after 10ms */
+                        usleep(TDB_WAL_GROUP_WRITER_WAIT_US);
+                        if (++wait_cycles > TDB_WAL_GROUP_WRITER_MAX_WAIT_CYCLES) break;
                     }
 
                     /* memory fence to ensure all memcpy operations from threads that reserved space
@@ -12506,8 +12506,6 @@ skip_ssi_check:
 
                 if (current_generation != my_generation)
                 {
-                    /* buffer was flushed while we were preparing -- write directly */
-                    atomic_fetch_sub(&cf->wal_group_buffer_size, cf_wal_size);
                     block_manager_t *target_wal =
                         atomic_load_explicit(&cf->active_wal, memory_order_acquire);
                     block_manager_block_t *direct_block =
@@ -12527,10 +12525,7 @@ skip_ssi_check:
                     /* re-check generation after incrementing writers */
                     if (atomic_load(&cf->wal_group_generation) != my_generation)
                     {
-                        /* generation changed while we were incrementing -- abort and write directly
-                         */
                         atomic_fetch_sub(&cf->wal_group_writers, 1);
-                        atomic_fetch_sub(&cf->wal_group_buffer_size, cf_wal_size);
                         block_manager_t *target_wal =
                             atomic_load_explicit(&cf->active_wal, memory_order_acquire);
                         block_manager_block_t *direct_block =

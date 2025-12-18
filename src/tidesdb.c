@@ -132,6 +132,8 @@ typedef struct
 #define TDB_OPENING_WAIT_MAX_MS                100
 #define TDB_MAX_FFLUSH_RETRY_ATTEMPTS          5
 #define TDB_FLUSH_RETRY_BACKOFF_US             100000
+#define TDB_SHUTDOWN_BROADCAST_ATTEMPTS        10
+#define TDB_SHUTDOWN_BROADCAST_INTERVAL_US     5000
 
 /* spooky-style Level 1 file count compaction triggers
  * α (alpha) -- trigger compaction when Level 1 reaches this many files
@@ -9928,30 +9930,60 @@ int tidesdb_close(tidesdb_t *db)
 
     if (db->flush_queue)
     {
+        /* set shutdown flag FIRST, before enqueueing NULLs
+         * this ensures queue_dequeue_wait will return NULL even if
+         * a thread enters the wait after we broadcast */
+        pthread_mutex_lock(&db->flush_queue->lock);
+        atomic_store(&db->flush_queue->shutdown, 1);
+        pthread_cond_broadcast(&db->flush_queue->not_empty);
+        pthread_mutex_unlock(&db->flush_queue->lock);
+
+        /* enqueue NULL items for each thread as a courtesy
+         * (not strictly needed since shutdown=1, but maintains consistency) */
         for (int i = 0; i < db->config.num_flush_threads; i++)
         {
             queue_enqueue(db->flush_queue, NULL);
         }
 
-        /* now set shutdown and broadcast to wake any waiting threads */
-        pthread_mutex_lock(&db->flush_queue->lock);
-        atomic_store(&db->flush_queue->shutdown, 1);
-        pthread_cond_broadcast(&db->flush_queue->not_empty);
-        pthread_mutex_unlock(&db->flush_queue->lock);
+        /* keep broadcasting periodically until all threads have exited
+         * this handles the race where a thread might be between the while loop check
+         * and pthread_cond_wait when we set shutdown=1 */
+        for (int attempt = 0; attempt < TDB_SHUTDOWN_BROADCAST_ATTEMPTS; attempt++)
+        {
+            pthread_mutex_lock(&db->flush_queue->lock);
+            pthread_cond_broadcast(&db->flush_queue->not_empty);
+            pthread_mutex_unlock(&db->flush_queue->lock);
+            usleep(TDB_SHUTDOWN_BROADCAST_INTERVAL_US);
+        }
     }
 
     if (db->compaction_queue)
     {
+        /* set shutdown flag FIRST, before enqueueing NULLs
+         * this ensures queue_dequeue_wait will return NULL even if
+         * a thread enters the wait after we broadcast */
+        pthread_mutex_lock(&db->compaction_queue->lock);
+        atomic_store(&db->compaction_queue->shutdown, 1);
+        pthread_cond_broadcast(&db->compaction_queue->not_empty);
+        pthread_mutex_unlock(&db->compaction_queue->lock);
+
+        /* enqueue NULL items for each thread as a courtesy
+         * (not strictly needed since shutdown=1, but maintains consistency) */
         for (int i = 0; i < db->config.num_compaction_threads; i++)
         {
             queue_enqueue(db->compaction_queue, NULL);
         }
 
-        /* now set shutdown and broadcast to wake any waiting threads */
-        pthread_mutex_lock(&db->compaction_queue->lock);
-        atomic_store(&db->compaction_queue->shutdown, 1);
-        pthread_cond_broadcast(&db->compaction_queue->not_empty);
-        pthread_mutex_unlock(&db->compaction_queue->lock);
+        /* keep broadcasting periodically until all threads have exited
+         * this handles the race where a thread might be between the while loop check
+         * and pthread_cond_wait when we set shutdown=1 */
+        for (int attempt = 0; attempt < TDB_SHUTDOWN_BROADCAST_ATTEMPTS; attempt++)
+        {
+            pthread_mutex_lock(&db->compaction_queue->lock);
+            pthread_cond_broadcast(&db->compaction_queue->not_empty);
+            pthread_mutex_unlock(&db->compaction_queue->lock);
+            usleep(TDB_SHUTDOWN_BROADCAST_INTERVAL_US);
+        }
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for %d flush threads to finish",

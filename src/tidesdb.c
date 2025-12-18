@@ -205,7 +205,11 @@ typedef struct
 #define TDB_ITER_SEEK_MAX_BLOCKS_SCAN 100000
 
 #define TDB_COMMIT_STATUS_BUFFER_SIZE    65536
-#define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE (4 * 1024 * 1024)
+#define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE 4 * 1024 * 1024
+
+/* WAL group buffer writer synchronization */
+#define TDB_WAL_GROUP_WRITER_WAIT_US         10
+#define TDB_WAL_GROUP_WRITER_MAX_WAIT_CYCLES 1000
 
 /* uint32_t max value */
 #define TDB_MAX_KEY_VALUE_SIZE UINT32_MAX
@@ -3086,6 +3090,19 @@ static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
     /* increment generation to signal that buffer has been flushed
      * threads that reserved space in the old generation will detect this */
     atomic_fetch_add(&cf->wal_group_generation, 1);
+
+    /* wait for all in-flight writers to complete their memcpy operations
+     * this is critical to prevent data corruption */
+    int wait_cycles = 0;
+    while (atomic_load(&cf->wal_group_writers) > 0)
+    {
+        usleep(TDB_WAL_GROUP_WRITER_WAIT_US);
+        if (++wait_cycles > TDB_WAL_GROUP_WRITER_MAX_WAIT_CYCLES)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Timeout waiting for WAL group writers");
+            break;
+        }
+    }
 
     /* memory fence to ensure all memcpy operations from threads that reserved space
      * before the exchange are visible to us before we flush */
@@ -10499,6 +10516,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     cf->wal_group_buffer_capacity = TDB_WAL_GROUP_COMMIT_BUFFER_SIZE;
     atomic_init(&cf->wal_group_leader, 0);
     atomic_init(&cf->wal_group_generation, 0);
+    atomic_init(&cf->wal_group_writers, 0);
 
     char manifest_path[TDB_MAX_PATH_LEN];
     snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
@@ -12418,16 +12436,20 @@ skip_ssi_check:
                 if (atomic_compare_exchange_strong(&cf->wal_group_leader, &expected, 1))
                 {
                     /* we won the leader election -- flush the buffer
-                     * wait briefly for in-flight memcpy operations to complete
-                     * this is critical to prevent data corruption */
-                    usleep(TDB_COMMIT_BUFFER_FLUSH_DELAY_US);
-
-                    /* atomically claim all data in the buffer by exchanging size with 0
+                     * atomically claim all data in the buffer by exchanging size with 0
                      * this prevents new writes from interfering with our flush */
                     size_t flush_size = atomic_exchange(&cf->wal_group_buffer_size, 0);
 
                     /* increment generation to invalidate any pending writes */
                     atomic_fetch_add(&cf->wal_group_generation, 1);
+
+                    /* wait for all in-flight writers to complete */
+                    int wait_cycles = 0;
+                    while (atomic_load(&cf->wal_group_writers) > 0)
+                    {
+                        usleep(10);
+                        if (++wait_cycles > 1000) break; /* timeout after 10ms */
+                    }
 
                     /* memory fence to ensure all memcpy operations from threads that reserved space
                      * before the exchange are visible to us before we flush */
@@ -12498,11 +12520,39 @@ skip_ssi_check:
                 }
                 else if (my_offset + cf_wal_size <= cf->wal_group_buffer_capacity)
                 {
-                    /* generation is still valid and we have space -- copy data */
-                    memcpy(cf->wal_group_buffer + my_offset, wal_batch, cf_wal_size);
+                    /* generation is still valid and we have space -- copy data
+                     * increment writer count before memcpy to prevent premature flush */
+                    atomic_fetch_add(&cf->wal_group_writers, 1);
 
-                    /* memory fence to ensure our memcpy is visible before any flush */
-                    atomic_thread_fence(memory_order_release);
+                    /* re-check generation after incrementing writers */
+                    if (atomic_load(&cf->wal_group_generation) != my_generation)
+                    {
+                        /* generation changed while we were incrementing -- abort and write directly
+                         */
+                        atomic_fetch_sub(&cf->wal_group_writers, 1);
+                        atomic_fetch_sub(&cf->wal_group_buffer_size, cf_wal_size);
+                        block_manager_t *target_wal =
+                            atomic_load_explicit(&cf->active_wal, memory_order_acquire);
+                        block_manager_block_t *direct_block =
+                            block_manager_block_create(cf_wal_size, wal_batch);
+                        if (direct_block)
+                        {
+                            block_manager_block_write(target_wal, direct_block);
+                            block_manager_block_release(direct_block);
+                        }
+                    }
+                    else
+                    {
+                        /* safe to copy now */
+                        memcpy(cf->wal_group_buffer + my_offset, wal_batch, cf_wal_size);
+
+                        /* memory fence to ensure our memcpy is visible before decrementing writers
+                         */
+                        atomic_thread_fence(memory_order_release);
+
+                        /* decrement writer count to signal we're done */
+                        atomic_fetch_sub(&cf->wal_group_writers, 1);
+                    }
                 }
                 else
                 {

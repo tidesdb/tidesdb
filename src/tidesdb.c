@@ -12411,6 +12411,9 @@ skip_ssi_check:
         uint8_t *wal_batch = malloc(cf_wal_size);
         if (!wal_batch) return TDB_ERR_MEMORY;
 
+        /* zero the buffer to prevent uninitialized memory in WAL */
+        memset(wal_batch, 0, cf_wal_size);
+
         uint8_t *wal_ptr = wal_batch;
 
         /* write multi-CF metadata if this is a multi-CF transaction */

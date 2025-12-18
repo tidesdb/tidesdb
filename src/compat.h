@@ -811,7 +811,12 @@ static inline int gettimeofday(struct timeval *tp, struct timezone *tzp)
  */
 static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
-    if (!buf || count == 0)
+    if (count == 0)
+    {
+        return 0; /* reading 0 bytes is valid, returns 0 */
+    }
+
+    if (!buf)
     {
         errno = EINVAL;
         return -1;
@@ -831,19 +836,38 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
     li.QuadPart = offset;
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
-    overlapped.hEvent = NULL;
+
+    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (overlapped.hEvent == NULL)
+    {
+        errno = GetLastError();
+        return -1;
+    }
 
     DWORD bytes_read = 0;
-    if (!ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped))
+    BOOL result = ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped);
+
+    if (!result)
     {
         DWORD err = GetLastError();
-        if (err != ERROR_IO_PENDING)
+        if (err == ERROR_IO_PENDING)
         {
+            if (!GetOverlappedResult(h, &overlapped, &bytes_read, TRUE))
+            {
+                CloseHandle(overlapped.hEvent);
+                errno = GetLastError();
+                return -1;
+            }
+        }
+        else
+        {
+            CloseHandle(overlapped.hEvent);
             errno = err;
             return -1;
         }
     }
 
+    CloseHandle(overlapped.hEvent);
     return (ssize_t)bytes_read;
 }
 
@@ -858,7 +882,12 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
  */
 static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 {
-    if (!buf || count == 0)
+    if (count == 0)
+    {
+        return 0; /* reading 0 bytes is valid, returns 0 */
+    }
+
+    if (!buf)
     {
         errno = EINVAL;
         return -1;
@@ -878,20 +907,40 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     li.QuadPart = offset;
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
-    overlapped.hEvent = NULL;
+
+    /* Create an event for synchronous behavior */
+    overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (overlapped.hEvent == NULL)
+    {
+        errno = GetLastError();
+        return -1;
+    }
 
     DWORD bytes_written = 0;
-    if (!WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped))
+    BOOL result = WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped);
+
+    if (!result)
     {
         DWORD err = GetLastError();
-
-        if (err != ERROR_IO_PENDING)
+        if (err == ERROR_IO_PENDING)
         {
+            /* Wait for the operation to complete */
+            if (!GetOverlappedResult(h, &overlapped, &bytes_written, TRUE))
+            {
+                CloseHandle(overlapped.hEvent);
+                errno = GetLastError();
+                return -1;
+            }
+        }
+        else
+        {
+            CloseHandle(overlapped.hEvent);
             errno = err;
             return -1;
         }
     }
 
+    CloseHandle(overlapped.hEvent);
     return (ssize_t)bytes_written;
 }
 #endif /* _MSC_VER */
@@ -940,6 +989,17 @@ static inline FILE *tdb_fopen(const char *filename, const char *mode)
  */
 static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
+    if (count == 0)
+    {
+        return 0; /* reading 0 bytes is valid, returns 0 */
+    }
+
+    if (!buf)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE)
     {
@@ -998,6 +1058,17 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
  */
 static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 {
+    if (count == 0)
+    {
+        return 0; /* reading 0 bytes is valid, returns 0 */
+    }
+
+    if (!buf)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE)
     {

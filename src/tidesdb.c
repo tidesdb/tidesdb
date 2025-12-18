@@ -12435,10 +12435,13 @@ skip_ssi_check:
                 int expected = 0;
                 if (atomic_compare_exchange_strong(&cf->wal_group_leader, &expected, 1))
                 {
-                    /* we won the leader election -- flush the buffer
-                     * atomically claim all data in the buffer by exchanging size with 0
-                     * this prevents new writes from interfering with our flush */
                     size_t flush_size = atomic_exchange(&cf->wal_group_buffer_size, 0);
+
+                    /* subtract our own reservation that was never copied */
+                    if (flush_size >= my_offset + cf_wal_size)
+                    {
+                        flush_size = my_offset; /* only flush data before our reservation */
+                    }
 
                     /* increment generation to invalidate any pending writes */
                     atomic_fetch_add(&cf->wal_group_generation, 1);
@@ -12455,12 +12458,7 @@ skip_ssi_check:
                      * before the exchange are visible to us before we flush */
                     atomic_thread_fence(memory_order_acquire);
 
-                    /* clamp to capacity to prevent overflow if multiple threads raced */
-                    if (flush_size > cf->wal_group_buffer_capacity)
-                    {
-                        flush_size = cf->wal_group_buffer_capacity;
-                    }
-
+                    /* flush buffer (excluding our own unfilled reservation) */
                     if (flush_size > 0)
                     {
                         block_manager_t *target_wal =
@@ -12475,10 +12473,19 @@ skip_ssi_check:
                         }
                     }
 
-                    /* buffer is now empty -- copy our data to start (guaranteed to fit since we
-                     * triggered flush) */
-                    memcpy(cf->wal_group_buffer, wal_batch, cf_wal_size);
-                    atomic_store(&cf->wal_group_buffer_size, cf_wal_size);
+                    /* write our own data directly to WAL (not to buffer) */
+                    block_manager_t *target_wal =
+                        atomic_load_explicit(&cf->active_wal, memory_order_acquire);
+                    block_manager_block_t *direct_block =
+                        block_manager_block_create(cf_wal_size, wal_batch);
+                    if (direct_block)
+                    {
+                        block_manager_block_write(target_wal, direct_block);
+                        block_manager_block_release(direct_block);
+                    }
+
+                    /* buffer is now empty, reset state */
+                    atomic_store(&cf->wal_group_buffer_size, 0);
                     atomic_store(&cf->wal_group_leader, 0);
                 }
                 else

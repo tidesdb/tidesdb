@@ -10500,6 +10500,20 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
         free(cf);
         return TDB_ERR_IO;
     }
+
+    /* truncate WAL to prevent reading stale data from previous runs
+     * this is critical on Windows where file deletion may be delayed due to file locking */
+    if (block_manager_truncate(new_wal) != 0)
+    {
+        block_manager_close(new_wal);
+        queue_free(cf->immutable_memtables);
+        skip_list_free(atomic_load(&cf->active_memtable));
+        free(cf->directory);
+        free(cf->name);
+        free(cf);
+        return TDB_ERR_IO;
+    }
+
     atomic_init(&cf->active_wal, new_wal);
 
     /* initialize with min_levels */
@@ -10972,6 +10986,18 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     if (block_manager_open(&new_wal, wal_path, convert_sync_mode(cf->config.sync_mode)) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to open new WAL: %s", cf->name, wal_path);
+        skip_list_free(new_memtable);
+        atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+        return TDB_ERR_IO;
+    }
+
+    /* truncate WAL to prevent reading stale data from previous runs
+     * this is critical on Windows where file deletion may be delayed due to file locking
+     * if an old WAL file exists, it may contain garbage data that would corrupt recovery */
+    if (block_manager_truncate(new_wal) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to truncate new WAL: %s", cf->name, wal_path);
+        block_manager_close(new_wal);
         skip_list_free(new_memtable);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
         return TDB_ERR_IO;

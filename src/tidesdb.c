@@ -3097,7 +3097,7 @@ static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
 
             if (group_block)
             {
-                block_manager_append(target_wal, group_block);
+                block_manager_block_write(target_wal, group_block);
                 block_manager_block_release(group_block);
             }
         }

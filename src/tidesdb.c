@@ -77,7 +77,6 @@ typedef struct
 #define TDB_LEVEL_PARTITION_PREFIX       "P"
 #define TDB_SSTABLE_KLOG_EXT             ".klog"
 #define TDB_SSTABLE_VLOG_EXT             ".vlog"
-#define TDB_SSTABLE_CACHE_PREFIX         "sst_"
 #define TDB_CACHE_KEY_SIZE               32
 #define TDB_SSTABLE_METADATA_MAGIC       0x5353544D
 #define TDB_SSTABLE_METADATA_HEADER_SIZE 84
@@ -91,7 +90,6 @@ typedef struct
 #define TDB_INITIAL_COMPARATOR_CAPACITY    8
 #define TDB_INITIAL_TXN_OPS_CAPACITY       16
 #define TDB_INITIAL_TXN_READ_SET_CAPACITY  16
-#define TDB_INITIAL_TXN_WRITE_SET_CAPACITY 16
 #define TDB_INITIAL_TXN_CF_CAPACITY        4
 #define TDB_INITIAL_TXN_SAVEPOINT_CAPACITY 4
 #define TDB_INITIAL_BLOCK_INDEX_CAPACITY   16
@@ -133,7 +131,6 @@ typedef struct
 #define TDB_FLUSH_RETRY_BACKOFF_US             100000
 #define TDB_SHUTDOWN_BROADCAST_ATTEMPTS        10
 #define TDB_SHUTDOWN_BROADCAST_INTERVAL_US     5000
-#define TDB_COMMIT_BUFFER_FLUSH_DELAY_US       1000
 
 /* spooky-style Level 1 file count compaction triggers
  * α (alpha) -- trigger compaction when Level 1 reaches this many files

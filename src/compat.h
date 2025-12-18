@@ -1439,10 +1439,10 @@ static inline size_t get_available_memory(void)
 
     mach_port = mach_host_self();
 
-    /* use 32-bit vm statistics on PPC 32-bit regardless of OS version
-     * host_statistics64 is not available on PPC 32-bit even on 10.6+ */
-#if defined(__ppc__) || defined(__ppc)
-    /* PPC 32-bit always uses 32-bit vm statistics */
+    /* use 32-bit vm statistics on PPC regardless of OS version.
+     * host_statistics64 is not available on 10.5 and for PPC 32-bit even on 10.6 */
+#if defined(__ppc__) || (MAC_OS_X_VERSION_MIN_REQUIRED < 1060)
+    /* PPC always uses 32-bit vm statistics */
     vm_statistics_data_t vm_stats;
     count = HOST_VM_INFO_COUNT;
     if (host_page_size(mach_port, &page_size) == KERN_SUCCESS &&

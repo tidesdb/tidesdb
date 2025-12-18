@@ -17,7 +17,6 @@
  * limitations under the License.
  */
 #include "tidesdb.h"
-
 #include "xxhash.h"
 
 /* read profiling macros */
@@ -128,12 +127,12 @@ typedef struct
 #define TDB_CLOSE_TXN_WAIT_SLEEP_US            1000
 #define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US     10000
 #define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS 100
+#define TDB_CLOSE_FLUSH_WAIT_MAX_MS            10000
 #define TDB_OPENING_WAIT_MAX_MS                100
 #define TDB_MAX_FFLUSH_RETRY_ATTEMPTS          5
 #define TDB_FLUSH_RETRY_BACKOFF_US             100000
 #define TDB_SHUTDOWN_BROADCAST_ATTEMPTS        10
 #define TDB_SHUTDOWN_BROADCAST_INTERVAL_US     5000
-#define TDB_COMMIT_BUFFER_FLUSH_DELAY_US       1000
 
 /* spooky-style Level 1 file count compaction triggers
  * α (alpha) -- trigger compaction when Level 1 reaches this many files
@@ -146,7 +145,7 @@ typedef struct
 #define TDB_L1_STOP_WRITES_DELAY_US        100000 /* γ delay 100ms stall */
 
 /* backpressure configuration */
-#define TDB_BACKPRESSURE_THRESHOLD_L1_FULL     99
+#define TDB_BACKPRESSURE_THRESHOLD_L1_FULL     100
 #define TDB_BACKPRESSURE_THRESHOLD_L1_CRITICAL 98
 #define TDB_BACKPRESSURE_THRESHOLD_L1_HIGH     95
 #define TDB_BACKPRESSURE_THRESHOLD_L1_MODERATE 90
@@ -172,12 +171,10 @@ typedef struct
 #define TDB_NANOSECONDS_PER_SECOND      1000000000
 #define TDB_NANOSECONDS_PER_MICROSECOND 1000
 
-#define TDB_MAX_TXN_CFS  10000
-#define TDB_MAX_PATH_LEN 4096
-#define TDB_MAX_TXN_OPS  100000
-/* similar to relational database systems like oracle, where table and column names are limited to
- * 128 characters */
-#define TDB_MAX_CF_NAME_LEN                     128
+#define TDB_MAX_TXN_CFS                         10000
+#define TDB_MAX_PATH_LEN                        4096
+#define TDB_MAX_TXN_OPS                         100000
+#define TDB_MAX_CF_NAME_LEN                     256
 #define TDB_MEMORY_PERCENTAGE                   0.6
 #define TDB_MIN_KEY_VALUE_SIZE                  (1024 * 1024)
 #define TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY 32
@@ -206,10 +203,6 @@ typedef struct
 
 #define TDB_COMMIT_STATUS_BUFFER_SIZE    65536
 #define TDB_WAL_GROUP_COMMIT_BUFFER_SIZE (4 * 1024 * 1024)
-
-/* WAL group buffer writer synchronization */
-#define TDB_WAL_GROUP_WRITER_WAIT_US         10
-#define TDB_WAL_GROUP_WRITER_MAX_WAIT_CYCLES 1000
 
 /* uint32_t max value */
 #define TDB_MAX_KEY_VALUE_SIZE UINT32_MAX
@@ -923,7 +916,6 @@ static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf);
 static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path,
                                skip_list_t **memtable, multi_cf_txn_tracker_t *tracker);
 static size_t tidesdb_calculate_level_capacity(int level_num, size_t base_capacity, size_t ratio);
-static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf);
 
 static int tidesdb_add_level(tidesdb_column_family_t *cf);
 static int tidesdb_remove_level(tidesdb_column_family_t *cf);
@@ -3068,65 +3060,6 @@ static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm)
                 skip_list_free(memtable_to_free);
             }
             pthread_attr_destroy(&attr);
-        }
-    }
-}
-
-/**
- * tidesdb_flush_wal_group_buffer
- * flush any pending data in the WAL group commit buffer to disk
- * this must be called before WAL rotation to prevent data loss
- * @param cf the column family
- */
-static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
-{
-    if (!cf) return;
-
-    /* atomically capture current buffer size and increment generation
-     * this prevents new writes from interfering and ensures threads
-     * that reserved space know if their generation was flushed */
-    size_t flush_size = atomic_exchange(&cf->wal_group_buffer_size, 0);
-
-    /* increment generation to signal that buffer has been flushed
-     * threads that reserved space in the old generation will detect this */
-    atomic_fetch_add(&cf->wal_group_generation, 1);
-
-    /* wait for all in-flight writers to complete their memcpy operations
-     * this is critical to prevent data corruption */
-    int wait_cycles = 0;
-    while (atomic_load(&cf->wal_group_writers) > 0)
-    {
-        usleep(TDB_WAL_GROUP_WRITER_WAIT_US);
-        if (++wait_cycles > TDB_WAL_GROUP_WRITER_MAX_WAIT_CYCLES)
-        {
-            TDB_DEBUG_LOG(TDB_LOG_WARN, "Timeout waiting for WAL group writers");
-            break;
-        }
-    }
-
-    /* memory fence to ensure all memcpy operations from threads that reserved space
-     * before the exchange are visible to us before we flush */
-    atomic_thread_fence(memory_order_acquire);
-
-    if (flush_size > 0)
-    {
-        /* clamp to capacity to prevent overflow */
-        if (flush_size > cf->wal_group_buffer_capacity)
-        {
-            flush_size = cf->wal_group_buffer_capacity;
-        }
-
-        block_manager_t *target_wal = atomic_load_explicit(&cf->active_wal, memory_order_acquire);
-        if (target_wal)
-        {
-            block_manager_block_t *group_block =
-                block_manager_block_create(flush_size, cf->wal_group_buffer);
-
-            if (group_block)
-            {
-                block_manager_block_write(target_wal, group_block);
-                block_manager_block_release(group_block);
-            }
         }
     }
 }
@@ -9896,11 +9829,6 @@ int tidesdb_close(tidesdb_t *db)
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' is flushing %d entries before close", cf->name,
                               entry_count);
 
-                /* flush group commit buffer before syncing WAL to prevent data loss
-                 * any pending writes in the buffer must be written to the WAL file
-                 * before we rotate the WAL during flush */
-                tidesdb_flush_wal_group_buffer(cf);
-
                 /* ensure WAL is synced before attempting flush to prevent data loss */
                 block_manager_t *active_wal =
                     atomic_load_explicit(&cf->active_wal, memory_order_acquire);
@@ -9952,13 +9880,11 @@ int tidesdb_close(tidesdb_t *db)
     TDB_DEBUG_LOG(TDB_LOG_INFO, "All memtables flushed");
 
     /* wait for enqueued flushes to complete before shutting down flush threads
-     * this ensures data is written to sstables, not left in WAL
-     * we must wait indefinitely - terminating flush workers while they have
-     * active work causes data loss */
+     * this ensures data is written to sstables, not left in WAL */
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for background flushes to complete");
     int flush_wait_count = 0;
     pthread_rwlock_rdlock(&db->cf_list_lock);
-    while (1)
+    while (flush_wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_MS)
     {
         int any_flushing = 0;
         for (int i = 0; i < db->num_column_families; i++)
@@ -9979,10 +9905,10 @@ int tidesdb_close(tidesdb_t *db)
             break;
         }
 
-        if (flush_wait_count % 1000 == 0 && flush_wait_count > 0)
+        if (flush_wait_count % 100 == 0 && flush_wait_count > 0)
         {
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "Still waiting for background flushes (waited %d seconds)",
-                          flush_wait_count / 1000);
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Still waiting for background flushes (waited %dms)",
+                          flush_wait_count);
         }
 
         pthread_rwlock_unlock(&db->cf_list_lock);
@@ -9991,7 +9917,15 @@ int tidesdb_close(tidesdb_t *db)
         pthread_rwlock_rdlock(&db->cf_list_lock);
     }
     pthread_rwlock_unlock(&db->cf_list_lock);
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed");
+
+    if (flush_wait_count >= TDB_CLOSE_FLUSH_WAIT_MAX_MS)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Background flushes did not complete within timeout");
+    }
+    else
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed");
+    }
 
     if (db->flush_queue)
     {
@@ -10515,8 +10449,6 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->wal_group_buffer_size, 0);
     cf->wal_group_buffer_capacity = TDB_WAL_GROUP_COMMIT_BUFFER_SIZE;
     atomic_init(&cf->wal_group_leader, 0);
-    atomic_init(&cf->wal_group_generation, 0);
-    atomic_init(&cf->wal_group_writers, 0);
 
     char manifest_path[TDB_MAX_PATH_LEN];
     snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,
@@ -10822,11 +10754,6 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
 
     block_manager_t *old_wal = atomic_load_explicit(&cf->active_wal, memory_order_acquire);
     uint64_t sst_id = atomic_fetch_add(&cf->next_sstable_id, 1);
-
-    /** we flush group commit buffer before WAL rotation to prevent data loss
-     * any pending writes in the buffer must be written to the old WAL file
-     * before we rotate to a new WAL */
-    tidesdb_flush_wal_group_buffer(cf);
 
     /* if using TDB_SYNC_INTERVAL, sync the old WAL before rotation
      * this essentially ensures WAL durability before it becomes immutable */
@@ -12421,9 +12348,6 @@ skip_ssi_check:
         }
         else
         {
-            /* capture current generation before reserving space */
-            uint64_t my_generation = atomic_load(&cf->wal_group_generation);
-
             /* atomically reserve space in buffer (lock-free!) */
             size_t my_offset = atomic_fetch_add(&cf->wal_group_buffer_size, cf_wal_size);
 
@@ -12435,41 +12359,17 @@ skip_ssi_check:
                 int expected = 0;
                 if (atomic_compare_exchange_strong(&cf->wal_group_leader, &expected, 1))
                 {
-                    size_t flush_size = atomic_exchange(&cf->wal_group_buffer_size, 0);
+                    /* we won -- flush the buffer
+                     * capture actual buffer size, not just our offset
+                     * other threads may have written after us but before we became leader */
+                    size_t flush_size = atomic_load(&cf->wal_group_buffer_size);
 
-                    /* subtract our own reservation that was never copied */
-                    if (flush_size >= my_offset + cf_wal_size)
+                    /* clamp to capacity to prevent overflow if multiple threads raced */
+                    if (flush_size > cf->wal_group_buffer_capacity)
                     {
-                        flush_size = my_offset; /* only flush data before our reservation */
+                        flush_size = cf->wal_group_buffer_capacity;
                     }
 
-                    /* increment generation to invalidate any pending writes */
-                    atomic_fetch_add(&cf->wal_group_generation, 1);
-
-                    /* wait for all in-flight writers to complete */
-                    int wait_cycles = 0;
-                    while (atomic_load(&cf->wal_group_writers) > 0)
-                    {
-                        usleep(TDB_WAL_GROUP_WRITER_WAIT_US);
-                        if (++wait_cycles > TDB_WAL_GROUP_WRITER_MAX_WAIT_CYCLES) break;
-                    }
-
-                    /* memory fence to ensure all memcpy operations from threads that reserved space
-                     * before the exchange are visible to us before we flush */
-                    atomic_thread_fence(memory_order_acquire);
-
-                    /***
-                     * append our own data to the buffer and flush everything in ONE atomic write
-                     * this prevents write ordering issues on Windows where multiple pwrite calls
-                     * may not be visible in order during recovery */
-                    if (flush_size + cf_wal_size <= cf->wal_group_buffer_capacity)
-                    {
-                        /* safe to append our data to the buffer */
-                        memcpy(cf->wal_group_buffer + flush_size, wal_batch, cf_wal_size);
-                        flush_size += cf_wal_size;
-                    }
-
-                    /* flush buffer (now includes our data) in a single atomic write */
                     if (flush_size > 0)
                     {
                         block_manager_t *target_wal =
@@ -12484,8 +12384,9 @@ skip_ssi_check:
                         }
                     }
 
-                    /* buffer is now empty, reset state */
-                    atomic_store(&cf->wal_group_buffer_size, 0);
+                    /* reset buffer -- copy our data to start (now guaranteed to fit) */
+                    memcpy(cf->wal_group_buffer, wal_batch, cf_wal_size);
+                    atomic_store(&cf->wal_group_buffer_size, cf_wal_size);
                     atomic_store(&cf->wal_group_leader, 0);
                 }
                 else
@@ -12508,53 +12409,10 @@ skip_ssi_check:
             else
             {
                 /* space reserved successfully -- copy data
-                 * but first check if our generation is still valid */
-                uint64_t current_generation = atomic_load(&cf->wal_group_generation);
-
-                if (current_generation != my_generation)
+                 * double-check we're not writing past buffer end (paranoid safety check) */
+                if (my_offset + cf_wal_size <= cf->wal_group_buffer_capacity)
                 {
-                    block_manager_t *target_wal =
-                        atomic_load_explicit(&cf->active_wal, memory_order_acquire);
-                    block_manager_block_t *direct_block =
-                        block_manager_block_create(cf_wal_size, wal_batch);
-                    if (direct_block)
-                    {
-                        block_manager_block_write(target_wal, direct_block);
-                        block_manager_block_release(direct_block);
-                    }
-                }
-                else if (my_offset + cf_wal_size <= cf->wal_group_buffer_capacity)
-                {
-                    /* generation is still valid and we have space -- copy data
-                     * increment writer count before memcpy to prevent premature flush */
-                    atomic_fetch_add(&cf->wal_group_writers, 1);
-
-                    /* re-check generation after incrementing writers */
-                    if (atomic_load(&cf->wal_group_generation) != my_generation)
-                    {
-                        atomic_fetch_sub(&cf->wal_group_writers, 1);
-                        block_manager_t *target_wal =
-                            atomic_load_explicit(&cf->active_wal, memory_order_acquire);
-                        block_manager_block_t *direct_block =
-                            block_manager_block_create(cf_wal_size, wal_batch);
-                        if (direct_block)
-                        {
-                            block_manager_block_write(target_wal, direct_block);
-                            block_manager_block_release(direct_block);
-                        }
-                    }
-                    else
-                    {
-                        /* safe to copy now */
-                        memcpy(cf->wal_group_buffer + my_offset, wal_batch, cf_wal_size);
-
-                        /* memory fence to ensure our memcpy is visible before decrementing writers
-                         */
-                        atomic_thread_fence(memory_order_release);
-
-                        /* decrement writer count to signal we're done */
-                        atomic_fetch_sub(&cf->wal_group_writers, 1);
-                    }
+                    memcpy(cf->wal_group_buffer + my_offset, wal_batch, cf_wal_size);
                 }
                 else
                 {
@@ -14735,18 +14593,14 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
         }
     }
 
-    /* we recover from each WAL file, applying all transactions
-     * we pass NULL for tracker here because during per-CF recovery,
-     * the tracker only has information from this CF's WAL files.
-     * for multi-CF transactions, we cannot determine completeness from a single CF's perspective.
-     * since each CF is recovered independently, we must apply all entries from the WAL. */
+    /* we recover from each WAL file, applying only complete transactions */
     while (!queue_is_empty(wal_files))
     {
         char *wal_path = queue_dequeue(wal_files);
         if (!wal_path) continue;
 
         skip_list_t *recovered_memtable = NULL;
-        int recover_result = tidesdb_wal_recover(cf, wal_path, &recovered_memtable, NULL);
+        int recover_result = tidesdb_wal_recover(cf, wal_path, &recovered_memtable, tracker);
 
         if (recover_result == TDB_SUCCESS && recovered_memtable)
         {

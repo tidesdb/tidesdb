@@ -3139,9 +3139,6 @@ static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
                               cf->name, flush_size, wal_offset,
                               atomic_load(&cf->wal_group_generation));
                 block_manager_block_release(group_block);
-
-                /* zero the buffer after flush to prevent garbage in next batch */
-                memset(cf->wal_group_buffer, 0, cf->wal_group_buffer_capacity);
             }
             else
             {

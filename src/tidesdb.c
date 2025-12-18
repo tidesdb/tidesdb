@@ -3087,6 +3087,11 @@ static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
      * that reserved space know if their generation was flushed */
     size_t flush_size = atomic_exchange(&cf->wal_group_buffer_size, 0);
 
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "CF '%s' WAL group buffer flush initiated (size: %zu bytes, generation: %" PRIu64
+                  ")",
+                  cf->name, flush_size, atomic_load(&cf->wal_group_generation));
+
     /* increment generation to signal that buffer has been flushed
      * threads that reserved space in the old generation will detect this */
     atomic_fetch_add(&cf->wal_group_generation, 1);
@@ -3113,6 +3118,9 @@ static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
         /* clamp to capacity to prevent overflow */
         if (flush_size > cf->wal_group_buffer_capacity)
         {
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "CF '%s' WAL group buffer flush size %zu exceeds capacity %zu, clamping",
+                          cf->name, flush_size, cf->wal_group_buffer_capacity);
             flush_size = cf->wal_group_buffer_capacity;
         }
 
@@ -3124,10 +3132,31 @@ static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
 
             if (group_block)
             {
-                block_manager_block_write(target_wal, group_block);
+                int64_t wal_offset = block_manager_block_write(target_wal, group_block);
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' WAL group buffer flushed %zu bytes at offset %" PRId64
+                              " (generation: %" PRIu64 ")",
+                              cf->name, flush_size, wal_offset,
+                              atomic_load(&cf->wal_group_generation));
                 block_manager_block_release(group_block);
             }
+            else
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                              "CF '%s' failed to create WAL group block for flush (size: %zu)",
+                              cf->name, flush_size);
+            }
         }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "CF '%s' WAL group buffer flush failed: no active WAL",
+                          cf->name);
+        }
+    }
+    else
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' WAL group buffer flush skipped (empty buffer)",
+                      cf->name);
     }
 }
 
@@ -8421,18 +8450,22 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path,
                                skip_list_t **memtable, multi_cf_txn_tracker_t *tracker)
 {
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' starting WAL recovery from: %s", cf->name, wal_path);
     block_manager_t *wal;
     if (block_manager_open(&wal, wal_path, BLOCK_MANAGER_SYNC_NONE) != 0)
     {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "CF '%s' failed to open WAL: %s", cf->name, wal_path);
         return TDB_ERR_IO;
     }
 
     /* validate and recover WAL file (permissive mode truncate partial writes) */
     if (block_manager_validate_last_block(wal, 0) != 0)
     {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL validation failed: %s", cf->name, wal_path);
         block_manager_close(wal);
         return TDB_ERR_IO;
     }
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' WAL validation passed: %s", cf->name, wal_path);
 
     /* resolve comparator for recovered memtable */
     skip_list_comparator_fn comparator_fn = NULL;
@@ -8461,15 +8494,20 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
         return TDB_ERR_IO;
     }
 
+    int block_count = 0;
+    int entry_count = 0;
     if (block_manager_cursor_goto_first(cursor) == 0)
     {
         do
         {
             block_manager_block_t *block = block_manager_cursor_read(cursor);
             if (!block) break;
+            block_count++;
 
             const uint8_t *ptr = block->data;
             size_t remaining = block->size;
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' WAL recovery reading block %d (size: %zu bytes)",
+                          cf->name, block_count, block->size);
 
             /* we check for multi-CF transaction metadata */
             int is_multi_cf_entry = 0;
@@ -8488,6 +8526,10 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                 {
                     is_multi_cf_entry = 1;
                     num_participant_cfs = peek_num_cfs;
+                    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                  "CF '%s' detected multi-CF entry (num_cfs: %d, checksum: %" PRIu64
+                                  ")",
+                                  cf->name, num_participant_cfs, peek_checksum);
 
                     /* calculate metadata size */
                     size_t cf_names_size = num_participant_cfs * TDB_MAX_CF_NAME_LEN;
@@ -8519,6 +8561,8 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                             block_manager_block_release(block);
                             continue;
                         }
+                        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' multi-CF metadata checksum valid",
+                                      cf->name);
                     }
                     else
                     {
@@ -8559,6 +8603,8 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 
             if (remaining < 1)
             {
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL block has insufficient data for entry",
+                              cf->name);
                 block_manager_block_release(block);
                 continue;
             }
@@ -8566,11 +8612,14 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             tidesdb_klog_entry_t entry;
             entry.flags = *ptr++;
             remaining--;
+            entry_count++;
 
             uint64_t key_size_u64;
             int bytes_read = decode_varint_v2(ptr, &key_size_u64, (int)remaining);
             if (bytes_read < 0 || key_size_u64 > UINT32_MAX)
             {
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid key_size", cf->name,
+                              entry_count);
                 block_manager_block_release(block);
                 continue;
             }
@@ -8582,6 +8631,8 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             bytes_read = decode_varint_v2(ptr, &value_size_u64, (int)remaining);
             if (bytes_read < 0 || value_size_u64 > UINT32_MAX)
             {
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid value_size", cf->name,
+                              entry_count);
                 block_manager_block_release(block);
                 continue;
             }
@@ -8593,6 +8644,8 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             bytes_read = decode_varint_v2(ptr, &seq_value, (int)remaining);
             if (bytes_read < 0)
             {
+                TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid seq", cf->name,
+                              entry_count);
                 block_manager_block_release(block);
                 continue;
             }
@@ -8620,6 +8673,9 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 
             if (remaining < entry.key_size)
             {
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "CF '%s' WAL entry %d: insufficient data for key (need %u, have %zu)",
+                              cf->name, entry_count, entry.key_size, remaining);
                 block_manager_block_release(block);
                 continue;
             }
@@ -8633,11 +8689,21 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             {
                 if (remaining < entry.value_size)
                 {
+                    TDB_DEBUG_LOG(
+                        TDB_LOG_WARN,
+                        "CF '%s' WAL entry %d: insufficient data for value (need %u, have %zu)",
+                        cf->name, entry_count, entry.value_size, remaining);
                     block_manager_block_release(block);
                     continue;
                 }
                 value = (uint8_t *)ptr;
             }
+
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' WAL entry %d: seq=%" PRIu64
+                          " key_size=%u value_size=%u flags=0x%02x ttl=%" PRId64,
+                          cf->name, entry_count, entry.seq, entry.key_size, entry.value_size,
+                          entry.flags, entry.ttl);
 
             /* for multi-CF transactions, add to tracker and validate completeness */
             int should_apply = 1;
@@ -8657,16 +8723,31 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             {
                 if (entry.flags & TDB_KV_FLAG_TOMBSTONE)
                 {
+                    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                  "CF '%s' WAL entry %d: applying tombstone (seq=%" PRIu64 ")",
+                                  cf->name, entry_count, entry.seq);
                     skip_list_put_with_seq(*memtable, key, entry.key_size, NULL, 0, 0, entry.seq,
                                            1);
                 }
                 else
                 {
+                    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                  "CF '%s' WAL entry %d: applying put (seq=%" PRIu64
+                                  " key_size=%u value_size=%u)",
+                                  cf->name, entry_count, entry.seq, entry.key_size,
+                                  entry.value_size);
                     skip_list_put_with_seq(*memtable, key, entry.key_size, value, entry.value_size,
                                            entry.ttl, entry.seq, 0);
                 }
 
                 /* block-level cache will be populated during normal read operations */
+            }
+            else
+            {
+                TDB_DEBUG_LOG(
+                    TDB_LOG_INFO,
+                    "CF '%s' WAL entry %d: skipping (incomplete multi-CF txn, seq=%" PRIu64 ")",
+                    cf->name, entry_count, entry.seq);
             }
 
             if (expected_cfs)
@@ -8682,6 +8763,10 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 
         } while (block_manager_cursor_next(cursor) == 0);
     }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "CF '%s' WAL recovery completed: %d blocks, %d entries, memtable has %zu entries",
+                  cf->name, block_count, entry_count, skip_list_count_entries(*memtable));
 
     block_manager_cursor_free(cursor);
     block_manager_close(wal);
@@ -12401,6 +12486,10 @@ skip_ssi_check:
         if (cf_wal_size > cf->wal_group_buffer_capacity)
         {
             /* transaction too large -- bypass group commit and write directly */
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' txn seq=%" PRIu64
+                          " bypassing group commit (size %zu > capacity %zu)",
+                          cf->name, txn->commit_seq, cf_wal_size, cf->wal_group_buffer_capacity);
             block_manager_t *target_wal =
                 atomic_load_explicit(&cf->active_wal, memory_order_acquire);
             block_manager_block_t *wal_block = block_manager_block_create(cf_wal_size, wal_batch);
@@ -12408,6 +12497,10 @@ skip_ssi_check:
             if (wal_block)
             {
                 int64_t wal_offset = block_manager_block_write(target_wal, wal_block);
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' txn seq=%" PRIu64
+                              " direct write %zu bytes at offset %" PRId64,
+                              cf->name, txn->commit_seq, cf_wal_size, wal_offset);
                 block_manager_block_release(wal_block);
 
                 if (wal_offset < 0)
@@ -12423,18 +12516,34 @@ skip_ssi_check:
         {
             /* capture current generation before reserving space */
             uint64_t my_generation = atomic_load(&cf->wal_group_generation);
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' txn seq=%" PRIu64
+                          " attempting group commit (size %zu, generation %" PRIu64 ")",
+                          cf->name, txn->commit_seq, cf_wal_size, my_generation);
 
             /* atomically reserve space in buffer (lock-free!) */
             size_t my_offset = atomic_fetch_add(&cf->wal_group_buffer_size, cf_wal_size);
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' txn seq=%" PRIu64
+                          " reserved buffer space at offset %zu (size %zu)",
+                          cf->name, txn->commit_seq, my_offset, cf_wal_size);
 
             /* check if we exceeded capacity */
             if (my_offset + cf_wal_size > cf->wal_group_buffer_capacity)
             {
                 /* buffer full -- need to flush
                  * try to become the flusher (only one thread wins) */
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' txn seq=%" PRIu64
+                              " detected buffer overflow (offset %zu + size %zu > capacity %zu)",
+                              cf->name, txn->commit_seq, my_offset, cf_wal_size,
+                              cf->wal_group_buffer_capacity);
                 int expected = 0;
                 if (atomic_compare_exchange_strong(&cf->wal_group_leader, &expected, 1))
                 {
+                    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                  "CF '%s' txn seq=%" PRIu64 " became group commit leader",
+                                  cf->name, txn->commit_seq);
                     size_t flush_size = atomic_exchange(&cf->wal_group_buffer_size, 0);
 
                     /* subtract our own reservation that was never copied */
@@ -12465,8 +12574,20 @@ skip_ssi_check:
                     if (flush_size + cf_wal_size <= cf->wal_group_buffer_capacity)
                     {
                         /* safe to append our data to the buffer */
+                        TDB_DEBUG_LOG(
+                            TDB_LOG_INFO,
+                            "CF '%s' txn seq=%" PRIu64
+                            " leader appending own data (flush_size %zu + cf_wal_size %zu)",
+                            cf->name, txn->commit_seq, flush_size, cf_wal_size);
                         memcpy(cf->wal_group_buffer + flush_size, wal_batch, cf_wal_size);
                         flush_size += cf_wal_size;
+                    }
+                    else
+                    {
+                        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                      "CF '%s' txn seq=%" PRIu64
+                                      " leader cannot append own data (would exceed capacity)",
+                                      cf->name, txn->commit_seq);
                     }
 
                     /* flush buffer (now includes our data) in a single atomic write */
@@ -12479,8 +12600,21 @@ skip_ssi_check:
 
                         if (group_block)
                         {
-                            block_manager_block_write(target_wal, group_block);
+                            int64_t wal_offset = block_manager_block_write(target_wal, group_block);
+                            TDB_DEBUG_LOG(
+                                TDB_LOG_INFO,
+                                "CF '%s' txn seq=%" PRIu64
+                                " leader flushed group commit buffer (%zu bytes at offset %" PRId64
+                                ")",
+                                cf->name, txn->commit_seq, flush_size, wal_offset);
                             block_manager_block_release(group_block);
+                        }
+                        else
+                        {
+                            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                          "CF '%s' txn seq=%" PRIu64
+                                          " leader failed to create group block",
+                                          cf->name, txn->commit_seq);
                         }
                     }
 
@@ -12492,13 +12626,21 @@ skip_ssi_check:
                 {
                     /* someone else is flushing -- write directly to avoid blocking
                      * this improves parallelism under high concurrency by avoiding spin-waits */
+                    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                  "CF '%s' txn seq=%" PRIu64 " lost leader race, writing directly",
+                                  cf->name, txn->commit_seq);
                     block_manager_t *target_wal =
                         atomic_load_explicit(&cf->active_wal, memory_order_acquire);
                     block_manager_block_t *direct_block =
                         block_manager_block_create(cf_wal_size, wal_batch);
                     if (direct_block)
                     {
-                        block_manager_block_write(target_wal, direct_block);
+                        int64_t wal_offset = block_manager_block_write(target_wal, direct_block);
+                        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                      "CF '%s' txn seq=%" PRIu64
+                                      " direct write after lost race (%zu bytes at offset %" PRId64
+                                      ")",
+                                      cf->name, txn->commit_seq, cf_wal_size, wal_offset);
                         block_manager_block_release(direct_block);
                     }
                     free(wal_batch);
@@ -12513,13 +12655,23 @@ skip_ssi_check:
 
                 if (current_generation != my_generation)
                 {
+                    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                  "CF '%s' txn seq=%" PRIu64 " generation changed (%" PRIu64
+                                  " -> %" PRIu64 "), writing directly",
+                                  cf->name, txn->commit_seq, my_generation, current_generation);
                     block_manager_t *target_wal =
                         atomic_load_explicit(&cf->active_wal, memory_order_acquire);
                     block_manager_block_t *direct_block =
                         block_manager_block_create(cf_wal_size, wal_batch);
                     if (direct_block)
                     {
-                        block_manager_block_write(target_wal, direct_block);
+                        int64_t wal_offset = block_manager_block_write(target_wal, direct_block);
+                        TDB_DEBUG_LOG(
+                            TDB_LOG_INFO,
+                            "CF '%s' txn seq=%" PRIu64
+                            " direct write after generation change (%zu bytes at offset %" PRId64
+                            ")",
+                            cf->name, txn->commit_seq, cf_wal_size, wal_offset);
                         block_manager_block_release(direct_block);
                     }
                 }
@@ -12533,19 +12685,34 @@ skip_ssi_check:
                     if (atomic_load(&cf->wal_group_generation) != my_generation)
                     {
                         atomic_fetch_sub(&cf->wal_group_writers, 1);
+                        TDB_DEBUG_LOG(
+                            TDB_LOG_INFO,
+                            "CF '%s' txn seq=%" PRIu64
+                            " generation changed after writer increment, writing directly",
+                            cf->name, txn->commit_seq);
                         block_manager_t *target_wal =
                             atomic_load_explicit(&cf->active_wal, memory_order_acquire);
                         block_manager_block_t *direct_block =
                             block_manager_block_create(cf_wal_size, wal_batch);
                         if (direct_block)
                         {
-                            block_manager_block_write(target_wal, direct_block);
+                            int64_t wal_offset =
+                                block_manager_block_write(target_wal, direct_block);
+                            TDB_DEBUG_LOG(
+                                TDB_LOG_INFO,
+                                "CF '%s' txn seq=%" PRIu64
+                                " direct write after re-check (%zu bytes at offset %" PRId64 ")",
+                                cf->name, txn->commit_seq, cf_wal_size, wal_offset);
                             block_manager_block_release(direct_block);
                         }
                     }
                     else
                     {
                         /* safe to copy now */
+                        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                      "CF '%s' txn seq=%" PRIu64
+                                      " copying to group buffer at offset %zu (size %zu)",
+                                      cf->name, txn->commit_seq, my_offset, cf_wal_size);
                         memcpy(cf->wal_group_buffer + my_offset, wal_batch, cf_wal_size);
 
                         /* memory fence to ensure our memcpy is visible before decrementing writers
@@ -14750,7 +14917,10 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 
         if (recover_result == TDB_SUCCESS && recovered_memtable)
         {
-            if (skip_list_count_entries(recovered_memtable) > 0)
+            size_t recovered_entries = skip_list_count_entries(recovered_memtable);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' recovered memtable from WAL: %s (%zu entries)",
+                          cf->name, wal_path, recovered_entries);
+            if (recovered_entries > 0)
             {
                 block_manager_t *wal_bm = NULL;
 
@@ -14786,6 +14956,10 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                             work->imm = imm;
                             work->sst_id = atomic_fetch_add_explicit(&cf->next_sstable_id, 1,
                                                                      memory_order_relaxed);
+                            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                          "CF '%s' allocated SSTable ID %" PRIu64
+                                          " for recovered WAL flush",
+                                          cf->name, work->sst_id);
                             tidesdb_immutable_memtable_ref(imm);
 
                             if (queue_enqueue(cf->db->flush_queue, work) != 0)
@@ -14840,7 +15014,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     {
         if (strstr(entry->d_name, TDB_SSTABLE_KLOG_EXT) != NULL)
         {
-            TDB_DEBUG_LOG(TDB_LOG_INFO, "Found %s file: %s", TDB_SSTABLE_KLOG_EXT, entry->d_name);
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' found .klog file: %s", cf->name, entry->d_name);
             int level_num = 1;
             int partition_num = -1;
             unsigned long long sst_id_ull = 0;
@@ -14870,8 +15044,9 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                 snprintf(sst_base, sizeof(sst_base), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
                          cf->directory, level_num);
                 parsed = 1;
-                TDB_DEBUG_LOG(TDB_LOG_INFO, "Parsed non-partitioned SSTable level=%d, id=%llu",
-                              level_num, sst_id_ull);
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' parsed non-partitioned SSTable level=%d, id=%" PRIu64,
+                              cf->name, level_num, sst_id_ull);
             }
 
             if (parsed)
@@ -15039,11 +15214,12 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 
     /* update global sequence based on recovered data */
     uint64_t current_seq = atomic_load_explicit(&cf->db->global_seq, memory_order_acquire);
-    if (global_max_seq + 1 > current_seq)
+    if (global_max_seq > atomic_load(&cf->db->global_seq))
     {
-        atomic_store_explicit(&cf->db->global_seq, global_max_seq + 1, memory_order_release);
+        uint64_t old_seq = atomic_load(&cf->db->global_seq);
+        atomic_store(&cf->db->global_seq, global_max_seq + 1);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' has updated global_seq from %" PRIu64 " to %" PRIu64,
-                      cf->name, current_seq, global_max_seq + 1);
+                      cf->name, old_seq, global_max_seq + 1);
     }
 
     if (global_max_seq > 0)
@@ -15068,14 +15244,17 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     }
 
     /* restore next_sstable_id from manifest to prevent ID collisions
-     * manifest sequence field tracks the next available sstable ID */
-    uint64_t manifest_next_id = atomic_load(&cf->manifest->sequence);
-
-    if (manifest_next_id > 0)
+     /* restore next_sstable_id from manifest */
+    if (cf->manifest)
     {
-        atomic_store(&cf->next_sstable_id, manifest_next_id);
-        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' restored next_sstable_id=%" PRIu64 " from manifest",
-                      cf->name, manifest_next_id);
+        uint64_t manifest_seq = atomic_load(&cf->manifest->sequence);
+        if (manifest_seq > atomic_load(&cf->next_sstable_id))
+        {
+            atomic_store(&cf->next_sstable_id, manifest_seq);
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' restored next_sstable_id=%" PRIu64 " from manifest", cf->name,
+                          manifest_seq);
+        }
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' recovery is complete, global_max_seq=%" PRIu64, cf->name,

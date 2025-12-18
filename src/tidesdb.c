@@ -8509,7 +8509,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
             TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' WAL recovery reading block %d (size: %zu bytes)",
                           cf->name, block_count, block->size);
 
-            /* we check for multi-CF transaction metadata */
+            /* we check for multi-CF transaction metadata (once per block) */
             int is_multi_cf_entry = 0;
             uint8_t num_participant_cfs = 0;
             char **expected_cfs = NULL;
@@ -8601,153 +8601,158 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                 }
             }
 
-            if (remaining < 1)
+            /* parse all entries within this block */
+            while (remaining > 0)
             {
-                TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL block has insufficient data for entry",
-                              cf->name);
-                block_manager_block_release(block);
-                continue;
-            }
-
-            tidesdb_klog_entry_t entry;
-            entry.flags = *ptr++;
-            remaining--;
-            entry_count++;
-
-            uint64_t key_size_u64;
-            int bytes_read = decode_varint_v2(ptr, &key_size_u64, (int)remaining);
-            if (bytes_read < 0 || key_size_u64 > UINT32_MAX)
-            {
-                TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid key_size", cf->name,
-                              entry_count);
-                block_manager_block_release(block);
-                continue;
-            }
-            ptr += bytes_read;
-            remaining -= bytes_read;
-            entry.key_size = (uint32_t)key_size_u64;
-
-            uint64_t value_size_u64;
-            bytes_read = decode_varint_v2(ptr, &value_size_u64, (int)remaining);
-            if (bytes_read < 0 || value_size_u64 > UINT32_MAX)
-            {
-                TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid value_size", cf->name,
-                              entry_count);
-                block_manager_block_release(block);
-                continue;
-            }
-            ptr += bytes_read;
-            remaining -= bytes_read;
-            entry.value_size = (uint32_t)value_size_u64;
-
-            uint64_t seq_value;
-            bytes_read = decode_varint_v2(ptr, &seq_value, (int)remaining);
-            if (bytes_read < 0)
-            {
-                TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid seq", cf->name,
-                              entry_count);
-                block_manager_block_release(block);
-                continue;
-            }
-            ptr += bytes_read;
-            remaining -= bytes_read;
-            entry.seq = seq_value;
-
-            if (entry.flags & TDB_KV_FLAG_HAS_TTL)
-            {
-                if (remaining < sizeof(int64_t))
-                {
-                    block_manager_block_release(block);
-                    continue;
-                }
-                entry.ttl = decode_int64_le_compat(ptr);
-                ptr += sizeof(int64_t);
-                remaining -= sizeof(int64_t);
-            }
-            else
-            {
-                entry.ttl = 0;
-            }
-
-            entry.vlog_offset = 0;
-
-            if (remaining < entry.key_size)
-            {
-                TDB_DEBUG_LOG(TDB_LOG_WARN,
-                              "CF '%s' WAL entry %d: insufficient data for key (need %u, have %zu)",
-                              cf->name, entry_count, entry.key_size, remaining);
-                block_manager_block_release(block);
-                continue;
-            }
-
-            uint8_t *key = (uint8_t *)ptr;
-            ptr += entry.key_size;
-            remaining -= entry.key_size;
-
-            uint8_t *value = NULL;
-            if (entry.value_size > 0)
-            {
-                if (remaining < entry.value_size)
+                if (remaining < 1)
                 {
                     TDB_DEBUG_LOG(
                         TDB_LOG_WARN,
-                        "CF '%s' WAL entry %d: insufficient data for value (need %u, have %zu)",
-                        cf->name, entry_count, entry.value_size, remaining);
-                    block_manager_block_release(block);
-                    continue;
-                }
-                value = (uint8_t *)ptr;
-            }
-
-            TDB_DEBUG_LOG(TDB_LOG_INFO,
-                          "CF '%s' WAL entry %d: seq=%" PRIu64
-                          " key_size=%u value_size=%u flags=0x%02x ttl=%" PRId64,
-                          cf->name, entry_count, entry.seq, entry.key_size, entry.value_size,
-                          entry.flags, entry.ttl);
-
-            /* for multi-CF transactions, add to tracker and validate completeness */
-            int should_apply = 1;
-            if (is_multi_cf_entry && (entry.seq & TDB_MULTI_CF_SEQ_FLAG))
-            {
-                if (tracker && expected_cfs)
-                {
-                    multi_cf_tracker_add(tracker, entry.seq, cf->name, expected_cfs,
-                                         num_participant_cfs);
+                        "CF '%s' WAL block has insufficient data for entry (remaining: %zu)",
+                        cf->name, remaining);
+                    break;
                 }
 
-                /* only apply if transaction is complete across all CFs */
-                should_apply = multi_cf_tracker_is_complete(tracker, entry.seq);
-            }
+                tidesdb_klog_entry_t entry;
+                entry.flags = *ptr++;
+                remaining--;
+                entry_count++;
 
-            if (should_apply)
-            {
-                if (entry.flags & TDB_KV_FLAG_TOMBSTONE)
+                uint64_t key_size_u64;
+                int bytes_read = decode_varint_v2(ptr, &key_size_u64, (int)remaining);
+                if (bytes_read < 0 || key_size_u64 > UINT32_MAX)
                 {
-                    TDB_DEBUG_LOG(TDB_LOG_INFO,
-                                  "CF '%s' WAL entry %d: applying tombstone (seq=%" PRIu64 ")",
-                                  cf->name, entry_count, entry.seq);
-                    skip_list_put_with_seq(*memtable, key, entry.key_size, NULL, 0, 0, entry.seq,
-                                           1);
+                    TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid key_size", cf->name,
+                                  entry_count);
+                    break;
+                }
+                ptr += bytes_read;
+                remaining -= bytes_read;
+                entry.key_size = (uint32_t)key_size_u64;
+
+                uint64_t value_size_u64;
+                bytes_read = decode_varint_v2(ptr, &value_size_u64, (int)remaining);
+                if (bytes_read < 0 || value_size_u64 > UINT32_MAX)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid value_size",
+                                  cf->name, entry_count);
+                    break;
+                }
+                ptr += bytes_read;
+                remaining -= bytes_read;
+                entry.value_size = (uint32_t)value_size_u64;
+
+                uint64_t seq_value;
+                bytes_read = decode_varint_v2(ptr, &seq_value, (int)remaining);
+                if (bytes_read < 0)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid seq", cf->name,
+                                  entry_count);
+                    break;
+                }
+                ptr += bytes_read;
+                remaining -= bytes_read;
+                entry.seq = seq_value;
+
+                if (entry.flags & TDB_KV_FLAG_HAS_TTL)
+                {
+                    if (remaining < sizeof(int64_t))
+                    {
+                        TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                      "CF '%s' WAL entry %d: insufficient data for TTL", cf->name,
+                                      entry_count);
+                        break;
+                    }
+                    entry.ttl = decode_int64_le_compat(ptr);
+                    ptr += sizeof(int64_t);
+                    remaining -= sizeof(int64_t);
                 }
                 else
                 {
-                    TDB_DEBUG_LOG(TDB_LOG_INFO,
-                                  "CF '%s' WAL entry %d: applying put (seq=%" PRIu64
-                                  " key_size=%u value_size=%u)",
-                                  cf->name, entry_count, entry.seq, entry.key_size,
-                                  entry.value_size);
-                    skip_list_put_with_seq(*memtable, key, entry.key_size, value, entry.value_size,
-                                           entry.ttl, entry.seq, 0);
+                    entry.ttl = 0;
                 }
 
-                /* block-level cache will be populated during normal read operations */
-            }
-            else
-            {
-                TDB_DEBUG_LOG(
-                    TDB_LOG_INFO,
-                    "CF '%s' WAL entry %d: skipping (incomplete multi-CF txn, seq=%" PRIu64 ")",
-                    cf->name, entry_count, entry.seq);
+                entry.vlog_offset = 0;
+
+                if (remaining < entry.key_size)
+                {
+                    TDB_DEBUG_LOG(
+                        TDB_LOG_WARN,
+                        "CF '%s' WAL entry %d: insufficient data for key (need %u, have %zu)",
+                        cf->name, entry_count, entry.key_size, remaining);
+                    break;
+                }
+
+                uint8_t *key = (uint8_t *)ptr;
+                ptr += entry.key_size;
+                remaining -= entry.key_size;
+
+                uint8_t *value = NULL;
+                if (entry.value_size > 0)
+                {
+                    if (remaining < entry.value_size)
+                    {
+                        TDB_DEBUG_LOG(
+                            TDB_LOG_WARN,
+                            "CF '%s' WAL entry %d: insufficient data for value (need %u, have %zu)",
+                            cf->name, entry_count, entry.value_size, remaining);
+                        break;
+                    }
+                    value = (uint8_t *)ptr;
+                    ptr += entry.value_size;
+                    remaining -= entry.value_size;
+                }
+
+                TDB_DEBUG_LOG(TDB_LOG_INFO,
+                              "CF '%s' WAL entry %d: seq=%" PRIu64
+                              " key_size=%u value_size=%u flags=0x%02x ttl=%" PRId64,
+                              cf->name, entry_count, entry.seq, entry.key_size, entry.value_size,
+                              entry.flags, entry.ttl);
+
+                /* for multi-CF transactions, add to tracker and validate completeness */
+                int should_apply = 1;
+                if (is_multi_cf_entry && (entry.seq & TDB_MULTI_CF_SEQ_FLAG))
+                {
+                    if (tracker && expected_cfs)
+                    {
+                        multi_cf_tracker_add(tracker, entry.seq, cf->name, expected_cfs,
+                                             num_participant_cfs);
+                    }
+
+                    /* only apply if transaction is complete across all CFs */
+                    should_apply = multi_cf_tracker_is_complete(tracker, entry.seq);
+                }
+
+                if (should_apply)
+                {
+                    if (entry.flags & TDB_KV_FLAG_TOMBSTONE)
+                    {
+                        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                      "CF '%s' WAL entry %d: applying tombstone (seq=%" PRIu64 ")",
+                                      cf->name, entry_count, entry.seq);
+                        skip_list_put_with_seq(*memtable, key, entry.key_size, NULL, 0, 0,
+                                               entry.seq, 1);
+                    }
+                    else
+                    {
+                        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                      "CF '%s' WAL entry %d: applying put (seq=%" PRIu64
+                                      " key_size=%u value_size=%u)",
+                                      cf->name, entry_count, entry.seq, entry.key_size,
+                                      entry.value_size);
+                        skip_list_put_with_seq(*memtable, key, entry.key_size, value,
+                                               entry.value_size, entry.ttl, entry.seq, 0);
+                    }
+
+                    /* block-level cache will be populated during normal read operations */
+                }
+                else
+                {
+                    TDB_DEBUG_LOG(
+                        TDB_LOG_INFO,
+                        "CF '%s' WAL entry %d: skipping (incomplete multi-CF txn, seq=%" PRIu64 ")",
+                        cf->name, entry_count, entry.seq);
+                }
             }
 
             if (expected_cfs)

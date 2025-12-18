@@ -3085,16 +3085,21 @@ static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
     /* atomically capture current buffer size and increment generation
      * this prevents new writes from interfering and ensures threads
      * that reserved space know if their generation was flushed */
+    uint64_t old_generation = atomic_load(&cf->wal_group_generation);
     size_t flush_size = atomic_exchange(&cf->wal_group_buffer_size, 0);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO,
                   "CF '%s' WAL group buffer flush initiated (size: %zu bytes, generation: %" PRIu64
-                  ")",
-                  cf->name, flush_size, atomic_load(&cf->wal_group_generation));
+                  ", buffer_size reset to 0)",
+                  cf->name, flush_size, old_generation);
 
     /* increment generation to signal that buffer has been flushed
      * threads that reserved space in the old generation will detect this */
     atomic_fetch_add(&cf->wal_group_generation, 1);
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "CF '%s' generation incremented: %" PRIu64 " -> %" PRIu64
+                  " (NEW WRITES CAN NOW START IN NEW GENERATION)",
+                  cf->name, old_generation, atomic_load(&cf->wal_group_generation));
 
     /* wait for all in-flight writers to complete their memcpy operations
      * this is critical to prevent data corruption */
@@ -3123,6 +3128,16 @@ static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
                           cf->name, flush_size, cf->wal_group_buffer_capacity);
             flush_size = cf->wal_group_buffer_capacity;
         }
+
+        /* DEBUG: Log buffer contents before flush */
+        size_t sample_size = flush_size < 16 ? flush_size : 16;
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' BEFORE flush: buffer[0-%zu]=", cf->name,
+                      sample_size - 1);
+        for (size_t i = 0; i < sample_size; i++)
+        {
+            fprintf(stderr, "%02x ", cf->wal_group_buffer[i]);
+        }
+        fprintf(stderr, "\n");
 
         block_manager_t *target_wal = atomic_load_explicit(&cf->active_wal, memory_order_acquire);
         if (target_wal)
@@ -12604,6 +12619,18 @@ skip_ssi_check:
                     /* flush buffer (now includes our data) in a single atomic write */
                     if (flush_size > 0)
                     {
+                        /* DEBUG: Log buffer contents before leader flush */
+                        size_t sample_size = flush_size < 16 ? flush_size : 16;
+                        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                      "CF '%s' txn seq=%" PRIu64
+                                      " LEADER BEFORE flush: buffer[0-%zu]=",
+                                      cf->name, txn->commit_seq, sample_size - 1);
+                        for (size_t i = 0; i < sample_size; i++)
+                        {
+                            fprintf(stderr, "%02x ", cf->wal_group_buffer[i]);
+                        }
+                        fprintf(stderr, "\n");
+
                         block_manager_t *target_wal =
                             atomic_load_explicit(&cf->active_wal, memory_order_acquire);
                         block_manager_block_t *group_block =
@@ -12719,12 +12746,34 @@ skip_ssi_check:
                     }
                     else
                     {
+                        /* DEBUG: Log source data before memcpy */
+                        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                      "CF '%s' txn seq=%" PRIu64
+                                      " BEFORE memcpy: wal_batch[0-3]=%02x %02x %02x %02x, "
+                                      "buffer[%zu-]=%02x %02x %02x %02x",
+                                      cf->name, txn->commit_seq, wal_batch[0], wal_batch[1],
+                                      wal_batch[2], wal_batch[3], my_offset,
+                                      cf->wal_group_buffer[my_offset],
+                                      cf->wal_group_buffer[my_offset + 1],
+                                      cf->wal_group_buffer[my_offset + 2],
+                                      cf->wal_group_buffer[my_offset + 3]);
+
                         /* safe to copy now */
                         TDB_DEBUG_LOG(TDB_LOG_INFO,
                                       "CF '%s' txn seq=%" PRIu64
                                       " copying to group buffer at offset %zu (size %zu)",
                                       cf->name, txn->commit_seq, my_offset, cf_wal_size);
                         memcpy(cf->wal_group_buffer + my_offset, wal_batch, cf_wal_size);
+
+                        /* DEBUG: Log destination data after memcpy */
+                        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                                      "CF '%s' txn seq=%" PRIu64
+                                      " AFTER memcpy: buffer[%zu-]=%02x %02x %02x %02x",
+                                      cf->name, txn->commit_seq, my_offset,
+                                      cf->wal_group_buffer[my_offset],
+                                      cf->wal_group_buffer[my_offset + 1],
+                                      cf->wal_group_buffer[my_offset + 2],
+                                      cf->wal_group_buffer[my_offset + 3]);
 
                         /* memory fence to ensure our memcpy is visible before decrementing writers
                          */

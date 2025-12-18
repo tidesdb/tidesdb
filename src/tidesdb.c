@@ -3139,6 +3139,9 @@ static void tidesdb_flush_wal_group_buffer(tidesdb_column_family_t *cf)
                               cf->name, flush_size, wal_offset,
                               atomic_load(&cf->wal_group_generation));
                 block_manager_block_release(group_block);
+
+                /* zero the buffer after flush to prevent garbage in next batch */
+                memset(cf->wal_group_buffer, 0, cf->wal_group_buffer_capacity);
             }
             else
             {
@@ -10607,6 +10610,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->wal_group_leader, 0);
     atomic_init(&cf->wal_group_generation, 0);
     atomic_init(&cf->wal_group_writers, 0);
+
+    /* zero the buffer to prevent uninitialized memory from being written to WAL */
+    memset(cf->wal_group_buffer, 0, cf->wal_group_buffer_capacity);
 
     char manifest_path[TDB_MAX_PATH_LEN];
     snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEPARATOR "%s", cf->directory,

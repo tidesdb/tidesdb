@@ -884,7 +884,7 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
 {
     if (count == 0)
     {
-        return 0; /* reading 0 bytes is valid, returns 0 */
+        return 0; /* writing 0 bytes is valid, returns 0 */
     }
 
     if (!buf)
@@ -898,6 +898,33 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     {
         errno = EBADF;
         return -1;
+    }
+
+    LARGE_INTEGER file_size;
+    if (!GetFileSizeEx(h, &file_size))
+    {
+        errno = GetLastError();
+        return -1;
+    }
+
+    off_t write_end = offset + (off_t)count;
+
+    if (write_end > file_size.QuadPart)
+    {
+        LARGE_INTEGER new_size;
+        new_size.QuadPart = write_end;
+
+        if (!SetFilePointerEx(h, new_size, NULL, FILE_BEGIN))
+        {
+            errno = GetLastError();
+            return -1;
+        }
+
+        if (!SetEndOfFile(h))
+        {
+            errno = GetLastError();
+            return -1;
+        }
     }
 
     OVERLAPPED overlapped;
@@ -1060,7 +1087,7 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
 {
     if (count == 0)
     {
-        return 0; /* reading 0 bytes is valid, returns 0 */
+        return 0; /* writing 0 bytes is valid, returns 0 */
     }
 
     if (!buf)
@@ -1074,6 +1101,40 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     {
         errno = EBADF;
         return -1;
+    }
+
+    /* windows WriteFile with OVERLAPPED doesn't automatically extend the file
+     * like POSIX pwrite does. We need to ensure the file is large enough
+     * before writing to prevent partial writes or corruption. */
+    LARGE_INTEGER file_size;
+    if (!GetFileSizeEx(h, &file_size))
+    {
+        errno = GetLastError();
+        return -1;
+    }
+
+    /* calc the end position of this write */
+    off_t write_end = offset + (off_t)count;
+
+    /* writing beyond current file size, extend the file first */
+    if (write_end > file_size.QuadPart)
+    {
+        LARGE_INTEGER new_size;
+        new_size.QuadPart = write_end;
+
+        /* seek to the new end pos */
+        if (!SetFilePointerEx(h, new_size, NULL, FILE_BEGIN))
+        {
+            errno = GetLastError();
+            return -1;
+        }
+
+        /* extend the file to the new size */
+        if (!SetEndOfFile(h))
+        {
+            errno = GetLastError();
+            return -1;
+        }
     }
 
     OVERLAPPED overlapped = {0};

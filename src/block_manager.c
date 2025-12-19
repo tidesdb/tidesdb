@@ -372,6 +372,85 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     return offset;
 }
 
+int64_t block_manager_reserve_and_write_direct(block_manager_t *bm, const uint8_t *data,
+                                               uint32_t size)
+{
+    if (!bm || !data || size == 0) return -1;
+
+    /* block size is stored as uint32_t, so enforce 4GB limit */
+    if (size > UINT32_MAX)
+    {
+        return -1;
+    }
+
+    /* check for overflow when computing total_size */
+    if (size > SIZE_MAX - BLOCK_MANAGER_BLOCK_HEADER_SIZE - BLOCK_MANAGER_FOOTER_SIZE)
+    {
+        return -1;
+    }
+    size_t total_size = BLOCK_MANAGER_BLOCK_HEADER_SIZE + size + BLOCK_MANAGER_FOOTER_SIZE;
+
+    /* atomically allocate space in file - this is the key synchronization point */
+    int64_t offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_size);
+
+    /* compute checksum of data */
+    uint32_t checksum = compute_checksum(data, size);
+
+    /* use stack buffer for small blocks to avoid malloc overhead */
+    unsigned char stack_buffer[65536]; /* 64KB stack buffer */
+    unsigned char *write_buffer;
+    int use_stack = (total_size <= sizeof(stack_buffer));
+
+    if (use_stack)
+    {
+        write_buffer = stack_buffer;
+    }
+    else
+    {
+        write_buffer = malloc(total_size);
+        if (!write_buffer) return -1;
+    }
+
+    /* serialize block: [size(4)][checksum(4)][data][size(4)][magic(4)] */
+    size_t buf_offset = 0;
+
+    encode_uint32_le_compat(write_buffer + buf_offset, size);
+    buf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
+
+    encode_uint32_le_compat(write_buffer + buf_offset, checksum);
+    buf_offset += BLOCK_MANAGER_CHECKSUM_LENGTH;
+
+    memcpy(write_buffer + buf_offset, data, size);
+    buf_offset += size;
+
+    /* write footer: size + magic for fast validation */
+    encode_uint32_le_compat(write_buffer + buf_offset, size);
+    buf_offset += 4;
+
+    encode_uint32_le_compat(write_buffer + buf_offset, BLOCK_MANAGER_FOOTER_MAGIC);
+    buf_offset += 4;
+
+    /* single atomic write to reserved offset */
+    ssize_t written = pwrite(bm->fd, write_buffer, total_size, offset);
+
+    if (!use_stack) free(write_buffer);
+
+    if (written != (ssize_t)total_size)
+    {
+        return -1;
+    }
+
+    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+    {
+        if (fdatasync(bm->fd) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return offset;
+}
+
 void block_manager_block_free(block_manager_block_t *block)
 {
     if (!block) return;

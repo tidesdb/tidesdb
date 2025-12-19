@@ -17,6 +17,8 @@
  * limitations under the License.
  */
 
+#include <pthread.h>
+
 #include "../src/skip_list.h"
 #include "test_utils.h"
 
@@ -1932,6 +1934,258 @@ static int reverse_memcmp_comparator(const uint8_t *key1, size_t key1_size, cons
     return 0;
 }
 
+typedef struct
+{
+    skip_list_t *list;
+    int thread_id;
+    int num_keys;
+    _Atomic(int) *completed;
+    _Atomic(int) *errors;
+} concurrent_flush_test_data_t;
+
+static void *concurrent_flush_writer_thread(void *arg)
+{
+    concurrent_flush_test_data_t *data = (concurrent_flush_test_data_t *)arg;
+
+    for (int i = 0; i < data->num_keys; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "thread_%d_key_%08d", data->thread_id, i);
+
+        char value[256];
+        snprintf(value, sizeof(value),
+                 "thread_%d_value_%08d_padding_to_make_larger_"
+                 "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+                 "YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
+                 "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+                 data->thread_id, i);
+
+        /* calculate sequence number: thread_id * 1000 + i + 1 */
+        uint64_t seq = data->thread_id * 1000 + i + 1;
+
+        if (skip_list_put_with_seq(data->list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                   strlen(value) + 1, 0, seq, 0) != 0)
+        {
+            atomic_fetch_add(data->errors, 1);
+        }
+        else
+        {
+            atomic_fetch_add(data->completed, 1);
+        }
+
+        if (i % 100 == 0)
+        {
+            usleep(100);
+        }
+    }
+
+    return NULL;
+}
+
+void test_skip_list_concurrent_write_flush_pattern()
+{
+    printf("\nRunning: test_skip_list_concurrent_write_flush_pattern...\n");
+
+    skip_list_t *list;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25), 0);
+
+    const int NUM_THREADS = 4;
+    const int KEYS_PER_THREAD = 1000;
+    const int TOTAL_KEYS = NUM_THREADS * KEYS_PER_THREAD;
+
+    printf("  Writing %d keys from %d threads...\n", TOTAL_KEYS, NUM_THREADS);
+
+    _Atomic(int) completed = 0;
+    _Atomic(int) errors = 0;
+
+    pthread_t *threads = (pthread_t *)malloc(NUM_THREADS * sizeof(pthread_t));
+    concurrent_flush_test_data_t *thread_data =
+        (concurrent_flush_test_data_t *)malloc(NUM_THREADS * sizeof(concurrent_flush_test_data_t));
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        thread_data[i].list = list;
+        thread_data[i].thread_id = i;
+        thread_data[i].num_keys = KEYS_PER_THREAD;
+        thread_data[i].completed = &completed;
+        thread_data[i].errors = &errors;
+        pthread_create(&threads[i], NULL, concurrent_flush_writer_thread, &thread_data[i]);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    int final_completed = atomic_load(&completed);
+    int final_errors = atomic_load(&errors);
+
+    printf("  Write complete: %d keys written, %d errors\n", final_completed, final_errors);
+    ASSERT_EQ(final_errors, 0);
+    ASSERT_EQ(final_completed, TOTAL_KEYS);
+
+    /* Now iterate through the skip list like the flush routine does */
+    printf("  Iterating through skip list (like flush)...\n");
+
+    skip_list_cursor_t *cursor;
+    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+
+    int iterated_count = 0;
+    uint8_t *first_key = NULL;
+    size_t first_key_size = 0;
+    uint8_t *last_key = NULL;
+    size_t last_key_size = 0;
+    uint64_t max_seq = 0;
+
+    if (skip_list_cursor_goto_first(cursor) == 0)
+    {
+        do
+        {
+            uint8_t *key = NULL;
+            size_t key_size = 0;
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            time_t ttl = 0;
+            uint8_t deleted = 0;
+            uint64_t seq = 0;
+
+            if (skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
+                                              &deleted, &seq) == 0)
+            {
+                iterated_count++;
+
+                /* Track first key (min) */
+                if (first_key == NULL)
+                {
+                    first_key = malloc(key_size);
+                    memcpy(first_key, key, key_size);
+                    first_key_size = key_size;
+                }
+
+                /* Track last key (max) - will be overwritten each iteration */
+                if (last_key != NULL) free(last_key);
+                last_key = malloc(key_size);
+                memcpy(last_key, key, key_size);
+                last_key_size = key_size;
+
+                /* Track max sequence */
+                if (seq > max_seq) max_seq = seq;
+
+                /* NOTE: skip_list_cursor_get_with_seq returns direct pointers to node memory,
+                 * not allocated copies. Do NOT free key or value here! */
+            }
+        } while (skip_list_cursor_next(cursor) == 0);
+    }
+
+    skip_list_cursor_free(cursor);
+
+    printf("  Iteration complete: %d entries found\n", iterated_count);
+    printf("  Expected: %d entries\n", TOTAL_KEYS);
+    printf("  Max sequence: %lu\n", max_seq);
+
+    if (first_key && last_key)
+    {
+        printf("  Min key: %.*s\n", (int)first_key_size - 1, (char *)first_key);
+        printf("  Max key: %.*s\n", (int)last_key_size - 1, (char *)last_key);
+    }
+
+    /* Verify we found all entries */
+    ASSERT_EQ(iterated_count, TOTAL_KEYS);
+    ASSERT_EQ(max_seq, TOTAL_KEYS);
+
+    /* Now verify we can read all keys back */
+    printf("  Verifying all keys are readable...\n");
+    int found_keys = 0;
+    int missing_keys = 0;
+
+    for (int tid = 0; tid < NUM_THREADS; tid++)
+    {
+        for (int i = 0; i < KEYS_PER_THREAD; i++)
+        {
+            char key[64];
+            snprintf(key, sizeof(key), "thread_%d_key_%08d", tid, i);
+
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            time_t ttl = 0;
+            uint8_t deleted = 0;
+            uint64_t seq = 0;
+
+            int get_result =
+                skip_list_get_with_seq(list, (uint8_t *)key, strlen(key) + 1, &value, &value_size,
+                                       &ttl, &deleted, &seq, UINT64_MAX, NULL, NULL);
+            if (get_result == 0)
+            {
+                found_keys++;
+                if (value) free(value);
+            }
+            else
+            {
+                missing_keys++;
+                if (missing_keys == 1)
+                {
+                    /* Debug first missing key */
+                    printf("  DEBUG: First missing key: %s (key_size=%zu, result=%d)\n", key,
+                           strlen(key) + 1, get_result);
+                    printf("  DEBUG: Trying to find it with iteration...\n");
+
+                    /* Try to find it via iteration to confirm it exists */
+                    skip_list_cursor_t *debug_cursor;
+                    if (skip_list_cursor_init(&debug_cursor, list) == 0)
+                    {
+                        if (skip_list_cursor_seek(debug_cursor, (uint8_t *)key, strlen(key) + 1) ==
+                            0)
+                        {
+                            uint8_t *found_key = NULL;
+                            size_t found_key_size = 0;
+                            uint8_t *found_value = NULL;
+                            size_t found_value_size = 0;
+                            time_t found_ttl = 0;
+                            uint8_t found_deleted = 0;
+                            uint64_t found_seq = 0;
+
+                            if (skip_list_cursor_get_with_seq(
+                                    debug_cursor, &found_key, &found_key_size, &found_value,
+                                    &found_value_size, &found_ttl, &found_deleted, &found_seq) == 0)
+                            {
+                                printf("  DEBUG: Found via cursor! key=%.*s, seq=%lu, deleted=%d\n",
+                                       (int)found_key_size - 1, (char *)found_key, found_seq,
+                                       found_deleted);
+                                /* NOTE: cursor returns direct pointers, do NOT free them */
+                            }
+                            else
+                            {
+                                printf("  DEBUG: Cursor seek succeeded but get failed\n");
+                            }
+                        }
+                        else
+                        {
+                            printf("  DEBUG: Cursor seek failed\n");
+                        }
+                        skip_list_cursor_free(debug_cursor);
+                    }
+                }
+                if (missing_keys <= 10)
+                {
+                    printf("  WARNING: Missing key: %s\n", key);
+                }
+            }
+        }
+    }
+
+    printf("  Found: %d keys, Missing: %d keys\n", found_keys, missing_keys);
+    ASSERT_EQ(missing_keys, 0);
+    ASSERT_EQ(found_keys, TOTAL_KEYS);
+
+    if (first_key) free(first_key);
+    if (last_key) free(last_key);
+    free(threads);
+    free(thread_data);
+    skip_list_free(list);
+
+    printf("  PASSED: All %d keys written and verified correctly\n", TOTAL_KEYS);
+}
+
 void test_skip_list_reverse_comparator()
 {
     skip_list_t *list = NULL;
@@ -2015,6 +2269,7 @@ int main(void)
     RUN_TEST(test_skip_list_concurrent_duplicate_keys, tests_passed);
     RUN_TEST(test_skip_list_lockfree_stress, tests_passed);
     RUN_TEST(test_skip_list_reverse_comparator, tests_passed);
+    RUN_TEST(test_skip_list_concurrent_write_flush_pattern, tests_passed);
 
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);

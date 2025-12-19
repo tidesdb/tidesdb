@@ -10,7 +10,7 @@ configure_file(
 )
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
-option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
+option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)

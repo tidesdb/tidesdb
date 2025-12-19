@@ -173,19 +173,6 @@ block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, voi
 int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
 
 /**
- * block_manager_reserve_and_write_direct
- * atomically reserves space in the file and writes data directly
- * this is used for lock-free concurrent WAL writes - each transaction atomically
- * reserves its file offset and writes to that position using pwrite()
- * @param bm the block manager
- * @param data the data to write
- * @param size the size of the data
- * @return block offset if successful, -1 if not
- */
-int64_t block_manager_reserve_and_write_direct(block_manager_t *bm, const uint8_t *data,
-                                               uint32_t size);
-
-/**
  * block_manager_block_free
  * frees a block
  * @param block the block to free

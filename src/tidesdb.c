@@ -132,10 +132,10 @@ typedef struct
 #define TDB_SHUTDOWN_BROADCAST_ATTEMPTS        10
 #define TDB_SHUTDOWN_BROADCAST_INTERVAL_US     5000
 
-/* spooky-style Level 1 file count compaction triggers
- * α (alpha) -- trigger compaction when Level 1 reaches this many files
- * β (beta) -- slow down writes when Level 1 reaches this many files
- * γ (gamma) -- stop writes when Level 1 reaches this many files (emergency) */
+/* spooky-style level 1 file count compaction triggers
+ * α (alpha) -- trigger compaction when level 1 reaches this many files
+ * β (beta) -- slow down writes when level 1 reaches this many files
+ * γ (gamma) -- stop writes when level 1 reaches this many files (emergency) */
 #define TDB_L1_FILE_NUM_COMPACTION_TRIGGER 4      /* α -- compact at 4 files */
 #define TDB_L1_SLOWDOWN_WRITES_TRIGGER     20     /* β -- throttle at 20 files */
 #define TDB_L1_STOP_WRITES_TRIGGER         36     /* γ -- stall at 36 files */
@@ -8954,7 +8954,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             }
         }
 
-        /* add sstable to Level 1 (array index 0) -- load levels atomically */
+        /* add sstable to level 1 (array index 0) -- load levels atomically */
 
         /* levels array is fixed, access directly */
         tidesdb_level_add_sstable(cf->levels[0], sst);
@@ -11819,7 +11819,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     /* search level-by-level with early termination
      * for non-existent keys, this avoids checking all ssts in all levels
-     * for existing keys in Level 1, this stops immediately without checking deeper levels */
+     * for existing keys in level 1, this stops immediately without checking deeper levels */
     for (int level_num = 0; level_num < num_levels; level_num++)
     {
         PROFILE_INC(txn->db, levels_searched);
@@ -11884,7 +11884,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     found_any = 1;
                     PROFILE_INC(txn->db, sstable_hits);
 
-                    /* Level 1 hit -- stop immediately, no need to check deeper levels */
+                    /* level 1 hit -- stop immediately, no need to check deeper levels */
                     if (level_num == 0)
                     {
                         tidesdb_sstable_unref(cf->db, sst);
@@ -12863,14 +12863,17 @@ skip_ssi_check:
                               cf->name, num_l1_sstables, TDB_L1_SLOWDOWN_WRITES_TRIGGER);
             }
 
-            /* capacity-based backpressure -- if Level 1 is near capacity, slow down writes
+            /* capacity-based backpressure -- if level 1 is near capacity, slow down writes
              * to give compaction time to catch up. This prevents runaway sst creation
              * during heavy batched writes.
              * i.e
-             *   -- 90-95% full -- 1ms delay (gentle slowdown)
-             *   -- 95-98% full -- 5ms delay (moderate slowdown)
-             *   -- 98-100% full -- 10ms delay (aggressive slowdown)
-             *   -- >100% full -- 50ms delay (emergency brake)
+             *   -- TDB_BACKPRESSURE_THRESHOLD_L1_MODERATE (90%) --
+             * TDB_BACKPRESSURE_DELAY_MODERATE_US (1ms)
+             *   -- TDB_BACKPRESSURE_THRESHOLD_L1_HIGH (95%) -- TDB_BACKPRESSURE_DELAY_HIGH_US (5ms)
+             *   -- TDB_BACKPRESSURE_THRESHOLD_L1_CRITICAL (98%) --
+             * TDB_BACKPRESSURE_DELAY_CRITICAL_US (10ms)
+             *   -- TDB_BACKPRESSURE_THRESHOLD_L1_FULL (99%) -- TDB_BACKPRESSURE_DELAY_EMERGENCY_US
+             * (50ms)
              */
             size_t level1_size =
                 atomic_load_explicit(&cf->levels[0]->current_size, memory_order_relaxed);
@@ -12883,12 +12886,13 @@ skip_ssi_check:
 
                 if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L1_FULL)
                 {
-                    /* Level 1 is full, apply strong backpressure */
+                    /* level 1 is full, apply strong backpressure */
                     usleep(TDB_BACKPRESSURE_DELAY_EMERGENCY_US);
                     TDB_DEBUG_LOG(TDB_LOG_WARN,
                                   "CF '%s' Level 1 capacity full (%d%%), applying emergency "
-                                  "backpressure (50ms)",
-                                  cf->name, utilization_pct);
+                                  "backpressure (%dms)",
+                                  cf->name, utilization_pct,
+                                  TDB_BACKPRESSURE_DELAY_EMERGENCY_US / 1000);
                 }
                 else if (utilization_pct >= TDB_BACKPRESSURE_THRESHOLD_L1_CRITICAL)
                 {
@@ -14445,22 +14449,42 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
     iter->current = NULL;
     iter->valid = 0;
 
-    /* if direction changed, advance all sources and rebuild as min-heap */
+    /* early exit if heap is empty */
+    if (iter->heap->num_sources == 0) return TDB_ERR_NOT_FOUND;
+
+    /* when direction changes from backward to forward, rebuild heap as min-heap */
     if (direction_changed)
     {
+        /* advance all sources and remove exhausted ones */
+        int write_idx = 0;
         for (int i = 0; i < iter->heap->num_sources; i++)
         {
             tidesdb_merge_source_t *source = iter->heap->sources[i];
-            if (tidesdb_merge_source_advance(source) != TDB_SUCCESS)
+            if (tidesdb_merge_source_advance(source) == TDB_SUCCESS && source->current_kv)
             {
+                /* keep this source */
+                iter->heap->sources[write_idx++] = source;
+            }
+            else
+            {
+                /* source exhausted, remove it */
                 source->current_kv = NULL;
+                tidesdb_merge_source_free(source);
             }
         }
+        iter->heap->num_sources = write_idx;
 
-        /* rebuild as min-heap for forward iteration */
+        /* rebuild as min-heap (bottom-up heapify) */
         for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
         {
             heap_sift_down(iter->heap, i);
+        }
+
+        /* if all sources exhausted, return not found */
+        if (iter->heap->num_sources == 0)
+        {
+            if (key_on_heap) free(current_key);
+            return TDB_ERR_NOT_FOUND;
         }
     }
 
@@ -14495,8 +14519,11 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
 
             if (key_on_heap) free(current_key);
 
-            /* advance source for next iteration */
-            tidesdb_merge_source_advance(source);
+            /* advance source for next iteration (already advanced once above in loop) */
+            if (tidesdb_merge_source_advance(source) != TDB_SUCCESS)
+            {
+                source->current_kv = NULL;
+            }
 
             iter->valid = 1;
             return TDB_SUCCESS;
@@ -14576,22 +14603,42 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
     iter->current = NULL;
     iter->valid = 0;
 
-    /* if direction changed, retreat all sources and rebuild as max-heap */
+    /* early exit if heap is empty */
+    if (iter->heap->num_sources == 0) return TDB_ERR_NOT_FOUND;
+
+    /* when direction changes from forward to backward, rebuild heap as max-heap */
     if (direction_changed)
     {
+        /* retreat all sources and remove exhausted ones */
+        int write_idx = 0;
         for (int i = 0; i < iter->heap->num_sources; i++)
         {
             tidesdb_merge_source_t *source = iter->heap->sources[i];
-            if (tidesdb_merge_source_retreat(source) != TDB_SUCCESS)
+            if (tidesdb_merge_source_retreat(source) == TDB_SUCCESS && source->current_kv)
             {
+                /* keep this source */
+                iter->heap->sources[write_idx++] = source;
+            }
+            else
+            {
+                /* source exhausted, remove it */
                 source->current_kv = NULL;
+                tidesdb_merge_source_free(source);
             }
         }
+        iter->heap->num_sources = write_idx;
 
-        /* rebuild as max-heap for backward iteration */
+        /* rebuild as max-heap (bottom-up heapify) */
         for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
         {
             heap_sift_down_max(iter->heap, i);
+        }
+
+        /* if all sources exhausted, return not found */
+        if (iter->heap->num_sources == 0)
+        {
+            if (key_on_heap) free(current_key);
+            return TDB_ERR_NOT_FOUND;
         }
     }
 
@@ -14626,7 +14673,11 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
 
             if (key_on_heap) free(current_key);
 
-            tidesdb_merge_source_retreat(source);
+            /* retreat source for next iteration */
+            if (tidesdb_merge_source_retreat(source) != TDB_SUCCESS)
+            {
+                source->current_kv = NULL;
+            }
 
             iter->valid = 1;
             return TDB_SUCCESS;

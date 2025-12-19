@@ -9203,9 +9203,10 @@ static void test_multiple_databases_concurrent_operations(void)
     printf("  operations per thread: %d, total expected: %d\n", OPS_PER_THREAD, TOTAL_EXPECTED_OPS);
 
     /* cleanup and create separate database directories */
-    char db_paths[NUM_DATABASES][256];
-    tidesdb_t *databases[NUM_DATABASES];
-    tidesdb_column_family_t *column_families[NUM_DATABASES];
+    char(*db_paths)[256] = malloc(NUM_DATABASES * sizeof(*db_paths));
+    tidesdb_t **databases = malloc(NUM_DATABASES * sizeof(tidesdb_t *));
+    tidesdb_column_family_t **column_families =
+        malloc(NUM_DATABASES * sizeof(tidesdb_column_family_t *));
 
     for (int i = 0; i < NUM_DATABASES; i++)
     {
@@ -9421,6 +9422,10 @@ static void test_multiple_databases_concurrent_operations(void)
         ASSERT_EQ(tidesdb_close(databases[i]), 0);
         remove_directory(db_paths[i]);
     }
+
+    free(db_paths);
+    free(databases);
+    free(column_families);
 
     printf("  multiple database concurrent operations test passed\n");
 }

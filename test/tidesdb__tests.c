@@ -9474,80 +9474,39 @@ static void test_disk_space_check_simulation(void)
     cleanup_test_dir();
 }
 
-/**
- * test_wal_group_commit_shutdown_recovery
- * comprehensive test for WAL group commit with concurrent writes, flushes,
- * shutdown, and recovery - mimics the benchmark scenario that exposed race conditions
- */
-static void test_wal_group_commit_shutdown_recovery(void)
+/* Thread data structure for WAL group commit test */
+typedef struct
 {
-    cleanup_test_dir();
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int thread_id;
+    int num_keys;
+    _Atomic(int) *completed;
+    _Atomic(int) *errors;
+} wal_test_writer_thread_data_t;
 
-    printf("\n  === WAL Group Commit Shutdown Recovery Test ===\n");
-    printf("  This test verifies all WAL group commit race condition fixes\n");
-    printf("  by simulating the benchmark scenario with concurrent writes,\n");
-    printf("  flushes, shutdown, and recovery.\n\n");
+/* Writer thread function for WAL group commit test */
+static void *wal_test_writer_thread(void *arg)
+{
+    wal_test_writer_thread_data_t *data = (wal_test_writer_thread_data_t *)arg;
 
-    /* Phase 1: Create database and write data concurrently */
-    printf("  [Phase 1] Creating database with small write buffer to trigger flushes...\n");
-
-    tidesdb_config_t config = tidesdb_default_config();
-    config.db_path = TEST_DB_PATH;
-
-    tidesdb_t *db = NULL;
-    ASSERT_EQ(tidesdb_open(&config, &db), 0);
-    ASSERT_TRUE(db != NULL);
-
-    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    /* small buffer to trigger multiple flushes during concurrent writes */
-    cf_config.write_buffer_size = 256 * 1024; /* 256KB - will trigger many flushes */
-
-    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
-    ASSERT_TRUE(cf != NULL);
-
-    const int NUM_THREADS = 4;
-    const int KEYS_PER_THREAD = 200;
-    const int TOTAL_KEYS = NUM_THREADS * KEYS_PER_THREAD;
-
-    printf("  Threads: %d, Keys per thread: %d, Total keys: %d\n", NUM_THREADS, KEYS_PER_THREAD,
-           TOTAL_KEYS);
-    printf("  Write buffer: %zu bytes (will trigger multiple flushes)\n\n",
-           cf_config.write_buffer_size);
-
-    /* Thread data structure */
-    typedef struct
+    for (int i = 0; i < data->num_keys; i++)
     {
-        tidesdb_t *db;
-        tidesdb_column_family_t *cf;
-        int thread_id;
-        int num_keys;
-        _Atomic(int) *completed;
-        _Atomic(int) *errors;
-    } writer_thread_data_t;
-
-    _Atomic(int) completed = 0;
-    _Atomic(int) errors = 0;
-
-    /* Writer thread function */
-    void *writer_thread(void *arg)
-    {
-        writer_thread_data_t *data = (writer_thread_data_t *)arg;
-
-        for (int i = 0; i < data->num_keys; i++)
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(data->db, &txn) != 0)
         {
-            tidesdb_txn_t *txn = NULL;
+            atomic_fetch_add(data->errors, 1);
+            continue;
             if (tidesdb_txn_begin(data->db, &txn) != 0)
             {
                 atomic_fetch_add(data->errors, 1);
                 continue;
             }
 
-            /* Generate key: thread_id + sequence */
+            /* thread_id + sequence */
             char key[64];
             snprintf(key, sizeof(key), "thread_%d_key_%08d", data->thread_id, i);
 
-            /* Generate value with some size to trigger flushes faster */
             char value[256];
             snprintf(value, sizeof(value),
                      "thread_%d_value_%08d_padding_to_make_larger_"
@@ -9575,7 +9534,6 @@ static void test_wal_group_commit_shutdown_recovery(void)
 
             tidesdb_txn_free(txn);
 
-            /* Add small random delay to vary timing and increase race window */
             if (i % 100 == 0)
             {
                 usleep(100);
@@ -9584,12 +9542,45 @@ static void test_wal_group_commit_shutdown_recovery(void)
 
         return NULL;
     }
+}
+
+static void test_wal_group_commit_shutdown_recovery(void)
+{
+    cleanup_test_dir();
+    printf("  Creating database with small write buffer to trigger flushes...\n");
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    cf_config.write_buffer_size = 256 * 1024;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int NUM_THREADS = 4;
+    const int KEYS_PER_THREAD = 1000;
+    const int TOTAL_KEYS = NUM_THREADS * KEYS_PER_THREAD;
+
+    printf("  Threads: %d, Keys per thread: %d, Total keys: %d\n", NUM_THREADS, KEYS_PER_THREAD,
+           TOTAL_KEYS);
+    printf("  Write buffer: %zu bytes (will trigger multiple flushes)\n\n",
+           cf_config.write_buffer_size);
+
+    _Atomic(int) completed = 0;
+    _Atomic(int) errors = 0;
 
     pthread_t *threads = (pthread_t *)malloc(NUM_THREADS * sizeof(pthread_t));
-    writer_thread_data_t *thread_data =
-        (writer_thread_data_t *)malloc(NUM_THREADS * sizeof(writer_thread_data_t));
+    wal_test_writer_thread_data_t *thread_data = (wal_test_writer_thread_data_t *)malloc(
+        NUM_THREADS * sizeof(wal_test_writer_thread_data_t));
 
-    printf("  [Phase 1] Starting %d concurrent writer threads...\n", NUM_THREADS);
+    printf("  Starting %d concurrent writer threads...\n", NUM_THREADS);
 
     for (int i = 0; i < NUM_THREADS; i++)
     {
@@ -9599,10 +9590,9 @@ static void test_wal_group_commit_shutdown_recovery(void)
         thread_data[i].num_keys = KEYS_PER_THREAD;
         thread_data[i].completed = &completed;
         thread_data[i].errors = &errors;
-        pthread_create(&threads[i], NULL, writer_thread, &thread_data[i]);
+        pthread_create(&threads[i], NULL, wal_test_writer_thread, &thread_data[i]);
     }
 
-    /* Wait for all threads to complete */
     for (int i = 0; i < NUM_THREADS; i++)
     {
         pthread_join(threads[i], NULL);
@@ -9611,13 +9601,12 @@ static void test_wal_group_commit_shutdown_recovery(void)
     int final_completed = atomic_load(&completed);
     int final_errors = atomic_load(&errors);
 
-    printf("  [Phase 1] Write complete: %d keys committed, %d errors\n", final_completed,
-           final_errors);
+    printf("  Write complete: %d keys committed, %d errors\n", final_completed, final_errors);
     ASSERT_EQ(final_errors, 0);
     ASSERT_EQ(final_completed, TOTAL_KEYS);
 
     /* Check database state before shutdown */
-    printf("\n  [Phase 1] Checking database state before shutdown...\n");
+    printf("\n  Checking database state before shutdown...\n");
     skip_list_t *active_mt = cf->active_memtable;
     int active_entries = skip_list_count_entries(active_mt);
     size_t imm_count = queue_size(cf->immutable_memtables);
@@ -9632,15 +9621,10 @@ static void test_wal_group_commit_shutdown_recovery(void)
         }
     }
 
-    /* Phase 2: Clean shutdown (this is where race conditions can occur) */
-    printf("\n  [Phase 2] Performing clean shutdown (testing race condition fixes)...\n");
-    printf("  This will flush WAL group buffer and wait for all in-flight writes...\n");
-
     ASSERT_EQ(tidesdb_close(db), 0);
-    printf("  [Phase 2] Shutdown complete!\n");
+    printf("  Shutdown complete!\n");
 
-    /* Phase 3: Reopen database and verify recovery */
-    printf("\n  [Phase 3] Reopening database to test WAL recovery...\n");
+    printf("\n  Reopening database to test WAL recovery...\n");
 
     db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
@@ -9649,7 +9633,7 @@ static void test_wal_group_commit_shutdown_recovery(void)
     cf = tidesdb_get_column_family(db, "test_cf");
     ASSERT_TRUE(cf != NULL);
 
-    printf("  [Phase 3] Database reopened successfully!\n");
+    printf("  Database reopened successfully!\n");
     printf("  Checking recovered state...\n");
 
     active_mt = cf->active_memtable;
@@ -9666,8 +9650,7 @@ static void test_wal_group_commit_shutdown_recovery(void)
         }
     }
 
-    /* Phase 4: Verify all keys are readable */
-    printf("\n  [Phase 4] Verifying all %d keys are readable after recovery...\n", TOTAL_KEYS);
+    printf("\n  Verifying all %d keys are readable after recovery...\n", TOTAL_KEYS);
 
     int found_keys = 0;
     int missing_keys = 0;
@@ -9713,7 +9696,7 @@ static void test_wal_group_commit_shutdown_recovery(void)
         }
     }
 
-    printf("\n  [Phase 4] Verification complete!\n");
+    printf("\n  Verification complete!\n");
     printf("  Found keys: %d\n", found_keys);
     printf("  Missing keys: %d\n", missing_keys);
     printf("  Expected keys: %d\n", TOTAL_KEYS);
@@ -9730,8 +9713,7 @@ static void test_wal_group_commit_shutdown_recovery(void)
     ASSERT_EQ(missing_keys, 0);
     ASSERT_EQ(found_keys, TOTAL_KEYS);
 
-    /* Phase 5: Test iteration after recovery */
-    printf("\n  [Phase 5] Testing iteration after recovery...\n");
+    printf("\n  Testing iteration after recovery...\n");
 
     tidesdb_txn_t *iter_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &iter_txn), 0);
@@ -9752,14 +9734,6 @@ static void test_wal_group_commit_shutdown_recovery(void)
 
     tidesdb_iter_free(iter);
     tidesdb_txn_free(iter_txn);
-
-    printf("\n  === Test Summary ===\n");
-    printf("  ✓ Concurrent writes with flushes: PASSED\n");
-    printf("  ✓ Clean shutdown with in-flight writes: PASSED\n");
-    printf("  ✓ WAL recovery: PASSED\n");
-    printf("  ✓ Data integrity: PASSED\n");
-    printf("  ✓ Iteration after recovery: PASSED\n");
-    printf("\n  All WAL group commit race conditions are fixed!\n\n");
 
     free(threads);
     free(thread_data);

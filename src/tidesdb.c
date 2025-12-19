@@ -14861,11 +14861,11 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                         {
                             tidesdb_level_add_sstable(cf->levels[level_num - 1], sst);
 
-                            TDB_DEBUG_LOG(TDB_LOG_INFO,
-                                          "CF '%s' loaded SSTable %" PRIu64
-                                          " (level=%d, max_seq=%" PRIu64 ", num_entries=%d)",
-                                          cf->name, sst_id, level_num, sst->max_seq,
-                                          sst->num_entries);
+                            TDB_DEBUG_LOG(
+                                TDB_LOG_INFO,
+                                "CF '%s' loaded SSTable %" PRIu64 " (level=%d, max_seq=%" PRIu64
+                                ", num_entries=%" PRIu64 ")",
+                                cf->name, sst_id, level_num, sst->max_seq, sst->num_entries);
 
                             tidesdb_sstable_unref(cf->db, sst);
                         }

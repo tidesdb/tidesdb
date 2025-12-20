@@ -336,7 +336,7 @@ typedef struct tidesdb_config_t
  * @param active_memtable active memtable
  * @param memtable_id id of active memtable
  * @param memtable_generation generation counter for memtable rotation
- * @param active_wal active write-ahead log
+ * @param wal write-ahead log
  * @param immutable_memtables queue of immutable memtables being flushed
  * @param pending_commits count of in-flight commits
  * @param active_txn_buffer buffer of active transactions for ssi conflict detection
@@ -365,7 +365,7 @@ struct tidesdb_column_family_t
     _Atomic(skip_list_t *) active_memtable;
     _Atomic(uint64_t) memtable_id;
     _Atomic(uint64_t) memtable_generation;
-    _Atomic(block_manager_t *) active_wal;
+    block_manager_t *wal;
     queue_t *immutable_memtables;
     _Atomic(uint64_t) pending_commits;
     buffer_t *active_txn_buffer;
@@ -435,6 +435,7 @@ struct tidesdb_sstable_t
     _Atomic(int) refcount;
     block_manager_t *klog_bm;
     block_manager_t *vlog_bm;
+    _Atomic(int) bm_opening; /* atomic flag to prevent concurrent block manager opens */
     tidesdb_column_family_config_t *config;
     _Atomic(int) marked_for_deletion;
     _Atomic(time_t) last_access_time;

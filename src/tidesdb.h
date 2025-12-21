@@ -30,7 +30,7 @@
 #include "queue.h"
 #include "skip_list.h"
 
-/* logging levels for TDB_DEBUG_LOG */
+/** logging levels for TDB_DEBUG_LOG */
 typedef enum
 {
     TDB_LOG_DEBUG = 0, /* general debugging info (most verbose) */
@@ -41,7 +41,7 @@ typedef enum
     TDB_LOG_NONE = 99  /* disable all logging */
 } tidesdb_log_level_t;
 
-extern int _tidesdb_log_level; /* minimum level to log (default is TDB_LOG_DEBUG) */
+extern int _tidesdb_log_level; /** minimum level to log (default is TDB_LOG_DEBUG) */
 
 #if defined(_MSC_VER)
 #define TDB_DEBUG_LOG(level, fmt, ...)                                                    \
@@ -180,7 +180,7 @@ typedef struct
 
 /**
  * tidesdb_sync_mode_t
- * synchronization modes for write ahead logging mainly.  sstable writes are sync'ed on completion.
+ * synchronization modes for writes
  */
 typedef enum
 {
@@ -313,8 +313,6 @@ typedef struct tidesdb_comparator_entry_t
  * TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE)
  * @param block_cache_size size of clock cache for hot sstable blocks
  * @param max_open_sstables maximum number of open sstables
- * @param wait_for_txns_on_close if true, wait up to defined time for active transactions on close
- *                                if false (default), close immediately and fail active transactions
  */
 typedef struct tidesdb_config_t
 {
@@ -324,8 +322,25 @@ typedef struct tidesdb_config_t
     tidesdb_log_level_t log_level;
     size_t block_cache_size;
     size_t max_open_sstables;
-    int wait_for_txns_on_close;
 } tidesdb_config_t;
+
+/**
+ * tidesdb_memtable_t
+ * a memtable(skiplist-wal)
+ * @param id the memtable id
+ * @param memtable the immutable memtable
+ * @param refcount reference count for safe concurrent access
+ * @param flushed 1 if flushed to sstable, 0 otherwise
+ * @param wal the memtable wal file
+ */
+typedef struct
+{
+    int id;
+    skip_list_t *memtable;
+    _Atomic(int) refcount;
+    _Atomic(int) flushed;
+    block_manager_t *wal;
+} tidesdb_memtable_t;
 
 /**
  * tidesdb_column_family_t
@@ -334,9 +349,6 @@ typedef struct tidesdb_config_t
  * @param directory directory for column family
  * @param config column family configuration
  * @param active_memtable active memtable
- * @param memtable_id id of active memtable
- * @param memtable_generation generation counter for memtable rotation
- * @param wal write-ahead log
  * @param immutable_memtables queue of immutable memtables being flushed
  * @param pending_commits count of in-flight commits
  * @param active_txn_buffer buffer of active transactions for ssi conflict detection
@@ -345,15 +357,7 @@ typedef struct tidesdb_config_t
  * @param next_sstable_id next sstable id
  * @param is_compacting atomic flag indicating compaction is queued
  * @param is_flushing atomic flag indicating flush is queued
- * @param immutable_cleanup_counter counter for batched immutable cleanup
- * @param wal_group_buffer shared buffer for batching wal writes (lock-free group commit)
- * @param wal_group_buffer_size current size of data in buffer (atomic)
- * @param wal_group_buffer_capacity total capacity of buffer
- * @param wal_group_leader atomic flag indicating a thread is leading group commit (CAS)
- * @param wal_group_generation generation counter to detect buffer flushes (prevents race
- * conditions)
- * @param wal_group_writers tracks threads currently writing to buffer
- * @param wal_group_draining prevents new reservations during flush
+ * @param wal_rotating atomic flag indicating WAL is being rotated (blocks new commits temporarily)
  * @param manifest manifest for column family
  * @param db parent database reference
  */
@@ -362,10 +366,7 @@ struct tidesdb_column_family_t
     char *name;
     char *directory;
     tidesdb_column_family_config_t config;
-    _Atomic(skip_list_t *) active_memtable;
-    _Atomic(uint64_t) memtable_id;
-    _Atomic(uint64_t) memtable_generation;
-    block_manager_t *wal;
+    _Atomic(tidesdb_memtable_t *) active_memtable;
     queue_t *immutable_memtables;
     _Atomic(uint64_t) pending_commits;
     buffer_t *active_txn_buffer;
@@ -374,14 +375,7 @@ struct tidesdb_column_family_t
     _Atomic(uint64_t) next_sstable_id;
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
-    _Atomic(int) immutable_cleanup_counter;
-    uint8_t *wal_group_buffer;
-    _Atomic(size_t) wal_group_buffer_size;
-    size_t wal_group_buffer_capacity;
-    _Atomic(int) wal_group_leader;
-    _Atomic(uint64_t) wal_group_generation;
-    _Atomic(int) wal_group_writers;
-    _Atomic(int) wal_group_draining;
+    _Atomic(int) wal_rotating;
     tidesdb_manifest_t *manifest;
     tidesdb_t *db;
 };
@@ -409,6 +403,7 @@ struct tidesdb_column_family_t
  * @param refcount reference count for safe concurrent access
  * @param klog_bm klog block manager
  * @param vlog_bm vlog block manager
+ * @param bm_opening atomic flag to prevent concurrent block manager opens
  * @param config column family configuration
  * @param marked_for_deletion flag indicating sstable is marked for deletion
  * @param last_access_time last access time for lru eviction
@@ -435,7 +430,7 @@ struct tidesdb_sstable_t
     _Atomic(int) refcount;
     block_manager_t *klog_bm;
     block_manager_t *vlog_bm;
-    _Atomic(int) bm_opening; /* atomic flag to prevent concurrent block manager opens */
+    _Atomic(int) bm_opening;
     tidesdb_column_family_config_t *config;
     _Atomic(int) marked_for_deletion;
     _Atomic(time_t) last_access_time;
@@ -683,7 +678,6 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void);
 
 /**
  * tidesdb_default_config
- * returns default configuration for database
  * @return default configuration for database
  */
 tidesdb_config_t tidesdb_default_config(void);

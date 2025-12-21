@@ -2521,4 +2521,287 @@ static inline int tdb_get_cpu_count(void)
 #endif
 }
 
+/*
+ * varint_size
+ * calculate exact size of varint encoding for a value
+ * @param value value to encode
+ * @return number of bytes needed
+ */
+static inline size_t varint_size(uint64_t value)
+{
+    size_t size = 1;
+    while (value >= 0x80)
+    {
+        size++;
+        value >>= 7;
+    }
+    return size;
+}
+
+/*
+ * WAL Batch Format (Compact)
+ * Batch Header:
+ *   version: 1 byte (0x01)
+ *   batch_flags: 1 byte (bit 0: multi_cf)
+ *   num_entries: varint
+ *   base_seq: varint (first sequence number in batch)
+ *   num_cfs: 1 byte (only if multi_cf flag set)
+ *   checksum: 4 bytes (xxhash32 of all entries)
+ *
+ * Per Entry:
+ *   flags: 1 byte (tombstone, has_ttl)
+ *   seq_delta: varint (delta from base_seq)
+ *   key_size: varint
+ *   value_size: varint
+ *   ttl: varint (only if has_ttl flag set)
+ *   key: N bytes
+ *   value: M bytes
+ */
+
+#define TDB_WAL_VERSION             0x01
+#define TDB_WAL_BATCH_FLAG_MULTI_CF 0x01
+
+/*
+ * serialize_wal_batch_header
+ * serialize the batch-level header for compact WAL format
+ * @param ptr output buffer
+ * @param num_entries number of entries in this batch
+ * @param base_seq first sequence number in batch
+ * @param is_multi_cf 1 if multi-CF transaction, 0 otherwise
+ * @param num_cfs number of column families (only used if is_multi_cf)
+ * @param checksum xxhash32 checksum of entry data
+ * @return pointer to end of written data
+ */
+static inline uint8_t *serialize_wal_batch_header(uint8_t *ptr, uint32_t num_entries,
+                                                  uint64_t base_seq, int is_multi_cf,
+                                                  uint8_t num_cfs, uint32_t checksum)
+{
+    /* version */
+    *ptr++ = TDB_WAL_VERSION;
+
+    /* batch flags */
+    uint8_t batch_flags = is_multi_cf ? TDB_WAL_BATCH_FLAG_MULTI_CF : 0;
+    *ptr++ = batch_flags;
+
+    /* num_entries */
+    ptr = encode_varint32(ptr, num_entries);
+
+    /* base_seq */
+    ptr = encode_varint64(ptr, base_seq);
+
+    /* num_cfs (only for multi-CF) */
+    if (is_multi_cf)
+    {
+        *ptr++ = num_cfs;
+    }
+
+    /* checksum */
+    encode_uint32_le_compat(ptr, checksum);
+    ptr += 4;
+
+    return ptr;
+}
+
+/*
+ * serialize_wal_entry_compact
+ * serialize a single WAL entry in compact format
+ * @param ptr output buffer
+ * @param flags entry flags (tombstone, has_ttl)
+ * @param seq_delta delta from base sequence
+ * @param key key data
+ * @param key_size key size
+ * @param value value data (can be NULL if value_size is 0)
+ * @param value_size value size
+ * @param ttl time-to-live (only written if flags has HAS_TTL)
+ * @return pointer to end of written data
+ */
+static inline uint8_t *serialize_wal_entry_compact(uint8_t *ptr, uint8_t flags, uint64_t seq_delta,
+                                                   const uint8_t *key, uint32_t key_size,
+                                                   const uint8_t *value, uint32_t value_size,
+                                                   int64_t ttl)
+{
+    /* flags */
+    *ptr++ = flags;
+
+    /* seq_delta */
+    ptr = encode_varint64(ptr, seq_delta);
+
+    /* key_size */
+    ptr = encode_varint32(ptr, key_size);
+
+    /* value_size */
+    ptr = encode_varint32(ptr, value_size);
+
+    /* ttl (only if HAS_TTL flag set) */
+    if (flags & 0x02) /* TDB_KV_FLAG_HAS_TTL */
+    {
+        ptr = encode_varint64(ptr, (uint64_t)ttl);
+    }
+
+    /* key */
+    memcpy(ptr, key, key_size);
+    ptr += key_size;
+
+    /* value */
+    if (value_size > 0 && value)
+    {
+        memcpy(ptr, value, value_size);
+        ptr += value_size;
+    }
+
+    return ptr;
+}
+
+/*
+ * deserialize_wal_batch_header
+ * deserialize the batch-level header for compact WAL format
+ * @param ptr input buffer
+ * @param end end of input buffer
+ * @param num_entries output number of entries
+ * @param base_seq output base sequence number
+ * @param is_multi_cf output 1 if multi-CF, 0 otherwise
+ * @param num_cfs output number of CFs (only valid if is_multi_cf)
+ * @param checksum output checksum
+ * @return pointer to next data, or NULL on error
+ */
+static inline const uint8_t *deserialize_wal_batch_header(const uint8_t *ptr, const uint8_t *end,
+                                                          uint32_t *num_entries, uint64_t *base_seq,
+                                                          int *is_multi_cf, uint8_t *num_cfs,
+                                                          uint32_t *checksum)
+{
+    if (ptr >= end) return NULL;
+
+    /* version */
+    uint8_t version = *ptr++;
+    if (version != TDB_WAL_VERSION) return NULL;
+
+    /* batch flags */
+    if (ptr >= end) return NULL;
+    uint8_t batch_flags = *ptr++;
+    *is_multi_cf = (batch_flags & TDB_WAL_BATCH_FLAG_MULTI_CF) ? 1 : 0;
+
+    /* num_entries */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, num_entries);
+    if (!ptr) return NULL;
+
+    /* base_seq */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint64(ptr, base_seq);
+    if (!ptr) return NULL;
+
+    /* num_cfs (only for multi-CF) */
+    if (*is_multi_cf)
+    {
+        if (ptr >= end) return NULL;
+        *num_cfs = *ptr++;
+    }
+    else
+    {
+        *num_cfs = 0;
+    }
+
+    /* checksum */
+    if (ptr + 4 > end) return NULL;
+    *checksum = decode_uint32_le_compat(ptr);
+    ptr += 4;
+
+    return ptr;
+}
+
+/*
+ * deserialize_wal_entry_compact
+ * deserialize a single WAL entry in compact format
+ * @param ptr input buffer
+ * @param end end of input buffer
+ * @param flags output flags
+ * @param seq_delta output sequence delta
+ * @param key_size output key size
+ * @param value_size output value size
+ * @param key_out output pointer to key data
+ * @param value_out output pointer to value data
+ * @param ttl output TTL (only valid if flags has HAS_TTL)
+ * @return pointer to next entry, or NULL on error
+ */
+static inline const uint8_t *deserialize_wal_entry_compact(const uint8_t *ptr, const uint8_t *end,
+                                                           uint8_t *flags, uint64_t *seq_delta,
+                                                           uint32_t *key_size, uint32_t *value_size,
+                                                           const uint8_t **key_out,
+                                                           const uint8_t **value_out, int64_t *ttl)
+{
+    /* flags */
+    if (ptr >= end) return NULL;
+    *flags = *ptr++;
+
+    /* seq_delta */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint64(ptr, seq_delta);
+    if (!ptr) return NULL;
+
+    /* key_size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, key_size);
+    if (!ptr || ptr + *key_size > end) return NULL;
+
+    /* value_size */
+    if (ptr >= end) return NULL;
+    ptr = decode_varint32(ptr, value_size);
+    if (!ptr || ptr + *value_size > end) return NULL;
+
+    /* ttl (only if HAS_TTL flag set) */
+    if (*flags & 0x02) /* TDB_KV_FLAG_HAS_TTL */
+    {
+        if (ptr >= end) return NULL;
+        uint64_t ttl_u64;
+        ptr = decode_varint64(ptr, &ttl_u64);
+        if (!ptr) return NULL;
+        *ttl = (int64_t)ttl_u64;
+    }
+    else
+    {
+        *ttl = 0;
+    }
+
+    /* key */
+    if (ptr + *key_size > end) return NULL;
+    *key_out = ptr;
+    ptr += *key_size;
+
+    /* value */
+    if (*value_size > 0)
+    {
+        if (ptr + *value_size > end) return NULL;
+        *value_out = ptr;
+        ptr += *value_size;
+    }
+    else
+    {
+        *value_out = NULL;
+    }
+
+    return ptr;
+}
+
+/*
+ * calculate_wal_batch_header_size
+ * calculate size needed for a WAL batch header in compact format
+ * @param num_entries number of entries
+ * @param base_seq base sequence number
+ * @param is_multi_cf 1 if multi-CF transaction
+ * @return header size in bytes
+ */
+static inline size_t calculate_wal_batch_header_size(uint32_t num_entries, uint64_t base_seq,
+                                                     int is_multi_cf)
+{
+    /* header size */
+    size_t size = 1;                  /* version */
+    size += 1;                        /* batch_flags */
+    size += varint_size(num_entries); /* num_entries */
+    size += varint_size(base_seq);    /* base_seq */
+    if (is_multi_cf) size += 1;       /* num_cfs */
+    size += 4;                        /* checksum */
+
+    return size;
+}
+
 #endif /* __COMPAT_H__ */

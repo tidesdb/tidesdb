@@ -7741,7 +7741,9 @@ static void test_concurrent_batched_transactions(void)
     ASSERT_EQ(final_ops, TOTAL_EXPECTED_KEYS);
 
     printf("  checking CF state...\n");
-    skip_list_t *active_mt = cf->active_memtable;
+    tidesdb_memtable_t *active_mt_wrapper =
+        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
     int active_entries = skip_list_count_entries(active_mt);
     size_t active_size = skip_list_get_size(active_mt);
     size_t imm_count = queue_size(cf->immutable_memtables);
@@ -7853,7 +7855,9 @@ static void test_concurrent_batched_random_keys(void)
     ASSERT_EQ(final_ops, TOTAL_EXPECTED_KEYS);
 
     printf("  checking CF state...\n");
-    skip_list_t *active_mt = cf->active_memtable;
+    tidesdb_memtable_t *active_mt_wrapper =
+        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
     int active_entries = skip_list_count_entries(active_mt);
     size_t active_size = skip_list_get_size(active_mt);
     size_t imm_count = queue_size(cf->immutable_memtables);
@@ -9311,7 +9315,8 @@ static void test_multiple_databases_concurrent_operations(void)
     printf("  checking database states...\n");
     for (int i = 0; i < NUM_DATABASES; i++)
     {
-        skip_list_t *active_mt = atomic_load(&column_families[i]->active_memtable);
+        tidesdb_memtable_t *active_mt_wrapper = atomic_load(&column_families[i]->active_memtable);
+        skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
         int active_entries = skip_list_count_entries(active_mt);
         size_t imm_count = queue_size(column_families[i]->immutable_memtables);
         int num_levels = atomic_load(&column_families[i]->num_active_levels);
@@ -9354,15 +9359,19 @@ static void test_multiple_databases_concurrent_operations(void)
                            (void *)column_families[db_id]);
 
                     /* try a direct skip list lookup to see if the key exists */
-                    skip_list_t *mt = atomic_load(&column_families[db_id]->active_memtable);
+                    tidesdb_memtable_t *mt_wrapper =
+                        atomic_load(&column_families[db_id]->active_memtable);
+                    skip_list_t *mt = mt_wrapper ? mt_wrapper->memtable : NULL;
                     uint8_t *direct_value = NULL;
                     size_t direct_value_size = 0;
                     time_t ttl = 0;
                     uint8_t deleted = 0;
                     uint64_t seq = 0;
-                    int direct_result = skip_list_get_with_seq(
-                        mt, (uint8_t *)key_buf, strlen(key_buf), &direct_value, &direct_value_size,
-                        &ttl, &deleted, &seq, verify_txn->snapshot_seq, NULL, NULL);
+                    int direct_result = mt ? skip_list_get_with_seq(
+                                                 mt, (uint8_t *)key_buf, strlen(key_buf),
+                                                 &direct_value, &direct_value_size, &ttl, &deleted,
+                                                 &seq, verify_txn->snapshot_seq, NULL, NULL)
+                                           : -1;
                     printf("  db%d direct skip_list_get_with_seq: result=%d, seq=%" PRIu64
                            ", deleted=%d\n",
                            db_id, direct_result, seq, deleted);
@@ -9598,8 +9607,9 @@ static void test_simple_flush_recovery(void)
 
         if (i == 0)
         {
-            skip_list_t *active_mt =
+            tidesdb_memtable_t *active_mt_wrapper =
                 atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+            skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
             int entry_count = skip_list_count_entries(active_mt);
             printf("  Active memtable has %d entries\n", entry_count);
 
@@ -9608,9 +9618,11 @@ static void test_simple_flush_recovery(void)
             time_t debug_ttl = 0;
             uint8_t debug_deleted = 0;
             uint64_t debug_seq = 0;
-            int debug_result = skip_list_get_with_seq(
-                active_mt, (uint8_t *)key, strlen(key) + 1, &debug_value, &debug_value_size,
-                &debug_ttl, &debug_deleted, &debug_seq, UINT64_MAX, NULL, NULL);
+            int debug_result = active_mt ? skip_list_get_with_seq(
+                                               active_mt, (uint8_t *)key, strlen(key) + 1,
+                                               &debug_value, &debug_value_size, &debug_ttl,
+                                               &debug_deleted, &debug_seq, UINT64_MAX, NULL, NULL)
+                                         : -1;
             if (debug_result == 0)
             {
                 printf("  First key found in memtable! seq=%lu\n", debug_seq);
@@ -9648,8 +9660,9 @@ static void test_simple_flush_recovery(void)
         if (i == 0 && result != 0)
         {
             printf("  First read failed! Checking memtable directly...\n");
-            skip_list_t *active_mt =
+            tidesdb_memtable_t *active_mt_wrapper =
                 atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+            skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
             printf("  Active memtable has %d entries\n", skip_list_count_entries(active_mt));
 
             uint8_t *debug_value = NULL;
@@ -9657,9 +9670,11 @@ static void test_simple_flush_recovery(void)
             time_t debug_ttl = 0;
             uint8_t debug_deleted = 0;
             uint64_t debug_seq = 0;
-            int debug_result = skip_list_get_with_seq(
-                active_mt, (uint8_t *)key, strlen(key) + 1, &debug_value, &debug_value_size,
-                &debug_ttl, &debug_deleted, &debug_seq, UINT64_MAX, NULL, NULL);
+            int debug_result = active_mt ? skip_list_get_with_seq(
+                                               active_mt, (uint8_t *)key, strlen(key) + 1,
+                                               &debug_value, &debug_value_size, &debug_ttl,
+                                               &debug_deleted, &debug_seq, UINT64_MAX, NULL, NULL)
+                                         : -1;
             if (debug_result == 0)
             {
                 printf("  Key IS in active memtable! seq=%lu\n", debug_seq);
@@ -9824,7 +9839,9 @@ static void test_wal_commit_shutdown_recovery(void)
 
     /* Check database state before shutdown */
     printf("\n  Checking database state before shutdown...\n");
-    skip_list_t *active_mt = cf->active_memtable;
+    tidesdb_memtable_t *active_mt_wrapper =
+        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
     int active_entries = skip_list_count_entries(active_mt);
     size_t imm_count = queue_size(cf->immutable_memtables);
     printf("  Active memtable: %d entries\n", active_entries);
@@ -9872,7 +9889,8 @@ static void test_wal_commit_shutdown_recovery(void)
 
     printf("  Checking recovered state...\n");
 
-    active_mt = cf->active_memtable;
+    active_mt_wrapper = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
     active_entries = skip_list_count_entries(active_mt);
     imm_count = queue_size(cf->immutable_memtables);
     printf("  Active memtable: %d entries\n", active_entries);

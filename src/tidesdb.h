@@ -155,10 +155,6 @@ typedef enum
 #define TDB_ERR_INVALID_DB   -11
 #define TDB_ERR_UNKNOWN      -12
 
-#define TDB_VERSION_MAJOR 6
-#define TDB_VERSION_MINOR 0
-#define TDB_VERSION_PATCH 0
-
 /* read profiling (enable with TDB_ENABLE_READ_PROFILING) */
 #ifdef TDB_ENABLE_READ_PROFILING
 typedef struct
@@ -206,12 +202,8 @@ typedef enum
 #define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_SYNC_INTERVAL_US            128000
 
-/* configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATOR_CTX  256
-
-/* file system permissions */
-#define TDB_DIR_PERMISSIONS 0755
 
 /**
  * tidesdb_comparator_fn
@@ -340,6 +332,7 @@ typedef struct
     _Atomic(int) refcount;
     _Atomic(int) flushed;
     block_manager_t *wal;
+    tidesdb_column_family_t *cf;
 } tidesdb_memtable_t;
 
 /**
@@ -349,15 +342,14 @@ typedef struct
  * @param directory directory for column family
  * @param config column family configuration
  * @param active_memtable active memtable
- * @param immutable_memtables queue of immutable memtables being flushed
- * @param pending_commits count of in-flight commits
  * @param active_txn_buffer buffer of active transactions for ssi conflict detection
  * @param levels fixed array of disk levels
  * @param num_active_levels number of currently active disk levels
  * @param next_sstable_id next sstable id
- * @param is_compacting atomic flag indicating compaction is queued
- * @param is_flushing atomic flag indicating flush is queued
- * @param wal_rotating atomic flag indicating WAL is being rotated (blocks new commits temporarily)
+ * @param next_wal_id next wal id (always incrementing, never reused)
+ * @param is_compacting atomic flag indicating compaction is occuring for column family
+ * @param is_flushing atomic flag indicating flush is occuring for column family
+ * @param rotating atomic flag indicating memtable is being rotated (blocks new commits temporarily)
  * @param manifest manifest for column family
  * @param db parent database reference
  */
@@ -367,15 +359,14 @@ struct tidesdb_column_family_t
     char *directory;
     tidesdb_column_family_config_t config;
     _Atomic(tidesdb_memtable_t *) active_memtable;
-    queue_t *immutable_memtables;
-    _Atomic(uint64_t) pending_commits;
     buffer_t *active_txn_buffer;
     tidesdb_level_t *levels[TDB_MAX_LEVELS];
     _Atomic(int) num_active_levels;
     _Atomic(uint64_t) next_sstable_id;
+    _Atomic(uint64_t) next_wal_id;
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
-    _Atomic(int) wal_rotating;
+    _Atomic(int) rotating;
     tidesdb_manifest_t *manifest;
     tidesdb_t *db;
 };

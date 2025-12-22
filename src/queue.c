@@ -362,6 +362,73 @@ void *queue_peek_at(queue_t *queue, size_t index)
     return QUEUE_LIKELY(current != NULL) ? current->data : NULL;
 }
 
+void *queue_remove_at(queue_t *queue, size_t index)
+{
+    if (QUEUE_UNLIKELY(!queue)) return NULL;
+
+    pthread_mutex_lock(&queue->lock);
+
+    size_t size = atomic_load_explicit(&queue->size, memory_order_relaxed);
+    if (QUEUE_UNLIKELY(index >= size))
+    {
+        pthread_mutex_unlock(&queue->lock);
+        return NULL;
+    }
+
+    queue_node_t *prev = NULL;
+    queue_node_t *current = queue->head;
+
+    /* traverse to the node at index */
+    for (size_t i = 0; i < index && current != NULL; i++)
+    {
+        prev = current;
+        current = current->next;
+    }
+
+    if (QUEUE_UNLIKELY(current == NULL))
+    {
+        pthread_mutex_unlock(&queue->lock);
+        return NULL;
+    }
+
+    void *data = current->data;
+
+    /* unlink the node */
+    if (prev == NULL)
+    {
+        /* removing head */
+        queue->head = current->next;
+        atomic_store_explicit(&queue->atomic_head, queue->head, memory_order_release);
+    }
+    else
+    {
+        prev->next = current->next;
+    }
+
+    /* update tail if removing last element */
+    if (current == queue->tail)
+    {
+        queue->tail = prev;
+    }
+
+    atomic_fetch_sub_explicit(&queue->size, 1, memory_order_release);
+
+    /* return node to pool or free it */
+    if (queue->pool_size < queue->max_pool_size)
+    {
+        current->next = queue->node_pool;
+        queue->node_pool = current;
+        queue->pool_size++;
+    }
+    else
+    {
+        free(current);
+    }
+
+    pthread_mutex_unlock(&queue->lock);
+    return data;
+}
+
 void queue_free(queue_t *queue)
 {
     if (queue == NULL) return;

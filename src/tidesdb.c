@@ -158,6 +158,8 @@ typedef struct tidesdb_compaction_work_t tidesdb_compaction_work_t;
 #define TDB_MAX_KEY_VALUE_SIZE                        UINT32_MAX
 #define TDB_WAL_VERSION                               7
 #define TDB_WAL_BATCH_FLAG_MULTI_CF                   0x01
+#define TDB_FLUSH_WAIT_REF_BACKOFF_US                 5000
+#define TDB_FLUSH_WAIT_REF_MAX_ATTEMPT                1000
 
 /*
  * serialize_wal_batch_header
@@ -6362,17 +6364,6 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     /* we ensure all writes are visible before making sstable discoverable */
     atomic_thread_fence(memory_order_seq_cst);
 
-    if (klog_bm)
-    {
-        block_manager_close(klog_bm);
-        new_sst->klog_bm = NULL;
-    }
-    if (vlog_bm)
-    {
-        block_manager_close(vlog_bm);
-        new_sst->vlog_bm = NULL;
-    }
-
     /* we save metadata for logging before potentially freeing sstable */
     uint64_t sst_id = new_sst->id;
     uint64_t num_entries = new_sst->num_entries;
@@ -8030,18 +8021,6 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             block_manager_get_size(klog_bm, &new_sst->klog_size);
             block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
-            /* we close write handles before adding to level */
-            if (klog_bm)
-            {
-                block_manager_close(klog_bm);
-                new_sst->klog_bm = NULL;
-            }
-            if (vlog_bm)
-            {
-                block_manager_close(vlog_bm);
-                new_sst->vlog_bm = NULL;
-            }
-
             /* we ensure all writes are visible before making sstable discoverable */
             atomic_thread_fence(memory_order_seq_cst);
 
@@ -8690,7 +8669,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
     while (1)
     {
-        /* check for shutdown */
         if (atomic_load_explicit(&db->flush_queue->shutdown, memory_order_acquire))
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker received shutdown signal, exiting");
@@ -8723,8 +8701,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
         if (!work)
         {
-            /* no work available, wait a bit and retry */
-            usleep(10000); /* 10ms */
             continue;
         }
 
@@ -8803,21 +8779,6 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* we ensure all writes are visible before making sstable discoverable */
         atomic_thread_fence(memory_order_seq_cst);
 
-        /* we close write handles before adding to level
-         * readers will reopen files on-demand through tidesdb_sstable_ensure_open
-         * this prevents file locking issues where readers cannot open files
-         * that are still held open by the flush worker */
-        if (sst->klog_bm)
-        {
-            block_manager_close(sst->klog_bm);
-            sst->klog_bm = NULL;
-        }
-        if (sst->vlog_bm)
-        {
-            block_manager_close(sst->vlog_bm);
-            sst->vlog_bm = NULL;
-        }
-
         /* add sstable to level 1 (array index 0) */
         tidesdb_level_add_sstable(cf->levels[0], sst);
 
@@ -8887,7 +8848,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* mark immutable as flushed so reads skip it and WAL can be deleted */
         atomic_store_explicit(&imm->flushed, 1, memory_order_release);
 
-        /* flush complete - release is_flushing */
+        /* flush complete -- release is_flushing */
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
 
         /* wait for refcount to drop to 1 (only our reference remains)
@@ -8903,9 +8864,9 @@ static void *tidesdb_flush_worker_thread(void *arg)
                               cf->name, imm->id);
                 break;
             }
-            usleep(1000); /* 1ms */
+            usleep(TDB_FLUSH_WAIT_REF_BACKOFF_US);
             wait_count++;
-            if (wait_count > 5000) /* 5 second timeout */
+            if (wait_count > TDB_FLUSH_WAIT_REF_BACKOFF_US)
             {
                 TDB_DEBUG_LOG(
                     TDB_LOG_WARN, "CF '%s' timeout waiting for refcount on imm id=%d (refcount=%d)",

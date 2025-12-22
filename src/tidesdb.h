@@ -204,6 +204,7 @@ typedef enum
 
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATOR_CTX  256
+#define TDB_DIR_PERMISSIONS     0755
 
 /**
  * tidesdb_comparator_fn

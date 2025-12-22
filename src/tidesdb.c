@@ -72,7 +72,6 @@ typedef struct tidesdb_compaction_work_t tidesdb_compaction_work_t;
 #define TDB_INITIAL_TXN_CF_CAPACITY        4
 #define TDB_INITIAL_TXN_SAVEPOINT_CAPACITY 4
 #define TDB_INITIAL_BLOCK_INDEX_CAPACITY   16
-#define TDB_DIR_PERMISSIONS                0755
 
 /* create write set hash table at this many ops */
 #define TDB_TXN_WRITE_HASH_THRESHOLD 64
@@ -8787,7 +8786,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             tidesdb_sstable_unref(db, sst);
             usleep(TDB_FLUSH_RETRY_DELAY_US);
             atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
-            /* release processing flag to retry later - work stays in queue */
+            /* release processing flag to retry later -- work stays in queue */
             atomic_store_explicit(&work->processing, 0, memory_order_release);
             continue;
         }
@@ -10513,8 +10512,6 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int forc
                   "CF '%s' rotation starting: old_mt id=%d has %d entries, refcount=%d", cf->name,
                   old_mt->id, old_mt_entries, atomic_load(&old_mt->refcount));
 
-    /* with the write lock held, no new commits can start, so refcount should already be 1
-     * (only the active_memtable reference). We still check in case of edge cases. */
     int current_refcount = atomic_load_explicit(&old_mt->refcount, memory_order_acquire);
     TDB_DEBUG_LOG(TDB_LOG_DEBUG,
                   "CF '%s' rotation: old_mt id=%d refcount=%d (expected 1 with write lock held)",
@@ -12321,12 +12318,8 @@ skip_ssi_check:
 
     for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
     {
-        /* cf_memtables[cf_idx] being NULL means we already released refcount and lock
-         * in the flush path above, so only release if still holding */
         if (cf_memtables[cf_idx])
         {
-            /* use release ordering to ensure all memtable writes are visible
-             * before the flush thread sees the decremented refcount */
             atomic_fetch_sub_explicit(&cf_memtables[cf_idx]->refcount, 1, memory_order_release);
         }
     }
@@ -14203,7 +14196,6 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf,
 
     int wal_exists = (num_wal_files > 0);
 
-    /* scan WAL files to find highest WAL ID and set next_wal_id accordingly */
     uint64_t max_wal_id = 0;
     for (int i = 0; i < num_wal_files; i++)
     {

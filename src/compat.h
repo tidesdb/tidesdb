@@ -2521,21 +2521,4 @@ static inline int tdb_get_cpu_count(void)
 #endif
 }
 
-/*
- * varint_size
- * calculate exact size of varint encoding for a value
- * @param value value to encode
- * @return number of bytes needed
- */
-static inline size_t varint_size(uint64_t value)
-{
-    size_t size = 1;
-    while (value >= 0x80)
-    {
-        size++;
-        value >>= 7;
-    }
-    return size;
-}
-
 #endif /* __COMPAT_H__ */

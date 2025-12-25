@@ -30,7 +30,7 @@
 #include "queue.h"
 #include "skip_list.h"
 
-/** logging levels for TDB_DEBUG_LOG */
+/* logging levels for TDB_DEBUG_LOG */
 typedef enum
 {
     TDB_LOG_DEBUG = 0, /* general debugging info (most verbose) */
@@ -41,7 +41,7 @@ typedef enum
     TDB_LOG_NONE = 99  /* disable all logging */
 } tidesdb_log_level_t;
 
-extern int _tidesdb_log_level; /** minimum level to log (default is TDB_LOG_DEBUG) */
+extern int _tidesdb_log_level; /* minimum level to log (default is TDB_LOG_DEBUG) */
 
 #if defined(_MSC_VER)
 #define TDB_DEBUG_LOG(level, fmt, ...)                                                    \
@@ -155,7 +155,6 @@ typedef enum
 #define TDB_ERR_INVALID_DB   -11
 #define TDB_ERR_UNKNOWN      -12
 
-/* read profiling (enable with TDB_ENABLE_READ_PROFILING) */
 #ifdef TDB_ENABLE_READ_PROFILING
 typedef struct
 {
@@ -176,7 +175,7 @@ typedef struct
 
 /**
  * tidesdb_sync_mode_t
- * synchronization modes for writes
+ * synchronization modes for write ahead logging mainly.  sstable writes are sync'ed on completion.
  */
 typedef enum
 {
@@ -202,9 +201,12 @@ typedef enum
 #define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024)
 #define TDB_DEFAULT_SYNC_INTERVAL_US            128000
 
+/* configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATOR_CTX  256
-#define TDB_DIR_PERMISSIONS     0755
+
+/* file system permissions */
+#define TDB_DIR_PERMISSIONS 0755
 
 /**
  * tidesdb_comparator_fn
@@ -222,6 +224,7 @@ typedef struct tidesdb_commit_status_t tidesdb_commit_status_t;
 typedef struct tidesdb_level_t tidesdb_level_t;
 typedef struct tidesdb_sstable_t tidesdb_sstable_t;
 typedef struct tidesdb_block_index_t tidesdb_block_index_t;
+typedef struct tidesdb_memtable_t tidesdb_memtable_t;
 
 /* forward declarations for main types to allow self-referential pointers */
 typedef struct tidesdb_t tidesdb_t;
@@ -319,22 +322,23 @@ typedef struct tidesdb_config_t
 
 /**
  * tidesdb_memtable_t
- * a memtable(skiplist-wal)
- * @param id the memtable id
- * @param memtable the immutable memtable
+ * pairs a skip list and WAL together for better isolation and rotation
+ * @param skip_list the skip list data structure
+ * @param wal associated write-ahead log
+ * @param id unique identifier for this memtable
+ * @param generation generation counter for memtable rotation
  * @param refcount reference count for safe concurrent access
- * @param flushed 1 if flushed to sstable, 0 otherwise
- * @param wal the memtable wal file
+ * @param flushed flag indicating if memtable has been flushed to disk
  */
-typedef struct
+struct tidesdb_memtable_t
 {
-    int id;
-    skip_list_t *memtable;
+    skip_list_t *skip_list;
+    block_manager_t *wal;
+    uint64_t id;
+    uint64_t generation;
     _Atomic(int) refcount;
     _Atomic(int) flushed;
-    block_manager_t *wal;
-    tidesdb_column_family_t *cf;
-} tidesdb_memtable_t;
+};
 
 /**
  * tidesdb_column_family_t
@@ -342,15 +346,23 @@ typedef struct
  * @param name name of column family
  * @param directory directory for column family
  * @param config column family configuration
- * @param active_memtable active memtable
+ * @param active_memtable active memtable (paired skip list and WAL)
+ * @param immutable_memtables queue of immutable memtables being flushed
+ * @param pending_commits count of in-flight commits
  * @param active_txn_buffer buffer of active transactions for ssi conflict detection
  * @param levels fixed array of disk levels
  * @param num_active_levels number of currently active disk levels
  * @param next_sstable_id next sstable id
- * @param next_wal_id next wal id (always incrementing, never reused)
- * @param is_compacting atomic flag indicating compaction is occuring for column family
- * @param is_flushing atomic flag indicating flush is occuring for column family
- * @param rotating atomic flag indicating memtable is being rotated (blocks new commits temporarily)
+ * @param is_compacting atomic flag indicating compaction is queued
+ * @param is_flushing atomic flag indicating flush is queued
+ * @param immutable_cleanup_counter counter for batched immutable cleanup
+ * @param wal_group_buffer shared buffer for batching wal writes (lock-free group commit)
+ * @param wal_group_buffer_size current size of data in buffer (atomic)
+ * @param wal_group_buffer_capacity total capacity of buffer
+ * @param wal_group_leader atomic flag indicating a thread is leading group commit (CAS)
+ * @param wal_group_generation generation counter to detect buffer flushes (prevents race
+ * conditions)
+ * @param wal_group_writers tracks threads currently writing to buffer
  * @param manifest manifest for column family
  * @param db parent database reference
  */
@@ -360,14 +372,21 @@ struct tidesdb_column_family_t
     char *directory;
     tidesdb_column_family_config_t config;
     _Atomic(tidesdb_memtable_t *) active_memtable;
+    queue_t *immutable_memtables;
+    _Atomic(uint64_t) pending_commits;
     buffer_t *active_txn_buffer;
     tidesdb_level_t *levels[TDB_MAX_LEVELS];
     _Atomic(int) num_active_levels;
     _Atomic(uint64_t) next_sstable_id;
-    _Atomic(uint64_t) next_wal_id;
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
-    _Atomic(int) rotating;
+    _Atomic(int) immutable_cleanup_counter;
+    uint8_t *wal_group_buffer;
+    _Atomic(size_t) wal_group_buffer_size;
+    size_t wal_group_buffer_capacity;
+    _Atomic(int) wal_group_leader;
+    _Atomic(uint64_t) wal_group_generation;
+    _Atomic(int) wal_group_writers;
     tidesdb_manifest_t *manifest;
     tidesdb_t *db;
 };
@@ -395,7 +414,6 @@ struct tidesdb_column_family_t
  * @param refcount reference count for safe concurrent access
  * @param klog_bm klog block manager
  * @param vlog_bm vlog block manager
- * @param bm_opening atomic flag to prevent concurrent block manager opens
  * @param config column family configuration
  * @param marked_for_deletion flag indicating sstable is marked for deletion
  * @param last_access_time last access time for lru eviction
@@ -422,7 +440,6 @@ struct tidesdb_sstable_t
     _Atomic(int) refcount;
     block_manager_t *klog_bm;
     block_manager_t *vlog_bm;
-    _Atomic(int) bm_opening;
     tidesdb_column_family_config_t *config;
     _Atomic(int) marked_for_deletion;
     _Atomic(time_t) last_access_time;
@@ -485,7 +502,6 @@ struct tidesdb_level_t
  * @param next_txn_id global transaction id counter
  * @param global_seq global sequence counter for snapshots and commits
  * @param commit_status tracks which sequences are committed
- * @param oldest_active_seq oldest active transaction sequence for gc
  * @param active_txns_lock rwlock for active transactions list
  * @param active_txns array of active serializable transactions
  * @param num_active_txns number of active transactions
@@ -526,7 +542,6 @@ struct tidesdb_t
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
     tidesdb_commit_status_t *commit_status;
-    _Atomic(uint64_t) oldest_active_seq;
     pthread_rwlock_t active_txns_lock;
     tidesdb_txn_t **active_txns;
     int num_active_txns;
@@ -663,7 +678,6 @@ struct tidesdb_stats_t
 
 /**
  * tidesdb_default_column_family_config
- * returns default configuration for column family
  * @return default configuration for column family
  */
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void);
@@ -711,6 +725,17 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator
 /**
  * tidesdb_close
  * closes a database
+ *
+ * behavior depends on config.wait_for_txns_on_close:
+ * -- false (default) -- proceeds immediately with close. active transactions will fail
+ *   on next operation with TDB_ERR_INVALID_DB. this is the recommended behavior
+ *   used by RocksDB, LevelDB, etc. Close completes in < N-ms.
+ * -- true -- waits up to n seconds for active transactions to complete. If timeout
+ *   expires, aborts close and returns TDB_ERR_UNKNOWN. This is legacy behavior
+ *   that can cause unpredictable latency and potential deadlocks.
+ *
+ * applications should finish all transactions before calling close.
+ *
  * @param db database handle
  * @return 0 on success, -n on failure
  */

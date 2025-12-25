@@ -730,34 +730,6 @@ int block_manager_truncate(block_manager_t *bm)
     return 0;
 }
 
-int block_manager_truncate_to_offset(block_manager_t *bm, uint64_t offset)
-{
-    if (!bm) return -1;
-
-    /* ensure offset is at least past the header */
-    if (offset < BLOCK_MANAGER_HEADER_SIZE)
-    {
-        offset = BLOCK_MANAGER_HEADER_SIZE;
-    }
-
-    /* truncate file to the specified offset */
-    if (ftruncate(bm->fd, offset) != 0)
-    {
-        return -1;
-    }
-
-    /* sync to ensure truncation is durable */
-    if (fdatasync(bm->fd) != 0)
-    {
-        return -1;
-    }
-
-    /* update cached file size */
-    atomic_store(&bm->current_file_size, offset);
-
-    return 0;
-}
-
 int block_manager_cursor_at_first(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;

@@ -6744,8 +6744,9 @@ static void test_background_flush_multiple_immutable_memtables(void)
     int final_writes = atomic_load(&total_writes);
     printf("  All threads completed. Successful writes: %d/%d\n", final_writes, TOTAL_ENTRIES);
 
-    size_t immutable_count = queue_size(db->flush_queue);
-    printf("  Flush queue size (pending flushes): %zu\n", immutable_count);
+    size_t immutable_count = queue_size(cf->immutable_memtables);
+    printf("  Immutable memtables queued: %zu\n", immutable_count);
+    printf("  Flush queue size: %zu\n", queue_size(db->flush_queue));
 
     /* immutable_count may be 0 if background flush workers processed them quickly
      * this is expected behavior and not a failure, we verify data correctness below */
@@ -7740,15 +7741,14 @@ static void test_concurrent_batched_transactions(void)
     ASSERT_EQ(final_ops, TOTAL_EXPECTED_KEYS);
 
     printf("  checking CF state...\n");
-    tidesdb_memtable_t *active_mt_wrapper =
-        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
+    tidesdb_memtable_t *active_mt_struct = cf->active_memtable;
+    skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
     int active_entries = skip_list_count_entries(active_mt);
     size_t active_size = skip_list_get_size(active_mt);
-    size_t imm_count = queue_size(db->flush_queue);
+    size_t imm_count = queue_size(cf->immutable_memtables);
     int num_levels = cf->num_active_levels;
     printf("  active memtable: %d entries, %zu bytes\n", active_entries, active_size);
-    printf("  flush queue size: %zu\n", imm_count);
+    printf("  immutable memtables: %zu\n", imm_count);
     printf("  active levels: %d\n", num_levels);
     for (int i = 0; i < num_levels; i++)
     {
@@ -7854,15 +7854,14 @@ static void test_concurrent_batched_random_keys(void)
     ASSERT_EQ(final_ops, TOTAL_EXPECTED_KEYS);
 
     printf("  checking CF state...\n");
-    tidesdb_memtable_t *active_mt_wrapper =
-        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
+    tidesdb_memtable_t *active_mt_struct = cf->active_memtable;
+    skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
     int active_entries = skip_list_count_entries(active_mt);
     size_t active_size = skip_list_get_size(active_mt);
-    size_t imm_count = queue_size(db->flush_queue);
+    size_t imm_count = queue_size(cf->immutable_memtables);
     int num_levels = cf->num_active_levels;
     printf("  active memtable: %d entries, %zu bytes\n", active_entries, active_size);
-    printf("  flush queue size: %zu\n", imm_count);
+    printf("  immutable memtables: %zu\n", imm_count);
     printf("  active levels: %d\n", num_levels);
     for (int i = 0; i < num_levels; i++)
     {
@@ -8586,12 +8585,11 @@ static void test_multi_cf_concurrent_compaction(void)
 static void test_wal_corruption_recovery(void)
 {
     cleanup_test_dir();
-    const int NUM_KEYS = 200; /* increased to exceed 4KB buffer */
+    const int NUM_KEYS = 50;
 
     {
         tidesdb_t *db = create_test_db();
         tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-        cf_config.write_buffer_size = 4096; /* tiny buffer to ensure flush happens */
 
         ASSERT_EQ(tidesdb_create_column_family(db, "wal_cf", &cf_config), 0);
         tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "wal_cf");
@@ -8602,10 +8600,9 @@ static void test_wal_corruption_recovery(void)
             tidesdb_txn_t *txn = NULL;
             ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
-            char key[32], value[256];
+            char key[32], value[64];
             snprintf(key, sizeof(key), "wal_key_%03d", i);
-            /* larger value to exceed 4KB buffer */
-            snprintf(value, sizeof(value), "wal_value_%03d_padding_to_make_larger_entry", i);
+            snprintf(value, sizeof(value), "wal_value_%03d", i);
 
             ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                       strlen(value) + 1, 0),
@@ -8614,24 +8611,9 @@ static void test_wal_corruption_recovery(void)
             tidesdb_txn_free(txn);
         }
 
-        /* force flush to ensure data is in SSTable, not just WAL */
-        int flush_result = tidesdb_flush_memtable(cf);
-        if (flush_result != 0)
-        {
-            printf("WARNING: Flush returned %d, memtable might be too small\n", flush_result);
-        }
-
-        int flush_complete = 0;
-        for (int wait = 0; wait < 50 && !flush_complete; wait++)
-        {
-            usleep(100000); /* 100ms */
-            /* check if level 1 has sst */
-            if (cf->levels[0] && atomic_load(&cf->levels[0]->num_sstables) > 0)
-            {
-                flush_complete = 1;
-            }
-        }
-        ASSERT_TRUE(flush_complete); /* ensure flush completed */
+        /* flush half the data */
+        ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+        usleep(200000);
 
         /* write more data (will be in WAL only) */
         for (int i = NUM_KEYS; i < NUM_KEYS + 20; i++)
@@ -8639,9 +8621,9 @@ static void test_wal_corruption_recovery(void)
             tidesdb_txn_t *txn = NULL;
             ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
-            char key[32], value[256];
+            char key[32], value[64];
             snprintf(key, sizeof(key), "wal_key_%03d", i);
-            snprintf(value, sizeof(value), "wal_value_%03d_padding_to_make_larger_entry", i);
+            snprintf(value, sizeof(value), "wal_value_%03d", i);
 
             ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
                                       strlen(value) + 1, 0),
@@ -9018,6 +9000,7 @@ static void test_cf_lifecycle_stress(void)
             tidesdb_txn_free(txn);
         }
 
+        /* flush */
         ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
         usleep(50000);
 
@@ -9037,6 +9020,7 @@ static void test_cf_lifecycle_stress(void)
 
         tidesdb_txn_free(txn);
 
+        /* drop CF */
         ASSERT_EQ(tidesdb_drop_column_family(db, cf_name), 0);
 
         /* verify CF is gone */
@@ -9122,6 +9106,50 @@ static void test_reverse_iterator_with_tombstones(void)
 
     tidesdb_iter_free(iter);
     tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_disk_space_check_simulation(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.min_disk_space = 1024 * 1024 * 1024; /* require 1GB free */
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "disk_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "disk_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    int writes_succeeded = 0;
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        int result = tidesdb_txn_begin(db, &txn);
+        if (result != 0) break;
+
+        char key[32], value[128];
+        snprintf(key, sizeof(key), "disk_key_%03d", i);
+        snprintf(value, sizeof(value), "disk_value_%03d_with_data", i);
+
+        result = tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                 strlen(value) + 1, 0);
+
+        if (result == 0)
+        {
+            result = tidesdb_txn_commit(txn);
+            if (result == 0)
+            {
+                writes_succeeded++;
+            }
+        }
+
+        tidesdb_txn_free(txn);
+    }
+
+    /* should have written at least some data */
+    ASSERT_TRUE(writes_succeeded > 0);
+
     tidesdb_close(db);
     cleanup_test_dir();
 }
@@ -9286,7 +9314,6 @@ static void test_multiple_databases_concurrent_operations(void)
         }
     }
 
-    /* wait for all threads to complete */
     printf("  waiting for threads to complete...\n");
     for (int i = 0; i < TOTAL_THREADS; i++)
     {
@@ -9313,7 +9340,7 @@ static void test_multiple_databases_concurrent_operations(void)
     for (int i = 0; i < NUM_DATABASES; i++)
     {
         tidesdb_memtable_t *active_mt_wrapper = atomic_load(&column_families[i]->active_memtable);
-        skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
+        skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->skip_list : NULL;
         int active_entries = skip_list_count_entries(active_mt);
         size_t imm_count = queue_size(databases[i]->flush_queue);
         int num_levels = atomic_load(&column_families[i]->num_active_levels);
@@ -9358,7 +9385,7 @@ static void test_multiple_databases_concurrent_operations(void)
                     /* try a direct skip list lookup to see if the key exists */
                     tidesdb_memtable_t *mt_wrapper =
                         atomic_load(&column_families[db_id]->active_memtable);
-                    skip_list_t *mt = mt_wrapper ? mt_wrapper->memtable : NULL;
+                    skip_list_t *mt = mt_wrapper ? mt_wrapper->skip_list : NULL;
                     uint8_t *direct_value = NULL;
                     size_t direct_value_size = 0;
                     time_t ttl = 0;
@@ -9435,7 +9462,6 @@ static void test_multiple_databases_concurrent_operations(void)
         ASSERT_TRUE(databases[i]->column_families[0] == column_families[i]);
     }
 
-    /* cleanup */
     free(threads);
     free(thread_data);
 
@@ -9448,50 +9474,6 @@ static void test_multiple_databases_concurrent_operations(void)
     free(db_paths);
     free(databases);
     free(column_families);
-}
-
-static void test_disk_space_check_simulation(void)
-{
-    cleanup_test_dir();
-    tidesdb_t *db = create_test_db();
-    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.min_disk_space = 1024 * 1024 * 1024; /* require 1GB free */
-
-    ASSERT_EQ(tidesdb_create_column_family(db, "disk_cf", &cf_config), 0);
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "disk_cf");
-    ASSERT_TRUE(cf != NULL);
-
-    int writes_succeeded = 0;
-    for (int i = 0; i < 100; i++)
-    {
-        tidesdb_txn_t *txn = NULL;
-        int result = tidesdb_txn_begin(db, &txn);
-        if (result != 0) break;
-
-        char key[32], value[128];
-        snprintf(key, sizeof(key), "disk_key_%03d", i);
-        snprintf(value, sizeof(value), "disk_value_%03d_with_data", i);
-
-        result = tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                 strlen(value) + 1, 0);
-
-        if (result == 0)
-        {
-            result = tidesdb_txn_commit(txn);
-            if (result == 0)
-            {
-                writes_succeeded++;
-            }
-        }
-
-        tidesdb_txn_free(txn);
-    }
-
-    /* should have written at least some data */
-    ASSERT_TRUE(writes_succeeded > 0);
-
-    tidesdb_close(db);
-    cleanup_test_dir();
 }
 
 typedef struct
@@ -9517,256 +9499,34 @@ static void *wal_test_writer_thread(void *arg)
             continue;
         }
 
-        /* thread_id + sequence */
         char key[64];
-        snprintf(key, sizeof(key), "thread_%d_key_%08d", data->thread_id, i);
-
         char value[256];
+        snprintf(key, sizeof(key), "wal_key_t%d_%04d", data->thread_id, i);
         snprintf(value, sizeof(value),
-                 "thread_%d_value_%08d_padding_to_make_larger_"
-                 "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-                 "YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
-                 "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+                 "wal_value_thread%d_entry%04d_with_sufficient_padding_to_trigger_flushes",
                  data->thread_id, i);
 
         if (tidesdb_txn_put(txn, data->cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                            strlen(value) + 1, 0) != 0)
+                            strlen(value) + 1, 0) == 0)
         {
-            atomic_fetch_add(data->errors, 1);
-            tidesdb_txn_free(txn);
-            continue;
-        }
-
-        if (tidesdb_txn_commit(txn) != 0)
-        {
-            atomic_fetch_add(data->errors, 1);
+            if (tidesdb_txn_commit(txn) == 0)
+            {
+                atomic_fetch_add(data->completed, 1);
+            }
+            else
+            {
+                atomic_fetch_add(data->errors, 1);
+            }
         }
         else
         {
-            atomic_fetch_add(data->completed, 1);
+            atomic_fetch_add(data->errors, 1);
         }
 
         tidesdb_txn_free(txn);
-
-        if (i % 100 == 0)
-        {
-            usleep(100);
-        }
     }
 
     return NULL;
-}
-
-static void test_simple_flush_recovery(void)
-{
-    cleanup_test_dir();
-
-    tidesdb_config_t config = tidesdb_default_config();
-    config.db_path = TEST_DB_PATH;
-
-    tidesdb_t *db = NULL;
-    ASSERT_EQ(tidesdb_open(&config, &db), 0);
-    ASSERT_TRUE(db != NULL);
-
-    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 256 * 1024; /* trigger flushes */
-
-    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
-    ASSERT_TRUE(cf != NULL);
-
-    const int TOTAL_KEYS = 4000;
-
-    printf("  Writing %d keys sequentially...\n", TOTAL_KEYS);
-
-    /* Write all keys sequentially (no threads) */
-    for (int i = 0; i < TOTAL_KEYS; i++)
-    {
-        char key[64];
-        snprintf(key, sizeof(key), "key_%08d", i);
-
-        char value[256];
-        snprintf(value, sizeof(value),
-                 "value_%08d_padding_XXXXXXXXXXXXXXXXXXXXXXXX"
-                 "YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
-                 "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
-                 i);
-
-        tidesdb_txn_t *txn = NULL;
-        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
-        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                  strlen(value) + 1, -1),
-                  0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
-        tidesdb_txn_free(txn);
-
-        if (i == 0)
-        {
-            tidesdb_memtable_t *active_mt_wrapper =
-                atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-            skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
-            int entry_count = skip_list_count_entries(active_mt);
-            printf("  Active memtable has %d entries\n", entry_count);
-
-            uint8_t *debug_value = NULL;
-            size_t debug_value_size = 0;
-            time_t debug_ttl = 0;
-            uint8_t debug_deleted = 0;
-            uint64_t debug_seq = 0;
-            int debug_result = active_mt ? skip_list_get_with_seq(
-                                               active_mt, (uint8_t *)key, strlen(key) + 1,
-                                               &debug_value, &debug_value_size, &debug_ttl,
-                                               &debug_deleted, &debug_seq, UINT64_MAX, NULL, NULL)
-                                         : -1;
-            if (debug_result == 0)
-            {
-                printf("  First key found in memtable! seq=%lu\n", debug_seq);
-                free(debug_value);
-            }
-            else
-            {
-                printf("  First key NOT found in memtable!\n");
-            }
-        }
-    }
-
-    printf("  Write complete: %d keys written\n", TOTAL_KEYS);
-
-    /* Read all keys back before shutdown */
-    printf("  Verifying all keys are readable before shutdown...\n");
-
-    uint64_t global_seq_before = atomic_load_explicit(&db->global_seq, memory_order_acquire);
-    printf("  global_seq before verification = %lu\n", global_seq_before);
-
-    int found_before = 0;
-    for (int i = 0; i < TOTAL_KEYS; i++)
-    {
-        char key[64];
-        snprintf(key, sizeof(key), "key_%08d", i);
-
-        tidesdb_txn_t *txn = NULL;
-        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
-
-        uint8_t *value = NULL;
-        size_t value_size = 0;
-        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
-
-        /* Debug first failure */
-        if (i == 0 && result != 0)
-        {
-            printf("  First read failed! Checking memtable directly...\n");
-            tidesdb_memtable_t *active_mt_wrapper =
-                atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-            skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
-            printf("  Active memtable has %d entries\n", skip_list_count_entries(active_mt));
-
-            uint8_t *debug_value = NULL;
-            size_t debug_value_size = 0;
-            time_t debug_ttl = 0;
-            uint8_t debug_deleted = 0;
-            uint64_t debug_seq = 0;
-            int debug_result = active_mt ? skip_list_get_with_seq(
-                                               active_mt, (uint8_t *)key, strlen(key) + 1,
-                                               &debug_value, &debug_value_size, &debug_ttl,
-                                               &debug_deleted, &debug_seq, UINT64_MAX, NULL, NULL)
-                                         : -1;
-            if (debug_result == 0)
-            {
-                printf("  Key IS in active memtable! seq=%lu\n", debug_seq);
-                free(debug_value);
-            }
-            else
-            {
-                printf("  Key NOT in active memtable, checking flush queue...\n");
-                size_t imm_count = queue_size(db->flush_queue);
-                printf("  %zu items in flush queue\n", imm_count);
-            }
-        }
-
-        if (result == 0 && value != NULL)
-        {
-            found_before++;
-            free(value);
-        }
-        else if (i < 10)
-        {
-            printf("  WARNING: Missing key before shutdown: %s\n", key);
-        }
-
-        tidesdb_txn_free(txn);
-    }
-
-    printf("  Found %d/%d keys before shutdown\n", found_before, TOTAL_KEYS);
-    ASSERT_EQ(found_before, TOTAL_KEYS);
-
-    /* Close database */
-    printf("  Closing database...\n");
-    ASSERT_EQ(tidesdb_close(db), 0);
-    printf("  Shutdown complete!\n\n");
-
-    /* Reopen database */
-    printf("  Reopening database to test recovery...\n");
-    db = NULL;
-    ASSERT_EQ(tidesdb_open(&config, &db), 0);
-    ASSERT_TRUE(db != NULL);
-
-    cf = tidesdb_get_column_family(db, "test_cf");
-    ASSERT_TRUE(cf != NULL);
-    printf("  Database reopened successfully!\n");
-
-    /* Verify all keys after recovery */
-    printf("  Verifying all %d keys are readable after recovery...\n", TOTAL_KEYS);
-    int found_after = 0;
-    int missing_after = 0;
-
-    for (int i = 0; i < TOTAL_KEYS; i++)
-    {
-        char key[64];
-        snprintf(key, sizeof(key), "key_%08d", i);
-
-        tidesdb_txn_t *txn = NULL;
-        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
-
-        uint8_t *value = NULL;
-        size_t value_size = 0;
-        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
-
-        if (result == 0 && value != NULL)
-        {
-            found_after++;
-            free(value);
-        }
-        else
-        {
-            missing_after++;
-            if (missing_after <= 10)
-            {
-                printf("  WARNING: Missing key after recovery: %s\n", key);
-            }
-        }
-
-        tidesdb_txn_free(txn);
-    }
-
-    printf("\n  Verification complete!\n");
-    printf("  Found keys: %d\n", found_after);
-    printf("  Missing keys: %d\n", missing_after);
-    printf("  Expected keys: %d\n", TOTAL_KEYS);
-
-    if (missing_after > 0)
-    {
-        printf(BOLDRED "  FAILURE: Data loss detected! %d keys missing!\n" RESET, missing_after);
-    }
-    else
-    {
-        printf(BOLDGREEN "  SUCCESS: All keys recovered correctly!\n" RESET);
-    }
-
-    ASSERT_EQ(missing_after, 0);
-    ASSERT_EQ(found_after, TOTAL_KEYS);
-
-    ASSERT_EQ(tidesdb_close(db), 0);
-    cleanup_test_dir();
 }
 
 static void test_wal_commit_shutdown_recovery(void)
@@ -9792,7 +9552,7 @@ static void test_wal_commit_shutdown_recovery(void)
     ASSERT_TRUE(cf != NULL);
 
     const int NUM_THREADS = 4;
-    const int KEYS_PER_THREAD = 100;
+    const int KEYS_PER_THREAD = 500;
     const int TOTAL_KEYS = NUM_THREADS * KEYS_PER_THREAD;
 
     printf("  Threads: %d, Keys per thread: %d, Total keys: %d\n", NUM_THREADS, KEYS_PER_THREAD,
@@ -9829,15 +9589,14 @@ static void test_wal_commit_shutdown_recovery(void)
     int final_errors = atomic_load(&errors);
 
     printf("  Write complete: %d keys committed, %d errors\n", final_completed, final_errors);
-    /* Note: Some commits may fail if they happen during shutdown - this is expected */
-    printf("  Expected commits: %d, Actual commits: %d\n", TOTAL_KEYS, final_completed);
-    ASSERT_TRUE(final_completed > 0); /* At least some keys should commit */
 
-    /* Check database state before shutdown */
+    printf("  Expected commits: %d, Actual commits: %d\n", TOTAL_KEYS, final_completed);
+    ASSERT_TRUE(final_completed > 0);
+
     printf("\n  Checking database state before shutdown...\n");
     tidesdb_memtable_t *active_mt_wrapper =
         atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
+    skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->skip_list : NULL;
     int active_entries = skip_list_count_entries(active_mt);
     size_t imm_count = queue_size(db->flush_queue);
     printf("  Active memtable: %d entries\n", active_entries);
@@ -9865,7 +9624,6 @@ static void test_wal_commit_shutdown_recovery(void)
     cf = tidesdb_get_column_family(db, "test_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* Wait for background flushes from WAL recovery to complete */
     printf("  Waiting for background flushes to complete...\n");
     int wait_count = 0;
     while (queue_size(db->flush_queue) > 0 && wait_count < 50)
@@ -9886,7 +9644,7 @@ static void test_wal_commit_shutdown_recovery(void)
     printf("  Checking recovered state...\n");
 
     active_mt_wrapper = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    active_mt = active_mt_wrapper ? active_mt_wrapper->memtable : NULL;
+    active_mt = active_mt_wrapper ? active_mt_wrapper->skip_list : NULL;
     active_entries = skip_list_count_entries(active_mt);
     imm_count = queue_size(db->flush_queue);
     printf("  Active memtable: %d entries\n", active_entries);
@@ -9926,7 +9684,7 @@ static void test_wal_commit_shutdown_recovery(void)
         for (int i = 0; i < KEYS_PER_THREAD; i++)
         {
             char key[64];
-            snprintf(key, sizeof(key), "thread_%d_key_%08d", tid, i);
+            snprintf(key, sizeof(key), "wal_key_t%d_%04d", tid, i);
 
             tidesdb_txn_t *txn = NULL;
             ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
@@ -9946,7 +9704,7 @@ static void test_wal_commit_shutdown_recovery(void)
             {
                 missing_keys++;
                 if (missing_keys <= 10)
-                { /* Only print first 10 missing keys */
+                {
                     printf("  WARNING: Missing key: %s\n", key);
                 }
             }
@@ -9954,7 +9712,6 @@ static void test_wal_commit_shutdown_recovery(void)
             tidesdb_txn_free(txn);
         }
 
-        /* Progress indicator */
         if ((tid + 1) % (NUM_THREADS / 4) == 0 || tid == NUM_THREADS - 1)
         {
             printf("  Progress: %d/%d threads verified (%d keys found so far)\n", tid + 1,
@@ -9968,7 +9725,6 @@ static void test_wal_commit_shutdown_recovery(void)
     printf("  Total attempted: %d\n", TOTAL_KEYS);
     printf("  Successfully committed before shutdown: %d\n", final_completed);
 
-    /* The critical invariant: all successfully committed keys MUST be recovered */
     if (found_keys == final_completed)
     {
         printf(BOLDGREEN "  SUCCESS: All committed keys recovered correctly!\n" RESET);
@@ -9979,7 +9735,6 @@ static void test_wal_commit_shutdown_recovery(void)
                final_completed, found_keys);
     }
 
-    /* Verify no data loss: all committed keys must be recovered */
     ASSERT_EQ(found_keys, final_completed);
 
     printf("\n  Testing iteration after recovery...\n");
@@ -10011,130 +9766,6 @@ static void test_wal_commit_shutdown_recovery(void)
     cleanup_test_dir();
 }
 
-static void test_sstable_reaper_block_manager_leak(void)
-{
-    cleanup_test_dir();
-
-    tidesdb_config_t config = tidesdb_default_config();
-    config.db_path = TEST_DB_PATH;
-    config.max_open_sstables = 5; /* very low to force frequent reaping */
-    config.num_flush_threads = 2;
-    config.num_compaction_threads = 2;
-
-    tidesdb_t *db = NULL;
-    ASSERT_EQ(tidesdb_open(&config, &db), 0);
-    ASSERT_TRUE(db != NULL);
-
-    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
-    cf_config.write_buffer_size = 1024 * 64;
-    cf_config.enable_bloom_filter = 1;
-    cf_config.enable_block_indexes = 1;
-
-    ASSERT_EQ(tidesdb_create_column_family(db, "reaper_test_cf", &cf_config), 0);
-    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "reaper_test_cf");
-    ASSERT_TRUE(cf != NULL);
-
-    printf("\n  Writing keys to create many SSTables...\n");
-
-    /* write many keys to create multiple sstables (more than max_open_sstables) */
-    int num_keys = 500;
-    for (int i = 0; i < num_keys; i++)
-    {
-        tidesdb_txn_t *txn = NULL;
-        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
-
-        char key[64], value[128];
-        snprintf(key, sizeof(key), "reaper_key_%06d", i);
-        snprintf(value, sizeof(value), "reaper_value_%06d_with_some_extra_data_to_fill_buffer", i);
-
-        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                  strlen(value) + 1, 0),
-                  0);
-        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
-        tidesdb_txn_free(txn);
-
-        /* flush every 50 keys to create multiple sstables */
-        if ((i + 1) % 50 == 0)
-        {
-            tidesdb_flush_memtable(cf);
-            usleep(10000); /* small delay to allow flush to complete */
-            printf("  Flushed at key %d\n", i + 1);
-        }
-    }
-
-    /* wait for all flushes to complete */
-    printf("  Waiting for flushes to complete...\n");
-    for (int i = 0; i < 100; i++)
-    {
-        usleep(10000);
-        if (queue_size(db->flush_queue) == 0) break;
-    }
-    usleep(100000); /* extra wait for sstables to be added to levels */
-
-    printf("  Starting stress test with concurrent reads...\n");
-
-    /* now perform many reads to stress test the reaper/reader race condition
-     * this should trigger the reaper to close block managers while readers are trying to open them
-     */
-    for (int round = 0; round < 10; round++)
-    {
-        printf("  Read round %d/10...\n", round + 1);
-
-        tidesdb_txn_t *txn = NULL;
-        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
-
-        /* read keys in random order to maximize sstable access patterns */
-        for (int i = 0; i < num_keys; i += 5) /* read every 5th key */
-        {
-            char key[64];
-            int key_idx = (i * 7) % num_keys; /* pseudo-random access pattern */
-            snprintf(key, sizeof(key), "reaper_key_%06d", key_idx);
-
-            uint8_t *value = NULL;
-            size_t value_size = 0;
-            int result =
-                tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
-
-            ASSERT_EQ(result, 0);
-            ASSERT_TRUE(value != NULL);
-            free(value);
-        }
-
-        tidesdb_txn_free(txn);
-
-        usleep(150000);
-    }
-
-    printf("  Stress test completed successfully\n");
-
-    printf("  Final verification of all keys...\n");
-    tidesdb_txn_t *txn = NULL;
-    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
-
-    for (int i = 0; i < num_keys; i++)
-    {
-        char key[64], expected[128];
-        snprintf(key, sizeof(key), "reaper_key_%06d", i);
-        snprintf(expected, sizeof(expected),
-                 "reaper_value_%06d_with_some_extra_data_to_fill_buffer", i);
-
-        uint8_t *value = NULL;
-        size_t value_size = 0;
-        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
-
-        ASSERT_EQ(result, 0);
-        ASSERT_TRUE(value != NULL);
-        ASSERT_TRUE(strcmp((char *)value, expected) == 0);
-        free(value);
-    }
-
-    tidesdb_txn_free(txn);
-    printf("  All keys verified successfully\n");
-
-    tidesdb_close(db);
-    cleanup_test_dir();
-}
-
 int main(void)
 {
     cleanup_test_dir();
@@ -10145,7 +9776,6 @@ int main(void)
     RUN_TEST(test_txn_delete, tests_passed);
     RUN_TEST(test_txn_rollback, tests_passed);
     RUN_TEST(test_multiple_column_families, tests_passed);
-    RUN_TEST(test_sstable_reaper_block_manager_leak, tests_passed);
     RUN_TEST(test_memtable_flush, tests_passed);
     RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
     RUN_TEST(test_persistence_and_recovery, tests_passed);
@@ -10257,11 +9887,13 @@ int main(void)
     RUN_TEST(test_many_sstables_with_block_indexes_cached, tests_passed);
     RUN_TEST(test_many_sstables_with_lz4_compression_cached, tests_passed);
     RUN_TEST(test_many_sstables_with_zstd_compression_cached, tests_passed);
+
 #ifndef __sun
     RUN_TEST(test_many_sstables_with_snappy_compression, tests_passed);
     RUN_TEST(test_many_sstables_with_snappy_compression_cached, tests_passed);
     RUN_TEST(test_compression_snappy, tests_passed);
 #endif
+
     RUN_TEST(test_many_sstables_all_features_enabled_cached, tests_passed);
     RUN_TEST(test_many_sstables_all_features_disabled_cached, tests_passed);
     RUN_TEST(test_many_sstables_bloom_and_compression_cached, tests_passed);
@@ -10284,7 +9916,6 @@ int main(void)
     RUN_TEST(test_deadlock_random_write_then_read, tests_passed);
     RUN_TEST(test_concurrent_read_close_race, tests_passed);
     RUN_TEST(test_crash_during_flush, tests_passed);
-    RUN_TEST(test_simple_flush_recovery, tests_passed);
     RUN_TEST(test_iterator_with_concurrent_flush, tests_passed);
     RUN_TEST(test_ttl_expiration_during_compaction, tests_passed);
     RUN_TEST(test_multi_cf_concurrent_compaction, tests_passed);
@@ -10294,6 +9925,7 @@ int main(void)
     RUN_TEST(test_cf_lifecycle_stress, tests_passed);
     RUN_TEST(test_reverse_iterator_with_tombstones, tests_passed);
     RUN_TEST(test_disk_space_check_simulation, tests_passed);
+    RUN_TEST(test_basic_open_close, tests_passed);
     RUN_TEST(test_multiple_databases_concurrent_operations, tests_passed);
     RUN_TEST(test_wal_commit_shutdown_recovery, tests_passed);
 

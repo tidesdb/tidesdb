@@ -29,7 +29,7 @@
 #define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF
 
 /* block manager version */
-#define BLOCK_MANAGER_VERSION 7
+#define BLOCK_MANAGER_VERSION 6
 
 /* header field sizes */
 /* magic number size in bytes */
@@ -260,16 +260,6 @@ void *block_manager_fsync_thread(void *arg);
  * @return 0 if successful, -1 if not
  */
 int block_manager_truncate(block_manager_t *bm);
-
-/**
- * block_manager_truncate_to_offset
- * truncates a block manager to a specific offset (checkpoint-based truncation)
- * preserves data from the offset onwards while removing earlier data
- * @param bm the block manager to truncate
- * @param offset the file offset to truncate to (must be >= BLOCK_MANAGER_HEADER_SIZE)
- * @return 0 if successful, -1 if not
- */
-int block_manager_truncate_to_offset(block_manager_t *bm, uint64_t offset);
 
 /**
  * block_manager_last_modified

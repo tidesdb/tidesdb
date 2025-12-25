@@ -1386,11 +1386,16 @@ void test_block_manager_goto_last_after_reopen()
     (void)remove("test_reopen.db");
 }
 
+/* test concurrent writes with varying sizes to reproduce Windows WAL corruption issue.
+ * this simulates the scenario where multiple threads write blocks concurrently,
+ * causing file extension beyond current EOF, which was failing on Windows. */
 void test_block_manager_concurrent_file_extension()
 {
     block_manager_t *bm = NULL;
     ASSERT_TRUE(block_manager_open(&bm, "test_concurrent_ext.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
+    /* write blocks with varying sizes that will cause file extension.
+     * this mimics the WAL scenario where entries have different sizes. */
     const int num_blocks = 50;
     char **expected_data = malloc(num_blocks * sizeof(char *));
     size_t *expected_sizes = malloc(num_blocks * sizeof(size_t));

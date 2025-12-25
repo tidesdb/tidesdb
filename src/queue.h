@@ -151,16 +151,6 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
 void *queue_peek_at(queue_t *queue, size_t index);
 
 /**
- * queue_remove_at
- * remove item at specific index from queue
- * index 0 is head (oldest), index size-1 is tail (newest)
- * @param queue the queue
- * @param index the index to remove
- * @return pointer to removed data, NULL if index out of bounds or error
- */
-void *queue_remove_at(queue_t *queue, size_t index);
-
-/**
  * queue_free
  * free the queue structure (does not free the data pointers)
  * @param queue the queue to free

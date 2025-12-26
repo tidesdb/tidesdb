@@ -11072,6 +11072,9 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     atomic_init(&immutable->flushed, 0);  /* not yet flushed */
     queue_enqueue(cf->immutable_memtables, immutable);
 
+    /* free the old memtable wrapper structure (skip_list and wal are now owned by immutable) */
+    if (old_mt) free(old_mt);
+
     TDB_DEBUG_LOG(TDB_LOG_INFO,
                   "CF '%s' memtable swapped, allocating flush work for SSTable %" PRIu64, cf->name,
                   sst_id);

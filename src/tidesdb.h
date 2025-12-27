@@ -149,17 +149,11 @@ typedef enum
 #define TDB_ERR_CORRUPTION   -5
 #define TDB_ERR_EXISTS       -6
 #define TDB_ERR_CONFLICT     -7
-#define TDB_ERR_OVERFLOW     -8
-#define TDB_ERR_TOO_LARGE    -9
-#define TDB_ERR_MEMORY_LIMIT -10
-#define TDB_ERR_INVALID_DB   -11
-#define TDB_ERR_UNKNOWN      -12
+#define TDB_ERR_TOO_LARGE    -8
+#define TDB_ERR_MEMORY_LIMIT -9
+#define TDB_ERR_INVALID_DB   -10
+#define TDB_ERR_UNKNOWN      -11
 
-#define TDB_VERSION_MAJOR 6
-#define TDB_VERSION_MINOR 0
-#define TDB_VERSION_PATCH 0
-
-/* read profiling (enable with TDB_ENABLE_READ_PROFILING) */
 #ifdef TDB_ENABLE_READ_PROFILING
 typedef struct
 {
@@ -197,7 +191,7 @@ typedef enum
 #define TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE 2
 #define TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE      2
 #define TDB_DEFAULT_BLOOM_FPR                   0.01
-#define TDB_DEFAULT_KLOG_VALUE_THRESHOLD        1024 * 4
+#define TDB_DEFAULT_KLOG_VALUE_THRESHOLD        (1024 * 4)
 #define TDB_DEFAULT_INDEX_SAMPLE_RATIO          1
 #define TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN      16
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024)
@@ -229,6 +223,7 @@ typedef struct tidesdb_commit_status_t tidesdb_commit_status_t;
 typedef struct tidesdb_level_t tidesdb_level_t;
 typedef struct tidesdb_sstable_t tidesdb_sstable_t;
 typedef struct tidesdb_block_index_t tidesdb_block_index_t;
+typedef struct tidesdb_memtable_t tidesdb_memtable_t;
 
 /* forward declarations for main types to allow self-referential pointers */
 typedef struct tidesdb_t tidesdb_t;
@@ -285,6 +280,8 @@ typedef struct tidesdb_column_family_config_t
     float skip_list_probability;
     tidesdb_isolation_level_t default_isolation_level;
     uint64_t min_disk_space;
+    int l1_file_count_trigger;
+    int l0_queue_stall_threshold;
 } tidesdb_column_family_config_t;
 
 /**
@@ -313,8 +310,6 @@ typedef struct tidesdb_comparator_entry_t
  * TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE)
  * @param block_cache_size size of clock cache for hot sstable blocks
  * @param max_open_sstables maximum number of open sstables
- * @param wait_for_txns_on_close if true, wait up to defined time for active transactions on close
- *                                if false (default), close immediately and fail active transactions
  */
 typedef struct tidesdb_config_t
 {
@@ -324,8 +319,27 @@ typedef struct tidesdb_config_t
     tidesdb_log_level_t log_level;
     size_t block_cache_size;
     size_t max_open_sstables;
-    int wait_for_txns_on_close;
 } tidesdb_config_t;
+
+/**
+ * tidesdb_memtable_t
+ * pairs a skip list and WAL together for better isolation and rotation
+ * @param skip_list the skip list data structure
+ * @param wal associated write-ahead log
+ * @param id unique identifier for this memtable
+ * @param generation generation counter for memtable rotation
+ * @param refcount reference count for safe concurrent access
+ * @param flushed flag indicating if memtable has been flushed to disk
+ */
+struct tidesdb_memtable_t
+{
+    skip_list_t *skip_list;
+    block_manager_t *wal;
+    uint64_t id;
+    uint64_t generation;
+    _Atomic(int) refcount;
+    _Atomic(int) flushed;
+};
 
 /**
  * tidesdb_column_family_t
@@ -333,10 +347,7 @@ typedef struct tidesdb_config_t
  * @param name name of column family
  * @param directory directory for column family
  * @param config column family configuration
- * @param active_memtable active memtable
- * @param memtable_id id of active memtable
- * @param memtable_generation generation counter for memtable rotation
- * @param active_wal active write-ahead log
+ * @param active_memtable active memtable (paired skip list and WAL)
  * @param immutable_memtables queue of immutable memtables being flushed
  * @param pending_commits count of in-flight commits
  * @param active_txn_buffer buffer of active transactions for ssi conflict detection
@@ -346,13 +357,6 @@ typedef struct tidesdb_config_t
  * @param is_compacting atomic flag indicating compaction is queued
  * @param is_flushing atomic flag indicating flush is queued
  * @param immutable_cleanup_counter counter for batched immutable cleanup
- * @param wal_group_buffer shared buffer for batching wal writes (lock-free group commit)
- * @param wal_group_buffer_size current size of data in buffer (atomic)
- * @param wal_group_buffer_capacity total capacity of buffer
- * @param wal_group_leader atomic flag indicating a thread is leading group commit (CAS)
- * @param wal_group_generation generation counter to detect buffer flushes (prevents race
- * conditions)
- * @param wal_group_writers tracks threads currently writing to buffer
  * @param manifest manifest for column family
  * @param db parent database reference
  */
@@ -361,10 +365,7 @@ struct tidesdb_column_family_t
     char *name;
     char *directory;
     tidesdb_column_family_config_t config;
-    _Atomic(skip_list_t *) active_memtable;
-    _Atomic(uint64_t) memtable_id;
-    _Atomic(uint64_t) memtable_generation;
-    _Atomic(block_manager_t *) active_wal;
+    _Atomic(tidesdb_memtable_t *) active_memtable;
     queue_t *immutable_memtables;
     _Atomic(uint64_t) pending_commits;
     buffer_t *active_txn_buffer;
@@ -374,12 +375,6 @@ struct tidesdb_column_family_t
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
     _Atomic(int) immutable_cleanup_counter;
-    uint8_t *wal_group_buffer;
-    _Atomic(size_t) wal_group_buffer_size;
-    size_t wal_group_buffer_capacity;
-    _Atomic(int) wal_group_leader;
-    _Atomic(uint64_t) wal_group_generation;
-    _Atomic(int) wal_group_writers;
     tidesdb_manifest_t *manifest;
     tidesdb_t *db;
 };
@@ -495,7 +490,6 @@ struct tidesdb_level_t
  * @param next_txn_id global transaction id counter
  * @param global_seq global sequence counter for snapshots and commits
  * @param commit_status tracks which sequences are committed
- * @param oldest_active_seq oldest active transaction sequence for gc
  * @param active_txns_lock rwlock for active transactions list
  * @param active_txns array of active serializable transactions
  * @param num_active_txns number of active transactions
@@ -536,7 +530,6 @@ struct tidesdb_t
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;
     tidesdb_commit_status_t *commit_status;
-    _Atomic(uint64_t) oldest_active_seq;
     pthread_rwlock_t active_txns_lock;
     tidesdb_txn_t **active_txns;
     int num_active_txns;
@@ -673,14 +666,12 @@ struct tidesdb_stats_t
 
 /**
  * tidesdb_default_column_family_config
- * returns default configuration for column family
  * @return default configuration for column family
  */
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void);
 
 /**
  * tidesdb_default_config
- * returns default configuration for database
  * @return default configuration for database
  */
 tidesdb_config_t tidesdb_default_config(void);
@@ -722,17 +713,6 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator
 /**
  * tidesdb_close
  * closes a database
- *
- * behavior depends on config.wait_for_txns_on_close:
- * -- false (default) -- proceeds immediately with close. active transactions will fail
- *   on next operation with TDB_ERR_INVALID_DB. this is the recommended behavior
- *   used by RocksDB, LevelDB, etc. Close completes in < N-ms.
- * -- true -- waits up to n seconds for active transactions to complete. If timeout
- *   expires, aborts close and returns TDB_ERR_UNKNOWN. This is legacy behavior
- *   that can cause unpredictable latency and potential deadlocks.
- *
- * applications should finish all transactions before calling close.
- *
  * @param db database handle
  * @return 0 on success, -n on failure
  */
@@ -903,6 +883,15 @@ int tidesdb_txn_savepoint(tidesdb_txn_t *txn, const char *name);
  * @return 0 on success, -n on failure
  */
 int tidesdb_txn_rollback_to_savepoint(tidesdb_txn_t *txn, const char *name);
+
+/**
+ * tidesdb_txn_release_savepoint
+ * releases a savepoint without rolling back
+ * @param txn transaction handle
+ * @param name name of savepoint
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_txn_release_savepoint(tidesdb_txn_t *txn, const char *name);
 
 /**
  * tidesdb_iter_new

@@ -20,6 +20,9 @@
 #include "../src/tidesdb.h"
 #include "test_utils.h"
 
+/* test configuration constants */
+#define TEST_FLUSH_DRAIN_WAIT_INTERVAL_US 100000 /* 100ms between checks */
+
 static int tests_passed = 0;
 static int tests_failed = 0;
 
@@ -7741,7 +7744,8 @@ static void test_concurrent_batched_transactions(void)
     ASSERT_EQ(final_ops, TOTAL_EXPECTED_KEYS);
 
     printf("  checking CF state...\n");
-    skip_list_t *active_mt = cf->active_memtable;
+    tidesdb_memtable_t *active_mt_struct = cf->active_memtable;
+    skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
     int active_entries = skip_list_count_entries(active_mt);
     size_t active_size = skip_list_get_size(active_mt);
     size_t imm_count = queue_size(cf->immutable_memtables);
@@ -7853,7 +7857,8 @@ static void test_concurrent_batched_random_keys(void)
     ASSERT_EQ(final_ops, TOTAL_EXPECTED_KEYS);
 
     printf("  checking CF state...\n");
-    skip_list_t *active_mt = cf->active_memtable;
+    tidesdb_memtable_t *active_mt_struct = cf->active_memtable;
+    skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
     int active_entries = skip_list_count_entries(active_mt);
     size_t active_size = skip_list_get_size(active_mt);
     size_t imm_count = queue_size(cf->immutable_memtables);
@@ -9152,6 +9157,642 @@ static void test_disk_space_check_simulation(void)
     cleanup_test_dir();
 }
 
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int db_id;
+    int thread_id;
+    int num_operations;
+    _Atomic(int) *total_ops;
+    _Atomic(int) *errors;
+    _Atomic(int) *cross_db_errors;
+} multi_db_thread_data_t;
+
+static void *multi_db_worker_thread(void *arg)
+{
+    multi_db_thread_data_t *data = (multi_db_thread_data_t *)arg;
+    char key_buf[64];
+    char value_buf[128];
+
+    for (int i = 0; i < data->num_operations; i++)
+    {
+        /* create unique keys per database and thread */
+        snprintf(key_buf, sizeof(key_buf), "db%d_thread%d_key%d", data->db_id, data->thread_id, i);
+        snprintf(value_buf, sizeof(value_buf), "db%d_thread%d_value%d", data->db_id,
+                 data->thread_id, i);
+
+        /* perform write operation */
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(data->db, &txn) != 0)
+        {
+            atomic_fetch_add(data->errors, 1);
+            continue;
+        }
+
+        if (tidesdb_txn_put(txn, data->cf, (uint8_t *)key_buf, strlen(key_buf),
+                            (uint8_t *)value_buf, strlen(value_buf), -1) != 0)
+        {
+            atomic_fetch_add(data->errors, 1);
+            tidesdb_txn_free(txn);
+            continue;
+        }
+
+        if (tidesdb_txn_commit(txn) != 0)
+        {
+            atomic_fetch_add(data->errors, 1);
+            tidesdb_txn_free(txn);
+            continue;
+        }
+
+        tidesdb_txn_free(txn);
+        atomic_fetch_add(data->total_ops, 1);
+
+        if (data->thread_id == 0 && i < 3)
+        {
+            printf("    [db%d thread%d] committed key%d\n", data->db_id, data->thread_id, i);
+        }
+
+        /* verify read from correct database */
+        tidesdb_txn_t *read_txn = NULL;
+        if (tidesdb_txn_begin(data->db, &read_txn) == 0)
+        {
+            uint8_t *read_value = NULL;
+            size_t read_value_size = 0;
+
+            if (tidesdb_txn_get(read_txn, data->cf, (uint8_t *)key_buf, strlen(key_buf),
+                                &read_value, &read_value_size) == 0)
+            {
+                /* verify value matches expected pattern */
+                if (read_value_size != strlen(value_buf) ||
+                    memcmp(read_value, value_buf, read_value_size) != 0)
+                {
+                    atomic_fetch_add(data->cross_db_errors, 1);
+                }
+                free(read_value);
+            }
+            tidesdb_txn_free(read_txn);
+        }
+    }
+
+    return NULL;
+}
+
+static void test_multiple_databases_concurrent_operations(void)
+{
+    const int NUM_DATABASES = 3;
+    const int THREADS_PER_DB = 2;
+    const int OPS_PER_THREAD = 50;
+    const int TOTAL_THREADS = NUM_DATABASES * THREADS_PER_DB;
+    const int TOTAL_EXPECTED_OPS = TOTAL_THREADS * OPS_PER_THREAD;
+
+    printf("  testing %d databases with %d threads each (%d total threads)...\n", NUM_DATABASES,
+           THREADS_PER_DB, TOTAL_THREADS);
+    printf("  operations per thread: %d, total expected: %d\n", OPS_PER_THREAD, TOTAL_EXPECTED_OPS);
+
+    /* cleanup and create separate database directories */
+    char(*db_paths)[256] = malloc(NUM_DATABASES * sizeof(*db_paths));
+    tidesdb_t **databases = malloc(NUM_DATABASES * sizeof(tidesdb_t *));
+    tidesdb_column_family_t **column_families =
+        malloc(NUM_DATABASES * sizeof(tidesdb_column_family_t *));
+
+    for (int i = 0; i < NUM_DATABASES; i++)
+    {
+        snprintf(db_paths[i], sizeof(db_paths[i]), "./test_tidesdb_multi_%d", i);
+        remove_directory(db_paths[i]);
+
+        /* create database with unique path */
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = db_paths[i];
+        config.num_flush_threads = 1;
+        config.num_compaction_threads = 1;
+
+        ASSERT_EQ(tidesdb_open(&config, &databases[i]), 0);
+        ASSERT_TRUE(databases[i] != NULL);
+
+        /* create column family for this database */
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.write_buffer_size = 4 * 1024 * 1024; /* 4MB */
+
+        char cf_name[64];
+        snprintf(cf_name, sizeof(cf_name), "test_cf_db%d", i);
+        ASSERT_EQ(tidesdb_create_column_family(databases[i], cf_name, &cf_config), 0);
+
+        column_families[i] = tidesdb_get_column_family(databases[i], cf_name);
+        ASSERT_TRUE(column_families[i] != NULL);
+
+        printf("  created database %d at %s with CF '%s' (cf=%p)\n", i, db_paths[i], cf_name,
+               (void *)column_families[i]);
+    }
+
+    /* shared counters */
+    _Atomic(int) total_ops = 0;
+    _Atomic(int) errors = 0;
+    _Atomic(int) cross_db_errors = 0;
+
+    /* allocate thread data and thread handles */
+    pthread_t *threads = (pthread_t *)malloc(TOTAL_THREADS * sizeof(pthread_t));
+    multi_db_thread_data_t *thread_data =
+        (multi_db_thread_data_t *)malloc(TOTAL_THREADS * sizeof(multi_db_thread_data_t));
+
+    /* launch threads -- each database gets THREADS_PER_DB threads */
+    printf("  launching %d threads...\n", TOTAL_THREADS);
+    int thread_idx = 0;
+    for (int db_id = 0; db_id < NUM_DATABASES; db_id++)
+    {
+        for (int t = 0; t < THREADS_PER_DB; t++)
+        {
+            thread_data[thread_idx].db = databases[db_id];
+            thread_data[thread_idx].cf = column_families[db_id];
+            thread_data[thread_idx].db_id = db_id;
+            thread_data[thread_idx].thread_id = t;
+            thread_data[thread_idx].num_operations = OPS_PER_THREAD;
+            thread_data[thread_idx].total_ops = &total_ops;
+            thread_data[thread_idx].errors = &errors;
+            thread_data[thread_idx].cross_db_errors = &cross_db_errors;
+
+            pthread_create(&threads[thread_idx], NULL, multi_db_worker_thread,
+                           &thread_data[thread_idx]);
+            thread_idx++;
+        }
+    }
+
+    printf("  waiting for threads to complete...\n");
+    for (int i = 0; i < TOTAL_THREADS; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    int final_ops = atomic_load(&total_ops);
+    int final_errors = atomic_load(&errors);
+    int final_cross_db_errors = atomic_load(&cross_db_errors);
+
+    printf("  operations complete: %d successful, %d errors, %d cross-db errors\n", final_ops,
+           final_errors, final_cross_db_errors);
+
+    /* verify no cross-database contamination */
+    ASSERT_EQ(final_cross_db_errors, 0);
+    ASSERT_EQ(final_ops, TOTAL_EXPECTED_OPS);
+
+    /* give a moment for any pending background operations */
+    printf("  waiting for background operations to settle...\n");
+    usleep(100000); /* 100ms */
+
+    /* check database state before verification */
+    printf("  checking database states...\n");
+    for (int i = 0; i < NUM_DATABASES; i++)
+    {
+        tidesdb_memtable_t *active_mt_wrapper = atomic_load(&column_families[i]->active_memtable);
+        skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->skip_list : NULL;
+        int active_entries = skip_list_count_entries(active_mt);
+        size_t imm_count = queue_size(databases[i]->flush_queue);
+        int num_levels = atomic_load(&column_families[i]->num_active_levels);
+        uint64_t global_seq = atomic_load(&databases[i]->global_seq);
+        printf("  db%d: active_memtable=%d entries, flush_queue=%zu, levels=%d, global_seq=%" PRIu64
+               "\n",
+               i, active_entries, imm_count, num_levels, global_seq);
+    }
+
+    /* verify each database has the correct keys */
+    printf("  verifying database isolation...\n");
+    for (int db_id = 0; db_id < NUM_DATABASES; db_id++)
+    {
+        tidesdb_txn_t *verify_txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(databases[db_id], &verify_txn), 0);
+        printf("  db%d verify_txn: snapshot_seq=%" PRIu64 ", isolation=%d\n", db_id,
+               verify_txn->snapshot_seq, verify_txn->isolation_level);
+
+        int keys_found = 0;
+        for (int t = 0; t < THREADS_PER_DB; t++)
+        {
+            for (int i = 0; i < OPS_PER_THREAD; i++)
+            {
+                char key_buf[64];
+                snprintf(key_buf, sizeof(key_buf), "db%d_thread%d_key%d", db_id, t, i);
+
+                uint8_t *value = NULL;
+                size_t value_size = 0;
+
+                int get_result =
+                    tidesdb_txn_get(verify_txn, column_families[db_id], (uint8_t *)key_buf,
+                                    strlen(key_buf), &value, &value_size);
+
+                /* debug first key lookup */
+                if (t == 0 && i == 0)
+                {
+                    printf("  db%d first key '%s' (len=%zu): result=%d, snapshot_seq=%" PRIu64
+                           ", cf=%p\n",
+                           db_id, key_buf, strlen(key_buf), get_result, verify_txn->snapshot_seq,
+                           (void *)column_families[db_id]);
+
+                    /* try a direct skip list lookup to see if the key exists */
+                    tidesdb_memtable_t *mt_wrapper =
+                        atomic_load(&column_families[db_id]->active_memtable);
+                    skip_list_t *mt = mt_wrapper ? mt_wrapper->skip_list : NULL;
+                    uint8_t *direct_value = NULL;
+                    size_t direct_value_size = 0;
+                    time_t ttl = 0;
+                    uint8_t deleted = 0;
+                    uint64_t seq = 0;
+                    int direct_result = mt ? skip_list_get_with_seq(
+                                                 mt, (uint8_t *)key_buf, strlen(key_buf),
+                                                 &direct_value, &direct_value_size, &ttl, &deleted,
+                                                 &seq, verify_txn->snapshot_seq, NULL, NULL)
+                                           : -1;
+                    printf("  db%d direct skip_list_get_with_seq: result=%d, seq=%" PRIu64
+                           ", deleted=%d\n",
+                           db_id, direct_result, seq, deleted);
+                    if (direct_result == 0 && direct_value) free(direct_value);
+
+                    /* print first few keys in memtable to see what's actually there */
+                    printf("  db%d memtable first 5 keys:\n", db_id);
+                    uint8_t *min_key = NULL;
+                    size_t min_key_size = 0;
+                    if (skip_list_get_min_key(mt, &min_key, &min_key_size) == 0)
+                    {
+                        printf("    min_key: '%.*s' (len=%zu)\n", (int)min_key_size, min_key,
+                               min_key_size);
+                        free(min_key);
+                    }
+                }
+
+                if (get_result == 0)
+                {
+                    keys_found++;
+                    free(value);
+                }
+            }
+        }
+
+        tidesdb_txn_free(verify_txn);
+
+        int expected_keys = THREADS_PER_DB * OPS_PER_THREAD;
+        printf("  database %d: found %d keys (expected %d)\n", db_id, keys_found, expected_keys);
+        ASSERT_EQ(keys_found, expected_keys);
+    }
+
+    /* verify no cross-contamination. check that db0 keys don't exist in db1 */
+    printf("  verifying no cross-contamination...\n");
+    tidesdb_txn_t *cross_check_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(databases[1], &cross_check_txn), 0);
+
+    char foreign_key[64];
+    snprintf(foreign_key, sizeof(foreign_key), "db0_thread0_key0");
+
+    uint8_t *foreign_value = NULL;
+    size_t foreign_value_size = 0;
+
+    /* this should fail -- db0's key should not exist in db1 */
+    int result = tidesdb_txn_get(cross_check_txn, column_families[1], (uint8_t *)foreign_key,
+                                 strlen(foreign_key), &foreign_value, &foreign_value_size);
+    ASSERT_NE(result, 0); /* should return error (key not found) */
+    ASSERT_TRUE(foreign_value == NULL);
+
+    tidesdb_txn_free(cross_check_txn);
+    printf("  cross-contamination check passed\n");
+
+    /* check database-specific state isolation */
+    printf("  checking database state isolation...\n");
+    for (int i = 0; i < NUM_DATABASES; i++)
+    {
+        /* verify each database has independent global_seq */
+        uint64_t seq = atomic_load(&databases[i]->global_seq);
+        printf("  database %d: global_seq = %" PRIu64 "\n", i, seq);
+        ASSERT_TRUE(seq > 0); /* should have advanced */
+
+        /* verify each database has independent column family list */
+        ASSERT_TRUE(databases[i]->num_column_families == 1);
+        ASSERT_TRUE(databases[i]->column_families[0] == column_families[i]);
+    }
+
+    free(threads);
+    free(thread_data);
+
+    for (int i = 0; i < NUM_DATABASES; i++)
+    {
+        ASSERT_EQ(tidesdb_close(databases[i]), 0);
+        remove_directory(db_paths[i]);
+    }
+
+    free(db_paths);
+    free(databases);
+    free(column_families);
+}
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int thread_id;
+    int num_keys;
+    _Atomic(int) *completed;
+    _Atomic(int) *errors;
+} wal_test_writer_thread_data_t;
+
+static void *wal_test_writer_thread(void *arg)
+{
+    wal_test_writer_thread_data_t *data = (wal_test_writer_thread_data_t *)arg;
+
+    for (int i = 0; i < data->num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(data->db, &txn) != 0)
+        {
+            atomic_fetch_add(data->errors, 1);
+            continue;
+        }
+
+        char key[64];
+        char value[256];
+        snprintf(key, sizeof(key), "wal_key_t%d_%04d", data->thread_id, i);
+        snprintf(value, sizeof(value),
+                 "wal_value_thread%d_entry%04d_with_sufficient_padding_to_trigger_flushes",
+                 data->thread_id, i);
+
+        if (tidesdb_txn_put(txn, data->cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                            strlen(value) + 1, 0) == 0)
+        {
+            if (tidesdb_txn_commit(txn) == 0)
+            {
+                atomic_fetch_add(data->completed, 1);
+            }
+            else
+            {
+                atomic_fetch_add(data->errors, 1);
+            }
+        }
+        else
+        {
+            atomic_fetch_add(data->errors, 1);
+        }
+
+        tidesdb_txn_free(txn);
+    }
+
+    return NULL;
+}
+
+static void test_wal_commit_shutdown_recovery(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.log_level = TDB_LOG_DEBUG;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    cf_config.write_buffer_size = 3200;
+    cf_config.enable_block_indexes = 0;
+    cf_config.enable_bloom_filter = 0;
+    cf_config.sync_mode = TDB_SYNC_FULL;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int NUM_THREADS = 4;
+    const int KEYS_PER_THREAD = 500;
+    const int TOTAL_KEYS = NUM_THREADS * KEYS_PER_THREAD;
+
+    printf("  Threads: %d, Keys per thread: %d, Total keys: %d\n", NUM_THREADS, KEYS_PER_THREAD,
+           TOTAL_KEYS);
+    printf("  Write buffer: %zu bytes (will trigger multiple flushes)\n\n",
+           cf_config.write_buffer_size);
+
+    _Atomic(int) completed = 0;
+    _Atomic(int) errors = 0;
+
+    pthread_t *threads = (pthread_t *)malloc(NUM_THREADS * sizeof(pthread_t));
+    wal_test_writer_thread_data_t *thread_data = (wal_test_writer_thread_data_t *)malloc(
+        NUM_THREADS * sizeof(wal_test_writer_thread_data_t));
+
+    printf("  Starting %d concurrent writer threads...\n", NUM_THREADS);
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        thread_data[i].db = db;
+        thread_data[i].cf = cf;
+        thread_data[i].thread_id = i;
+        thread_data[i].num_keys = KEYS_PER_THREAD;
+        thread_data[i].completed = &completed;
+        thread_data[i].errors = &errors;
+        pthread_create(&threads[i], NULL, wal_test_writer_thread, &thread_data[i]);
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    int final_completed = atomic_load(&completed);
+    int final_errors = atomic_load(&errors);
+
+    printf("  Write complete: %d keys committed, %d errors\n", final_completed, final_errors);
+
+    printf("  Expected commits: %d, Actual commits: %d\n", TOTAL_KEYS, final_completed);
+    ASSERT_TRUE(final_completed > 0);
+
+    /* wait for flush queue to drain before shutdown to avoid race condition
+     * where flush workers are still processing while tidesdb_close() frees resources */
+    printf("\n  Waiting for pending flushes to complete before shutdown...\n");
+    int wait_count = 0;
+    size_t flush_queue_size = queue_size(db->flush_queue);
+    int is_flushing = atomic_load(&cf->is_flushing);
+
+    while (flush_queue_size > 0 || is_flushing)
+    {
+        if (wait_count % 10 == 0)
+        {
+            printf("  Flush queue: %zu, is_flushing: %d (waiting...)\n", flush_queue_size,
+                   is_flushing);
+        }
+        usleep(TEST_FLUSH_DRAIN_WAIT_INTERVAL_US);
+        wait_count++;
+        flush_queue_size = queue_size(db->flush_queue);
+        is_flushing = atomic_load(&cf->is_flushing);
+    }
+
+    printf("  All pending flushes completed (waited %d × %d μs)\n", wait_count,
+           TEST_FLUSH_DRAIN_WAIT_INTERVAL_US);
+
+    printf("\n  Checking database state before shutdown...\n");
+    tidesdb_memtable_t *active_mt_wrapper =
+        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    skip_list_t *active_mt = active_mt_wrapper ? active_mt_wrapper->skip_list : NULL;
+    int active_entries = skip_list_count_entries(active_mt);
+    size_t imm_count = queue_size(db->flush_queue);
+    printf("  Active memtable: %d entries\n", active_entries);
+    printf("  Flush queue size: %zu\n", imm_count);
+    printf("  Active levels: %d\n", cf->num_active_levels);
+    for (int i = 0; i < cf->num_active_levels; i++)
+    {
+        if (cf->levels[i])
+        {
+            printf("  Level %d: %d sstables\n", i, cf->levels[i]->num_sstables);
+        }
+    }
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    printf("  Shutdown complete!\n");
+
+    printf("\n  Reopening database to test WAL recovery...\n");
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    printf("  Database reopened successfully!\n");
+
+    cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    printf("  Waiting for background flushes to complete...\n");
+    wait_count = 0;
+    while (queue_size(db->flush_queue) > 0 && wait_count < 50)
+    {
+        usleep(100000); /* 100ms */
+        wait_count++;
+    }
+    if (wait_count >= 50)
+    {
+        printf("  WARNING: Timeout waiting for flushes (flush_queue: %zu)\n",
+               queue_size(db->flush_queue));
+    }
+    else
+    {
+        printf("  Background flushes completed\n");
+    }
+
+    printf("  Checking recovered state...\n");
+
+    active_mt_wrapper = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    active_mt = active_mt_wrapper ? active_mt_wrapper->skip_list : NULL;
+    active_entries = skip_list_count_entries(active_mt);
+    imm_count = queue_size(db->flush_queue);
+    printf("  Active memtable: %d entries\n", active_entries);
+    printf("  Flush queue size: %zu\n", imm_count);
+    printf("  Active levels: %d\n", cf->num_active_levels);
+    for (int i = 0; i < cf->num_active_levels; i++)
+    {
+        if (cf->levels[i])
+        {
+            printf("  Level %d: %d sstables\n", i, cf->levels[i]->num_sstables);
+
+            for (int j = 0; j < cf->levels[i]->num_sstables; j++)
+            {
+                tidesdb_sstable_t *sst = cf->levels[i]->sstables[j];
+                if (sst)
+                {
+                    printf("    SSTable %d: id=%" PRIu64 ", entries=%" PRIu64 ", max_seq=%" PRIu64
+                           "\n",
+                           j, sst->id, sst->num_entries, sst->max_seq);
+                    if (sst->min_key && sst->max_key)
+                    {
+                        printf("      min_key: %.*s, max_key: %.*s\n", (int)sst->min_key_size,
+                               (char *)sst->min_key, (int)sst->max_key_size, (char *)sst->max_key);
+                    }
+                }
+            }
+        }
+    }
+
+    printf("\n  Verifying all %d keys are readable after recovery...\n", TOTAL_KEYS);
+
+    int found_keys = 0;
+    int missing_keys = 0;
+
+    for (int tid = 0; tid < NUM_THREADS; tid++)
+    {
+        for (int i = 0; i < KEYS_PER_THREAD; i++)
+        {
+            char key[64];
+            snprintf(key, sizeof(key), "wal_key_t%d_%04d", tid, i);
+
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+
+            int result =
+                tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+            if (result == 0 && value != NULL)
+            {
+                found_keys++;
+                free(value);
+            }
+            else
+            {
+                missing_keys++;
+                if (missing_keys <= 10)
+                {
+                    printf("  WARNING: Missing key: %s\n", key);
+                }
+            }
+
+            tidesdb_txn_free(txn);
+        }
+
+        if ((tid + 1) % (NUM_THREADS / 4) == 0 || tid == NUM_THREADS - 1)
+        {
+            printf("  Progress: %d/%d threads verified (%d keys found so far)\n", tid + 1,
+                   NUM_THREADS, found_keys);
+        }
+    }
+
+    printf("\n  Verification complete!\n");
+    printf("  Found keys: %d\n", found_keys);
+    printf("  Missing keys: %d\n", missing_keys);
+    printf("  Total attempted: %d\n", TOTAL_KEYS);
+    printf("  Successfully committed before shutdown: %d\n", final_completed);
+
+    if (found_keys == final_completed)
+    {
+        printf(BOLDGREEN "  SUCCESS: All committed keys recovered correctly!\n" RESET);
+    }
+    else
+    {
+        printf(BOLDRED "  FAILURE: Data loss detected! Expected %d, found %d\n" RESET,
+               final_completed, found_keys);
+    }
+
+    ASSERT_EQ(found_keys, final_completed);
+
+    printf("\n  Testing iteration after recovery...\n");
+
+    tidesdb_txn_t *iter_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &iter_txn), 0);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(iter_txn, cf, &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    int iter_count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        iter_count++;
+        tidesdb_iter_next(iter);
+    }
+
+    printf("  Iteration found %d keys (expected %d committed)\n", iter_count, final_completed);
+    ASSERT_EQ(iter_count, final_completed);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(iter_txn);
+
+    free(threads);
+    free(thread_data);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -9311,6 +9952,9 @@ int main(void)
     RUN_TEST(test_cf_lifecycle_stress, tests_passed);
     RUN_TEST(test_reverse_iterator_with_tombstones, tests_passed);
     RUN_TEST(test_disk_space_check_simulation, tests_passed);
+    RUN_TEST(test_basic_open_close, tests_passed);
+    RUN_TEST(test_multiple_databases_concurrent_operations, tests_passed);
+    RUN_TEST(test_wal_commit_shutdown_recovery, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

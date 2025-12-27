@@ -9546,6 +9546,7 @@ static void test_wal_commit_shutdown_recovery(void)
     cf_config.write_buffer_size = 3200;
     cf_config.enable_block_indexes = 0;
     cf_config.enable_bloom_filter = 0;
+    cf_config.sync_mode = TDB_SYNC_FULL;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");

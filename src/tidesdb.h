@@ -149,11 +149,10 @@ typedef enum
 #define TDB_ERR_CORRUPTION   -5
 #define TDB_ERR_EXISTS       -6
 #define TDB_ERR_CONFLICT     -7
-#define TDB_ERR_OVERFLOW     -8
-#define TDB_ERR_TOO_LARGE    -9
-#define TDB_ERR_MEMORY_LIMIT -10
-#define TDB_ERR_INVALID_DB   -11
-#define TDB_ERR_UNKNOWN      -12
+#define TDB_ERR_TOO_LARGE    -8
+#define TDB_ERR_MEMORY_LIMIT -9
+#define TDB_ERR_INVALID_DB   -10
+#define TDB_ERR_UNKNOWN      -11
 
 #ifdef TDB_ENABLE_READ_PROFILING
 typedef struct
@@ -281,6 +280,8 @@ typedef struct tidesdb_column_family_config_t
     float skip_list_probability;
     tidesdb_isolation_level_t default_isolation_level;
     uint64_t min_disk_space;
+    int l1_file_count_trigger;
+    int l0_queue_stall_threshold;
 } tidesdb_column_family_config_t;
 
 /**
@@ -356,13 +357,6 @@ struct tidesdb_memtable_t
  * @param is_compacting atomic flag indicating compaction is queued
  * @param is_flushing atomic flag indicating flush is queued
  * @param immutable_cleanup_counter counter for batched immutable cleanup
- * @param wal_group_buffer shared buffer for batching wal writes (lock-free group commit)
- * @param wal_group_buffer_size current size of data in buffer (atomic)
- * @param wal_group_buffer_capacity total capacity of buffer
- * @param wal_group_leader atomic flag indicating a thread is leading group commit (CAS)
- * @param wal_group_generation generation counter to detect buffer flushes (prevents race
- * conditions)
- * @param wal_group_writers tracks threads currently writing to buffer
  * @param manifest manifest for column family
  * @param db parent database reference
  */
@@ -381,12 +375,6 @@ struct tidesdb_column_family_t
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
     _Atomic(int) immutable_cleanup_counter;
-    uint8_t *wal_group_buffer;
-    _Atomic(size_t) wal_group_buffer_size;
-    size_t wal_group_buffer_capacity;
-    _Atomic(int) wal_group_leader;
-    _Atomic(uint64_t) wal_group_generation;
-    _Atomic(int) wal_group_writers;
     tidesdb_manifest_t *manifest;
     tidesdb_t *db;
 };
@@ -725,17 +713,6 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator
 /**
  * tidesdb_close
  * closes a database
- *
- * behavior depends on config.wait_for_txns_on_close:
- * -- false (default) -- proceeds immediately with close. active transactions will fail
- *   on next operation with TDB_ERR_INVALID_DB. this is the recommended behavior
- *   used by RocksDB, LevelDB, etc. Close completes in < N-ms.
- * -- true -- waits up to n seconds for active transactions to complete. If timeout
- *   expires, aborts close and returns TDB_ERR_UNKNOWN. This is legacy behavior
- *   that can cause unpredictable latency and potential deadlocks.
- *
- * applications should finish all transactions before calling close.
- *
  * @param db database handle
  * @return 0 on success, -n on failure
  */
@@ -906,6 +883,15 @@ int tidesdb_txn_savepoint(tidesdb_txn_t *txn, const char *name);
  * @return 0 on success, -n on failure
  */
 int tidesdb_txn_rollback_to_savepoint(tidesdb_txn_t *txn, const char *name);
+
+/**
+ * tidesdb_txn_release_savepoint
+ * releases a savepoint without rolling back
+ * @param txn transaction handle
+ * @param name name of savepoint
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_txn_release_savepoint(tidesdb_txn_t *txn, const char *name);
 
 /**
  * tidesdb_iter_new

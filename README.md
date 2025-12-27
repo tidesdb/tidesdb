@@ -24,7 +24,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - **Two-tier caching**
   - File handle cache with LRU eviction (default 512 open SSTables). Background reaper closes oldest unused files.
   - Block cache using partitioned CLOCK eviction (2 partitions per CPU core, default 64MB). Caches deserialized klog blocks with zero-copy API and reference bit protection.
-- **Background thread pools** for flush and compaction (default 2 threads each). Work queues distribute tasks. Compaction auto-triggers when Level 1 reaches 4 files (Spooky α parameter).
+- **Background thread pools** for flush and compaction (default 2 threads each). Work queues distribute tasks. Compaction auto-triggers when Level 1 reaches (default 4) files.
 - **Three sync modes** · `TDB_SYNC_NONE` (OS-managed), `TDB_SYNC_FULL` (fsync every write), `TDB_SYNC_INTERVAL` (periodic sync). Structural operations always enforce durability.
 - **Compression support** · LZ4, Zstd, Snappy (configurable per column family). Applied to klog and vlog blocks, not WAL.
 - **Block indexes** for fast seeks. Sample every Nth block (configurable ratio, default 1 = every block) storing prefix boundaries and file positions for binary search.

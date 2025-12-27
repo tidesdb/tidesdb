@@ -20,6 +20,9 @@
 #include "../src/tidesdb.h"
 #include "test_utils.h"
 
+/* test configuration constants */
+#define TEST_FLUSH_DRAIN_WAIT_INTERVAL_US 100000 /* 100ms between checks */
+
 static int tests_passed = 0;
 static int tests_failed = 0;
 
@@ -9594,6 +9597,29 @@ static void test_wal_commit_shutdown_recovery(void)
     printf("  Expected commits: %d, Actual commits: %d\n", TOTAL_KEYS, final_completed);
     ASSERT_TRUE(final_completed > 0);
 
+    /* wait for flush queue to drain before shutdown to avoid race condition
+     * where flush workers are still processing while tidesdb_close() frees resources */
+    printf("\n  Waiting for pending flushes to complete before shutdown...\n");
+    int wait_count = 0;
+    size_t flush_queue_size = queue_size(db->flush_queue);
+    int is_flushing = atomic_load(&cf->is_flushing);
+
+    while (flush_queue_size > 0 || is_flushing)
+    {
+        if (wait_count % 10 == 0)
+        {
+            printf("  Flush queue: %zu, is_flushing: %d (waiting...)\n", flush_queue_size,
+                   is_flushing);
+        }
+        usleep(TEST_FLUSH_DRAIN_WAIT_INTERVAL_US);
+        wait_count++;
+        flush_queue_size = queue_size(db->flush_queue);
+        is_flushing = atomic_load(&cf->is_flushing);
+    }
+
+    printf("  All pending flushes completed (waited %d × %d μs)\n", wait_count,
+           TEST_FLUSH_DRAIN_WAIT_INTERVAL_US);
+
     printf("\n  Checking database state before shutdown...\n");
     tidesdb_memtable_t *active_mt_wrapper =
         atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
@@ -9626,7 +9652,7 @@ static void test_wal_commit_shutdown_recovery(void)
     ASSERT_TRUE(cf != NULL);
 
     printf("  Waiting for background flushes to complete...\n");
-    int wait_count = 0;
+    wait_count = 0;
     while (queue_size(db->flush_queue) > 0 && wait_count < 50)
     {
         usleep(100000); /* 100ms */

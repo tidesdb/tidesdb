@@ -147,7 +147,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_NANOSECONDS_PER_SECOND      1000000000
 #define TDB_NANOSECONDS_PER_MICROSECOND 1000
 
-#define TDB_MAX_TXN_CFS  10000
+#define TDB_MAX_TXN_CFS  256
 #define TDB_MAX_PATH_LEN 4096
 #define TDB_MAX_TXN_OPS  100000
 /* similar to relational database systems like oracle, where table and column names are limited to
@@ -558,13 +558,13 @@ static int tidesdb_visibility_check_callback(void *opaque_ctx, uint64_t seq)
 }
 
 /**
- * encode_varint_v2
+ * encode_varint
  * encode uint64_t as varint (1-10 bytes)
  * @param buf output buffer (must have at least 10 bytes)
  * @param value value to encode
  * @return number of bytes written
  */
-static inline int encode_varint_v2(uint8_t *buf, uint64_t value)
+static inline int encode_varint(uint8_t *buf, uint64_t value)
 {
     int pos = 0;
     while (value >= 0x80)
@@ -577,14 +577,14 @@ static inline int encode_varint_v2(uint8_t *buf, uint64_t value)
 }
 
 /**
- * decode_varint_v2
+ * decode_varint
  * decode varint to uint64_t
  * @param buf input buffer
  * @param value output value
  * @param max_bytes maximum bytes to read (bounds check)
  * @return number of bytes read, or -1 on error
  */
-static inline int decode_varint_v2(const uint8_t *buf, uint64_t *value, int max_bytes)
+static inline int decode_varint(const uint8_t *buf, uint64_t *value, int max_bytes)
 {
     *value = 0;
     int shift = 0;
@@ -1698,14 +1698,14 @@ static int tidesdb_klog_block_add_entry(tidesdb_klog_block_t *block, const tides
 
     /* calculate actual varint sizes for key_size, value_size, seq */
     uint8_t temp_buf[10];
-    entry_size += encode_varint_v2(temp_buf, kv->entry.key_size);
-    entry_size += encode_varint_v2(temp_buf, kv->entry.value_size);
-    entry_size += encode_varint_v2(temp_buf, kv->entry.seq);
+    entry_size += encode_varint(temp_buf, kv->entry.key_size);
+    entry_size += encode_varint(temp_buf, kv->entry.value_size);
+    entry_size += encode_varint(temp_buf, kv->entry.seq);
 
     if (kv->entry.ttl != 0) entry_size += 8;
     if (kv->entry.vlog_offset != 0)
     {
-        entry_size += encode_varint_v2(temp_buf, kv->entry.vlog_offset);
+        entry_size += encode_varint(temp_buf, kv->entry.vlog_offset);
     }
 
     entry_size += kv->entry.key_size;
@@ -1878,10 +1878,10 @@ static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **o
 
         *ptr++ = flags;
 
-        ptr += encode_varint_v2(ptr, entry->key_size);
-        ptr += encode_varint_v2(ptr, entry->value_size);
+        ptr += encode_varint(ptr, entry->key_size);
+        ptr += encode_varint(ptr, entry->value_size);
 
-        ptr += encode_varint_v2(ptr, seq_value);
+        ptr += encode_varint(ptr, seq_value);
 
         if (flags & TDB_KV_FLAG_HAS_TTL)
         {
@@ -1891,7 +1891,7 @@ static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **o
 
         if (flags & TDB_KV_FLAG_HAS_VLOG)
         {
-            ptr += encode_varint_v2(ptr, entry->vlog_offset);
+            ptr += encode_varint(ptr, entry->vlog_offset);
         }
 
         memcpy(ptr, block->keys[i], entry->key_size);
@@ -1958,18 +1958,18 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         uint64_t key_size_u64, value_size_u64, seq_value;
         int bytes_read;
 
-        bytes_read = decode_varint_v2(scan_ptr, &key_size_u64, (int)scan_remaining);
+        bytes_read = decode_varint(scan_ptr, &key_size_u64, (int)scan_remaining);
         if (bytes_read < 0 || key_size_u64 > UINT32_MAX) return TDB_ERR_CORRUPTION;
         scan_ptr += bytes_read;
         scan_remaining -= bytes_read;
         total_key_size += (size_t)key_size_u64;
 
-        bytes_read = decode_varint_v2(scan_ptr, &value_size_u64, (int)scan_remaining);
+        bytes_read = decode_varint(scan_ptr, &value_size_u64, (int)scan_remaining);
         if (bytes_read < 0 || value_size_u64 > UINT32_MAX) return TDB_ERR_CORRUPTION;
         scan_ptr += bytes_read;
         scan_remaining -= bytes_read;
 
-        bytes_read = decode_varint_v2(scan_ptr, &seq_value, (int)scan_remaining);
+        bytes_read = decode_varint(scan_ptr, &seq_value, (int)scan_remaining);
         if (bytes_read < 0) return TDB_ERR_CORRUPTION;
         scan_ptr += bytes_read;
         scan_remaining -= bytes_read;
@@ -1984,7 +1984,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         if (flags & TDB_KV_FLAG_HAS_VLOG)
         {
             uint64_t vlog_offset;
-            bytes_read = decode_varint_v2(scan_ptr, &vlog_offset, (int)scan_remaining);
+            bytes_read = decode_varint(scan_ptr, &vlog_offset, (int)scan_remaining);
             if (bytes_read < 0) return TDB_ERR_CORRUPTION;
             scan_ptr += bytes_read;
             scan_remaining -= bytes_read;
@@ -2057,7 +2057,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         (*block)->entries[i].flags = flags & ~TDB_KV_FLAG_DELTA_SEQ;
 
         uint64_t key_size_u64;
-        int bytes_read = decode_varint_v2(ptr, &key_size_u64, (int)remaining);
+        int bytes_read = decode_varint(ptr, &key_size_u64, (int)remaining);
         if (bytes_read < 0 || key_size_u64 > UINT32_MAX)
         {
             TDB_DEBUG_LOG(TDB_LOG_FATAL, "Invalid key_size varint at entry %u", i);
@@ -2070,7 +2070,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         (*block)->entries[i].key_size = (uint32_t)key_size_u64;
 
         uint64_t value_size_u64;
-        bytes_read = decode_varint_v2(ptr, &value_size_u64, (int)remaining);
+        bytes_read = decode_varint(ptr, &value_size_u64, (int)remaining);
         if (bytes_read < 0 || value_size_u64 > UINT32_MAX)
         {
             TDB_DEBUG_LOG(TDB_LOG_FATAL, "Invalid value_size varint at entry %u", i);
@@ -2083,7 +2083,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         (*block)->entries[i].value_size = (uint32_t)value_size_u64;
 
         uint64_t seq_value;
-        bytes_read = decode_varint_v2(ptr, &seq_value, (int)remaining);
+        bytes_read = decode_varint(ptr, &seq_value, (int)remaining);
         if (bytes_read < 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_FATAL, "Invalid seq varint at entry %u", i);
@@ -2125,7 +2125,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         if (flags & TDB_KV_FLAG_HAS_VLOG)
         {
             uint64_t vlog_offset;
-            bytes_read = decode_varint_v2(ptr, &vlog_offset, (int)remaining);
+            bytes_read = decode_varint(ptr, &vlog_offset, (int)remaining);
             if (bytes_read < 0)
             {
                 TDB_DEBUG_LOG(TDB_LOG_FATAL, "Invalid vlog_offset varint at entry %u", i);
@@ -8229,7 +8229,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                 entry_count++;
 
                 uint64_t key_size_u64;
-                int bytes_read = decode_varint_v2(ptr, &key_size_u64, (int)remaining);
+                int bytes_read = decode_varint(ptr, &key_size_u64, (int)remaining);
                 if (bytes_read < 0 || key_size_u64 > UINT32_MAX)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid key_size", cf->name,
@@ -8241,7 +8241,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                 entry.key_size = (uint32_t)key_size_u64;
 
                 uint64_t value_size_u64;
-                bytes_read = decode_varint_v2(ptr, &value_size_u64, (int)remaining);
+                bytes_read = decode_varint(ptr, &value_size_u64, (int)remaining);
                 if (bytes_read < 0 || value_size_u64 > UINT32_MAX)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid value_size",
@@ -8253,7 +8253,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                 entry.value_size = (uint32_t)value_size_u64;
 
                 uint64_t seq_value;
-                bytes_read = decode_varint_v2(ptr, &seq_value, (int)remaining);
+                bytes_read = decode_varint(ptr, &seq_value, (int)remaining);
                 if (bytes_read < 0)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL entry %d: invalid seq", cf->name,
@@ -11894,9 +11894,9 @@ static uint8_t *tidesdb_txn_serialize_wal(tidesdb_txn_t *txn, tidesdb_column_fam
         if (op->ttl != 0) flags |= TDB_KV_FLAG_HAS_TTL;
         *wal_ptr++ = flags;
 
-        wal_ptr += encode_varint_v2(wal_ptr, op->key_size);
-        wal_ptr += encode_varint_v2(wal_ptr, op->value_size);
-        wal_ptr += encode_varint_v2(wal_ptr, txn->commit_seq);
+        wal_ptr += encode_varint(wal_ptr, op->key_size);
+        wal_ptr += encode_varint(wal_ptr, op->value_size);
+        wal_ptr += encode_varint(wal_ptr, txn->commit_seq);
 
         if (op->ttl != 0)
         {
@@ -15022,13 +15022,13 @@ static uint8_t *compact_block_index_serialize(const tidesdb_block_index_t *index
     if (index->count > 0)
     {
         /* first file position stored as-is */
-        ptr += encode_varint_v2(ptr, index->file_positions[0]);
+        ptr += encode_varint(ptr, index->file_positions[0]);
 
         /* remaining file positions stored as deltas */
         for (uint32_t i = 1; i < index->count; i++)
         {
             uint64_t delta = index->file_positions[i] - index->file_positions[i - 1];
-            ptr += encode_varint_v2(ptr, delta);
+            ptr += encode_varint(ptr, delta);
         }
     }
 
@@ -15116,7 +15116,7 @@ static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *dat
         uint64_t value;
         int bytes_read;
         /* first file position */
-        bytes_read = decode_varint_v2(ptr, &value, (int)(end - ptr));
+        bytes_read = decode_varint(ptr, &value, (int)(end - ptr));
         if (bytes_read < 0) goto error;
         index->file_positions[0] = value;
         ptr += bytes_read;
@@ -15125,7 +15125,7 @@ static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *dat
         for (uint32_t i = 1; i < count; i++)
         {
             uint64_t delta;
-            bytes_read = decode_varint_v2(ptr, &delta, (int)(end - ptr));
+            bytes_read = decode_varint(ptr, &delta, (int)(end - ptr));
             if (bytes_read < 0) goto error;
             ptr += bytes_read;
             index->file_positions[i] = index->file_positions[i - 1] + delta;

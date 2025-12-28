@@ -9755,9 +9755,17 @@ int tidesdb_close(tidesdb_t *db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Stopping SSTable reaper thread");
         atomic_store(&db->sstable_reaper_active, 0);
 
-        pthread_mutex_lock(&db->reaper_thread_mutex);
-        pthread_cond_signal(&db->reaper_thread_cond);
-        pthread_mutex_unlock(&db->reaper_thread_mutex);
+        /* keep signaling periodically until the reaper thread exits
+         * this handles the race where the thread might be between the while loop check
+         * and pthread_cond_timedwait when we set sstable_reaper_active=0
+         * also works around NetBSD pthread_cond_timedwait issues (PR #56275) */
+        for (int attempt = 0; attempt < TDB_SHUTDOWN_BROADCAST_ATTEMPTS; attempt++)
+        {
+            pthread_mutex_lock(&db->reaper_thread_mutex);
+            pthread_cond_signal(&db->reaper_thread_cond);
+            pthread_mutex_unlock(&db->reaper_thread_mutex);
+            usleep(TDB_SHUTDOWN_BROADCAST_INTERVAL_US);
+        }
 
         pthread_join(db->sstable_reaper_thread, NULL);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper thread stopped");

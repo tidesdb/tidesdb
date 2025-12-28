@@ -1511,12 +1511,14 @@ static inline size_t get_available_memory(void)
 #endif
     return 0;
 #else
-    /* illumos/solaris and other POSIX systems */
+    /* illumos/solaris and other POSIX systems
+     * note: on 32-bit systems, multiplying pages * page_size can overflow
+     * so we cast to 64-bit before multiplication */
     long pages = sysconf(_SC_AVPHYS_PAGES);
     long page_size = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page_size > 0)
     {
-        return (size_t)(pages * page_size);
+        return (size_t)((uint64_t)pages * (uint64_t)page_size);
     }
     return 0;
 #endif
@@ -1563,7 +1565,8 @@ static inline size_t get_total_memory(void)
     size_t len;
 
     mib[0] = CTL_HW;
-#if defined(__OpenBSD__)
+#if defined(__OpenBSD__) || defined(__NetBSD__)
+    /* OpenBSD and NetBSD support HW_PHYSMEM64 for 64-bit physical memory */
     mib[1] = HW_PHYSMEM64;
     int64_t physmem64;
     len = sizeof(physmem64);
@@ -1572,6 +1575,7 @@ static inline size_t get_total_memory(void)
         return (size_t)physmem64;
     }
 #else
+    /* FreeBSD and DragonFlyBSD use HW_PHYSMEM which returns size_t */
     mib[1] = HW_PHYSMEM;
     len = sizeof(physical_memory);
     if (sysctl(mib, 2, &physical_memory, &len, NULL, 0) == 0)
@@ -1581,12 +1585,14 @@ static inline size_t get_total_memory(void)
 #endif
     return 0;
 #else
-    /* illumos/solaris and other POSIX systems */
+    /* illumos/solaris and other POSIX systems
+     * note: on 32-bit systems, multiplying pages * page_size can overflow
+     * so we cast to 64-bit before multiplication */
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page_size > 0)
     {
-        return (size_t)(pages * page_size);
+        return (size_t)((uint64_t)pages * (uint64_t)page_size);
     }
     return 0;
 #endif

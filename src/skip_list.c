@@ -1136,7 +1136,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
         }
 
         /* CAS failed -- next_at_0 now contains the current value of pred->forward[0]
-         * Check if a node was inserted that matches our key */
+         * we check if a node was inserted that matches our key */
         if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0))
         {
             int cmp = skip_list_compare_keys_inline(list, next_at_0->key, next_at_0->key_size, key,

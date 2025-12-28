@@ -1409,7 +1409,7 @@ void test_block_manager_concurrent_file_extension()
         {
             expected_data[i][j] = (char)((i + j) % 256);
         }
-        /* Add a marker at the end */
+        /* we add a marker at the end */
         snprintf(expected_data[i] + data_size - 20, 20, "_block_%d_end", i);
 
         block_manager_block_t *block = block_manager_block_create(data_size, expected_data[i]);

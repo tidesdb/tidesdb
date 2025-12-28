@@ -243,11 +243,6 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
         return;
     }
 
-    /* WE WON! we transitioned to DELETING
-     * At this point, no NEW readers can access this entry (state != VALID)
-     * However, existing readers may still be in the middle of memcpy.
-     * We need a grace period to let them finish. */
-
     /* fence to ensure state change is visible (acquire/release sufficient) */
     atomic_thread_fence(memory_order_acq_rel);
 

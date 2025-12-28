@@ -2249,12 +2249,9 @@ static int tidesdb_vlog_read_value(tidesdb_t *db, tidesdb_sstable_t *sst, uint64
             }
             return TDB_SUCCESS;
         }
-        else
-        {
-            /* decompression failed */
-            free(block_data);
-            return TDB_ERR_CORRUPTION;
-        }
+        /* decompression failed */
+        free(block_data);
+        return TDB_ERR_CORRUPTION;
     }
 
     *value = block_data;
@@ -11813,6 +11810,7 @@ check_found_result:
         }
         tidesdb_kv_pair_free(best_kv);
     }
+
     return TDB_ERR_NOT_FOUND;
 }
 
@@ -12308,7 +12306,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
         tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
 
-        if (mt) atomic_fetch_add_explicit(&mt->refcount, 1, memory_order_acquire);
+        if (mt) atomic_fetch_add_explicit(&mt->refcount, 1, memory_order_acq_rel);
         cf_memtables[cf_idx] = mt;
         /* capture skip_list pointer now - the skip_list stays valid even after mt wrapper is freed
          * because skip_list ownership transfers to immutable during flush */

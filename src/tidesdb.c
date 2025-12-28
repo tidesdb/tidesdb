@@ -6599,11 +6599,28 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                                            comparator_fn, comparator_ctx);
         }
 
-        /* process entries from partition-specific heap -- all keys are guaranteed to be in range */
+        /* process entries from partition-specific heap -- filter keys by partition range */
         while (!tidesdb_merge_heap_empty(partition_heap))
         {
             tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop(partition_heap, NULL);
             if (!kv) break;
+
+            /* filter keys by partition range -- merge source reads all keys from SSTable
+             * but we only want keys that fall within this partition's boundaries */
+            if (range_start && comparator_fn(kv->key, kv->entry.key_size, range_start,
+                                             range_start_size, comparator_ctx) < 0)
+            {
+                /* key is before partition range, skip */
+                tidesdb_kv_pair_free(kv);
+                continue;
+            }
+            if (range_end && comparator_fn(kv->key, kv->entry.key_size, range_end, range_end_size,
+                                           comparator_ctx) >= 0)
+            {
+                /* key is at or after partition end, skip */
+                tidesdb_kv_pair_free(kv);
+                continue;
+            }
 
             /* skip duplicate keys (keep newest based on seq) */
             if (last_key && last_key_size == kv->entry.key_size &&

@@ -659,6 +659,14 @@ int main()
     printf("  Block Index Prefix Length: %d\n", BENCH_BLOCK_INDEX_PREFIX_LEN);
     printf("  Comparator: %s\n", BENCH_COMPARATOR_NAME);
     printf("  Isolation Level: %s\n", get_isolation_level_name(BENCH_ISOLATION_LEVEL));
+    printf("  K-Log Value Threshold: %zu bytes (%.2f KB)\n", (size_t)BENCH_KLOG_VALUE_THRESHOLD,
+           (double)BENCH_KLOG_VALUE_THRESHOLD / 1024.0);
+    printf("  Sync Interval: %d μs\n", BENCH_SYNC_INTERVAL_US);
+    printf("  Min Disk Space: %zu bytes (%.2f MB)\n", (size_t)BENCH_MIN_DISK_SPACE,
+           (double)BENCH_MIN_DISK_SPACE / (1024.0 * 1024.0));
+    printf("  L1 File Count Trigger: %d\n", BENCH_L1_FILE_COUNT_TRIGGER);
+    printf("  L0 Queue Stall Threshold: %d\n", BENCH_L0_QUEUE_STALL_THRESHOLD);
+    printf("  Max Open SSTables: %d\n", BENCH_MAX_OPEN_SSTABLES);
     printf("*======================================*\n\n" RESET);
 
     uint8_t **keys = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t *));
@@ -758,7 +766,7 @@ int main()
                                .num_flush_threads = BENCH_DB_FLUSH_POOL_THREADS,
                                .num_compaction_threads = BENCH_DB_COMPACTION_POOL_THREADS,
                                .block_cache_size = BENCH_BLOCK_CACHE_SIZE,
-                               .max_open_sstables = 1000};
+                               .max_open_sstables = BENCH_MAX_OPEN_SSTABLES};
     int open_result = tidesdb_open(&config, &tdb);
     if (open_result != 0)
     {
@@ -790,10 +798,15 @@ int main()
     cf_config.enable_block_indexes = BENCH_ENABLE_BLOCK_INDEXES;
     cf_config.index_sample_ratio = BENCH_BLOCK_INDEX_SAMPLING_COUNT;
     cf_config.sync_mode = BENCH_SYNC_MODE;
+    cf_config.sync_interval_us = BENCH_SYNC_INTERVAL_US;
     strncpy(cf_config.comparator_name, BENCH_COMPARATOR_NAME, TDB_MAX_COMPARATOR_NAME - 1);
     cf_config.comparator_name[TDB_MAX_COMPARATOR_NAME - 1] = '\0';
     cf_config.default_isolation_level = BENCH_ISOLATION_LEVEL;
     cf_config.block_index_prefix_len = BENCH_BLOCK_INDEX_PREFIX_LEN;
+    cf_config.klog_value_threshold = BENCH_KLOG_VALUE_THRESHOLD;
+    cf_config.min_disk_space = BENCH_MIN_DISK_SPACE;
+    cf_config.l1_file_count_trigger = BENCH_L1_FILE_COUNT_TRIGGER;
+    cf_config.l0_queue_stall_threshold = BENCH_L0_QUEUE_STALL_THRESHOLD;
 
     if (tidesdb_create_column_family(tdb, BENCH_CF_NAME, &cf_config) != 0)
     {

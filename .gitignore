@@ -26,11 +26,3 @@ build
 .vscode
 vcpkg_installed
 .vs
-test_tidesdb
-how-does-tidesdb-work.md
-c.md
-building.md
-what-is-tidesdb.md
-test_runs.log
-workflow-logs
-cpp

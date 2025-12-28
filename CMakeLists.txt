@@ -308,6 +308,21 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_ISOLATION_LEVEL)
         set(BENCH_ISOLATION_LEVEL TDB_ISOLATION_READ_COMMITTED)
     endif()
+    if(NOT DEFINED BENCH_KLOG_VALUE_THRESHOLD)
+        math(EXPR BENCH_KLOG_VALUE_THRESHOLD 4096)
+    endif()
+    if(NOT DEFINED BENCH_MIN_DISK_SPACE)
+        math(EXPR BENCH_MIN_DISK_SPACE 104857600)
+    endif()
+    if(NOT DEFINED BENCH_L1_FILE_COUNT_TRIGGER)
+        set(BENCH_L1_FILE_COUNT_TRIGGER 4)
+    endif()
+    if(NOT DEFINED BENCH_L0_QUEUE_STALL_THRESHOLD)
+        set(BENCH_L0_QUEUE_STALL_THRESHOLD 10)
+    endif()
+    if(NOT DEFINED BENCH_MAX_OPEN_SSTABLES)
+        set(BENCH_MAX_OPEN_SSTABLES 512)
+    endif()
 
     add_executable(block_manager_tests test/block_manager__tests.c)
     add_executable(skip_list_tests test/skip_list__tests.c)
@@ -359,6 +374,11 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
             BENCH_DB_FLUSH_POOL_THREADS=${BENCH_DB_FLUSH_POOL_THREADS}
             BENCH_DB_COMPACTION_POOL_THREADS=${BENCH_DB_COMPACTION_POOL_THREADS}
             BENCH_ISOLATION_LEVEL=${BENCH_ISOLATION_LEVEL}
+            BENCH_KLOG_VALUE_THRESHOLD=${BENCH_KLOG_VALUE_THRESHOLD}
+            BENCH_MIN_DISK_SPACE=${BENCH_MIN_DISK_SPACE}
+            BENCH_L1_FILE_COUNT_TRIGGER=${BENCH_L1_FILE_COUNT_TRIGGER}
+            BENCH_L0_QUEUE_STALL_THRESHOLD=${BENCH_L0_QUEUE_STALL_THRESHOLD}
+            BENCH_MAX_OPEN_SSTABLES=${BENCH_MAX_OPEN_SSTABLES}
     )
 
     # add include and link directories for test executables

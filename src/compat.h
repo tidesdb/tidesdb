@@ -1511,12 +1511,14 @@ static inline size_t get_available_memory(void)
 #endif
     return 0;
 #else
-    /* illumos/solaris and other POSIX systems */
+    /* illumos/solaris and other POSIX systems
+     * note: on 32-bit systems, multiplying pages * page_size can overflow
+     * so we cast to 64-bit before multiplication */
     long pages = sysconf(_SC_AVPHYS_PAGES);
     long page_size = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page_size > 0)
     {
-        return (size_t)(pages * page_size);
+        return (size_t)((uint64_t)pages * (uint64_t)page_size);
     }
     return 0;
 #endif
@@ -1583,12 +1585,14 @@ static inline size_t get_total_memory(void)
 #endif
     return 0;
 #else
-    /* illumos/solaris and other POSIX systems */
+    /* illumos/solaris and other POSIX systems
+     * note: on 32-bit systems, multiplying pages * page_size can overflow
+     * so we cast to 64-bit before multiplication */
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page_size > 0)
     {
-        return (size_t)(pages * page_size);
+        return (size_t)((uint64_t)pages * (uint64_t)page_size);
     }
     return 0;
 #endif

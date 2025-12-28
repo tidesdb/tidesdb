@@ -29,6 +29,12 @@
 #define QUEUE_UNLIKELY(x) (x)
 #endif
 
+/* timed wait configuration for NetBSD compatibility
+ * NetBSD's pthread_cond_wait can miss signals, so we use timed waits
+ * with periodic wakeups to check shutdown flags */
+#define QUEUE_WAIT_TIMEOUT_NS 100000000  /* 100ms in nanoseconds */
+#define QUEUE_NS_PER_SEC      1000000000 /* nanoseconds per second */
+
 /**
  * queue_alloc_node
  * allocate a node from pool or heap
@@ -202,10 +208,20 @@ void *queue_dequeue_wait(queue_t *queue)
     /* increment waiter count before waiting */
     queue->waiter_count++;
 
-    /* wait until queue is not empty or shutdown */
+    /* wait until queue is not empty or shutdown
+     * use pthread_cond_timedwait with periodic wakeups to handle platforms
+     * where pthread_cond_wait can miss signals (e.g., NetBSD) */
     while (queue->head == NULL && !queue->shutdown)
     {
-        pthread_cond_wait(&queue->not_empty, &queue->lock);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += QUEUE_WAIT_TIMEOUT_NS;
+        if (ts.tv_nsec >= QUEUE_NS_PER_SEC)
+        {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= QUEUE_NS_PER_SEC;
+        }
+        pthread_cond_timedwait(&queue->not_empty, &queue->lock, &ts);
     }
 
     /* decrement waiter count after waking up */
@@ -394,9 +410,19 @@ void queue_free(queue_t *queue)
     queue->node_pool = NULL;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
+    /* wait for all waiting threads to exit before destroying primitives
+     * use timed wait to handle NetBSD where signals can be missed */
     while (queue->waiter_count > 0)
     {
-        pthread_cond_wait(&queue->not_empty, &queue->lock);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += QUEUE_WAIT_TIMEOUT_NS;
+        if (ts.tv_nsec >= QUEUE_NS_PER_SEC)
+        {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= QUEUE_NS_PER_SEC;
+        }
+        pthread_cond_timedwait(&queue->not_empty, &queue->lock, &ts);
     }
 
     pthread_mutex_unlock(&queue->lock);
@@ -444,10 +470,19 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     queue->node_pool = NULL;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
-    /* wait for all waiting threads to exit before destroying primitives */
+    /* wait for all waiting threads to exit before destroying primitives
+     * use timed wait to handle NetBSD where signals can be missed */
     while (queue->waiter_count > 0)
     {
-        pthread_cond_wait(&queue->not_empty, &queue->lock);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += QUEUE_WAIT_TIMEOUT_NS;
+        if (ts.tv_nsec >= QUEUE_NS_PER_SEC)
+        {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= QUEUE_NS_PER_SEC;
+        }
+        pthread_cond_timedwait(&queue->not_empty, &queue->lock, &ts);
     }
 
     pthread_mutex_unlock(&queue->lock);

@@ -8850,6 +8850,12 @@ static void *tidesdb_sync_worker_thread(void *arg)
         }
 
         pthread_mutex_lock(&db->sync_thread_mutex);
+        /* check shutdown flag while holding mutex to avoid race with signal */
+        if (!atomic_load(&db->sync_thread_active))
+        {
+            pthread_mutex_unlock(&db->sync_thread_mutex);
+            break;
+        }
         pthread_cond_timedwait(&db->sync_thread_cond, &db->sync_thread_mutex, &ts);
         pthread_mutex_unlock(&db->sync_thread_mutex);
 
@@ -8880,6 +8886,12 @@ static void *tidesdb_sync_worker_thread(void *arg)
             }
         }
         pthread_rwlock_unlock(&db->cf_list_lock);
+
+        /* we check shutdown flag after sync operations to exit promptly */
+        if (!atomic_load(&db->sync_thread_active))
+        {
+            break;
+        }
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread stopped");
@@ -8937,6 +8949,12 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         }
 
         pthread_mutex_lock(&db->reaper_thread_mutex);
+        /* check shutdown flag while holding mutex to avoid race with signal */
+        if (!atomic_load(&db->sstable_reaper_active))
+        {
+            pthread_mutex_unlock(&db->reaper_thread_mutex);
+            break;
+        }
         pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
         pthread_mutex_unlock(&db->reaper_thread_mutex);
 
@@ -12235,23 +12253,22 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
 #undef TXN_DEDUP_HASH_SIZE
 
-        atomic_fetch_sub_explicit(&mt->refcount, 1, memory_order_release);
-    }
-
-    txn->is_committed = 1;
-
-    for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
-    {
-        tidesdb_column_family_t *cf = txn->cfs[cf_idx];
-        tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-        size_t memtable_size = (size_t)skip_list_get_size(mt ? mt->skip_list : NULL);
+        /* check if this CF needs flushing before releasing refcount
+         * this ensures we check size while holding a valid reference to the memtable */
+        size_t memtable_size = (size_t)skip_list_get_size(mt->skip_list);
         size_t flush_threshold = cf->config.write_buffer_size + (cf->config.write_buffer_size / 4);
+        int needs_flush = (memtable_size >= flush_threshold);
 
-        if (memtable_size >= flush_threshold)
+        atomic_fetch_sub_explicit(&mt->refcount, 1, memory_order_release);
+
+        /* trigger flush after releasing refcount to avoid holding it during flush */
+        if (needs_flush)
         {
             tidesdb_flush_memtable(cf);
         }
     }
+
+    txn->is_committed = 1;
 
     atomic_thread_fence(memory_order_seq_cst);
     tidesdb_commit_status_mark(txn->db->commit_status, txn->commit_seq,

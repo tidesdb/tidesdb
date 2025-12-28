@@ -808,8 +808,8 @@ time_t block_manager_last_modified(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    struct stat st;
-    if (stat(bm->file_path, &st) != 0) return -1;
+    struct STAT_STRUCT st;
+    if (STAT_FUNC(bm->file_path, &st) != 0) return -1;
     return st.st_mtime;
 }
 
@@ -1075,5 +1075,6 @@ int block_manager_read_at_offset(block_manager_t *bm, uint64_t offset, size_t si
 
 int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode)
 {
+    if (!bm || !file_path) return -1;
     return block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode));
 }

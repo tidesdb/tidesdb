@@ -56,21 +56,9 @@
 /* block footer for fast validation: size + magic */
 #define BLOCK_MANAGER_FOOTER_MAGIC 0x42445442 /* "BTDB" reversed */
 #define BLOCK_MANAGER_FOOTER_SIZE  8          /* 4-byte size + 4-byte magic */
-/* extra bytes for headers in stack buffers */
-#define BLOCK_MANAGER_STACK_BUFFER_OVERHEAD 64
+
 /* default file permissions (rw-r--r--) */
 #define BLOCK_MANAGER_FILE_MODE 0644
-
-/* batch reading block metadata */
-#define BLOCK_MANAGER_BATCH_READ_META_SIZE 4096
-
-/* position cache sizing constants */
-/* average block size estimate for initial capacity calculation */
-#define BLOCK_MANAGER_AVG_BLOCK_SIZE_ESTIMATE 160
-/* buffer for position cache initial capacity */
-#define BLOCK_MANAGER_POSITION_CACHE_BUFFER 100
-/* minimum position cache capacity */
-#define BLOCK_MANAGER_MIN_POSITION_CACHE_CAPACITY 1000
 
 typedef enum
 {

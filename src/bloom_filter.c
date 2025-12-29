@@ -18,6 +18,8 @@
  */
 #include "bloom_filter.h"
 
+#include <tgmath.h>
+
 /* bit manipulation macros for packed bitset */
 #define BF_BITS_PER_WORD        64
 #define BF_WORD_INDEX(bit)      ((bit) / BF_BITS_PER_WORD)
@@ -25,7 +27,7 @@
 #define BF_SET_BIT(bitset, bit) ((bitset)[BF_WORD_INDEX(bit)] |= (1ULL << BF_BIT_INDEX(bit)))
 #define BF_GET_BIT(bitset, bit) (((bitset)[BF_WORD_INDEX(bit)] >> BF_BIT_INDEX(bit)) & 1ULL)
 
-int bloom_filter_new(bloom_filter_t **bf, double p, int n)
+int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
 {
     if (p <= 0.0 || p >= 1.0 || n <= 0)
     {
@@ -89,10 +91,10 @@ int bloom_filter_new(bloom_filter_t **bf, double p, int n)
     return 0;
 }
 
-void bloom_filter_add(bloom_filter_t *bf, const uint8_t *entry, size_t size)
+void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
 {
     /* add a key to the bloom filter using H hash functions */
-    for (unsigned int i = 0; i < bf->h; i++)
+    for (int i = 0; i < (int)bf->h; i++)
     {
         unsigned int hash = bloom_filter_hash(entry, size, i);
         size_t index = hash % bf->m;
@@ -100,11 +102,11 @@ void bloom_filter_add(bloom_filter_t *bf, const uint8_t *entry, size_t size)
     }
 }
 
-int bloom_filter_contains(bloom_filter_t *bf, const uint8_t *entry, size_t size)
+int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
 {
     /* check if a key is in the bloom filter using H hash functions
      * early exit on first zero bit (likely case for negative lookups) */
-    for (unsigned int i = 0; i < bf->h; i++)
+    for (int i = 0; i < (int)bf->h; i++)
     {
         unsigned int hash = bloom_filter_hash(entry, size, i);
         size_t index = hash % bf->m;
@@ -116,7 +118,7 @@ int bloom_filter_contains(bloom_filter_t *bf, const uint8_t *entry, size_t size)
     return 1; /* probably in set */
 }
 
-int bloom_filter_is_full(bloom_filter_t *bf)
+int bloom_filter_is_full(const bloom_filter_t *bf)
 {
     /* check if all words are fully set (optimized for packed bits) */
     for (unsigned int i = 0; i < bf->size_in_words - 1; i++)
@@ -133,11 +135,8 @@ int bloom_filter_is_full(bloom_filter_t *bf)
     {
         return (bf->bitset[bf->size_in_words - 1] == UINT64_MAX);
     }
-    else
-    {
-        uint64_t mask = (1ULL << remaining_bits) - 1;
-        return ((bf->bitset[bf->size_in_words - 1] & mask) == mask);
-    }
+    uint64_t mask = (1ULL << remaining_bits) - 1;
+    return ((bf->bitset[bf->size_in_words - 1] & mask) == mask);
 }
 
 unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
@@ -183,7 +182,7 @@ unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
     return h;
 }
 
-uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size)
+uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
 {
     /* count non-zero words for sparse encoding */
     unsigned int non_zero_count = 0;

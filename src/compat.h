@@ -47,6 +47,18 @@
 #define tdb_strdup(s) strdup(s)
 #endif
 
+/* cross-platform fabs abstraction */
+#include <math.h>
+#if defined(_MSC_VER)
+#define tdb_fabs(x) fabs(x)
+#elif defined(__APPLE__)
+/* macOS may require explicit declaration in some contexts */
+#define tdb_fabs(x) fabs(x)
+#else
+/* POSIX systems */
+#define tdb_fabs(x) fabs(x)
+#endif
+
 /* cross-platform fsync abstraction */
 #if defined(_WIN32)
 #include <io.h>
@@ -900,40 +912,6 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
         return -1;
     }
 
-    /* Windows WriteFile with OVERLAPPED *does* extend files automatically,
-     * but the extension may cause blocking. To match POSIX pwrite behavior,
-     * we pre-extend the file if writing beyond EOF. This prevents blocking
-     * during concurrent writes and ensures zero-initialization of gaps. */
-    LARGE_INTEGER file_size;
-    if (!GetFileSizeEx(h, &file_size))
-    {
-        errno = GetLastError();
-        return -1;
-    }
-
-    off_t write_end = offset + (off_t)count;
-
-    /* Pre-extend file if writing beyond current EOF */
-    if (write_end > file_size.QuadPart)
-    {
-        LARGE_INTEGER new_size;
-        new_size.QuadPart = write_end;
-
-        /* SetFilePointerEx + SetEndOfFile atomically extends the file.
-         * This is thread-safe because the file system serializes these operations. */
-        if (!SetFilePointerEx(h, new_size, NULL, FILE_BEGIN))
-        {
-            errno = GetLastError();
-            return -1;
-        }
-
-        if (!SetEndOfFile(h))
-        {
-            errno = GetLastError();
-            return -1;
-        }
-    }
-
     OVERLAPPED overlapped;
     ZeroMemory(&overlapped, sizeof(OVERLAPPED));
 
@@ -942,7 +920,6 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     overlapped.Offset = li.LowPart;
     overlapped.OffsetHigh = li.HighPart;
 
-    /* Create an event for synchronous behavior */
     overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (overlapped.hEvent == NULL)
     {
@@ -958,7 +935,6 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
         DWORD err = GetLastError();
         if (err == ERROR_IO_PENDING)
         {
-            /* Wait for the operation to complete */
             if (!GetOverlappedResult(h, &overlapped, &bytes_written, TRUE))
             {
                 CloseHandle(overlapped.hEvent);
@@ -1108,40 +1084,6 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
     {
         errno = EBADF;
         return -1;
-    }
-
-    /* Windows WriteFile with OVERLAPPED *does* extend files automatically,
-     * but the extension may cause blocking. To match POSIX pwrite behavior,
-     * we pre-extend the file if writing beyond EOF. This prevents blocking
-     * during concurrent writes and ensures zero-initialization of gaps. */
-    LARGE_INTEGER file_size;
-    if (!GetFileSizeEx(h, &file_size))
-    {
-        errno = GetLastError();
-        return -1;
-    }
-
-    off_t write_end = offset + (off_t)count;
-
-    /* Pre-extend file if writing beyond current EOF */
-    if (write_end > file_size.QuadPart)
-    {
-        LARGE_INTEGER new_size;
-        new_size.QuadPart = write_end;
-
-        /* SetFilePointerEx + SetEndOfFile atomically extends the file.
-         * This is thread-safe because the file system serializes these operations. */
-        if (!SetFilePointerEx(h, new_size, NULL, FILE_BEGIN))
-        {
-            errno = GetLastError();
-            return -1;
-        }
-
-        if (!SetEndOfFile(h))
-        {
-            errno = GetLastError();
-            return -1;
-        }
     }
 
     OVERLAPPED overlapped = {0};

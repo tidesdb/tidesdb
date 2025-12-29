@@ -242,7 +242,7 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
  * @param list skip list
  * @return random level
  */
-int skip_list_random_level(skip_list_t *list);
+int skip_list_random_level(const skip_list_t *list);
 
 /**
  * skip_list_compare_keys
@@ -254,7 +254,7 @@ int skip_list_random_level(skip_list_t *list);
  * @param key2_size size of second key
  * @return negative if key1 < key2, 0 if equal, positive if key1 > key2
  */
-int skip_list_compare_keys(skip_list_t *list, const uint8_t *key1, size_t key1_size,
+int skip_list_compare_keys(const skip_list_t *list, const uint8_t *key1, size_t key1_size,
                            const uint8_t *key2, size_t key2_size);
 
 /**
@@ -496,7 +496,7 @@ void skip_list_free(skip_list_t *list);
  * @param node node to check
  * @return 0 on success, -1 on failure
  */
-int skip_list_check_and_update_ttl(skip_list_t *list, skip_list_node_t *node);
+int skip_list_check_and_update_ttl(const skip_list_t *list, skip_list_node_t *node);
 
 /**
  * skip_list_get_size

@@ -131,7 +131,7 @@ void test_false_positive_rate()
     printf("Actual false positive rate: %f\n", actual_fp_rate);
 
     /* some deviation since its a probabilistic data structure */
-    ASSERT_TRUE(fabs(actual_fp_rate - p) < 0.01);
+    ASSERT_TRUE(tdb_fabs(actual_fp_rate - p) < 0.01);
 
     (void)bloom_filter_free(bf);
 }

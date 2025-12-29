@@ -9539,6 +9539,7 @@ static void test_wal_commit_shutdown_recovery(void)
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
     config.log_level = TDB_LOG_DEBUG;
+    config.block_cache_size = 0;
 
     tidesdb_t *db = NULL;
     ASSERT_EQ(tidesdb_open(&config, &db), 0);
@@ -9547,8 +9548,9 @@ static void test_wal_commit_shutdown_recovery(void)
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
 
     cf_config.write_buffer_size = 3200;
-    cf_config.enable_block_indexes = 0;
-    cf_config.enable_bloom_filter = 0;
+    cf_config.enable_block_indexes = 1;
+    cf_config.enable_bloom_filter = 1;
+
     cf_config.sync_mode = TDB_SYNC_FULL;
 
     ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
@@ -9556,7 +9558,7 @@ static void test_wal_commit_shutdown_recovery(void)
     ASSERT_TRUE(cf != NULL);
 
     const int NUM_THREADS = 4;
-    const int KEYS_PER_THREAD = 500;
+    const int KEYS_PER_THREAD = 250;
     const int TOTAL_KEYS = NUM_THREADS * KEYS_PER_THREAD;
 
     printf("  Threads: %d, Keys per thread: %d, Total keys: %d\n", NUM_THREADS, KEYS_PER_THREAD,

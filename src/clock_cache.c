@@ -27,7 +27,7 @@
  * @param payload_len payload length
  * @return total entry size
  */
-static inline size_t _entry_size(size_t key_len, size_t payload_len)
+static inline size_t entry_size(size_t key_len, size_t payload_len)
 {
     return key_len + payload_len + sizeof(clock_cache_entry_t);
 }
@@ -40,7 +40,8 @@ static inline size_t _entry_size(size_t key_len, size_t payload_len)
  * @param key_len the key length
  * @return partition index
  */
-static inline size_t _hash_to_partition(clock_cache_t *cache, const char *key, size_t key_len)
+static inline size_t hash_to_partition(const clock_cache_t *cache, const char *key,
+                                       const size_t key_len)
 {
     uint64_t hash = XXH3_64bits(key, key_len);
     return (size_t)(hash & cache->partition_mask);
@@ -53,7 +54,7 @@ static inline size_t _hash_to_partition(clock_cache_t *cache, const char *key, s
  * @param key_len the key length
  * @return hash
  */
-static inline uint64_t _compute_hash(const char *key, size_t key_len)
+static inline uint64_t compute_hash(const char *key, const size_t key_len)
 {
     return XXH3_64bits(key, key_len);
 }
@@ -65,7 +66,8 @@ static inline uint64_t _compute_hash(const char *key, size_t key_len)
  * @param hash the hash
  * @param slot_idx the slot index
  */
-static void _hash_table_insert(clock_cache_partition_t *partition, uint64_t hash, size_t slot_idx)
+static void hash_table_insert(clock_cache_partition_t *partition, uint64_t hash,
+                              const size_t slot_idx)
 {
     clock_cache_entry_t *slot = &partition->slots[slot_idx];
 
@@ -105,7 +107,8 @@ static void _hash_table_insert(clock_cache_partition_t *partition, uint64_t hash
  * @param hash the hash
  * @param slot_idx the slot index
  */
-static void _hash_table_remove(clock_cache_partition_t *partition, uint64_t hash, size_t slot_idx)
+static void hash_table_remove(clock_cache_partition_t *partition, const uint64_t hash,
+                              const size_t slot_idx)
 {
     /* gotta find and clear this slot from hash index */
     size_t idx = hash & partition->hash_mask;
@@ -138,10 +141,10 @@ static void _hash_table_remove(clock_cache_partition_t *partition, uint64_t hash
  * @param out_index output parameter for index
  * @return the entry or NULL if not found
  */
-static clock_cache_entry_t *_find_entry(clock_cache_partition_t *partition, const char *key,
-                                        size_t key_len, size_t *out_index)
+static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const char *key,
+                                       size_t key_len, size_t *out_index)
 {
-    uint64_t target_hash = _compute_hash(key, key_len);
+    uint64_t target_hash = compute_hash(key, key_len);
     size_t idx = target_hash & partition->hash_mask;
     size_t max_probe = (partition->hash_index_size < CLOCK_CACHE_MAX_HASH_PROBE)
                            ? partition->hash_index_size
@@ -232,8 +235,8 @@ static clock_cache_entry_t *_find_entry(clock_cache_partition_t *partition, cons
  * @param partition the partition
  * @param entry the entry
  */
-static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition,
-                        clock_cache_entry_t *entry)
+static void free_entry(clock_cache_t *cache, clock_cache_partition_t *partition,
+                       clock_cache_entry_t *entry)
 {
     /* try to claim entry for deletion using CAS */
     uint8_t expected = ENTRY_VALID;
@@ -277,9 +280,9 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
     }
 
     /* mark hash entry as deleted (tombstone) -- but keep back-pointer for reuse */
-    uint64_t hash = _compute_hash(key, klen);
+    uint64_t hash = compute_hash(key, klen);
     size_t slot_idx = entry - partition->slots;
-    _hash_table_remove(partition, hash, slot_idx);
+    hash_table_remove(partition, hash, slot_idx);
 
     /* mem fence -- ensure all readers see deleted before we free (acq_rel sufficient) */
     atomic_thread_fence(memory_order_acq_rel);
@@ -316,7 +319,7 @@ static void _free_entry(clock_cache_t *cache, clock_cache_partition_t *partition
  * @param partition the partition
  * @return the slot index of the evicted entry
  */
-static size_t _clock_evict(clock_cache_t *cache, clock_cache_partition_t *partition)
+static size_t clock_evict(clock_cache_t *cache, clock_cache_partition_t *partition)
 {
     size_t iterations = 0;
     size_t max_iterations = partition->num_slots; /* reduced from 2x to 1x for better concurrency */
@@ -354,7 +357,7 @@ static size_t _clock_evict(clock_cache_t *cache, clock_cache_partition_t *partit
             if (ref == 0)
             {
                 /* found victim -- try to evict */
-                _free_entry(cache, partition, entry);
+                free_entry(cache, partition, entry);
 
                 /* update thread position for next time */
                 thread_hand = hand + 1;
@@ -376,7 +379,7 @@ static size_t _clock_evict(clock_cache_t *cache, clock_cache_partition_t *partit
 
     if (state == ENTRY_VALID)
     {
-        _free_entry(cache, partition, entry);
+        free_entry(cache, partition, entry);
     }
 
     return hand;
@@ -390,8 +393,8 @@ static size_t _clock_evict(clock_cache_t *cache, clock_cache_partition_t *partit
  * @param required_bytes the required bytes
  * @return 0 on success, -1 on failure
  */
-static int _ensure_space(clock_cache_t *cache, clock_cache_partition_t *partition,
-                         size_t required_bytes)
+static int ensure_space(clock_cache_t *cache, clock_cache_partition_t *partition,
+                        const size_t required_bytes)
 {
     (void)required_bytes;
 
@@ -403,7 +406,7 @@ static int _ensure_space(clock_cache_t *cache, clock_cache_partition_t *partitio
     size_t threshold = (partition->num_slots * 85) / 100;
     if (occupied >= threshold)
     {
-        _clock_evict(cache, partition);
+        clock_evict(cache, partition);
     }
 
     return 0;
@@ -614,21 +617,21 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
 
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return -1;
 
-    size_t partition_idx = _hash_to_partition(cache, key, key_len);
+    size_t partition_idx = hash_to_partition(cache, key, key_len);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
-    uint64_t hash = _compute_hash(key, key_len);
-    size_t entry_bytes = _entry_size(key_len, payload_len);
+    uint64_t hash = compute_hash(key, key_len);
+    size_t entry_bytes = entry_size(key_len, payload_len);
 
     /* try to find and invalidate existing entry (best-effort update) */
-    clock_cache_entry_t *old_entry = _find_entry(partition, key, key_len, NULL);
+    clock_cache_entry_t *old_entry = find_entry(partition, key, key_len, NULL);
     if (old_entry)
     {
         /* mark old entry as deleted to avoid duplicates */
-        _free_entry(cache, partition, old_entry);
+        free_entry(cache, partition, old_entry);
     }
 
     /* always ensure space to enforce max_bytes limit */
-    _ensure_space(cache, partition, entry_bytes);
+    ensure_space(cache, partition, entry_bytes);
 
     clock_cache_entry_t *entry = NULL;
     size_t slot_idx = 0;
@@ -636,7 +639,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
 
     for (int retry = 0; retry < max_retries; retry++)
     {
-        slot_idx = _clock_evict(cache, partition);
+        slot_idx = clock_evict(cache, partition);
         entry = &partition->slots[slot_idx];
 
         /* we try to claim slot with CAS, EMPTY --> WRITING */
@@ -685,21 +688,22 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     atomic_fetch_add_explicit(&partition->occupied_count, 1, memory_order_relaxed);
 
     /* add to hash index after entry is valid */
-    _hash_table_insert(partition, hash, slot_idx);
+    hash_table_insert(partition, hash, slot_idx);
 
     return 0;
 }
 
-uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, size_t *payload_len)
+uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key_len,
+                         size_t *payload_len)
 {
     if (!cache || !key || key_len == 0) return NULL;
 
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return NULL;
 
-    size_t partition_idx = _hash_to_partition(cache, key, key_len);
+    size_t partition_idx = hash_to_partition(cache, key, key_len);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
-    clock_cache_entry_t *entry = _find_entry(partition, key, key_len, NULL);
+    clock_cache_entry_t *entry = find_entry(partition, key, key_len, NULL);
 
     if (!entry)
     {
@@ -746,23 +750,23 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len, 
     return result;
 }
 
-int clock_cache_delete(clock_cache_t *cache, const char *key, size_t key_len)
+int clock_cache_delete(clock_cache_t *cache, const char *key, const size_t key_len)
 {
     if (!cache || !key || key_len == 0) return -1;
 
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return -1;
 
-    size_t partition_idx = _hash_to_partition(cache, key, key_len);
+    size_t partition_idx = hash_to_partition(cache, key, key_len);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
-    clock_cache_entry_t *entry = _find_entry(partition, key, key_len, NULL);
+    clock_cache_entry_t *entry = find_entry(partition, key, key_len, NULL);
 
     if (!entry)
     {
         return -1;
     }
 
-    _free_entry(cache, partition, entry);
+    free_entry(cache, partition, entry);
 
     return 0;
 }
@@ -780,7 +784,7 @@ void clock_cache_clear(clock_cache_t *cache)
             uint8_t state = atomic_load_explicit(&partition->slots[j].state, memory_order_acquire);
             if (state == ENTRY_VALID)
             {
-                _free_entry(cache, partition, &partition->slots[j]);
+                free_entry(cache, partition, &partition->slots[j]);
             }
         }
     }
@@ -806,7 +810,7 @@ void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats)
                     atomic_load_explicit(&partition->slots[j].key_len, memory_order_relaxed);
                 size_t plen =
                     atomic_load_explicit(&partition->slots[j].payload_len, memory_order_relaxed);
-                total_bytes += _entry_size(klen, plen);
+                total_bytes += entry_size(klen, plen);
                 total_entries++;
             }
         }
@@ -819,11 +823,11 @@ void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats)
     stats->num_partitions = cache->num_partitions;
 
     uint64_t total_accesses = stats->hits + stats->misses;
-    stats->hit_rate = (total_accesses > 0) ? ((double)stats->hits / total_accesses) : 0.0;
+    stats->hit_rate = (total_accesses > 0) ? ((double)stats->hits / (double)total_accesses) : 0.0;
 }
 
 size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size_t prefix_len,
-                                  clock_cache_foreach_callback_t callback, void *user_data)
+                                  const clock_cache_foreach_callback_t callback, void *user_data)
 {
     if (!cache || !prefix || prefix_len == 0 || !callback) return 0;
 

@@ -83,8 +83,9 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
 
     if (fgets(line, sizeof(line), fp))
     {
-        int version = atoi(line);
-        if (version != MANIFEST_VERSION)
+        char *endptr;
+        long version = strtol(line, &endptr, 10);
+        if (endptr == line || version != MANIFEST_VERSION)
         {
             fclose(fp);
             pthread_rwlock_destroy(&manifest->lock);
@@ -109,12 +110,30 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     {
         int level;
         uint64_t id, num_entries, size_bytes;
+        char *ptr = line;
+        char *endptr;
 
-        if (sscanf(line, "%d,%" SCNu64 ",%" SCNu64 ",%" SCNu64, &level, &id, &num_entries,
-                   &size_bytes) == 4)
-        {
-            tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
-        }
+        /* parse level */
+        long level_val = strtol(ptr, &endptr, 10);
+        if (endptr == ptr || *endptr != ',') continue;
+        level = (int)level_val;
+        ptr = endptr + 1;
+
+        /* parse id */
+        id = strtoull(ptr, &endptr, 10);
+        if (endptr == ptr || *endptr != ',') continue;
+        ptr = endptr + 1;
+
+        /* parse num_entries */
+        num_entries = strtoull(ptr, &endptr, 10);
+        if (endptr == ptr || *endptr != ',') continue;
+        ptr = endptr + 1;
+
+        /* parse size_bytes */
+        size_bytes = strtoull(ptr, &endptr, 10);
+        if (endptr == ptr) continue;
+
+        tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
     }
 
     /* keep file open for future use */

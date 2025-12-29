@@ -606,6 +606,9 @@ struct tidesdb_txn_t
     tidesdb_column_family_t **read_cfs;
     int read_set_count;
     int read_set_capacity;
+    uint8_t **read_key_arenas;  /* arena buffers for read keys */
+    int read_key_arena_count;   /* number of arena buffers */
+    size_t read_key_arena_used; /* bytes used in current arena */
     void *write_set_hash;
     void *read_set_hash;
     tidesdb_column_family_t **cfs;

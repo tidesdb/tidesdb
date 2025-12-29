@@ -89,6 +89,10 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_TXN_SMALL_SCAN_LIMIT 64
 /* grow read set by this amount */
 #define TDB_TXN_READ_SET_BATCH_GROW 256
+/* arena size for read key allocation (4KB) */
+#define TDB_TXN_READ_KEY_ARENA_SIZE 4096
+/* initial arena array capacity */
+#define TDB_TXN_READ_KEY_ARENA_INITIAL_CAPACITY 4
 /* initial capacity for active txn list */
 #define TDB_ACTIVE_TXN_INITIAL_CAPACITY 1024
 /* hash table capacity for write set (power of 2) */
@@ -258,7 +262,7 @@ typedef struct
  * @param entries array of entries
  * @param keys array of key data
  * @param inline_values array of inline values (null if in vlog)
- * @param max_key maximum key in this block (for seek optimization)
+ * @param max_key maximum key in this block
  * @param max_key_size size of maximum key
  */
 typedef struct
@@ -3538,38 +3542,58 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         return TDB_ERR_NOT_FOUND;
     }
 
-    /* bloom filter check is done by caller before calling this function */
+    if (sst->bloom_filter)
+    {
+        PROFILE_INC(db, bloom_checks);
+        if (!bloom_filter_contains(sst->bloom_filter, key, key_size))
+        {
+            return TDB_ERR_NOT_FOUND;
+        }
+        PROFILE_INC(db, bloom_hits);
+    }
 
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
     tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
 
-    /* check if key is within SSTable's key range */
+    /* check if this is a reverse comparator (min_key > max_key in actual values) */
+    int min_max_cmp = comparator_fn(sst->min_key, sst->min_key_size, sst->max_key,
+                                    sst->max_key_size, comparator_ctx);
+    int is_reverse = (min_max_cmp > 0); /* min > max in comparator order means reverse */
+
     int min_cmp = comparator_fn(key, key_size, sst->min_key, sst->min_key_size, comparator_ctx);
     int max_cmp = comparator_fn(key, key_size, sst->max_key, sst->max_key_size, comparator_ctx);
 
-    if (min_cmp < 0 || max_cmp > 0)
+    if (is_reverse)
     {
-        return TDB_ERR_NOT_FOUND;
+        /* for reverse comparators, min_key is largest, max_key is smallest
+         * key is in range if max_key <= key <= min_key (in actual values)
+         * with reverse comparator -- key >= max means cmp(key,max) <= 0, key <= min means
+         * cmp(key,min) >= 0 */
+        if (min_cmp < 0 || max_cmp > 0)
+        {
+            return TDB_ERR_NOT_FOUND;
+        }
+    }
+    else
+    {
+        /* normal order */
+        if (min_cmp < 0 || max_cmp > 0)
+        {
+            return TDB_ERR_NOT_FOUND;
+        }
     }
 
     /* use block indexes to find starting klog block */
     uint64_t start_file_position = 0;
-    int block_index_exact_match = 0; /* set if block index found exact containing block */
     if (sst->block_indexes)
     {
         int index_result = compact_block_index_find_predecessor(sst->block_indexes, key, key_size,
                                                                 &start_file_position);
 
-        if (index_result == -1)
+        if (index_result != 0)
         {
-            /* block index definitively says key doesnt exist (beyond last block) */
-            return TDB_ERR_NOT_FOUND;
-        }
-        else if (index_result == 0 && start_file_position > 0)
-        {
-            /* block index found a specific block that should contain the key */
-            block_index_exact_match = 1;
+            start_file_position = 0;
         }
     }
 
@@ -3604,8 +3628,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     int result = TDB_ERR_NOT_FOUND;
     uint64_t block_num = 0;
 
-    /* track block position for cache keys */
-    uint64_t block_position = klog_cursor->current_pos;
     char cf_name[TDB_CACHE_KEY_SIZE];
     int has_cf_name = (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) == 0);
 
@@ -3618,14 +3640,17 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             break;
         }
 
+        /* capture current block position before reading (for cache key) */
+        uint64_t block_position = klog_cursor->current_pos;
+
         tidesdb_klog_block_t *klog_block = NULL;
         tidesdb_ref_counted_block_t *rc_block = NULL;
         block_manager_block_t *block = NULL;
 
         if (db->clock_cache && has_cf_name)
         {
-            klog_block = tidesdb_cache_block_get(db, cf_name, sst->klog_path,
-                                                 klog_cursor->current_pos, &rc_block);
+            klog_block =
+                tidesdb_cache_block_get(db, cf_name, sst->klog_path, block_position, &rc_block);
             if (klog_block)
             {
                 PROFILE_INC(db, cache_block_hits);
@@ -3636,6 +3661,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         {
             PROFILE_INC(db, cache_block_misses);
             PROFILE_INC(db, disk_reads);
+
             block = tidesdb_read_block(db, sst, klog_cursor);
 
             if (!block)
@@ -3689,7 +3715,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                     found_idx = mid;
                     break;
                 }
-                else if (cmp < 0)
+                if (cmp < 0)
                 {
                     right = mid - 1;
                 }
@@ -3757,19 +3783,11 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         /* cleanup block resources before moving to next */
         if (block) block_manager_block_release(block);
 
-        /* if block index gave us an exact match and key wasnt found,
-         * dont scan subsequent blocks - the key definitely doesnt exist */
-        if (block_index_exact_match && block_num == 0)
-        {
-            break;
-        }
-
         /* reset for next iteration */
         rc_block = NULL;
         klog_block = NULL;
 
         block_num++;
-        block_position = klog_cursor->current_pos;
 
         if (block_manager_cursor_next(klog_cursor) != 0)
         {
@@ -3778,7 +3796,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     }
 
 cleanup:
-    /* stack-allocated cursor doesnt need freeing */
+
     return result;
 }
 
@@ -3913,6 +3931,30 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
                             block_manager_close(klog_bm);
                             block_manager_close(vlog_bm);
                             return TDB_ERR_CORRUPTION;
+                        }
+
+                        /* validate first data block is readable to detect incomplete ssts */
+                        block_manager_cursor_t *validate_cursor;
+                        if (block_manager_cursor_init(&validate_cursor, klog_bm) == 0)
+                        {
+                            if (block_manager_cursor_goto_first(validate_cursor) == 0)
+                            {
+                                block_manager_block_t *first_block =
+                                    block_manager_cursor_read(validate_cursor);
+                                if (!first_block || first_block->size == 0)
+                                {
+                                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                                  "SSTable %s first data block unreadable or empty",
+                                                  sst->klog_path);
+                                    if (first_block) block_manager_block_release(first_block);
+                                    block_manager_cursor_free(validate_cursor);
+                                    block_manager_close(klog_bm);
+                                    block_manager_close(vlog_bm);
+                                    return TDB_ERR_CORRUPTION;
+                                }
+                                block_manager_block_release(first_block);
+                            }
+                            block_manager_cursor_free(validate_cursor);
                         }
                     }
 
@@ -4147,8 +4189,9 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
         }
         else
         {
-            /* no resize needed, just add to existing array */
-            /* atomically reserve a slot by incrementing count first */
+            /* no resize needed, just add to existing array
+             * atomically reserve a slot by incrementing count FIRST,
+             * then write to the reserved slot */
             int expected = old_num;
 
             /* verify we have space before trying to reserve */
@@ -4158,31 +4201,24 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
                 continue;
             }
 
-            /* write sst pointer to array first, before incrementing count
-             * this prevents readers from seeing incremented count while slot is unpopulated */
-            old_arr[old_num] = sst;
-
-            /* ensure write is visible before count increment */
-            atomic_thread_fence(memory_order_release);
-
-            /* now atomically increment count to publish the new sst */
+            /* atomically reserve slot by incrementing count
+             * this ensures no two threads get the same slot */
             if (atomic_compare_exchange_strong_explicit(&level->num_sstables, &expected,
-                                                        old_num + 1, memory_order_release,
+                                                        old_num + 1, memory_order_acq_rel,
                                                         memory_order_acquire))
             {
-                /* success! sst is now visible to readers */
+                /* we successfully reserved slot old_num
+                 * now write our sst to the reserved slot */
+                old_arr[old_num] = sst;
+
+                /* ensure write is visible to readers */
+                atomic_thread_fence(memory_order_release);
+
                 atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                           memory_order_relaxed);
                 return TDB_SUCCESS;
             }
-            else
-            {
-                /* CAS failed -- another thread modified count
-                 * clear the slot we wrote to and retry */
-                old_arr[old_num] = NULL;
-                atomic_thread_fence(memory_order_release);
-            }
-            /* CAS failed, another thread modified count, retry */
+            /* CAS failed, another thread reserved the slot first, retry */
         }
     }
 }
@@ -9865,6 +9901,45 @@ int tidesdb_close(tidesdb_t *db)
     pthread_rwlock_unlock(&db->cf_list_lock);
     TDB_DEBUG_LOG(TDB_LOG_INFO, "All background flushes completed (queue is empty)");
 
+    /* wait for any in-progress compactions to complete before shutdown
+     * this prevents data loss from compaction removing old ssts while
+     * the new merged SSTable is not yet fully persisted */
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for in-progress compactions to complete");
+    int compaction_wait_count = 0;
+    while (1)
+    {
+        int any_compacting = 0;
+        pthread_rwlock_rdlock(&db->cf_list_lock);
+        for (int i = 0; i < db->num_column_families; i++)
+        {
+            if (db->column_families[i])
+            {
+                if (atomic_load_explicit(&db->column_families[i]->is_compacting,
+                                         memory_order_acquire))
+                {
+                    any_compacting = 1;
+                    break;
+                }
+            }
+        }
+        pthread_rwlock_unlock(&db->cf_list_lock);
+
+        if (!any_compacting)
+        {
+            break;
+        }
+
+        if (compaction_wait_count % 100 == 0 && compaction_wait_count > 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "Still waiting for in-progress compactions (waited %d ms)",
+                          compaction_wait_count);
+        }
+
+        usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
+        compaction_wait_count++;
+    }
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "All in-progress compactions completed");
+
     if (db->flush_queue)
     {
         /* set shutdown flag first, before enqueueing NULLs
@@ -11198,10 +11273,63 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
         txn->read_set_capacity = new_cap;
     }
 
-    txn->read_keys[txn->read_set_count] = malloc(key_size);
-    if (!txn->read_keys[txn->read_set_count]) return -1;
+    /* arena allocation for read keys to reduce malloc overhead */
+    uint8_t *key_ptr = NULL;
 
-    memcpy(txn->read_keys[txn->read_set_count], key, key_size);
+    /* check if current arena has space */
+    if (txn->read_key_arenas && txn->read_key_arena_count > 0)
+    {
+        size_t remaining = TDB_TXN_READ_KEY_ARENA_SIZE - txn->read_key_arena_used;
+        if (key_size <= remaining)
+        {
+            /* bump allocate from current arena */
+            key_ptr =
+                txn->read_key_arenas[txn->read_key_arena_count - 1] + txn->read_key_arena_used;
+            txn->read_key_arena_used += key_size;
+        }
+    }
+
+    /* need new arena or first allocation */
+    if (!key_ptr)
+    {
+        /* allocate new arena */
+        size_t arena_size =
+            (key_size > TDB_TXN_READ_KEY_ARENA_SIZE) ? key_size : TDB_TXN_READ_KEY_ARENA_SIZE;
+        uint8_t *new_arena = malloc(arena_size);
+        if (!new_arena) return -1;
+
+        /* grow arena array if needed */
+        if (!txn->read_key_arenas || txn->read_key_arena_count == 0)
+        {
+            txn->read_key_arenas =
+                malloc(TDB_TXN_READ_KEY_ARENA_INITIAL_CAPACITY * sizeof(uint8_t *));
+            if (!txn->read_key_arenas)
+            {
+                free(new_arena);
+                return -1;
+            }
+        }
+        else if ((txn->read_key_arena_count & (txn->read_key_arena_count - 1)) == 0 &&
+                 txn->read_key_arena_count >= TDB_TXN_READ_KEY_ARENA_INITIAL_CAPACITY)
+        {
+            /* power of 2 and >= initial capacity, double the array */
+            int new_cap = txn->read_key_arena_count * 2;
+            uint8_t **new_arenas = realloc(txn->read_key_arenas, new_cap * sizeof(uint8_t *));
+            if (!new_arenas)
+            {
+                free(new_arena);
+                return -1;
+            }
+            txn->read_key_arenas = new_arenas;
+        }
+
+        txn->read_key_arenas[txn->read_key_arena_count++] = new_arena;
+        key_ptr = new_arena;
+        txn->read_key_arena_used = key_size;
+    }
+
+    memcpy(key_ptr, key, key_size);
+    txn->read_keys[txn->read_set_count] = key_ptr;
     txn->read_key_sizes[txn->read_set_count] = key_size;
     txn->read_seqs[txn->read_set_count] = seq;
     txn->read_cfs[txn->read_set_count] = cf;
@@ -11312,22 +11440,37 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
         return TDB_ERR_MEMORY;
     }
 
-    (*txn)->read_set_capacity = TDB_INITIAL_TXN_READ_SET_CAPACITY;
-    (*txn)->read_keys = calloc((*txn)->read_set_capacity, sizeof(uint8_t *));
-    (*txn)->read_key_sizes = calloc((*txn)->read_set_capacity, sizeof(size_t));
-    (*txn)->read_seqs = calloc((*txn)->read_set_capacity, sizeof(uint64_t));
-    (*txn)->read_cfs = calloc((*txn)->read_set_capacity, sizeof(tidesdb_column_family_t *));
-
-    if (!(*txn)->read_keys || !(*txn)->read_key_sizes || !(*txn)->read_seqs || !(*txn)->read_cfs)
+    /* defer read set allocation for isolation levels that dont need conflict detection
+     * READ_UNCOMMITTED and READ_COMMITTED skip read tracking entirely */
+    if (isolation >= TDB_ISOLATION_REPEATABLE_READ)
     {
-        free((*txn)->read_keys);
-        free((*txn)->read_key_sizes);
-        free((*txn)->read_seqs);
-        free((*txn)->read_cfs);
-        free((*txn)->ops);
-        free(*txn);
-        *txn = NULL;
-        return TDB_ERR_MEMORY;
+        (*txn)->read_set_capacity = TDB_INITIAL_TXN_READ_SET_CAPACITY;
+        (*txn)->read_keys = calloc((*txn)->read_set_capacity, sizeof(uint8_t *));
+        (*txn)->read_key_sizes = calloc((*txn)->read_set_capacity, sizeof(size_t));
+        (*txn)->read_seqs = calloc((*txn)->read_set_capacity, sizeof(uint64_t));
+        (*txn)->read_cfs = calloc((*txn)->read_set_capacity, sizeof(tidesdb_column_family_t *));
+
+        if (!(*txn)->read_keys || !(*txn)->read_key_sizes || !(*txn)->read_seqs ||
+            !(*txn)->read_cfs)
+        {
+            free((*txn)->read_keys);
+            free((*txn)->read_key_sizes);
+            free((*txn)->read_seqs);
+            free((*txn)->read_cfs);
+            free((*txn)->ops);
+            free(*txn);
+            *txn = NULL;
+            return TDB_ERR_MEMORY;
+        }
+    }
+    else
+    {
+        /* low isolation levels dont track reads */
+        (*txn)->read_set_capacity = 0;
+        (*txn)->read_keys = NULL;
+        (*txn)->read_key_sizes = NULL;
+        (*txn)->read_seqs = NULL;
+        (*txn)->read_cfs = NULL;
     }
 
     (*txn)->write_set_hash = NULL; /* hash table created lazily for large transactions */
@@ -11851,37 +11994,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
             PROFILE_INC(txn->db, sstables_checked);
 
-            /* range check -- skip ssts that dont overlap key */
-            if (sst->min_key && sst->max_key)
-            {
-                int min_max_cmp = comparator_fn(sst->min_key, sst->min_key_size, sst->max_key,
-                                                sst->max_key_size, comparator_ctx);
-                int is_reverse = (min_max_cmp > 0);
-                int cmp_min =
-                    comparator_fn(key, key_size, sst->min_key, sst->min_key_size, comparator_ctx);
-                int cmp_max =
-                    comparator_fn(key, key_size, sst->max_key, sst->max_key_size, comparator_ctx);
-
-                int out_of_range =
-                    is_reverse ? (cmp_min > 0 || cmp_max < 0) : (cmp_min < 0 || cmp_max > 0);
-                if (out_of_range)
-                {
-                    continue;
-                }
-            }
-
-            /* bloom filter check -- skip if definitely not present */
-            if (sst->bloom_filter)
-            {
-                PROFILE_INC(txn->db, bloom_checks);
-                if (!bloom_filter_contains(sst->bloom_filter, key, key_size))
-                {
-                    continue;
-                }
-                PROFILE_INC(txn->db, bloom_hits);
-            }
-
-            /* take ref only for ssts we will actually read */
+            /* take ref for ssts we will check */
             tidesdb_sstable_ref(sst);
 
             tidesdb_kv_pair_t *candidate_kv = NULL;
@@ -12051,10 +12164,12 @@ void tidesdb_txn_free(tidesdb_txn_t *txn) /* NOLINT(misc-no-recursion) */
     }
     free(txn->ops);
 
-    for (int i = 0; i < txn->read_set_count; i++)
+    /* free arena buffers instead of individual keys */
+    for (int i = 0; i < txn->read_key_arena_count; i++)
     {
-        free(txn->read_keys[i]);
+        free(txn->read_key_arenas[i]);
     }
+    free(txn->read_key_arenas);
     free(txn->read_keys);
     free(txn->read_key_sizes);
     free(txn->read_seqs);
@@ -12477,19 +12592,21 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         /* use captured skip_list pointer -- dont access mt->skip_list as mt may be freed */
         skip_list_t *memtable = cf_skiplists[cf_idx];
 
-        /* hash-based dedup for O(N) performance */
-#define TXN_DEDUP_HASH_SIZE 1024
-        typedef struct
+        /* count ops for this CF to decide dedup strategy */
+        int cf_op_count = 0;
+        for (int i = 0; i < txn->num_ops; i++)
         {
-            uint8_t *key;
-            size_t key_size;
-            int op_idx;
-        } dedup_entry_t;
+            if (txn->ops[i].cf == cf) cf_op_count++;
+        }
 
-        dedup_entry_t *dedup_hash = calloc(TXN_DEDUP_HASH_SIZE, sizeof(dedup_entry_t));
-        if (!dedup_hash)
+        /* for small transactions, skip dedup entirely -- skip_list handles duplicates
+         * and the overhead of hash table allocation isnt worth it */
+#define TXN_DEDUP_SKIP_THRESHOLD 32
+#define TXN_DEDUP_HASH_SIZE      1024
+
+        if (cf_op_count <= TXN_DEDUP_SKIP_THRESHOLD)
         {
-            /* fallback: write all ops without dedup (skip_list handles duplicates) */
+            /* small transaction: write all ops directly, skip_list handles duplicates */
             for (int i = 0; i < txn->num_ops; i++)
             {
                 tidesdb_txn_op_t *op = &txn->ops[i];
@@ -12500,65 +12617,92 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
         else
         {
-            /* build hash table from newest to oldest (reverse order) */
-            for (int i = txn->num_ops - 1; i >= 0; i--)
+            /* larger transaction: use hash-based dedup for O(N) performance */
+            typedef struct
             {
-                tidesdb_txn_op_t *op = &txn->ops[i];
-                if (op->cf != cf) continue;
+                uint8_t *key;
+                size_t key_size;
+                int op_idx;
+            } dedup_entry_t;
 
-                /* compute hash */
-                uint32_t hash = 0;
-                for (size_t b = 0; b < op->key_size; b++)
+            dedup_entry_t *dedup_hash = calloc(TXN_DEDUP_HASH_SIZE, sizeof(dedup_entry_t));
+            if (!dedup_hash)
+            {
+                /* fallback: write all ops without dedup (skip_list handles duplicates) */
+                for (int i = 0; i < txn->num_ops; i++)
                 {
-                    hash = hash * 31 + op->key[b];
-                }
-                int slot = (int)(hash % TXN_DEDUP_HASH_SIZE);
-
-                /* linear probing to find empty slot or matching key */
-                int inserted = 0;
-                int is_duplicate = 0;
-                for (int probe = 0; probe < TXN_DEDUP_HASH_SIZE; probe++)
-                {
-                    if (dedup_hash[slot].key == NULL)
-                    {
-                        /* empty slot, insert this op */
-                        dedup_hash[slot].key = op->key;
-                        dedup_hash[slot].key_size = op->key_size;
-                        dedup_hash[slot].op_idx = i;
-                        inserted = 1;
-                        break;
-                    }
-                    if (dedup_hash[slot].key_size == op->key_size &&
-                        memcmp(dedup_hash[slot].key, op->key, op->key_size) == 0)
-                    {
-                        /* duplicate found, skip this op */
-                        is_duplicate = 1;
-                        break;
-                    }
-                    slot = (slot + 1) % TXN_DEDUP_HASH_SIZE;
-                }
-
-                /* if hash table is full and key is not a duplicate, write directly to memtable */
-                if (!inserted && !is_duplicate)
-                {
+                    tidesdb_txn_op_t *op = &txn->ops[i];
+                    if (op->cf != cf) continue;
                     skip_list_put_with_seq(memtable, op->key, op->key_size, op->value,
                                            op->value_size, op->ttl, txn->commit_seq, op->is_delete);
                 }
             }
-
-            /* write deduplicated ops from hash table to memtable */
-            for (int slot = 0; slot < TXN_DEDUP_HASH_SIZE; slot++)
+            else
             {
-                if (dedup_hash[slot].key != NULL)
+                /* build hash table from newest to oldest (reverse order) */
+                for (int i = txn->num_ops - 1; i >= 0; i--)
                 {
-                    tidesdb_txn_op_t *op = &txn->ops[dedup_hash[slot].op_idx];
-                    skip_list_put_with_seq(memtable, op->key, op->key_size, op->value,
-                                           op->value_size, op->ttl, txn->commit_seq, op->is_delete);
-                }
-            }
+                    tidesdb_txn_op_t *op = &txn->ops[i];
+                    if (op->cf != cf) continue;
 
-            free(dedup_hash);
+                    /* compute hash */
+                    uint32_t hash = 0;
+                    for (size_t b = 0; b < op->key_size; b++)
+                    {
+                        hash = hash * 31 + op->key[b];
+                    }
+                    int slot = (int)(hash % TXN_DEDUP_HASH_SIZE);
+
+                    /* linear probing to find empty slot or matching key */
+                    int inserted = 0;
+                    int is_duplicate = 0;
+                    for (int probe = 0; probe < TXN_DEDUP_HASH_SIZE; probe++)
+                    {
+                        if (dedup_hash[slot].key == NULL)
+                        {
+                            /* empty slot, insert this op */
+                            dedup_hash[slot].key = op->key;
+                            dedup_hash[slot].key_size = op->key_size;
+                            dedup_hash[slot].op_idx = i;
+                            inserted = 1;
+                            break;
+                        }
+                        if (dedup_hash[slot].key_size == op->key_size &&
+                            memcmp(dedup_hash[slot].key, op->key, op->key_size) == 0)
+                        {
+                            /* duplicate found, skip this op */
+                            is_duplicate = 1;
+                            break;
+                        }
+                        slot = (slot + 1) % TXN_DEDUP_HASH_SIZE;
+                    }
+
+                    /* if hash table is full and key is not a duplicate, write directly to memtable
+                     */
+                    if (!inserted && !is_duplicate)
+                    {
+                        skip_list_put_with_seq(memtable, op->key, op->key_size, op->value,
+                                               op->value_size, op->ttl, txn->commit_seq,
+                                               op->is_delete);
+                    }
+                }
+
+                /* write deduplicated ops from hash table to memtable */
+                for (int slot = 0; slot < TXN_DEDUP_HASH_SIZE; slot++)
+                {
+                    if (dedup_hash[slot].key != NULL)
+                    {
+                        tidesdb_txn_op_t *op = &txn->ops[dedup_hash[slot].op_idx];
+                        skip_list_put_with_seq(memtable, op->key, op->key_size, op->value,
+                                               op->value_size, op->ttl, txn->commit_seq,
+                                               op->is_delete);
+                    }
+                }
+
+                free(dedup_hash);
+            }
         }
+#undef TXN_DEDUP_SKIP_THRESHOLD
 #undef TXN_DEDUP_HASH_SIZE
 
         /* check if this CF needs flushing before releasing refcount
@@ -14891,7 +15035,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     }
 
     /* update global sequence based on recovered data
-     * use >= because global_seq is initialized to 1, so if max_seq from SSTable is also 1,
+     * use >= because global_seq is initialized to 1, so if max_seq from sst is also 1,
      * we still need to advance global_seq to 2 to avoid sequence collisions */
     uint64_t current_seq = atomic_load_explicit(&cf->db->global_seq, memory_order_acquire);
     if (global_max_seq >= current_seq)

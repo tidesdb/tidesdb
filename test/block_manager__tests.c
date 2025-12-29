@@ -1501,6 +1501,163 @@ void test_block_manager_concurrent_file_extension()
     (void)remove("test_concurrent_ext.db");
 }
 
+typedef struct
+{
+    block_manager_t *bm;
+    int thread_id;
+    int num_blocks;
+    int *success_count;
+    pthread_mutex_t *mutex;
+} concurrent_write_args_t;
+
+static void *concurrent_write_thread(void *arg)
+{
+    concurrent_write_args_t *args = (concurrent_write_args_t *)arg;
+    int local_success = 0;
+
+    for (int i = 0; i < args->num_blocks; i++)
+    {
+        char data[64];
+        snprintf(data, sizeof(data), "thread_%d_block_%d_data", args->thread_id, i);
+        size_t data_size = strlen(data) + 1;
+
+        block_manager_block_t *block = block_manager_block_create(data_size, data);
+        if (!block) continue;
+
+        int64_t offset = block_manager_block_write(args->bm, block);
+        block_manager_block_free(block);
+
+        if (offset >= 0)
+        {
+            local_success++;
+        }
+    }
+
+    pthread_mutex_lock(args->mutex);
+    *args->success_count += local_success;
+    pthread_mutex_unlock(args->mutex);
+
+    return NULL;
+}
+
+void test_block_manager_concurrent_write_size_reopen()
+{
+    const char *test_file = "test_concurrent_size_reopen.db";
+    const int num_threads = 4;
+    const int blocks_per_thread = 50;
+    const int total_expected_blocks = num_threads * blocks_per_thread;
+
+    (void)remove(test_file);
+
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* get initial file size (should be just header) */
+    uint64_t initial_size;
+    ASSERT_TRUE(block_manager_get_size(bm, &initial_size) == 0);
+    printf("Initial file size: %" PRIu64 " bytes\n", initial_size);
+    ASSERT_EQ(initial_size, BLOCK_MANAGER_HEADER_SIZE);
+
+    /* spawn concurrent writer threads */
+    pthread_t threads[num_threads];
+    concurrent_write_args_t args[num_threads];
+    int success_count = 0;
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        args[i].bm = bm;
+        args[i].thread_id = i;
+        args[i].num_blocks = blocks_per_thread;
+        args[i].success_count = &success_count;
+        args[i].mutex = &mutex;
+        ASSERT_TRUE(pthread_create(&threads[i], NULL, concurrent_write_thread, &args[i]) == 0);
+    }
+
+    /* wait for all threads to complete */
+    for (int i = 0; i < num_threads; i++)
+    {
+        ASSERT_TRUE(pthread_join(threads[i], NULL) == 0);
+    }
+
+    pthread_mutex_destroy(&mutex);
+
+    printf("Successfully wrote %d blocks (expected %d)\n", success_count, total_expected_blocks);
+    ASSERT_EQ(success_count, total_expected_blocks);
+
+    /* verify file size after writes */
+    uint64_t size_after_writes;
+    ASSERT_TRUE(block_manager_get_size(bm, &size_after_writes) == 0);
+    printf("File size after writes: %" PRIu64 " bytes\n", size_after_writes);
+    ASSERT_TRUE(size_after_writes > initial_size);
+
+    /* count blocks to verify */
+    int block_count = block_manager_count_blocks(bm);
+    printf("Block count after writes: %d (expected %d)\n", block_count, total_expected_blocks);
+    ASSERT_EQ(block_count, total_expected_blocks);
+
+    /* close the block manager */
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+
+    /* reopen and verify file size is preserved */
+    bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    uint64_t size_after_reopen;
+    ASSERT_TRUE(block_manager_get_size(bm, &size_after_reopen) == 0);
+    printf("File size after reopen: %" PRIu64 " bytes\n", size_after_reopen);
+    ASSERT_EQ(size_after_reopen, size_after_writes);
+
+    /* verify block count after reopen */
+    int block_count_after_reopen = block_manager_count_blocks(bm);
+    printf("Block count after reopen: %d (expected %d)\n", block_count_after_reopen,
+           total_expected_blocks);
+    ASSERT_EQ(block_count_after_reopen, total_expected_blocks);
+
+    /* verify all blocks are readable and have correct data */
+    block_manager_cursor_t *cursor;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+    ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
+
+    int readable_blocks = 0;
+    int thread_counts[num_threads];
+    memset(thread_counts, 0, sizeof(thread_counts));
+
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (!block) break;
+
+        /* parse thread_id from block data */
+        char *data = (char *)block->data;
+        int thread_id = -1;
+        if (sscanf(data, "thread_%d_block_", &thread_id) == 1 && thread_id >= 0 &&
+            thread_id < num_threads)
+        {
+            thread_counts[thread_id]++;
+        }
+
+        readable_blocks++;
+        block_manager_block_free(block);
+    } while (block_manager_cursor_next(cursor) == 0);
+
+    block_manager_cursor_free(cursor);
+
+    printf("Readable blocks after reopen: %d (expected %d)\n", readable_blocks,
+           total_expected_blocks);
+    ASSERT_EQ(readable_blocks, total_expected_blocks);
+
+    /* verify each thread wrote the expected number of blocks */
+    for (int i = 0; i < num_threads; i++)
+    {
+        printf("Thread %d wrote %d blocks (expected %d)\n", i, thread_counts[i], blocks_per_thread);
+        ASSERT_EQ(thread_counts[i], blocks_per_thread);
+    }
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    (void)remove(test_file);
+}
+
 int main(void)
 {
     RUN_TEST(test_block_manager_open, tests_passed);
@@ -1525,6 +1682,7 @@ int main(void)
     RUN_TEST(test_block_manager_concurrent_rw, tests_passed);
     RUN_TEST(test_block_manager_sync_modes, tests_passed);
     RUN_TEST(test_block_manager_empty_block, tests_passed);
+    RUN_TEST(test_block_manager_concurrent_write_size_reopen, tests_passed);
 
     srand((unsigned int)time(NULL)); /* NOLINT(cert-msc51-cpp) */
     RUN_TEST(benchmark_block_manager, tests_passed);

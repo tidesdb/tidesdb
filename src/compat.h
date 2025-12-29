@@ -47,6 +47,18 @@
 #define tdb_strdup(s) strdup(s)
 #endif
 
+/* cross-platform fabs abstraction */
+#include <math.h>
+#if defined(_MSC_VER)
+#define tdb_fabs(x) fabs(x)
+#elif defined(__APPLE__)
+/* macOS may require explicit declaration in some contexts */
+#define tdb_fabs(x) fabs(x)
+#else
+/* POSIX systems */
+#define tdb_fabs(x) fabs(x)
+#endif
+
 /* cross-platform fsync abstraction */
 #if defined(_WIN32)
 #include <io.h>

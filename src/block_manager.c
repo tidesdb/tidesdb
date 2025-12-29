@@ -406,6 +406,26 @@ void block_manager_block_release(block_manager_block_t *block)
     }
 }
 
+int block_manager_cursor_init_stack(block_manager_cursor_t *cursor, block_manager_t *bm)
+{
+    if (!cursor || !bm) return -1;
+
+    cursor->bm = bm;
+
+    /* initialize to position before first block */
+    cursor->current_pos = BLOCK_MANAGER_HEADER_SIZE;
+    cursor->current_block_size = 0;
+    cursor->block_index = -1; /* -1 means before first block */
+
+    /* hint to OS that we'll be reading sequentially */
+    set_file_sequential_hint(bm->fd);
+
+    /* position at first block so cursor_read works immediately */
+    block_manager_cursor_goto_first(cursor);
+
+    return 0;
+}
+
 int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *bm)
 {
     if (!bm) return -1;
@@ -413,20 +433,7 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
     (*cursor) = malloc(sizeof(block_manager_cursor_t));
     if (!(*cursor)) return -1;
 
-    (*cursor)->bm = bm;
-
-    /* initialize to position before first block */
-    (*cursor)->current_pos = BLOCK_MANAGER_HEADER_SIZE;
-    (*cursor)->current_block_size = 0;
-    (*cursor)->block_index = -1; /* -1 means before first block */
-
-    /* hint to OS that we'll be reading sequentially */
-    set_file_sequential_hint(bm->fd);
-
-    /* position at first block so cursor_read works immediately */
-    block_manager_cursor_goto_first(*cursor);
-
-    return 0;
+    return block_manager_cursor_init_stack(*cursor, bm);
 }
 
 int block_manager_cursor_next(block_manager_cursor_t *cursor)

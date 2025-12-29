@@ -184,12 +184,22 @@ void block_manager_block_release(block_manager_block_t *block);
 
 /**
  * block_manager_cursor_init
- * initializes a block manager cursor
+ * initializes a block manager cursor (heap allocated)
  * @param cursor the cursor to initialize
  * @param bm the block manager to initialize the cursor on
  * @return 0 if successful, -1 if not
  */
 int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *bm);
+
+/**
+ * block_manager_cursor_init_stack
+ * initializes a pre-allocated block manager cursor (stack or caller-allocated)
+ * avoids heap allocation in hot paths
+ * @param cursor pointer to pre-allocated cursor struct
+ * @param bm the block manager to initialize the cursor on
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_cursor_init_stack(block_manager_cursor_t *cursor, block_manager_t *bm);
 
 /**
  * cursor_next

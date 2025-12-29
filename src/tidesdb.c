@@ -3538,26 +3538,16 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         return TDB_ERR_NOT_FOUND;
     }
 
-    if (sst->bloom_filter && !bloom_filter_contains(sst->bloom_filter, key, key_size))
-    {
-        return TDB_ERR_NOT_FOUND;
-    }
+    /* bloom filter check is done by caller before calling this function */
 
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
     tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
 
-    /* check if this is a reverse comparator (min_key > max_key in actual values) */
-    int min_max_cmp = comparator_fn(sst->min_key, sst->min_key_size, sst->max_key,
-                                    sst->max_key_size, comparator_ctx);
-    int is_reverse = (min_max_cmp > 0); /* min > max in comparator order means reverse */
-
+    /* check if key is within SSTable's key range */
     int min_cmp = comparator_fn(key, key_size, sst->min_key, sst->min_key_size, comparator_ctx);
     int max_cmp = comparator_fn(key, key_size, sst->max_key, sst->max_key_size, comparator_ctx);
 
-    /* both reverse and normal order use the same condition since min/max keys
-     * are stored in comparator order */
-    (void)is_reverse;
     if (min_cmp < 0 || max_cmp > 0)
     {
         return TDB_ERR_NOT_FOUND;
@@ -3576,10 +3566,11 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         }
     }
 
-    /* search klog blocks using block manager cursor */
-    block_manager_cursor_t *klog_cursor;
+    /* search klog blocks using stack-allocated cursor to avoid heap allocation */
+    block_manager_cursor_t klog_cursor_stack;
+    block_manager_cursor_t *klog_cursor = &klog_cursor_stack;
 
-    if (block_manager_cursor_init(&klog_cursor, bms.klog_bm) != 0)
+    if (block_manager_cursor_init_stack(klog_cursor, bms.klog_bm) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to initialize klog cursor",
                       sst->id);
@@ -3600,7 +3591,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     if (sst->klog_data_end_offset > 0 && klog_cursor->current_pos >= sst->klog_data_end_offset)
     {
         /* block index pointed us to auxiliary structures, key not found */
-        block_manager_cursor_free(klog_cursor);
         return TDB_ERR_NOT_FOUND;
     }
 
@@ -3775,7 +3765,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     }
 
 cleanup:
-    block_manager_cursor_free(klog_cursor);
+    /* stack-allocated cursor doesnt need freeing */
     return result;
 }
 

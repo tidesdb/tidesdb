@@ -303,7 +303,7 @@ int queue_clear(queue_t *queue)
                 batch_head = current;
                 batch_tail = current;
             }
-            else
+            else if (batch_tail != NULL)
             {
                 batch_tail->next = current;
                 batch_tail = current;
@@ -320,7 +320,7 @@ int queue_clear(queue_t *queue)
     }
 
     /* attach batch to pool in one operation */
-    if (batch_head != NULL)
+    if (batch_head != NULL && batch_tail != NULL)
     {
         batch_tail->next = queue->node_pool;
         queue->node_pool = batch_head;

@@ -621,11 +621,133 @@ static inline size_t varint_size(uint64_t value)
     return size;
 }
 
+/**
+ * tdb_parse_wal_id
+ * parse WAL ID from filename like "wal_12345.log"
+ * @param filename the filename to parse
+ * @param id output WAL ID
+ * @return 1 on success, 0 on failure
+ */
+static int tdb_parse_wal_id(const char *filename, uint64_t *id)
+{
+    if (!filename || !id) return 0;
+
+    size_t prefix_len = strlen(TDB_WAL_PREFIX);
+    if (strncmp(filename, TDB_WAL_PREFIX, prefix_len) != 0) return 0;
+
+    const char *p = filename + prefix_len;
+    char *endptr;
+    unsigned long long val = strtoull(p, &endptr, 10);
+    if (endptr == p) return 0;
+
+    if (strcmp(endptr, TDB_WAL_EXT) != 0) return 0;
+
+    *id = (uint64_t)val;
+    return 1;
+}
+
+/**
+ * tdb_parse_level_num
+ * parse level number from filename like "L5_..."
+ * @param filename the filename to parse
+ * @param level_num output level number
+ * @return 1 on success, 0 on failure
+ */
+static int tdb_parse_level_num(const char *filename, int *level_num)
+{
+    if (!filename || !level_num) return 0;
+
+    size_t prefix_len = strlen(TDB_LEVEL_PREFIX);
+    if (strncmp(filename, TDB_LEVEL_PREFIX, prefix_len) != 0) return 0;
+
+    const char *p = filename + prefix_len;
+    char *endptr;
+    long val = strtol(p, &endptr, 10);
+    if (endptr == p) return 0;
+
+    *level_num = (int)val;
+    return 1;
+}
+
+/**
+ * tdb_parse_sstable_non_partitioned
+ * parse non-partitioned SSTable filename like "L5_12345.klog"
+ * @param filename the filename to parse
+ * @param level_num output level number
+ * @param sst_id output SSTable ID
+ * @return 1 on success, 0 on failure
+ */
+static int tdb_parse_sstable_non_partitioned(const char *filename, int *level_num,
+                                             unsigned long long *sst_id)
+{
+    if (!filename || !level_num || !sst_id) return 0;
+
+    size_t prefix_len = strlen(TDB_LEVEL_PREFIX);
+    if (strncmp(filename, TDB_LEVEL_PREFIX, prefix_len) != 0) return 0;
+
+    const char *p = filename + prefix_len;
+    char *endptr;
+    long level = strtol(p, &endptr, 10);
+    if (endptr == p || *endptr != '_') return 0;
+
+    p = endptr + 1;
+    unsigned long long id = strtoull(p, &endptr, 10);
+    if (endptr == p) return 0;
+
+    if (strcmp(endptr, TDB_SSTABLE_KLOG_EXT) != 0) return 0;
+
+    *level_num = (int)level;
+    *sst_id = id;
+    return 1;
+}
+
+/**
+ * tdb_parse_sstable_partitioned
+ * parse partitioned SSTable filename like "L5P2_12345.klog"
+ * @param filename the filename to parse
+ * @param level_num output level number
+ * @param partition_num output partition number
+ * @param sst_id output SSTable ID
+ * @return 1 on success, 0 on failure
+ */
+static int tdb_parse_sstable_partitioned(const char *filename, int *level_num, int *partition_num,
+                                         unsigned long long *sst_id)
+{
+    if (!filename || !level_num || !partition_num || !sst_id) return 0;
+
+    size_t level_prefix_len = strlen(TDB_LEVEL_PREFIX);
+    if (strncmp(filename, TDB_LEVEL_PREFIX, level_prefix_len) != 0) return 0;
+
+    const char *p = filename + level_prefix_len;
+    char *endptr;
+    long level = strtol(p, &endptr, 10);
+    if (endptr == p) return 0;
+
+    size_t partition_prefix_len = strlen(TDB_LEVEL_PARTITION_PREFIX);
+    if (strncmp(endptr, TDB_LEVEL_PARTITION_PREFIX, partition_prefix_len) != 0) return 0;
+
+    p = endptr + partition_prefix_len;
+    long partition = strtol(p, &endptr, 10);
+    if (endptr == p || *endptr != '_') return 0;
+
+    p = endptr + 1;
+    unsigned long long id = strtoull(p, &endptr, 10);
+    if (endptr == p) return 0;
+
+    if (strcmp(endptr, TDB_SSTABLE_KLOG_EXT) != 0) return 0;
+
+    *level_num = (int)level;
+    *partition_num = (int)partition;
+    *sst_id = id;
+    return 1;
+}
+
 static tidesdb_klog_block_t *tidesdb_klog_block_create(void);
 static void tidesdb_klog_block_free(tidesdb_klog_block_t *block);
 static int tidesdb_klog_block_add_entry(tidesdb_klog_block_t *block, const tidesdb_kv_pair_t *kv,
-                                        tidesdb_t *db, tidesdb_column_family_config_t *config);
-static int tidesdb_klog_block_is_full(tidesdb_klog_block_t *block, size_t max_size);
+                                        tidesdb_t *db,
+                                        const tidesdb_column_family_config_t *config);
+static int tidesdb_klog_block_is_full(const tidesdb_klog_block_t *block, size_t max_size);
 static int tidesdb_klog_block_serialize(tidesdb_klog_block_t *block, uint8_t **out,
                                         size_t *out_size);
 static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
@@ -643,16 +765,17 @@ typedef struct
     block_manager_t *vlog_bm;
 } tidesdb_block_managers_t;
 
-static int tidesdb_sstable_get_block_managers(tidesdb_t *db, tidesdb_sstable_t *sst,
+static int tidesdb_sstable_get_block_managers(const tidesdb_t *db, tidesdb_sstable_t *sst,
                                               tidesdb_block_managers_t *bms);
-static int tidesdb_vlog_read_value(tidesdb_t *db, tidesdb_sstable_t *sst, uint64_t vlog_offset,
-                                   size_t value_size, uint8_t **value);
-static int tidesdb_vlog_read_value_with_cursor(tidesdb_t *db, tidesdb_sstable_t *sst,
-                                               block_manager_cursor_t *cursor, uint64_t vlog_offset,
-                                               size_t value_size, uint8_t **value);
+static int tidesdb_vlog_read_value(const tidesdb_t *db, tidesdb_sstable_t *sst,
+                                   uint64_t vlog_offset, size_t value_size, uint8_t **value);
+static int tidesdb_vlog_read_value_with_cursor(const tidesdb_t *db, tidesdb_sstable_t *sst,
+                                               const block_manager_cursor_t *cursor,
+                                               uint64_t vlog_offset, size_t value_size,
+                                               uint8_t **value);
 static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base_path, uint64_t id,
                                                  const tidesdb_column_family_config_t *config);
-static void tidesdb_sstable_free(tidesdb_t *db, tidesdb_sstable_t *sst);
+static void tidesdb_sstable_free(const tidesdb_t *db, tidesdb_sstable_t *sst);
 
 static void compact_block_index_free(tidesdb_block_index_t *index);
 static int compact_block_index_find_predecessor(const tidesdb_block_index_t *index,
@@ -669,14 +792,14 @@ static uint8_t *compact_block_index_serialize(const tidesdb_block_index_t *index
 static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *data,
                                                               size_t data_size);
 static void tidesdb_sstable_ref(tidesdb_sstable_t *sst);
-static void tidesdb_sstable_unref(tidesdb_t *db, tidesdb_sstable_t *sst);
+static void tidesdb_sstable_unref(const tidesdb_t *db, tidesdb_sstable_t *sst);
 static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t *sst,
                                                skip_list_t *memtable, tidesdb_column_family_t *cf);
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
                                size_t key_size, tidesdb_kv_pair_t **kv);
 static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst);
 static tidesdb_level_t *tidesdb_level_create(int level_num, size_t capacity);
-static void tidesdb_level_free(tidesdb_t *db, tidesdb_level_t *level);
+static void tidesdb_level_free(const tidesdb_t *db, tidesdb_level_t *level);
 static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *sst);
 static int tidesdb_level_remove_sstable(tidesdb_t *db, tidesdb_level_t *level,
                                         tidesdb_sstable_t *sst);
@@ -688,7 +811,7 @@ static int tidesdb_merge_heap_add_source(tidesdb_merge_heap_t *heap,
                                          tidesdb_merge_source_t *source);
 static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
                                                  tidesdb_sstable_t **corrupted_sst);
-static int tidesdb_merge_heap_empty(tidesdb_merge_heap_t *heap);
+static int tidesdb_merge_heap_empty(const tidesdb_merge_heap_t *heap);
 static tidesdb_merge_source_t *tidesdb_merge_source_from_memtable(
     skip_list_t *memtable, tidesdb_column_family_config_t *config,
     tidesdb_immutable_memtable_t *imm);
@@ -1096,7 +1219,7 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, size_t key_size, size_t value
 
     size_t total_size = key_size + value_size;
 
-    uint64_t memory_based_limit = (uint64_t)(db->available_memory * TDB_MEMORY_PERCENTAGE);
+    uint64_t memory_based_limit = (uint64_t)((double)db->available_memory * TDB_MEMORY_PERCENTAGE);
     uint64_t max_allowed_size =
         memory_based_limit > TDB_MIN_KEY_VALUE_SIZE ? memory_based_limit : TDB_MIN_KEY_VALUE_SIZE;
 
@@ -1682,7 +1805,7 @@ static void tidesdb_klog_block_free(tidesdb_klog_block_t *block)
  * @return 0 on success, -1 on error
  */
 static int tidesdb_klog_block_add_entry(tidesdb_klog_block_t *block, const tidesdb_kv_pair_t *kv,
-                                        tidesdb_t *db, tidesdb_column_family_config_t *config)
+                                        tidesdb_t *db, const tidesdb_column_family_config_t *config)
 {
     int inline_value = (kv->entry.value_size < config->klog_value_threshold);
 
@@ -1798,7 +1921,7 @@ static int tidesdb_klog_block_add_entry(tidesdb_klog_block_t *block, const tides
  * 64KB target -> fill to 128KB uncompressed -> compresses to ~40-60KB
  * this maximizes block density while staying under the target after compression.
  */
-static int tidesdb_klog_block_is_full(tidesdb_klog_block_t *block, size_t max_size)
+static int tidesdb_klog_block_is_full(const tidesdb_klog_block_t *block, size_t max_size)
 {
     return block->block_size >= (max_size * 2);
 }
@@ -2191,14 +2314,15 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 /**
  * tidesdb_vlog_read_value
  * read a value from vlog
+ * @param db database instance
  * @param sst sstable containing vlog
  * @param vlog_offset offset of value in vlog
  * @param value_size size of value
  * @param value output value
  * @return 0 on success, -1 on error
  */
-static int tidesdb_vlog_read_value(tidesdb_t *db, tidesdb_sstable_t *sst, uint64_t vlog_offset,
-                                   size_t value_size, uint8_t **value)
+static int tidesdb_vlog_read_value(const tidesdb_t *db, tidesdb_sstable_t *sst,
+                                   uint64_t vlog_offset, size_t value_size, uint8_t **value)
 {
     tidesdb_block_managers_t bms;
     if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
@@ -2280,9 +2404,10 @@ static int tidesdb_vlog_read_value(tidesdb_t *db, tidesdb_sstable_t *sst, uint64
  * @param value output value
  * @return 0 on success, -1 on error
  */
-static int tidesdb_vlog_read_value_with_cursor(tidesdb_t *db, tidesdb_sstable_t *sst,
-                                               block_manager_cursor_t *cursor, uint64_t vlog_offset,
-                                               size_t value_size, uint8_t **value)
+static int tidesdb_vlog_read_value_with_cursor(const tidesdb_t *db, tidesdb_sstable_t *sst,
+                                               const block_manager_cursor_t *cursor,
+                                               uint64_t vlog_offset, size_t value_size,
+                                               uint8_t **value)
 {
     (void)cursor; /* cursor not needed with direct offset access */
 
@@ -2298,7 +2423,7 @@ static int tidesdb_vlog_read_value_with_cursor(tidesdb_t *db, tidesdb_sstable_t 
  * @param bms output block managers structure
  * @return TDB_SUCCESS on success, TDB_ERR_IO on failure
  */
-static int tidesdb_sstable_get_block_managers(tidesdb_t *db, tidesdb_sstable_t *sst,
+static int tidesdb_sstable_get_block_managers(const tidesdb_t *db, tidesdb_sstable_t *sst,
                                               tidesdb_block_managers_t *bms)
 {
     if (!db || !sst || !bms) return TDB_ERR_IO;
@@ -2366,6 +2491,7 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
 /**
  * tidesdb_sstable_create
  * create a new sstable
+ * @param db database instance
  * @param base_path base path for sstable files
  * @param id sstable id
  * @param config column family configuration
@@ -2423,7 +2549,7 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
  * @param db database instance
  * @param sst sstable to free
  */
-static void tidesdb_sstable_free(tidesdb_t *db, tidesdb_sstable_t *sst)
+static void tidesdb_sstable_free(const tidesdb_t *db, tidesdb_sstable_t *sst)
 {
     (void)db; /* db parameter kept for API consistency but not needed */
     if (!sst) return;
@@ -2479,7 +2605,7 @@ static void tidesdb_sstable_ref(tidesdb_sstable_t *sst)
  * @param db database instance
  * @param sst sstable to unreference
  */
-static void tidesdb_sstable_unref(tidesdb_t *db, tidesdb_sstable_t *sst)
+static void tidesdb_sstable_unref(const tidesdb_t *db, tidesdb_sstable_t *sst)
 {
     if (!sst) return;
     int old_refcount = atomic_fetch_sub(&sst->refcount, 1);
@@ -2566,14 +2692,14 @@ static uint32_t tidesdb_write_set_hash_key(tidesdb_column_family_t *cf, const ui
  * @param txn transaction
  * @param op_index operation index
  */
-static void tidesdb_write_set_hash_insert(tidesdb_write_set_hash_t *hash, tidesdb_txn_t *txn,
+static void tidesdb_write_set_hash_insert(tidesdb_write_set_hash_t *hash, const tidesdb_txn_t *txn,
                                           int op_index)
 {
     if (!hash || op_index < 0 || op_index >= txn->num_ops) return;
 
     tidesdb_txn_op_t *op = &txn->ops[op_index];
     uint32_t h = tidesdb_write_set_hash_key(op->cf, op->key, op->key_size);
-    int slot = h % hash->capacity;
+    int slot = (int)(h % (uint32_t)hash->capacity);
 
     /* linear probing to find empty slot or matching key */
     for (int probe = 0; probe < TDB_TXN_MAX_PROBE_LENGTH; probe++)
@@ -2613,14 +2739,14 @@ static void tidesdb_write_set_hash_insert(tidesdb_write_set_hash_t *hash, tidesd
  * @param key_size key size
  * @return operation index if found, -1 if not found
  */
-static int tidesdb_write_set_hash_lookup(tidesdb_write_set_hash_t *hash, tidesdb_txn_t *txn,
+static int tidesdb_write_set_hash_lookup(tidesdb_write_set_hash_t *hash, const tidesdb_txn_t *txn,
                                          tidesdb_column_family_t *cf, const uint8_t *key,
                                          size_t key_size)
 {
     if (!hash) return -1;
 
     uint32_t h = tidesdb_write_set_hash_key(cf, key, key_size);
-    int slot = h % hash->capacity;
+    int slot = (int)(h % (uint32_t)hash->capacity);
 
     /* linear probing to find key */
     for (int probe = 0; probe < TDB_TXN_MAX_PROBE_LENGTH; probe++)
@@ -2721,14 +2847,14 @@ static uint32_t tidesdb_read_set_hash_key(tidesdb_column_family_t *cf, const uin
  * @param txn transaction
  * @param read_index read set index
  */
-static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, tidesdb_txn_t *txn,
+static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, const tidesdb_txn_t *txn,
                                          int read_index)
 {
     if (!hash || read_index < 0 || read_index >= txn->read_set_count) return;
 
     uint32_t h = tidesdb_read_set_hash_key(txn->read_cfs[read_index], txn->read_keys[read_index],
                                            txn->read_key_sizes[read_index]);
-    int slot = h % hash->capacity;
+    int slot = (int)(h % (uint32_t)hash->capacity);
 
     /* linear probing to find empty slot or matching key */
     for (int probe = 0; probe < TDB_TXN_MAX_PROBE_LENGTH; probe++)
@@ -2769,14 +2895,15 @@ static void tidesdb_read_set_hash_insert(tidesdb_read_set_hash_t *hash, tidesdb_
  * @param key_size key size
  * @return 1 if conflict found, 0 otherwise
  */
-static int tidesdb_read_set_hash_check_conflict(tidesdb_read_set_hash_t *hash, tidesdb_txn_t *txn,
+static int tidesdb_read_set_hash_check_conflict(tidesdb_read_set_hash_t *hash,
+                                                const tidesdb_txn_t *txn,
                                                 tidesdb_column_family_t *cf, const uint8_t *key,
                                                 size_t key_size)
 {
     if (!hash) return 0;
 
     uint32_t h = tidesdb_read_set_hash_key(cf, key, key_size);
-    int slot = h % hash->capacity;
+    int slot = (int)(h % (uint32_t)hash->capacity);
 
     /* linear probing to find key */
     for (int probe = 0; probe < TDB_TXN_MAX_PROBE_LENGTH; probe++)
@@ -3383,6 +3510,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 /**
  * tidesdb_sstable_get
  * get a key-value pair from an sstable
+ * @param db the database
  * @param sst the sstable
  * @param key the key
  * @param key_size the size of the key
@@ -3427,24 +3555,12 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     int min_cmp = comparator_fn(key, key_size, sst->min_key, sst->min_key_size, comparator_ctx);
     int max_cmp = comparator_fn(key, key_size, sst->max_key, sst->max_key_size, comparator_ctx);
 
-    if (is_reverse)
+    /* both reverse and normal order use the same condition since min/max keys
+     * are stored in comparator order */
+    (void)is_reverse;
+    if (min_cmp < 0 || max_cmp > 0)
     {
-        /* for reverse comparators, min_key is largest, max_key is smallest
-         * key is in range if max_key <= key <= min_key (in actual values)
-         * with reverse comparator -- key >= max means cmp(key,max) <= 0, key <= min means
-         * cmp(key,min) >= 0 */
-        if (min_cmp < 0 || max_cmp > 0)
-        {
-            return TDB_ERR_NOT_FOUND;
-        }
-    }
-    else
-    {
-        /* normal order */
-        if (min_cmp < 0 || max_cmp > 0)
-        {
-            return TDB_ERR_NOT_FOUND;
-        }
+        return TDB_ERR_NOT_FOUND;
     }
 
     /* use block indexes to find starting klog block */
@@ -3934,9 +4050,10 @@ static tidesdb_level_t *tidesdb_level_create(int level_num, size_t capacity)
 /**
  * tidesdb_level_free
  * free a level
+ * @param db database
  * @param level level to free
  */
-static void tidesdb_level_free(tidesdb_t *db, tidesdb_level_t *level)
+static void tidesdb_level_free(const tidesdb_t *db, tidesdb_level_t *level)
 {
     if (!level) return;
 
@@ -4240,7 +4357,7 @@ static void heap_swap(tidesdb_merge_source_t **a, tidesdb_merge_source_t **b)
  * @param j index of second element
  * @return comparison result
  */
-static int heap_compare(tidesdb_merge_heap_t *heap, int i, int j)
+static int heap_compare(const tidesdb_merge_heap_t *heap, int i, int j)
 {
     tidesdb_kv_pair_t *a = heap->sources[i]->current_kv;
     tidesdb_kv_pair_t *b = heap->sources[j]->current_kv;
@@ -4504,7 +4621,7 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
  * @param heap merge heap to check
  * @return 1 if empty, 0 otherwise
  */
-static int tidesdb_merge_heap_empty(tidesdb_merge_heap_t *heap)
+static int tidesdb_merge_heap_empty(const tidesdb_merge_heap_t *heap)
 {
     return heap->num_sources == 0;
 }
@@ -5106,7 +5223,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
 
                     /* start at last entry of previous block */
                     source->source.sstable.current_entry_idx =
-                        source->source.sstable.current_block->num_entries - 1;
+                        (int)(source->source.sstable.current_block->num_entries - 1);
 
                     tidesdb_klog_block_t *current_kb = source->source.sstable.current_block;
                     int idx = source->source.sstable.current_entry_idx;
@@ -5664,7 +5781,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     if (new_sst->config->enable_bloom_filter)
     {
-        if (bloom_filter_new(&bloom, new_sst->config->bloom_fpr, estimated_entries) == 0)
+        if (bloom_filter_new(&bloom, new_sst->config->bloom_fpr, (int)estimated_entries) == 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Bloom filter created (estimated entries: %" PRIu64 ")",
                           estimated_entries);
@@ -6578,7 +6695,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
 
         if (cf->config.enable_bloom_filter)
         {
-            if (bloom_filter_new(&bloom, cf->config.bloom_fpr, partition_entries) == 0)
+            if (bloom_filter_new(&bloom, cf->config.bloom_fpr, (int)partition_entries) == 0)
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO,
                               "partition %d bloom filter created (estimated entries: %" PRIu64 ")",
@@ -7311,7 +7428,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
 
             if (cf->config.enable_bloom_filter)
             {
-                if (bloom_filter_new(&bloom, cf->config.bloom_fpr, estimated_entries) == 0)
+                if (bloom_filter_new(&bloom, cf->config.bloom_fpr, (int)estimated_entries) == 0)
                 {
                     TDB_DEBUG_LOG(
                         TDB_LOG_INFO,
@@ -8897,8 +9014,9 @@ static void *tidesdb_sync_worker_thread(void *arg)
 
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += (sleep_us / TDB_MICROSECONDS_PER_SECOND);
-        ts.tv_nsec += (sleep_us % TDB_MICROSECONDS_PER_SECOND) * TDB_NANOSECONDS_PER_MICROSECOND;
+        ts.tv_sec += (time_t)(sleep_us / TDB_MICROSECONDS_PER_SECOND);
+        ts.tv_nsec +=
+            (long)(sleep_us % TDB_MICROSECONDS_PER_SECOND) * TDB_NANOSECONDS_PER_MICROSECOND;
         if (ts.tv_nsec >= TDB_NANOSECONDS_PER_SECOND)
         {
             ts.tv_sec++;
@@ -10256,7 +10374,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
             if (strstr(entry->d_name, TDB_SSTABLE_KLOG_EXT) != NULL)
             {
                 int level_num = 0;
-                if (sscanf(entry->d_name, TDB_LEVEL_PREFIX "%d_", &level_num) >= 1)
+                if (tdb_parse_level_num(entry->d_name, &level_num))
                 {
                     if (level_num > max_existing_level)
                     {
@@ -11652,9 +11770,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     /* now search immutable memtables safely with references held
      * search in reverse order (newest first) to find most recent version */
 
-    int result = TDB_ERR_UNKNOWN; /* used for cleanup label */
     if (immutable_refs && immutable_count > 0)
     {
+        int result = TDB_ERR_UNKNOWN;
         for (int i = (int)immutable_count - 1; i >= 0; i--)
         {
             tidesdb_immutable_memtable_t *immutable = immutable_refs[i];
@@ -11919,7 +12037,7 @@ int tidesdb_txn_rollback(tidesdb_txn_t *txn)
     return TDB_SUCCESS;
 }
 
-void tidesdb_txn_free(tidesdb_txn_t *txn)
+void tidesdb_txn_free(tidesdb_txn_t *txn) /* NOLINT(misc-no-recursion) */
 {
     if (!txn) return;
 
@@ -11970,7 +12088,7 @@ void tidesdb_txn_free(tidesdb_txn_t *txn)
  * @param threshold_seq threshold sequence
  * @return 1 if conflict, 0 if no conflict
  */
-static int tidesdb_txn_check_seq_conflict(skip_list_t *sl, uint8_t *key, size_t key_size,
+static int tidesdb_txn_check_seq_conflict(skip_list_t *sl, const uint8_t *key, size_t key_size,
                                           uint64_t threshold_seq)
 {
     if (!sl) return 0;
@@ -12055,8 +12173,8 @@ static void tidesdb_txn_cleanup_imm_snapshot(tidesdb_immutable_memtable_t **imm_
  * @param out_size output parameter for serialized size
  * @return serialized WAL batch
  */
-static uint8_t *tidesdb_txn_serialize_wal(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
-                                          size_t *out_size)
+static uint8_t *tidesdb_txn_serialize_wal(const tidesdb_txn_t *txn,
+                                          const tidesdb_column_family_t *cf, size_t *out_size)
 {
     /* calculate WAL size */
     size_t cf_wal_size = 0;
@@ -12391,7 +12509,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 {
                     hash = hash * 31 + op->key[b];
                 }
-                int slot = hash % TXN_DEDUP_HASH_SIZE;
+                int slot = (int)(hash % TXN_DEDUP_HASH_SIZE);
 
                 /* linear probing to find empty slot or matching key */
                 int inserted = 0;
@@ -13268,8 +13386,8 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 {
                     /* target might be in this block, binary search */
                     int left = 0;
-                    int right = kb->num_entries - 1;
-                    int result_idx = kb->num_entries;
+                    int right = (int)kb->num_entries - 1;
+                    int result_idx = (int)kb->num_entries;
 
                     while (left <= right)
                     {
@@ -13602,7 +13720,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
 
                 /* this block might contain the target, binary search for last entry <= target */
                 int left = 0;
-                int right = kb->num_entries - 1;
+                int right = (int)kb->num_entries - 1;
                 int result_idx = -1;
 
                 while (left <= right)
@@ -13938,7 +14056,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
                             source->source.sstable.current_block_data = block;
 
                             /* last entry in last block */
-                            int idx = source->source.sstable.current_block->num_entries - 1;
+                            int idx = (int)source->source.sstable.current_block->num_entries - 1;
                             source->source.sstable.current_entry_idx = idx;
 
                             tidesdb_klog_block_t *kb = source->source.sstable.current_block;
@@ -14448,8 +14566,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
                     else
                         name2 = wal_array[j + 1];
 
-                    sscanf(name1, TDB_WAL_PREFIX "%" PRIu64 TDB_WAL_EXT, &id1);
-                    sscanf(name2, TDB_WAL_PREFIX "%" PRIu64 TDB_WAL_EXT, &id2);
+                    tdb_parse_wal_id(name1, &id1);
+                    tdb_parse_wal_id(name2, &id2);
 
                     if (id1 > id2)
                     {
@@ -14583,10 +14701,8 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
 
             /** try parsing partitioned format first:
              * L{level}P{partition}_{id}.klog */
-            if (sscanf(entry->d_name,
-                       TDB_LEVEL_PREFIX "%d" TDB_LEVEL_PARTITION_PREFIX
-                                        "%d_" TDB_U64_FMT TDB_SSTABLE_KLOG_EXT,
-                       &level_num, &partition_num, &sst_id_ull) == 3)
+            if (tdb_parse_sstable_partitioned(entry->d_name, &level_num, &partition_num,
+                                              &sst_id_ull))
             {
                 snprintf(sst_base, sizeof(sst_base),
                          "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d" TDB_LEVEL_PARTITION_PREFIX "%d",
@@ -14598,8 +14714,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             }
             /** try non-partitioned format:
              * L{level}_{id}.klog */
-            else if (sscanf(entry->d_name, TDB_LEVEL_PREFIX "%d_" TDB_U64_FMT TDB_SSTABLE_KLOG_EXT,
-                            &level_num, &sst_id_ull) == 2)
+            else if (tdb_parse_sstable_non_partitioned(entry->d_name, &level_num, &sst_id_ull))
             {
                 snprintf(sst_base, sizeof(sst_base), "%s" PATH_SEPARATOR TDB_LEVEL_PREFIX "%d",
                          cf->directory, level_num);
@@ -14807,7 +14922,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
     /* restore next_sstable_id from manifest to prevent ID collisions */
     if (cf->manifest)
     {
-        uint64_t manifest_seq = atomic_load(&cf->manifest->sequence);
+        manifest_seq = atomic_load(&cf->manifest->sequence);
         if (manifest_seq > atomic_load(&cf->next_sstable_id))
         {
             atomic_store(&cf->next_sstable_id, manifest_seq);
@@ -15019,23 +15134,23 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     /* parse numeric fields */
     if (strcmp(name, "write_buffer_size") == 0)
     {
-        ctx->config->write_buffer_size = (size_t)atoll(value);
+        ctx->config->write_buffer_size = (size_t)strtoll(value, NULL, 10);
     }
     else if (strcmp(name, "level_size_ratio") == 0)
     {
-        ctx->config->level_size_ratio = (size_t)atoll(value);
+        ctx->config->level_size_ratio = (size_t)strtoll(value, NULL, 10);
     }
     else if (strcmp(name, "min_levels") == 0)
     {
-        ctx->config->min_levels = atoi(value);
+        ctx->config->min_levels = (int)strtol(value, NULL, 10);
     }
     else if (strcmp(name, "dividing_level_offset") == 0)
     {
-        ctx->config->dividing_level_offset = atoi(value);
+        ctx->config->dividing_level_offset = (int)strtol(value, NULL, 10);
     }
     else if (strcmp(name, "value_threshold") == 0)
     {
-        ctx->config->klog_value_threshold = (size_t)atoll(value);
+        ctx->config->klog_value_threshold = (size_t)strtoll(value, NULL, 10);
     }
     else if (strcmp(name, "compression_algorithm") == 0)
     {
@@ -15050,43 +15165,43 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     }
     else if (strcmp(name, "enable_bloom_filter") == 0)
     {
-        ctx->config->enable_bloom_filter = atoi(value);
+        ctx->config->enable_bloom_filter = (int)strtol(value, NULL, 10);
     }
     else if (strcmp(name, "bloom_fpr") == 0)
     {
-        ctx->config->bloom_fpr = atof(value);
+        ctx->config->bloom_fpr = strtod(value, NULL);
     }
     else if (strcmp(name, "enable_block_indexes") == 0)
     {
-        ctx->config->enable_block_indexes = atoi(value);
+        ctx->config->enable_block_indexes = (int)strtol(value, NULL, 10);
     }
     else if (strcmp(name, "index_sample_ratio") == 0)
     {
-        ctx->config->index_sample_ratio = atoi(value);
+        ctx->config->index_sample_ratio = (int)strtol(value, NULL, 10);
     }
     else if (strcmp(name, "block_index_prefix_len") == 0)
     {
-        ctx->config->block_index_prefix_len = atoi(value);
+        ctx->config->block_index_prefix_len = (int)strtol(value, NULL, 10);
     }
     else if (strcmp(name, "sync_mode") == 0)
     {
-        ctx->config->sync_mode = atoi(value);
+        ctx->config->sync_mode = (int)strtol(value, NULL, 10);
     }
     else if (strcmp(name, "sync_interval_us") == 0)
     {
-        ctx->config->sync_interval_us = (uint64_t)atoll(value);
+        ctx->config->sync_interval_us = (size_t)strtoll(value, NULL, 10);
     }
     else if (strcmp(name, "skip_list_max_level") == 0)
     {
-        ctx->config->skip_list_max_level = atoi(value);
+        ctx->config->skip_list_max_level = (int)strtol(value, NULL, 10);
     }
     else if (strcmp(name, "skip_list_probability") == 0)
     {
-        ctx->config->skip_list_probability = (float)atof(value);
+        ctx->config->skip_list_probability = (float)strtod(value, NULL);
     }
     else if (strcmp(name, "default_isolation_level") == 0)
     {
-        int level = atoi(value);
+        int level = (int)strtol(value, NULL, 10);
         if (level >= TDB_ISOLATION_READ_UNCOMMITTED && level <= TDB_ISOLATION_SERIALIZABLE)
         {
             ctx->config->default_isolation_level = (tidesdb_isolation_level_t)level;
@@ -15094,11 +15209,11 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     }
     else if (strcmp(name, "l1_file_count_trigger") == 0)
     {
-        ctx->config->l1_file_count_trigger = atoi(value);
+        ctx->config->l1_file_count_trigger = (int)strtol(value, NULL, 10);
     }
     else if (strcmp(name, "l0_queue_stall_threshold") == 0)
     {
-        ctx->config->l0_queue_stall_threshold = atoi(value);
+        ctx->config->l0_queue_stall_threshold = (int)strtol(value, NULL, 10);
     }
     else if (strcmp(name, "comparator_name") == 0)
     {
@@ -15405,9 +15520,8 @@ static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *dat
     if (count > 0)
     {
         uint64_t value;
-        int bytes_read;
         /* first file position */
-        bytes_read = decode_varint(ptr, &value, (int)(end - ptr));
+        int bytes_read = decode_varint(ptr, &value, (int)(end - ptr));
         if (bytes_read < 0) goto error;
         index->file_positions[0] = value;
         ptr += bytes_read;
@@ -15525,7 +15639,7 @@ static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *
  * @param index the block index to search
  * @param key the search key
  * @param key_len length of the search key
- * @param block_num output parameter for the found block number
+ * @param file_position output parameter for the found block file position
  * @return 0 on success, -1 if no suitable block found
  */
 static int compact_block_index_find_predecessor(const tidesdb_block_index_t *index,

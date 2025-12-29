@@ -18,8 +18,6 @@
  */
 #ifndef __BLOOM_FILTER_H__
 #define __BLOOM_FILTER_H__
-#include <tgmath.h>
-
 #include "compat.h"
 
 /**
@@ -55,7 +53,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, int n);
  * @param entry the entry to add
  * @param size the size of the entry
  */
-void bloom_filter_add(bloom_filter_t *bf, const uint8_t *entry, size_t size);
+void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, size_t size);
 
 /**
  * bloom_filter_contains
@@ -65,7 +63,7 @@ void bloom_filter_add(bloom_filter_t *bf, const uint8_t *entry, size_t size);
  * @param size the size of the entry
  * @return 1 if the entry is in the bloom filter, 0 if not
  */
-int bloom_filter_contains(bloom_filter_t *bf, const uint8_t *entry, size_t size);
+int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, size_t size);
 
 /**
  * bloom_filter_is_full
@@ -73,7 +71,7 @@ int bloom_filter_contains(bloom_filter_t *bf, const uint8_t *entry, size_t size)
  * @param bf the bloom filter to check
  * @return 1 if the bloom filter is full, 0 if not
  */
-int bloom_filter_is_full(bloom_filter_t *bf);
+int bloom_filter_is_full(const bloom_filter_t *bf);
 
 /**
  * bloom_filter_hash
@@ -95,7 +93,7 @@ unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed);
  * @param out_size the size of the serialized bloom filter
  * @return the serialized bloom filter
  */
-uint8_t *bloom_filter_serialize(bloom_filter_t *bf, size_t *out_size);
+uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size);
 
 /**
  * bloom_filter_deserialize

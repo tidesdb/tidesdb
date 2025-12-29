@@ -27,13 +27,13 @@
 #define BUFFER_UNLIKELY(x) (x)
 #endif
 
-int buffer_new(buffer_t **buffer, uint32_t capacity)
+int buffer_new(buffer_t **buffer, const uint32_t capacity)
 {
     return buffer_new_with_eviction(buffer, capacity, NULL, NULL);
 }
 
-int buffer_new_with_eviction(buffer_t **buffer, uint32_t capacity, buffer_eviction_fn eviction_fn,
-                             void *eviction_ctx)
+int buffer_new_with_eviction(buffer_t **buffer, const uint32_t capacity,
+                             const buffer_eviction_fn eviction_fn, void *eviction_ctx)
 {
     if (BUFFER_UNLIKELY(buffer == NULL || capacity == 0)) return -1;
 
@@ -67,7 +67,7 @@ int buffer_new_with_eviction(buffer_t **buffer, uint32_t capacity, buffer_evicti
     return 0;
 }
 
-int buffer_set_retry_params(buffer_t *buffer, uint32_t max_retries, uint32_t backoff_us)
+int buffer_set_retry_params(buffer_t *buffer, const uint32_t max_retries, const uint32_t backoff_us)
 {
     if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
     buffer->max_retries = max_retries;
@@ -80,7 +80,7 @@ int buffer_set_retry_params(buffer_t *buffer, uint32_t max_retries, uint32_t bac
  * attempts to acquire a specific slot
  * @return 0 on success, -1 if slot not free
  */
-static int try_acquire_slot(buffer_t *buffer, uint32_t index, void *data, uint32_t *id)
+static int try_acquire_slot(buffer_t *buffer, const uint32_t index, void *data, uint32_t *id)
 {
     buffer_slot_t *slot = &buffer->slots[index];
 
@@ -181,7 +181,7 @@ int buffer_acquire(buffer_t *buffer, void *data, uint32_t *id)
     return -1; /* max retries exceeded */
 }
 
-int buffer_get(buffer_t *buffer, uint32_t id, void **data)
+int buffer_get(const buffer_t *buffer, const uint32_t id, void **data)
 {
     if (BUFFER_UNLIKELY(buffer == NULL || data == NULL)) return -1;
     if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
@@ -207,7 +207,7 @@ int buffer_get(buffer_t *buffer, uint32_t id, void **data)
  * @param call_eviction whether to call eviction callback
  * @return 0 on success, -1 on failure
  */
-static inline int buffer_release_internal(buffer_t *buffer, uint32_t id, int call_eviction)
+static inline int buffer_release_internal(buffer_t *buffer, const uint32_t id, int call_eviction)
 {
     buffer_slot_t *slot = &buffer->slots[id];
 
@@ -241,7 +241,7 @@ static inline int buffer_release_internal(buffer_t *buffer, uint32_t id, int cal
     return 0;
 }
 
-int buffer_release(buffer_t *buffer, uint32_t id)
+int buffer_release(buffer_t *buffer, const uint32_t id)
 {
     if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
     if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
@@ -249,7 +249,7 @@ int buffer_release(buffer_t *buffer, uint32_t id)
     return buffer_release_internal(buffer, id, 1);
 }
 
-int buffer_release_silent(buffer_t *buffer, uint32_t id)
+int buffer_release_silent(buffer_t *buffer, const uint32_t id)
 {
     if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
     if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
@@ -257,7 +257,7 @@ int buffer_release_silent(buffer_t *buffer, uint32_t id)
     return buffer_release_internal(buffer, id, 0);
 }
 
-int buffer_is_occupied(buffer_t *buffer, uint32_t id)
+int buffer_is_occupied(buffer_t *buffer, const uint32_t id)
 {
     if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
     if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
@@ -272,7 +272,7 @@ int buffer_active_count(buffer_t *buffer)
     return (int)atomic_load_explicit(&buffer->active_count, memory_order_acquire);
 }
 
-int buffer_capacity(buffer_t *buffer)
+int buffer_capacity(const buffer_t *buffer)
 {
     if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
     return (int)buffer->capacity;
@@ -305,7 +305,7 @@ void buffer_free(buffer_t *buffer)
     buffer = NULL;
 }
 
-int buffer_foreach(buffer_t *buffer, void (*callback)(uint32_t id, void *data, void *ctx),
+int buffer_foreach(const buffer_t *buffer, void (*callback)(uint32_t id, void *data, void *ctx),
                    void *ctx)
 {
     if (BUFFER_UNLIKELY(buffer == NULL || callback == NULL)) return -1;
@@ -328,7 +328,7 @@ int buffer_foreach(buffer_t *buffer, void (*callback)(uint32_t id, void *data, v
     return count;
 }
 
-int buffer_get_generation(buffer_t *buffer, uint32_t id, uint64_t *generation)
+int buffer_get_generation(buffer_t *buffer, const uint32_t id, uint64_t *generation)
 {
     if (BUFFER_UNLIKELY(buffer == NULL || generation == NULL)) return -1;
     if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
@@ -337,7 +337,7 @@ int buffer_get_generation(buffer_t *buffer, uint32_t id, uint64_t *generation)
     return 0;
 }
 
-int buffer_validate(buffer_t *buffer, uint32_t id, uint64_t expected_generation)
+int buffer_validate(const buffer_t *buffer, const uint32_t id, uint64_t expected_generation)
 {
     if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
     if (BUFFER_UNLIKELY(id >= buffer->capacity)) return 0;

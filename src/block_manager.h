@@ -141,7 +141,7 @@ int block_manager_close(block_manager_t *bm);
  * @param data the data to be placed in block
  * @return a new block
  */
-block_manager_block_t *block_manager_block_create(uint64_t size, void *data);
+block_manager_block_t *block_manager_block_create(uint64_t size, const void *data);
 
 /**
  * block_manager_block_create_from_buffer

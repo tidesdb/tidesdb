@@ -147,7 +147,7 @@ int buffer_try_acquire(buffer_t *buffer, void *data, uint32_t *id);
  * @param data output data pointer
  * @return 0 on success, -1 on failure (invalid ID or slot not occupied)
  */
-int buffer_get(buffer_t *buffer, uint32_t id, void **data);
+int buffer_get(const buffer_t *buffer, uint32_t id, void **data);
 
 /**
  * buffer_release
@@ -191,7 +191,7 @@ int buffer_active_count(buffer_t *buffer);
  * @param buffer buffer
  * @return capacity, or -1 on error
  */
-int buffer_capacity(buffer_t *buffer);
+int buffer_capacity(const buffer_t *buffer);
 
 /**
  * buffer_clear
@@ -217,7 +217,7 @@ void buffer_free(buffer_t *buffer);
  * @param ctx user context
  * @return number of slots visited, or -1 on error
  */
-int buffer_foreach(buffer_t *buffer, void (*callback)(uint32_t id, void *data, void *ctx),
+int buffer_foreach(const buffer_t *buffer, void (*callback)(uint32_t id, void *data, void *ctx),
                    void *ctx);
 
 /**
@@ -238,6 +238,6 @@ int buffer_get_generation(buffer_t *buffer, uint32_t id, uint64_t *generation);
  * @param expected_generation expected generation (0 to skip check)
  * @return 1 if valid, 0 if invalid, -1 on error
  */
-int buffer_validate(buffer_t *buffer, uint32_t id, uint64_t expected_generation);
+int buffer_validate(const buffer_t *buffer, uint32_t id, uint64_t expected_generation);
 
 #endif /* __BUFFER_H__ */

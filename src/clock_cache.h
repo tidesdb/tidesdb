@@ -250,10 +250,10 @@ void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats);
 /**
  * clock_cache_foreach_prefix
  * iterate over all entries matching a key prefix
- * @param cache the cache
- * @param prefix the key prefix to match
- * @param prefix_len the prefix length
- * @param callback function to call for each matching entry (return 0 to continue, non-zero to stop)
+ * @param key the key prefix to match
+ * @param key_len the prefix length
+ * @param payload the payload (can be any pointer type)
+ * @param payload_len the payload length
  * @param user_data user data passed to callback
  * @return number of entries processed
  */

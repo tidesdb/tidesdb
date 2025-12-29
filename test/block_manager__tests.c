@@ -1441,25 +1441,25 @@ void test_block_manager_concurrent_file_extension()
         snprintf(marker, 20, "_block_%d_end", i);
 
         char *actual_marker = (char *)(read_block->data) + expected_sizes[i] - 20;
-        int marker_len = strlen(marker);
+        size_t marker_len = strlen(marker);
 
         if (memcmp(actual_marker, marker, marker_len) != 0)
         {
             printf("\nBlock %d marker mismatch:\n", i);
-            printf("  Expected (%d bytes): '%s'\n", marker_len, marker);
+            printf("  Expected (%zu bytes): '%s'\n", marker_len, marker);
             printf("  Actual: '");
-            for (int k = 0; k < marker_len && k < 20; k++)
+            for (size_t k = 0; k < marker_len && k < 20; k++)
             {
                 printf("%c", actual_marker[k]);
             }
             printf("'\n");
             printf("  Hex comparison:\n    Expected: ");
-            for (int k = 0; k < marker_len; k++)
+            for (size_t k = 0; k < marker_len; k++)
             {
                 printf("%02x ", (unsigned char)marker[k]);
             }
             printf("\n    Actual:   ");
-            for (int k = 0; k < marker_len; k++)
+            for (size_t k = 0; k < marker_len; k++)
             {
                 printf("%02x ", (unsigned char)actual_marker[k]);
             }
@@ -1540,11 +1540,14 @@ static void *concurrent_write_thread(void *arg)
     return NULL;
 }
 
+#define CONCURRENT_TEST_NUM_THREADS       4
+#define CONCURRENT_TEST_BLOCKS_PER_THREAD 50
+
 void test_block_manager_concurrent_write_size_reopen()
 {
     const char *test_file = "test_concurrent_size_reopen.db";
-    const int num_threads = 4;
-    const int blocks_per_thread = 50;
+    const int num_threads = CONCURRENT_TEST_NUM_THREADS;
+    const int blocks_per_thread = CONCURRENT_TEST_BLOCKS_PER_THREAD;
     const int total_expected_blocks = num_threads * blocks_per_thread;
 
     (void)remove(test_file);
@@ -1559,8 +1562,8 @@ void test_block_manager_concurrent_write_size_reopen()
     ASSERT_EQ(initial_size, BLOCK_MANAGER_HEADER_SIZE);
 
     /* spawn concurrent writer threads */
-    pthread_t threads[num_threads];
-    concurrent_write_args_t args[num_threads];
+    pthread_t threads[CONCURRENT_TEST_NUM_THREADS];
+    concurrent_write_args_t args[CONCURRENT_TEST_NUM_THREADS];
     int success_count = 0;
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1620,7 +1623,7 @@ void test_block_manager_concurrent_write_size_reopen()
     ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
 
     int readable_blocks = 0;
-    int thread_counts[num_threads];
+    int thread_counts[CONCURRENT_TEST_NUM_THREADS];
     memset(thread_counts, 0, sizeof(thread_counts));
 
     do

@@ -10005,6 +10005,222 @@ static void test_iterator_seek_after_reopen(void)
     cleanup_test_dir();
 }
 
+static void test_iterator_seek_for_prev_after_reopen(void)
+{
+    cleanup_test_dir();
+
+    const char *keys[] = {"foo", "foobar", "foobaz"};
+    const char *values[] = {"value1", "value2", "value3"};
+    const int num_keys = 3;
+
+    {
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.enable_bloom_filter = 0;
+        cf_config.enable_block_indexes = 0;
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)keys[i], strlen(keys[i]) + 1,
+                                  (uint8_t *)values[i], strlen(values[i]) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+
+    {
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        tidesdb_iter_t *iter = NULL;
+        ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+        ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+        ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+        int total_count = 0;
+        while (tidesdb_iter_valid(iter))
+        {
+            total_count++;
+            tidesdb_iter_next(iter);
+        }
+        ASSERT_EQ(total_count, num_keys);
+
+        tidesdb_iter_free(iter);
+        ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+        const char *seek_key = "foobaz";
+        int seek_result =
+            tidesdb_iter_seek_for_prev(iter, (uint8_t *)seek_key, strlen(seek_key) + 1);
+        ASSERT_EQ(seek_result, 0);
+        ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+        int count = 0;
+        while (tidesdb_iter_valid(iter))
+        {
+            uint8_t *key = NULL;
+            size_t key_size = 0;
+            ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+            ASSERT_TRUE(key != NULL);
+
+            count++;
+            tidesdb_iter_prev(iter);
+        }
+
+        ASSERT_EQ(count, num_keys);
+
+        tidesdb_iter_free(iter);
+        tidesdb_txn_free(txn);
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+
+    cleanup_test_dir();
+}
+
+static void test_iterator_seek_for_prev_after_reopen_indexes(void)
+{
+    cleanup_test_dir();
+
+    const char *keys[] = {"foo", "foobar", "foobaz"};
+    const char *values[] = {"value1", "value2", "value3"};
+    const int num_keys = 3;
+
+    {
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.enable_bloom_filter = 0;
+        cf_config.enable_block_indexes = 1;
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)keys[i], strlen(keys[i]) + 1,
+                                  (uint8_t *)values[i], strlen(values[i]) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+
+    {
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), 0);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        tidesdb_iter_t *iter = NULL;
+        ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+        ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+        ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+        int total_count = 0;
+        while (tidesdb_iter_valid(iter))
+        {
+            total_count++;
+            tidesdb_iter_next(iter);
+        }
+        ASSERT_EQ(total_count, num_keys);
+
+        tidesdb_iter_free(iter);
+        ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+        const char *seek_key = "foobaz";
+        int seek_result =
+            tidesdb_iter_seek_for_prev(iter, (uint8_t *)seek_key, strlen(seek_key) + 1);
+        ASSERT_EQ(seek_result, 0);
+        ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+        int count = 0;
+        while (tidesdb_iter_valid(iter))
+        {
+            uint8_t *key = NULL;
+            size_t key_size = 0;
+            ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+            ASSERT_TRUE(key != NULL);
+
+            count++;
+            tidesdb_iter_prev(iter);
+        }
+
+        ASSERT_EQ(count, num_keys);
+
+        tidesdb_iter_free(iter);
+        tidesdb_txn_free(txn);
+        ASSERT_EQ(tidesdb_close(db), 0);
+    }
+
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -10169,6 +10385,8 @@ int main(void)
     RUN_TEST(test_wal_commit_shutdown_recovery, tests_passed);
     RUN_TEST(test_iterator_seek_after_reopen_bloom_indexes_disabled, tests_passed);
     RUN_TEST(test_iterator_seek_after_reopen, tests_passed);
+    RUN_TEST(test_iterator_seek_for_prev_after_reopen, tests_passed);
+    RUN_TEST(test_iterator_seek_for_prev_after_reopen_indexes, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

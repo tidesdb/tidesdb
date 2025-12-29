@@ -671,10 +671,10 @@ static int tdb_parse_level_num(const char *filename, int *level_num)
 
 /**
  * tdb_parse_sstable_non_partitioned
- * parse non-partitioned SSTable filename like "L5_12345.klog"
+ * parse non-partitioned sstable filename like "L5_12345.klog"
  * @param filename the filename to parse
  * @param level_num output level number
- * @param sst_id output SSTable ID
+ * @param sst_id output sstable id
  * @return 1 on success, 0 on failure
  */
 static int tdb_parse_sstable_non_partitioned(const char *filename, int *level_num,
@@ -703,11 +703,11 @@ static int tdb_parse_sstable_non_partitioned(const char *filename, int *level_nu
 
 /**
  * tdb_parse_sstable_partitioned
- * parse partitioned SSTable filename like "L5P2_12345.klog"
+ * parse partitioned sstable filename like "L5P2_12345.klog"
  * @param filename the filename to parse
  * @param level_num output level number
  * @param partition_num output partition number
- * @param sst_id output SSTable ID
+ * @param sst_id output sstable id
  * @return 1 on success, 0 on failure
  */
 static int tdb_parse_sstable_partitioned(const char *filename, int *level_num, int *partition_num,
@@ -3555,14 +3555,21 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     /* use block indexes to find starting klog block */
     uint64_t start_file_position = 0;
+    int block_index_exact_match = 0; /* set if block index found exact containing block */
     if (sst->block_indexes)
     {
         int index_result = compact_block_index_find_predecessor(sst->block_indexes, key, key_size,
                                                                 &start_file_position);
 
-        if (index_result != 0)
+        if (index_result == -1)
         {
-            start_file_position = 0;
+            /* block index definitively says key doesnt exist (beyond last block) */
+            return TDB_ERR_NOT_FOUND;
+        }
+        else if (index_result == 0 && start_file_position > 0)
+        {
+            /* block index found a specific block that should contain the key */
+            block_index_exact_match = 1;
         }
     }
 
@@ -3707,23 +3714,22 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                     (*kv)->entry = klog_block->entries[i];
 
                     /* get value (inline or from vlog) */
-                    if (klog_block->entries[i].vlog_offset == 0)
-                    {
-                        if (klog_block->inline_values[i])
-                        {
-                            (*kv)->value = malloc(klog_block->entries[i].value_size);
+                    uint64_t vlog_offset = klog_block->entries[i].vlog_offset;
+                    size_t value_size = klog_block->entries[i].value_size;
 
-                            if ((*kv)->value)
-                            {
-                                memcpy((*kv)->value, klog_block->inline_values[i],
-                                       klog_block->entries[i].value_size);
-                            }
+                    if (vlog_offset == 0 && klog_block->inline_values[i] && value_size > 0)
+                    {
+                        /* inline value path -- data already in memory */
+                        (*kv)->value = malloc(value_size);
+                        if ((*kv)->value)
+                        {
+                            memcpy((*kv)->value, klog_block->inline_values[i], value_size);
                         }
                     }
-                    else
+                    else if (vlog_offset > 0)
                     {
-                        tidesdb_vlog_read_value(db, sst, klog_block->entries[i].vlog_offset,
-                                                klog_block->entries[i].value_size, &(*kv)->value);
+                        /* vlog path -- requires disk I/O */
+                        tidesdb_vlog_read_value(db, sst, vlog_offset, value_size, &(*kv)->value);
                     }
 
                     result = TDB_SUCCESS;
@@ -3740,7 +3746,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                 }
             }
         }
-        /* key not found in this block, continue to next block */
+        /* key not found in this block */
 
         /* release ref-counted block or free deserialized block */
         if (rc_block)
@@ -3750,6 +3756,13 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         /* cleanup block resources before moving to next */
         if (block) block_manager_block_release(block);
+
+        /* if block index gave us an exact match and key wasnt found,
+         * dont scan subsequent blocks - the key definitely doesnt exist */
+        if (block_index_exact_match && block_num == 0)
+        {
+            break;
+        }
 
         /* reset for next iteration */
         rc_block = NULL;
@@ -5122,7 +5135,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
         /* check if we can move to a previous block */
         if (!block_manager_cursor_has_prev(source->source.sstable.klog_cursor))
         {
-            /* already at first block, can't go back */
+            /* already at first block, cant go back */
             return TDB_ERR_NOT_FOUND;
         }
 
@@ -7124,7 +7137,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                           "partition %d: Skipping empty SSTable %" PRIu64 " (0 entries)", partition,
                           new_sst->id);
 
-            /* free bloom and block_indexes since they won't be freed by sstable_unref */
+            /* free bloom and block_indexes since they wont be freed by sstable_unref */
             if (bloom) bloom_filter_free(bloom);
             if (block_indexes) compact_block_index_free(block_indexes);
 
@@ -9031,7 +9044,7 @@ static void *tidesdb_sync_worker_thread(void *arg)
 
         if (min_interval == UINT64_MAX)
         {
-            /* no CFs needed syncing, skip sync phase */
+            /* no CFs needed syncing, skip sync */
             continue;
         }
 
@@ -10656,7 +10669,7 @@ static int wait_for_open(tidesdb_t *db)
     {
         if (wait_count >= TDB_OPENING_WAIT_MAX_MS)
         {
-            /* database is not open and hasn't opened after timeout
+            /* database is not open and hasnt opened after timeout
              * its likely closing or closed */
             return TDB_ERR_INVALID_DB;
         }
@@ -10879,7 +10892,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     tidesdb_immutable_memtable_t *immutable = old_mt;
     if (!immutable)
     {
-        /* no old memtable to flush - this shouldn't happen but handle gracefully */
+        /* no old memtable to flush - this shouldnt happen but handle gracefully */
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' no old memtable to flush", cf->name);
         skip_list_free(old_memtable);
         if (old_wal) block_manager_close(old_wal);
@@ -10891,7 +10904,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
      * just reset flushed flag */
     atomic_store_explicit(&immutable->flushed, 0, memory_order_release);
 
-    /* enqueue immutable - this should never fail but check anyway to prevent data loss */
+    /* enqueue immutable -- this should never fail but check anyway to prevent data loss */
     if (queue_enqueue(cf->immutable_memtables, immutable) != 0)
     {
         TDB_DEBUG_LOG(
@@ -11371,7 +11384,7 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
         else
         {
             /* capacity exceeded -- log warning but continue.
-             * this transaction won't participate in SSI conflict detection,
+             * this transaction wont participate in SSI conflict detection,
              * but will still get correct snapshot isolation semantics. */
             TDB_DEBUG_LOG(TDB_LOG_WARN,
                           "Active transaction list full (%d), SSI may be less effective",
@@ -11612,7 +11625,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             }
         }
 
-        /* if transaction is large and we didn't find in recent ops, scan remainder */
+        /* if transaction is large and we didnt find in recent ops, scan remainder */
         if (scan_end > 0)
         {
             for (int i = scan_end - 1; i >= 0; i--)
@@ -11648,7 +11661,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     else if (txn->isolation_level == TDB_ISOLATION_READ_COMMITTED)
     {
         /* refresh snapshot to see latest committed data
-         * READ_COMMITTED doesn't need visibility callback because:
+         * READ_COMMITTED doesnt need visibility callback because:
          * 1. it refreshes snapshot on each read to see all data up to current global_seq
          * 2. commit status buffer is circular and can have stale entries after recovery
          * 3. any data in memtable with seq <= snapshot_seq is considered visible
@@ -11838,7 +11851,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
             PROFILE_INC(txn->db, sstables_checked);
 
-            /* range check -- skip ssts that don't overlap key */
+            /* range check -- skip ssts that dont overlap key */
             if (sst->min_key && sst->max_key)
             {
                 int min_max_cmp = comparator_fn(sst->min_key, sst->min_key_size, sst->max_key,
@@ -12461,7 +12474,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         if (!mt) continue;
 
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
-        /* use captured skip_list pointer - don't access mt->skip_list as mt may be freed */
+        /* use captured skip_list pointer -- dont access mt->skip_list as mt may be freed */
         skip_list_t *memtable = cf_skiplists[cf_idx];
 
         /* hash-based dedup for O(N) performance */
@@ -13806,7 +13819,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                     last_valid_block->entries[last_valid_idx].flags & TDB_KV_FLAG_TOMBSTONE);
 
                 free(vlog_value);
-                /* rc_block is now owned by the source, don't release it */
+                /* rc_block is now owned by the source, dont release it */
             }
         }
     }
@@ -15716,7 +15729,7 @@ static int compact_block_index_find_predecessor(const tidesdb_block_index_t *ind
     {
         /* we found a valid predecessor block
          * now check if search_key is beyond this blocks max_key
-         * if so, key definitely doesn't exist in this sst */
+         * if so, key definitely doesnt exist in this sst */
         const uint8_t *result_max_prefix = index->max_key_prefixes + (result * index->prefix_len);
         int cmp_result_max;
         if (index->comparator)
@@ -15735,7 +15748,7 @@ static int compact_block_index_find_predecessor(const tidesdb_block_index_t *ind
             /* check if this is the last block, if so, key doesnt exist */
             if (result == (int64_t)(index->count - 1))
             {
-                return -1; /* key is beyond last block, doesn't exist */
+                return -1; /* key is beyond last block, doesnt exist */
             }
             /* otherwise, key might be in next block (gap between blocks)
              * return this blocks position and let sequential scan handle it */

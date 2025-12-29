@@ -16,7 +16,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Hybrid and adaptive compaction with three modes: full preemptive merge (minimize space amplification), dividing merge (create partition boundaries), and partitioned merge (minimize write amplification). Dynamic Capacity Adjustment (DCA) automatically scales level capacities based on data size. Dynamic level management adds/removes levels on demand.
 - Automatic crash recovery reconstructs memtables from write-ahead log (WAL) files on startup. WAL entries are replayed into skip lists and queued for flush to disk.
 - Optional bloom filters (configurable false positive rate) reduce disk reads for absent keys. Built during SSTable creation and persisted in metadata.
-- Key-value separation (WiscKey-style) with configurable threshold (default 4KB). Small values stored inline in klog, large values in vlog with offset reference. Reduces write amplification during compaction.
+- Key-value separation (WiscKey-style) with configurable threshold. Small values stored inline in klog, large values in vlog with offset reference. Reduces write amplification during compaction.
 - TTL support for automatic key-value expiration. Expired entries skipped during reads and removed during compaction.
 - Custom comparators with built-in default comparators: memcmp, lexicographic, reverse. Used consistently across skip lists, SSTables, and compaction.
 - Lock-free block manager using `pread`/`pwrite` for concurrent I/O. Reference-counted blocks with atomic operations. xxHash32 checksums for integrity. Supports up to 4GB blocks with partial reads.

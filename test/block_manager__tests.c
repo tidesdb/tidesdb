@@ -1553,7 +1553,7 @@ void test_block_manager_concurrent_write_size_reopen()
     (void)remove(test_file);
 
     block_manager_t *bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_FULL) == 0);
 
     /* get initial file size (should be just header) */
     uint64_t initial_size;
@@ -1604,7 +1604,7 @@ void test_block_manager_concurrent_write_size_reopen()
 
     /* reopen and verify file size is preserved */
     bm = NULL;
-    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_NONE) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, test_file, BLOCK_MANAGER_SYNC_FULL) == 0);
 
     uint64_t size_after_reopen;
     ASSERT_TRUE(block_manager_get_size(bm, &size_after_reopen) == 0);

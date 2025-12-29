@@ -13700,15 +13700,6 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
             tidesdb_sstable_t *sst = source->source.sstable.sst;
             block_manager_cursor_t *cursor = source->source.sstable.klog_cursor;
 
-            if (sst->bloom_filter)
-            {
-                if (!bloom_filter_contains(sst->bloom_filter, key, key_size))
-                {
-                    /* key definitely not in this sst, skip it */
-                    continue;
-                }
-            }
-
             /* clean up previous state */
             if (source->source.sstable.current_rc_block)
             {

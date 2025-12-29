@@ -12124,27 +12124,21 @@ static uint8_t *tidesdb_txn_serialize_wal(tidesdb_txn_t *txn, tidesdb_column_fam
     return wal_batch;
 }
 
-/**
- * tidesdb_txn_commit
- * commit a transaction
- * @param txn transaction to commit
- * @return 0 on success, non-zero on failure
- */
 int tidesdb_txn_commit(tidesdb_txn_t *txn)
 {
     if (!txn || txn->is_committed || txn->is_aborted) return TDB_ERR_INVALID_ARGS;
+
+    /* validate */
+    if (txn->num_ops > 0)
+    {
+        if (txn->num_cfs <= 0 || txn->num_ops > TDB_MAX_TXN_OPS) return TDB_ERR_INVALID_ARGS;
+    }
 
     /* read-only fast path */
     if (txn->num_ops == 0 && txn->isolation_level < TDB_ISOLATION_REPEATABLE_READ)
     {
         txn->is_committed = 1;
         return TDB_SUCCESS;
-    }
-
-    /* validate */
-    if (txn->num_ops > 0)
-    {
-        if (txn->num_cfs <= 0 || txn->num_ops > TDB_MAX_TXN_OPS) return TDB_ERR_INVALID_ARGS;
     }
 
     /* rep read, check read-write conflicts */

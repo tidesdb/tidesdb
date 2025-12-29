@@ -224,8 +224,6 @@ typedef struct tidesdb_level_t tidesdb_level_t;
 typedef struct tidesdb_sstable_t tidesdb_sstable_t;
 typedef struct tidesdb_block_index_t tidesdb_block_index_t;
 typedef struct tidesdb_memtable_t tidesdb_memtable_t;
-
-/* forward declarations for main types to allow self-referential pointers */
 typedef struct tidesdb_t tidesdb_t;
 typedef struct tidesdb_column_family_t tidesdb_column_family_t;
 typedef struct tidesdb_txn_t tidesdb_txn_t;
@@ -256,6 +254,8 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param skip_list_probability skip list probability
  * @param default_isolation_level default isolation level
  * @param min_disk_space minimum free disk space required (bytes)
+ * @param l1_file_count_trigger trigger for L1 file count, utilized for compaction triggering
+ * @param l0_queue_stall_threshold threshold for L0 queue stall, utilized for backpressure
  */
 typedef struct tidesdb_column_family_config_t
 {
@@ -436,7 +436,7 @@ struct tidesdb_sstable_t
 
 /**
  * tidesdb_level_t
- * a level in the lsm tree
+ * a level in the lsm tree within a column family
  * @param level_num level number
  * @param capacity capacity of level in bytes
  * @param current_size current size of level in bytes
@@ -648,7 +648,7 @@ struct tidesdb_iter_t
 
 /**
  * tidesdb_stats_t
- * statistics for database
+ * statistics for database column family
  * @param num_levels number of levels
  * @param memtable_size size of memtable
  * @param level_sizes sizes of each level
@@ -672,7 +672,7 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void);
 
 /**
  * tidesdb_default_config
- * @return default configuration for database
+ * @return default configuration for a database
  */
 tidesdb_config_t tidesdb_default_config(void);
 
@@ -745,7 +745,7 @@ void tidesdb_reset_read_stats(tidesdb_t *db);
 
 /**
  * tidesdb_create_column_family
- * creates a column family
+ * creates a new column family with specified configuration
  * @param db database handle
  * @param name name of column family
  * @param config configuration for column family
@@ -765,7 +765,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
 
 /**
  * tidesdb_get_column_family
- * gets a column family
+ * gets a column family from a database
  * @param db database handle
  * @param name name of column family
  * @return pointer to column family, NULL on failure
@@ -774,7 +774,7 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
 
 /**
  * tidesdb_list_column_families
- * lists all column families in the database
+ * lists all column families in requested database
  * @param db database handle
  * @param names pointer to array of column family names (caller must free each name and the array)
  * @param count pointer to store the number of column families
@@ -804,7 +804,7 @@ int tidesdb_txn_begin_with_isolation(tidesdb_t *db, tidesdb_isolation_level_t is
 
 /**
  * tidesdb_txn_put
- * adds a put operation to the transaction
+ * adds a write operation to a transaction
  * @param txn transaction handle
  * @param cf column family to put into
  * @param key key to put
@@ -819,7 +819,7 @@ int tidesdb_txn_put(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
 /**
  * tidesdb_txn_get
- * gets a value from the transaction
+ * gets a value from a transaction
  * @param txn transaction handle
  * @param cf column family to get from
  * @param key key to get
@@ -833,7 +833,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
 /**
  * tidesdb_txn_delete
- * adds a delete operation to the transaction
+ * adds a delete operation to a transaction
  * @param txn transaction handle
  * @param cf column family to delete from
  * @param key key to delete
@@ -845,7 +845,7 @@ int tidesdb_txn_delete(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const ui
 
 /**
  * tidesdb_txn_rollback
- * rolls back the transaction
+ * rolls back a transaction
  * @param txn transaction handle
  * @return 0 on success, -n on failure
  */
@@ -853,7 +853,7 @@ int tidesdb_txn_rollback(tidesdb_txn_t *txn);
 
 /**
  * tidesdb_txn_commit
- * commits the transaction
+ * commits a transaction to the database
  * @param txn transaction handle
  * @return 0 on success, -n on failure
  */
@@ -915,7 +915,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
 
 /**
  * tidesdb_iter_seek_for_prev
- * seeks to the previous key in the iterator
+ * seeks to a previous key in the iterator
  * @param iter iterator handle
  * @param key key to seek to
  * @param key_size size of key
@@ -941,7 +941,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter);
 
 /**
  * tidesdb_iter_next
- * seeks to the next key in the iterator
+ * seeks to a next key in the iterator
  * @param iter iterator handle
  * @return 0 on success, -n on failure
  */
@@ -949,7 +949,7 @@ int tidesdb_iter_next(tidesdb_iter_t *iter);
 
 /**
  * tidesdb_iter_prev
- * seeks to the previous key in the iterator
+ * seeks to a previous key in the iterator
  * @param iter iterator handle
  * @return 0 on success, -n on failure
  */
@@ -957,7 +957,7 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter);
 
 /**
  * tidesdb_iter_valid
- * checks if the iterator is valid
+ * checks if an iterator is valid
  * @param iter iterator handle
  * @return 0 on success, -n on failure
  */
@@ -965,7 +965,7 @@ int tidesdb_iter_valid(tidesdb_iter_t *iter);
 
 /**
  * tidesdb_iter_key
- * gets the key from the iterator
+ * gets a key from an iterator
  * @param iter iterator handle
  * @param key pointer to key
  * @param key_size pointer to size of key
@@ -975,7 +975,7 @@ int tidesdb_iter_key(tidesdb_iter_t *iter, uint8_t **key, size_t *key_size);
 
 /**
  * tidesdb_iter_value
- * gets the value from the iterator
+ * gets a value from an iterator
  * @param iter iterator handle
  * @param value pointer to value
  * @param value_size pointer to size of value
@@ -985,7 +985,7 @@ int tidesdb_iter_value(tidesdb_iter_t *iter, uint8_t **value, size_t *value_size
 
 /**
  * tidesdb_iter_free
- * frees the iterator
+ * frees an iterator
  * @param iter iterator handle
  */
 void tidesdb_iter_free(tidesdb_iter_t *iter);
@@ -1076,7 +1076,7 @@ int tidesdb_comparator_case_insensitive(const uint8_t *key1, size_t key1_size, c
 
 /**
  * tidesdb_compact
- * compacts the column family
+ * compacts a column family. enqueues a compaction task
  * @param cf column family handle
  * @return 0 on success, -n on failure
  */
@@ -1084,7 +1084,7 @@ int tidesdb_compact(tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_flush_memtable
- * flushes the memtable to disk
+ * flushes a column family's memtable to disk (sorted run to level 1)
  * @param cf column family handle
  * @return 0 on success, -n on failure
  */
@@ -1103,7 +1103,7 @@ int tidesdb_cf_config_load_from_ini(const char *ini_file, const char *section_na
 
 /**
  * tidesdb_cf_config_save_to_ini
- * saves the column family configuration to an INI file
+ * saves a column family configuration to an INI file (column family config)
  * @param ini_file INI file path
  * @param section_name section name in INI file
  * @param config pointer to column family configuration
@@ -1114,7 +1114,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
 
 /**
  * tidesdb_cf_update_runtime_config
- * updates the runtime configuration of the column family
+ * updates the runtime configuration of a column family
  * @param cf column family handle
  * @param new_config new configuration
  * @param persist_to_disk whether to persist the configuration to disk
@@ -1126,7 +1126,7 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
 
 /**
  * tidesdb_get_stats
- * gets the statistics of the column family
+ * gets the statistics of a column family
  * @param cf column family handle
  * @param stats pointer to statistics
  * @return 0 on success, -n on failure
@@ -1135,7 +1135,7 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats);
 
 /**
  * tidesdb_free_stats
- * frees the statistics
+ * frees the statistics of the column family
  * @param stats statistics
  */
 void tidesdb_free_stats(tidesdb_stats_t *stats);

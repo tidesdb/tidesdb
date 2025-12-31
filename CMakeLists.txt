@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 7.0.5)
+set(PROJECT_VERSION 7.0.6)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -12,8 +12,17 @@ configure_file(
 # when building for production releases, you/we want to disable all warnings and sanitizers
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
-option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
+
+# BUILD_SHARED_LIBS controls static vs shared library
+# default to STATIC on windows (avoids DLL export/import complexity), SHARED elsewhere
+if(NOT DEFINED BUILD_SHARED_LIBS)
+    if(WIN32)
+        set(BUILD_SHARED_LIBS OFF)
+    else()
+        set(BUILD_SHARED_LIBS ON)
+    endif()
+endif()
 
 if(ENABLE_READ_PROFILING)
     add_compile_definitions(TDB_ENABLE_READ_PROFILING)
@@ -63,12 +72,10 @@ endif()
 
 include_directories(external) # for external libraries linking internally
 
-# build as STATIC on Windows to avoid DLL export/import complexity in tests
-if(WIN32)
-    add_library(tidesdb STATIC src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/clock_cache.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
-else()
-    add_library(tidesdb SHARED src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/clock_cache.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
-endif()
+# create library (respects BUILD_SHARED_LIBS option)
+# note: on Windows, STATIC is recommended to avoid DLL export/import complexity
+# users can override with -DBUILD_SHARED_LIBS=ON/OFF
+add_library(tidesdb src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/clock_cache.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
 
 target_include_directories(tidesdb PRIVATE src)
 

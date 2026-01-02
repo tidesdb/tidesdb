@@ -67,10 +67,64 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
         return NULL;
     }
 
+    /* we clean up orphaned temp files from incomplete commits
+     * temp files are named -- <path>.tmp.<thread_id>.<pid>
+     * if main manifest exists, temp files are stale and can be removed */
+    char dir_path[MANIFEST_PATH_LEN];
+    const char *last_sep = strrchr(path, PATH_SEPARATOR[0]);
+    if (last_sep)
+    {
+        size_t dir_len = last_sep - path;
+        if (dir_len < sizeof(dir_path))
+        {
+            memcpy(dir_path, path, dir_len);
+            dir_path[dir_len] = '\0';
+        }
+        else
+        {
+            strcpy(dir_path, ".");
+        }
+    }
+    else
+    {
+        strcpy(dir_path, ".");
+    }
+
+    /* get base filename for pattern matching */
+    const char *base_name = last_sep ? last_sep + 1 : path;
+    size_t base_len = strlen(base_name);
+
+    /* scan directory for orphaned temp files */
+    DIR *dir = opendir(dir_path);
+    if (dir)
+    {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL)
+        {
+            /* check if filename matches pattern: <base_name>.tmp.* */
+            size_t entry_len = strlen(entry->d_name);
+            if (entry_len > base_len + 5 && strncmp(entry->d_name, base_name, base_len) == 0 &&
+                strncmp(entry->d_name + base_len, ".tmp.", 5) == 0)
+            {
+                /* found orphaned temp file, remove it */
+                char temp_full_path[MANIFEST_PATH_LEN];
+                size_t dir_path_len = strlen(dir_path);
+                /* check if combined path fits in buffer (dir + separator + entry + null) */
+                if (dir_path_len + 1 + entry_len + 1 <= MANIFEST_PATH_LEN)
+                {
+                    snprintf(temp_full_path, sizeof(temp_full_path), "%s" PATH_SEPARATOR "%s",
+                             dir_path, entry->d_name);
+                    remove(temp_full_path);
+                }
+            }
+        }
+        closedir(dir);
+    }
+
     FILE *fp = tdb_fopen(path, "r");
     if (!fp)
     {
-        /* file doesn't exist, return empty manifest */
+        /* file doesnt exist, return empty manifest */
         if (errno == ENOENT) return manifest;
         /* other error */
         pthread_rwlock_destroy(&manifest->lock);
@@ -327,7 +381,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
 
     fclose(fp);
 
-    /* atomic rename - this is the commit point */
+    /* atomic rename -- this is the commit point */
     if (atomic_rename_file(temp_path, path) != 0)
     {
         remove(temp_path);

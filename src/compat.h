@@ -2435,7 +2435,34 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
     return 0;
 #else
     /* POSIX rename() is atomic and replaces existing files */
-    return rename(old_path, new_path);
+    if (rename(old_path, new_path) != 0)
+    {
+        return -1;
+    }
+
+    /* sync parent directory to ensure rename metadata is durable
+     * this is critical for crash safety on non-journaling filesystems
+     * https://groups.google.com/g/comp.unix.programmer/c/AM2V83RCOVE?pli=1
+     * https://man7.org/linux/man-pages/man2/rename.2.html
+     */
+    char dir_path[4096];
+    const char *last_sep = strrchr(new_path, '/');
+    if (last_sep && (size_t)(last_sep - new_path) < sizeof(dir_path) - 1)
+    {
+        size_t dir_len = last_sep - new_path;
+        memcpy(dir_path, new_path, dir_len);
+        dir_path[dir_len] = '\0';
+
+        /* open and sync directory */
+        int dir_fd = open(dir_path, O_RDONLY);
+        if (dir_fd >= 0)
+        {
+            fsync(dir_fd);
+            close(dir_fd);
+        }
+    }
+
+    return 0;
 #endif
 }
 

@@ -411,6 +411,7 @@ typedef struct tidesdb_ref_counted_block_t tidesdb_ref_counted_block_t;
  * @param source union of memtable or sstable source
  * @param current_kv current key-value pair
  * @param config column family configuration
+ * @param is_cached if 1, don't free when popped from heap (for iterators)
  */
 typedef struct
 {
@@ -444,7 +445,7 @@ typedef struct
 
     tidesdb_kv_pair_t *current_kv;
     tidesdb_column_family_config_t *config;
-    int is_cached; /* if 1, don't free when popped from heap */
+    int is_cached;
 } tidesdb_merge_source_t;
 
 /**

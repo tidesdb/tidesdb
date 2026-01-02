@@ -156,8 +156,6 @@ static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, i
                                                  uint64_t id, uint64_t num_entries,
                                                  uint64_t size_bytes)
 {
-    if (!manifest) return -1;
-
     for (int i = 0; i < manifest->num_entries; i++)
     {
         if (manifest->entries[i].level == level && manifest->entries[i].id == id)
@@ -283,8 +281,11 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
         manifest->fp = NULL;
     }
 
-    /* open for writing (truncates file) */
-    FILE *fp = tdb_fopen(path, "w");
+    char temp_path[MANIFEST_PATH_LEN];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp.%lu.%d", path, (unsigned long)TDB_THREAD_ID(),
+             TDB_GETPID());
+
+    FILE *fp = tdb_fopen(temp_path, "w");
     if (!fp)
     {
         pthread_rwlock_unlock(&manifest->lock);
@@ -305,6 +306,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     if (fflush(fp) != 0)
     {
         fclose(fp);
+        remove(temp_path);
         pthread_rwlock_unlock(&manifest->lock);
         atomic_fetch_sub(&manifest->active_ops, 1);
         return -1;
@@ -313,10 +315,26 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     int fd = tdb_fileno(fp);
     if (fd >= 0)
     {
-        tdb_fsync(fd);
+        if (tdb_fsync(fd) != 0)
+        {
+            fclose(fp);
+            remove(temp_path);
+            pthread_rwlock_unlock(&manifest->lock);
+            atomic_fetch_sub(&manifest->active_ops, 1);
+            return -1;
+        }
     }
 
     fclose(fp);
+
+    /* atomic rename - this is the commit point */
+    if (atomic_rename_file(temp_path, path) != 0)
+    {
+        remove(temp_path);
+        pthread_rwlock_unlock(&manifest->lock);
+        atomic_fetch_sub(&manifest->active_ops, 1);
+        return -1;
+    }
 
     /* reopen for reading */
     manifest->fp = tdb_fopen(path, "r");

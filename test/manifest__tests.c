@@ -453,6 +453,66 @@ void test_manifest_crash_recovery()
     remove(crash_test_path);
 }
 
+void test_manifest_orphaned_temp_cleanup()
+{
+    const char *test_path = "." PATH_SEPARATOR "test_orphan_manifest";
+
+    /* phase 1: create a valid manifest */
+    tidesdb_manifest_t *m1 = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(m1 != NULL);
+    tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536);
+    tidesdb_manifest_update_sequence(m1, 1000);
+    ASSERT_EQ(tidesdb_manifest_commit(m1, test_path), 0);
+    tidesdb_manifest_close(m1);
+
+    /* phase 2: simulate crash by creating orphaned temp files
+     * these would be left behind if commit crashed before rename */
+    char temp1[256], temp2[256], temp3[256];
+    snprintf(temp1, sizeof(temp1), "%s.tmp.12345.9999", test_path);
+    snprintf(temp2, sizeof(temp2), "%s.tmp.67890.8888", test_path);
+    snprintf(temp3, sizeof(temp3), "%s.tmp.11111.7777", test_path);
+
+    /* create fake orphaned temp files with some content */
+    FILE *f1 = tdb_fopen(temp1, "w");
+    ASSERT_TRUE(f1 != NULL);
+    fprintf(f1, "7\n2000\n1,200,2000,131072\n");
+    fclose(f1);
+
+    FILE *f2 = tdb_fopen(temp2, "w");
+    ASSERT_TRUE(f2 != NULL);
+    fprintf(f2, "7\n3000\n1,300,3000,196608\n");
+    fclose(f2);
+
+    FILE *f3 = tdb_fopen(temp3, "w");
+    ASSERT_TRUE(f3 != NULL);
+    fprintf(f3, "7\n4000\n1,400,4000,262144\n");
+    fclose(f3);
+
+    /* verify temp files exist */
+    ASSERT_EQ(access(temp1, F_OK), 0);
+    ASSERT_EQ(access(temp2, F_OK), 0);
+    ASSERT_EQ(access(temp3, F_OK), 0);
+
+    /* phase 3: open manifest - should trigger cleanup of orphaned temps */
+    tidesdb_manifest_t *m2 = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(m2 != NULL);
+
+    /* verify original manifest data is intact */
+    ASSERT_EQ(m2->num_entries, 1);
+    ASSERT_EQ(m2->sequence, 1000);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 1, 100));
+
+    tidesdb_manifest_close(m2);
+
+    /* phase 4: verify orphaned temp files were cleaned up */
+    ASSERT_NE(access(temp1, F_OK), 0);
+    ASSERT_NE(access(temp2, F_OK), 0);
+    ASSERT_NE(access(temp3, F_OK), 0);
+
+    /* cleanup */
+    remove(test_path);
+}
+
 int main()
 {
     RUN_TEST(test_manifest_create, tests_passed);
@@ -469,6 +529,7 @@ int main()
     RUN_TEST(test_manifest_persistence_cycle, tests_passed);
     RUN_TEST(test_manifest_auto_compaction, tests_passed);
     RUN_TEST(test_manifest_crash_recovery, tests_passed);
+    RUN_TEST(test_manifest_orphaned_temp_cleanup, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

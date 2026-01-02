@@ -394,6 +394,65 @@ void test_manifest_auto_compaction()
     remove_directory("." PATH_SEPARATOR "test_manifest_dir");
 }
 
+void test_manifest_crash_recovery()
+{
+    const char *crash_test_path = "." PATH_SEPARATOR "test_crash_manifest";
+
+    tidesdb_manifest_t *m1 = tidesdb_manifest_open(crash_test_path);
+    ASSERT_TRUE(m1 != NULL);
+
+    tidesdb_manifest_add_sstable(m1, 1, 100, 1000, 65536);
+    tidesdb_manifest_add_sstable(m1, 1, 101, 1500, 98304);
+    tidesdb_manifest_add_sstable(m1, 2, 200, 2000, 131072);
+    tidesdb_manifest_update_sequence(m1, 5000);
+
+    ASSERT_EQ(tidesdb_manifest_commit(m1, crash_test_path), 0);
+    tidesdb_manifest_close(m1);
+
+    tidesdb_manifest_t *m2 = tidesdb_manifest_open(crash_test_path);
+    ASSERT_TRUE(m2 != NULL);
+    ASSERT_EQ(m2->num_entries, 3);
+    ASSERT_EQ(m2->sequence, 5000);
+
+    tidesdb_manifest_add_sstable(m2, 3, 300, 3000, 196608);
+    tidesdb_manifest_remove_sstable(m2, 1, 100);
+    tidesdb_manifest_update_sequence(m2, 6000);
+
+    ASSERT_EQ(m2->num_entries, 3);
+    ASSERT_FALSE(tidesdb_manifest_has_sstable(m2, 1, 100));
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 3, 300));
+    ASSERT_EQ(m2->sequence, 6000);
+
+    tidesdb_manifest_close(m2);
+
+    tidesdb_manifest_t *m3 = tidesdb_manifest_open(crash_test_path);
+    ASSERT_TRUE(m3 != NULL);
+
+    ASSERT_EQ(m3->num_entries, 3);
+    ASSERT_EQ(m3->sequence, 5000);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m3, 1, 100));
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m3, 1, 101));
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m3, 2, 200));
+    ASSERT_FALSE(tidesdb_manifest_has_sstable(m3, 3, 300));
+
+    tidesdb_manifest_add_sstable(m3, 3, 301, 3500, 200000);
+    tidesdb_manifest_update_sequence(m3, 7000);
+    ASSERT_EQ(tidesdb_manifest_commit(m3, crash_test_path), 0);
+    tidesdb_manifest_close(m3);
+
+    tidesdb_manifest_t *m4 = tidesdb_manifest_open(crash_test_path);
+    ASSERT_TRUE(m4 != NULL);
+    ASSERT_EQ(m4->num_entries, 4);
+    ASSERT_EQ(m4->sequence, 7000);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m4, 1, 100));
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m4, 1, 101));
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m4, 2, 200));
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m4, 3, 301));
+
+    tidesdb_manifest_close(m4);
+    remove(crash_test_path);
+}
+
 int main()
 {
     RUN_TEST(test_manifest_create, tests_passed);
@@ -409,6 +468,7 @@ int main()
     RUN_TEST(test_manifest_multiple_levels, tests_passed);
     RUN_TEST(test_manifest_persistence_cycle, tests_passed);
     RUN_TEST(test_manifest_auto_compaction, tests_passed);
+    RUN_TEST(test_manifest_crash_recovery, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

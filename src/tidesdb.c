@@ -10267,7 +10267,7 @@ int tidesdb_close(tidesdb_t *db)
  * txn_entry_evict
  * eviction callback for active transaction buffer
  */
-static void txn_entry_evict(void *data, const void *ctx)
+static void txn_entry_evict(void *data, void *ctx)
 {
     (void)ctx;
     if (data) free(data);

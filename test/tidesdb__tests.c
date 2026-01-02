@@ -3291,12 +3291,13 @@ static void test_data_integrity_after_compaction(void)
 
     tidesdb_compact(cf);
 
-    /* wait for compaction to complete by checking both queue and is_compacting flag */
-    for (int i = 0; i < 100; i++)
+    /* wait for compaction to complete by checking both queues and is_compacting flag */
+    for (int i = 0; i < 200; i++)
     {
         usleep(50000);
         int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting)
         {
             usleep(100000);
             break;
@@ -3632,12 +3633,13 @@ static void test_dividing_merge_strategy(void)
     /* trigger compaction -- should use dividing merge */
     tidesdb_compact(cf);
 
-    /* wait for compaction to complete by checking both queue and is_compacting flag */
-    for (int i = 0; i < 100; i++)
+    /* wait for compaction to complete by checking both queues and is_compacting flag */
+    for (int i = 0; i < 200; i++)
     {
         usleep(50000);
         int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting)
         {
             usleep(100000);
             break;
@@ -3743,12 +3745,13 @@ static void test_partitioned_merge_strategy(void)
     printf("Compacting - look for 'Partitioned preemptive merge: levels X to Z' in logs\n");
     tidesdb_compact(cf);
 
-    /* wait for compaction to complete by checking both queue and is_compacting flag */
+    /* wait for compaction to complete by checking both queues and is_compacting flag */
     for (int i = 0; i < 200; i++)
     {
         usleep(50000);
         int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting)
         {
             usleep(100000);
             break;
@@ -3829,11 +3832,12 @@ static void test_multi_level_compaction_strategies(void)
     tidesdb_compact(cf);
 
     /* wait for compaction to complete */
-    for (int i = 0; i < 100; i++)
+    for (int i = 0; i < 200; i++)
     {
         usleep(50000);
         int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting)
         {
             usleep(100000);
             break;
@@ -3871,11 +3875,12 @@ static void test_multi_level_compaction_strategies(void)
     tidesdb_compact(cf);
 
     /* wait for compaction to complete */
-    for (int i = 0; i < 100; i++)
+    for (int i = 0; i < 200; i++)
     {
         usleep(50000);
         int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting)
         {
             usleep(100000);
             break;
@@ -3913,11 +3918,12 @@ static void test_multi_level_compaction_strategies(void)
     tidesdb_compact(cf);
 
     /* wait for compaction to complete */
-    for (int i = 0; i < 100; i++)
+    for (int i = 0; i < 200; i++)
     {
         usleep(50000);
         int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting)
         {
             usleep(100000);
             break;
@@ -3993,26 +3999,39 @@ static void test_boundary_partitioning(void)
         }
     }
 
-    /* wait for flush queue to drain */
-    for (int i = 0; i < 100; i++)
-    {
-        usleep(10000);
-        if (queue_size(db->flush_queue) == 0) break;
-    }
-
-    tidesdb_compact(cf);
-
-    /* wait for compaction to complete by checking both queue and is_compacting flag
-     * this is necessary because tidesdb_compact() is async and just enqueues work */
-    for (int i = 0; i < 100; i++)
+    /* wait for all background operations to complete
+     * flushes can trigger auto-compactions, so we need to wait for everything to settle */
+    for (int i = 0; i < 200; i++)
     {
         usleep(50000);
         int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
-        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting)
         {
-            /* compaction finished, wait a bit more for cleanup */
             usleep(100000);
             break;
+        }
+    }
+
+    /* trigger explicit compaction */
+    tidesdb_compact(cf);
+
+    /* wait for compaction and any cascading operations to complete */
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting)
+        {
+            /* all queues empty and no compaction running, wait a bit more then verify stable */
+            usleep(100000);
+            is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
+            if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+                !is_compacting)
+            {
+                break;
+            }
         }
     }
 
@@ -8522,7 +8541,19 @@ static void test_ttl_expiration_during_compaction(void)
 
     /* trigger compaction -- should remove expired entries */
     tidesdb_compact(cf);
-    usleep(300000);
+
+    /* wait for compaction to complete */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting)
+        {
+            usleep(100000);
+            break;
+        }
+    }
 
     /* verify only non-expired keys remain */
     tidesdb_txn_t *txn = NULL;
@@ -8851,7 +8882,19 @@ static void test_compaction_with_overlapping_ranges(void)
 
     /* trigger compaction to merge overlapping ranges */
     tidesdb_compact(cf);
-    usleep(300000);
+
+    /* wait for compaction to complete */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting)
+        {
+            usleep(100000);
+            break;
+        }
+    }
 
     /* verify latest values are preserved */
     tidesdb_txn_t *txn = NULL;

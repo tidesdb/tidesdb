@@ -4276,16 +4276,17 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
             }
         }
 
-        /* try to swap in new array first
-         * we must swap array before updating count to prevent race where
-         * readers see new (smaller) count with old (larger) array, missing ssts */
+        /* for remove: swap array FIRST, then update count
+         * readers use pattern: load array, load count, re-load count, use min(count1, count2)
+         * this handles both add-with-resize (array changes, count increases) and
+         * remove (array changes, count decreases) races safely */
         if (atomic_compare_exchange_strong_explicit(&level->sstables, &old_arr, new_arr,
                                                     memory_order_release, memory_order_acquire))
         {
-            /* CAS succeeded, now atomically update count
-             * fence ensures array swap is visible before count update */
+            /* array swapped, now update count */
             atomic_thread_fence(memory_order_seq_cst);
             atomic_store_explicit(&level->num_sstables, new_idx, memory_order_release);
+
             /* success! update size */
             atomic_fetch_sub_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                       memory_order_relaxed);
@@ -9238,12 +9239,22 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             break;
         }
 
-        /* scan all column families for closeable ssts */
+        /* scan all column families for closeable ssts
+         * check shutdown flag frequently to allow prompt exit on BSD systems
+         * where the scan loop may take longer due to scheduler behavior */
+        int shutdown_requested = 0;
         pthread_rwlock_rdlock(&db->cf_list_lock);
-        for (int i = 0; i < db->num_column_families; i++)
+        for (int i = 0; i < db->num_column_families && !shutdown_requested; i++)
         {
             tidesdb_column_family_t *cf = db->column_families[i];
             if (!cf) continue;
+
+            /* check shutdown inside loop to exit promptly */
+            if (!atomic_load(&db->sstable_reaper_active))
+            {
+                shutdown_requested = 1;
+                break;
+            }
 
             int num_levels = atomic_load(&cf->num_active_levels);
             for (int level = 0; level < num_levels && level < TDB_MAX_LEVELS; level++)
@@ -9251,11 +9262,17 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 tidesdb_level_t *lvl = cf->levels[level];
                 if (!lvl) continue;
 
-                /* load array pointer before count to avoid race with compaction
-                 * re-check array pointer after loading count to handle add-with-resize case */
+                /* load array pointer and count with careful ordering to handle concurrent
+                 * modifications re-load count to detect concurrent remove, use minimum to avoid OOB
+                 */
                 tidesdb_sstable_t **ssts =
                     atomic_load_explicit(&lvl->sstables, memory_order_acquire);
                 int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+
+                /* re-load count to detect concurrent remove */
+                int num_ssts_recheck =
+                    atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+                if (num_ssts_recheck < num_ssts) num_ssts = num_ssts_recheck;
 
                 /* verify array hasnt changed (handles add-with-resize race) */
                 tidesdb_sstable_t **ssts_check =
@@ -9285,6 +9302,17 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             }
         }
         pthread_rwlock_unlock(&db->cf_list_lock);
+
+        /* if shutdown was requested during scan, release any acquired refs and exit */
+        if (shutdown_requested)
+        {
+            for (int i = 0; i < candidate_count; i++)
+            {
+                atomic_fetch_sub(&candidates[i].sst->refcount, 1);
+            }
+            free(candidates);
+            break;
+        }
 
         /* check shutdown flag after releasing lock to exit promptly */
         if (!atomic_load(&db->sstable_reaper_active))
@@ -12022,19 +12050,31 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         PROFILE_INC(txn->db, levels_searched);
         tidesdb_level_t *level = cf->levels[level_num];
 
-        /* load array pointer before count to avoid race with compaction
-         * compaction swaps array first, then updates count. If we load count first,
-         * we might get old (larger) count with new (smaller) array, causing OOB access.
-         * re-check array pointer after loading count to handle add-with-resize case */
+        /* load array pointer and count with careful ordering to handle concurrent modifications
+         * both add-with-resize and remove swap array first, then update count
+         * race scenarios:
+         * - remove: new (smaller) array swapped, count not yet decremented -> OOB if we use old
+         * count
+         * - add-with-resize: new (larger) array swapped, count not yet incremented -> miss new
+         * element solution: load array, load count, re-load count, use minimum of two counts this
+         * ensures we never access beyond valid array bounds */
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
-        /* verify array hasnt changed (handles add-with-resize race) */
+        /* re-load count to detect concurrent remove that swapped array but hasnt updated count yet
+         */
+        int num_ssts_recheck = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        if (num_ssts_recheck < num_ssts)
+        {
+            num_ssts = num_ssts_recheck; /* use smaller count to avoid OOB */
+        }
+
+        /* also verify array hasnt changed (handles add-with-resize race) */
         tidesdb_sstable_t **sstables_check =
             atomic_load_explicit(&level->sstables, memory_order_acquire);
         if (sstables_check != sstables)
         {
-            /* array was resized, use new array and count */
+            /* array was resized, reload everything */
             sstables = sstables_check;
             num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         }
@@ -12363,10 +12403,14 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
         tidesdb_level_t *level = cf->levels[level_idx];
         if (!level) continue;
 
-        /* load array pointer before count to avoid race with compaction
-         * re-check array pointer after loading count to handle add-with-resize case */
+        /* load array pointer and count with careful ordering to handle concurrent modifications
+         * re-load count to detect concurrent remove, use minimum to avoid OOB */
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_sstables = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+        /* re-load count to detect concurrent remove */
+        int num_sstables_recheck = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        if (num_sstables_recheck < num_sstables) num_sstables = num_sstables_recheck;
 
         /* verify array hasnt changed (handles add-with-resize race) */
         tidesdb_sstable_t **sstables_check =
@@ -13365,11 +13409,15 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         {
             tidesdb_level_t *level = cf->levels[i];
 
-            /* load array pointer before count to avoid race with compaction
-             * re-check array pointer after loading count to handle add-with-resize case */
+            /* load array pointer and count with careful ordering to handle concurrent modifications
+             * re-load count to detect concurrent remove, use minimum to avoid OOB */
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&level->sstables, memory_order_acquire);
             int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+            /* re-load count to detect concurrent remove */
+            int num_ssts_recheck = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+            if (num_ssts_recheck < num_ssts) num_ssts = num_ssts_recheck;
 
             /* verify array hasnt changed (handles add-with-resize race) */
             tidesdb_sstable_t **sstables_check =
@@ -13509,11 +13557,15 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
             tidesdb_level_t *level = cf->levels[lvl];
             if (!level) continue;
 
-            /* load array pointer before count to avoid race with compaction
-             * re-check array pointer after loading count to handle add-with-resize case */
+            /* load array pointer and count with careful ordering to handle concurrent modifications
+             * re-load count to detect concurrent remove, use minimum to avoid OOB */
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&level->sstables, memory_order_acquire);
             int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+            /* re-load count to detect concurrent remove */
+            int num_ssts_recheck = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+            if (num_ssts_recheck < num_ssts) num_ssts = num_ssts_recheck;
 
             /* verify array hasnt changed (handles add-with-resize race) */
             tidesdb_sstable_t **sstables_check =
@@ -14012,11 +14064,15 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
             tidesdb_level_t *level = cf->levels[lvl];
             if (!level) continue;
 
-            /* load array pointer before count to avoid race with compaction
-             * re-check array pointer after loading count to handle add-with-resize case */
+            /* load array pointer and count with careful ordering to handle concurrent modifications
+             * re-load count to detect concurrent remove, use minimum to avoid OOB */
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&level->sstables, memory_order_acquire);
             int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+            /* re-load count to detect concurrent remove */
+            int num_ssts_recheck = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+            if (num_ssts_recheck < num_ssts) num_ssts = num_ssts_recheck;
 
             /* verify array hasnt changed (handles add-with-resize race) */
             tidesdb_sstable_t **sstables_check =
@@ -15358,10 +15414,14 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
         tidesdb_level_t *level = cf->levels[level_idx];
         if (!level) continue;
 
-        /* load array pointer before count to avoid race with compaction
-         * re-check array pointer after loading count to handle add-with-resize case */
+        /* load array pointer and count with careful ordering to handle concurrent modifications
+         * re-load count to detect concurrent remove, use minimum to avoid OOB */
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+        /* re-load count to detect concurrent remove */
+        int num_ssts_recheck = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        if (num_ssts_recheck < num_ssts) num_ssts = num_ssts_recheck;
 
         /* verify array hasnt changed (handles add-with-resize race) */
         tidesdb_sstable_t **sstables_check =

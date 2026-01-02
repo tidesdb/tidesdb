@@ -2488,7 +2488,10 @@ static void test_read_own_writes_in_transaction(void)
     ASSERT_EQ(tidesdb_txn_delete(txn, cf, key, sizeof(key)), 0);
     ASSERT_TRUE(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved_value, &retrieved_size) != 0);
 
-    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    int commit_result = tidesdb_txn_commit(txn);
+    printf("COMMIT RESULT: %d (expected 0)\n", commit_result);
+    fflush(stdout);
+    ASSERT_EQ(commit_result, 0);
     tidesdb_txn_free(txn);
     tidesdb_close(db);
     cleanup_test_dir();

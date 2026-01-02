@@ -361,21 +361,20 @@ void *queue_peek_at(queue_t *queue, size_t index)
 {
     if (QUEUE_UNLIKELY(!queue)) return NULL;
 
-    /* optimization: early bounds check without lock */
-    size_t size = atomic_load_explicit(&queue->size, memory_order_relaxed);
-    if (QUEUE_UNLIKELY(index >= size))
-    {
-        return NULL;
-    }
+    pthread_mutex_lock(&queue->lock);
 
-    /* lock-free traversal using atomic_head */
-    queue_node_t *current = atomic_load_explicit(&queue->atomic_head, memory_order_acquire);
+    /* traverse to index while holding lock to prevent node recycling race */
+    queue_node_t *current = queue->head;
     for (size_t i = 0; i < index && QUEUE_LIKELY(current != NULL); i++)
     {
         current = current->next;
     }
 
-    return QUEUE_LIKELY(current != NULL) ? current->data : NULL;
+    void *data = QUEUE_LIKELY(current != NULL) ? current->data : NULL;
+
+    pthread_mutex_unlock(&queue->lock);
+
+    return data;
 }
 
 void queue_free(queue_t *queue)

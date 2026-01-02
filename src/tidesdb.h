@@ -639,6 +639,10 @@ struct tidesdb_txn_t
  * @param direction direction of iteration (1=forward, -n=backward)
  * @param snapshot_time snapshot time for ttl checks
  * @param cf_snapshot snapshot sequence for visibility checks
+ * @param cached_sources cached sst sources for reuse across seeks
+ * @param num_cached_sources number of cached sources
+ * @param cached_sources_capacity capacity of cached sources array
+ * @param cached_sstable_version next_sstable_id when sources were cached
  */
 struct tidesdb_iter_t
 {
@@ -650,6 +654,10 @@ struct tidesdb_iter_t
     int direction;
     time_t snapshot_time;
     uint64_t cf_snapshot;
+    void **cached_sources;
+    int num_cached_sources;
+    int cached_sources_capacity;
+    uint64_t cached_sstable_version;
 };
 
 /**

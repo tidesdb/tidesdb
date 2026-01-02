@@ -444,6 +444,7 @@ typedef struct
 
     tidesdb_kv_pair_t *current_kv;
     tidesdb_column_family_config_t *config;
+    int is_cached; /* if 1, don't free when popped from heap */
 } tidesdb_merge_source_t;
 
 /**
@@ -4511,7 +4512,10 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop_max(tidesdb_merge_heap_t *heap)
     if (!top->current_kv)
     {
         /* top source exhausted, remove it */
-        tidesdb_merge_source_free(top);
+        if (!top->is_cached)
+        {
+            tidesdb_merge_source_free(top);
+        }
         heap->sources[0] = heap->sources[heap->num_sources - 1];
         heap->num_sources--;
         if (heap->num_sources > 0) heap_sift_down_max(heap, 0);
@@ -4525,7 +4529,10 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop_max(tidesdb_merge_heap_t *heap)
     if (tidesdb_merge_source_retreat(top) != TDB_SUCCESS)
     {
         /* source exhausted, remove it */
-        tidesdb_merge_source_free(top);
+        if (!top->is_cached)
+        {
+            tidesdb_merge_source_free(top);
+        }
         heap->sources[0] = heap->sources[heap->num_sources - 1];
         heap->num_sources--;
     }
@@ -4574,7 +4581,11 @@ static void tidesdb_merge_heap_free(tidesdb_merge_heap_t *heap)
 
     for (int i = 0; i < heap->num_sources; i++)
     {
-        tidesdb_merge_source_free(heap->sources[i]);
+        /* skip freeing cached sources - they're owned by the iterator */
+        if (!heap->sources[i]->is_cached)
+        {
+            tidesdb_merge_source_free(heap->sources[i]);
+        }
     }
 
     free(heap->sources);
@@ -4643,7 +4654,12 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
         /* remove from heap */
         heap->sources[0] = heap->sources[heap->num_sources - 1];
         heap->num_sources--;
-        tidesdb_merge_source_free(top);
+
+        /* only free if not cached for reuse */
+        if (!top->is_cached)
+        {
+            tidesdb_merge_source_free(top);
+        }
     }
 
     if (heap->num_sources > 0)
@@ -4683,6 +4699,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_memtable(
     source->type = MERGE_SOURCE_MEMTABLE;
     source->config = config;
     source->source.memtable.imm = imm;
+    source->is_cached = 0; /* memtable sources are not cached */
 
     if (imm)
     {
@@ -4733,6 +4750,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
     source->type = MERGE_SOURCE_SSTABLE;
     source->source.sstable.sst = sst;
     source->source.sstable.db = db; /* store db for later vlog reads */
+    source->is_cached = 0;          /* will be set to 1 if cached by iterator */
 
     tidesdb_sstable_ref(sst);
 
@@ -9187,7 +9205,11 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper triggered: %d/%d open SSTables", current_open,
                       max_open);
 
-        /* collect all ssts with refcount=0 and last_access_time */
+        /**
+         * sstable_candidate_t
+         * @param sst sstable to close
+         * @param last_access last access time
+         * collect all ssts with refcount=0 and last_access_time */
         typedef struct
         {
             tidesdb_sstable_t *sst;
@@ -9903,7 +9925,7 @@ int tidesdb_close(tidesdb_t *db)
 
     /* wait for any in-progress compactions to complete before shutdown
      * this prevents data loss from compaction removing old ssts while
-     * the new merged SSTable is not yet fully persisted */
+     * the new merged sst is not yet fully persisted */
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for in-progress compactions to complete");
     int compaction_wait_count = 0;
     while (1)
@@ -10967,7 +10989,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     tidesdb_immutable_memtable_t *immutable = old_mt;
     if (!immutable)
     {
-        /* no old memtable to flush - this shouldnt happen but handle gracefully */
+        /* no old memtable to flush -- this shouldnt happen but handle gracefully */
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' no old memtable to flush", cf->name);
         skip_list_free(old_memtable);
         if (old_wal) block_manager_close(old_wal);
@@ -12617,7 +12639,13 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
         else
         {
-            /* larger transaction: use hash-based dedup for O(N) performance */
+            /**
+             * dedup_entry_t
+             * larger transaction: use hash-based dedup for O(N) performance
+             * @param key key to dedup
+             * @param key_size size of key
+             * @param op_idx index of op in txn->ops
+             */
             typedef struct
             {
                 uint8_t *key;
@@ -13028,6 +13056,11 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     (*iter)->valid = 0;
     (*iter)->direction = 0;
     (*iter)->snapshot_time = atomic_load(&txn->db->cached_current_time);
+    (*iter)->cached_sources = NULL;
+    (*iter)->num_cached_sources = 0;
+    (*iter)->cached_sources_capacity = 0;
+    (*iter)->cached_sstable_version =
+        atomic_load_explicit(&cf->next_sstable_id, memory_order_acquire);
 
     /* create merge heap for this CF */
     skip_list_comparator_fn comparator_fn = NULL;
@@ -13188,23 +13221,44 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         }
     }
 
+    /* cache sst sources for reuse across seeks */
     if (ssts_array)
     {
+        (*iter)->cached_sources_capacity = sst_count;
+        (*iter)->cached_sources = malloc(sst_count * sizeof(tidesdb_merge_source_t *));
+        if (!(*iter)->cached_sources)
+        {
+            for (int i = 0; i < sst_count; i++)
+            {
+                tidesdb_sstable_unref(cf->db, ssts_array[i]);
+            }
+            free(ssts_array);
+            tidesdb_merge_heap_free((*iter)->heap);
+            free(*iter);
+            return TDB_ERR_MEMORY;
+        }
+
         for (int i = 0; i < sst_count; i++)
         {
             tidesdb_sstable_t *sst = ssts_array[i];
 
             tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable(cf->db, sst);
-            if (sst_source && sst_source->current_kv != NULL)
+            if (sst_source)
             {
-                if (tidesdb_merge_heap_add_source((*iter)->heap, sst_source) != TDB_SUCCESS)
+                /* mark as cached so it won't be freed when popped from heap */
+                sst_source->is_cached = 1;
+
+                /* cache the source for reuse */
+                (*iter)->cached_sources[(*iter)->num_cached_sources++] = sst_source;
+
+                /* add to heap if it has initial data */
+                if (sst_source->current_kv != NULL)
                 {
-                    tidesdb_merge_source_free(sst_source);
+                    if (tidesdb_merge_heap_add_source((*iter)->heap, sst_source) != TDB_SUCCESS)
+                    {
+                        /* source is still cached, just not in heap initially */
+                    }
                 }
-            }
-            else if (sst_source)
-            {
-                tidesdb_merge_source_free(sst_source);
             }
 
             tidesdb_sstable_unref(cf->db, sst);
@@ -13225,94 +13279,154 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
     iter->valid = 0;
     iter->direction = 1;
 
-    /* if heap is empty or sources are exhausted (no current_kv), reinitialize sources
-     * sources may still be in heap but with current_kv = NULL after full iteration */
-    int need_reinit = (iter->heap->num_sources == 0);
-    if (!need_reinit)
-    {
-        /* check if all sources are exhausted (current_kv == NULL) */
-        int all_exhausted = 1;
-        for (int i = 0; i < iter->heap->num_sources; i++)
-        {
-            if (iter->heap->sources[i]->current_kv != NULL)
-            {
-                all_exhausted = 0;
-                break;
-            }
-        }
-        need_reinit = all_exhausted;
-    }
+    tidesdb_column_family_t *cf = iter->cf;
 
-    if (need_reinit)
+    /* check if sst layout has changed (compaction created new ssts, or ssts were deleted) */
+    uint64_t current_version = atomic_load_explicit(&cf->next_sstable_id, memory_order_acquire);
+    if (current_version != iter->cached_sstable_version)
     {
-        /* free any remaining exhausted sources */
+        /* clear heap first to remove references to cached sources */
         for (int i = 0; i < iter->heap->num_sources; i++)
         {
-            tidesdb_merge_source_free(iter->heap->sources[i]);
+            if (!iter->heap->sources[i]->is_cached)
+            {
+                tidesdb_merge_source_free(iter->heap->sources[i]);
+            }
         }
         iter->heap->num_sources = 0;
-        tidesdb_column_family_t *cf = iter->cf;
 
-        /* add active memtable source */
-        tidesdb_memtable_t *active_mt_struct =
-            atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-        skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
-
-        tidesdb_merge_source_t *memtable_source =
-            tidesdb_merge_source_from_memtable(active_mt, &cf->config, NULL);
-        if (memtable_source)
+        /* sst layout changed, invalidate cached sources */
+        for (int i = 0; i < iter->num_cached_sources; i++)
         {
-            if (tidesdb_merge_heap_add_source(iter->heap, memtable_source) != TDB_SUCCESS)
-            {
-                tidesdb_merge_source_free(memtable_source);
-            }
+            tidesdb_merge_source_free(iter->cached_sources[i]);
         }
+        iter->num_cached_sources = 0;
+        iter->cached_sstable_version = current_version;
 
-        /* add immutable memtable sources */
-        size_t imm_count =
-            atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
-        for (size_t i = 0; i < imm_count; i++)
-        {
-            tidesdb_immutable_memtable_t *imm =
-                (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
-            if (imm && imm->skip_list)
-            {
-                tidesdb_merge_source_t *source =
-                    tidesdb_merge_source_from_memtable(imm->skip_list, &cf->config, imm);
-                if (source)
-                {
-                    if (tidesdb_merge_heap_add_source(iter->heap, source) != TDB_SUCCESS)
-                    {
-                        tidesdb_merge_source_free(source);
-                    }
-                }
-            }
-        }
-
+        /* recreate cached sources with new sst layout */
+        tidesdb_sstable_t **ssts_array = NULL;
+        int sst_count = 0;
         int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+
         for (int lvl = 0; lvl < num_levels; lvl++)
         {
             tidesdb_level_t *level = cf->levels[lvl];
             if (!level) continue;
 
             int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+            if (num_ssts == 0) continue;
+
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&level->sstables, memory_order_acquire);
-
             for (int j = 0; j < num_ssts; j++)
             {
                 tidesdb_sstable_t *sst = sstables[j];
-                if (!sst) continue;
+                if (sst)
+                {
+                    tidesdb_sstable_ref(sst);
 
+                    tidesdb_sstable_t **new_array =
+                        realloc(ssts_array, (sst_count + 1) * sizeof(tidesdb_sstable_t *));
+                    if (!new_array)
+                    {
+                        tidesdb_sstable_unref(cf->db, sst);
+                        for (int k = 0; k < sst_count; k++)
+                            tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                        free(ssts_array);
+                        return TDB_ERR_MEMORY;
+                    }
+                    ssts_array = new_array;
+                    ssts_array[sst_count++] = sst;
+                }
+            }
+        }
+
+        if (ssts_array)
+        {
+            if (!iter->cached_sources || iter->cached_sources_capacity < sst_count)
+            {
+                void **new_cached = realloc(iter->cached_sources, sst_count * sizeof(void *));
+                if (!new_cached)
+                {
+                    for (int k = 0; k < sst_count; k++)
+                        tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                    free(ssts_array);
+                    return TDB_ERR_MEMORY;
+                }
+                iter->cached_sources = new_cached;
+                iter->cached_sources_capacity = sst_count;
+            }
+
+            for (int i = 0; i < sst_count; i++)
+            {
+                tidesdb_sstable_t *sst = ssts_array[i];
                 tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable(cf->db, sst);
                 if (sst_source)
                 {
-                    if (tidesdb_merge_heap_add_source(iter->heap, sst_source) != TDB_SUCCESS)
-                    {
-                        tidesdb_merge_source_free(sst_source);
-                    }
+                    sst_source->is_cached = 1;
+                    iter->cached_sources[iter->num_cached_sources++] = sst_source;
+                }
+                tidesdb_sstable_unref(cf->db, sst);
+            }
+            free(ssts_array);
+        }
+    }
+    else
+    {
+        /* sst layout unchanged, just clear heap but keep cached sources */
+        /* free non-cached sources that are currently in the heap */
+        for (int i = 0; i < iter->heap->num_sources; i++)
+        {
+            if (!iter->heap->sources[i]->is_cached)
+            {
+                tidesdb_merge_source_free(iter->heap->sources[i]);
+            }
+        }
+        iter->heap->num_sources = 0;
+    }
+
+    /* add active memtable source (recreate each time as memtable can change) */
+    tidesdb_memtable_t *active_mt_struct =
+        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
+
+    tidesdb_merge_source_t *memtable_source =
+        tidesdb_merge_source_from_memtable(active_mt, &cf->config, NULL);
+    if (memtable_source)
+    {
+        if (tidesdb_merge_heap_add_source(iter->heap, memtable_source) != TDB_SUCCESS)
+        {
+            tidesdb_merge_source_free(memtable_source);
+        }
+    }
+
+    /* add immutable memtable sources (recreate each time as immutables can change) */
+    size_t imm_count = atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
+    for (size_t i = 0; i < imm_count; i++)
+    {
+        tidesdb_immutable_memtable_t *imm =
+            (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
+        if (imm && imm->skip_list)
+        {
+            tidesdb_merge_source_t *source =
+                tidesdb_merge_source_from_memtable(imm->skip_list, &cf->config, imm);
+            if (source)
+            {
+                if (tidesdb_merge_heap_add_source(iter->heap, source) != TDB_SUCCESS)
+                {
+                    tidesdb_merge_source_free(source);
                 }
             }
+        }
+    }
+
+    /* reuse cached sst sources instead of recreating them */
+    for (int i = 0; i < iter->num_cached_sources; i++)
+    {
+        tidesdb_merge_source_t *source = iter->cached_sources[i];
+        if (tidesdb_merge_heap_add_source(iter->heap, source) != TDB_SUCCESS)
+        {
+            /* source remains cached but not in heap */
         }
     }
 
@@ -13620,37 +13734,26 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         }
     }
 
-    /* rebuild heap as min-heap */
+    /* rebuild heap as min-heap -- heap now maintains sources at their current keys */
     for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
     {
         heap_sift_down(iter->heap, i);
     }
 
-    /* peek at first visible entry (dont pop yet, sources are already positioned) */
+    /* find first visible entry by popping from heap */
     while (!tidesdb_merge_heap_empty(iter->heap))
     {
-        tidesdb_merge_source_t *top = iter->heap->sources[0];
-        if (!top->current_kv) break;
+        tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop(iter->heap, NULL);
+        if (!kv) break;
 
-        if (!tidesdb_iter_kv_visible(iter, top->current_kv))
+        if (!tidesdb_iter_kv_visible(iter, kv))
         {
-            /* not visible, advance this source and re-heapify */
-            if (tidesdb_merge_source_advance(top) != 0)
-            {
-                /* source exhausted, remove from heap */
-                iter->heap->sources[0] = iter->heap->sources[iter->heap->num_sources - 1];
-                iter->heap->num_sources--;
-                tidesdb_merge_source_free(top);
-            }
-            if (iter->heap->num_sources > 0)
-            {
-                heap_sift_down(iter->heap, 0);
-            }
+            tidesdb_kv_pair_free(kv);
             continue;
         }
 
-        /* found visible entry, clone it without advancing */
-        iter->current = tidesdb_kv_pair_clone(top->current_kv);
+        /* found visible entry - this is our starting position */
+        iter->current = kv;
         iter->valid = 1;
         return TDB_SUCCESS;
     }
@@ -13662,15 +13765,198 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
 {
     if (!iter || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
+
     tidesdb_kv_pair_free(iter->current);
     iter->current = NULL;
     iter->valid = 0;
     iter->direction = -1;
 
-    /* reposition each source to target key */
-    for (int i = 0; i < iter->heap->num_sources; i++)
+    tidesdb_column_family_t *cf = iter->cf;
+
+    /* check if sst layout has changed (compaction created new ssts, or ssts were deleted) */
+    uint64_t current_version = atomic_load_explicit(&cf->next_sstable_id, memory_order_acquire);
+
+    if (current_version != iter->cached_sstable_version)
     {
-        tidesdb_merge_source_t *source = iter->heap->sources[i];
+
+
+        /* clear heap first to remove references to cached sources */
+        for (int i = 0; i < iter->heap->num_sources; i++)
+        {
+            if (!iter->heap->sources[i]->is_cached)
+            {
+                tidesdb_merge_source_free(iter->heap->sources[i]);
+            }
+        }
+        iter->heap->num_sources = 0;
+
+        /* sst layout changed, invalidate cached sources */
+        for (int i = 0; i < iter->num_cached_sources; i++)
+        {
+            tidesdb_merge_source_free(iter->cached_sources[i]);
+        }
+        iter->num_cached_sources = 0;
+        iter->cached_sstable_version = current_version;
+
+        /* recreate cached sources with new sst layout */
+        tidesdb_sstable_t **ssts_array = NULL;
+        int sst_count = 0;
+        int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+
+        for (int lvl = 0; lvl < num_levels; lvl++)
+        {
+            tidesdb_level_t *level = cf->levels[lvl];
+            if (!level) continue;
+
+            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+            if (num_ssts == 0) continue;
+
+            tidesdb_sstable_t **sstables =
+                atomic_load_explicit(&level->sstables, memory_order_acquire);
+            for (int j = 0; j < num_ssts; j++)
+            {
+                tidesdb_sstable_t *sst = sstables[j];
+                if (sst)
+                {
+                    tidesdb_sstable_ref(sst);
+
+                    tidesdb_sstable_t **new_array =
+                        realloc(ssts_array, (sst_count + 1) * sizeof(tidesdb_sstable_t *));
+                    if (!new_array)
+                    {
+                        tidesdb_sstable_unref(cf->db, sst);
+                        for (int k = 0; k < sst_count; k++)
+                            tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                        free(ssts_array);
+                        return TDB_ERR_MEMORY;
+                    }
+                    ssts_array = new_array;
+                    ssts_array[sst_count++] = sst;
+                }
+            }
+        }
+
+        if (ssts_array)
+        {
+            if (!iter->cached_sources || iter->cached_sources_capacity < sst_count)
+            {
+                void **new_cached = realloc(iter->cached_sources, sst_count * sizeof(void *));
+                if (!new_cached)
+                {
+                    for (int k = 0; k < sst_count; k++)
+                        tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                    free(ssts_array);
+                    return TDB_ERR_MEMORY;
+                }
+                iter->cached_sources = new_cached;
+                iter->cached_sources_capacity = sst_count;
+            }
+
+            for (int i = 0; i < sst_count; i++)
+            {
+                tidesdb_sstable_t *sst = ssts_array[i];
+                tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable(cf->db, sst);
+                if (sst_source)
+                {
+                    sst_source->is_cached = 1;
+                    iter->cached_sources[iter->num_cached_sources++] = sst_source;
+                }
+                tidesdb_sstable_unref(cf->db, sst);
+            }
+            free(ssts_array);
+        }
+    }
+    else
+    {
+        /* sst layout unchanged, just clear heap but keep cached sources */
+        /* free non-cached sources that are currently in the heap */
+        for (int i = 0; i < iter->heap->num_sources; i++)
+        {
+            if (!iter->heap->sources[i]->is_cached)
+            {
+                tidesdb_merge_source_free(iter->heap->sources[i]);
+            }
+        }
+        iter->heap->num_sources = 0;
+    }
+
+
+    /* collect sources without adding to heap yet */
+    tidesdb_merge_source_t **temp_sources = malloc(16 * sizeof(tidesdb_merge_source_t *));
+    if (!temp_sources) return TDB_ERR_MEMORY;
+    int temp_count = 0;
+    int temp_capacity = 16;
+
+    /* collect active memtable source */
+    tidesdb_memtable_t *active_mt_struct =
+        atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
+
+    tidesdb_merge_source_t *memtable_source =
+        tidesdb_merge_source_from_memtable(active_mt, &cf->config, NULL);
+    if (memtable_source)
+    {
+        temp_sources[temp_count++] = memtable_source;
+    }
+
+    /* collect immutable memtable sources */
+    size_t imm_count = atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
+    for (size_t i = 0; i < imm_count; i++)
+    {
+        tidesdb_immutable_memtable_t *imm =
+            (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
+        if (imm && imm->skip_list)
+        {
+            tidesdb_merge_source_t *source =
+                tidesdb_merge_source_from_memtable(imm->skip_list, &cf->config, imm);
+            if (source)
+            {
+                if (temp_count >= temp_capacity)
+                {
+                    temp_capacity *= 2;
+                    tidesdb_merge_source_t **new_temp =
+                        realloc(temp_sources, temp_capacity * sizeof(tidesdb_merge_source_t *));
+                    if (!new_temp)
+                    {
+                        tidesdb_merge_source_free(source);
+                        for (int j = 0; j < temp_count; j++)
+                            tidesdb_merge_source_free(temp_sources[j]);
+                        free(temp_sources);
+                        return TDB_ERR_MEMORY;
+                    }
+                    temp_sources = new_temp;
+                }
+                temp_sources[temp_count++] = source;
+            }
+        }
+    }
+
+    /* add cached sst sources to temp_sources for repositioning */
+
+    for (int i = 0; i < iter->num_cached_sources; i++)
+    {
+        tidesdb_merge_source_t *source = iter->cached_sources[i];
+        if (temp_count >= temp_capacity)
+        {
+            temp_capacity *= 2;
+            tidesdb_merge_source_t **new_temp =
+                realloc(temp_sources, temp_capacity * sizeof(tidesdb_merge_source_t *));
+            if (!new_temp)
+            {
+                for (int j = 0; j < temp_count; j++) tidesdb_merge_source_free(temp_sources[j]);
+                free(temp_sources);
+                return TDB_ERR_MEMORY;
+            }
+            temp_sources = new_temp;
+        }
+        temp_sources[temp_count++] = source;
+    }
+
+
+    /* reposition all sources (memtables and cached ssts) to target key */
+    for (int i = 0; i < temp_count; i++)
+    {
+        tidesdb_merge_source_t *source = temp_sources[i];
         tidesdb_kv_pair_free(source->current_kv);
         source->current_kv = NULL;
 
@@ -13959,101 +14245,61 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         }
     }
 
+    /* add all repositioned sources to heap */
+    int sources_added = 0;
+    for (int i = 0; i < temp_count; i++)
+    {
+        tidesdb_merge_source_t *source = temp_sources[i];
+        if (source->current_kv != NULL)
+        {
+            if (tidesdb_merge_heap_add_source(iter->heap, source) != TDB_SUCCESS)
+            {
+                /* failed to add, free non-cached sources */
+                if (!source->is_cached)
+                {
+                    tidesdb_merge_source_free(source);
+                }
+            }
+            else
+            {
+                sources_added++;
+            }
+        }
+        else
+        {
+            /* source has no data, free if not cached */
+            if (!source->is_cached)
+            {
+                tidesdb_merge_source_free(source);
+            }
+        }
+    }
+    free(temp_sources);
+
+
     /* rebuild heap as max-heap for backward iteration */
     for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
     {
-        int current = i;
-        while (current * 2 + 1 < iter->heap->num_sources)
-        {
-            int largest = current;
-            int left = 2 * current + 1;
-            int right = 2 * current + 2;
-
-            if (left < iter->heap->num_sources && iter->heap->sources[left]->current_kv &&
-                (!iter->heap->sources[largest]->current_kv ||
-                 iter->heap->comparator(iter->heap->sources[left]->current_kv->key,
-                                        iter->heap->sources[left]->current_kv->entry.key_size,
-                                        iter->heap->sources[largest]->current_kv->key,
-                                        iter->heap->sources[largest]->current_kv->entry.key_size,
-                                        iter->heap->comparator_ctx) > 0))
-            {
-                largest = left;
-            }
-
-            if (right < iter->heap->num_sources && iter->heap->sources[right]->current_kv &&
-                (!iter->heap->sources[largest]->current_kv ||
-                 iter->heap->comparator(iter->heap->sources[right]->current_kv->key,
-                                        iter->heap->sources[right]->current_kv->entry.key_size,
-                                        iter->heap->sources[largest]->current_kv->key,
-                                        iter->heap->sources[largest]->current_kv->entry.key_size,
-                                        iter->heap->comparator_ctx) > 0))
-            {
-                largest = right;
-            }
-
-            if (largest == current) break;
-
-            tidesdb_merge_source_t *temp = iter->heap->sources[current];
-            iter->heap->sources[current] = iter->heap->sources[largest];
-            iter->heap->sources[largest] = temp;
-            current = largest;
-        }
+        heap_sift_down_max(iter->heap, i);
     }
 
-    /* pop largest visible entry */
-    while (iter->heap->num_sources > 0 && iter->heap->sources[0]->current_kv)
+    /* find largest visible entry by popping from max-heap */
+
+    while (!tidesdb_merge_heap_empty(iter->heap))
     {
-        tidesdb_kv_pair_t *kv = iter->heap->sources[0]->current_kv;
+        tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop_max(iter->heap);
+        if (!kv) break;
 
-        if (tidesdb_iter_kv_visible(iter, kv))
+        if (!tidesdb_iter_kv_visible(iter, kv))
         {
-            iter->current = tidesdb_kv_pair_create(
-                kv->key, kv->entry.key_size, kv->value, kv->entry.value_size, kv->entry.ttl,
-                kv->entry.seq, kv->entry.flags & TDB_KV_FLAG_TOMBSTONE);
-            iter->valid = 1;
-            return TDB_SUCCESS;
+            tidesdb_kv_pair_free(kv);
+            continue;
         }
 
-        /* not visible, retreat and re-heapify */
-        tidesdb_merge_source_retreat(iter->heap->sources[0]);
-
-        /* sift down from root */
-        int current = 0;
-        while (current * 2 + 1 < iter->heap->num_sources)
-        {
-            int largest = current;
-            int left = 2 * current + 1;
-            int right = 2 * current + 2;
-
-            if (left < iter->heap->num_sources && iter->heap->sources[left]->current_kv &&
-                (!iter->heap->sources[largest]->current_kv ||
-                 iter->heap->comparator(iter->heap->sources[left]->current_kv->key,
-                                        iter->heap->sources[left]->current_kv->entry.key_size,
-                                        iter->heap->sources[largest]->current_kv->key,
-                                        iter->heap->sources[largest]->current_kv->entry.key_size,
-                                        iter->heap->comparator_ctx) > 0))
-            {
-                largest = left;
-            }
-
-            if (right < iter->heap->num_sources && iter->heap->sources[right]->current_kv &&
-                (!iter->heap->sources[largest]->current_kv ||
-                 iter->heap->comparator(iter->heap->sources[right]->current_kv->key,
-                                        iter->heap->sources[right]->current_kv->entry.key_size,
-                                        iter->heap->sources[largest]->current_kv->key,
-                                        iter->heap->sources[largest]->current_kv->entry.key_size,
-                                        iter->heap->comparator_ctx) > 0))
-            {
-                largest = right;
-            }
-
-            if (largest == current) break;
-
-            tidesdb_merge_source_t *temp = iter->heap->sources[current];
-            iter->heap->sources[current] = iter->heap->sources[largest];
-            iter->heap->sources[largest] = temp;
-            current = largest;
-        }
+        /* found visible entry -- this is our starting position */
+        iter->current = kv;
+        iter->valid = 1;
+        return TDB_SUCCESS;
     }
 
     return TDB_ERR_NOT_FOUND;
@@ -14329,6 +14575,7 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
     /* set direction to forward */
     iter->direction = 1;
 
+    /* save current key to skip duplicates */
     uint8_t stack_key[TDB_ITER_STACK_KEY_SIZE];
     uint8_t *current_key = NULL;
     size_t current_key_size = 0;
@@ -14376,73 +14623,35 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         }
     }
 
-    if (iter->heap->num_sources == 1)
+    /* pop from heap until we find next visible entry */
+    while (!tidesdb_merge_heap_empty(iter->heap))
     {
-        tidesdb_merge_source_t *source = iter->heap->sources[0];
-        while (source->current_kv)
+        tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop(iter->heap, NULL);
+        if (!kv) break;
+
+        /* skip duplicates (same key as previous) */
+        if (current_key && current_key_size == kv->entry.key_size &&
+            memcmp(current_key, kv->key, current_key_size) == 0)
         {
-            tidesdb_kv_pair_t *kv = source->current_kv;
-
-            if (current_key && current_key_size == kv->entry.key_size &&
-                memcmp(current_key, kv->key, current_key_size) == 0)
-            {
-                if (tidesdb_merge_source_advance(source) != TDB_SUCCESS) break;
-                continue;
-            }
-
-            if (!tidesdb_iter_kv_visible(iter, kv))
-            {
-                if (tidesdb_merge_source_advance(source) != TDB_SUCCESS) break;
-                continue;
-            }
-
-            /* snapshot isolation -- track read for conflict detection */
-            tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
-                                        kv->entry.seq);
-
-            /* create copy for iterator */
-            iter->current = tidesdb_kv_pair_create(
-                kv->key, kv->entry.key_size, kv->value, kv->entry.value_size, kv->entry.ttl,
-                kv->entry.seq, kv->entry.flags & TDB_KV_FLAG_TOMBSTONE);
-
-            if (key_on_heap) free(current_key);
-
-            /* advance source for next iteration */
-            tidesdb_merge_source_advance(source);
-
-            iter->valid = 1;
-            return TDB_SUCCESS;
+            tidesdb_kv_pair_free(kv);
+            continue;
         }
-    }
-    else
-    {
-        while (!tidesdb_merge_heap_empty(iter->heap))
+
+        /* skip invisible entries */
+        if (!tidesdb_iter_kv_visible(iter, kv))
         {
-            tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop(iter->heap, NULL);
-            if (!kv) break;
-
-            if (current_key && current_key_size == kv->entry.key_size &&
-                memcmp(current_key, kv->key, current_key_size) == 0)
-            {
-                tidesdb_kv_pair_free(kv);
-                continue;
-            }
-
-            if (!tidesdb_iter_kv_visible(iter, kv))
-            {
-                tidesdb_kv_pair_free(kv);
-                continue;
-            }
-
-            /* snapshot isolation -- track read for conflict detection */
-            tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
-                                        kv->entry.seq);
-
-            if (key_on_heap) free(current_key);
-            iter->current = kv;
-            iter->valid = 1;
-            return TDB_SUCCESS;
+            tidesdb_kv_pair_free(kv);
+            continue;
         }
+
+        /* snapshot isolation -- track read for conflict detection */
+        tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
+                                    kv->entry.seq);
+
+        if (key_on_heap) free(current_key);
+        iter->current = kv;
+        iter->valid = 1;
+        return TDB_SUCCESS;
     }
 
     if (key_on_heap) free(current_key);
@@ -14507,53 +14716,13 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         }
     }
 
-    if (iter->heap->num_sources == 1)
-    {
-        tidesdb_merge_source_t *source = iter->heap->sources[0];
-        while (source->current_kv)
-        {
-            tidesdb_kv_pair_t *kv = source->current_kv;
-
-            if (current_key && current_key_size == kv->entry.key_size &&
-                memcmp(current_key, kv->key, current_key_size) == 0)
-            {
-                if (tidesdb_merge_source_retreat(source) != TDB_SUCCESS) break;
-                continue;
-            }
-
-            if (!tidesdb_iter_kv_visible(iter, kv))
-            {
-                if (tidesdb_merge_source_retreat(source) != TDB_SUCCESS) break;
-                continue;
-            }
-
-            /* snapshot isolation -- track read for conflict detection */
-            tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
-                                        kv->entry.seq);
-
-            /* create copy for iterator */
-            iter->current = tidesdb_kv_pair_create(
-                kv->key, kv->entry.key_size, kv->value, kv->entry.value_size, kv->entry.ttl,
-                kv->entry.seq, kv->entry.flags & TDB_KV_FLAG_TOMBSTONE);
-
-            if (key_on_heap) free(current_key);
-
-            tidesdb_merge_source_retreat(source);
-
-            iter->valid = 1;
-            return TDB_SUCCESS;
-        }
-
-        if (key_on_heap) free(current_key);
-        return TDB_ERR_NOT_FOUND;
-    }
-
-    /* get previous entry, skipping duplicates */
+    /* pop from max-heap until we find previous visible entry */
     while (!tidesdb_merge_heap_empty(iter->heap))
     {
         tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop_max(iter->heap);
         if (!kv) break;
 
+        /* skip duplicates (same key as previous) */
         if (current_key && current_key_size == kv->entry.key_size &&
             memcmp(current_key, kv->key, current_key_size) == 0)
         {
@@ -14561,6 +14730,7 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
             continue;
         }
 
+        /* skip invisible entries */
         if (!tidesdb_iter_kv_visible(iter, kv))
         {
             tidesdb_kv_pair_free(kv);
@@ -14615,6 +14785,15 @@ void tidesdb_iter_free(tidesdb_iter_t *iter)
 
     tidesdb_kv_pair_free(iter->current);
     tidesdb_merge_heap_free(iter->heap);
+
+    if (iter->cached_sources)
+    {
+        for (int i = 0; i < iter->num_cached_sources; i++)
+        {
+            tidesdb_merge_source_free(iter->cached_sources[i]);
+        }
+        free(iter->cached_sources);
+    }
 
     free(iter);
 }

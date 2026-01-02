@@ -10221,6 +10221,526 @@ static void test_iterator_seek_for_prev_after_reopen_indexes(void)
     cleanup_test_dir();
 }
 
+static void test_iter_next_large_values_many_sstables(void)
+{
+    cleanup_test_dir();
+
+    const int NUM_KEYS = 500;
+    const int VALUE_SIZE = 8192; /* 8KB values */
+    const int KEYS_PER_FLUSH = 50;
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+    cf_config.write_buffer_size = 64 * 1024;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "iter_next_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "iter_next_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    uint8_t *large_value = malloc(VALUE_SIZE);
+    ASSERT_TRUE(large_value != NULL);
+
+    /* insert keys with unique large values */
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+        memset(large_value, 'A' + (i % 26), VALUE_SIZE);
+        large_value[0] = (uint8_t)(i & 0xFF);
+        large_value[1] = (uint8_t)((i >> 8) & 0xFF);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        snprintf(key, sizeof(key), "key_%08d", i);
+
+        ASSERT_EQ(
+            tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
+            0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if ((i + 1) % KEYS_PER_FLUSH == 0)
+        {
+            tidesdb_flush_memtable(cf);
+        }
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    /* test iteration with iter_next -- read all keys and verify values */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+    int count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *found_key = NULL;
+        size_t found_key_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &found_key, &found_key_size), 0);
+
+        uint8_t *found_value = NULL;
+        size_t found_value_size = 0;
+        ASSERT_EQ(tidesdb_iter_value(iter, &found_value, &found_value_size), 0);
+        ASSERT_EQ(found_value_size, (size_t)VALUE_SIZE);
+
+        /* verify value content matches expected pattern */
+        char expected_key[32];
+        snprintf(expected_key, sizeof(expected_key), "key_%08d", count);
+        ASSERT_TRUE(strcmp((char *)found_key, expected_key) == 0);
+
+        int expected_idx = count;
+        ASSERT_EQ(found_value[0], (uint8_t)(expected_idx & 0xFF));
+        ASSERT_EQ(found_value[1], (uint8_t)((expected_idx >> 8) & 0xFF));
+
+        tidesdb_iter_next(iter);
+        count++;
+    }
+
+    ASSERT_EQ(count, NUM_KEYS);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    free(large_value);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_iter_prev_large_values_many_sstables(void)
+{
+    cleanup_test_dir();
+
+    const int NUM_KEYS = 500;
+    const int VALUE_SIZE = 8192;
+    const int KEYS_PER_FLUSH = 50;
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+    cf_config.write_buffer_size = 64 * 1024;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "iter_prev_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "iter_prev_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    uint8_t *large_value = malloc(VALUE_SIZE);
+    ASSERT_TRUE(large_value != NULL);
+
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+        memset(large_value, 'A' + (i % 26), VALUE_SIZE);
+        large_value[0] = (uint8_t)(i & 0xFF);
+        large_value[1] = (uint8_t)((i >> 8) & 0xFF);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        snprintf(key, sizeof(key), "key_%08d", i);
+
+        ASSERT_EQ(
+            tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
+            0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if ((i + 1) % KEYS_PER_FLUSH == 0)
+        {
+            tidesdb_flush_memtable(cf);
+        }
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    /* test backward iteration with iter_prev */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+    ASSERT_EQ(tidesdb_iter_seek_to_last(iter), 0);
+    ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+    int count = 0;
+    int expected_idx = NUM_KEYS - 1;
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *found_key = NULL;
+        size_t found_key_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &found_key, &found_key_size), 0);
+
+        uint8_t *found_value = NULL;
+        size_t found_value_size = 0;
+        ASSERT_EQ(tidesdb_iter_value(iter, &found_value, &found_value_size), 0);
+        ASSERT_EQ(found_value_size, (size_t)VALUE_SIZE);
+
+        char exp_key[32];
+        snprintf(exp_key, sizeof(exp_key), "key_%08d", expected_idx);
+        ASSERT_TRUE(strcmp((char *)found_key, exp_key) == 0);
+
+        ASSERT_EQ(found_value[0], (uint8_t)(expected_idx & 0xFF));
+        ASSERT_EQ(found_value[1], (uint8_t)((expected_idx >> 8) & 0xFF));
+
+        tidesdb_iter_prev(iter);
+        count++;
+        expected_idx--;
+    }
+
+    ASSERT_EQ(count, NUM_KEYS);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    free(large_value);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_get_large_values_many_sstables(void)
+{
+    cleanup_test_dir();
+
+    const int NUM_KEYS = 500;
+    const int VALUE_SIZE = 8192;
+    const int KEYS_PER_FLUSH = 50;
+    const int NUM_GETS = 200;
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+    cf_config.write_buffer_size = 64 * 1024;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "get_test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "get_test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    uint8_t *large_value = malloc(VALUE_SIZE);
+    ASSERT_TRUE(large_value != NULL);
+
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+        memset(large_value, 'A' + (i % 26), VALUE_SIZE);
+        large_value[0] = (uint8_t)(i & 0xFF);
+        large_value[1] = (uint8_t)((i >> 8) & 0xFF);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        snprintf(key, sizeof(key), "key_%08d", i);
+
+        ASSERT_EQ(
+            tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
+            0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if ((i + 1) % KEYS_PER_FLUSH == 0)
+        {
+            tidesdb_flush_memtable(cf);
+        }
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    /* test random GETs */
+    srand(54321);
+
+    for (int g = 0; g < NUM_GETS; g++)
+    {
+        int target_idx = rand() % NUM_KEYS;
+        char key[32];
+        snprintf(key, sizeof(key), "key_%08d", target_idx);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        uint8_t *found_value = NULL;
+        size_t found_value_size = 0;
+        int get_result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &found_value,
+                                         &found_value_size);
+        ASSERT_EQ(get_result, 0);
+        ASSERT_TRUE(found_value != NULL);
+        ASSERT_EQ(found_value_size, (size_t)VALUE_SIZE);
+
+        ASSERT_EQ(found_value[0], (uint8_t)(target_idx & 0xFF));
+        ASSERT_EQ(found_value[1], (uint8_t)((target_idx >> 8) & 0xFF));
+
+        free(found_value);
+        tidesdb_txn_free(txn);
+    }
+
+    free(large_value);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_range_iteration_large_values_many_sstables(void)
+{
+    cleanup_test_dir();
+
+    const int NUM_KEYS = 500;
+    const int VALUE_SIZE = 8192;
+    const int KEYS_PER_FLUSH = 50;
+    const int NUM_RANGES = 50;
+    const int RANGE_SIZE = 20;
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+    cf_config.write_buffer_size = 64 * 1024;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "range_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "range_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    uint8_t *large_value = malloc(VALUE_SIZE);
+    ASSERT_TRUE(large_value != NULL);
+
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+        memset(large_value, 'A' + (i % 26), VALUE_SIZE);
+        large_value[0] = (uint8_t)(i & 0xFF);
+        large_value[1] = (uint8_t)((i >> 8) & 0xFF);
+
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        snprintf(key, sizeof(key), "key_%08d", i);
+
+        ASSERT_EQ(
+            tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
+            0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if ((i + 1) % KEYS_PER_FLUSH == 0)
+        {
+            tidesdb_flush_memtable(cf);
+        }
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+    srand(99999);
+
+    for (int r = 0; r < NUM_RANGES; r++)
+    {
+        int start_idx = rand() % (NUM_KEYS - RANGE_SIZE);
+        char seek_key[32];
+        snprintf(seek_key, sizeof(seek_key), "key_%08d", start_idx);
+        fprintf(stderr, "Range %d: seeking to '%s' (start_idx=%d)\n", r, seek_key, start_idx);
+
+        ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)seek_key, strlen(seek_key) + 1), 0);
+        ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+        int count = 0;
+        int expected_idx = start_idx;
+        while (tidesdb_iter_valid(iter) && count < RANGE_SIZE)
+        {
+            uint8_t *found_key = NULL;
+            size_t found_key_size = 0;
+            ASSERT_EQ(tidesdb_iter_key(iter, &found_key, &found_key_size), 0);
+
+            uint8_t *found_value = NULL;
+            size_t found_value_size = 0;
+            ASSERT_EQ(tidesdb_iter_value(iter, &found_value, &found_value_size), 0);
+            ASSERT_EQ(found_value_size, (size_t)VALUE_SIZE);
+
+            char exp_key[32];
+            snprintf(exp_key, sizeof(exp_key), "key_%08d", expected_idx);
+            if (strcmp((char *)found_key, exp_key) != 0)
+            {
+                fprintf(stderr, "KEY MISMATCH at range %d, count %d: expected '%s', got '%s'\n", r,
+                        count, exp_key, (char *)found_key);
+                /* abort early to see the issue */
+                ASSERT_TRUE(0);
+            }
+
+            if (found_value[0] != (uint8_t)(expected_idx & 0xFF) ||
+                found_value[1] != (uint8_t)((expected_idx >> 8) & 0xFF))
+            {
+                fprintf(stderr, "VALUE MISMATCH at key '%s': expected [%d,%d], got [%d,%d]\n",
+                        (char *)found_key, expected_idx & 0xFF, (expected_idx >> 8) & 0xFF,
+                        found_value[0], found_value[1]);
+            }
+
+            ASSERT_EQ(found_value[0], (uint8_t)(expected_idx & 0xFF));
+            ASSERT_EQ(found_value[1], (uint8_t)((expected_idx >> 8) & 0xFF));
+
+            tidesdb_iter_next(iter);
+            count++;
+            expected_idx++;
+        }
+
+        ASSERT_EQ(count, RANGE_SIZE);
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    free(large_value);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_seek_large_values_many_sstables(void)
+{
+    cleanup_test_dir();
+
+    const int NUM_KEYS = 1000;
+    const int VALUE_SIZE = 8192;
+    const int KEYS_PER_FLUSH = 100;
+    const int NUM_SEEKS = 100;
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+    cf_config.write_buffer_size = 64 * 1024;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "seek_test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "seek_test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    uint8_t *large_value = malloc(VALUE_SIZE);
+    ASSERT_TRUE(large_value != NULL);
+    memset(large_value, 'X', VALUE_SIZE);
+
+    for (int i = 0; i < NUM_KEYS; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        snprintf(key, sizeof(key), "key_%08d", i);
+
+        ASSERT_EQ(
+            tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value, VALUE_SIZE, 0),
+            0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        /* force flush every KEYS_PER_FLUSH keys to create multiple SSTables */
+        if ((i + 1) % KEYS_PER_FLUSH == 0)
+        {
+            tidesdb_flush_memtable(cf);
+        }
+    }
+
+    /* final flush */
+    tidesdb_flush_memtable(cf);
+
+    /* now test random seeks - this is what crashes in benchmark */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+
+    srand(12345); /* deterministic seed */
+
+    for (int s = 0; s < NUM_SEEKS; s++)
+    {
+        int target_idx = rand() % NUM_KEYS;
+        char seek_key[32];
+        snprintf(seek_key, sizeof(seek_key), "key_%08d", target_idx);
+
+        int seek_result = tidesdb_iter_seek(iter, (uint8_t *)seek_key, strlen(seek_key) + 1);
+        ASSERT_EQ(seek_result, 0);
+        ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+        /* verify we got the right key */
+        uint8_t *found_key = NULL;
+        size_t found_key_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &found_key, &found_key_size), 0);
+        ASSERT_TRUE(found_key != NULL);
+        ASSERT_TRUE(strcmp((char *)found_key, seek_key) == 0);
+
+        /* verify value is correct size */
+        uint8_t *found_value = NULL;
+        size_t found_value_size = 0;
+        ASSERT_EQ(tidesdb_iter_value(iter, &found_value, &found_value_size), 0);
+        ASSERT_EQ(found_value_size, (size_t)VALUE_SIZE);
+    }
+
+    /* also test seek_for_prev */
+    for (int s = 0; s < NUM_SEEKS; s++)
+    {
+        int target_idx = rand() % NUM_KEYS;
+        char seek_key[32];
+        snprintf(seek_key, sizeof(seek_key), "key_%08d", target_idx);
+
+        int seek_result =
+            tidesdb_iter_seek_for_prev(iter, (uint8_t *)seek_key, strlen(seek_key) + 1);
+        ASSERT_EQ(seek_result, 0);
+        ASSERT_TRUE(tidesdb_iter_valid(iter));
+
+        /* verify we got the right key (or one before it) */
+        uint8_t *found_key = NULL;
+        size_t found_key_size = 0;
+        ASSERT_EQ(tidesdb_iter_key(iter, &found_key, &found_key_size), 0);
+        ASSERT_TRUE(found_key != NULL);
+        ASSERT_TRUE(strcmp((char *)found_key, seek_key) <= 0);
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    free(large_value);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -10387,6 +10907,11 @@ int main(void)
     RUN_TEST(test_iterator_seek_after_reopen, tests_passed);
     RUN_TEST(test_iterator_seek_for_prev_after_reopen, tests_passed);
     RUN_TEST(test_iterator_seek_for_prev_after_reopen_indexes, tests_passed);
+    RUN_TEST(test_iter_next_large_values_many_sstables, tests_passed);
+    RUN_TEST(test_iter_prev_large_values_many_sstables, tests_passed);
+    RUN_TEST(test_get_large_values_many_sstables, tests_passed);
+    RUN_TEST(test_range_iteration_large_values_many_sstables, tests_passed);
+    RUN_TEST(test_seek_large_values_many_sstables, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

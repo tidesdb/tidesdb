@@ -1080,6 +1080,50 @@ int block_manager_read_at_offset(block_manager_t *bm, uint64_t offset, size_t si
     return 0;
 }
 
+int block_manager_read_block_data_at_offset(block_manager_t *bm, uint64_t offset, uint8_t **data,
+                                            uint32_t *data_size)
+{
+    if (!bm || !data || !data_size) return -1;
+
+    /* read block header (size + checksum) in one operation */
+    unsigned char header[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
+    ssize_t nread = pread(bm->fd, header, BLOCK_MANAGER_BLOCK_HEADER_SIZE, (off_t)offset);
+    if (nread != BLOCK_MANAGER_BLOCK_HEADER_SIZE)
+    {
+        return -1;
+    }
+
+    /* decode size and checksum from header */
+    uint32_t block_size = decode_uint32_le_compat(header);
+    uint32_t expected_checksum = decode_uint32_le_compat(header + BLOCK_MANAGER_SIZE_FIELD_SIZE);
+
+    if (block_size == 0) return -1; /* invalid block */
+
+    /* allocate buffer for block data */
+    uint8_t *block_data = malloc(block_size);
+    if (!block_data) return -1;
+
+    /* read block data immediately after header */
+    uint64_t data_offset = offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    nread = pread(bm->fd, block_data, block_size, (off_t)data_offset);
+    if (nread != (ssize_t)block_size)
+    {
+        free(block_data);
+        return -1;
+    }
+
+    /* verify checksum */
+    if (verify_checksum(block_data, block_size, expected_checksum) != 0)
+    {
+        free(block_data);
+        return -1; /* checksum mismatch */
+    }
+
+    *data = block_data;
+    *data_size = block_size;
+    return 0;
+}
+
 int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode)
 {
     if (!bm || !file_path) return -1;

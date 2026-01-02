@@ -2463,27 +2463,42 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
         return 0; /* already open */
     }
 
-    /* open block managers if needed */
+    /* open block managers if needed, using CAS to prevent race conditions
+     * where two threads both try to open the same sstable simultaneously */
     if (!sst->klog_bm)
     {
-        if (block_manager_open(&sst->klog_bm, sst->klog_path,
+        block_manager_t *new_klog_bm = NULL;
+        if (block_manager_open(&new_klog_bm, sst->klog_path,
                                convert_sync_mode(sst->config->sync_mode)) != 0)
         {
             return -1;
+        }
+        /* CAS to set klog_bm -- if another thread already set it, close ours */
+        block_manager_t *expected = NULL;
+        if (!atomic_compare_exchange_strong((atomic_uintptr_t *)&sst->klog_bm,
+                                            (uintptr_t *)&expected, (uintptr_t)new_klog_bm))
+        {
+            /* another thread already opened it, close our duplicate */
+            block_manager_close(new_klog_bm);
         }
     }
 
     if (!sst->vlog_bm)
     {
-        if (block_manager_open(&sst->vlog_bm, sst->vlog_path,
+        block_manager_t *new_vlog_bm = NULL;
+        if (block_manager_open(&new_vlog_bm, sst->vlog_path,
                                convert_sync_mode(sst->config->sync_mode)) != 0)
         {
-            if (sst->klog_bm)
-            {
-                block_manager_close(sst->klog_bm);
-                sst->klog_bm = NULL;
-            }
+            /* we dont close klog_bm here -- it may be used by another thread */
             return -1;
+        }
+        /* CAS to set vlog_bm -- if another thread already set it, close ours */
+        block_manager_t *expected = NULL;
+        if (!atomic_compare_exchange_strong((atomic_uintptr_t *)&sst->vlog_bm,
+                                            (uintptr_t *)&expected, (uintptr_t)new_vlog_bm))
+        {
+            /* another thread already opened it, close our duplicate */
+            block_manager_close(new_vlog_bm);
         }
     }
 
@@ -4901,6 +4916,19 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
                 klog_block->entries[0].seq, klog_block->entries[0].flags & TDB_KV_FLAG_TOMBSTONE);
 
             free(vlog_value);
+
+            /* if kv pair creation failed, clean up and return NULL */
+            if (!source->current_kv)
+            {
+                tidesdb_klog_block_free(klog_block);
+                block_manager_block_release(block);
+                tidesdb_sstable_unref(db, sst);
+                block_manager_cursor_free(source->source.sstable.klog_cursor);
+                block_manager_cursor_free(source->source.sstable.vlog_cursor);
+                free(source);
+                return NULL;
+            }
+
             /* dont free decompressed or release block,we're still using the deserialized data */
             return source;
         }
@@ -4915,7 +4943,12 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
         return NULL;
     }
 
-    return source;
+    /* cursor_goto_first failed, clean up and return NULL */
+    tidesdb_sstable_unref(db, sst);
+    block_manager_cursor_free(source->source.sstable.klog_cursor);
+    block_manager_cursor_free(source->source.sstable.vlog_cursor);
+    free(source);
+    return NULL;
 }
 
 /**
@@ -11959,6 +11992,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                 }
             }
             immutable_count = idx;
+            /* if no immutables were actually captured, free the array now */
+            if (immutable_count == 0)
+            {
+                free(immutable_refs);
+                immutable_refs = NULL;
+            }
         }
         else
         {
@@ -12092,14 +12131,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         PROFILE_INC(txn->db, levels_searched);
         tidesdb_level_t *level = cf->levels[level_num];
 
-        /* load array pointer and count with careful ordering to handle concurrent modifications
-         * both add-with-resize and remove swap array first, then update count
-         * race scenarios:
-         * - remove: new (smaller) array swapped, count not yet decremented -> OOB if we use old
-         * count
-         * - add-with-resize: new (larger) array swapped, count not yet incremented -> miss new
-         * element solution: load array, load count, re-load count, use minimum of two counts this
-         * ensures we never access beyond valid array bounds */
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
@@ -12802,7 +12833,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
              * wal_size > 0 but wal_batch == NULL means allocation failed */
             if (wal_size > 0)
             {
-                /* allocation failed - abort commit to preserve durability */
+                /* allocation failed -- abort commit to preserve durability */
                 for (int cleanup_idx = 0; cleanup_idx <= cf_idx; cleanup_idx++)
                 {
                     if (cf_memtables[cleanup_idx])
@@ -12825,7 +12856,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             block_manager_block_t *wal_block = block_manager_block_create(wal_size, wal_batch);
             if (!wal_block)
             {
-                /* block creation failed - abort commit to preserve durability */
+                /* block creation failed -- abort commit to preserve durability */
                 free(wal_batch);
                 for (int cleanup_idx = 0; cleanup_idx <= cf_idx; cleanup_idx++)
                 {
@@ -13464,6 +13495,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         {
             tidesdb_level_t *level = cf->levels[i];
 
+        retry_level:;
             /* load array pointer and count with careful ordering to handle concurrent modifications
              * re-load count to detect concurrent remove, use minimum to avoid OOB */
             tidesdb_sstable_t **sstables =
@@ -13483,10 +13515,30 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                 num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
             }
 
+            /* track how many refs we had before this level to allow rollback on retry */
+            int sst_count_before_level = sst_count;
+
             /* take refs on all sstables in this level immediately in tight loop
              * this minimizes window where compaction could free the array */
+            int need_retry = 0;
             for (int j = 0; j < num_ssts; j++)
             {
+                /* check if array changed before accessing -- if so, our sstables pointer is stale
+                 */
+                tidesdb_sstable_t **current_arr =
+                    atomic_load_explicit(&level->sstables, memory_order_acquire);
+                if (current_arr != sstables)
+                {
+                    /* array was swapped, release refs and retry with new array */
+                    for (int k = sst_count_before_level; k < sst_count; k++)
+                    {
+                        tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                    }
+                    sst_count = sst_count_before_level;
+                    need_retry = 1;
+                    break;
+                }
+
                 tidesdb_sstable_t *sst = sstables[j];
                 if (!sst) continue;
 
@@ -13511,16 +13563,26 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                     ssts_capacity = new_capacity;
                 }
 
-                /* try to acquire reference to protect against concurrent deletion
-                 * use try_ref to safely handle concurrent removal */
+                /* we try to acquire reference to protect against concurrent deletion
+                 * if try_ref fails, the sstable is being freed by compaction
+                 * we must retry the entire level to get the updated array with new merged sstable
+                 */
                 if (!tidesdb_sstable_try_ref(sst))
                 {
-                    continue; /* sstable is being freed, skip it */
+                    /* release refs acquired for this level and retry */
+                    for (int k = sst_count_before_level; k < sst_count; k++)
+                    {
+                        tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                    }
+                    sst_count = sst_count_before_level;
+                    need_retry = 1;
+                    break;
                 }
                 ssts_array[sst_count++] = sst;
             }
 
             if (!ssts_array) break; /* allocation failed */
+            if (need_retry) goto retry_level;
         }
     }
 
@@ -13616,6 +13678,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
             tidesdb_level_t *level = cf->levels[lvl];
             if (!level) continue;
 
+        retry_seek_level:;
             /* load array pointer and count with careful ordering to handle concurrent modifications
              * re-load count to detect concurrent remove, use minimum to avoid OOB */
             tidesdb_sstable_t **sstables =
@@ -13636,15 +13699,39 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
             }
             if (num_ssts == 0) continue;
 
+            /* track count before this level for rollback on retry */
+            int sst_count_before_level = sst_count;
+            int need_retry = 0;
+
             for (int j = 0; j < num_ssts; j++)
             {
+                /* check if array changed before accessing -- if so, our sstables pointer is stale
+                 */
+                tidesdb_sstable_t **current_arr =
+                    atomic_load_explicit(&level->sstables, memory_order_acquire);
+                if (current_arr != sstables)
+                {
+                    /* array was swapped, release refs and retry with new array */
+                    for (int k = sst_count_before_level; k < sst_count; k++)
+                        tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                    sst_count = sst_count_before_level;
+                    need_retry = 1;
+                    break;
+                }
+
                 tidesdb_sstable_t *sst = sstables[j];
                 if (sst)
                 {
-                    /* try to acquire reference to protect against concurrent deletion */
+                    /* try to acquire reference to protect against concurrent deletion
+                     * if try_ref fails, retry the level to get updated array */
                     if (!tidesdb_sstable_try_ref(sst))
                     {
-                        continue; /* sstable is being freed, skip it */
+                        /* release refs acquired for this level and retry */
+                        for (int k = sst_count_before_level; k < sst_count; k++)
+                            tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                        sst_count = sst_count_before_level;
+                        need_retry = 1;
+                        break;
                     }
 
                     tidesdb_sstable_t **new_array =
@@ -13661,6 +13748,8 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                     ssts_array[sst_count++] = sst;
                 }
             }
+
+            if (need_retry) goto retry_seek_level;
         }
 
         if (ssts_array)
@@ -14127,6 +14216,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
             tidesdb_level_t *level = cf->levels[lvl];
             if (!level) continue;
 
+        retry_seek_for_prev_level:;
             /* load array pointer and count with careful ordering to handle concurrent modifications
              * re-load count to detect concurrent remove, use minimum to avoid OOB */
             tidesdb_sstable_t **sstables =
@@ -14147,15 +14237,39 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
             }
             if (num_ssts == 0) continue;
 
+            /* track count before this level for rollback on retry */
+            int sst_count_before_level = sst_count;
+            int need_retry = 0;
+
             for (int j = 0; j < num_ssts; j++)
             {
+                /* check if array changed before accessing -- if so, our sstables pointer is stale
+                 */
+                tidesdb_sstable_t **current_arr =
+                    atomic_load_explicit(&level->sstables, memory_order_acquire);
+                if (current_arr != sstables)
+                {
+                    /* array was swapped, release refs and retry with new array */
+                    for (int k = sst_count_before_level; k < sst_count; k++)
+                        tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                    sst_count = sst_count_before_level;
+                    need_retry = 1;
+                    break;
+                }
+
                 tidesdb_sstable_t *sst = sstables[j];
                 if (sst)
                 {
-                    /* try to acquire reference to protect against concurrent deletion */
+                    /* try to acquire reference to protect against concurrent deletion
+                     * if try_ref fails, retry the level to get updated array */
                     if (!tidesdb_sstable_try_ref(sst))
                     {
-                        continue; /* sstable is being freed, skip it */
+                        /* release refs acquired for this level and retry */
+                        for (int k = sst_count_before_level; k < sst_count; k++)
+                            tidesdb_sstable_unref(cf->db, ssts_array[k]);
+                        sst_count = sst_count_before_level;
+                        need_retry = 1;
+                        break;
                     }
 
                     tidesdb_sstable_t **new_array =
@@ -14172,6 +14286,8 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                     ssts_array[sst_count++] = sst;
                 }
             }
+
+            if (need_retry) goto retry_seek_for_prev_level;
         }
 
         if (ssts_array)

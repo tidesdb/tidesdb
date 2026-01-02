@@ -6370,6 +6370,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "Removed SSTable %" PRIu64 " from level %d", sst->id,
                               lvl->level_num);
+                /* increment version to invalidate cached iterator sources */
+                atomic_fetch_add_explicit(&cf->next_sstable_id, 1, memory_order_release);
                 removed = 1;
                 removed_level = lvl->level_num;
                 break; /* found and removed, no need to check other levels */
@@ -7220,6 +7222,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 int result = tidesdb_level_remove_sstable(cf->db, cf->levels[level], sst);
                 if (result == TDB_SUCCESS)
                 {
+                    /* increment version to invalidate cached iterator sources */
+                    atomic_fetch_add_explicit(&cf->next_sstable_id, 1, memory_order_release);
                     removed_level = cf->levels[level]->level_num;
                     break; /* found and removed, no need to check other levels */
                 }
@@ -8036,6 +8040,8 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             int result = tidesdb_level_remove_sstable(cf->db, cf->levels[level_idx], sst);
             if (result == TDB_SUCCESS)
             {
+                /* increment version to invalidate cached iterator sources */
+                atomic_fetch_add_explicit(&cf->next_sstable_id, 1, memory_order_release);
                 removed_level = cf->levels[level_idx]->level_num;
                 break; /* found and removed, no need to check other levels */
             }
@@ -13765,7 +13771,6 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
 {
     if (!iter || !key || key_size == 0) return TDB_ERR_INVALID_ARGS;
 
-
     tidesdb_kv_pair_free(iter->current);
     iter->current = NULL;
     iter->valid = 0;
@@ -13778,8 +13783,6 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
 
     if (current_version != iter->cached_sstable_version)
     {
-
-
         /* clear heap first to remove references to cached sources */
         for (int i = 0; i < iter->heap->num_sources; i++)
         {
@@ -13880,7 +13883,6 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         iter->heap->num_sources = 0;
     }
 
-
     /* collect sources without adding to heap yet */
     tidesdb_merge_source_t **temp_sources = malloc(16 * sizeof(tidesdb_merge_source_t *));
     if (!temp_sources) return TDB_ERR_MEMORY;
@@ -13951,7 +13953,6 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         }
         temp_sources[temp_count++] = source;
     }
-
 
     /* reposition all sources (memtables and cached ssts) to target key */
     for (int i = 0; i < temp_count; i++)
@@ -14275,7 +14276,6 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         }
     }
     free(temp_sources);
-
 
     /* rebuild heap as max-heap for backward iteration */
     for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)

@@ -548,8 +548,10 @@ void test_manifest_concurrent_operations()
 
     const int num_threads = 4;
     const int ops_per_thread = 50;
-    pthread_t threads[num_threads * 2];
-    thread_data_t thread_data[num_threads * 2];
+    pthread_t *threads = malloc(sizeof(pthread_t) * num_threads * 2);
+    thread_data_t *thread_data = malloc(sizeof(thread_data_t) * num_threads * 2);
+    ASSERT_TRUE(threads != NULL);
+    ASSERT_TRUE(thread_data != NULL);
 
     /* create writer threads */
     for (int i = 0; i < num_threads; i++)
@@ -590,6 +592,9 @@ void test_manifest_concurrent_operations()
 
     tidesdb_manifest_close(m2);
     remove(test_path);
+
+    free(threads);
+    free(thread_data);
 }
 
 void test_manifest_corrupted_recovery()

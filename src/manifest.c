@@ -108,9 +108,14 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
             {
                 /* found orphaned temp file, remove it */
                 char temp_full_path[MANIFEST_PATH_LEN];
-                snprintf(temp_full_path, sizeof(temp_full_path), "%s" PATH_SEPARATOR "%s", dir_path,
-                         entry->d_name);
-                remove(temp_full_path);
+                size_t dir_path_len = strlen(dir_path);
+                /* check if combined path fits in buffer (dir + separator + entry + null) */
+                if (dir_path_len + 1 + entry_len + 1 <= MANIFEST_PATH_LEN)
+                {
+                    snprintf(temp_full_path, sizeof(temp_full_path), "%s" PATH_SEPARATOR "%s",
+                             dir_path, entry->d_name);
+                    remove(temp_full_path);
+                }
             }
         }
         closedir(dir);

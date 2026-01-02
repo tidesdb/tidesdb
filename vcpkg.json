@@ -1,6 +1,6 @@
 {
   "name": "tidesdb",
-  "version-string": "7.0.9",
+  "version-string": "7.0.10",
   "description": "TidesDB is a high-performance durable, transactional embeddable storage engine designed for flash and RAM optimization.",
   "dependencies": [
     "zstd",

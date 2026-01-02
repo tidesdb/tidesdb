@@ -405,7 +405,7 @@ typedef struct tidesdb_ref_counted_block_t tidesdb_ref_counted_block_t;
  * @param source union of memtable or sstable source
  * @param current_kv current key-value pair
  * @param config column family configuration
- * @param is_cached if 1, don't free when popped from heap (for iterators)
+ * @param is_cached if 1, dont free when popped from heap (for iterators)
  */
 typedef struct
 {
@@ -9251,9 +9251,20 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 tidesdb_level_t *lvl = cf->levels[level];
                 if (!lvl) continue;
 
-                /* atomically load sstables array and count */
-                tidesdb_sstable_t **ssts = atomic_load(&lvl->sstables);
-                int num_ssts = atomic_load(&lvl->num_sstables);
+                /* load array pointer before count to avoid race with compaction
+                 * re-check array pointer after loading count to handle add-with-resize case */
+                tidesdb_sstable_t **ssts =
+                    atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+                int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+
+                /* verify array hasnt changed (handles add-with-resize race) */
+                tidesdb_sstable_t **ssts_check =
+                    atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+                if (ssts_check != ssts)
+                {
+                    ssts = ssts_check;
+                    num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+                }
 
                 for (int j = 0; j < num_ssts; j++)
                 {
@@ -10435,7 +10446,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
 
     /* truncate WAL to prevent reading stale data from previous runs
-     * this is critical on windows where file deletion may be delayed due to file locking */
+     * this is a must on windows where file deletion may be delayed due to file locking */
     if (block_manager_truncate(new_wal) != 0)
     {
         block_manager_close(new_wal);
@@ -10931,9 +10942,6 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
         return TDB_ERR_IO;
     }
 
-    /* truncate WAL to prevent reading stale data from previous runs
-     * this is critical on windows where file deletion may be delayed due to file locking
-     * if an old WAL file exists, it may contain garbage data that would corrupt recovery */
     if (block_manager_truncate(new_wal) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to truncate new WAL: %s", cf->name, wal_path);
@@ -12013,9 +12021,23 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     {
         PROFILE_INC(txn->db, levels_searched);
         tidesdb_level_t *level = cf->levels[level_num];
+
+        /* load array pointer before count to avoid race with compaction
+         * compaction swaps array first, then updates count. If we load count first,
+         * we might get old (larger) count with new (smaller) array, causing OOB access.
+         * re-check array pointer after loading count to handle add-with-resize case */
+        tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
-        tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
+        /* verify array hasnt changed (handles add-with-resize race) */
+        tidesdb_sstable_t **sstables_check =
+            atomic_load_explicit(&level->sstables, memory_order_acquire);
+        if (sstables_check != sstables)
+        {
+            /* array was resized, use new array and count */
+            sstables = sstables_check;
+            num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        }
 
         for (int j = 0; j < num_ssts; j++)
         {
@@ -12329,14 +12351,31 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
 {
     if (!db || !cf) return 0;
 
+    /* track highest sequence found across all ssts
+     * in l0/L1 levels, ssts can overlap and newer ones are appended at the end
+     * we must check all ssts to find the true highest sequence for this key */
+    uint64_t max_found_seq = 0;
+    int found_any = 0;
+
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
     for (int level_idx = 0; level_idx < num_levels; level_idx++)
     {
         tidesdb_level_t *level = cf->levels[level_idx];
         if (!level) continue;
 
+        /* load array pointer before count to avoid race with compaction
+         * re-check array pointer after loading count to handle add-with-resize case */
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_sstables = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+        /* verify array hasnt changed (handles add-with-resize race) */
+        tidesdb_sstable_t **sstables_check =
+            atomic_load_explicit(&level->sstables, memory_order_acquire);
+        if (sstables_check != sstables)
+        {
+            sstables = sstables_check;
+            num_sstables = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        }
 
         for (int sst_idx = 0; sst_idx < num_sstables; sst_idx++)
         {
@@ -12348,15 +12387,17 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
             {
                 uint64_t found_seq = kv->entry.seq;
                 tidesdb_kv_pair_free(kv);
-                if (found_seq > threshold_seq)
+                found_any = 1;
+                if (found_seq > max_found_seq)
                 {
-                    return 1;
+                    max_found_seq = found_seq;
                 }
-                return 0;
             }
         }
     }
-    return 0;
+
+    /* conflict if we found any version with seq > threshold */
+    return (found_any && max_found_seq > threshold_seq) ? 1 : 0;
 }
 
 /**
@@ -12397,6 +12438,7 @@ static uint8_t *tidesdb_txn_serialize_wal(const tidesdb_txn_t *txn,
     }
 
     /* allocate and serialize */
+    *out_size = cf_wal_size; /* set size before allocation so caller can detect alloc failure */
     uint8_t *wal_batch = malloc(cf_wal_size);
     if (!wal_batch) return NULL;
 
@@ -12652,12 +12694,29 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         cf_memtables[cf_idx] = mt;
         cf_skiplists[cf_idx] = mt ? mt->skip_list : NULL;
 
-        size_t wal_size;
+        size_t wal_size = 0;
         uint8_t *wal_batch = tidesdb_txn_serialize_wal(txn, cf, &wal_size);
 
         if (!wal_batch)
         {
-            /* no ops for this CF -- skip WAL write but keep memtable/skiplist for potential use */
+            /* wal_size == 0 means no ops for this CF, which is fine
+             * wal_size > 0 but wal_batch == NULL means allocation failed */
+            if (wal_size > 0)
+            {
+                /* allocation failed - abort commit to preserve durability */
+                for (int cleanup_idx = 0; cleanup_idx <= cf_idx; cleanup_idx++)
+                {
+                    if (cf_memtables[cleanup_idx])
+                    {
+                        atomic_fetch_sub_explicit(&cf_memtables[cleanup_idx]->refcount, 1,
+                                                  memory_order_release);
+                    }
+                }
+                free(cf_memtables);
+                free(cf_skiplists);
+                return TDB_ERR_MEMORY;
+            }
+            /* no ops for this CF -- skip WAL write */
             continue;
         }
 
@@ -12665,25 +12724,39 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         if (wal)
         {
             block_manager_block_t *wal_block = block_manager_block_create(wal_size, wal_batch);
-            if (wal_block)
+            if (!wal_block)
             {
-                int64_t wal_result = block_manager_block_write(wal, wal_block);
-                block_manager_block_release(wal_block);
-                if (wal_result < 0)
+                /* block creation failed - abort commit to preserve durability */
+                free(wal_batch);
+                for (int cleanup_idx = 0; cleanup_idx <= cf_idx; cleanup_idx++)
                 {
-                    free(wal_batch);
-                    for (int cleanup_idx = 0; cleanup_idx <= cf_idx; cleanup_idx++)
+                    if (cf_memtables[cleanup_idx])
                     {
-                        if (cf_memtables[cleanup_idx])
-                        {
-                            atomic_fetch_sub_explicit(&cf_memtables[cleanup_idx]->refcount, 1,
-                                                      memory_order_release);
-                        }
+                        atomic_fetch_sub_explicit(&cf_memtables[cleanup_idx]->refcount, 1,
+                                                  memory_order_release);
                     }
-                    free(cf_memtables);
-                    free(cf_skiplists);
-                    return TDB_ERR_IO;
                 }
+                free(cf_memtables);
+                free(cf_skiplists);
+                return TDB_ERR_MEMORY;
+            }
+
+            int64_t wal_result = block_manager_block_write(wal, wal_block);
+            block_manager_block_release(wal_block);
+            if (wal_result < 0)
+            {
+                free(wal_batch);
+                for (int cleanup_idx = 0; cleanup_idx <= cf_idx; cleanup_idx++)
+                {
+                    if (cf_memtables[cleanup_idx])
+                    {
+                        atomic_fetch_sub_explicit(&cf_memtables[cleanup_idx]->refcount, 1,
+                                                  memory_order_release);
+                    }
+                }
+                free(cf_memtables);
+                free(cf_skiplists);
+                return TDB_ERR_IO;
             }
         }
 
@@ -13292,9 +13365,20 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         {
             tidesdb_level_t *level = cf->levels[i];
 
-            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+            /* load array pointer before count to avoid race with compaction
+             * re-check array pointer after loading count to handle add-with-resize case */
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&level->sstables, memory_order_acquire);
+            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+            /* verify array hasnt changed (handles add-with-resize race) */
+            tidesdb_sstable_t **sstables_check =
+                atomic_load_explicit(&level->sstables, memory_order_acquire);
+            if (sstables_check != sstables)
+            {
+                sstables = sstables_check;
+                num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+            }
 
             /* take refs on all sstables in this level immediately in tight loop
              * this minimizes window where compaction could free the array */
@@ -13357,7 +13441,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
             tidesdb_merge_source_t *sst_source = tidesdb_merge_source_from_sstable(cf->db, sst);
             if (sst_source)
             {
-                /* mark as cached so it won't be freed when popped from heap */
+                /* mark as cached so it wont be freed when popped from heap */
                 sst_source->is_cached = 1;
 
                 /* cache the source for reuse */
@@ -13425,11 +13509,22 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
             tidesdb_level_t *level = cf->levels[lvl];
             if (!level) continue;
 
-            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
-            if (num_ssts == 0) continue;
-
+            /* load array pointer before count to avoid race with compaction
+             * re-check array pointer after loading count to handle add-with-resize case */
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&level->sstables, memory_order_acquire);
+            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+            /* verify array hasnt changed (handles add-with-resize race) */
+            tidesdb_sstable_t **sstables_check =
+                atomic_load_explicit(&level->sstables, memory_order_acquire);
+            if (sstables_check != sstables)
+            {
+                sstables = sstables_check;
+                num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+            }
+            if (num_ssts == 0) continue;
+
             for (int j = 0; j < num_ssts; j++)
             {
                 tidesdb_sstable_t *sst = sstables[j];
@@ -13917,11 +14012,22 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
             tidesdb_level_t *level = cf->levels[lvl];
             if (!level) continue;
 
-            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
-            if (num_ssts == 0) continue;
-
+            /* load array pointer before count to avoid race with compaction
+             * re-check array pointer after loading count to handle add-with-resize case */
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&level->sstables, memory_order_acquire);
+            int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+            /* verify array hasnt changed (handles add-with-resize race) */
+            tidesdb_sstable_t **sstables_check =
+                atomic_load_explicit(&level->sstables, memory_order_acquire);
+            if (sstables_check != sstables)
+            {
+                sstables = sstables_check;
+                num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+            }
+            if (num_ssts == 0) continue;
+
             for (int j = 0; j < num_ssts; j++)
             {
                 tidesdb_sstable_t *sst = sstables[j];
@@ -15252,8 +15358,19 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
         tidesdb_level_t *level = cf->levels[level_idx];
         if (!level) continue;
 
+        /* load array pointer before count to avoid race with compaction
+         * re-check array pointer after loading count to handle add-with-resize case */
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+        /* verify array hasnt changed (handles add-with-resize race) */
+        tidesdb_sstable_t **sstables_check =
+            atomic_load_explicit(&level->sstables, memory_order_acquire);
+        if (sstables_check != sstables)
+        {
+            sstables = sstables_check;
+            num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        }
 
         for (int sst_idx = 0; sst_idx < num_ssts; sst_idx++)
         {

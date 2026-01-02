@@ -10673,17 +10673,15 @@ static void test_seek_large_values_many_sstables(void)
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
         tidesdb_txn_free(txn);
 
-        /* force flush every KEYS_PER_FLUSH keys to create multiple SSTables */
+        /* force flush every KEYS_PER_FLUSH keys to create multiple ssts */
         if ((i + 1) % KEYS_PER_FLUSH == 0)
         {
             tidesdb_flush_memtable(cf);
         }
     }
 
-    /* final flush */
     tidesdb_flush_memtable(cf);
 
-    /* now test random seeks - this is what crashes in benchmark */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 

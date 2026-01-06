@@ -39,7 +39,7 @@ jobs:
             export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
-              -DTIDESDB_WITH_SANITIZER=OFF
+              -DTIDESDB_WITH_SANITIZER=ON
             
             echo ""
             echo "*=====================================*"
@@ -85,7 +85,7 @@ jobs:
             export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
-              -DTIDESDB_WITH_SANITIZER=OFF
+              -DTIDESDB_WITH_SANITIZER=ON
             
             echo ""
             echo "*=====================================*"
@@ -130,7 +130,7 @@ jobs:
             export PKG_CONFIG_PATH=/usr/pkg/lib/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
-              -DTIDESDB_WITH_SANITIZER=OFF
+              -DTIDESDB_WITH_SANITIZER=ON
             
             echo ""
             echo "*=====================================*"
@@ -177,7 +177,7 @@ jobs:
             export PKG_CONFIG_PATH=/opt/ooce/lib/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
-              -DTIDESDB_WITH_SANITIZER=OFF 
+              -DTIDESDB_WITH_SANITIZER=ON 
             
             echo ""
             echo "*=====================================*"
@@ -224,7 +224,7 @@ jobs:
             export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/libdata/pkgconfig
             cmake -S . -B build \
               -DTIDESDB_BUILD_TESTS=ON \
-              -DTIDESDB_WITH_SANITIZER=OFF
+              -DTIDESDB_WITH_SANITIZER=ON
             
             echo ""
             echo "*=====================================*"

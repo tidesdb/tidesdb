@@ -195,10 +195,11 @@ typedef enum
 #define TDB_DEFAULT_INDEX_SAMPLE_RATIO          1
 #define TDB_DEFAULT_BLOCK_INDEX_PREFIX_LEN      16
 #define TDB_DEFAULT_MIN_DISK_SPACE              (100 * 1024 * 1024)
-#define TDB_DEFAULT_MAX_OPEN_SSTABLES           512
-#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE      (1024 * 64)
-#define TDB_DEFAULT_BLOCK_CACHE_SIZE            (64 * 1024 * 1024)
-#define TDB_DEFAULT_SYNC_INTERVAL_US            128000
+#define TDB_DEFAULT_MAX_OPEN_SSTABLES \
+    256 /* x2 each sstable has 2 fds, so really the default is 512 */
+#define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE (1024 * 64)
+#define TDB_DEFAULT_BLOCK_CACHE_SIZE       (64 * 1024 * 1024)
+#define TDB_DEFAULT_SYNC_INTERVAL_US       128000
 
 /* configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64

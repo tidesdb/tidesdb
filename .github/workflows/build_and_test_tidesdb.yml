@@ -586,7 +586,8 @@ jobs:
               -DCMAKE_MODULE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
               -DTIDESDB_WITH_SANITIZER=ON
           else
-            cmake -S . -B build
+            cmake -S . -B build \
+              -DTIDESDB_WITH_SANITIZER=ON
           fi
           cmake --build build --config Release
       

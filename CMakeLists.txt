@@ -51,6 +51,9 @@ if(TIDESDB_WITH_SANITIZER)
     elseif(MINGW)
         # MinGW/GCC flags
         add_compile_options(-Wextra -Wall -std=c11)
+    elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|SunOS")
+        # ASan support varies, just enable warnings
+        add_compile_options(-Wextra -Wall)
     else()
         # Unix/Linux/macOS flags
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)

@@ -93,6 +93,16 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
 
 void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
 {
+    if (bf == NULL)
+    {
+        return;
+    }
+
+    if (entry == NULL || size == 0)
+    {
+        return;
+    }
+
     /* add a key to the bloom filter using H hash functions */
     for (int i = 0; i < (int)bf->h; i++)
     {
@@ -104,6 +114,16 @@ void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size
 
 int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
 {
+    if (bf == NULL)
+    {
+        return -1;
+    }
+
+    if (entry == NULL || size == 0)
+    {
+        return -1;
+    }
+
     /* check if a key is in the bloom filter using H hash functions
      * early exit on first zero bit (likely case for negative lookups) */
     for (int i = 0; i < (int)bf->h; i++)
@@ -120,6 +140,16 @@ int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const 
 
 int bloom_filter_is_full(const bloom_filter_t *bf)
 {
+    if (bf == NULL)
+    {
+        return -1;
+    }
+
+    if (bf->bitset == NULL)
+    {
+        return -1;
+    }
+
     /* check if all words are fully set (optimized for packed bits) */
     for (unsigned int i = 0; i < bf->size_in_words - 1; i++)
     {
@@ -141,6 +171,11 @@ int bloom_filter_is_full(const bloom_filter_t *bf)
 
 unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
 {
+    if (entry == NULL || size == 0)
+    {
+        return 0;
+    }
+
     /* local constants */
     const uint32_t m = 0xc6a4a793;       /*  large prime */
     const uint32_t r = 24;               /* right shift value */
@@ -184,6 +219,11 @@ unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
 
 uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
 {
+    if (bf == NULL)
+    {
+        return NULL;
+    }
+
     /* count non-zero words for sparse encoding */
     unsigned int non_zero_count = 0;
     for (unsigned int i = 0; i < bf->size_in_words; i++)
@@ -229,6 +269,11 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
 
 bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
 {
+    if (data == NULL)
+    {
+        return NULL;
+    }
+
     const uint8_t *ptr = data;
 
     /* read header with varint decoding */

@@ -158,7 +158,7 @@ void test_boundary_conditions()
     (void)bloom_filter_new(&bf, 0.01, 1000);
     const char *empty_key = "";
     (void)bloom_filter_add(bf, (const uint8_t *)empty_key, strlen(empty_key));
-    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)empty_key, strlen(empty_key)), 1);
+    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)empty_key, strlen(empty_key)), -1);
     (void)bloom_filter_free(bf);
 }
 
@@ -169,7 +169,7 @@ void test_bloom_filter_edge_cases()
     /* empty key */
     bloom_filter_new(&bf, 0.01, 100);
     bloom_filter_add(bf, (uint8_t *)"", 0);
-    ASSERT_EQ(bloom_filter_contains(bf, (uint8_t *)"", 0), 1);
+    ASSERT_EQ(bloom_filter_contains(bf, (uint8_t *)"", 0), -1);
 
     /* fairly large key */
     uint8_t large_key[10000];

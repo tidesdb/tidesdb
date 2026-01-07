@@ -791,7 +791,7 @@ static void tidesdb_sstable_ref(tidesdb_sstable_t *sst);
 static int tidesdb_sstable_try_ref(tidesdb_sstable_t *sst);
 static void tidesdb_sstable_unref(const tidesdb_t *db, tidesdb_sstable_t *sst);
 static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t *sst,
-                                               skip_list_t *memtable, tidesdb_column_family_t *cf);
+                                               skip_list_t *memtable);
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
                                size_t key_size, tidesdb_kv_pair_t **kv);
 static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst);
@@ -3001,13 +3001,11 @@ static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm)
  * @param db database instance
  * @param sst sstable to write to
  * @param memtable memtable to write from
- * @param cf column family
  * @return 0 on success, -1 on error
  */
 static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t *sst,
-                                               skip_list_t *memtable, tidesdb_column_family_t *cf)
+                                               skip_list_t *memtable)
 {
-    (void)cf; /* unused parameter */
     if (!db || !sst || !memtable) return TDB_ERR_INVALID_ARGS;
 
     int num_entries = skip_list_count_entries(memtable);
@@ -8688,7 +8686,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             continue;
         }
 
-        int write_result = tidesdb_sstable_write_from_memtable(db, sst, memtable, cf);
+        int write_result = tidesdb_sstable_write_from_memtable(db, sst, memtable);
         if (write_result != TDB_SUCCESS)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO,

@@ -1184,6 +1184,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
             {
                 /* next_at_0 < key, advance pred */
                 pred = next_at_0;
+                continue; /* making forward progress, dont count as failed CAS */
             }
             /* else cmp > 0: next_at_0 > key, retry CAS with same pred */
         }

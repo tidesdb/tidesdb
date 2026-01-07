@@ -974,7 +974,7 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter);
  * tidesdb_iter_valid
  * checks if an iterator is valid
  * @param iter iterator handle
- * @return 0 on success, -n on failure
+ * @return non-zero if valid, 0 if invalid
  */
 int tidesdb_iter_valid(tidesdb_iter_t *iter);
 

@@ -3577,7 +3577,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
          * key is in range if max_key <= key <= min_key (in actual values)
          * with reverse comparator -- key >= max means cmp(key,max) <= 0, key <= min means
          * cmp(key,min) >= 0 */
-        if (min_cmp < 0 || max_cmp > 0)
+        if (min_cmp > 0 || max_cmp < 0)
         {
             return TDB_ERR_NOT_FOUND;
         }
@@ -5023,127 +5023,124 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
             free(vlog_value);
             return TDB_SUCCESS;
         }
-        else
+        /* move to next block, cursor will handle position tracking */
+
+        /* release previous block and decompressed data before moving to next */
+        /* free current_block first since its pointers reference decompressed_data */
+        if (source->source.sstable.current_rc_block)
         {
-            /* move to next block, cursor will handle position tracking */
+            tidesdb_block_release(source->source.sstable.current_rc_block);
+            source->source.sstable.current_rc_block = NULL;
+        }
+        else if (source->source.sstable.current_block)
+        {
+            tidesdb_klog_block_free(source->source.sstable.current_block);
+        }
+        source->source.sstable.current_block = NULL;
+        if (source->source.sstable.decompressed_data)
+        {
+            free(source->source.sstable.decompressed_data);
+            source->source.sstable.decompressed_data = NULL;
+        }
+        if (source->source.sstable.current_block_data)
+        {
+            block_manager_block_release(source->source.sstable.current_block_data);
+            source->source.sstable.current_block_data = NULL;
+        }
 
-            /* release previous block and decompressed data before moving to next */
-            /* free current_block first since its pointers reference decompressed_data */
-            if (source->source.sstable.current_rc_block)
+        /* move to next block */
+        if (block_manager_cursor_next(source->source.sstable.klog_cursor) == 0)
+        {
+            /* check if cursor is past data end offset */
+            if (source->source.sstable.sst->klog_data_end_offset > 0 &&
+                source->source.sstable.klog_cursor->current_pos >=
+                    source->source.sstable.sst->klog_data_end_offset)
             {
-                tidesdb_block_release(source->source.sstable.current_rc_block);
-                source->source.sstable.current_rc_block = NULL;
-            }
-            else if (source->source.sstable.current_block)
-            {
-                tidesdb_klog_block_free(source->source.sstable.current_block);
-            }
-            source->source.sstable.current_block = NULL;
-            if (source->source.sstable.decompressed_data)
-            {
-                free(source->source.sstable.decompressed_data);
-                source->source.sstable.decompressed_data = NULL;
-            }
-            if (source->source.sstable.current_block_data)
-            {
-                block_manager_block_release(source->source.sstable.current_block_data);
-                source->source.sstable.current_block_data = NULL;
+                /* reached end of data blocks */
+                return TDB_ERR_NOT_FOUND;
             }
 
-            /* move to next block */
-            if (block_manager_cursor_next(source->source.sstable.klog_cursor) == 0)
+            block_manager_block_t *block =
+                block_manager_cursor_read(source->source.sstable.klog_cursor);
+            if (block)
             {
-                /* check if cursor is past data end offset */
-                if (source->source.sstable.sst->klog_data_end_offset > 0 &&
-                    source->source.sstable.klog_cursor->current_pos >=
-                        source->source.sstable.sst->klog_data_end_offset)
+                /* block is owned by us, decompress if needed */
+                uint8_t *data = block->data;
+                size_t data_size = block->size;
+                uint8_t *decompressed = NULL;
+
+                if (source->config->compression_algorithm != NO_COMPRESSION)
                 {
-                    /* reached end of data blocks */
-                    return TDB_ERR_NOT_FOUND;
+                    size_t decompressed_size;
+                    decompressed = decompress_data(block->data, block->size, &decompressed_size,
+                                                   source->config->compression_algorithm);
+                    if (decompressed)
+                    {
+                        data = decompressed;
+                        data_size = decompressed_size;
+                        /* keep decompressed buffer, deserialized pointers reference it */
+                        source->source.sstable.decompressed_data = decompressed;
+                    }
                 }
 
-                block_manager_block_t *block =
-                    block_manager_cursor_read(source->source.sstable.klog_cursor);
-                if (block)
+                tidesdb_klog_block_free(source->source.sstable.current_block);
+                source->source.sstable.current_block = NULL;
+
+                int deserialize_result = tidesdb_klog_block_deserialize(
+                    data, data_size, &source->source.sstable.current_block);
+
+                if (deserialize_result != 0)
                 {
-                    /* block is owned by us, decompress if needed */
-                    uint8_t *data = block->data;
-                    size_t data_size = block->size;
-                    uint8_t *decompressed = NULL;
-
-                    if (source->config->compression_algorithm != NO_COMPRESSION)
-                    {
-                        size_t decompressed_size;
-                        decompressed = decompress_data(block->data, block->size, &decompressed_size,
-                                                       source->config->compression_algorithm);
-                        if (decompressed)
-                        {
-                            data = decompressed;
-                            data_size = decompressed_size;
-                            /* keep decompressed buffer, deserialized pointers reference it */
-                            source->source.sstable.decompressed_data = decompressed;
-                        }
-                    }
-
-                    tidesdb_klog_block_free(source->source.sstable.current_block);
-                    source->source.sstable.current_block = NULL;
-
-                    int deserialize_result = tidesdb_klog_block_deserialize(
-                        data, data_size, &source->source.sstable.current_block);
-
-                    if (deserialize_result != 0)
-                    {
-                        TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                                      "Klog block deserialization failed (error=%d), "
-                                      "aborting source for SSTable %" PRIu64,
-                                      deserialize_result, source->source.sstable.sst->id);
-                        if (decompressed)
-                        {
-                            free(decompressed);
-                            source->source.sstable.decompressed_data = NULL;
-                        }
-                        block_manager_block_release(block);
-                        return TDB_ERR_CORRUPTION;
-                    }
-
-                    if (source->source.sstable.current_block &&
-                        source->source.sstable.current_block->num_entries > 0)
-                    {
-                        source->source.sstable.current_entry_idx = 0;
-
-                        tidesdb_klog_block_t *current_kb = source->source.sstable.current_block;
-                        uint8_t *value = current_kb->inline_values[0];
-
-                        uint8_t *vlog_value = NULL;
-                        if (current_kb->entries[0].vlog_offset > 0)
-                        {
-                            tidesdb_vlog_read_value(source->source.sstable.db,
-                                                    source->source.sstable.sst,
-                                                    current_kb->entries[0].vlog_offset,
-                                                    current_kb->entries[0].value_size, &vlog_value);
-                            value = vlog_value;
-                        }
-
-                        source->current_kv = tidesdb_kv_pair_create(
-                            current_kb->keys[0], current_kb->entries[0].key_size, value,
-                            current_kb->entries[0].value_size, current_kb->entries[0].ttl,
-                            current_kb->entries[0].seq,
-                            (current_kb->entries[0].flags & TDB_KV_FLAG_TOMBSTONE) != 0);
-
-                        free(vlog_value);
-                        source->source.sstable.current_block_data = block;
-                        return TDB_SUCCESS;
-                    }
-
-                    /* empty block or other issue, clean up and continue */
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                                  "Klog block deserialization failed (error=%d), "
+                                  "aborting source for SSTable %" PRIu64,
+                                  deserialize_result, source->source.sstable.sst->id);
                     if (decompressed)
                     {
                         free(decompressed);
                         source->source.sstable.decompressed_data = NULL;
                     }
                     block_manager_block_release(block);
-                    source->source.sstable.current_block_data = NULL;
+                    return TDB_ERR_CORRUPTION;
                 }
+
+                if (source->source.sstable.current_block &&
+                    source->source.sstable.current_block->num_entries > 0)
+                {
+                    source->source.sstable.current_entry_idx = 0;
+
+                    tidesdb_klog_block_t *current_kb = source->source.sstable.current_block;
+                    uint8_t *value = current_kb->inline_values[0];
+
+                    uint8_t *vlog_value = NULL;
+                    if (current_kb->entries[0].vlog_offset > 0)
+                    {
+                        tidesdb_vlog_read_value(source->source.sstable.db,
+                                                source->source.sstable.sst,
+                                                current_kb->entries[0].vlog_offset,
+                                                current_kb->entries[0].value_size, &vlog_value);
+                        value = vlog_value;
+                    }
+
+                    source->current_kv = tidesdb_kv_pair_create(
+                        current_kb->keys[0], current_kb->entries[0].key_size, value,
+                        current_kb->entries[0].value_size, current_kb->entries[0].ttl,
+                        current_kb->entries[0].seq,
+                        (current_kb->entries[0].flags & TDB_KV_FLAG_TOMBSTONE) != 0);
+
+                    free(vlog_value);
+                    source->source.sstable.current_block_data = block;
+                    return TDB_SUCCESS;
+                }
+
+                /* empty block or other issue, clean up and continue */
+                if (decompressed)
+                {
+                    free(decompressed);
+                    source->source.sstable.decompressed_data = NULL;
+                }
+                block_manager_block_release(block);
+                source->source.sstable.current_block_data = NULL;
             }
         }
     }

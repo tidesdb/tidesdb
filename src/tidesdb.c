@@ -4231,36 +4231,44 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
         }
         else
         {
-            /* no resize needed, just add to existing array
-             * atomically reserve a slot by incrementing count FIRST,
-             * then write to the reserved slot */
             int expected = old_num;
 
-            /* verify we have space before trying to reserve */
+            /* verify we have space before trying to add */
             if (expected >= old_capacity)
             {
                 /* no space, retry with resize path */
                 continue;
             }
 
-            /* atomically reserve slot by incrementing count
-             * this ensures no two threads get the same slot */
-            if (atomic_compare_exchange_strong_explicit(&level->num_sstables, &expected,
-                                                        old_num + 1, memory_order_acq_rel,
-                                                        memory_order_acquire))
+            /* create new array with the additional sstable already in place */
+            tidesdb_sstable_t **new_arr = malloc(old_capacity * sizeof(tidesdb_sstable_t *));
+            if (!new_arr)
             {
-                /* we successfully reserved slot old_num
-                 * now write our sst to the reserved slot */
-                old_arr[old_num] = sst;
+                tidesdb_sstable_unref(sst->db, sst);
+                return TDB_ERR_MEMORY;
+            }
 
-                /* ensure write is visible to readers */
-                atomic_thread_fence(memory_order_release);
+            memcpy(new_arr, old_arr, old_num * sizeof(tidesdb_sstable_t *));
+            new_arr[old_num] = sst;
+
+            if (atomic_compare_exchange_strong_explicit(&level->sstables, &old_arr, new_arr,
+                                                        memory_order_release, memory_order_acquire))
+            {
+                /* array swapped successfully, now update count
+                 * readers will see new array with sst already in place before count increases */
+                atomic_thread_fence(memory_order_seq_cst);
+                atomic_store_explicit(&level->num_sstables, old_num + 1, memory_order_release);
 
                 atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                           memory_order_relaxed);
+
+                /* free old array */
+                free(old_arr);
+
                 return TDB_SUCCESS;
             }
-            /* CAS failed, another thread reserved the slot first, retry */
+            /* CAS failed, another thread modified the array first, retry */
+            free(new_arr);
         }
     }
 }

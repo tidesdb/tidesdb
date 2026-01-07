@@ -10,7 +10,7 @@ on:
 jobs:
   freebsd-build:
     runs-on: ubuntu-latest
-    name: FreeBSD 14.0 x64
+    name: FreeBSD 15.0 x64
     
     steps:
       - name: Checkout repository
@@ -19,7 +19,7 @@ jobs:
       - name: Build and test on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
-          release: '14.0'
+          release: '15.0'
           usesh: true
           sync: rsync
           copyback: false
@@ -56,7 +56,7 @@ jobs:
 
   openbsd-build:
     runs-on: ubuntu-latest
-    name: OpenBSD 7.4 x64
+    name: OpenBSD 7.8 x64
     
     steps:
       - name: Checkout repository
@@ -65,12 +65,12 @@ jobs:
       - name: Build and test on OpenBSD
         uses: vmactions/openbsd-vm@v1
         with:
-          release: '7.4'
+          release: '7.8'
           usesh: true
           sync: rsync
           copyback: false
           prepare: |
-            export PKG_PATH=http://ftp.openbsd.org/pub/OpenBSD/7.4/packages/amd64/
+            export PKG_PATH=http://ftp.openbsd.org/pub/OpenBSD/7.8/packages/amd64/
             pkg_add cmake gmake lz4 zstd snappy pkgconf
           run: |
             echo "*=====================================*"
@@ -102,7 +102,7 @@ jobs:
 
   netbsd-build:
     runs-on: ubuntu-latest
-    name: NetBSD 9.3 x64
+    name: NetBSD 10.1 x64
     
     steps:
       - name: Checkout repository
@@ -111,7 +111,7 @@ jobs:
       - name: Build and test on NetBSD
         uses: vmactions/netbsd-vm@v1
         with:
-          release: '9.3'
+          release: '10.1'
           usesh: true
           sync: rsync
           copyback: false

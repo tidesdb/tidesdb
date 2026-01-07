@@ -28,7 +28,6 @@
 #define MANIFEST_CLOSE_WAIT_US 100
 /* max iterations (10000 × 100μs = 1 second) */
 #define MANIFEST_CLOSE_MAX_WAITS 10000
-#define MANIFEST_CLOSE_WAIT_US   100
 
 #include "compat.h"
 

@@ -1071,7 +1071,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
         atomic_init(&BACKWARD_PTR(new_node, i, new_level), NULL);
     }
 
-    /* we inster at level 0 first with duplicate check in CAS loop */
+    /* we insert at level 0 first with duplicate check in CAS loop */
     skip_list_node_t *pred = update[0];
     skip_list_node_t *next_at_0;
     int cas_attempts = 0;
@@ -1304,7 +1304,7 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                     break;
                 }
             }
-            /* nersion is too new or not committed -- check next (older) version */
+            /* version is too new or not committed -- check next (older) version */
             version = atomic_load_explicit(&version->next, memory_order_acquire);
         }
 

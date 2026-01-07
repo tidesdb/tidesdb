@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 7.0.10)
+set(PROJECT_VERSION 7.0.11)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -51,6 +51,9 @@ if(TIDESDB_WITH_SANITIZER)
     elseif(MINGW)
         # MinGW/GCC flags
         add_compile_options(-Wextra -Wall -std=c11)
+    elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|SunOS|DragonFly")
+        # ASan support varies on BSD variants, just enable warnings
+        add_compile_options(-Wextra -Wall)
     else()
         # Unix/Linux/macOS flags
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)

@@ -4560,6 +4560,222 @@ void test_multi_cf_iterator_seek(void)
     cleanup_test_dir();
 }
 
+void test_iterator_prefix_seek_behavior(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_t *db = create_test_db();
+    assert(db != NULL);
+
+    tidesdb_column_family_config_t config = tidesdb_default_column_family_config();
+    assert(tidesdb_create_column_family(db, "prefix_cf", &config) == TDB_SUCCESS);
+
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "prefix_cf");
+
+    tidesdb_txn_t *txn;
+    assert(tidesdb_txn_begin(db, &txn) == TDB_SUCCESS);
+
+    const char *keys[] = {"user:100", "user:200", "user:300", "user:400", "user:500"};
+    const char *values[] = {"alice", "bob", "charlie", "david", "eve"};
+    const int num_keys = 5;
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        assert(tidesdb_txn_put(txn, cf, (uint8_t *)keys[i], strlen(keys[i]) + 1,
+                               (uint8_t *)values[i], strlen(values[i]) + 1, 0) == TDB_SUCCESS);
+    }
+
+    assert(tidesdb_txn_commit(txn) == TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+
+    assert(tidesdb_txn_begin(db, &txn) == TDB_SUCCESS);
+
+    tidesdb_iter_t *iter;
+    assert(tidesdb_iter_new(txn, cf, &iter) == TDB_SUCCESS);
+
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+
+    const char *seek1 = "user:150";
+    assert(tidesdb_iter_seek(iter, (uint8_t *)seek1, strlen(seek1) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "user:200") == 0);
+
+    const char *seek2 = "user:250";
+    assert(tidesdb_iter_seek(iter, (uint8_t *)seek2, strlen(seek2) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "user:300") == 0);
+
+    const char *seek3 = "user:";
+    assert(tidesdb_iter_seek(iter, (uint8_t *)seek3, strlen(seek3) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "user:100") == 0);
+
+    assert(tidesdb_iter_seek(iter, (uint8_t *)seek3, strlen(seek3) + 1) == TDB_SUCCESS);
+    int count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+        assert(strncmp((char *)key, "user:", 5) == 0);
+        count++;
+        if (tidesdb_iter_next(iter) != TDB_SUCCESS) break;
+    }
+    assert(count == num_keys);
+
+    const char *seek5 = "user:350";
+    assert(tidesdb_iter_seek_for_prev(iter, (uint8_t *)seek5, strlen(seek5) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "user:300") == 0);
+
+    const char *seek6 = "user:999";
+    assert(tidesdb_iter_seek_for_prev(iter, (uint8_t *)seek6, strlen(seek6) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "user:500") == 0);
+
+    const char *seek8 = "aaa";
+    assert(tidesdb_iter_seek(iter, (uint8_t *)seek8, strlen(seek8) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "user:100") == 0);
+
+    value = NULL;
+    value_size = 0;
+    int get_result =
+        tidesdb_txn_get(txn, cf, (uint8_t *)seek1, strlen(seek1) + 1, &value, &value_size);
+    assert(get_result == TDB_ERR_NOT_FOUND);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+void test_iterator_prefix_seek_with_sstables(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t db_config = tidesdb_default_config();
+    db_config.db_path = TEST_DB_PATH;
+    db_config.block_cache_size = 8 * 1024 * 1024;
+
+    tidesdb_t *db = NULL;
+    assert(tidesdb_open(&db_config, &db) == TDB_SUCCESS);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 32 * 1024;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+    assert(tidesdb_create_column_family(db, "prefix_sst_cf", &cf_config) == TDB_SUCCESS);
+
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "prefix_sst_cf");
+
+    const char *prefixes[] = {"user:", "order:", "product:"};
+    const int num_prefixes = 3;
+    const int keys_per_prefix = 10;
+
+    for (int p = 0; p < num_prefixes; p++)
+    {
+        for (int i = 0; i < keys_per_prefix; i++)
+        {
+            tidesdb_txn_t *txn;
+            assert(tidesdb_txn_begin(db, &txn) == TDB_SUCCESS);
+
+            char key[64], value[64];
+            snprintf(key, sizeof(key), "%s%03d", prefixes[p], (i + 1) * 100);
+            snprintf(value, sizeof(value), "%svalue_%03d", prefixes[p], i);
+
+            assert(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                   strlen(value) + 1, 0) == TDB_SUCCESS);
+            assert(tidesdb_txn_commit(txn) == TDB_SUCCESS);
+            tidesdb_txn_free(txn);
+        }
+
+        tidesdb_flush_memtable(cf);
+        usleep(50000);
+    }
+
+    for (int i = 0; i < 50; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+    usleep(100000);
+
+    tidesdb_txn_t *txn;
+    assert(tidesdb_txn_begin(db, &txn) == TDB_SUCCESS);
+
+    tidesdb_iter_t *iter;
+    assert(tidesdb_iter_new(txn, cf, &iter) == TDB_SUCCESS);
+
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+
+    const char *seek1 = "user:150";
+    assert(tidesdb_iter_seek(iter, (uint8_t *)seek1, strlen(seek1) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "user:200") == 0);
+
+    const char *seek2 = "user:";
+    assert(tidesdb_iter_seek(iter, (uint8_t *)seek2, strlen(seek2) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "user:100") == 0);
+
+    assert(tidesdb_iter_seek(iter, (uint8_t *)seek2, strlen(seek2) + 1) == TDB_SUCCESS);
+    int count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+        if (strncmp((char *)key, "user:", 5) != 0) break;
+        count++;
+        if (tidesdb_iter_next(iter) != TDB_SUCCESS) break;
+    }
+    assert(count == keys_per_prefix);
+
+    const char *seek3 = "order:";
+    assert(tidesdb_iter_seek(iter, (uint8_t *)seek3, strlen(seek3) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "order:100") == 0);
+
+    const char *seek4 = "order:550";
+    assert(tidesdb_iter_seek_for_prev(iter, (uint8_t *)seek4, strlen(seek4) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "order:500") == 0);
+
+    const char *seek5 = "product:999";
+    assert(tidesdb_iter_seek_for_prev(iter, (uint8_t *)seek5, strlen(seek5) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strncmp((char *)key, "product:", 8) == 0);
+
+    const char *seek6 = "aaa";
+    assert(tidesdb_iter_seek(iter, (uint8_t *)seek6, strlen(seek6) + 1) == TDB_SUCCESS);
+    assert(tidesdb_iter_valid(iter));
+    assert(tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS);
+    assert(strcmp((char *)key, "order:100") == 0);
+
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    int get_result =
+        tidesdb_txn_get(txn, cf, (uint8_t *)seek1, strlen(seek1) + 1, &value, &value_size);
+    assert(get_result == TDB_ERR_NOT_FOUND);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 void test_multi_cf_iterator_seek_for_prev(void)
 {
     cleanup_test_dir();
@@ -10901,6 +11117,8 @@ int main(void)
     RUN_TEST(test_multi_cf_iterator_reverse, tests_passed);
     RUN_TEST(test_multi_cf_iterator_seek, tests_passed);
     RUN_TEST(test_multi_cf_iterator_seek_for_prev, tests_passed);
+    RUN_TEST(test_iterator_prefix_seek_behavior, tests_passed);
+    RUN_TEST(test_iterator_prefix_seek_with_sstables, tests_passed);
     RUN_TEST(test_savepoints, tests_passed);
     RUN_TEST(test_ini_config, tests_passed);
     RUN_TEST(test_runtime_config_update, tests_passed);

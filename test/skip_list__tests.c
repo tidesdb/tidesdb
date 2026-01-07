@@ -1983,6 +1983,106 @@ void test_skip_list_reverse_comparator()
     skip_list_free(list);
 }
 
+void test_skip_list_prefix_seek_behavior()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+
+    /* common prefixes: user:100, user:200, user:300, user:400, user:500 */
+    const char *keys[] = {"user:100", "user:200", "user:300", "user:400", "user:500"};
+    const char *values[] = {"alice", "bob", "charlie", "david", "eve"};
+    const int num_keys = 5;
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)keys[i], strlen(keys[i]) + 1,
+                                         (uint8_t *)values[i], strlen(values[i]) + 1, -1, i + 1, 0),
+                  0);
+    }
+
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    time_t ttl = 0;
+    uint8_t deleted = 0;
+
+    const char *seek1 = "user:150";
+    ASSERT_EQ(skip_list_cursor_seek(cursor, (uint8_t *)seek1, strlen(seek1) + 1), 0);
+    ASSERT_EQ(skip_list_cursor_next(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(strcmp((char *)key, "user:200"), 0);
+    ASSERT_EQ(strcmp((char *)value, "bob"), 0);
+
+    const char *seek2 = "user:250";
+    ASSERT_EQ(skip_list_cursor_seek(cursor, (uint8_t *)seek2, strlen(seek2) + 1), 0);
+    ASSERT_EQ(skip_list_cursor_next(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(strcmp((char *)key, "user:300"), 0);
+
+    const char *seek3 = "user:";
+    ASSERT_EQ(skip_list_cursor_seek(cursor, (uint8_t *)seek3, strlen(seek3) + 1), 0);
+    ASSERT_EQ(skip_list_cursor_next(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(strcmp((char *)key, "user:100"), 0);
+
+    ASSERT_EQ(skip_list_cursor_seek(cursor, (uint8_t *)seek3, strlen(seek3) + 1), 0);
+    int count = 0;
+    while (skip_list_cursor_next(cursor) == 0 && skip_list_cursor_valid(cursor) == 1)
+    {
+        ASSERT_EQ(
+            skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted), 0);
+        /* verify key starts with "user:" */
+        ASSERT_EQ(strncmp((char *)key, "user:", 5), 0);
+        count++;
+    }
+    ASSERT_EQ(count, num_keys);
+
+    const char *seek5 = "user:350";
+    ASSERT_EQ(skip_list_cursor_seek_for_prev(cursor, (uint8_t *)seek5, strlen(seek5) + 1), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(strcmp((char *)key, "user:300"), 0);
+    const char *seek6 = "user:999";
+    ASSERT_EQ(skip_list_cursor_seek(cursor, (uint8_t *)seek6, strlen(seek6) + 1), 0);
+
+    int next_result = skip_list_cursor_next(cursor);
+    if (next_result == 0)
+    {
+        ASSERT_EQ(skip_list_cursor_valid(cursor), 0);
+    }
+
+    ASSERT_EQ(skip_list_cursor_seek_for_prev(cursor, (uint8_t *)seek6, strlen(seek6) + 1), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(strcmp((char *)key, "user:500"), 0);
+
+    const char *seek8 = "aaa";
+    ASSERT_EQ(skip_list_cursor_seek(cursor, (uint8_t *)seek8, strlen(seek8) + 1), 0);
+    ASSERT_EQ(skip_list_cursor_next(cursor), 0);
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+
+    ASSERT_EQ(strcmp((char *)key, "user:100"), 0);
+
+    uint8_t *get_value = NULL;
+    size_t get_value_size = 0;
+    uint8_t get_deleted = 0;
+    time_t get_ttl;
+    int get_result = skip_list_get(list, (uint8_t *)seek1, strlen(seek1) + 1, &get_value,
+                                   &get_value_size, &get_ttl, &get_deleted);
+    ASSERT_EQ(get_result, -1);
+
+    skip_list_cursor_free(cursor);
+    skip_list_free(list);
+}
+
 int main(void)
 {
     RUN_TEST(test_skip_list_create_node, tests_passed);
@@ -2015,6 +2115,7 @@ int main(void)
     RUN_TEST(test_skip_list_concurrent_duplicate_keys, tests_passed);
     RUN_TEST(test_skip_list_lockfree_stress, tests_passed);
     RUN_TEST(test_skip_list_reverse_comparator, tests_passed);
+    RUN_TEST(test_skip_list_prefix_seek_behavior, tests_passed);
 
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);

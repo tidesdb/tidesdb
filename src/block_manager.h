@@ -328,6 +328,8 @@ int block_manager_get_size(block_manager_t *bm, uint64_t *size);
 /**
  * block_manager_escalate_fsync
  * escalates an fsync to the underlying block manager file
+ * @param bm the block manager to fsync
+ * @return 0 if successful, -1 if not
  */
 int block_manager_escalate_fsync(block_manager_t *bm);
 
@@ -373,7 +375,7 @@ int block_manager_validate_last_block(block_manager_t *bm, int strict);
  * converts TidesDB sync mode enum values to block manager sync mode enum values
  * this method provides compatibility between the public TidesDB API (which uses
  * TDB_SYNC_NONE/TDB_SYNC_FULL) and the internal block manager API (which uses
- * BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_TDB_SYNC_FULL)
+ * BLOCK_MANAGER_SYNC_NONE/BLOCK_MANAGER_SYNC_FULL)
  * @param tdb_sync_mode the TidesDB sync mode (TDB_SYNC_NONE=0, TDB_SYNC_FULL=1)
  * @return the corresponding block manager sync mode enum value
  */

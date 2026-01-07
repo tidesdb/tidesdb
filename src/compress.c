@@ -185,6 +185,11 @@ uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_s
                     free(decompressed_data);
                     return NULL;
                 }
+                if (zstd_result != *decompressed_size)
+                {
+                    free(decompressed_data);
+                    return NULL;
+                }
             }
             break;
         }

@@ -35,7 +35,8 @@ int buffer_new(buffer_t **buffer, const uint32_t capacity)
 int buffer_new_with_eviction(buffer_t **buffer, const uint32_t capacity,
                              const buffer_eviction_fn eviction_fn, void *eviction_ctx)
 {
-    if (BUFFER_UNLIKELY(buffer == NULL || capacity == 0)) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
+    if (BUFFER_UNLIKELY(capacity == 0)) return -1;
 
     buffer_t *new_buffer = (buffer_t *)malloc(sizeof(buffer_t));
     if (BUFFER_UNLIKELY(new_buffer == NULL)) return -1;
@@ -110,7 +111,8 @@ static int try_acquire_slot(buffer_t *buffer, const uint32_t index, void *data, 
 
 int buffer_try_acquire(buffer_t *buffer, void *data, uint32_t *id)
 {
-    if (BUFFER_UNLIKELY(buffer == NULL || id == NULL)) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
+    if (BUFFER_UNLIKELY(id == NULL)) return -1;
 
     uint32_t capacity = buffer->capacity;
     uint32_t start = atomic_load_explicit(&buffer->hint_index, memory_order_relaxed) % capacity;
@@ -135,7 +137,8 @@ int buffer_try_acquire(buffer_t *buffer, void *data, uint32_t *id)
 
 int buffer_acquire(buffer_t *buffer, void *data, uint32_t *id)
 {
-    if (BUFFER_UNLIKELY(buffer == NULL || id == NULL)) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
+    if (BUFFER_UNLIKELY(id == NULL)) return -1;
 
     uint32_t retries = 0;
     uint32_t backoff = buffer->backoff_us;
@@ -183,7 +186,8 @@ int buffer_acquire(buffer_t *buffer, void *data, uint32_t *id)
 
 int buffer_get(const buffer_t *buffer, const uint32_t id, void **data)
 {
-    if (BUFFER_UNLIKELY(buffer == NULL || data == NULL)) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
+    if (BUFFER_UNLIKELY(data == NULL)) return -1;
     if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
 
     buffer_slot_t *slot = &buffer->slots[id];
@@ -308,10 +312,11 @@ void buffer_free(buffer_t *buffer)
 int buffer_foreach(const buffer_t *buffer, void (*callback)(uint32_t id, void *data, void *ctx),
                    void *ctx)
 {
-    if (BUFFER_UNLIKELY(buffer == NULL || callback == NULL)) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
+    if (BUFFER_UNLIKELY(callback == NULL)) return -1;
 
     int count = 0;
-    uint32_t capacity = buffer->capacity; /* cache capacity */
+    const uint32_t capacity = buffer->capacity; /* cache capacity */
     for (uint32_t i = 0; i < capacity; i++)
     {
         buffer_slot_t *slot = &buffer->slots[i];
@@ -330,7 +335,8 @@ int buffer_foreach(const buffer_t *buffer, void (*callback)(uint32_t id, void *d
 
 int buffer_get_generation(buffer_t *buffer, const uint32_t id, uint64_t *generation)
 {
-    if (BUFFER_UNLIKELY(buffer == NULL || generation == NULL)) return -1;
+    if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
+    if (BUFFER_UNLIKELY(generation == NULL)) return -1;
     if (BUFFER_UNLIKELY(id >= buffer->capacity)) return -1;
 
     *generation = atomic_load_explicit(&buffer->slots[id].generation, memory_order_acquire);

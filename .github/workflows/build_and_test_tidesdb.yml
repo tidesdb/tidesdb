@@ -256,7 +256,7 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
             -DCMAKE_MODULE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
             -DTIDESDB_BUILD_TESTS=ON \
-            -DTIDESDB_WITH_SANITIZER=OFF
+            -DTIDESDB_WITH_SANITIZER=ON
 
       - name: Configure CMake (macOS PowerPC cross-compile)
         if: runner.os == 'Linux' && matrix.arch == 'ppc-macos'
@@ -277,7 +277,7 @@ jobs:
             -DCMAKE_MODULE_LINKER_FLAGS="-L/usr/powerpc-linux-gnu/lib -L/usr/lib/powerpc-linux-gnu" \
             -DUSE_HOMEBREW=OFF \
             -DTIDESDB_BUILD_TESTS=ON \
-            -DTIDESDB_WITH_SANITIZER=OFF
+            -DTIDESDB_WITH_SANITIZER=ON
 
       - name: Configure CMake (macOS x86)
         if: runner.os == 'macOS' && matrix.arch == 'x86'

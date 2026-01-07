@@ -1,3 +1,21 @@
+/**
+ *
+ * Copyright (C) TidesDB
+ *
+ * Original Author: Alex Gaetano Padula
+ *
+ * Licensed under the Mozilla Public License, v. 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.mozilla.org/en-US/MPL/2.0/
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #ifndef __CLOCK_CACHE_H__
 #define __CLOCK_CACHE_H__
 #include "compat.h"
@@ -68,9 +86,10 @@ typedef struct
 #define CLOCK_CACHE_MIN_SLOTS_PER_PARTITION 64   /* minimum slots per partition */
 #define CLOCK_CACHE_MAX_SLOTS_PER_PARTITION 2048 /* maximum slots per partition */
 #define CLOCK_CACHE_AVG_ENTRY_SIZE          100  /* estimated average entry size in bytes */
-#define CLOCK_CACHE_HASH_INDEX_MULTIPLIER \
-    1.5 /* hash index size = slots * multiplier (reduced for memory efficiency) */
-#define CLOCK_CACHE_MAX_HASH_PROBE 64 /* max linear probing distance */
+/* hash index size = slots * 3 / 2 (1.5x, using integer arithmetic) */
+#define CLOCK_CACHE_HASH_INDEX_MULTIPLIER_NUM 3
+#define CLOCK_CACHE_HASH_INDEX_MULTIPLIER_DEN 2
+#define CLOCK_CACHE_MAX_HASH_PROBE            64 /* max linear probing distance */
 
 /**
  * clock_cache_partition_t
@@ -248,14 +267,14 @@ void clock_cache_clear(clock_cache_t *cache);
 void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats);
 
 /**
- * clock_cache_foreach_prefix
- * iterate over all entries matching a key prefix
- * @param key the key prefix to match
- * @param key_len the prefix length
- * @param payload the payload (can be any pointer type)
+ * clock_cache_foreach_callback_t
+ * callback function for iterating over cache entries
+ * @param key the entry key
+ * @param key_len the key length
+ * @param payload the entry payload
  * @param payload_len the payload length
- * @param user_data user data passed to callback
- * @return number of entries processed
+ * @param user_data user data passed from caller
+ * @return 0 to continue iteration, non-zero to stop
  */
 typedef int (*clock_cache_foreach_callback_t)(const char *key, size_t key_len,
                                               const uint8_t *payload, size_t payload_len,

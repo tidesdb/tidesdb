@@ -347,7 +347,7 @@ int buffer_validate(const buffer_t *buffer, const uint32_t id, uint64_t expected
 {
     if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
     if (BUFFER_UNLIKELY(id >= buffer->capacity)) return 0;
-https:  // www.youtube.com/watch?v=jo7f059kJ-A&list=RDsA4_97zXBYk&index=2
+
     buffer_slot_t *slot = &buffer->slots[id];
     uint32_t state = atomic_load_explicit(&slot->state, memory_order_acquire);
 

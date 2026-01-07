@@ -21,7 +21,7 @@
 #include "../external/xxhash.h"
 
 /**
- * _entry_size
+ * entry_size
  * compute total entry size
  * @param key_len key length
  * @param payload_len payload length
@@ -33,7 +33,7 @@ static inline size_t entry_size(size_t key_len, size_t payload_len)
 }
 
 /**
- * _hash_to_partition
+ * hash_to_partition
  * hash key to partition index
  * @param cache the cache
  * @param key the key
@@ -48,7 +48,7 @@ static inline size_t hash_to_partition(const clock_cache_t *cache, const char *k
 }
 
 /**
- * _compute_hash
+ * compute_hash
  * compute full hash for key
  * @param key the key
  * @param key_len the key length
@@ -60,7 +60,7 @@ static inline uint64_t compute_hash(const char *key, const size_t key_len)
 }
 
 /**
- * _hash_table_insert
+ * hash_table_insert
  * insert slot into hash index with linear probing
  * @param partition the partition
  * @param hash the hash
@@ -101,7 +101,7 @@ static void hash_table_insert(clock_cache_partition_t *partition, uint64_t hash,
 }
 
 /**
- * _hash_table_remove
+ * hash_table_remove
  * remove slot from hash index
  * @param partition the partition
  * @param hash the hash
@@ -133,7 +133,7 @@ static void hash_table_remove(clock_cache_partition_t *partition, const uint64_t
 }
 
 /**
- * _find_entry
+ * find_entry
  * find entry using hash index for O(1) lookup
  * @param partition the partition
  * @param key the key
@@ -229,7 +229,7 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
 }
 
 /**
- * _free_entry
+ * free_entry
  * free entry contents -- lock-free with atomic state transitions
  * @param cache the cache
  * @param partition the partition
@@ -288,7 +288,7 @@ static void free_entry(clock_cache_t *cache, clock_cache_partition_t *partition,
     atomic_thread_fence(memory_order_acq_rel);
 
     /* call eviction callback if provided (for custom cleanup of pointed-to data) */
-    if (cache->evict_callback && payload)
+    if (cache->evict_callback)
     {
         cache->evict_callback(payload, plen);
     }
@@ -308,12 +308,12 @@ static void free_entry(clock_cache_t *cache, clock_cache_partition_t *partition,
     /* decrement occupied count */
     atomic_fetch_sub_explicit(&partition->occupied_count, 1, memory_order_relaxed);
 
-    /* transistion to empty state */
+    /* transition to empty state */
     atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
 }
 
 /**
- * _clock_evict
+ * clock_evict
  * clock eviction
  * @param cache the cache
  * @param partition the partition
@@ -386,7 +386,7 @@ static size_t clock_evict(clock_cache_t *cache, clock_cache_partition_t *partiti
 }
 
 /**
- * _ensure_space
+ * ensure_space
  * ensure space in partition
  * @param cache the cache
  * @param partition the partition
@@ -489,9 +489,10 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
         atomic_store_explicit(&partition->occupied_count, 0, memory_order_relaxed);
         atomic_store_explicit(&partition->bytes_used, 0, memory_order_relaxed);
 
-        /* calculate hash index size (2x slots for low collision rate) */
+        /* calculate hash index size (1.5x slots for low collision rate) */
         partition->hash_index_size =
-            config->slots_per_partition * CLOCK_CACHE_HASH_INDEX_MULTIPLIER;
+            (config->slots_per_partition * CLOCK_CACHE_HASH_INDEX_MULTIPLIER_NUM) /
+            CLOCK_CACHE_HASH_INDEX_MULTIPLIER_DEN;
         /* round up to next power of 2 */
         size_t size = 1;
         while (size < partition->hash_index_size) size <<= 1;
@@ -607,7 +608,6 @@ void clock_cache_destroy(clock_cache_t *cache)
 
     free(cache->partitions);
     free(cache);
-    cache = NULL;
 }
 
 int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const void *payload,

@@ -58,6 +58,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_LEVEL_PARTITION_PREFIX       "P"
 #define TDB_SSTABLE_KLOG_EXT             ".klog"
 #define TDB_SSTABLE_VLOG_EXT             ".vlog"
+#define TDB_LOCK_FILE                    "LOCK"
 #define TDB_CACHE_KEY_SIZE               64
 #define TDB_SSTABLE_METADATA_MAGIC       0x5353544D
 #define TDB_SSTABLE_METADATA_HEADER_SIZE 84
@@ -8366,7 +8367,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 {
     TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' starting WAL recovery from: %s", cf->name, wal_path);
     block_manager_t *wal;
-    if (block_manager_open(&wal, wal_path, BLOCK_MANAGER_SYNC_FULL) != 0)
+    if (block_manager_open(&wal, wal_path, TDB_SYNC_FULL) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "CF '%s' failed to open WAL: %s", cf->name, wal_path);
         return TDB_ERR_IO;
@@ -9531,10 +9532,37 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     mkdir((*db)->db_path, TDB_DIR_PERMISSIONS);
 
+    char lock_path[TDB_MAX_PATH_LEN];
+    snprintf(lock_path, sizeof(lock_path), "%s" PATH_SEPARATOR TDB_LOCK_FILE, (*db)->db_path);
+
+    (*db)->lock_fd = open(lock_path, O_RDWR | O_CREAT, 0644);
+    if ((*db)->lock_fd < 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to open lock file: %s", lock_path);
+        free((*db)->db_path);
+        free(*db);
+        return TDB_ERR_IO;
+    }
+
+    if (tdb_file_lock_exclusive((*db)->lock_fd) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                      "Database is locked by another process. Only one process can open a database "
+                      "directory at a time.");
+        close((*db)->lock_fd);
+        free((*db)->db_path);
+        free(*db);
+        return TDB_ERR_LOCKED;
+    }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Acquired exclusive lock on database directory");
+
     (*db)->cf_capacity = TDB_INITIAL_CF_CAPACITY;
     tidesdb_column_family_t **cfs = calloc((*db)->cf_capacity, sizeof(tidesdb_column_family_t *));
     if (!cfs)
     {
+        tdb_file_unlock((*db)->lock_fd);
+        close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         return TDB_ERR_MEMORY;
@@ -9548,6 +9576,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     if (pthread_rwlock_init(&(*db)->cf_list_lock, NULL) != 0)
     {
         free(cfs);
+        tdb_file_unlock((*db)->lock_fd);
+        close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         return TDB_ERR_MEMORY;
@@ -9559,6 +9589,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     {
         pthread_rwlock_destroy(&(*db)->cf_list_lock);
         free((*db)->column_families);
+        tdb_file_unlock((*db)->lock_fd);
+        close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         return TDB_ERR_MEMORY;
@@ -9586,6 +9618,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(initial_comparators);
         pthread_rwlock_destroy(&(*db)->cf_list_lock);
         free((*db)->column_families);
+        tdb_file_unlock((*db)->lock_fd);
+        close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         return TDB_ERR_MEMORY;
@@ -9603,6 +9637,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(atomic_load(&(*db)->comparators));
         pthread_rwlock_destroy(&(*db)->cf_list_lock);
         free((*db)->column_families);
+        tdb_file_unlock((*db)->lock_fd);
+        close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         return TDB_ERR_MEMORY;
@@ -9616,6 +9652,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(atomic_load(&(*db)->comparators));
         pthread_rwlock_destroy(&(*db)->cf_list_lock);
         free((*db)->column_families);
+        tdb_file_unlock((*db)->lock_fd);
+        close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         return TDB_ERR_MEMORY;
@@ -9632,6 +9670,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(atomic_load(&(*db)->comparators));
         pthread_rwlock_destroy(&(*db)->cf_list_lock);
         free((*db)->column_families);
+        tdb_file_unlock((*db)->lock_fd);
+        close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         return TDB_ERR_MEMORY;
@@ -9672,6 +9712,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(atomic_load(&(*db)->comparators));
         pthread_rwlock_destroy(&(*db)->cf_list_lock);
         free((*db)->column_families);
+        tdb_file_unlock((*db)->lock_fd);
+        close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         return TDB_ERR_MEMORY;
@@ -9694,6 +9736,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free(atomic_load(&(*db)->comparators));
             pthread_rwlock_destroy(&(*db)->cf_list_lock);
             free((*db)->column_families);
+            tdb_file_unlock((*db)->lock_fd);
+            close((*db)->lock_fd);
             free((*db)->db_path);
             free(*db);
             return TDB_ERR_MEMORY;
@@ -9722,6 +9766,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(atomic_load(&(*db)->comparators));
         pthread_rwlock_destroy(&(*db)->cf_list_lock);
         free((*db)->column_families);
+        tdb_file_unlock((*db)->lock_fd);
+        close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         return TDB_ERR_MEMORY;
@@ -9745,6 +9791,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free(atomic_load(&(*db)->comparators));
             pthread_rwlock_destroy(&(*db)->cf_list_lock);
             free((*db)->column_families);
+            tdb_file_unlock((*db)->lock_fd);
+            close((*db)->lock_fd);
             free((*db)->db_path);
             free(*db);
             return TDB_ERR_MEMORY;
@@ -9768,6 +9816,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         free(atomic_load(&(*db)->comparators));
         pthread_rwlock_destroy(&(*db)->cf_list_lock);
         free((*db)->column_families);
+        tdb_file_unlock((*db)->lock_fd);
+        close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         return TDB_ERR_MEMORY;
@@ -9798,6 +9848,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             free(atomic_load(&(*db)->comparators));
             pthread_rwlock_destroy(&(*db)->cf_list_lock);
             free((*db)->column_families);
+            tdb_file_unlock((*db)->lock_fd);
+            close((*db)->lock_fd);
             free((*db)->db_path);
             free(*db);
             return TDB_ERR_MEMORY;
@@ -10325,6 +10377,14 @@ int tidesdb_close(tidesdb_t *db)
         pthread_rwlock_destroy(&db->active_txns_lock);
     }
 
+    /* release database directory lock */
+    if (db->lock_fd >= 0)
+    {
+        tdb_file_unlock(db->lock_fd);
+        close(db->lock_fd);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Released database directory lock");
+    }
+
     free(db);
 
     db = NULL;
@@ -10493,7 +10553,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
              cf->directory, 0ULL);
 
     block_manager_t *new_wal = NULL;
-    if (block_manager_open(&new_wal, wal_path, BLOCK_MANAGER_SYNC_NONE) != 0)
+    if (block_manager_open(&new_wal, wal_path, config->sync_mode) != 0)
     {
         queue_free(cf->immutable_memtables);
         skip_list_free(new_memtable);
@@ -15310,7 +15370,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             {
                 block_manager_t *wal_bm = NULL;
 
-                if (block_manager_open(&wal_bm, wal_path, BLOCK_MANAGER_SYNC_FULL) != 0)
+                if (block_manager_open(&wal_bm, wal_path, TDB_SYNC_FULL) != 0)
                 {
                     TDB_DEBUG_LOG(TDB_LOG_WARN,
                                   "CF '%s' failed to reopen WAL for flush tracking: %s", cf->name,
@@ -16069,6 +16129,13 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
     cf->config.sync_interval_us = new_config->sync_interval_us;
     cf->config.klog_value_threshold = new_config->klog_value_threshold;
     cf->config.default_isolation_level = new_config->default_isolation_level;
+
+    /* propagate sync_mode change to the active WAL's block manager */
+    tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    if (mt && mt->wal)
+    {
+        block_manager_set_sync_mode(mt->wal, new_config->sync_mode);
+    }
 
     if (persist_to_disk)
     {

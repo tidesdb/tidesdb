@@ -68,6 +68,79 @@
 #define tdb_fsync(fd) fsync(fd)
 #endif
 
+/* cross-platform file locking abstraction for database directory lock */
+#if defined(_WIN32)
+#include <windows.h>
+/*
+ * tdb_file_lock_exclusive
+ * acquires an exclusive lock on a file (non-blocking)
+ * @param fd the file descriptor to lock
+ * @return 0 on success, -1 if already locked or error
+ */
+static inline int tdb_file_lock_exclusive(int fd)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+
+    OVERLAPPED ov = {0};
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov))
+    {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * tdb_file_unlock
+ * releases a lock on a file
+ * @param fd the file descriptor to unlock
+ * @return 0 on success, -1 on error
+ */
+static inline int tdb_file_unlock(int fd)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+
+    OVERLAPPED ov = {0};
+    if (!UnlockFileEx(h, 0, 1, 0, &ov))
+    {
+        return -1;
+    }
+    return 0;
+}
+#else
+#include <sys/file.h>
+/*
+ * tdb_file_lock_exclusive
+ * acquires an exclusive lock on a file (non-blocking)
+ * @param fd the file descriptor to lock
+ * @return 0 on success, -1 if already locked or error
+ */
+static inline int tdb_file_lock_exclusive(int fd)
+{
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * tdb_file_unlock
+ * releases a lock on a file
+ * @param fd the file descriptor to unlock
+ * @return 0 on success, -1 on error
+ */
+static inline int tdb_file_unlock(int fd)
+{
+    if (flock(fd, LOCK_UN) != 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 /* cross-platform localtime abstraction */
 #if defined(_WIN32)
 /* (MSVC and MinGW) use localtime_s with reversed parameter order */

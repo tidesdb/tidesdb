@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 7.0.11)
+set(PROJECT_VERSION 7.1.0)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -10,7 +10,7 @@ configure_file(
 )
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
-option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
+option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
 
@@ -333,7 +333,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_L0_QUEUE_STALL_THRESHOLD 10)
     endif()
     if(NOT DEFINED BENCH_MAX_OPEN_SSTABLES)
-        set(BENCH_MAX_OPEN_SSTABLES 512)
+        set(BENCH_MAX_OPEN_SSTABLES 256)
     endif()
 
     add_executable(block_manager_tests test/block_manager__tests.c)

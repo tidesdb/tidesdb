@@ -74,7 +74,7 @@
 #define TDB_LOCK_ERROR   2 /* irrecoverable error */
 
 /* default retry count for EINTR during lock acquisition */
-#define TDB_LOCK_DEFAULT_RETRIES 5
+#define TDB_LOCK_DEFAULT_RETRIES 3
 
 /* cross-platform file locking abstraction for database directory lock */
 #if defined(_WIN32)
@@ -158,13 +158,18 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
         }
 
         int err = errno;
+
+        /* lock held by another process
+         * EWOULDBLOCK/EAGAIN -- standard POSIX non-blocking lock failure
+         * EACCES -- some systems (notably with fcntl-style locking) return this
+         *****/
 #if EWOULDBLOCK == EAGAIN
-        if (err == EWOULDBLOCK)
+        if (err == EWOULDBLOCK || err == EACCES)
 #else
-        if (err == EWOULDBLOCK || err == EAGAIN)
+        if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES)
 #endif
         {
-            return TDB_LOCK_HELD; /* lock is held by another process */
+            return TDB_LOCK_HELD;
         }
         if (err == EINTR)
         {

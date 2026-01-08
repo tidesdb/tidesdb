@@ -90,22 +90,25 @@
  */
 static inline int tdb_file_lock_exclusive(int fd, int max_retries)
 {
-    (void)max_retries;
+    (void)max_retries; /* windows with LOCKFILE_FAIL_IMMEDIATELY has no retryable errs */
 
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE) return TDB_LOCK_ERROR;
 
     OVERLAPPED ov = {0};
-    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov))
+    if (LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov))
     {
-        DWORD err = GetLastError();
-        if (err == ERROR_LOCK_VIOLATION || err == ERROR_IO_PENDING)
-        {
-            return TDB_LOCK_HELD;
-        }
-        return TDB_LOCK_ERROR;
+        return TDB_LOCK_SUCCESS;
     }
-    return TDB_LOCK_SUCCESS;
+
+    /* with LOCKFILE_FAIL_IMMEDIATELY, ERROR_LOCK_VIOLATION means lock is held
+     **** https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex */
+    DWORD err = GetLastError();
+    if (err == ERROR_LOCK_VIOLATION)
+    {
+        return TDB_LOCK_HELD;
+    }
+    return TDB_LOCK_ERROR;
 }
 
 /*

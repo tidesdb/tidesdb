@@ -3139,7 +3139,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
                 size_t final_size = value_size;
                 uint8_t *compressed = NULL;
 
-                /* compress if configured */
                 if (sst->config->compression_algorithm != NO_COMPRESSION)
                 {
                     size_t compressed_size;
@@ -3508,7 +3507,7 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
         free(metadata_data);
     }
 
-    /* get final file sizes after writing metadata block
+    /* we get final file sizes after writing metadata block
      * this ensures in-memory sst struct has correct sizes */
     block_manager_get_size(bms.klog_bm, &sst->klog_size);
     block_manager_get_size(bms.vlog_bm, &sst->vlog_size);
@@ -3564,7 +3563,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     void *comparator_ctx = NULL;
     tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
 
-    /* check if this is a reverse comparator (min_key > max_key in actual values) */
+    /* we check if this is a reverse comparator (min_key > max_key in actual values) */
     int min_max_cmp = comparator_fn(sst->min_key, sst->min_key_size, sst->max_key,
                                     sst->max_key_size, comparator_ctx);
     int is_reverse = (min_max_cmp > 0); /* min > max in comparator order means reverse */
@@ -5680,7 +5679,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         return TDB_ERR_MEMORY;
     }
 
-    /* collect sstable pointers matching snapshot (with references) */
+    /* we collect sstable pointers matching snapshot (with references) */
     int sst_idx = 0;
     for (int level = start_level; level <= target_level; level++)
     {
@@ -5693,7 +5692,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             tidesdb_sstable_t *sst = sstables[i];
             if (!sst) continue;
 
-            /* only collect if this sst was in our snapshot */
+            /* we only collect if this sst was in our snapshot */
             int in_snapshot = 0;
             size_t snapshot_size = queue_size(sstable_ids_snapshot);
             for (size_t j = 0; j < snapshot_size; j++)
@@ -8153,13 +8152,12 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
     }
 
-    /* load num_levels atomically */
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Triggering compaction for column family: %s (levels: %d)",
                   cf->name, num_levels);
 
-    /* calculate X (dividing level) */
+    /* we calculate X (dividing level) */
     int X = num_levels - 1 - cf->config.dividing_level_offset;
     if (X < 1) X = 1;
 
@@ -8179,12 +8177,12 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
                 atomic_load_explicit(&cf->levels[i]->current_size, memory_order_relaxed);
         }
 
-        /* check if C_q < cumulative_size (level cannot accommodate the merge) */
+        /* we check if C_q < cumulative_size (level cannot accommodate the merge) */
         size_t level_q_capacity =
             atomic_load_explicit(&cf->levels[q]->capacity, memory_order_relaxed);
         if (level_q_capacity < cumulative_size)
         {
-            /* found smallest level that cannot accommodate -- this is our target */
+            /* we found smallest level that cannot accommodate -- this is our target */
             target_lvl = q;
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Target level %d capacity=%zu < cumulative_size=%zu", q,
                           level_q_capacity, cumulative_size);
@@ -8211,10 +8209,10 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         result = tidesdb_dividing_merge(cf, X - 1); /* convert to 0-indexed */
     }
 
-    /* reload num_levels atomically after compaction */
+    /* we reload num_levels atomically after compaction */
     num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
 
-    /* recalculate X with potentially new num_levels */
+    /* we recalculate X with potentially new num_levels */
     X = num_levels - 1 - cf->config.dividing_level_offset;
     if (X < 1) X = 1;
 
@@ -10091,7 +10089,7 @@ int tidesdb_close(tidesdb_t *db)
 
     if (db->flush_queue)
     {
-        /* set shutdown flag first, before enqueueing NULLs
+        /* we set shutdown flag first, before enqueueing NULLs
          * this ensures queue_dequeue_wait will return NULL even if
          * a thread enters the wait after we broadcast */
         pthread_mutex_lock(&db->flush_queue->lock);
@@ -10120,16 +10118,13 @@ int tidesdb_close(tidesdb_t *db)
 
     if (db->compaction_queue)
     {
-        /* set shutdown flag first, before enqueueing NULLs
+        /* we set shutdown flag first, before enqueueing NULLs
          * this ensures queue_dequeue_wait will return NULL even if
          * a thread enters the wait after we broadcast */
         pthread_mutex_lock(&db->compaction_queue->lock);
         atomic_store(&db->compaction_queue->shutdown, 1);
         pthread_cond_broadcast(&db->compaction_queue->not_empty);
         pthread_mutex_unlock(&db->compaction_queue->lock);
-
-        /* enqueue NULL items for each thread as a courtesy
-         * (not strictly needed since shutdown=1, but maintains consistency) */
         for (int i = 0; i < db->config.num_compaction_threads; i++)
         {
             queue_enqueue(db->compaction_queue, NULL);
@@ -10153,8 +10148,6 @@ int tidesdb_close(tidesdb_t *db)
     {
         for (int i = 0; i < db->config.num_flush_threads; i++)
         {
-            /* on netbsd, pthread_cond_wait can miss signals, so we keep broadcasting
-             * while waiting for each thread to exit */
             if (db->flush_queue)
             {
                 for (int attempt = 0; attempt < TDB_SHUTDOWN_BROADCAST_ATTEMPTS; attempt++)
@@ -10200,7 +10193,6 @@ int tidesdb_close(tidesdb_t *db)
     }
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Compaction threads finished");
 
-    /* stop sync worker thread if running */
     if (atomic_load(&db->sync_thread_active))
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Stopping sync worker thread");
@@ -10225,7 +10217,6 @@ int tidesdb_close(tidesdb_t *db)
         pthread_cond_destroy(&db->sync_thread_cond);
     }
 
-    /* stop sstable file reaper thread if running */
     if (atomic_load(&db->sstable_reaper_active))
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Stopping reaper thread");
@@ -10253,7 +10244,6 @@ int tidesdb_close(tidesdb_t *db)
         pthread_cond_destroy(&db->reaper_thread_cond);
     }
 
-    /* drain and free any remaining work items before freeing queues */
     if (db->flush_queue)
     {
         while (!queue_is_empty(db->flush_queue))
@@ -10295,7 +10285,7 @@ int tidesdb_close(tidesdb_t *db)
             int cleaned = 0;
             int skipped = 0;
 
-            /* only clean up immutable memtables that have been flushed
+            /* we only clean up immutable memtables that have been flushed
              * unflushed immutables still contain data that needs to be persisted
              * they will be recovered from WAL on next startup */
             size_t queue_size_before = queue_size(cf->immutable_memtables);
@@ -10377,7 +10367,6 @@ int tidesdb_close(tidesdb_t *db)
         pthread_rwlock_destroy(&db->active_txns_lock);
     }
 
-    /* release database directory lock */
     if (db->lock_fd >= 0)
     {
         tdb_file_unlock(db->lock_fd);
@@ -11363,7 +11352,7 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
         return 0; /* READ_UNCOMMITTED and READ_COMMITTED dont need read tracking */
     }
 
-    /**  check last few entries first (hot cache, likely duplicates)
+    /** we check last few entries first (hot cache, likely duplicates)
      * most iterators read sequentially, so recent keys are often duplicates */
     int check_recent = (txn->read_set_count < 8) ? txn->read_set_count : 8;
     for (int i = txn->read_set_count - 1; i >= txn->read_set_count - check_recent; i--)

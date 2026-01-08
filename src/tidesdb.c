@@ -9550,6 +9550,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_LOCKED;
     }
 
@@ -11431,7 +11432,7 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
         }
     }
 
-    /* need new arena or first allocation */
+    /* we need new arena or first allocation */
     if (!key_ptr)
     {
         /* allocate new arena */
@@ -12124,7 +12125,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     uint64_t best_seq = UINT64_MAX;
     int found_any = 0;
 
-    /* search level-by-level with early termination
+    /* we search level-by-level with early termination
      * for non-existent keys, this avoids checking all ssts in all levels
      * for existing keys in level 1, this stops immediately without checking deeper levels */
     for (int level_num = 0; level_num < num_levels; level_num++)
@@ -12135,7 +12136,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
-        /* re-load count to detect concurrent remove that swapped array but hasnt updated count yet
+        /* we re-load count to detect concurrent remove that swapped array but hasnt updated count
+         * yet
          */
         int num_ssts_recheck = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         if (num_ssts_recheck < num_ssts)
@@ -12143,12 +12145,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             num_ssts = num_ssts_recheck; /* use smaller count to avoid OOB */
         }
 
-        /* also verify array hasnt changed (handles add-with-resize race) */
+        /* we also verify array hasnt changed (handles add-with-resize race) */
         tidesdb_sstable_t **sstables_check =
             atomic_load_explicit(&level->sstables, memory_order_acquire);
         if (sstables_check != sstables)
         {
-            /* array was resized, reload everything */
+            /* the array was resized, reload everything */
             sstables = sstables_check;
             num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         }
@@ -12160,7 +12162,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
             PROFILE_INC(txn->db, sstables_checked);
 
-            /* try to take ref for ssts we will check
+            /* we try to take ref for ssts we will check
              * we use try_ref to safely handle concurrent removal -- if refcount is 0,
              * the sstable is being freed and we must skip it */
             if (!tidesdb_sstable_try_ref(sst))
@@ -12211,7 +12213,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
 check_found_result:
 
-    /* check if we found a valid (non-deleted, non-expired) version */
+    /* we check if we found a valid (non-deleted, non-expired) version */
     if (found_any && best_kv)
     {
         if (!(best_kv->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
@@ -12334,8 +12336,6 @@ void tidesdb_txn_free(tidesdb_txn_t *txn) /* NOLINT(misc-no-recursion) */
         free(txn->ops[i].value);
     }
     free(txn->ops);
-
-    /* free arena buffers instead of individual keys */
     for (int i = 0; i < txn->read_key_arena_count; i++)
     {
         free(txn->read_key_arenas[i]);
@@ -12481,16 +12481,16 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
         tidesdb_level_t *level = cf->levels[level_idx];
         if (!level) continue;
 
-        /* load array pointer and count with careful ordering to handle concurrent modifications
+        /* we load array pointer and count with careful ordering to handle concurrent modifications
          * re-load count to detect concurrent remove, use minimum to avoid OOB */
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_sstables = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
-        /* re-load count to detect concurrent remove */
+        /* we re-load count to detect concurrent remove */
         int num_sstables_recheck = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         if (num_sstables_recheck < num_sstables) num_sstables = num_sstables_recheck;
 
-        /* verify array hasnt changed (handles add-with-resize race) */
+        /* we verify array hasnt changed (handles add-with-resize race) */
         tidesdb_sstable_t **sstables_check =
             atomic_load_explicit(&level->sstables, memory_order_acquire);
         if (sstables_check != sstables)
@@ -12504,7 +12504,7 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
             tidesdb_sstable_t *sst = sstables[sst_idx];
             if (!sst) continue;
 
-            /* try to take ref to safely handle concurrent removal */
+            /* we try to take ref to safely handle concurrent removal */
             if (!tidesdb_sstable_try_ref(sst))
             {
                 continue; /* sstable is being freed, skip it */
@@ -14651,7 +14651,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                 if (block_manager_cursor_next(cursor) != 0) break;
             }
 
-            /* use the last valid entry we found */
+            /* we use the last valid entry we found */
             if (last_valid_block && last_valid_idx >= 0)
             {
                 source->source.sstable.current_block = last_valid_block;
@@ -14715,13 +14715,13 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
     }
     free(temp_sources);
 
-    /* rebuild heap as max-heap for backward iteration */
+    /* we rebuild heap as max-heap for backward iteration **/
     for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
     {
         heap_sift_down_max(iter->heap, i);
     }
 
-    /* find largest visible entry by popping from max-heap */
+    /* we find largest visible entry by popping from max-heap */
 
     while (!tidesdb_merge_heap_empty(iter->heap))
     {

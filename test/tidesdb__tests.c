@@ -11055,7 +11055,6 @@ static void test_seek_large_values_many_sstables(void)
         ASSERT_EQ(seek_result, 0);
         ASSERT_TRUE(tidesdb_iter_valid(iter));
 
-        /* verify we got the right key (or one before it) */
         uint8_t *found_key = NULL;
         size_t found_key_size = 0;
         ASSERT_EQ(tidesdb_iter_key(iter, &found_key, &found_key_size), 0);
@@ -11070,6 +11069,135 @@ static void test_seek_large_values_many_sstables(void)
     tidesdb_close(db);
     cleanup_test_dir();
 }
+
+static void test_database_lock_prevents_double_open(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db1 = NULL;
+    tidesdb_t *db2 = NULL;
+
+    ASSERT_EQ(tidesdb_open(&config, &db1), TDB_SUCCESS);
+    ASSERT_TRUE(db1 != NULL);
+
+    /* second open of same path should fail with TDB_ERR_LOCKED */
+    int result = tidesdb_open(&config, &db2);
+    ASSERT_EQ(result, TDB_ERR_LOCKED);
+    ASSERT_TRUE(db2 == NULL);
+
+    ASSERT_EQ(tidesdb_close(db1), TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_open(&config, &db2), TDB_SUCCESS);
+    ASSERT_TRUE(db2 != NULL);
+
+    ASSERT_EQ(tidesdb_close(db2), TDB_SUCCESS);
+    cleanup_test_dir();
+}
+
+static void test_database_lock_released_on_close(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    for (int i = 0; i < 5; i++)
+    {
+        tidesdb_t *db = NULL;
+        ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+        ASSERT_TRUE(db != NULL);
+
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        if (i == 0)
+        {
+            ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), TDB_SUCCESS);
+        }
+
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+        if (cf)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+            char key[32], value[32];
+            snprintf(key, sizeof(key), "key_%d", i);
+            snprintf(value, sizeof(value), "value_%d", i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, -1),
+                      TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+            tidesdb_txn_free(txn);
+        }
+
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    }
+
+    cleanup_test_dir();
+}
+
+#ifndef _WIN32
+#include <sys/wait.h>
+
+static void test_database_lock_multi_process(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    /* fork a child process that tries to open the same database */
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+
+    if (pid == 0)
+    {
+        /* child process -- should fail to open the locked database */
+        tidesdb_t *child_db = NULL;
+        int result = tidesdb_open(&config, &child_db);
+        _exit(result == TDB_ERR_LOCKED ? 0 : 1);
+    }
+
+    /* parent waits for child */
+    int status;
+    waitpid(pid, &status, 0);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0); /* child got TDB_ERR_LOCKED as expected */
+
+    /* parent closes database */
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    /* we now fork another child that should succeed in opening */
+    pid = fork();
+    ASSERT_TRUE(pid >= 0);
+
+    if (pid == 0)
+    {
+        /* child process -- should succeed now that parent released lock */
+        tidesdb_t *child_db = NULL;
+        int result = tidesdb_open(&config, &child_db);
+        if (result != TDB_SUCCESS || child_db == NULL)
+        {
+            _exit(1);
+        }
+        tidesdb_close(child_db);
+        _exit(0);
+    }
+
+    /* parent waits for child */
+    waitpid(pid, &status, 0);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0); /* child opened successfully */
+
+    cleanup_test_dir();
+}
+#endif
 
 int main(void)
 {
@@ -11244,6 +11372,11 @@ int main(void)
     RUN_TEST(test_get_large_values_many_sstables, tests_passed);
     RUN_TEST(test_range_iteration_large_values_many_sstables, tests_passed);
     RUN_TEST(test_seek_large_values_many_sstables, tests_passed);
+    RUN_TEST(test_database_lock_prevents_double_open, tests_passed);
+    RUN_TEST(test_database_lock_released_on_close, tests_passed);
+#ifndef _WIN32
+    RUN_TEST(test_database_lock_multi_process, tests_passed);
+#endif
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

@@ -2621,6 +2621,7 @@ static int tidesdb_sstable_try_ref(tidesdb_sstable_t *sst)
  */
 static void tidesdb_sstable_unref(const tidesdb_t *db, tidesdb_sstable_t *sst)
 {
+    (void)db;
     if (!sst) return;
     int old_refcount = atomic_fetch_sub(&sst->refcount, 1);
     if (old_refcount == 1)
@@ -9542,16 +9543,25 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         return TDB_ERR_IO;
     }
 
-    if (tdb_file_lock_exclusive((*db)->lock_fd) != 0)
+    int lock_result = tdb_file_lock_exclusive((*db)->lock_fd, TDB_LOCK_DEFAULT_RETRIES);
+    if (lock_result != TDB_LOCK_SUCCESS)
     {
-        TDB_DEBUG_LOG(TDB_LOG_ERROR,
-                      "Database is locked by another process. Only one process can open a database "
-                      "directory at a time.");
+        if (lock_result == TDB_LOCK_HELD)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "Database is locked by another process. Only one process can open a "
+                          "database directory at a time.");
+        }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "Failed to acquire database lock due to an irrecoverable error.");
+        }
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
         *db = NULL;
-        return TDB_ERR_LOCKED;
+        return (lock_result == TDB_LOCK_HELD) ? TDB_ERR_LOCKED : TDB_ERR_IO;
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Acquired exclusive lock on database directory");

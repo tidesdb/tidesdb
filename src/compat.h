@@ -68,6 +68,14 @@
 #define tdb_fsync(fd) fsync(fd)
 #endif
 
+/* file lock error codes */
+#define TDB_LOCK_SUCCESS 0 /* lock acquired successfully */
+#define TDB_LOCK_HELD    1 /* lock is held by another process (EWOULDBLOCK/EAGAIN) */
+#define TDB_LOCK_ERROR   2 /* irrecoverable error */
+
+/* default retry count for EINTR during lock acquisition */
+#define TDB_LOCK_DEFAULT_RETRIES 5
+
 /* cross-platform file locking abstraction for database directory lock */
 #if defined(_WIN32)
 #include <windows.h>
@@ -75,19 +83,29 @@
  * tdb_file_lock_exclusive
  * acquires an exclusive lock on a file (non-blocking)
  * @param fd the file descriptor to lock
- * @return 0 on success, -1 if already locked or error
+ * @param max_retries maximum retries for transient errors (i.e., signal interrupts)
+ * @return TDB_LOCK_SUCCESS on success,
+ *         TDB_LOCK_HELD if lock is held by another process,
+ *         TDB_LOCK_ERROR on irrecoverable error
  */
-static inline int tdb_file_lock_exclusive(int fd)
+static inline int tdb_file_lock_exclusive(int fd, int max_retries)
 {
+    (void)max_retries;
+
     HANDLE h = (HANDLE)_get_osfhandle(fd);
-    if (h == INVALID_HANDLE_VALUE) return -1;
+    if (h == INVALID_HANDLE_VALUE) return TDB_LOCK_ERROR;
 
     OVERLAPPED ov = {0};
     if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov))
     {
-        return -1;
+        DWORD err = GetLastError();
+        if (err == ERROR_LOCK_VIOLATION || err == ERROR_IO_PENDING)
+        {
+            return TDB_LOCK_HELD;
+        }
+        return TDB_LOCK_ERROR;
     }
-    return 0;
+    return TDB_LOCK_SUCCESS;
 }
 
 /*
@@ -109,20 +127,51 @@ static inline int tdb_file_unlock(int fd)
     return 0;
 }
 #else
+#include <errno.h>
 #include <sys/file.h>
 /*
  * tdb_file_lock_exclusive
  * acquires an exclusive lock on a file (non-blocking)
+ * handles errno appropriately
+ *   - EWOULDBLOCK/EAGAIN -- lock is held by another process
+ *   - EINTR -- signal interrupt, retry up to max_retries
+ *   - other errors?? irrecoverable
  * @param fd the file descriptor to lock
- * @return 0 on success, -1 if already locked or error
+ * @param max_retries maximum retries for EINTR (signal interrupts)
+ * @return TDB_LOCK_SUCCESS on success,
+ *         TDB_LOCK_HELD if lock is held by another process,
+ *         TDB_LOCK_ERROR on irrecoverable error
  */
-static inline int tdb_file_lock_exclusive(int fd)
+static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
 {
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    int retries = 0;
+    if (max_retries <= 0) max_retries = TDB_LOCK_DEFAULT_RETRIES;
+
+    while (retries <= max_retries)
     {
-        return -1;
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+        {
+            return TDB_LOCK_SUCCESS;
+        }
+
+        int err = errno;
+#if EWOULDBLOCK == EAGAIN
+        if (err == EWOULDBLOCK)
+#else
+        if (err == EWOULDBLOCK || err == EAGAIN)
+#endif
+        {
+            return TDB_LOCK_HELD; /* lock is held by another process */
+        }
+        if (err == EINTR)
+        {
+            retries++;
+            continue; /* retry on signal interrupt */
+        }
+        return TDB_LOCK_ERROR; /* irrecoverable err */
     }
-    return 0;
+
+    return TDB_LOCK_ERROR; /* completely exhausted retries for EINTR */
 }
 
 /*
@@ -131,7 +180,7 @@ static inline int tdb_file_lock_exclusive(int fd)
  * @param fd the file descriptor to unlock
  * @return 0 on success, -1 on error
  */
-static inline int tdb_file_unlock(int fd)
+static inline int tdb_file_unlock(const int fd)
 {
     if (flock(fd, LOCK_UN) != 0)
     {

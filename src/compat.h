@@ -264,6 +264,7 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
 
 #if TDB_USE_FCNTL_SETLK
     struct flock fl;
+    memset(&fl, 0, sizeof(fl));
     fl.l_type = F_WRLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start = 0;
@@ -325,6 +326,7 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
     return TDB_LOCK_ERROR;
 #else
     struct flock fl;
+    memset(&fl, 0, sizeof(fl));
     fl.l_type = F_WRLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start = 0;
@@ -371,6 +373,7 @@ static inline int tdb_file_unlock(const int fd)
     tdb_file_lock_clear_pid(fd);
 
     struct flock fl;
+    memset(&fl, 0, sizeof(fl));
     fl.l_type = F_UNLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start = 0;
@@ -391,6 +394,7 @@ static inline int tdb_file_unlock(const int fd)
 #else
     /* linux with F_OFD_SETLK */
     struct flock fl;
+    memset(&fl, 0, sizeof(fl));
     fl.l_type = F_UNLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start = 0;

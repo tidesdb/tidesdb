@@ -4093,6 +4093,7 @@ static tidesdb_level_t *tidesdb_level_create(const int level_num, size_t capacit
     atomic_init(&level->num_sstables, 0);
     atomic_init(&level->sstables_capacity, TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY);
     atomic_init(&level->num_boundaries, 0);
+    atomic_init(&level->retired_sstables_arr, NULL);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Level %d created with capacity %zu", level_num, capacity);
 
@@ -4121,6 +4122,11 @@ static void tidesdb_level_free(const tidesdb_t *db, tidesdb_level_t *level)
     }
 
     free(ssts);
+
+    /* free any retired array that was deferred */
+    tidesdb_sstable_t **retired =
+        atomic_load_explicit(&level->retired_sstables_arr, memory_order_acquire);
+    free(retired);
     int num_boundaries = atomic_load_explicit(&level->num_boundaries, memory_order_acquire);
     uint8_t **file_boundaries = atomic_load_explicit(&level->file_boundaries, memory_order_acquire);
     size_t *boundary_sizes = atomic_load_explicit(&level->boundary_sizes, memory_order_acquire);
@@ -4185,7 +4191,9 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
                 atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                           memory_order_relaxed);
 
-                free(old_arr);
+                tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
+                    &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
+                free(prev_retired);
 
                 return TDB_SUCCESS;
             }
@@ -4225,7 +4233,9 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
                 atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                           memory_order_relaxed);
 
-                free(old_arr);
+                tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
+                    &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
+                free(prev_retired);
 
                 return TDB_SUCCESS;
             }
@@ -4308,7 +4318,9 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
                 tidesdb_sstable_unref(db, old_arr[i]);
             }
 
-            free(old_arr);
+            tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
+                &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
+            free(prev_retired);
 
             return TDB_SUCCESS;
         }

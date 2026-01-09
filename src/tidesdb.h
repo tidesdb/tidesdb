@@ -448,6 +448,7 @@ struct tidesdb_sstable_t
  * @param file_boundaries file boundaries for partitioning
  * @param boundary_sizes sizes of boundary keys
  * @param num_boundaries number of boundaries
+ * @param retired_sstables_arr array of retired sstables (mainly TOCTOU protection)
  */
 struct tidesdb_level_t
 {
@@ -460,6 +461,7 @@ struct tidesdb_level_t
     _Atomic(uint8_t **) file_boundaries;
     _Atomic(size_t *) boundary_sizes;
     _Atomic(int) num_boundaries;
+    _Atomic(tidesdb_sstable_t **) retired_sstables_arr;
 };
 
 /**

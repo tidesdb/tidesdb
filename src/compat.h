@@ -135,18 +135,29 @@ static inline int tdb_file_unlock(int fd)
 
 /*** linux 3.15+ supports F_OFD_SETLK (Open File Description locks) which are per-fd
  * and have sane semantics. we should utilize these when available, and otherwise fall back to
- * flock(). https://lwn.net/Articles/640404/ and https://apenwarr.ca/log/20101213 */
-#ifndef F_OFD_SETLK
-#define TDB_USE_FLOCK 1
+ * flock(). https://lwn.net/Articles/640404/ and https://apenwarr.ca/log/20101213
+ *
+ * macOS does not support F_OFD_SETLK but has reliable fcntl() F_SETLK locks.
+ * flock() on macOS can stall on certain filesystems (NFS, some APFS edge cases)
+ * so we use fcntl() F_SETLK instead which is more reliable. */
+#if defined(__APPLE__)
+#define TDB_USE_FLOCK       0
+#define TDB_USE_FCNTL_SETLK 1
+#include <sys/file.h>
+#elif !defined(F_OFD_SETLK)
+#define TDB_USE_FLOCK       1
+#define TDB_USE_FCNTL_SETLK 0
 #include <sys/file.h>
 #else
-#define TDB_USE_FLOCK 0
+#define TDB_USE_FLOCK       0
+#define TDB_USE_FCNTL_SETLK 0
 #endif
 
 /*
  * tdb_file_lock_exclusive
  * acquires an exclusive lock on a file (non-blocking)
- * uses F_OFD_SETLK on linux 3.15+ for per-fd locking, flock() otherwise
+ * uses F_OFD_SETLK on linux 3.15+ for per-fd locking,
+ * fcntl() F_SETLK on macOS, flock() on other systems
  * @param fd the file descriptor to lock
  * @param max_retries maximum retries for EINTR (signal interrupts)
  * @return TDB_LOCK_SUCCESS on success,
@@ -159,10 +170,46 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
     if (max_retries <= 0) max_retries = TDB_LOCK_DEFAULT_RETRIES;
 
 #if TDB_USE_FLOCK
-    /* systems without F_OFD_SETLK */
+    /* systems without F_OFD_SETLK or fcntl F_SETLK */
     while (retries <= max_retries)
     {
         if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+        {
+            return TDB_LOCK_SUCCESS;
+        }
+
+        int err = errno;
+
+#if EWOULDBLOCK == EAGAIN
+        if (err == EWOULDBLOCK || err == EACCES)
+#else
+        if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES)
+#endif
+        {
+            return TDB_LOCK_HELD;
+        }
+        if (err == EINTR)
+        {
+            retries++;
+            continue;
+        }
+        return TDB_LOCK_ERROR;
+    }
+    return TDB_LOCK_ERROR;
+#elif TDB_USE_FCNTL_SETLK
+    /***
+     **
+     * flock() on macOS can stall on NFS and some APFS edge cases */
+    struct flock fl;
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_pid = 0;
+
+    while (retries <= max_retries)
+    {
+        if (fcntl(fd, F_SETLK, &fl) == 0)
         {
             return TDB_LOCK_SUCCESS;
         }
@@ -232,6 +279,19 @@ static inline int tdb_file_unlock(const int fd)
 {
 #if TDB_USE_FLOCK
     if (flock(fd, LOCK_UN) != 0)
+    {
+        return -1;
+    }
+    return 0;
+#elif TDB_USE_FCNTL_SETLK
+    struct flock fl;
+    fl.l_type = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_pid = 0;
+
+    if (fcntl(fd, F_SETLK, &fl) != 0)
     {
         return -1;
     }

@@ -11148,32 +11148,56 @@ static void test_database_lock_multi_process(void)
     tidesdb_config_t config = tidesdb_default_config();
     config.db_path = TEST_DB_PATH;
 
-    tidesdb_t *db = NULL;
-    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
-    ASSERT_TRUE(db != NULL);
+    char signal_file[256];
+    snprintf(signal_file, sizeof(signal_file), "%s/.parent_ready", TEST_DB_PATH);
 
-    /* fork a child process that tries to open the same database */
     pid_t pid = fork();
     ASSERT_TRUE(pid >= 0);
 
     if (pid == 0)
     {
-        /* child process -- should fail to open the locked database */
+        /* child process -- wait for parent to signal it has opened the database */
+        int wait_count = 0;
+        while (access(signal_file, F_OK) != 0 && wait_count < 100)
+        {
+            usleep(10000); /* 10ms */
+            wait_count++;
+        }
+
+        if (wait_count >= 100)
+        {
+            _exit(2); /* timeout waiting for parent */
+        }
+
+        /* now try to open the locked database -- should fail */
         tidesdb_t *child_db = NULL;
         int result = tidesdb_open(&config, &child_db);
         _exit(result == TDB_ERR_LOCKED ? 0 : 1);
     }
 
-    /* parent waits for child */
+    /* parent process -- open database first */
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    /* signal child that database is open */
+    FILE *f = fopen(signal_file, "w");
+    ASSERT_TRUE(f != NULL);
+    fclose(f);
+
+    /* wait for child */
     int status;
     waitpid(pid, &status, 0);
     ASSERT_TRUE(WIFEXITED(status));
     ASSERT_EQ(WEXITSTATUS(status), 0); /* child got TDB_ERR_LOCKED as expected */
 
+    /* remove signal file */
+    remove(signal_file);
+
     /* parent closes database */
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
 
-    /* we now fork another child that should succeed in opening */
+    /* test that a new process can now open the database */
     pid = fork();
     ASSERT_TRUE(pid >= 0);
 

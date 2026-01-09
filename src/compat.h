@@ -78,7 +78,29 @@
 
 /* cross-platform file locking abstraction for database directory lock */
 #if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
+
+/*
+ * tdb_open_lock_file
+ * opens a lock file (Windows version - lock acquired separately)
+ * @param path the path to the lock file
+ * @param lock_result output -- TDB_LOCK_SUCCESS on successful open (lock not yet acquired)
+ * @return file descriptor on success (>= 0), -1 on error
+ */
+static inline int tdb_open_lock_file(const char *path, int *lock_result)
+{
+    int fd = _open(path, _O_RDWR | _O_CREAT | _O_BINARY, 0644);
+    if (fd < 0)
+    {
+        *lock_result = TDB_LOCK_ERROR;
+        return -1;
+    }
+    *lock_result = TDB_LOCK_SUCCESS; /* caller will call tdb_file_lock_exclusive */
+    return fd;
+}
+
 /*
  * tdb_file_lock_exclusive
  * acquires an exclusive lock on a file (non-blocking)
@@ -135,18 +157,100 @@ static inline int tdb_file_unlock(int fd)
 
 /*** linux 3.15+ supports F_OFD_SETLK (Open File Description locks) which are per-fd
  * and have sane semantics. we should utilize these when available, and otherwise fall back to
- * flock(). https://lwn.net/Articles/640404/ and https://apenwarr.ca/log/20101213 */
-#ifndef F_OFD_SETLK
-#define TDB_USE_FLOCK 1
+ * fcntl() F_SETLK. https://lwn.net/Articles/640404/ and https://apenwarr.ca/log/20101213
+ *
+ * macOS/BSD -- We use fcntl() F_SETLK which has per-process semantics. Critically, fcntl() locks
+ * are NOT inherited across fork(), so child processes will properly fail to acquire the lock.
+ * flock() was considered but locks persist across fork(), causing the child to inherit the lock
+ * and then block when trying to acquire a new lock on a different fd.
+ * https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html
+ */
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
+    defined(__DragonFly__)
+#define TDB_USE_FLOCK       0
+#define TDB_USE_FCNTL_SETLK 1
+#include <sys/file.h>
+#elif !defined(F_OFD_SETLK)
+#define TDB_USE_FLOCK       1
+#define TDB_USE_FCNTL_SETLK 0
 #include <sys/file.h>
 #else
-#define TDB_USE_FLOCK 0
+#define TDB_USE_FLOCK       0
+#define TDB_USE_FCNTL_SETLK 0
+#endif
+
+/*
+ * tdb_open_lock_file
+ * opens a lock file for locking (lock acquired separately via tdb_file_lock_exclusive)
+ * @param path the path to the lock file
+ * @param lock_result output -- TDB_LOCK_SUCCESS, TDB_LOCK_HELD, or TDB_LOCK_ERROR
+ * @return file descriptor on success (>= 0), -1 on error
+ */
+static inline int tdb_open_lock_file(const char *path, int *lock_result)
+{
+    /* open the lock file */
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0)
+    {
+        *lock_result = TDB_LOCK_ERROR;
+        return -1;
+    }
+
+#if TDB_USE_FCNTL_SETLK
+    /* fcntl() F_SETLK allows same-process re-locking, so check PID file first.
+     * Read PID before acquiring lock to detect same-process double-open. */
+    char pid_buf[32] = {0};
+    ssize_t n = pread(fd, pid_buf, sizeof(pid_buf) - 1, 0);
+    if (n > 0)
+    {
+        pid_t file_pid = (pid_t)atol(pid_buf);
+        if (file_pid == getpid())
+        {
+            /* same process already holds lock */
+            close(fd);
+            *lock_result = TDB_LOCK_HELD;
+            return -1;
+        }
+    }
+#endif
+
+    *lock_result = TDB_LOCK_SUCCESS;
+    return fd;
+}
+
+#if TDB_USE_FCNTL_SETLK
+/*
+ * tdb_file_lock_write_pid
+ * writes the current PID to the lock file after acquiring the lock
+ * @param fd the file descriptor of the lock file
+ */
+static inline void tdb_file_lock_write_pid(const int fd)
+{
+    char our_pid[32];
+    int len = snprintf(our_pid, sizeof(our_pid), "%d\n", (int)getpid());
+    if (ftruncate(fd, 0) == 0)
+    {
+        (void)pwrite(fd, our_pid, len, 0);
+    }
+}
+
+/*
+ * tdb_file_lock_clear_pid
+ * clears the PID from the lock file before releasing the lock
+ * @param fd the file descriptor of the lock file
+ */
+static inline void tdb_file_lock_clear_pid(const int fd)
+{
+    (void)ftruncate(fd, 0);
+}
 #endif
 
 /*
  * tdb_file_lock_exclusive
  * acquires an exclusive lock on a file (non-blocking)
- * uses F_OFD_SETLK on linux 3.15+ for per-fd locking, flock() otherwise
+ * uses fcntl() F_SETLK on macOS/BSD (locks NOT inherited across fork)
+ * uses flock() on older systems without F_OFD_SETLK
+ * uses F_OFD_SETLK on linux 3.15+ for per-fd locking
  * @param fd the file descriptor to lock
  * @param max_retries maximum retries for EINTR (signal interrupts)
  * @return TDB_LOCK_SUCCESS on success,
@@ -158,8 +262,43 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
     int retries = 0;
     if (max_retries <= 0) max_retries = TDB_LOCK_DEFAULT_RETRIES;
 
-#if TDB_USE_FLOCK
-    /* systems without F_OFD_SETLK */
+#if TDB_USE_FCNTL_SETLK
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_pid = 0;
+
+    while (retries <= max_retries)
+    {
+        if (fcntl(fd, F_SETLK, &fl) == 0)
+        {
+            /* write PID to lock file for same-process detection */
+            tdb_file_lock_write_pid(fd);
+            return TDB_LOCK_SUCCESS;
+        }
+
+        int err = errno;
+
+#if EWOULDBLOCK == EAGAIN
+        if (err == EWOULDBLOCK || err == EACCES)
+#else
+        if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES)
+#endif
+        {
+            return TDB_LOCK_HELD;
+        }
+        if (err == EINTR)
+        {
+            retries++;
+            continue;
+        }
+        return TDB_LOCK_ERROR;
+    }
+    return TDB_LOCK_ERROR;
+#elif TDB_USE_FLOCK
     while (retries <= max_retries)
     {
         if (flock(fd, LOCK_EX | LOCK_NB) == 0)
@@ -186,8 +325,8 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
     }
     return TDB_LOCK_ERROR;
 #else
-    /* use F_OFD_SETLK for per-fd locking (linux 3.15+) */
     struct flock fl;
+    memset(&fl, 0, sizeof(fl));
     fl.l_type = F_WRLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start = 0;
@@ -230,14 +369,32 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
  */
 static inline int tdb_file_unlock(const int fd)
 {
-#if TDB_USE_FLOCK
+#if TDB_USE_FCNTL_SETLK
+    tdb_file_lock_clear_pid(fd);
+
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_pid = 0;
+
+    if (fcntl(fd, F_SETLK, &fl) != 0)
+    {
+        return -1;
+    }
+    return 0;
+#elif TDB_USE_FLOCK
     if (flock(fd, LOCK_UN) != 0)
     {
         return -1;
     }
     return 0;
 #else
+    /* linux with F_OFD_SETLK */
     struct flock fl;
+    memset(&fl, 0, sizeof(fl));
     fl.l_type = F_UNLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start = 0;
@@ -330,7 +487,7 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #elif defined(__GNUC__) || defined(__clang__)
 #define THREAD_LOCAL __thread
 #else
-#define THREAD_LOCAL /* fallback: no thread-local support */
+#define THREAD_LOCAL /* fallback -- no thread-local support */
 #endif
 
 /* cross-platform prefetch hints for cache optimization */
@@ -1566,7 +1723,7 @@ static inline size_t get_available_memory(void)
 
     mach_port = mach_host_self();
 
-    /* use 32-bit vm statistics on PPC regardless of OS version.
+    /* 32-bit vm statistics on PPC regardless of OS version.
      * host_statistics64 is not available on 10.5 and for PPC 32-bit even on 10.6 */
 #if defined(__ppc__) || (MAC_OS_X_VERSION_MIN_REQUIRED < 1060)
     /* PPC always uses 32-bit vm statistics */
@@ -2588,7 +2745,7 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
     if (!old_path || !new_path) return -1;
 
 #ifdef _WIN32
-    /* use MoveFileEx with MOVEFILE_REPLACE_EXISTING for atomic rename on Windows
+    /* MoveFileEx with MOVEFILE_REPLACE_EXISTING for atomic rename on Windows
      * this is truly atomic and replaces the target file if it exists */
     if (!MoveFileEx(old_path, new_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
     {

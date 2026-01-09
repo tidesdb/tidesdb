@@ -382,6 +382,14 @@ int block_manager_validate_last_block(block_manager_t *bm, int strict);
 block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode);
 
 /**
+ * block_manager_set_sync_mode
+ * updates the sync mode of an existing block manager
+ * @param bm the block manager to update
+ * @param sync_mode the new sync mode (TDB_SYNC_NONE=0, TDB_SYNC_FULL=1)
+ */
+void block_manager_set_sync_mode(block_manager_t *bm, int sync_mode);
+
+/**
  * block_manager_get_block_size_at_offset
  * reads the size of a block at a specific file offset
  * useful for determining allocation size before reading block data

@@ -68,6 +68,191 @@
 #define tdb_fsync(fd) fsync(fd)
 #endif
 
+/* file lock error codes */
+#define TDB_LOCK_SUCCESS 0 /* lock acquired successfully */
+#define TDB_LOCK_HELD    1 /* lock is held by another process (EWOULDBLOCK/EAGAIN) */
+#define TDB_LOCK_ERROR   2 /* irrecoverable error */
+
+/* default retry count for EINTR during lock acquisition */
+#define TDB_LOCK_DEFAULT_RETRIES 3
+
+/* cross-platform file locking abstraction for database directory lock */
+#if defined(_WIN32)
+#include <windows.h>
+/*
+ * tdb_file_lock_exclusive
+ * acquires an exclusive lock on a file (non-blocking)
+ * @param fd the file descriptor to lock
+ * @param max_retries maximum retries for transient errors (i.e., signal interrupts)
+ * @return TDB_LOCK_SUCCESS on success,
+ *         TDB_LOCK_HELD if lock is held by another process,
+ *         TDB_LOCK_ERROR on irrecoverable error
+ */
+static inline int tdb_file_lock_exclusive(int fd, int max_retries)
+{
+    (void)max_retries; /* windows with LOCKFILE_FAIL_IMMEDIATELY has no retryable errs */
+
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return TDB_LOCK_ERROR;
+
+    OVERLAPPED ov = {0};
+    if (LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov))
+    {
+        return TDB_LOCK_SUCCESS;
+    }
+
+    /* with LOCKFILE_FAIL_IMMEDIATELY, ERROR_LOCK_VIOLATION means lock is held
+     **** https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex */
+    DWORD err = GetLastError();
+    if (err == ERROR_LOCK_VIOLATION)
+    {
+        return TDB_LOCK_HELD;
+    }
+    return TDB_LOCK_ERROR;
+}
+
+/*
+ * tdb_file_unlock
+ * releases a lock on a file
+ * @param fd the file descriptor to unlock
+ * @return 0 on success, -1 on error
+ */
+static inline int tdb_file_unlock(int fd)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+
+    OVERLAPPED ov = {0};
+    if (!UnlockFileEx(h, 0, 1, 0, &ov))
+    {
+        return -1;
+    }
+    return 0;
+}
+#else
+#include <errno.h>
+#include <fcntl.h>
+
+/*** linux 3.15+ supports F_OFD_SETLK (Open File Description locks) which are per-fd
+ * and have sane semantics. we should utilize these when available, and otherwise fall back to
+ * flock(). https://lwn.net/Articles/640404/ and https://apenwarr.ca/log/20101213 */
+#ifndef F_OFD_SETLK
+#define TDB_USE_FLOCK 1
+#include <sys/file.h>
+#else
+#define TDB_USE_FLOCK 0
+#endif
+
+/*
+ * tdb_file_lock_exclusive
+ * acquires an exclusive lock on a file (non-blocking)
+ * uses F_OFD_SETLK on linux 3.15+ for per-fd locking, flock() otherwise
+ * @param fd the file descriptor to lock
+ * @param max_retries maximum retries for EINTR (signal interrupts)
+ * @return TDB_LOCK_SUCCESS on success,
+ *         TDB_LOCK_HELD if lock is held by another process,
+ *         TDB_LOCK_ERROR on irrecoverable error
+ */
+static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
+{
+    int retries = 0;
+    if (max_retries <= 0) max_retries = TDB_LOCK_DEFAULT_RETRIES;
+
+#if TDB_USE_FLOCK
+    /* systems without F_OFD_SETLK */
+    while (retries <= max_retries)
+    {
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+        {
+            return TDB_LOCK_SUCCESS;
+        }
+
+        int err = errno;
+
+#if EWOULDBLOCK == EAGAIN
+        if (err == EWOULDBLOCK || err == EACCES)
+#else
+        if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES)
+#endif
+        {
+            return TDB_LOCK_HELD;
+        }
+        if (err == EINTR)
+        {
+            retries++;
+            continue;
+        }
+        return TDB_LOCK_ERROR;
+    }
+    return TDB_LOCK_ERROR;
+#else
+    /* use F_OFD_SETLK for per-fd locking (linux 3.15+) */
+    struct flock fl;
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_pid = 0; /* ignored for OFD locks */
+
+    while (retries <= max_retries)
+    {
+        if (fcntl(fd, F_OFD_SETLK, &fl) == 0)
+        {
+            return TDB_LOCK_SUCCESS;
+        }
+
+        int err = errno;
+
+#if EWOULDBLOCK == EAGAIN
+        if (err == EWOULDBLOCK || err == EACCES)
+#else
+        if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES)
+#endif
+        {
+            return TDB_LOCK_HELD;
+        }
+        if (err == EINTR)
+        {
+            retries++;
+            continue;
+        }
+        return TDB_LOCK_ERROR;
+    }
+    return TDB_LOCK_ERROR;
+#endif
+}
+
+/*
+ * tdb_file_unlock
+ * releases a lock on a file
+ * @param fd the file descriptor to unlock
+ * @return 0 on success, -1 on error
+ */
+static inline int tdb_file_unlock(const int fd)
+{
+#if TDB_USE_FLOCK
+    if (flock(fd, LOCK_UN) != 0)
+    {
+        return -1;
+    }
+    return 0;
+#else
+    struct flock fl;
+    fl.l_type = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_pid = 0;
+
+    if (fcntl(fd, F_OFD_SETLK, &fl) != 0)
+    {
+        return -1;
+    }
+    return 0;
+#endif
+}
+#endif
+
 /* cross-platform localtime abstraction */
 #if defined(_WIN32)
 /* (MSVC and MinGW) use localtime_s with reversed parameter order */

@@ -153,6 +153,7 @@ typedef enum
 #define TDB_ERR_MEMORY_LIMIT -9
 #define TDB_ERR_INVALID_DB   -10
 #define TDB_ERR_UNKNOWN      -11
+#define TDB_ERR_LOCKED       -12
 
 #ifdef TDB_ENABLE_READ_PROFILING
 typedef struct
@@ -501,6 +502,7 @@ struct tidesdb_level_t
  * @param available_memory available system memory in bytes
  * @param total_memory total system memory in bytes
  * @param cf_list_lock rwlock for cf list modifications
+ * @param lock_fd file descriptor for lock file
  */
 struct tidesdb_t
 {
@@ -541,6 +543,7 @@ struct tidesdb_t
     uint64_t available_memory;
     uint64_t total_memory;
     pthread_rwlock_t cf_list_lock;
+    int lock_fd;
 #ifdef TDB_ENABLE_READ_PROFILING
     tidesdb_read_stats_t read_stats;
 #endif

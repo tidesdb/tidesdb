@@ -59,7 +59,7 @@
  * @param size the size of the data
  * @return the 32-bit checksum
  */
-static inline uint32_t compute_checksum(const void *data, size_t size)
+static inline uint32_t compute_checksum(const void *data, const size_t size)
 {
     return XXH32(data, size, 0);
 }
@@ -72,7 +72,8 @@ static inline uint32_t compute_checksum(const void *data, size_t size)
  * @param expected_checksum the expected checksum
  * @return 0 if the checksum matches, -1 otherwise
  */
-static inline int verify_checksum(const void *data, size_t size, uint32_t expected_checksum)
+static inline int verify_checksum(const void *data, const size_t size,
+                                  const uint32_t expected_checksum)
 {
     uint32_t computed = compute_checksum(data, size);
     return (computed == expected_checksum) ? 0 : -1;
@@ -107,7 +108,7 @@ static int write_header(int fd)
  * @param fd the file descriptor to read from
  * @return 0 if successful, -1 otherwise
  */
-static int read_header(int fd)
+static int read_header(const int fd)
 {
     unsigned char header[BLOCK_MANAGER_HEADER_SIZE];
 
@@ -134,7 +135,7 @@ static int read_header(int fd)
  * @param size the size to store the result in
  * @return 0 if successful, -1 otherwise
  */
-static int get_file_size(int fd, uint64_t *size)
+static int get_file_size(const int fd, uint64_t *size)
 {
     struct STAT_STRUCT st;
     if (FSTAT_FUNC(fd, &st) != 0) return -1;
@@ -151,7 +152,7 @@ static int get_file_size(int fd, uint64_t *size)
  * @return 0 if successful, -1 if not
  */
 static int block_manager_open_internal(block_manager_t **bm, const char *file_path,
-                                       block_manager_sync_mode_t sync_mode)
+                                       const block_manager_sync_mode_t sync_mode)
 {
     block_manager_t *new_bm = malloc(sizeof(block_manager_t));
     if (!new_bm)
@@ -277,7 +278,7 @@ block_manager_block_t *block_manager_block_create(const uint64_t size, const voi
     return block;
 }
 
-block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, void *data)
+block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t size, void *data)
 {
     if (size > UINT32_MAX)
     {
@@ -494,7 +495,7 @@ int block_manager_cursor_has_prev(block_manager_cursor_t *cursor)
  * @return the block if successful, NULL otherwise
  */
 static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t *bm,
-                                                                 uint64_t offset)
+                                                                 const uint64_t offset)
 {
     if (!bm) return NULL;
 
@@ -797,7 +798,7 @@ int block_manager_get_size(block_manager_t *bm, uint64_t *size)
     return 0;
 }
 
-int block_manager_cursor_goto(block_manager_cursor_t *cursor, uint64_t pos)
+int block_manager_cursor_goto(block_manager_cursor_t *cursor, const uint64_t pos)
 {
     if (!cursor) return -1;
 
@@ -860,7 +861,7 @@ int block_manager_count_blocks(block_manager_t *bm)
     return count;
 }
 
-int block_manager_validate_last_block(block_manager_t *bm, int strict)
+int block_manager_validate_last_block(block_manager_t *bm, const int strict)
 {
     if (!bm) return -1;
 
@@ -1035,7 +1036,7 @@ int block_manager_validate_last_block(block_manager_t *bm, int strict)
  * @param tdb_sync_mode the tidesdb sync mode
  * @return the corresponding block manager sync mode
  */
-block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode)
+block_manager_sync_mode_t convert_sync_mode(const int tdb_sync_mode)
 {
     switch (tdb_sync_mode)
     {
@@ -1046,6 +1047,12 @@ block_manager_sync_mode_t convert_sync_mode(int tdb_sync_mode)
         default:
             return BLOCK_MANAGER_SYNC_NONE;
     }
+}
+
+void block_manager_set_sync_mode(block_manager_t *bm, const int sync_mode)
+{
+    if (!bm) return;
+    bm->sync_mode = convert_sync_mode(sync_mode);
 }
 
 int block_manager_get_block_size_at_offset(block_manager_t *bm, uint64_t offset, uint32_t *size)
@@ -1066,7 +1073,8 @@ int block_manager_get_block_size_at_offset(block_manager_t *bm, uint64_t offset,
     return 0;
 }
 
-int block_manager_read_at_offset(block_manager_t *bm, uint64_t offset, size_t size, uint8_t *data)
+int block_manager_read_at_offset(block_manager_t *bm, const uint64_t offset, const size_t size,
+                                 uint8_t *data)
 {
     if (!bm || !data || size == 0) return -1;
 
@@ -1080,8 +1088,8 @@ int block_manager_read_at_offset(block_manager_t *bm, uint64_t offset, size_t si
     return 0;
 }
 
-int block_manager_read_block_data_at_offset(block_manager_t *bm, uint64_t offset, uint8_t **data,
-                                            uint32_t *data_size)
+int block_manager_read_block_data_at_offset(block_manager_t *bm, const uint64_t offset,
+                                            uint8_t **data, uint32_t *data_size)
 {
     if (!bm || !data || !data_size) return -1;
 
@@ -1124,7 +1132,7 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, uint64_t offset
     return 0;
 }
 
-int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode)
+int block_manager_open(block_manager_t **bm, const char *file_path, const int sync_mode)
 {
     if (!bm || !file_path) return -1;
     return block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode));

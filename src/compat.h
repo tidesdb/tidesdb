@@ -79,6 +79,26 @@
 /* cross-platform file locking abstraction for database directory lock */
 #if defined(_WIN32)
 #include <windows.h>
+
+/*
+ * tdb_open_lock_file
+ * opens a lock file (Windows version - lock acquired separately)
+ * @param path the path to the lock file
+ * @param lock_result output: TDB_LOCK_SUCCESS on successful open (lock not yet acquired)
+ * @return file descriptor on success (>= 0), -1 on error
+ */
+static inline int tdb_open_lock_file(const char *path, int *lock_result)
+{
+    int fd = _open(path, _O_RDWR | _O_CREAT | _O_BINARY, 0644);
+    if (fd < 0)
+    {
+        *lock_result = TDB_LOCK_ERROR;
+        return -1;
+    }
+    *lock_result = TDB_LOCK_SUCCESS; /* caller will call tdb_file_lock_exclusive */
+    return fd;
+}
+
 /*
  * tdb_file_lock_exclusive
  * acquires an exclusive lock on a file (non-blocking)

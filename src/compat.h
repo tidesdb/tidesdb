@@ -131,14 +131,22 @@ static inline int tdb_file_unlock(int fd)
 }
 #else
 #include <errno.h>
+#include <fcntl.h>
+
+/*** linux 3.15+ supports F_OFD_SETLK (Open File Description locks) which are per-fd
+ * and have sane semantics. we should utilize these when available, and otherwise fall back to
+ * flock(). https://lwn.net/Articles/640404/ and https://apenwarr.ca/log/20101213 */
+#ifndef F_OFD_SETLK
+#define TDB_USE_FLOCK 1
 #include <sys/file.h>
+#else
+#define TDB_USE_FLOCK 0
+#endif
+
 /*
  * tdb_file_lock_exclusive
  * acquires an exclusive lock on a file (non-blocking)
- * handles errno appropriately
- *   - EWOULDBLOCK/EAGAIN -- lock is held by another process
- *   - EINTR -- signal interrupt, retry up to max_retries
- *   - other errors?? irrecoverable
+ * uses F_OFD_SETLK on linux 3.15+ for per-fd locking, flock() otherwise
  * @param fd the file descriptor to lock
  * @param max_retries maximum retries for EINTR (signal interrupts)
  * @return TDB_LOCK_SUCCESS on success,
@@ -150,6 +158,8 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
     int retries = 0;
     if (max_retries <= 0) max_retries = TDB_LOCK_DEFAULT_RETRIES;
 
+#if TDB_USE_FLOCK
+    /* systems without F_OFD_SETLK */
     while (retries <= max_retries)
     {
         if (flock(fd, LOCK_EX | LOCK_NB) == 0)
@@ -159,10 +169,6 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
 
         int err = errno;
 
-        /* lock held by another process
-         * EWOULDBLOCK/EAGAIN -- standard POSIX non-blocking lock failure
-         * EACCES -- some systems (notably with fcntl-style locking) return this
-         *****/
 #if EWOULDBLOCK == EAGAIN
         if (err == EWOULDBLOCK || err == EACCES)
 #else
@@ -174,12 +180,46 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
         if (err == EINTR)
         {
             retries++;
-            continue; /* retry on signal interrupt */
+            continue;
         }
-        return TDB_LOCK_ERROR; /* irrecoverable err */
+        return TDB_LOCK_ERROR;
     }
+    return TDB_LOCK_ERROR;
+#else
+    /* use F_OFD_SETLK for per-fd locking (linux 3.15+) */
+    struct flock fl;
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_pid = 0; /* ignored for OFD locks */
 
-    return TDB_LOCK_ERROR; /* completely exhausted retries for EINTR */
+    while (retries <= max_retries)
+    {
+        if (fcntl(fd, F_OFD_SETLK, &fl) == 0)
+        {
+            return TDB_LOCK_SUCCESS;
+        }
+
+        int err = errno;
+
+#if EWOULDBLOCK == EAGAIN
+        if (err == EWOULDBLOCK || err == EACCES)
+#else
+        if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES)
+#endif
+        {
+            return TDB_LOCK_HELD;
+        }
+        if (err == EINTR)
+        {
+            retries++;
+            continue;
+        }
+        return TDB_LOCK_ERROR;
+    }
+    return TDB_LOCK_ERROR;
+#endif
 }
 
 /*
@@ -190,11 +230,26 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
  */
 static inline int tdb_file_unlock(const int fd)
 {
+#if TDB_USE_FLOCK
     if (flock(fd, LOCK_UN) != 0)
     {
         return -1;
     }
     return 0;
+#else
+    struct flock fl;
+    fl.l_type = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_pid = 0;
+
+    if (fcntl(fd, F_OFD_SETLK, &fl) != 0)
+    {
+        return -1;
+    }
+    return 0;
+#endif
 }
 #endif
 

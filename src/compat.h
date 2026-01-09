@@ -78,13 +78,15 @@
 
 /* cross-platform file locking abstraction for database directory lock */
 #if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
 
 /*
  * tdb_open_lock_file
  * opens a lock file (Windows version - lock acquired separately)
  * @param path the path to the lock file
- * @param lock_result output: TDB_LOCK_SUCCESS on successful open (lock not yet acquired)
+ * @param lock_result output -- TDB_LOCK_SUCCESS on successful open (lock not yet acquired)
  * @return file descriptor on success (>= 0), -1 on error
  */
 static inline int tdb_open_lock_file(const char *path, int *lock_result)
@@ -157,15 +159,15 @@ static inline int tdb_file_unlock(int fd)
  * and have sane semantics. we should utilize these when available, and otherwise fall back to
  * flock(). https://lwn.net/Articles/640404/ and https://apenwarr.ca/log/20101213
  *
- * macOS/BSD flock() and fcntl() F_SETLK are per-process, not per-fd, so the same process
- * can re-acquire locks. We use O_EXLOCK at open time on macOS/BSD for atomic exclusive
- * lock acquisition that properly fails for same-process re-locking.
+ * macOS/BSD -- We use flock() after open. O_EXLOCK was considered but has issues with fork()
+ * on older macOS x86 systems where O_NONBLOCK may not work correctly, causing hangs.
+ * flock() with LOCK_NB properly returns EWOULDBLOCK in forked children.
  * https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html
  */
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
     defined(__DragonFly__)
-#define TDB_USE_FLOCK       0
-#define TDB_USE_OPEN_EXLOCK 1
+#define TDB_USE_FLOCK       1
+#define TDB_USE_OPEN_EXLOCK 0
 #include <sys/file.h>
 #elif !defined(F_OFD_SETLK)
 #define TDB_USE_FLOCK       1
@@ -178,50 +180,67 @@ static inline int tdb_file_unlock(int fd)
 
 /*
  * tdb_open_lock_file
- * opens a lock file, optionally with exclusive lock (for O_EXLOCK systems)
+ * opens a lock file and acquires an exclusive lock
+ * on macOS/BSD, also writes PID to detect same-process re-locking since flock() allows it
  * @param path the path to the lock file
  * @param lock_result output -- TDB_LOCK_SUCCESS, TDB_LOCK_HELD, or TDB_LOCK_ERROR
  * @return file descriptor on success (>= 0), -1 on error
  */
 static inline int tdb_open_lock_file(const char *path, int *lock_result)
 {
-#if TDB_USE_OPEN_EXLOCK
-    /* macOS/BSD -- O_EXLOCK | O_NONBLOCK for atomic non-blocking exclusive lock at open time.
-     * This properly fails with EWOULDBLOCK if any fd (even same process) holds the lock. */
-    int fd = open(path, O_RDWR | O_CREAT | O_EXLOCK | O_NONBLOCK, 0644);
-    if (fd >= 0)
-    {
-        *lock_result = TDB_LOCK_SUCCESS;
-        return fd;
-    }
-    int err = errno;
-    if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES)
-    {
-        *lock_result = TDB_LOCK_HELD;
-    }
-    else
-    {
-        *lock_result = TDB_LOCK_ERROR;
-    }
-    return -1;
-#else
-    /* other systems -- open normally, lock separately */
-    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    /* open the lock file */
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0)
     {
         *lock_result = TDB_LOCK_ERROR;
         return -1;
     }
-    *lock_result = TDB_LOCK_SUCCESS; /* caller will call tdb_file_lock_exclusive */
-    return fd;
+
+#if TDB_USE_FLOCK
+    /* flock() allows same-process re-locking, so we use a PID file to detect it.
+     * First try to acquire the lock. If we get it, check if PID matches (same process). */
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        int err = errno;
+        close(fd);
+        *lock_result = (err == EWOULDBLOCK || err == EAGAIN) ? TDB_LOCK_HELD : TDB_LOCK_ERROR;
+        return -1;
+    }
+
+    /* we got the lock - check if PID in file matches current process (same-process re-lock) */
+    char pid_buf[32] = {0};
+    ssize_t n = pread(fd, pid_buf, sizeof(pid_buf) - 1, 0);
+    if (n > 0)
+    {
+        pid_t file_pid = (pid_t)atol(pid_buf);
+        if (file_pid == getpid())
+        {
+            /* same process already holds lock - this is a re-lock attempt */
+            flock(fd, LOCK_UN);
+            close(fd);
+            *lock_result = TDB_LOCK_HELD;
+            return -1;
+        }
+    }
+
+    /* write our PID to the lock file */
+    char our_pid[32];
+    int len = snprintf(our_pid, sizeof(our_pid), "%d\n", (int)getpid());
+    if (ftruncate(fd, 0) == 0)
+    {
+        pwrite(fd, our_pid, len, 0);
+    }
 #endif
+
+    *lock_result = TDB_LOCK_SUCCESS;
+    return fd;
 }
 
 /*
  * tdb_file_lock_exclusive
  * acquires an exclusive lock on a file (non-blocking)
- * uses F_OFD_SETLK on linux 3.15+ for per-fd locking, flock() on other systems
- * on macOS/BSD with O_EXLOCK, this is a no-op (lock acquired at open time)
+ * on flock() systems, lock is already acquired in tdb_open_lock_file, so this is a no-op
+ * uses F_OFD_SETLK on linux 3.15+ for per-fd locking
  * @param fd the file descriptor to lock
  * @param max_retries maximum retries for EINTR (signal interrupts)
  * @return TDB_LOCK_SUCCESS on success,
@@ -230,41 +249,11 @@ static inline int tdb_open_lock_file(const char *path, int *lock_result)
  */
 static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
 {
-#if TDB_USE_OPEN_EXLOCK
-    /* macOS/BSD -- lock was acquired at open time via O_EXLOCK */
+#if TDB_USE_FLOCK
+    /* flock() lock already acquired in tdb_open_lock_file with PID check */
     (void)fd;
     (void)max_retries;
     return TDB_LOCK_SUCCESS;
-#elif TDB_USE_FLOCK
-    /* systems without F_OFD_SETLK */
-    int retries = 0;
-    if (max_retries <= 0) max_retries = TDB_LOCK_DEFAULT_RETRIES;
-
-    while (retries <= max_retries)
-    {
-        if (flock(fd, LOCK_EX | LOCK_NB) == 0)
-        {
-            return TDB_LOCK_SUCCESS;
-        }
-
-        int err = errno;
-
-#if EWOULDBLOCK == EAGAIN
-        if (err == EWOULDBLOCK || err == EACCES)
-#else
-        if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES)
-#endif
-        {
-            return TDB_LOCK_HELD;
-        }
-        if (err == EINTR)
-        {
-            retries++;
-            continue;
-        }
-        return TDB_LOCK_ERROR;
-    }
-    return TDB_LOCK_ERROR;
 #else
     /* F_OFD_SETLK for per-fd locking (linux 3.15+) */
     int retries = 0;
@@ -313,15 +302,9 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
  */
 static inline int tdb_file_unlock(const int fd)
 {
-#if TDB_USE_OPEN_EXLOCK
-    /* macOS/BSD -- lock acquired via O_EXLOCK is released when fd is closed.
-     * flock(LOCK_UN) also works to release it explicitly. */
-    if (flock(fd, LOCK_UN) != 0)
-    {
-        return -1;
-    }
-    return 0;
-#elif TDB_USE_FLOCK
+#if TDB_USE_FLOCK
+    /* clear PID from lock file before releasing */
+    (void)ftruncate(fd, 0);
     if (flock(fd, LOCK_UN) != 0)
     {
         return -1;
@@ -422,7 +405,7 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #elif defined(__GNUC__) || defined(__clang__)
 #define THREAD_LOCAL __thread
 #else
-#define THREAD_LOCAL /* fallback: no thread-local support */
+#define THREAD_LOCAL /* fallback -- no thread-local support */
 #endif
 
 /* cross-platform prefetch hints for cache optimization */

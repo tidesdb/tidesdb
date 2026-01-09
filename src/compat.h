@@ -137,27 +137,71 @@ static inline int tdb_file_unlock(int fd)
  * and have sane semantics. we should utilize these when available, and otherwise fall back to
  * flock(). https://lwn.net/Articles/640404/ and https://apenwarr.ca/log/20101213
  *
- * macOS does not support F_OFD_SETLK but has reliable fcntl() F_SETLK locks.
- * flock() on macOS can stall on certain filesystems (NFS, some APFS edge cases)
- * so we use fcntl() F_SETLK instead which is more reliable. */
-#if defined(__APPLE__)
+ * macOS/BSD flock() and fcntl() F_SETLK are per-process, not per-fd, so the same process
+ * can re-acquire locks. We use O_EXLOCK at open time on macOS/BSD for atomic exclusive
+ * lock acquisition that properly fails for same-process re-locking.
+ * https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html
+ */
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
+    defined(__DragonFly__)
 #define TDB_USE_FLOCK       0
-#define TDB_USE_FCNTL_SETLK 1
+#define TDB_USE_OPEN_EXLOCK 1
 #include <sys/file.h>
 #elif !defined(F_OFD_SETLK)
 #define TDB_USE_FLOCK       1
-#define TDB_USE_FCNTL_SETLK 0
+#define TDB_USE_OPEN_EXLOCK 0
 #include <sys/file.h>
 #else
 #define TDB_USE_FLOCK       0
-#define TDB_USE_FCNTL_SETLK 0
+#define TDB_USE_OPEN_EXLOCK 0
 #endif
+
+/*
+ * tdb_open_lock_file
+ * opens a lock file, optionally with exclusive lock (for O_EXLOCK systems)
+ * @param path the path to the lock file
+ * @param lock_result output -- TDB_LOCK_SUCCESS, TDB_LOCK_HELD, or TDB_LOCK_ERROR
+ * @return file descriptor on success (>= 0), -1 on error
+ */
+static inline int tdb_open_lock_file(const char *path, int *lock_result)
+{
+#if TDB_USE_OPEN_EXLOCK
+    /* macOS/BSD -- O_EXLOCK | O_NONBLOCK for atomic non-blocking exclusive lock at open time.
+     * This properly fails with EWOULDBLOCK if any fd (even same process) holds the lock. */
+    int fd = open(path, O_RDWR | O_CREAT | O_EXLOCK | O_NONBLOCK, 0644);
+    if (fd >= 0)
+    {
+        *lock_result = TDB_LOCK_SUCCESS;
+        return fd;
+    }
+    int err = errno;
+    if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES)
+    {
+        *lock_result = TDB_LOCK_HELD;
+    }
+    else
+    {
+        *lock_result = TDB_LOCK_ERROR;
+    }
+    return -1;
+#else
+    /* other systems -- open normally, lock separately */
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0)
+    {
+        *lock_result = TDB_LOCK_ERROR;
+        return -1;
+    }
+    *lock_result = TDB_LOCK_SUCCESS; /* caller will call tdb_file_lock_exclusive */
+    return fd;
+#endif
+}
 
 /*
  * tdb_file_lock_exclusive
  * acquires an exclusive lock on a file (non-blocking)
- * uses F_OFD_SETLK on linux 3.15+ for per-fd locking,
- * fcntl() F_SETLK on macOS, flock() on other systems
+ * uses F_OFD_SETLK on linux 3.15+ for per-fd locking, flock() on other systems
+ * on macOS/BSD with O_EXLOCK, this is a no-op (lock acquired at open time)
  * @param fd the file descriptor to lock
  * @param max_retries maximum retries for EINTR (signal interrupts)
  * @return TDB_LOCK_SUCCESS on success,
@@ -166,11 +210,16 @@ static inline int tdb_file_unlock(int fd)
  */
 static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
 {
+#if TDB_USE_OPEN_EXLOCK
+    /* macOS/BSD -- lock was acquired at open time via O_EXLOCK */
+    (void)fd;
+    (void)max_retries;
+    return TDB_LOCK_SUCCESS;
+#elif TDB_USE_FLOCK
+    /* systems without F_OFD_SETLK */
     int retries = 0;
     if (max_retries <= 0) max_retries = TDB_LOCK_DEFAULT_RETRIES;
 
-#if TDB_USE_FLOCK
-    /* systems without F_OFD_SETLK or fcntl F_SETLK */
     while (retries <= max_retries)
     {
         if (flock(fd, LOCK_EX | LOCK_NB) == 0)
@@ -196,44 +245,11 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
         return TDB_LOCK_ERROR;
     }
     return TDB_LOCK_ERROR;
-#elif TDB_USE_FCNTL_SETLK
-    /***
-     **
-     * flock() on macOS can stall on NFS and some APFS edge cases */
-    struct flock fl;
-    fl.l_type = F_WRLCK;
-    fl.l_whence = SEEK_SET;
-    fl.l_start = 0;
-    fl.l_len = 0;
-    fl.l_pid = 0;
-
-    while (retries <= max_retries)
-    {
-        if (fcntl(fd, F_SETLK, &fl) == 0)
-        {
-            return TDB_LOCK_SUCCESS;
-        }
-
-        int err = errno;
-
-#if EWOULDBLOCK == EAGAIN
-        if (err == EWOULDBLOCK || err == EACCES)
 #else
-        if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES)
-#endif
-        {
-            return TDB_LOCK_HELD;
-        }
-        if (err == EINTR)
-        {
-            retries++;
-            continue;
-        }
-        return TDB_LOCK_ERROR;
-    }
-    return TDB_LOCK_ERROR;
-#else
-    /* use F_OFD_SETLK for per-fd locking (linux 3.15+) */
+    /* F_OFD_SETLK for per-fd locking (linux 3.15+) */
+    int retries = 0;
+    if (max_retries <= 0) max_retries = TDB_LOCK_DEFAULT_RETRIES;
+
     struct flock fl;
     fl.l_type = F_WRLCK;
     fl.l_whence = SEEK_SET;
@@ -277,26 +293,22 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
  */
 static inline int tdb_file_unlock(const int fd)
 {
-#if TDB_USE_FLOCK
+#if TDB_USE_OPEN_EXLOCK
+    /* macOS/BSD -- lock acquired via O_EXLOCK is released when fd is closed.
+     * flock(LOCK_UN) also works to release it explicitly. */
     if (flock(fd, LOCK_UN) != 0)
     {
         return -1;
     }
     return 0;
-#elif TDB_USE_FCNTL_SETLK
-    struct flock fl;
-    fl.l_type = F_UNLCK;
-    fl.l_whence = SEEK_SET;
-    fl.l_start = 0;
-    fl.l_len = 0;
-    fl.l_pid = 0;
-
-    if (fcntl(fd, F_SETLK, &fl) != 0)
+#elif TDB_USE_FLOCK
+    if (flock(fd, LOCK_UN) != 0)
     {
         return -1;
     }
     return 0;
 #else
+    /* linux with F_OFD_SETLK */
     struct flock fl;
     fl.l_type = F_UNLCK;
     fl.l_whence = SEEK_SET;
@@ -1626,7 +1638,7 @@ static inline size_t get_available_memory(void)
 
     mach_port = mach_host_self();
 
-    /* use 32-bit vm statistics on PPC regardless of OS version.
+    /* 32-bit vm statistics on PPC regardless of OS version.
      * host_statistics64 is not available on 10.5 and for PPC 32-bit even on 10.6 */
 #if defined(__ppc__) || (MAC_OS_X_VERSION_MIN_REQUIRED < 1060)
     /* PPC always uses 32-bit vm statistics */
@@ -2648,7 +2660,7 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
     if (!old_path || !new_path) return -1;
 
 #ifdef _WIN32
-    /* use MoveFileEx with MOVEFILE_REPLACE_EXISTING for atomic rename on Windows
+    /* MoveFileEx with MOVEFILE_REPLACE_EXISTING for atomic rename on Windows
      * this is truly atomic and replaces the target file if it exists */
     if (!MoveFileEx(old_path, new_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
     {

@@ -9546,16 +9546,28 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     char lock_path[TDB_MAX_PATH_LEN];
     snprintf(lock_path, sizeof(lock_path), "%s" PATH_SEPARATOR TDB_LOCK_FILE, (*db)->db_path);
 
-    (*db)->lock_fd = open(lock_path, O_RDWR | O_CREAT, 0644);
+    int lock_result;
+    (*db)->lock_fd = tdb_open_lock_file(lock_path, &lock_result);
     if ((*db)->lock_fd < 0)
     {
-        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to open lock file: %s", lock_path);
+        if (lock_result == TDB_LOCK_HELD)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "Database is locked by another process. Only one process can open a "
+                          "database directory at a time.");
+        }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to open lock file: %s", lock_path);
+        }
         free((*db)->db_path);
         free(*db);
-        return TDB_ERR_IO;
+        *db = NULL;
+        return (lock_result == TDB_LOCK_HELD) ? TDB_ERR_LOCKED : TDB_ERR_IO;
     }
 
-    int lock_result = tdb_file_lock_exclusive((*db)->lock_fd, TDB_LOCK_DEFAULT_RETRIES);
+    /* on systems without O_EXLOCK, acquire lock after open */
+    lock_result = tdb_file_lock_exclusive((*db)->lock_fd, TDB_LOCK_DEFAULT_RETRIES);
     if (lock_result != TDB_LOCK_SUCCESS)
     {
         if (lock_result == TDB_LOCK_HELD)

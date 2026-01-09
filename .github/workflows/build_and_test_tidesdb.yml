@@ -223,7 +223,7 @@ jobs:
       - name: Configure CMake (Linux/macOS x64)
         if: runner.os != 'Windows' && matrix.arch == 'x64'
         shell: bash
-        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON
+        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=ON
 
       - name: Configure CMake (Linux x86)
         if: runner.os == 'Linux' && matrix.arch == 'x86'
@@ -236,7 +236,8 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
             -DCMAKE_SHARED_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
             -DCMAKE_MODULE_LINKER_FLAGS="-m32 -L/usr/lib/i386-linux-gnu" \
-            -DTIDESDB_BUILD_TESTS=ON
+            -DTIDESDB_BUILD_TESTS=ON \
+            -DTIDESDB_WITH_SANITIZER=ON
 
       - name: Configure CMake (Linux PowerPC)
         if: runner.os == 'Linux' && matrix.arch == 'ppc'
@@ -289,19 +290,20 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="-m32" \
             -DCMAKE_SHARED_LINKER_FLAGS="-m32" \
             -DCMAKE_MODULE_LINKER_FLAGS="-m32" \
-            -DTIDESDB_BUILD_TESTS=ON
+            -DTIDESDB_BUILD_TESTS=ON \
+            -DTIDESDB_WITH_SANITIZER=ON
 
       - name: Configure CMake (Windows MSVC x64)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
         shell: pwsh
         run: |
-          cmake -S . -B build -A x64 -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -S . -B build -A x64 -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Configure CMake (Windows MSVC x86)
         if: matrix.compiler == 'msvc' && matrix.arch == 'x86'
         shell: pwsh
         run: |
-          cmake -S . -B build -A Win32 -DTIDESDB_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -S . -B build -A Win32 -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Configure CMake (Windows MinGW)
         if: matrix.compiler == 'mingw'
@@ -318,6 +320,7 @@ jobs:
                 -DCMAKE_C_FLAGS="-m32" `
                 -DCMAKE_SYSTEM_PROCESSOR=x86 `
                 -DTIDESDB_BUILD_TESTS=ON `
+                -DTIDESDB_WITH_SANITIZER=ON `
                 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
                 -DVCPKG_TARGET_TRIPLET=x86-windows
           } else {
@@ -330,6 +333,7 @@ jobs:
               Write-Host "Configuring for 64-bit MinGW build..."
               cmake -S . -B build -G "MinGW Makefiles" `
                 -DTIDESDB_BUILD_TESTS=ON `
+                -DTIDESDB_WITH_SANITIZER=ON `
                 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
                 -DVCPKG_TARGET_TRIPLET=x64-windows
           }

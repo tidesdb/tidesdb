@@ -132,18 +132,22 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_IMMUTABLE_FORCE_CLEANUP_MAX_WAIT 1000000 /* max 1 second wait per immutable */
 
 /* default L0/L1 management configuration */
-#define TDB_DEFAULT_L1_FILE_COUNT_TRIGGER    4
-#define TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD 10
+#define TDB_DEFAULT_L1_FILE_COUNT_TRIGGER 4
+#define TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD             \
+    20 /* increased from 10 - more headroom before stall \
+        */
 
-/* backpressure timing configuration */
+/* backpressure timing configuration
+ * tuned for high throughput with gradual slowdown rather than aggressive early delays
+ * RocksDB uses similar approach with level0_slowdown_writes_trigger at ~20 files */
 #define TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US  10000 /* 10ms between stall checks */
 #define TDB_BACKPRESSURE_STALL_MAX_ITERATIONS     1000  /* max 10 seconds stall */
-#define TDB_BACKPRESSURE_HIGH_DELAY_US            5000  /* 5ms for high pressure */
-#define TDB_BACKPRESSURE_MODERATE_DELAY_US        1000  /* 1ms for moderate pressure */
-#define TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO     0.6   /* 60% of stall threshold */
-#define TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO 0.3   /* 30% of stall threshold */
-#define TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER       3     /* 3x L1 trigger = high */
-#define TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER   2     /* 2x L1 trigger = moderate */
+#define TDB_BACKPRESSURE_HIGH_DELAY_US            2000  /* 2ms for high pressure (was 5ms) */
+#define TDB_BACKPRESSURE_MODERATE_DELAY_US        500   /* 0.5ms for moderate pressure (was 1ms) */
+#define TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO     0.8   /* 80% of stall threshold (was 60%) */
+#define TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO 0.5   /* 50% of stall threshold (was 30%) */
+#define TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER       4     /* 4x L1 trigger = high (was 3x) */
+#define TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER   3     /* 3x L1 trigger = moderate (was 2x) */
 
 /* time conversion constants for pthread_cond_timedwait */
 #define TDB_MICROSECONDS_PER_SECOND     1000000
@@ -1033,17 +1037,24 @@ static tidesdb_klog_block_t *tidesdb_cache_block_get(tidesdb_t *db, const char *
         tidesdb_block_cache_key(cf_name, klog_path, block_position, cache_key, sizeof(cache_key));
     if (key_len == 0) return NULL;
 
+    /* use zero-copy cache lookup to avoid malloc/memcpy/free overhead on every cache hit
+     * the cache entry holds ref_bit while we access the payload */
     size_t payload_len = 0;
-    void *payload = clock_cache_get(db->clock_cache, cache_key, key_len, &payload_len);
+    clock_cache_entry_t *cache_entry = NULL;
+    const void *payload =
+        clock_cache_get_zero_copy(db->clock_cache, cache_key, key_len, &payload_len, &cache_entry);
+
     if (!payload || payload_len != sizeof(tidesdb_ref_counted_block_t *))
     {
-        free(payload);
+        if (cache_entry) clock_cache_release(cache_entry);
         return NULL;
     }
 
     /* extract ref-counted block pointer */
-    tidesdb_ref_counted_block_t *rc_block = *(tidesdb_ref_counted_block_t **)payload;
-    free(payload);
+    tidesdb_ref_counted_block_t *rc_block = *(tidesdb_ref_counted_block_t *const *)payload;
+
+    /* release cache entry ref_bit now that we've read the pointer */
+    clock_cache_release(cache_entry);
 
     if (!rc_block || !rc_block->block) return NULL;
 
@@ -3594,12 +3605,17 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     /* we utilize block indexes to find starting klog block */
     uint64_t start_file_position = 0;
+    int used_block_index = 0;
     if (sst->block_indexes)
     {
         int index_result = compact_block_index_find_predecessor(sst->block_indexes, key, key_size,
                                                                 &start_file_position);
 
-        if (index_result != 0)
+        if (index_result == 0 && start_file_position > 0)
+        {
+            used_block_index = 1; /* block index found target block, enable early termination */
+        }
+        else
         {
             start_file_position = 0;
         }
@@ -3789,6 +3805,13 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         /* cleanup block resources before moving to next */
         if (block) block_manager_block_release(block);
+
+        /* early termination: if block index pointed us to a specific block and key wasn't found,
+         * stop searching since blocks are sorted and key cannot be in subsequent blocks */
+        if (used_block_index)
+        {
+            break;
+        }
 
         /* reset for next iteration */
         rc_block = NULL;
@@ -12150,13 +12173,10 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     found_any = 1;
                     PROFILE_INC(txn->db, sstable_hits);
 
-                    /* l1 hit -- stop immediately, no need to check deeper levels */
-                    if (level_num == 0)
-                    {
-                        tidesdb_sstable_unref(cf->db, sst);
-
-                        goto check_found_result;
-                    }
+                    /* for L0, stop immediately since we found the key
+                     * for L1+, SSTables are non-overlapping so also stop immediately */
+                    tidesdb_sstable_unref(cf->db, sst);
+                    goto check_found_result;
                 }
                 else
                 {
@@ -12165,13 +12185,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             }
 
             tidesdb_sstable_unref(cf->db, sst);
-        }
-
-        /* early termination -- if we found key in this level, stop searching deeper
-         * this is safe because newer versions are always in shallower levels */
-        if (found_any && level_num == 0)
-        {
-            break;
         }
     }
 
@@ -12864,7 +12877,10 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         skip_list_t *memtable = cf_skiplists[cf_idx];
 
-#define TXN_DEDUP_HASH_SIZE 1024
+        /* dynamically size dedup hash based on transaction size
+         * use 2x the number of ops to reduce collisions, minimum 1024 */
+        int dedup_hash_size = txn->num_ops * 2;
+        if (dedup_hash_size < 1024) dedup_hash_size = 1024;
 
         /**
          * dedup_entry_t
@@ -12879,7 +12895,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             int op_idx;
         } dedup_entry_t;
 
-        dedup_entry_t *dedup_hash = calloc(TXN_DEDUP_HASH_SIZE, sizeof(dedup_entry_t));
+        dedup_entry_t *dedup_hash = calloc(dedup_hash_size, sizeof(dedup_entry_t));
         if (!dedup_hash)
         {
             /* fallback is to write all ops without dedup (skip_list handles duplicates) */
@@ -12919,12 +12935,12 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                 {
                     hash = hash * 31 + op->key[b];
                 }
-                int slot = (int)(hash % TXN_DEDUP_HASH_SIZE);
+                int slot = (int)(hash % dedup_hash_size);
 
                 /* linear probing to find empty slot or matching key */
                 int inserted = 0;
                 int is_duplicate = 0;
-                for (int probe = 0; probe < TXN_DEDUP_HASH_SIZE; probe++)
+                for (int probe = 0; probe < dedup_hash_size; probe++)
                 {
                     if (dedup_hash[slot].key == NULL)
                     {
@@ -12942,7 +12958,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                         is_duplicate = 1;
                         break;
                     }
-                    slot = (slot + 1) % TXN_DEDUP_HASH_SIZE;
+                    slot = (slot + 1) % dedup_hash_size;
                 }
 
                 /* if hash table is full and key is not a duplicate, write directly to memtable
@@ -12970,7 +12986,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             }
 
             /* write deduplicated ops from hash table to memtable */
-            for (int slot = 0; slot < TXN_DEDUP_HASH_SIZE; slot++)
+            for (int slot = 0; slot < dedup_hash_size; slot++)
             {
                 if (dedup_hash[slot].key != NULL)
                 {
@@ -12997,7 +13013,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
             free(dedup_hash);
         }
-#undef TXN_DEDUP_HASH_SIZE
 
         /* we check if this CF needs flushing before releasing refcount
          * use the captured 'memtable' pointer (mt->skip_list) since mt wrapper may be freed

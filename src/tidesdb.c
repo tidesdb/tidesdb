@@ -8106,6 +8106,11 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
         return TDB_SUCCESS;
     }
 
+    /* we update cached_current_time to ensure TTL checks during compaction use fresh time
+     * this prevents race conditions where stale cached time causes expired keys to not be filtered
+     */
+    atomic_store(&cf->db->cached_current_time, time(NULL));
+
     /* we force flush memtable before compaction to ensure all data is in ssts
      * this prevents data loss where keys in memtable are not included in compaction */
     tidesdb_flush_memtable_internal(cf, 0, 1);
@@ -10946,6 +10951,9 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
             return TDB_SUCCESS;
         }
     }
+
+    /* we update cached_current_time to ensure TTL checks during flush use fresh time */
+    atomic_store(&cf->db->cached_current_time, time(NULL));
 
     tidesdb_memtable_t *old_mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
     skip_list_t *old_memtable = old_mt ? old_mt->skip_list : NULL;

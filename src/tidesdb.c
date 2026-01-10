@@ -13397,7 +13397,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     }
 
     tidesdb_merge_source_t *memtable_source =
-        tidesdb_merge_source_from_memtable(active_mt, &cf->config, NULL);
+        tidesdb_merge_source_from_memtable(active_mt, &cf->config, active_mt_struct);
     if (memtable_source && memtable_source->current_kv != NULL)
     {
         if (tidesdb_merge_heap_add_source((*iter)->heap, memtable_source) != TDB_SUCCESS)
@@ -13757,7 +13757,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
     skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
 
     tidesdb_merge_source_t *memtable_source =
-        tidesdb_merge_source_from_memtable(active_mt, &cf->config, NULL);
+        tidesdb_merge_source_from_memtable(active_mt, &cf->config, active_mt_struct);
     if (memtable_source)
     {
         if (tidesdb_merge_heap_add_source(iter->heap, memtable_source) != TDB_SUCCESS)
@@ -14317,7 +14317,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
     skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
 
     tidesdb_merge_source_t *memtable_source =
-        tidesdb_merge_source_from_memtable(active_mt, &cf->config, NULL);
+        tidesdb_merge_source_from_memtable(active_mt, &cf->config, active_mt_struct);
     if (memtable_source)
     {
         temp_sources[temp_count++] = memtable_source;

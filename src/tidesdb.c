@@ -13766,13 +13766,35 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
         }
     }
 
-    /* we add immutable memtable sources (recreate each time as immutables can change) */
+    /* we snapshot immutable memtables atomically to prevent race with cleanup loop
+     * the cleanup loop temporarily empties the queue, so we must take refs before iterating */
     size_t imm_count = atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
-    for (size_t i = 0; i < imm_count; i++)
+    tidesdb_immutable_memtable_t **imm_snapshot = NULL;
+    size_t imm_snapshot_count = 0;
+
+    if (imm_count > 0)
     {
-        tidesdb_immutable_memtable_t *imm =
-            (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
-        if (imm && imm->skip_list)
+        imm_snapshot = malloc(imm_count * sizeof(tidesdb_immutable_memtable_t *));
+        if (imm_snapshot)
+        {
+            for (size_t i = 0; i < imm_count; i++)
+            {
+                tidesdb_immutable_memtable_t *imm =
+                    (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
+                if (imm)
+                {
+                    tidesdb_immutable_memtable_ref(imm);
+                    imm_snapshot[imm_snapshot_count++] = imm;
+                }
+            }
+        }
+    }
+
+    /* now create sources from snapshot -- refs protect against concurrent cleanup */
+    for (size_t i = 0; i < imm_snapshot_count; i++)
+    {
+        tidesdb_immutable_memtable_t *imm = imm_snapshot[i];
+        if (imm->skip_list)
         {
             tidesdb_merge_source_t *source =
                 tidesdb_merge_source_from_memtable(imm->skip_list, &cf->config, imm);
@@ -13784,7 +13806,9 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
                 }
             }
         }
+        tidesdb_immutable_memtable_unref(imm);
     }
+    free(imm_snapshot);
 
     /* reuse cached sst sources instead of recreating them */
     for (int i = 0; i < iter->num_cached_sources; i++)
@@ -14299,13 +14323,35 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
         temp_sources[temp_count++] = memtable_source;
     }
 
-    /* we collect immutable memtable sources */
+    /* we snapshot immutable memtables atomically to prevent race with cleanup loop
+     * the cleanup loop temporarily empties the queue, so we must take refs before iterating */
     size_t imm_count = atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
-    for (size_t i = 0; i < imm_count; i++)
+    tidesdb_immutable_memtable_t **imm_snapshot = NULL;
+    size_t imm_snapshot_count = 0;
+
+    if (imm_count > 0)
     {
-        tidesdb_immutable_memtable_t *imm =
-            (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
-        if (imm && imm->skip_list)
+        imm_snapshot = malloc(imm_count * sizeof(tidesdb_immutable_memtable_t *));
+        if (imm_snapshot)
+        {
+            for (size_t i = 0; i < imm_count; i++)
+            {
+                tidesdb_immutable_memtable_t *imm =
+                    (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
+                if (imm)
+                {
+                    tidesdb_immutable_memtable_ref(imm);
+                    imm_snapshot[imm_snapshot_count++] = imm;
+                }
+            }
+        }
+    }
+
+    /* now create sources from snapshot -- refs protect against concurrent cleanup */
+    for (size_t i = 0; i < imm_snapshot_count; i++)
+    {
+        tidesdb_immutable_memtable_t *imm = imm_snapshot[i];
+        if (imm->skip_list)
         {
             tidesdb_merge_source_t *source =
                 tidesdb_merge_source_from_memtable(imm->skip_list, &cf->config, imm);
@@ -14321,6 +14367,9 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                         tidesdb_merge_source_free(source);
                         for (int j = 0; j < temp_count; j++)
                             tidesdb_merge_source_free(temp_sources[j]);
+                        for (size_t k = i; k < imm_snapshot_count; k++)
+                            tidesdb_immutable_memtable_unref(imm_snapshot[k]);
+                        free(imm_snapshot);
                         free(temp_sources);
                         return TDB_ERR_MEMORY;
                     }
@@ -14329,7 +14378,9 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                 temp_sources[temp_count++] = source;
             }
         }
+        tidesdb_immutable_memtable_unref(imm);
     }
+    free(imm_snapshot);
 
     for (int i = 0; i < iter->num_cached_sources; i++)
     {

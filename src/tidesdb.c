@@ -8361,9 +8361,9 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
         comparator_ctx = NULL;
     }
 
-    if (skip_list_new_with_comparator(memtable, cf->config.skip_list_max_level,
-                                      cf->config.skip_list_probability, comparator_fn,
-                                      comparator_ctx) != 0)
+    if (skip_list_new_with_comparator_and_cached_time(
+            memtable, cf->config.skip_list_max_level, cf->config.skip_list_probability,
+            comparator_fn, comparator_ctx, &cf->db->cached_current_time) != 0)
     {
         block_manager_close(wal);
         return TDB_ERR_MEMORY;
@@ -10497,9 +10497,9 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     cf->config.comparator_fn_cached = comparator_fn;
     cf->config.comparator_ctx_cached = comparator_ctx;
 
-    if (skip_list_new_with_comparator(&new_memtable, config->skip_list_max_level,
-                                      config->skip_list_probability, comparator_fn,
-                                      comparator_ctx) != 0)
+    if (skip_list_new_with_comparator_and_cached_time(
+            &new_memtable, config->skip_list_max_level, config->skip_list_probability,
+            comparator_fn, comparator_ctx, &db->cached_current_time) != 0)
     {
         free(cf->directory);
         free(cf->name);
@@ -10996,9 +10996,9 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     }
 
     skip_list_t *new_memtable;
-    if (skip_list_new_with_comparator(&new_memtable, cf->config.skip_list_max_level,
-                                      cf->config.skip_list_probability, comparator_fn,
-                                      comparator_ctx) != 0)
+    if (skip_list_new_with_comparator_and_cached_time(
+            &new_memtable, cf->config.skip_list_max_level, cf->config.skip_list_probability,
+            comparator_fn, comparator_ctx, &cf->db->cached_current_time) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to create new memtable", cf->name);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);

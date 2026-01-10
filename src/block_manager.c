@@ -489,7 +489,7 @@ int block_manager_cursor_has_prev(block_manager_cursor_t *cursor)
 
 /**
  * block_manager_read_block_at_offset
- * reads a block at a specific offset, checking cache first
+ * reads a block at a specific offset
  * @param bm the block manager
  * @param offset the offset to read from
  * @return the block if successful, NULL otherwise
@@ -499,22 +499,27 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 {
     if (!bm) return NULL;
 
-    /* read block header, [size(4)][checksum(4)] */
-    unsigned char header_buf[BLOCK_MANAGER_BLOCK_HEADER_SIZE];
-    if (pread(bm->fd, header_buf, sizeof(header_buf), (off_t)offset) != sizeof(header_buf))
-        return NULL;
+/* we use stack buffer for small blocks to read header+data in one syscall
+ * for blocks <= 64KB -- header size, we read everything in one pread
+ * for larger blocks, we fall back to two-syscall approach */
+#define READ_STACK_BUF_SIZE 65536
+    unsigned char stack_buf[READ_STACK_BUF_SIZE];
 
-    uint32_t block_size = decode_uint32_le_compat(header_buf);
+    /* first pread -- try to get header + data in one syscall */
+    const ssize_t initial_read = pread(bm->fd, stack_buf, READ_STACK_BUF_SIZE, (off_t)offset);
+    if (initial_read < (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE) return NULL;
+
+    const uint32_t block_size = decode_uint32_le_compat(stack_buf);
     if (block_size == 0) return NULL;
 
-    uint32_t stored_checksum = decode_uint32_le_compat(header_buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);
+    const uint32_t stored_checksum =
+        decode_uint32_le_compat(stack_buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);
 
-    /* allocate block structure */
     block_manager_block_t *block = malloc(sizeof(block_manager_block_t));
     if (!block) return NULL;
 
     block->size = block_size;
-    atomic_init(&block->ref_count, 1); /* initial reference for caller */
+    atomic_init(&block->ref_count, 1);
     block->data = malloc(block_size);
     if (!block->data)
     {
@@ -522,16 +527,34 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         return NULL;
     }
 
-    /* read block data */
-    off_t data_pos = (off_t)offset + (off_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE;
-    if (pread(bm->fd, block->data, block_size, data_pos) != (ssize_t)block_size)
+    /* we check if we already have all the data from initial read */
+    const size_t total_needed = BLOCK_MANAGER_BLOCK_HEADER_SIZE + block_size;
+    if ((size_t)initial_read >= total_needed)
     {
-        free(block->data);
-        free(block);
-        return NULL;
+        /* single syscall path: copy data from stack buffer */
+        memcpy(block->data, stack_buf + BLOCK_MANAGER_BLOCK_HEADER_SIZE, block_size);
+    }
+    else
+    {
+        /* large block -- need second read for remaining data */
+        const size_t already_have = (size_t)initial_read - BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+        if (already_have > 0)
+        {
+            memcpy(block->data, stack_buf + BLOCK_MANAGER_BLOCK_HEADER_SIZE, already_have);
+        }
+
+        /* we read remaining data */
+        const size_t remaining = block_size - already_have;
+        const off_t remaining_offset = (off_t)offset + (off_t)initial_read;
+        if (pread(bm->fd, (uint8_t *)block->data + already_have, remaining, remaining_offset) !=
+            (ssize_t)remaining)
+        {
+            free(block->data);
+            free(block);
+            return NULL;
+        }
     }
 
-    /* verify checksum */
     if (verify_checksum(block->data, block_size, stored_checksum) != 0)
     {
         free(block->data);
@@ -540,6 +563,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     }
 
     return block;
+#undef READ_STACK_BUF_SIZE
 }
 
 block_manager_block_t *block_manager_cursor_read(block_manager_cursor_t *cursor)

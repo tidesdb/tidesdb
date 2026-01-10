@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MANIFEST_TMP_EXT ".tmp."
+
 /**
  * tidesdb_manifest_add_sstable_unlocked
  * adds an sstable to the manifest
@@ -68,7 +70,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     }
 
     /* we clean up orphaned temp files from incomplete commits
-     * temp files are named -- <path>.tmp.<thread_id>.<pid>
+     * temp files are named -- <path>MANIFEST_TMP_EXT<thread_id>.<pid>
      * if main manifest exists, temp files are stale and can be removed */
     char dir_path[MANIFEST_PATH_LEN];
     const char *last_sep = strrchr(path, PATH_SEPARATOR[0]);
@@ -101,10 +103,10 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL)
         {
-            /* check if filename matches pattern: <base_name>.tmp.* */
+            /* check if filename matches pattern: <base_name>MANIFEST_TMP_EXT* */
             size_t entry_len = strlen(entry->d_name);
             if (entry_len > base_len + 5 && strncmp(entry->d_name, base_name, base_len) == 0 &&
-                strncmp(entry->d_name + base_len, ".tmp.", 5) == 0)
+                strncmp(entry->d_name + base_len, MANIFEST_TMP_EXT, 5) == 0)
             {
                 /* found orphaned temp file, remove it */
                 char temp_full_path[MANIFEST_PATH_LEN];
@@ -343,8 +345,8 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     }
 
     char temp_path[MANIFEST_PATH_LEN];
-    snprintf(temp_path, sizeof(temp_path), "%s.tmp.%lu.%d", path, (unsigned long)TDB_THREAD_ID(),
-             TDB_GETPID());
+    snprintf(temp_path, sizeof(temp_path), "%s" MANIFEST_TMP_EXT "%lu.%d", path,
+             (unsigned long)TDB_THREAD_ID(), TDB_GETPID());
 
     FILE *fp = tdb_fopen(temp_path, "w");
     if (!fp)
@@ -373,7 +375,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
         return -1;
     }
 
-    int fd = tdb_fileno(fp);
+    const int fd = tdb_fileno(fp);
     if (fd >= 0)
     {
         if (tdb_fsync(fd) != 0)
@@ -417,8 +419,6 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
         wait_count++;
     }
 
-    /* acquire write lock to ensure no operations are in progress
-     * this prevents destroying the lock while another thread holds it */
     pthread_rwlock_wrlock(&manifest->lock);
 
     if (manifest->fp)

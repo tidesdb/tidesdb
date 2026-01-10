@@ -124,6 +124,7 @@ struct skip_list_node_t
  * @param entry_count track entry count atomically to avoid O(n) traversals
  * @param comparator key comparison function
  * @param comparator_ctx context for comparator
+ * @param cached_time pointer to external cached time (NULL = use time(NULL))
  */
 typedef struct skip_list_t
 {
@@ -136,6 +137,7 @@ typedef struct skip_list_t
     _Atomic(int) entry_count;
     skip_list_comparator_fn comparator;
     void *comparator_ctx;
+    _Atomic(time_t) *cached_time;
 } skip_list_t;
 
 /**
@@ -235,6 +237,23 @@ int skip_list_new(skip_list_t **list, int max_level, float probability);
  */
 int skip_list_new_with_comparator(skip_list_t **list, int max_level, float probability,
                                   skip_list_comparator_fn comparator, void *comparator_ctx);
+
+/**
+ * skip_list_new_with_comparator_and_cached_time
+ * creates a new skip list with custom comparator and cached time pointer
+ * @param list pointer to skip list pointer
+ * @param max_level maximum level
+ * @param probability probability for level generation
+ * @param comparator custom key comparison function
+ * @param comparator_ctx context for comparator
+ * @param cached_time pointer to external cached time (avoids time() syscalls)
+ * @return 0 on success, -1 on failure
+ */
+int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, int max_level,
+                                                  float probability,
+                                                  skip_list_comparator_fn comparator,
+                                                  void *comparator_ctx,
+                                                  _Atomic(time_t) *cached_time);
 
 /**
  * skip_list_random_level

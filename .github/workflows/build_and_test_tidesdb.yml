@@ -50,6 +50,10 @@ jobs:
             arch: ppc-macos
             compiler: gcc-powerpc
             target_os: macos
+          - os: ubuntu-latest
+            name: Linux RISC-V 64-bit
+            arch: riscv64
+            compiler: gcc-riscv64
 
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
@@ -84,11 +88,9 @@ jobs:
             build-essential cmake pkg-config \
             git wget
 
-          # Build dependencies from source for PowerPC
           mkdir -p /tmp/ppc-deps
           cd /tmp/ppc-deps
 
-          # Build LZ4
           wget https://github.com/lz4/lz4/archive/refs/tags/v1.9.4.tar.gz -O lz4.tar.gz
           tar xzf lz4.tar.gz
           cd lz4-1.9.4
@@ -96,7 +98,6 @@ jobs:
           sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
           cd ..
 
-          # Build Zstandard
           wget https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-1.5.5.tar.gz
           tar xzf zstd-1.5.5.tar.gz
           cd zstd-1.5.5
@@ -104,7 +105,6 @@ jobs:
           sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
           cd ..
 
-          # Build Snappy
           wget https://github.com/google/snappy/archive/refs/tags/1.1.10.tar.gz -O snappy.tar.gz
           tar xzf snappy.tar.gz
           cd snappy-1.1.10
@@ -114,6 +114,49 @@ jobs:
             -DCMAKE_C_COMPILER=powerpc-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=powerpc-linux-gnu-g++ \
             -DCMAKE_INSTALL_PREFIX=/usr/powerpc-linux-gnu \
+            -DSNAPPY_BUILD_TESTS=OFF \
+            -DSNAPPY_BUILD_BENCHMARKS=OFF
+          cmake --build build
+          sudo cmake --install build
+
+      - name: Install dependencies (Linux RISC-V 64-bit)
+        if: runner.os == 'Linux' && matrix.arch == 'riscv64'
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            crossbuild-essential-riscv64 \
+            gcc-riscv64-linux-gnu \
+            g++-riscv64-linux-gnu \
+            qemu-user-static \
+            build-essential cmake pkg-config \
+            git wget
+
+          mkdir -p /tmp/riscv64-deps
+          cd /tmp/riscv64-deps
+
+          wget https://github.com/lz4/lz4/archive/refs/tags/v1.9.4.tar.gz -O lz4.tar.gz
+          tar xzf lz4.tar.gz
+          cd lz4-1.9.4
+          make CC=riscv64-linux-gnu-gcc lib
+          sudo make CC=riscv64-linux-gnu-gcc PREFIX=/usr/riscv64-linux-gnu install
+          cd ..
+
+          wget https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-1.5.5.tar.gz
+          tar xzf zstd-1.5.5.tar.gz
+          cd zstd-1.5.5
+          make CC=riscv64-linux-gnu-gcc lib
+          sudo make CC=riscv64-linux-gnu-gcc PREFIX=/usr/riscv64-linux-gnu install
+          cd ..
+
+          wget https://github.com/google/snappy/archive/refs/tags/1.1.10.tar.gz -O snappy.tar.gz
+          tar xzf snappy.tar.gz
+          cd snappy-1.1.10
+          cmake -S . -B build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=riscv64 \
+            -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++ \
+            -DCMAKE_INSTALL_PREFIX=/usr/riscv64-linux-gnu \
             -DSNAPPY_BUILD_TESTS=OFF \
             -DSNAPPY_BUILD_BENCHMARKS=OFF
           cmake --build build
@@ -131,11 +174,9 @@ jobs:
             build-essential cmake pkg-config \
             git wget
 
-          # Build dependencies from source for PowerPC
           mkdir -p /tmp/ppc-deps
           cd /tmp/ppc-deps
 
-          # Build LZ4
           wget https://github.com/lz4/lz4/archive/refs/tags/v1.9.4.tar.gz -O lz4.tar.gz
           tar xzf lz4.tar.gz
           cd lz4-1.9.4
@@ -143,7 +184,6 @@ jobs:
           sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
           cd ..
 
-          # Build Zstandard
           wget https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-1.5.5.tar.gz
           tar xzf zstd-1.5.5.tar.gz
           cd zstd-1.5.5
@@ -151,7 +191,6 @@ jobs:
           sudo make CC=powerpc-linux-gnu-gcc PREFIX=/usr/powerpc-linux-gnu install
           cd ..
 
-          # Build Snappy
           wget https://github.com/google/snappy/archive/refs/tags/1.1.10.tar.gz -O snappy.tar.gz
           tar xzf snappy.tar.gz
           cd snappy-1.1.10
@@ -259,6 +298,26 @@ jobs:
             -DTIDESDB_BUILD_TESTS=ON \
             -DTIDESDB_WITH_SANITIZER=ON
 
+      - name: Configure CMake (Linux RISC-V 64-bit)
+        if: runner.os == 'Linux' && matrix.arch == 'riscv64'
+        shell: bash
+        run: |
+          export PKG_CONFIG_PATH=/usr/riscv64-linux-gnu/lib/pkgconfig
+          cmake -S . -B build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=riscv64 \
+            -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++ \
+            -DCMAKE_FIND_ROOT_PATH=/usr/riscv64-linux-gnu \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DCMAKE_EXE_LINKER_FLAGS="-L/usr/riscv64-linux-gnu/lib -L/usr/lib/riscv64-linux-gnu" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/riscv64-linux-gnu/lib -L/usr/lib/riscv64-linux-gnu" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-L/usr/riscv64-linux-gnu/lib -L/usr/lib/riscv64-linux-gnu" \
+            -DTIDESDB_BUILD_TESTS=ON \
+            -DTIDESDB_WITH_SANITIZER=OFF
+
       - name: Configure CMake (macOS PowerPC cross-compile)
         if: runner.os == 'Linux' && matrix.arch == 'ppc-macos'
         shell: bash
@@ -351,6 +410,9 @@ jobs:
           elif [ "${{ matrix.arch }}" == "ppc-macos" ]; then
             CTEST_OUTPUT_ON_FAILURE=1 qemu-ppc-static -L /usr/powerpc-linux-gnu ./tidesdb_tests || true
             echo "**macOS PowerPC (G5) cross-compiled binary run via QEMU emulation"
+          elif [ "${{ matrix.arch }}" == "riscv64" ]; then
+            CTEST_OUTPUT_ON_FAILURE=1 qemu-riscv64-static -L /usr/riscv64-linux-gnu ./tidesdb_tests || true
+            echo "**Linux RISC-V 64-bit tests run via QEMU emulation"
           else
             ctest -V --output-on-failure --timeout 1800 --build-config Release
           fi

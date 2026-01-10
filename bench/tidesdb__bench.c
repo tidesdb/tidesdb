@@ -56,7 +56,7 @@ typedef struct
  * @param size size of buffer
  * @param index index of key
  */
-void generate_sequential_key(uint8_t *buffer, size_t size, int index)
+void generate_sequential_key(uint8_t *buffer, const size_t size, const int index)
 {
     /* use a format that fits in the buffer size */
     snprintf((char *)buffer, size, "k%06d", index);
@@ -68,7 +68,7 @@ void generate_sequential_key(uint8_t *buffer, size_t size, int index)
  * @param buffer buffer to store key
  * @param size size of buffer
  */
-void generate_random_key(uint8_t *buffer, size_t size)
+void generate_random_key(uint8_t *buffer, const size_t size)
 {
     const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     for (size_t i = 0; i < size - 1; i++)
@@ -85,9 +85,9 @@ void generate_random_key(uint8_t *buffer, size_t size)
  * @param max_value maximum value
  * @return zipfian-distributed number
  */
-int zipfian_next(int max_value)
+int zipfian_next(const int max_value)
 {
-    double random = (double)rand() / RAND_MAX;
+    const double random = (double)rand() / RAND_MAX;
 
     /* simple zipfian approximation */
     if (random < 0.8)
@@ -111,7 +111,7 @@ int zipfian_next(int max_value)
  * @param size size of buffer
  * @param operation_index the operation index (used to generate deterministic key)
  */
-void generate_zipfian_key(uint8_t *buffer, size_t size, int operation_index)
+void generate_zipfian_key(uint8_t *buffer, const size_t size, const int operation_index)
 {
     /** we use operation index directly to ensure deterministic key generation
      * format: k%010d fits in 16 bytes (k + 10 digits + null = 12 bytes) */
@@ -124,7 +124,7 @@ void generate_zipfian_key(uint8_t *buffer, size_t size, int operation_index)
  * @param buffer buffer to store string
  * @param size size of buffer
  */
-void generate_random_string(uint8_t *buffer, size_t size)
+void generate_random_string(uint8_t *buffer, const size_t size)
 {
     const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     for (size_t i = 0; i < size - 1; i++)
@@ -142,7 +142,7 @@ void generate_random_string(uint8_t *buffer, size_t size)
  * @param size size of buffer
  * @param index index to generate value for
  */
-void generate_deterministic_value(uint8_t *buffer, size_t size, int index)
+void generate_deterministic_value(uint8_t *buffer, const size_t size, const int index)
 {
     /* create a deterministic pattern: "val_XXXX" where XXXX is the index */
     snprintf((char *)buffer, size, "val_%04d", index);

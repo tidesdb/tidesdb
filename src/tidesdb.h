@@ -348,14 +348,14 @@ struct tidesdb_memtable_t
 
 /**
  * tidesdb_column_family_t
- * a column family is independent key-value storage
+ * a column family is an independent key-value storage with its own config, memtables, WALs, etc.
  * @param name name of column family
  * @param directory directory for column family
  * @param config column family configuration
  * @param active_memtable active memtable (paired skip list and WAL)
  * @param immutable_memtables queue of immutable memtables being flushed
  * @param pending_commits count of in-flight commits
- * @param active_txn_buffer buffer of active transactions for ssi conflict detection
+ * @param active_txn_buffer buffer of active transactions for SSI conflict detection
  * @param levels fixed array of disk levels
  * @param num_active_levels number of currently active disk levels
  * @param next_sstable_id next sstable id

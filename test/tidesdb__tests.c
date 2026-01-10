@@ -11223,6 +11223,477 @@ static void test_database_lock_multi_process(void)
 }
 #endif
 
+static void test_ttl_expiration_after_reopen(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    cf_config.compression_algorithm = NO_COMPRESSION;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "ttl_reopen_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ttl_reopen_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    time_t now = time(NULL);
+    const int num_keys = 100;
+
+    /* we write many keys with short TTL (2 seconds) */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "ttl_reopen_key_%04d", i);
+        snprintf(value, sizeof(value), "ttl_reopen_value_%04d", i);
+
+        time_t ttl = now + 2; /* expires in 2 seconds */
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, ttl),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    /*** we now verify keys are accessible before expiration */
+    tidesdb_txn_t *verify_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &verify_txn), TDB_SUCCESS);
+
+    int accessible_before = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "ttl_reopen_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        if (tidesdb_txn_get(verify_txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size) ==
+            TDB_SUCCESS)
+        {
+            accessible_before++;
+            free(value);
+        }
+    }
+    tidesdb_txn_free(verify_txn);
+    ASSERT_EQ(accessible_before, num_keys);
+
+    /** we take a nap and wait for TTL to expire */
+    sleep(3);
+
+    /* we close database -- this triggers flush and potentially compaction */
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    cf = tidesdb_get_column_family(db, "ttl_reopen_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* we now verify all keys are now inaccessible (expired) */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    int expired_count = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "ttl_reopen_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        if (result != TDB_SUCCESS || value == NULL)
+        {
+            expired_count++;
+        }
+        else
+        {
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+
+    /*** all keys should be expired/inaccessible */
+    ASSERT_EQ(expired_count, num_keys);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_ttl_expiration_with_deletes_after_reopen(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    cf_config.compression_algorithm = NO_COMPRESSION;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "ttl_delete_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ttl_delete_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    time_t now = time(NULL);
+    const int num_keys = 100;
+
+    /* we write many keys with short TTL (2 seconds) */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "ttl_delete_key_%04d", i);
+        snprintf(value, sizeof(value), "ttl_delete_value_%04d", i);
+
+        time_t ttl = now + 2; /* expires in 2 seconds */
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, ttl),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    /* we now delete all keys explicitly */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32];
+        snprintf(key, sizeof(key), "ttl_delete_key_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    /* we close database -- this triggers flush */
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    /* we reopen database */
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    cf = tidesdb_get_column_family(db, "ttl_delete_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* we verify all keys are now inaccessible (deleted) */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    int deleted_count = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "ttl_delete_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        if (result != TDB_SUCCESS || value == NULL)
+        {
+            deleted_count++;
+        }
+        else
+        {
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+
+    /* all keys should be deleted/inaccessible */
+    ASSERT_EQ(deleted_count, num_keys);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_ttl_expiration_range_delete_after_reopen(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    cf_config.compression_algorithm = NO_COMPRESSION;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "ttl_range_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ttl_range_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    time_t now = time(NULL);
+    const int num_keys = 100;
+    const int delete_start = 25;
+    const int delete_end = 75;
+
+    /* we write many keys with long TTL (1 hour) */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "ttl_range_key_%04d", i);
+        snprintf(value, sizeof(value), "ttl_range_value_%04d", i);
+
+        time_t ttl = now + 3600; /* expires in 1 hour */
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, ttl),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    /* we delete only a range of keys [delete_start, delete_end) */
+    for (int i = delete_start; i < delete_end; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32];
+        snprintf(key, sizeof(key), "ttl_range_key_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    /* we close database -- this triggers flush */
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    /* we reopen database */
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    cf = tidesdb_get_column_family(db, "ttl_range_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* we verify deleted range is inaccessible, others remain */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    int deleted_count = 0;
+    int accessible_count = 0;
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "ttl_range_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        if (result != TDB_SUCCESS || value == NULL)
+        {
+            deleted_count++;
+            /* we verify this key was in the deleted range */
+            ASSERT_TRUE(i >= delete_start && i < delete_end);
+        }
+        else
+        {
+            accessible_count++;
+            /* we verify this key was outside the deleted range */
+            ASSERT_TRUE(i < delete_start || i >= delete_end);
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+
+    /* we verify counts match expected */
+    ASSERT_EQ(deleted_count, delete_end - delete_start);
+    ASSERT_EQ(accessible_count, num_keys - (delete_end - delete_start));
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_many_sstables_low_max_open_reaper_eviction(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.max_open_sstables = 5; /* very low limit to force reaper eviction */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 2048; /* small buffer to trigger frequent flushes */
+    cf_config.compression_algorithm = NO_COMPRESSION;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "reaper_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "reaper_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_sstables = 20; /* more than max_open_sstables to force eviction */
+    const int keys_per_sstable = 30;
+    const int total_keys = num_sstables * keys_per_sstable;
+
+    /* we write keys and flush to create many sstables exceeding max_open limit */
+    for (int i = 0; i < total_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "reaper_key_%06d", i);
+        snprintf(value, sizeof(value), "reaper_value_%06d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+
+        /* we flush periodically to create sstables */
+        if ((i + 1) % keys_per_sstable == 0)
+        {
+            tidesdb_flush_memtable(cf);
+            usleep(50000); /* give time for flush and reaper to run */
+        }
+    }
+
+    /* we wait for all flushes to complete */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(20000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+    usleep(200000); /* extra time for reaper to evict sstables */
+
+    /** we now verify all keys are still accessible even after reaper eviction
+     * this tests the system's ability to reopen evicted sstable files */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    int success_count = 0;
+    int fail_count = 0;
+
+    for (int i = 0; i < total_keys; i++)
+    {
+        char key[32], expected[64];
+        snprintf(key, sizeof(key), "reaper_key_%06d", i);
+        snprintf(expected, sizeof(expected), "reaper_value_%06d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        if (result == TDB_SUCCESS && value != NULL)
+        {
+            ASSERT_EQ(strcmp((char *)value, expected), 0);
+            success_count++;
+            free(value);
+        }
+        else
+        {
+            fail_count++;
+        }
+    }
+
+    tidesdb_txn_free(txn);
+
+    /* all keys should be accessible * * */
+    ASSERT_EQ(success_count, total_keys);
+    ASSERT_EQ(fail_count, 0);
+
+    /* we now test iteration across evicted sstables */
+    tidesdb_txn_t *iter_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &iter_txn), TDB_SUCCESS);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(iter_txn, cf, &iter), TDB_SUCCESS);
+    ASSERT_TRUE(iter != NULL);
+
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), TDB_SUCCESS);
+
+    int iter_count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        iter_count++;
+        if (tidesdb_iter_next(iter) != TDB_SUCCESS) break;
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(iter_txn);
+
+    /* we should be able to iterate all keys */
+    ASSERT_EQ(iter_count, total_keys);
+
+    /* we close and reopen to test persistence after eviction cycles */
+    ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    cf = tidesdb_get_column_family(db, "reaper_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* we verify all keys still accessible after reopen */
+    tidesdb_txn_t *reopen_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &reopen_txn), TDB_SUCCESS);
+
+    int reopen_success = 0;
+    for (int i = 0; i < total_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "reaper_key_%06d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        if (tidesdb_txn_get(reopen_txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size) ==
+            TDB_SUCCESS)
+        {
+            reopen_success++;
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(reopen_txn);
+    ASSERT_EQ(reopen_success, total_keys);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -11401,6 +11872,10 @@ int main(void)
 #ifndef _WIN32
     RUN_TEST(test_database_lock_multi_process, tests_passed);
 #endif
+    RUN_TEST(test_ttl_expiration_after_reopen, tests_passed);
+    RUN_TEST(test_ttl_expiration_with_deletes_after_reopen, tests_passed);
+    RUN_TEST(test_ttl_expiration_range_delete_after_reopen, tests_passed);
+    RUN_TEST(test_many_sstables_low_max_open_reaper_eviction, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

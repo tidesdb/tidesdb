@@ -132,9 +132,8 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_IMMUTABLE_FORCE_CLEANUP_MAX_WAIT 1000000 /* max 1 second wait per immutable */
 
 /* default L0/L1 management configuration */
-#define TDB_DEFAULT_L1_FILE_COUNT_TRIGGER 4
-#define TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD             \
-    20
+#define TDB_DEFAULT_L1_FILE_COUNT_TRIGGER    4
+#define TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD 20
 
 /* backpressure timing configuration
  * */
@@ -7130,7 +7129,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         block_manager_get_size(klog_bm, &new_sst->klog_size);
         block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
-        /* we keep block managers open for immediate reads, reaper will close if needed once it's evicted */
+        /* we keep block managers open for immediate reads, reaper will close if needed once it's
+         * evicted */
         new_sst->klog_bm = klog_bm;
         new_sst->vlog_bm = vlog_bm;
         atomic_store(&new_sst->last_access_time,

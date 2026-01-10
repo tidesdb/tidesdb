@@ -202,6 +202,28 @@ typedef struct tidesdb_stats_t
     tidesdb_column_family_config_t *config;
 } tidesdb_stats_t;
 
+/**
+ * tidesdb_cache_stats_t
+ * statistics for database block cache
+ * @param enabled whether block cache is enabled
+ * @param total_entries total number of cached entries
+ * @param total_bytes total bytes used by cache
+ * @param hits cache hits
+ * @param misses cache misses
+ * @param hit_rate hit rate (hits / (hits + misses))
+ * @param num_partitions number of cache partitions
+ */
+typedef struct tidesdb_cache_stats_t
+{
+    int enabled;
+    size_t total_entries;
+    size_t total_bytes;
+    uint64_t hits;
+    uint64_t misses;
+    double hit_rate;
+    size_t num_partitions;
+} tidesdb_cache_stats_t;
+
 /**** system default configuration functions */
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void);
 tidesdb_config_t tidesdb_default_config(void);
@@ -284,5 +306,6 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
 /**** statistics operations */
 int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats);
 void tidesdb_free_stats(tidesdb_stats_t *stats);
+int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
 
 #endif /* __TIDESDB_DB_H__ */

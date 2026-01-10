@@ -688,6 +688,28 @@ struct tidesdb_stats_t
 };
 
 /**
+ * tidesdb_cache_stats_t
+ * statistics for database block cache
+ * @param enabled whether block cache is enabled
+ * @param total_entries total number of cached entries
+ * @param total_bytes total bytes used by cache
+ * @param hits cache hits
+ * @param misses cache misses
+ * @param hit_rate hit rate (hits / (hits + misses))
+ * @param num_partitions number of cache partitions
+ */
+typedef struct tidesdb_cache_stats_t
+{
+    int enabled;
+    size_t total_entries;
+    size_t total_bytes;
+    uint64_t hits;
+    uint64_t misses;
+    double hit_rate;
+    size_t num_partitions;
+} tidesdb_cache_stats_t;
+
+/**
  * tidesdb_default_column_family_config
  * @return default configuration for column family
  */
@@ -1162,5 +1184,15 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats);
  * @param stats statistics
  */
 void tidesdb_free_stats(tidesdb_stats_t *stats);
+
+/**
+ * tidesdb_get_cache_stats
+ * gets block cache statistics for the database
+ * @param db database handle
+ * @param stats output parameter for cache statistics
+ * @return 0 on success, -n on failure
+ * @note if block cache is disabled, stats->enabled will be 0 and other fields will be zero
+ */
+int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
 
 #endif /* __TIDESDB_H__ */

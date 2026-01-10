@@ -13397,7 +13397,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     }
 
     tidesdb_merge_source_t *memtable_source =
-        tidesdb_merge_source_from_memtable(active_mt, &cf->config, NULL);
+        tidesdb_merge_source_from_memtable(active_mt, &cf->config, active_mt_struct);
     if (memtable_source && memtable_source->current_kv != NULL)
     {
         if (tidesdb_merge_heap_add_source((*iter)->heap, memtable_source) != TDB_SUCCESS)
@@ -13757,7 +13757,7 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, size_t key_size)
     skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
 
     tidesdb_merge_source_t *memtable_source =
-        tidesdb_merge_source_from_memtable(active_mt, &cf->config, NULL);
+        tidesdb_merge_source_from_memtable(active_mt, &cf->config, active_mt_struct);
     if (memtable_source)
     {
         if (tidesdb_merge_heap_add_source(iter->heap, memtable_source) != TDB_SUCCESS)
@@ -14317,7 +14317,7 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
     skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
 
     tidesdb_merge_source_t *memtable_source =
-        tidesdb_merge_source_from_memtable(active_mt, &cf->config, NULL);
+        tidesdb_merge_source_from_memtable(active_mt, &cf->config, active_mt_struct);
     if (memtable_source)
     {
         temp_sources[temp_count++] = memtable_source;
@@ -15829,14 +15829,19 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
 
     (*stats)->level_sizes = malloc((*stats)->num_levels * sizeof(size_t));
     (*stats)->level_num_sstables = malloc((*stats)->num_levels * sizeof(int));
+    (*stats)->config = malloc(sizeof(tidesdb_column_family_config_t));
 
-    if (!(*stats)->level_sizes || !(*stats)->level_num_sstables)
+    if (!(*stats)->level_sizes || !(*stats)->level_num_sstables || !(*stats)->config)
     {
         free((*stats)->level_sizes);
         free((*stats)->level_num_sstables);
+        free((*stats)->config);
         free(*stats);
         return TDB_ERR_MEMORY;
     }
+
+    /* copy column family configuration */
+    memcpy((*stats)->config, &cf->config, sizeof(tidesdb_column_family_config_t));
     for (int i = 0; i < (*stats)->num_levels; i++)
     {
         (*stats)->level_sizes[i] = atomic_load(&cf->levels[i]->current_size);
@@ -15852,7 +15857,35 @@ void tidesdb_free_stats(tidesdb_stats_t *stats)
     if (!stats) return;
     free(stats->level_sizes);
     free(stats->level_num_sstables);
+    free(stats->config);
     free(stats);
+}
+
+int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats)
+{
+    if (!db || !stats) return TDB_ERR_INVALID_ARGS;
+
+    memset(stats, 0, sizeof(tidesdb_cache_stats_t));
+
+    if (!db->clock_cache)
+    {
+        stats->enabled = 0;
+        return TDB_SUCCESS;
+    }
+
+    stats->enabled = 1;
+
+    clock_cache_stats_t cache_stats;
+    clock_cache_get_stats(db->clock_cache, &cache_stats);
+
+    stats->total_entries = cache_stats.total_entries;
+    stats->total_bytes = cache_stats.total_bytes;
+    stats->hits = cache_stats.hits;
+    stats->misses = cache_stats.misses;
+    stats->hit_rate = cache_stats.hit_rate;
+    stats->num_partitions = cache_stats.num_partitions;
+
+    return TDB_SUCCESS;
 }
 
 /**

@@ -2439,7 +2439,9 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
     {
         block_manager_t *new_klog_bm = NULL;
         if (block_manager_open(&new_klog_bm, sst->klog_path,
-                               convert_sync_mode(sst->config->sync_mode)) != 0)
+                               convert_sync_mode(sst->config->sync_mode == TDB_SYNC_INTERVAL
+                                                     ? TDB_SYNC_FULL
+                                                     : sst->config->sync_mode)) != 0)
         {
             return -1;
         }
@@ -5798,8 +5800,10 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     block_manager_t *klog_bm = NULL;
     block_manager_t *vlog_bm = NULL;
 
-    if (block_manager_open(&klog_bm, new_sst->klog_path, convert_sync_mode(cf->config.sync_mode)) !=
-        0)
+    if (block_manager_open(&klog_bm, new_sst->klog_path,
+                           convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                 ? TDB_SYNC_FULL
+                                                 : cf->config.sync_mode)) != 0)
     {
         tidesdb_sstable_unref(cf->db, new_sst);
         tidesdb_merge_heap_free(heap);
@@ -5818,8 +5822,10 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         return TDB_ERR_IO;
     }
 
-    if (block_manager_open(&vlog_bm, new_sst->vlog_path, convert_sync_mode(cf->config.sync_mode)) !=
-        0)
+    if (block_manager_open(&vlog_bm, new_sst->vlog_path,
+                           convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                 ? TDB_SYNC_FULL
+                                                 : cf->config.sync_mode)) != 0)
     {
         block_manager_close(klog_bm);
         tidesdb_sstable_unref(cf->db, new_sst);
@@ -6745,7 +6751,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         block_manager_t *vlog_bm = NULL;
 
         if (block_manager_open(&klog_bm, new_sst->klog_path,
-                               convert_sync_mode(cf->config.sync_mode)) != 0)
+                               convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                     ? TDB_SYNC_FULL
+                                                     : cf->config.sync_mode)) != 0)
         {
             tidesdb_merge_heap_free(partition_heap);
             tidesdb_sstable_unref(cf->db, new_sst);
@@ -6753,7 +6761,9 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         }
 
         if (block_manager_open(&vlog_bm, new_sst->vlog_path,
-                               convert_sync_mode(cf->config.sync_mode)) != 0)
+                               convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                     ? TDB_SYNC_FULL
+                                                     : cf->config.sync_mode)) != 0)
         {
             block_manager_close(klog_bm);
             tidesdb_merge_heap_free(partition_heap);
@@ -7510,9 +7520,13 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
             block_manager_t *vlog_bm = NULL;
 
             block_manager_open(&klog_bm, new_sst->klog_path,
-                               convert_sync_mode(cf->config.sync_mode));
+                               convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                     ? TDB_SYNC_FULL
+                                                     : cf->config.sync_mode));
             block_manager_open(&vlog_bm, new_sst->vlog_path,
-                               convert_sync_mode(cf->config.sync_mode));
+                               convert_sync_mode(cf->config.sync_mode == TDB_SYNC_INTERVAL
+                                                     ? TDB_SYNC_FULL
+                                                     : cf->config.sync_mode));
 
             bloom_filter_t *bloom = NULL;
             tidesdb_block_index_t *block_indexes = NULL;

@@ -134,20 +134,18 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 /* default L0/L1 management configuration */
 #define TDB_DEFAULT_L1_FILE_COUNT_TRIGGER 4
 #define TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD             \
-    20 /* increased from 10 - more headroom before stall \
-        */
+    20
 
 /* backpressure timing configuration
- * tuned for high throughput with gradual slowdown rather than aggressive early delays
- * RocksDB uses similar approach with level0_slowdown_writes_trigger at ~20 files */
+ * */
 #define TDB_BACKPRESSURE_STALL_CHECK_INTERVAL_US  10000 /* 10ms between stall checks */
 #define TDB_BACKPRESSURE_STALL_MAX_ITERATIONS     1000  /* max 10 seconds stall */
 #define TDB_BACKPRESSURE_HIGH_DELAY_US            2000  /* 2ms for high pressure (was 5ms) */
 #define TDB_BACKPRESSURE_MODERATE_DELAY_US        500   /* 0.5ms for moderate pressure (was 1ms) */
 #define TDB_BACKPRESSURE_HIGH_THRESHOLD_RATIO     0.8   /* 80% of stall threshold (was 60%) */
 #define TDB_BACKPRESSURE_MODERATE_THRESHOLD_RATIO 0.5   /* 50% of stall threshold (was 30%) */
-#define TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER       4     /* 4x L1 trigger = high (was 3x) */
-#define TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER   3     /* 3x L1 trigger = moderate (was 2x) */
+#define TDB_BACKPRESSURE_L1_HIGH_MULTIPLIER       4     /* 4x L1 trigger = high  */
+#define TDB_BACKPRESSURE_L1_MODERATE_MULTIPLIER   3     /* 3x L1 trigger = moderate */
 
 /* time conversion constants for pthread_cond_timedwait */
 #define TDB_MICROSECONDS_PER_SECOND     1000000
@@ -1037,8 +1035,6 @@ static tidesdb_klog_block_t *tidesdb_cache_block_get(tidesdb_t *db, const char *
         tidesdb_block_cache_key(cf_name, klog_path, block_position, cache_key, sizeof(cache_key));
     if (key_len == 0) return NULL;
 
-    /* use zero-copy cache lookup to avoid malloc/memcpy/free overhead on every cache hit
-     * the cache entry holds ref_bit while we access the payload */
     size_t payload_len = 0;
     clock_cache_entry_t *cache_entry = NULL;
     const void *payload =
@@ -3806,7 +3802,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         /* cleanup block resources before moving to next */
         if (block) block_manager_block_release(block);
 
-        /* early termination: if block index pointed us to a specific block and key wasn't found,
+        /* if block index pointed us to a specific block and key wasnt found,
          * stop searching since blocks are sorted and key cannot be in subsequent blocks */
         if (used_block_index)
         {
@@ -7134,7 +7130,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         block_manager_get_size(klog_bm, &new_sst->klog_size);
         block_manager_get_size(vlog_bm, &new_sst->vlog_size);
 
-        /* keep block managers open for immediate reads, reaper will close if needed */
+        /* we keep block managers open for immediate reads, reaper will close if needed once it's evicted */
         new_sst->klog_bm = klog_bm;
         new_sst->vlog_bm = vlog_bm;
         atomic_store(&new_sst->last_access_time,
@@ -12174,7 +12170,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     PROFILE_INC(txn->db, sstable_hits);
 
                     /* for L0, stop immediately since we found the key
-                     * for L1+, SSTables are non-overlapping so also stop immediately */
+                     * for L1+, sstables are non-overlapping so also stop immediately */
                     tidesdb_sstable_unref(cf->db, sst);
                     goto check_found_result;
                 }
@@ -12878,7 +12874,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         skip_list_t *memtable = cf_skiplists[cf_idx];
 
         /* dynamically size dedup hash based on transaction size
-         * use 2x the number of ops to reduce collisions, minimum 1024 */
+         * use 2x the number of ops to reduce collisions, with a minimum of 1024 */
         int dedup_hash_size = txn->num_ops * 2;
         if (dedup_hash_size < 1024) dedup_hash_size = 1024;
 
@@ -15366,7 +15362,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             }
             else
             {
-                /* empty recovered memtable ,safe to delete WAL since it contains no data */
+                /* empty recovered memtable, safe to delete WAL since it contains no data */
                 skip_list_free(recovered_memtable);
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' empty recovered memtable, deleting WAL: %s",
                               cf->name, wal_path);
@@ -15427,7 +15423,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             {
                 uint64_t sst_id = (uint64_t)sst_id_ull;
 
-                /* check manifest to see if this sstable is complete
+                /* we check manifest to see if this sstable is complete
                  * only load sstables that are in the manifest
                  * no lock needed -- recovery is single-threaded */
                 int in_manifest = tidesdb_manifest_has_sstable(cf->manifest, level_num, sst_id);
@@ -15628,7 +15624,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
         }
     }
 
-    /* restore next_sstable_id from manifest to prevent ID collisions */
+    /* we restore next_sstable_id from manifest to prevent ID collisions */
     if (cf->manifest)
     {
         manifest_seq = atomic_load(&cf->manifest->sequence);

@@ -12864,13 +12864,6 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         skip_list_t *memtable = cf_skiplists[cf_idx];
 
-        /* count ops for this CF to decide dedup strategy */
-        int cf_op_count = 0;
-        for (int i = 0; i < txn->num_ops; i++)
-        {
-            if (txn->ops[i].cf == cf) cf_op_count++;
-        }
-
 #define TXN_DEDUP_HASH_SIZE 1024
 
         /**
@@ -14633,7 +14626,6 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
     }
 
     /* we add all repositioned sources to heap */
-    int sources_added = 0;
     for (int i = 0; i < temp_count; i++)
     {
         tidesdb_merge_source_t *source = temp_sources[i];
@@ -14646,10 +14638,6 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, size_t 
                 {
                     tidesdb_merge_source_free(source);
                 }
-            }
-            else
-            {
-                sources_added++;
             }
         }
         else

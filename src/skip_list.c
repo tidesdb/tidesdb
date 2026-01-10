@@ -58,20 +58,6 @@ static inline time_t skip_list_get_current_time(const skip_list_t *list)
 }
 
 /**
- * skip_list_version_is_invalid
- * checks if version is expired or deleted
- * @param version version to check
- * @return 1 if invalid, 0 if valid
- */
-static inline int skip_list_version_is_invalid(skip_list_version_t *version)
-{
-    if (version == NULL) return 1;
-    if (VERSION_IS_DELETED(version)) return 1;
-    if (version->ttl > 0 && version->ttl < time(NULL)) return 1;
-    return 0;
-}
-
-/**
  * skip_list_version_is_invalid_with_time
  * checks if version is expired or deleted using provided time
  * @param version version to check

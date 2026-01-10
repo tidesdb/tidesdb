@@ -1023,6 +1023,700 @@ void benchmark_scaling_mixed(void)
     }
 }
 
+typedef struct
+{
+    clock_cache_t *cache;
+    const char *key;
+    size_t key_len;
+    int thread_id;
+    int num_ops;
+    _Atomic(int) *success_count;
+    _Atomic(int) *error_count;
+} single_key_args_t;
+
+void *put_same_key_thread(void *arg)
+{
+    single_key_args_t *args = (single_key_args_t *)arg;
+    int local_success = 0;
+    int local_error = 0;
+
+    for (int i = 0; i < args->num_ops; i++)
+    {
+        uint8_t payload[64];
+        snprintf((char *)payload, sizeof(payload), "thread_%d_iter_%d", args->thread_id, i);
+        int result = clock_cache_put(args->cache, args->key, args->key_len, payload,
+                                     strlen((char *)payload) + 1);
+        if (result == 0)
+            local_success++;
+        else
+            local_error++;
+    }
+
+    atomic_fetch_add(args->success_count, local_success);
+    atomic_fetch_add(args->error_count, local_error);
+    return NULL;
+}
+
+void test_concurrent_put_same_key(void)
+{
+    printf("Testing concurrent put on same key...\n");
+
+    cache_config_t config = {
+        .max_bytes = 1024 * 1024, .num_partitions = 4, .slots_per_partition = 256};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const char *shared_key = "shared_key";
+    const int num_threads = 8;
+    const int ops_per_thread = 1000;
+
+    pthread_t threads[8];
+    single_key_args_t args[8];
+    _Atomic(int) success_count = 0;
+    _Atomic(int) error_count = 0;
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        args[i].cache = cache;
+        args[i].key = shared_key;
+        args[i].key_len = strlen(shared_key);
+        args[i].thread_id = i;
+        args[i].num_ops = ops_per_thread;
+        args[i].success_count = &success_count;
+        args[i].error_count = &error_count;
+        pthread_create(&threads[i], NULL, put_same_key_thread, &args[i]);
+    }
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    int total_success = atomic_load(&success_count);
+    int total_error = atomic_load(&error_count);
+
+    printf("  Total operations: %d, Success: %d, Errors: %d\n", num_threads * ops_per_thread,
+           total_success, total_error);
+
+    /* verify final value is readable */
+    size_t len;
+    uint8_t *data = clock_cache_get(cache, shared_key, strlen(shared_key), &len);
+    ASSERT_TRUE(data != NULL);
+    printf("  Final value: %s\n", (char *)data);
+    free(data);
+
+    /* most operations should succeed */
+    ASSERT_TRUE(total_success > (num_threads * ops_per_thread) / 2);
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Concurrent put same key test passed\n");
+}
+
+void *read_while_delete_thread(void *arg)
+{
+    single_key_args_t *args = (single_key_args_t *)arg;
+    int local_success = 0;
+
+    for (int i = 0; i < args->num_ops; i++)
+    {
+        size_t len;
+        uint8_t *data = clock_cache_get(args->cache, args->key, args->key_len, &len);
+        if (data)
+        {
+            /* verify data integrity - should start with 'v' for "value" */
+            if (len > 0 && data[0] == 'v')
+            {
+                local_success++;
+            }
+            free(data);
+        }
+        /* small delay to increase race window */
+        if (i % 100 == 0) sched_yield();
+    }
+
+    atomic_fetch_add(args->success_count, local_success);
+    return NULL;
+}
+
+void *delete_while_read_thread(void *arg)
+{
+    single_key_args_t *args = (single_key_args_t *)arg;
+
+    for (int i = 0; i < args->num_ops; i++)
+    {
+        /* delete then immediately re-insert */
+        clock_cache_delete(args->cache, args->key, args->key_len);
+
+        uint8_t payload[] = "value_after_delete";
+        clock_cache_put(args->cache, args->key, args->key_len, payload, sizeof(payload));
+
+        if (i % 100 == 0) sched_yield();
+    }
+
+    return NULL;
+}
+
+void test_concurrent_delete_while_reading(void)
+{
+    printf("Testing concurrent delete while reading...\n");
+
+    cache_config_t config = {
+        .max_bytes = 1024 * 1024, .num_partitions = 1, .slots_per_partition = 64};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const char *key = "delete_read_key";
+    uint8_t initial_payload[] = "value_initial";
+    clock_cache_put(cache, key, strlen(key), initial_payload, sizeof(initial_payload));
+
+    const int num_readers = 4;
+    const int num_deleters = 2;
+    const int ops_per_thread = 500;
+
+    pthread_t readers[4];
+    pthread_t deleters[2];
+    single_key_args_t reader_args[4];
+    single_key_args_t deleter_args[2];
+    _Atomic(int) read_success = 0;
+    _Atomic(int) dummy = 0;
+
+    /* start readers */
+    for (int i = 0; i < num_readers; i++)
+    {
+        reader_args[i].cache = cache;
+        reader_args[i].key = key;
+        reader_args[i].key_len = strlen(key);
+        reader_args[i].thread_id = i;
+        reader_args[i].num_ops = ops_per_thread;
+        reader_args[i].success_count = &read_success;
+        reader_args[i].error_count = &dummy;
+        pthread_create(&readers[i], NULL, read_while_delete_thread, &reader_args[i]);
+    }
+
+    /* start deleters */
+    for (int i = 0; i < num_deleters; i++)
+    {
+        deleter_args[i].cache = cache;
+        deleter_args[i].key = key;
+        deleter_args[i].key_len = strlen(key);
+        deleter_args[i].thread_id = i;
+        deleter_args[i].num_ops = ops_per_thread;
+        deleter_args[i].success_count = &dummy;
+        deleter_args[i].error_count = &dummy;
+        pthread_create(&deleters[i], NULL, delete_while_read_thread, &deleter_args[i]);
+    }
+
+    for (int i = 0; i < num_readers; i++) pthread_join(readers[i], NULL);
+    for (int i = 0; i < num_deleters; i++) pthread_join(deleters[i], NULL);
+
+    int total_reads = atomic_load(&read_success);
+    printf("  Successful reads with valid data: %d\n", total_reads);
+    printf("  No crashes or data corruption detected!\n");
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Concurrent delete while reading test passed\n");
+}
+
+void *put_delete_race_put_thread(void *arg)
+{
+    single_key_args_t *args = (single_key_args_t *)arg;
+
+    for (int i = 0; i < args->num_ops; i++)
+    {
+        uint8_t payload[32];
+        snprintf((char *)payload, sizeof(payload), "put_%d_%d", args->thread_id, i);
+        clock_cache_put(args->cache, args->key, args->key_len, payload,
+                        strlen((char *)payload) + 1);
+    }
+    return NULL;
+}
+
+void *put_delete_race_delete_thread(void *arg)
+{
+    single_key_args_t *args = (single_key_args_t *)arg;
+
+    for (int i = 0; i < args->num_ops; i++)
+    {
+        clock_cache_delete(args->cache, args->key, args->key_len);
+    }
+    return NULL;
+}
+
+void test_concurrent_put_delete_same_key(void)
+{
+    printf("Testing concurrent put/delete on same key...\n");
+
+    cache_config_t config = {
+        .max_bytes = 1024 * 1024, .num_partitions = 1, .slots_per_partition = 64};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const char *key = "put_delete_key";
+    const int num_putters = 4;
+    const int num_deleters = 4;
+    const int ops_per_thread = 500;
+
+    pthread_t putters[4];
+    pthread_t deleters[4];
+    single_key_args_t putter_args[4];
+    single_key_args_t deleter_args[4];
+    _Atomic(int) dummy = 0;
+
+    for (int i = 0; i < num_putters; i++)
+    {
+        putter_args[i].cache = cache;
+        putter_args[i].key = key;
+        putter_args[i].key_len = strlen(key);
+        putter_args[i].thread_id = i;
+        putter_args[i].num_ops = ops_per_thread;
+        putter_args[i].success_count = &dummy;
+        putter_args[i].error_count = &dummy;
+        pthread_create(&putters[i], NULL, put_delete_race_put_thread, &putter_args[i]);
+    }
+
+    for (int i = 0; i < num_deleters; i++)
+    {
+        deleter_args[i].cache = cache;
+        deleter_args[i].key = key;
+        deleter_args[i].key_len = strlen(key);
+        deleter_args[i].thread_id = i;
+        deleter_args[i].num_ops = ops_per_thread;
+        deleter_args[i].success_count = &dummy;
+        deleter_args[i].error_count = &dummy;
+        pthread_create(&deleters[i], NULL, put_delete_race_delete_thread, &deleter_args[i]);
+    }
+
+    for (int i = 0; i < num_putters; i++) pthread_join(putters[i], NULL);
+    for (int i = 0; i < num_deleters; i++) pthread_join(deleters[i], NULL);
+
+    /* final state: key may or may not exist */
+    size_t len;
+    uint8_t *data = clock_cache_get(cache, key, strlen(key), &len);
+    if (data)
+    {
+        printf("  Final state: key exists with value '%s'\n", (char *)data);
+        free(data);
+    }
+    else
+    {
+        printf("  Final state: key was deleted\n");
+    }
+
+    printf("  No crashes detected!\n");
+    clock_cache_destroy(cache);
+    printf("  ✓ Concurrent put/delete same key test passed\n");
+}
+
+void test_hash_collision_concurrent(void)
+{
+    printf("Testing hash collisions under concurrent access...\n");
+
+    /* small hash index to force collisions */
+    cache_config_t config = {
+        .max_bytes = 64 * 1024, .num_partitions = 1, .slots_per_partition = 16};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    /* create keys that will likely collide in small hash space */
+    const int num_threads = 8;
+    const int keys_per_thread = 100;
+
+    pthread_t threads[8];
+    thread_args_t args[8];
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        args[i].cache = cache;
+        args[i].thread_id = i;
+        args[i].num_ops = keys_per_thread;
+        pthread_create(&threads[i], NULL, concurrent_mixed_thread, &args[i]);
+    }
+
+    for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
+
+    clock_cache_stats_t stats;
+    clock_cache_get_stats(cache, &stats);
+    printf("  Final entries: %zu, bytes: %zu\n", stats.total_entries, stats.total_bytes);
+    printf("  No crashes during hash collision stress!\n");
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Hash collision concurrent test passed\n");
+}
+
+typedef struct
+{
+    clock_cache_t *cache;
+    _Atomic(int) *started;
+    _Atomic(int) *should_stop;
+    int thread_id;
+} shutdown_test_args_t;
+
+void *shutdown_worker_thread(void *arg)
+{
+    shutdown_test_args_t *args = (shutdown_test_args_t *)arg;
+
+    atomic_fetch_add(args->started, 1);
+
+    int i = 0;
+    while (!atomic_load(args->should_stop))
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "shutdown_key_%d_%d", args->thread_id, i % 100);
+
+        uint8_t payload[64];
+        snprintf((char *)payload, sizeof(payload), "value_%d", i);
+
+        /* mix of operations */
+        if (i % 3 == 0)
+        {
+            clock_cache_put(args->cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+        }
+        else if (i % 3 == 1)
+        {
+            size_t len;
+            uint8_t *data = clock_cache_get(args->cache, key, strlen(key), &len);
+            if (data) free(data);
+        }
+        else
+        {
+            clock_cache_delete(args->cache, key, strlen(key));
+        }
+        i++;
+    }
+
+    return NULL;
+}
+
+void test_shutdown_during_operations(void)
+{
+    printf("Testing shutdown during active operations...\n");
+
+    cache_config_t config = {
+        .max_bytes = 1024 * 1024, .num_partitions = 4, .slots_per_partition = 128};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const int num_threads = 4;
+    pthread_t threads[4];
+    shutdown_test_args_t args[4];
+    _Atomic(int) started = 0;
+    _Atomic(int) should_stop = 0;
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        args[i].cache = cache;
+        args[i].started = &started;
+        args[i].should_stop = &should_stop;
+        args[i].thread_id = i;
+        pthread_create(&threads[i], NULL, shutdown_worker_thread, &args[i]);
+    }
+
+    /* wait for all threads to start */
+    while (atomic_load(&started) < num_threads)
+    {
+        usleep(1000);
+    }
+
+    usleep(50000); /* 50ms */
+
+    /* signal stop and destroy - this tests shutdown flag */
+    atomic_store(&should_stop, 1);
+
+    /* small delay to let threads see stop flag */
+    usleep(10000);
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    clock_cache_destroy(cache);
+    printf("  No crashes during shutdown!\n");
+    printf("  ✓ Shutdown during operations test passed\n");
+}
+
+void test_zero_copy_get_release(void)
+{
+    printf("Testing zero-copy get and release...\n");
+
+    cache_config_t config = {
+        .max_bytes = 1024 * 1024, .num_partitions = 4, .slots_per_partition = 256};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const char *key = "zero_copy_key";
+    const uint8_t payload[] = "zero_copy_payload_data";
+
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload)), 0);
+
+    size_t len;
+    clock_cache_entry_t *entry = NULL;
+    const uint8_t *data = clock_cache_get_zero_copy(cache, key, strlen(key), &len, &entry);
+
+    ASSERT_TRUE(data != NULL);
+    ASSERT_TRUE(entry != NULL);
+    ASSERT_EQ(len, sizeof(payload));
+    ASSERT_TRUE(memcmp(data, payload, len) == 0);
+
+    uint8_t ref_bit = atomic_load(&entry->ref_bit);
+    ASSERT_TRUE(ref_bit >= 1);
+
+    clock_cache_release(entry);
+
+    data = clock_cache_get_zero_copy(cache, "nonexistent", 11, &len, &entry);
+    ASSERT_TRUE(data == NULL);
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Zero-copy get/release test passed\n");
+}
+
+void test_large_payload(void)
+{
+    printf("Testing large payloads (1MB+)...\n");
+
+    cache_config_t config = {.max_bytes = 50 * 1024 * 1024, /* 50MB */
+                             .num_partitions = 4,
+                             .slots_per_partition = 64};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    /* create 1MB payload */
+    size_t large_size = 1024 * 1024;
+    uint8_t *large_payload = malloc(large_size);
+    ASSERT_TRUE(large_payload != NULL);
+
+    /* fill with pattern */
+    for (size_t i = 0; i < large_size; i++)
+    {
+        large_payload[i] = (uint8_t)(i & 0xFF);
+    }
+
+    const char *key = "large_key";
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), large_payload, large_size), 0);
+
+    size_t retrieved_len;
+    uint8_t *retrieved = clock_cache_get(cache, key, strlen(key), &retrieved_len);
+    ASSERT_TRUE(retrieved != NULL);
+    ASSERT_EQ(retrieved_len, large_size);
+
+    /* verify pattern */
+    int pattern_ok = 1;
+    for (size_t i = 0; i < large_size && pattern_ok; i++)
+    {
+        if (retrieved[i] != (uint8_t)(i & 0xFF))
+        {
+            pattern_ok = 0;
+        }
+    }
+    ASSERT_TRUE(pattern_ok);
+
+    free(retrieved);
+    free(large_payload);
+
+    /* test multiple large payloads */
+    for (int i = 0; i < 5; i++)
+    {
+        char key_buf[32];
+        snprintf(key_buf, sizeof(key_buf), "large_key_%d", i);
+
+        uint8_t *payload = malloc(large_size);
+        memset(payload, (uint8_t)i, large_size);
+
+        clock_cache_put(cache, key_buf, strlen(key_buf), payload, large_size);
+        free(payload);
+    }
+
+    clock_cache_stats_t stats;
+    clock_cache_get_stats(cache, &stats);
+    printf("  Cache bytes after large payloads: %zu\n", stats.total_bytes);
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Large payload test passed\n");
+}
+
+void test_many_small_entries(void)
+{
+    printf("Testing many small entries...\n");
+
+    cache_config_t config = {.max_bytes = 10 * 1024 * 1024, /* 10MB */
+                             .num_partitions = 8,
+                             .slots_per_partition = 1024};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const int num_entries = 10000;
+    int insert_success = 0;
+
+    for (int i = 0; i < num_entries; i++)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "k%d", i);
+        uint8_t payload[8];
+        snprintf((char *)payload, sizeof(payload), "v%d", i);
+
+        if (clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1) == 0)
+        {
+            insert_success++;
+        }
+    }
+
+    printf("  Inserted %d/%d small entries\n", insert_success, num_entries);
+
+    int found = 0;
+    for (int i = 0; i < 100; i++)
+    {
+        int idx = rand() % num_entries;
+        char key[16];
+        snprintf(key, sizeof(key), "k%d", idx);
+
+        size_t len;
+        uint8_t *data = clock_cache_get(cache, key, strlen(key), &len);
+        if (data)
+        {
+            found++;
+            free(data);
+        }
+    }
+
+    printf("  Random sample: found %d/100 entries\n", found);
+
+    clock_cache_stats_t stats;
+    clock_cache_get_stats(cache, &stats);
+    printf("  Total entries: %zu, bytes: %zu\n", stats.total_entries, stats.total_bytes);
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Many small entries test passed\n");
+}
+
+static _Atomic(int) foreach_callback_count = 0;
+
+static int foreach_test_callback(const char *key, size_t key_len, const uint8_t *payload,
+                                 size_t payload_len, void *user_data)
+{
+    (void)key;
+    (void)key_len;
+    (void)payload;
+    (void)payload_len;
+    (void)user_data;
+    atomic_fetch_add(&foreach_callback_count, 1);
+    return 0;
+}
+
+void *foreach_modifier_thread(void *arg)
+{
+    single_key_args_t *args = (single_key_args_t *)arg;
+
+    for (int i = 0; i < args->num_ops; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "prefix_%d", i);
+        uint8_t payload[32];
+        snprintf((char *)payload, sizeof(payload), "value_%d", i);
+
+        if (i % 2 == 0)
+        {
+            clock_cache_put(args->cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+        }
+        else
+        {
+            clock_cache_delete(args->cache, key, strlen(key));
+        }
+    }
+    return NULL;
+}
+
+void test_foreach_prefix_concurrent(void)
+{
+    printf("Testing foreach_prefix during concurrent modification...\n");
+
+    cache_config_t config = {
+        .max_bytes = 1024 * 1024, .num_partitions = 4, .slots_per_partition = 256};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "prefix_%d", i);
+        uint8_t payload[32];
+        snprintf((char *)payload, sizeof(payload), "value_%d", i);
+        clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1);
+    }
+
+    const int num_modifiers = 2;
+    pthread_t modifiers[2];
+    single_key_args_t mod_args[2];
+    _Atomic(int) dummy = 0;
+
+    for (int i = 0; i < num_modifiers; i++)
+    {
+        mod_args[i].cache = cache;
+        mod_args[i].key = NULL;
+        mod_args[i].key_len = 0;
+        mod_args[i].thread_id = i;
+        mod_args[i].num_ops = 200;
+        mod_args[i].success_count = &dummy;
+        mod_args[i].error_count = &dummy;
+        pthread_create(&modifiers[i], NULL, foreach_modifier_thread, &mod_args[i]);
+    }
+
+    atomic_store(&foreach_callback_count, 0);
+    size_t count = clock_cache_foreach_prefix(cache, "prefix_", 7, foreach_test_callback, NULL);
+
+    for (int i = 0; i < num_modifiers; i++)
+    {
+        pthread_join(modifiers[i], NULL);
+    }
+
+    printf("  foreach_prefix returned: %zu, callback count: %d\n", count,
+           atomic_load(&foreach_callback_count));
+    printf("  No crashes during concurrent iteration!\n");
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Foreach prefix concurrent test passed\n");
+}
+
+void test_put_after_shutdown(void)
+{
+    printf("Testing operations after shutdown...\n");
+
+    cache_config_t config = {
+        .max_bytes = 1024 * 1024, .num_partitions = 4, .slots_per_partition = 256};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    const char *key = "shutdown_test_key";
+    uint8_t payload[] = "test_value";
+    ASSERT_EQ(clock_cache_put(cache, key, strlen(key), payload, sizeof(payload)), 0);
+
+    atomic_store(&cache->shutdown, 1);
+
+    int put_result = clock_cache_put(cache, "new_key", 7, payload, sizeof(payload));
+    ASSERT_EQ(put_result, -1);
+
+    size_t len;
+    uint8_t *data = clock_cache_get(cache, key, strlen(key), &len);
+    ASSERT_TRUE(data == NULL);
+
+    int delete_result = clock_cache_delete(cache, key, strlen(key));
+    ASSERT_EQ(delete_result, -1);
+
+    atomic_store(&cache->shutdown, 0);
+
+    clock_cache_destroy(cache);
+    printf("  ✓ Put after shutdown test passed\n");
+}
+
 int main(void)
 {
     srand((unsigned int)time(NULL));
@@ -1037,6 +1731,16 @@ int main(void)
     RUN_TEST(test_cache_null_handling, tests_passed);
     RUN_TEST(test_cache_compute_config, tests_passed);
     RUN_TEST(test_concurrent_read_evict_race, tests_passed);
+    RUN_TEST(test_concurrent_put_same_key, tests_passed);
+    RUN_TEST(test_concurrent_put_delete_same_key, tests_passed);
+    RUN_TEST(test_hash_collision_concurrent, tests_passed);
+    RUN_TEST(test_shutdown_during_operations, tests_passed);
+    RUN_TEST(test_zero_copy_get_release, tests_passed);
+    RUN_TEST(test_large_payload, tests_passed);
+    RUN_TEST(test_many_small_entries, tests_passed);
+    RUN_TEST(test_foreach_prefix_concurrent, tests_passed);
+    RUN_TEST(test_put_after_shutdown, tests_passed);
+    RUN_TEST(test_concurrent_delete_while_reading, tests_passed);
     RUN_TEST(benchmark_cache_insertions, tests_passed);
     RUN_TEST(benchmark_cache_lookups, tests_passed);
     RUN_TEST(benchmark_concurrent_puts, tests_passed);

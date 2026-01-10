@@ -223,13 +223,13 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len,
 /**
  * clock_cache_get_zero_copy
  * retrieve a value by key without copying (zero-copy, lock-free)
- * WARNING: Caller MUST call clock_cache_release() when done to decrement ref_bit
+ * caller must call clock_cache_release() when done to decrement ref_bit
  * @param cache the cache
  * @param key the key
  * @param key_len the key length
  * @param payload_len output parameter for payload length
  * @param entry_out output parameter for entry pointer (needed for release)
- * @return pointer to cached payload (DO NOT FREE) or NULL if not found
+ * @return pointer to cached payload (*DO NOT FREE*) or NULL if not found
  */
 const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key, size_t key_len,
                                          size_t *payload_len, clock_cache_entry_t **entry_out);

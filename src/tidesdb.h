@@ -179,8 +179,10 @@ typedef struct
  */
 typedef enum
 {
-    TDB_SYNC_NONE, /* writes are not synced on every write, only once say sstable files are completed */
-    TDB_SYNC_FULL, /* writes are synced on every write, background and foreground wal and sstable files */
+    TDB_SYNC_NONE, /* writes are not synced on every write, only once say sstable files are
+                      completed */
+    TDB_SYNC_FULL, /* writes are synced on every write, background and foreground wal and sstable
+                      files */
     TDB_SYNC_INTERVAL, /* writes are synced on every write (background) all files,
     foreground wal syncs are done through sync worker */
 } tidesdb_sync_mode_t;

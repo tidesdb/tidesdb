@@ -375,8 +375,7 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
 static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *partition)
 {
     size_t iterations = 0;
-    const size_t max_iterations =
-        partition->num_slots;
+    const size_t max_iterations = partition->num_slots;
 
     /* we start from thread-local position to reduce contention on clock_hand */
     static THREAD_LOCAL size_t thread_hand = 0;
@@ -481,7 +480,8 @@ void clock_cache_compute_config(const size_t max_bytes, cache_config_t *config)
     while (p < num_partitions) p <<= 1;
     num_partitions = p;
 
-    /* estimate average entry size is ~CLOCK_CACHE_AVG_ENTRY_SIZE bytes (key + payload + overhead) */
+    /* estimate average entry size is ~CLOCK_CACHE_AVG_ENTRY_SIZE bytes (key + payload + overhead)
+     */
     const size_t avg_entry_size = CLOCK_CACHE_AVG_ENTRY_SIZE;
     size_t total_entries = max_bytes / avg_entry_size;
     if (total_entries < num_partitions) total_entries = num_partitions;

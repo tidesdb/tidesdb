@@ -496,7 +496,6 @@ static void test_stats(void)
     ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
 
-    /* write some data */
     for (int i = 0; i < 10; i++)
     {
         tidesdb_txn_t *txn = NULL;
@@ -520,6 +519,144 @@ static void test_stats(void)
     ASSERT_TRUE(stats->memtable_size > 0);
 
     tidesdb_free_stats(stats);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_cache_stats(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "cache_test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "cache_test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* we test cache stats with cache enabled (default config has cache enabled) */
+    tidesdb_cache_stats_t cache_stats;
+    ASSERT_EQ(tidesdb_get_cache_stats(db, &cache_stats), 0);
+    ASSERT_TRUE(cache_stats.enabled == 1);
+    ASSERT_TRUE(cache_stats.num_partitions > 0);
+
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[256];
+        snprintf(key, sizeof(key), "cache_key_%04d", i);
+        snprintf(value, sizeof(value), "cache_value_%04d_padding_to_make_it_larger", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    cf = tidesdb_get_column_family(db, "cache_test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        snprintf(key, sizeof(key), "cache_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        ASSERT_EQ(result, 0);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+        tidesdb_txn_free(txn);
+    }
+
+    /* we check cache stats after reads - should have some hits/misses */
+    ASSERT_EQ(tidesdb_get_cache_stats(db, &cache_stats), 0);
+    ASSERT_TRUE(cache_stats.enabled == 1);
+
+    /* after reading from ssts, we should have cache activity */
+    const uint64_t total_accesses = cache_stats.hits + cache_stats.misses;
+    ASSERT_TRUE(total_accesses > 0);
+
+    /* we read same data again - should get cache hits */
+    const uint64_t hits_before = cache_stats.hits;
+
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        snprintf(key, sizeof(key), "cache_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        ASSERT_EQ(result, 0);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_get_cache_stats(db, &cache_stats), 0);
+
+    /* hits should have increased from re-reading cached data */
+    ASSERT_TRUE(cache_stats.hits >= hits_before);
+
+    /* hit rate should be valid (0.0 to 1.0) */
+    ASSERT_TRUE(cache_stats.hit_rate >= 0.0 && cache_stats.hit_rate <= 1.0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_cache_stats_disabled(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.block_cache_size = 0; /* disable cache */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    /* we test cache stats with cache disabled */
+    tidesdb_cache_stats_t cache_stats;
+    ASSERT_EQ(tidesdb_get_cache_stats(db, &cache_stats), 0);
+    ASSERT_TRUE(cache_stats.enabled == 0);
+    ASSERT_TRUE(cache_stats.total_entries == 0);
+    ASSERT_TRUE(cache_stats.total_bytes == 0);
+    ASSERT_TRUE(cache_stats.hits == 0);
+    ASSERT_TRUE(cache_stats.misses == 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_cache_stats_invalid_args(void)
+{
+    /* test with NULL arguments */
+    tidesdb_cache_stats_t cache_stats;
+    ASSERT_EQ(tidesdb_get_cache_stats(NULL, &cache_stats), TDB_ERR_INVALID_ARGS);
+
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    ASSERT_EQ(tidesdb_get_cache_stats(db, NULL), TDB_ERR_INVALID_ARGS);
+
     tidesdb_close(db);
     cleanup_test_dir();
 }
@@ -12340,6 +12477,9 @@ int main(void)
     RUN_TEST(test_multi_cf_transaction_recovery_comprehensive, tests_passed);
     RUN_TEST(test_iterator_basic, tests_passed);
     RUN_TEST(test_stats, tests_passed);
+    RUN_TEST(test_cache_stats, tests_passed);
+    RUN_TEST(test_cache_stats_disabled, tests_passed);
+    RUN_TEST(test_cache_stats_invalid_args, tests_passed);
     RUN_TEST(test_iterator_seek, tests_passed);
     RUN_TEST(test_iterator_seek_for_prev, tests_passed);
     RUN_TEST(test_tidesdb_block_index_seek, tests_passed);

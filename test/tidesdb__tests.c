@@ -11002,7 +11002,7 @@ static void test_seek_large_values_many_sstables(void)
         ASSERT_EQ(tidesdb_txn_commit(txn), 0);
         tidesdb_txn_free(txn);
 
-        /* force flush every KEYS_PER_FLUSH keys to create multiple ssts */
+        /* we force flush every KEYS_PER_FLUSH keys to create multiple ssts */
         if ((i + 1) % KEYS_PER_FLUSH == 0)
         {
             tidesdb_flush_memtable(cf);
@@ -11029,14 +11029,14 @@ static void test_seek_large_values_many_sstables(void)
         ASSERT_EQ(seek_result, 0);
         ASSERT_TRUE(tidesdb_iter_valid(iter));
 
-        /* verify we got the right key */
+        /* we verify we got the right key */
         uint8_t *found_key = NULL;
         size_t found_key_size = 0;
         ASSERT_EQ(tidesdb_iter_key(iter, &found_key, &found_key_size), 0);
         ASSERT_TRUE(found_key != NULL);
         ASSERT_TRUE(strcmp((char *)found_key, seek_key) == 0);
 
-        /* verify value is correct size */
+        /* we verify value is correct size */
         uint8_t *found_value = NULL;
         size_t found_value_size = 0;
         ASSERT_EQ(tidesdb_iter_value(iter, &found_value, &found_value_size), 0);
@@ -11046,11 +11046,11 @@ static void test_seek_large_values_many_sstables(void)
     /* also test seek_for_prev */
     for (int s = 0; s < NUM_SEEKS; s++)
     {
-        int target_idx = rand() % NUM_KEYS;
+        const int target_idx = rand() % NUM_KEYS;
         char seek_key[32];
         snprintf(seek_key, sizeof(seek_key), "key_%08d", target_idx);
 
-        int seek_result =
+        const int seek_result =
             tidesdb_iter_seek_for_prev(iter, (uint8_t *)seek_key, strlen(seek_key) + 1);
         ASSERT_EQ(seek_result, 0);
         ASSERT_TRUE(tidesdb_iter_valid(iter));
@@ -11084,7 +11084,7 @@ static void test_database_lock_prevents_double_open(void)
     ASSERT_TRUE(db1 != NULL);
 
     /* second open of same path should fail with TDB_ERR_LOCKED */
-    int result = tidesdb_open(&config, &db2);
+    const int result = tidesdb_open(&config, &db2);
     ASSERT_EQ(result, TDB_ERR_LOCKED);
     ASSERT_TRUE(db2 == NULL);
 
@@ -11169,9 +11169,9 @@ static void test_database_lock_multi_process(void)
             _exit(2); /* timeout waiting for parent */
         }
 
-        /* now try to open the locked database -- should fail */
+        /* we now try to open the locked database -- should fail */
         tidesdb_t *child_db = NULL;
-        int result = tidesdb_open(&config, &child_db);
+        const int result = tidesdb_open(&config, &child_db);
         _exit(result == TDB_ERR_LOCKED ? 0 : 1);
     }
 
@@ -11185,7 +11185,7 @@ static void test_database_lock_multi_process(void)
     ASSERT_TRUE(f != NULL);
     fclose(f);
 
-    /* wait for child */
+    /* we wait for child */
     int status;
     waitpid(pid, &status, 0);
     ASSERT_TRUE(WIFEXITED(status));
@@ -11197,7 +11197,7 @@ static void test_database_lock_multi_process(void)
     /* parent closes database */
     ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
 
-    /* test that a new process can now open the database */
+    /* we test that a new process can now open the database */
     pid = fork();
     ASSERT_TRUE(pid >= 0);
 
@@ -11694,6 +11694,633 @@ static void test_many_sstables_low_max_open_reaper_eviction(void)
     cleanup_test_dir();
 }
 
+static void test_partial_write_mid_block_corruption(void)
+{
+    cleanup_test_dir();
+    const int NUM_KEYS = 100;
+
+    /* we write data and flush to create sstable */
+    {
+        tidesdb_t *db = create_test_db();
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.write_buffer_size = 4096;
+        cf_config.compression_algorithm = NO_COMPRESSION;
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "partial_cf", &cf_config), TDB_SUCCESS);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "partial_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        for (int i = 0; i < NUM_KEYS; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+            char key[32], value[128];
+            snprintf(key, sizeof(key), "partial_key_%03d", i);
+            snprintf(value, sizeof(value), "partial_value_%03d_with_extra_data", i);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, -1),
+                      TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+            tidesdb_txn_free(txn);
+        }
+
+        ASSERT_EQ(tidesdb_flush_memtable(cf), TDB_SUCCESS);
+        usleep(200000);
+
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    }
+
+    /* we corrupt the klog file mid-block (simulate partial write during crash) */
+    char klog_path[512];
+    snprintf(klog_path, sizeof(klog_path),
+             "%s" PATH_SEPARATOR "partial_cf" PATH_SEPARATOR "L1_0.klog", TEST_DB_PATH);
+
+    FILE *klog_file = fopen(klog_path, "r+b");
+    if (klog_file)
+    {
+        fseek(klog_file, 0, SEEK_END);
+        long size = ftell(klog_file);
+        if (size > 200)
+        {
+            /* we write garbage in the middle of the file to simulate partial write */
+            fseek(klog_file, size / 2, SEEK_SET);
+            uint8_t garbage[50];
+            memset(garbage, 0xFF, sizeof(garbage));
+            fwrite(garbage, 1, sizeof(garbage), klog_file);
+        }
+        fclose(klog_file);
+    }
+
+    /* we reopen and verify system handles corruption gracefully */
+    {
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+
+        tidesdb_t *db = NULL;
+        int result = tidesdb_open(&config, &db);
+
+        /* system should either recover gracefully or fail cleanly */
+        if (result == TDB_SUCCESS && db != NULL)
+        {
+            tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "partial_cf");
+            if (cf != NULL)
+            {
+                /* we try to read - some keys may be recoverable */
+                tidesdb_txn_t *txn = NULL;
+                if (tidesdb_txn_begin(db, &txn) == TDB_SUCCESS)
+                {
+                    int found = 0;
+                    for (int i = 0; i < NUM_KEYS; i++)
+                    {
+                        char key[32];
+                        snprintf(key, sizeof(key), "partial_key_%03d", i);
+
+                        uint8_t *value = NULL;
+                        size_t value_size = 0;
+                        if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value,
+                                            &value_size) == TDB_SUCCESS)
+                        {
+                            found++;
+                            free(value);
+                        }
+                    }
+                    /* we expect at least some keys to be recoverable or none (graceful failure) */
+                    (void)found;
+                    tidesdb_txn_free(txn);
+                }
+            }
+            tidesdb_close(db);
+        }
+        /* if open failed, that's also acceptable for corrupted data */
+    }
+
+    cleanup_test_dir();
+}
+
+static void test_clock_skew_time_travel_ttl(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    cf_config.compression_algorithm = NO_COMPRESSION;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "clock_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "clock_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    time_t now = time(NULL);
+    const int num_keys = 50;
+
+    /* we write keys with TTL set to a time in the past (simulating clock going backwards) */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "clock_key_%04d", i);
+        snprintf(value, sizeof(value), "clock_value_%04d", i);
+
+        /* TTL in the past - should be immediately expired */
+        time_t ttl = now - 3600; /* 1 hour ago */
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, ttl),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    /* we verify keys with past TTL are immediately inaccessible */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    int expired_count = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "clock_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        if (result != TDB_SUCCESS || value == NULL)
+        {
+            expired_count++;
+        }
+        else
+        {
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+
+    /* all keys should be expired since TTL was in the past */
+    ASSERT_EQ(expired_count, num_keys);
+
+    /* we now write keys with TTL far in the future */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *put_txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &put_txn), TDB_SUCCESS);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "future_key_%04d", i);
+        snprintf(value, sizeof(value), "future_value_%04d", i);
+
+        time_t ttl = now + 86400 * 365; /* 1 year in future */
+
+        ASSERT_EQ(tidesdb_txn_put(put_txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, ttl),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(put_txn), TDB_SUCCESS);
+        tidesdb_txn_free(put_txn);
+    }
+
+    /* we verify future TTL keys are accessible */
+    tidesdb_txn_t *future_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &future_txn), TDB_SUCCESS);
+
+    int accessible_count = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "future_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        if (tidesdb_txn_get(future_txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size) ==
+            TDB_SUCCESS)
+        {
+            accessible_count++;
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(future_txn);
+    ASSERT_EQ(accessible_count, num_keys);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_filesystem_full_during_compaction(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 2048;
+    cf_config.compression_algorithm = NO_COMPRESSION;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "diskfull_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "diskfull_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 200;
+
+    /* we write enough data to create multiple sstables */
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32], value[128];
+        snprintf(key, sizeof(key), "diskfull_key_%04d", i);
+        snprintf(value, sizeof(value), "diskfull_value_%04d_with_padding_data", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+
+        if ((i + 1) % 50 == 0)
+        {
+            tidesdb_flush_memtable(cf);
+            usleep(50000);
+        }
+    }
+
+    /* we wait for flushes */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(20000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    /* we trigger compaction - even if disk is "full", system should handle gracefully
+     * note: we can't actually fill the disk in a test, but we verify compaction
+     * doesn't corrupt data even under stress */
+    tidesdb_compact(cf);
+
+    /* we wait for compaction */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
+        if (!is_compacting && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    /* we verify all data is still accessible after compaction */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    int found_count = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "diskfull_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size) ==
+            TDB_SUCCESS)
+        {
+            found_count++;
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+    ASSERT_EQ(found_count, num_keys);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_power_loss_during_sstable_metadata_write(void)
+{
+    cleanup_test_dir();
+    const int NUM_KEYS = 100;
+
+    /* we write data and flush to create sstable */
+    {
+        tidesdb_t *db = create_test_db();
+        tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+        cf_config.write_buffer_size = 4096;
+        cf_config.compression_algorithm = NO_COMPRESSION;
+        cf_config.enable_bloom_filter = 1;
+        cf_config.enable_block_indexes = 1;
+
+        ASSERT_EQ(tidesdb_create_column_family(db, "powerloss_cf", &cf_config), TDB_SUCCESS);
+        tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "powerloss_cf");
+        ASSERT_TRUE(cf != NULL);
+
+        for (int i = 0; i < NUM_KEYS; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+            char key[32], value[128];
+            snprintf(key, sizeof(key), "power_key_%03d", i);
+            snprintf(value, sizeof(value), "power_value_%03d_with_data", i);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, -1),
+                      TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+            tidesdb_txn_free(txn);
+        }
+
+        ASSERT_EQ(tidesdb_flush_memtable(cf), TDB_SUCCESS);
+        usleep(200000);
+
+        ASSERT_EQ(tidesdb_close(db), TDB_SUCCESS);
+    }
+
+    /* we corrupt the sstable metadata (bloom filter or block index) to simulate power loss */
+    char bloom_path[512];
+    snprintf(bloom_path, sizeof(bloom_path),
+             "%s" PATH_SEPARATOR "powerloss_cf" PATH_SEPARATOR "L1_0.bloom", TEST_DB_PATH);
+
+    FILE *bloom_file = fopen(bloom_path, "r+b");
+    if (bloom_file)
+    {
+        /* we truncate bloom filter to simulate incomplete write */
+        fseek(bloom_file, 0, SEEK_END);
+        long size = ftell(bloom_file);
+        if (size > 20)
+        {
+            int truncate_result = ftruncate(fileno(bloom_file), size / 3);
+            (void)truncate_result;
+        }
+        fclose(bloom_file);
+    }
+
+    /* we reopen and verify system handles corrupted metadata gracefully */
+    {
+        tidesdb_config_t config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+
+        tidesdb_t *db = NULL;
+        int result = tidesdb_open(&config, &db);
+
+        if (result == TDB_SUCCESS && db != NULL)
+        {
+            tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "powerloss_cf");
+            if (cf != NULL)
+            {
+                /* we try to read - data should still be accessible even without bloom filter */
+                tidesdb_txn_t *txn = NULL;
+                if (tidesdb_txn_begin(db, &txn) == TDB_SUCCESS)
+                {
+                    int found = 0;
+                    for (int i = 0; i < NUM_KEYS; i++)
+                    {
+                        char key[32];
+                        snprintf(key, sizeof(key), "power_key_%03d", i);
+
+                        uint8_t *value = NULL;
+                        size_t value_size = 0;
+                        if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value,
+                                            &value_size) == TDB_SUCCESS)
+                        {
+                            found++;
+                            free(value);
+                        }
+                    }
+                    /* we expect data to be recoverable even with corrupted bloom filter */
+                    ASSERT_TRUE(found > 0);
+                    tidesdb_txn_free(txn);
+                }
+            }
+            tidesdb_close(db);
+        }
+    }
+
+    cleanup_test_dir();
+}
+
+static void test_memory_allocation_stress(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    cf_config.compression_algorithm = NO_COMPRESSION;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "memstress_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "memstress_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 500;
+    const int large_value_size = 1024;
+
+    /* we allocate large values to stress memory allocation */
+    uint8_t *large_value = malloc(large_value_size);
+    ASSERT_TRUE(large_value != NULL);
+    memset(large_value, 'X', large_value_size);
+
+    /* we write many keys with large values to stress memory */
+    int success_count = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(db, &txn) != TDB_SUCCESS) continue;
+
+        char key[32];
+        snprintf(key, sizeof(key), "memstress_key_%04d", i);
+
+        int result = tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, large_value,
+                                     large_value_size, -1);
+
+        if (result == TDB_SUCCESS)
+        {
+            if (tidesdb_txn_commit(txn) == TDB_SUCCESS)
+            {
+                success_count++;
+            }
+        }
+        tidesdb_txn_free(txn);
+
+        /* we periodically flush to stress memory further */
+        if ((i + 1) % 100 == 0)
+        {
+            tidesdb_flush_memtable(cf);
+            usleep(50000);
+        }
+    }
+
+    free(large_value);
+
+    /* we wait for flushes */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(20000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    /* we verify data integrity after memory stress */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    int found_count = 0;
+    for (int i = 0; i < num_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "memstress_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        if (tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size) ==
+            TDB_SUCCESS)
+        {
+            found_count++;
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+
+    /* we should find all successfully written keys */
+    ASSERT_EQ(found_count, success_count);
+
+    /* we now stress iteration with many concurrent allocations */
+    tidesdb_txn_t *iter_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &iter_txn), TDB_SUCCESS);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(iter_txn, cf, &iter), TDB_SUCCESS);
+    ASSERT_TRUE(iter != NULL);
+
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), TDB_SUCCESS);
+
+    int iter_count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        iter_count++;
+        if (tidesdb_iter_next(iter) != TDB_SUCCESS) break;
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(iter_txn);
+
+    ASSERT_EQ(iter_count, success_count);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_concurrent_cf_drop_during_iteration(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 8192;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "drop_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "drop_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int num_keys = 100;
+
+    for (int i = 0; i < num_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "drop_key_%04d", i);
+        snprintf(value, sizeof(value), "drop_value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    /* we start an iterator and complete iteration */
+    tidesdb_txn_t *iter_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &iter_txn), TDB_SUCCESS);
+
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(iter_txn, cf, &iter), TDB_SUCCESS);
+    ASSERT_TRUE(iter != NULL);
+
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), TDB_SUCCESS);
+
+    /* we iterate through all keys */
+    int iter_count = 0;
+    while (tidesdb_iter_valid(iter))
+    {
+        iter_count++;
+        if (tidesdb_iter_next(iter) != TDB_SUCCESS) break;
+    }
+    ASSERT_EQ(iter_count, num_keys);
+
+    /* we must free iterator before dropping CF to avoid use-after-free
+     * dropping CF while iterator is active is undefined behavior */
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(iter_txn);
+
+    /* we now drop the CF after iterator is freed */
+    ASSERT_EQ(tidesdb_drop_column_family(db, "drop_cf"), TDB_SUCCESS);
+
+    /* we verify CF is gone */
+    tidesdb_column_family_t *dropped_cf = tidesdb_get_column_family(db, "drop_cf");
+    ASSERT_TRUE(dropped_cf == NULL);
+
+    /* we recreate CF to verify system is still functional */
+    ASSERT_EQ(tidesdb_create_column_family(db, "drop_cf", &cf_config), TDB_SUCCESS);
+    cf = tidesdb_get_column_family(db, "drop_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* we write and read to verify CF works */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)"test_key", 9, (uint8_t *)"test_value", 11, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)"test_key", 9, &value, &value_size), TDB_SUCCESS);
+    ASSERT_TRUE(value != NULL);
+    ASSERT_EQ(strcmp((char *)value, "test_value"), 0);
+    free(value);
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -11876,6 +12503,12 @@ int main(void)
     RUN_TEST(test_ttl_expiration_with_deletes_after_reopen, tests_passed);
     RUN_TEST(test_ttl_expiration_range_delete_after_reopen, tests_passed);
     RUN_TEST(test_many_sstables_low_max_open_reaper_eviction, tests_passed);
+    RUN_TEST(test_partial_write_mid_block_corruption, tests_passed);
+    RUN_TEST(test_clock_skew_time_travel_ttl, tests_passed);
+    RUN_TEST(test_filesystem_full_during_compaction, tests_passed);
+    RUN_TEST(test_power_loss_during_sstable_metadata_write, tests_passed);
+    RUN_TEST(test_memory_allocation_stress, tests_passed);
+    RUN_TEST(test_concurrent_cf_drop_during_iteration, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

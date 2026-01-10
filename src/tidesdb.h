@@ -1196,4 +1196,3 @@ void tidesdb_free_stats(tidesdb_stats_t *stats);
 int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
 
 #endif /* __TIDESDB_H__ */
-#endif /* __TIDESDB_H__ */

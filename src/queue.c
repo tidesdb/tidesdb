@@ -29,9 +29,6 @@
 #define QUEUE_UNLIKELY(x) (x)
 #endif
 
-/* timed wait configuration for NetBSD compatibility
- * NetBSD's pthread_cond_wait can miss signals, so we use timed waits
- * with periodic wakeups to check shutdown flags */
 #define QUEUE_WAIT_TIMEOUT_NS 100000000  /* 100ms in nanoseconds */
 #define QUEUE_NS_PER_SEC      1000000000 /* nanoseconds per second */
 
@@ -45,7 +42,7 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
 {
     queue_node_t *node = NULL;
 
-    /* check pool first (common case) */
+    /* we check pool first (common case) */
     if (QUEUE_LIKELY(queue->node_pool != NULL))
     {
         node = queue->node_pool;
@@ -68,7 +65,6 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
  */
 static inline void queue_free_node(queue_t *queue, queue_node_t *node)
 {
-    /* optimization: pool not full is common case */
     if (QUEUE_LIKELY(queue->pool_size < queue->max_pool_size))
     {
         /* return to pool */
@@ -120,7 +116,6 @@ int queue_enqueue(queue_t *queue, void *data)
 
     pthread_mutex_lock(&queue->lock);
 
-    /* allocate from pool (must be inside lock) */
     queue_node_t *node = queue_alloc_node(queue);
     if (QUEUE_UNLIKELY(node == NULL))
     {
@@ -131,7 +126,6 @@ int queue_enqueue(queue_t *queue, void *data)
     node->data = data;
     node->next = NULL;
 
-    /* empty queue is less common after startup */
     if (QUEUE_UNLIKELY(queue->tail == NULL))
     {
         queue->head = node;
@@ -140,7 +134,7 @@ int queue_enqueue(queue_t *queue, void *data)
     }
     else
     {
-        /* add to end (common case) */
+        /* we add to end (common case) */
         queue->tail->next = node;
         queue->tail = node;
     }
@@ -205,12 +199,8 @@ void *queue_dequeue_wait(queue_t *queue)
 
     pthread_mutex_lock(&queue->lock);
 
-    /* increment waiter count before waiting */
     queue->waiter_count++;
 
-    /* wait until queue is not empty or shutdown
-     * use pthread_cond_timedwait with periodic wakeups to handle platforms
-     * where pthread_cond_wait can miss signals (e.g., NetBSD) */
     while (queue->head == NULL && !queue->shutdown)
     {
         struct timespec ts;
@@ -224,10 +214,9 @@ void *queue_dequeue_wait(queue_t *queue)
         pthread_cond_timedwait(&queue->not_empty, &queue->lock, &ts);
     }
 
-    /* decrement waiter count after waking up */
     queue->waiter_count--;
 
-    /* always broadcast when waiter_count changes to wake queue_free if waiting */
+    /* we must always broadcast when waiter_count changes to wake queue_free if waiting */
     if (queue->waiter_count == 0)
     {
         pthread_cond_broadcast(&queue->not_empty);
@@ -285,7 +274,7 @@ int queue_clear(queue_t *queue)
 
     pthread_mutex_lock(&queue->lock);
 
-    /* optimization: batch return nodes to pool for better cache locality */
+    /* we batch return nodes to pool for better cache locality */
     queue_node_t *current = queue->head;
     queue_node_t *batch_head = NULL;
     queue_node_t *batch_tail = NULL;
@@ -295,7 +284,6 @@ int queue_clear(queue_t *queue)
     {
         queue_node_t *next = current->next;
 
-        /* build batch list */
         if (batch_count < queue->max_pool_size - queue->pool_size)
         {
             if (batch_head == NULL)
@@ -312,14 +300,14 @@ int queue_clear(queue_t *queue)
         }
         else
         {
-            /* pool would be full, free directly */
+            /* pool would be full, thus we free directly */
             free(current);
         }
 
         current = next;
     }
 
-    /* attach batch to pool in one operation */
+    /* we attach batch to pool in one operation */
     if (batch_head != NULL && batch_tail != NULL)
     {
         batch_tail->next = queue->node_pool;
@@ -339,12 +327,13 @@ int queue_clear(queue_t *queue)
 
 int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *context)
 {
-    if (QUEUE_UNLIKELY(queue == NULL || fn == NULL)) return -1;
+    if (QUEUE_UNLIKELY(queue == NULL)) return -1;
+    if (QUEUE_UNLIKELY(fn == NULL)) return -1;
 
     pthread_mutex_lock(&queue->lock);
 
     int count = 0;
-    queue_node_t *current = queue->head;
+    const queue_node_t *current = queue->head;
     while (QUEUE_LIKELY(current != NULL))
     {
         fn(current->data, context);
@@ -357,14 +346,13 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
     return count;
 }
 
-void *queue_peek_at(queue_t *queue, size_t index)
+void *queue_peek_at(queue_t *queue, const size_t index)
 {
     if (QUEUE_UNLIKELY(!queue)) return NULL;
 
     pthread_mutex_lock(&queue->lock);
 
-    /* traverse to index while holding lock to prevent node recycling race */
-    queue_node_t *current = queue->head;
+    const queue_node_t *current = queue->head;
     for (size_t i = 0; i < index && QUEUE_LIKELY(current != NULL); i++)
     {
         current = current->next;
@@ -383,11 +371,11 @@ void queue_free(queue_t *queue)
 
     pthread_mutex_lock(&queue->lock);
 
-    /* set shutdown flag and wake all waiting threads */
+    /* we set shutdown flag and wake all waiting threads */
     queue->shutdown = 1;
     pthread_cond_broadcast(&queue->not_empty);
 
-    /* clear the queue while holding the lock */
+    /* we clear the queue whilst holding the lock */
     queue_node_t *current = queue->head;
     while (current != NULL)
     {
@@ -438,11 +426,10 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
 
     pthread_mutex_lock(&queue->lock);
 
-    /* set shutdown flag first and wake all waiting threads */
+    /* we set shutdown flag first and wake all waiting threads */
     queue->shutdown = 1;
     pthread_cond_broadcast(&queue->not_empty);
 
-    /* free all queue nodes and their data */
     queue_node_t *current = queue->head;
     while (current != NULL)
     {
@@ -455,7 +442,6 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         current = next;
     }
 
-    /* free node pool */
     current = queue->node_pool;
     while (current != NULL)
     {
@@ -469,8 +455,8 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     queue->node_pool = NULL;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
-    /* wait for all waiting threads to exit before destroying primitives
-     * use timed wait to handle NetBSD where signals can be missed */
+    /* we mustwait for all waiting threads to exit before destroying primitives
+     * we use timed wait to handle BSD platforms where signals can be missed */
     while (queue->waiter_count > 0)
     {
         struct timespec ts;

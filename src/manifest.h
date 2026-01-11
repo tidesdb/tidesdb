@@ -20,10 +20,9 @@
 #define __MANIFEST_H__
 
 #define MANIFEST_INITIAL_CAPACITY 64
-/* we align with tidesdb core major */
-#define MANIFEST_VERSION      7
-#define MANIFEST_PATH_LEN     4096
-#define MANIFEST_MAX_LINE_LEN 256
+#define MANIFEST_VERSION          7
+#define MANIFEST_PATH_LEN         4096
+#define MANIFEST_MAX_LINE_LEN     256
 /* microseconds to wait between checks */
 #define MANIFEST_CLOSE_WAIT_US 100
 /* max iterations (10000 × 100μs = 1 second) */

@@ -188,15 +188,31 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
             continue;
         }
 
-        /* re-check key pointer hasnt been cleared */
+        /* we re-check key pointer hasnt been cleared */
         char *key_recheck = atomic_load_explicit(&entry->key, memory_order_acquire);
-        if (key_recheck != entry_key_ptr)
+        if (key_recheck != entry_key_ptr || !key_recheck)
         {
             atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
             continue;
         }
 
-        int match = (memcmp(entry_key_ptr, key, key_len) == 0);
+        /* final state check right before memcmp, ensure not being deleted */
+        uint8_t state_check = atomic_load_explicit(&entry->state, memory_order_acquire);
+        if (state_check != ENTRY_VALID)
+        {
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            continue;
+        }
+
+        /* we re-load key pointer one more time right before memcmp */
+        char *key_final = atomic_load_explicit(&entry->key, memory_order_acquire);
+        if (key_final != key_recheck || !key_final)
+        {
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            continue;
+        }
+
+        const int match = (memcmp(key_final, key, key_len) == 0);
 
         atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
 
@@ -243,13 +259,30 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
         }
 
         char *key_recheck = atomic_load_explicit(&entry->key, memory_order_acquire);
-        if (key_recheck != entry_key_ptr)
+        if (key_recheck != entry_key_ptr || !key_recheck)
         {
             atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
             continue;
         }
 
-        const int match = (memcmp(entry_key_ptr, key, key_len) == 0);
+        /* final state check right before memcmp - ensure not being deleted */
+        uint8_t state_check = atomic_load_explicit(&entry->state, memory_order_acquire);
+        if (state_check != ENTRY_VALID)
+        {
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            continue;
+        }
+
+        /* re-load key pointer one more time right before memcmp */
+        char *key_final = atomic_load_explicit(&entry->key, memory_order_acquire);
+        if (key_final != key_recheck || !key_final)
+        {
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            continue;
+        }
+
+        /* use key_final for memcmp - loaded right before use while holding ref_bit */
+        const int match = (memcmp(key_final, key, key_len) == 0);
 
         atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
 
@@ -358,7 +391,6 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
     atomic_store_explicit(&entry->ref_bit, 0, memory_order_release);
     /** hash_entry back-pointer is not cleared -- it stays for reuse */
 
-    /* decrement occupied count */
     atomic_fetch_sub_explicit(&partition->occupied_count, 1, memory_order_relaxed);
 
     /* transition to empty state */
@@ -450,7 +482,7 @@ static int ensure_space(const clock_cache_t *cache, clock_cache_partition_t *par
 {
     (void)required_bytes;
 
-    /* use cached occupied count instead of scanning all slots */
+    /* we use cached occupied count instead of scanning all slots */
     size_t occupied = atomic_load_explicit(&partition->occupied_count, memory_order_relaxed);
 
     /* if partition is getting full (>CLOCK_CACHE_PARTITION_FULL_THRESHOLD%), evict one entry  */

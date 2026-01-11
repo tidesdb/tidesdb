@@ -873,6 +873,20 @@ static inline int atomic_compare_exchange_strong_ptr(void *volatile *ptr, void *
 #define O_SEQUENTIAL _O_SEQUENTIAL
 #endif
 
+/* O_DSYNC/O_SYNC for synchronous writes
+ * POSIX -- O_DSYNC syncs data only, O_SYNC syncs data + metadata
+ * windows -- no direct equivalent at open() time, use _commit() per-write
+ * macOS -- has O_DSYNC since 10.7 */
+#ifndef O_DSYNC
+#ifdef _WIN32
+#define O_DSYNC 0 /*  no O_DSYNC, will use _commit() fallback */
+#elif defined(__APPLE__)
+#define O_DSYNC 0x400000 /* macOS -- O_DSYNC = 0x400000 */
+#else
+#define O_DSYNC 0 /* fallback if not defined */
+#endif
+#endif
+
 #ifndef M_LN2
 #define M_LN2 0.69314718055994530942 /* log_e 2 */
 #endif
@@ -2466,6 +2480,134 @@ static inline int set_file_sequential_hint(int fd)
     return 0;
 #else
     (void)fd; /* unused on other platforms */
+    return 0;
+#endif
+}
+
+/*
+ * set_file_random_hint
+ * hints to the OS that file access will be random (disables read-ahead)
+ * useful for point lookups where sequential read-ahead wastes I/O
+ * @param fd the file descriptor
+ * @return 0 on success, -1 on failure (non-critical, can be ignored)
+ */
+static inline int set_file_random_hint(int fd)
+{
+#ifdef __linux__
+    return posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#elif defined(__APPLE__)
+    return fcntl(fd, F_RDAHEAD, 0);
+#elif defined(_WIN32)
+    /* _O_RANDOM flag would need to be set at open time
+     * for existing fd, we cant change this, so no-op */
+    (void)fd;
+    return 0;
+#else
+    (void)fd;
+    return 0;
+#endif
+}
+
+/*
+ * prefetch_file_region
+ * initiates non-blocking read of specified region into page cache
+ * useful when you know you'll need data soon (e.g., before decompression)
+ * @param fd the file descriptor
+ * @param offset starting offset to prefetch
+ * @param len number of bytes to prefetch (0 = until end of file)
+ * @return 0 on success, -1 on failure (non-critical, can be ignored)
+ */
+static inline int prefetch_file_region(int fd, off_t offset, off_t len)
+{
+#ifdef __linux__
+    return posix_fadvise(fd, offset, len, POSIX_FADV_WILLNEED);
+#elif defined(__APPLE__)
+    /* on macos we utilize F_RDADVISE for read-ahead hint */
+    struct radvisory ra;
+    ra.ra_offset = offset;
+    ra.ra_count = (int)(len > 0 ? len : (1024 * 1024)); /* default 1MB if len=0 */
+    return fcntl(fd, F_RDADVISE, &ra);
+#elif defined(_WIN32)
+    /* windows PrefetchVirtualMemory requires mapped memory
+     * for file-based prefetch, we do a small read to trigger caching on the system */
+    (void)fd;
+    (void)offset;
+    (void)len;
+    return 0;
+#else
+    (void)fd;
+    (void)offset;
+    (void)len;
+    return 0;
+#endif
+}
+
+/*
+ * evict_file_region
+ * hints to OS that specified region is no longer needed and can be evicted from cache
+ * useful after streaming reads (e.g., compaction) to prevent cache pollution
+ * call fsync/fdatasync first if dirty pages need to be written
+ * @param fd the file descriptor
+ * @param offset starting offset to evict
+ * @param len number of bytes to evict (0 = until end of file)
+ * @return 0 on success, -1 on failure (non-critical, can be ignored)
+ */
+static inline int evict_file_region(int fd, off_t offset, off_t len)
+{
+#ifdef __linux__
+    return posix_fadvise(fd, offset, len, POSIX_FADV_DONTNEED);
+#elif defined(__APPLE__)
+    /* on macos F_NOCACHE disables caching for future I/O but doesn't evict
+     * theres no direct equivalent to POSIX_FADV_DONTNEED
+     * msync with MS_INVALIDATE on mmap'd regions is closest but requires mmap */
+    (void)fd;
+    (void)offset;
+    (void)len;
+    return 0;
+#elif defined(_WIN32)
+    /* no direct equivalent without memory mapping
+     * FILE_FLAG_NO_BUFFERING at open time is closest but requires alignment */
+    (void)fd;
+    (void)offset;
+    (void)len;
+    return 0;
+#else
+    (void)fd;
+    (void)offset;
+    (void)len;
+    return 0;
+#endif
+}
+
+/*
+ * set_file_noreuse_hint
+ * hints that specified region will be accessed only once (streaming)
+ * kernel page replacement can deprioritize these pages
+ * effective on Linux 6.3+ (was no-op from 2.6.18 to 6.2)
+ * @param fd the file descriptor
+ * @param offset starting offset
+ * @param len number of bytes (0 = until end of file)
+ * @return 0 on success, -1 on failure (non-critical, can be ignored)
+ */
+static inline int set_file_noreuse_hint(int fd, off_t offset, off_t len)
+{
+#ifdef __linux__
+    return posix_fadvise(fd, offset, len, POSIX_FADV_NOREUSE);
+#elif defined(__APPLE__)
+    /* F_NOCACHE is similar -- tells system not to cache I/O
+     * this affects all future I/O on this fd, not just a region */
+    return fcntl(fd, F_NOCACHE, 1);
+#elif defined(_WIN32)
+    /** FILE_FLAG_SEQUENTIAL_SCAN at open time is closest
+     * for existing fd, no equivalent */
+    (void)fd;
+    (void)offset;
+    (void)len;
+    return 0;
+#else
+    (void)fd;
+    (void)offset;
+    (void)len;
     return 0;
 #endif
 }

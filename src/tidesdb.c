@@ -2468,6 +2468,11 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
             /* we dont close klog_bm here -- it may be used by another thread */
             return -1;
         }
+
+        /* hint that vlog access is random (point lookups by offset)
+         * this disables read-ahead which would waste I/O for random access */
+        set_file_random_hint(new_vlog_bm->fd);
+
         /* CAS to set vlog_bm -- if another thread already set it, close ours */
         block_manager_t *expected = NULL;
         if (!atomic_compare_exchange_strong((atomic_uintptr_t *)&sst->vlog_bm,
@@ -2549,6 +2554,20 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
 static void tidesdb_sstable_free(tidesdb_sstable_t *sst)
 {
     if (!sst) return;
+
+    /* if marked for deletion, evict file data from page cache before closing
+     * this prevents cache pollution from compacted-away SSTables */
+    if (atomic_load_explicit(&sst->marked_for_deletion, memory_order_acquire))
+    {
+        if (sst->klog_bm)
+        {
+            evict_file_region(sst->klog_bm->fd, 0, 0);
+        }
+        if (sst->vlog_bm)
+        {
+            evict_file_region(sst->vlog_bm->fd, 0, 0);
+        }
+    }
 
     if (sst->klog_bm)
     {
@@ -4813,6 +4832,11 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
         free(source);
         return NULL;
     }
+
+    /* hint to OS that this is streaming read (data will be accessed only once)
+     * this helps prevent cache pollution during compaction */
+    set_file_noreuse_hint(bms.klog_bm->fd, 0, 0);
+    set_file_noreuse_hint(bms.vlog_bm->fd, 0, 0);
 
     source->source.sstable.current_block_data = NULL; /* no block data yet */
     source->source.sstable.current_rc_block = NULL;   /* no ref-counted block yet */
@@ -8366,6 +8390,18 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
         return TDB_ERR_IO;
     }
 
+    /* hint to OS that we'll read the entire WAL sequentially and only once
+     * this optimizes read-ahead and allows kernel to deprioritize these pages */
+    set_file_sequential_hint(wal->fd);
+    set_file_noreuse_hint(wal->fd, 0, 0);
+
+    /* prefetch WAL file into page cache for faster recovery */
+    uint64_t wal_size = atomic_load(&wal->current_file_size);
+    if (wal_size > 0)
+    {
+        prefetch_file_region(wal->fd, 0, (off_t)wal_size);
+    }
+
     /* validate and recover WAL file (permissive mode truncate partial writes) */
     if (block_manager_validate_last_block(wal, 0) != 0)
     {
@@ -8539,6 +8575,11 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
                   cf->name, block_count, entry_count, skip_list_count_entries(*memtable));
 
     block_manager_cursor_free(cursor);
+
+    /* evict WAL data from page cache after recovery - data is now in memtable
+     * this frees cache space for more useful data during normal operation */
+    evict_file_region(wal->fd, 0, 0);
+
     block_manager_close(wal);
 
     return TDB_SUCCESS;

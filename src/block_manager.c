@@ -167,6 +167,15 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     int file_exists = access(file_path, F_OK) == 0;
 
     int flags = O_RDWR | O_CREAT;
+
+    /* use O_DSYNC for synchronous data writes in SYNC_FULL mode
+     * this ensures each pwrite is durable before returning, eliminating
+     * the need for per-write fdatasync() calls on platforms that support it */
+    if (sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0)
+    {
+        flags |= O_DSYNC;
+    }
+
     mode_t mode = BLOCK_MANAGER_FILE_MODE;
 
     new_bm->fd = open(file_path, flags, mode);
@@ -201,7 +210,9 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
             *bm = NULL;
             return -1;
         }
-        if (new_bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+        /* if O_DSYNC is available, pwrite already synced the header
+         * otherwise fall back to explicit fdatasync */
+        if (new_bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
         {
             if (fdatasync(new_bm->fd) != 0)
             {
@@ -237,7 +248,9 @@ int block_manager_close(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+    /* final sync on close - only needed if O_DSYNC wasn't used
+     * with O_DSYNC, all writes are already durable */
+    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
     {
         (void)fdatasync(bm->fd);
     }
@@ -362,7 +375,9 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
         return -1;
     }
 
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+    /* if O_DSYNC is available and was used at open time, pwrite already synced
+     * otherwise fall back to explicit fdatasync for durability */
+    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
     {
         if (fdatasync(bm->fd) != 0)
         {
@@ -739,7 +754,14 @@ int block_manager_truncate(block_manager_t *bm)
         return -1;
     }
 
-    bm->fd = open(bm->file_path, O_RDWR | O_CREAT, 0644);
+    /* reopen with same flags as original open, including O_DSYNC if in SYNC_FULL mode */
+    int flags = O_RDWR | O_CREAT;
+    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0)
+    {
+        flags |= O_DSYNC;
+    }
+
+    bm->fd = open(bm->file_path, flags, 0644);
     if (bm->fd == -1)
     {
         return -1;
@@ -751,9 +773,13 @@ int block_manager_truncate(block_manager_t *bm)
         return -1;
     }
 
-    if (fdatasync(bm->fd) != 0)
+    /* sync header - only needed if O_DSYNC not available */
+    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
     {
-        return -1;
+        if (fdatasync(bm->fd) != 0)
+        {
+            return -1;
+        }
     }
 
     /* reset cached file size to header size */
@@ -902,7 +928,11 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
         {
             return -1;
         }
-        fdatasync(bm->fd);
+        /* sync header - only needed if O_DSYNC not available */
+        if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+        {
+            fdatasync(bm->fd);
+        }
         return 0;
     }
 
@@ -1005,9 +1035,19 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
             fprintf(stderr, "[block_manager] Truncating %s from %" PRIu64 " to %" PRIu64 " bytes\n",
                     bm->file_path, file_size, valid_size);
             if (ftruncate(bm->fd, (off_t)valid_size) != 0) return -1;
-            fdatasync(bm->fd);
+            /* sync truncation - only needed if O_DSYNC not available */
+            if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+            {
+                fdatasync(bm->fd);
+            }
             close(bm->fd);
-            bm->fd = open(bm->file_path, O_RDWR | O_CREAT, 0644);
+            /* reopen with same flags as original open */
+            int flags = O_RDWR | O_CREAT;
+            if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0)
+            {
+                flags |= O_DSYNC;
+            }
+            bm->fd = open(bm->file_path, flags, 0644);
             if (bm->fd == -1) return -1;
             atomic_store(&bm->current_file_size, valid_size);
             fprintf(stderr, "[block_manager] Truncation complete, file reopened\n");
@@ -1020,7 +1060,7 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
     }
 
     /* footer magic is valid, verify size matches header */
-    uint64_t block_start =
+    const uint64_t block_start =
         file_size - BLOCK_MANAGER_FOOTER_SIZE - footer_size - BLOCK_MANAGER_BLOCK_HEADER_SIZE;
     if (block_start < BLOCK_MANAGER_HEADER_SIZE)
     {

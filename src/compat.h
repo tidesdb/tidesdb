@@ -84,7 +84,7 @@
 
 /*
  * tdb_open_lock_file
- * opens a lock file (Windows version - lock acquired separately)
+ * opens a lock file (windows version -- lock acquired separately)
  * @param path the path to the lock file
  * @param lock_result output -- TDB_LOCK_SUCCESS on successful open (lock not yet acquired)
  * @return file descriptor on success (>= 0), -1 on error
@@ -871,20 +871,6 @@ static inline int atomic_compare_exchange_strong_ptr(void *volatile *ptr, void *
 #endif
 #ifndef O_SEQUENTIAL
 #define O_SEQUENTIAL _O_SEQUENTIAL
-#endif
-
-/* O_DSYNC/O_SYNC for synchronous writes
- * POSIX -- O_DSYNC syncs data only, O_SYNC syncs data + metadata
- * windows -- no direct equivalent at open() time, use _commit() per-write
- * macOS -- has O_DSYNC since 10.7 */
-#ifndef O_DSYNC
-#ifdef _WIN32
-#define O_DSYNC 0 /*  no O_DSYNC, will use _commit() fallback */
-#elif defined(__APPLE__)
-#define O_DSYNC 0x400000 /* macOS -- O_DSYNC = 0x400000 */
-#else
-#define O_DSYNC 0 /* fallback if not defined */
-#endif
 #endif
 
 #ifndef M_LN2
@@ -1697,6 +1683,20 @@ typedef pthread_mutex_t mutex_t;
 typedef pthread_cond_t cond_t;
 typedef pthread_mutex_t crit_section_t;
 typedef pthread_rwlock_t rwlock_t;
+#endif
+
+/* O_DSYNC/O_SYNC for synchronous writes (must be after all platform includes)
+ * POSIX -- O_DSYNC syncs data only, O_SYNC syncs data + metadata
+ * windows -- no direct equivalent at open() time, use fdatasync() per-write
+ * some BSDs (DragonFlyBSD, older FreeBSD) may not define O_DSYNC */
+#ifndef O_DSYNC
+#ifdef _WIN32
+#define O_DSYNC 0 /* no O_DSYNC, will use fdatasync() fallback */
+#elif defined(__APPLE__)
+#define O_DSYNC 0x400000 /* macOS -- O_DSYNC = 0x400000 */
+#else
+#define O_DSYNC 0 /* fallback for BSDs and others without O_DSYNC */
+#endif
 #endif
 
 /* atomic compare exchange for pointers (all platforms with C11 atomics) */
@@ -2668,7 +2668,7 @@ static inline int tdb_get_available_disk_space(const char *path, uint64_t *avail
 #define cpu_pause() ((void)0)
 #endif
 
-/* cpu yield for longer waits - gives up time slice to scheduler */
+/* cpu yield for longer waits -- gives up time slice to scheduler */
 #ifdef _WIN32
 #include <windows.h>
 #define cpu_yield() SwitchToThread()

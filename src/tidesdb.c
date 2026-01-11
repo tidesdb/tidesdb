@@ -8576,7 +8576,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 
     block_manager_cursor_free(cursor);
 
-    /* evict WAL data from page cache after recovery - data is now in memtable
+    /* we evict WAL data from page cache after recovery, data is now in memtable
      * this frees cache space for more useful data during normal operation */
     evict_file_region(wal->fd, 0, 0);
 
@@ -15707,7 +15707,7 @@ static int tidesdb_recover_column_family(tidesdb_column_family_t *cf)
             atomic_store_explicit(&cs->max_seq, global_max_seq, memory_order_release);
         }
 
-        /* mark all sequences as committed */
+        /* we mark all sequences as committed */
         for (uint64_t seq = 1; seq <= global_max_seq; seq++)
         {
             size_t idx = seq % cs->capacity;
@@ -15881,7 +15881,6 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
         return TDB_ERR_MEMORY;
     }
 
-    /* copy column family configuration */
     memcpy((*stats)->config, &cf->config, sizeof(tidesdb_column_family_config_t));
     for (int i = 0; i < (*stats)->num_levels; i++)
     {
@@ -16030,7 +16029,7 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     }
     else if (strcmp(name, "default_isolation_level") == 0)
     {
-        int level = (int)strtol(value, NULL, 10);
+        const int level = (int)strtol(value, NULL, 10);
         if (level >= TDB_ISOLATION_READ_UNCOMMITTED && level <= TDB_ISOLATION_SERIALIZABLE)
         {
             ctx->config->default_isolation_level = (tidesdb_isolation_level_t)level;
@@ -16067,7 +16066,7 @@ int tidesdb_cf_config_load_from_ini(const char *ini_file, const char *section_na
 
     ini_config_context_t ctx = {.config = config, .target_section = section_name};
 
-    int result = ini_parse(ini_file, ini_config_handler, &ctx);
+    const int result = ini_parse(ini_file, ini_config_handler, &ctx);
     if (result < 0)
     {
         return TDB_ERR_IO; /* failed to open or parse */
@@ -16136,7 +16135,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     }
 
     fflush(fp);
-    int fd = tdb_fileno(fp);
+    const int fd = tdb_fileno(fp);
     if (fd >= 0)
     {
         fsync(fd);
@@ -16145,7 +16144,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
 
     /* we have to sync parent directory to ensure file entry is persisted
      * uses cross-platform tdb_sync_directory (no-op on Windows, fsync on POSIX) */
-    char *last_sep = strrchr(ini_file, PATH_SEPARATOR[0]);
+    const char *last_sep = strrchr(ini_file, PATH_SEPARATOR[0]);
     if (last_sep)
     {
         char parent_dir[TDB_MAX_PATH_LEN];
@@ -16163,7 +16162,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
 
 int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
                                      const tidesdb_column_family_config_t *new_config,
-                                     int persist_to_disk)
+                                     const int persist_to_disk)
 {
     if (!cf || !new_config) return TDB_ERR_INVALID_ARGS;
 
@@ -16197,7 +16196,7 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
                  "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
                  cf->db->config.db_path, cf->name);
 
-        int result = tidesdb_cf_config_save_to_ini(config_path, cf->name, &cf->config);
+        const int result = tidesdb_cf_config_save_to_ini(config_path, cf->name, &cf->config);
         if (result != TDB_SUCCESS)
         {
             return result;
@@ -16243,9 +16242,9 @@ static uint8_t *compact_block_index_serialize(const tidesdb_block_index_t *index
 
     /* header
      * count (4) + prefix_len (1) + file_positions (varint) + min/max prefixes */
-    size_t max_size = sizeof(uint32_t) + sizeof(uint8_t) +
-                      index->count * 10 +                   /* file_positions (varint) */
-                      index->count * index->prefix_len * 2; /* min + max prefixes */
+    const size_t max_size = sizeof(uint32_t) + sizeof(uint8_t) +
+                            index->count * 10 +                   /* file_positions (varint) */
+                            index->count * index->prefix_len * 2; /* min + max prefixes */
 
     uint8_t *data = malloc(max_size);
     if (!data) return NULL;
@@ -16267,7 +16266,7 @@ static uint8_t *compact_block_index_serialize(const tidesdb_block_index_t *index
         /* remaining file positions stored as deltas */
         for (uint32_t i = 1; i < index->count; i++)
         {
-            uint64_t delta = index->file_positions[i] - index->file_positions[i - 1];
+            const uint64_t delta = index->file_positions[i] - index->file_positions[i - 1];
             ptr += encode_varint(ptr, delta);
         }
     }
@@ -16283,7 +16282,7 @@ static uint8_t *compact_block_index_serialize(const tidesdb_block_index_t *index
     uint8_t *final_data = realloc(data, actual_size);
     if (!final_data)
     {
-        /* realloc failed, but original data is still valid */
+        /* realloc failed, but the original data is still valid */
         *out_size = actual_size;
         return data;
     }
@@ -16300,7 +16299,7 @@ static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *dat
     const uint8_t *ptr = data;
     const uint8_t *end = data + data_size;
 
-    /* read header
+    /* we read header
      * count + prefix_len */
     const uint32_t count = decode_uint32_le_compat(ptr);
     ptr += sizeof(uint32_t);
@@ -16369,7 +16368,7 @@ static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *dat
         }
     }
 
-    size_t prefix_bytes = count * prefix_len;
+    const size_t prefix_bytes = count * prefix_len;
     if (ptr + prefix_bytes > end) goto error;
     memcpy(index->min_key_prefixes, ptr, prefix_bytes);
     ptr += prefix_bytes;
@@ -16410,7 +16409,7 @@ static int compact_block_index_add(tidesdb_block_index_t *index, const uint8_t *
 
     if (index->count >= index->capacity)
     {
-        uint32_t new_capacity = index->capacity * 2;
+        const uint32_t new_capacity = index->capacity * 2;
 
         /* we must handle realloc failures carefully to avoid memory leaks
          * if any realloc fails, we keep the original pointers intact */
@@ -16479,7 +16478,7 @@ static int compact_block_index_find_predecessor(const tidesdb_block_index_t *ind
     if (!index || !key || index->count == 0) return -1;
 
     uint8_t search_prefix[TDB_BLOCK_INDEX_PREFIX_MAX];
-    size_t copy_len = (key_len < index->prefix_len) ? key_len : index->prefix_len;
+    const size_t copy_len = (key_len < index->prefix_len) ? key_len : index->prefix_len;
     memcpy(search_prefix, key, copy_len);
     if (copy_len < index->prefix_len)
     {
@@ -16505,13 +16504,13 @@ static int compact_block_index_find_predecessor(const tidesdb_block_index_t *ind
         return 0;
     }
 
-    /* binary search to find the rightmost block where min_key <= search_key <= max_key
+    /* we utilize binary search to find the rightmost block where min_key <= search_key <= max_key
      * or the last block where min_key <= search_key if no exact range match */
     int64_t left = 0, right = index->count - 1, result = -1;
 
     while (left <= right)
     {
-        int64_t mid = left + (right - left) / 2;
+        const int64_t mid = left + (right - left) / 2;
         const uint8_t *mid_min_prefix = index->min_key_prefixes + (mid * index->prefix_len);
         const uint8_t *mid_max_prefix = index->max_key_prefixes + (mid * index->prefix_len);
 

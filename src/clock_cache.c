@@ -265,7 +265,7 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
             continue;
         }
 
-        /* final state check right before memcmp - ensure not being deleted */
+        /* final state check right before memcmp to ensure not being deleted */
         uint8_t state_check = atomic_load_explicit(&entry->state, memory_order_acquire);
         if (state_check != ENTRY_VALID)
         {
@@ -281,7 +281,6 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
             continue;
         }
 
-        /* use key_final for memcmp - loaded right before use while holding ref_bit */
         const int match = (memcmp(key_final, key, key_len) == 0);
 
         atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
@@ -365,13 +364,13 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
     /* fence to ensure pointer clears are visible before we free */
     atomic_thread_fence(memory_order_seq_cst);
 
-    /* re-check ref_bit after clearing pointers - a reader may have snuck in
+    /* we must re-check ref_bit after clearing pointers, a reader may have snuck in
      * between our first check and clearing pointers */
     ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
     if (ref > 1)
     {
         /* a reader incremented ref_bit after we started deleting
-         * restore pointers and revert state - let the reader finish */
+         * restore pointers and revert state, we must let the reader finish */
         atomic_store_explicit(&entry->key, key, memory_order_release);
         atomic_store_explicit(&entry->payload, payload, memory_order_release);
         atomic_store_explicit(&entry->state, ENTRY_VALID, memory_order_release);
@@ -383,7 +382,6 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
         cache->evict_callback(payload, plen);
     }
 
-    /* now safe to free - all readers will see NULL pointers */
     free(key);
     free(payload);
     atomic_store_explicit(&entry->key_len, 0, memory_order_release);
@@ -997,8 +995,27 @@ size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size
 
             if (!key || key_len < prefix_len) continue;
 
+            /* increment ref_bit to protect entry during access */
+            atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acquire);
+
+            /* re-verify state after incrementing ref_bit */
+            state = atomic_load_explicit(&entry->state, memory_order_acquire);
+            if (state != ENTRY_VALID)
+            {
+                atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+                continue;
+            }
+
+            /* re-load key pointer to ensure it hasnt been cleared */
+            char *key_recheck = atomic_load_explicit(&entry->key, memory_order_acquire);
+            if (key_recheck != key || !key_recheck)
+            {
+                atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+                continue;
+            }
+
             /* we check prefix match */
-            if (memcmp(key, prefix, prefix_len) == 0)
+            if (memcmp(key_recheck, prefix, prefix_len) == 0)
             {
                 uint8_t *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
                 size_t payload_len =
@@ -1006,11 +1023,21 @@ size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size
 
                 if (payload)
                 {
-                    int result = callback(key, key_len, payload, payload_len, user_data);
+                    int result = callback(key_recheck, key_len, payload, payload_len, user_data);
                     count++;
+
+                    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
 
                     if (result != 0) return count;
                 }
+                else
+                {
+                    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+                }
+            }
+            else
+            {
+                atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
             }
         }
     }

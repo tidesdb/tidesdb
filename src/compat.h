@@ -198,7 +198,7 @@ static inline int tdb_open_lock_file(const char *path, int *lock_result)
 
 #if TDB_USE_FCNTL_SETLK
     /* fcntl() F_SETLK allows same-process re-locking, so check PID file first.
-     * Read PID before acquiring lock to detect same-process double-open. */
+     * read PID before acquiring lock to detect same-process double-open. */
     char pid_buf[32] = {0};
     ssize_t n = pread(fd, pid_buf, sizeof(pid_buf) - 1, 0);
     if (n > 0)
@@ -275,7 +275,7 @@ static inline int tdb_file_lock_exclusive(const int fd, int max_retries)
     {
         if (fcntl(fd, F_SETLK, &fl) == 0)
         {
-            /* write PID to lock file for same-process detection */
+            /* we write PID to lock file for same-process detection */
             tdb_file_lock_write_pid(fd);
             return TDB_LOCK_SUCCESS;
         }
@@ -493,7 +493,7 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 /* cross-platform prefetch hints for cache optimization */
 #if defined(__GNUC__) || defined(__clang__)
 /* __builtin_prefetch(addr, rw, locality)
- * rw: 0 = read, 1 = write
+ * rw -- 0 = read, 1 = write
  * locality: 0 = no temporal locality, 3 = high temporal locality */
 #define PREFETCH_READ(addr)  __builtin_prefetch((addr), 0, 3)
 #define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 3)
@@ -1372,7 +1372,7 @@ static inline ssize_t pread(int fd, void *buf, size_t count, off_t offset)
         return -1;
     }
 
-    DWORD bytes_read;
+    DWORD bytes_read = 0;
     BOOL result = ReadFile(h, buf, (DWORD)count, &bytes_read, &overlapped);
 
     if (!result)
@@ -1441,7 +1441,7 @@ static inline ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset
         return -1;
     }
 
-    DWORD bytes_written;
+    DWORD bytes_written = 0;
     BOOL result = WriteFile(h, buf, (DWORD)count, &bytes_written, &overlapped);
 
     if (!result)
@@ -1810,7 +1810,7 @@ static inline size_t get_available_memory(void)
     return 0;
 #else
     /* illumos/solaris and other POSIX systems
-     * note: on 32-bit systems, multiplying pages * page_size can overflow
+     * note -- on 32-bit systems, multiplying pages * page_size can overflow
      * so we cast to 64-bit before multiplication */
     long pages = sysconf(_SC_AVPHYS_PAGES);
     long page_size = sysconf(_SC_PAGESIZE);
@@ -1884,7 +1884,7 @@ static inline size_t get_total_memory(void)
     return 0;
 #else
     /* illumos/solaris and other POSIX systems
-     * note: on 32-bit systems, multiplying pages * page_size can overflow
+     * note -- on 32-bit systems, multiplying pages * page_size can overflow
      * so we cast to 64-bit before multiplication */
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGESIZE);
@@ -2017,7 +2017,7 @@ static inline uint32_t decode_uint32_le(const uint8_t *buf)
  */
 static inline void encode_int64_le(uint8_t *buf, int64_t val)
 {
-    uint64_t uval = (uint64_t)val;
+    const uint64_t uval = (uint64_t)val;
     buf[0] = (uint8_t)(uval & 0xFF);
     buf[1] = (uint8_t)((uval >> 8) & 0xFF);
     buf[2] = (uint8_t)((uval >> 16) & 0xFF);
@@ -2036,9 +2036,10 @@ static inline void encode_int64_le(uint8_t *buf, int64_t val)
  */
 static inline int64_t decode_int64_le(const uint8_t *buf)
 {
-    uint64_t uval = ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
-                    ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) |
-                    ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
+    const uint64_t uval = ((uint64_t)buf[0]) | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) |
+                          ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) |
+                          ((uint64_t)buf[5] << 40) | ((uint64_t)buf[6] << 48) |
+                          ((uint64_t)buf[7] << 56);
     return (int64_t)uval;
 }
 
@@ -2773,7 +2774,7 @@ static inline int remove_directory_once(const char *path)
 
     closedir(dir);
 
-    /* try to remove the directory itself */
+    /* we try to remove the directory itself */
 #ifdef _WIN32
     if (_rmdir(path) != 0) result = -1;
 #else
@@ -2792,7 +2793,6 @@ static inline int remove_directory_once(const char *path)
  */
 static inline int remove_directory(const char *path)
 {
-    /* check if directory exists */
     DIR *dir = opendir(path);
     if (!dir) return 0; /* already gone, success */
     closedir(dir);
@@ -2838,7 +2838,6 @@ static inline int remove_directory(const char *path)
         }
     }
 
-    /* final check */
     dir = opendir(path);
     if (!dir) return 0; /* success */
     closedir(dir);
@@ -2861,13 +2860,13 @@ static inline int tdb_sync_directory(const char *dir_path)
     return 0;
 #else
     /* POSIX -- must fsync directory to persist directory entries */
-    int fd = open(dir_path, O_RDONLY);
+    const int fd = open(dir_path, O_RDONLY);
     if (fd < 0)
     {
         /* non-fatal -- directory might not support fsync (e.g., some network filesystems) */
         return -1;
     }
-    int result = fsync(fd);
+    const int result = fsync(fd);
     close(fd);
     return result;
 #endif
@@ -2924,7 +2923,7 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
         return -1;
     }
 
-    /* sync parent directory to ensure rename metadata is durable
+    /* we sync parent directory to ensure rename metadata is durable
      * this is critical for crash safety on non-journaling filesystems
      * https://groups.google.com/g/comp.unix.programmer/c/AM2V83RCOVE?pli=1
      * https://man7.org/linux/man-pages/man2/rename.2.html
@@ -2937,8 +2936,7 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
         memcpy(dir_path, new_path, dir_len);
         dir_path[dir_len] = '\0';
 
-        /* open and sync directory */
-        int dir_fd = open(dir_path, O_RDONLY);
+        const int dir_fd = open(dir_path, O_RDONLY);
         if (dir_fd >= 0)
         {
             fsync(dir_fd);

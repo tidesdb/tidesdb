@@ -86,16 +86,14 @@ static inline int verify_checksum(const void *data, const size_t size,
  * @param fd the file descriptor to write to
  * @return 0 if successful, -1 otherwise
  */
-static int write_header(int fd)
+static int write_header(const int fd)
 {
     unsigned char header[BLOCK_MANAGER_HEADER_SIZE];
-    uint32_t magic = BLOCK_MANAGER_MAGIC;
-    uint8_t version = BLOCK_MANAGER_VERSION;
-    uint32_t padding = 0;
+    const uint32_t padding = 0;
 
     /* header format, [3-byte magic][1-byte version][4-byte padding] = 8 bytes */
-    encode_uint32_le_compat(header, magic);
-    header[BLOCK_MANAGER_MAGIC_SIZE] = version;
+    encode_uint32_le_compat(header, BLOCK_MANAGER_MAGIC);
+    header[BLOCK_MANAGER_MAGIC_SIZE] = BLOCK_MANAGER_VERSION;
     encode_uint32_le_compat(header + BLOCK_MANAGER_MAGIC_SIZE + BLOCK_MANAGER_VERSION_SIZE,
                             padding);
 
@@ -227,7 +225,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         }
     }
 
-    /* set current_file_size if not already set by validation */
+    /* we set current_file_size if not already set by validation */
     if (atomic_load(&new_bm->current_file_size) == 0)
     {
         uint64_t file_size = 0;
@@ -321,7 +319,6 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     }
 
     /* block format, [size][checksum][data][size][magic] */
-    /* check for overflow when computing total_size */
     if (block->size > SIZE_MAX - BLOCK_MANAGER_BLOCK_HEADER_SIZE - BLOCK_MANAGER_FOOTER_SIZE)
     {
         return -1;
@@ -466,7 +463,7 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
         if (nread == 0) return 1; /* EOF */
         return -1;
     }
-    uint32_t block_size = decode_uint32_le_compat(size_buf);
+    const uint32_t block_size = decode_uint32_le_compat(size_buf);
     if (block_size == 0) return -1; /* invalid block */
 
     /* next block starts after, [size][checksum][data][footer_size][footer_magic] */
@@ -750,6 +747,12 @@ int block_manager_truncate(block_manager_t *bm)
         return -1;
     }
 
+    /* ftruncate is not covered by O_DSYNC, always sync truncation */
+    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+    {
+        fdatasync(bm->fd);
+    }
+
     if (close(bm->fd) != 0)
     {
         return -1;
@@ -946,6 +949,11 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
         {
             return -1;
         }
+        /* ftruncate is not covered by O_DSYNC, always sync truncation */
+        if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+        {
+            fdatasync(bm->fd);
+        }
         lseek(bm->fd, 0, SEEK_SET);
         atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
         return 0;
@@ -965,6 +973,11 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
         }
         /* permissive mode -- truncate to header */
         if (ftruncate(bm->fd, (off_t)BLOCK_MANAGER_HEADER_SIZE) == -1) return -1;
+        /* ftruncate is not covered by O_DSYNC, always sync truncation */
+        if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+        {
+            fdatasync(bm->fd);
+        }
         atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
         return 0;
     }
@@ -1060,6 +1073,11 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
         }
         /*** permissive mode -- truncate to header */
         if (ftruncate(bm->fd, (off_t)BLOCK_MANAGER_HEADER_SIZE) == -1) return -1;
+        /* ftruncate is not covered by O_DSYNC, always sync truncation */
+        if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+        {
+            fdatasync(bm->fd);
+        }
         atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
         return 0;
     }

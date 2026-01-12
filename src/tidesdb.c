@@ -142,7 +142,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_REFCOUNT_DRAIN_YIELD_THRESHOLD 1024   /* yield up to this count, then sleep */
 #define TDB_REFCOUNT_DRAIN_SLEEP_US        10     /* sleep interval after yield threshold */
 #define TDB_REFCOUNT_DRAIN_LOG_INTERVAL    0xFFFF /* log warning every ~64K iterations */
-#define TDB_REFCOUNT_DRAIN_BASELINE        2      /* baseline refcount: 1 original + 1 work ref */
+#define TDB_REFCOUNT_DRAIN_BASELINE        2      /* baseline refcount -- 1 original + 1 work ref */
 
 /* default L0/L1 management configuration */
 #define TDB_DEFAULT_L1_FILE_COUNT_TRIGGER    4
@@ -3670,7 +3670,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         /* we check if cursor is past data end offset (into auxiliary structures) */
         if (sst->klog_data_end_offset > 0 && klog_cursor->current_pos >= sst->klog_data_end_offset)
         {
-            /* reached auxiliary structures, stop reading data blocks */
+            /* we reached auxiliary structures, stop reading data blocks */
             break;
         }
 
@@ -3680,6 +3680,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         tidesdb_klog_block_t *klog_block = NULL;
         tidesdb_ref_counted_block_t *rc_block = NULL;
         block_manager_block_t *block = NULL;
+        int should_stop_search = 0;
 
         if (db->clock_cache && has_cf_name)
         {
@@ -3731,6 +3732,20 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         if (klog_block && klog_block->num_entries > 0)
         {
+            /* we skip block entirely if key > max_key (key comes after this block in comparator
+             * order) this avoids binary search overhead when we can determine key isn't in this
+             * block */
+            if (klog_block->max_key && klog_block->max_key_size > 0)
+            {
+                int max_key_cmp = comparator_fn(key, key_size, klog_block->max_key,
+                                                klog_block->max_key_size, comparator_ctx);
+                if (max_key_cmp > 0)
+                {
+                    /* key > max_key of this block, skip to next block */
+                    goto skip_block;
+                }
+            }
+
             /* we utilize binary search entries in this block (entries are sorted by key) */
             int32_t left = 0;
             int32_t right = (int32_t)klog_block->num_entries - 1;
@@ -3772,7 +3787,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                 {
                     (*kv)->entry = klog_block->entries[i];
 
-                    /* get value (inline or from vlog) */
+                    /* we get value (inline or from vlog) */
                     uint64_t vlog_offset = klog_block->entries[i].vlog_offset;
                     size_t value_size = klog_block->entries[i].value_size;
 
@@ -3807,6 +3822,24 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         }
         /* key not found in this block */
 
+    skip_block:
+        /** early termination
+         * we check if key is beyond this block's range
+         * for normal comparators -- if key < first_key, key cannot exist in subsequent blocks
+         * for reverse comparators -- if key > first_key (cmp < 0), key cannot exist in subsequent
+         * blocks since blocks are iterated in comparator order */
+        if (klog_block && klog_block->num_entries > 0)
+        {
+            int first_key_cmp = comparator_fn(key, key_size, klog_block->keys[0],
+                                              klog_block->entries[0].key_size, comparator_ctx);
+            /* for both normal and reverse comparators, if key comes before first_key in
+             * comparator order (cmp < 0), key cannot exist in this or subsequent blocks */
+            if (first_key_cmp < 0)
+            {
+                should_stop_search = 1;
+            }
+        }
+
         /* release ref-counted block or free deserialized block */
         if (rc_block)
             tidesdb_block_release(rc_block);
@@ -3815,6 +3848,12 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         /* cleanup block resources before moving to next */
         if (block) block_manager_block_release(block);
+
+        /* stop if key < first key of block (early termination for sorted blocks) */
+        if (should_stop_search)
+        {
+            break;
+        }
 
         /* if block index pointed us to a specific block and key wasnt found,
          * stop searching since blocks are sorted and key cannot be in subsequent blocks */
@@ -8684,7 +8723,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
         /* wait for all in-flight writers to finish before reading from memtable
          * writers hold refcount while writing to WAL and skip_list
          * we must wait for them to complete to ensure we capture all entries
-         * refcount accounting: 1 (original) + 1 (work ref) = 2 when no external refs
+         * refcount accounting -- 1 (original) + 1 (work ref) = 2 when no external refs
          * this wait happens in the background flush thread, not the hot path */
         int drain_iterations = 0;
         while (atomic_load_explicit(&imm->refcount, memory_order_acquire) >

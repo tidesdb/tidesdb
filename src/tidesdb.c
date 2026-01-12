@@ -5519,7 +5519,7 @@ static int tidesdb_remove_level(tidesdb_column_family_t *cf)
     tidesdb_level_t *largest = cf->levels[old_num_levels - 1];
     int num_largest_ssts = atomic_load_explicit(&largest->num_sstables, memory_order_acquire);
 
-    /* we only remove level if its completely empty */
+    /* we only remove level if it's completely empty */
     if (num_largest_ssts > 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Cannot remove level %d - has %d SSTables", largest->level_num,
@@ -10952,7 +10952,7 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
 
 static int wait_for_open(tidesdb_t *db)
 {
-    /* we wait for database to open and finish recovery, but timeout if its closing
+    /* we wait for database to open and finish recovery, but timeout if it's closing
      * this prevents threads from hanging forever when database is being closed
      * and prevents transactions from starting during recovery */
     int wait_count = 0;
@@ -10962,7 +10962,7 @@ static int wait_for_open(tidesdb_t *db)
         if (wait_count >= TDB_OPENING_WAIT_MAX_MS)
         {
             /* the database is not open and hasnt opened after timeout
-             * its likely closing or closed */
+             * it's likely closing or closed */
             return TDB_ERR_INVALID_DB;
         }
 

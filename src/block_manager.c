@@ -18,8 +18,6 @@
  */
 #include "block_manager.h"
 
-#include <stdbool.h>
-
 #include "xxhash.h"
 
 #define BLOCK_MANAGER_STACK_BUFFER_SIZE 65536
@@ -86,9 +84,9 @@ static inline int verify_checksum(const void *data, const size_t size,
  * can_use_odsync
  * check if we can use O_DSYNC flag for writes based on the sync mode
  * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL)
- * return true if O_DSYNC is enabled and we are using SYNC_FULL mode, false otherwise
+ * return 1 if O_DSYNC is enabled and we are using SYNC_FULL mode, 0 otherwise
  */
-static inline bool can_use_odsync(const block_manager_sync_mode_t sync_mode)
+static inline int can_use_odsync(const block_manager_sync_mode_t sync_mode)
 {
     return sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0;
 }

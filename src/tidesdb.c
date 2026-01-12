@@ -3731,6 +3731,19 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         if (klog_block && klog_block->num_entries > 0)
         {
+            /* skip block entirely if key > max_key (key comes after this block in comparator order)
+             * this avoids binary search overhead when we can determine key isn't in this block */
+            if (klog_block->max_key && klog_block->max_key_size > 0)
+            {
+                int max_key_cmp = comparator_fn(key, key_size, klog_block->max_key,
+                                                klog_block->max_key_size, comparator_ctx);
+                if (max_key_cmp > 0)
+                {
+                    /* key > max_key of this block, skip to next block */
+                    goto skip_block;
+                }
+            }
+
             /* we utilize binary search entries in this block (entries are sorted by key) */
             int32_t left = 0;
             int32_t right = (int32_t)klog_block->num_entries - 1;
@@ -3807,6 +3820,24 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         }
         /* key not found in this block */
 
+    skip_block:
+        /* early termination: check if key is beyond this block's range
+         * for normal comparators: if key < first_key, key cannot exist in subsequent blocks
+         * for reverse comparators: if key > first_key (cmp < 0), key cannot exist in subsequent
+         * blocks since blocks are iterated in comparator order */
+        int should_stop_search = 0;
+        if (klog_block && klog_block->num_entries > 0)
+        {
+            int first_key_cmp = comparator_fn(key, key_size, klog_block->keys[0],
+                                              klog_block->entries[0].key_size, comparator_ctx);
+            /* for both normal and reverse comparators, if key comes before first_key in
+             * comparator order (cmp < 0), key cannot exist in this or subsequent blocks */
+            if (first_key_cmp < 0)
+            {
+                should_stop_search = 1;
+            }
+        }
+
         /* release ref-counted block or free deserialized block */
         if (rc_block)
             tidesdb_block_release(rc_block);
@@ -3815,6 +3846,12 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         /* cleanup block resources before moving to next */
         if (block) block_manager_block_release(block);
+
+        /* stop if key < first key of block (early termination for sorted blocks) */
+        if (should_stop_search)
+        {
+            break;
+        }
 
         /* if block index pointed us to a specific block and key wasnt found,
          * stop searching since blocks are sorted and key cannot be in subsequent blocks */

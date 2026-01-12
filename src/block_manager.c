@@ -88,7 +88,8 @@ static inline int verify_checksum(const void *data, const size_t size,
  * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL)
  * return true if O_DSYNC is enabled and we are using SYNC_FULL mode, false otherwise
  */
-static inline bool can_use_odsync(const block_manager_sync_mode_t sync_mode) {
+static inline bool can_use_odsync(const block_manager_sync_mode_t sync_mode)
+{
     return sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0;
 }
 

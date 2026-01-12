@@ -3670,7 +3670,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         /* we check if cursor is past data end offset (into auxiliary structures) */
         if (sst->klog_data_end_offset > 0 && klog_cursor->current_pos >= sst->klog_data_end_offset)
         {
-            /* reached auxiliary structures, stop reading data blocks */
+            /* we reached auxiliary structures, stop reading data blocks */
             break;
         }
 
@@ -3680,6 +3680,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         tidesdb_klog_block_t *klog_block = NULL;
         tidesdb_ref_counted_block_t *rc_block = NULL;
         block_manager_block_t *block = NULL;
+        int should_stop_search = 0;
 
         if (db->clock_cache && has_cf_name)
         {
@@ -3731,7 +3732,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
         if (klog_block && klog_block->num_entries > 0)
         {
-            /* skip block entirely if key > max_key (key comes after this block in comparator order)
+            /* we skip block entirely if key > max_key (key comes after this block in comparator order)
              * this avoids binary search overhead when we can determine key isn't in this block */
             if (klog_block->max_key && klog_block->max_key_size > 0)
             {
@@ -3785,7 +3786,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                 {
                     (*kv)->entry = klog_block->entries[i];
 
-                    /* get value (inline or from vlog) */
+                    /* we get value (inline or from vlog) */
                     uint64_t vlog_offset = klog_block->entries[i].vlog_offset;
                     size_t value_size = klog_block->entries[i].value_size;
 
@@ -3821,11 +3822,11 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         /* key not found in this block */
 
     skip_block:
-        /* early termination: check if key is beyond this block's range
-         * for normal comparators: if key < first_key, key cannot exist in subsequent blocks
-         * for reverse comparators: if key > first_key (cmp < 0), key cannot exist in subsequent
+        /** early termination
+         * we check if key is beyond this block's range
+         * for normal comparators -- if key < first_key, key cannot exist in subsequent blocks
+         * for reverse comparators -- if key > first_key (cmp < 0), key cannot exist in subsequent
          * blocks since blocks are iterated in comparator order */
-        int should_stop_search = 0;
         if (klog_block && klog_block->num_entries > 0)
         {
             int first_key_cmp = comparator_fn(key, key_size, klog_block->keys[0],

@@ -1,4 +1,4 @@
-### When contributing to TidesDB a couple things.
+### When contributing to TidesDB, keep a couple things in mind:
 
 - Make sure your code comments are all lower case and in English and using `/* */` style.
 - When adding to tidesdb.c or tidesdb.h please make sure you follow prefixing conventions for internal, public methods.

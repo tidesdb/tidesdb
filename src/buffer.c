@@ -85,7 +85,7 @@ static int try_acquire_slot(buffer_t *buffer, const uint32_t index, void *data, 
 {
     buffer_slot_t *slot = &buffer->slots[index];
 
-    /* try to transition FREE -> ACQUIRED */
+    /* we try to transition FREE -> ACQUIRED */
     uint32_t expected = BUFFER_SLOT_FREE;
     if (!atomic_compare_exchange_strong_explicit(&slot->state, &expected, BUFFER_SLOT_ACQUIRED,
                                                  memory_order_acquire, memory_order_relaxed))
@@ -117,14 +117,14 @@ int buffer_try_acquire(buffer_t *buffer, void *data, uint32_t *id)
     uint32_t capacity = buffer->capacity;
     uint32_t start = atomic_load_explicit(&buffer->hint_index, memory_order_relaxed) % capacity;
 
-    /* scan from hint position */
+    /* we scan from hint position */
     for (uint32_t i = 0; i < capacity; i++)
     {
         uint32_t index = (start + i) % capacity;
 
         if (BUFFER_LIKELY(try_acquire_slot(buffer, index, data, id) == 0))
         {
-            /* update hint to next slot for future searches */
+            /* we update hint to next slot for future searches */
             atomic_store_explicit(&buffer->hint_index, (index + 1) % capacity,
                                   memory_order_relaxed);
             return 0;
@@ -150,12 +150,12 @@ int buffer_acquire(buffer_t *buffer, void *data, uint32_t *id)
             return 0;
         }
 
-        /* exponential backoff with cap */
+        /* we use exponential backoff with cap */
         if (BUFFER_LIKELY(backoff > 0))
         {
             if (backoff < BUFFER_ACQUIRE_BACKOFF)
             {
-                /* short backoff: just pause */
+                /* short backoff; just pause */
                 for (uint32_t i = 0; i < backoff; i++)
                 {
                     cpu_pause();
@@ -233,7 +233,6 @@ static inline int buffer_release_internal(buffer_t *buffer, const uint32_t id, i
         buffer->eviction_fn(data, buffer->eviction_ctx);
     }
 
-    /* clear data */
     atomic_store_explicit(&slot->data, NULL, memory_order_relaxed);
 
     /* transition RELEASING -> FREE */
@@ -287,10 +286,10 @@ int buffer_clear(buffer_t *buffer)
     if (BUFFER_UNLIKELY(buffer == NULL)) return -1;
 
     /* cache capacity and skip bounds checks in loop */
-    uint32_t capacity = buffer->capacity;
+    const uint32_t capacity = buffer->capacity;
     for (uint32_t i = 0; i < capacity; i++)
     {
-        /* use internal helper to skip redundant bounds checks */
+        /* we use internal helper to skip redundant bounds checks */
         buffer_release_internal(buffer, i, 1);
     }
 
@@ -300,8 +299,6 @@ int buffer_clear(buffer_t *buffer)
 void buffer_free(buffer_t *buffer)
 {
     if (BUFFER_UNLIKELY(buffer == NULL)) return;
-
-    /* release all occupied slots */
     buffer_clear(buffer);
 
     free(buffer->slots);

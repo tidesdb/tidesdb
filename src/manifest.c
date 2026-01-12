@@ -76,7 +76,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     const char *last_sep = strrchr(path, PATH_SEPARATOR[0]);
     if (last_sep)
     {
-        size_t dir_len = last_sep - path;
+        const size_t dir_len = last_sep - path;
         if (dir_len < sizeof(dir_path))
         {
             memcpy(dir_path, path, dir_len);
@@ -92,27 +92,27 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
         strcpy(dir_path, ".");
     }
 
-    /* get base filename for pattern matching */
+    /* base filename for pattern matching */
     const char *base_name = last_sep ? last_sep + 1 : path;
-    size_t base_len = strlen(base_name);
+    const size_t base_len = strlen(base_name);
 
-    /* scan directory for orphaned temp files */
+    /* we scan directory looking for orphaned temp files */
     DIR *dir = opendir(dir_path);
     if (dir)
     {
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL)
         {
-            /* check if filename matches pattern: <base_name>MANIFEST_TMP_EXT* */
-            size_t entry_len = strlen(entry->d_name);
+            /* we check if filename matches pattern -- <base_name>MANIFEST_TMP_EXT* */
+            const size_t entry_len = strlen(entry->d_name);
             if (entry_len > base_len + 5 && strncmp(entry->d_name, base_name, base_len) == 0 &&
                 strncmp(entry->d_name + base_len, MANIFEST_TMP_EXT, 5) == 0)
             {
-                /* found orphaned temp file, remove it */
+                /* found orphaned temp file, we remove it */
                 char temp_full_path[MANIFEST_PATH_LEN];
-                size_t dir_path_len = strlen(dir_path);
-                size_t sep_len = strlen(PATH_SEPARATOR);
-                /* check if combined path fits in buffer (dir + separator + entry + null) */
+                const size_t dir_path_len = strlen(dir_path);
+                const size_t sep_len = strlen(PATH_SEPARATOR);
+                /* we check if combined path fits in buffer (dir + separator + entry + null) */
                 if (dir_path_len + sep_len + entry_len + 1 <= MANIFEST_PATH_LEN)
                 {
                     size_t offset = 0;
@@ -133,7 +133,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     FILE *fp = tdb_fopen(path, "r");
     if (!fp)
     {
-        /* file doesnt exist, return empty manifest */
+        /* the file doesnt exist, return empty manifest */
         if (errno == ENOENT) return manifest;
         /* other error */
         pthread_rwlock_destroy(&manifest->lock);
@@ -147,7 +147,7 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     if (fgets(line, sizeof(line), fp))
     {
         char *endptr;
-        long version = strtol(line, &endptr, 10);
+        const long version = strtol(line, &endptr, 10);
         if (endptr == line || version != MANIFEST_VERSION)
         {
             fclose(fp);
@@ -171,35 +171,33 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
 
     while (fgets(line, sizeof(line), fp))
     {
-        int level;
-        uint64_t id, num_entries, size_bytes;
-        char *ptr = line;
+        const char *ptr = line;
         char *endptr;
 
         /* parse level */
-        long level_val = strtol(ptr, &endptr, 10);
+        const long level_val = strtol(ptr, &endptr, 10);
         if (endptr == ptr || *endptr != ',') continue;
-        level = (int)level_val;
+        const int level = (int)level_val;
         ptr = endptr + 1;
 
         /* parse id */
-        id = strtoull(ptr, &endptr, 10);
+        const uint64_t id = strtoull(ptr, &endptr, 10);
         if (endptr == ptr || *endptr != ',') continue;
         ptr = endptr + 1;
 
         /* parse num_entries */
-        num_entries = strtoull(ptr, &endptr, 10);
+        const uint64_t num_entries = strtoull(ptr, &endptr, 10);
         if (endptr == ptr || *endptr != ',') continue;
         ptr = endptr + 1;
 
         /* parse size_bytes */
-        size_bytes = strtoull(ptr, &endptr, 10);
+        const uint64_t size_bytes = strtoull(ptr, &endptr, 10);
         if (endptr == ptr) continue;
 
         tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
     }
 
-    /* keep file open for future use */
+    /* we keep file open for future use */
     manifest->fp = fp;
 
     return manifest;
@@ -215,9 +213,9 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
  * @param size_bytes size of sstable in bytes
  * @return 0 on success, -1 on error
  */
-static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, int level,
-                                                 uint64_t id, uint64_t num_entries,
-                                                 uint64_t size_bytes)
+static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, const int level,
+                                                 const uint64_t id, const uint64_t num_entries,
+                                                 const uint64_t size_bytes)
 {
     for (int i = 0; i < manifest->num_entries; i++)
     {
@@ -231,7 +229,7 @@ static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, i
 
     if (manifest->num_entries >= manifest->capacity)
     {
-        int new_capacity = manifest->capacity * 2;
+        const int new_capacity = manifest->capacity * 2;
         tidesdb_manifest_entry_t *new_entries =
             realloc(manifest->entries, sizeof(tidesdb_manifest_entry_t) * new_capacity);
         if (!new_entries)
@@ -252,21 +250,22 @@ static int tidesdb_manifest_add_sstable_unlocked(tidesdb_manifest_t *manifest, i
     return 0;
 }
 
-int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, int level, uint64_t id,
-                                 uint64_t num_entries, uint64_t size_bytes)
+int tidesdb_manifest_add_sstable(tidesdb_manifest_t *manifest, const int level, const uint64_t id,
+                                 const uint64_t num_entries, const uint64_t size_bytes)
 {
     if (!manifest) return -1;
 
     atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_wrlock(&manifest->lock);
-    int result =
+    const int result =
         tidesdb_manifest_add_sstable_unlocked(manifest, level, id, num_entries, size_bytes);
     pthread_rwlock_unlock(&manifest->lock);
     atomic_fetch_sub(&manifest->active_ops, 1);
     return result;
 }
 
-int tidesdb_manifest_remove_sstable(tidesdb_manifest_t *manifest, int level, uint64_t id)
+int tidesdb_manifest_remove_sstable(tidesdb_manifest_t *manifest, const int level,
+                                    const uint64_t id)
 {
     if (!manifest) return -1;
 
@@ -291,7 +290,7 @@ int tidesdb_manifest_remove_sstable(tidesdb_manifest_t *manifest, int level, uin
     return -1;
 }
 
-int tidesdb_manifest_has_sstable(tidesdb_manifest_t *manifest, int level, uint64_t id)
+int tidesdb_manifest_has_sstable(tidesdb_manifest_t *manifest, const int level, const uint64_t id)
 {
     if (!manifest) return 0;
 
@@ -328,7 +327,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_wrlock(&manifest->lock);
 
-    /* close existing file pointer if path changed */
+    /* we close existing file pointer if path changed */
     if (manifest->fp && strcmp(manifest->path, path) != 0)
     {
         fclose(manifest->fp);
@@ -337,7 +336,6 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
         manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
     }
 
-    /* close for rewriting */
     if (manifest->fp)
     {
         fclose(manifest->fp);
@@ -399,7 +397,7 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
         return -1;
     }
 
-    /* reopen for reading */
+    /* we reopen for reading */
     manifest->fp = tdb_fopen(path, "r");
 
     pthread_rwlock_unlock(&manifest->lock);
@@ -427,7 +425,6 @@ void tidesdb_manifest_close(tidesdb_manifest_t *manifest)
         manifest->fp = NULL;
     }
 
-    /* unlock before destroying */
     pthread_rwlock_unlock(&manifest->lock);
     pthread_rwlock_destroy(&manifest->lock);
     free(manifest->entries);

@@ -350,6 +350,19 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                            void *visibility_ctx);
 
 /**
+ * skip_list_get_max_seq
+ * retrieves only the maximum sequence number for a key without allocating value
+ * optimized for conflict detection where only seq comparison is needed
+ * @param list skip list
+ * @param key key data
+ * @param key_size size of key
+ * @param out_seq output parameter for sequence number (set to 0 if not found)
+ * @return 0 if key found, -1 if not found or error
+ */
+int skip_list_get_max_seq(skip_list_t *list, const uint8_t *key, size_t key_size,
+                          uint64_t *out_seq);
+
+/**
  * skip_list_cursor_init
  * initializes a new cursor
  * @param cursor pointer to cursor pointer

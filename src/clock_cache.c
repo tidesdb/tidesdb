@@ -179,12 +179,12 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
         char *entry_key_ptr = atomic_load_explicit(&entry->key, memory_order_acquire);
         if (!entry_key_ptr) continue;
 
-        atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acquire);
+        atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
 
         uint8_t state_before = atomic_load_explicit(&entry->state, memory_order_acquire);
         if (state_before != ENTRY_VALID)
         {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
             continue;
         }
 
@@ -192,7 +192,7 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
         char *key_recheck = atomic_load_explicit(&entry->key, memory_order_acquire);
         if (key_recheck != entry_key_ptr || !key_recheck)
         {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
             continue;
         }
 
@@ -200,7 +200,7 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
         uint8_t state_check = atomic_load_explicit(&entry->state, memory_order_acquire);
         if (state_check != ENTRY_VALID)
         {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
             continue;
         }
 
@@ -208,13 +208,13 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
         char *key_final = atomic_load_explicit(&entry->key, memory_order_acquire);
         if (key_final != key_recheck || !key_final)
         {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
             continue;
         }
 
         const int match = (memcmp(key_final, key, key_len) == 0);
 
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
 
         if (match)
         {
@@ -249,19 +249,19 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
         char *entry_key_ptr = atomic_load_explicit(&entry->key, memory_order_acquire);
         if (!entry_key_ptr) continue;
 
-        atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acquire);
+        atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
 
         uint8_t state_before = atomic_load_explicit(&entry->state, memory_order_acquire);
         if (state_before != ENTRY_VALID)
         {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
             continue;
         }
 
         char *key_recheck = atomic_load_explicit(&entry->key, memory_order_acquire);
         if (key_recheck != entry_key_ptr || !key_recheck)
         {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
             continue;
         }
 
@@ -269,7 +269,7 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
         uint8_t state_check = atomic_load_explicit(&entry->state, memory_order_acquire);
         if (state_check != ENTRY_VALID)
         {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
             continue;
         }
 
@@ -277,13 +277,13 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
         char *key_final = atomic_load_explicit(&entry->key, memory_order_acquire);
         if (key_final != key_recheck || !key_final)
         {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
             continue;
         }
 
         const int match = (memcmp(key_final, key, key_len) == 0);
 
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
 
         if (match)
         {
@@ -790,13 +790,13 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
     }
 
     /* we increment ref_bit to protect entry from eviction during read */
-    atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acquire);
+    atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
 
     /* we verify entry is still valid after incrementing ref_bit */
     uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
     if (state != ENTRY_VALID)
     {
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
         return NULL;
     }
 
@@ -805,14 +805,14 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
 
     if (!entry_payload || entry_payload_len == 0)
     {
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
         return NULL;
     }
 
     uint8_t *result = (uint8_t *)malloc(entry_payload_len);
     if (!result)
     {
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
         return NULL;
     }
 
@@ -821,13 +821,13 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
     {
         /* cleared or changed, abort */
         free(result);
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
         return NULL;
     }
 
     memcpy(result, entry_payload, entry_payload_len);
 
-    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
 
     if (payload_len) *payload_len = entry_payload_len;
 
@@ -855,13 +855,13 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
     }
 
     /* we increment ref_bit to protect entry from eviction during use */
-    atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acquire);
+    atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
 
     /* we verify entry is still valid after incrementing ref_bit */
     uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
     if (state != ENTRY_VALID)
     {
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
         return NULL;
     }
 
@@ -870,7 +870,7 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
 
     if (!entry_payload || entry_payload_len == 0)
     {
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
         return NULL;
     }
 
@@ -878,7 +878,7 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
     uint8_t *payload_recheck = atomic_load_explicit(&entry->payload, memory_order_acquire);
     if (payload_recheck != entry_payload)
     {
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
         return NULL;
     }
 
@@ -892,7 +892,7 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
 void clock_cache_release(clock_cache_entry_t *entry)
 {
     if (!entry) return;
-    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_release);
+    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
 }
 
 int clock_cache_delete(clock_cache_t *cache, const char *key, const size_t key_len)

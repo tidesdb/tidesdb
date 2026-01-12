@@ -27,9 +27,7 @@
 #define BLOCK_MANAGER_MAGIC 0x544442
 /* 3-byte mask for magic number validation */
 #define BLOCK_MANAGER_MAGIC_MASK 0xFFFFFF
-
-/* block manager version */
-#define BLOCK_MANAGER_VERSION 7
+#define BLOCK_MANAGER_VERSION    7
 
 /* header field sizes */
 /* magic number size in bytes */
@@ -40,8 +38,7 @@
 #define BLOCK_MANAGER_BLOCK_SIZE_SIZE 4
 /* padding field size in bytes */
 #define BLOCK_MANAGER_PADDING_SIZE 4
-
-#define BLOCK_MANAGER_HEADER_SIZE 8
+#define BLOCK_MANAGER_HEADER_SIZE  8
 
 /* block field sizes */
 /* block size field (uint32_t) -- supports blocks up to 4GB */

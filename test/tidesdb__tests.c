@@ -9646,7 +9646,6 @@ static void *multi_db_worker_thread(void *arg)
 
     for (int i = 0; i < data->num_operations; i++)
     {
-        /* create unique keys per database and thread */
         snprintf(key_buf, sizeof(key_buf), "db%d_thread%d_key%d", data->db_id, data->thread_id, i);
         snprintf(value_buf, sizeof(value_buf), "db%d_thread%d_value%d", data->db_id,
                  data->thread_id, i);
@@ -9846,7 +9845,6 @@ static void test_multiple_databases_concurrent_operations(void)
                     tidesdb_txn_get(verify_txn, column_families[db_id], (uint8_t *)key_buf,
                                     strlen(key_buf), &value, &value_size);
 
-                /* debug first key lookup */
                 if (t == 0 && i == 0)
                 {
                     printf("  db%d first key '%s' (len=%zu): result=%d, snapshot_seq=%" PRIu64
@@ -12097,7 +12095,6 @@ static void test_filesystem_full_during_compaction(void)
         }
     }
 
-    /* we wait for flushes */
     for (int i = 0; i < 100; i++)
     {
         usleep(20000);
@@ -12105,7 +12102,7 @@ static void test_filesystem_full_during_compaction(void)
     }
 
     /* we trigger compaction - even if disk is "full", system should handle gracefully
-     * note: we can't actually fill the disk in a test, but we verify compaction
+     * note -- we can't actually fill the disk in a test, but we verify compaction
      * doesn't corrupt data even under stress */
     tidesdb_compact(cf);
 
@@ -12149,7 +12146,6 @@ static void test_power_loss_during_sstable_metadata_write(void)
     cleanup_test_dir();
     const int NUM_KEYS = 100;
 
-    /* we write data and flush to create sstable */
     {
         tidesdb_t *db = create_test_db();
         tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
@@ -12306,7 +12302,6 @@ static void test_memory_allocation_stress(void)
 
     free(large_value);
 
-    /* we wait for flushes */
     for (int i = 0; i < 100; i++)
     {
         usleep(20000);

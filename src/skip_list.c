@@ -1276,6 +1276,41 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     return 0;
 }
 
+int skip_list_get_max_seq(skip_list_t *list, const uint8_t *key, size_t key_size, uint64_t *out_seq)
+{
+    if (list == NULL || key == NULL || key_size == 0 || out_seq == NULL) return -1;
+
+    *out_seq = 0;
+
+    skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
+    skip_list_node_t *current = header;
+    const int max_level = atomic_load_explicit(&list->level, memory_order_acquire);
+
+    for (int i = max_level; i >= 0; i--)
+    {
+        skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        while (next != NULL && !NODE_IS_SENTINEL(next) && next->key != NULL)
+        {
+            int cmp = skip_list_compare_keys_inline(list, next->key, next->key_size, key, key_size);
+            if (cmp >= 0) break;
+            current = next;
+            next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        }
+    }
+
+    skip_list_node_t *target = atomic_load_explicit(&current->forward[0], memory_order_acquire);
+    if (target == NULL || NODE_IS_SENTINEL(target) || target->key == NULL) return -1;
+
+    int cmp = skip_list_compare_keys_inline(list, target->key, target->key_size, key, key_size);
+    if (cmp != 0) return -1;
+
+    skip_list_version_t *version = atomic_load_explicit(&target->versions, memory_order_acquire);
+    if (version == NULL) return -1;
+
+    *out_seq = atomic_load_explicit(&version->seq, memory_order_acquire);
+    return 0;
+}
+
 int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
                            size_t *value_size, time_t *ttl, uint8_t *deleted, uint64_t *seq,
                            uint64_t snapshot_seq, skip_list_visibility_check_fn visibility_check,

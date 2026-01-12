@@ -81,6 +81,17 @@ static inline int verify_checksum(const void *data, const size_t size,
 }
 
 /**
+ * can_use_odsync
+ * check if we can use O_DSYNC flag for writes based on the sync mode
+ * @param sync_mode the sync mode (TDB_SYNC_NONE, TDB_SYNC_FULL)
+ * return 1 if O_DSYNC is enabled and we are using SYNC_FULL mode, 0 otherwise
+ */
+static inline int can_use_odsync(const block_manager_sync_mode_t sync_mode)
+{
+    return sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0;
+}
+
+/**
  * write_header
  * write file header using pwrite
  * @param fd the file descriptor to write to
@@ -172,7 +183,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
      * the need for per-write fdatasync() calls on platforms that support it.
      * this is also faster, less syscalls, for example
      */
-    if (sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0)
+    if (can_use_odsync(sync_mode))
     {
         flags |= O_DSYNC;
     }
@@ -213,7 +224,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         }
         /* if O_DSYNC is available, pwrite already synced the header
          * otherwise fall back to explicit fdatasync */
-        if (new_bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+        if (!can_use_odsync(sync_mode))
         {
             if (fdatasync(new_bm->fd) != 0)
             {
@@ -249,9 +260,9 @@ int block_manager_close(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    /* final sync on close -- really only needed if O_DSYNC wasnt used
+    /* final sync on close -- really only needed if O_DSYNC was not used
      * with O_DSYNC, all writes are already durable */
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+    if (!can_use_odsync(bm->sync_mode))
     {
         (void)fdatasync(bm->fd);
     }
@@ -377,7 +388,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
     /* if O_DSYNC is available and was used at open time, pwrite already synced
      * otherwise fall back to explicit fdatasync for durability */
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+    if (!can_use_odsync(bm->sync_mode))
     {
         if (fdatasync(bm->fd) != 0)
         {
@@ -760,7 +771,7 @@ int block_manager_truncate(block_manager_t *bm)
 
     /* we reopen with same flags as original open, including O_DSYNC if in SYNC_FULL mode */
     int flags = O_RDWR | O_CREAT;
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0)
+    if (can_use_odsync(bm->sync_mode))
     {
         flags |= O_DSYNC;
     }
@@ -776,7 +787,7 @@ int block_manager_truncate(block_manager_t *bm)
         return -1;
     }
 
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+    if (!can_use_odsync(bm->sync_mode))
     {
         if (fdatasync(bm->fd) != 0)
         {
@@ -925,7 +936,7 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
         {
             return -1;
         }
-        if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+        if (!can_use_odsync(bm->sync_mode))
         {
             fdatasync(bm->fd);
         }
@@ -1038,14 +1049,14 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
                     bm->file_path, file_size, valid_size);
             if (ftruncate(bm->fd, (off_t)valid_size) != 0) return -1;
             /* sync truncation - only needed if O_DSYNC not available */
-            if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+            if (!can_use_odsync(bm->sync_mode))
             {
                 fdatasync(bm->fd);
             }
             close(bm->fd);
             /* reopen with same flags as original open */
             int flags = O_RDWR | O_CREAT;
-            if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0)
+            if (can_use_odsync(bm->sync_mode))
             {
                 flags |= O_DSYNC;
             }

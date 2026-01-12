@@ -12,7 +12,7 @@ By contributing to TidesDB, you certify that your contribution was created in wh
 
 All contributions must include a "Signed-off-by" line in the commit message. This certifies that you agree to the Developer Certificate of Origin (see [Developer Certificate of Origin (DCO)](DCO) file for the full text).
 
-**Note:** DCO sign-off is automatically checked by the [DCO bot](https://github.com/apps/dco) on all pull requests. The bot will show a status check that must pass before your PR can be merged. Pull requests with commits missing sign-off will be blocked until all commits are signed off.
+DCO sign-off is automatically checked by the [DCO bot](https://github.com/apps/dco) on all pull requests. The bot will show a status check that must pass before your PR can be merged. Pull requests with commits missing sign-off will be blocked until all commits are signed off.
 
 To sign off your commits, use the `-s` or `--signoff` flag:
 

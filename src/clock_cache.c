@@ -135,15 +135,90 @@ static void hash_table_remove(clock_cache_partition_t *partition, const uint64_t
 }
 
 /**
- * find_entry
- * find entry using hash index for O(1) lookup
- * @param partition the partition
+ * try_match_entry
+ * @param entry the entry
  * @param key the key
  * @param key_len the key length
+ * @param target_hash the target hash
  * @return the entry or NULL if not found
  */
+static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const char *key,
+                                            size_t key_len, uint64_t target_hash)
+{
+    uint8_t state = atomic_load_explicit(&entry->state, memory_order_relaxed);
+    if (state != ENTRY_VALID) return NULL;
+
+    uint64_t entry_hash = atomic_load_explicit(&entry->cached_hash, memory_order_relaxed);
+    if (entry_hash != target_hash) return NULL;
+
+    size_t entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_relaxed);
+    if (entry_key_len != key_len) return NULL;
+
+    /* Pin entry *before* reading pointers to close UAF window (see #675) */
+    atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
+
+    uint8_t state_before = atomic_load_explicit(&entry->state, memory_order_acquire);
+    if (state_before != ENTRY_VALID)
+    {
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
+        return NULL;
+    }
+
+    char *entry_key_ptr = atomic_load_explicit(&entry->key, memory_order_acquire);
+    if (!entry_key_ptr)
+    {
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
+        return NULL;
+    }
+
+    /* Re-validate invariants while pinned */
+    entry_hash = atomic_load_explicit(&entry->cached_hash, memory_order_acquire);
+    if (entry_hash != target_hash)
+    {
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
+        return NULL;
+    }
+
+    entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_acquire);
+    if (entry_key_len != key_len)
+    {
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
+        return NULL;
+    }
+
+    uint8_t state_check = atomic_load_explicit(&entry->state, memory_order_acquire);
+    if (state_check != ENTRY_VALID)
+    {
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
+        return NULL;
+    }
+
+    char *key_final = atomic_load_explicit(&entry->key, memory_order_acquire);
+    if (!key_final || key_final != entry_key_ptr)
+    {
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
+        return NULL;
+    }
+
+    const int match = (memcmp(key_final, key, key_len) == 0);
+
+    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
+
+    if (!match) return NULL;
+
+    uint8_t state_after = atomic_load_explicit(&entry->state, memory_order_acquire);
+    char *key_after = atomic_load_explicit(&entry->key, memory_order_acquire);
+
+    if (state_after == ENTRY_VALID && key_after == key_final)
+    {
+        return entry;
+    }
+
+    return NULL;
+}
+
 static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const char *key,
-                                       size_t key_len)
+                                       const size_t key_len)
 {
     uint64_t target_hash = compute_hash(key, key_len);
     const size_t idx = target_hash & partition->hash_mask;
@@ -161,73 +236,10 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
             return NULL;
         }
 
+        PREFETCH_READ(&partition->slots[slot_idx]);
         clock_cache_entry_t *entry = &partition->slots[slot_idx];
-
-        /* we check state first -- relaxed is fine, we validate later */
-        uint8_t state = atomic_load_explicit(&entry->state, memory_order_relaxed);
-        if (state != ENTRY_VALID) continue;
-
-        /* we check cached hash matches -- relaxed */
-        uint64_t entry_hash = atomic_load_explicit(&entry->cached_hash, memory_order_relaxed);
-        if (entry_hash != target_hash) continue;
-
-        /* we load key length -- relaxed */
-        size_t entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_relaxed);
-        if (entry_key_len != key_len) continue;
-
-        /* now key pointer with acquire for final validation */
-        char *entry_key_ptr = atomic_load_explicit(&entry->key, memory_order_acquire);
-        if (!entry_key_ptr) continue;
-
-        atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-
-        uint8_t state_before = atomic_load_explicit(&entry->state, memory_order_acquire);
-        if (state_before != ENTRY_VALID)
-        {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-            continue;
-        }
-
-        /* we re-check key pointer hasnt been cleared */
-        char *key_recheck = atomic_load_explicit(&entry->key, memory_order_acquire);
-        if (key_recheck != entry_key_ptr || !key_recheck)
-        {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-            continue;
-        }
-
-        /* final state check right before memcmp, ensure not being deleted */
-        uint8_t state_check = atomic_load_explicit(&entry->state, memory_order_acquire);
-        if (state_check != ENTRY_VALID)
-        {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-            continue;
-        }
-
-        /* we re-load key pointer one more time right before memcmp */
-        char *key_final = atomic_load_explicit(&entry->key, memory_order_acquire);
-        if (key_final != key_recheck || !key_final)
-        {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-            continue;
-        }
-
-        const int match = (memcmp(key_final, key, key_len) == 0);
-
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-
-        if (match)
-        {
-            /* we verify entry is still valid after releasing ref_bit */
-            uint8_t state_after = atomic_load_explicit(&entry->state, memory_order_acquire);
-            char *key_after = atomic_load_explicit(&entry->key, memory_order_acquire);
-
-            if (state_after == ENTRY_VALID && key_after == entry_key_ptr)
-            {
-                /* match confirmed and entry still valid */
-                return entry;
-            }
-        }
+        clock_cache_entry_t *match = try_match_entry(entry, key, key_len, target_hash);
+        if (match) return match;
     }
 
     /* if hash index lookup failed, we do linear scan of all slots */
@@ -235,66 +247,10 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
 
     for (size_t i = 0; i < partition->num_slots; i++)
     {
+        PREFETCH_READ(&partition->slots[i]);
         clock_cache_entry_t *entry = &partition->slots[i];
-
-        uint8_t state = atomic_load_explicit(&entry->state, memory_order_relaxed);
-        if (state != ENTRY_VALID) continue;
-
-        uint64_t entry_hash = atomic_load_explicit(&entry->cached_hash, memory_order_relaxed);
-        if (entry_hash != target_hash) continue;
-
-        size_t entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_relaxed);
-        if (entry_key_len != key_len) continue;
-
-        char *entry_key_ptr = atomic_load_explicit(&entry->key, memory_order_acquire);
-        if (!entry_key_ptr) continue;
-
-        atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-
-        uint8_t state_before = atomic_load_explicit(&entry->state, memory_order_acquire);
-        if (state_before != ENTRY_VALID)
-        {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-            continue;
-        }
-
-        char *key_recheck = atomic_load_explicit(&entry->key, memory_order_acquire);
-        if (key_recheck != entry_key_ptr || !key_recheck)
-        {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-            continue;
-        }
-
-        /* final state check right before memcmp to ensure not being deleted */
-        uint8_t state_check = atomic_load_explicit(&entry->state, memory_order_acquire);
-        if (state_check != ENTRY_VALID)
-        {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-            continue;
-        }
-
-        /* re-load key pointer one more time right before memcmp */
-        char *key_final = atomic_load_explicit(&entry->key, memory_order_acquire);
-        if (key_final != key_recheck || !key_final)
-        {
-            atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-            continue;
-        }
-
-        const int match = (memcmp(key_final, key, key_len) == 0);
-
-        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-
-        if (match)
-        {
-            uint8_t state_after = atomic_load_explicit(&entry->state, memory_order_acquire);
-            char *key_after = atomic_load_explicit(&entry->key, memory_order_acquire);
-
-            if (state_after == ENTRY_VALID && key_after == entry_key_ptr)
-            {
-                return entry;
-            }
-        }
+        clock_cache_entry_t *match = try_match_entry(entry, key, key_len, target_hash);
+        if (match) return match;
     }
 
     return NULL;
@@ -421,6 +377,8 @@ static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *p
         /* we use local counter with occasional sync to global clock_hand */
         const size_t hand = (start_pos + iterations) % partition->num_slots;
         clock_cache_entry_t *entry = &partition->slots[hand];
+        const size_t next_hand = (hand + 1) % partition->num_slots;
+        PREFETCH_READ(&partition->slots[next_hand]);
 
         /* we check state atomically */
         uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
@@ -440,6 +398,7 @@ static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *p
             if (ref == 0)
             {
                 /* found victim -- try to evict */
+                PREFETCH_WRITE(entry);
                 free_entry(cache, partition, entry);
 
                 /* we update thread position for next time */
@@ -457,6 +416,7 @@ static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *p
     size_t hand =
         atomic_load_explicit(&partition->clock_hand, memory_order_acquire) % partition->num_slots;
     clock_cache_entry_t *entry = &partition->slots[hand];
+    PREFETCH_WRITE(entry);
     uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
 
     if (state == ENTRY_VALID)
@@ -721,6 +681,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     {
         slot_idx = clock_evict(cache, partition);
         entry = &partition->slots[slot_idx];
+        PREFETCH_WRITE(entry);
 
         /* we try to claim slot with CAS, EMPTY --> WRITING */
         uint8_t expected = ENTRY_EMPTY;

@@ -541,10 +541,10 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, const size_t key_size, 
         /** we prefetch next node to reduce cache miss latency */
         if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
         {
-            __builtin_prefetch(next, 0, 3); /* prefetch for read, high temporal locality */
+            PREFETCH_READ(next); /* prefetch for read, high temporal locality */
             if (next->key != NULL)
             {
-                __builtin_prefetch(next->key, 0, 3);
+                PREFETCH_READ(next->key);
             }
         }
 
@@ -558,10 +558,10 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, const size_t key_size, 
             /** prefetch next iteration */
             if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
             {
-                __builtin_prefetch(next, 0, 3);
+                PREFETCH_READ(next);
                 if (next->key != NULL)
                 {
-                    __builtin_prefetch(next->key, 0, 3);
+                    PREFETCH_READ(next->key);
                 }
             }
         }
@@ -636,10 +636,10 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, const size_t key_siz
 
         if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
         {
-            __builtin_prefetch(next, 0, 3);
+            PREFETCH_READ(next);
             if (next->key != NULL)
             {
-                __builtin_prefetch(next->key, 0, 3);
+                PREFETCH_READ(next->key);
             }
         }
 
@@ -652,10 +652,10 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, const size_t key_siz
 
             if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
             {
-                __builtin_prefetch(next, 0, 3);
+                PREFETCH_READ(next);
                 if (next->key != NULL)
                 {
-                    __builtin_prefetch(next->key, 0, 3);
+                    PREFETCH_READ(next->key);
                 }
             }
         }
@@ -1113,10 +1113,10 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
 
         if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
         {
-            __builtin_prefetch(next, 0, 3);
+            PREFETCH_READ(next);
             if (next->key != NULL)
             {
-                __builtin_prefetch(next->key, 0, 3);
+                PREFETCH_READ(next->key);
             }
         }
 
@@ -1129,10 +1129,10 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
 
             if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
             {
-                __builtin_prefetch(next, 0, 3);
+                PREFETCH_READ(next);
                 if (next->key != NULL)
                 {
-                    __builtin_prefetch(next->key, 0, 3);
+                    PREFETCH_READ(next->key);
                 }
             }
         }

@@ -262,8 +262,9 @@ int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const ui
  * @param seq sequence number for MVCC
  * @return pointer to new version, NULL on failure
  */
-static skip_list_version_t *skip_list_create_version(const uint8_t *value, size_t value_size,
-                                                     time_t ttl, uint8_t deleted, uint64_t seq)
+static skip_list_version_t *skip_list_create_version(const uint8_t *value, const size_t value_size,
+                                                     const time_t ttl, const uint8_t deleted,
+                                                     uint64_t seq)
 {
     skip_list_version_t *version = (skip_list_version_t *)malloc(sizeof(skip_list_version_t));
     if (version == NULL) return NULL;
@@ -325,7 +326,7 @@ static void skip_list_free_version_list(skip_list_version_t *head)
  * @param level level of the node
  * @return pointer to new sentinel node, NULL on failure
  */
-static skip_list_node_t *skip_list_create_sentinel(int level)
+static skip_list_node_t *skip_list_create_sentinel(const int level)
 {
     size_t pointers_size = (level + 1) * 2 * sizeof(_Atomic(skip_list_node_t *));
     skip_list_node_t *node = (skip_list_node_t *)malloc(sizeof(skip_list_node_t) + pointers_size);
@@ -346,9 +347,9 @@ static skip_list_node_t *skip_list_create_sentinel(int level)
     return node;
 }
 
-skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t key_size,
-                                        const uint8_t *value, size_t value_size, time_t ttl,
-                                        uint8_t deleted)
+skip_list_node_t *skip_list_create_node(const int level, const uint8_t *key, size_t key_size,
+                                        const uint8_t *value, const size_t value_size,
+                                        const time_t ttl, const uint8_t deleted)
 {
     if (key == NULL || key_size == 0) return NULL;
 
@@ -404,7 +405,7 @@ int skip_list_free_node(skip_list_node_t *node)
     return 0;
 }
 
-int skip_list_new(skip_list_t **list, int max_level, float probability)
+int skip_list_new(skip_list_t **list, const int max_level, const float probability)
 {
     return skip_list_new_with_comparator(list, max_level, probability, skip_list_comparator_memcmp,
                                          NULL);
@@ -417,8 +418,8 @@ int skip_list_new_with_comparator(skip_list_t **list, int max_level, float proba
                                                          comparator_ctx, NULL);
 }
 
-int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, int max_level,
-                                                  float probability,
+int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, const int max_level,
+                                                  const float probability,
                                                   skip_list_comparator_fn comparator,
                                                   void *comparator_ctx,
                                                   _Atomic(time_t) *cached_time)
@@ -437,7 +438,7 @@ int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, int max_le
     atomic_init(&new_list->total_size, 0);
     atomic_init(&new_list->entry_count, 0);
 
-    /* create sentinel nodes with no keys -- they are identified by the sentinel flag */
+    /* we create sentinel nodes with no keys -- they are identified by the sentinel flag */
     skip_list_node_t *header = skip_list_create_sentinel(max_level);
     skip_list_node_t *tail = skip_list_create_sentinel(max_level);
 
@@ -486,16 +487,16 @@ int skip_list_random_level(const skip_list_t *list)
         rng_state = (uint64_t)TDB_THREAD_ID() ^ (uint64_t)time(NULL);
     }
 
-    /* convert probability to threshold for fast comparison
+    /* we convert probability to threshold for fast comparison
      * probability range is (0.0, 1.0), we scale to [0, UINT64_MAX] */
-    uint64_t threshold = (uint64_t)(list->probability * (double)UINT64_MAX);
+    const uint64_t threshold = (uint64_t)(list->probability * (double)UINT64_MAX);
 
     int level = 0;
 
     /* keep generating levels while random value < threshold */
     while (level < list->max_level)
     {
-        uint64_t rnd = skip_list_xorshift64star(&rng_state);
+        const uint64_t rnd = skip_list_xorshift64star(&rng_state);
         if (rnd >= threshold) break;
         level++;
     }
@@ -702,7 +703,7 @@ int skip_list_clear(skip_list_t *list)
         current = next;
     }
 
-    int max_level = list->max_level;
+    const int max_level = list->max_level;
     for (int i = 0; i <= max_level; i++)
     {
         atomic_store_explicit(&header->forward[i], tail, memory_order_release);
@@ -786,7 +787,7 @@ int skip_list_get_max_key(skip_list_t *list, uint8_t **key, size_t *key_size)
 
     if (current == NULL || NODE_IS_SENTINEL(current)) return -1;
 
-    /* scan backwards to find last valid (non-deleted, non-expired) entry */
+    /* we scan backwards to find last valid (non-deleted, non-expired) entry */
     const time_t current_time = skip_list_get_current_time(list);
     skip_list_node_t *header = atomic_load_explicit(&list->header, memory_order_acquire);
     while (current != NULL && current != header)
@@ -887,7 +888,7 @@ int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_
 
     if (ttl != NULL) *ttl = version->ttl;
 
-    /* check if version is invalid (expired or deleted) */
+    /* we check if version is invalid (expired or deleted) */
     if (skip_list_version_is_invalid_with_time(version, skip_list_get_current_time(cursor->list)))
     {
         if (deleted != NULL) *deleted = 1;
@@ -1014,7 +1015,7 @@ int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t
 
     skip_list_node_t *header = atomic_load_explicit(&cursor->list->header, memory_order_acquire);
     skip_list_node_t *current = header;
-    int max_level =
+    const int max_level =
         atomic_load_explicit(&cursor->list->level, memory_order_acquire); /* cache level */
 
     /* find the node before the target key */
@@ -1037,7 +1038,8 @@ int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t
     return 0;
 }
 
-int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *key, size_t key_size)
+int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *key,
+                                   const size_t key_size)
 {
     if (cursor == NULL || key == NULL || key_size == 0) return -1;
 
@@ -1046,7 +1048,7 @@ int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *ke
     int max_level =
         atomic_load_explicit(&cursor->list->level, memory_order_acquire); /* cache level */
 
-    /* find the last node with key <= target */
+    /* we find the last node with key <= target */
     for (int i = max_level; i >= 0; i--)
     {
         skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
@@ -1144,7 +1146,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
             skip_list_compare_keys_inline(list, existing->key, existing->key_size, key, key_size);
         if (cmp == 0)
         {
-            /* key exists, validate sequence and add new version */
+            /* the key exists, validate sequence and add new version */
             skip_list_version_t *latest =
                 atomic_load_explicit(&existing->versions, memory_order_acquire);
             if (skip_list_validate_sequence(latest, seq) != 0)
@@ -1305,7 +1307,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                 if (!use_stack) free(update);
                 return 0;
             }
-            else if (cmp < 0)
+            if (cmp < 0)
             {
                 pred = next_at_0;
                 continue;
@@ -1357,7 +1359,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                 if (!use_stack) free(update);
                 return 0;
             }
-            else if (cmp < 0)
+            if (cmp < 0)
             {
                 pred = next_at_0;
                 continue;
@@ -1412,7 +1414,8 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     return 0;
 }
 
-int skip_list_get_max_seq(skip_list_t *list, const uint8_t *key, size_t key_size, uint64_t *out_seq)
+int skip_list_get_max_seq(skip_list_t *list, const uint8_t *key, const size_t key_size,
+                          uint64_t *out_seq)
 {
     if (list == NULL || key == NULL || key_size == 0 || out_seq == NULL) return -1;
 
@@ -1447,10 +1450,10 @@ int skip_list_get_max_seq(skip_list_t *list, const uint8_t *key, size_t key_size
     return 0;
 }
 
-int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
-                           size_t *value_size, time_t *ttl, uint8_t *deleted, uint64_t *seq,
-                           uint64_t snapshot_seq, skip_list_visibility_check_fn visibility_check,
-                           void *visibility_ctx)
+int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t key_size,
+                           uint8_t **value, size_t *value_size, time_t *ttl, uint8_t *deleted,
+                           uint64_t *seq, uint64_t snapshot_seq,
+                           skip_list_visibility_check_fn visibility_check, void *visibility_ctx)
 {
     if (list == NULL || key == NULL || key_size == 0 || value == NULL || value_size == NULL)
         return -1;
@@ -1490,7 +1493,7 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     else
     {
         /**
-         * find the newest committed version with seq <= snapshot_seq.
+         * we find the newest committed version with seq <= snapshot_seq.
          * version chain is ordered newest-to-oldest, so we return the first
          * version that passes both checks. */
         while (version != NULL)

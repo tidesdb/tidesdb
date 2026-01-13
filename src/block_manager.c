@@ -55,6 +55,27 @@
  */
 
 /**
+ * odsync_available
+ * check if O_DSYNC is available on the specific platform
+ * @return 1 if O_DSYNC is available, 0 otherwise
+ */
+static inline int odsync_available(void)
+{
+    return O_DSYNC != 0;
+}
+
+/**
+ * is_sync_full
+ * is a block manager in sync full mode?
+ * @param bm
+ * @return 1 if sync mode is full, 0 otherwise
+ */
+static inline int is_sync_full(const block_manager_t *bm)
+{
+    return bm->sync_mode == BLOCK_MANAGER_SYNC_FULL;
+}
+
+/**
  * compute_checksum
  * compute xxHash32 checksum
  * @param data the data to compute the checksum for
@@ -163,6 +184,8 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     /* initialize atomic variable to prevent reading uninitialized memory */
     atomic_init(&new_bm->current_file_size, 0);
 
+    new_bm->sync_mode = sync_mode;
+
     const int file_exists = access(file_path, F_OK) == 0;
 
     int flags = O_RDWR | O_CREAT;
@@ -172,7 +195,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
      * the need for per-write fdatasync() calls on platforms that support it.
      * this is also faster, less syscalls, for example
      */
-    if (sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0)
+    if (is_sync_full(new_bm) && odsync_available())
     {
         flags |= O_DSYNC;
     }
@@ -189,8 +212,6 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
 
     strncpy(new_bm->file_path, file_path, MAX_FILE_PATH_LENGTH - 1);
     new_bm->file_path[MAX_FILE_PATH_LENGTH - 1] = '\0';
-
-    new_bm->sync_mode = sync_mode;
 
     if (file_exists)
     {
@@ -213,7 +234,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
         }
         /* if O_DSYNC is available, pwrite already synced the header
          * otherwise fall back to explicit fdatasync */
-        if (new_bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+        if (is_sync_full(new_bm) && !odsync_available())
         {
             if (fdatasync(new_bm->fd) != 0)
             {
@@ -251,7 +272,7 @@ int block_manager_close(block_manager_t *bm)
 
     /* final sync on close -- really only needed if O_DSYNC wasnt used
      * with O_DSYNC, all writes are already durable */
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+    if (is_sync_full(bm) && !odsync_available())
     {
         (void)fdatasync(bm->fd);
     }
@@ -377,7 +398,7 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
 
     /* if O_DSYNC is available and was used at open time, pwrite already synced
      * otherwise fall back to explicit fdatasync for durability */
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+    if (is_sync_full(bm) && !odsync_available())
     {
         if (fdatasync(bm->fd) != 0)
         {
@@ -748,7 +769,7 @@ int block_manager_truncate(block_manager_t *bm)
     }
 
     /* ftruncate is not covered by O_DSYNC, always sync truncation */
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+    if (is_sync_full(bm))
     {
         fdatasync(bm->fd);
     }
@@ -760,7 +781,7 @@ int block_manager_truncate(block_manager_t *bm)
 
     /* we reopen with same flags as original open, including O_DSYNC if in SYNC_FULL mode */
     int flags = O_RDWR | O_CREAT;
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0)
+    if (is_sync_full(bm) && odsync_available())
     {
         flags |= O_DSYNC;
     }
@@ -776,7 +797,7 @@ int block_manager_truncate(block_manager_t *bm)
         return -1;
     }
 
-    if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+    if (is_sync_full(bm) && !odsync_available())
     {
         if (fdatasync(bm->fd) != 0)
         {
@@ -925,7 +946,7 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
         {
             return -1;
         }
-        if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+        if (is_sync_full(bm) && !odsync_available())
         {
             fdatasync(bm->fd);
         }
@@ -950,7 +971,7 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
             return -1;
         }
         /* ftruncate is not covered by O_DSYNC, always sync truncation */
-        if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+        if (is_sync_full(bm))
         {
             fdatasync(bm->fd);
         }
@@ -974,7 +995,7 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
         /* permissive mode -- truncate to header */
         if (ftruncate(bm->fd, (off_t)BLOCK_MANAGER_HEADER_SIZE) == -1) return -1;
         /* ftruncate is not covered by O_DSYNC, always sync truncation */
-        if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+        if (is_sync_full(bm))
         {
             fdatasync(bm->fd);
         }
@@ -1037,15 +1058,15 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
             fprintf(stderr, "[block_manager] Truncating %s from %" PRIu64 " to %" PRIu64 " bytes\n",
                     bm->file_path, file_size, valid_size);
             if (ftruncate(bm->fd, (off_t)valid_size) != 0) return -1;
-            /* sync truncation - only needed if O_DSYNC not available */
-            if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC == 0)
+
+            if (is_sync_full(bm))
             {
                 fdatasync(bm->fd);
             }
             close(bm->fd);
             /* reopen with same flags as original open */
             int flags = O_RDWR | O_CREAT;
-            if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL && O_DSYNC != 0)
+            if (is_sync_full(bm) && odsync_available())
             {
                 flags |= O_DSYNC;
             }
@@ -1074,7 +1095,7 @@ int block_manager_validate_last_block(block_manager_t *bm, const int strict)
         /*** permissive mode -- truncate to header */
         if (ftruncate(bm->fd, (off_t)BLOCK_MANAGER_HEADER_SIZE) == -1) return -1;
         /* ftruncate is not covered by O_DSYNC, always sync truncation */
-        if (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL)
+        if (is_sync_full(bm))
         {
             fdatasync(bm->fd);
         }

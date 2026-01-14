@@ -323,12 +323,12 @@ int block_manager_cursor_goto_first(block_manager_cursor_t *cursor);
 int block_manager_get_size(block_manager_t *bm, uint64_t *size);
 
 /**
- * block_manager_escalate_fsync
- * escalates an fsync to the underlying block manager file
+ * block_manager_escalate_fdatasync
+ * escalates an fdatasync to the underlying block manager file
  * @param bm the block manager to fsync
  * @return 0 if successful, -1 if not
  */
-int block_manager_escalate_fsync(block_manager_t *bm);
+int block_manager_escalate_fdatasync(block_manager_t *bm);
 
 /**
  * block_manager_cursor_at_last

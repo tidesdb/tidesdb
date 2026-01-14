@@ -879,7 +879,7 @@ int block_manager_cursor_goto(block_manager_cursor_t *cursor, const uint64_t pos
     return 0;
 }
 
-int block_manager_escalate_fsync(block_manager_t *bm)
+int block_manager_escalate_fdatasync(block_manager_t *bm)
 {
     if (!bm) return -1;
     return fdatasync(bm->fd);

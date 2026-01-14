@@ -324,7 +324,7 @@ int block_manager_get_size(block_manager_t *bm, uint64_t *size);
 
 /**
  * block_manager_escalate_fdatasync
- * escalates an fdatasync to the underlying block manager file
+ * escalates an fdatasync syscall to the underlying block manager file
  * @param bm the block manager to fsync
  * @return 0 if successful, -1 if not
  */

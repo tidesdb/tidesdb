@@ -3535,8 +3535,8 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     block_manager_get_size(bms.klog_bm, &sst->klog_size);
     block_manager_get_size(bms.vlog_bm, &sst->vlog_size);
 
-    if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
-    if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+    if (bms.klog_bm) block_manager_escalate_fdatasync(bms.klog_bm);
+    if (bms.vlog_bm) block_manager_escalate_fdatasync(bms.vlog_bm);
 
     return TDB_SUCCESS;
 }
@@ -6338,8 +6338,8 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
 
     tidesdb_merge_heap_free(heap);
 
-    block_manager_escalate_fsync(klog_bm);
-    block_manager_escalate_fsync(vlog_bm);
+    block_manager_escalate_fdatasync(klog_bm);
+    block_manager_escalate_fdatasync(vlog_bm);
 
     new_sst->klog_bm = klog_bm;
     new_sst->vlog_bm = vlog_bm;
@@ -8820,8 +8820,8 @@ static void *tidesdb_flush_worker_thread(void *arg)
         tidesdb_block_managers_t bms;
         if (tidesdb_sstable_get_block_managers(db, sst, &bms) == TDB_SUCCESS)
         {
-            if (bms.klog_bm) block_manager_escalate_fsync(bms.klog_bm);
-            if (bms.vlog_bm) block_manager_escalate_fsync(bms.vlog_bm);
+            if (bms.klog_bm) block_manager_escalate_fdatasync(bms.klog_bm);
+            if (bms.vlog_bm) block_manager_escalate_fdatasync(bms.vlog_bm);
         }
 
         /* we ensure all writes are visible before making sstable discoverable */
@@ -9243,7 +9243,7 @@ static void *tidesdb_sync_worker_thread(void *arg)
                 tidesdb_memtable_t *mt = atomic_load(&cf->active_memtable);
                 if (mt && mt->wal)
                 {
-                    block_manager_escalate_fsync(mt->wal);
+                    block_manager_escalate_fdatasync(mt->wal);
                 }
             }
         }
@@ -11123,7 +11123,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
      * this essentially ensures WAL durability before it becomes immutable */
     if (cf->config.sync_mode == TDB_SYNC_INTERVAL && old_wal)
     {
-        block_manager_escalate_fsync(old_wal);
+        block_manager_escalate_fdatasync(old_wal);
     }
 
     skip_list_comparator_fn comparator_fn = NULL;

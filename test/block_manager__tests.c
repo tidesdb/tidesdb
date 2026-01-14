@@ -789,7 +789,7 @@ void test_block_manager_validate_last_block()
     }
 
     /* ensure all writes are flushed to disk */
-    block_manager_escalate_fsync(bm);
+    block_manager_escalate_fdatasync(bm);
     ASSERT_TRUE(block_manager_close(bm) == 0);
 
     /* we now manually corrupt the file by appending just a size prefix without data */

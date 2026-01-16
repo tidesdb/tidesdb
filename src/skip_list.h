@@ -37,6 +37,18 @@ typedef struct skip_list_version_t skip_list_version_t;
 /* skip_list_version_t flag bits */
 #define SKIP_LIST_FLAG_DELETED 0x01 /* version is tombstone */
 
+/**
+ * skip_list_cmp_type_t
+ * comparator type enum
+ */
+typedef enum
+{
+    SKIP_LIST_CMP_MEMCMP = 0, /* default memcmp-based comparison */
+    SKIP_LIST_CMP_STRING,     /* string-based comparison */
+    SKIP_LIST_CMP_NUMERIC,    /* numeric comparison (8-byte keys) */
+    SKIP_LIST_CMP_CUSTOM      /* custom comparator function */
+} skip_list_cmp_type_t;
+
 /* skip_list_node_t flag bits */
 #define SKIP_LIST_NODE_FLAG_SENTINEL 0x01 /* node is a sentinel (header or tail) */
 
@@ -135,6 +147,7 @@ typedef struct skip_list_t
     _Atomic(skip_list_node_t *) tail;
     _Atomic(size_t) total_size;
     _Atomic(int) entry_count;
+    skip_list_cmp_type_t cmp_type;
     skip_list_comparator_fn comparator;
     void *comparator_ctx;
     _Atomic(time_t) *cached_time;

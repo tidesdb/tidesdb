@@ -507,6 +507,58 @@ typedef atomic_uint_fast64_t atomic_uint64_t;
 #define PREFETCH_WRITE(addr) ((void)0)
 #endif
 
+/* cross-platform count trailing zeros for 64-bit integers */
+#if defined(__GNUC__) || defined(__clang__)
+#define TDB_CTZ64(x) __builtin_ctzll(x)
+#elif defined(_MSC_VER)
+/*
+ * tdb_ctz64_msvc
+ * counts trailing zeros in a 64-bit integer (MSVC version)
+ * @param x the value to count trailing zeros in
+ * @return number of trailing zero bits (0-63), or 64 if x is 0
+ */
+static inline int tdb_ctz64_msvc(uint64_t x)
+{
+    unsigned long index;
+#if defined(_WIN64)
+    if (_BitScanForward64(&index, x))
+    {
+        return (int)index;
+    }
+#else
+    /* 32-bit MSVC: check low and high 32-bit halves */
+    if (_BitScanForward(&index, (unsigned long)x))
+    {
+        return (int)index;
+    }
+    if (_BitScanForward(&index, (unsigned long)(x >> 32)))
+    {
+        return (int)(index + 32);
+    }
+#endif
+    return 64; /* all zeros */
+}
+#define TDB_CTZ64(x) tdb_ctz64_msvc(x)
+#else
+/* portable fallback using de Bruijn sequence */
+/*
+ * tdb_ctz64_portable
+ * counts trailing zeros in a 64-bit integer (portable version)
+ * @param x the value to count trailing zeros in
+ * @return number of trailing zero bits (0-63), or 64 if x is 0
+ */
+static inline int tdb_ctz64_portable(uint64_t x)
+{
+    if (x == 0) return 64;
+    static const int debruijn_table[64] = {
+        0,  1,  2,  53, 3,  7,  54, 27, 4,  38, 41, 8,  34, 55, 48, 28, 62, 5,  39, 46, 44, 42,
+        22, 9,  24, 35, 59, 56, 49, 18, 29, 11, 63, 52, 6,  26, 37, 40, 33, 47, 61, 45, 43, 21,
+        23, 58, 17, 10, 51, 25, 36, 32, 60, 20, 57, 16, 50, 31, 19, 15, 30, 14, 13, 12};
+    return debruijn_table[((x & -x) * 0x022FDD63CC95386DULL) >> 58];
+}
+#define TDB_CTZ64(x) tdb_ctz64_portable(x)
+#endif
+
 /* cross-platform thread ID for unique file naming */
 #if defined(_WIN32)
 #include <windows.h>

@@ -20,6 +20,8 @@
 
 #include <tgmath.h>
 
+#define BLOOM_UNLIKELY(x) TDB_UNLIKELY(x)
+
 /* bit manipulation macros for packed bitset */
 #define BF_BITS_PER_WORD        64
 #define BF_WORD_INDEX(bit)      ((bit) / BF_BITS_PER_WORD)
@@ -40,13 +42,13 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
         return -1;
     }
 
-    /* calculate the size of the bitset (m) using the formula
+    /* we calculate the size of the bitset (m) using the formula
      * m = -n * ln(p) / (ln(2)^2)
      *
      */
-    double m_double = ceil(-((double)n) * log(p) / (M_LN2 * M_LN2));
+    const double m_double = ceil(-((double)n) * log(p) / (M_LN2 * M_LN2));
 
-    /* validate m is within valid range */
+    /* we validate m is within valid range */
     if (m_double <= 0.0 || m_double > (double)UINT32_MAX)
     {
         free(*bf);
@@ -55,13 +57,13 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
 
     (*bf)->m = (unsigned int)m_double;
 
-    /* calculate the number of hash functions (h) using the formula
+    /* we calculate the number of hash functions (h) using the formula
      * h = (m / n) * ln(2)
      *
      */
-    double h_double = ceil(((double)(*bf)->m) / n * M_LN2);
+    const double h_double = ceil(((double)(*bf)->m) / n * M_LN2);
 
-    /* validate h is reasonable (typically 1-20) */
+    /* we validate h is reasonable (typically 1-20) */
     if (h_double <= 0.0 || h_double > 100.0)
     {
         free(*bf);
@@ -70,17 +72,17 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
 
     (*bf)->h = (unsigned int)h_double;
 
-    /* calculate number of 64-bit words needed for packed bitset */
+    /* we calculate number of 64-bit words needed for packed bitset */
     (*bf)->size_in_words = ((*bf)->m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
 
-    /* validate size_in_words to prevent overflow */
+    /* we validate size_in_words to prevent overflow */
     if ((*bf)->size_in_words == 0 || (*bf)->size_in_words > UINT32_MAX / sizeof(uint64_t))
     {
         free(*bf);
         return -1;
     }
 
-    /* alloc memory for the packed bitset and initialize it to 0 */
+    /* we alloc memory for the packed bitset and initialize it to 0 */
     (*bf)->bitset = calloc((size_t)(*bf)->size_in_words, sizeof(uint64_t));
     if ((*bf)->bitset == NULL)
     {
@@ -93,44 +95,40 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
 
 void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
 {
-    if (bf == NULL)
-    {
-        return;
-    }
+    if (BLOOM_UNLIKELY(bf == NULL)) return;
+    if (BLOOM_UNLIKELY(entry == NULL || size == 0)) return;
 
-    if (entry == NULL || size == 0)
-    {
-        return;
-    }
+    /* we cache struct fields to avoid repeated memory access */
+    const unsigned int h = bf->h;
+    const unsigned int m = bf->m;
+    uint64_t *const bitset = bf->bitset;
 
-    /* add a key to the bloom filter using H hash functions */
-    for (int i = 0; i < (int)bf->h; i++)
+    /* we add a key to the bloom filter using H hash functions */
+    for (unsigned int i = 0; i < h; i++)
     {
-        unsigned int hash = bloom_filter_hash(entry, size, i);
-        size_t index = hash % bf->m;
-        BF_SET_BIT(bf->bitset, index);
+        const unsigned int hash = bloom_filter_hash(entry, size, (int)i);
+        const size_t index = hash % m;
+        BF_SET_BIT(bitset, index);
     }
 }
 
 int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
 {
-    if (bf == NULL)
-    {
-        return -1;
-    }
+    if (BLOOM_UNLIKELY(bf == NULL)) return -1;
+    if (BLOOM_UNLIKELY(entry == NULL || size == 0)) return -1;
 
-    if (entry == NULL || size == 0)
-    {
-        return -1;
-    }
+    /* we cache struct fields to avoid repeated memory access */
+    const unsigned int h = bf->h;
+    const unsigned int m = bf->m;
+    const uint64_t *const bitset = bf->bitset;
 
-    /* check if a key is in the bloom filter using H hash functions
+    /* we check if a key is in the bloom filter using H hash functions
      * early exit on first zero bit (likely case for negative lookups) */
-    for (int i = 0; i < (int)bf->h; i++)
+    for (unsigned int i = 0; i < h; i++)
     {
-        unsigned int hash = bloom_filter_hash(entry, size, i);
-        size_t index = hash % bf->m;
-        if (!BF_GET_BIT(bf->bitset, index))
+        const unsigned int hash = bloom_filter_hash(entry, size, (int)i);
+        const size_t index = hash % m;
+        if (!BF_GET_BIT(bitset, index))
         {
             return 0; /* definitely not in set */
         }
@@ -140,77 +138,69 @@ int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const 
 
 int bloom_filter_is_full(const bloom_filter_t *bf)
 {
-    if (bf == NULL)
-    {
-        return -1;
-    }
+    if (BLOOM_UNLIKELY(bf == NULL)) return -1;
+    if (BLOOM_UNLIKELY(bf->bitset == NULL)) return -1;
 
-    if (bf->bitset == NULL)
-    {
-        return -1;
-    }
+    const uint64_t *const bitset = bf->bitset;
+    const unsigned int size_in_words = bf->size_in_words;
 
-    /* check if all words are fully set (optimized for packed bits) */
-    for (unsigned int i = 0; i < bf->size_in_words - 1; i++)
+    /* we check if all words are fully set (optimized for packed bits) */
+    for (unsigned int i = 0; i < size_in_words - 1; i++)
     {
-        if (bf->bitset[i] != UINT64_MAX)
+        if (bitset[i] != UINT64_MAX)
         {
             return 0;
         }
     }
 
-    /* check last word (may be partial) */
-    unsigned int remaining_bits = bf->m % BF_BITS_PER_WORD;
+    /* we check last word (may be partial) */
+    const unsigned int remaining_bits = bf->m % BF_BITS_PER_WORD;
     if (remaining_bits == 0)
     {
-        return (bf->bitset[bf->size_in_words - 1] == UINT64_MAX);
+        return (bitset[size_in_words - 1] == UINT64_MAX);
     }
-    uint64_t mask = (1ULL << remaining_bits) - 1;
-    return ((bf->bitset[bf->size_in_words - 1] & mask) == mask);
+    const uint64_t mask = (1ULL << remaining_bits) - 1;
+    return ((bitset[size_in_words - 1] & mask) == mask);
 }
 
-unsigned int bloom_filter_hash(const uint8_t *entry, size_t size, int seed)
+unsigned int bloom_filter_hash(const uint8_t *entry, const size_t size, const int seed)
 {
-    if (entry == NULL || size == 0)
-    {
-        return 0;
-    }
+    if (BLOOM_UNLIKELY(entry == NULL || size == 0)) return 0;
 
-    /* local constants */
-    const uint32_t m = 0xc6a4a793;       /*  large prime */
-    const uint32_t r = 24;               /* right shift value */
-    const uint8_t *limit = entry + size; /* pointer to the end of the entry */
-    uint32_t h =
-        (uint32_t)seed ^ ((uint32_t)size * m); /* initial hash value based on seed and size */
+    /* hash constants */
+    const uint32_t prime = 0xc6a4a793;
+    const uint32_t shift = 24;
+    const uint8_t *limit = entry + size;
+    uint32_t h = (uint32_t)seed ^ ((uint32_t)size * prime);
 
+    /* we process 4 bytes at a time */
     while (entry + 4 <= limit)
     {
-        uint32_t w = decode_fixed_32((const char *)entry);
+        /* inline decode_fixed_32 to avoid function call overhead */
+        const uint32_t w = ((uint32_t)(uint8_t)entry[0]) | ((uint32_t)(uint8_t)entry[1] << 8) |
+                           ((uint32_t)(uint8_t)entry[2] << 16) |
+                           ((uint32_t)(uint8_t)entry[3] << 24);
         entry += 4;
         h += w;
-        h *= m;         /* multiply the hash by the large prime number */
-        h ^= (h >> 16); /* xor the hash with its right-shifted value */
+        h *= prime;
+        h ^= (h >> 16);
     }
 
     /* process any remaining bytes (less than 4) */
     switch (limit - entry)
     {
         case 3:
-            h += (unsigned int)((uint8_t)entry[2])
-                 << 16; /* add the third byte shifted left by 16 bits */
-        /* fall through */
+            h += (uint32_t)entry[2] << 16;
+            /* fall through */
         case 2:
-            h += (unsigned int)((uint8_t)entry[1])
-                 << 8; /* add the second byte shifted left by 8 bits */
-        /* fall through */
+            h += (uint32_t)entry[1] << 8;
+            /* fall through */
         case 1:
-            h += (uint8_t)entry[0]; /*add the first byte*/
-            h *= m;                 /* multiply the hash by the large prime */
-            h ^= (h >> r);          /* xor the hash with its right-shifted value */
+            h += entry[0];
+            h *= prime;
+            h ^= (h >> shift);
             break;
         default:
-            /* no real action required here, break is just to avoid
-             * compiler warnings */
             break;
     }
 
@@ -244,7 +234,7 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
 
     uint8_t *ptr = buffer;
 
-    /* write header with varint encoding */
+    /* we write header with varint encoding */
     ptr = encode_varint32(ptr, (uint32_t)bf->m);
     ptr = encode_varint32(ptr, (uint32_t)bf->h);
     ptr = encode_varint32(ptr, (uint32_t)non_zero_count);
@@ -276,7 +266,7 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
 
     const uint8_t *ptr = data;
 
-    /* read header with varint decoding */
+    /* we read header with varint decoding */
     uint32_t m_u32, h_u32, non_zero_count;
     ptr = decode_varint32(ptr, &m_u32);
     ptr = decode_varint32(ptr, &h_u32);
@@ -297,7 +287,7 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
         return NULL;
     }
 
-    unsigned int size_in_words = (m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
+    const unsigned int size_in_words = (m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
 
     /* sanity check result */
     if (size_in_words == 0)
@@ -305,7 +295,7 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
         return NULL;
     }
 
-    /* allocate and zero-initialize bitset */
+    /* we allocate and zero-initialize bitset */
     uint64_t *bitset = calloc((size_t)size_in_words, sizeof(uint64_t));
     if (bitset == NULL)
     {

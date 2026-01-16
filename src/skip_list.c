@@ -35,7 +35,7 @@ static inline int skip_list_compare_keys_numeric_inline(const uint8_t *key1, con
 
 /**
  * skip_list_compare_keys_16_inline
- * fast inline comparison for 16-byte keys (common in benchmarks)
+ * fast inline comparison for 16-byte keys
  * @param key1 first key
  * @param key2 second key
  * @return negative if key1 < key2, 0 if equal, positive if key1 > key2
@@ -54,14 +54,14 @@ static inline int skip_list_compare_keys_16_inline(const uint8_t *key1, const ui
 }
 
 /**
- * skip_list_get_latest_valid_version - OPTIMIZED VERSION
- * Fast path for accessing the latest valid version
+ * skip_list_get_latest_valid_version
+ * fast path for accessing the latest valid version
  */
 static inline int skip_list_version_is_invalid_with_time(skip_list_version_t *version,
                                                          time_t current_time);
 
 static inline skip_list_version_t *skip_list_get_latest_valid_version(skip_list_node_t *node,
-                                                                      time_t current_time)
+                                                                      const time_t current_time)
 {
     skip_list_version_t *version = atomic_load_explicit(&node->versions, memory_order_acquire);
 
@@ -102,6 +102,7 @@ static void skip_list_free_version(skip_list_version_t *version);
 /**
  * skip_list_compare_keys_inline
  * inline comparator for hot paths
+ * uses cmp_type enum to avoid function pointer comparison overhead
  * @param list skip list
  * @param key1 first key
  * @param key1_size size of first key
@@ -113,21 +114,35 @@ static inline int skip_list_compare_keys_inline(const skip_list_t *list, const u
                                                 const size_t key1_size, const uint8_t *key2,
                                                 const size_t key2_size)
 {
-    if (SKIP_LIST_LIKELY(list->comparator == skip_list_comparator_memcmp && key1_size == key2_size))
+    switch (list->cmp_type)
     {
-        if (key1_size == 8)
-        {
-            return skip_list_compare_keys_numeric_inline(key1, key2);
-        }
-        if (key1_size == 16)
-        {
-            return skip_list_compare_keys_16_inline(key1, key2);
-        }
+        case SKIP_LIST_CMP_MEMCMP:
+            if (SKIP_LIST_LIKELY(key1_size == key2_size))
+            {
+                if (key1_size == 8)
+                {
+                    return skip_list_compare_keys_numeric_inline(key1, key2);
+                }
+                if (key1_size == 16)
+                {
+                    return skip_list_compare_keys_16_inline(key1, key2);
+                }
 
-        const int cmp = memcmp(key1, key2, key1_size);
-        return (cmp == 0) ? 0 : ((cmp < 0) ? -1 : 1);
+                const int cmp = memcmp(key1, key2, key1_size);
+                return (cmp == 0) ? 0 : ((cmp < 0) ? -1 : 1);
+            }
+            return skip_list_comparator_memcmp(key1, key1_size, key2, key2_size, NULL);
+
+        case SKIP_LIST_CMP_NUMERIC:
+            return skip_list_compare_keys_numeric_inline(key1, key2);
+
+        case SKIP_LIST_CMP_STRING:
+            return skip_list_comparator_string(key1, key1_size, key2, key2_size, NULL);
+
+        case SKIP_LIST_CMP_CUSTOM:
+        default:
+            return list->comparator(key1, key1_size, key2, key2_size, list->comparator_ctx);
     }
-    return list->comparator(key1, key1_size, key2, key2_size, list->comparator_ctx);
 }
 
 /**
@@ -153,7 +168,7 @@ static inline time_t skip_list_get_current_time(const skip_list_t *list)
  * @return 1 if invalid, 0 if valid
  */
 static inline int skip_list_version_is_invalid_with_time(skip_list_version_t *version,
-                                                         time_t current_time)
+                                                         const time_t current_time)
 {
     if (version == NULL) return 1;
     if (VERSION_IS_DELETED(version)) return 1;
@@ -190,7 +205,7 @@ static inline int skip_list_validate_sequence(skip_list_version_t *existing_vers
  * @return 0 on success, -1 on failure
  */
 static int skip_list_insert_version_cas(_Atomic(skip_list_version_t *) *versions_ptr,
-                                        skip_list_version_t *new_version, uint64_t seq,
+                                        skip_list_version_t *new_version, const uint64_t seq,
                                         skip_list_t *list, size_t value_size)
 {
     skip_list_version_t *old_head;
@@ -198,7 +213,6 @@ static int skip_list_insert_version_cas(_Atomic(skip_list_version_t *) *versions
     {
         old_head = atomic_load_explicit(versions_ptr, memory_order_acquire);
 
-        /* validate sequence number */
         if (skip_list_validate_sequence(old_head, seq) != 0)
         {
             skip_list_free_version(new_version);
@@ -209,7 +223,7 @@ static int skip_list_insert_version_cas(_Atomic(skip_list_version_t *) *versions
     } while (!atomic_compare_exchange_weak_explicit(versions_ptr, &old_head, new_version,
                                                     memory_order_release, memory_order_acquire));
 
-    /* update total_size: subtract old, add new */
+    /* we update total_size, subtract old, add new */
     if (old_head && old_head->value_size > 0)
     {
         atomic_fetch_sub_explicit(&list->total_size, old_head->value_size, memory_order_relaxed);
@@ -223,7 +237,7 @@ int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uin
 {
     (void)ctx;
     size_t min_size = key1_size < key2_size ? key1_size : key2_size;
-    int cmp = memcmp(key1, key2, min_size);
+    const int cmp = memcmp(key1, key2, min_size);
     if (cmp != 0) return cmp < 0 ? -1 : 1;
     return (key1_size < key2_size) ? -1 : (key1_size > key2_size) ? 1 : 0;
 }
@@ -432,6 +446,25 @@ int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, const int 
     atomic_init(&new_list->level, 0);
     new_list->max_level = max_level;
     new_list->probability = probability;
+
+    /* we determine comparator typen */
+    if (comparator == skip_list_comparator_memcmp)
+    {
+        new_list->cmp_type = SKIP_LIST_CMP_MEMCMP;
+    }
+    else if (comparator == skip_list_comparator_string)
+    {
+        new_list->cmp_type = SKIP_LIST_CMP_STRING;
+    }
+    else if (comparator == skip_list_comparator_numeric)
+    {
+        new_list->cmp_type = SKIP_LIST_CMP_NUMERIC;
+    }
+    else
+    {
+        new_list->cmp_type = SKIP_LIST_CMP_CUSTOM;
+    }
+
     new_list->comparator = comparator;
     new_list->comparator_ctx = comparator_ctx;
     new_list->cached_time = cached_time;
@@ -481,27 +514,23 @@ int skip_list_random_level(const skip_list_t *list)
 
     /* thread-local RNG state */
     static _Thread_local uint64_t rng_state = 0;
-    if (rng_state == 0)
+    if (SKIP_LIST_UNLIKELY(rng_state == 0))
     {
-        /* initialize with thread ID + timestamp for uniqueness */
-        rng_state = (uint64_t)TDB_THREAD_ID() ^ (uint64_t)time(NULL);
+        /** we init with thread ID + address entropy for uniqueness
+         * avoids time() syscall on hot path */
+        rng_state = (uint64_t)TDB_THREAD_ID() ^ ((uint64_t)&rng_state >> 3);
+        if (rng_state == 0) rng_state = 1; /* ensure non-zero */
     }
 
-    /* we convert probability to threshold for fast comparison
-     * probability range is (0.0, 1.0), we scale to [0, UINT64_MAX] */
-    const uint64_t threshold = (uint64_t)(list->probability * (double)UINT64_MAX);
+    const uint64_t rnd = skip_list_xorshift64star(&rng_state);
 
-    int level = 0;
+    /* geometric distribution via trailing zeros
+     * for p=0.25, we need ~2 bits per level on average
+     * TDB_CTZ64 counts trailing zeros, giving geometric distribution
+     * we divide by 2 to approximate p=0.25 (each level requires ~2 zero bits) */
+    const int level = TDB_CTZ64(rnd | (1ULL << 62)) >> 1;
 
-    /* keep generating levels while random value < threshold */
-    while (level < list->max_level)
-    {
-        const uint64_t rnd = skip_list_xorshift64star(&rng_state);
-        if (rnd >= threshold) break;
-        level++;
-    }
-
-    return level;
+    return level < list->max_level ? level : list->max_level;
 }
 
 int skip_list_compare_keys(const skip_list_t *list, const uint8_t *key1, size_t key1_size,
@@ -555,7 +584,7 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, const size_t key_size, 
             current = next;
             next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
 
-            /** prefetch next iteration */
+            /** we prefetch next iteration */
             if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
             {
                 PREFETCH_READ(next);
@@ -752,7 +781,7 @@ int skip_list_get_min_key(skip_list_t *list, uint8_t **key, size_t *key_size)
 
     if (first == NULL || NODE_IS_SENTINEL(first)) return -1;
 
-    /* find first valid (non-deleted, non-expired) entry */
+    /* we find first valid (non-deleted, non-expired) entry */
     const time_t current_time = skip_list_get_current_time(list);
     skip_list_node_t *current = first;
     while (current != NULL && !NODE_IS_SENTINEL(current))
@@ -922,7 +951,7 @@ int skip_list_cursor_get_with_seq(skip_list_cursor_t *cursor, uint8_t **key, siz
     if (ttl != NULL) *ttl = version->ttl;
     if (seq != NULL) *seq = atomic_load_explicit(&version->seq, memory_order_acquire);
 
-    /* check if version is invalid (expired or deleted) */
+    /* we check if version is invalid (expired or deleted) */
     if (skip_list_version_is_invalid_with_time(version, skip_list_get_current_time(cursor->list)))
     {
         if (deleted != NULL) *deleted = 1;
@@ -1032,7 +1061,7 @@ int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t
         }
     }
 
-    /* position cursor at the node before target
+    /* we position cursor at the node before target
      * caller must call skip_list_cursor_next() to access first key >= target */
     cursor->current = current;
     return 0;
@@ -1045,7 +1074,7 @@ int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *ke
 
     skip_list_node_t *header = atomic_load_explicit(&cursor->list->header, memory_order_acquire);
     skip_list_node_t *current = header;
-    int max_level =
+    const int max_level =
         atomic_load_explicit(&cursor->list->level, memory_order_acquire); /* cache level */
 
     /* we find the last node with key <= target */
@@ -1062,7 +1091,7 @@ int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *ke
         }
     }
 
-    /* current is now the last node with key <= target, or header if no such key */
+    /* the current is now the last node with key <= target, or header if no such key */
     if (NODE_IS_SENTINEL(current))
     {
         /* no key <= target exists, cursor is invalid */
@@ -1463,7 +1492,7 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
     const int max_level =
         atomic_load_explicit(&list->level, memory_order_acquire); /* cache level */
 
-    /* find the node */
+    /* attempt to find the node */
     for (int i = max_level; i >= 0; i--)
     {
         skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);

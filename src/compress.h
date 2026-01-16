@@ -47,7 +47,7 @@ typedef enum
  * @param type the compression algorithm to use
  * @return the compressed data
  */
-uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
+uint8_t *compress_data(const uint8_t *data, size_t data_size, size_t *compressed_size,
                        compression_algorithm type);
 
 /**
@@ -59,7 +59,7 @@ uint8_t *compress_data(uint8_t *data, size_t data_size, size_t *compressed_size,
  * @param type the compression algorithm to use
  * @return the decompressed data
  */
-uint8_t *decompress_data(uint8_t *data, size_t data_size, size_t *decompressed_size,
+uint8_t *decompress_data(const uint8_t *data, size_t data_size, size_t *decompressed_size,
                          compression_algorithm type);
 
 #endif /* __COMPRESS_H__ */

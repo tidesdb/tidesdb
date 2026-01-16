@@ -23,6 +23,9 @@
 /* node pool configuration */
 #define QUEUE_MAX_POOL_SIZE 64
 
+/* spin count before blocking in dequeue_wait */
+#define QUEUE_SPIN_COUNT 100
+
 /**
  * queue_node_t
  * internal node structure for the queue
@@ -38,30 +41,35 @@ typedef struct queue_node_t
 /**
  * queue_t
  * thread-safe FIFO queue implementation with node pooling
- * @param head pointer to first node (protected by lock for writes)
- * @param atomic_head pointer to first node (atomic for lock-free reads)
- * @param tail pointer to last node
+ * uses separate head and tail locks to reduce contention
+ * @param head pointer to first node (protected by head_lock)
+ * @param tail pointer to last node (protected by tail_lock)
+ * @param dummy sentinel node separating head and tail for lock independence
  * @param size current number of elements (atomic for lock-free reads)
  * @param shutdown has queue been shutdown?
  * @param waiter_count number of threads currently waiting in queue_dequeue_wait
- * @param lock mutex for thread safety
+ * @param head_lock mutex for dequeue operations
+ * @param tail_lock mutex for enqueue operations
  * @param not_empty condition variable signaled when queue becomes non-empty
  * @param node_pool free list of reusable nodes for performance
  * @param pool_size current size of node pool
+ * @param pool_lock mutex for node pool access
  * @param max_pool_size maximum nodes to keep in pool
  */
 typedef struct
 {
     queue_node_t *head;
-    _Atomic(queue_node_t *) atomic_head;
     queue_node_t *tail;
+    queue_node_t *dummy;
     _Atomic(size_t) size;
     _Atomic(int) shutdown;
-    int waiter_count;
-    pthread_mutex_t lock;
+    _Atomic(int) waiter_count;
+    pthread_mutex_t head_lock;
+    pthread_mutex_t tail_lock;
     pthread_cond_t not_empty;
     queue_node_t *node_pool;
-    size_t pool_size;
+    _Atomic(size_t) pool_size;
+    pthread_mutex_t pool_lock;
     size_t max_pool_size;
 } queue_t;
 
@@ -149,6 +157,14 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
  * @return pointer to data at index, NULL if index out of bounds or error
  */
 void *queue_peek_at(queue_t *queue, size_t index);
+
+/**
+ * queue_shutdown
+ * signal shutdown to all waiting threads without freeing the queue
+ * threads blocked in queue_dequeue_wait will return NULL
+ * @param queue the queue to shutdown
+ */
+void queue_shutdown(queue_t *queue);
 
 /**
  * queue_free

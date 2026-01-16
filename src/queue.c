@@ -20,14 +20,9 @@
 
 #include "compat.h"
 
-/* branch prediction hints for hot paths */
-#if defined(__GNUC__) || defined(__clang__)
-#define QUEUE_LIKELY(x)   __builtin_expect(!!(x), 1)
-#define QUEUE_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#else
-#define QUEUE_LIKELY(x)   (x)
-#define QUEUE_UNLIKELY(x) (x)
-#endif
+/* use compat.h branch prediction hints */
+#define QUEUE_LIKELY(x)   TDB_LIKELY(x)
+#define QUEUE_UNLIKELY(x) TDB_UNLIKELY(x)
 
 #define QUEUE_WAIT_TIMEOUT_NS 100000000  /* 100ms in nanoseconds */
 #define QUEUE_NS_PER_SEC      1000000000 /* nanoseconds per second */

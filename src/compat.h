@@ -47,6 +47,15 @@
 #define tdb_strdup(s) strdup(s)
 #endif
 
+/* branch prediction hints for hot paths */
+#if defined(__GNUC__) || defined(__clang__)
+#define TDB_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define TDB_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define TDB_LIKELY(x)   (x)
+#define TDB_UNLIKELY(x) (x)
+#endif
+
 /* cross-platform fabs abstraction */
 #include <math.h>
 #if defined(_MSC_VER)

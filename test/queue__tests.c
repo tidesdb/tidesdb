@@ -524,10 +524,7 @@ void test_queue_free_with_waiting_threads(void)
         usleep(1000);
     }
 
-    pthread_mutex_lock(&queue->lock);
-    queue->shutdown = 1;
-    pthread_cond_broadcast(&queue->not_empty);
-    pthread_mutex_unlock(&queue->lock);
+    queue_shutdown(queue);
 
     pthread_join(waiter, NULL);
 

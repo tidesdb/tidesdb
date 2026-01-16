@@ -35,6 +35,7 @@
 /**
  * queue_alloc_node
  * allocate a node from pool or heap
+ * pool access is protected by pool_lock for thread safety
  * @param queue the queue to allocate the node from
  * @return the allocated node, or NULL on failure
  */
@@ -42,41 +43,51 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
 {
     queue_node_t *node = NULL;
 
+    pthread_mutex_lock(&queue->pool_lock);
+
     /* we check pool first (common case) */
     if (QUEUE_LIKELY(queue->node_pool != NULL))
     {
         node = queue->node_pool;
         queue->node_pool = node->next;
-        queue->pool_size--;
-    }
-    else
-    {
-        node = (queue_node_t *)malloc(sizeof(queue_node_t));
+        atomic_fetch_sub_explicit(&queue->pool_size, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&queue->pool_lock);
+        return node;
     }
 
+    pthread_mutex_unlock(&queue->pool_lock);
+
+    /* pool empty, allocate from heap */
+    node = (queue_node_t *)malloc(sizeof(queue_node_t));
     return node;
 }
 
 /**
  * queue_free_node
  * return node to pool or free it
+ * pool access is protected by pool_lock for thread safety
  * @param queue the queue to return the node to
  * @param node the node to return
  */
 static inline void queue_free_node(queue_t *queue, queue_node_t *node)
 {
-    if (QUEUE_LIKELY(queue->pool_size < queue->max_pool_size))
+    pthread_mutex_lock(&queue->pool_lock);
+
+    if (QUEUE_LIKELY(atomic_load_explicit(&queue->pool_size, memory_order_relaxed) <
+                     queue->max_pool_size))
     {
         /* return to pool */
         node->next = queue->node_pool;
         queue->node_pool = node;
-        queue->pool_size++;
+        atomic_fetch_add_explicit(&queue->pool_size, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&queue->pool_lock);
+        return;
     }
-    else
-    {
-        /* pool full, actually free */
-        free(node);
-    }
+
+    pthread_mutex_unlock(&queue->pool_lock);
+
+    /* pool full, actually free */
+    free(node);
 }
 
 queue_t *queue_new(void)
@@ -84,25 +95,57 @@ queue_t *queue_new(void)
     queue_t *queue = (queue_t *)malloc(sizeof(queue_t));
     if (queue == NULL) return NULL;
 
-    queue->head = NULL;
-    atomic_store(&queue->atomic_head, NULL);
-    queue->tail = NULL;
+    /* we create a dummy node to separate head and tail
+     * this allows enqueue and dequeue to operate independently */
+    queue_node_t *dummy = (queue_node_t *)malloc(sizeof(queue_node_t));
+    if (dummy == NULL)
+    {
+        free(queue);
+        return NULL;
+    }
+    dummy->data = NULL;
+    dummy->next = NULL;
+
+    queue->head = dummy;
+    queue->tail = dummy;
+    queue->dummy = dummy;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
-    queue->shutdown = 0;
-    queue->waiter_count = 0;
+    atomic_store_explicit(&queue->shutdown, 0, memory_order_relaxed);
+    atomic_store_explicit(&queue->waiter_count, 0, memory_order_relaxed);
     queue->node_pool = NULL;
-    queue->pool_size = 0;
+    atomic_store_explicit(&queue->pool_size, 0, memory_order_relaxed);
     queue->max_pool_size = QUEUE_MAX_POOL_SIZE;
 
-    if (pthread_mutex_init(&queue->lock, NULL) != 0)
+    if (pthread_mutex_init(&queue->head_lock, NULL) != 0)
     {
+        free(dummy);
+        free(queue);
+        return NULL;
+    }
+
+    if (pthread_mutex_init(&queue->tail_lock, NULL) != 0)
+    {
+        pthread_mutex_destroy(&queue->head_lock);
+        free(dummy);
+        free(queue);
+        return NULL;
+    }
+
+    if (pthread_mutex_init(&queue->pool_lock, NULL) != 0)
+    {
+        pthread_mutex_destroy(&queue->tail_lock);
+        pthread_mutex_destroy(&queue->head_lock);
+        free(dummy);
         free(queue);
         return NULL;
     }
 
     if (pthread_cond_init(&queue->not_empty, NULL) != 0)
     {
-        pthread_mutex_destroy(&queue->lock);
+        pthread_mutex_destroy(&queue->pool_lock);
+        pthread_mutex_destroy(&queue->tail_lock);
+        pthread_mutex_destroy(&queue->head_lock);
+        free(dummy);
         free(queue);
         return NULL;
     }
@@ -114,70 +157,66 @@ int queue_enqueue(queue_t *queue, void *data)
 {
     if (QUEUE_UNLIKELY(queue == NULL)) return -1;
 
-    pthread_mutex_lock(&queue->lock);
-
     queue_node_t *node = queue_alloc_node(queue);
     if (QUEUE_UNLIKELY(node == NULL))
     {
-        pthread_mutex_unlock(&queue->lock);
         return -1;
     }
 
     node->data = data;
     node->next = NULL;
 
-    if (QUEUE_UNLIKELY(queue->tail == NULL))
+    /* we only lock tail for enqueue - head operations are independent */
+    pthread_mutex_lock(&queue->tail_lock);
+
+    queue->tail->next = node;
+    queue->tail = node;
+
+    /* we check if we need to signal before releasing lock */
+    const size_t old_size = atomic_fetch_add_explicit(&queue->size, 1, memory_order_release);
+    const int has_waiters = atomic_load_explicit(&queue->waiter_count, memory_order_acquire) > 0;
+
+    pthread_mutex_unlock(&queue->tail_lock);
+
+    /* we signal outside lock to reduce lock hold time
+     * only signal if queue was empty and there are waiters */
+    if (old_size == 0 && has_waiters)
     {
-        queue->head = node;
-        atomic_store_explicit(&queue->atomic_head, node, memory_order_release);
-        queue->tail = node;
+        pthread_mutex_lock(&queue->head_lock);
+        pthread_cond_signal(&queue->not_empty);
+        pthread_mutex_unlock(&queue->head_lock);
     }
-    else
-    {
-        /* we add to end (common case) */
-        queue->tail->next = node;
-        queue->tail = node;
-    }
-
-    atomic_fetch_add_explicit(&queue->size, 1, memory_order_relaxed);
-
-    /* signal waiting threads that queue is not empty */
-    pthread_cond_signal(&queue->not_empty);
-
-    pthread_mutex_unlock(&queue->lock);
 
     return 0;
 }
 
 /**
  * queue_dequeue_internal
- * internal helper for dequeue logic (lock must be held)
+ * internal helper for dequeue logic (head_lock must be held)
+ * uses dummy node technique for lock-free separation of head and tail
  * @param queue the queue
  * @return pointer to dequeued data, NULL if queue is empty
  */
 static inline void *queue_dequeue_internal(queue_t *queue)
 {
-    if (QUEUE_UNLIKELY(queue->head == NULL))
+    queue_node_t *old_head = queue->head;
+    queue_node_t *new_head = old_head->next;
+
+    /* if next is NULL, queue is empty */
+    if (QUEUE_UNLIKELY(new_head == NULL))
     {
         return NULL;
     }
 
-    queue_node_t *node = queue->head;
-    void *data = node->data;
-
-    queue->head = node->next;
-    atomic_store_explicit(&queue->atomic_head, node->next, memory_order_release);
-
-    /* optimization: check if queue became empty */
-    if (QUEUE_UNLIKELY(queue->head == NULL))
-    {
-        queue->tail = NULL;
-    }
+    /* we advance head to next node (which becomes new dummy) */
+    void *data = new_head->data;
+    new_head->data = NULL; /* clear data since this node becomes the new dummy */
+    queue->head = new_head;
 
     atomic_fetch_sub_explicit(&queue->size, 1, memory_order_relaxed);
 
-    /* return node to pool */
-    queue_free_node(queue, node);
+    /* return old dummy node to pool */
+    queue_free_node(queue, old_head);
 
     return data;
 }
@@ -186,9 +225,9 @@ void *queue_dequeue(queue_t *queue)
 {
     if (QUEUE_UNLIKELY(queue == NULL)) return NULL;
 
-    pthread_mutex_lock(&queue->lock);
+    pthread_mutex_lock(&queue->head_lock);
     void *data = queue_dequeue_internal(queue);
-    pthread_mutex_unlock(&queue->lock);
+    pthread_mutex_unlock(&queue->head_lock);
 
     return data;
 }
@@ -197,11 +236,29 @@ void *queue_dequeue_wait(queue_t *queue)
 {
     if (QUEUE_UNLIKELY(queue == NULL)) return NULL;
 
-    pthread_mutex_lock(&queue->lock);
+    /* we spin briefly before blocking to avoid syscall overhead */
+    for (int i = 0; i < QUEUE_SPIN_COUNT; i++)
+    {
+        if (atomic_load_explicit(&queue->size, memory_order_acquire) > 0)
+        {
+            pthread_mutex_lock(&queue->head_lock);
+            void *data = queue_dequeue_internal(queue);
+            pthread_mutex_unlock(&queue->head_lock);
+            if (data != NULL)
+            {
+                return data;
+            }
+        }
+        cpu_pause();
+    }
 
-    queue->waiter_count++;
+    /* we fall back to blocking wait */
+    pthread_mutex_lock(&queue->head_lock);
 
-    while (queue->head == NULL && !queue->shutdown)
+    atomic_fetch_add_explicit(&queue->waiter_count, 1, memory_order_relaxed);
+
+    while (queue->head->next == NULL &&
+           !atomic_load_explicit(&queue->shutdown, memory_order_acquire))
     {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -211,28 +268,30 @@ void *queue_dequeue_wait(queue_t *queue)
             ts.tv_sec += 1;
             ts.tv_nsec -= QUEUE_NS_PER_SEC;
         }
-        pthread_cond_timedwait(&queue->not_empty, &queue->lock, &ts);
+        pthread_cond_timedwait(&queue->not_empty, &queue->head_lock, &ts);
     }
 
-    queue->waiter_count--;
+    const int remaining_waiters =
+        atomic_fetch_sub_explicit(&queue->waiter_count, 1, memory_order_relaxed) - 1;
 
-    /* we must always broadcast when waiter_count changes to wake queue_free if waiting */
-    if (queue->waiter_count == 0)
+    /* we broadcast when last waiter exits to wake queue_free if waiting */
+    if (remaining_waiters == 0)
     {
         pthread_cond_broadcast(&queue->not_empty);
     }
 
     /* if shutdown and no data, return NULL */
-    if (QUEUE_UNLIKELY(queue->shutdown && queue->head == NULL))
+    if (QUEUE_UNLIKELY(atomic_load_explicit(&queue->shutdown, memory_order_acquire) &&
+                       queue->head->next == NULL))
     {
-        pthread_mutex_unlock(&queue->lock);
+        pthread_mutex_unlock(&queue->head_lock);
         return NULL;
     }
 
     /* use internal helper to avoid code duplication */
     void *data = queue_dequeue_internal(queue);
 
-    pthread_mutex_unlock(&queue->lock);
+    pthread_mutex_unlock(&queue->head_lock);
 
     return data;
 }
@@ -241,15 +300,16 @@ void *queue_peek(queue_t *queue)
 {
     if (QUEUE_UNLIKELY(queue == NULL)) return NULL;
 
-    pthread_mutex_lock(&queue->lock);
+    pthread_mutex_lock(&queue->head_lock);
 
     void *data = NULL;
-    if (QUEUE_LIKELY(queue->head != NULL))
+    /* with dummy node, actual data is in head->next */
+    if (QUEUE_LIKELY(queue->head->next != NULL))
     {
-        data = queue->head->data;
+        data = queue->head->next->data;
     }
 
-    pthread_mutex_unlock(&queue->lock);
+    pthread_mutex_unlock(&queue->head_lock);
 
     return data;
 }
@@ -272,55 +332,26 @@ int queue_clear(queue_t *queue)
 {
     if (QUEUE_UNLIKELY(queue == NULL)) return -1;
 
-    pthread_mutex_lock(&queue->lock);
+    /* we lock both head and tail to ensure exclusive access */
+    pthread_mutex_lock(&queue->head_lock);
+    pthread_mutex_lock(&queue->tail_lock);
 
-    /* we batch return nodes to pool for better cache locality */
-    queue_node_t *current = queue->head;
-    queue_node_t *batch_head = NULL;
-    queue_node_t *batch_tail = NULL;
-    size_t batch_count = 0;
-
+    /* we free all nodes after the dummy */
+    queue_node_t *current = queue->head->next;
     while (current != NULL)
     {
         queue_node_t *next = current->next;
-
-        if (batch_count < queue->max_pool_size - queue->pool_size)
-        {
-            if (batch_head == NULL)
-            {
-                batch_head = current;
-                batch_tail = current;
-            }
-            else if (batch_tail != NULL)
-            {
-                batch_tail->next = current;
-                batch_tail = current;
-            }
-            batch_count++;
-        }
-        else
-        {
-            /* pool would be full, thus we free directly */
-            free(current);
-        }
-
+        queue_free_node(queue, current);
         current = next;
     }
 
-    /* we attach batch to pool in one operation */
-    if (batch_head != NULL && batch_tail != NULL)
-    {
-        batch_tail->next = queue->node_pool;
-        queue->node_pool = batch_head;
-        queue->pool_size += batch_count;
-    }
-
-    queue->head = NULL;
-    queue->tail = NULL;
-    atomic_store_explicit(&queue->atomic_head, NULL, memory_order_release);
+    /* we reset to empty state with just the dummy */
+    queue->head->next = NULL;
+    queue->tail = queue->head;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
-    pthread_mutex_unlock(&queue->lock);
+    pthread_mutex_unlock(&queue->tail_lock);
+    pthread_mutex_unlock(&queue->head_lock);
 
     return 0;
 }
@@ -330,10 +361,13 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
     if (QUEUE_UNLIKELY(queue == NULL)) return -1;
     if (QUEUE_UNLIKELY(fn == NULL)) return -1;
 
-    pthread_mutex_lock(&queue->lock);
+    /* we lock both to ensure consistent iteration */
+    pthread_mutex_lock(&queue->head_lock);
+    pthread_mutex_lock(&queue->tail_lock);
 
     int count = 0;
-    const queue_node_t *current = queue->head;
+    /* with dummy node, actual data starts at head->next */
+    const queue_node_t *current = queue->head->next;
     while (QUEUE_LIKELY(current != NULL))
     {
         fn(current->data, context);
@@ -341,7 +375,8 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
         current = current->next;
     }
 
-    pthread_mutex_unlock(&queue->lock);
+    pthread_mutex_unlock(&queue->tail_lock);
+    pthread_mutex_unlock(&queue->head_lock);
 
     return count;
 }
@@ -350,9 +385,10 @@ void *queue_peek_at(queue_t *queue, const size_t index)
 {
     if (QUEUE_UNLIKELY(!queue)) return NULL;
 
-    pthread_mutex_lock(&queue->lock);
+    pthread_mutex_lock(&queue->head_lock);
 
-    const queue_node_t *current = queue->head;
+    /* with dummy node, actual data starts at head->next */
+    const queue_node_t *current = queue->head->next;
     for (size_t i = 0; i < index && QUEUE_LIKELY(current != NULL); i++)
     {
         current = current->next;
@@ -360,46 +396,35 @@ void *queue_peek_at(queue_t *queue, const size_t index)
 
     void *data = QUEUE_LIKELY(current != NULL) ? current->data : NULL;
 
-    pthread_mutex_unlock(&queue->lock);
+    pthread_mutex_unlock(&queue->head_lock);
 
     return data;
+}
+
+void queue_shutdown(queue_t *queue)
+{
+    if (queue == NULL) return;
+
+    /* we set shutdown flag and wake all waiting threads */
+    atomic_store_explicit(&queue->shutdown, 1, memory_order_release);
+
+    pthread_mutex_lock(&queue->head_lock);
+    pthread_cond_broadcast(&queue->not_empty);
+    pthread_mutex_unlock(&queue->head_lock);
 }
 
 void queue_free(queue_t *queue)
 {
     if (queue == NULL) return;
 
-    pthread_mutex_lock(&queue->lock);
+    /* we ensure shutdown is set and wake all waiting threads */
+    queue_shutdown(queue);
 
-    /* we set shutdown flag and wake all waiting threads */
-    queue->shutdown = 1;
-    pthread_cond_broadcast(&queue->not_empty);
+    pthread_mutex_lock(&queue->head_lock);
 
-    /* we clear the queue whilst holding the lock */
-    queue_node_t *current = queue->head;
-    while (current != NULL)
-    {
-        queue_node_t *next = current->next;
-        free(current);
-        current = next;
-    }
-
-    current = queue->node_pool;
-    while (current != NULL)
-    {
-        queue_node_t *next = current->next;
-        free(current);
-        current = next;
-    }
-
-    queue->head = NULL;
-    queue->tail = NULL;
-    queue->node_pool = NULL;
-    atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
-
-    /* wait for all waiting threads to exit before destroying primitives
-     * use timed wait to handle NetBSD where signals can be missed */
-    while (queue->waiter_count > 0)
+    /* we wait for all waiting threads to exit before destroying primitives
+     * use timed wait to handle BSD platforms where signals can be missed */
+    while (atomic_load_explicit(&queue->waiter_count, memory_order_acquire) > 0)
     {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -409,27 +434,84 @@ void queue_free(queue_t *queue)
             ts.tv_sec += 1;
             ts.tv_nsec -= QUEUE_NS_PER_SEC;
         }
-        pthread_cond_timedwait(&queue->not_empty, &queue->lock, &ts);
+        pthread_cond_timedwait(&queue->not_empty, &queue->head_lock, &ts);
     }
 
-    pthread_mutex_unlock(&queue->lock);
-    pthread_mutex_destroy(&queue->lock);
+    pthread_mutex_unlock(&queue->head_lock);
+
+    /* now safe to lock both and free everything */
+    pthread_mutex_lock(&queue->head_lock);
+    pthread_mutex_lock(&queue->tail_lock);
+
+    /* we free all nodes including the dummy */
+    queue_node_t *current = queue->head;
+    while (current != NULL)
+    {
+        queue_node_t *next = current->next;
+        free(current);
+        current = next;
+    }
+
+    /* we free the node pool */
+    pthread_mutex_lock(&queue->pool_lock);
+    current = queue->node_pool;
+    while (current != NULL)
+    {
+        queue_node_t *next = current->next;
+        free(current);
+        current = next;
+    }
+    queue->node_pool = NULL;
+    pthread_mutex_unlock(&queue->pool_lock);
+
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->dummy = NULL;
+    atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
+
+    pthread_mutex_unlock(&queue->tail_lock);
+    pthread_mutex_unlock(&queue->head_lock);
+
+    pthread_mutex_destroy(&queue->pool_lock);
+    pthread_mutex_destroy(&queue->tail_lock);
+    pthread_mutex_destroy(&queue->head_lock);
     pthread_cond_destroy(&queue->not_empty);
 
     free(queue);
-    queue = NULL;
 }
 
 void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
 {
     if (queue == NULL) return;
 
-    pthread_mutex_lock(&queue->lock);
+    /* we set shutdown flag and wake all waiting threads */
+    atomic_store_explicit(&queue->shutdown, 1, memory_order_release);
 
-    /* we set shutdown flag first and wake all waiting threads */
-    queue->shutdown = 1;
+    pthread_mutex_lock(&queue->head_lock);
     pthread_cond_broadcast(&queue->not_empty);
 
+    /* we wait for all waiting threads to exit before destroying primitives
+     * we use timed wait to handle BSD platforms where signals can be missed */
+    while (atomic_load_explicit(&queue->waiter_count, memory_order_acquire) > 0)
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += QUEUE_WAIT_TIMEOUT_NS;
+        if (ts.tv_nsec >= QUEUE_NS_PER_SEC)
+        {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= QUEUE_NS_PER_SEC;
+        }
+        pthread_cond_timedwait(&queue->not_empty, &queue->head_lock, &ts);
+    }
+
+    pthread_mutex_unlock(&queue->head_lock);
+
+    /* now safe to lock both and free everything */
+    pthread_mutex_lock(&queue->head_lock);
+    pthread_mutex_lock(&queue->tail_lock);
+
+    /* we free all nodes including the dummy, freeing user data */
     queue_node_t *current = queue->head;
     while (current != NULL)
     {
@@ -442,6 +524,8 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         current = next;
     }
 
+    /* we free the node pool */
+    pthread_mutex_lock(&queue->pool_lock);
     current = queue->node_pool;
     while (current != NULL)
     {
@@ -449,32 +533,21 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
         free(current);
         current = next;
     }
+    queue->node_pool = NULL;
+    pthread_mutex_unlock(&queue->pool_lock);
 
     queue->head = NULL;
     queue->tail = NULL;
-    queue->node_pool = NULL;
+    queue->dummy = NULL;
     atomic_store_explicit(&queue->size, 0, memory_order_relaxed);
 
-    /* we mustwait for all waiting threads to exit before destroying primitives
-     * we use timed wait to handle BSD platforms where signals can be missed */
-    while (queue->waiter_count > 0)
-    {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += QUEUE_WAIT_TIMEOUT_NS;
-        if (ts.tv_nsec >= QUEUE_NS_PER_SEC)
-        {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= QUEUE_NS_PER_SEC;
-        }
-        pthread_cond_timedwait(&queue->not_empty, &queue->lock, &ts);
-    }
+    pthread_mutex_unlock(&queue->tail_lock);
+    pthread_mutex_unlock(&queue->head_lock);
 
-    pthread_mutex_unlock(&queue->lock);
-
-    pthread_mutex_destroy(&queue->lock);
+    pthread_mutex_destroy(&queue->pool_lock);
+    pthread_mutex_destroy(&queue->tail_lock);
+    pthread_mutex_destroy(&queue->head_lock);
     pthread_cond_destroy(&queue->not_empty);
 
     free(queue);
-    queue = NULL;
 }

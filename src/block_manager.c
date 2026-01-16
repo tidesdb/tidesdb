@@ -20,6 +20,9 @@
 
 #include "xxhash.h"
 
+#define BM_UNLIKELY(x) TDB_UNLIKELY(x)
+#define BM_LIKELY(x)   TDB_LIKELY(x)
+
 #define BLOCK_MANAGER_STACK_BUFFER_SIZE 65536
 
 /**
@@ -331,10 +334,10 @@ block_manager_block_t *block_manager_block_create_from_buffer(const uint64_t siz
 
 int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block)
 {
-    if (!bm || !block) return -1;
+    if (BM_UNLIKELY(!bm || !block)) return -1;
 
     /* block size is stored as uint32_t, so enforce 4GB limit */
-    if (block->size > UINT32_MAX)
+    if (BM_UNLIKELY(block->size > UINT32_MAX))
     {
         return -1;
     }
@@ -532,7 +535,10 @@ int block_manager_cursor_has_prev(block_manager_cursor_t *cursor)
 static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t *bm,
                                                                  const uint64_t offset)
 {
-    if (!bm) return NULL;
+    if (BM_UNLIKELY(!bm)) return NULL;
+
+    /* cache fd to avoid repeated struct dereference */
+    const int fd = bm->fd;
 
 /* we use stack buffer for small blocks to read header+data in one syscall
  * for blocks <= 64KB -- header size, we read everything in one pread
@@ -541,11 +547,11 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     unsigned char stack_buf[READ_STACK_BUF_SIZE];
 
     /* first pread -- try to get header + data in one syscall */
-    const ssize_t initial_read = pread(bm->fd, stack_buf, READ_STACK_BUF_SIZE, (off_t)offset);
-    if (initial_read < (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE) return NULL;
+    const ssize_t initial_read = pread(fd, stack_buf, READ_STACK_BUF_SIZE, (off_t)offset);
+    if (BM_UNLIKELY(initial_read < (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE)) return NULL;
 
     const uint32_t block_size = decode_uint32_le_compat(stack_buf);
-    if (block_size == 0) return NULL;
+    if (BM_UNLIKELY(block_size == 0)) return NULL;
 
     const uint32_t stored_checksum =
         decode_uint32_le_compat(stack_buf + BLOCK_MANAGER_SIZE_FIELD_SIZE);
@@ -556,7 +562,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
     block->size = block_size;
     atomic_init(&block->ref_count, 1);
     block->data = malloc(block_size);
-    if (!block->data)
+    if (BM_UNLIKELY(!block->data))
     {
         free(block);
         return NULL;
@@ -564,7 +570,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 
     /* we check if we already have all the data from initial read */
     const size_t total_needed = BLOCK_MANAGER_BLOCK_HEADER_SIZE + block_size;
-    if ((size_t)initial_read >= total_needed)
+    if (BM_LIKELY((size_t)initial_read >= total_needed))
     {
         /* single syscall path: copy data from stack buffer */
         memcpy(block->data, stack_buf + BLOCK_MANAGER_BLOCK_HEADER_SIZE, block_size);
@@ -581,8 +587,8 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
         /* we read remaining data */
         const size_t remaining = block_size - already_have;
         const off_t remaining_offset = (off_t)offset + (off_t)initial_read;
-        if (pread(bm->fd, (uint8_t *)block->data + already_have, remaining, remaining_offset) !=
-            (ssize_t)remaining)
+        if (BM_UNLIKELY(pread(fd, (uint8_t *)block->data + already_have, remaining,
+                              remaining_offset) != (ssize_t)remaining))
         {
             free(block->data);
             free(block);

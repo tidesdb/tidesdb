@@ -969,7 +969,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
     const uint64_t min_block_size = BLOCK_MANAGER_BLOCK_HEADER_SIZE + BLOCK_MANAGER_FOOTER_SIZE;
     if (file_size < BLOCK_MANAGER_HEADER_SIZE + min_block_size)
     {
-        if (validation == TDB_STRICT_BLOCK_VALIDATION)
+        if (validation == BLOCK_MANAGER_STRICT_BLOCK_VALIDATION)
         {
             return -1;
         }
@@ -994,7 +994,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
 
     if (n != BLOCK_MANAGER_FOOTER_SIZE)
     {
-        if (validation == TDB_STRICT_BLOCK_VALIDATION)
+        if (validation == BLOCK_MANAGER_STRICT_BLOCK_VALIDATION)
         {
             /* strict mode -- can't read footer = corruption */
             return -1;
@@ -1020,7 +1020,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
                 "[block_manager] File %s: invalid footer magic 0x%08x (expected 0x%08x), "
                 "file_size=%" PRIu64 "\n",
                 bm->file_path, footer_magic, BLOCK_MANAGER_FOOTER_MAGIC, file_size);
-        if (validation == TDB_STRICT_BLOCK_VALIDATION)
+        if (validation == BLOCK_MANAGER_STRICT_BLOCK_VALIDATION)
         {
             return -1;
         }
@@ -1094,7 +1094,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
         file_size - BLOCK_MANAGER_FOOTER_SIZE - footer_size - BLOCK_MANAGER_BLOCK_HEADER_SIZE;
     if (block_start < BLOCK_MANAGER_HEADER_SIZE)
     {
-        if (validation == TDB_STRICT_BLOCK_VALIDATION)
+        if (validation == BLOCK_MANAGER_STRICT_BLOCK_VALIDATION)
         {
             /*** strict mode -- invalid block position = corruption */
             return -1;

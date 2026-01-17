@@ -3902,7 +3902,7 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
     }
 
     /* validate klog file (strict mode -- reject any corruption) */
-    if (block_manager_validate_last_block(klog_bm, 1) != 0)
+    if (block_manager_validate_last_block(klog_bm, TDB_STRICT_BLOCK_VALIDATION) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable klog file %s is corrupted", sst->klog_path);
         block_manager_close(klog_bm);
@@ -3920,7 +3920,7 @@ static int tidesdb_sstable_load(tidesdb_t *db, tidesdb_sstable_t *sst)
     }
 
     /* validate vlog file (strict mode -- reject any corruption) */
-    if (block_manager_validate_last_block(vlog_bm, 1) != 0)
+    if (block_manager_validate_last_block(vlog_bm, TDB_STRICT_BLOCK_VALIDATION) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable vlog file %s is corrupted", sst->vlog_path);
         block_manager_close(klog_bm);
@@ -8445,7 +8445,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
     }
 
     /* validate and recover WAL file (permissive mode truncate partial writes) */
-    if (block_manager_validate_last_block(wal, 0) != 0)
+    if (block_manager_validate_last_block(wal, TDB_PERMISSIVE_BLOCK_VALIDATION) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL validation failed: %s", cf->name, wal_path);
         block_manager_close(wal);

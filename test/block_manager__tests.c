@@ -813,7 +813,7 @@ void test_block_manager_validate_last_block()
 
     /* now reopen the block manager and explicitly validate (permissive mode) */
     ASSERT_TRUE(block_manager_open(&bm, "validate_test.db", BLOCK_MANAGER_SYNC_NONE) == 0);
-    ASSERT_TRUE(block_manager_validate_last_block(bm, 0) ==
+    ASSERT_TRUE(block_manager_validate_last_block(bm, TDB_PERMISSIVE_BLOCK_VALIDATION) ==
                 0); /* permissive, truncate corruption */
 
     /* we get the file size after validation/repair */

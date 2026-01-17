@@ -154,7 +154,6 @@ static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const ch
     size_t entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_relaxed);
     if (entry_key_len != key_len) return NULL;
 
-    /* Pin entry *before* reading pointers to close UAF window (see #675) */
     atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
 
     uint8_t state_before = atomic_load_explicit(&entry->state, memory_order_acquire);
@@ -171,7 +170,6 @@ static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const ch
         return NULL;
     }
 
-    /* Re-validate invariants while pinned */
     entry_hash = atomic_load_explicit(&entry->cached_hash, memory_order_acquire);
     if (entry_hash != target_hash)
     {
@@ -202,9 +200,11 @@ static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const ch
 
     const int match = (memcmp(key_final, key, key_len) == 0);
 
-    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-
-    if (!match) return NULL;
+    if (!match)
+    {
+        atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
+        return NULL;
+    }
 
     uint8_t state_after = atomic_load_explicit(&entry->state, memory_order_acquire);
     char *key_after = atomic_load_explicit(&entry->key, memory_order_acquire);
@@ -214,13 +214,14 @@ static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const ch
         return entry;
     }
 
+    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
     return NULL;
 }
 
 static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const char *key,
                                        const size_t key_len)
 {
-    uint64_t target_hash = compute_hash(key, key_len);
+    const uint64_t target_hash = compute_hash(key, key_len);
     const size_t idx = target_hash & partition->hash_mask;
     const size_t max_probe = (partition->hash_index_size < CLOCK_CACHE_MAX_HASH_PROBE)
                                  ? partition->hash_index_size
@@ -666,6 +667,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     clock_cache_entry_t *old_entry = find_entry(partition, key, key_len);
     if (old_entry)
     {
+        atomic_fetch_sub_explicit(&old_entry->ref_bit, 1, memory_order_acq_rel);
         /* we mark old entry as deleted to avoid duplicates */
         free_entry(cache, partition, old_entry);
     }
@@ -750,10 +752,6 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
         return NULL;
     }
 
-    /* we increment ref_bit to protect entry from eviction during read */
-    atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-
-    /* we verify entry is still valid after incrementing ref_bit */
     uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
     if (state != ENTRY_VALID)
     {
@@ -815,10 +813,6 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
         return NULL;
     }
 
-    /* we increment ref_bit to protect entry from eviction during use */
-    atomic_fetch_add_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
-
-    /* we verify entry is still valid after incrementing ref_bit */
     uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
     if (state != ENTRY_VALID)
     {
@@ -872,6 +866,7 @@ int clock_cache_delete(clock_cache_t *cache, const char *key, const size_t key_l
         return -1;
     }
 
+    atomic_fetch_sub_explicit(&entry->ref_bit, 1, memory_order_acq_rel);
     free_entry(cache, partition, entry);
 
     return 0;

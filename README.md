@@ -32,11 +32,11 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Clean C API · Returns `TDB_SUCCESS` (0) on success, negative error codes on failure (`TDB_ERR_MEMORY`, `TDB_ERR_INVALID_ARGS`, `TDB_ERR_NOT_FOUND`, `TDB_ERR_IO`, `TDB_ERR_CORRUPTION`, `TDB_ERR_CONFLICT`, etc.). Configurable debug logging with 6 levels: `TDB_LOG_DEBUG` (most verbose), `TDB_LOG_INFO`, `TDB_LOG_WARN`, `TDB_LOG_ERROR`, `TDB_LOG_FATAL`, and `TDB_LOG_NONE` (disable). Log level set via `tidesdb_config_t` at database open. Timestamped log output to stderr with file/line information.
 
 ## Getting Started
-To learn more about TidesDB, check out [What is TidesDB?](https://tidesdb.com/getting-started/what-is-tidesdb/).
+To learn more about TidesDB, check out [What is TidesDB?](https://tidesdb.com/getting-started/what-is-tidesdb/)
 
 For building and benchmarking instructions [Building & Benchmarking TidesDB](https://tidesdb.com/reference/building/)
 
-For C usage documentation, see the [TidesDB C Reference](https://tidesdb.com/reference/c/).
+For C usage documentation, see the [TidesDB C Reference](https://tidesdb.com/reference/c/)
 
 ## Discord Community
 Join the [TidesDB Discord Community](https://discord.gg/tWEmjR66cy) to ask questions, work on development, and discuss the future of TidesDB.

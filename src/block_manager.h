@@ -63,6 +63,13 @@ typedef enum
     BLOCK_MANAGER_SYNC_FULL,
 } block_manager_sync_mode_t;
 
+typedef enum
+{
+    TDB_PERMISSIVE_BLOCK_VALIDATION =
+        0,                          /* no error on validation, we truncate to last valid block */
+    TDB_STRICT_BLOCK_VALIDATION = 1 /* error on validation */
+} tidesdb_block_validation_mode_t;
+
 /**
  * block_manager_t
  * block manager struct
@@ -324,7 +331,7 @@ int block_manager_get_size(block_manager_t *bm, uint64_t *size);
 
 /**
  * block_manager_escalate_fsync
- * escalates an fsync to the underlying block manager file
+ * escalates an fsync syscall to the underlying block manager file
  * @param bm the block manager to fsync
  * @return 0 if successful, -1 if not
  */
@@ -358,14 +365,14 @@ int block_manager_cursor_at_second(block_manager_cursor_t *cursor);
  * block_manager_validate_last_block
  * validates the integrity of the last block in a block manager file
  * @param bm the block manager
- * @param strict if 1, reject any corruption (for SSTables); if 0, truncate to last valid block (for
- * WAL)
+ * @param validation the type of validation to apply, either strict or permissive
  * @return 0 if valid or successfully recovered, -1 if validation fails
  *
  * In strict mode -- any corruption returns -1, file is not modified
  * In permissive mode -- truncates to last valid block on corruption
  */
-int block_manager_validate_last_block(block_manager_t *bm, int strict);
+int block_manager_validate_last_block(block_manager_t *bm,
+                                      tidesdb_block_validation_mode_t validation);
 
 /**
  * convert_sync_mode

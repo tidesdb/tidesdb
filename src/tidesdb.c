@@ -8340,6 +8340,7 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
     }
 
     /* we validate and recover WAL file (permissive mode truncate partial writes) */
+    /* validate and recover WAL file (permissive mode truncate partial writes) */
     if (block_manager_validate_last_block(wal, TDB_PERMISSIVE_BLOCK_VALIDATION) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' WAL validation failed: %s", cf->name, wal_path);

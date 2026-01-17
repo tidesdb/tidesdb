@@ -65,9 +65,9 @@ typedef enum
 
 typedef enum
 {
-    TDB_PERMISSIVE_BLOCK_VALIDATION =
-        0,                          /* no error on validation, we truncate to last valid block */
-    TDB_STRICT_BLOCK_VALIDATION = 1 /* error on validation */
+    BLOCK_MANAGER_PERMISSIVE_BLOCK_VALIDATION =
+        0, /* no error on validation, we truncate to last valid block */
+    BLOCK_MANAGER_STRICT_BLOCK_VALIDATION = 1 /* error on validation */
 } tidesdb_block_validation_mode_t;
 
 /**

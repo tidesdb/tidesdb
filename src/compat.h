@@ -2658,6 +2658,8 @@ static inline int set_file_noreuse_hint(int fd, off_t offset, off_t len)
 #elif defined(__APPLE__)
     /* F_NOCACHE is similar -- tells system not to cache I/O
      * this affects all future I/O on this fd, not just a region */
+    (void)offset;
+    (void)len;
     return fcntl(fd, F_NOCACHE, 1);
 #elif defined(_WIN32)
     /** FILE_FLAG_SEQUENTIAL_SCAN at open time is closest

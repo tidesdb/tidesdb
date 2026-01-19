@@ -359,6 +359,7 @@ struct tidesdb_memtable_t
  * @param levels fixed array of disk levels
  * @param num_active_levels number of currently active disk levels
  * @param next_sstable_id next sstable id
+ * @param sstable_layout_version monotonic version for sstable layout changes
  * @param is_compacting atomic flag indicating compaction is queued
  * @param is_flushing atomic flag indicating flush is queued
  * @param immutable_cleanup_counter counter for batched immutable cleanup
@@ -377,6 +378,7 @@ struct tidesdb_column_family_t
     tidesdb_level_t *levels[TDB_MAX_LEVELS];
     _Atomic(int) num_active_levels;
     _Atomic(uint64_t) next_sstable_id;
+    _Atomic(uint64_t) sstable_layout_version;
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
     _Atomic(int) immutable_cleanup_counter;
@@ -651,7 +653,7 @@ struct tidesdb_txn_t
  * @param cached_sources cached sst sources for reuse across seeks
  * @param num_cached_sources number of cached sources
  * @param cached_sources_capacity capacity of cached sources array
- * @param cached_sstable_version next_sstable_id when sources were cached
+ * @param cached_layout_version sstable layout version when sources were cached
  */
 struct tidesdb_iter_t
 {
@@ -666,7 +668,7 @@ struct tidesdb_iter_t
     void **cached_sources;
     int num_cached_sources;
     int cached_sources_capacity;
-    uint64_t cached_sstable_version;
+    uint64_t cached_layout_version;
 };
 
 /**
@@ -1194,5 +1196,16 @@ void tidesdb_free_stats(tidesdb_stats_t *stats);
  * @note if block cache is disabled, stats->enabled will be 0 and other fields will be zero
  */
 int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
+
+/**
+ * tidesdb_backup
+ * backup current database to a directory. this is a best effort backup that copies immutable files
+ * first, then forces a sorted run, waits for the flush/compaction queues to drain, and performs a
+ * final copy to pick up wal's and the manifest while skipping already copied sstable files.
+ * @param db
+ * @param dir
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_backup(tidesdb_t *db, char *dir);
 
 #endif /* __TIDESDB_H__ */

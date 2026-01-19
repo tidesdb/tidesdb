@@ -15813,6 +15813,27 @@ static int tidesdb_backup_is_wal_file(const char *name)
     return 1;
 }
 
+static int tidesdb_backup_sstable_in_manifest(const tidesdb_column_family_t *cf, const char *name)
+{
+    if (!cf || !cf->manifest || !name) return 0;
+
+    int level_num = 0;
+    int partition_num = 0;
+    unsigned long long sst_id_ull = 0;
+
+    if (tdb_parse_sstable_partitioned(name, &level_num, &partition_num, &sst_id_ull))
+    {
+        return tidesdb_manifest_has_sstable(cf->manifest, level_num, (uint64_t)sst_id_ull);
+    }
+
+    if (tdb_parse_sstable_non_partitioned(name, &level_num, &sst_id_ull))
+    {
+        return tidesdb_manifest_has_sstable(cf->manifest, level_num, (uint64_t)sst_id_ull);
+    }
+
+    return 0;
+}
+
 static int tidesdb_backup_copy_file(const char *src_path, const char *dst_path)
 {
     FILE *src = tdb_fopen(src_path, "rb");
@@ -15853,7 +15874,8 @@ static int tidesdb_backup_copy_file(const char *src_path, const char *dst_path)
 }
 
 static int tidesdb_backup_copy_dir(const char *src_dir, const char *dst_dir,
-                                   const tidesdb_backup_copy_mode_t mode)
+                                   const tidesdb_backup_copy_mode_t mode,
+                                   const tidesdb_column_family_t *cf)
 {
     struct STAT_STRUCT dst_st;
     if (STAT_FUNC(dst_dir, &dst_st) != 0)
@@ -15906,7 +15928,7 @@ static int tidesdb_backup_copy_dir(const char *src_dir, const char *dst_dir,
 
         if (S_ISDIR(src_st.st_mode))
         {
-            result = tidesdb_backup_copy_dir(src_path, dst_path, mode);
+            result = tidesdb_backup_copy_dir(src_path, dst_path, mode, cf);
         }
         else
         {
@@ -15916,7 +15938,18 @@ static int tidesdb_backup_copy_dir(const char *src_dir, const char *dst_dir,
 
             if (mode == TDB_BACKUP_COPY_IMMUTABLE)
             {
-                should_copy = !is_wal;
+                if (is_wal)
+                {
+                    should_copy = 0;
+                }
+                else if (is_sstable)
+                {
+                    should_copy = tidesdb_backup_sstable_in_manifest(cf, entry->d_name);
+                }
+                else
+                {
+                    should_copy = 1;
+                }
             }
             else
             {
@@ -15947,6 +15980,34 @@ static int tidesdb_backup_copy_dir(const char *src_dir, const char *dst_dir,
     return result;
 }
 
+static int tidesdb_backup_copy_all_cfs(tidesdb_t *db, const char *dir,
+                                       const tidesdb_backup_copy_mode_t mode)
+{
+    int result = TDB_SUCCESS;
+
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        tidesdb_column_family_t *cf = db->column_families[i];
+        if (!cf) continue;
+
+        char dst_dir[TDB_MAX_PATH_LEN];
+        const int needed =
+            snprintf(dst_dir, sizeof(dst_dir), "%s" PATH_SEPARATOR "%s", dir, cf->name);
+        if (needed < 0 || (size_t)needed >= sizeof(dst_dir))
+        {
+            result = TDB_ERR_IO;
+            break;
+        }
+
+        result = tidesdb_backup_copy_dir(cf->directory, dst_dir, mode, cf);
+        if (result != TDB_SUCCESS) break;
+    }
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    return result;
+}
+
 int tidesdb_backup(tidesdb_t *db, char *dir)
 {
     if (!db || !dir) return TDB_ERR_INVALID_ARGS;
@@ -15969,7 +16030,7 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting backup to directory: %s", dir);
 
-    int result = tidesdb_backup_copy_dir(db->db_path, dir, TDB_BACKUP_COPY_IMMUTABLE);
+    int result = tidesdb_backup_copy_all_cfs(db, dir, TDB_BACKUP_COPY_IMMUTABLE);
     if (result != TDB_SUCCESS) return result;
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Flushing memtables before final backup copy");
@@ -16086,7 +16147,7 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
         compaction_wait_count++;
     }
 
-    result = tidesdb_backup_copy_dir(db->db_path, dir, TDB_BACKUP_COPY_FINAL);
+    result = tidesdb_backup_copy_all_cfs(db, dir, TDB_BACKUP_COPY_FINAL);
     if (result != TDB_SUCCESS) return result;
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Backup completed successfully: %s", dir);

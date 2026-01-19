@@ -590,6 +590,7 @@ static inline int tdb_ctz64_portable(uint64_t x)
 #include <direct.h>
 #include <fcntl.h>
 #include <io.h>
+#include <share.h>
 #include <sys/stat.h>
 #include <windows.h>
 
@@ -651,7 +652,7 @@ static inline int ftruncate(int fd, off_t length)
  */
 static inline int _tidesdb_open_wrapper_3(const char *path, int flags, mode_t mode)
 {
-    return _open(path, flags | _O_BINARY | _O_SEQUENTIAL, mode);
+    return _sopen(path, flags | _O_BINARY | _O_SEQUENTIAL, _SH_DENYNO, mode);
 }
 
 /* open for windows */
@@ -663,7 +664,7 @@ static inline int _tidesdb_open_wrapper_3(const char *path, int flags, mode_t mo
  */
 static inline int _tidesdb_open_wrapper_2(const char *path, int flags)
 {
-    return _open(path, flags | _O_BINARY, 0);
+    return _sopen(path, flags | _O_BINARY, _SH_DENYNO, 0);
 }
 #define open(...) _tidesdb_open_wrapper_3(__VA_ARGS__)
 
@@ -1125,10 +1126,7 @@ static inline int sem_post(sem_t *sem)
  */
 static inline FILE *tdb_fopen(const char *filename, const char *mode)
 {
-    FILE *fp = NULL;
-    errno_t err = fopen_s(&fp, filename, mode);
-    if (err != 0) return NULL;
-    return fp;
+    return _fsopen(filename, mode, _SH_DENYNO);
 }
 #define fopen tdb_fopen
 

@@ -1197,7 +1197,9 @@ int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
 
 /**
  * tidesdb_backup
- * backup current database to a directory
+ * backup current database to a directory. this is a best effort backup that copies immutable files
+ * first, then forces a sorted run, waits for the flush/compaction queues to drain, and performs a
+ * final copy to pick up wal's and the manifest while skipping already copied sstable files.
  * @param db
  * @param dir
  * @return 0 on success, -n on failure

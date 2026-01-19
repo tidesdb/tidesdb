@@ -3812,14 +3812,12 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
     /* we utilize block indexes to find starting klog block */
     uint64_t start_file_position = 0;
-    int used_block_index = 0;
     if (sst->block_indexes)
     {
         const int index_result = compact_block_index_find_predecessor(
             sst->block_indexes, key, key_size, &start_file_position);
         if (index_result == 0 && start_file_position > 0)
         {
-            used_block_index = 1;
         }
         else
         {
@@ -3856,13 +3854,17 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     char cf_name[TDB_CACHE_KEY_SIZE];
     const int has_cf_name = (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) == 0);
 
-    for (uint64_t block_num = 0; block_num < sst->num_klog_blocks; block_num++)
+    uint64_t blocks_scanned = 0;
+    int used_block_index = (start_file_position > 0);
+
+    while (blocks_scanned < sst->num_klog_blocks)
     {
         if (sst->klog_data_end_offset > 0 && klog_cursor->current_pos >= sst->klog_data_end_offset)
         {
             break;
         }
 
+        const uint64_t block_num = blocks_scanned;
         const uint64_t block_position = klog_cursor->current_pos;
 
         tidesdb_klog_block_t *klog_block = NULL;
@@ -3880,6 +3882,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                 TDB_DEBUG_LOG(TDB_LOG_ERROR,
                               "SSTable %" PRIu64 " block %" PRIu64 " deserialization failed",
                               sst->id, block_num);
+                blocks_scanned++;
                 if (block_manager_cursor_next(klog_cursor) != 0) break;
                 continue;
             }
@@ -3889,6 +3892,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         }
 
         int should_stop_search = 0;
+        int restart_scan = 0;
 
         if (klog_block && klog_block->num_entries > 0)
         {
@@ -3937,7 +3941,15 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                               comparator_ctx);
             if (first_key_cmp < 0)
             {
-                should_stop_search = 1;
+                if (used_block_index)
+                {
+                    used_block_index = 0;
+                    restart_scan = 1;
+                }
+                else
+                {
+                    should_stop_search = 1;
+                }
             }
         }
 
@@ -3949,11 +3961,19 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
             tidesdb_klog_block_free(klog_block);
         if (raw_block) block_manager_block_release(raw_block);
 
-        if (should_stop_search || used_block_index)
+        if (restart_scan)
+        {
+            if (block_manager_cursor_goto_first(klog_cursor) != 0) break;
+            blocks_scanned = 0;
+            continue;
+        }
+
+        if (should_stop_search)
         {
             break;
         }
 
+        blocks_scanned++;
         if (block_manager_cursor_next(klog_cursor) != 0)
         {
             break;
@@ -12015,12 +12035,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         visibility_check = tidesdb_visibility_check_callback;
     }
 
-    tidesdb_immutable_memtable_t **immutable_refs = NULL;
-    size_t immutable_count = 0;
-
-    immutable_refs =
-        tidesdb_snapshot_immutable_memtables(cf->immutable_memtables, &immutable_count);
-
     /* we now load active memtable -- any keys that rotated are already in our immutable snapshot */
     tidesdb_memtable_t *active_mt_struct =
         atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
@@ -12044,12 +12058,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         {
             /* we found a tombstone in active memtable, key is deleted */
             free(temp_value);
-            /* cleanup immutable refs before returning */
-            for (size_t i = 0; i < immutable_count; i++)
-            {
-                if (immutable_refs[i]) tidesdb_immutable_memtable_unref(immutable_refs[i]);
-            }
-            free(immutable_refs);
             return TDB_ERR_NOT_FOUND;
         }
 
@@ -12060,11 +12068,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
             PROFILE_INC(txn->db, memtable_hits);
             tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq);
-            for (size_t i = 0; i < immutable_count; i++)
-            {
-                if (immutable_refs[i]) tidesdb_immutable_memtable_unref(immutable_refs[i]);
-            }
-            free(immutable_refs);
             return TDB_SUCCESS;
         }
 
@@ -12072,6 +12075,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         free(temp_value);
         /* fall through to check immutables */
     }
+
+    tidesdb_immutable_memtable_t **immutable_refs = NULL;
+    size_t immutable_count = 0;
+
+    immutable_refs =
+        tidesdb_snapshot_immutable_memtables(cf->immutable_memtables, &immutable_count);
 
     /* we now search immutable memtables safely with references held
      * search in reverse order (newest first) to find most recent version */
@@ -12127,14 +12136,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     }
 
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    const time_t now = atomic_load(&txn->db->cached_current_time);
 
-    tidesdb_kv_pair_t *best_kv = NULL;
-    uint64_t best_seq = UINT64_MAX;
-    int found_any = 0;
-
-    /* we search level-by-level with early termination
-     * for non-existent keys, this avoids checking all ssts in all levels
-     * for existing keys in level 1, this stops immediately without checking deeper levels */
     for (int level_num = 0; level_num < num_levels; level_num++)
     {
         PROFILE_INC(txn->db, levels_searched);
@@ -12162,7 +12165,11 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         }
 
-        for (int j = 0; j < num_ssts; j++)
+        const int start = (level_num == 0) ? num_ssts - 1 : 0;
+        const int end = (level_num == 0) ? -1 : num_ssts;
+        const int step = (level_num == 0) ? -1 : 1;
+
+        for (int j = start; j != end; j += step)
         {
             tidesdb_sstable_t *sst = sstables[j];
             if (!sst) continue;
@@ -12185,49 +12192,44 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                 uint64_t candidate_seq = candidate_kv->entry.seq;
                 int accept = (snapshot_seq == UINT64_MAX) ? 1 : (candidate_seq <= snapshot_seq);
 
-                if (accept && (best_seq == UINT64_MAX || candidate_seq > best_seq))
+                if (accept)
                 {
-                    if (best_kv) tidesdb_kv_pair_free(best_kv);
-                    best_kv = candidate_kv;
-                    best_seq = candidate_seq;
-                    found_any = 1;
+                    const int is_tombstone =
+                        (candidate_kv->entry.flags & TDB_KV_FLAG_TOMBSTONE) != 0;
+                    const int ttl_ok =
+                        (candidate_kv->entry.ttl <= 0 || candidate_kv->entry.ttl > now);
+
                     PROFILE_INC(txn->db, sstable_hits);
 
-                    /* for L0, stop immediately since we found the key
-                     * for L1+, sstables are non-overlapping so also stop immediately */
+                    if (!is_tombstone && ttl_ok)
+                    {
+                        *value = malloc(candidate_kv->entry.value_size);
+                        if (!*value)
+                        {
+                            tidesdb_kv_pair_free(candidate_kv);
+                            tidesdb_sstable_unref(cf->db, sst);
+                            return TDB_ERR_MEMORY;
+                        }
+                        memcpy(*value, candidate_kv->value, candidate_kv->entry.value_size);
+                        *value_size = candidate_kv->entry.value_size;
+
+                        tidesdb_txn_add_to_read_set(txn, cf, key, key_size, candidate_seq);
+
+                        tidesdb_kv_pair_free(candidate_kv);
+                        tidesdb_sstable_unref(cf->db, sst);
+                        return TDB_SUCCESS;
+                    }
+
+                    tidesdb_kv_pair_free(candidate_kv);
                     tidesdb_sstable_unref(cf->db, sst);
-                    goto check_found_result;
+                    return TDB_ERR_NOT_FOUND;
                 }
+
                 tidesdb_kv_pair_free(candidate_kv);
             }
 
             tidesdb_sstable_unref(cf->db, sst);
         }
-    }
-
-check_found_result:
-
-    /* we check if we found a valid (non-deleted, non-expired) version */
-    if (found_any && best_kv)
-    {
-        if (!(best_kv->entry.flags & TDB_KV_FLAG_TOMBSTONE) &&
-            (best_kv->entry.ttl <= 0 ||
-             best_kv->entry.ttl > atomic_load(&txn->db->cached_current_time)))
-        {
-            *value = malloc(best_kv->entry.value_size);
-            if (*value)
-            {
-                memcpy(*value, best_kv->value, best_kv->entry.value_size);
-                *value_size = best_kv->entry.value_size;
-
-                tidesdb_txn_add_to_read_set(txn, cf, key, key_size, best_seq);
-
-                tidesdb_kv_pair_free(best_kv);
-
-                return TDB_SUCCESS;
-            }
-        }
-        tidesdb_kv_pair_free(best_kv);
     }
 
     return TDB_ERR_NOT_FOUND;
@@ -12462,7 +12464,11 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
             num_sstables = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         }
 
-        for (int sst_idx = 0; sst_idx < num_sstables; sst_idx++)
+        const int start = (level_idx == 0) ? num_sstables - 1 : 0;
+        const int end = (level_idx == 0) ? -1 : num_sstables;
+        const int step = (level_idx == 0) ? -1 : 1;
+
+        for (int sst_idx = start; sst_idx != end; sst_idx += step)
         {
             tidesdb_sstable_t *sst = sstables[sst_idx];
             if (!sst) continue;
@@ -12482,6 +12488,11 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
                 if (found_seq > max_found_seq)
                 {
                     max_found_seq = found_seq;
+                }
+                if (found_seq > threshold_seq)
+                {
+                    tidesdb_sstable_unref(db, sst);
+                    return 1;
                 }
             }
 

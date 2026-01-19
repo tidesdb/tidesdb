@@ -3011,6 +3011,65 @@ static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm)
     }
 }
 
+typedef struct
+{
+    tidesdb_immutable_memtable_t **items;
+    size_t count;
+    size_t capacity;
+    int failed;
+} tidesdb_imm_snapshot_ctx_t;
+
+static void tidesdb_collect_imm_snapshot(void *data, void *context)
+{
+    tidesdb_imm_snapshot_ctx_t *ctx = (tidesdb_imm_snapshot_ctx_t *)context;
+    if (!ctx || ctx->failed || !data) return;
+
+    if (ctx->count >= ctx->capacity)
+    {
+        size_t new_capacity = ctx->capacity == 0 ? 8 : ctx->capacity * 2;
+        void *new_items =
+            realloc(ctx->items, new_capacity * sizeof(tidesdb_immutable_memtable_t *));
+        if (!new_items)
+        {
+            ctx->failed = 1;
+            return;
+        }
+        ctx->items = new_items;
+        ctx->capacity = new_capacity;
+    }
+
+    tidesdb_immutable_memtable_t *imm = (tidesdb_immutable_memtable_t *)data;
+    tidesdb_immutable_memtable_ref(imm);
+    ctx->items[ctx->count++] = imm;
+}
+
+static tidesdb_immutable_memtable_t **tidesdb_snapshot_immutable_memtables(queue_t *queue,
+                                                                           size_t *out_count)
+{
+    if (out_count) *out_count = 0;
+    if (!queue) return NULL;
+
+    tidesdb_imm_snapshot_ctx_t ctx = {0};
+    ctx.capacity = 8;
+    ctx.items = malloc(ctx.capacity * sizeof(tidesdb_immutable_memtable_t *));
+    if (!ctx.items) return NULL;
+
+    queue_foreach(queue, tidesdb_collect_imm_snapshot, &ctx);
+
+    if (ctx.failed || ctx.count == 0)
+    {
+        for (size_t i = 0; i < ctx.count; i++)
+        {
+            if (ctx.items[i]) tidesdb_immutable_memtable_unref(ctx.items[i]);
+        }
+        free(ctx.items);
+        return NULL;
+    }
+
+    if (out_count) *out_count = ctx.count;
+    return ctx.items;
+}
+
 /**
  * tidesdb_write_vlog_entry
  * write a large value to vlog and update kv with offset
@@ -11959,36 +12018,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     tidesdb_immutable_memtable_t **immutable_refs = NULL;
     size_t immutable_count = 0;
 
-    immutable_count = atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
-    if (immutable_count > 0)
-    {
-        immutable_refs = malloc(immutable_count * sizeof(tidesdb_immutable_memtable_t *));
-        if (immutable_refs)
-        {
-            size_t idx = 0;
-            for (size_t i = 0; i < immutable_count; i++)
-            {
-                tidesdb_immutable_memtable_t *imm =
-                    (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
-                if (imm)
-                {
-                    tidesdb_immutable_memtable_ref(imm);
-                    immutable_refs[idx++] = imm;
-                }
-            }
-            immutable_count = idx;
-            /* if no immutables were actually captured, free the array now */
-            if (immutable_count == 0)
-            {
-                free(immutable_refs);
-                immutable_refs = NULL;
-            }
-        }
-        else
-        {
-            immutable_count = 0;
-        }
-    }
+    immutable_refs =
+        tidesdb_snapshot_immutable_memtables(cf->immutable_memtables, &immutable_count);
 
     /* we now load active memtable -- any keys that rotated are already in our immutable snapshot */
     tidesdb_memtable_t *active_mt_struct =
@@ -12365,34 +12396,7 @@ static int tidesdb_txn_check_seq_conflict(skip_list_t *sl, const uint8_t *key,
 static tidesdb_immutable_memtable_t **tidesdb_txn_get_imm_snapshot(tidesdb_column_family_t *cf,
                                                                    size_t *out_count)
 {
-    size_t imm_count = atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
-    if (imm_count == 0)
-    {
-        *out_count = 0;
-        return NULL;
-    }
-
-    tidesdb_immutable_memtable_t **imm_refs =
-        malloc(imm_count * sizeof(tidesdb_immutable_memtable_t *));
-    if (!imm_refs)
-    {
-        *out_count = 0;
-        return NULL;
-    }
-
-    size_t idx = 0;
-    for (size_t i = 0; i < imm_count; i++)
-    {
-        tidesdb_immutable_memtable_t *imm =
-            (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
-        if (imm)
-        {
-            tidesdb_immutable_memtable_ref(imm);
-            imm_refs[idx++] = imm;
-        }
-    }
-    *out_count = idx;
-    return imm_refs;
+    return tidesdb_snapshot_immutable_memtables(cf->immutable_memtables, out_count);
 }
 
 /**
@@ -13429,33 +13433,9 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         return TDB_ERR_MEMORY;
     }
 
-    tidesdb_immutable_memtable_t **imm_snapshot = NULL;
     size_t imm_count = 0;
-
-    imm_count = atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
-    if (imm_count > 0)
-    {
-        imm_snapshot = malloc(imm_count * sizeof(tidesdb_immutable_memtable_t *));
-        if (imm_snapshot)
-        {
-            size_t idx = 0;
-            for (size_t i = 0; i < imm_count; i++)
-            {
-                tidesdb_immutable_memtable_t *imm =
-                    (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
-                if (imm)
-                {
-                    tidesdb_immutable_memtable_ref(imm);
-                    imm_snapshot[idx++] = imm;
-                }
-            }
-            imm_count = idx;
-        }
-        else
-        {
-            imm_count = 0;
-        }
-    }
+    tidesdb_immutable_memtable_t **imm_snapshot =
+        tidesdb_snapshot_immutable_memtables(cf->immutable_memtables, &imm_count);
 
     /* we now load active memtable -- any keys that rotated are already in our snapshot */
     tidesdb_memtable_t *active_mt_struct =
@@ -13837,29 +13817,10 @@ static int tidesdb_iter_collect_memtable_sources(const tidesdb_iter_t *iter,
         (*sources)[(*count)++] = memtable_source;
     }
 
-    /* we snapshot immutable memtables atomically */
-    const size_t imm_count =
-        atomic_load_explicit(&cf->immutable_memtables->size, memory_order_acquire);
-    tidesdb_immutable_memtable_t **imm_snapshot = NULL;
+    /* we snapshot immutable memtables */
     size_t imm_snapshot_count = 0;
-
-    if (imm_count > 0)
-    {
-        imm_snapshot = malloc(imm_count * sizeof(tidesdb_immutable_memtable_t *));
-        if (imm_snapshot)
-        {
-            for (size_t i = 0; i < imm_count; i++)
-            {
-                tidesdb_immutable_memtable_t *imm =
-                    (tidesdb_immutable_memtable_t *)queue_peek_at(cf->immutable_memtables, i);
-                if (imm)
-                {
-                    tidesdb_immutable_memtable_ref(imm);
-                    imm_snapshot[imm_snapshot_count++] = imm;
-                }
-            }
-        }
-    }
+    tidesdb_immutable_memtable_t **imm_snapshot =
+        tidesdb_snapshot_immutable_memtables(cf->immutable_memtables, &imm_snapshot_count);
 
     /* we create sources from snapshot */
     for (size_t i = 0; i < imm_snapshot_count; i++)

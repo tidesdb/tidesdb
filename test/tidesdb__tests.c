@@ -12885,7 +12885,7 @@ int main(void)
     //     RUN_TEST(test_iter_next_large_values_many_sstables, tests_passed);
     //     RUN_TEST(test_iter_prev_large_values_many_sstables, tests_passed);
     //     RUN_TEST(test_get_large_values_many_sstables, tests_passed);
-    for (int i = 0; i < 200; i++)
+    for (int i = 0; i < 250; i++)
     {
         /* going to pass through workflow to assure race is gone on all platforms */
         RUN_TEST(test_range_iteration_large_values_many_sstables, tests_passed);

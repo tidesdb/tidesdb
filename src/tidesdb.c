@@ -4421,6 +4421,11 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
     }
 }
 
+static void tidesdb_bump_sstable_layout_version(tidesdb_column_family_t *cf)
+{
+    atomic_fetch_add_explicit(&cf->sstable_layout_version, 1, memory_order_release);
+}
+
 /**
  * tidesdb_level_update_boundaries
  * update the boundaries of a level
@@ -5891,6 +5896,7 @@ static void tidesdb_cleanup_merged_sstables(tidesdb_column_family_t *cf, queue_t
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "Removed SSTable %" PRIu64 " from level %d", sst->id,
                               lvl->level_num);
                 atomic_fetch_add_explicit(&cf->next_sstable_id, 1, memory_order_release);
+                tidesdb_bump_sstable_layout_version(cf);
                 removed = 1;
                 removed_level = lvl->level_num;
                 break;
@@ -6534,6 +6540,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                           "Adding merged SSTable %" PRIu64 " to level %d (array index %d)",
                           new_sst->id, cf->levels[target_idx]->level_num, target_idx);
             tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
+            tidesdb_bump_sstable_layout_version(cf);
 
             tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                          new_sst->id, new_sst->num_entries,
@@ -7277,6 +7284,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                     "Partition %d: Adding merged SSTable %" PRIu64 " to level %d (array index %d)",
                     partition, new_sst->id, cf->levels[target_idx]->level_num, target_idx);
                 tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
+                tidesdb_bump_sstable_layout_version(cf);
 
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
@@ -8005,6 +8013,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 }
 
                 tidesdb_level_add_sstable(cf->levels[target_idx], new_sst);
+                tidesdb_bump_sstable_layout_version(cf);
 
                 tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_idx]->level_num,
                                              new_sst->id, new_sst->num_entries,
@@ -8764,6 +8773,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
         /* levels array is fixed, access directly */
         tidesdb_level_add_sstable(cf->levels[0], sst);
+        tidesdb_bump_sstable_layout_version(cf);
 
         atomic_thread_fence(memory_order_release);
 
@@ -10693,6 +10703,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     atomic_init(&cf->num_active_levels, min_levels);
 
     atomic_init(&cf->next_sstable_id, 0);
+    atomic_init(&cf->sstable_layout_version, 0);
     atomic_init(&cf->is_compacting, 0);
     atomic_init(&cf->is_flushing, 0);
     atomic_init(&cf->immutable_cleanup_counter, 0);
@@ -13403,8 +13414,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     (*iter)->cached_sources = NULL;
     (*iter)->num_cached_sources = 0;
     (*iter)->cached_sources_capacity = 0;
-    (*iter)->cached_sstable_version =
-        atomic_load_explicit(&cf->next_sstable_id, memory_order_acquire);
+    (*iter)->cached_layout_version =
+        atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
 
     /* we create merge heap for this CF */
     skip_list_comparator_fn comparator_fn = NULL;
@@ -13686,7 +13697,8 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
         tidesdb_merge_source_free(iter->cached_sources[i]);
     }
     iter->num_cached_sources = 0;
-    iter->cached_sstable_version = atomic_load_explicit(&cf->next_sstable_id, memory_order_acquire);
+    iter->cached_layout_version =
+        atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
 
     /* we collect all sstables with references */
     tidesdb_sstable_t **ssts_array = NULL;
@@ -14457,8 +14469,8 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
 
     /* we check if sst layout has changed */
     const uint64_t current_version =
-        atomic_load_explicit(&cf->next_sstable_id, memory_order_acquire);
-    if (current_version != iter->cached_sstable_version)
+        atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
+    if (current_version != iter->cached_layout_version)
     {
         const int result = tidesdb_iter_rebuild_sst_cache(iter);
         if (result != TDB_SUCCESS) return result;
@@ -14543,8 +14555,8 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
 
     /* we check if sst layout has changed */
     const uint64_t current_version =
-        atomic_load_explicit(&cf->next_sstable_id, memory_order_acquire);
-    if (current_version != iter->cached_sstable_version)
+        atomic_load_explicit(&cf->sstable_layout_version, memory_order_acquire);
+    if (current_version != iter->cached_layout_version)
     {
         const int result = tidesdb_iter_rebuild_sst_cache(iter);
         if (result != TDB_SUCCESS) return result;
@@ -15414,6 +15426,7 @@ static void tidesdb_recover_single_sstable(tidesdb_column_family_t *cf, const st
     if (level_num <= current_levels)
     {
         tidesdb_level_add_sstable(cf->levels[level_num - 1], sst);
+        tidesdb_bump_sstable_layout_version(cf);
     }
 
     tidesdb_sstable_unref(cf->db, sst);

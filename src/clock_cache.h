@@ -56,7 +56,7 @@ typedef struct
  * @param payload atomic pointer to heap-allocated payload
  * @param key_len atomic key length
  * @param payload_len atomic payload length
- * @param ref_bit atomic reference bit for CLOCK algorithm
+ * @param ref_bit atomic ref bit (LSB) plus reader count in upper bits
  * @param state atomic state: 0=empty, 1=writing, 2=valid, 3=deleting
  * @param cached_hash cached hash value for this entry
  */
@@ -79,7 +79,6 @@ typedef struct
 
 /** cache configuration constants */
 #define CLOCK_CACHE_MAX_PUT_RETRIES         100  /* max retries for claiming a slot */
-#define CLOCK_CACHE_SMALL_PARTITION_SLOTS   8    /* threshold for small test caches */
 #define CLOCK_CACHE_MIN_PARTITIONS          4    /* minimum number of partitions */
 #define CLOCK_CACHE_MAX_PARTITIONS          128  /* maximum number of partitions */
 #define CLOCK_CACHE_PARTITIONS_PER_CPU      2    /* partitions per CPU core */

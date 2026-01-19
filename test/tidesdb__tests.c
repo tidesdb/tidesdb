@@ -22,6 +22,7 @@
 
 /* test configuration constants */
 #define TEST_FLUSH_DRAIN_WAIT_INTERVAL_US 100000
+#define TEST_DB_BACKUP_PATH               "./test_tidesdb_backup"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -430,6 +431,261 @@ static void test_persistence_and_recovery(void)
     }
 
     cleanup_test_dir();
+}
+
+static void test_backup_basic(void)
+{
+    cleanup_test_dir();
+    remove_directory(TEST_DB_BACKUP_PATH);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.compression_algorithm = NO_COMPRESSION;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "backup_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "backup_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char value[128];
+        snprintf(key, sizeof(key), "backup_key_%04d", i);
+        snprintf(value, sizeof(value), "backup_value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    for (int i = 0; i < 50; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+    usleep(50000);
+
+    for (int i = 50; i < 80; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char value[128];
+        snprintf(key, sizeof(key), "backup_key_%04d", i);
+        snprintf(value, sizeof(value), "backup_value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_backup(db, TEST_DB_BACKUP_PATH), 0);
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_BACKUP_PATH;
+
+    tidesdb_t *backup_db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &backup_db), 0);
+    ASSERT_TRUE(backup_db != NULL);
+
+    tidesdb_column_family_t *backup_cf = tidesdb_get_column_family(backup_db, "backup_cf");
+    ASSERT_TRUE(backup_cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(backup_db, &txn), 0);
+    for (int i = 0; i < 80; i++)
+    {
+        char key[64];
+        char expected[128];
+        snprintf(key, sizeof(key), "backup_key_%04d", i);
+        snprintf(expected, sizeof(expected), "backup_value_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(txn, backup_cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+            0);
+        ASSERT_TRUE(value != NULL);
+        ASSERT_TRUE(strcmp((char *)value, expected) == 0);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(backup_db), 0);
+    cleanup_test_dir();
+    remove_directory(TEST_DB_BACKUP_PATH);
+}
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int start_key;
+    int end_key;
+    _Atomic(int) last_written;
+    _Atomic(int) *stop;
+    _Atomic(int) *errors;
+} backup_concurrent_writer_t;
+
+static void *backup_concurrent_writer_thread(void *arg)
+{
+    backup_concurrent_writer_t *data = (backup_concurrent_writer_t *)arg;
+    for (int i = data->start_key; i < data->end_key; i++)
+    {
+        if (atomic_load(data->stop)) break;
+
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(data->db, &txn) != 0)
+        {
+            atomic_fetch_add(data->errors, 1);
+            continue;
+        }
+
+        char key[64];
+        char value[128];
+        snprintf(key, sizeof(key), "concurrent_key_%05d", i);
+        snprintf(value, sizeof(value), "concurrent_value_%05d", i);
+
+        if (tidesdb_txn_put(txn, data->cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                            strlen(value) + 1, 0) != 0)
+        {
+            atomic_fetch_add(data->errors, 1);
+            tidesdb_txn_free(txn);
+            continue;
+        }
+
+        if (tidesdb_txn_commit(txn) != 0)
+        {
+            atomic_fetch_add(data->errors, 1);
+        }
+        tidesdb_txn_free(txn);
+        atomic_store(&data->last_written, i);
+    }
+    return NULL;
+}
+
+static void test_backup_concurrent_writes(void)
+{
+    cleanup_test_dir();
+    remove_directory(TEST_DB_BACKUP_PATH);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.compression_algorithm = NO_COMPRESSION;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "backup_concurrent_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "backup_concurrent_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int NUM_THREADS = 4;
+    const int KEYS_PER_THREAD = 200;
+    const int PREBACKUP_KEYS_PER_THREAD = 50;
+
+    _Atomic(int) stop_flag = 0;
+    _Atomic(int) errors = 0;
+
+    pthread_t *threads = malloc(sizeof(pthread_t) * NUM_THREADS);
+    backup_concurrent_writer_t *thread_data =
+        malloc(sizeof(backup_concurrent_writer_t) * NUM_THREADS);
+    ASSERT_TRUE(threads != NULL);
+    ASSERT_TRUE(thread_data != NULL);
+
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        thread_data[i].db = db;
+        thread_data[i].cf = cf;
+        thread_data[i].start_key = i * KEYS_PER_THREAD;
+        thread_data[i].end_key = (i + 1) * KEYS_PER_THREAD;
+        thread_data[i].stop = &stop_flag;
+        thread_data[i].errors = &errors;
+        atomic_init(&thread_data[i].last_written, -1);
+        pthread_create(&threads[i], NULL, backup_concurrent_writer_thread, &thread_data[i]);
+    }
+
+    int all_ready = 0;
+    for (int attempt = 0; attempt < 500; attempt++)
+    {
+        all_ready = 1;
+        for (int i = 0; i < NUM_THREADS; i++)
+        {
+            int min_written = thread_data[i].start_key + PREBACKUP_KEYS_PER_THREAD - 1;
+            if (atomic_load(&thread_data[i].last_written) < min_written)
+            {
+                all_ready = 0;
+                break;
+            }
+        }
+        if (all_ready) break;
+        usleep(10000);
+    }
+    ASSERT_TRUE(all_ready);
+
+    ASSERT_EQ(tidesdb_backup(db, TEST_DB_BACKUP_PATH), 0);
+
+    atomic_store(&stop_flag, 1);
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    ASSERT_EQ(atomic_load(&errors), 0);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_BACKUP_PATH;
+
+    tidesdb_t *backup_db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &backup_db), 0);
+    ASSERT_TRUE(backup_db != NULL);
+
+    tidesdb_column_family_t *backup_cf =
+        tidesdb_get_column_family(backup_db, "backup_concurrent_cf");
+    ASSERT_TRUE(backup_cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(backup_db, &txn), 0);
+    for (int t = 0; t < NUM_THREADS; t++)
+    {
+        int start = t * KEYS_PER_THREAD;
+        int end = start + PREBACKUP_KEYS_PER_THREAD;
+        for (int i = start; i < end; i++)
+        {
+            char key[64];
+            char expected[128];
+            snprintf(key, sizeof(key), "concurrent_key_%05d", i);
+            snprintf(expected, sizeof(expected), "concurrent_value_%05d", i);
+
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            ASSERT_EQ(tidesdb_txn_get(txn, backup_cf, (uint8_t *)key, strlen(key) + 1, &value,
+                                      &value_size),
+                      0);
+            ASSERT_TRUE(value != NULL);
+            ASSERT_TRUE(strcmp((char *)value, expected) == 0);
+            free(value);
+        }
+    }
+    tidesdb_txn_free(txn);
+
+    free(thread_data);
+    free(threads);
+
+    ASSERT_EQ(tidesdb_close(backup_db), 0);
+    cleanup_test_dir();
+    remove_directory(TEST_DB_BACKUP_PATH);
 }
 
 static void test_iterator_basic(void)
@@ -12466,6 +12722,8 @@ int main(void)
     RUN_TEST(test_memtable_flush, tests_passed);
     RUN_TEST(test_background_flush_multiple_immutable_memtables, tests_passed);
     RUN_TEST(test_persistence_and_recovery, tests_passed);
+    RUN_TEST(test_backup_basic, tests_passed);
+    RUN_TEST(test_backup_concurrent_writes, tests_passed);
     RUN_TEST(test_multi_cf_wal_recovery, tests_passed);
     RUN_TEST(test_multi_cf_many_sstables_recovery, tests_passed);
     RUN_TEST(test_multi_cf_transaction_atomicity_recovery, tests_passed);

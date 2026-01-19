@@ -18,6 +18,8 @@
  */
 #include "tidesdb.h"
 
+#include <errno.h>
+
 #include "xxhash.h"
 
 /* read profiling macros */
@@ -65,6 +67,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_KLOG_BLOCK_SIZE              (64 * 1024)
 #define TDB_STACK_SSTS                   64
 #define TDB_ITER_STACK_KEY_SIZE          256
+#define TDB_BACKUP_COPY_BUFFER_SIZE      (256 * 1024)
 
 /* initial capacity values for dynamic arrays */
 #define TDB_INITIAL_MERGE_HEAP_CAPACITY    16
@@ -15781,6 +15784,312 @@ int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats)
     stats->hit_rate = cache_stats.hit_rate;
     stats->num_partitions = cache_stats.num_partitions;
 
+    return TDB_SUCCESS;
+}
+
+typedef enum
+{
+    TDB_BACKUP_COPY_IMMUTABLE = 1,
+    TDB_BACKUP_COPY_FINAL = 2
+} tidesdb_backup_copy_mode_t;
+
+static int tidesdb_backup_is_sstable_file(const char *name)
+{
+    if (!name) return 0;
+    const char *ext = strrchr(name, '.');
+    if (!ext) return 0;
+    return (strcmp(ext, TDB_SSTABLE_KLOG_EXT) == 0 || strcmp(ext, TDB_SSTABLE_VLOG_EXT) == 0);
+}
+
+static int tidesdb_backup_is_wal_file(const char *name)
+{
+    if (!name) return 0;
+    const size_t name_len = strlen(name);
+    const size_t prefix_len = strlen(TDB_WAL_PREFIX);
+    const size_t ext_len = strlen(TDB_WAL_EXT);
+    if (name_len <= prefix_len + ext_len) return 0;
+    if (strncmp(name, TDB_WAL_PREFIX, prefix_len) != 0) return 0;
+    if (strcmp(name + name_len - ext_len, TDB_WAL_EXT) != 0) return 0;
+    return 1;
+}
+
+static int tidesdb_backup_copy_file(const char *src_path, const char *dst_path)
+{
+    FILE *src = tdb_fopen(src_path, "rb");
+    if (!src)
+    {
+        if (errno == ENOENT) return TDB_SUCCESS;
+        return TDB_ERR_IO;
+    }
+
+    FILE *dst = tdb_fopen(dst_path, "wb");
+    if (!dst)
+    {
+        fclose(src);
+        return TDB_ERR_IO;
+    }
+
+    char buffer[TDB_BACKUP_COPY_BUFFER_SIZE];
+    size_t bytes_read = 0;
+    int result = TDB_SUCCESS;
+
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), src)) > 0)
+    {
+        if (fwrite(buffer, 1, bytes_read, dst) != bytes_read)
+        {
+            result = TDB_ERR_IO;
+            break;
+        }
+    }
+
+    if (ferror(src)) result = TDB_ERR_IO;
+
+    if (fflush(dst) != 0) result = TDB_ERR_IO;
+
+    if (fclose(dst) != 0) result = TDB_ERR_IO;
+    fclose(src);
+
+    return result;
+}
+
+static int tidesdb_backup_copy_dir(const char *src_dir, const char *dst_dir,
+                                   const tidesdb_backup_copy_mode_t mode)
+{
+    struct STAT_STRUCT dst_st;
+    if (STAT_FUNC(dst_dir, &dst_st) != 0)
+    {
+        if (mkdir(dst_dir, TDB_DIR_PERMISSIONS) != 0)
+        {
+            return TDB_ERR_IO;
+        }
+    }
+    else if (!S_ISDIR(dst_st.st_mode))
+    {
+        return TDB_ERR_IO;
+    }
+
+    DIR *dir = opendir(src_dir);
+    if (!dir) return TDB_ERR_IO;
+
+    struct dirent *entry;
+    int result = TDB_SUCCESS;
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (strcmp(entry->d_name, TDB_LOCK_FILE) == 0) continue;
+
+        const size_t src_len = strlen(src_dir) + strlen(PATH_SEPARATOR) + strlen(entry->d_name) + 1;
+        const size_t dst_len = strlen(dst_dir) + strlen(PATH_SEPARATOR) + strlen(entry->d_name) + 1;
+        char *src_path = malloc(src_len);
+        char *dst_path = malloc(dst_len);
+        if (!src_path || !dst_path)
+        {
+            free(src_path);
+            free(dst_path);
+            result = TDB_ERR_MEMORY;
+            break;
+        }
+
+        snprintf(src_path, src_len, "%s%s%s", src_dir, PATH_SEPARATOR, entry->d_name);
+        snprintf(dst_path, dst_len, "%s%s%s", dst_dir, PATH_SEPARATOR, entry->d_name);
+
+        struct STAT_STRUCT src_st;
+        if (STAT_FUNC(src_path, &src_st) != 0)
+        {
+            if (errno != ENOENT) result = TDB_ERR_IO;
+            free(src_path);
+            free(dst_path);
+            if (result != TDB_SUCCESS) break;
+            continue;
+        }
+
+        if (S_ISDIR(src_st.st_mode))
+        {
+            result = tidesdb_backup_copy_dir(src_path, dst_path, mode);
+        }
+        else
+        {
+            const int is_sstable = tidesdb_backup_is_sstable_file(entry->d_name);
+            const int is_wal = tidesdb_backup_is_wal_file(entry->d_name);
+            int should_copy = 0;
+
+            if (mode == TDB_BACKUP_COPY_IMMUTABLE)
+            {
+                should_copy = !is_wal;
+            }
+            else
+            {
+                if (is_sstable)
+                {
+                    struct STAT_STRUCT existing_st;
+                    if (STAT_FUNC(dst_path, &existing_st) != 0)
+                    {
+                        should_copy = 1;
+                    }
+                }
+                else
+                {
+                    should_copy = 1;
+                }
+            }
+
+            if (should_copy) result = tidesdb_backup_copy_file(src_path, dst_path);
+        }
+
+        free(src_path);
+        free(dst_path);
+
+        if (result != TDB_SUCCESS) break;
+    }
+
+    closedir(dir);
+    return result;
+}
+
+int tidesdb_backup(tidesdb_t *db, char *dir)
+{
+    if (!db || !dir) return TDB_ERR_INVALID_ARGS;
+
+    const int wait_result = wait_for_open(db);
+    if (wait_result != TDB_SUCCESS) return wait_result;
+
+    if (strcmp(db->db_path, dir) == 0) return TDB_ERR_INVALID_ARGS;
+
+    struct STAT_STRUCT st;
+    if (STAT_FUNC(dir, &st) == 0)
+    {
+        if (!S_ISDIR(st.st_mode)) return TDB_ERR_INVALID_ARGS;
+        if (!is_directory_empty(dir)) return TDB_ERR_EXISTS;
+    }
+    else
+    {
+        if (mkdir(dir, TDB_DIR_PERMISSIONS) != 0) return TDB_ERR_IO;
+    }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting backup to directory: %s", dir);
+
+    int result = tidesdb_backup_copy_dir(db->db_path, dir, TDB_BACKUP_COPY_IMMUTABLE);
+    if (result != TDB_SUCCESS) return result;
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Flushing memtables before final backup copy");
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        tidesdb_column_family_t *cf = db->column_families[i];
+        if (!cf) continue;
+
+        int wait_count = 0;
+        while (atomic_load_explicit(&cf->is_flushing, memory_order_acquire) != 0 &&
+               wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS)
+        {
+            usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
+            wait_count++;
+        }
+
+        result = tidesdb_flush_memtable_internal(cf, 0, 1);
+        if (result != TDB_SUCCESS)
+        {
+            pthread_rwlock_unlock(&db->cf_list_lock);
+            return result;
+        }
+    }
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for background flushes to complete");
+    int flush_wait_count = 0;
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    while (1)
+    {
+        int any_flushing = 0;
+        size_t queue_size_val = 0;
+
+        for (int i = 0; i < db->num_column_families; i++)
+        {
+            if (db->column_families[i])
+            {
+                if (atomic_load_explicit(&db->column_families[i]->is_flushing,
+                                         memory_order_acquire))
+                {
+                    any_flushing = 1;
+                    break;
+                }
+            }
+        }
+
+        if (db->flush_queue)
+        {
+            queue_size_val = queue_size(db->flush_queue);
+        }
+
+        if (!any_flushing && queue_size_val == 0)
+        {
+            break;
+        }
+
+        if (flush_wait_count % 1000 == 0 && flush_wait_count > 0)
+        {
+            TDB_DEBUG_LOG(
+                TDB_LOG_INFO,
+                "Still waiting for background flushes (waited %d seconds, queue_size=%zu)",
+                flush_wait_count / 1000, queue_size_val);
+        }
+
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
+        flush_wait_count++;
+        pthread_rwlock_rdlock(&db->cf_list_lock);
+    }
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Waiting for in-progress compactions to complete");
+    int compaction_wait_count = 0;
+    while (1)
+    {
+        int any_compacting = 0;
+        size_t compaction_queue_size = 0;
+
+        pthread_rwlock_rdlock(&db->cf_list_lock);
+        for (int i = 0; i < db->num_column_families; i++)
+        {
+            if (db->column_families[i])
+            {
+                if (atomic_load_explicit(&db->column_families[i]->is_compacting,
+                                         memory_order_acquire))
+                {
+                    any_compacting = 1;
+                    break;
+                }
+            }
+        }
+        pthread_rwlock_unlock(&db->cf_list_lock);
+
+        if (db->compaction_queue)
+        {
+            compaction_queue_size = queue_size(db->compaction_queue);
+        }
+
+        if (!any_compacting && compaction_queue_size == 0)
+        {
+            break;
+        }
+
+        if (compaction_wait_count % 100 == 0 && compaction_wait_count > 0)
+        {
+            TDB_DEBUG_LOG(
+                TDB_LOG_INFO,
+                "Still waiting for in-progress compactions (waited %d ms, queue_size=%zu)",
+                compaction_wait_count, compaction_queue_size);
+        }
+
+        usleep(TDB_CLOSE_TXN_WAIT_SLEEP_US);
+        compaction_wait_count++;
+    }
+
+    result = tidesdb_backup_copy_dir(db->db_path, dir, TDB_BACKUP_COPY_FINAL);
+    if (result != TDB_SUCCESS) return result;
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Backup completed successfully: %s", dir);
     return TDB_SUCCESS;
 }
 

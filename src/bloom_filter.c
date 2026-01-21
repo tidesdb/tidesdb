@@ -18,6 +18,7 @@
  */
 #include "bloom_filter.h"
 
+#include <string.h>
 #include <tgmath.h>
 
 #define BLOOM_UNLIKELY(x) TDB_UNLIKELY(x)
@@ -144,7 +145,7 @@ int bloom_filter_is_full(const bloom_filter_t *bf)
     const uint64_t *const bitset = bf->bitset;
     const unsigned int size_in_words = bf->size_in_words;
 
-    /* we check if all words are fully set (optimized for packed bits) */
+    /* we check if all words are fully set */
     for (unsigned int i = 0; i < size_in_words - 1; i++)
     {
         if (bitset[i] != UINT64_MAX)
@@ -176,17 +177,15 @@ unsigned int bloom_filter_hash(const uint8_t *entry, const size_t size, const in
     /* we process 4 bytes at a time */
     while (entry + 4 <= limit)
     {
-        /* inline decode_fixed_32 to avoid function call overhead */
-        const uint32_t w = ((uint32_t)(uint8_t)entry[0]) | ((uint32_t)(uint8_t)entry[1] << 8) |
-                           ((uint32_t)(uint8_t)entry[2] << 16) |
-                           ((uint32_t)(uint8_t)entry[3] << 24);
+        uint32_t w;
+        memcpy(&w, entry, sizeof(w));
         entry += 4;
         h += w;
         h *= prime;
         h ^= (h >> 16);
     }
 
-    /* process any remaining bytes (less than 4) */
+    /* we process any remaining bytes (less than 4) */
     switch (limit - entry)
     {
         case 3:
@@ -225,7 +224,7 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
      * -- header: 3 varint32s (m, h, non_zero_count) = 15 bytes max
      * -- sparse data: each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
      */
-    size_t max_size = 15 + non_zero_count * 15;
+    const size_t max_size = 15 + non_zero_count * 15;
     uint8_t *buffer = malloc(max_size);
     if (buffer == NULL)
     {
@@ -239,7 +238,7 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
     ptr = encode_varint32(ptr, (uint32_t)bf->h);
     ptr = encode_varint32(ptr, (uint32_t)non_zero_count);
 
-    /* write sparse bitset: only non-zero words with their indices */
+    /* we write sparse bitset -- only non-zero words with their indices */
     for (unsigned int i = 0; i < bf->size_in_words; i++)
     {
         if (bf->bitset[i] != 0)
@@ -302,7 +301,7 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
         return NULL;
     }
 
-    /* read sparse bitset: only non-zero words */
+    /* we read sparse bitset -- only non-zero words */
     for (uint32_t i = 0; i < non_zero_count; i++)
     {
         uint32_t index;

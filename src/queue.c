@@ -297,17 +297,60 @@ void *queue_dequeue_wait(queue_t *queue)
         return NULL;
     }
 
-    /** we acquire write lock to coordinate with readers, then dequeue */
-    pthread_mutex_unlock(&queue->head_lock);
-    pthread_rwlock_wrlock(&queue->read_lock);
-    pthread_mutex_lock(&queue->head_lock);
+    /** we acquire write lock to coordinate with readers, then dequeue
+     * we must re-check for data after re-acquiring locks since another thread
+     * could have stolen the item while we released head_lock */
+    while (1)
+    {
+        pthread_mutex_unlock(&queue->head_lock);
+        pthread_rwlock_wrlock(&queue->read_lock);
+        pthread_mutex_lock(&queue->head_lock);
 
-    void *data = queue_dequeue_internal(queue);
+        /** we check if data is still available */
+        if (queue->head->next != NULL)
+        {
+            void *data = queue_dequeue_internal(queue);
+            pthread_mutex_unlock(&queue->head_lock);
+            pthread_rwlock_unlock(&queue->read_lock);
+            return data;
+        }
 
-    pthread_mutex_unlock(&queue->head_lock);
-    pthread_rwlock_unlock(&queue->read_lock);
+        /* data was stolen! release locks and wait again */
+        pthread_rwlock_unlock(&queue->read_lock);
 
-    return data;
+        if (atomic_load_explicit(&queue->shutdown, memory_order_acquire))
+        {
+            pthread_mutex_unlock(&queue->head_lock);
+            return NULL;
+        }
+
+        /* increment waiter count and wait for more data */
+        atomic_fetch_add_explicit(&queue->waiter_count, 1, memory_order_relaxed);
+
+        while (queue->head->next == NULL &&
+               !atomic_load_explicit(&queue->shutdown, memory_order_acquire))
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += QUEUE_WAIT_TIMEOUT_NS;
+            if (ts.tv_nsec >= QUEUE_NS_PER_SEC)
+            {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= QUEUE_NS_PER_SEC;
+            }
+            pthread_cond_timedwait(&queue->not_empty, &queue->head_lock, &ts);
+        }
+
+        atomic_fetch_sub_explicit(&queue->waiter_count, 1, memory_order_relaxed);
+
+        /* we check for shutdown after waking */
+        if (atomic_load_explicit(&queue->shutdown, memory_order_acquire) &&
+            queue->head->next == NULL)
+        {
+            pthread_mutex_unlock(&queue->head_lock);
+            return NULL;
+        }
+    }
 }
 
 void *queue_peek(queue_t *queue)

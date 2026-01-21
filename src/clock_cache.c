@@ -21,7 +21,7 @@
 #include "../external/xxhash.h"
 
 #define CLOCK_CACHE_PARTITION_FULL_THRESHOLD 85
-#define CLOCK_CACHE_YIELD_COUNT              5
+#define CLOCK_CACHE_YIELD_COUNT              1
 #define CLOCK_CACHE_REF_BIT                  1u
 #define CLOCK_CACHE_READER_INC               2u
 #define CLOCK_CACHE_REF_MASK                 ((uint8_t)~CLOCK_CACHE_REF_BIT)
@@ -217,10 +217,10 @@ static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const ch
     return NULL;
 }
 
-static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const char *key,
-                                       const size_t key_len)
+static clock_cache_entry_t *find_entry_with_hash(clock_cache_partition_t *partition,
+                                                 const char *key, const size_t key_len,
+                                                 const uint64_t target_hash)
 {
-    const uint64_t target_hash = compute_hash(key, key_len);
     const size_t idx = target_hash & partition->hash_mask;
     const size_t max_probe = (partition->hash_index_size < CLOCK_CACHE_MAX_HASH_PROBE)
                                  ? partition->hash_index_size
@@ -251,6 +251,17 @@ static clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const
     }
 
     return NULL;
+}
+
+/**
+ * find_entry
+ * wrapper that computes hash and calls find_entry_with_hash
+ */
+static inline clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const char *key,
+                                              const size_t key_len)
+{
+    const uint64_t hash = compute_hash(key, key_len);
+    return find_entry_with_hash(partition, key, key_len, hash);
 }
 
 /**
@@ -657,13 +668,13 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
 
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return -1;
 
-    const size_t partition_idx = hash_to_partition(cache, key, key_len);
-    clock_cache_partition_t *partition = &cache->partitions[partition_idx];
     const uint64_t hash = compute_hash(key, key_len);
+    const size_t partition_idx = (size_t)(hash & cache->partition_mask);
+    clock_cache_partition_t *partition = &cache->partitions[partition_idx];
     const size_t entry_bytes = entry_size(key_len, payload_len);
 
     /* we try to find and invalidate existing entry (best-effort update) */
-    clock_cache_entry_t *old_entry = find_entry(partition, key, key_len);
+    clock_cache_entry_t *old_entry = find_entry_with_hash(partition, key, key_len, hash);
     if (old_entry)
     {
         /* we mark old entry as deleted to avoid duplicates */
@@ -739,10 +750,11 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
 
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return NULL;
 
-    const size_t partition_idx = hash_to_partition(cache, key, key_len);
+    const uint64_t hash = compute_hash(key, key_len);
+    const size_t partition_idx = (size_t)(hash & cache->partition_mask);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
-    clock_cache_entry_t *entry = find_entry(partition, key, key_len);
+    clock_cache_entry_t *entry = find_entry_with_hash(partition, key, key_len, hash);
 
     if (!entry)
     {
@@ -805,10 +817,11 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
 
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return NULL;
 
-    const size_t partition_idx = hash_to_partition(cache, key, key_len);
+    const uint64_t hash = compute_hash(key, key_len);
+    const size_t partition_idx = (size_t)(hash & cache->partition_mask);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
-    clock_cache_entry_t *entry = find_entry(partition, key, key_len);
+    clock_cache_entry_t *entry = find_entry_with_hash(partition, key, key_len, hash);
 
     if (!entry)
     {
@@ -865,10 +878,11 @@ int clock_cache_delete(clock_cache_t *cache, const char *key, const size_t key_l
 
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return -1;
 
-    const size_t partition_idx = hash_to_partition(cache, key, key_len);
+    const uint64_t hash = compute_hash(key, key_len);
+    const size_t partition_idx = (size_t)(hash & cache->partition_mask);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
-    clock_cache_entry_t *entry = find_entry(partition, key, key_len);
+    clock_cache_entry_t *entry = find_entry_with_hash(partition, key, key_len, hash);
 
     if (!entry)
     {

@@ -419,7 +419,7 @@ int block_manager_read_at_offset(block_manager_t *bm, uint64_t offset, size_t si
 /**
  * block_manager_read_block_data_at_offset
  * reads a complete block (header + data) at a specific file offset in one I/O operation
- * optimized for vlog reads - combines size lookup and data read into single pread
+ * optimized for vlog reads -- combines size lookup and data read into single pread
  * @param bm the block manager to read from
  * @param offset the file offset of the block (start of block header)
  * @param data output buffer pointer (allocated by function, caller must free)

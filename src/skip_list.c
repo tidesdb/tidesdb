@@ -42,13 +42,18 @@ static inline int skip_list_compare_keys_numeric_inline(const uint8_t *key1, con
  */
 static inline int skip_list_compare_keys_16_inline(const uint8_t *key1, const uint8_t *key2)
 {
-    uint64_t v1_hi, v1_lo, v2_hi, v2_lo;
+    /* we compare high 8 bytes first -- the most discriminating for sorted data */
+    uint64_t v1_hi, v2_hi;
     memcpy(&v1_hi, key1, sizeof(uint64_t));
-    memcpy(&v1_lo, key1 + 8, sizeof(uint64_t));
     memcpy(&v2_hi, key2, sizeof(uint64_t));
-    memcpy(&v2_lo, key2 + 8, sizeof(uint64_t));
 
     if (v1_hi != v2_hi) return (v1_hi < v2_hi) ? -1 : 1;
+
+    /* only load low bytes if high bytes are equal */
+    uint64_t v1_lo, v2_lo;
+    memcpy(&v1_lo, key1 + 8, sizeof(uint64_t));
+    memcpy(&v2_lo, key2 + 8, sizeof(uint64_t));
+
     if (v1_lo != v2_lo) return (v1_lo < v2_lo) ? -1 : 1;
     return 0;
 }
@@ -66,12 +71,9 @@ static inline skip_list_version_t *skip_list_get_latest_valid_version(skip_list_
     skip_list_version_t *version = atomic_load_explicit(&node->versions, memory_order_acquire);
 
     if (SKIP_LIST_UNLIKELY(version == NULL)) return NULL;
-
-    // Fast path: single valid version (most common case in read-heavy workloads)
     skip_list_version_t *next = atomic_load_explicit(&version->next, memory_order_relaxed);
     if (SKIP_LIST_LIKELY(next == NULL))
     {
-        // Only one version, check if valid
         if (!skip_list_version_is_invalid_with_time(version, current_time))
         {
             return version;
@@ -79,7 +81,6 @@ static inline skip_list_version_t *skip_list_get_latest_valid_version(skip_list_
         return NULL;
     }
 
-    // Slow path: walk version chain
     while (version != NULL)
     {
         if (!skip_list_version_is_invalid_with_time(version, current_time))
@@ -114,25 +115,29 @@ static inline int skip_list_compare_keys_inline(const skip_list_t *list, const u
                                                 const size_t key1_size, const uint8_t *key2,
                                                 const size_t key2_size)
 {
+    /* fast path for most common case -- memcmp with equal-sized keys */
+    if (SKIP_LIST_LIKELY(list->cmp_type == SKIP_LIST_CMP_MEMCMP))
+    {
+        if (SKIP_LIST_LIKELY(key1_size == key2_size))
+        {
+            if (key1_size == 8)
+            {
+                return skip_list_compare_keys_numeric_inline(key1, key2);
+            }
+            if (key1_size == 16)
+            {
+                return skip_list_compare_keys_16_inline(key1, key2);
+            }
+
+            const int cmp = memcmp(key1, key2, key1_size);
+            return (cmp == 0) ? 0 : ((cmp < 0) ? -1 : 1);
+        }
+        return skip_list_comparator_memcmp(key1, key1_size, key2, key2_size, NULL);
+    }
+
+    /* slow path for other comparator types */
     switch (list->cmp_type)
     {
-        case SKIP_LIST_CMP_MEMCMP:
-            if (SKIP_LIST_LIKELY(key1_size == key2_size))
-            {
-                if (key1_size == 8)
-                {
-                    return skip_list_compare_keys_numeric_inline(key1, key2);
-                }
-                if (key1_size == 16)
-                {
-                    return skip_list_compare_keys_16_inline(key1, key2);
-                }
-
-                const int cmp = memcmp(key1, key2, key1_size);
-                return (cmp == 0) ? 0 : ((cmp < 0) ? -1 : 1);
-            }
-            return skip_list_comparator_memcmp(key1, key1_size, key2, key2_size, NULL);
-
         case SKIP_LIST_CMP_NUMERIC:
             return skip_list_compare_keys_numeric_inline(key1, key2);
 
@@ -562,10 +567,12 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, const size_t key_size, 
     const int max_level =
         atomic_load_explicit(&list->level, memory_order_acquire); /* cache level */
 
-    /* we search from top level down with prefetching */
+    /* we search from top level down with prefetching
+     * use relaxed loads during traversal, acquire only at level 0 for final target */
     for (int i = max_level; i >= 0; i--)
     {
-        skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+        const int mem_order = (i == 0) ? memory_order_acquire : memory_order_relaxed;
+        skip_list_node_t *next = atomic_load_explicit(&current->forward[i], mem_order);
 
         /** we prefetch next node to reduce cache miss latency */
         if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
@@ -582,7 +589,7 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, const size_t key_size, 
             int cmp = skip_list_compare_keys_inline(list, next->key, next->key_size, key, key_size);
             if (SKIP_LIST_UNLIKELY(cmp >= 0)) break;
             current = next;
-            next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+            next = atomic_load_explicit(&current->forward[i], mem_order);
 
             /** we prefetch next iteration */
             if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
@@ -1516,7 +1523,6 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
 
     if (snapshot_seq == UINT64_MAX)
     {
-        /* read uncommitted: see all versions, use latest */
         if (version == NULL) return -1;
     }
     else

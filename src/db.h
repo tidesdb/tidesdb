@@ -75,7 +75,8 @@ typedef enum
     SNAPPY_COMPRESSION = 1,
 #endif
     LZ4_COMPRESSION = 2,
-    ZSTD_COMPRESSION = 3
+    ZSTD_COMPRESSION = 3,
+    LZ4_FAST_COMRESSION = 4
 } compression_algorithm;
 
 /** column family sync modes */

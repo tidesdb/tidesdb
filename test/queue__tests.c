@@ -986,6 +986,193 @@ void benchmark_queue_scaling()
     }
 }
 
+#define BENCH_FOREACH_PEEK_NUM_THREADS 4
+#define BENCH_FOREACH_PEEK_QUEUE_SIZE  100
+#define BENCH_FOREACH_PEEK_ITERATIONS  1000
+
+typedef struct
+{
+    queue_t *queue;
+    int iterations;
+    struct timespec *start_time;
+    _Atomic int *ready_count;
+    int total_threads;
+} benchmark_foreach_peek_args_t;
+
+static void foreach_noop_callback(void *data, void *context)
+{
+    (void)data;
+    _Atomic int *count = (_Atomic int *)context;
+    atomic_fetch_add(count, 1);
+}
+
+static void *benchmark_foreach_thread(void *arg)
+{
+    benchmark_foreach_peek_args_t *args = (benchmark_foreach_peek_args_t *)arg;
+
+    atomic_fetch_add(args->ready_count, 1);
+
+    while (atomic_load(args->ready_count) < args->total_threads)
+    {
+        cpu_pause();
+    }
+
+    while (args->start_time->tv_sec == 0)
+    {
+        cpu_pause();
+    }
+
+    _Atomic int visit_count = 0;
+
+    for (int i = 0; i < args->iterations; i++)
+    {
+        queue_foreach(args->queue, foreach_noop_callback, &visit_count);
+    }
+
+    return (void *)(uintptr_t)atomic_load(&visit_count);
+}
+
+static void *benchmark_peek_at_thread(void *arg)
+{
+    benchmark_foreach_peek_args_t *args = (benchmark_foreach_peek_args_t *)arg;
+    size_t queue_sz = queue_size(args->queue);
+
+    atomic_fetch_add(args->ready_count, 1);
+
+    while (atomic_load(args->ready_count) < args->total_threads)
+    {
+        cpu_pause();
+    }
+
+    while (args->start_time->tv_sec == 0)
+    {
+        cpu_pause();
+    }
+
+    int success_count = 0;
+
+    for (int i = 0; i < args->iterations; i++)
+    {
+        for (size_t idx = 0; idx < queue_sz; idx++)
+        {
+            void *data = queue_peek_at(args->queue, idx);
+            if (data != NULL)
+            {
+                success_count++;
+            }
+        }
+    }
+
+    return (void *)(uintptr_t)success_count;
+}
+
+void benchmark_queue_foreach_peek_at_concurrent()
+{
+    printf("\n");
+    queue_t *queue = queue_new();
+
+    int *values = malloc(BENCH_FOREACH_PEEK_QUEUE_SIZE * sizeof(int));
+    for (int i = 0; i < BENCH_FOREACH_PEEK_QUEUE_SIZE; i++)
+    {
+        values[i] = i;
+        queue_enqueue(queue, &values[i]);
+    }
+
+    printf("  Queue size: %d, Iterations per thread: %d\n", BENCH_FOREACH_PEEK_QUEUE_SIZE,
+           BENCH_FOREACH_PEEK_ITERATIONS);
+
+    /* Benchmark queue_foreach with multiple threads */
+    {
+        pthread_t threads[BENCH_FOREACH_PEEK_NUM_THREADS];
+        benchmark_foreach_peek_args_t args[BENCH_FOREACH_PEEK_NUM_THREADS];
+        struct timespec start_time = {0, 0};
+        _Atomic int ready_count = 0;
+
+        for (int i = 0; i < BENCH_FOREACH_PEEK_NUM_THREADS; i++)
+        {
+            args[i].queue = queue;
+            args[i].iterations = BENCH_FOREACH_PEEK_ITERATIONS;
+            args[i].start_time = &start_time;
+            args[i].ready_count = &ready_count;
+            args[i].total_threads = BENCH_FOREACH_PEEK_NUM_THREADS;
+            pthread_create(&threads[i], NULL, benchmark_foreach_thread, &args[i]);
+        }
+
+        while (atomic_load(&ready_count) < BENCH_FOREACH_PEEK_NUM_THREADS)
+        {
+            usleep(100);
+        }
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        start_time = start;
+
+        long total_visits = 0;
+        for (int i = 0; i < BENCH_FOREACH_PEEK_NUM_THREADS; i++)
+        {
+            void *result;
+            pthread_join(threads[i], &result);
+            total_visits += (long)(uintptr_t)result;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        double total_foreach_calls =
+            (double)BENCH_FOREACH_PEEK_NUM_THREADS * BENCH_FOREACH_PEEK_ITERATIONS;
+        double ops_per_sec = total_foreach_calls / elapsed;
+
+        printf("  queue_foreach: %d threads, %.2f M calls/sec (%.3f s), %ld total visits\n",
+               BENCH_FOREACH_PEEK_NUM_THREADS, ops_per_sec / 1e6, elapsed, total_visits);
+    }
+
+    /* Benchmark queue_peek_at with multiple threads */
+    {
+        pthread_t threads[BENCH_FOREACH_PEEK_NUM_THREADS];
+        benchmark_foreach_peek_args_t args[BENCH_FOREACH_PEEK_NUM_THREADS];
+        struct timespec start_time = {0, 0};
+        _Atomic int ready_count = 0;
+
+        for (int i = 0; i < BENCH_FOREACH_PEEK_NUM_THREADS; i++)
+        {
+            args[i].queue = queue;
+            args[i].iterations = BENCH_FOREACH_PEEK_ITERATIONS;
+            args[i].start_time = &start_time;
+            args[i].ready_count = &ready_count;
+            args[i].total_threads = BENCH_FOREACH_PEEK_NUM_THREADS;
+            pthread_create(&threads[i], NULL, benchmark_peek_at_thread, &args[i]);
+        }
+
+        while (atomic_load(&ready_count) < BENCH_FOREACH_PEEK_NUM_THREADS)
+        {
+            usleep(100);
+        }
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        start_time = start;
+
+        long total_peeks = 0;
+        for (int i = 0; i < BENCH_FOREACH_PEEK_NUM_THREADS; i++)
+        {
+            void *result;
+            pthread_join(threads[i], &result);
+            total_peeks += (long)(uintptr_t)result;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        double total_peek_calls = (double)BENCH_FOREACH_PEEK_NUM_THREADS *
+                                  BENCH_FOREACH_PEEK_ITERATIONS * BENCH_FOREACH_PEEK_QUEUE_SIZE;
+        double ops_per_sec = total_peek_calls / elapsed;
+
+        printf("  queue_peek_at: %d threads, %.2f M calls/sec (%.3f s), %ld successful peeks\n",
+               BENCH_FOREACH_PEEK_NUM_THREADS, ops_per_sec / 1e6, elapsed, total_peeks);
+    }
+
+    free(values);
+    queue_free(queue);
+}
+
 int main(void)
 {
     RUN_TEST(test_queue_new, tests_passed);
@@ -1012,6 +1199,7 @@ int main(void)
     RUN_TEST(benchmark_queue_concurrent_producers_consumers, tests_passed);
     RUN_TEST(benchmark_queue_mixed_operations, tests_passed);
     RUN_TEST(benchmark_queue_scaling, tests_passed);
+    RUN_TEST(benchmark_queue_foreach_peek_at_concurrent, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

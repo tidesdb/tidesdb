@@ -100,6 +100,8 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
     DIR *dir = opendir(dir_path);
     if (dir)
     {
+        const size_t dir_path_len = strlen(dir_path);
+        const size_t sep_len = strlen(PATH_SEPARATOR);
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL)
         {
@@ -110,8 +112,6 @@ tidesdb_manifest_t *tidesdb_manifest_open(const char *path)
             {
                 /* found orphaned temp file, we remove it */
                 char temp_full_path[MANIFEST_PATH_LEN];
-                const size_t dir_path_len = strlen(dir_path);
-                const size_t sep_len = strlen(PATH_SEPARATOR);
                 /* we check if combined path fits in buffer (dir + separator + entry + null) */
                 if (dir_path_len + sep_len + entry_len + 1 <= MANIFEST_PATH_LEN)
                 {
@@ -276,8 +276,8 @@ int tidesdb_manifest_remove_sstable(tidesdb_manifest_t *manifest, const int leve
     {
         if (manifest->entries[i].level == level && manifest->entries[i].id == id)
         {
-            memmove(&manifest->entries[i], &manifest->entries[i + 1],
-                    sizeof(tidesdb_manifest_entry_t) * (manifest->num_entries - i - 1));
+            /* we swap with last element for O(1) removal (order not required) */
+            manifest->entries[i] = manifest->entries[manifest->num_entries - 1];
             manifest->num_entries--;
             pthread_rwlock_unlock(&manifest->lock);
             atomic_fetch_sub(&manifest->active_ops, 1);

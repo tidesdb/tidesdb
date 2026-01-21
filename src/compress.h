@@ -36,6 +36,7 @@ typedef enum
 #endif
     LZ4_COMPRESSION,
     ZSTD_COMPRESSION,
+    LZ4_FAST_COMPRESSION,
 } compression_algorithm;
 
 /**

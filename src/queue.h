@@ -48,8 +48,9 @@ typedef struct queue_node_t
  * @param size current number of elements (atomic for lock-free reads)
  * @param shutdown has queue been shutdown?
  * @param waiter_count number of threads currently waiting in queue_dequeue_wait
- * @param head_lock mutex for dequeue operations
+ * @param head_lock mutex for dequeue/write operations on head
  * @param tail_lock mutex for enqueue operations
+ * @param read_lock rwlock for read-only operations (peek, foreach)
  * @param not_empty condition variable signaled when queue becomes non-empty
  * @param node_pool free list of reusable nodes for performance
  * @param pool_size current size of node pool
@@ -66,6 +67,7 @@ typedef struct
     _Atomic(int) waiter_count;
     pthread_mutex_t head_lock;
     pthread_mutex_t tail_lock;
+    pthread_rwlock_t read_lock;
     pthread_cond_t not_empty;
     queue_node_t *node_pool;
     _Atomic(size_t) pool_size;

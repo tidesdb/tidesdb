@@ -88,6 +88,25 @@ void test_compress_decompress_lz4()
     free(decompressed_data);
 }
 
+void test_compress_decompress_lz4_fast()
+{
+    uint8_t data[] = "test data for lz4 fast compression";
+    size_t data_size = sizeof(data);
+    size_t compressed_size;
+    size_t decompressed_size;
+    uint8_t *compressed_data =
+        compress_data(data, data_size, &compressed_size, LZ4_FAST_COMPRESSION);
+    ASSERT_TRUE(compressed_data != NULL);
+
+    uint8_t *decompressed_data =
+        decompress_data(compressed_data, compressed_size, &decompressed_size, LZ4_FAST_COMPRESSION);
+    ASSERT_TRUE(decompressed_data != NULL);
+    ASSERT_EQ(decompressed_size, data_size);
+    ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);
+    free(compressed_data);
+    free(decompressed_data);
+}
+
 void test_compress_decompress_zstd()
 {
     uint8_t data[] = "test data";
@@ -111,6 +130,7 @@ void test_compress_empty_data()
     uint8_t data[] = "";
     size_t data_size = 1; /* just null terminator */
     test_compress_decompress_algorithm(LZ4_COMPRESSION, "LZ4", data, data_size);
+    test_compress_decompress_algorithm(LZ4_FAST_COMPRESSION, "LZ4_FAST", data, data_size);
     test_compress_decompress_algorithm(ZSTD_COMPRESSION, "ZSTD", data, data_size);
 #ifndef __sun
     test_compress_decompress_algorithm(SNAPPY_COMPRESSION, "SNAPPY", data, data_size);
@@ -130,6 +150,7 @@ void test_compress_large_data()
     }
 
     test_compress_decompress_algorithm(LZ4_COMPRESSION, "LZ4", data, data_size);
+    test_compress_decompress_algorithm(LZ4_FAST_COMPRESSION, "LZ4_FAST", data, data_size);
     test_compress_decompress_algorithm(ZSTD_COMPRESSION, "ZSTD", data, data_size);
 #ifndef __sun
     test_compress_decompress_algorithm(SNAPPY_COMPRESSION, "SNAPPY", data, data_size);
@@ -151,6 +172,7 @@ void test_compress_random_data()
     }
 
     test_compress_decompress_algorithm(LZ4_COMPRESSION, "LZ4", data, data_size);
+    test_compress_decompress_algorithm(LZ4_FAST_COMPRESSION, "LZ4_FAST", data, data_size);
     test_compress_decompress_algorithm(ZSTD_COMPRESSION, "ZSTD", data, data_size);
 #ifndef __sun
     test_compress_decompress_algorithm(SNAPPY_COMPRESSION, "SNAPPY", data, data_size);
@@ -188,6 +210,9 @@ void test_decompress_insufficient_data()
 
     /* should fail for all algorithms that use size header */
     uint8_t *result = decompress_data(data, 4, &decompressed_size, LZ4_COMPRESSION);
+    ASSERT_TRUE(result == NULL);
+
+    result = decompress_data(data, 4, &decompressed_size, LZ4_FAST_COMPRESSION);
     ASSERT_TRUE(result == NULL);
 
     result = decompress_data(data, 4, &decompressed_size, ZSTD_COMPRESSION);
@@ -282,6 +307,7 @@ int main(void)
     RUN_TEST(test_compress_decompress_snappy, tests_passed);
 #endif
     RUN_TEST(test_compress_decompress_lz4, tests_passed);
+    RUN_TEST(test_compress_decompress_lz4_fast, tests_passed);
     RUN_TEST(test_compress_decompress_zstd, tests_passed);
     RUN_TEST(test_compress_empty_data, tests_passed);
     RUN_TEST(test_compress_large_data, tests_passed);

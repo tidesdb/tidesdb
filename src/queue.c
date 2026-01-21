@@ -20,7 +20,6 @@
 
 #include "compat.h"
 
-/* use compat.h branch prediction hints */
 #define QUEUE_LIKELY(x)   TDB_LIKELY(x)
 #define QUEUE_UNLIKELY(x) TDB_UNLIKELY(x)
 
@@ -135,8 +134,19 @@ queue_t *queue_new(void)
         return NULL;
     }
 
+    if (pthread_rwlock_init(&queue->read_lock, NULL) != 0)
+    {
+        pthread_mutex_destroy(&queue->pool_lock);
+        pthread_mutex_destroy(&queue->tail_lock);
+        pthread_mutex_destroy(&queue->head_lock);
+        free(dummy);
+        free(queue);
+        return NULL;
+    }
+
     if (pthread_cond_init(&queue->not_empty, NULL) != 0)
     {
+        pthread_rwlock_destroy(&queue->read_lock);
         pthread_mutex_destroy(&queue->pool_lock);
         pthread_mutex_destroy(&queue->tail_lock);
         pthread_mutex_destroy(&queue->head_lock);
@@ -161,7 +171,7 @@ int queue_enqueue(queue_t *queue, void *data)
     node->data = data;
     node->next = NULL;
 
-    /* we only lock tail for enqueue - head operations are independent */
+    /* we only lock tail for enqueue -- the head operations are independent */
     pthread_mutex_lock(&queue->tail_lock);
 
     queue->tail->next = node;
@@ -220,9 +230,11 @@ void *queue_dequeue(queue_t *queue)
 {
     if (QUEUE_UNLIKELY(queue == NULL)) return NULL;
 
+    pthread_rwlock_wrlock(&queue->read_lock);
     pthread_mutex_lock(&queue->head_lock);
     void *data = queue_dequeue_internal(queue);
     pthread_mutex_unlock(&queue->head_lock);
+    pthread_rwlock_unlock(&queue->read_lock);
 
     return data;
 }
@@ -236,9 +248,11 @@ void *queue_dequeue_wait(queue_t *queue)
     {
         if (atomic_load_explicit(&queue->size, memory_order_acquire) > 0)
         {
+            pthread_rwlock_wrlock(&queue->read_lock);
             pthread_mutex_lock(&queue->head_lock);
             void *data = queue_dequeue_internal(queue);
             pthread_mutex_unlock(&queue->head_lock);
+            pthread_rwlock_unlock(&queue->read_lock);
             if (data != NULL)
             {
                 return data;
@@ -283,10 +297,15 @@ void *queue_dequeue_wait(queue_t *queue)
         return NULL;
     }
 
-    /* use internal helper to avoid code duplication */
+    /** we acquire write lock to coordinate with readers, then dequeue */
+    pthread_mutex_unlock(&queue->head_lock);
+    pthread_rwlock_wrlock(&queue->read_lock);
+    pthread_mutex_lock(&queue->head_lock);
+
     void *data = queue_dequeue_internal(queue);
 
     pthread_mutex_unlock(&queue->head_lock);
+    pthread_rwlock_unlock(&queue->read_lock);
 
     return data;
 }
@@ -295,7 +314,7 @@ void *queue_peek(queue_t *queue)
 {
     if (QUEUE_UNLIKELY(queue == NULL)) return NULL;
 
-    pthread_mutex_lock(&queue->head_lock);
+    pthread_rwlock_rdlock(&queue->read_lock);
 
     void *data = NULL;
     /* with dummy node, actual data is in head->next */
@@ -304,7 +323,7 @@ void *queue_peek(queue_t *queue)
         data = queue->head->next->data;
     }
 
-    pthread_mutex_unlock(&queue->head_lock);
+    pthread_rwlock_unlock(&queue->read_lock);
 
     return data;
 }
@@ -327,7 +346,8 @@ int queue_clear(queue_t *queue)
 {
     if (QUEUE_UNLIKELY(queue == NULL)) return -1;
 
-    /* we lock both head and tail to ensure exclusive access */
+    /* we lock write lock first, then both head and tail to ensure exclusive access */
+    pthread_rwlock_wrlock(&queue->read_lock);
     pthread_mutex_lock(&queue->head_lock);
     pthread_mutex_lock(&queue->tail_lock);
 
@@ -347,6 +367,7 @@ int queue_clear(queue_t *queue)
 
     pthread_mutex_unlock(&queue->tail_lock);
     pthread_mutex_unlock(&queue->head_lock);
+    pthread_rwlock_unlock(&queue->read_lock);
 
     return 0;
 }
@@ -356,9 +377,7 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
     if (QUEUE_UNLIKELY(queue == NULL)) return -1;
     if (QUEUE_UNLIKELY(fn == NULL)) return -1;
 
-    /* we lock both to ensure consistent iteration */
-    pthread_mutex_lock(&queue->head_lock);
-    pthread_mutex_lock(&queue->tail_lock);
+    pthread_rwlock_rdlock(&queue->read_lock);
 
     int count = 0;
     /* with dummy node, actual data starts at head->next */
@@ -370,8 +389,7 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
         current = current->next;
     }
 
-    pthread_mutex_unlock(&queue->tail_lock);
-    pthread_mutex_unlock(&queue->head_lock);
+    pthread_rwlock_unlock(&queue->read_lock);
 
     return count;
 }
@@ -380,7 +398,12 @@ void *queue_peek_at(queue_t *queue, const size_t index)
 {
     if (QUEUE_UNLIKELY(!queue)) return NULL;
 
-    pthread_mutex_lock(&queue->head_lock);
+    if (index >= atomic_load_explicit(&queue->size, memory_order_relaxed))
+    {
+        return NULL;
+    }
+
+    pthread_rwlock_rdlock(&queue->read_lock);
 
     /* with dummy node, actual data starts at head->next */
     const queue_node_t *current = queue->head->next;
@@ -391,7 +414,7 @@ void *queue_peek_at(queue_t *queue, const size_t index)
 
     void *data = QUEUE_LIKELY(current != NULL) ? current->data : NULL;
 
-    pthread_mutex_unlock(&queue->head_lock);
+    pthread_rwlock_unlock(&queue->read_lock);
 
     return data;
 }
@@ -434,7 +457,6 @@ void queue_free(queue_t *queue)
 
     pthread_mutex_unlock(&queue->head_lock);
 
-    /* now safe to lock both and free everything */
     pthread_mutex_lock(&queue->head_lock);
     pthread_mutex_lock(&queue->tail_lock);
 
@@ -468,6 +490,7 @@ void queue_free(queue_t *queue)
     pthread_mutex_unlock(&queue->head_lock);
 
     pthread_mutex_destroy(&queue->pool_lock);
+    pthread_rwlock_destroy(&queue->read_lock);
     pthread_mutex_destroy(&queue->tail_lock);
     pthread_mutex_destroy(&queue->head_lock);
     pthread_cond_destroy(&queue->not_empty);
@@ -502,7 +525,6 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
 
     pthread_mutex_unlock(&queue->head_lock);
 
-    /* now safe to lock both and free everything */
     pthread_mutex_lock(&queue->head_lock);
     pthread_mutex_lock(&queue->tail_lock);
 
@@ -540,6 +562,7 @@ void queue_free_with_data(queue_t *queue, void (*free_fn)(void *))
     pthread_mutex_unlock(&queue->head_lock);
 
     pthread_mutex_destroy(&queue->pool_lock);
+    pthread_rwlock_destroy(&queue->read_lock);
     pthread_mutex_destroy(&queue->tail_lock);
     pthread_mutex_destroy(&queue->head_lock);
     pthread_cond_destroy(&queue->not_empty);

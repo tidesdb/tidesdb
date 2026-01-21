@@ -42,7 +42,7 @@ static inline int skip_list_compare_keys_numeric_inline(const uint8_t *key1, con
  */
 static inline int skip_list_compare_keys_16_inline(const uint8_t *key1, const uint8_t *key2)
 {
-    /* compare high 8 bytes first - most discriminating for sorted data */
+    /* we compare high 8 bytes first -- the most discriminating for sorted data */
     uint64_t v1_hi, v2_hi;
     memcpy(&v1_hi, key1, sizeof(uint64_t));
     memcpy(&v2_hi, key2, sizeof(uint64_t));

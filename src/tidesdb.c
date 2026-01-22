@@ -16907,3 +16907,9 @@ void tidesdb_reset_read_stats(tidesdb_t *db)
     atomic_store(&db->read_stats.disk_reads, 0);
 }
 #endif
+
+void tidesdb_free(void *ptr)
+{
+    if (!ptr) return;
+    free(ptr);
+}

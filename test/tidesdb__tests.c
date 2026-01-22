@@ -49,6 +49,39 @@ static void test_basic_open_close(void)
     cleanup_test_dir();
 }
 
+static void test_tidesdb_free(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    uint8_t key[] = "test_key";
+    uint8_t value[] = "test_value";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved_value, &retrieved_size), 0);
+    ASSERT_TRUE(retrieved_value != NULL);
+    ASSERT_EQ(retrieved_size, sizeof(value));
+    ASSERT_TRUE(memcmp(retrieved_value, value, sizeof(value)) == 0);
+
+    tidesdb_free(retrieved_value);
+
+    tidesdb_free(NULL);
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_column_family_creation(void)
 {
     cleanup_test_dir();
@@ -12785,6 +12818,7 @@ int main(void)
 {
     cleanup_test_dir();
     RUN_TEST(test_basic_open_close, tests_passed);
+    RUN_TEST(test_tidesdb_free, tests_passed);
     RUN_TEST(test_column_family_creation, tests_passed);
     RUN_TEST(test_list_column_families, tests_passed);
     RUN_TEST(test_basic_txn_put_get, tests_passed);

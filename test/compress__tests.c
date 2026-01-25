@@ -57,11 +57,12 @@ void test_compress_decompress_snappy()
     size_t data_size = sizeof(data);
     size_t compressed_size;
     size_t decompressed_size;
-    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, SNAPPY_COMPRESSION);
+    uint8_t *compressed_data =
+        compress_data(data, data_size, &compressed_size, TDB_COMPRESS_SNAPPY);
     ASSERT_TRUE(compressed_data != NULL);
 
     uint8_t *decompressed_data =
-        decompress_data(compressed_data, compressed_size, &decompressed_size, SNAPPY_COMPRESSION);
+        decompress_data(compressed_data, compressed_size, &decompressed_size, TDB_COMPRESS_SNAPPY);
     ASSERT_TRUE(decompressed_data != NULL);
     ASSERT_EQ(decompressed_size, data_size);
     ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);
@@ -76,11 +77,11 @@ void test_compress_decompress_lz4()
     size_t data_size = sizeof(data);
     size_t compressed_size;
     size_t decompressed_size;
-    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, LZ4_COMPRESSION);
+    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, TDB_COMPRESS_LZ4);
     ASSERT_TRUE(compressed_data != NULL);
 
     uint8_t *decompressed_data =
-        decompress_data(compressed_data, compressed_size, &decompressed_size, LZ4_COMPRESSION);
+        decompress_data(compressed_data, compressed_size, &decompressed_size, TDB_COMPRESS_LZ4);
     ASSERT_TRUE(decompressed_data != NULL);
     ASSERT_EQ(decompressed_size, data_size);
     ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);
@@ -95,11 +96,11 @@ void test_compress_decompress_lz4_fast()
     size_t compressed_size;
     size_t decompressed_size;
     uint8_t *compressed_data =
-        compress_data(data, data_size, &compressed_size, LZ4_FAST_COMPRESSION);
+        compress_data(data, data_size, &compressed_size, TDB_COMPRESS_LZ4_FAST);
     ASSERT_TRUE(compressed_data != NULL);
 
-    uint8_t *decompressed_data =
-        decompress_data(compressed_data, compressed_size, &decompressed_size, LZ4_FAST_COMPRESSION);
+    uint8_t *decompressed_data = decompress_data(compressed_data, compressed_size,
+                                                 &decompressed_size, TDB_COMPRESS_LZ4_FAST);
     ASSERT_TRUE(decompressed_data != NULL);
     ASSERT_EQ(decompressed_size, data_size);
     ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);
@@ -113,11 +114,11 @@ void test_compress_decompress_zstd()
     size_t data_size = sizeof(data);
     size_t compressed_size;
     size_t decompressed_size;
-    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, ZSTD_COMPRESSION);
+    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, TDB_COMPRESS_ZSTD);
     ASSERT_TRUE(compressed_data != NULL);
 
     uint8_t *decompressed_data =
-        decompress_data(compressed_data, compressed_size, &decompressed_size, ZSTD_COMPRESSION);
+        decompress_data(compressed_data, compressed_size, &decompressed_size, TDB_COMPRESS_ZSTD);
     ASSERT_TRUE(decompressed_data != NULL);
     ASSERT_EQ(decompressed_size, data_size);
     ASSERT_EQ(memcmp(data, decompressed_data, data_size), 0);
@@ -129,11 +130,11 @@ void test_compress_empty_data()
 {
     uint8_t data[] = "";
     size_t data_size = 1; /* just null terminator */
-    test_compress_decompress_algorithm(LZ4_COMPRESSION, "LZ4", data, data_size);
-    test_compress_decompress_algorithm(LZ4_FAST_COMPRESSION, "LZ4_FAST", data, data_size);
-    test_compress_decompress_algorithm(ZSTD_COMPRESSION, "ZSTD", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_LZ4, "LZ4", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_LZ4_FAST, "LZ4_FAST", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_ZSTD, "ZSTD", data, data_size);
 #ifndef __sun
-    test_compress_decompress_algorithm(SNAPPY_COMPRESSION, "SNAPPY", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_SNAPPY, "SNAPPY", data, data_size);
 #endif
 }
 
@@ -149,11 +150,11 @@ void test_compress_large_data()
         data[i] = (uint8_t)(i % 256);
     }
 
-    test_compress_decompress_algorithm(LZ4_COMPRESSION, "LZ4", data, data_size);
-    test_compress_decompress_algorithm(LZ4_FAST_COMPRESSION, "LZ4_FAST", data, data_size);
-    test_compress_decompress_algorithm(ZSTD_COMPRESSION, "ZSTD", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_LZ4, "LZ4", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_LZ4_FAST, "LZ4_FAST", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_ZSTD, "ZSTD", data, data_size);
 #ifndef __sun
-    test_compress_decompress_algorithm(SNAPPY_COMPRESSION, "SNAPPY", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_SNAPPY, "SNAPPY", data, data_size);
 #endif
 
     free(data);
@@ -171,11 +172,11 @@ void test_compress_random_data()
         data[i] = (uint8_t)rand();
     }
 
-    test_compress_decompress_algorithm(LZ4_COMPRESSION, "LZ4", data, data_size);
-    test_compress_decompress_algorithm(LZ4_FAST_COMPRESSION, "LZ4_FAST", data, data_size);
-    test_compress_decompress_algorithm(ZSTD_COMPRESSION, "ZSTD", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_LZ4, "LZ4", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_LZ4_FAST, "LZ4_FAST", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_ZSTD, "ZSTD", data, data_size);
 #ifndef __sun
-    test_compress_decompress_algorithm(SNAPPY_COMPRESSION, "SNAPPY", data, data_size);
+    test_compress_decompress_algorithm(TDB_COMPRESS_SNAPPY, "SNAPPY", data, data_size);
 #endif
 
     free(data);
@@ -187,7 +188,7 @@ void test_decompress_corrupted_size_header()
     size_t data_size = sizeof(data);
     size_t compressed_size;
 
-    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, LZ4_COMPRESSION);
+    uint8_t *compressed_data = compress_data(data, data_size, &compressed_size, TDB_COMPRESS_LZ4);
     ASSERT_TRUE(compressed_data != NULL);
 
     /* corrupt the size header to exceed UINT32_MAX */
@@ -197,7 +198,7 @@ void test_decompress_corrupted_size_header()
     /* decompression should fail */
     size_t decompressed_size;
     uint8_t *decompressed_data =
-        decompress_data(compressed_data, compressed_size, &decompressed_size, LZ4_COMPRESSION);
+        decompress_data(compressed_data, compressed_size, &decompressed_size, TDB_COMPRESS_LZ4);
     ASSERT_TRUE(decompressed_data == NULL);
 
     free(compressed_data);
@@ -209,17 +210,17 @@ void test_decompress_insufficient_data()
     size_t decompressed_size;
 
     /* should fail for all algorithms that use size header */
-    uint8_t *result = decompress_data(data, 4, &decompressed_size, LZ4_COMPRESSION);
+    uint8_t *result = decompress_data(data, 4, &decompressed_size, TDB_COMPRESS_LZ4);
     ASSERT_TRUE(result == NULL);
 
-    result = decompress_data(data, 4, &decompressed_size, LZ4_FAST_COMPRESSION);
+    result = decompress_data(data, 4, &decompressed_size, TDB_COMPRESS_LZ4_FAST);
     ASSERT_TRUE(result == NULL);
 
-    result = decompress_data(data, 4, &decompressed_size, ZSTD_COMPRESSION);
+    result = decompress_data(data, 4, &decompressed_size, TDB_COMPRESS_ZSTD);
     ASSERT_TRUE(result == NULL);
 
 #ifndef __sun
-    result = decompress_data(data, 4, &decompressed_size, SNAPPY_COMPRESSION);
+    result = decompress_data(data, 4, &decompressed_size, TDB_COMPRESS_SNAPPY);
     ASSERT_TRUE(result == NULL);
 #endif
 }
@@ -230,13 +231,13 @@ void test_size_encoding_portability()
     size_t data_size = sizeof(data);
     size_t compressed_size;
 
-    uint8_t *compressed_lz4 = compress_data(data, data_size, &compressed_size, LZ4_COMPRESSION);
+    uint8_t *compressed_lz4 = compress_data(data, data_size, &compressed_size, TDB_COMPRESS_LZ4);
     ASSERT_TRUE(compressed_lz4 != NULL);
     uint64_t decoded_size_lz4 = decode_uint64_le_compat(compressed_lz4);
     ASSERT_EQ(decoded_size_lz4, data_size);
     free(compressed_lz4);
 
-    uint8_t *compressed_zstd = compress_data(data, data_size, &compressed_size, ZSTD_COMPRESSION);
+    uint8_t *compressed_zstd = compress_data(data, data_size, &compressed_size, TDB_COMPRESS_ZSTD);
     ASSERT_TRUE(compressed_zstd != NULL);
     uint64_t decoded_size_zstd = decode_uint64_le_compat(compressed_zstd);
     ASSERT_EQ(decoded_size_zstd, data_size);
@@ -245,7 +246,7 @@ void test_size_encoding_portability()
 #ifndef __sun
     /* test SNAPPY */
     uint8_t *compressed_snappy =
-        compress_data(data, data_size, &compressed_size, SNAPPY_COMPRESSION);
+        compress_data(data, data_size, &compressed_size, TDB_COMPRESS_SNAPPY);
     ASSERT_TRUE(compressed_snappy != NULL);
     uint64_t decoded_size_snappy = decode_uint64_le_compat(compressed_snappy);
     ASSERT_EQ(decoded_size_snappy, data_size);
@@ -278,7 +279,7 @@ void test_compressed_size_includes_header()
     size_t data_size = sizeof(data);
     size_t compressed_size;
 
-    uint8_t *compressed = compress_data(data, data_size, &compressed_size, LZ4_COMPRESSION);
+    uint8_t *compressed = compress_data(data, data_size, &compressed_size, TDB_COMPRESS_LZ4);
     ASSERT_TRUE(compressed != NULL);
     /* compressed size should be at least sizeof(uint64_t) for the header */
     ASSERT_TRUE(compressed_size >= sizeof(uint64_t));

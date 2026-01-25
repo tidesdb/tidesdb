@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 7.3.3)
+set(PROJECT_VERSION 7.4.0)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -288,7 +288,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_ENABLE_COMPRESSION 1)
     endif()
     if(NOT DEFINED BENCH_COMPRESSION_ALGORITHM)
-        set(BENCH_COMPRESSION_ALGORITHM LZ4_COMPRESSION)
+        set(BENCH_COMPRESSION_ALGORITHM TDB_COMPRESS_LZ4)
     endif()
     if(NOT DEFINED BENCH_ENABLE_BLOOM_FILTER)
         set(BENCH_ENABLE_BLOOM_FILTER 1)

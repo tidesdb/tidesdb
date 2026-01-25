@@ -1101,7 +1101,7 @@ static block_manager_block_t *tidesdb_read_block(tidesdb_t *db, tidesdb_sstable_
     block_manager_block_t *block = block_manager_cursor_read(cursor);
     if (!block) return NULL;
 
-    if (sst->config && sst->config->compression_algorithm != NO_COMPRESSION)
+    if (sst->config && sst->config->compression_algorithm != TDB_COMPRESS_NONE)
     {
         size_t decompressed_size;
         uint8_t *decompressed = decompress_data(block->data, block->size, &decompressed_size,
@@ -1407,11 +1407,11 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
     if (sst->config)
     {
         /* validate compression algorithm value */
-        if (compression_algorithm != NO_COMPRESSION &&
+        if (compression_algorithm != TDB_COMPRESS_NONE &&
 #ifndef __sun
-            compression_algorithm != SNAPPY_COMPRESSION &&
+            compression_algorithm != TDB_COMPRESS_SNAPPY &&
 #endif
-            compression_algorithm != LZ4_COMPRESSION && compression_algorithm != ZSTD_COMPRESSION)
+            compression_algorithm != TDB_COMPRESS_LZ4 && compression_algorithm != TDB_COMPRESS_ZSTD)
         {
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable metadata has invalid compression_algorithm: %u",
                           compression_algorithm);
@@ -1595,7 +1595,7 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .min_levels = TDB_DEFAULT_MIN_LEVELS,
         .dividing_level_offset = TDB_DEFAULT_DIVIDING_LEVEL_OFFSET,
         .klog_value_threshold = TDB_DEFAULT_KLOG_VALUE_THRESHOLD,
-        .compression_algorithm = LZ4_COMPRESSION,
+        .compression_algorithm = TDB_COMPRESS_LZ4,
         .enable_bloom_filter = 1,
         .bloom_fpr = TDB_DEFAULT_BLOOM_FPR,
         .enable_block_indexes = 1,
@@ -2340,7 +2340,7 @@ static int tidesdb_vlog_read_value(const tidesdb_t *db, tidesdb_sstable_t *sst,
         return TDB_ERR_IO;
     }
 
-    if (sst->config->compression_algorithm != NO_COMPRESSION)
+    if (sst->config->compression_algorithm != TDB_COMPRESS_NONE)
     {
         size_t decompressed_size;
         uint8_t *decompressed = decompress_data(block_data, block_size, &decompressed_size,
@@ -3086,7 +3086,7 @@ static int tidesdb_write_vlog_entry(const tidesdb_sstable_t *sst, block_manager_
     size_t final_size = kv->entry.value_size;
     uint8_t *compressed = NULL;
 
-    if (sst->config->compression_algorithm != NO_COMPRESSION)
+    if (sst->config->compression_algorithm != TDB_COMPRESS_NONE)
     {
         size_t compressed_size;
         compressed = compress_data(kv->value, kv->entry.value_size, &compressed_size,
@@ -3149,7 +3149,7 @@ static int tidesdb_flush_klog_block(const tidesdb_sstable_t *sst, block_manager_
     uint8_t *final_klog_data = klog_data;
     size_t final_klog_size = klog_size;
 
-    if (sst->config->compression_algorithm != NO_COMPRESSION)
+    if (sst->config->compression_algorithm != TDB_COMPRESS_NONE)
     {
         size_t compressed_size;
         uint8_t *compressed = compress_data(klog_data, klog_size, &compressed_size,
@@ -5251,7 +5251,7 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
             size_t data_size = block->size;
             uint8_t *decompressed = NULL;
 
-            if (source->config->compression_algorithm != NO_COMPRESSION)
+            if (source->config->compression_algorithm != TDB_COMPRESS_NONE)
             {
                 size_t decompressed_size;
                 decompressed = decompress_data(block->data, block->size, &decompressed_size,
@@ -5444,7 +5444,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
             size_t data_size = block->size;
             uint8_t *decompressed = NULL;
 
-            if (source->config->compression_algorithm != NO_COMPRESSION)
+            if (source->config->compression_algorithm != TDB_COMPRESS_NONE)
             {
                 size_t decompressed_size;
                 decompressed = decompress_data(block->data, block->size, &decompressed_size,
@@ -6255,7 +6255,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             size_t final_size = kv->entry.value_size;
             uint8_t *compressed = NULL;
 
-            if (new_sst->config->compression_algorithm != NO_COMPRESSION)
+            if (new_sst->config->compression_algorithm != TDB_COMPRESS_NONE)
             {
                 size_t compressed_size;
                 compressed = compress_data(kv->value, kv->entry.value_size, &compressed_size,
@@ -6316,7 +6316,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                 uint8_t *final_data = klog_data;
                 size_t final_size = klog_size;
 
-                if (cf->config.compression_algorithm != NO_COMPRESSION)
+                if (cf->config.compression_algorithm != TDB_COMPRESS_NONE)
                 {
                     size_t compressed_size;
                     uint8_t *compressed = compress_data(klog_data, klog_size, &compressed_size,
@@ -6407,7 +6407,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             uint8_t *final_data = klog_data;
             size_t final_size = klog_size;
 
-            if (cf->config.compression_algorithm != NO_COMPRESSION)
+            if (cf->config.compression_algorithm != TDB_COMPRESS_NONE)
             {
                 size_t compressed_size;
                 uint8_t *compressed = compress_data(klog_data, klog_size, &compressed_size,
@@ -7087,7 +7087,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                     uint8_t *final_klog_data = klog_data;
                     size_t final_klog_size = klog_size;
 
-                    if (cf->config.compression_algorithm != NO_COMPRESSION)
+                    if (cf->config.compression_algorithm != TDB_COMPRESS_NONE)
                     {
                         size_t compressed_size;
                         uint8_t *compressed = compress_data(klog_data, klog_size, &compressed_size,
@@ -7156,7 +7156,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                 uint8_t *final_klog_data = klog_data;
                 size_t final_klog_size = klog_size;
 
-                if (cf->config.compression_algorithm != NO_COMPRESSION)
+                if (cf->config.compression_algorithm != TDB_COMPRESS_NONE)
                 {
                     size_t compressed_size;
                     uint8_t *compressed = compress_data(klog_data, klog_size, &compressed_size,
@@ -7729,7 +7729,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                     size_t final_size = kv->entry.value_size;
                     uint8_t *compressed = NULL;
 
-                    if (cf->config.compression_algorithm != NO_COMPRESSION)
+                    if (cf->config.compression_algorithm != TDB_COMPRESS_NONE)
                     {
                         size_t compressed_size;
                         compressed =
@@ -7805,7 +7805,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                         uint8_t *final_data = klog_data;
                         size_t final_size = klog_size;
 
-                        if (cf->config.compression_algorithm != NO_COMPRESSION)
+                        if (cf->config.compression_algorithm != TDB_COMPRESS_NONE)
                         {
                             size_t compressed_size;
                             uint8_t *compressed =
@@ -7871,7 +7871,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                     uint8_t *final_data = klog_data;
                     size_t final_size = klog_size;
 
-                    if (new_sst->config->compression_algorithm != NO_COMPRESSION)
+                    if (new_sst->config->compression_algorithm != TDB_COMPRESS_NONE)
                     {
                         size_t compressed_size;
                         uint8_t *compressed = compress_data(klog_data, klog_size, &compressed_size,
@@ -14038,7 +14038,7 @@ static int tidesdb_iter_read_klog_block(const tidesdb_sstable_t *sst,
     const uint8_t *data = bmblock->data;
     size_t data_size = bmblock->size;
 
-    if (sst->config->compression_algorithm != NO_COMPRESSION)
+    if (sst->config->compression_algorithm != TDB_COMPRESS_NONE)
     {
         *decompressed_out = decompress_data(bmblock->data, bmblock->size, &data_size,
                                             sst->config->compression_algorithm);
@@ -14705,7 +14705,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
                     size_t data_size = block->size;
                     uint8_t *decompressed = NULL;
 
-                    if (source->config->compression_algorithm != NO_COMPRESSION)
+                    if (source->config->compression_algorithm != TDB_COMPRESS_NONE)
                     {
                         size_t decompressed_size;
                         decompressed = decompress_data(block->data, block->size, &decompressed_size,
@@ -16271,12 +16271,12 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     else if (strcmp(name, "compression_algorithm") == 0)
     {
         if (strcmp(value, "LZ4") == 0)
-            ctx->config->compression_algorithm = LZ4_COMPRESSION;
+            ctx->config->compression_algorithm = TDB_COMPRESS_LZ4;
         else if (strcmp(value, "ZSTD") == 0)
-            ctx->config->compression_algorithm = ZSTD_COMPRESSION;
+            ctx->config->compression_algorithm = TDB_COMPRESS_ZSTD;
 #ifndef __sun
         else if (strcmp(value, "SNAPPY") == 0)
-            ctx->config->compression_algorithm = SNAPPY_COMPRESSION;
+            ctx->config->compression_algorithm = TDB_COMPRESS_SNAPPY;
 #endif
     }
     else if (strcmp(name, "enable_bloom_filter") == 0)
@@ -16386,17 +16386,17 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     const char *compression_str = "NONE";
     switch (config->compression_algorithm)
     {
-        case NO_COMPRESSION:
+        case TDB_COMPRESS_NONE:
             compression_str = "NONE";
             break;
-        case LZ4_COMPRESSION:
+        case TDB_COMPRESS_LZ4:
             compression_str = "LZ4";
             break;
-        case ZSTD_COMPRESSION:
+        case TDB_COMPRESS_ZSTD:
             compression_str = "ZSTD";
             break;
 #ifndef __sun
-        case SNAPPY_COMPRESSION:
+        case TDB_COMPRESS_SNAPPY:
             compression_str = "SNAPPY";
             break;
 #endif

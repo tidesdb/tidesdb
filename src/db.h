@@ -67,16 +67,16 @@ typedef enum
     TDB_ISOLATION_SERIALIZABLE = 4
 } tidesdb_isolation_level_t;
 
-/** compression algorithms -- */
+/** compression algorithms */
 typedef enum
 {
-    NO_COMPRESSION = 0,
+    TDB_COMPRESS_NONE = 0,
 #ifndef __sun
-    SNAPPY_COMPRESSION = 1,
+    TDB_COMPRESS_SNAPPY = 1,
 #endif
-    LZ4_COMPRESSION = 2,
-    ZSTD_COMPRESSION = 3,
-    LZ4_FAST_COMRESSION = 4
+    TDB_COMPRESS_LZ4 = 2,
+    TDB_COMPRESS_ZSTD = 3,
+    TDB_COMPRESS_LZ4_FAST = 4
 } compression_algorithm;
 
 /** column family sync modes */
@@ -144,7 +144,7 @@ typedef struct tidesdb_column_family_config_t
     int min_levels;
     int dividing_level_offset;
     size_t klog_value_threshold;
-    compression_algorithm compression_algo;
+    compression_algorithm compression_algorithm;
     int enable_bloom_filter;
     double bloom_fpr;
     int enable_block_indexes;

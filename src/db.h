@@ -193,6 +193,13 @@ typedef struct tidesdb_config_t
  * @param level_sizes sizes of each level
  * @param level_num_sstables number of sstables in each level
  * @param config column family configuration
+ * @param total_keys total number of keys across memtable and all sstables
+ * @param total_data_size total data size (klog + vlog) across all sstables
+ * @param avg_key_size average key size in bytes
+ * @param avg_value_size average value size in bytes
+ * @param level_key_counts number of keys per level
+ * @param read_amp read amplification (point lookup cost multiplier)
+ * @param hit_rate cache hit rate (0.0 if cache disabled)
  */
 typedef struct tidesdb_stats_t
 {
@@ -201,6 +208,13 @@ typedef struct tidesdb_stats_t
     size_t *level_sizes;
     int *level_num_sstables;
     tidesdb_column_family_config_t *config;
+    uint64_t total_keys;
+    uint64_t total_data_size;
+    double avg_key_size;
+    double avg_value_size;
+    uint64_t *level_key_counts;
+    double read_amp;
+    double hit_rate;
 } tidesdb_stats_t;
 
 /**
@@ -294,6 +308,7 @@ int tidesdb_comparator_case_insensitive(const uint8_t *key1, size_t key1_size, c
 /**** maintenance operations */
 int tidesdb_compact(tidesdb_column_family_t *cf);
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf);
+int tidesdb_backup(tidesdb_t *db, char *dir);
 
 /**** configuration operations */
 int tidesdb_cf_config_load_from_ini(const char *ini_file, const char *section_name,

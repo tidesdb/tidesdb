@@ -11461,9 +11461,9 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
 
     /* we swap active_memtable pointer -- new writers will use the new memtable
      * no need to wait for old memtable refcount to drain here becase:
-     * - old memtable becomes immutable and is enqueued for background flush
-     * - refcount naturally drains as in-flight writers finish
-     * - tidesdb_immutable_memtable_unref() handles cleanup when refcount hits 0 */
+     * -- old memtable becomes immutable and is enqueued for background flush
+     * -- refcount naturally drains as in-flight writers finish
+     * -- tidesdb_immutable_memtable_unref() handles cleanup when refcount hits 0 */
     atomic_store_explicit(&cf->active_memtable, new_mt, memory_order_release);
     atomic_thread_fence(memory_order_seq_cst);
 

@@ -1013,7 +1013,7 @@ static void test_cache_stats(void)
         tidesdb_txn_free(txn);
     }
 
-    /* we check cache stats after reads - should have some hits/misses */
+    /* we check cache stats after reads -- should have some hits/misses */
     ASSERT_EQ(tidesdb_get_cache_stats(db, &cache_stats), 0);
     ASSERT_TRUE(cache_stats.enabled == 1);
 
@@ -12680,7 +12680,7 @@ static void test_partial_write_mid_block_corruption(void)
             tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "partial_cf");
             if (cf != NULL)
             {
-                /* we try to read - some keys may be recoverable */
+                /* we try to read -- some keys may be recoverable */
                 tidesdb_txn_t *txn = NULL;
                 if (tidesdb_txn_begin(db, &txn) == TDB_SUCCESS)
                 {
@@ -12744,7 +12744,7 @@ static void test_clock_skew_time_travel_ttl(void)
         snprintf(key, sizeof(key), "clock_key_%04d", i);
         snprintf(value, sizeof(value), "clock_value_%04d", i);
 
-        /* TTL in the past - should be immediately expired */
+        /* TTL in the past -- should be immediately expired */
         time_t ttl = now - 3600; /* 1 hour ago */
 
         ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
@@ -12879,7 +12879,7 @@ static void test_filesystem_full_during_compaction(void)
         if (queue_size(db->flush_queue) == 0) break;
     }
 
-    /* we trigger compaction - even if disk is "full", system should handle gracefully
+    /* we trigger compaction -- even if disk is "full", system should handle gracefully
      * note -- we can't actually fill the disk in a test, but we verify compaction
      * doesn't corrupt data even under stress */
     tidesdb_compact(cf);
@@ -12990,7 +12990,7 @@ static void test_power_loss_during_sstable_metadata_write(void)
             tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "powerloss_cf");
             if (cf != NULL)
             {
-                /* we try to read - data should still be accessible even without bloom filter */
+                /* we try to read -- data should still be accessible even without bloom filter */
                 tidesdb_txn_t *txn = NULL;
                 if (tidesdb_txn_begin(db, &txn) == TDB_SUCCESS)
                 {

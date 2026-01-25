@@ -11040,7 +11040,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
             char wal_path[MAX_FILE_PATH_LENGTH];
             snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log",
                      cf->directory, old_wal_id);
-            active_mt->wal = block_manager_open(wal_path, cf->config.sync_mode);
+            block_manager_open(&active_mt->wal, wal_path, cf->config.sync_mode);
         }
         pthread_rwlock_unlock(&db->cf_list_lock);
         return TDB_ERR_IO;
@@ -11052,8 +11052,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         char new_wal_path[MAX_FILE_PATH_LENGTH];
         snprintf(new_wal_path, sizeof(new_wal_path), "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log",
                  new_directory, old_wal_id);
-        active_mt->wal = block_manager_open(new_wal_path, cf->config.sync_mode);
-        if (!active_mt->wal)
+        if (block_manager_open(&active_mt->wal, new_wal_path, cf->config.sync_mode) != 0)
         {
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to reopen WAL at %s after rename", new_wal_path);
         }

@@ -11077,11 +11077,16 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
     if (old_wal)
     {
         char new_wal_path[MAX_FILE_PATH_LENGTH];
-        snprintf(new_wal_path, sizeof(new_wal_path), "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log",
-                 new_directory, old_wal_id);
-        if (block_manager_open(&active_mt->wal, new_wal_path, cf->config.sync_mode) != 0)
+        int wal_written =
+            snprintf(new_wal_path, sizeof(new_wal_path), "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log",
+                     new_directory, old_wal_id);
+        if (wal_written > 0 && (size_t)wal_written < sizeof(new_wal_path))
         {
-            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to reopen WAL at %s after rename", new_wal_path);
+            if (block_manager_open(&active_mt->wal, new_wal_path, cf->config.sync_mode) != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to reopen WAL at %s after rename",
+                              new_wal_path);
+            }
         }
     }
 
@@ -11115,7 +11120,6 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
     /* update all sst file paths in all levels
      * note: we already hold cf_list_lock and waited for flush/compaction to complete,
      * so it's safe to modify sstable paths without additional locking */
-    const int num_levels = atomic_load(&cf->num_active_levels);
     for (int lvl = 0; lvl < num_levels; lvl++)
     {
         tidesdb_level_t *level = cf->levels[lvl];

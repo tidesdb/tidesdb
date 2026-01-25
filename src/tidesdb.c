@@ -11029,6 +11029,33 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         active_mt->wal = NULL;
     }
 
+    /* close all sst file handles before rename (required on Windows) */
+    const int num_levels = atomic_load(&cf->num_active_levels);
+    for (int lvl = 0; lvl < num_levels; lvl++)
+    {
+        tidesdb_level_t *level = cf->levels[lvl];
+        if (!level) continue;
+
+        const int num_sst = atomic_load(&level->num_sstables);
+        tidesdb_sstable_t **sstables = atomic_load(&level->sstables);
+        for (int s = 0; s < num_sst; s++)
+        {
+            tidesdb_sstable_t *sst = sstables[s];
+            if (!sst) continue;
+
+            if (sst->klog_bm)
+            {
+                block_manager_close(sst->klog_bm);
+                sst->klog_bm = NULL;
+            }
+            if (sst->vlog_bm)
+            {
+                block_manager_close(sst->vlog_bm);
+                sst->vlog_bm = NULL;
+            }
+        }
+    }
+
     /* we rename directory on disk */
     if (rename(cf->directory, new_directory) != 0)
     {
@@ -11129,18 +11156,6 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
                     free(sst->vlog_path);
                     sst->vlog_path = new_vlog;
                 }
-            }
-
-            /* close block managers if they're open - they'll reopen with new paths */
-            if (sst->klog_bm)
-            {
-                block_manager_close(sst->klog_bm);
-                sst->klog_bm = NULL;
-            }
-            if (sst->vlog_bm)
-            {
-                block_manager_close(sst->vlog_bm);
-                sst->vlog_bm = NULL;
             }
         }
     }

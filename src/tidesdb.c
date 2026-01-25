@@ -11056,6 +11056,18 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         }
     }
 
+    /* close manifest file handle before rename (required on Windows) */
+    if (cf->manifest)
+    {
+        pthread_rwlock_wrlock(&cf->manifest->lock);
+        if (cf->manifest->fp)
+        {
+            fclose(cf->manifest->fp);
+            cf->manifest->fp = NULL;
+        }
+        pthread_rwlock_unlock(&cf->manifest->lock);
+    }
+
     /* we rename directory on disk */
     if (rename(cf->directory, new_directory) != 0)
     {
@@ -11183,16 +11195,11 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
                            "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_MANIFEST_NAME, new_directory);
         if (written > 0 && (size_t)written < sizeof(manifest_path))
         {
-            /* update the manifest's internal path to the new location */
+            /* update the manifest's internal path to the new location
+             * note: fp was already closed before rename for Windows compatibility */
             pthread_rwlock_wrlock(&cf->manifest->lock);
             strncpy(cf->manifest->path, manifest_path, MANIFEST_PATH_LEN - 1);
             cf->manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
-            /* close old file pointer since file was moved */
-            if (cf->manifest->fp)
-            {
-                fclose(cf->manifest->fp);
-                cf->manifest->fp = NULL;
-            }
             pthread_rwlock_unlock(&cf->manifest->lock);
 
             /* commit manifest to new location to ensure it's written */

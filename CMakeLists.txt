@@ -1,4 +1,14 @@
 cmake_minimum_required(VERSION 3.25)
+
+# mimalloc option must be defined before project() for vcpkg manifest features
+option(TIDESDB_WITH_MIMALLOC "Use mimalloc as the memory allocator" OFF)
+
+# enable vcpkg mimalloc feature when TIDESDB_WITH_MIMALLOC is ON
+# this must be set before project() for vcpkg to pick it up
+if(TIDESDB_WITH_MIMALLOC)
+    list(APPEND VCPKG_MANIFEST_FEATURES "mimalloc")
+endif()
+
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
@@ -13,12 +23,6 @@ configure_file(
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
-option(TIDESDB_WITH_MIMALLOC "Use mimalloc as the memory allocator" OFF)
-
-# enable vcpkg mimalloc feature when TIDESDB_WITH_MIMALLOC is ON
-if(TIDESDB_WITH_MIMALLOC)
-    list(APPEND VCPKG_MANIFEST_FEATURES "mimalloc")
-endif()
 
 # BUILD_SHARED_LIBS controls static vs shared library
 # Default to STATIC on Windows (avoids DLL export/import complexity), SHARED elsewhere

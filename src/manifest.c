@@ -16,13 +16,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "manifest.h"
+
+#ifdef TDB_USE_MIMALLOC
+#include <mimalloc-override.h>
+#endif
 
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "manifest.h"
 
 #define MANIFEST_TMP_EXT ".tmp."
 

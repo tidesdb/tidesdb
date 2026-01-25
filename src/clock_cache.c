@@ -16,9 +16,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "clock_cache.h"
+
+#ifdef TDB_USE_MIMALLOC
+#include <mimalloc-override.h>
+#endif
 
 #include "../external/xxhash.h"
+#include "clock_cache.h"
 
 #define CLOCK_CACHE_PARTITION_FULL_THRESHOLD 85
 #define CLOCK_CACHE_YIELD_COUNT              1

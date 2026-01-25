@@ -8,5 +8,13 @@
     "lz4",
     "pthreads"
   ],
+  "features": {
+    "mimalloc": {
+      "description": "Use mimalloc as the memory allocator for improved performance",
+      "dependencies": [
+        "mimalloc"
+      ]
+    }
+  },
   "builtin-baseline": "7220a4eebf20515cdd9c34721e15ca082bae9038"
 }

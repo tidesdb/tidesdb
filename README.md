@@ -30,6 +30,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Cross-platform · Linux, macOS, Windows, BSD variants, Solaris/Illumos on x86, ARM, RISC-V, PowerPC (32-bit and 64-bit). Comprehensive platform abstraction layer.
 - File portability · Little-endian serialization throughout. Database files work across any platform/architecture without conversion.
 - Clean C API · Returns `TDB_SUCCESS` (0) on success, negative error codes on failure (`TDB_ERR_MEMORY`, `TDB_ERR_INVALID_ARGS`, `TDB_ERR_NOT_FOUND`, `TDB_ERR_IO`, `TDB_ERR_CORRUPTION`, `TDB_ERR_CONFLICT`, etc.). Configurable debug logging with 6 levels: `TDB_LOG_DEBUG` (most verbose), `TDB_LOG_INFO`, `TDB_LOG_WARN`, `TDB_LOG_ERROR`, `TDB_LOG_FATAL`, and `TDB_LOG_NONE` (disable). Log level set via `tidesdb_config_t` at database open. Timestamped log output to stderr with file/line information.
+- Optional mimalloc support
 
 ## Getting Started
 To learn more about TidesDB, check out [What is TidesDB?](https://tidesdb.com/getting-started/what-is-tidesdb/)

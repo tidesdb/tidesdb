@@ -13,6 +13,7 @@ configure_file(
 option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
+option(TIDESDB_WITH_MIMALLOC "Use mimalloc as the memory allocator" OFF)
 
 # BUILD_SHARED_LIBS controls static vs shared library
 # Default to STATIC on Windows (avoids DLL export/import complexity), SHARED elsewhere
@@ -92,6 +93,17 @@ if(WIN32)
     find_package(PThreads4W REQUIRED)
 endif()
 
+# mimalloc support (optional, OFF by default)
+if(TIDESDB_WITH_MIMALLOC)
+    if(WIN32)
+        find_package(mimalloc CONFIG REQUIRED)
+    else()
+        find_package(mimalloc REQUIRED)
+    endif()
+    target_compile_definitions(tidesdb PUBLIC TDB_USE_MIMALLOC)
+    message(STATUS "Building with mimalloc memory allocator")
+endif()
+
 if(APPLE)
     # macOS supports multiple package managers (Homebrew, MacPorts, pkgsrc, Fink, etc)
     # we allow user to specify custom paths via -DMACOS_DEPENDENCY_PREFIX=/path
@@ -141,6 +153,10 @@ if(APPLE)
     if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         target_link_libraries(tidesdb PUBLIC atomic)
     endif()
+
+    if(TIDESDB_WITH_MIMALLOC)
+        target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
 elseif(WIN32)
     # for windows, link against compression libraries and pthreads
     target_link_libraries(tidesdb PUBLIC
@@ -149,6 +165,10 @@ elseif(WIN32)
             lz4::lz4
             PThreads4W::PThreads4W
     )
+
+    if(TIDESDB_WITH_MIMALLOC)
+        target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     # FreeBSD packages installed in /usr/local
     target_include_directories(tidesdb PUBLIC /usr/local/include)
@@ -160,6 +180,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
             snappy      # snappy compression
             pthread     # pthread library
     )
+
+    if(TIDESDB_WITH_MIMALLOC)
+        target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
     # OpenBSD -- packages installed in /usr/local
     target_include_directories(tidesdb PUBLIC /usr/local/include)
@@ -171,6 +195,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
             snappy      # snappy compression
             pthread     # pthread library
     )
+
+    if(TIDESDB_WITH_MIMALLOC)
+        target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
     # NetBSD -- packages installed in /usr/pkg
     target_include_directories(tidesdb PUBLIC /usr/pkg/include)
@@ -182,6 +210,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
             snappy      # snappy compression
             pthread     # pthread library
     )
+
+    if(TIDESDB_WITH_MIMALLOC)
+        target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
     # DragonFlyBSD -- packages installed in /usr/local
     target_include_directories(tidesdb PUBLIC /usr/local/include)
@@ -193,6 +225,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
             snappy      # snappy compression
             pthread     # pthread library
     )
+
+    if(TIDESDB_WITH_MIMALLOC)
+        target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
     # OmniOS/Illumos -- OpenIndiana Community Edition packages in /opt/ooce
     # Note: snappy is not available in OmniOS repos, using only lz4 and zstd
@@ -204,6 +240,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
             zstd        # zstandard compression
             pthread     # pthread library
     )
+
+    if(TIDESDB_WITH_MIMALLOC)
+        target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
 else()
     # for linux and other unix systems
     target_link_libraries(tidesdb PUBLIC
@@ -215,6 +255,10 @@ else()
             stdc++      # C++ standard library (required by Snappy)
             atomic      # atomic operations library (required for 32-bit architectures like PowerPC)
     )
+
+    if(TIDESDB_WITH_MIMALLOC)
+        target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
 endif()
 
 install(TARGETS tidesdb

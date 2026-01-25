@@ -16,10 +16,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tidesdb.h"
+
+#ifdef TDB_USE_MIMALLOC
+#include <mimalloc-override.h>
+#endif
 
 #include <errno.h>
 
+#include "tidesdb.h"
 #include "xxhash.h"
 
 /* read profiling macros */
@@ -10936,6 +10940,228 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     return TDB_SUCCESS;
 }
 
+int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char *new_name)
+{
+    if (!db || !old_name || !new_name) return TDB_ERR_INVALID_ARGS;
+
+    /* we validate new name length */
+    if (strlen(new_name) == 0 || strlen(new_name) >= TDB_MAX_CF_NAME_LEN)
+    {
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    /** we check for same name */
+    if (strcmp(old_name, new_name) == 0)
+    {
+        return TDB_SUCCESS; /* no-op */
+    }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Renaming column family: %s -> %s", old_name, new_name);
+
+    pthread_rwlock_wrlock(&db->cf_list_lock);
+
+    /* we find the CF to rename */
+    tidesdb_column_family_t *cf = NULL;
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        if (db->column_families[i] && strcmp(db->column_families[i]->name, old_name) == 0)
+        {
+            cf = db->column_families[i];
+            break;
+        }
+    }
+
+    if (!cf)
+    {
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        return TDB_ERR_NOT_FOUND;
+    }
+
+    /* we check if new name already exists */
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        if (db->column_families[i] && strcmp(db->column_families[i]->name, new_name) == 0)
+        {
+            pthread_rwlock_unlock(&db->cf_list_lock);
+            return TDB_ERR_EXISTS;
+        }
+    }
+
+    /* wait for any in-progress flush to complete */
+    int wait_count = 0;
+    while (atomic_load_explicit(&cf->is_flushing, memory_order_acquire) != 0 &&
+           wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS)
+    {
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
+        wait_count++;
+        pthread_rwlock_wrlock(&db->cf_list_lock);
+    }
+
+    /* wait for any in-progress compaction to complete */
+    wait_count = 0;
+    while (atomic_load_explicit(&cf->is_compacting, memory_order_acquire) != 0 &&
+           wait_count < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS)
+    {
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
+        wait_count++;
+        pthread_rwlock_wrlock(&db->cf_list_lock);
+    }
+
+    /* we build new directory path */
+    char new_directory[MAX_FILE_PATH_LENGTH];
+    int written = snprintf(new_directory, sizeof(new_directory), "%s%s%s", db->db_path,
+                           PATH_SEPARATOR, new_name);
+    if (written < 0 || (size_t)written >= sizeof(new_directory))
+    {
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    /* we rename directory on disk */
+    if (rename(cf->directory, new_directory) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to rename directory %s to %s: %s", cf->directory,
+                      new_directory, strerror(errno));
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        return TDB_ERR_IO;
+    }
+
+    /* we update CF name */
+    char *new_name_copy = strdup(new_name);
+    if (!new_name_copy)
+    {
+        /* try to revert directory rename */
+        rename(new_directory, cf->directory);
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        return TDB_ERR_MEMORY;
+    }
+
+    /* we update CF directory */
+    char *new_dir_copy = strdup(new_directory);
+    if (!new_dir_copy)
+    {
+        free(new_name_copy);
+        /* try to revert directory rename */
+        rename(new_directory, cf->directory);
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        return TDB_ERR_MEMORY;
+    }
+
+    /* we swap in new values */
+    char *old_name_ptr = cf->name;
+    char *old_dir_ptr = cf->directory;
+    cf->name = new_name_copy;
+    cf->directory = new_dir_copy;
+
+    /* update all sst file paths in all levels
+     * note: we already hold cf_list_lock and waited for flush/compaction to complete,
+     * so it's safe to modify sstable paths without additional locking */
+    const int num_levels = atomic_load(&cf->num_active_levels);
+    for (int lvl = 0; lvl < num_levels; lvl++)
+    {
+        tidesdb_level_t *level = cf->levels[lvl];
+        if (!level) continue;
+
+        const int num_sst = atomic_load(&level->num_sstables);
+        tidesdb_sstable_t **sstables = atomic_load(&level->sstables);
+        for (int s = 0; s < num_sst; s++)
+        {
+            tidesdb_sstable_t *sst = sstables[s];
+            if (!sst) continue;
+
+            /* build new klog path */
+            char new_klog_path[MAX_FILE_PATH_LENGTH];
+            int path_written = snprintf(new_klog_path, sizeof(new_klog_path),
+                                        "%s" PATH_SEPARATOR "L%d_%" PRIu64 ".klog", new_directory,
+                                        lvl + 1, sst->id);
+            if (path_written > 0 && (size_t)path_written < sizeof(new_klog_path))
+            {
+                char *new_klog = strdup(new_klog_path);
+                if (new_klog)
+                {
+                    free(sst->klog_path);
+                    sst->klog_path = new_klog;
+                }
+            }
+
+            /* build new vlog path */
+            char new_vlog_path[MAX_FILE_PATH_LENGTH];
+            path_written = snprintf(new_vlog_path, sizeof(new_vlog_path),
+                                    "%s" PATH_SEPARATOR "L%d_%" PRIu64 ".vlog", new_directory,
+                                    lvl + 1, sst->id);
+            if (path_written > 0 && (size_t)path_written < sizeof(new_vlog_path))
+            {
+                char *new_vlog = strdup(new_vlog_path);
+                if (new_vlog)
+                {
+                    free(sst->vlog_path);
+                    sst->vlog_path = new_vlog;
+                }
+            }
+
+            /* close block managers if they're open - they'll reopen with new paths */
+            if (sst->klog_bm)
+            {
+                block_manager_close(sst->klog_bm);
+                sst->klog_bm = NULL;
+            }
+            if (sst->vlog_bm)
+            {
+                block_manager_close(sst->vlog_bm);
+                sst->vlog_bm = NULL;
+            }
+        }
+    }
+
+    /* we update config file with new name */
+    char config_path[MAX_FILE_PATH_LENGTH];
+    written =
+        snprintf(config_path, sizeof(config_path),
+                 "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+                 new_directory);
+    if (written > 0 && (size_t)written < sizeof(config_path))
+    {
+        tidesdb_cf_config_save_to_ini(config_path, new_name, &cf->config);
+    }
+
+    /* update manifest path - must update internal path before commit */
+    if (cf->manifest)
+    {
+        char manifest_path[MAX_FILE_PATH_LENGTH];
+        written = snprintf(manifest_path, sizeof(manifest_path),
+                           "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_MANIFEST_NAME, new_directory);
+        if (written > 0 && (size_t)written < sizeof(manifest_path))
+        {
+            /* update the manifest's internal path to the new location */
+            pthread_rwlock_wrlock(&cf->manifest->lock);
+            strncpy(cf->manifest->path, manifest_path, MANIFEST_PATH_LEN - 1);
+            cf->manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
+            /* close old file pointer since file was moved */
+            if (cf->manifest->fp)
+            {
+                fclose(cf->manifest->fp);
+                cf->manifest->fp = NULL;
+            }
+            pthread_rwlock_unlock(&cf->manifest->lock);
+
+            /* commit manifest to new location to ensure it's written */
+            tidesdb_manifest_commit(cf->manifest, manifest_path);
+        }
+    }
+
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    /* free old strings after releasing lock */
+    free(old_name_ptr);
+    free(old_dir_ptr);
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Successfully renamed column family: %s -> %s", old_name, new_name);
+
+    return TDB_SUCCESS;
+}
+
 static tidesdb_column_family_t *tidesdb_get_column_family_internal(tidesdb_t *db, const char *name)
 {
     if (!db || !name) return NULL;
@@ -11051,6 +11277,18 @@ int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf)
 {
     return tidesdb_flush_memtable_internal(cf, 0, 0);
+}
+
+int tidesdb_is_flushing(tidesdb_column_family_t *cf)
+{
+    if (!cf) return 0;
+    return atomic_load_explicit(&cf->is_flushing, memory_order_acquire) != 0 ? 1 : 0;
+}
+
+int tidesdb_is_compacting(tidesdb_column_family_t *cf)
+{
+    if (!cf) return 0;
+    return atomic_load_explicit(&cf->is_compacting, memory_order_acquire) != 0 ? 1 : 0;
 }
 
 static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int already_holds_lock,

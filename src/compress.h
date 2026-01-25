@@ -30,13 +30,13 @@
 /* snappy is not available on SunOS/OmniOS/Illumos */
 typedef enum
 {
-    NO_COMPRESSION = 0,
+    TDB_COMPRESS_NONE = 0,
 #ifndef __sun
-    SNAPPY_COMPRESSION,
+    TDB_COMPRESS_SNAPPY = 1,
 #endif
-    LZ4_COMPRESSION,
-    ZSTD_COMPRESSION,
-    LZ4_FAST_COMPRESSION,
+    TDB_COMPRESS_LZ4 = 2,
+    TDB_COMPRESS_ZSTD = 3,
+    TDB_COMPRESS_LZ4_FAST = 4,
 } compression_algorithm;
 
 /**

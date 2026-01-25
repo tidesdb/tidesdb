@@ -825,6 +825,16 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
 
 /**
+ * tidesdb_rename_column_family
+ * renames a column family safely (flushes pending data first)
+ * @param db database handle
+ * @param old_name current name of column family
+ * @param new_name new name for column family
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char *new_name);
+
+/**
  * tidesdb_get_column_family
  * gets a column family from a database
  * @param db database handle
@@ -1150,6 +1160,22 @@ int tidesdb_compact(tidesdb_column_family_t *cf);
  * @return 0 on success, -n on failure
  */
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf);
+
+/**
+ * tidesdb_is_flushing
+ * checks if a column family is currently flushing
+ * @param cf column family handle
+ * @return 1 if flushing, 0 if not flushing
+ */
+int tidesdb_is_flushing(tidesdb_column_family_t *cf);
+
+/**
+ * tidesdb_is_compacting
+ * checks if a column family is currently compacting
+ * @param cf column family handle
+ * @return 1 if compacting, 0 if not compacting
+ */
+int tidesdb_is_compacting(tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_cf_config_load_from_ini

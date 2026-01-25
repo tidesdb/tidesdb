@@ -17,11 +17,8 @@
  * limitations under the License.
  */
 
-#ifdef TDB_USE_MIMALLOC
-#include <mimalloc-override.h>
-#endif
-
 #include "block_manager.h"
+
 #include "xxhash.h"
 
 #define BM_UNLIKELY(x) TDB_UNLIKELY(x)

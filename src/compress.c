@@ -17,10 +17,6 @@
  * limitations under the License.
  */
 
-#ifdef TDB_USE_MIMALLOC
-#include <mimalloc-override.h>
-#endif
-
 #include "compress.h"
 
 uint8_t *compress_data(const uint8_t *data, const size_t data_size, size_t *compressed_size,

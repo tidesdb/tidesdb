@@ -17,10 +17,6 @@
  * limitations under the License.
  */
 
-#ifdef TDB_USE_MIMALLOC
-#include <mimalloc-override.h>
-#endif
-
 #include "skip_list.h"
 
 /**

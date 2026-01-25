@@ -17,13 +17,10 @@
  * limitations under the License.
  */
 
-#ifdef TDB_USE_MIMALLOC
-#include <mimalloc-override.h>
-#endif
+#include "tidesdb.h"
 
 #include <errno.h>
 
-#include "tidesdb.h"
 #include "xxhash.h"
 
 /* read profiling macros */
@@ -11019,13 +11016,47 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         return TDB_ERR_INVALID_ARGS;
     }
 
+    /* on Windows, we must close all file handles before renaming directory
+     * close the active memtable's WAL */
+    tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
+    block_manager_t *old_wal = NULL;
+    uint64_t old_wal_id = 0;
+    if (active_mt && active_mt->wal)
+    {
+        old_wal = active_mt->wal;
+        old_wal_id = active_mt->id;
+        block_manager_close(old_wal);
+        active_mt->wal = NULL;
+    }
+
     /* we rename directory on disk */
     if (rename(cf->directory, new_directory) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to rename directory %s to %s: %s", cf->directory,
                       new_directory, strerror(errno));
+        /* try to reopen WAL at old location */
+        if (old_wal)
+        {
+            char wal_path[MAX_FILE_PATH_LENGTH];
+            snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log",
+                     cf->directory, old_wal_id);
+            active_mt->wal = block_manager_open(wal_path, cf->config.sync_mode);
+        }
         pthread_rwlock_unlock(&db->cf_list_lock);
         return TDB_ERR_IO;
+    }
+
+    /* reopen WAL at new location */
+    if (old_wal)
+    {
+        char new_wal_path[MAX_FILE_PATH_LENGTH];
+        snprintf(new_wal_path, sizeof(new_wal_path), "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log",
+                 new_directory, old_wal_id);
+        active_mt->wal = block_manager_open(new_wal_path, cf->config.sync_mode);
+        if (!active_mt->wal)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to reopen WAL at %s after rename", new_wal_path);
+        }
     }
 
     /* we update CF name */

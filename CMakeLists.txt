@@ -94,13 +94,13 @@ if(WIN32)
 endif()
 
 # mimalloc support (optional, OFF by default)
+# mimalloc provides automatic malloc/free override when linked
 if(TIDESDB_WITH_MIMALLOC)
     if(WIN32)
         find_package(mimalloc CONFIG REQUIRED)
     else()
         find_package(mimalloc REQUIRED)
     endif()
-    target_compile_definitions(tidesdb PUBLIC TDB_USE_MIMALLOC)
     message(STATUS "Building with mimalloc memory allocator")
 endif()
 

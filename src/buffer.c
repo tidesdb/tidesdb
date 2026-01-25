@@ -17,10 +17,6 @@
  * limitations under the License.
  */
 
-#ifdef TDB_USE_MIMALLOC
-#include <mimalloc-override.h>
-#endif
-
 #include "buffer.h"
 
 /* branch prediction hints for hot paths */

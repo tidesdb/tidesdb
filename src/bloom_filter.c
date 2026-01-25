@@ -17,14 +17,10 @@
  * limitations under the License.
  */
 
-#ifdef TDB_USE_MIMALLOC
-#include <mimalloc-override.h>
-#endif
+#include "bloom_filter.h"
 
 #include <string.h>
 #include <tgmath.h>
-
-#include "bloom_filter.h"
 
 #define BLOOM_UNLIKELY(x) TDB_UNLIKELY(x)
 

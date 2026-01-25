@@ -17,12 +17,9 @@
  * limitations under the License.
  */
 
-#ifdef TDB_USE_MIMALLOC
-#include <mimalloc-override.h>
-#endif
+#include "queue.h"
 
 #include "compat.h"
-#include "queue.h"
 
 #define QUEUE_LIKELY(x)   TDB_LIKELY(x)
 #define QUEUE_UNLIKELY(x) TDB_UNLIKELY(x)

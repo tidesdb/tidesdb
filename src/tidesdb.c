@@ -15714,23 +15714,100 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
 
     (*stats)->level_sizes = malloc((*stats)->num_levels * sizeof(size_t));
     (*stats)->level_num_sstables = malloc((*stats)->num_levels * sizeof(int));
+    (*stats)->level_key_counts = malloc((*stats)->num_levels * sizeof(uint64_t));
     (*stats)->config = malloc(sizeof(tidesdb_column_family_config_t));
 
-    if (!(*stats)->level_sizes || !(*stats)->level_num_sstables || !(*stats)->config)
+    if (!(*stats)->level_sizes || !(*stats)->level_num_sstables || !(*stats)->level_key_counts ||
+        !(*stats)->config)
     {
         free((*stats)->level_sizes);
         free((*stats)->level_num_sstables);
+        free((*stats)->level_key_counts);
         free((*stats)->config);
         free(*stats);
         return TDB_ERR_MEMORY;
     }
 
     memcpy((*stats)->config, &cf->config, sizeof(tidesdb_column_family_config_t));
+
+    /* we count memtable keys */
+    uint64_t memtable_keys = active_mt ? (uint64_t)skip_list_count_entries(active_mt) : 0;
+    uint64_t total_keys = memtable_keys;
+    uint64_t total_data_size = 0;
+    uint64_t total_sstable_entries = 0;
+    uint64_t total_klog_size = 0;
+    int total_sstables = 0;
+
     for (int i = 0; i < (*stats)->num_levels; i++)
     {
         (*stats)->level_sizes[i] = atomic_load(&cf->levels[i]->current_size);
-        (*stats)->level_num_sstables[i] =
-            atomic_load_explicit(&cf->levels[i]->num_sstables, memory_order_acquire);
+        int num_sstables = atomic_load_explicit(&cf->levels[i]->num_sstables, memory_order_acquire);
+        (*stats)->level_num_sstables[i] = num_sstables;
+
+        /* we count keys per level from sstables */
+        uint64_t level_keys = 0;
+        tidesdb_sstable_t **sstables =
+            atomic_load_explicit(&cf->levels[i]->sstables, memory_order_acquire);
+        for (int j = 0; j < num_sstables; j++)
+        {
+            if (sstables[j])
+            {
+                level_keys += sstables[j]->num_entries;
+                total_data_size += sstables[j]->klog_size + sstables[j]->vlog_size;
+                total_klog_size += sstables[j]->klog_size;
+                total_sstable_entries += sstables[j]->num_entries;
+            }
+        }
+        (*stats)->level_key_counts[i] = level_keys;
+        total_keys += level_keys;
+        total_sstables += num_sstables;
+    }
+
+    (*stats)->total_keys = total_keys;
+    (*stats)->total_data_size = total_data_size;
+
+    /* we estimate avg key/value sizes from memtable size and sstable data */
+    if (total_keys > 0)
+    {
+        /* memtable tracks total_size as key_size + value_size for each entry */
+        uint64_t memtable_data_size = (*stats)->memtable_size;
+        uint64_t total_kv_size = memtable_data_size + total_klog_size;
+        double avg_entry_size = (double)total_kv_size / (double)total_keys;
+        /* we assume roughly equal key/value split as approximation */
+        (*stats)->avg_key_size = avg_entry_size * 0.3;
+        (*stats)->avg_value_size = avg_entry_size * 0.7;
+    }
+    else
+    {
+        (*stats)->avg_key_size = 0.0;
+        (*stats)->avg_value_size = 0.0;
+    }
+
+    /* we calculate read amplification: worst case is 1 (memtable) + sum of sstables per level */
+    double read_amp = 1.0; /* memtable lookup */
+    for (int i = 0; i < (*stats)->num_levels; i++)
+    {
+        /* for leveled compaction, L0 may have overlapping sstables, higher levels have 1 */
+        if (i == 0)
+        {
+            read_amp += (*stats)->level_num_sstables[i];
+        }
+        else
+        {
+            read_amp += ((*stats)->level_num_sstables[i] > 0 ? 1.0 : 0.0);
+        }
+    }
+    (*stats)->read_amp = read_amp;
+
+    /* we get cache hit rate from database if available */
+    (*stats)->hit_rate = 0.0;
+    if (cf->db && cf->db->clock_cache)
+    {
+        tidesdb_cache_stats_t cache_stats;
+        if (tidesdb_get_cache_stats(cf->db, &cache_stats) == TDB_SUCCESS && cache_stats.enabled)
+        {
+            (*stats)->hit_rate = cache_stats.hit_rate;
+        }
     }
 
     return TDB_SUCCESS;
@@ -15741,6 +15818,7 @@ void tidesdb_free_stats(tidesdb_stats_t *stats)
     if (!stats) return;
     free(stats->level_sizes);
     free(stats->level_num_sstables);
+    free(stats->level_key_counts);
     free(stats->config);
     free(stats);
 }

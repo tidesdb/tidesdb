@@ -816,3 +816,83 @@ jobs:
         run: |
           cd build
           ctest -V --output-on-failure --timeout 1800 --build-config Release
+
+  build-with-tcmalloc:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux x64 (tcmalloc)
+            arch: x64
+          - os: macos-latest
+            name: macOS x64 (tcmalloc)
+            arch: x64
+          - os: windows-latest
+            name: Windows MSVC x64 (tcmalloc)
+            compiler: msvc
+            arch: x64
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux x64)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install -y libzstd-dev liblz4-dev libsnappy-dev libgoogle-perftools-dev build-essential cmake pkg-config
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: brew install zstd lz4 snappy gperftools
+
+      - name: Setup vcpkg binary cache (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg_cache"
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE
+          echo "VCPKG_DEFAULT_BINARY_CACHE=$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Cache vcpkg packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: vcpkg-tcmalloc-${{ matrix.compiler }}-${{ matrix.arch }}-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-tcmalloc-${{ matrix.compiler }}-${{ matrix.arch }}-
+            vcpkg-${{ matrix.compiler }}-${{ matrix.arch }}-
+
+      - name: Install dependencies (Windows MSVC x64)
+        if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          git pull
+          .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows gperftools:x64-windows
+
+      - name: Configure CMake (Linux/macOS x64)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF -DTIDESDB_WITH_TCMALLOC=ON
+
+      - name: Configure CMake (Windows MSVC x64)
+        if: matrix.compiler == 'msvc' && matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF -DTIDESDB_WITH_TCMALLOC=ON -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run tests
+        shell: bash
+        run: |
+          cd build
+          ctest -V --output-on-failure --timeout 1800 --build-config Release

@@ -174,6 +174,7 @@ typedef struct tidesdb_column_family_config_t
  * TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE)
  * @param block_cache_size size of clock cache for hot sstable blocks
  * @param max_open_sstables maximum number of open sstables
+ * @param log_to_file flag to determine if debug logging should be written to a file
  */
 typedef struct tidesdb_config_t
 {
@@ -183,6 +184,7 @@ typedef struct tidesdb_config_t
     tidesdb_log_level_t log_level;
     size_t block_cache_size;
     size_t max_open_sstables;
+    int log_to_file;
 } tidesdb_config_t;
 
 /**
@@ -256,6 +258,16 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, tidesdb_comparator_f
 int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config);
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
+
+/**
+ * tidesdb_rename_column_family
+ * atomically renames a column family and its underlying directory
+ * waits for any in-progress flush/compaction to complete before renaming
+ * @param db database handle
+ * @param old_name current name of the column family
+ * @param new_name new name for the column family
+ * @return TDB_SUCCESS, TDB_ERR_NOT_FOUND, TDB_ERR_EXISTS, or TDB_ERR_IO
+ */
 int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char *new_name);
 tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *name);
 int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count);
@@ -309,7 +321,21 @@ int tidesdb_comparator_case_insensitive(const uint8_t *key1, size_t key1_size, c
 /**** maintenance operations */
 int tidesdb_compact(tidesdb_column_family_t *cf);
 int tidesdb_flush_memtable(tidesdb_column_family_t *cf);
+
+/**
+ * tidesdb_is_flushing
+ * check if a column family has a flush operation in progress
+ * @param cf column family handle
+ * @return 1 if flushing, 0 otherwise
+ */
 int tidesdb_is_flushing(tidesdb_column_family_t *cf);
+
+/**
+ * tidesdb_is_compacting
+ * check if a column family has a compaction operation in progress
+ * @param cf column family handle
+ * @return 1 if compacting, 0 otherwise
+ */
 int tidesdb_is_compacting(tidesdb_column_family_t *cf);
 int tidesdb_backup(tidesdb_t *db, char *dir);
 

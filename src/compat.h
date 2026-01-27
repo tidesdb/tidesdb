@@ -47,6 +47,13 @@
 #define tdb_strdup(s) strdup(s)
 #endif
 
+/* cross-platform line buffering - Windows doesn't support _IOLBF properly with NULL buffer */
+#if defined(_MSC_VER)
+#define tdb_setlinebuf(stream) setvbuf((stream), NULL, _IONBF, 0)
+#else
+#define tdb_setlinebuf(stream) setvbuf((stream), NULL, _IOLBF, 0)
+#endif
+
 /* branch prediction hints for hot paths */
 #if defined(__GNUC__) || defined(__clang__)
 #define TDB_LIKELY(x)   __builtin_expect(!!(x), 1)

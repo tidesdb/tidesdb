@@ -20,6 +20,7 @@
 #include "tidesdb.h"
 
 #include <errno.h>
+#include <stdarg.h>
 
 #include "xxhash.h"
 
@@ -37,6 +38,79 @@ int _tidesdb_log_level = TDB_LOG_DEBUG;
 
 /* global log file pointer (NULL = stderr, non-NULL = file) */
 FILE *_tidesdb_log_file = NULL;
+
+/* global log truncation threshold (0 = no truncation) */
+size_t _tidesdb_log_truncate = 0;
+
+/* global log file path for truncation */
+char _tidesdb_log_path[MAX_FILE_PATH_LENGTH] = {0};
+
+/* mutex to protect log file access during truncation */
+static pthread_mutex_t _tidesdb_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * tidesdb_log_write
+ * writes a log message to the log file or stderr
+ * handles truncation if configured
+ * @param level log level
+ * @param file source file name
+ * @param line source line number
+ * @param fmt format string
+ * @param ... format arguments
+ */
+void tidesdb_log_write(const int level, const char *file, const int line, const char *fmt, ...)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    const time_t sec = ts.tv_sec;
+    struct tm tm_info;
+    tdb_localtime(&sec, &tm_info);
+
+    const char *level_str = (level == TDB_LOG_DEBUG)   ? "DEBUG"
+                            : (level == TDB_LOG_INFO)  ? "INFO"
+                            : (level == TDB_LOG_WARN)  ? "WARN"
+                            : (level == TDB_LOG_ERROR) ? "ERROR"
+                                                       : "FATAL";
+
+    pthread_mutex_lock(&_tidesdb_log_mutex);
+
+    FILE *log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;
+
+    fprintf(log_out, "[%02d:%02d:%02d.%03d] [%s] %s:%d: ", tm_info.tm_hour, tm_info.tm_min,
+            tm_info.tm_sec, (int)(ts.tv_nsec / 1000000), level_str, file, line);
+
+    va_list args;
+    va_start(args, fmt);
+    if (fmt) vfprintf(log_out, fmt, args);
+    va_end(args);
+
+    fprintf(log_out, "\n");
+
+    if (_tidesdb_log_file)
+    {
+        fflush(_tidesdb_log_file);
+
+        if (_tidesdb_log_truncate > 0 && _tidesdb_log_path[0] != '\0')
+        {
+            const long current_pos = ftell(_tidesdb_log_file);
+            if (current_pos > 0 && (size_t)current_pos >= _tidesdb_log_truncate)
+            {
+                fclose(_tidesdb_log_file);
+                _tidesdb_log_file = fopen(_tidesdb_log_path, "w");
+                if (_tidesdb_log_file)
+                {
+                    tdb_setlinebuf(_tidesdb_log_file);
+                    fprintf(_tidesdb_log_file, "[LOG TRUNCATED - exceeded %zu bytes]\n",
+                            _tidesdb_log_truncate);
+                    fflush(_tidesdb_log_file);
+                }
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&_tidesdb_log_mutex);
+}
 
 typedef tidesdb_t tidesdb_t;
 typedef tidesdb_column_family_t tidesdb_column_family_t;
@@ -1629,7 +1703,8 @@ tidesdb_config_t tidesdb_default_config(void)
                               .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
                               .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
                               .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES,
-                              .log_to_file = 0};
+                              .log_to_file = 0,
+                              .log_truncation_at = TDB_DEFAULT_LOG_FILE_TRUNCATION};
 }
 
 /**
@@ -9608,6 +9683,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     /* initialize log file to NULL (stderr) by default */
     (*db)->log_file = NULL;
     _tidesdb_log_file = NULL;
+    _tidesdb_log_truncate = 0;
+    _tidesdb_log_path[0] = '\0';
 
     if (mkdir((*db)->db_path, TDB_DIR_PERMISSIONS) != 0 && errno != EEXIST)
     {
@@ -9630,7 +9707,14 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         {
             _tidesdb_log_file = (*db)->log_file;
             /* we must set line buffering for better real-time logging */
-            setvbuf((*db)->log_file, NULL, _IOLBF, 0);
+            tdb_setlinebuf((*db)->log_file);
+
+            /* we set up log truncation if configured */
+            _tidesdb_log_truncate = config->log_truncation_at;
+            if (_tidesdb_log_truncate > 0)
+            {
+                snprintf(_tidesdb_log_path, sizeof(_tidesdb_log_path), "%s", log_path);
+            }
         }
         else
         {
@@ -10027,8 +10111,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     pthread_mutex_init(&(*db)->sync_thread_mutex, NULL);
     pthread_cond_init(&(*db)->sync_thread_cond, NULL);
 
-    if (needs_sync_thread)
+    if (needs_sync_thread && !atomic_load(&(*db)->sync_thread_active))
     {
+        /* we only start if not already started during recovery by tidesdb_create_column_family */
         atomic_store(&(*db)->sync_thread_active, 1);
         if (pthread_create(&(*db)->sync_thread, NULL, tidesdb_sync_worker_thread, *db) != 0)
         {
@@ -10043,7 +10128,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread created");
         }
     }
-    else
+    else if (!needs_sync_thread && !atomic_load(&(*db)->sync_thread_active))
     {
         atomic_store(&(*db)->sync_thread_active, 0);
     }
@@ -10350,10 +10435,11 @@ int tidesdb_close(tidesdb_t *db)
 
         pthread_join(db->sync_thread, NULL);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread stopped");
-
-        pthread_mutex_destroy(&db->sync_thread_mutex);
-        pthread_cond_destroy(&db->sync_thread_cond);
     }
+
+    /*** we always destroy sync mutex/cond since they're always initialized */
+    pthread_mutex_destroy(&db->sync_thread_mutex);
+    pthread_cond_destroy(&db->sync_thread_cond);
 
     if (atomic_load(&db->sstable_reaper_active))
     {
@@ -10512,14 +10598,18 @@ int tidesdb_close(tidesdb_t *db)
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "TidesDB closed successfully");
 
-    /* close log file if it was opened */
-    if (db->log_file)
+    /* we close log file if it was opened (protected by log mutex) */
+    pthread_mutex_lock(&_tidesdb_log_mutex);
+    if (_tidesdb_log_file)
     {
-        fflush(db->log_file);
-        fclose(db->log_file);
-        db->log_file = NULL;
+        fflush(_tidesdb_log_file);
+        fclose(_tidesdb_log_file);
         _tidesdb_log_file = NULL;
+        _tidesdb_log_truncate = 0;
+        _tidesdb_log_path[0] = '\0';
     }
+    db->log_file = NULL;
+    pthread_mutex_unlock(&_tidesdb_log_mutex);
 
     free(db);
 
@@ -10931,6 +11021,26 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Created CF '%s' (total: %d)", name, db->num_column_families);
 
+    /* we start sync thread if this CF needs interval syncing and thread isn't running
+     * but not during recovery -- tidesdb_open will handle thread creation after recovery */
+    if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us > 0 &&
+        !atomic_load(&db->is_recovering))
+    {
+        if (!atomic_load(&db->sync_thread_active))
+        {
+            atomic_store(&db->sync_thread_active, 1);
+            if (pthread_create(&db->sync_thread, NULL, tidesdb_sync_worker_thread, db) != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create sync worker thread for new CF");
+                atomic_store(&db->sync_thread_active, 0);
+            }
+            else
+            {
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread started for CF '%s'", name);
+            }
+        }
+    }
+
     return TDB_SUCCESS;
 }
 
@@ -11242,8 +11352,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
             /* we update the manifest's internal path to the new location
              *** note -- fp was already closed before rename for Windows compatibility */
             pthread_rwlock_wrlock(&cf->manifest->lock);
-            strncpy(cf->manifest->path, manifest_path, MANIFEST_PATH_LEN - 1);
-            cf->manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
+            memcpy(cf->manifest->path, manifest_path, sizeof(manifest_path));
             pthread_rwlock_unlock(&cf->manifest->lock);
 
             /* commit manifest to new location to ensure it's written */
@@ -12427,7 +12536,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         int result = TDB_ERR_UNKNOWN;
         for (int i = (int)immutable_count - 1; i >= 0; i--)
         {
-            tidesdb_immutable_memtable_t *immutable = immutable_refs[i];
+            const tidesdb_immutable_memtable_t *immutable = immutable_refs[i];
             if (immutable && immutable->skip_list)
             {
                 if (skip_list_get_with_seq(immutable->skip_list, key, key_size, &temp_value,
@@ -12477,6 +12586,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     for (int level_num = 0; level_num < num_levels; level_num++)
     {
+    retry_level:
         PROFILE_INC(txn->db, levels_searched);
         tidesdb_level_t *level = cf->levels[level_num];
 
@@ -12515,10 +12625,13 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
             /* we try to take ref for ssts we will check
              * we use try_ref to safely handle concurrent removal -- if refcount is 0,
-             * the sstable is being freed and we must skip it */
+             * the sstable is being freed and we must skip it
+             **********************************************************************
+             *** when try_ref fails, the array may have been swapped with a new one
+             * containing the merged sstable, so we must retry the entire level */
             if (!tidesdb_sstable_try_ref(sst))
             {
-                continue; /* sstable is being freed, skip it */
+                goto retry_level;
             }
 
             tidesdb_kv_pair_t *candidate_kv = NULL;

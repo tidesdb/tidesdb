@@ -49,6 +49,110 @@ static void test_basic_open_close(void)
     cleanup_test_dir();
 }
 
+static void test_log_file(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.log_to_file = 1;
+    config.log_level = TDB_LOG_DEBUG;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    uint8_t key[] = "log_test_key";
+    uint8_t value[] = "log_test_value";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    char log_path[1024];
+    snprintf(log_path, sizeof(log_path), "%s/LOG", TEST_DB_PATH);
+
+    FILE *log_file = fopen(log_path, "r");
+    ASSERT_TRUE(log_file != NULL);
+
+    fseek(log_file, 0, SEEK_END);
+    long log_size = ftell(log_file);
+    ASSERT_TRUE(log_size > 0);
+
+    fclose(log_file);
+    cleanup_test_dir();
+}
+
+static void test_log_file_truncation(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.log_to_file = 1;
+    config.log_level = TDB_LOG_DEBUG;
+    config.log_truncation_at = 1024;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char value[256];
+        snprintf(key, sizeof(key), "truncation_test_key_%d", i);
+        snprintf(value, sizeof(value), "truncation_test_value_with_longer_content_%d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    char log_path[1024];
+    snprintf(log_path, sizeof(log_path), "%s/LOG", TEST_DB_PATH);
+
+    FILE *log_file = fopen(log_path, "r");
+    ASSERT_TRUE(log_file != NULL);
+
+    fseek(log_file, 0, SEEK_END);
+    long log_size = ftell(log_file);
+
+    ASSERT_TRUE(log_size < 2048);
+
+    fseek(log_file, 0, SEEK_SET);
+    char buffer[128];
+    char *result = fgets(buffer, sizeof(buffer), log_file);
+    ASSERT_TRUE(result != NULL);
+    ASSERT_TRUE(strstr(buffer, "LOG TRUNCATED") != NULL);
+
+    fclose(log_file);
+    cleanup_test_dir();
+}
+
 static void test_tidesdb_free(void)
 {
     cleanup_test_dir();
@@ -874,7 +978,7 @@ static void test_stats_comprehensive(void)
     for (int i = 0; i < stats->num_levels; i++)
     {
         ASSERT_TRUE(stats->level_num_sstables[i] >= 0);
-        ASSERT_TRUE(stats->level_key_counts[i] >= 0);
+        (void)stats->level_key_counts[i];
     }
 
     /* verify config was copied */
@@ -13403,6 +13507,8 @@ int main(void)
     RUN_TEST(test_reverse_iterator_with_tombstones, tests_passed);
     RUN_TEST(test_disk_space_check_simulation, tests_passed);
     RUN_TEST(test_basic_open_close, tests_passed);
+    RUN_TEST(test_log_file, tests_passed);
+    RUN_TEST(test_log_file_truncation, tests_passed);
     RUN_TEST(test_multiple_databases_concurrent_operations, tests_passed);
     RUN_TEST(test_wal_commit_shutdown_recovery, tests_passed);
     RUN_TEST(test_iterator_seek_after_reopen_bloom_indexes_disabled, tests_passed);

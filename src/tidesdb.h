@@ -41,8 +41,12 @@ typedef enum
     TDB_LOG_NONE = 99  /* disable all logging */
 } tidesdb_log_level_t;
 
-extern int _tidesdb_log_level;  /* minimum level to log (default is TDB_LOG_DEBUG) */
-extern FILE *_tidesdb_log_file; /* log file pointer (NULL = stderr, non-NULL = file) */
+extern int _tidesdb_log_level;       /* minimum level to log (default is TDB_LOG_DEBUG) */
+extern FILE *_tidesdb_log_file;      /* log file pointer (NULL = stderr, non-NULL = file) */
+extern size_t _tidesdb_log_truncate; /* truncate log file at this size (0 = no truncation) */
+extern char _tidesdb_log_path[4096]; /* path to log file for truncation */
+
+void _tidesdb_check_log_truncation(void);
 
 #if defined(_MSC_VER)
 #define TDB_DEBUG_LOG(level, fmt, ...)                                                     \
@@ -64,7 +68,11 @@ extern FILE *_tidesdb_log_file; /* log file pointer (NULL = stderr, non-NULL = f
             fprintf(_log_out, "[%02d:%02d:%02d.%03ld] [%s] %s:%d: " fmt "\n", _tm.tm_hour, \
                     _tm.tm_min, _tm.tm_sec, _ts.tv_nsec / 1000000L, _level_str, __FILE__,  \
                     __LINE__, ##__VA_ARGS__);                                              \
-            if (_tidesdb_log_file) fflush(_tidesdb_log_file);                              \
+            if (_tidesdb_log_file)                                                         \
+            {                                                                              \
+                fflush(_tidesdb_log_file);                                                 \
+                _tidesdb_check_log_truncation();                                           \
+            }                                                                              \
         }                                                                                  \
     } while (0)
 #else
@@ -87,7 +95,11 @@ extern FILE *_tidesdb_log_file; /* log file pointer (NULL = stderr, non-NULL = f
             fprintf(_log_out, "[%02d:%02d:%02d.%03ld] [%s] %s:%d: " fmt "\n", _tm.tm_hour, \
                     _tm.tm_min, _tm.tm_sec, _ts.tv_nsec / 1000000L, _level_str, __FILE__,  \
                     __LINE__, ##__VA_ARGS__);                                              \
-            if (_tidesdb_log_file) fflush(_tidesdb_log_file);                              \
+            if (_tidesdb_log_file)                                                         \
+            {                                                                              \
+                fflush(_tidesdb_log_file);                                                 \
+                _tidesdb_check_log_truncation();                                           \
+            }                                                                              \
         }                                                                                  \
     } while (0)
 #endif
@@ -209,6 +221,7 @@ typedef enum
 #define TDB_DEFAULT_ACTIVE_TXN_BUFFER_SIZE (1024 * 64)
 #define TDB_DEFAULT_BLOCK_CACHE_SIZE       (64 * 1024 * 1024)
 #define TDB_DEFAULT_SYNC_INTERVAL_US       128000
+#define TDB_DEFAULT_LOG_FILE_TRUNCATION    24 * (1024 * 1024)
 
 /* configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64
@@ -321,6 +334,7 @@ typedef struct tidesdb_comparator_entry_t
  * @param block_cache_size size of clock cache for hot sstable blocks
  * @param max_open_sstables maximum number of open sstables
  * @param log_to_file flag to determine if debug logging should be written to a file
+ * @param log_truncation_at size in bytes at which to truncate the log file, 0 = no truncation
  */
 typedef struct tidesdb_config_t
 {
@@ -331,6 +345,7 @@ typedef struct tidesdb_config_t
     size_t block_cache_size;
     size_t max_open_sstables;
     int log_to_file;
+    size_t log_truncation_at;
 } tidesdb_config_t;
 
 /**

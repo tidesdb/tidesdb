@@ -38,6 +38,38 @@ int _tidesdb_log_level = TDB_LOG_DEBUG;
 /* global log file pointer (NULL = stderr, non-NULL = file) */
 FILE *_tidesdb_log_file = NULL;
 
+/* global log truncation threshold (0 = no truncation) */
+size_t _tidesdb_log_truncate = 0;
+
+/* global log file path for truncation */
+char _tidesdb_log_path[MAX_FILE_PATH_LENGTH] = {0};
+
+/**
+ * _tidesdb_check_log_truncation
+ * checks if log file exceeds truncation threshold and truncates if needed
+ */
+void _tidesdb_check_log_truncation(void)
+{
+    if (_tidesdb_log_truncate == 0 || _tidesdb_log_file == NULL || _tidesdb_log_path[0] == '\0')
+        return;
+
+    long current_pos = ftell(_tidesdb_log_file);
+    if (current_pos < 0) return;
+
+    if ((size_t)current_pos >= _tidesdb_log_truncate)
+    {
+        fclose(_tidesdb_log_file);
+        _tidesdb_log_file = fopen(_tidesdb_log_path, "w");
+        if (_tidesdb_log_file)
+        {
+            setvbuf(_tidesdb_log_file, NULL, _IOLBF, 0);
+            fprintf(_tidesdb_log_file, "[LOG TRUNCATED - exceeded %zu bytes]\n",
+                    _tidesdb_log_truncate);
+            fflush(_tidesdb_log_file);
+        }
+    }
+}
+
 typedef tidesdb_t tidesdb_t;
 typedef tidesdb_column_family_t tidesdb_column_family_t;
 typedef tidesdb_level_t tidesdb_level_t;
@@ -1629,7 +1661,8 @@ tidesdb_config_t tidesdb_default_config(void)
                               .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
                               .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
                               .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES,
-                              .log_to_file = 0};
+                              .log_to_file = 0,
+                              .log_truncation_at = TDB_DEFAULT_LOG_FILE_TRUNCATION};
 }
 
 /**
@@ -9608,6 +9641,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     /* initialize log file to NULL (stderr) by default */
     (*db)->log_file = NULL;
     _tidesdb_log_file = NULL;
+    _tidesdb_log_truncate = 0;
+    _tidesdb_log_path[0] = '\0';
 
     if (mkdir((*db)->db_path, TDB_DIR_PERMISSIONS) != 0 && errno != EEXIST)
     {
@@ -9631,6 +9666,13 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             _tidesdb_log_file = (*db)->log_file;
             /* we must set line buffering for better real-time logging */
             setvbuf((*db)->log_file, NULL, _IOLBF, 0);
+
+            /* we set up log truncation if configured */
+            _tidesdb_log_truncate = config->log_truncation_at;
+            if (_tidesdb_log_truncate > 0)
+            {
+                snprintf(_tidesdb_log_path, sizeof(_tidesdb_log_path), "%s", log_path);
+            }
         }
         else
         {
@@ -10513,13 +10555,15 @@ int tidesdb_close(tidesdb_t *db)
     TDB_DEBUG_LOG(TDB_LOG_INFO, "TidesDB closed successfully");
 
     /* close log file if it was opened */
-    if (db->log_file)
+    if (_tidesdb_log_file)
     {
-        fflush(db->log_file);
-        fclose(db->log_file);
-        db->log_file = NULL;
+        fflush(_tidesdb_log_file);
+        fclose(_tidesdb_log_file);
         _tidesdb_log_file = NULL;
+        _tidesdb_log_truncate = 0;
+        _tidesdb_log_path[0] = '\0';
     }
+    db->log_file = NULL;
 
     free(db);
 

@@ -41,49 +41,54 @@ typedef enum
     TDB_LOG_NONE = 99  /* disable all logging */
 } tidesdb_log_level_t;
 
-extern int _tidesdb_log_level; /* minimum level to log (default is TDB_LOG_DEBUG) */
+extern int _tidesdb_log_level;  /* minimum level to log (default is TDB_LOG_DEBUG) */
+extern FILE *_tidesdb_log_file; /* log file pointer (NULL = stderr, non-NULL = file) */
 
 #if defined(_MSC_VER)
-#define TDB_DEBUG_LOG(level, fmt, ...)                                                    \
-    do                                                                                    \
-    {                                                                                     \
-        if ((level) >= _tidesdb_log_level && _tidesdb_log_level != TDB_LOG_NONE)          \
-        {                                                                                 \
-            struct timespec _ts;                                                          \
-            timespec_get(&_ts, TIME_UTC);                                                 \
-            time_t _sec = _ts.tv_sec;                                                     \
-            struct tm _tm;                                                                \
-            tdb_localtime(&_sec, &_tm);                                                   \
-            const char *_level_str = (level) == TDB_LOG_DEBUG   ? "DEBUG"                 \
-                                     : (level) == TDB_LOG_INFO  ? "INFO"                  \
-                                     : (level) == TDB_LOG_WARN  ? "WARN"                  \
-                                     : (level) == TDB_LOG_ERROR ? "ERROR"                 \
-                                                                : "FATAL";                \
-            fprintf(stderr, "[%02d:%02d:%02d.%03ld] [%s] %s:%d: " fmt "\n", _tm.tm_hour,  \
-                    _tm.tm_min, _tm.tm_sec, _ts.tv_nsec / 1000000L, _level_str, __FILE__, \
-                    __LINE__, ##__VA_ARGS__);                                             \
-        }                                                                                 \
+#define TDB_DEBUG_LOG(level, fmt, ...)                                                     \
+    do                                                                                     \
+    {                                                                                      \
+        if ((level) >= _tidesdb_log_level && _tidesdb_log_level != TDB_LOG_NONE)           \
+        {                                                                                  \
+            struct timespec _ts;                                                           \
+            timespec_get(&_ts, TIME_UTC);                                                  \
+            time_t _sec = _ts.tv_sec;                                                      \
+            struct tm _tm;                                                                 \
+            tdb_localtime(&_sec, &_tm);                                                    \
+            const char *_level_str = (level) == TDB_LOG_DEBUG   ? "DEBUG"                  \
+                                     : (level) == TDB_LOG_INFO  ? "INFO"                   \
+                                     : (level) == TDB_LOG_WARN  ? "WARN"                   \
+                                     : (level) == TDB_LOG_ERROR ? "ERROR"                  \
+                                                                : "FATAL";                 \
+            FILE *_log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;               \
+            fprintf(_log_out, "[%02d:%02d:%02d.%03ld] [%s] %s:%d: " fmt "\n", _tm.tm_hour, \
+                    _tm.tm_min, _tm.tm_sec, _ts.tv_nsec / 1000000L, _level_str, __FILE__,  \
+                    __LINE__, ##__VA_ARGS__);                                              \
+            if (_tidesdb_log_file) fflush(_tidesdb_log_file);                              \
+        }                                                                                  \
     } while (0)
 #else
-#define TDB_DEBUG_LOG(level, fmt, ...)                                                    \
-    do                                                                                    \
-    {                                                                                     \
-        if ((level) >= _tidesdb_log_level && _tidesdb_log_level != TDB_LOG_NONE)          \
-        {                                                                                 \
-            struct timespec _ts;                                                          \
-            clock_gettime(CLOCK_REALTIME, &_ts);                                          \
-            time_t _sec = _ts.tv_sec;                                                     \
-            struct tm _tm;                                                                \
-            tdb_localtime(&_sec, &_tm);                                                   \
-            const char *_level_str = (level) == TDB_LOG_DEBUG   ? "DEBUG"                 \
-                                     : (level) == TDB_LOG_INFO  ? "INFO"                  \
-                                     : (level) == TDB_LOG_WARN  ? "WARN"                  \
-                                     : (level) == TDB_LOG_ERROR ? "ERROR"                 \
-                                                                : "FATAL";                \
-            fprintf(stderr, "[%02d:%02d:%02d.%03ld] [%s] %s:%d: " fmt "\n", _tm.tm_hour,  \
-                    _tm.tm_min, _tm.tm_sec, _ts.tv_nsec / 1000000L, _level_str, __FILE__, \
-                    __LINE__, ##__VA_ARGS__);                                             \
-        }                                                                                 \
+#define TDB_DEBUG_LOG(level, fmt, ...)                                                     \
+    do                                                                                     \
+    {                                                                                      \
+        if ((level) >= _tidesdb_log_level && _tidesdb_log_level != TDB_LOG_NONE)           \
+        {                                                                                  \
+            struct timespec _ts;                                                           \
+            clock_gettime(CLOCK_REALTIME, &_ts);                                           \
+            time_t _sec = _ts.tv_sec;                                                      \
+            struct tm _tm;                                                                 \
+            tdb_localtime(&_sec, &_tm);                                                    \
+            const char *_level_str = (level) == TDB_LOG_DEBUG   ? "DEBUG"                  \
+                                     : (level) == TDB_LOG_INFO  ? "INFO"                   \
+                                     : (level) == TDB_LOG_WARN  ? "WARN"                   \
+                                     : (level) == TDB_LOG_ERROR ? "ERROR"                  \
+                                                                : "FATAL";                 \
+            FILE *_log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;               \
+            fprintf(_log_out, "[%02d:%02d:%02d.%03ld] [%s] %s:%d: " fmt "\n", _tm.tm_hour, \
+                    _tm.tm_min, _tm.tm_sec, _ts.tv_nsec / 1000000L, _level_str, __FILE__,  \
+                    __LINE__, ##__VA_ARGS__);                                              \
+            if (_tidesdb_log_file) fflush(_tidesdb_log_file);                              \
+        }                                                                                  \
     } while (0)
 #endif
 
@@ -315,6 +320,7 @@ typedef struct tidesdb_comparator_entry_t
  * TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE)
  * @param block_cache_size size of clock cache for hot sstable blocks
  * @param max_open_sstables maximum number of open sstables
+ * @param log_to_file flag to determine if debug logging should be written to a file
  */
 typedef struct tidesdb_config_t
 {
@@ -324,6 +330,7 @@ typedef struct tidesdb_config_t
     tidesdb_log_level_t log_level;
     size_t block_cache_size;
     size_t max_open_sstables;
+    int log_to_file;
 } tidesdb_config_t;
 
 /**
@@ -510,6 +517,7 @@ struct tidesdb_level_t
  * @param total_memory total system memory in bytes
  * @param cf_list_lock rwlock for cf list modifications
  * @param lock_fd file descriptor for lock file
+ * @param log_file file descriptor for log file
  */
 struct tidesdb_t
 {
@@ -551,6 +559,7 @@ struct tidesdb_t
     uint64_t total_memory;
     pthread_rwlock_t cf_list_lock;
     int lock_fd;
+    FILE *log_file;
 #ifdef TDB_ENABLE_READ_PROFILING
     tidesdb_read_stats_t read_stats;
 #endif

@@ -35,6 +35,9 @@
 /* global log level definition */
 int _tidesdb_log_level = TDB_LOG_DEBUG;
 
+/* global log file pointer (NULL = stderr, non-NULL = file) */
+FILE *_tidesdb_log_file = NULL;
+
 typedef tidesdb_t tidesdb_t;
 typedef tidesdb_column_family_t tidesdb_column_family_t;
 typedef tidesdb_level_t tidesdb_level_t;
@@ -52,6 +55,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_KV_FLAG_HAS_VLOG  0x04
 #define TDB_KV_FLAG_DELTA_SEQ 0x08
 
+#define TDB_LOG_FILE                     "LOG"
 #define TDB_WAL_PREFIX                   "wal_"
 #define TDB_WAL_EXT                      ".log"
 #define TDB_COLUMN_FAMILY_CONFIG_NAME    "config"
@@ -1231,7 +1235,7 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, const size_t key_size, const 
  * @param vlog_size size of vlog file
  * @param min_key_size size of min key
  * @param max_key_size size of max key
- * @param compression_algorithm compression algorithm used (0=none, 1=lz4, 2=zstd, 3=snappy,
+ * @param compression_algorithm compression algorithm used (0=none, 1=snappy, 2=lz4, 3=zstd,
  * 4=lz4_fast)
  * @param reserved  padding for alignment
  * @param checksum xxHash64 checksum of all fields except checksum itself
@@ -1624,7 +1628,8 @@ tidesdb_config_t tidesdb_default_config(void)
                               .num_flush_threads = TDB_DEFAULT_FLUSH_THREAD_POOL_SIZE,
                               .num_compaction_threads = TDB_DEFAULT_COMPACTION_THREAD_POOL_SIZE,
                               .block_cache_size = TDB_DEFAULT_BLOCK_CACHE_SIZE,
-                              .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES};
+                              .max_open_sstables = TDB_DEFAULT_MAX_OPEN_SSTABLES,
+                              .log_to_file = 0};
 }
 
 /**
@@ -9600,16 +9605,49 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     _tidesdb_log_level = config->log_level;
 
+    /* initialize log file to NULL (stderr) by default */
+    (*db)->log_file = NULL;
+    _tidesdb_log_file = NULL;
+
+    if (mkdir((*db)->db_path, TDB_DIR_PERMISSIONS) != 0 && errno != EEXIST)
+    {
+        fprintf(stderr, "Failed to create database directory %s: %s\n", (*db)->db_path,
+                strerror(errno));
+        free((*db)->db_path);
+        free(*db);
+        *db = NULL;
+        return TDB_ERR_IO;
+    }
+
+    /* if log_to_file is enabled, open the log file in the database directory */
+    if (config->log_to_file)
+    {
+        char log_path[TDB_MAX_PATH_LEN];
+        snprintf(log_path, sizeof(log_path), "%s" PATH_SEPARATOR TDB_LOG_FILE, (*db)->db_path);
+
+        (*db)->log_file = fopen(log_path, "a");
+        if ((*db)->log_file)
+        {
+            _tidesdb_log_file = (*db)->log_file;
+            /* we must set line buffering for better real-time logging */
+            setvbuf((*db)->log_file, NULL, _IOLBF, 0);
+        }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to open log file %s, falling back to default.",
+                          log_path);
+        }
+    }
+
     const char *level_names[] = {"DEBUG", "INFO", "WARN", "ERROR", "FATAL", "NONE"};
     const char *level_str =
         (_tidesdb_log_level >= TDB_LOG_DEBUG && _tidesdb_log_level <= TDB_LOG_FATAL)
             ? level_names[_tidesdb_log_level]
             : (_tidesdb_log_level == TDB_LOG_NONE ? "NONE" : "UNKNOWN");
 
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Opening TidesDB with path=%s, log_level=%s, workers=%d",
-                  config->db_path, level_str, config->num_compaction_threads);
-
-    mkdir((*db)->db_path, TDB_DIR_PERMISSIONS);
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Opening TidesDB with path=%s, log_level=%s, workers=%d%s",
+                  config->db_path, level_str, config->num_compaction_threads,
+                  config->log_to_file ? ", logging to file" : "");
 
     char lock_path[TDB_MAX_PATH_LEN];
     snprintf(lock_path, sizeof(lock_path), "%s" PATH_SEPARATOR TDB_LOCK_FILE, (*db)->db_path);
@@ -10470,6 +10508,17 @@ int tidesdb_close(tidesdb_t *db)
         tdb_file_unlock(db->lock_fd);
         close(db->lock_fd);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Released database directory lock");
+    }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "TidesDB closed successfully");
+
+    /* close log file if it was opened */
+    if (db->log_file)
+    {
+        fflush(db->log_file);
+        fclose(db->log_file);
+        db->log_file = NULL;
+        _tidesdb_log_file = NULL;
     }
 
     free(db);

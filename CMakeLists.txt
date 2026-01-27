@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 
 # mimalloc option must be defined before project() for vcpkg manifest features
 option(TIDESDB_WITH_MIMALLOC "Use mimalloc as the memory allocator" OFF)
+option(TIDESDB_WITH_TCMALLOC "Use tcmalloc as the memory allocator" OFF)
 
 # enable vcpkg mimalloc feature when TIDESDB_WITH_MIMALLOC is ON
 # this must be set before project() for vcpkg to pick it up
@@ -9,10 +10,12 @@ if(TIDESDB_WITH_MIMALLOC)
     list(APPEND VCPKG_MANIFEST_FEATURES "mimalloc")
 endif()
 
+# tcmalloc vcpkg feature not needed - tcmalloc is not supported on Windows
+
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 7.4.0)
+set(PROJECT_VERSION 7.4.1)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -113,6 +116,18 @@ if(TIDESDB_WITH_MIMALLOC)
     message(STATUS "Building with mimalloc memory allocator")
 endif()
 
+# tcmalloc support (optional, OFF by default)
+# tcmalloc provides automatic malloc/free override when linked
+if(TIDESDB_WITH_TCMALLOC)
+    find_package(PkgConfig REQUIRED)
+    # try full libtcmalloc first (Linux libgoogle-perftools-dev), then minimal (vcpkg)
+    pkg_check_modules(TCMALLOC libtcmalloc)
+    if(NOT TCMALLOC_FOUND)
+        pkg_check_modules(TCMALLOC REQUIRED libtcmalloc_minimal)
+    endif()
+    message(STATUS "Building with tcmalloc memory allocator")
+endif()
+
 if(APPLE)
     # macOS supports multiple package managers (Homebrew, MacPorts, pkgsrc, Fink, etc)
     # we allow user to specify custom paths via -DMACOS_DEPENDENCY_PREFIX=/path
@@ -166,6 +181,11 @@ if(APPLE)
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
     endif()
+
+    if(TIDESDB_WITH_TCMALLOC)
+        target_link_libraries(tidesdb PUBLIC ${TCMALLOC_LIBRARIES})
+        target_include_directories(tidesdb PUBLIC ${TCMALLOC_INCLUDE_DIRS})
+    endif()
 elseif(WIN32)
     # for windows, link against compression libraries and pthreads
     target_link_libraries(tidesdb PUBLIC
@@ -178,6 +198,8 @@ elseif(WIN32)
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
     endif()
+
+    # tcmalloc is not supported on Windows
 elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     # FreeBSD packages installed in /usr/local
     target_include_directories(tidesdb PUBLIC /usr/local/include)
@@ -192,6 +214,11 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
+
+    if(TIDESDB_WITH_TCMALLOC)
+        target_link_libraries(tidesdb PUBLIC ${TCMALLOC_LIBRARIES})
+        target_include_directories(tidesdb PUBLIC ${TCMALLOC_INCLUDE_DIRS})
     endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
     # OpenBSD -- packages installed in /usr/local
@@ -208,6 +235,11 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
     endif()
+
+    if(TIDESDB_WITH_TCMALLOC)
+        target_link_libraries(tidesdb PUBLIC ${TCMALLOC_LIBRARIES})
+        target_include_directories(tidesdb PUBLIC ${TCMALLOC_INCLUDE_DIRS})
+    endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
     # NetBSD -- packages installed in /usr/pkg
     target_include_directories(tidesdb PUBLIC /usr/pkg/include)
@@ -222,6 +254,11 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
+
+    if(TIDESDB_WITH_TCMALLOC)
+        target_link_libraries(tidesdb PUBLIC ${TCMALLOC_LIBRARIES})
+        target_include_directories(tidesdb PUBLIC ${TCMALLOC_INCLUDE_DIRS})
     endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
     # DragonFlyBSD -- packages installed in /usr/local
@@ -238,6 +275,11 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
     endif()
+
+    if(TIDESDB_WITH_TCMALLOC)
+        target_link_libraries(tidesdb PUBLIC ${TCMALLOC_LIBRARIES})
+        target_include_directories(tidesdb PUBLIC ${TCMALLOC_INCLUDE_DIRS})
+    endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
     # OmniOS/Illumos -- OpenIndiana Community Edition packages in /opt/ooce
     # Note: snappy is not available in OmniOS repos, using only lz4 and zstd
@@ -253,6 +295,11 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
     endif()
+
+    if(TIDESDB_WITH_TCMALLOC)
+        target_link_libraries(tidesdb PUBLIC ${TCMALLOC_LIBRARIES})
+        target_include_directories(tidesdb PUBLIC ${TCMALLOC_INCLUDE_DIRS})
+    endif()
 else()
     # for linux and other unix systems
     target_link_libraries(tidesdb PUBLIC
@@ -267,6 +314,11 @@ else()
 
     if(TIDESDB_WITH_MIMALLOC)
         target_link_libraries(tidesdb PUBLIC mimalloc)
+    endif()
+
+    if(TIDESDB_WITH_TCMALLOC)
+        target_link_libraries(tidesdb PUBLIC ${TCMALLOC_LIBRARIES})
+        target_include_directories(tidesdb PUBLIC ${TCMALLOC_INCLUDE_DIRS})
     endif()
 endif()
 

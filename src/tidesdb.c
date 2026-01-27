@@ -10434,10 +10434,11 @@ int tidesdb_close(tidesdb_t *db)
 
         pthread_join(db->sync_thread, NULL);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread stopped");
-
-        pthread_mutex_destroy(&db->sync_thread_mutex);
-        pthread_cond_destroy(&db->sync_thread_cond);
     }
+
+    /*** we always destroy sync mutex/cond since they're always initialized */
+    pthread_mutex_destroy(&db->sync_thread_mutex);
+    pthread_cond_destroy(&db->sync_thread_cond);
 
     if (atomic_load(&db->sstable_reaper_active))
     {
@@ -11018,6 +11019,24 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Created CF '%s' (total: %d)", name, db->num_column_families);
+
+    /* we start sync thread if this CF needs interval syncing and thread isn't running */
+    if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us > 0)
+    {
+        if (!atomic_load(&db->sync_thread_active))
+        {
+            atomic_store(&db->sync_thread_active, 1);
+            if (pthread_create(&db->sync_thread, NULL, tidesdb_sync_worker_thread, db) != 0)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create sync worker thread for new CF");
+                atomic_store(&db->sync_thread_active, 0);
+            }
+            else
+            {
+                TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread started for CF '%s'", name);
+            }
+        }
+    }
 
     return TDB_SUCCESS;
 }

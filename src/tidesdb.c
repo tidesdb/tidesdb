@@ -46,13 +46,7 @@ size_t _tidesdb_log_truncate = 0;
 char _tidesdb_log_path[MAX_FILE_PATH_LENGTH] = {0};
 
 /* mutex to protect log file access during truncation */
-static pthread_mutex_t _tidesdb_log_mutex;
-static pthread_once_t _tidesdb_log_mutex_once = PTHREAD_ONCE_INIT;
-
-static void tidesdb_log_mutex_init(void)
-{
-    pthread_mutex_init(&_tidesdb_log_mutex, NULL);
-}
+static pthread_mutex_t _tidesdb_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * tidesdb_log_write
@@ -79,7 +73,6 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
                             : (level == TDB_LOG_ERROR) ? "ERROR"
                                                        : "FATAL";
 
-    pthread_once(&_tidesdb_log_mutex_once, tidesdb_log_mutex_init);
     pthread_mutex_lock(&_tidesdb_log_mutex);
 
     FILE *log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;
@@ -107,7 +100,7 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
                 _tidesdb_log_file = fopen(_tidesdb_log_path, "w");
                 if (_tidesdb_log_file)
                 {
-                    setvbuf(_tidesdb_log_file, NULL, _IOLBF, 0);
+                    tdb_setlinebuf(_tidesdb_log_file);
                     fprintf(_tidesdb_log_file, "[LOG TRUNCATED - exceeded %zu bytes]\n",
                             _tidesdb_log_truncate);
                     fflush(_tidesdb_log_file);
@@ -9714,7 +9707,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         {
             _tidesdb_log_file = (*db)->log_file;
             /* we must set line buffering for better real-time logging */
-            setvbuf((*db)->log_file, NULL, _IOLBF, 0);
+            tdb_setlinebuf((*db)->log_file);
 
             /* we set up log truncation if configured */
             _tidesdb_log_truncate = config->log_truncation_at;
@@ -10604,7 +10597,6 @@ int tidesdb_close(tidesdb_t *db)
     TDB_DEBUG_LOG(TDB_LOG_INFO, "TidesDB closed successfully");
 
     /* we close log file if it was opened (protected by log mutex) */
-    pthread_once(&_tidesdb_log_mutex_once, tidesdb_log_mutex_init);
     pthread_mutex_lock(&_tidesdb_log_mutex);
     if (_tidesdb_log_file)
     {

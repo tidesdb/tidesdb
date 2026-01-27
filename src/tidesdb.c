@@ -20,6 +20,7 @@
 #include "tidesdb.h"
 
 #include <errno.h>
+#include <stdarg.h>
 
 #include "xxhash.h"
 
@@ -45,27 +46,61 @@ size_t _tidesdb_log_truncate = 0;
 char _tidesdb_log_path[MAX_FILE_PATH_LENGTH] = {0};
 
 /**
- * _tidesdb_check_log_truncation
- * checks if log file exceeds truncation threshold and truncates if needed
+ * _tidesdb_log_write
+ * writes a log message to the log file or stderr
+ * handles truncation if configured
+ * @param level log level
+ * @param file source file name
+ * @param line source line number
+ * @param fmt format string
+ * @param ... format arguments
  */
-void _tidesdb_check_log_truncation(void)
+void _tidesdb_log_write(const int level, const char *file, const int line, const char *fmt, ...)
 {
-    if (_tidesdb_log_truncate == 0 || _tidesdb_log_file == NULL || _tidesdb_log_path[0] == '\0')
-        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
 
-    long current_pos = ftell(_tidesdb_log_file);
-    if (current_pos < 0) return;
+    const time_t sec = ts.tv_sec;
+    struct tm tm_info;
+    tdb_localtime(&sec, &tm_info);
 
-    if ((size_t)current_pos >= _tidesdb_log_truncate)
+    const char *level_str = (level == TDB_LOG_DEBUG)   ? "DEBUG"
+                            : (level == TDB_LOG_INFO)  ? "INFO"
+                            : (level == TDB_LOG_WARN)  ? "WARN"
+                            : (level == TDB_LOG_ERROR) ? "ERROR"
+                                                       : "FATAL";
+
+    FILE *log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;
+
+    fprintf(log_out, "[%02d:%02d:%02d.%03d] [%s] %s:%d: ", tm_info.tm_hour, tm_info.tm_min,
+            tm_info.tm_sec, (int)(ts.tv_nsec / 1000000), level_str, file, line);
+
+    va_list args;
+    va_start(args, fmt);
+    if (fmt) vfprintf(log_out, fmt, args);
+    va_end(args);
+
+    fprintf(log_out, "\n");
+
+    if (_tidesdb_log_file)
     {
-        fclose(_tidesdb_log_file);
-        _tidesdb_log_file = fopen(_tidesdb_log_path, "w");
-        if (_tidesdb_log_file)
+        fflush(_tidesdb_log_file);
+
+        if (_tidesdb_log_truncate > 0 && _tidesdb_log_path[0] != '\0')
         {
-            setvbuf(_tidesdb_log_file, NULL, _IOLBF, 0);
-            fprintf(_tidesdb_log_file, "[LOG TRUNCATED - exceeded %zu bytes]\n",
-                    _tidesdb_log_truncate);
-            fflush(_tidesdb_log_file);
+            const long current_pos = ftell(_tidesdb_log_file);
+            if (current_pos > 0 && (size_t)current_pos >= _tidesdb_log_truncate)
+            {
+                fclose(_tidesdb_log_file);
+                _tidesdb_log_file = fopen(_tidesdb_log_path, "w");
+                if (_tidesdb_log_file)
+                {
+                    setvbuf(_tidesdb_log_file, NULL, _IOLBF, 0);
+                    fprintf(_tidesdb_log_file, "[LOG TRUNCATED - exceeded %zu bytes]\n",
+                            _tidesdb_log_truncate);
+                    fflush(_tidesdb_log_file);
+                }
+            }
         }
     }
 }
@@ -11286,8 +11321,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
             /* we update the manifest's internal path to the new location
              *** note -- fp was already closed before rename for Windows compatibility */
             pthread_rwlock_wrlock(&cf->manifest->lock);
-            strncpy(cf->manifest->path, manifest_path, MANIFEST_PATH_LEN - 1);
-            cf->manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
+            memcpy(cf->manifest->path, manifest_path, sizeof(manifest_path));
             pthread_rwlock_unlock(&cf->manifest->lock);
 
             /* commit manifest to new location to ensure it's written */
@@ -12471,7 +12505,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         int result = TDB_ERR_UNKNOWN;
         for (int i = (int)immutable_count - 1; i >= 0; i--)
         {
-            tidesdb_immutable_memtable_t *immutable = immutable_refs[i];
+            const tidesdb_immutable_memtable_t *immutable = immutable_refs[i];
             if (immutable && immutable->skip_list)
             {
                 if (skip_list_get_with_seq(immutable->skip_list, key, key_size, &temp_value,

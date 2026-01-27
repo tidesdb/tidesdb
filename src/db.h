@@ -174,7 +174,8 @@ typedef struct tidesdb_column_family_config_t
  * TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE)
  * @param block_cache_size size of clock cache for hot sstable blocks
  * @param max_open_sstables maximum number of open sstables
- * @param log_to_file flag to determine if debug logging should be written to a file
+ * @param log_to_file flag to determine if debug logging should be written to a file\
+ * @param log_truncation_at log file truncation threshold (0 = no truncation)
  */
 typedef struct tidesdb_config_t
 {
@@ -185,6 +186,7 @@ typedef struct tidesdb_config_t
     size_t block_cache_size;
     size_t max_open_sstables;
     int log_to_file;
+    size_t log_truncation_at;
 } tidesdb_config_t;
 
 /**

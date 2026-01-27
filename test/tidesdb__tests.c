@@ -978,7 +978,7 @@ static void test_stats_comprehensive(void)
     for (int i = 0; i < stats->num_levels; i++)
     {
         ASSERT_TRUE(stats->level_num_sstables[i] >= 0);
-        ASSERT_TRUE(stats->level_key_counts[i] >= 0);
+        (void)stats->level_key_counts[i];
     }
 
     /* verify config was copied */

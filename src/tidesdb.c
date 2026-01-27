@@ -10111,8 +10111,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     pthread_mutex_init(&(*db)->sync_thread_mutex, NULL);
     pthread_cond_init(&(*db)->sync_thread_cond, NULL);
 
-    if (needs_sync_thread)
+    if (needs_sync_thread && !atomic_load(&(*db)->sync_thread_active))
     {
+        /* we only start if not already started during recovery by tidesdb_create_column_family */
         atomic_store(&(*db)->sync_thread_active, 1);
         if (pthread_create(&(*db)->sync_thread, NULL, tidesdb_sync_worker_thread, *db) != 0)
         {
@@ -10127,7 +10128,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread created");
         }
     }
-    else
+    else if (!needs_sync_thread && !atomic_load(&(*db)->sync_thread_active))
     {
         atomic_store(&(*db)->sync_thread_active, 0);
     }
@@ -11020,8 +11021,10 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Created CF '%s' (total: %d)", name, db->num_column_families);
 
-    /* we start sync thread if this CF needs interval syncing and thread isn't running */
-    if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us > 0)
+    /* we start sync thread if this CF needs interval syncing and thread isn't running
+     * but not during recovery -- tidesdb_open will handle thread creation after recovery */
+    if (config->sync_mode == TDB_SYNC_INTERVAL && config->sync_interval_us > 0 &&
+        !atomic_load(&db->is_recovering))
     {
         if (!atomic_load(&db->sync_thread_active))
         {
@@ -12583,6 +12586,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     for (int level_num = 0; level_num < num_levels; level_num++)
     {
+    retry_level:
         PROFILE_INC(txn->db, levels_searched);
         tidesdb_level_t *level = cf->levels[level_num];
 
@@ -12621,10 +12625,13 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
             /* we try to take ref for ssts we will check
              * we use try_ref to safely handle concurrent removal -- if refcount is 0,
-             * the sstable is being freed and we must skip it */
+             * the sstable is being freed and we must skip it
+             **********************************************************************
+             *** when try_ref fails, the array may have been swapped with a new one
+             * containing the merged sstable, so we must retry the entire level */
             if (!tidesdb_sstable_try_ref(sst))
             {
-                continue; /* sstable is being freed, skip it */
+                goto retry_level;
             }
 
             tidesdb_kv_pair_t *candidate_kv = NULL;

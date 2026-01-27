@@ -46,13 +46,13 @@ extern FILE *_tidesdb_log_file;      /* log file pointer (NULL = stderr, non-NUL
 extern size_t _tidesdb_log_truncate; /* truncate log file at this size (0 = no truncation) */
 extern char _tidesdb_log_path[MAX_FILE_PATH_LENGTH]; /* path to log file for truncation */
 
-void _tidesdb_log_write(int level, const char *file, int line, const char *fmt, ...);
+void tidesdb_log_write(int level, const char *file, int line, const char *fmt, ...);
 
 #define TDB_DEBUG_LOG(level, fmt, ...)                                           \
     do                                                                           \
     {                                                                            \
         if ((level) >= _tidesdb_log_level && _tidesdb_log_level != TDB_LOG_NONE) \
-            _tidesdb_log_write((level), __FILE__, __LINE__, fmt, ##__VA_ARGS__); \
+            tidesdb_log_write((level), __FILE__, __LINE__, fmt, ##__VA_ARGS__);  \
     } while (0)
 
 /**

@@ -10,9 +10,7 @@ if(TIDESDB_WITH_MIMALLOC)
     list(APPEND VCPKG_MANIFEST_FEATURES "mimalloc")
 endif()
 
-if(TIDESDB_WITH_TCMALLOC)
-    list(APPEND VCPKG_MANIFEST_FEATURES "tcmalloc")
-endif()
+# tcmalloc vcpkg feature not needed - tcmalloc is not supported on Windows
 
 project(tidesdb C)
 
@@ -201,10 +199,7 @@ elseif(WIN32)
         target_link_libraries(tidesdb PUBLIC mimalloc)
     endif()
 
-    if(TIDESDB_WITH_TCMALLOC)
-        target_link_libraries(tidesdb PUBLIC ${TCMALLOC_LIBRARIES})
-        target_include_directories(tidesdb PUBLIC ${TCMALLOC_INCLUDE_DIRS})
-    endif()
+    # tcmalloc is not supported on Windows
 elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     # FreeBSD packages installed in /usr/local
     target_include_directories(tidesdb PUBLIC /usr/local/include)

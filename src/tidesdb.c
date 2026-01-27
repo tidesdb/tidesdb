@@ -46,7 +46,13 @@ size_t _tidesdb_log_truncate = 0;
 char _tidesdb_log_path[MAX_FILE_PATH_LENGTH] = {0};
 
 /* mutex to protect log file access during truncation */
-static pthread_mutex_t _tidesdb_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t _tidesdb_log_mutex;
+static pthread_once_t _tidesdb_log_mutex_once = PTHREAD_ONCE_INIT;
+
+static void _tidesdb_log_mutex_init(void)
+{
+    pthread_mutex_init(&_tidesdb_log_mutex, NULL);
+}
 
 /**
  * _tidesdb_log_write
@@ -73,6 +79,7 @@ void _tidesdb_log_write(const int level, const char *file, const int line, const
                             : (level == TDB_LOG_ERROR) ? "ERROR"
                                                        : "FATAL";
 
+    pthread_once(&_tidesdb_log_mutex_once, _tidesdb_log_mutex_init);
     pthread_mutex_lock(&_tidesdb_log_mutex);
 
     FILE *log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;
@@ -10597,6 +10604,7 @@ int tidesdb_close(tidesdb_t *db)
     TDB_DEBUG_LOG(TDB_LOG_INFO, "TidesDB closed successfully");
 
     /* close log file if it was opened (protected by log mutex) */
+    pthread_once(&_tidesdb_log_mutex_once, _tidesdb_log_mutex_init);
     pthread_mutex_lock(&_tidesdb_log_mutex);
     if (_tidesdb_log_file)
     {

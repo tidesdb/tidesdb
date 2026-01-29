@@ -169,12 +169,13 @@ static inline int64_t skip_list_get_current_time(const skip_list_t *list)
         printf("skip_list_get_current_time: cached_time ptr is NULL\n");
         return (int64_t)time(NULL);
     }
-    time_t cached = atomic_load_explicit(list->cached_time, memory_order_acquire);
+    time_t cached = atomic_load_explicit(list->cached_time, memory_order_seq_cst);
     if (cached <= 0)
     {
         printf("skip_list_get_current_time: cached value is %ld (invalid)\n", (long)cached);
         return (int64_t)time(NULL);
     }
+    printf("skip_list_get_current_time: cached=%ld\n", (long)cached);
     return (int64_t)cached;
 }
 

@@ -9397,7 +9397,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
     while (atomic_load(&db->sstable_reaper_active))
     {
-        atomic_store(&db->cached_current_time, time(NULL));
+        atomic_store_explicit(&db->cached_current_time, time(NULL), memory_order_seq_cst);
 
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -10012,8 +10012,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     }
 
     /* we initialize cached_current_time before recovery so skip lists created during
-     * recovery have a valid time pointer for TTL checks */
-    atomic_store(&(*db)->cached_current_time, time(NULL));
+     * recovery have a valid time pointer for TTL checks
+     * use seq_cst for strongest memory ordering on all platforms */
+    atomic_store_explicit(&(*db)->cached_current_time, time(NULL), memory_order_seq_cst);
 
     int rc = tidesdb_recover_database(*db);
     if (rc != TDB_SUCCESS)

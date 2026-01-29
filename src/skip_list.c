@@ -161,16 +161,15 @@ static inline int64_t skip_list_get_current_time(const skip_list_t *list)
 {
     if (list != NULL && list->cached_time != NULL)
     {
-        /* we use volatile pointer cast to avoid platform-specific issues with
-         * atomic_load on _Atomic(time_t)* on 32-bit MinGW/GCC */
-        const volatile time_t *time_ptr = (volatile time_t *)list->cached_time;
-        const time_t cached = *time_ptr;
+        time_t cached = atomic_load_explicit(list->cached_time, memory_order_acquire);
         /* we validate cached time is reasonable (not 0 or negative) */
-        if (cached > 0)
-        {
-            return (int64_t)cached;
-        }
+        // if (cached > 0)
+        // {
+        //     return (int64_t)cached;
+        // }
+        printf("cached time: %ld\n", cached);
     }
+    printf("sys time: %ld\n", time(NULL)); // just temp for mingw x86
     return (int64_t)time(NULL);
 }
 

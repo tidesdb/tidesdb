@@ -10011,6 +10011,10 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Block clock cache disabled (block_cache_size=0)");
     }
 
+    /* we initialize cached_current_time before recovery so skip lists created during
+     * recovery have a valid time pointer for TTL checks */
+    atomic_store(&(*db)->cached_current_time, time(NULL));
+
     int rc = tidesdb_recover_database(*db);
     if (rc != TDB_SUCCESS)
     {
@@ -10171,8 +10175,6 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     {
         atomic_store(&(*db)->sync_thread_active, 0);
     }
-
-    atomic_store(&(*db)->cached_current_time, time(NULL));
 
     pthread_mutex_init(&(*db)->reaper_thread_mutex, NULL);
     pthread_cond_init(&(*db)->reaper_thread_cond, NULL);
@@ -11454,7 +11456,8 @@ static int wait_for_open(tidesdb_t *db)
      * and prevents transactions from starting during recovery */
     int wait_count = 0;
 
-    while (!atomic_load(&db->is_open) || atomic_load(&db->is_recovering))
+    while (!atomic_load_explicit(&db->is_open, memory_order_acquire) ||
+           atomic_load_explicit(&db->is_recovering, memory_order_acquire))
     {
         if (wait_count >= TDB_OPENING_WAIT_MAX_MS)
         {

@@ -9397,7 +9397,9 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
     while (atomic_load(&db->sstable_reaper_active))
     {
-        time_t now = time(NULL);
+        struct timespec now_ts;
+        clock_gettime(CLOCK_REALTIME, &now_ts);
+        time_t now = now_ts.tv_sec;
         atomic_store_explicit(&db->cached_current_time, now, memory_order_seq_cst);
         printf("reaper: ptr=%p, updated cached_current_time to %ld\n",
                (void *)&db->cached_current_time, (long)now);

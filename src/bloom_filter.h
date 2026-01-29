@@ -56,6 +56,17 @@ int bloom_filter_new(bloom_filter_t **bf, double p, int n);
 void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, size_t size);
 
 /**
+ * bloom_filter_add_batch
+ * adds multiple entries to the bloom filter in a batch for better cache locality
+ * @param bf the bloom filter to add to
+ * @param entries array of entry pointers
+ * @param sizes array of entry sizes
+ * @param count number of entries to add
+ */
+void bloom_filter_add_batch(const bloom_filter_t *bf, const uint8_t **entries, const size_t *sizes,
+                            size_t count);
+
+/**
  * bloom_filter_contains
  * checks if an entry is in the bloom filter
  * @param bf the bloom filter to check

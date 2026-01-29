@@ -10,12 +10,10 @@ if(TIDESDB_WITH_MIMALLOC)
     list(APPEND VCPKG_MANIFEST_FEATURES "mimalloc")
 endif()
 
-# tcmalloc vcpkg feature not needed - tcmalloc is not supported on Windows
-
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 7.4.2)
+set(PROJECT_VERSION 7.4.3)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -329,6 +327,25 @@ install(TARGETS tidesdb
 install(DIRECTORY src/ DESTINATION include/tidesdb FILES_MATCHING PATTERN "*.h")
 install(FILES external/ini.h external/xxhash.h DESTINATION include/tidesdb)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h" DESTINATION include/tidesdb)
+
+# we create consolidated include directory in build tree for easy consumption
+# this allows consumers to use -I<build_dir>/include and #include <tidesdb/tidesdb.h>
+set(BUILD_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/include/tidesdb")
+file(MAKE_DIRECTORY ${BUILD_INCLUDE_DIR})
+
+# copy all public headers to build include directory
+file(GLOB SRC_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h")
+file(GLOB EXT_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/external/*.h")
+file(COPY ${SRC_HEADERS} DESTINATION ${BUILD_INCLUDE_DIR})
+file(COPY ${EXT_HEADERS} DESTINATION ${BUILD_INCLUDE_DIR})
+
+# copy generated version header (done at build time since it's generated)
+add_custom_command(TARGET tidesdb POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_BINARY_DIR}/tidesdb_version.h"
+        "${BUILD_INCLUDE_DIR}/tidesdb_version.h"
+        COMMENT "Copying tidesdb_version.h to build include directory"
+)
 
 if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     enable_testing()

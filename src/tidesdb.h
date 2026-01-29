@@ -141,6 +141,10 @@ typedef struct
 } tidesdb_read_stats_t;
 #endif
 
+/* similar to relational database systems like oracle, where table and column names are limited to
+ * 128 characters */
+#define TDB_MAX_CF_NAME_LEN 128
+
 /**
  * tidesdb_sync_mode_t
  * synchronization modes
@@ -366,6 +370,7 @@ struct tidesdb_column_family_t
  * @param id unique identifier
  * @param klog_path path to .klog file
  * @param vlog_path path to .vlog file
+ * @param cf_name cached column family name for block cache lookups
  * @param min_key minimum key in this sstable
  * @param min_key_size size of minimum key
  * @param max_key maximum key in this sstable
@@ -392,6 +397,7 @@ struct tidesdb_sstable_t
     uint64_t id;
     char *klog_path;
     char *vlog_path;
+    char cf_name[TDB_MAX_CF_NAME_LEN];
     uint8_t *min_key;
     size_t min_key_size;
     uint8_t *max_key;

@@ -10740,7 +10740,7 @@ static void test_multiple_databases_concurrent_operations(void)
                     skip_list_t *mt = mt_wrapper ? mt_wrapper->skip_list : NULL;
                     uint8_t *direct_value = NULL;
                     size_t direct_value_size = 0;
-                    time_t ttl = 0;
+                    int64_t ttl = 0;
                     uint8_t deleted = 0;
                     uint64_t seq = 0;
                     int direct_result = mt ? skip_list_get_with_seq(

@@ -512,6 +512,80 @@ void benchmark_bloom_filter()
     (void)bloom_filter_free(bf);
 }
 
+void test_bloom_filter_add_batch()
+{
+    bloom_filter_t *bf;
+    (void)bloom_filter_new(&bf, 0.01, 1000);
+
+    /* we test batch add with multiple keys */
+    const char *keys[] = {"batch_key1", "batch_key2", "batch_key3", "batch_key4", "batch_key5"};
+    const uint8_t *entries[5];
+    size_t sizes[5];
+
+    for (int i = 0; i < 5; i++)
+    {
+        entries[i] = (const uint8_t *)keys[i];
+        sizes[i] = strlen(keys[i]);
+    }
+
+    bloom_filter_add_batch(bf, entries, sizes, 5);
+
+    /* we verify all batch-added keys are found */
+    for (int i = 0; i < 5; i++)
+    {
+        ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)keys[i], strlen(keys[i])), 1);
+    }
+
+    /* we verify non-existent key is not found */
+    ASSERT_EQ(bloom_filter_contains(bf, (const uint8_t *)"nonexistent", 11), 0);
+
+    (void)bloom_filter_free(bf);
+}
+
+void test_bloom_filter_batch_vs_single()
+{
+    /* we verify batch add produces same results as single add */
+    bloom_filter_t *bf_single;
+    bloom_filter_t *bf_batch;
+    (void)bloom_filter_new(&bf_single, 0.01, 1000);
+    (void)bloom_filter_new(&bf_batch, 0.01, 1000);
+
+    const char *keys[] = {"key_a", "key_b", "key_c", "key_d", "key_e"};
+    const uint8_t *entries[5];
+    size_t sizes[5];
+
+    /* we add to single filter one at a time */
+    for (int i = 0; i < 5; i++)
+    {
+        entries[i] = (const uint8_t *)keys[i];
+        sizes[i] = strlen(keys[i]);
+        bloom_filter_add(bf_single, entries[i], sizes[i]);
+    }
+
+    /* we add to batch filter all at once */
+    bloom_filter_add_batch(bf_batch, entries, sizes, 5);
+
+    /* we verify both filters have same results */
+    for (int i = 0; i < 5; i++)
+    {
+        ASSERT_EQ(bloom_filter_contains(bf_single, entries[i], sizes[i]), 1);
+        ASSERT_EQ(bloom_filter_contains(bf_batch, entries[i], sizes[i]), 1);
+    }
+
+    /* we verify bitsets are identical */
+    ASSERT_EQ(bf_single->m, bf_batch->m);
+    ASSERT_EQ(bf_single->h, bf_batch->h);
+    ASSERT_EQ(bf_single->size_in_words, bf_batch->size_in_words);
+
+    for (unsigned int i = 0; i < bf_single->size_in_words; i++)
+    {
+        ASSERT_EQ(bf_single->bitset[i], bf_batch->bitset[i]);
+    }
+
+    (void)bloom_filter_free(bf_single);
+    (void)bloom_filter_free(bf_batch);
+}
+
 int main(void)
 {
     RUN_TEST(test_bloom_filter_new, tests_passed);
@@ -529,6 +603,8 @@ int main(void)
     RUN_TEST(test_bloom_filter_binary_keys, tests_passed);
     RUN_TEST(test_bloom_filter_free_null, tests_passed);
     RUN_TEST(test_bloom_filter_large_capacity_random_keys, tests_passed);
+    RUN_TEST(test_bloom_filter_add_batch, tests_passed);
+    RUN_TEST(test_bloom_filter_batch_vs_single, tests_passed);
     RUN_TEST(benchmark_bloom_filter, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

@@ -423,6 +423,102 @@ int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *bl
     return offset;
 }
 
+int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t **blocks,
+                                    const size_t count, int64_t *offsets)
+{
+    if (BM_UNLIKELY(!bm || !blocks || count == 0 || !offsets)) return -1;
+
+    /* we calculate total size needed for all blocks */
+    size_t total_batch_size = 0;
+    for (size_t i = 0; i < count; i++)
+    {
+        if (!blocks[i]) continue;
+        if (blocks[i]->size > UINT32_MAX) return -1;
+
+        const size_t block_total =
+            BLOCK_MANAGER_BLOCK_HEADER_SIZE + blocks[i]->size + BLOCK_MANAGER_FOOTER_SIZE;
+        total_batch_size += block_total;
+    }
+
+    if (total_batch_size == 0) return 0;
+
+    /* we atomically allocate space for all blocks at once */
+    const int64_t base_offset = (int64_t)atomic_fetch_add(&bm->current_file_size, total_batch_size);
+
+    /* we allocate combined buffer for all blocks */
+    unsigned char *write_buffer = malloc(total_batch_size);
+    if (!write_buffer) return -1;
+
+    /* we serialize all blocks into the combined buffer */
+    size_t buf_offset = 0;
+    int64_t current_offset = base_offset;
+    int success_count = 0;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        if (!blocks[i])
+        {
+            offsets[i] = -1;
+            continue;
+        }
+
+        block_manager_block_t *block = blocks[i];
+        const size_t block_total =
+            BLOCK_MANAGER_BLOCK_HEADER_SIZE + block->size + BLOCK_MANAGER_FOOTER_SIZE;
+
+        /* we record offset for this block */
+        offsets[i] = current_offset;
+
+        /* we compute checksum */
+        const uint32_t checksum = compute_checksum(block->data, block->size);
+
+        /* we serialize block: [size(4)][checksum(4)][data][size(4)][magic(4)] */
+        encode_uint32_le_compat(write_buffer + buf_offset, (uint32_t)block->size);
+        buf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
+
+        encode_uint32_le_compat(write_buffer + buf_offset, checksum);
+        buf_offset += BLOCK_MANAGER_CHECKSUM_LENGTH;
+
+        memcpy(write_buffer + buf_offset, block->data, block->size);
+        buf_offset += block->size;
+
+        /* we write footer */
+        encode_uint32_le_compat(write_buffer + buf_offset, (uint32_t)block->size);
+        buf_offset += 4;
+
+        encode_uint32_le_compat(write_buffer + buf_offset, BLOCK_MANAGER_FOOTER_MAGIC);
+        buf_offset += 4;
+
+        current_offset += (int64_t)block_total;
+        success_count++;
+    }
+
+    /* we perform single atomic write for all blocks */
+    const ssize_t written = pwrite(bm->fd, write_buffer, total_batch_size, base_offset);
+    free(write_buffer);
+
+    if (written != (ssize_t)total_batch_size)
+    {
+        /* we mark all offsets as failed */
+        for (size_t i = 0; i < count; i++)
+        {
+            offsets[i] = -1;
+        }
+        return -1;
+    }
+
+    /* we sync if needed */
+    if (is_sync_full(bm) && !odsync_available())
+    {
+        if (fdatasync(bm->fd) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return success_count;
+}
+
 void block_manager_block_free(block_manager_block_t *block)
 {
     if (!block) return;
@@ -672,6 +768,23 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
     }
 
     /* we don't verify checksum for partial reads since we don't have full data */
+    return block;
+}
+
+block_manager_block_t *block_manager_cursor_read_and_advance(block_manager_cursor_t *cursor)
+{
+    if (!cursor) return NULL;
+
+    block_manager_block_t *block =
+        block_manager_read_block_at_offset(cursor->bm, cursor->current_pos);
+    if (!block) return NULL;
+
+    /* we advance cursor using the block size we just read, avoiding redundant pread */
+    cursor->current_block_size = block->size;
+    cursor->current_pos +=
+        BLOCK_MANAGER_BLOCK_HEADER_SIZE + block->size + BLOCK_MANAGER_FOOTER_SIZE;
+    cursor->block_index++;
+
     return block;
 }
 

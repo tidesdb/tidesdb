@@ -47,7 +47,7 @@
 #define tdb_strdup(s) strdup(s)
 #endif
 
-/* cross-platform line buffering - Windows doesn't support _IOLBF properly with NULL buffer */
+/* cross-platform line buffering -- Windows doesn't support _IOLBF properly with NULL buffer */
 #if defined(_MSC_VER)
 #define tdb_setlinebuf(stream) setvbuf((stream), NULL, _IONBF, 0)
 #else
@@ -3043,6 +3043,27 @@ static inline int tdb_get_cpu_count(void)
         return (int)count;
     }
     return 4; /* fallback */
+#endif
+}
+
+/*
+ * tdb_get_current_time
+ * cross-platform function to get current Unix timestamp in seconds
+ * @return current Unix timestamp in seconds
+ */
+static inline time_t tdb_get_current_time(void)
+{
+#if defined(_WIN32)
+    SYSTEMTIME st;
+    FILETIME ft;
+    GetSystemTime(&st);
+    SystemTimeToFileTime(&st, &ft);
+    ULARGE_INTEGER ui;
+    ui.LowPart = ft.dwLowDateTime;
+    ui.HighPart = ft.dwHighDateTime;
+    return (time_t)((ui.QuadPart - 116444736000000000ULL) / 10000000ULL);
+#else
+    return time(NULL);
 #endif
 }
 

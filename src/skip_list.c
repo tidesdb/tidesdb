@@ -157,28 +157,13 @@ static inline int skip_list_compare_keys_inline(const skip_list_t *list, const u
  * @param list skip list (may be NULL)
  * @return current time as int64_t for consistent 64-bit handling
  */
-static inline int64_t skip_list_get_current_time(const skip_list_t *list)
+static inline time_t skip_list_get_current_time(const skip_list_t *list)
 {
-    if (list == NULL)
+    if (list != NULL && list->cached_time != NULL)
     {
-        printf("skip_list_get_current_time: list is NULL\n");
-        return (int64_t)tdb_get_current_time();
+        return atomic_load_explicit(list->cached_time, memory_order_relaxed);
     }
-    if (list->cached_time == NULL)
-    {
-        printf("skip_list_get_current_time: cached_time ptr is NULL\n");
-        return (int64_t)tdb_get_current_time();
-    }
-    time_t cached = atomic_load_explicit(list->cached_time, memory_order_seq_cst);
-    time_t sys_now = tdb_get_current_time();
-    printf("skip_list_get_current_time: ptr=%p, cached=%ld, sys_time=%ld\n",
-           (void *)list->cached_time, (long)cached, (long)sys_now);
-    fflush(stdout);
-    if (cached <= 0)
-    {
-        return (int64_t)sys_now;
-    }
-    return (int64_t)cached;
+    return (int64_t)time(NULL);
 }
 
 /**

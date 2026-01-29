@@ -12543,17 +12543,22 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         active_mt, key, key_size, &temp_value, &temp_value_size, &ttl, &deleted, &found_seq,
         snapshot_seq, visibility_check, txn->db->commit_status);
 
+    printf("tidesdb_txn_get: memtable_result=%d, deleted=%d, ttl=%ld, now=%ld\n", memtable_result,
+           deleted, (long)ttl, (long)now);
+
     if (memtable_result == 0)
     {
         if (deleted)
         {
             /* we found a tombstone in active memtable, key is deleted */
+            printf("tidesdb_txn_get: key marked as deleted/expired by skip_list\n");
             free(temp_value);
             return TDB_ERR_NOT_FOUND;
         }
 
         if (ttl <= 0 || ttl > now)
         {
+            printf("tidesdb_txn_get: key valid (ttl<=0 or ttl>now)\n");
             *value = temp_value;
             *value_size = temp_value_size;
 
@@ -12562,6 +12567,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             return TDB_SUCCESS;
         }
 
+        printf("tidesdb_txn_get: TTL expired (ttl=%ld <= now=%ld)\n", (long)ttl, (long)now);
         /* TTL expired */
         free(temp_value);
         /* fall through to check immutables */

@@ -159,18 +159,23 @@ static inline int skip_list_compare_keys_inline(const skip_list_t *list, const u
  */
 static inline int64_t skip_list_get_current_time(const skip_list_t *list)
 {
-    if (list != NULL && list->cached_time != NULL)
+    if (list == NULL)
     {
-        time_t cached = atomic_load_explicit(list->cached_time, memory_order_acquire);
-        /* we validate cached time is reasonable (not 0 or negative) */
-        // if (cached > 0)
-        // {
-        //     return (int64_t)cached;
-        // }
-        printf("cached time: %ld\n", cached);
+        printf("skip_list_get_current_time: list is NULL\n");
+        return (int64_t)time(NULL);
     }
-    printf("sys time: %ld\n", time(NULL)); // just temp for mingw x86
-    return (int64_t)time(NULL);
+    if (list->cached_time == NULL)
+    {
+        printf("skip_list_get_current_time: cached_time ptr is NULL\n");
+        return (int64_t)time(NULL);
+    }
+    time_t cached = atomic_load_explicit(list->cached_time, memory_order_acquire);
+    if (cached <= 0)
+    {
+        printf("skip_list_get_current_time: cached value is %ld (invalid)\n", (long)cached);
+        return (int64_t)time(NULL);
+    }
+    return (int64_t)cached;
 }
 
 /**
@@ -1852,13 +1857,19 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
     /* always set ttl if provided */
     if (ttl != NULL) *ttl = version->ttl;
 
-    if (version->ttl > 0 && version->ttl <= skip_list_get_current_time(list))
+    if (version->ttl > 0)
     {
-        if (deleted != NULL) *deleted = 1;
-        *value = NULL;
-        *value_size = 0;
-        if (seq != NULL) *seq = atomic_load_explicit(&version->seq, memory_order_acquire);
-        return 0; /* return success but mark as expired/deleted */
+        int64_t current_time = skip_list_get_current_time(list);
+        printf("skip_list_get_with_seq: ttl=%ld, current_time=%ld, expired=%d\n",
+               (long)version->ttl, (long)current_time, version->ttl <= current_time);
+        if (version->ttl <= current_time)
+        {
+            if (deleted != NULL) *deleted = 1;
+            *value = NULL;
+            *value_size = 0;
+            if (seq != NULL) *seq = atomic_load_explicit(&version->seq, memory_order_acquire);
+            return 0; /* return success but mark as expired/deleted */
+        }
     }
 
     uint8_t is_deleted = VERSION_IS_DELETED(version);

@@ -246,12 +246,9 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_NANOSECONDS_PER_SECOND      1000000000
 #define TDB_NANOSECONDS_PER_MICROSECOND 1000
 
-#define TDB_MAX_TXN_CFS  256
-#define TDB_MAX_PATH_LEN 4096
-#define TDB_MAX_TXN_OPS  100000
-/* similar to relational database systems like oracle, where table and column names are limited to
- * 128 characters */
-#define TDB_MAX_CF_NAME_LEN                     128
+#define TDB_MAX_TXN_CFS                         256
+#define TDB_MAX_PATH_LEN                        4096
+#define TDB_MAX_TXN_OPS                         100000
 #define TDB_MEMORY_PERCENTAGE                   0.6
 #define TDB_MIN_KEY_VALUE_SIZE                  (1024 * 1024)
 #define TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY 32
@@ -2611,6 +2608,12 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
     snprintf(sst->vlog_path, path_len, "%s_" TDB_U64_FMT TDB_SSTABLE_VLOG_EXT, base_path,
              TDB_U64_CAST(id));
 
+    /* we cache CF name from path to avoid repeated parsing during reads */
+    if (tidesdb_get_cf_name_from_path(sst->klog_path, sst->cf_name) != 0)
+    {
+        sst->cf_name[0] = '\0'; /* fallback: empty string if extraction fails */
+    }
+
     return sst;
 }
 
@@ -3933,9 +3936,9 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         return TDB_ERR_NOT_FOUND;
     }
 
-    /* we iterate through klog blocks */
-    char cf_name[TDB_CACHE_KEY_SIZE];
-    const int has_cf_name = (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) == 0);
+    /* we use cached CF name from sst struct to avoid repeated path parsing */
+    const char *cf_name = sst->cf_name;
+    const int has_cf_name = (cf_name[0] != '\0');
 
     uint64_t blocks_scanned = 0;
     int used_block_index = (start_file_position > 0);
@@ -3990,7 +3993,26 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                 }
             }
 
-            /* we binary search for key in block */
+            /* we check first key before binary search to avoid O(log n) comparisons
+             * when key is below blocks range */
+            const int first_key_cmp =
+                comparator_fn(key, key_size, klog_block->keys[0], klog_block->entries[0].key_size,
+                              comparator_ctx);
+            if (first_key_cmp < 0)
+            {
+                if (used_block_index)
+                {
+                    used_block_index = 0;
+                    restart_scan = 1;
+                }
+                else
+                {
+                    should_stop_search = 1;
+                }
+                goto release_and_next;
+            }
+
+            /* we binary search for key in block (key is within block range) */
             int32_t found_idx = -1;
             if (tidesdb_klog_block_find_key(klog_block, key, key_size, comparator_fn,
                                             comparator_ctx, &found_idx) == 0)
@@ -4015,23 +4037,6 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                     if (raw_block) block_manager_block_release(raw_block);
 
                     return TDB_SUCCESS;
-                }
-            }
-
-            /* we check for early termination */
-            const int first_key_cmp =
-                comparator_fn(key, key_size, klog_block->keys[0], klog_block->entries[0].key_size,
-                              comparator_ctx);
-            if (first_key_cmp < 0)
-            {
-                if (used_block_index)
-                {
-                    used_block_index = 0;
-                    restart_scan = 1;
-                }
-                else
-                {
-                    should_stop_search = 1;
                 }
             }
         }
@@ -14597,8 +14602,8 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
         block_manager_cursor_goto_first(cursor);
     }
 
-    char cf_name[TDB_CACHE_KEY_SIZE];
-    const int has_cf_name = (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) == 0);
+    const char *cf_name = sst->cf_name;
+    const int has_cf_name = (cf_name[0] != '\0');
 
     int blocks_scanned = 0;
 
@@ -14728,8 +14733,9 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
         block_manager_cursor_goto_first(cursor);
     }
 
-    char cf_name[TDB_CACHE_KEY_SIZE];
-    const int has_cf_name = (tidesdb_get_cf_name_from_path(sst->klog_path, cf_name) == 0);
+    /* we use cached CF name from SSTable struct to avoid repeated path parsing */
+    const char *cf_name = sst->cf_name;
+    const int has_cf_name = (cf_name[0] != '\0');
 
     tidesdb_klog_block_t *last_valid_block = NULL;
     int last_valid_idx = -1;

@@ -1565,7 +1565,7 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
     /* always set ttl if provided */
     if (ttl != NULL) *ttl = version->ttl;
 
-    if (version->ttl > 0 && version->ttl < time(NULL))
+    if (version->ttl > 0 && version->ttl < skip_list_get_current_time(list))
     {
         if (deleted != NULL) *deleted = 1;
         *value = NULL;

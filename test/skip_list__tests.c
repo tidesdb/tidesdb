@@ -2196,7 +2196,7 @@ void test_skip_list_put_batch_sorted()
 
 void benchmark_skip_list_batch_vs_single()
 {
-    printf(BOLDWHITE "\n=== Batch vs Single Put Benchmark ===\n" RESET);
+    printf(BOLDWHITE "\n----------------- Batch vs Single Put Benchmark -----------------\n" RESET);
 
     const int num_entries = 100000;
     skip_list_batch_entry_t *entries = malloc(num_entries * sizeof(skip_list_batch_entry_t));

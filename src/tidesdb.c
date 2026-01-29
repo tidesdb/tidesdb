@@ -558,7 +558,6 @@ struct tidesdb_merge_heap_t
 /**
  * tidesdb_commit_status_create
  * creates a new commit status tracker
- * @param capacity size of the circular buffer
  * @return commit status tracker or NULL on error
  */
 static tidesdb_commit_status_t *tidesdb_commit_status_create()
@@ -1621,16 +1620,17 @@ int tidesdb_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8
                               size_t key2_size, void *ctx)
 {
     (void)ctx;
-    if (!key1 && !key2) return 0;
-    if (!key1) return -1;
-    if (!key2) return 1;
+    /* fast path -- equal size keys (most common case) */
+    if (TDB_LIKELY(key1_size == key2_size))
+    {
+        return memcmp(key1, key2, key1_size);
+    }
 
-    size_t min_size = key1_size < key2_size ? key1_size : key2_size;
-    const int cmp = (min_size > 0) ? memcmp(key1, key2, min_size) : 0;
-    if (cmp != 0) return cmp < 0 ? -1 : 1; /* normalize to -1 or 1 */
-    if (key1_size < key2_size) return -1;
-    if (key1_size > key2_size) return 1;
-    return 0;
+    /* slow path -- different size keys */
+    const size_t min_size = key1_size < key2_size ? key1_size : key2_size;
+    const int cmp = memcmp(key1, key2, min_size);
+    if (cmp != 0) return cmp;
+    return (key1_size < key2_size) ? -1 : 1;
 }
 
 int tidesdb_comparator_lexicographic(const uint8_t *key1, size_t key1_size, const uint8_t *key2,

@@ -1663,6 +1663,7 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
                         }
                     }
                     skip_list_free_node(new_node);
+                    new_node = NULL; /* prevent use-after-free in higher level linking */
                     inserted = 1;
                     break;
                 }
@@ -1686,7 +1687,8 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
             if (cas_attempts > SKIP_LIST_MAX_CAS_ATTEMPTS)
             {
                 skip_list_free_node(new_node);
-                inserted = 1; /* mark as handled to avoid double-free */
+                new_node = NULL; /* prevent use-after-free in higher level linking */
+                inserted = 1;    /* mark as handled to avoid double-free */
                 break;
             }
         }
@@ -1697,7 +1699,7 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
             continue;
         }
 
-        if (cas_attempts <= SKIP_LIST_MAX_CAS_ATTEMPTS && update[0] == pred)
+        if (new_node != NULL && cas_attempts <= SKIP_LIST_MAX_CAS_ATTEMPTS && update[0] == pred)
         {
             /* we successfully inserted new node, link higher levels */
             atomic_store_explicit(&BACKWARD_PTR(new_node, 0, new_level), update[0],

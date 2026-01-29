@@ -165,6 +165,18 @@ block_manager_block_t *block_manager_block_create_from_buffer(uint64_t size, voi
 int64_t block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
 
 /**
+ * block_manager_block_write_batch
+ * writes multiple blocks in a single I/O operation for better performance
+ * @param bm the block manager to write the blocks to
+ * @param blocks array of blocks to write
+ * @param count number of blocks
+ * @param offsets output array for block offsets (must be pre-allocated with count elements)
+ * @return number of successfully written blocks, -1 on critical failure
+ */
+int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t **blocks,
+                                    size_t count, int64_t *offsets);
+
+/**
  * block_manager_block_free
  * frees a block
  * @param block the block to free

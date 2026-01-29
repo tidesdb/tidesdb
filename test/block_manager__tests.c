@@ -1661,11 +1661,79 @@ void test_block_manager_concurrent_write_size_reopen()
     (void)remove(test_file);
 }
 
+void test_block_manager_block_write_batch(void)
+{
+    block_manager_t *bm = NULL;
+    ASSERT_TRUE(block_manager_open(&bm, "test_batch.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* we create multiple blocks */
+    const int num_blocks = 5;
+    block_manager_block_t *blocks[5];
+    int64_t offsets[5];
+    char data[5][32];
+
+    for (int i = 0; i < num_blocks; i++)
+    {
+        snprintf(data[i], 32, "batch_block_data_%d", i);
+        blocks[i] = block_manager_block_create(strlen(data[i]) + 1, data[i]);
+        ASSERT_TRUE(blocks[i] != NULL);
+    }
+
+    /* we write all blocks in one batch */
+    int result = block_manager_block_write_batch(bm, blocks, num_blocks, offsets);
+    ASSERT_EQ(result, num_blocks);
+
+    /* we verify all offsets are valid and increasing */
+    for (int i = 0; i < num_blocks; i++)
+    {
+        ASSERT_TRUE(offsets[i] >= 0);
+        if (i > 0)
+        {
+            ASSERT_TRUE(offsets[i] > offsets[i - 1]);
+        }
+    }
+
+    /* we free the blocks */
+    for (int i = 0; i < num_blocks; i++)
+    {
+        block_manager_block_free(blocks[i]);
+    }
+
+    /* we close and reopen to verify persistence */
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    ASSERT_TRUE(block_manager_open(&bm, "test_batch.db", BLOCK_MANAGER_SYNC_NONE) == 0);
+
+    /* we read back and verify all blocks */
+    block_manager_cursor_t *cursor = NULL;
+    ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
+
+    int blocks_read = 0;
+    do
+    {
+        block_manager_block_t *block = block_manager_cursor_read(cursor);
+        if (block)
+        {
+            char expected[32];
+            snprintf(expected, 32, "batch_block_data_%d", blocks_read);
+            ASSERT_EQ(strcmp((char *)block->data, expected), 0);
+            block_manager_block_free(block);
+            blocks_read++;
+        }
+    } while (block_manager_cursor_next(cursor) == 0);
+
+    block_manager_cursor_free(cursor);
+    ASSERT_EQ(blocks_read, num_blocks);
+
+    ASSERT_TRUE(block_manager_close(bm) == 0);
+    remove("test_batch.db");
+}
+
 int main(void)
 {
     RUN_TEST(test_block_manager_open, tests_passed);
     RUN_TEST(test_block_manager_block_create, tests_passed);
     RUN_TEST(test_block_manager_block_write, tests_passed);
+    RUN_TEST(test_block_manager_block_write_batch, tests_passed);
     RUN_TEST(test_block_manager_block_write_close_reopen_read, tests_passed);
     RUN_TEST(test_block_manager_truncate, tests_passed);
     RUN_TEST(test_block_manager_count_blocks, tests_passed);

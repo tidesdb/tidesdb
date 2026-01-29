@@ -114,6 +114,35 @@ void bloom_filter_add(const bloom_filter_t *bf, const uint8_t *entry, const size
     }
 }
 
+void bloom_filter_add_batch(const bloom_filter_t *bf, const uint8_t **entries, const size_t *sizes,
+                            const size_t count)
+{
+    if (BLOOM_UNLIKELY(bf == NULL)) return;
+    if (BLOOM_UNLIKELY(entries == NULL || sizes == NULL || count == 0)) return;
+
+    /* we cache struct fields to avoid repeated memory access */
+    const unsigned int h = bf->h;
+    const unsigned int m = bf->m;
+    uint64_t *const bitset = bf->bitset;
+
+    /* we process entries in batch for better cache locality
+     * by keeping bitset access patterns more predictable */
+    for (size_t e = 0; e < count; e++)
+    {
+        const uint8_t *entry = entries[e];
+        const size_t size = sizes[e];
+
+        if (BLOOM_UNLIKELY(entry == NULL || size == 0)) continue;
+
+        for (unsigned int i = 0; i < h; i++)
+        {
+            const unsigned int hash = bloom_filter_hash(entry, size, (int)i);
+            const size_t index = hash % m;
+            BF_SET_BIT(bitset, index);
+        }
+    }
+}
+
 int bloom_filter_contains(const bloom_filter_t *bf, const uint8_t *entry, const size_t size)
 {
     if (BLOOM_UNLIKELY(bf == NULL)) return -1;

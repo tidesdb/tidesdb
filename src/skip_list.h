@@ -72,12 +72,12 @@ typedef enum
  */
 struct skip_list_version_t
 {
-    _Atomic(uint8_t) flags;
     _Atomic(uint64_t) seq;
     uint8_t *value;
     size_t value_size;
-    time_t ttl;
+    int64_t ttl;
     _Atomic(skip_list_version_t *) next;
+    _Atomic(uint8_t) flags;
 };
 
 /**
@@ -217,7 +217,7 @@ int skip_list_comparator_numeric(const uint8_t *key1, size_t key1_size, const ui
  * @return pointer to new node, NULL on failure
  */
 skip_list_node_t *skip_list_create_node(int level, const uint8_t *key, size_t key_size,
-                                        const uint8_t *value, size_t value_size, time_t ttl,
+                                        const uint8_t *value, size_t value_size, int64_t ttl,
                                         uint8_t deleted);
 
 /**
@@ -303,7 +303,7 @@ int skip_list_compare_keys(const skip_list_t *list, const uint8_t *key1, size_t 
  * @return 0 on success, -1 on failure
  */
 int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size,
-                           const uint8_t *value, size_t value_size, time_t ttl, uint64_t seq,
+                           const uint8_t *value, size_t value_size, int64_t ttl, uint64_t seq,
                            uint8_t deleted);
 
 /**
@@ -318,6 +318,32 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
 int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size, uint64_t seq);
 
 /**
+ * skip_list_batch_entry_t
+ * entry for batch put operations
+ */
+typedef struct
+{
+    const uint8_t *key;
+    size_t key_size;
+    const uint8_t *value;
+    size_t value_size;
+    uint64_t seq;
+    int64_t ttl;
+    uint8_t deleted;
+} skip_list_batch_entry_t;
+
+/**
+ * skip_list_put_batch
+ * inserts multiple key-value pairs in a batch for better performance
+ * entries should ideally be sorted by key for optimal performance
+ * @param list skip list
+ * @param entries array of batch entries
+ * @param count number of entries
+ * @return number of successfully inserted entries, -1 on critical failure
+ */
+int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entries, size_t count);
+
+/**
  * skip_list_get
  * retrieves a value by key
  * @param list skip list
@@ -330,7 +356,7 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, size_t key_size, uin
  * @return 0 on success, -1 on failure
  */
 int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
-                  size_t *value_size, time_t *ttl, uint8_t *deleted);
+                  size_t *value_size, int64_t *ttl, uint8_t *deleted);
 
 /**
  * skip_list_visibility_check_fn
@@ -358,7 +384,7 @@ typedef int (*skip_list_visibility_check_fn)(void *opaque_ctx, uint64_t seq);
  * @return 0 on success, -1 on failure
  */
 int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_t **value,
-                           size_t *value_size, time_t *ttl, uint8_t *deleted, uint64_t *seq,
+                           size_t *value_size, int64_t *ttl, uint8_t *deleted, uint64_t *seq,
                            uint64_t snapshot_seq, skip_list_visibility_check_fn visibility_check,
                            void *visibility_ctx);
 
@@ -413,7 +439,7 @@ int skip_list_cursor_prev(skip_list_cursor_t *cursor);
  * @return 0 on success, -1 on failure
  */
 int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_size,
-                         uint8_t **value, size_t *value_size, time_t *ttl, uint8_t *deleted);
+                         uint8_t **value, size_t *value_size, int64_t *ttl, uint8_t *deleted);
 
 /**
  * skip_list_cursor_get_with_seq
@@ -429,7 +455,7 @@ int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_
  * @return 0 on success, -1 on failure
  */
 int skip_list_cursor_get_with_seq(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_size,
-                                  uint8_t **value, size_t *value_size, time_t *ttl,
+                                  uint8_t **value, size_t *value_size, int64_t *ttl,
                                   uint8_t *deleted, uint64_t *seq);
 
 /**

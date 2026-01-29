@@ -2083,6 +2083,187 @@ void test_skip_list_prefix_seek_behavior()
     skip_list_free(list);
 }
 
+void test_skip_list_put_batch()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    /* we test batch put with multiple entries */
+    skip_list_batch_entry_t entries[5];
+    const char *keys[] = {"batch_key1", "batch_key2", "batch_key3", "batch_key4", "batch_key5"};
+    const char *values[] = {"value1", "value2", "value3", "value4", "value5"};
+
+    for (int i = 0; i < 5; i++)
+    {
+        entries[i].key = (const uint8_t *)keys[i];
+        entries[i].key_size = strlen(keys[i]) + 1;
+        entries[i].value = (const uint8_t *)values[i];
+        entries[i].value_size = strlen(values[i]) + 1;
+        entries[i].ttl = -1;
+        entries[i].seq = (uint64_t)(i + 1);
+        entries[i].deleted = 0;
+    }
+
+    int result = skip_list_put_batch(list, entries, 5);
+    ASSERT_EQ(result, 5);
+
+    /* we verify all entries are retrievable */
+    for (int i = 0; i < 5; i++)
+    {
+        uint8_t *retrieved_value = NULL;
+        size_t retrieved_value_size = 0;
+        time_t ttl;
+        uint8_t deleted;
+        int get_result = skip_list_get(list, (const uint8_t *)keys[i], strlen(keys[i]) + 1,
+                                       &retrieved_value, &retrieved_value_size, &ttl, &deleted);
+        ASSERT_EQ(get_result, 0);
+        ASSERT_EQ(deleted, 0);
+        ASSERT_EQ(strcmp((char *)retrieved_value, values[i]), 0);
+        free(retrieved_value);
+    }
+
+    ASSERT_EQ(skip_list_count_entries(list), 5);
+
+    skip_list_free(list);
+}
+
+void test_skip_list_put_batch_sorted()
+{
+    /* we test batch put with sorted keys for optimal performance */
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    const int batch_size = 100;
+    skip_list_batch_entry_t *entries = malloc(batch_size * sizeof(skip_list_batch_entry_t));
+    char **keys = malloc(batch_size * sizeof(char *));
+    char **values = malloc(batch_size * sizeof(char *));
+
+    /* we create sorted keys */
+    for (int i = 0; i < batch_size; i++)
+    {
+        keys[i] = malloc(32);
+        values[i] = malloc(32);
+        snprintf(keys[i], 32, "sorted_key_%04d", i);
+        snprintf(values[i], 32, "value_%04d", i);
+
+        entries[i].key = (const uint8_t *)keys[i];
+        entries[i].key_size = strlen(keys[i]) + 1;
+        entries[i].value = (const uint8_t *)values[i];
+        entries[i].value_size = strlen(values[i]) + 1;
+        entries[i].ttl = -1;
+        entries[i].seq = (uint64_t)(i + 1);
+        entries[i].deleted = 0;
+    }
+
+    int result = skip_list_put_batch(list, entries, batch_size);
+    ASSERT_EQ(result, batch_size);
+    ASSERT_EQ(skip_list_count_entries(list), batch_size);
+
+    /* we verify first, middle, and last entries */
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_value_size = 0;
+    time_t ttl;
+    uint8_t deleted;
+
+    ASSERT_EQ(skip_list_get(list, (const uint8_t *)keys[0], strlen(keys[0]) + 1, &retrieved_value,
+                            &retrieved_value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(strcmp((char *)retrieved_value, values[0]), 0);
+    free(retrieved_value);
+
+    ASSERT_EQ(skip_list_get(list, (const uint8_t *)keys[50], strlen(keys[50]) + 1, &retrieved_value,
+                            &retrieved_value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(strcmp((char *)retrieved_value, values[50]), 0);
+    free(retrieved_value);
+
+    ASSERT_EQ(skip_list_get(list, (const uint8_t *)keys[99], strlen(keys[99]) + 1, &retrieved_value,
+                            &retrieved_value_size, &ttl, &deleted),
+              0);
+    ASSERT_EQ(strcmp((char *)retrieved_value, values[99]), 0);
+    free(retrieved_value);
+
+    for (int i = 0; i < batch_size; i++)
+    {
+        free(keys[i]);
+        free(values[i]);
+    }
+    free(keys);
+    free(values);
+    free(entries);
+    skip_list_free(list);
+}
+
+void benchmark_skip_list_batch_vs_single()
+{
+    printf(BOLDWHITE "\n=== Batch vs Single Put Benchmark ===\n" RESET);
+
+    const int num_entries = 100000;
+    skip_list_batch_entry_t *entries = malloc(num_entries * sizeof(skip_list_batch_entry_t));
+    char **keys = malloc(num_entries * sizeof(char *));
+    char **values = malloc(num_entries * sizeof(char *));
+
+    /* we prepare entries */
+    for (int i = 0; i < num_entries; i++)
+    {
+        keys[i] = malloc(32);
+        values[i] = malloc(64);
+        snprintf(keys[i], 32, "bench_key_%08d", i);
+        snprintf(values[i], 64, "bench_value_%08d", i);
+
+        entries[i].key = (const uint8_t *)keys[i];
+        entries[i].key_size = strlen(keys[i]) + 1;
+        entries[i].value = (const uint8_t *)values[i];
+        entries[i].value_size = strlen(values[i]) + 1;
+        entries[i].ttl = -1;
+        entries[i].seq = (uint64_t)(i + 1);
+        entries[i].deleted = 0;
+    }
+
+    /* we benchmark single puts */
+    skip_list_t *list_single = NULL;
+    skip_list_new(&list_single, 12, 0.24f);
+
+    clock_t start_single = clock();
+    for (int i = 0; i < num_entries; i++)
+    {
+        skip_list_put_with_seq(list_single, entries[i].key, entries[i].key_size, entries[i].value,
+                               entries[i].value_size, entries[i].ttl, entries[i].seq,
+                               entries[i].deleted);
+    }
+    clock_t end_single = clock();
+    double time_single = (double)(end_single - start_single) / CLOCKS_PER_SEC;
+
+    /* we benchmark batch puts */
+    skip_list_t *list_batch = NULL;
+    skip_list_new(&list_batch, 12, 0.24f);
+
+    clock_t start_batch = clock();
+    skip_list_put_batch(list_batch, entries, num_entries);
+    clock_t end_batch = clock();
+    double time_batch = (double)(end_batch - start_batch) / CLOCKS_PER_SEC;
+
+    printf(CYAN "Single put (%d entries): %.4f seconds (%.0f ops/sec)\n" RESET, num_entries,
+           time_single, num_entries / time_single);
+    printf(CYAN "Batch put (%d entries):  %.4f seconds (%.0f ops/sec)\n" RESET, num_entries,
+           time_batch, num_entries / time_batch);
+    printf(BOLDWHITE "Speedup: %.2fx\n" RESET, time_single / time_batch);
+
+    ASSERT_EQ(skip_list_count_entries(list_single), num_entries);
+    ASSERT_EQ(skip_list_count_entries(list_batch), num_entries);
+
+    for (int i = 0; i < num_entries; i++)
+    {
+        free(keys[i]);
+        free(values[i]);
+    }
+    free(keys);
+    free(values);
+    free(entries);
+    skip_list_free(list_single);
+    skip_list_free(list_batch);
+}
+
 int main(void)
 {
     RUN_TEST(test_skip_list_create_node, tests_passed);
@@ -2116,11 +2297,14 @@ int main(void)
     RUN_TEST(test_skip_list_lockfree_stress, tests_passed);
     RUN_TEST(test_skip_list_reverse_comparator, tests_passed);
     RUN_TEST(test_skip_list_prefix_seek_behavior, tests_passed);
+    RUN_TEST(test_skip_list_put_batch, tests_passed);
+    RUN_TEST(test_skip_list_put_batch_sorted, tests_passed);
 
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);
     RUN_TEST(benchmark_skip_list_zipfian, tests_passed);
     RUN_TEST(benchmark_skip_list_deletions, tests_passed);
+    RUN_TEST(benchmark_skip_list_batch_vs_single, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

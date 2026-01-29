@@ -1208,6 +1208,49 @@ static block_manager_block_t *tidesdb_read_block(tidesdb_t *db, tidesdb_sstable_
 }
 
 /**
+ * tidesdb_read_block_and_advance
+ * reads, decompresses a block from disk, and advances cursor in one operation
+ * more efficient than tidesdb_read_block + cursor_next as it avoids redundant pread
+ * @param db the database
+ * @param sst the sstable (for compression config)
+ * @param cursor the block manager cursor (will be advanced)
+ * @return the decompressed block if successful, NULL otherwise
+ */
+static block_manager_block_t *tidesdb_read_block_and_advance(tidesdb_t *db, tidesdb_sstable_t *sst,
+                                                             block_manager_cursor_t *cursor)
+{
+    if (!db || !sst || !cursor) return NULL;
+
+    block_manager_block_t *block = block_manager_cursor_read_and_advance(cursor);
+    if (!block) return NULL;
+
+    if (sst->config && sst->config->compression_algorithm != TDB_COMPRESS_NONE)
+    {
+        size_t decompressed_size;
+        uint8_t *decompressed = decompress_data(block->data, block->size, &decompressed_size,
+                                                sst->config->compression_algorithm);
+        if (decompressed)
+        {
+            free(block->data);
+            block->data = decompressed;
+            block->size = decompressed_size;
+        }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                          "Decompression failed for SSTable %s (id=%" PRIu64
+                          ") compression=%u block_size=%zu",
+                          sst->klog_path ? sst->klog_path : "unknown", sst->id,
+                          (unsigned int)sst->config->compression_algorithm, (size_t)block->size);
+            block_manager_block_release(block);
+            return NULL;
+        }
+    }
+
+    return block;
+}
+
+/**
  * tidesdb_check_disk_space
  * check if theres enough free disk space using cached value
  * refreshes cache every DISK_SPACE_CHECK_INTERVAL_SECONDS seconds to avoid expensive statvfs calls
@@ -3803,6 +3846,7 @@ static int tidesdb_kv_pair_load_value(const tidesdb_t *db, tidesdb_sstable_t *ss
  * @param block_position the file position of the block
  * @param cf_name the column family name (for cache key)
  * @param has_cf_name whether cf_name is valid
+ * @param advance_cursor if true, advance cursor after reading (avoids redundant pread)
  * @param klog_block_out output: the deserialized klog block
  * @param rc_block_out output: ref-counted block if from cache (NULL if not cached)
  * @param raw_block_out output: raw block if read from disk (NULL if from cache)
@@ -3811,7 +3855,7 @@ static int tidesdb_kv_pair_load_value(const tidesdb_t *db, tidesdb_sstable_t *ss
 static int tidesdb_read_klog_block_cached(tidesdb_t *db, tidesdb_sstable_t *sst,
                                           block_manager_cursor_t *cursor,
                                           const uint64_t block_position, const char *cf_name,
-                                          const int has_cf_name,
+                                          const int has_cf_name, const int advance_cursor,
                                           tidesdb_klog_block_t **klog_block_out,
                                           tidesdb_ref_counted_block_t **rc_block_out,
                                           block_manager_block_t **raw_block_out)
@@ -3836,7 +3880,8 @@ static int tidesdb_read_klog_block_cached(tidesdb_t *db, tidesdb_sstable_t *sst,
     PROFILE_INC(db, cache_block_misses);
     PROFILE_INC(db, disk_reads);
 
-    block_manager_block_t *block = tidesdb_read_block(db, sst, cursor);
+    block_manager_block_t *block = advance_cursor ? tidesdb_read_block_and_advance(db, sst, cursor)
+                                                  : tidesdb_read_block(db, sst, cursor);
     if (!block)
     {
         return TDB_ERR_IO;
@@ -3988,10 +4033,13 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         tidesdb_ref_counted_block_t *rc_block = NULL;
         block_manager_block_t *raw_block = NULL;
 
-        /* we read block with cache support */
+        /* we read block with cache support
+         * advance_cursor=1 when reading from disk to avoid redundant pread in cursor_next */
         const int read_result =
             tidesdb_read_klog_block_cached(db, sst, klog_cursor, block_position, cf_name,
-                                           has_cf_name, &klog_block, &rc_block, &raw_block);
+                                           has_cf_name, 1, &klog_block, &rc_block, &raw_block);
+        /* track if cursor was advanced (only on disk read, not cache hit) */
+        const int cursor_advanced = (rc_block == NULL && raw_block != NULL);
         if (read_result != TDB_SUCCESS)
         {
             if (read_result == TDB_ERR_CORRUPTION)
@@ -4093,7 +4141,8 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         }
 
         blocks_scanned++;
-        if (block_manager_cursor_next(klog_cursor) != 0)
+        /* only call cursor_next if cursor wasn't already advanced by read_and_advance */
+        if (!cursor_advanced && block_manager_cursor_next(klog_cursor) != 0)
         {
             break;
         }

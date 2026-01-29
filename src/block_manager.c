@@ -771,6 +771,23 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
     return block;
 }
 
+block_manager_block_t *block_manager_cursor_read_and_advance(block_manager_cursor_t *cursor)
+{
+    if (!cursor) return NULL;
+
+    block_manager_block_t *block =
+        block_manager_read_block_at_offset(cursor->bm, cursor->current_pos);
+    if (!block) return NULL;
+
+    /* we advance cursor using the block size we just read, avoiding redundant pread */
+    cursor->current_block_size = block->size;
+    cursor->current_pos +=
+        BLOCK_MANAGER_BLOCK_HEADER_SIZE + block->size + BLOCK_MANAGER_FOOTER_SIZE;
+    cursor->block_index++;
+
+    return block;
+}
+
 void block_manager_cursor_free(block_manager_cursor_t *cursor)
 {
     if (cursor)

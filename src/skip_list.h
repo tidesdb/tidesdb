@@ -63,12 +63,12 @@ typedef enum
 /**
  * skip_list_version_t
  * a single version of a key's value
- * @param flags version flags (deleted, etc)
  * @param seq sequence number for MVCC (monotonically increasing)
  * @param value value data
  * @param value_size size of value
  * @param ttl time-to-live
  * @param next next older version
+ * @param flags version flags (deleted, etc)
  */
 struct skip_list_version_t
 {

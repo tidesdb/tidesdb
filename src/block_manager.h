@@ -245,6 +245,15 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
                                                          size_t max_bytes);
 
 /**
+ * block_manager_cursor_read_and_advance
+ * reads the block at cursor position and advances cursor to next block in one operation
+ * this is more efficient than separate read + next calls as it avoids redundant pread
+ * @param cursor the cursor to read from and advance
+ * @return the block read from the cursor, NULL on error or EOF
+ */
+block_manager_block_t *block_manager_cursor_read_and_advance(block_manager_cursor_t *cursor);
+
+/**
  * block_manager_cursor_free
  * frees a cursor
  * @param cursor the cursor to free

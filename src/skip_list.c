@@ -159,11 +159,19 @@ static inline int skip_list_compare_keys_inline(const skip_list_t *list, const u
  */
 static inline time_t skip_list_get_current_time(const skip_list_t *list)
 {
+#if defined(__MINGW32__) && !defined(__MINGW64__)
+    /* on MinGW x86, cached time has visibility issues across threads, it seems to be a compiler bug
+     ********
+     */
+    (void)list;
+    return time(NULL);
+#else
     if (list != NULL && list->cached_time != NULL)
     {
         return atomic_load_explicit(list->cached_time, memory_order_relaxed);
     }
-    return (int64_t)time(NULL);
+    return time(NULL);
+#endif
 }
 
 /**
@@ -527,7 +535,7 @@ int skip_list_random_level(const skip_list_t *list)
     {
         /** we init with thread ID + address entropy for uniqueness
          * avoids time() syscall on hot path */
-        rng_state = (uint64_t)TDB_THREAD_ID() ^ ((uint64_t)&rng_state >> 3);
+        rng_state = (uint64_t)TDB_THREAD_ID() ^ ((uintptr_t)&rng_state >> 3);
         if (rng_state == 0) rng_state = 1; /* ensure non-zero */
     }
 
@@ -1850,10 +1858,7 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
 
     if (version->ttl > 0)
     {
-        int64_t current_time = skip_list_get_current_time(list);
-        printf("skip_list_get_with_seq: ttl=%ld, current_time=%ld, expired=%d\n",
-               (long)version->ttl, (long)current_time, version->ttl <= current_time);
-        if (version->ttl <= current_time)
+        if (version->ttl <= skip_list_get_current_time(list))
         {
             if (deleted != NULL) *deleted = 1;
             *value = NULL;

@@ -9395,39 +9395,10 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
     tidesdb_t *db = (tidesdb_t *)arg;
     TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper thread started");
 
-    time_t last_time = 0;
-    int stale_count = 0;
     while (atomic_load(&db->sstable_reaper_active))
     {
         time_t now = tdb_get_current_time();
-
-        /* we detect stale time -- if same as last after sleep, force fresh syscall */
-        if (now == last_time)
-        {
-            stale_count++;
-            if (stale_count >= 10)
-            {
-                /* direct time() call if tdb_get_current_time is stale */
-                now = time(NULL);
-                if (now == last_time)
-                {
-                    struct timespec ts;
-                    clock_gettime(CLOCK_REALTIME, &ts);
-                    now = ts.tv_sec;
-                }
-                stale_count = 0;
-            }
-        }
-        else
-        {
-            stale_count = 0;
-        }
-        last_time = now;
-
         atomic_store_explicit(&db->cached_current_time, now, memory_order_seq_cst);
-        printf("reaper: ptr=%p, updated cached_current_time to %ld\n",
-               (void *)&db->cached_current_time, (long)now);
-        fflush(stdout);
 
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -9444,11 +9415,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         if (atomic_load(&db->sstable_reaper_active))
         {
-            int wait_result =
-                pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
-            printf("reaper: pthread_cond_timedwait returned %d (ETIMEDOUT=%d)\n", wait_result,
-                   ETIMEDOUT);
-            fflush(stdout);
+            pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
         }
         int should_exit = !atomic_load(&db->sstable_reaper_active);
         pthread_mutex_unlock(&db->reaper_thread_mutex);
@@ -12573,22 +12540,17 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         active_mt, key, key_size, &temp_value, &temp_value_size, &ttl, &deleted, &found_seq,
         snapshot_seq, visibility_check, txn->db->commit_status);
 
-    printf("tidesdb_txn_get: memtable_result=%d, deleted=%d, ttl=%ld, now=%ld\n", memtable_result,
-           deleted, (long)ttl, (long)now);
-
     if (memtable_result == 0)
     {
         if (deleted)
         {
             /* we found a tombstone in active memtable, key is deleted */
-            printf("tidesdb_txn_get: key marked as deleted/expired by skip_list\n");
             free(temp_value);
             return TDB_ERR_NOT_FOUND;
         }
 
         if (ttl <= 0 || ttl > now)
         {
-            printf("tidesdb_txn_get: key valid (ttl<=0 or ttl>now)\n");
             *value = temp_value;
             *value_size = temp_value_size;
 
@@ -12597,7 +12559,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             return TDB_SUCCESS;
         }
 
-        printf("tidesdb_txn_get: TTL expired (ttl=%ld <= now=%ld)\n", (long)ttl, (long)now);
         /* TTL expired */
         free(temp_value);
         /* fall through to check immutables */
@@ -17524,8 +17485,7 @@ void tidesdb_print_read_stats(tidesdb_t *db)
         stats.total_reads > 0 ? ((double)stats.sstables_checked / stats.total_reads) : 0.0;
     double avg_blocks_per_read =
         stats.total_reads > 0 ? ((double)stats.blocks_read / stats.total_reads) : 0.0;
-
-    printf("\n*=== TidesDB Read Profiling Stats ===*\n");
+    printf("\n*---------------------- TidesDB Read Profiling Stats ----------------------*\n");
     printf("Total Reads:           " PRIu64 "\n", stats.total_reads);
     printf("\nRead Hit Location:\n");
     printf("  Memtable hits:       " PRIu64 " (%.1f%%)\n", stats.memtable_hits,
@@ -17560,7 +17520,7 @@ void tidesdb_print_read_stats(tidesdb_t *db)
         printf("  Global misses:       " PRIu64 "\n", cache_stats.misses);
         printf("  Global hit rate:     %.1f%%\n", cache_stats.hit_rate * 100.0);
     }
-    printf("*====================================*\n\n");
+    printf("*--------------------------------------------------------------------------*\n\n");
 }
 
 /**

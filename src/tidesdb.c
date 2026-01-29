@@ -9397,7 +9397,11 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
     while (atomic_load(&db->sstable_reaper_active))
     {
-        atomic_store_explicit(&db->cached_current_time, time(NULL), memory_order_seq_cst);
+        time_t now = time(NULL);
+        atomic_store_explicit(&db->cached_current_time, now, memory_order_seq_cst);
+        printf("reaper: ptr=%p, updated cached_current_time to %ld\n",
+               (void *)&db->cached_current_time, (long)now);
+        fflush(stdout);
 
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -9412,15 +9416,13 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         pthread_mutex_lock(&db->reaper_thread_mutex);
 
-        while (atomic_load(&db->sstable_reaper_active))
+        if (atomic_load(&db->sstable_reaper_active))
         {
             int wait_result =
                 pthread_cond_timedwait(&db->reaper_thread_cond, &db->reaper_thread_mutex, &ts);
-
-            if (wait_result == ETIMEDOUT || !atomic_load(&db->sstable_reaper_active))
-            {
-                break;
-            }
+            printf("reaper: pthread_cond_timedwait returned %d (ETIMEDOUT=%d)\n", wait_result,
+                   ETIMEDOUT);
+            fflush(stdout);
         }
         int should_exit = !atomic_load(&db->sstable_reaper_active);
         pthread_mutex_unlock(&db->reaper_thread_mutex);

@@ -487,6 +487,13 @@ int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, const int 
     new_list->comparator = comparator;
     new_list->comparator_ctx = comparator_ctx;
     new_list->cached_time = cached_time;
+
+    /* if cached_time pointer is provided, ensure it has a valid initial value */
+    if (cached_time != NULL)
+    {
+        atomic_store_explicit(cached_time, time(NULL), memory_order_seq_cst);
+    }
+
     atomic_init(&new_list->total_size, 0);
     atomic_init(&new_list->entry_count, 0);
 

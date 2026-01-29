@@ -9395,9 +9395,35 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
     tidesdb_t *db = (tidesdb_t *)arg;
     TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper thread started");
 
+    time_t last_time = 0;
+    int stale_count = 0;
     while (atomic_load(&db->sstable_reaper_active))
     {
         time_t now = tdb_get_current_time();
+
+        /* we detect stale time -- if same as last after sleep, force fresh syscall */
+        if (now == last_time)
+        {
+            stale_count++;
+            if (stale_count >= 10)
+            {
+                /* direct time() call if tdb_get_current_time is stale */
+                now = time(NULL);
+                if (now == last_time)
+                {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    now = ts.tv_sec;
+                }
+                stale_count = 0;
+            }
+        }
+        else
+        {
+            stale_count = 0;
+        }
+        last_time = now;
+
         atomic_store_explicit(&db->cached_current_time, now, memory_order_seq_cst);
         printf("reaper: ptr=%p, updated cached_current_time to %ld\n",
                (void *)&db->cached_current_time, (long)now);

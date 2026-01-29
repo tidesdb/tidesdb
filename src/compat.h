@@ -3054,9 +3054,11 @@ static inline int tdb_get_cpu_count(void)
 static inline time_t tdb_get_current_time(void)
 {
 #if defined(_WIN32)
+    SYSTEMTIME st;
     FILETIME ft;
+    GetSystemTime(&st);
+    SystemTimeToFileTime(&st, &ft);
     ULARGE_INTEGER ui;
-    GetSystemTimeAsFileTime(&ft);
     ui.LowPart = ft.dwLowDateTime;
     ui.HighPart = ft.dwHighDateTime;
     return (time_t)((ui.QuadPart - 116444736000000000ULL) / 10000000ULL);

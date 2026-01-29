@@ -398,7 +398,7 @@ void test_skip_list_ttl()
     uint8_t *retrieved_value;
     size_t retrieved_value_size;
     uint8_t deleted;
-    time_t retrieved_ttl;
+    int64_t retrieved_ttl;
     int result = skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size,
                                &retrieved_ttl, &deleted);
 
@@ -2074,7 +2074,7 @@ void test_skip_list_prefix_seek_behavior()
     uint8_t *get_value = NULL;
     size_t get_value_size = 0;
     uint8_t get_deleted = 0;
-    time_t get_ttl;
+    int64_t get_ttl;
     int get_result = skip_list_get(list, (uint8_t *)seek1, strlen(seek1) + 1, &get_value,
                                    &get_value_size, &get_ttl, &get_deleted);
     ASSERT_EQ(get_result, -1);

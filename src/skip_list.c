@@ -161,7 +161,7 @@ static inline int64_t skip_list_get_current_time(const skip_list_t *list)
 {
     if (list != NULL && list->cached_time != NULL)
     {
-        time_t cached = atomic_load_explicit(list->cached_time, memory_order_relaxed);
+        time_t cached = atomic_load_explicit(list->cached_time, memory_order_acquire);
         /* we validate cached time is reasonable (not 0 or negative) */
         if (cached > 0)
         {
@@ -555,7 +555,7 @@ int skip_list_check_and_update_ttl(const skip_list_t *list, skip_list_node_t *no
 {
     if (node == NULL) return -1;
     skip_list_version_t *version = atomic_load_explicit(&node->versions, memory_order_acquire);
-    if (version != NULL && version->ttl > 0 && version->ttl < skip_list_get_current_time(list))
+    if (version != NULL && version->ttl > 0 && version->ttl <= skip_list_get_current_time(list))
     {
         return 1;
     }
@@ -1850,7 +1850,7 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
     /* always set ttl if provided */
     if (ttl != NULL) *ttl = version->ttl;
 
-    if (version->ttl > 0 && version->ttl < skip_list_get_current_time(list))
+    if (version->ttl > 0 && version->ttl <= skip_list_get_current_time(list))
     {
         if (deleted != NULL) *deleted = 1;
         *value = NULL;

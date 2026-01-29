@@ -3860,18 +3860,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         return TDB_ERR_NOT_FOUND;
     }
 
-    /* we check bloom filter for early exit */
-    if (sst->bloom_filter)
-    {
-        PROFILE_INC(db, bloom_checks);
-        if (!bloom_filter_contains(sst->bloom_filter, key, key_size))
-        {
-            return TDB_ERR_NOT_FOUND;
-        }
-        PROFILE_INC(db, bloom_hits);
-    }
-
-    /* we resolve comparator and check key range */
+    /* we resolve comparator and check key range first (cheaper than bloom filter) */
     skip_list_comparator_fn comparator_fn = NULL;
     void *comparator_ctx = NULL;
     tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
@@ -3891,6 +3880,17 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
     else
     {
         if (min_cmp < 0 || max_cmp > 0) return TDB_ERR_NOT_FOUND;
+    }
+
+    /* we check bloom filter for early exit (after range check since bloom is more expensive) */
+    if (sst->bloom_filter)
+    {
+        PROFILE_INC(db, bloom_checks);
+        if (!bloom_filter_contains(sst->bloom_filter, key, key_size))
+        {
+            return TDB_ERR_NOT_FOUND;
+        }
+        PROFILE_INC(db, bloom_hits);
     }
 
     /* we utilize block indexes to find starting klog block */
@@ -12488,6 +12488,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
     atomic_thread_fence(memory_order_acquire);
 
+    /* we cache current time once for consistent TTL checks throughout this read */
+    const time_t now = atomic_load(&txn->db->cached_current_time);
+
     uint8_t *temp_value;
     size_t temp_value_size;
     time_t ttl;
@@ -12507,7 +12510,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             return TDB_ERR_NOT_FOUND;
         }
 
-        if (ttl <= 0 || ttl > atomic_load(&txn->db->cached_current_time))
+        if (ttl <= 0 || ttl > now)
         {
             *value = temp_value;
             *value_size = temp_value_size;
@@ -12525,8 +12528,12 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     tidesdb_immutable_memtable_t **immutable_refs = NULL;
     size_t immutable_count = 0;
 
-    immutable_refs =
-        tidesdb_snapshot_immutable_memtables(cf->immutable_memtables, &immutable_count);
+    /* we skip snapshot allocation if immutable queue is empty */
+    if (!queue_is_empty(cf->immutable_memtables))
+    {
+        immutable_refs =
+            tidesdb_snapshot_immutable_memtables(cf->immutable_memtables, &immutable_count);
+    }
 
     /* we now search immutable memtables safely with references held
      * search in reverse order (newest first) to find most recent version */
@@ -12552,7 +12559,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                         goto cleanup_immutables;
                     }
 
-                    if (ttl <= 0 || ttl > atomic_load(&txn->db->cached_current_time))
+                    if (ttl <= 0 || ttl > now)
                     {
                         *value = temp_value;
                         *value_size = temp_value_size;
@@ -12582,7 +12589,6 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     }
 
     int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
-    const time_t now = atomic_load(&txn->db->cached_current_time);
 
     for (int level_num = 0; level_num < num_levels; level_num++)
     {

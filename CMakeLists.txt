@@ -10,12 +10,10 @@ if(TIDESDB_WITH_MIMALLOC)
     list(APPEND VCPKG_MANIFEST_FEATURES "mimalloc")
 endif()
 
-# tcmalloc vcpkg feature not needed - tcmalloc is not supported on Windows
-
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 7.4.2)
+set(PROJECT_VERSION 7.4.3)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"

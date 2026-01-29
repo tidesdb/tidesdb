@@ -47,7 +47,7 @@
 #define tdb_strdup(s) strdup(s)
 #endif
 
-/* cross-platform line buffering - Windows doesn't support _IOLBF properly with NULL buffer */
+/* cross-platform line buffering -- Windows doesn't support _IOLBF properly with NULL buffer */
 #if defined(_MSC_VER)
 #define tdb_setlinebuf(stream) setvbuf((stream), NULL, _IONBF, 0)
 #else

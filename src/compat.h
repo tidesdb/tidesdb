@@ -3046,4 +3046,23 @@ static inline int tdb_get_cpu_count(void)
 #endif
 }
 
+/*
+ * tdb_get_current_time
+ * cross-platform function to get current Unix timestamp in seconds
+ * @return current Unix timestamp in seconds
+ */
+static inline time_t tdb_get_current_time(void)
+{
+#if defined(_WIN32)
+    FILETIME ft;
+    ULARGE_INTEGER ui;
+    GetSystemTimeAsFileTime(&ft);
+    ui.LowPart = ft.dwLowDateTime;
+    ui.HighPart = ft.dwHighDateTime;
+    return (time_t)((ui.QuadPart - 116444736000000000ULL) / 10000000ULL);
+#else
+    return time(NULL);
+#endif
+}
+
 #endif /* __COMPAT_H__ */

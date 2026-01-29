@@ -8300,7 +8300,7 @@ int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
     /* we update cached_current_time to ensure TTL checks during compaction use fresh time
      * this prevents race conditions where stale cached time causes expired keys to not be filtered
      */
-    atomic_store(&cf->db->cached_current_time, time(NULL));
+    atomic_store(&cf->db->cached_current_time, tdb_get_current_time());
 
     /* we force flush memtable before compaction to ensure all data is in ssts
      * this prevents data loss where keys in memtable are not included in compaction */
@@ -9397,9 +9397,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
     while (atomic_load(&db->sstable_reaper_active))
     {
-        struct timespec now_ts;
-        clock_gettime(CLOCK_REALTIME, &now_ts);
-        time_t now = now_ts.tv_sec;
+        time_t now = tdb_get_current_time();
         atomic_store_explicit(&db->cached_current_time, now, memory_order_seq_cst);
         printf("reaper: ptr=%p, updated cached_current_time to %ld\n",
                (void *)&db->cached_current_time, (long)now);
@@ -10018,7 +10016,8 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     /* we initialize cached_current_time before recovery so skip lists created during
      * recovery have a valid time pointer for TTL checks
      * use seq_cst for strongest memory ordering on all platforms */
-    atomic_store_explicit(&(*db)->cached_current_time, time(NULL), memory_order_seq_cst);
+    atomic_store_explicit(&(*db)->cached_current_time, tdb_get_current_time(),
+                          memory_order_seq_cst);
 
     int rc = tidesdb_recover_database(*db);
     if (rc != TDB_SUCCESS)
@@ -11563,7 +11562,7 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     }
 
     /* we update cached_current_time to ensure TTL checks during flush use fresh time */
-    atomic_store(&cf->db->cached_current_time, time(NULL));
+    atomic_store(&cf->db->cached_current_time, tdb_get_current_time());
 
     tidesdb_memtable_t *old_mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
     skip_list_t *old_memtable = old_mt ? old_mt->skip_list : NULL;

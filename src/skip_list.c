@@ -162,15 +162,15 @@ static inline int64_t skip_list_get_current_time(const skip_list_t *list)
     if (list == NULL)
     {
         printf("skip_list_get_current_time: list is NULL\n");
-        return (int64_t)time(NULL);
+        return (int64_t)tdb_get_current_time();
     }
     if (list->cached_time == NULL)
     {
         printf("skip_list_get_current_time: cached_time ptr is NULL\n");
-        return (int64_t)time(NULL);
+        return (int64_t)tdb_get_current_time();
     }
     time_t cached = atomic_load_explicit(list->cached_time, memory_order_seq_cst);
-    time_t sys_now = time(NULL);
+    time_t sys_now = tdb_get_current_time();
     printf("skip_list_get_current_time: ptr=%p, cached=%ld, sys_time=%ld\n",
            (void *)list->cached_time, (long)cached, (long)sys_now);
     fflush(stdout);
@@ -490,7 +490,7 @@ int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, const int 
     new_list->comparator_ctx = comparator_ctx;
     new_list->cached_time = cached_time;
 
-    atomic_store_explicit(cached_time, time(NULL), memory_order_seq_cst);
+    atomic_store_explicit(cached_time, tdb_get_current_time(), memory_order_seq_cst);
 
     atomic_init(&new_list->total_size, 0);
     atomic_init(&new_list->entry_count, 0);

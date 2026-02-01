@@ -46,7 +46,7 @@ size_t _tidesdb_log_truncate = 0;
 char _tidesdb_log_path[MAX_FILE_PATH_LENGTH] = {0};
 
 /* mutex to protect log file access during truncation */
-static pthread_mutex_t _tidesdb_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t tidesdb_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * tidesdb_log_write
@@ -73,7 +73,7 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
                             : (level == TDB_LOG_ERROR) ? "ERROR"
                                                        : "FATAL";
 
-    pthread_mutex_lock(&_tidesdb_log_mutex);
+    pthread_mutex_lock(&tidesdb_log_mutex);
 
     FILE *log_out = _tidesdb_log_file ? _tidesdb_log_file : stderr;
 
@@ -109,7 +109,7 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
         }
     }
 
-    pthread_mutex_unlock(&_tidesdb_log_mutex);
+    pthread_mutex_unlock(&tidesdb_log_mutex);
 }
 
 typedef tidesdb_t tidesdb_t;
@@ -128,6 +128,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_KV_FLAG_HAS_TTL   0x02
 #define TDB_KV_FLAG_HAS_VLOG  0x04
 #define TDB_KV_FLAG_DELTA_SEQ 0x08
+#define TDB_KV_FLAG_ARENA     0x80
 
 #define TDB_LOG_FILE                     "LOG"
 #define TDB_WAL_PREFIX                   "wal_"
@@ -1765,33 +1766,34 @@ static tidesdb_kv_pair_t *tidesdb_kv_pair_create(const uint8_t *key, const size_
                                                  const time_t ttl, const uint64_t seq,
                                                  const int is_tombstone)
 {
-    tidesdb_kv_pair_t *kv = calloc(1, sizeof(tidesdb_kv_pair_t));
-    if (!kv) return NULL;
+    /* arena allocation -- single malloc for struct + key + value
+     * [tidesdb_kv_pair_t][key_data][value_data]
+     * this reduces malloc calls from 3 to 1, improves cache locality! */
+    const size_t value_alloc = (value_size > 0 && value) ? value_size : 0;
+    const size_t arena_size = sizeof(tidesdb_kv_pair_t) + key_size + value_alloc;
+
+    uint8_t *arena = malloc(arena_size);
+    if (!arena) return NULL;
+
+    tidesdb_kv_pair_t *kv = (tidesdb_kv_pair_t *)arena;
+    memset(kv, 0, sizeof(tidesdb_kv_pair_t));
 
     kv->entry.flags = is_tombstone ? TDB_KV_FLAG_TOMBSTONE : 0;
+    kv->entry.flags |= TDB_KV_FLAG_ARENA; /* mark as arena-allocated */
     kv->entry.key_size = (uint32_t)key_size;
     kv->entry.value_size = (uint32_t)value_size;
     kv->entry.ttl = ttl;
     kv->entry.seq = seq;
     kv->entry.vlog_offset = 0;
 
-    kv->key = malloc(key_size);
-    if (!kv->key)
-    {
-        free(kv);
-        return NULL;
-    }
+    /* key immediately follows struct */
+    kv->key = arena + sizeof(tidesdb_kv_pair_t);
     memcpy(kv->key, key, key_size);
 
-    if (value_size > 0 && value)
+    /* value follows key */
+    if (value_alloc > 0)
     {
-        kv->value = malloc(value_size);
-        if (!kv->value)
-        {
-            free(kv->key);
-            free(kv);
-            return NULL;
-        }
+        kv->value = kv->key + key_size;
         memcpy(kv->value, value, value_size);
     }
 
@@ -1806,6 +1808,29 @@ static tidesdb_kv_pair_t *tidesdb_kv_pair_create(const uint8_t *key, const size_
 static void tidesdb_kv_pair_free(tidesdb_kv_pair_t *kv)
 {
     if (!kv) return;
+
+    /* arena-allocated KV pairs use single allocation for struct + key + value
+     * however, value may be loaded separately (e.g., from vlog) after creation
+     * [struct][key_data][value_data_if_included]
+     * if value was included in arena, it points to exactly kv->key + key_size */
+    if (kv->entry.flags & TDB_KV_FLAG_ARENA)
+    {
+        if (kv->value != NULL)
+        {
+            /* value is in arena only if it points to key + key_size
+             * otherwise it was allocated separately and must be freed */
+            const uint8_t *expected_arena_value = kv->key + kv->entry.key_size;
+            if (kv->value != expected_arena_value)
+            {
+                free(kv->value); /* value was allocated separately */
+            }
+        }
+
+        free(kv); /* single free for arena (struct + key + maybe value) */
+        return;
+    }
+
+    /* legacy path for non-arena KV pairs */
     free(kv->key);
     free(kv->value);
     free(kv);
@@ -2184,9 +2209,8 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         scan_remaining--;
 
         uint64_t key_size_u64, value_size_u64, seq_value;
-        int bytes_read;
 
-        bytes_read = decode_varint(scan_ptr, &key_size_u64, (int)scan_remaining);
+        int bytes_read = decode_varint(scan_ptr, &key_size_u64, (int)scan_remaining);
         if (bytes_read < 0 || key_size_u64 > UINT32_MAX) return TDB_ERR_CORRUPTION;
         scan_ptr += bytes_read;
         scan_remaining -= bytes_read;
@@ -3485,10 +3509,6 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
     uint8_t *last_key = NULL;
     uint8_t *block_first_key = NULL;
     uint8_t *block_last_key = NULL;
-    size_t block_first_key_capacity = 0;
-    size_t block_last_key_capacity = 0;
-    size_t first_key_capacity = 0;
-    size_t last_key_capacity = 0;
 
     /* we resolve comparator once for the entire flush operation */
     skip_list_comparator_fn comparator_fn = NULL;
@@ -3558,9 +3578,12 @@ static int tidesdb_sstable_write_from_memtable(tidesdb_t *db, tidesdb_sstable_t 
 
     if (skip_list_cursor_goto_first(cursor) == 0)
     {
+        size_t block_first_key_capacity = 0;
+        size_t block_last_key_capacity = 0;
+        size_t first_key_capacity = 0;
+        size_t last_key_capacity = 0;
         /* we use stack-allocated KV pair to avoid malloc/free per entry */
-        tidesdb_kv_pair_t kv_stack;
-        memset(&kv_stack, 0, sizeof(kv_stack));
+        tidesdb_kv_pair_t kv_stack = {0};
 
         do
         {
@@ -4105,7 +4128,10 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
                 if (*kv)
                 {
+                    /* we preserve arena flag when copying entry */
+                    const uint8_t arena_flag = (*kv)->entry.flags & TDB_KV_FLAG_ARENA;
                     (*kv)->entry = klog_block->entries[i];
+                    (*kv)->entry.flags |= arena_flag;
                     tidesdb_kv_pair_load_value(db, sst, klog_block, i, *kv);
 
                     /* we release resources and return success */
@@ -10686,7 +10712,7 @@ int tidesdb_close(tidesdb_t *db)
     TDB_DEBUG_LOG(TDB_LOG_INFO, "TidesDB closed successfully");
 
     /* we close log file if it was opened (protected by log mutex) */
-    pthread_mutex_lock(&_tidesdb_log_mutex);
+    pthread_mutex_lock(&tidesdb_log_mutex);
     if (_tidesdb_log_file)
     {
         fflush(_tidesdb_log_file);
@@ -10696,7 +10722,7 @@ int tidesdb_close(tidesdb_t *db)
         _tidesdb_log_path[0] = '\0';
     }
     db->log_file = NULL;
-    pthread_mutex_unlock(&_tidesdb_log_mutex);
+    pthread_mutex_unlock(&tidesdb_log_mutex);
 
     free(db);
 
@@ -12940,8 +12966,8 @@ static int tidesdb_txn_check_seq_conflict(skip_list_t *sl, const uint8_t *key,
  * @param out_count output parameter for number of immutable memtables
  * @return immutable memtable references
  */
-static tidesdb_immutable_memtable_t **tidesdb_txn_get_imm_snapshot(tidesdb_column_family_t *cf,
-                                                                   size_t *out_count)
+static tidesdb_immutable_memtable_t **tidesdb_txn_get_imm_snapshot(
+    const tidesdb_column_family_t *cf, size_t *out_count)
 {
     return tidesdb_snapshot_immutable_memtables(cf->immutable_memtables, out_count);
 }
@@ -16939,6 +16965,10 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     {
         ctx->config->l0_queue_stall_threshold = (int)strtol(value, NULL, 10);
     }
+    else if (strcmp(name, "min_disk_space") == 0)
+    {
+        ctx->config->min_disk_space = (uint64_t)strtoull(value, NULL, 10);
+    }
     else if (strcmp(name, "comparator_name") == 0)
     {
         strncpy(ctx->config->comparator_name, value, TDB_MAX_COMPARATOR_NAME - 1);
@@ -17026,6 +17056,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     fprintf(fp, "default_isolation_level = %d\n", config->default_isolation_level);
     fprintf(fp, "l1_file_count_trigger = %d\n", config->l1_file_count_trigger);
     fprintf(fp, "l0_queue_stall_threshold = %d\n", config->l0_queue_stall_threshold);
+    fprintf(fp, "min_disk_space = %" PRIu64 "\n", config->min_disk_space);
 
     fprintf(fp, "comparator_name = %s\n", config->comparator_name);
     if (config->comparator_ctx_str[0] != '\0')
@@ -17079,6 +17110,11 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
     cf->config.sync_interval_us = new_config->sync_interval_us;
     cf->config.klog_value_threshold = new_config->klog_value_threshold;
     cf->config.default_isolation_level = new_config->default_isolation_level;
+    cf->config.skip_list_max_level = new_config->skip_list_max_level;
+    cf->config.skip_list_probability = new_config->skip_list_probability;
+    cf->config.l1_file_count_trigger = new_config->l1_file_count_trigger;
+    cf->config.l0_queue_stall_threshold = new_config->l0_queue_stall_threshold;
+    cf->config.min_disk_space = new_config->min_disk_space;
 
     tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
     if (mt && mt->wal)

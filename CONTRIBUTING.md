@@ -6,6 +6,23 @@
 - Assure your changes are tested and pass all tests.
 - Make sure your changes are well documented.
 
+### Contributor License Agreement (CLA)
+
+To ensure TidesDB can be widely adopted and supported by individuals and
+organizations, new contributions require agreement to the
+[TidesDB Contributor License Agreement (CLA)](CLA.md).
+
+- Contributions made **before January 31st, 2025** are governed solely by the
+  Developer Certificate of Origin (DCO).
+- Contributions made **on or after January 31st, 2025** require both:
+    - A Signed-off-by commit (DCO), and
+    - Agreement to the CLA.
+
+The CLA does **not** change the open source license of TidesDB.
+All contributions remain distributed under the Mozilla Public License v2.0 (MPLv2).
+
+---
+
 ### Developer Certificate of Origin
 
 By contributing to TidesDB, you certify that your contribution was created in whole or in part by you, that you have the right to submit it under the Mozilla Public License Version 2.0, and that you understand and agree that the project and your contribution are public and that a record of the contribution (including all personal information you submit with it) is maintained indefinitely and may be redistributed consistent with the project and the license.

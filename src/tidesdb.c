@@ -7799,12 +7799,12 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         new_sst->vlog_bm = NULL;
     }
 
-merge_complete:
+merge_complete:;
     /* we save metadata for logging before potentially freeing sstable */
-    uint64_t sst_id = new_sst->id;
-    uint64_t num_entries = new_sst->num_entries;
-    uint64_t num_klog_blocks = new_sst->num_klog_blocks;
-    uint64_t num_vlog_blocks = new_sst->num_vlog_blocks;
+    const uint64_t sst_id = new_sst->id;
+    const uint64_t num_entries = new_sst->num_entries;
+    const uint64_t num_klog_blocks = new_sst->num_klog_blocks;
+    const uint64_t num_vlog_blocks = new_sst->num_vlog_blocks;
 
     /* we only add sstable if it has entries -- empty sstables cause corruption */
     if (num_entries > 0)

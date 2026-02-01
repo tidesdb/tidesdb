@@ -86,7 +86,7 @@ static inline int odsync_available(void)
  */
 static inline int is_sync_full(const block_manager_t *bm)
 {
-    return bm->sync_mode == BLOCK_MANAGER_SYNC_FULL;
+    return bm->sync_full_cached;
 }
 
 /**
@@ -199,6 +199,7 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
     atomic_init(&new_bm->current_file_size, 0);
 
     new_bm->sync_mode = sync_mode;
+    new_bm->sync_full_cached = (sync_mode == BLOCK_MANAGER_SYNC_FULL);
 
     const int file_exists = access(file_path, F_OK) == 0;
 
@@ -472,7 +473,7 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
         /* we compute checksum */
         const uint32_t checksum = compute_checksum(block->data, block->size);
 
-        /* we serialize block: [size(4)][checksum(4)][data][size(4)][magic(4)] */
+        /* we serialize block -- [size(4)][checksum(4)][data][size(4)][magic(4)] */
         encode_uint32_le_compat(write_buffer + buf_offset, (uint32_t)block->size);
         buf_offset += BLOCK_MANAGER_SIZE_FIELD_SIZE;
 
@@ -563,7 +564,7 @@ int block_manager_cursor_init_stack(block_manager_cursor_t *cursor, block_manage
     cursor->current_pos = BLOCK_MANAGER_HEADER_SIZE;
     cursor->current_block_size = 0;
     cursor->block_index = -1; /* -1 means before first block */
-
+    cursor->block_size_valid = 0;
     set_file_sequential_hint(bm->fd);
 
     /* position at first block so cursor_read works immediately */
@@ -586,21 +587,33 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
-    ssize_t nread =
-        pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)cursor->current_pos);
-    if (nread != BLOCK_MANAGER_SIZE_FIELD_SIZE)
+    uint32_t block_size;
+
+    /* use cached block size if valid, otherwise read from disk */
+    if (cursor->block_size_valid && cursor->current_block_size > 0)
     {
-        if (nread == 0) return 1; /* EOF */
-        return -1;
+        block_size = (uint32_t)cursor->current_block_size;
     }
-    const uint32_t block_size = decode_uint32_le_compat(size_buf);
-    if (block_size == 0) return -1; /* invalid block */
+    else
+    {
+        unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+        ssize_t nread = pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                              (off_t)cursor->current_pos);
+        if (nread != BLOCK_MANAGER_SIZE_FIELD_SIZE)
+        {
+            if (nread == 0) return 1; /* EOF */
+            return -1;
+        }
+        block_size = decode_uint32_le_compat(size_buf);
+        if (block_size == 0) return -1; /* invalid block */
+    }
 
     /* next block starts after, [size][checksum][data][footer_size][footer_magic] */
     cursor->current_pos +=
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
-    cursor->current_block_size = block_size;
+    cursor->current_block_size = 0;
+    cursor->block_size_valid = 0; /* invalidate cache after moving */
+    cursor->block_index++;
 
     return 0;
 }
@@ -611,6 +624,12 @@ int block_manager_cursor_has_next(block_manager_cursor_t *cursor)
 
     const uint64_t file_size = atomic_load(&cursor->bm->current_file_size);
     if (cursor->current_pos >= file_size) return 0; /* at or past EOF */
+
+    /* use cached block size if valid */
+    if (cursor->block_size_valid && cursor->current_block_size > 0)
+    {
+        return 1;
+    }
 
     /* read current block size to check if current block is valid */
     unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
@@ -624,6 +643,10 @@ int block_manager_cursor_has_next(block_manager_cursor_t *cursor)
 
     const uint32_t block_size = decode_uint32_le_compat(size_buf);
     if (block_size == 0) return -1; /* invalid block */
+
+    /* cache the block size for subsequent cursor_next call */
+    cursor->current_block_size = block_size;
+    cursor->block_size_valid = 1;
 
     /* has_next returns 1 if cursor_next would succeed (can read current block and move forward) */
     return 1;
@@ -657,7 +680,7 @@ static block_manager_block_t *block_manager_read_block_at_offset(block_manager_t
 #define READ_STACK_BUF_SIZE 65536
     unsigned char stack_buf[READ_STACK_BUF_SIZE];
 
-    /* first pread -- try to get header + data in one syscall */
+    /* first pread -- we try to get header + data in one syscall */
     const ssize_t initial_read = pread(fd, stack_buf, READ_STACK_BUF_SIZE, (off_t)offset);
     if (BM_UNLIKELY(initial_read < (ssize_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE)) return NULL;
 
@@ -737,7 +760,7 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
     if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=
         BLOCK_MANAGER_SIZE_FIELD_SIZE)
         return NULL;
-    uint32_t block_size = decode_uint32_le_compat(size_buf);
+    const uint32_t block_size = decode_uint32_le_compat(size_buf);
     if (block_size == 0) return NULL;
 
     /* if block is smaller than max_bytes, read full block */
@@ -758,7 +781,7 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
         return NULL;
     }
 
-    /* read only first max_bytes of data */
+    /* we read only first max_bytes of data */
     const off_t data_pos = (off_t)offset + (off_t)BLOCK_MANAGER_BLOCK_HEADER_SIZE;
     if (pread(bm->fd, block->data, max_bytes, data_pos) != (ssize_t)max_bytes)
     {
@@ -801,36 +824,53 @@ int block_manager_cursor_prev(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    uint64_t scan_pos = BLOCK_MANAGER_HEADER_SIZE;
+    /* already at first block position, can't go back */
+    if (cursor->current_pos <= BLOCK_MANAGER_HEADER_SIZE) return -1;
 
-    while (scan_pos < cursor->current_pos)
+    const uint64_t prev_footer_end = cursor->current_pos;
+    if (prev_footer_end <
+        BLOCK_MANAGER_HEADER_SIZE + BLOCK_MANAGER_BLOCK_HEADER_SIZE + BLOCK_MANAGER_FOOTER_SIZE)
     {
-        unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
-        if (pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)scan_pos) !=
-            BLOCK_MANAGER_SIZE_FIELD_SIZE)
-            return -1;
-        const uint32_t block_size = decode_uint32_le_compat(size_buf);
-        if (block_size == 0) return -1;
-
-        /* we calculate next block position, [size][checksum][data][footer] */
-        const uint64_t total_block_size =
-            BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
-        const uint64_t next_pos = scan_pos + total_block_size;
-
-        /* we check if next block is our current position */
-        if (next_pos == cursor->current_pos)
-        {
-            /* scan_pos is the block immediately before current */
-            cursor->current_pos = scan_pos;
-            cursor->current_block_size = block_size;
-            return 0;
-        }
-
-        /* move to next block */
-        scan_pos = next_pos;
+        return -1; /* not enough space for a valid previous block */
     }
 
-    return -1;
+    unsigned char footer_buf[BLOCK_MANAGER_FOOTER_SIZE];
+    const off_t footer_offset = (off_t)(prev_footer_end - BLOCK_MANAGER_FOOTER_SIZE);
+    if (pread(cursor->bm->fd, footer_buf, BLOCK_MANAGER_FOOTER_SIZE, footer_offset) !=
+        BLOCK_MANAGER_FOOTER_SIZE)
+    {
+        return -1;
+    }
+
+    const uint32_t prev_block_size = decode_uint32_le_compat(footer_buf);
+    const uint32_t footer_magic = decode_uint32_le_compat(footer_buf + 4);
+
+    /* validate footer magic */
+    if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC || prev_block_size == 0)
+    {
+        return -1;
+    }
+
+    /* we calculate start of previous block */
+    const uint64_t prev_total_size =
+        BLOCK_MANAGER_BLOCK_HEADER_SIZE + prev_block_size + BLOCK_MANAGER_FOOTER_SIZE;
+    if (cursor->current_pos < prev_total_size)
+    {
+        return -1; /* invalid -- would underflow */
+    }
+
+    const uint64_t prev_block_start = cursor->current_pos - prev_total_size;
+    if (prev_block_start < BLOCK_MANAGER_HEADER_SIZE)
+    {
+        return -1; /* invalid -- before file header */
+    }
+
+    cursor->current_pos = prev_block_start;
+    cursor->current_block_size = prev_block_size;
+    cursor->block_size_valid = 1; /* we know the size from footer */
+    cursor->block_index--;
+
+    return 0;
 }
 
 int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)
@@ -840,6 +880,7 @@ int block_manager_cursor_goto_first(block_manager_cursor_t *cursor)
     cursor->current_pos = BLOCK_MANAGER_HEADER_SIZE;
     cursor->current_block_size = 0;
     cursor->block_index = -1;
+    cursor->block_size_valid = 0;
 
     return 0;
 }
@@ -886,7 +927,8 @@ int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
 
     cursor->current_pos = file_size - total_block_size;
     cursor->current_block_size = block_size;
-    cursor->block_index = -1; /* unknown index */
+    cursor->block_size_valid = 1; /* we know the size from footer */
+    cursor->block_index = -1;     /* unknown index */
 
     return 0;
 }
@@ -1008,6 +1050,7 @@ int block_manager_cursor_goto(block_manager_cursor_t *cursor, const uint64_t pos
     if (!cursor) return -1;
 
     cursor->current_pos = pos;
+    cursor->block_size_valid = 0; /* invalidate cache when jumping to arbitrary position */
     return 0;
 }
 
@@ -1277,6 +1320,7 @@ void block_manager_set_sync_mode(block_manager_t *bm, const int sync_mode)
 {
     if (!bm) return;
     bm->sync_mode = convert_sync_mode(sync_mode);
+    bm->sync_full_cached = (bm->sync_mode == BLOCK_MANAGER_SYNC_FULL);
 }
 
 int block_manager_get_block_size_at_offset(block_manager_t *bm, const uint64_t offset,

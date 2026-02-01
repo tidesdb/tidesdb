@@ -84,6 +84,7 @@ typedef struct
     int fd;
     char file_path[MAX_FILE_PATH_LENGTH];
     block_manager_sync_mode_t sync_mode;
+    int sync_full_cached; /* cached result of (sync_mode == BLOCK_MANAGER_SYNC_FULL) */
     /* explicit alignment for atomic uint64_t to avoid ABI issues on 32-bit platforms */
     ATOMIC_ALIGN(8) _Atomic uint64_t current_file_size;
 } block_manager_t;
@@ -118,6 +119,7 @@ typedef struct
     uint64_t current_pos;
     uint64_t current_block_size;
     int block_index;
+    int block_size_valid; /* 1 if current_block_size is cached and valid, 0 otherwise */
 } block_manager_cursor_t;
 
 /**

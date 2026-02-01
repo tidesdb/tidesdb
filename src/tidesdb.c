@@ -128,6 +128,7 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_KV_FLAG_HAS_TTL   0x02
 #define TDB_KV_FLAG_HAS_VLOG  0x04
 #define TDB_KV_FLAG_DELTA_SEQ 0x08
+#define TDB_KV_FLAG_ARENA     0x80
 
 #define TDB_LOG_FILE                     "LOG"
 #define TDB_WAL_PREFIX                   "wal_"
@@ -1765,33 +1766,34 @@ static tidesdb_kv_pair_t *tidesdb_kv_pair_create(const uint8_t *key, const size_
                                                  const time_t ttl, const uint64_t seq,
                                                  const int is_tombstone)
 {
-    tidesdb_kv_pair_t *kv = calloc(1, sizeof(tidesdb_kv_pair_t));
-    if (!kv) return NULL;
+    /* arena allocation -- single malloc for struct + key + value
+     * [tidesdb_kv_pair_t][key_data][value_data]
+     * this reduces malloc calls from 3 to 1, improves cache locality! */
+    const size_t value_alloc = (value_size > 0 && value) ? value_size : 0;
+    const size_t arena_size = sizeof(tidesdb_kv_pair_t) + key_size + value_alloc;
+
+    uint8_t *arena = malloc(arena_size);
+    if (!arena) return NULL;
+
+    tidesdb_kv_pair_t *kv = (tidesdb_kv_pair_t *)arena;
+    memset(kv, 0, sizeof(tidesdb_kv_pair_t));
 
     kv->entry.flags = is_tombstone ? TDB_KV_FLAG_TOMBSTONE : 0;
+    kv->entry.flags |= TDB_KV_FLAG_ARENA; /* mark as arena-allocated */
     kv->entry.key_size = (uint32_t)key_size;
     kv->entry.value_size = (uint32_t)value_size;
     kv->entry.ttl = ttl;
     kv->entry.seq = seq;
     kv->entry.vlog_offset = 0;
 
-    kv->key = malloc(key_size);
-    if (!kv->key)
-    {
-        free(kv);
-        return NULL;
-    }
+    /* key immediately follows struct */
+    kv->key = arena + sizeof(tidesdb_kv_pair_t);
     memcpy(kv->key, key, key_size);
 
-    if (value_size > 0 && value)
+    /* value follows key */
+    if (value_alloc > 0)
     {
-        kv->value = malloc(value_size);
-        if (!kv->value)
-        {
-            free(kv->key);
-            free(kv);
-            return NULL;
-        }
+        kv->value = kv->key + key_size;
         memcpy(kv->value, value, value_size);
     }
 
@@ -1806,6 +1808,31 @@ static tidesdb_kv_pair_t *tidesdb_kv_pair_create(const uint8_t *key, const size_
 static void tidesdb_kv_pair_free(tidesdb_kv_pair_t *kv)
 {
     if (!kv) return;
+
+    /* arena-allocated KV pairs use single allocation for struct + key + value
+     * however, value may be loaded separately (e.g., from vlog) after creation
+     * we detect this by checking if value pointer is outside the arena bounds */
+    if (kv->entry.flags & TDB_KV_FLAG_ARENA)
+    {
+        /*  [struct][key_data][value_data]
+         * if value was allocated separately, it wont be in this range */
+        if (kv->value != NULL)
+        {
+            const uint8_t *arena_start = (const uint8_t *)kv;
+            const uint8_t *arena_end =
+                arena_start + sizeof(tidesdb_kv_pair_t) + kv->entry.key_size + kv->entry.value_size;
+
+            if (kv->value < arena_start || kv->value >= arena_end)
+            {
+                free(kv->value); /* value was allocated separately */
+            }
+        }
+
+        free(kv); /* single free for arena (struct + key) */
+        return;
+    }
+
+    /* legacy path for non-arena KV pairs */
     free(kv->key);
     free(kv->value);
     free(kv);
@@ -4103,7 +4130,10 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
 
                 if (*kv)
                 {
+                    /* we preserve arena flag when copying entry */
+                    const uint8_t arena_flag = (*kv)->entry.flags & TDB_KV_FLAG_ARENA;
                     (*kv)->entry = klog_block->entries[i];
+                    (*kv)->entry.flags |= arena_flag;
                     tidesdb_kv_pair_load_value(db, sst, klog_block, i, *kv);
 
                     /* we release resources and return success */

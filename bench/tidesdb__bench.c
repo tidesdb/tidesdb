@@ -667,6 +667,7 @@ int main()
     printf("  L1 File Count Trigger: %d\n", BENCH_L1_FILE_COUNT_TRIGGER);
     printf("  L0 Queue Stall Threshold: %d\n", BENCH_L0_QUEUE_STALL_THRESHOLD);
     printf("  Max Open SSTables: %d\n", BENCH_MAX_OPEN_SSTABLES);
+    printf("  Use B+tree: %s\n", BENCH_USE_BTREE ? "enabled" : "disabled");
     printf("*======================================*\n\n" RESET);
 
     uint8_t **keys = malloc(BENCH_NUM_OPERATIONS * sizeof(uint8_t *));
@@ -807,6 +808,7 @@ int main()
     cf_config.min_disk_space = BENCH_MIN_DISK_SPACE;
     cf_config.l1_file_count_trigger = BENCH_L1_FILE_COUNT_TRIGGER;
     cf_config.l0_queue_stall_threshold = BENCH_L0_QUEUE_STALL_THRESHOLD;
+    cf_config.use_btree = BENCH_USE_BTREE;
 
     if (tidesdb_create_column_family(tdb, BENCH_CF_NAME, &cf_config) != 0)
     {

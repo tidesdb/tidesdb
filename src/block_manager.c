@@ -520,6 +520,78 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
     return success_count;
 }
 
+int block_manager_write_at(block_manager_t *bm, const int64_t offset, const uint8_t *data,
+                           const size_t size)
+{
+    if (!bm || !data || size == 0 || offset < 0) return -1;
+
+    const ssize_t written = pwrite(bm->fd, data, size, offset);
+    if (written != (ssize_t)size)
+    {
+        return -1;
+    }
+
+    if (is_sync_full(bm) && !odsync_available())
+    {
+        if (fdatasync(bm->fd) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+int block_manager_update_checksum(block_manager_t *bm, const int64_t block_offset)
+{
+    if (!bm || block_offset < 0) return -1;
+
+    /* we read block size from header */
+    unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+    if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, block_offset) !=
+        BLOCK_MANAGER_SIZE_FIELD_SIZE)
+    {
+        return -1;
+    }
+
+    const uint32_t block_size = decode_uint32_le_compat(size_buf);
+    if (block_size == 0) return -1;
+
+    uint8_t *data = malloc(block_size);
+    if (!data) return -1;
+
+    const off_t data_offset = block_offset + BLOCK_MANAGER_BLOCK_HEADER_SIZE;
+    if (pread(bm->fd, data, block_size, data_offset) != (ssize_t)block_size)
+    {
+        free(data);
+        return -1;
+    }
+
+    /* we compute new checksum */
+    const uint32_t new_checksum = compute_checksum(data, block_size);
+    free(data);
+
+    unsigned char checksum_buf[BLOCK_MANAGER_CHECKSUM_LENGTH];
+    encode_uint32_le_compat(checksum_buf, new_checksum);
+
+    const off_t checksum_offset = block_offset + BLOCK_MANAGER_SIZE_FIELD_SIZE;
+    if (pwrite(bm->fd, checksum_buf, BLOCK_MANAGER_CHECKSUM_LENGTH, checksum_offset) !=
+        BLOCK_MANAGER_CHECKSUM_LENGTH)
+    {
+        return -1;
+    }
+
+    if (is_sync_full(bm) && !odsync_available())
+    {
+        if (fdatasync(bm->fd) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 void block_manager_block_free(block_manager_block_t *block)
 {
     if (!block) return;

@@ -21,6 +21,7 @@
 
 #include "block_manager.h"
 #include "bloom_filter.h"
+#include "btree.h"
 #include "buffer.h"
 #include "clock_cache.h"
 #include "compat.h"
@@ -234,6 +235,7 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param min_disk_space minimum free disk space required (bytes)
  * @param l1_file_count_trigger trigger for L1 file count, utilized for compaction triggering
  * @param l0_queue_stall_threshold threshold for L0 queue stall, utilized for backpressure
+ * @param use_btree use btree for klog, faster reads depending on workload
  */
 typedef struct tidesdb_column_family_config_t
 {
@@ -260,6 +262,7 @@ typedef struct tidesdb_column_family_config_t
     uint64_t min_disk_space;
     int l1_file_count_trigger;
     int l0_queue_stall_threshold;
+    int use_btree;
 } tidesdb_column_family_config_t;
 
 /**
@@ -391,6 +394,10 @@ struct tidesdb_column_family_t
  * @param marked_for_deletion flag indicating sstable is marked for deletion
  * @param last_access_time last access time for lru eviction
  * @param db database handle (for resolving comparators from registry)
+ * @param use_btree flag indicating sstable uses btree format
+ * @param btree_root_offset root node offset for btree
+ * @param btree_first_leaf first leaf offset for btree forward iteration
+ * @param btree_last_leaf last leaf offset for btree backward iteration
  */
 struct tidesdb_sstable_t
 {
@@ -418,6 +425,10 @@ struct tidesdb_sstable_t
     _Atomic(int) marked_for_deletion;
     _Atomic(time_t) last_access_time;
     tidesdb_t *db;
+    int use_btree;
+    int64_t btree_root_offset;
+    int64_t btree_first_leaf;
+    int64_t btree_last_leaf;
 };
 
 /**
@@ -516,6 +527,7 @@ struct tidesdb_t
     pthread_mutex_t reaper_thread_mutex;
     pthread_cond_t reaper_thread_cond;
     clock_cache_t *clock_cache;
+    clock_cache_t *btree_node_cache;
     _Atomic(int) num_open_sstables;
     _Atomic(uint64_t) next_txn_id;
     _Atomic(uint64_t) global_seq;

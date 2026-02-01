@@ -987,7 +987,7 @@ static void test_stats_comprehensive(void)
     tidesdb_free_stats(stats);
     stats = NULL;
 
-    /* test 4 -- flush to create SSTables and verify level stats */
+    /* test 4 -- flush to create ssts and verify level stats */
     ASSERT_EQ(tidesdb_flush_memtable(cf), TDB_SUCCESS);
 
     /* wait for flush to complete */
@@ -1028,7 +1028,7 @@ static void test_stats_comprehensive(void)
     ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
     ASSERT_TRUE(stats != NULL);
 
-    /* verify we have data in SSTables now */
+    /* verify we have data in ssts now */
     ASSERT_TRUE(stats->total_keys > 0);
     ASSERT_TRUE(stats->total_data_size > 0);
 
@@ -7197,13 +7197,15 @@ typedef struct
     int keys_per_sstable;
     int block_cache_size;
     tidesdb_comparator_fn comparator;
+    int use_btree;
 } sim_test_config_t;
 
 static void run_sstable_simulation(sim_test_config_t *config)
 {
-    printf("  Running: %s (bloom=%d, idx=%d, comp=%d, ssts=%d, keys=%d)\n", config->test_name,
-           config->enable_bloom, config->enable_indexes, config->compression_algo,
-           config->num_sstables, config->keys_per_sstable);
+    printf("  Running: %s (bloom=%d, idx=%d, comp=%d, ssts=%d, keys=%d, btree=%d)\n",
+           config->test_name, config->enable_bloom, config->enable_indexes,
+           config->compression_algo, config->num_sstables, config->keys_per_sstable,
+           config->use_btree);
 
     cleanup_test_dir();
     tidesdb_t *db = create_test_db();
@@ -7216,6 +7218,7 @@ static void run_sstable_simulation(sim_test_config_t *config)
     cf_config.enable_block_indexes = config->enable_indexes;
     cf_config.compression_algorithm = config->compression_algo;
     cf_config.bloom_fpr = 0.01;
+    cf_config.use_btree = config->use_btree;
 
     /* apply comparator if specified */
     if (config->comparator != NULL)
@@ -7760,6 +7763,886 @@ static void test_many_sstables_all_comparators(void)
                                 .keys_per_sstable = 40,
                                 .comparator = tidesdb_comparator_lexicographic};
     run_sstable_simulation(&config);
+}
+
+static void test_btree_sstable_basic(void)
+{
+    sim_test_config_t config = {.test_name = "btree_basic",
+                                .enable_bloom = 1,
+                                .enable_indexes = 0, /* btree doesn't use block indexes */
+                                .compression_algo = TDB_COMPRESS_NONE,
+                                .num_sstables = 10,
+                                .block_cache_size = 0,
+                                .keys_per_sstable = 50,
+                                .comparator = NULL,
+                                .use_btree = 1};
+    run_sstable_simulation(&config);
+}
+
+static void test_btree_sstable_with_bloom(void)
+{
+    sim_test_config_t config = {.test_name = "btree_with_bloom",
+                                .enable_bloom = 1,
+                                .enable_indexes = 0,
+                                .compression_algo = TDB_COMPRESS_NONE,
+                                .num_sstables = 15,
+                                .block_cache_size = 0,
+                                .keys_per_sstable = 40,
+                                .comparator = NULL,
+                                .use_btree = 1};
+    run_sstable_simulation(&config);
+}
+
+static void test_btree_sstable_without_bloom(void)
+{
+    sim_test_config_t config = {.test_name = "btree_without_bloom",
+                                .enable_bloom = 0,
+                                .enable_indexes = 0,
+                                .compression_algo = TDB_COMPRESS_NONE,
+                                .num_sstables = 15,
+                                .block_cache_size = 0,
+                                .keys_per_sstable = 40,
+                                .comparator = NULL,
+                                .use_btree = 1};
+    run_sstable_simulation(&config);
+}
+
+static void test_btree_sstable_many_keys(void)
+{
+    sim_test_config_t config = {.test_name = "btree_many_keys",
+                                .enable_bloom = 1,
+                                .enable_indexes = 0,
+                                .compression_algo = TDB_COMPRESS_NONE,
+                                .num_sstables = 20,
+                                .block_cache_size = 0,
+                                .keys_per_sstable = 100,
+                                .comparator = NULL,
+                                .use_btree = 1};
+    run_sstable_simulation(&config);
+}
+
+static void test_btree_sstable_with_cache(void)
+{
+    sim_test_config_t config = {.test_name = "btree_with_cache",
+                                .enable_bloom = 1,
+                                .enable_indexes = 0,
+                                .compression_algo = TDB_COMPRESS_NONE,
+                                .num_sstables = 15,
+                                .block_cache_size = 16 * 1024 * 1024, /* 16MB */
+                                .keys_per_sstable = 50,
+                                .comparator = NULL,
+                                .use_btree = 1};
+    run_sstable_simulation(&config);
+}
+
+static void test_btree_sstable_comparator_lexicographic(void)
+{
+    sim_test_config_t config = {.test_name = "btree_comparator_lexicographic",
+                                .enable_bloom = 1,
+                                .enable_indexes = 0,
+                                .compression_algo = TDB_COMPRESS_NONE,
+                                .num_sstables = 10,
+                                .block_cache_size = 0,
+                                .keys_per_sstable = 40,
+                                .comparator = tidesdb_comparator_lexicographic,
+                                .use_btree = 1};
+    run_sstable_simulation(&config);
+}
+
+static void test_btree_sstable_comparator_reverse(void)
+{
+    sim_test_config_t config = {.test_name = "btree_comparator_reverse",
+                                .enable_bloom = 1,
+                                .enable_indexes = 0,
+                                .compression_algo = TDB_COMPRESS_NONE,
+                                .num_sstables = 10,
+                                .block_cache_size = 0,
+                                .keys_per_sstable = 40,
+                                .comparator = tidesdb_comparator_reverse_memcmp,
+                                .use_btree = 1};
+    run_sstable_simulation(&config);
+}
+
+static void test_btree_compaction_basic(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 2048;
+    cf_config.level_size_ratio = 10;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0; /* btree doesn't use block indexes */
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_compact_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_compact_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 200; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[128];
+        snprintf(key, sizeof(key), "key_%03d", i);
+        snprintf(value, sizeof(value), "value_%03d_with_some_data", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if (i % 10 == 9)
+        {
+            tidesdb_flush_memtable(cf);
+            usleep(50000);
+        }
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    int max_wait = 200;
+    for (int i = 0; i < max_wait; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0)
+        {
+            usleep(100000);
+            break;
+        }
+    }
+
+    tidesdb_compact(cf);
+
+    for (int i = 0; i < max_wait; i++)
+    {
+        usleep(50000);
+        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
+        if (queue_size(db->compaction_queue) == 0 && !is_compacting)
+        {
+            usleep(100000);
+            break;
+        }
+    }
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 200; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "key_%03d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        ASSERT_EQ(result, 0);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+    }
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_btree_compaction_with_deletes(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 2048;
+    cf_config.level_size_ratio = 10;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_del_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_del_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 100; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "del_key_%03d", i);
+        snprintf(value, sizeof(value), "del_value_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        if (i % 10 == 9) tidesdb_flush_memtable(cf);
+    }
+
+    for (int i = 0; i < 100; i += 2)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "del_key_%03d", i);
+        ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_compact(cf);
+
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "del_key_%03d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        if (i % 2 == 0)
+        {
+            ASSERT_TRUE(result != 0); /* deleted keys should not be found */
+        }
+        else
+        {
+            ASSERT_EQ(result, 0);
+            ASSERT_TRUE(value != NULL);
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_btree_flush_basic(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_flush_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_flush_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "flush_key_%03d", i);
+        snprintf(value, sizeof(value), "flush_value_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "flush_key_%03d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+    }
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_btree_dca_min_levels_constraint(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 512;
+    cf_config.level_size_ratio = 2;
+    cf_config.min_levels = 4;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_min_levels_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_min_levels_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    int initial_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    ASSERT_TRUE(initial_levels >= 4);
+
+    for (int i = 0; i < 20; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "btree_min_key_%03d", i);
+        snprintf(value, sizeof(value), "btree_min_value_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    for (int round = 0; round < 3; round++)
+    {
+        tidesdb_compact(cf);
+        for (int i = 0; i < 200; i++)
+        {
+            usleep(50000);
+            if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+        }
+    }
+
+    int final_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+    ASSERT_TRUE(final_levels >= 4);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    for (int i = 0; i < 20; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "btree_min_key_%03d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_btree_merge_heap_source_exhaustion(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 512;
+    cf_config.level_size_ratio = 2;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_exhaust_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_exhaust_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* create multiple small sstables with non-overlapping ranges */
+    for (int batch = 0; batch < 5; batch++)
+    {
+        for (int i = 0; i < 10; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[32], value[64];
+            snprintf(key, sizeof(key), "batch%d_key_%03d", batch, i);
+            snprintf(value, sizeof(value), "batch%d_value_%03d", batch, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+        tidesdb_flush_memtable(cf);
+        usleep(100000);
+    }
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_compact(cf);
+
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int batch = 0; batch < 5; batch++)
+    {
+        for (int i = 0; i < 10; i++)
+        {
+            char key[32];
+            snprintf(key, sizeof(key), "batch%d_key_%03d", batch, i);
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            ASSERT_EQ(
+                tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size), 0);
+            ASSERT_TRUE(value != NULL);
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_btree_compaction_all_tombstones(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.level_size_ratio = 2;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_tomb_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_tomb_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* insert keys */
+    for (int i = 0; i < 30; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "tomb_key_%03d", i);
+        snprintf(value, sizeof(value), "tomb_value_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    for (int i = 0; i < 30; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "tomb_key_%03d", i);
+        ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_compact(cf);
+
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 30; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "tomb_key_%03d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        ASSERT_TRUE(result != 0);
+    }
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_btree_flush_during_compaction(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.level_size_ratio = 2;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_flush_compact_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_flush_compact_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int batch = 0; batch < 5; batch++)
+    {
+        for (int i = 0; i < 20; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[32], value[64];
+            snprintf(key, sizeof(key), "fc_key_%03d_%03d", batch, i);
+            snprintf(value, sizeof(value), "fc_value_%03d_%03d", batch, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+        tidesdb_flush_memtable(cf);
+        usleep(50000);
+    }
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_compact(cf);
+
+    /* immediately write more data and flush during compaction */
+    for (int i = 0; i < 20; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "fc_new_key_%03d", i);
+        snprintf(value, sizeof(value), "fc_new_value_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    /* wait for everything to complete */
+    for (int i = 0; i < 300; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0 &&
+            queue_size(db->flush_queue) == 0)
+            break;
+    }
+
+    /* we verify all data */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int batch = 0; batch < 5; batch++)
+    {
+        for (int i = 0; i < 20; i++)
+        {
+            char key[32];
+            snprintf(key, sizeof(key), "fc_key_%03d_%03d", batch, i);
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            ASSERT_EQ(
+                tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size), 0);
+            ASSERT_TRUE(value != NULL);
+            free(value);
+        }
+    }
+
+    for (int i = 0; i < 20; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "fc_new_key_%03d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+    }
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_btree_compaction_max_seq_propagation(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 512;
+    cf_config.level_size_ratio = 2;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_seq_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_seq_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int batch = 0; batch < 3; batch++)
+    {
+        for (int i = 0; i < 15; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[32], value[64];
+            snprintf(key, sizeof(key), "seq_key_%03d", i);
+            snprintf(value, sizeof(value), "seq_value_batch%d_%03d", batch, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+        tidesdb_flush_memtable(cf);
+        usleep(100000);
+    }
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_compact(cf);
+
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    /* we verify we get the latest values (from batch 2) */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 15; i++)
+    {
+        char key[32], expected_value[64];
+        snprintf(key, sizeof(key), "seq_key_%03d", i);
+        snprintf(expected_value, sizeof(expected_value), "seq_value_batch2_%03d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        ASSERT_TRUE(value != NULL);
+        ASSERT_TRUE(strcmp((char *)value, expected_value) == 0);
+        free(value);
+    }
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_btree_merge_with_bloom_disabled(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.level_size_ratio = 2;
+    cf_config.use_btree = 1;
+    cf_config.enable_bloom_filter = 0;
+    cf_config.enable_block_indexes = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_no_bloom_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_no_bloom_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int batch = 0; batch < 3; batch++)
+    {
+        for (int i = 0; i < 20; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[32], value[64];
+            snprintf(key, sizeof(key), "nb_key_%03d_%03d", batch, i);
+            snprintf(value, sizeof(value), "nb_value_%03d_%03d", batch, i);
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+        tidesdb_flush_memtable(cf);
+        usleep(100000);
+    }
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_compact(cf);
+
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int batch = 0; batch < 3; batch++)
+    {
+        for (int i = 0; i < 20; i++)
+        {
+            char key[32];
+            snprintf(key, sizeof(key), "nb_key_%03d_%03d", batch, i);
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            ASSERT_EQ(
+                tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size), 0);
+            ASSERT_TRUE(value != NULL);
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_btree_compaction_interleaved_deletes(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.level_size_ratio = 2;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_interleave_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_interleave_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* insert all keys first */
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "il_key_%03d", i);
+        snprintf(value, sizeof(value), "il_value_%03d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+    usleep(100000);
+
+    for (int i = 0; i < 50; i += 2)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "il_key_%03d", i);
+        ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+    usleep(100000);
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    tidesdb_compact(cf);
+
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (!tidesdb_is_compacting(cf) && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "il_key_%03d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        if (i % 2 == 0)
+        {
+            /* even keys were deleted */
+            ASSERT_TRUE(result != 0);
+        }
+        else
+        {
+            /* odd keys should exist */
+            ASSERT_EQ(result, 0);
+            ASSERT_TRUE(value != NULL);
+            free(value);
+        }
+    }
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
 }
 
 static void test_large_value_iteration(void)
@@ -16453,6 +17336,23 @@ int main(void)
     RUN_TEST(test_flush_sync_interval_wal_escalation, tests_passed);
     RUN_TEST(test_merge_vlog_large_value_compression, tests_passed);
     RUN_TEST(test_compaction_partitioned_z_calculation, tests_passed);
+    RUN_TEST(test_btree_sstable_basic, tests_passed);
+    RUN_TEST(test_btree_sstable_with_bloom, tests_passed);
+    RUN_TEST(test_btree_sstable_without_bloom, tests_passed);
+    RUN_TEST(test_btree_sstable_many_keys, tests_passed);
+    RUN_TEST(test_btree_sstable_with_cache, tests_passed);
+    RUN_TEST(test_btree_sstable_comparator_lexicographic, tests_passed);
+    RUN_TEST(test_btree_sstable_comparator_reverse, tests_passed);
+    RUN_TEST(test_btree_compaction_basic, tests_passed);
+    RUN_TEST(test_btree_compaction_with_deletes, tests_passed);
+    RUN_TEST(test_btree_flush_basic, tests_passed);
+    RUN_TEST(test_btree_dca_min_levels_constraint, tests_passed);
+    RUN_TEST(test_btree_merge_heap_source_exhaustion, tests_passed);
+    RUN_TEST(test_btree_compaction_all_tombstones, tests_passed);
+    RUN_TEST(test_btree_flush_during_compaction, tests_passed);
+    RUN_TEST(test_btree_compaction_max_seq_propagation, tests_passed);
+    RUN_TEST(test_btree_merge_with_bloom_disabled, tests_passed);
+    RUN_TEST(test_btree_compaction_interleaved_deletes, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

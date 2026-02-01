@@ -13,7 +13,7 @@ endif()
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 7.4.4)
+set(PROJECT_VERSION 8.0.0)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -91,7 +91,7 @@ include_directories(external) # for external libraries linking internally
 # create library (respects BUILD_SHARED_LIBS option)
 # note: on Windows, STATIC is recommended to avoid DLL export/import complexity
 # users can override with -DBUILD_SHARED_LIBS=ON/OFF
-add_library(tidesdb src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/clock_cache.c src/queue.c src/buffer.c external/xxhash.c external/ini.c)
+add_library(tidesdb src/tidesdb.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/manifest.c src/clock_cache.c src/queue.c src/buffer.c src/btree.c external/xxhash.c external/ini.c)
 
 target_include_directories(tidesdb PRIVATE src)
 
@@ -457,6 +457,9 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_MAX_OPEN_SSTABLES)
         set(BENCH_MAX_OPEN_SSTABLES 256)
     endif()
+    if(NOT DEFINED BENCH_USE_BTREE)
+        set(BENCH_USE_BTREE 0)
+    endif()
 
     add_executable(block_manager_tests test/block_manager__tests.c)
     add_executable(skip_list_tests test/skip_list__tests.c)
@@ -466,6 +469,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(manifest_tests test/manifest__tests.c)
     add_executable(queue_tests test/queue__tests.c)
     add_executable(buffer_tests test/buffer__tests.c)
+    add_executable(btree_tests test/btree__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
     add_executable(tidesdb_bench bench/tidesdb__bench.c)
 
@@ -513,10 +517,11 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
             BENCH_L1_FILE_COUNT_TRIGGER=${BENCH_L1_FILE_COUNT_TRIGGER}
             BENCH_L0_QUEUE_STALL_THRESHOLD=${BENCH_L0_QUEUE_STALL_THRESHOLD}
             BENCH_MAX_OPEN_SSTABLES=${BENCH_MAX_OPEN_SSTABLES}
+            BENCH_USE_BTREE=${BENCH_USE_BTREE}
     )
 
     # add include and link directories for test executables
-    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests buffer_tests tidesdb_tests tidesdb_bench)
+    foreach(test_target block_manager_tests skip_list_tests compress_tests bloom_filter_tests manifest_tests clock_cache_tests queue_tests buffer_tests btree_tests tidesdb_tests tidesdb_bench)
         target_link_libraries(${test_target} PRIVATE tidesdb)
         target_include_directories(${test_target} PRIVATE external)
     endforeach()
@@ -529,6 +534,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_test(NAME clock_cache_tests COMMAND clock_cache_tests)
     add_test(NAME queue_tests COMMAND queue_tests)
     add_test(NAME buffer_tests COMMAND buffer_tests)
+    add_test(NAME btree_tests COMMAND btree_tests)
     add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)

@@ -1,0 +1,164 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cycles'
+# Event count (approx.): 6716849984
+#
+# Overhead  Command          Shared Object       Symbol                                          
+# ........  ...............  ..................  ................................................
+#
+    29.86%  bloom_filter_te  libc.so.6           [.] __random
+            |          
+            |--28.27%--__random
+            |          main
+            |          __libc_start_call_main
+            |          
+            |--0.86%--__random_r
+            |          main
+            |          __libc_start_call_main
+            |          
+             --0.73%--rand
+                       main
+                       __libc_start_call_main
+
+    27.82%  bloom_filter_te  libtidesdb.so       [.] bloom_filter_add
+            |          
+             --27.46%--bloom_filter_add
+                       |          
+                       |--23.08%--test_bloom_filter_large_capacity_random_keys
+                       |          main
+                       |          __libc_start_call_main
+                       |          
+                       |--3.55%--benchmark_bloom_filter
+                       |          main
+                       |          __libc_start_call_main
+                       |          
+                        --0.82%--test_false_positive_rate
+                                  main
+                                  __libc_start_call_main
+
+    18.05%  bloom_filter_te  libtidesdb.so       [.] bloom_filter_hash
+            |          
+             --17.62%--bloom_filter_hash
+                       |          
+                       |--14.52%--bloom_filter_add
+                       |          |          
+                       |          |--11.31%--test_bloom_filter_large_capacity_random_keys
+                       |          |          main
+                       |          |          __libc_start_call_main
+                       |          |          
+                       |           --3.21%--benchmark_bloom_filter
+                       |                     main
+                       |                     __libc_start_call_main
+                       |          
+                        --3.11%--bloom_filter_contains
+                                  |          
+                                   --3.04%--benchmark_bloom_filter
+                                             main
+                                             __libc_start_call_main
+
+     5.88%  bloom_filter_te  libc.so.6           [.] __random_r
+            |          
+            |--5.17%--__random_r
+            |          main
+            |          __libc_start_call_main
+            |          
+             --0.71%--__random
+                       main
+                       __libc_start_call_main
+
+     4.64%  bloom_filter_te  bloom_filter_tests  [.] test_bloom_filter_large_capacity_random_keys
+            |          
+            |--3.55%--test_bloom_filter_large_capacity_random_keys
+            |          main
+            |          __libc_start_call_main
+            |          
+             --1.09%--0x560893fbf1c0
+                       main
+                       __libc_start_call_main
+
+     4.30%  bloom_filter_te  libtidesdb.so       [.] bloom_filter_contains
+            |          
+             --4.02%--bloom_filter_contains
+                       |          
+                       |--2.89%--benchmark_bloom_filter
+                       |          main
+                       |          __libc_start_call_main
+                       |          
+                        --1.13%--test_bloom_filter_large_capacity_random_keys
+                                  main
+                                  __libc_start_call_main
+
+     1.78%  bloom_filter_te  libc.so.6           [.] __printf_buffer
+            |          
+             --1.63%--__printf_buffer
+                       |          
+                        --1.14%--0x7fff5198cf74
+
+     1.07%  bloom_filter_te  libc.so.6           [.] _itoa_word
+            |          
+             --0.85%--_itoa_word
+                       0x7fff5198cf74
+
+     1.00%  bloom_filter_te  libc.so.6           [.] rand
+            |          
+             --0.57%--test_bloom_filter_large_capacity_random_keys
+                       main
+                       __libc_start_call_main
+
+     0.85%  bloom_filter_te  libc.so.6           [.] __printf_buffer_write
+            |          
+             --0.63%--__printf_buffer_write
+
+     0.78%  bloom_filter_te  libtidesdb.so       [.] decode_varint64
+            |
+            ---decode_varint64
+               bloom_filter_deserialize
+               test_bloom_filter_large_capacity_random_keys
+               main
+               __libc_start_call_main
+
+     0.71%  bloom_filter_te  libtidesdb.so       [.] 0x00000000000085d4
+            |
+            ---bloom_filter_hash
+
+     0.64%  bloom_filter_te  libtidesdb.so       [.] encode_varint64
+            |
+            ---encode_varint64
+               bloom_filter_serialize
+
+     0.36%  bloom_filter_te  bloom_filter_tests  [.] 0x00000000000011c4
+     0.26%  bloom_filter_te  [unknown]           [k] 0xffffffffb188cbaf
+     0.21%  bloom_filter_te  libtidesdb.so       [.] bloom_filter_serialize
+     0.21%  bloom_filter_te  bloom_filter_tests  [.] benchmark_bloom_filter
+     0.14%  bloom_filter_te  libc.so.6           [.] __strchrnul_evex
+     0.14%  bloom_filter_te  libtidesdb.so       [.] encode_varint32
+     0.14%  bloom_filter_te  libc.so.6           [.] __vsnprintf_internal
+     0.14%  bloom_filter_te  libc.so.6           [.] __strlen_evex
+     0.14%  bloom_filter_te  libc.so.6           [.] 0x0000000000022514
+     0.14%  bloom_filter_te  libc.so.6           [.] __memmove_evex_unaligned_erms
+     0.11%  bloom_filter_te  [unknown]           [k] 0xffffffffb2437fb2
+     0.07%  bloom_filter_te  [unknown]           [k] 0xffffffffb15b8050
+     0.07%  bloom_filter_te  [unknown]           [k] 0xffffffffb174428d
+     0.07%  bloom_filter_te  libtidesdb.so       [.] decode_varint32
+     0.07%  bloom_filter_te  [unknown]           [k] 0xffffffffb17dfc47
+     0.07%  bloom_filter_te  bloom_filter_tests  [.] 0x0000000000001244
+     0.07%  bloom_filter_te  [unknown]           [k] 0xffffffffb17de3b7
+     0.07%  bloom_filter_te  [unknown]           [k] 0xffffffffb1c947e7
+     0.07%  bloom_filter_te  [unknown]           [k] 0xffffffffb24c381e
+     0.07%  bloom_filter_te  libc.so.6           [.] __snprintf
+     0.00%  bloom_filter_te  [unknown]           [k] 0xffffffffb1407cbc
+     0.00%  bloom_filter_te  [unknown]           [k] 0xffffffffb2601889
+     0.00%  perf-exec        [unknown]           [k] 0xffffffffb145246a
+     0.00%  bloom_filter_te  [unknown]           [k] 0xffffffffb26018bc
+     0.00%  bloom_filter_te  [unknown]           [k] 0xffffffffb14b9466
+     0.00%  perf-exec        [unknown]           [k] 0xffffffffb14b9466
+     0.00%  bloom_filter_te  [unknown]           [k] 0xffffffffb14b9464
+     0.00%  perf-exec        [unknown]           [k] 0xffffffffb14b9464
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

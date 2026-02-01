@@ -1378,6 +1378,8 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, const size_t key_size, const 
  *   -- int64_t btree_root_offset
  *   -- int64_t btree_first_leaf
  *   -- int64_t btree_last_leaf
+ *   -- uint64_t btree_node_count
+ *   -- uint32_t btree_height
  */
 typedef struct
 {
@@ -1412,11 +1414,13 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
     const size_t header_size = TDB_SSTABLE_METADATA_HEADER_SIZE;
     const size_t checksum_size = 8;
 
-    /* btree metadata size: root_offset(8) + first_leaf(8) + last_leaf(8) */
+    /* btree metadata size: root_offset(8) + first_leaf(8) + last_leaf(8) + node_count(8) +
+     * height(4)
+     */
     size_t btree_meta_size = 0;
     if (sst->use_btree)
     {
-        btree_meta_size = 8 + 8 + 8;
+        btree_meta_size = 8 + 8 + 8 + 8 + 4;
     }
 
     const size_t total_size =
@@ -1480,6 +1484,10 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
         ptr += 8;
         memcpy(ptr, &sst->btree_last_leaf, 8);
         ptr += 8;
+        encode_uint64_le_compat(ptr, sst->btree_node_count);
+        ptr += 8;
+        encode_uint32_le_compat(ptr, sst->btree_height);
+        ptr += 4;
     }
 
     /* we compute and append checksum over everything except the checksum field itself */
@@ -1643,6 +1651,10 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
         ptr += 8;
         memcpy(&sst->btree_last_leaf, ptr, 8);
         ptr += 8;
+        sst->btree_node_count = decode_uint64_le_compat(ptr);
+        ptr += 8;
+        sst->btree_height = decode_uint32_le_compat(ptr);
+        ptr += 4;
     }
 
     return 0;
@@ -2779,9 +2791,9 @@ static int tidesdb_btree_cache_delete_callback(const char *key, size_t key_len,
 
 /**
  * tidesdb_invalidate_btree_cache_for_sstable
- * invalidate all btree node cache entries for a specific SSTable
+ * invalidate all btree node cache entries for a specific sstable
  * @param db the database
- * @param sst_id the SSTable ID
+ * @param sst_id the sstable ID
  */
 static void tidesdb_invalidate_btree_cache_for_sstable(tidesdb_t *db, uint64_t sst_id)
 {
@@ -3734,6 +3746,8 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_ssta
     sst->btree_root_offset = tree->root_offset;
     sst->btree_first_leaf = tree->first_leaf_offset;
     sst->btree_last_leaf = tree->last_leaf_offset;
+    sst->btree_node_count = tree->node_count;
+    sst->btree_height = tree->height;
     sst->num_entries = entry_count;
     sst->max_seq = max_seq;
 
@@ -3995,6 +4009,8 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
     sst->btree_root_offset = tree->root_offset;
     sst->btree_first_leaf = tree->first_leaf_offset;
     sst->btree_last_leaf = tree->last_leaf_offset;
+    sst->btree_node_count = tree->node_count;
+    sst->btree_height = tree->height;
     sst->num_entries = entry_count;
     sst->max_seq = max_seq;
     sst->num_vlog_blocks = vlog_block_num;
@@ -6647,7 +6663,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                 {
                     data = decompressed;
                     data_size = decompressed_size;
-                    /* keep decompressed buffer, deserialized pointers reference it */
+                    /* we keep decompressed buffer, deserialized pointers reference it */
                     source->source.sstable.decompressed_data = decompressed;
                 }
             }
@@ -17666,9 +17682,13 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
     uint64_t memtable_keys = active_mt ? (uint64_t)skip_list_count_entries(active_mt) : 0;
     uint64_t total_keys = memtable_keys;
     uint64_t total_data_size = 0;
-    uint64_t total_sstable_entries = 0;
     uint64_t total_klog_size = 0;
-    int total_sstables = 0;
+
+    /* btree stats aggregation */
+    uint64_t btree_total_nodes = 0;
+    uint32_t btree_max_height = 0;
+    uint64_t btree_height_sum = 0;
+    int btree_sstable_count = 0;
 
     for (int i = 0; i < (*stats)->num_levels; i++)
     {
@@ -17687,13 +17707,30 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
                 level_keys += sstables[j]->num_entries;
                 total_data_size += sstables[j]->klog_size + sstables[j]->vlog_size;
                 total_klog_size += sstables[j]->klog_size;
-                total_sstable_entries += sstables[j]->num_entries;
+
+                /* aggregate btree stats if this sstable uses btree */
+                if (sstables[j]->use_btree && sstables[j]->btree_root_offset >= 0)
+                {
+                    btree_sstable_count++;
+                    btree_total_nodes += sstables[j]->btree_node_count;
+                    btree_height_sum += sstables[j]->btree_height;
+                    if (sstables[j]->btree_height > btree_max_height)
+                    {
+                        btree_max_height = sstables[j]->btree_height;
+                    }
+                }
             }
         }
         (*stats)->level_key_counts[i] = level_keys;
         total_keys += level_keys;
-        total_sstables += num_sstables;
     }
+
+    /* we populate btree stats */
+    (*stats)->use_btree = cf->config.use_btree;
+    (*stats)->btree_total_nodes = btree_total_nodes;
+    (*stats)->btree_max_height = btree_max_height;
+    (*stats)->btree_avg_height =
+        btree_sstable_count > 0 ? (double)btree_height_sum / btree_sstable_count : 0.0;
 
     (*stats)->total_keys = total_keys;
     (*stats)->total_data_size = total_data_size;

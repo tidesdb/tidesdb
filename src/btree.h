@@ -250,6 +250,22 @@ struct btree_t
 };
 
 /**
+ * btree_stats_t
+ * statistics for a single B+tree (per-SSTable)
+ * @param entry_count total number of entries
+ * @param node_count total number of nodes
+ * @param height tree height (1 = single leaf, 2+ = has internal nodes)
+ * @param serialized_size total bytes on disk
+ */
+typedef struct
+{
+    uint64_t entry_count;
+    uint64_t node_count;
+    uint32_t height;
+    uint64_t serialized_size;
+} btree_stats_t;
+
+/**
  * btree_cursor_t
  * cursor for iterating through the B+tree
  * uses tree traversal for leaf-to-leaf navigation (memory efficient)
@@ -418,6 +434,15 @@ int btree_get_max_key(btree_t *tree, uint8_t **key, size_t *key_size);
  * returns maximum sequence number in tree
  */
 uint64_t btree_get_max_seq(const btree_t *tree);
+
+/**
+ * btree_get_stats
+ * populates statistics for the B+tree
+ * @param tree the B+tree
+ * @param stats output statistics structure
+ * @return 0 on success, -1 on failure
+ */
+int btree_get_stats(const btree_t *tree, btree_stats_t *stats);
 
 /**
  * btree_free

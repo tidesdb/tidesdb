@@ -398,6 +398,8 @@ struct tidesdb_column_family_t
  * @param btree_root_offset root node offset for btree
  * @param btree_first_leaf first leaf offset for btree forward iteration
  * @param btree_last_leaf last leaf offset for btree backward iteration
+ * @param btree_node_count total number of nodes in btree
+ * @param btree_height height of btree
  */
 struct tidesdb_sstable_t
 {
@@ -429,6 +431,8 @@ struct tidesdb_sstable_t
     int64_t btree_root_offset;
     int64_t btree_first_leaf;
     int64_t btree_last_leaf;
+    uint64_t btree_node_count;
+    uint32_t btree_height;
 };
 
 /**
@@ -679,6 +683,10 @@ struct tidesdb_iter_t
  * @param level_key_counts number of keys per level
  * @param read_amp read amplification (point lookup cost multiplier)
  * @param hit_rate cache hit rate (0.0 if cache disabled)
+ * @param use_btree whether column family uses B+tree format
+ * @param btree_total_nodes total B+tree nodes across all SSTables
+ * @param btree_max_height maximum tree height across all SSTables
+ * @param btree_avg_height average tree height across all SSTables
  */
 struct tidesdb_stats_t
 {
@@ -694,6 +702,11 @@ struct tidesdb_stats_t
     uint64_t *level_key_counts;
     double read_amp;
     double hit_rate;
+    /* btree stats (only populated if use_btree=1) */
+    int use_btree;
+    uint64_t btree_total_nodes;
+    uint32_t btree_max_height;
+    double btree_avg_height;
 };
 
 /**

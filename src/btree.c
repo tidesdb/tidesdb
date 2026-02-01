@@ -2258,6 +2258,28 @@ uint64_t btree_get_max_seq(const btree_t *tree)
     return tree ? tree->max_seq : 0;
 }
 
+int btree_get_stats(const btree_t *tree, btree_stats_t *stats)
+{
+    if (!tree || !stats) return -1;
+
+    stats->entry_count = tree->entry_count;
+    stats->node_count = tree->node_count;
+    stats->height = tree->height;
+
+    /* we get serialized size from block manager if available */
+    stats->serialized_size = 0;
+    if (tree->bm)
+    {
+        uint64_t size;
+        if (block_manager_get_size(tree->bm, &size) == 0)
+        {
+            stats->serialized_size = size;
+        }
+    }
+
+    return 0;
+}
+
 void btree_free(btree_t *tree)
 {
     if (!tree) return;

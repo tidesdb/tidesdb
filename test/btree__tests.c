@@ -17,6 +17,7 @@
  * limitations under the License.
  */
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -884,8 +885,8 @@ void bench_btree_build()
         double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0;
         double ops_per_sec = num_entries / elapsed;
 
-        printf("  Build %d entries: %.3f sec (%.0f ops/sec), %lu nodes\n", num_entries, elapsed,
-               ops_per_sec, tree->node_count);
+        printf("  Build %d entries: %.3f sec (%.0f ops/sec), %" PRIu64 " nodes\n", num_entries,
+               elapsed, ops_per_sec, tree->node_count);
 
         btree_free(tree);
         btree_builder_free(builder);
@@ -1687,8 +1688,8 @@ void bench_btree_node_sizes()
         uint64_t file_size;
         block_manager_get_size(bm, &file_size);
 
-        printf("  %10zuB %10.3f s %10.3f s %9.2f MB %12lu\n", node_sizes[s], build_time, get_time,
-               file_size / (1024.0 * 1024.0), tree->node_count);
+        printf("  %10zuB %10.3f s %10.3f s %9.2f MB %12" PRIu64 "\n", node_sizes[s], build_time,
+               get_time, file_size / (1024.0 * 1024.0), tree->node_count);
 
         btree_free(tree);
         btree_builder_free(builder);
@@ -1762,8 +1763,8 @@ void bench_btree_node_sizes()
         uint64_t file_size;
         block_manager_get_size(bm, &file_size);
 
-        printf("  %10zuB %10.3f s %10.3f s %9.2f MB %12lu\n", node_sizes[s], build_time, get_time,
-               file_size / (1024.0 * 1024.0), tree->node_count);
+        printf("  %10zuB %10.3f s %10.3f s %9.2f MB %12" PRIu64 "\n", node_sizes[s], build_time,
+               get_time, file_size / (1024.0 * 1024.0), tree->node_count);
 
         btree_free(tree);
         btree_builder_free(builder);

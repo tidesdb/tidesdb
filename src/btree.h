@@ -78,6 +78,14 @@ typedef struct btree_arena_block_t
     struct btree_arena_block_t *next;
 } btree_arena_block_t;
 
+/*
+ * btree_arena_t
+ * simple arena allocator for btree nodes to reduce malloc/free overhead
+ * allocations are bump-pointer style, freed all at once when arena is destroyed
+ * @param current current block
+ * @param blocks linked list of blocks
+ * @param total_allocated total bytes allocated
+ */
 struct btree_arena_t
 {
     btree_arena_block_t *current;

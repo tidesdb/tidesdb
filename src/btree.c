@@ -637,7 +637,7 @@ static int btree_internal_serialize(const btree_level_entry_t *entries, const ui
     const uint32_t num_keys = (num_entries > 1) ? num_entries - 1 : 0;
     const uint32_t num_children = num_entries;
 
-    /* estimate size needed */
+    /* we estimate size needed */
     size_t est_size = 1;                     /* type */
     est_size += btree_varint_size(num_keys); /* num_keys */
     est_size += 8;                           /* base_offset */

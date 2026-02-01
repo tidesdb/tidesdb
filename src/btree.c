@@ -19,6 +19,8 @@
 
 #include "btree.h"
 
+#include <inttypes.h>
+
 #include "compress.h"
 #include "xxhash.h"
 
@@ -1119,12 +1121,13 @@ int btree_node_read_with_compression(block_manager_t *bm, const int64_t offset, 
 
     if (compression_algo != TDB_COMPRESS_NONE && block->size > 20)
     {
-        const uint32_t original_size = decode_uint32_le_compat(block->data);
+        const uint8_t *block_data = (const uint8_t *)block->data;
+        const uint32_t original_size = decode_uint32_le_compat(block_data);
         int64_t header_prev_offset;
         int64_t header_next_offset;
-        memcpy(&header_prev_offset, block->data + 4, 8);
-        memcpy(&header_next_offset, block->data + 12, 8);
-        const uint8_t *compressed_data = block->data + 20;
+        memcpy(&header_prev_offset, block_data + 4, 8);
+        memcpy(&header_next_offset, block_data + 12, 8);
+        const uint8_t *compressed_data = block_data + 20;
         const size_t compressed_size = block->size - 20;
 
         size_t decompressed_size;
@@ -1256,12 +1259,13 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
 
     if (tree->config.compression_algo != TDB_COMPRESS_NONE && block->size > 20)
     {
-        const uint32_t original_size = decode_uint32_le_compat(block->data);
+        const uint8_t *block_data = (const uint8_t *)block->data;
+        const uint32_t original_size = decode_uint32_le_compat(block_data);
         int64_t header_prev_offset;
         int64_t header_next_offset;
-        memcpy(&header_prev_offset, block->data + 4, 8);
-        memcpy(&header_next_offset, block->data + 12, 8);
-        const uint8_t *compressed_data = block->data + 20;
+        memcpy(&header_prev_offset, block_data + 4, 8);
+        memcpy(&header_next_offset, block_data + 12, 8);
+        const uint8_t *compressed_data = block_data + 20;
         const size_t compressed_size = block->size - 20;
 
         size_t decompressed_size;
@@ -1843,12 +1847,13 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
         if (!block) return -1;
 
         /* we calculate next_offset position: type(1) + num_entries(varint) + prev_offset(8) */
+        uint8_t *block_data = (uint8_t *)block->data;
         size_t off = 1; /* skip type byte */
         uint64_t num_entries;
-        off += btree_varint_decode(block->data + off, &num_entries);
+        off += btree_varint_decode(block_data + off, &num_entries);
         off += 8; /* skip prev_offset, now at next_offset position */
 
-        memcpy((uint8_t *)block->data + off, &next_leaf_offset, sizeof(int64_t));
+        memcpy(block_data + off, &next_leaf_offset, sizeof(int64_t));
 
         const uint32_t new_checksum = XXH32(block->data, block->size, 0);
 
@@ -2326,13 +2331,13 @@ static void btree_print_node(btree_t *tree, const int64_t offset, const int dept
     if (btree_node_read_with_compression(tree->bm, offset, &node, tree->config.compression_algo) !=
         0)
     {
-        printf("%*s[ERROR reading node at offset %ld]\n", depth * 2, "", offset);
+        printf("%*s[ERROR reading node at offset %" PRId64 "]\n", depth * 2, "", offset);
         return;
     }
 
     if (node->type == BTREE_NODE_INTERNAL)
     {
-        printf("%*sINTERNAL (offset=%ld, keys=%u, children=%u)\n", depth * 2, "", offset,
+        printf("%*sINTERNAL (offset=%" PRId64 ", keys=%u, children=%u)\n", depth * 2, "", offset,
                node->num_entries, node->num_entries + 1);
 
         for (uint32_t i = 0; i < node->num_entries; i++)
@@ -2343,19 +2348,21 @@ static void btree_print_node(btree_t *tree, const int64_t offset, const int dept
 
         for (uint32_t i = 0; i <= node->num_entries; i++)
         {
-            printf("%*s  child[%u] -> offset %ld\n", depth * 2, "", i, node->child_offsets[i]);
+            printf("%*s  child[%u] -> offset %" PRId64 "\n", depth * 2, "", i,
+                   node->child_offsets[i]);
             btree_print_node(tree, node->child_offsets[i], depth + 1);
         }
     }
     else
     {
-        printf("%*sLEAF (offset=%ld, entries=%u, prev=%ld, next=%ld)\n", depth * 2, "", offset,
-               node->num_entries, node->prev_offset, node->next_offset);
+        printf("%*sLEAF (offset=%" PRId64 ", entries=%u, prev=%" PRId64 ", next=%" PRId64 ")\n",
+               depth * 2, "", offset, node->num_entries, node->prev_offset, node->next_offset);
 
         for (uint32_t i = 0; i < node->num_entries && i < 5; i++)
         {
-            printf("%*s  [%u] key=\"%.20s%s\" seq=%lu\n", depth * 2, "", i, (char *)node->keys[i],
-                   node->key_sizes[i] > 20 ? "..." : "", node->entries[i].seq);
+            printf("%*s  [%u] key=\"%.20s%s\" seq=%" PRIu64 "\n", depth * 2, "", i,
+                   (char *)node->keys[i], node->key_sizes[i] > 20 ? "..." : "",
+                   node->entries[i].seq);
         }
         if (node->num_entries > 5)
         {
@@ -2375,12 +2382,12 @@ void btree_print_tree(btree_t *tree)
     }
 
     printf("--- B+Tree Structure ---\n");
-    printf("entry_count: %lu\n", tree->entry_count);
-    printf("node_count: %lu\n", tree->node_count);
+    printf("entry_count: %" PRIu64 "\n", tree->entry_count);
+    printf("node_count: %" PRIu64 "\n", tree->node_count);
     printf("height: %u\n", tree->height);
-    printf("root_offset: %ld\n", tree->root_offset);
-    printf("first_leaf_offset: %ld\n", tree->first_leaf_offset);
-    printf("last_leaf_offset: %ld\n", tree->last_leaf_offset);
+    printf("root_offset: %" PRId64 "\n", tree->root_offset);
+    printf("first_leaf_offset: %" PRId64 "\n", tree->first_leaf_offset);
+    printf("last_leaf_offset: %" PRId64 "\n", tree->last_leaf_offset);
 
     if (tree->min_key)
     {

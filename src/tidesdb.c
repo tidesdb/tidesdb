@@ -1811,24 +1811,22 @@ static void tidesdb_kv_pair_free(tidesdb_kv_pair_t *kv)
 
     /* arena-allocated KV pairs use single allocation for struct + key + value
      * however, value may be loaded separately (e.g., from vlog) after creation
-     * we detect this by checking if value pointer is outside the arena bounds */
+     * [struct][key_data][value_data_if_included]
+     * if value was included in arena, it points to exactly kv->key + key_size */
     if (kv->entry.flags & TDB_KV_FLAG_ARENA)
     {
-        /*  [struct][key_data][value_data]
-         * if value was allocated separately, it wont be in this range */
         if (kv->value != NULL)
         {
-            const uint8_t *arena_start = (const uint8_t *)kv;
-            const uint8_t *arena_end =
-                arena_start + sizeof(tidesdb_kv_pair_t) + kv->entry.key_size + kv->entry.value_size;
-
-            if (kv->value < arena_start || kv->value >= arena_end)
+            /* value is in arena only if it points to key + key_size
+             * otherwise it was allocated separately and must be freed */
+            const uint8_t *expected_arena_value = kv->key + kv->entry.key_size;
+            if (kv->value != expected_arena_value)
             {
                 free(kv->value); /* value was allocated separately */
             }
         }
 
-        free(kv); /* single free for arena (struct + key) */
+        free(kv); /* single free for arena (struct + key + maybe value) */
         return;
     }
 

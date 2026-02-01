@@ -61,7 +61,7 @@ static inline int skip_list_compare_keys_16_inline(const uint8_t *key1, const ui
 
 /**
  * skip_list_compare_keys_32_inline
- * fast inline comparison for 32-byte keys (e.g., SHA-256 hashes)
+ * fast inline comparison for 32-byte keys
  * @param key1 first key
  * @param key2 second key
  * @return negative if key1 < key2, 0 if equal, positive if key1 > key2

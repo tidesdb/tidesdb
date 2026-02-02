@@ -136,6 +136,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param min_disk_space minimum free disk space required (bytes)
  * @param l1_file_count_trigger trigger for L1 file count, utilized for compaction triggering
  * @param l0_queue_stall_threshold threshold for L0 queue stall, utilized for backpressure
+ * @param use_btree whether btree is used
  */
 typedef struct tidesdb_column_family_config_t
 {
@@ -162,6 +163,7 @@ typedef struct tidesdb_column_family_config_t
     uint64_t min_disk_space;
     int l1_file_count_trigger;
     int l0_queue_stall_threshold;
+    int use_btree;
 } tidesdb_column_family_config_t;
 
 /**
@@ -204,6 +206,10 @@ typedef struct tidesdb_config_t
  * @param level_key_counts number of keys per level
  * @param read_amp read amplification (point lookup cost multiplier)
  * @param hit_rate cache hit rate (0.0 if cache disabled)
+ * @param use_btree whether btree is used
+ * @param btree_total_nodes total number of nodes in btree
+ * @param btree_max_height maximum height of btree
+ * @param btree_avg_height average height of btree
  */
 typedef struct tidesdb_stats_t
 {
@@ -219,6 +225,10 @@ typedef struct tidesdb_stats_t
     uint64_t *level_key_counts;
     double read_amp;
     double hit_rate;
+    int use_btree;
+    uint64_t btree_total_nodes;
+    uint32_t btree_max_height;
+    double btree_avg_height;
 } tidesdb_stats_t;
 
 /**

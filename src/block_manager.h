@@ -179,6 +179,28 @@ int block_manager_block_write_batch(block_manager_t *bm, block_manager_block_t *
                                     size_t count, int64_t *offsets);
 
 /**
+ * block_manager_write_at
+ * writes raw bytes at a specific offset (for patching existing data)
+ * WARNING: use with care - this bypasses block checksums
+ * @param bm the block manager
+ * @param offset the file offset to write at
+ * @param data the data to write
+ * @param size the size of data to write
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_write_at(block_manager_t *bm, int64_t offset, const uint8_t *data, size_t size);
+
+/**
+ * block_manager_update_checksum
+ * recalculates and updates the checksum of a block after in-place modification
+ * use this after block_manager_write_at to fix the checksum
+ * @param bm the block manager
+ * @param block_offset the file offset of the block (start of block header)
+ * @return 0 if successful, -1 if not
+ */
+int block_manager_update_checksum(block_manager_t *bm, int64_t block_offset);
+
+/**
  * block_manager_block_free
  * frees a block
  * @param block the block to free

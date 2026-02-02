@@ -41,21 +41,6 @@ static inline size_t entry_size(const size_t key_len, const size_t payload_len)
 }
 
 /**
- * hash_to_partition
- * hash key to partition index
- * @param cache the cache
- * @param key the key
- * @param key_len the key length
- * @return partition index
- */
-static inline size_t hash_to_partition(const clock_cache_t *cache, const char *key,
-                                       const size_t key_len)
-{
-    const uint64_t hash = XXH3_64bits(key, key_len);
-    return (size_t)(hash & cache->partition_mask);
-}
-
-/**
  * compute_hash
  * compute full hash for key
  * @param key the key
@@ -252,17 +237,6 @@ static clock_cache_entry_t *find_entry_with_hash(clock_cache_partition_t *partit
     }
 
     return NULL;
-}
-
-/**
- * find_entry
- * wrapper that computes hash and calls find_entry_with_hash
- */
-static inline clock_cache_entry_t *find_entry(clock_cache_partition_t *partition, const char *key,
-                                              const size_t key_len)
-{
-    const uint64_t hash = compute_hash(key, key_len);
-    return find_entry_with_hash(partition, key, key_len, hash);
 }
 
 /**

@@ -508,7 +508,8 @@ typedef struct
     enum
     {
         MERGE_SOURCE_MEMTABLE,
-        MERGE_SOURCE_SSTABLE
+        MERGE_SOURCE_SSTABLE,
+        MERGE_SOURCE_BTREE
     } type;
 
     union
@@ -531,6 +532,14 @@ typedef struct
             uint8_t *decompressed_data;
             int current_entry_idx;
         } sstable;
+
+        struct
+        {
+            tidesdb_t *db;
+            tidesdb_sstable_t *sst;
+            btree_cursor_t *cursor;
+            block_manager_cursor_t *vlog_cursor;
+        } btree;
     } source;
 
     tidesdb_kv_pair_t *current_kv;
@@ -892,6 +901,10 @@ static int tidesdb_merge_heap_empty(const tidesdb_merge_heap_t *heap);
 static tidesdb_merge_source_t *tidesdb_merge_source_from_memtable(
     skip_list_t *memtable, tidesdb_column_family_config_t *config,
     tidesdb_immutable_memtable_t *imm);
+static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t *db,
+                                                                      tidesdb_sstable_t *sst);
+static tidesdb_merge_source_t *tidesdb_merge_source_from_btree(tidesdb_t *db,
+                                                               tidesdb_sstable_t *sst);
 static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
                                                                  tidesdb_sstable_t *sst);
 static void tidesdb_merge_source_free(tidesdb_merge_source_t *source);
@@ -901,6 +914,11 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
                                          int target_level);
 static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level);
 static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_level, int end_level);
+static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
+                                                 tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
+                                                 block_manager_t *klog_bm, block_manager_t *vlog_bm,
+                                                 bloom_filter_t *bloom,
+                                                 queue_t *sstables_to_delete);
 static int tidesdb_trigger_compaction(tidesdb_column_family_t *cf);
 static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path,
                                skip_list_t **memtable);
@@ -1353,8 +1371,15 @@ static int tidesdb_validate_kv_size(tidesdb_t *db, const size_t key_size, const 
  * @param max_key_size size of max key
  * @param compression_algorithm compression algorithm used (0=none, 1=snappy, 2=lz4, 3=zstd,
  * 4=lz4_fast)
- * @param reserved  padding for alignment
+ * @param flags metadata flags (bit 0 = use_btree, bits 1-31 reserved)
  * @param checksum xxHash64 checksum of all fields except checksum itself
+ *
+ * if flags & SSTABLE_FLAG_BTREE is set, additional btree metadata follows after max_key:
+ *   -- int64_t btree_root_offset
+ *   -- int64_t btree_first_leaf
+ *   -- int64_t btree_last_leaf
+ *   -- uint64_t btree_node_count
+ *   -- uint32_t btree_height
  */
 typedef struct
 {
@@ -1367,9 +1392,12 @@ typedef struct
     uint64_t min_key_size;
     uint64_t max_key_size;
     uint32_t compression_algorithm;
-    uint32_t reserved;
+    uint32_t flags;
     uint64_t checksum;
 } sstable_metadata_header_t;
+
+/* sstable metadata flags */
+#define SSTABLE_FLAG_BTREE 0x01 /* sstable uses btree format instead of klog blocks */
 
 /**
  * sstable_metadata_serialize
@@ -1382,10 +1410,21 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
 {
     if (!sst || !out_data || !out_size) return -1;
 
-    /* we calculate size -- header + keys + checksum */
+    /* we calculate size -- header + keys + btree metadata (if applicable) + checksum */
     const size_t header_size = TDB_SSTABLE_METADATA_HEADER_SIZE;
     const size_t checksum_size = 8;
-    const size_t total_size = header_size + sst->min_key_size + sst->max_key_size + checksum_size;
+
+    /* btree metadata size: root_offset(8) + first_leaf(8) + last_leaf(8) + node_count(8) +
+     * height(4)
+     */
+    size_t btree_meta_size = 0;
+    if (sst->use_btree)
+    {
+        btree_meta_size = 8 + 8 + 8 + 8 + 4;
+    }
+
+    const size_t total_size =
+        header_size + sst->min_key_size + sst->max_key_size + btree_meta_size + checksum_size;
 
     uint8_t *data = malloc(total_size);
     if (!data) return -1;
@@ -1415,7 +1454,14 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
     ptr += 8;
     encode_uint32_le_compat(ptr, sst->config->compression_algorithm);
     ptr += 4;
-    encode_uint32_le_compat(ptr, 0); /* reserved */
+
+    /* flags field -- we set SSTABLE_FLAG_BTREE if using btree */
+    uint32_t flags = 0;
+    if (sst->use_btree)
+    {
+        flags |= SSTABLE_FLAG_BTREE;
+    }
+    encode_uint32_le_compat(ptr, flags);
     ptr += 4;
 
     if (sst->min_key && sst->min_key_size > 0)
@@ -1427,6 +1473,21 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
     {
         memcpy(ptr, sst->max_key, sst->max_key_size);
         ptr += sst->max_key_size;
+    }
+
+    /* btree metadata (if applicable) */
+    if (sst->use_btree)
+    {
+        memcpy(ptr, &sst->btree_root_offset, 8);
+        ptr += 8;
+        memcpy(ptr, &sst->btree_first_leaf, 8);
+        ptr += 8;
+        memcpy(ptr, &sst->btree_last_leaf, 8);
+        ptr += 8;
+        encode_uint64_le_compat(ptr, sst->btree_node_count);
+        ptr += 8;
+        encode_uint32_le_compat(ptr, sst->btree_height);
+        ptr += 4;
     }
 
     /* we compute and append checksum over everything except the checksum field itself */
@@ -1488,10 +1549,22 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
     const uint32_t compression_algorithm = decode_uint32_le_compat(ptr);
     ptr += 4;
 
-    /* we skip reserved field */
+    /* read flags field (was reserved in older versions, 0 = legacy block-based) */
+    const uint32_t flags = decode_uint32_le_compat(ptr);
     ptr += 4;
 
-    const size_t expected_size = 92 + min_key_size + max_key_size;
+    const int use_btree = (flags & SSTABLE_FLAG_BTREE) ? 1 : 0;
+
+    /* we calculate expected size based on whether btree metadata is present */
+    size_t btree_meta_size = 0;
+
+    if (use_btree)
+    {
+        /* btree metadata: root(8) + first_leaf(8) + last_leaf(8) = 24 bytes */
+        btree_meta_size = 8 + 8 + 8;
+    }
+
+    const size_t expected_size = 92 + min_key_size + max_key_size + btree_meta_size;
     if (data_size != expected_size)
     {
         TDB_DEBUG_LOG(TDB_LOG_FATAL, "SSTable metadata size mismatch (expected: %zu, got: %zu)",
@@ -1499,14 +1572,13 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
         return -1;
     }
 
-    /* we read keys and checksum */
-    const uint8_t *key_ptr = ptr;
-    const uint8_t *checksum_ptr = key_ptr + min_key_size + max_key_size;
-    const uint64_t stored_checksum = decode_uint64_le_compat(checksum_ptr);
-
     /* we verify checksum over everything except checksum field */
     const size_t checksum_data_size = data_size - 8;
     const uint64_t computed_checksum = XXH64(data, checksum_data_size, 0);
+
+    /* we checksum is at the end of the data */
+    const uint8_t *checksum_ptr = data + data_size - 8;
+    const uint64_t stored_checksum = decode_uint64_le_compat(checksum_ptr);
 
     if (computed_checksum != stored_checksum)
     {
@@ -1524,6 +1596,7 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
     sst->klog_size = klog_size;
     sst->vlog_size = vlog_size;
     sst->max_seq = max_seq; /* assign recovered max sequence number */
+    sst->use_btree = use_btree;
 
     /* we restore compression algorithm from metadata */
     if (sst->config)
@@ -1566,6 +1639,22 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
         }
         memcpy(sst->max_key, ptr, max_key_size);
         sst->max_key_size = max_key_size;
+        ptr += max_key_size;
+    }
+
+    /* we read btree metadata if present */
+    if (use_btree)
+    {
+        memcpy(&sst->btree_root_offset, ptr, 8);
+        ptr += 8;
+        memcpy(&sst->btree_first_leaf, ptr, 8);
+        ptr += 8;
+        memcpy(&sst->btree_last_leaf, ptr, 8);
+        ptr += 8;
+        sst->btree_node_count = decode_uint64_le_compat(ptr);
+        ptr += 8;
+        sst->btree_height = decode_uint32_le_compat(ptr);
+        ptr += 4;
     }
 
     return 0;
@@ -1699,7 +1788,7 @@ int tidesdb_comparator_case_insensitive(const uint8_t *key1, size_t key1_size, c
         unsigned char c1 = key1[i];
         unsigned char c2 = key2[i];
 
-        /* convert to lowercase for ASCII characters */
+        /* we convert to lowercase for ASCII characters */
         if (c1 >= 'A' && c1 <= 'Z') c1 = c1 + ('a' - 'A');
         if (c2 >= 'A' && c2 <= 'Z') c2 = c2 + ('a' - 'A');
 
@@ -1735,7 +1824,8 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .default_isolation_level = TDB_ISOLATION_READ_COMMITTED,
         .min_disk_space = TDB_DEFAULT_MIN_DISK_SPACE,
         .l1_file_count_trigger = TDB_DEFAULT_L1_FILE_COUNT_TRIGGER,
-        .l0_queue_stall_threshold = TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD};
+        .l0_queue_stall_threshold = TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD,
+        .use_btree = 0};
 }
 
 tidesdb_config_t tidesdb_default_config(void)
@@ -1989,7 +2079,7 @@ static int tidesdb_klog_block_add_entry(tidesdb_klog_block_t *block, const tides
         if (!new_inline_values) return TDB_ERR_MEMORY;
         block->inline_values = new_inline_values;
 
-        size_t new_elements = new_capacity - old_capacity;
+        const size_t new_elements = new_capacity - old_capacity;
         memset(block->keys + old_capacity, 0, new_elements * sizeof(uint8_t *));
         memset(block->inline_values + old_capacity, 0, new_elements * sizeof(uint8_t *));
 
@@ -2431,7 +2521,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 
     if (num_entries > 0)
     {
-        uint32_t last_idx = num_entries - 1;
+        const uint32_t last_idx = num_entries - 1;
         (*block)->max_key = malloc((*block)->entries[last_idx].key_size);
         if ((*block)->max_key)
         {
@@ -2655,6 +2745,7 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
     atomic_init(&sst->last_access_time, 0);
     sst->klog_bm = NULL;
     sst->vlog_bm = NULL;
+    sst->use_btree = config->use_btree;
 
     const size_t path_len = strlen(base_path) + 32;
     sst->klog_path = malloc(path_len);
@@ -2684,6 +2775,37 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
 }
 
 /**
+ * tidesdb_btree_cache_delete_callback
+ * callback for clock_cache_foreach_prefix to delete matching entries
+ */
+static int tidesdb_btree_cache_delete_callback(const char *key, size_t key_len,
+                                               const uint8_t *payload, size_t payload_len,
+                                               void *user_data)
+{
+    (void)payload;
+    (void)payload_len;
+    clock_cache_t *cache = (clock_cache_t *)user_data;
+    clock_cache_delete(cache, key, key_len);
+    return 0; /* continue iteration */
+}
+
+/**
+ * tidesdb_invalidate_btree_cache_for_sstable
+ * invalidate all btree node cache entries for a specific sstable
+ * @param db the database
+ * @param sst_id the sstable ID
+ */
+static void tidesdb_invalidate_btree_cache_for_sstable(tidesdb_t *db, uint64_t sst_id)
+{
+    if (!db || !db->btree_node_cache) return;
+
+    char prefix[32];
+    const int prefix_len = snprintf(prefix, sizeof(prefix), "%" PRIu64 ":", sst_id);
+    clock_cache_foreach_prefix(db->btree_node_cache, prefix, (size_t)prefix_len,
+                               tidesdb_btree_cache_delete_callback, db->btree_node_cache);
+}
+
+/**
  * tidesdb_sstable_free
  * free an sstable
  * @param sst sstable to free
@@ -2691,6 +2813,12 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
 static void tidesdb_sstable_free(tidesdb_sstable_t *sst)
 {
     if (!sst) return;
+
+    /* invalidate btree node cache entries for this SSTable before freeing */
+    if (sst->use_btree && sst->db && sst->db->btree_node_cache)
+    {
+        tidesdb_invalidate_btree_cache_for_sstable(sst->db, sst->id);
+    }
 
     /* if marked for deletion, evict file data from page cache before closing
      * this prevents cache pollution from compacted-away sstables */
@@ -3468,6 +3596,469 @@ static int tidesdb_sstable_write_footer(tidesdb_sstable_t *sst, block_manager_t 
 }
 
 /**
+ * tidesdb_sstable_write_from_memtable_btree
+ * write a memtable to an sstable using B+tree format
+ * @param db database instance
+ * @param sst sstable to write to
+ * @param memtable memtable to write from
+ * @return 0 on success, -1 on error
+ */
+static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_sstable_t *sst,
+                                                     skip_list_t *memtable)
+{
+    if (!db || !sst || !memtable) return TDB_ERR_INVALID_ARGS;
+
+    int num_entries = skip_list_count_entries(memtable);
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "SSTable %" PRIu64 " writing from memtable using B+tree (%d entries)", sst->id,
+                  num_entries);
+
+    if (tidesdb_sstable_ensure_open(db, sst) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to ensure open", sst->id);
+        return TDB_ERR_IO;
+    }
+
+    tidesdb_block_managers_t bms;
+    if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to get block managers", sst->id);
+        return TDB_ERR_IO;
+    }
+
+    block_manager_t *klog_bm = bms.klog_bm;
+    block_manager_t *vlog_bm = bms.vlog_bm;
+
+    /* resolve comparator from column family config */
+    skip_list_comparator_fn comparator_fn = NULL;
+    void *comparator_ctx = NULL;
+    tidesdb_resolve_comparator(db, sst->config, &comparator_fn, &comparator_ctx);
+
+    /* we create btree builder with column family's comparator
+     * btree uses BTREE_CMP_CUSTOM when a custom comparator is provided */
+    btree_config_t btree_config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                                   .value_threshold = sst->config->klog_value_threshold,
+                                   .comparator = (btree_comparator_fn)comparator_fn,
+                                   .comparator_ctx = comparator_ctx,
+                                   .cmp_type = comparator_fn ? BTREE_CMP_CUSTOM : BTREE_CMP_MEMCMP,
+                                   .compression_algo = sst->config->compression_algorithm};
+
+    btree_builder_t *builder = NULL;
+    if (btree_builder_new(&builder, klog_bm, &btree_config) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to create btree builder", sst->id);
+        return TDB_ERR_MEMORY;
+    }
+
+    /* create bloom filter if enabled */
+    bloom_filter_t *bloom = NULL;
+    if (sst->config->enable_bloom_filter)
+    {
+        if (bloom_filter_new(&bloom, sst->config->bloom_fpr, num_entries) != 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to create bloom filter",
+                          sst->id);
+            btree_builder_free(builder);
+            return TDB_ERR_MEMORY;
+        }
+    }
+
+    /* iterate memtable and add entries to btree */
+    skip_list_cursor_t *cursor = NULL;
+    if (skip_list_cursor_init(&cursor, memtable) != 0)
+    {
+        if (bloom) bloom_filter_free(bloom);
+        btree_builder_free(builder);
+        return TDB_ERR_MEMORY;
+    }
+
+    uint64_t entry_count = 0;
+    uint64_t max_seq = 0;
+
+    while (skip_list_cursor_valid(cursor))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint64_t seq = 0;
+        int64_t ttl = 0;
+        uint8_t deleted = 0;
+
+        if (skip_list_cursor_get_with_seq(cursor, &key, &key_size, &value, &value_size, &ttl,
+                                          &deleted, &seq) != 0)
+        {
+            skip_list_cursor_next(cursor);
+            continue;
+        }
+
+        /* write value to vlog and get offset */
+        uint64_t vlog_offset = 0;
+        if (value && value_size > 0 && !deleted)
+        {
+            block_manager_block_t *vlog_block = block_manager_block_create(value_size, value);
+            if (vlog_block)
+            {
+                int64_t offset = block_manager_block_write(vlog_bm, vlog_block);
+                if (offset >= 0)
+                {
+                    vlog_offset = (uint64_t)offset;
+                }
+                block_manager_block_release(vlog_block);
+            }
+        }
+
+        /* we add to btree */
+        const uint8_t flags = deleted ? 1 : 0; /* BTREE_ENTRY_FLAG_TOMBSTONE = 1 */
+        if (btree_builder_add(builder, key, key_size, NULL, value_size, vlog_offset, seq, ttl,
+                              flags) != 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to add entry to btree",
+                          sst->id);
+        }
+
+        /* we add to bloom filter */
+        if (bloom)
+        {
+            bloom_filter_add(bloom, key, key_size);
+        }
+
+        if (seq > max_seq) max_seq = seq;
+        entry_count++;
+
+        skip_list_cursor_next(cursor);
+    }
+
+    skip_list_cursor_free(cursor);
+
+    /* we finish btree build */
+    btree_t *tree = NULL;
+    if (btree_builder_finish(builder, &tree) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "SSTable %" PRIu64 " failed to finish btree", sst->id);
+        if (bloom) bloom_filter_free(bloom);
+        btree_builder_free(builder);
+        return TDB_ERR_IO;
+    }
+
+    /* we copy btree metadata to sstable */
+    sst->use_btree = 1;
+    sst->btree_root_offset = tree->root_offset;
+    sst->btree_first_leaf = tree->first_leaf_offset;
+    sst->btree_last_leaf = tree->last_leaf_offset;
+    sst->btree_node_count = tree->node_count;
+    sst->btree_height = tree->height;
+    sst->num_entries = entry_count;
+    sst->max_seq = max_seq;
+
+    /* copy min/max keys */
+    if (tree->min_key && tree->min_key_size > 0)
+    {
+        sst->min_key = malloc(tree->min_key_size);
+        if (sst->min_key)
+        {
+            memcpy(sst->min_key, tree->min_key, tree->min_key_size);
+            sst->min_key_size = tree->min_key_size;
+        }
+    }
+    if (tree->max_key && tree->max_key_size > 0)
+    {
+        sst->max_key = malloc(tree->max_key_size);
+        if (sst->max_key)
+        {
+            memcpy(sst->max_key, tree->max_key, tree->max_key_size);
+            sst->max_key_size = tree->max_key_size;
+        }
+    }
+
+    btree_free(tree);
+    btree_builder_free(builder);
+
+    /* we write bloom filter block */
+    if (bloom)
+    {
+        size_t bloom_size = 0;
+        uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
+        if (bloom_data)
+        {
+            block_manager_block_t *bloom_block = block_manager_block_create(bloom_size, bloom_data);
+            if (bloom_block)
+            {
+                block_manager_block_write(klog_bm, bloom_block);
+                block_manager_block_release(bloom_block);
+            }
+            free(bloom_data);
+        }
+        sst->bloom_filter = bloom;
+    }
+    else
+    {
+        const uint8_t empty_bloom_data[1] = {0};
+        block_manager_block_t *empty_bloom = block_manager_block_create(1, empty_bloom_data);
+        if (empty_bloom)
+        {
+            block_manager_block_write(klog_bm, empty_bloom);
+            block_manager_block_release(empty_bloom);
+        }
+    }
+
+    /* write metadata block */
+    uint64_t klog_size_before_metadata;
+    uint64_t vlog_size_before_metadata;
+    block_manager_get_size(klog_bm, &klog_size_before_metadata);
+    block_manager_get_size(vlog_bm, &vlog_size_before_metadata);
+
+    sst->klog_size = klog_size_before_metadata;
+    sst->vlog_size = vlog_size_before_metadata;
+
+    uint8_t *metadata_data = NULL;
+    size_t metadata_size = 0;
+    if (sstable_metadata_serialize(sst, &metadata_data, &metadata_size) == 0)
+    {
+        block_manager_block_t *metadata_block =
+            block_manager_block_create(metadata_size, metadata_data);
+        if (metadata_block)
+        {
+            block_manager_block_write(klog_bm, metadata_block);
+            block_manager_block_release(metadata_block);
+        }
+        free(metadata_data);
+    }
+
+    block_manager_get_size(klog_bm, &sst->klog_size);
+    block_manager_get_size(vlog_bm, &sst->vlog_size);
+
+    if (klog_bm) block_manager_escalate_fsync(klog_bm);
+    if (vlog_bm) block_manager_escalate_fsync(vlog_bm);
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO,
+                  "SSTable %" PRIu64 " btree flush complete: %" PRIu64 " entries, root=%ld",
+                  sst->id, entry_count, sst->btree_root_offset);
+
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_sstable_write_from_heap_btree
+ * write merged entries from a heap to an sstable using B+tree format
+ * @param cf column family
+ * @param sst sstable to write to
+ * @param heap merge heap containing entries
+ * @param klog_bm klog block manager (already open)
+ * @param vlog_bm vlog block manager (already open)
+ * @param bloom bloom filter (optional, may be NULL)
+ * @param sstables_to_delete queue for corrupted sstables
+ * @return 0 on success, error code on failure
+ */
+static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
+                                                 tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
+                                                 block_manager_t *klog_bm, block_manager_t *vlog_bm,
+                                                 bloom_filter_t *bloom, queue_t *sstables_to_delete)
+{
+    if (!cf || !sst || !heap || !klog_bm || !vlog_bm) return TDB_ERR_INVALID_ARGS;
+
+    skip_list_comparator_fn comparator_fn = NULL;
+    void *comparator_ctx = NULL;
+    tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
+
+    btree_config_t btree_config = {
+        .target_node_size = BTREE_DEFAULT_NODE_SIZE,
+        .value_threshold = cf->config.klog_value_threshold,
+        .cmp_type = comparator_fn ? BTREE_CMP_CUSTOM : BTREE_CMP_MEMCMP,
+        .comparator = (btree_comparator_fn)comparator_fn,
+        .comparator_ctx = comparator_ctx,
+        .compression_algo = cf->config.compression_algorithm,
+    };
+
+    btree_builder_t *builder = NULL;
+    if (btree_builder_new(&builder, klog_bm, &btree_config) != 0)
+    {
+        return TDB_ERR_MEMORY;
+    }
+
+    uint8_t *last_key = NULL;
+    size_t last_key_size = 0;
+    uint64_t entry_count = 0;
+    uint64_t max_seq = 0;
+    uint64_t vlog_block_num = 0;
+
+    while (!tidesdb_merge_heap_empty(heap))
+    {
+        tidesdb_sstable_t *corrupted_sst = NULL;
+        tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop(heap, &corrupted_sst);
+
+        if (corrupted_sst && sstables_to_delete)
+        {
+            queue_enqueue(sstables_to_delete, corrupted_sst);
+        }
+
+        if (!kv) break;
+
+        if (last_key && last_key_size == kv->entry.key_size &&
+            memcmp(last_key, kv->key, last_key_size) == 0)
+        {
+            tidesdb_kv_pair_free(kv);
+            continue;
+        }
+
+        free(last_key);
+        last_key = malloc(kv->entry.key_size);
+        if (last_key)
+        {
+            memcpy(last_key, kv->key, kv->entry.key_size);
+            last_key_size = kv->entry.key_size;
+        }
+
+        if (kv->entry.flags & TDB_KV_FLAG_TOMBSTONE)
+        {
+            tidesdb_kv_pair_free(kv);
+            continue;
+        }
+
+        if (kv->entry.ttl > 0 && kv->entry.ttl < atomic_load_explicit(&cf->db->cached_current_time,
+                                                                      memory_order_relaxed))
+        {
+            tidesdb_kv_pair_free(kv);
+            continue;
+        }
+
+        if (bloom)
+        {
+            bloom_filter_add(bloom, kv->key, kv->entry.key_size);
+        }
+
+        uint64_t vlog_offset = 0;
+        if (kv->entry.value_size >= cf->config.klog_value_threshold && kv->value)
+        {
+            uint8_t *final_data = kv->value;
+            size_t final_size = kv->entry.value_size;
+            uint8_t *compressed = NULL;
+
+            if (sst->config->compression_algorithm != TDB_COMPRESS_NONE)
+            {
+                size_t compressed_size;
+                compressed = compress_data(kv->value, kv->entry.value_size, &compressed_size,
+                                           sst->config->compression_algorithm);
+                if (compressed)
+                {
+                    final_data = compressed;
+                    final_size = compressed_size;
+                }
+            }
+
+            block_manager_block_t *vlog_block = block_manager_block_create(final_size, final_data);
+            if (vlog_block)
+            {
+                const int64_t block_offset = block_manager_block_write(vlog_bm, vlog_block);
+                if (block_offset >= 0)
+                {
+                    vlog_offset = (uint64_t)block_offset;
+                    vlog_block_num++;
+                }
+                block_manager_block_release(vlog_block);
+            }
+            free(compressed);
+        }
+
+        const uint8_t *value_to_store = (vlog_offset > 0) ? NULL : kv->value;
+        const size_t value_size_to_store = (vlog_offset > 0) ? 0 : kv->entry.value_size;
+
+        if (btree_builder_add(builder, kv->key, kv->entry.key_size, value_to_store,
+                              value_size_to_store, vlog_offset, kv->entry.seq, kv->entry.ttl,
+                              (kv->entry.flags & TDB_KV_FLAG_TOMBSTONE) != 0) != 0)
+        {
+            tidesdb_kv_pair_free(kv);
+            free(last_key);
+            btree_builder_free(builder);
+            return TDB_ERR_IO;
+        }
+
+        if (kv->entry.seq > max_seq) max_seq = kv->entry.seq;
+
+        if (!sst->min_key)
+        {
+            sst->min_key = malloc(kv->entry.key_size);
+            if (sst->min_key)
+            {
+                memcpy(sst->min_key, kv->key, kv->entry.key_size);
+                sst->min_key_size = kv->entry.key_size;
+            }
+        }
+
+        free(sst->max_key);
+        sst->max_key = malloc(kv->entry.key_size);
+        if (sst->max_key)
+        {
+            memcpy(sst->max_key, kv->key, kv->entry.key_size);
+            sst->max_key_size = kv->entry.key_size;
+        }
+
+        entry_count++;
+        tidesdb_kv_pair_free(kv);
+    }
+
+    free(last_key);
+
+    btree_t *tree = NULL;
+    if (btree_builder_finish(builder, &tree) != 0 || !tree)
+    {
+        btree_builder_free(builder);
+        return TDB_ERR_IO;
+    }
+
+    sst->btree_root_offset = tree->root_offset;
+    sst->btree_first_leaf = tree->first_leaf_offset;
+    sst->btree_last_leaf = tree->last_leaf_offset;
+    sst->btree_node_count = tree->node_count;
+    sst->btree_height = tree->height;
+    sst->num_entries = entry_count;
+    sst->max_seq = max_seq;
+    sst->num_vlog_blocks = vlog_block_num;
+
+    block_manager_get_size(klog_bm, &sst->klog_data_end_offset);
+    block_manager_get_size(klog_bm, &sst->klog_size);
+    block_manager_get_size(vlog_bm, &sst->vlog_size);
+
+    if (bloom)
+    {
+        size_t bloom_size;
+        uint8_t *bloom_data = bloom_filter_serialize(bloom, &bloom_size);
+        if (bloom_data)
+        {
+            block_manager_block_t *bloom_block = block_manager_block_create(bloom_size, bloom_data);
+            if (bloom_block)
+            {
+                block_manager_block_write(klog_bm, bloom_block);
+                block_manager_block_release(bloom_block);
+            }
+            free(bloom_data);
+        }
+        sst->bloom_filter = bloom;
+    }
+
+    uint8_t *metadata = NULL;
+    size_t metadata_size = 0;
+    if (sstable_metadata_serialize(sst, &metadata, &metadata_size) == 0 && metadata)
+    {
+        block_manager_block_t *metadata_block = block_manager_block_create(metadata_size, metadata);
+        if (metadata_block)
+        {
+            block_manager_block_write(klog_bm, metadata_block);
+            block_manager_block_release(metadata_block);
+        }
+        free(metadata);
+    }
+
+    btree_free(tree);
+    btree_builder_free(builder);
+
+    if (klog_bm) block_manager_escalate_fsync(klog_bm);
+    if (vlog_bm) block_manager_escalate_fsync(vlog_bm);
+
+    return TDB_SUCCESS;
+}
+
+/**
  * tidesdb_sstable_write_from_memtable
  * write a memtable to an sstable
  * @param db database instance
@@ -3933,6 +4524,163 @@ static int tidesdb_read_klog_block_cached(tidesdb_t *db, tidesdb_sstable_t *sst,
 }
 
 /**
+ * tidesdb_sstable_get_btree
+ * get a key-value pair from a btree-based sstable
+ * @param db the database
+ * @param sst the sstable
+ * @param key the key
+ * @param key_size the size of the key
+ * @param kv the key-value pair
+ */
+static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
+                                     const size_t key_size, tidesdb_kv_pair_t **kv)
+{
+    if (tidesdb_sstable_ensure_open(db, sst) != 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "SSTable %" PRIu64 " failed to ensure open (btree)", sst->id);
+        return TDB_ERR_IO;
+    }
+
+    tidesdb_block_managers_t bms;
+    if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
+    {
+        return TDB_ERR_IO;
+    }
+
+    if (!sst->min_key || !sst->max_key)
+    {
+        return TDB_ERR_NOT_FOUND;
+    }
+
+    /* resolve comparator and check key range */
+    skip_list_comparator_fn comparator_fn = NULL;
+    void *comparator_ctx = NULL;
+    tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+
+    const int min_cmp =
+        comparator_fn(key, key_size, sst->min_key, sst->min_key_size, comparator_ctx);
+    const int max_cmp =
+        comparator_fn(key, key_size, sst->max_key, sst->max_key_size, comparator_ctx);
+
+    if (min_cmp < 0 || max_cmp > 0)
+    {
+        return TDB_ERR_NOT_FOUND;
+    }
+
+    if (sst->bloom_filter)
+    {
+        PROFILE_INC(db, bloom_checks);
+        if (!bloom_filter_contains(sst->bloom_filter, key, key_size))
+        {
+            return TDB_ERR_NOT_FOUND;
+        }
+        PROFILE_INC(db, bloom_hits);
+    }
+
+    btree_t tree = {.bm = bms.klog_bm,
+                    .root_offset = sst->btree_root_offset,
+                    .first_leaf_offset = sst->btree_first_leaf,
+                    .last_leaf_offset = sst->btree_last_leaf,
+                    .config = {.target_node_size = BTREE_DEFAULT_NODE_SIZE,
+                               .value_threshold = sst->config->klog_value_threshold,
+                               .comparator = (btree_comparator_fn)comparator_fn,
+                               .comparator_ctx = comparator_ctx,
+                               .cmp_type = comparator_fn ? BTREE_CMP_CUSTOM : BTREE_CMP_MEMCMP,
+                               .compression_algo = sst->config->compression_algorithm},
+                    .node_cache = db->btree_node_cache,
+                    .cache_key_prefix = sst->id};
+
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    uint64_t vlog_offset = 0;
+    uint64_t seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+
+    const int result =
+        btree_get(&tree, key, key_size, &value, &value_size, &vlog_offset, &seq, &ttl, &deleted);
+    if (result != 0)
+    {
+        return TDB_ERR_NOT_FOUND;
+    }
+
+    /* we check if tombstone */
+    if (deleted)
+    {
+        free(value);
+        return TDB_ERR_NOT_FOUND;
+    }
+
+    /* we check TTL */
+    if (ttl > 0)
+    {
+        const int64_t now = (int64_t)time(NULL);
+        if (now > ttl)
+        {
+            free(value);
+            return TDB_ERR_NOT_FOUND;
+        }
+    }
+
+    /* if value is in vlog, read it */
+    if (vlog_offset > 0)
+    {
+        free(value); /* free placeholder if any */
+        value = NULL;
+
+        block_manager_cursor_t vlog_cursor;
+        if (block_manager_cursor_init_stack(&vlog_cursor, bms.vlog_bm) != 0)
+        {
+            return TDB_ERR_IO;
+        }
+
+        block_manager_cursor_goto(&vlog_cursor, vlog_offset);
+        block_manager_block_t *vlog_block = block_manager_cursor_read(&vlog_cursor);
+        if (!vlog_block)
+        {
+            return TDB_ERR_IO;
+        }
+
+        value = malloc(vlog_block->size);
+        if (!value)
+        {
+            block_manager_block_free(vlog_block);
+            return TDB_ERR_MEMORY;
+        }
+        memcpy(value, vlog_block->data, vlog_block->size);
+        value_size = vlog_block->size;
+        block_manager_block_free(vlog_block);
+    }
+
+    /* we create kv pair */
+    tidesdb_kv_pair_t *pair = malloc(sizeof(tidesdb_kv_pair_t));
+    if (!pair)
+    {
+        free(value);
+        return TDB_ERR_MEMORY;
+    }
+
+    pair->key = malloc(key_size);
+    if (!pair->key)
+    {
+        free(value);
+        free(pair);
+        return TDB_ERR_MEMORY;
+    }
+    memcpy(pair->key, key, key_size);
+    pair->entry.key_size = key_size;
+    pair->value = value;
+    pair->entry.value_size = value_size;
+    pair->entry.ttl = ttl;
+    pair->entry.seq = seq;
+    pair->entry.vlog_offset = vlog_offset;
+    pair->entry.flags = 0;
+
+    *kv = pair;
+    return TDB_SUCCESS;
+}
+
+/**
  * tidesdb_sstable_get
  * get a key-value pair from an sstable
  * @param db the database
@@ -3942,8 +4690,14 @@ static int tidesdb_read_klog_block_cached(tidesdb_t *db, tidesdb_sstable_t *sst,
  * @param kv the key-value pair
  */
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
-                               size_t key_size, tidesdb_kv_pair_t **kv)
+                               const size_t key_size, tidesdb_kv_pair_t **kv)
 {
+    /* branch based on sstable type */
+    if (sst->use_btree)
+    {
+        return tidesdb_sstable_get_btree(db, sst, key, key_size, kv);
+    }
+
     if (tidesdb_sstable_ensure_open(db, sst) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "SSTable %" PRIu64 " failed to ensure open", sst->id);
@@ -5122,14 +5876,14 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_memtable(
 }
 
 /**
- * tidesdb_merge_source_from_sstable
- * create a merge source from an sstable
+ * tidesdb_merge_source_from_sstable_klog
+ * create a merge source from a klog-based sstable
  * @param db database instance
  * @param sst sstable
  * @return merge source or NULL on error
  */
-static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
-                                                                 tidesdb_sstable_t *sst)
+static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable_klog(tidesdb_t *db,
+                                                                      tidesdb_sstable_t *sst)
 {
     tidesdb_merge_source_t *source = malloc(sizeof(tidesdb_merge_source_t));
     if (!source) return NULL;
@@ -5296,6 +6050,176 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
 }
 
 /**
+ * tidesdb_merge_source_from_btree
+ * create a merge source from a btree-based sstable
+ * @param db database instance
+ * @param sst sstable with btree index
+ * @return merge source or NULL on error
+ */
+static tidesdb_merge_source_t *tidesdb_merge_source_from_btree(tidesdb_t *db,
+                                                               tidesdb_sstable_t *sst)
+{
+    tidesdb_merge_source_t *source = malloc(sizeof(tidesdb_merge_source_t));
+    if (!source) return NULL;
+
+    source->type = MERGE_SOURCE_BTREE;
+    source->source.btree.sst = sst;
+    source->source.btree.db = db;
+    source->is_cached = 0;
+
+    tidesdb_sstable_ref(sst);
+
+    if (tidesdb_sstable_ensure_open(db, sst) != 0)
+    {
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    tidesdb_block_managers_t bms;
+    if (tidesdb_sstable_get_block_managers(db, sst, &bms) != TDB_SUCCESS)
+    {
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    /* resolve comparator */
+    skip_list_comparator_fn comparator_fn = NULL;
+    void *comparator_ctx = NULL;
+    tidesdb_resolve_comparator(db, sst->config, &comparator_fn, &comparator_ctx);
+
+    /* we create btree handle */
+    btree_t *tree = malloc(sizeof(btree_t));
+    if (!tree)
+    {
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    memset(tree, 0, sizeof(btree_t));
+    tree->bm = bms.klog_bm;
+    tree->root_offset = sst->btree_root_offset;
+    tree->first_leaf_offset = sst->btree_first_leaf;
+    tree->last_leaf_offset = sst->btree_last_leaf;
+    tree->config.target_node_size = BTREE_DEFAULT_NODE_SIZE;
+    tree->config.value_threshold = sst->config->klog_value_threshold;
+    tree->config.comparator = (btree_comparator_fn)comparator_fn;
+    tree->config.comparator_ctx = comparator_ctx;
+    tree->config.cmp_type = comparator_fn ? BTREE_CMP_CUSTOM : BTREE_CMP_MEMCMP;
+    tree->config.compression_algo = sst->config->compression_algorithm;
+    tree->node_cache = db->btree_node_cache;
+    tree->cache_key_prefix = sst->id;
+
+    btree_cursor_t *cursor = NULL;
+    if (btree_cursor_init(&cursor, tree) != 0)
+    {
+        free(tree);
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    if (btree_cursor_goto_first(cursor) != 0)
+    {
+        btree_cursor_free(cursor);
+        free(tree);
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    source->source.btree.cursor = cursor;
+
+    /* we init vlog cursor */
+    if (block_manager_cursor_init(&source->source.btree.vlog_cursor, bms.vlog_bm) != 0)
+    {
+        btree_cursor_free(cursor);
+        free(tree);
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    source->current_kv = NULL;
+    source->config = sst->config;
+
+    /* get first entry */
+    uint8_t *key = NULL, *value = NULL;
+    size_t key_size = 0, value_size = 0;
+    uint64_t vlog_offset = 0, seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+
+    if (btree_cursor_get(cursor, &key, &key_size, &value, &value_size, &vlog_offset, &seq, &ttl,
+                         &deleted) != 0)
+    {
+        block_manager_cursor_free(source->source.btree.vlog_cursor);
+        btree_cursor_free(cursor);
+        free(tree);
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    const uint8_t *actual_value = value;
+    size_t actual_value_size = value_size;
+    uint8_t *vlog_value = NULL;
+    if (vlog_offset > 0)
+    {
+        block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
+        block_manager_block_t *vlog_block =
+            block_manager_cursor_read(source->source.btree.vlog_cursor);
+        if (vlog_block)
+        {
+            vlog_value = malloc(vlog_block->size);
+            if (vlog_value)
+            {
+                memcpy(vlog_value, vlog_block->data, vlog_block->size);
+                actual_value = vlog_value;
+                actual_value_size = vlog_block->size;
+            }
+            block_manager_block_free(vlog_block);
+        }
+    }
+
+    source->current_kv =
+        tidesdb_kv_pair_create(key, key_size, actual_value, actual_value_size, ttl, seq, deleted);
+    free(vlog_value); /* only free vlog_value if we allocated it */
+
+    if (!source->current_kv)
+    {
+        block_manager_cursor_free(source->source.btree.vlog_cursor);
+        btree_cursor_free(cursor);
+        free(tree);
+        tidesdb_sstable_unref(db, sst);
+        free(source);
+        return NULL;
+    }
+
+    return source;
+}
+
+/**
+ * tidesdb_merge_source_from_sstable
+ * create a merge source from an sstable (branches based on use_btree flag)
+ * @param db database instance
+ * @param sst sstable
+ * @return merge source or NULL on error
+ */
+static tidesdb_merge_source_t *tidesdb_merge_source_from_sstable(tidesdb_t *db,
+                                                                 tidesdb_sstable_t *sst)
+{
+    /* use sst->use_btree which is set from metadata, not config */
+    if (sst->use_btree)
+    {
+        return tidesdb_merge_source_from_btree(db, sst);
+    }
+    return tidesdb_merge_source_from_sstable_klog(db, sst);
+}
+
+/**
  * tidesdb_merge_source_free
  * free a merge source
  * @param source merge source to free
@@ -5311,6 +6235,17 @@ static void tidesdb_merge_source_free(tidesdb_merge_source_t *source)
         {
             tidesdb_immutable_memtable_unref(source->source.memtable.imm);
         }
+    }
+    else if (source->type == MERGE_SOURCE_BTREE)
+    {
+        if (source->source.btree.cursor)
+        {
+            btree_t *tree = source->source.btree.cursor->tree;
+            btree_cursor_free(source->source.btree.cursor);
+            free(tree);
+        }
+        block_manager_cursor_free(source->source.btree.vlog_cursor);
+        tidesdb_sstable_unref(NULL, source->source.btree.sst);
     }
     else
     {
@@ -5365,6 +6300,47 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
             {
                 source->current_kv =
                     tidesdb_kv_pair_create(key, key_size, value, value_size, ttl, seq, deleted);
+                return TDB_SUCCESS;
+            }
+        }
+    }
+    else if (source->type == MERGE_SOURCE_BTREE)
+    {
+        if (btree_cursor_next(source->source.btree.cursor) == 0)
+        {
+            uint8_t *key = NULL, *value = NULL;
+            size_t key_size = 0, value_size = 0;
+            uint64_t vlog_offset = 0, seq = 0;
+            int64_t ttl = 0;
+            uint8_t deleted = 0;
+
+            if (btree_cursor_get(source->source.btree.cursor, &key, &key_size, &value, &value_size,
+                                 &vlog_offset, &seq, &ttl, &deleted) == 0)
+            {
+                const uint8_t *actual_value = value;
+                size_t actual_value_size = value_size;
+                uint8_t *vlog_value = NULL;
+                if (vlog_offset > 0)
+                {
+                    block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
+                    block_manager_block_t *vlog_block =
+                        block_manager_cursor_read(source->source.btree.vlog_cursor);
+                    if (vlog_block)
+                    {
+                        vlog_value = malloc(vlog_block->size);
+                        if (vlog_value)
+                        {
+                            memcpy(vlog_value, vlog_block->data, vlog_block->size);
+                            actual_value = vlog_value;
+                            actual_value_size = vlog_block->size;
+                        }
+                        block_manager_block_free(vlog_block);
+                    }
+                }
+
+                source->current_kv = tidesdb_kv_pair_create(key, key_size, actual_value,
+                                                            actual_value_size, ttl, seq, deleted);
+                free(vlog_value); /* only free vlog_value if we allocated it */
                 return TDB_SUCCESS;
             }
         }
@@ -5554,6 +6530,47 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
             }
         }
     }
+    else if (source->type == MERGE_SOURCE_BTREE)
+    {
+        if (btree_cursor_prev(source->source.btree.cursor) == 0)
+        {
+            uint8_t *key = NULL, *value = NULL;
+            size_t key_size = 0, value_size = 0;
+            uint64_t vlog_offset = 0, seq = 0;
+            int64_t ttl = 0;
+            uint8_t deleted = 0;
+
+            if (btree_cursor_get(source->source.btree.cursor, &key, &key_size, &value, &value_size,
+                                 &vlog_offset, &seq, &ttl, &deleted) == 0)
+            {
+                const uint8_t *actual_value = value;
+                size_t actual_value_size = value_size;
+                uint8_t *vlog_value = NULL;
+                if (vlog_offset > 0)
+                {
+                    block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
+                    block_manager_block_t *vlog_block =
+                        block_manager_cursor_read(source->source.btree.vlog_cursor);
+                    if (vlog_block)
+                    {
+                        vlog_value = malloc(vlog_block->size);
+                        if (vlog_value)
+                        {
+                            memcpy(vlog_value, vlog_block->data, vlog_block->size);
+                            actual_value = vlog_value;
+                            actual_value_size = vlog_block->size;
+                        }
+                        block_manager_block_free(vlog_block);
+                    }
+                }
+
+                source->current_kv = tidesdb_kv_pair_create(key, key_size, actual_value,
+                                                            actual_value_size, ttl, seq, deleted);
+                free(vlog_value); /* we only free vlog_value if we allocated it */
+                return TDB_SUCCESS;
+            }
+        }
+    }
     else
     {
         /* we move to previous entry in current block or previous block */
@@ -5646,7 +6663,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                 {
                     data = decompressed;
                     data_size = decompressed_size;
-                    /* keep decompressed buffer, deserialized pointers reference it */
+                    /* we keep decompressed buffer, deserialized pointers reference it */
                     source->source.sstable.decompressed_data = decompressed;
                 }
             }
@@ -6357,7 +7374,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Bloom filter disabled");
     }
 
-    if (new_sst->config->enable_block_indexes)
+    if (new_sst->config->enable_block_indexes && !cf->config.use_btree)
     {
         block_indexes =
             compact_block_index_create(estimated_entries, new_sst->config->block_index_prefix_len,
@@ -6374,6 +7391,28 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     else
     {
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Block indexes disabled");
+    }
+
+    /* branch to btree output if use_btree is enabled */
+    if (cf->config.use_btree)
+    {
+        int btree_result = tidesdb_sstable_write_from_heap_btree(
+            cf, new_sst, heap, klog_bm, vlog_bm, bloom, sstables_to_delete);
+        block_manager_close(klog_bm);
+        block_manager_close(vlog_bm);
+        tidesdb_merge_heap_free(heap);
+
+        if (btree_result != TDB_SUCCESS)
+        {
+            tidesdb_sstable_unref(cf->db, new_sst);
+            tidesdb_cleanup_merged_sstables(cf, sstables_to_delete, start_level, target_level);
+            queue_free(sstables_to_delete);
+            tidesdb_cleanup_snapshot_ids(sstable_ids_snapshot);
+            return btree_result;
+        }
+
+        bloom = NULL;
+        goto merge_complete;
     }
 
     tidesdb_klog_block_t *current_klog_block = tidesdb_klog_block_create();
@@ -6776,11 +7815,12 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         new_sst->vlog_bm = NULL;
     }
 
+merge_complete:;
     /* we save metadata for logging before potentially freeing sstable */
-    uint64_t sst_id = new_sst->id;
-    uint64_t num_entries = new_sst->num_entries;
-    uint64_t num_klog_blocks = new_sst->num_klog_blocks;
-    uint64_t num_vlog_blocks = new_sst->num_vlog_blocks;
+    const uint64_t sst_id = new_sst->id;
+    const uint64_t num_entries = new_sst->num_entries;
+    const uint64_t num_klog_blocks = new_sst->num_klog_blocks;
+    const uint64_t num_vlog_blocks = new_sst->num_vlog_blocks;
 
     /* we only add sstable if it has entries -- empty sstables cause corruption */
     if (num_entries > 0)
@@ -7160,11 +8200,43 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
             }
         }
 
-        if (cf->config.enable_block_indexes)
+        if (cf->config.enable_block_indexes && !cf->config.use_btree)
         {
             block_indexes =
                 compact_block_index_create(partition_entries, cf->config.block_index_prefix_len,
                                            comparator_fn, comparator_ctx);
+        }
+
+        /* branch to btree output if use_btree is enabled */
+        if (cf->config.use_btree)
+        {
+            int btree_result = tidesdb_sstable_write_from_heap_btree(cf, new_sst, partition_heap,
+                                                                     klog_bm, vlog_bm, bloom, NULL);
+            block_manager_close(klog_bm);
+            block_manager_close(vlog_bm);
+            tidesdb_merge_heap_free(partition_heap);
+
+            bloom = NULL;
+
+            if (btree_result != TDB_SUCCESS || new_sst->num_entries == 0)
+            {
+                if (new_sst->num_entries == 0)
+                {
+                    remove(new_sst->klog_path);
+                    remove(new_sst->vlog_path);
+                }
+                tidesdb_sstable_unref(cf->db, new_sst);
+                continue;
+            }
+
+            /* add the btree sstable to target level */
+            tidesdb_level_add_sstable(cf->levels[target_level], new_sst);
+            tidesdb_bump_sstable_layout_version(cf);
+            tidesdb_manifest_add_sstable(cf->manifest, cf->levels[target_level]->level_num,
+                                         new_sst->id, new_sst->num_entries,
+                                         new_sst->klog_size + new_sst->vlog_size);
+            tidesdb_sstable_unref(cf->db, new_sst);
+            continue;
         }
 
         /* we process entries from partition-specific heap -- filter keys by partition range */
@@ -7815,12 +8887,44 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                 }
             }
 
-            if (cf->config.enable_block_indexes)
+            if (cf->config.enable_block_indexes && !cf->config.use_btree)
             {
                 /* we reuse comparator_fn and comparator_ctx from outer scope */
                 block_indexes =
                     compact_block_index_create(estimated_entries, cf->config.block_index_prefix_len,
                                                comparator_fn, comparator_ctx);
+            }
+
+            /* branch to btree output if use_btree is enabled */
+            if (cf->config.use_btree)
+            {
+                int btree_result = tidesdb_sstable_write_from_heap_btree(cf, new_sst, heap, klog_bm,
+                                                                         vlog_bm, bloom, NULL);
+                block_manager_close(klog_bm);
+                block_manager_close(vlog_bm);
+                tidesdb_merge_heap_free(heap);
+
+                bloom = NULL;
+
+                if (btree_result != TDB_SUCCESS || new_sst->num_entries == 0)
+                {
+                    if (new_sst->num_entries == 0)
+                    {
+                        remove(new_sst->klog_path);
+                        remove(new_sst->vlog_path);
+                    }
+                    tidesdb_sstable_unref(cf->db, new_sst);
+                    continue;
+                }
+
+                /* add the btree sstable to target level */
+                tidesdb_level_add_sstable(cf->levels[end_idx], new_sst);
+                tidesdb_bump_sstable_layout_version(cf);
+                tidesdb_manifest_add_sstable(cf->manifest, cf->levels[end_idx]->level_num,
+                                             new_sst->id, new_sst->num_entries,
+                                             new_sst->klog_size + new_sst->vlog_size);
+                tidesdb_sstable_unref(cf->db, new_sst);
+                continue;
             }
 
             /* we merge and write entries in partition range */
@@ -8966,7 +10070,16 @@ static void *tidesdb_flush_worker_thread(void *arg)
             continue;
         }
 
-        int write_result = tidesdb_sstable_write_from_memtable(db, sst, memtable);
+        /* branch based on use_btree config */
+        int write_result;
+        if (cf->config.use_btree)
+        {
+            write_result = tidesdb_sstable_write_from_memtable_btree(db, sst, memtable);
+        }
+        else
+        {
+            write_result = tidesdb_sstable_write_from_memtable(db, sst, memtable);
+        }
         if (write_result != TDB_SUCCESS)
         {
             TDB_DEBUG_LOG(TDB_LOG_INFO,
@@ -10081,6 +11194,21 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Block clock cache disabled (block_cache_size=0)");
     }
 
+    /* create btree node cache (uses same size as block cache for now) */
+    if (config->block_cache_size > 0)
+    {
+        (*db)->btree_node_cache = btree_create_node_cache(config->block_cache_size);
+        if ((*db)->btree_node_cache)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "B+tree node cache created with max_bytes=%.2f MB",
+                          (double)config->block_cache_size / (1024 * 1024));
+        }
+    }
+    else
+    {
+        (*db)->btree_node_cache = NULL;
+    }
+
     /* we initialize cached_current_time before recovery so skip lists created during
      * recovery have a valid time pointer for TTL checks
      * use seq_cst for strongest memory ordering on all platforms */
@@ -10689,6 +11817,16 @@ int tidesdb_close(tidesdb_t *db)
                       stats.total_bytes, stats.total_entries);
         clock_cache_destroy(db->clock_cache);
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Clock cache freed");
+    }
+
+    if (db->btree_node_cache)
+    {
+        clock_cache_stats_t stats;
+        clock_cache_get_stats(db->btree_node_cache, &stats);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Freeing btree node cache (bytes: %zu, entries: %zu)",
+                      stats.total_bytes, stats.total_entries);
+        clock_cache_destroy(db->btree_node_cache);
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "B+tree node cache freed");
     }
 
     if (db->commit_status)
@@ -13441,7 +14579,6 @@ static int tidesdb_txn_apply_ops_to_memtable(const tidesdb_txn_t *txn,
         }
     }
 
-    /* we write deduplicated ops - use batch when count exceeds threshold */
     int result = TDB_SUCCESS;
     const int dedup_count = used_slots ? used_slot_count : cf_op_count;
 
@@ -14731,6 +15868,139 @@ static tidesdb_kv_pair_t *tidesdb_iter_create_kv_from_block(const tidesdb_iter_t
 }
 
 /**
+ * tidesdb_iter_seek_btree_source_forward
+ * seek a btree source forward to find first entry >= key
+ * @param source the btree source
+ * @param key the target key
+ * @param key_size the size of the key
+ */
+static void tidesdb_iter_seek_btree_source_forward(tidesdb_merge_source_t *source,
+                                                   const uint8_t *key, const size_t key_size)
+{
+    btree_cursor_t *cursor = source->source.btree.cursor;
+
+    tidesdb_kv_pair_free(source->current_kv);
+    source->current_kv = NULL;
+
+    if (btree_cursor_seek(cursor, key, key_size) != 0)
+    {
+        return;
+    }
+
+    uint8_t *found_key = NULL, *value = NULL;
+    size_t found_key_size = 0, value_size = 0;
+    uint64_t vlog_offset = 0, seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+
+    if (btree_cursor_get(cursor, &found_key, &found_key_size, &value, &value_size, &vlog_offset,
+                         &seq, &ttl, &deleted) != 0)
+    {
+        return;
+    }
+
+    const uint8_t *actual_value = value;
+    size_t actual_value_size = value_size;
+    uint8_t *vlog_value = NULL;
+    if (vlog_offset > 0)
+    {
+        block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
+        block_manager_block_t *vlog_block =
+            block_manager_cursor_read(source->source.btree.vlog_cursor);
+        if (vlog_block)
+        {
+            vlog_value = malloc(vlog_block->size);
+            if (vlog_value)
+            {
+                memcpy(vlog_value, vlog_block->data, vlog_block->size);
+                actual_value = vlog_value;
+                actual_value_size = vlog_block->size;
+            }
+            block_manager_block_free(vlog_block);
+        }
+    }
+
+    source->current_kv = tidesdb_kv_pair_create(found_key, found_key_size, actual_value,
+                                                actual_value_size, ttl, seq, deleted);
+    free(vlog_value); /* only free vlog_value if we allocated it */
+}
+
+/**
+ * tidesdb_iter_seek_btree_source_backward
+ * seek a btree source backward to find last entry <= key
+ * @param source the btree source
+ * @param key the target key
+ * @param key_size the size of the key
+ */
+static void tidesdb_iter_seek_btree_source_backward(tidesdb_merge_source_t *source,
+                                                    const uint8_t *key, const size_t key_size)
+{
+    btree_cursor_t *cursor = source->source.btree.cursor;
+
+    tidesdb_kv_pair_free(source->current_kv);
+    source->current_kv = NULL;
+
+    if (btree_cursor_seek(cursor, key, key_size) != 0)
+    {
+        if (btree_cursor_goto_last(cursor) != 0) return;
+    }
+
+    uint8_t *found_key = NULL, *value = NULL;
+    size_t found_key_size = 0, value_size = 0;
+    uint64_t vlog_offset = 0, seq = 0;
+    int64_t ttl = 0;
+    uint8_t deleted = 0;
+
+    if (btree_cursor_get(cursor, &found_key, &found_key_size, &value, &value_size, &vlog_offset,
+                         &seq, &ttl, &deleted) != 0)
+    {
+        return;
+    }
+
+    skip_list_comparator_fn comparator_fn = NULL;
+    void *comparator_ctx = NULL;
+    tidesdb_resolve_comparator(source->source.btree.db, source->config, &comparator_fn,
+                               &comparator_ctx);
+
+    int cmp = comparator_fn(found_key, found_key_size, key, key_size, comparator_ctx);
+    if (cmp > 0)
+    {
+        if (btree_cursor_prev(cursor) != 0) return;
+
+        if (btree_cursor_get(cursor, &found_key, &found_key_size, &value, &value_size, &vlog_offset,
+                             &seq, &ttl, &deleted) != 0)
+        {
+            return;
+        }
+    }
+
+    uint8_t *actual_value = value;
+    size_t actual_value_size = value_size;
+    uint8_t *vlog_value = NULL;
+    if (vlog_offset > 0)
+    {
+        block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
+        block_manager_block_t *vlog_block =
+            block_manager_cursor_read(source->source.btree.vlog_cursor);
+        if (vlog_block)
+        {
+            vlog_value = malloc(vlog_block->size);
+            if (vlog_value)
+            {
+                memcpy(vlog_value, vlog_block->data, vlog_block->size);
+                actual_value = vlog_value;
+                actual_value_size = vlog_block->size;
+            }
+            block_manager_block_free(vlog_block);
+        }
+    }
+
+    source->current_kv = tidesdb_kv_pair_create(found_key, found_key_size, actual_value,
+                                                actual_value_size, ttl, seq, deleted);
+    free(vlog_value); /* only free vlog_value if we allocated it */
+}
+
+/**
  * tidesdb_iter_seek_sstable_source_forward
  * seek an sstable source forward to find first entry >= key
  * @param iter the iterator
@@ -14898,7 +16168,7 @@ static void tidesdb_iter_seek_sstable_source_backward(const tidesdb_iter_t *iter
         block_manager_cursor_goto_first(cursor);
     }
 
-    /* we use cached CF name from SSTable struct to avoid repeated path parsing */
+    /* we use cached CF name from sst struct to avoid repeated path parsing */
     const char *cf_name = sst->cf_name;
     const int has_cf_name = (cf_name[0] != '\0');
 
@@ -15115,6 +16385,10 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
         {
             tidesdb_iter_seek_memtable_source(source, key, key_size, 1);
         }
+        else if (source->type == MERGE_SOURCE_BTREE)
+        {
+            tidesdb_iter_seek_btree_source_forward(source, key, key_size);
+        }
         else
         {
             tidesdb_iter_seek_sstable_source_forward(iter, source, key, key_size);
@@ -15200,6 +16474,10 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
         if (source->type == MERGE_SOURCE_MEMTABLE)
         {
             tidesdb_iter_seek_memtable_source(source, key, key_size, -1);
+        }
+        else if (source->type == MERGE_SOURCE_BTREE)
+        {
+            tidesdb_iter_seek_btree_source_backward(source, key, key_size);
         }
         else
         {
@@ -15293,8 +16571,50 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
                 }
             }
         }
+        else if (source->type == MERGE_SOURCE_BTREE)
+        {
+            if (btree_cursor_goto_last(source->source.btree.cursor) == 0)
+            {
+                uint8_t *key = NULL, *value = NULL;
+                size_t key_size = 0, value_size = 0;
+                uint64_t vlog_offset = 0, seq = 0;
+                int64_t ttl = 0;
+                uint8_t deleted = 0;
+
+                if (btree_cursor_get(source->source.btree.cursor, &key, &key_size, &value,
+                                     &value_size, &vlog_offset, &seq, &ttl, &deleted) == 0)
+                {
+                    const uint8_t *actual_value = value;
+                    size_t actual_value_size = value_size;
+                    uint8_t *vlog_value = NULL;
+                    if (vlog_offset > 0)
+                    {
+                        block_manager_cursor_goto(source->source.btree.vlog_cursor, vlog_offset);
+                        block_manager_block_t *vlog_block =
+                            block_manager_cursor_read(source->source.btree.vlog_cursor);
+                        if (vlog_block)
+                        {
+                            vlog_value = malloc(vlog_block->size);
+                            if (vlog_value)
+                            {
+                                memcpy(vlog_value, vlog_block->data, vlog_block->size);
+                                actual_value = vlog_value;
+                                actual_value_size = vlog_block->size;
+                            }
+                            block_manager_block_free(vlog_block);
+                        }
+                    }
+
+                    tidesdb_kv_pair_free(source->current_kv);
+                    source->current_kv = tidesdb_kv_pair_create(
+                        key, key_size, actual_value, actual_value_size, ttl, seq, deleted);
+                    free(vlog_value);
+                }
+            }
+        }
         else
         {
+            /* klog sstable source */
             const uint64_t num_blocks = source->source.sstable.sst->num_klog_blocks;
             block_manager_cursor_t *cursor = source->source.sstable.klog_cursor;
 
@@ -16362,9 +17682,13 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
     uint64_t memtable_keys = active_mt ? (uint64_t)skip_list_count_entries(active_mt) : 0;
     uint64_t total_keys = memtable_keys;
     uint64_t total_data_size = 0;
-    uint64_t total_sstable_entries = 0;
     uint64_t total_klog_size = 0;
-    int total_sstables = 0;
+
+    /* btree stats aggregation */
+    uint64_t btree_total_nodes = 0;
+    uint32_t btree_max_height = 0;
+    uint64_t btree_height_sum = 0;
+    int btree_sstable_count = 0;
 
     for (int i = 0; i < (*stats)->num_levels; i++)
     {
@@ -16383,13 +17707,30 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
                 level_keys += sstables[j]->num_entries;
                 total_data_size += sstables[j]->klog_size + sstables[j]->vlog_size;
                 total_klog_size += sstables[j]->klog_size;
-                total_sstable_entries += sstables[j]->num_entries;
+
+                /* aggregate btree stats if this sstable uses btree */
+                if (sstables[j]->use_btree && sstables[j]->btree_root_offset >= 0)
+                {
+                    btree_sstable_count++;
+                    btree_total_nodes += sstables[j]->btree_node_count;
+                    btree_height_sum += sstables[j]->btree_height;
+                    if (sstables[j]->btree_height > btree_max_height)
+                    {
+                        btree_max_height = sstables[j]->btree_height;
+                    }
+                }
             }
         }
         (*stats)->level_key_counts[i] = level_keys;
         total_keys += level_keys;
-        total_sstables += num_sstables;
     }
+
+    /* we populate btree stats */
+    (*stats)->use_btree = cf->config.use_btree;
+    (*stats)->btree_total_nodes = btree_total_nodes;
+    (*stats)->btree_max_height = btree_max_height;
+    (*stats)->btree_avg_height =
+        btree_sstable_count > 0 ? (double)btree_height_sum / btree_sstable_count : 0.0;
 
     (*stats)->total_keys = total_keys;
     (*stats)->total_data_size = total_data_size;
@@ -16969,6 +18310,10 @@ static int ini_config_handler(void *user, const char *section, const char *name,
     {
         ctx->config->min_disk_space = (uint64_t)strtoull(value, NULL, 10);
     }
+    else if (strcmp(name, "use_btree") == 0)
+    {
+        ctx->config->use_btree = (int)strtol(value, NULL, 10);
+    }
     else if (strcmp(name, "comparator_name") == 0)
     {
         strncpy(ctx->config->comparator_name, value, TDB_MAX_COMPARATOR_NAME - 1);
@@ -17057,6 +18402,7 @@ int tidesdb_cf_config_save_to_ini(const char *ini_file, const char *section_name
     fprintf(fp, "l1_file_count_trigger = %d\n", config->l1_file_count_trigger);
     fprintf(fp, "l0_queue_stall_threshold = %d\n", config->l0_queue_stall_threshold);
     fprintf(fp, "min_disk_space = %" PRIu64 "\n", config->min_disk_space);
+    fprintf(fp, "use_btree = %d\n", config->use_btree);
 
     fprintf(fp, "comparator_name = %s\n", config->comparator_name);
     if (config->comparator_ctx_str[0] != '\0')

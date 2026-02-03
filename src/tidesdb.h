@@ -343,6 +343,7 @@ struct tidesdb_memtable_t
  * @param is_compacting atomic flag indicating compaction is queued
  * @param is_flushing atomic flag indicating flush is queued
  * @param immutable_cleanup_counter counter for batched immutable cleanup
+ * @param marked_for_deletion flag indicating column family is marked for deletion
  * @param manifest manifest for column family
  * @param db parent database reference
  */
@@ -362,6 +363,7 @@ struct tidesdb_column_family_t
     _Atomic(int) is_compacting;
     _Atomic(int) is_flushing;
     _Atomic(int) immutable_cleanup_counter;
+    _Atomic(int) marked_for_deletion;
     tidesdb_manifest_t *manifest;
     tidesdb_t *db;
 };

@@ -859,7 +859,7 @@ jobs:
           cd build
           ctest -V --output-on-failure --timeout 1800 --build-config Release
 
-  create-portable-db-btree:
+  create-portable-db-lsmb:
     runs-on: ubuntu-latest
     needs: build-and-test
     name: Create Portable Test Database LSMB+ (x64 Linux)
@@ -881,7 +881,7 @@ jobs:
       - name: Create test database with LSMB+ format
         run: |
           cd build
-          cat > create_db_btree.c << 'EOF'
+          cat > create_db_lsmb.c << 'EOF'
           #include "../src/tidesdb.h"
           #include <stdio.h>
           #include <string.h>
@@ -890,7 +890,7 @@ jobs:
           int main() {
               tidesdb_t *db;
               tidesdb_config_t cfg = tidesdb_default_config();
-              cfg.db_path = "./testdb_btree";
+              cfg.db_path = "./testdb_lsmb";
               cfg.num_flush_threads = 1;
               cfg.log_level = TDB_LOG_DEBUG;
               cfg.num_compaction_threads = 1;
@@ -899,18 +899,18 @@ jobs:
               tidesdb_column_family_config_t cf_cfg = tidesdb_default_column_family_config();
               cf_cfg.write_buffer_size = 1024;
               cf_cfg.enable_bloom_filter = 1;
-              cf_cfg.enable_block_indexes = 1;
-              cf_cfg.sstable_format = TDB_SSTABLE_FORMAT_BTREE;
-              if (tidesdb_create_column_family(db, "test_cf_btree", &cf_cfg) != 0) return 1;
+              cf_cfg.enable_block_indexes = 0;
+              cf_cfg.use_btree = 1;
+              if (tidesdb_create_column_family(db, "test_cf_lsmb", &cf_cfg) != 0) return 1;
 
-              tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf_btree");
+              tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf_lsmb");
               tidesdb_txn_t *txn;
               if (tidesdb_txn_begin(db, &txn) != 0) return 1;
 
               for (int i = 0; i < 100; i++) {
                   char key[64], value[128];
-                  snprintf(key, sizeof(key), "btree_key_%d", i);
-                  snprintf(value, sizeof(value), "btree_value_%d", i);
+                  snprintf(key, sizeof(key), "lsmb_key_%d", i);
+                  snprintf(value, sizeof(value), "lsmb_value_%d", i);
                   tidesdb_txn_put(txn, cf, (uint8_t*)key, strlen(key) + 1, (uint8_t*)value, strlen(value) + 1, 0);
               }
               tidesdb_txn_commit(txn);
@@ -924,28 +924,28 @@ jobs:
               return 0;
           }
           EOF
-          gcc -o create_db_btree create_db_btree.c -I../src -I../external -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-          LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./create_db_btree
+          gcc -o create_db_lsmb create_db_lsmb.c -I../src -I../external -L. -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+          LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 LD_LIBRARY_PATH=. ./create_db_lsmb
 
       - name: Verify database contents before upload
         run: |
           echo "=== LSMB+ Database directory structure ==="
-          ls -laR build/testdb_btree/
+          ls -laR build/testdb_lsmb/
           echo ""
           echo "=== Looking for SSTable files ==="
-          find build/testdb_btree -name "*.klog" -o -name "*.vlog" | head -20
+          find build/testdb_lsmb -name "*.klog" -o -name "*.vlog" | head -20
           echo ""
           echo "=== Looking for WAL files ==="
-          find build/testdb_btree -name "*.log" | head -20
+          find build/testdb_lsmb -name "*.log" | head -20
           echo ""
           echo "=== Looking for INI files ==="
-          find build/testdb_btree -name "*.ini"
+          find build/testdb_lsmb -name "*.ini"
 
       - name: Upload database
         uses: actions/upload-artifact@v4
         with:
-          name: portable-db-btree
-          path: build/testdb_btree/
+          name: portable-db-lsmb
+          path: build/testdb_lsmb/
           retention-days: 1
 
   verify-portable-db-lsmb:
@@ -990,23 +990,23 @@ jobs:
       - name: Download database
         uses: actions/download-artifact@v4
         with:
-          name: portable-db-btree
-          path: testdb_btree
+          name: portable-db-lsmb
+          path: testdb_lsmb
 
       - name: Verify downloaded database contents
         shell: bash
         run: |
           echo "=== Downloaded LSMB+ database structure ==="
-          ls -laR testdb_btree/ || ls -laR testdb_btree || true
+          ls -laR testdb_lsmb/ || ls -laR testdb_lsmb || true
           echo ""
           echo "=== Looking for SSTable files ==="
-          find testdb_btree -name "*.klog" -o -name "*.vlog" | head -20 || true
+          find testdb_lsmb -name "*.klog" -o -name "*.vlog" | head -20 || true
           echo ""
           echo "=== Looking for WAL files ==="
-          find testdb_btree -name "*.log" | head -20 || true
+          find testdb_lsmb -name "*.log" | head -20 || true
           echo ""
           echo "=== Looking for INI files ==="
-          find testdb_btree -name "*.ini" || true
+          find testdb_lsmb -name "*.ini" || true
 
       - name: Install dependencies (Linux x86)
         if: runner.os == 'Linux' && matrix.arch == 'x86'
@@ -1033,9 +1033,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg_cache
-          key: vcpkg-verify-btree-${{ matrix.compiler }}-${{ matrix.arch }}-${{ hashFiles('**/CMakeLists.txt') }}
+          key: vcpkg-verify-lsmb-${{ matrix.compiler }}-${{ matrix.arch }}-${{ hashFiles('**/CMakeLists.txt') }}
           restore-keys: |
-            vcpkg-verify-btree-${{ matrix.compiler }}-${{ matrix.arch }}-
+            vcpkg-verify-lsmb-${{ matrix.compiler }}-${{ matrix.arch }}-
             vcpkg-verify-${{ matrix.compiler }}-${{ matrix.arch }}-
             vcpkg-${{ matrix.compiler }}-${{ matrix.arch }}-
       
@@ -1104,7 +1104,7 @@ jobs:
         shell: bash
         run: |
           cd build
-          cat > verify_db_btree.c << 'EOF'
+          cat > verify_db_lsmb.c << 'EOF'
           #include "../src/tidesdb.h"
           #include <stdio.h>
           #include <string.h>
@@ -1112,14 +1112,14 @@ jobs:
           int main() {
               tidesdb_t *db;
               tidesdb_config_t cfg = tidesdb_default_config();
-              cfg.db_path = "../testdb_btree";
+              cfg.db_path = "../testdb_lsmb";
               cfg.log_level = TDB_LOG_DEBUG;
               cfg.num_flush_threads = 1;
               cfg.num_compaction_threads = 1;
               if (tidesdb_open(&cfg, &db) != 0) { fprintf(stderr, "Failed to open\n"); return 1; }
 
               /* Get existing column family from the portable LSMB+ database */
-              tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf_btree");
+              tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf_lsmb");
               if (!cf) { fprintf(stderr, "CF not found\n"); return 1; }
 
               tidesdb_txn_t *txn;
@@ -1127,8 +1127,8 @@ jobs:
 
               for (int i = 0; i < 100; i++) {
                   char key[64], expected[128];
-                  snprintf(key, sizeof(key), "btree_key_%d", i);
-                  snprintf(expected, sizeof(expected), "btree_value_%d", i);
+                  snprintf(key, sizeof(key), "lsmb_key_%d", i);
+                  snprintf(expected, sizeof(expected), "lsmb_value_%d", i);
                   uint8_t *value = NULL;
                   size_t value_size = 0;
                   if (tidesdb_txn_get(txn, cf, (uint8_t*)key, strlen(key) + 1, &value, &value_size) != 0) {
@@ -1149,15 +1149,15 @@ jobs:
           EOF
           
           if [ "$RUNNER_OS" == "Windows" ]; then
-            mv verify_db_btree.c ../
+            mv verify_db_lsmb.c ../
             if [ "${{ matrix.compiler }}" == "msvc" ]; then
-              sed -i 's|\.\./testdb_btree|../../testdb_btree|g' ../verify_db_btree.c
+              sed -i 's|\.\./testdb_lsmb|../../testdb_lsmb|g' ../verify_db_lsmb.c
             fi
             cat >> ../CMakeLists.txt << 'CMAKEEOF'
           
-          add_executable(verify_db_btree verify_db_btree.c)
-          target_link_libraries(verify_db_btree PRIVATE tidesdb)
-          target_include_directories(verify_db_btree PRIVATE external)
+          add_executable(verify_db_lsmb verify_db_lsmb.c)
+          target_link_libraries(verify_db_lsmb PRIVATE tidesdb)
+          target_include_directories(verify_db_lsmb PRIVATE external)
           CMAKEEOF
             # Reconfigure and build from build directory
             cd ..
@@ -1165,18 +1165,18 @@ jobs:
             cd build
             cmake --build . --config Release
             if [ "${{ matrix.compiler }}" == "mingw" ]; then
-              ./verify_db_btree.exe
+              ./verify_db_lsmb.exe
             else
               cd Release
-              ./verify_db_btree.exe
+              ./verify_db_lsmb.exe
             fi
           elif [ "$RUNNER_OS" == "Linux" ]; then
-            gcc -m32 -o verify_db_btree verify_db_btree.c \
+            gcc -m32 -o verify_db_lsmb verify_db_lsmb.c \
               -I../src -I../external \
               -L. -L/usr/lib/i386-linux-gnu \
               -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-            LD_LIBRARY_PATH=.:/usr/lib/i386-linux-gnu ./verify_db_btree
+            LD_LIBRARY_PATH=.:/usr/lib/i386-linux-gnu ./verify_db_lsmb
           else
-            gcc -o verify_db_btree verify_db_btree.c -I../src -I../external -I/opt/homebrew/include -I/usr/local/include -L. -L/opt/homebrew/lib -L/usr/local/lib -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
-            DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_db_btree
+            gcc -o verify_db_lsmb verify_db_lsmb.c -I../src -I../external -I/opt/homebrew/include -I/usr/local/include -L. -L/opt/homebrew/lib -L/usr/local/lib -ltidesdb -lzstd -llz4 -lsnappy -lpthread -lm
+            DYLD_LIBRARY_PATH=.:/opt/homebrew/lib:/usr/local/lib ./verify_db_lsmb
           fi

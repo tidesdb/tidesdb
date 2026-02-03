@@ -292,11 +292,15 @@ int block_manager_close(block_manager_t *bm)
         (void)fdatasync(bm->fd);
     }
 
-    if (close(bm->fd) != 0) return -1;
+    int close_result = 0;
+    if (bm->fd >= 0 && close(bm->fd) != 0)
+    {
+        close_result = -1;
+    }
 
     free(bm);
 
-    return 0;
+    return close_result;
 }
 
 block_manager_block_t *block_manager_block_create(const uint64_t size, const void *data)

@@ -1478,11 +1478,11 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
     /* btree metadata (if applicable) */
     if (sst->use_btree)
     {
-        memcpy(ptr, &sst->btree_root_offset, 8);
+        encode_int64_le_compat(ptr, sst->btree_root_offset);
         ptr += 8;
-        memcpy(ptr, &sst->btree_first_leaf, 8);
+        encode_int64_le_compat(ptr, sst->btree_first_leaf);
         ptr += 8;
-        memcpy(ptr, &sst->btree_last_leaf, 8);
+        encode_int64_le_compat(ptr, sst->btree_last_leaf);
         ptr += 8;
         encode_uint64_le_compat(ptr, sst->btree_node_count);
         ptr += 8;
@@ -1560,8 +1560,9 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
 
     if (use_btree)
     {
-        /* btree metadata: root(8) + first_leaf(8) + last_leaf(8) = 24 bytes */
-        btree_meta_size = 8 + 8 + 8;
+        /* btree metadata: root(8) + first_leaf(8) + last_leaf(8) + node_count(8) + height(4) = 36
+         * bytes */
+        btree_meta_size = 8 + 8 + 8 + 8 + 4;
     }
 
     const size_t expected_size = 92 + min_key_size + max_key_size + btree_meta_size;
@@ -1645,11 +1646,11 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
     /* we read btree metadata if present */
     if (use_btree)
     {
-        memcpy(&sst->btree_root_offset, ptr, 8);
+        sst->btree_root_offset = decode_int64_le_compat(ptr);
         ptr += 8;
-        memcpy(&sst->btree_first_leaf, ptr, 8);
+        sst->btree_first_leaf = decode_int64_le_compat(ptr);
         ptr += 8;
-        memcpy(&sst->btree_last_leaf, ptr, 8);
+        sst->btree_last_leaf = decode_int64_le_compat(ptr);
         ptr += 8;
         sst->btree_node_count = decode_uint64_le_compat(ptr);
         ptr += 8;
@@ -9468,11 +9469,24 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
  */
 int tidesdb_trigger_compaction(tidesdb_column_family_t *cf)
 {
+    /* we check if CF is marked for deletion before doing any work */
+    if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+    {
+        return TDB_SUCCESS;
+    }
+
     int expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&cf->is_compacting, &expected, 1,
                                                  memory_order_acquire, memory_order_relaxed))
     {
         /* another compaction is already running, skip this one */
+        return TDB_SUCCESS;
+    }
+
+    /* we check again after acquiring is_compacting in case drop happened between checks */
+    if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+    {
+        atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
         return TDB_SUCCESS;
     }
 
@@ -10000,6 +10014,19 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
         tidesdb_column_family_t *cf = work->cf;
         tidesdb_immutable_memtable_t *imm = work->imm;
+
+        /* we check if CF is marked for deletion -- if so, skip processing and cleanup */
+        if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' is marked for deletion, skipping flush for SSTable %" PRIu64,
+                          cf->name, work->sst_id);
+            atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+            tidesdb_immutable_memtable_unref(imm);
+            free(work);
+            continue;
+        }
+
         skip_list_t *memtable = imm->skip_list;
         block_manager_t *wal = imm->wal;
 
@@ -10409,6 +10436,16 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 
         if (cf == NULL)
         {
+            free(work);
+            continue;
+        }
+
+        /* we check if CF is marked for deletion -- if so, skip processing */
+        if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+        {
+            TDB_DEBUG_LOG(TDB_LOG_INFO, "CF '%s' is marked for deletion, skipping compaction",
+                          cf->name);
+            atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
             free(work);
             continue;
         }
@@ -12323,6 +12360,9 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         return TDB_ERR_NOT_FOUND;
     }
 
+    /* we mark CF for deletion first -- workers will check this flag and skip processing */
+    atomic_store_explicit(&cf_to_drop->marked_for_deletion, 1, memory_order_release);
+
     /* we shift remaining CFs down */
     for (int i = found_idx; i < db->num_column_families - 1; i++)
     {
@@ -12332,6 +12372,26 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     db->num_column_families--;
 
     pthread_rwlock_unlock(&db->cf_list_lock);
+
+    /* we wait for any in-progress flush to complete before freeing CF
+     * workers check marked_for_deletion and will skip new work, but we must
+     * wait for any work that started before we set the flag */
+    int wait_count = 0;
+    while (atomic_load_explicit(&cf_to_drop->is_flushing, memory_order_acquire) != 0 &&
+           wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS)
+    {
+        usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
+        wait_count++;
+    }
+
+    /* we wait for any in-progress compaction to complete */
+    wait_count = 0;
+    while (atomic_load_explicit(&cf_to_drop->is_compacting, memory_order_acquire) != 0 &&
+           wait_count < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS)
+    {
+        usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
+        wait_count++;
+    }
 
     const int result = remove_directory(cf_to_drop->directory);
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Deleted column family directory: %s (result: %d)",
@@ -12756,6 +12816,12 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
 {
     if (!cf) return TDB_ERR_INVALID_ARGS;
 
+    /* we check if CF is marked for deletion -- skip flush if so */
+    if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+    {
+        return TDB_SUCCESS;
+    }
+
     if (!already_holds_lock)
     {
         int expected = 0;
@@ -12765,6 +12831,16 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
             /* another flush is already running, skip this one */
             return TDB_SUCCESS;
         }
+    }
+
+    /* we check again after acquiring is_flushing in case drop happened between checks */
+    if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+    {
+        if (!already_holds_lock)
+        {
+            atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+        }
+        return TDB_SUCCESS;
     }
 
     /* we update cached_current_time to ensure TTL checks during flush use fresh time */
@@ -12818,6 +12894,17 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
         comparator_ctx = NULL;
     }
 
+    /* we check marked_for_deletion again before allocating resources
+     * this prevents leaking memtable/WAL if CF is being dropped */
+    if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "CF '%s' is marked for deletion, aborting flush before resource allocation",
+                      cf->name);
+        atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+        return TDB_SUCCESS;
+    }
+
     skip_list_t *new_memtable;
     if (skip_list_new_with_comparator_and_cached_time(
             &new_memtable, cf->config.skip_list_max_level, cf->config.skip_list_probability,
@@ -12869,6 +12956,20 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     atomic_init(&new_mt->refcount, 1);
     atomic_init(&new_mt->flushed, 0);
 
+    /* we check marked_for_deletion again after allocating resources
+     * this handles the race where CF is dropped while we were allocating */
+    if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "CF '%s' is marked for deletion, cleaning up newly allocated resources",
+                      cf->name);
+        skip_list_free(new_memtable);
+        block_manager_close(new_wal);
+        free(new_mt);
+        atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+        return TDB_SUCCESS;
+    }
+
     /* we swap active_memtable pointer -- new writers will use the new memtable
      * no need to wait for old memtable refcount to drain here becase:
      * -- old memtable becomes immutable and is enqueued for background flush
@@ -12884,12 +12985,12 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     tidesdb_immutable_memtable_t *immutable = old_mt;
     if (!immutable)
     {
-        /* no old memtable to flush -- this shouldnt happen but handle gracefully */
+        /* no old memtable to flush -- this shouldnt happen but handle gracefully
+         * note: new_mt is already stored as active_memtable, so we cannot free it here
+         * the new memtable will be cleaned up when the CF is freed */
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' no old memtable to flush", cf->name);
-        skip_list_free(old_memtable);
-        if (old_wal) block_manager_close(old_wal);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
-        return TDB_ERR_MEMORY;
+        return TDB_SUCCESS;
     }
 
     /* old_mt already has correct skip_list, wal, id, generation, and refcount
@@ -14468,7 +14569,7 @@ static int tidesdb_txn_apply_ops_to_memtable(const tidesdb_txn_t *txn,
     {
         for (int i = txn->num_ops - 1; i >= 0; i--)
         {
-            tidesdb_txn_op_t *op = &txn->ops[i];
+            const tidesdb_txn_op_t *op = &txn->ops[i];
             if (op->cf != cf) continue;
 
             /* we check if this key appears later (newer version exists) */

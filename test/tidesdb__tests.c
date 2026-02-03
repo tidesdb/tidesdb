@@ -8645,6 +8645,420 @@ static void test_btree_compaction_interleaved_deletes(void)
     cleanup_test_dir();
 }
 
+static void test_cf_drop_during_pending_flush(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.num_flush_threads = 1;
+    config.num_compaction_threads = 1;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 512;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "flush_drop_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "flush_drop_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    for (int i = 0; i < 20; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "flush_drop_key_%04d", i);
+        snprintf(value, sizeof(value), "flush_drop_value_%04d_padding_data", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+
+    /* immediately drop the CF while flush work may still be pending
+     * this should be handled gracefully without crashing */
+    int drop_result = tidesdb_drop_column_family(db, "flush_drop_cf");
+
+    /* drop may succeed or fail depending on timing - either is acceptable
+     * the key is that it should not crash */
+    (void)drop_result;
+
+    /* wait for any pending work to complete */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    /* verify CF is gone or system is still functional */
+    cf = tidesdb_get_column_family(db, "flush_drop_cf");
+
+    /* we create a new CF to verify system is still functional */
+    ASSERT_EQ(tidesdb_create_column_family(db, "verify_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *verify_cf = tidesdb_get_column_family(db, "verify_cf");
+    ASSERT_TRUE(verify_cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(txn, verify_cf, (uint8_t *)"test", 5, (uint8_t *)"value", 6, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_cf_drop_during_active_compaction(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.num_flush_threads = 2;
+    config.num_compaction_threads = 1;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 512;
+    cf_config.level_size_ratio = 2;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "compact_drop_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "compact_drop_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write multiple batches to create multiple SSTables for compaction */
+    for (int batch = 0; batch < 5; batch++)
+    {
+        for (int i = 0; i < 30; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+            char key[32];
+            char value[64];
+            snprintf(key, sizeof(key), "compact_drop_key_%d_%04d", batch, i);
+            snprintf(value, sizeof(value), "compact_drop_value_%d_%04d_data", batch, i);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, -1),
+                      TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+            tidesdb_txn_free(txn);
+        }
+
+        tidesdb_flush_memtable(cf);
+        usleep(30000);
+    }
+
+    /* wait for flushes to complete */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    /* trigger compaction - this enqueues work with cf pointer */
+    tidesdb_compact(cf);
+
+    /* immediately drop the CF while compaction work may be running
+     * this should be handled gracefully without crashing */
+    int drop_result = tidesdb_drop_column_family(db, "compact_drop_cf");
+    (void)drop_result;
+
+    /* wait for any pending compaction work */
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(25000);
+        if (queue_size(db->compaction_queue) == 0) break;
+    }
+
+    /* create a new CF to verify system is still functional */
+    ASSERT_EQ(tidesdb_create_column_family(db, "verify_cf2", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *verify_cf = tidesdb_get_column_family(db, "verify_cf2");
+    ASSERT_TRUE(verify_cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(txn, verify_cf, (uint8_t *)"test", 5, (uint8_t *)"value", 6, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/**
+ * test_cf_rename_during_pending_flush
+ * tests that renaming a column family while flush work is pending
+ * does not cause issues when the flush worker processes the work item
+ */
+static void test_cf_rename_during_pending_flush(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.num_flush_threads = 1;
+    config.num_compaction_threads = 1;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 512;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "rename_flush_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "rename_flush_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write data to trigger flush */
+    for (int i = 0; i < 20; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "rename_flush_key_%04d", i);
+        snprintf(value, sizeof(value), "rename_flush_value_%04d_padding", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    /* trigger flush */
+    tidesdb_flush_memtable(cf);
+
+    /* immediately rename the CF while flush work may still be pending */
+    int rename_result = tidesdb_rename_column_family(db, "rename_flush_cf", "renamed_flush_cf");
+    (void)rename_result;
+
+    /* wait for flush to complete */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+    usleep(50000);
+
+    /* verify the renamed CF exists and data is accessible */
+    tidesdb_column_family_t *renamed_cf = tidesdb_get_column_family(db, "renamed_flush_cf");
+    if (renamed_cf != NULL)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        /* try to read one of the keys - may or may not exist depending on timing */
+        int get_result = tidesdb_txn_get(txn, renamed_cf, (uint8_t *)"rename_flush_key_0010", 22,
+                                         &value, &value_size);
+        if (get_result == TDB_SUCCESS && value != NULL)
+        {
+            free(value);
+        }
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/**
+ * test_cf_rename_during_active_compaction
+ * tests that renaming a column family while compaction is actively running
+ * does not cause issues when the compaction worker accesses the CF
+ */
+static void test_cf_rename_during_active_compaction(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.num_flush_threads = 2;
+    config.num_compaction_threads = 1;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 512;
+    cf_config.level_size_ratio = 2;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "rename_compact_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "rename_compact_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write multiple batches to create SSTables */
+    for (int batch = 0; batch < 5; batch++)
+    {
+        for (int i = 0; i < 30; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+            char key[32];
+            char value[64];
+            snprintf(key, sizeof(key), "rename_compact_key_%d_%04d", batch, i);
+            snprintf(value, sizeof(value), "rename_compact_value_%d_%04d", batch, i);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, -1),
+                      TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+            tidesdb_txn_free(txn);
+        }
+
+        tidesdb_flush_memtable(cf);
+        usleep(30000);
+    }
+
+    /* wait for flushes */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    /* trigger compaction */
+    tidesdb_compact(cf);
+
+    /* immediately rename the CF while compaction may be running */
+    int rename_result = tidesdb_rename_column_family(db, "rename_compact_cf", "renamed_compact_cf");
+    (void)rename_result;
+
+    /* wait for compaction */
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(25000);
+        if (queue_size(db->compaction_queue) == 0) break;
+    }
+
+    /* verify system is still functional */
+    tidesdb_column_family_t *renamed_cf = tidesdb_get_column_family(db, "renamed_compact_cf");
+    if (renamed_cf != NULL)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_put(txn, renamed_cf, (uint8_t *)"verify", 7, (uint8_t *)"ok", 3, -1),
+                  TDB_SUCCESS);
+        ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/**
+ * test_multiple_cf_drop_with_concurrent_workers
+ * tests dropping multiple column families concurrently while workers are active
+ */
+static void test_multiple_cf_drop_with_concurrent_workers(void)
+{
+    cleanup_test_dir();
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.num_flush_threads = 2;
+    config.num_compaction_threads = 2;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), TDB_SUCCESS);
+    ASSERT_TRUE(db != NULL);
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 512;
+
+    const int NUM_CFS = 4;
+    char cf_names[4][32] = {"multi_drop_cf_0", "multi_drop_cf_1", "multi_drop_cf_2",
+                            "multi_drop_cf_3"};
+    tidesdb_column_family_t *cfs[4];
+
+    /* create multiple CFs */
+    for (int c = 0; c < NUM_CFS; c++)
+    {
+        ASSERT_EQ(tidesdb_create_column_family(db, cf_names[c], &cf_config), TDB_SUCCESS);
+        cfs[c] = tidesdb_get_column_family(db, cf_names[c]);
+        ASSERT_TRUE(cfs[c] != NULL);
+    }
+
+    /* write data to all CFs */
+    for (int c = 0; c < NUM_CFS; c++)
+    {
+        for (int i = 0; i < 15; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+
+            char key[32];
+            char value[64];
+            snprintf(key, sizeof(key), "multi_key_%d_%04d", c, i);
+            snprintf(value, sizeof(value), "multi_value_%d_%04d_data", c, i);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, cfs[c], (uint8_t *)key, strlen(key) + 1,
+                                      (uint8_t *)value, strlen(value) + 1, -1),
+                      TDB_SUCCESS);
+            ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+            tidesdb_txn_free(txn);
+        }
+    }
+
+    /* trigger flushes on all CFs */
+    for (int c = 0; c < NUM_CFS; c++)
+    {
+        tidesdb_flush_memtable(cfs[c]);
+    }
+
+    /* drop CFs while flushes may be pending */
+    for (int c = 0; c < NUM_CFS; c++)
+    {
+        int drop_result = tidesdb_drop_column_family(db, cf_names[c]);
+        (void)drop_result;
+    }
+
+    /* wait for workers to finish */
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(20000);
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0) break;
+    }
+
+    /* verify system is still functional by creating a new CF */
+    ASSERT_EQ(tidesdb_create_column_family(db, "final_verify_cf", &cf_config), TDB_SUCCESS);
+    tidesdb_column_family_t *verify_cf = tidesdb_get_column_family(db, "final_verify_cf");
+    ASSERT_TRUE(verify_cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_put(txn, verify_cf, (uint8_t *)"final", 6, (uint8_t *)"test", 5, -1),
+              TDB_SUCCESS);
+    ASSERT_EQ(tidesdb_txn_commit(txn), TDB_SUCCESS);
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_large_value_iteration(void)
 {
     cleanup_test_dir();
@@ -17353,6 +17767,11 @@ int main(void)
     RUN_TEST(test_btree_compaction_max_seq_propagation, tests_passed);
     RUN_TEST(test_btree_merge_with_bloom_disabled, tests_passed);
     RUN_TEST(test_btree_compaction_interleaved_deletes, tests_passed);
+    RUN_TEST(test_cf_drop_during_pending_flush, tests_passed);
+    RUN_TEST(test_cf_drop_during_active_compaction, tests_passed);
+    RUN_TEST(test_cf_rename_during_pending_flush, tests_passed);
+    RUN_TEST(test_cf_rename_during_active_compaction, tests_passed);
+    RUN_TEST(test_multiple_cf_drop_with_concurrent_workers, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

@@ -479,9 +479,9 @@ static int btree_leaf_serialize(const btree_pending_leaf_t *leaf, const int64_t 
         size_t off = 0;
         buffer[off++] = BTREE_NODE_LEAF;
         off += btree_varint_encode(buffer + off, 0);
-        memcpy(buffer + off, &prev_offset, 8);
+        encode_int64_le_compat(buffer + off, prev_offset);
         off += 8;
-        memcpy(buffer + off, &next_offset, 8);
+        encode_int64_le_compat(buffer + off, next_offset);
         off += 8;
         *out = buffer;
         *out_size = off;
@@ -557,9 +557,9 @@ static int btree_leaf_serialize(const btree_pending_leaf_t *leaf, const int64_t 
     /* header */
     buffer[off++] = BTREE_NODE_LEAF;
     off += btree_varint_encode(buffer + off, leaf->num_entries);
-    memcpy(buffer + off, &prev_offset, 8);
+    encode_int64_le_compat(buffer + off, prev_offset);
     off += 8;
-    memcpy(buffer + off, &next_offset, 8);
+    encode_int64_le_compat(buffer + off, next_offset);
     off += 8;
 
     /* key indirection table placeholder -- we'll fill this after writing keys */
@@ -661,7 +661,7 @@ static int btree_internal_serialize(const btree_level_entry_t *entries, const ui
 
     /* base offset is the first child offset */
     const int64_t base_offset = entries[0].child_offset;
-    memcpy(buffer + off, &base_offset, 8);
+    encode_int64_le_compat(buffer + off, base_offset);
     off += 8;
 
     /* child offset deltas */
@@ -719,9 +719,9 @@ static int btree_node_deserialize(const uint8_t *data, const size_t data_size, b
 
     if (n->type == BTREE_NODE_LEAF)
     {
-        memcpy(&n->prev_offset, data + off, 8);
+        n->prev_offset = decode_int64_le_compat(data + off);
         off += 8;
-        memcpy(&n->next_offset, data + off, 8);
+        n->next_offset = decode_int64_le_compat(data + off);
         off += 8;
 
         if (n->num_entries > 0)
@@ -849,8 +849,7 @@ static int btree_node_deserialize(const uint8_t *data, const size_t data_size, b
             return -1;
         }
 
-        int64_t base_offset;
-        memcpy(&base_offset, data + off, 8);
+        int64_t base_offset = decode_int64_le_compat(data + off);
         off += 8;
 
         int64_t prev_offset = base_offset;
@@ -915,9 +914,9 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
 
     if (n->type == BTREE_NODE_LEAF)
     {
-        memcpy(&n->prev_offset, data + off, 8);
+        n->prev_offset = decode_int64_le_compat(data + off);
         off += 8;
-        memcpy(&n->next_offset, data + off, 8);
+        n->next_offset = decode_int64_le_compat(data + off);
         off += 8;
 
         if (n->num_entries > 0)
@@ -1031,8 +1030,7 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
             memset(n->key_sizes, 0, num_keys * sizeof(size_t));
         }
 
-        int64_t base_offset;
-        memcpy(&base_offset, data + off, 8);
+        int64_t base_offset = decode_int64_le_compat(data + off);
         off += 8;
 
         /* we decode delta-encoded child offsets */
@@ -1123,10 +1121,8 @@ int btree_node_read_with_compression(block_manager_t *bm, const int64_t offset, 
     {
         const uint8_t *block_data = (const uint8_t *)block->data;
         const uint32_t original_size = decode_uint32_le_compat(block_data);
-        int64_t header_prev_offset;
-        int64_t header_next_offset;
-        memcpy(&header_prev_offset, block_data + 4, 8);
-        memcpy(&header_next_offset, block_data + 12, 8);
+        int64_t header_prev_offset = decode_int64_le_compat(block_data + 4);
+        int64_t header_next_offset = decode_int64_le_compat(block_data + 12);
         const uint8_t *compressed_data = block_data + 20;
         const size_t compressed_size = block->size - 20;
 
@@ -1142,9 +1138,9 @@ int btree_node_read_with_compression(block_manager_t *bm, const int64_t offset, 
                 size_t pos = 1;
                 uint64_t num_entries;
                 pos += btree_varint_decode(decompressed + pos, &num_entries);
-                /* now pos points to prev_offset */
-                memcpy(decompressed + pos, &header_prev_offset, 8);
-                memcpy(decompressed + pos + 8, &header_next_offset, 8);
+                /* now pos points to prev_offset - write in little-endian format */
+                encode_int64_le_compat(decompressed + pos, header_prev_offset);
+                encode_int64_le_compat(decompressed + pos + 8, header_next_offset);
             }
             data = decompressed;
             data_size = decompressed_size;
@@ -1261,10 +1257,8 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
     {
         const uint8_t *block_data = (const uint8_t *)block->data;
         const uint32_t original_size = decode_uint32_le_compat(block_data);
-        int64_t header_prev_offset;
-        int64_t header_next_offset;
-        memcpy(&header_prev_offset, block_data + 4, 8);
-        memcpy(&header_next_offset, block_data + 12, 8);
+        int64_t header_prev_offset = decode_int64_le_compat(block_data + 4);
+        int64_t header_next_offset = decode_int64_le_compat(block_data + 12);
         const uint8_t *compressed_data = block_data + 20;
         const size_t compressed_size = block->size - 20;
 
@@ -1280,9 +1274,9 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
                 size_t pos = 1;
                 uint64_t num_entries;
                 pos += btree_varint_decode(decompressed + pos, &num_entries);
-                /* now pos points to prev_offset */
-                memcpy(decompressed + pos, &header_prev_offset, 8);
-                memcpy(decompressed + pos + 8, &header_next_offset, 8);
+                /* now pos points to prev_offset - write in little-endian format */
+                encode_int64_le_compat(decompressed + pos, header_prev_offset);
+                encode_int64_le_compat(decompressed + pos + 8, header_next_offset);
             }
             data = decompressed;
             data_size = decompressed_size;
@@ -1737,8 +1731,8 @@ static int btree_builder_build_internal_levels(btree_builder_t *builder, int64_t
                         encode_uint32_le_compat(block_with_header, (uint32_t)serialized_size);
                         int64_t unused_prev = -1;
                         int64_t unused_next = -1;
-                        memcpy(block_with_header + 4, &unused_prev, 8);
-                        memcpy(block_with_header + 12, &unused_next, 8);
+                        encode_int64_le_compat(block_with_header + 4, unused_prev);
+                        encode_int64_le_compat(block_with_header + 12, unused_next);
                         memcpy(block_with_header + header_size, compressed, compressed_size);
                         final_data = block_with_header;
                     }
@@ -1927,8 +1921,8 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
             encode_uint32_le_compat(block_data, original_size);
             int64_t placeholder_prev = -1;
             int64_t placeholder_next = -1;
-            memcpy(block_data + 4, &placeholder_prev, 8);
-            memcpy(block_data + 12, &placeholder_next, 8);
+            encode_int64_le_compat(block_data + 4, placeholder_prev);
+            encode_int64_le_compat(block_data + 12, placeholder_next);
             memcpy(block_data + header_size, compressed, compressed_size);
             free(compressed);
 

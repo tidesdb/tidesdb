@@ -1478,11 +1478,11 @@ static int sstable_metadata_serialize(tidesdb_sstable_t *sst, uint8_t **out_data
     /* btree metadata (if applicable) */
     if (sst->use_btree)
     {
-        memcpy(ptr, &sst->btree_root_offset, 8);
+        encode_int64_le_compat(ptr, sst->btree_root_offset);
         ptr += 8;
-        memcpy(ptr, &sst->btree_first_leaf, 8);
+        encode_int64_le_compat(ptr, sst->btree_first_leaf);
         ptr += 8;
-        memcpy(ptr, &sst->btree_last_leaf, 8);
+        encode_int64_le_compat(ptr, sst->btree_last_leaf);
         ptr += 8;
         encode_uint64_le_compat(ptr, sst->btree_node_count);
         ptr += 8;
@@ -1560,8 +1560,9 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
 
     if (use_btree)
     {
-        /* btree metadata: root(8) + first_leaf(8) + last_leaf(8) = 24 bytes */
-        btree_meta_size = 8 + 8 + 8;
+        /* btree metadata: root(8) + first_leaf(8) + last_leaf(8) + node_count(8) + height(4) = 36
+         * bytes */
+        btree_meta_size = 8 + 8 + 8 + 8 + 4;
     }
 
     const size_t expected_size = 92 + min_key_size + max_key_size + btree_meta_size;
@@ -1645,11 +1646,11 @@ static int sstable_metadata_deserialize(const uint8_t *data, const size_t data_s
     /* we read btree metadata if present */
     if (use_btree)
     {
-        memcpy(&sst->btree_root_offset, ptr, 8);
+        sst->btree_root_offset = decode_int64_le_compat(ptr);
         ptr += 8;
-        memcpy(&sst->btree_first_leaf, ptr, 8);
+        sst->btree_first_leaf = decode_int64_le_compat(ptr);
         ptr += 8;
-        memcpy(&sst->btree_last_leaf, ptr, 8);
+        sst->btree_last_leaf = decode_int64_le_compat(ptr);
         ptr += 8;
         sst->btree_node_count = decode_uint64_le_compat(ptr);
         ptr += 8;
@@ -10020,6 +10021,7 @@ static void *tidesdb_flush_worker_thread(void *arg)
             TDB_DEBUG_LOG(TDB_LOG_INFO,
                           "CF '%s' is marked for deletion, skipping flush for SSTable %" PRIu64,
                           cf->name, work->sst_id);
+            atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
             tidesdb_immutable_memtable_unref(imm);
             free(work);
             continue;
@@ -12954,6 +12956,20 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     atomic_init(&new_mt->refcount, 1);
     atomic_init(&new_mt->flushed, 0);
 
+    /* we check marked_for_deletion again after allocating resources
+     * this handles the race where CF is dropped while we were allocating */
+    if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
+    {
+        TDB_DEBUG_LOG(TDB_LOG_INFO,
+                      "CF '%s' is marked for deletion, cleaning up newly allocated resources",
+                      cf->name);
+        skip_list_free(new_memtable);
+        block_manager_close(new_wal);
+        free(new_mt);
+        atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+        return TDB_SUCCESS;
+    }
+
     /* we swap active_memtable pointer -- new writers will use the new memtable
      * no need to wait for old memtable refcount to drain here becase:
      * -- old memtable becomes immutable and is enqueued for background flush
@@ -12969,12 +12985,12 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int alre
     tidesdb_immutable_memtable_t *immutable = old_mt;
     if (!immutable)
     {
-        /* no old memtable to flush -- this shouldnt happen but handle gracefully */
+        /* no old memtable to flush -- this shouldnt happen but handle gracefully
+         * note: new_mt is already stored as active_memtable, so we cannot free it here
+         * the new memtable will be cleaned up when the CF is freed */
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' no old memtable to flush", cf->name);
-        skip_list_free(old_memtable);
-        if (old_wal) block_manager_close(old_wal);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
-        return TDB_ERR_MEMORY;
+        return TDB_SUCCESS;
     }
 
     /* old_mt already has correct skip_list, wal, id, generation, and refcount

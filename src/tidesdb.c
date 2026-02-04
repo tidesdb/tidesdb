@@ -3916,13 +3916,14 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_ssta
  * @param vlog_bm vlog block manager (already open)
  * @param bloom bloom filter (optional, may be NULL)
  * @param sstables_to_delete queue for corrupted sstables
+ * @param is_largest_level whether this is the largest level
  * @return 0 on success, error code on failure
  */
 static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
                                                  tidesdb_sstable_t *sst, tidesdb_merge_heap_t *heap,
                                                  block_manager_t *klog_bm, block_manager_t *vlog_bm,
                                                  bloom_filter_t *bloom, queue_t *sstables_to_delete,
-                                                 int is_largest_level)
+                                                 const int is_largest_level)
 {
     if (!cf || !sst || !heap || !klog_bm || !vlog_bm) return TDB_ERR_INVALID_ARGS;
 
@@ -3978,7 +3979,7 @@ static int tidesdb_sstable_write_from_heap_btree(tidesdb_column_family_t *cf,
             last_key_size = kv->entry.key_size;
         }
 
-        /* only drop tombstones when merging into the largest level */
+        /* we only drop tombstones when merging into the largest level */
         if ((kv->entry.flags & TDB_KV_FLAG_TOMBSTONE) && is_largest_level)
         {
             tidesdb_kv_pair_free(kv);
@@ -4742,9 +4743,9 @@ static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, cons
         return TDB_ERR_MEMORY;
     }
     memcpy(pair->key, key, key_size);
-    pair->entry.key_size = key_size;
+    pair->entry.key_size = (uint32_t)key_size;
     pair->value = value;
-    pair->entry.value_size = value_size;
+    pair->entry.value_size = (uint32_t)value_size;
     pair->entry.ttl = ttl;
     pair->entry.seq = seq;
     pair->entry.vlog_offset = vlog_offset;
@@ -7305,7 +7306,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         return TDB_ERR_INVALID_ARGS;
     }
 
-    /* determine if we're merging into the largest (bottommost) level
+    /* we determine if we're merging into the largest (bottommost) level
      * tombstones can only be dropped when merging into the largest level
      * because there's no lower level that might contain the data being deleted */
     const int is_largest_level = (target_level == num_levels - 1);
@@ -7546,7 +7547,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
             last_key_size = kv->entry.key_size;
         }
 
-        /* only drop tombstones when merging into the largest level
+        /* we only drop tombstones when merging into the largest level
          * tombstones must be preserved in upper levels to mask deleted keys in lower levels */
         if ((kv->entry.flags & TDB_KV_FLAG_TOMBSTONE) && is_largest_level)
         {
@@ -8288,7 +8289,7 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
                                            comparator_fn, comparator_ctx);
         }
 
-        /* branch to btree output if use_btree is enabled
+        /* we branch to btree output if use_btree is enabled
          * dividing merge never goes to largest level (it adds a level first) */
         if (cf->config.use_btree)
         {
@@ -8972,7 +8973,7 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
                                                comparator_fn, comparator_ctx);
             }
 
-            /* branch to btree output if use_btree is enabled
+            /* we branch to btree output if use_btree is enabled
              * partitioned merge goes to the level before largest, so not largest level */
             if (cf->config.use_btree)
             {

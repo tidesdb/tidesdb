@@ -8615,7 +8615,7 @@ static void test_btree_many_sstables_delete_verify_stats(void)
 
     tidesdb_free_stats(stats_before);
 
-    /* delete every other key */
+    /* we delete every other key */
     for (int i = 0; i < total_keys; i += 2)
     {
         tidesdb_txn_t *txn = NULL;
@@ -8630,7 +8630,7 @@ static void test_btree_many_sstables_delete_verify_stats(void)
     /* flush deletes */
     tidesdb_flush_memtable(cf);
 
-    /* wait for all flushes and compactions to complete
+    /* we wait for all flushes and compactions to complete
      * we need multiple consecutive idle checks because new compactions
      * can be triggered immediately after a flush or compaction completes */
     int idle_count = 0;
@@ -8650,14 +8650,14 @@ static void test_btree_many_sstables_delete_verify_stats(void)
         }
     }
 
-    /* get stats after delete */
+    /* we get stats after delete */
     tidesdb_stats_t *stats_after = NULL;
     ASSERT_EQ(tidesdb_get_stats(cf, &stats_after), 0);
     ASSERT_TRUE(stats_after != NULL);
     ASSERT_TRUE(stats_after->use_btree == 1);
 
-    /* verify deleted keys return not found and existing keys are accessible
-     * note: tombstones mask deleted keys even if not yet physically removed by compaction */
+    /* we verify deleted keys return not found and existing keys are accessible
+     **** tombstones mask deleted keys even if not yet physically removed by compaction */
     tidesdb_txn_t *txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -8678,7 +8678,7 @@ static void test_btree_many_sstables_delete_verify_stats(void)
             {
                 deleted_found++;
                 if (deleted_found <= 5)
-                    printf("DEBUG: deleted key %d was FOUND (should be not found), value=%s\n", i,
+                    printf("deleted key %d was FOUND (should be not found), value=%s\n", i,
                            (char *)value);
                 free(value);
             }
@@ -8693,8 +8693,8 @@ static void test_btree_many_sstables_delete_verify_stats(void)
             }
         }
     }
-    printf("DEBUG: deleted_found=%d, existing_found=%d (expected 0, %d)\n", deleted_found,
-           existing_found, total_keys / 2);
+    printf("deleted_found=%d, existing_found=%d (expected 0, %d)\n", deleted_found, existing_found,
+           total_keys / 2);
     fflush(stdout);
 
     tidesdb_txn_free(txn);

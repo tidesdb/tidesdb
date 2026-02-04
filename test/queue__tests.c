@@ -1026,7 +1026,7 @@ static void *benchmark_foreach_thread(void *arg)
 
     for (int i = 0; i < args->iterations; i++)
     {
-        queue_foreach(args->queue, foreach_noop_callback, &visit_count);
+        queue_foreach(args->queue, foreach_noop_callback, (void *)&visit_count);
     }
 
     return (void *)(uintptr_t)atomic_load(&visit_count);

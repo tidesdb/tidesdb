@@ -1125,7 +1125,7 @@ static void test_cache_stats(void)
     const uint64_t total_accesses = cache_stats.hits + cache_stats.misses;
     ASSERT_TRUE(total_accesses > 0);
 
-    /* we read same data again - should get cache hits */
+    /* we read same data again -- should get cache hits */
     const uint64_t hits_before = cache_stats.hits;
 
     for (int i = 0; i < 100; i++)
@@ -8555,6 +8555,143 @@ static void test_btree_merge_with_bloom_disabled(void)
     cleanup_test_dir();
 }
 
+static void test_btree_many_sstables_delete_verify_stats(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 2048;
+    cf_config.level_size_ratio = 4;
+    cf_config.use_btree = 1;
+    cf_config.enable_block_indexes = 0;
+    cf_config.enable_bloom_filter = 1;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "btree_stats_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_stats_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int total_keys = 500;
+    const int keys_per_flush = 25;
+
+    /* insert many keys to generate multiple SSTables */
+    for (int i = 0; i < total_keys; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[128];
+        snprintf(key, sizeof(key), "btree_stats_key_%05d", i);
+        snprintf(value, sizeof(value), "btree_stats_value_%05d_with_extra_data", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        /* flush every keys_per_flush keys to create multiple SSTables */
+        if ((i + 1) % keys_per_flush == 0)
+        {
+            tidesdb_flush_memtable(cf);
+            usleep(50000);
+        }
+    }
+
+    /* final flush */
+    tidesdb_flush_memtable(cf);
+
+    /* wait for flushes to complete */
+    for (int i = 0; i < 200; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+
+    /* get stats before delete */
+    tidesdb_stats_t *stats_before = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats_before), 0);
+    ASSERT_TRUE(stats_before != NULL);
+    ASSERT_TRUE(stats_before->use_btree == 1);
+    ASSERT_TRUE(stats_before->num_levels > 0);
+    ASSERT_TRUE(stats_before->total_keys > 0);
+
+    tidesdb_free_stats(stats_before);
+
+    /* delete every other key */
+    for (int i = 0; i < total_keys; i += 2)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32];
+        snprintf(key, sizeof(key), "btree_stats_key_%05d", i);
+        ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)key, strlen(key) + 1), 0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* flush deletes */
+    tidesdb_flush_memtable(cf);
+
+    /* wait for all flushes and compactions to complete */
+    for (int i = 0; i < 500; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0 && !tidesdb_is_compacting(cf) &&
+            queue_size(db->compaction_queue) == 0)
+            break;
+    }
+
+    /* get stats after delete */
+    tidesdb_stats_t *stats_after = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats_after), 0);
+    ASSERT_TRUE(stats_after != NULL);
+    ASSERT_TRUE(stats_after->use_btree == 1);
+
+    /* verify deleted keys return not found and existing keys are accessible
+     * note: tombstones mask deleted keys even if not yet physically removed by compaction */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    int deleted_found = 0;
+    int existing_found = 0;
+    for (int i = 0; i < total_keys; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "btree_stats_key_%05d", i);
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        int result = tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+
+        if (i % 2 == 0)
+        {
+            /* even keys were deleted -- should return not found */
+            if (result == 0)
+            {
+                deleted_found++;
+                free(value);
+            }
+        }
+        else
+        {
+            /* odd keys should exist */
+            if (result == 0)
+            {
+                existing_found++;
+                free(value);
+            }
+        }
+    }
+
+    tidesdb_txn_free(txn);
+
+    /* all odd keys should be found */
+    ASSERT_EQ(existing_found, total_keys / 2);
+    /* no deleted keys should be found (tombstones mask them) */
+    ASSERT_EQ(deleted_found, 0);
+
+    tidesdb_free_stats(stats_after);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_btree_compaction_interleaved_deletes(void)
 {
     cleanup_test_dir();
@@ -8688,7 +8825,7 @@ static void test_cf_drop_during_pending_flush(void)
      * this should be handled gracefully without crashing */
     int drop_result = tidesdb_drop_column_family(db, "flush_drop_cf");
 
-    /* drop may succeed or fail depending on timing - either is acceptable
+    /* drop may succeed or fail depending on timing -- either is acceptable
      * the key is that it should not crash */
     (void)drop_result;
 
@@ -8770,7 +8907,7 @@ static void test_cf_drop_during_active_compaction(void)
         if (queue_size(db->flush_queue) == 0) break;
     }
 
-    /* trigger compaction - this enqueues work with cf pointer */
+    /* trigger compaction -- this enqueues work with cf pointer */
     tidesdb_compact(cf);
 
     /* immediately drop the CF while compaction work may be running
@@ -8868,7 +9005,7 @@ static void test_cf_rename_during_pending_flush(void)
 
         uint8_t *value = NULL;
         size_t value_size = 0;
-        /* try to read one of the keys - may or may not exist depending on timing */
+        /* try to read one of the keys -- may or may not exist depending on timing */
         int get_result = tidesdb_txn_get(txn, renamed_cf, (uint8_t *)"rename_flush_key_0010", 22,
                                          &value, &value_size);
         if (get_result == TDB_SUCCESS && value != NULL)
@@ -17767,6 +17904,7 @@ int main(void)
     RUN_TEST(test_btree_compaction_max_seq_propagation, tests_passed);
     RUN_TEST(test_btree_merge_with_bloom_disabled, tests_passed);
     RUN_TEST(test_btree_compaction_interleaved_deletes, tests_passed);
+    RUN_TEST(test_btree_many_sstables_delete_verify_stats, tests_passed);
     RUN_TEST(test_cf_drop_during_pending_flush, tests_passed);
     RUN_TEST(test_cf_drop_during_active_compaction, tests_passed);
     RUN_TEST(test_cf_rename_during_pending_flush, tests_passed);

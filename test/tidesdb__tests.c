@@ -8564,7 +8564,7 @@ static void test_btree_many_sstables_delete_verify_stats(void)
     cf_config.level_size_ratio = 4;
     cf_config.use_btree = 1;
     cf_config.enable_block_indexes = 0;
-    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_bloom_filter = 0; /* disabled to test tombstone masking */
 
     ASSERT_EQ(tidesdb_create_column_family(db, "btree_stats_cf", &cf_config), 0);
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "btree_stats_cf");
@@ -8630,13 +8630,24 @@ static void test_btree_many_sstables_delete_verify_stats(void)
     /* flush deletes */
     tidesdb_flush_memtable(cf);
 
-    /* wait for all flushes and compactions to complete */
-    for (int i = 0; i < 500; i++)
+    /* wait for all flushes and compactions to complete
+     * we need multiple consecutive idle checks because new compactions
+     * can be triggered immediately after a flush or compaction completes */
+    int idle_count = 0;
+    for (int i = 0; i < 600; i++)
     {
         usleep(50000);
         if (queue_size(db->flush_queue) == 0 && !tidesdb_is_compacting(cf) &&
             queue_size(db->compaction_queue) == 0)
-            break;
+        {
+            idle_count++;
+            /* require 10 consecutive idle checks (500ms total) to ensure stability */
+            if (idle_count >= 10) break;
+        }
+        else
+        {
+            idle_count = 0; /* reset if any work is detected */
+        }
     }
 
     /* get stats after delete */
@@ -8666,6 +8677,9 @@ static void test_btree_many_sstables_delete_verify_stats(void)
             if (result == 0)
             {
                 deleted_found++;
+                if (deleted_found <= 5)
+                    printf("DEBUG: deleted key %d was FOUND (should be not found), value=%s\n", i,
+                           (char *)value);
                 free(value);
             }
         }
@@ -8679,6 +8693,9 @@ static void test_btree_many_sstables_delete_verify_stats(void)
             }
         }
     }
+    printf("DEBUG: deleted_found=%d, existing_found=%d (expected 0, %d)\n", deleted_found,
+           existing_found, total_keys / 2);
+    fflush(stdout);
 
     tidesdb_txn_free(txn);
 

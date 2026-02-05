@@ -27,12 +27,13 @@ static void (*real_free)(void *) = free;
 
 #include "alloc.h"
 
-/* global allocator instance initialized with system defaults */
+/* global allocator instance initialized with system defaults
+ * we initialize with real stdlib functions so malloc/free work before tidesdb_init is called */
 tidesdb_allocator_t tidesdb_allocator = {
-    .malloc_fn = NULL,
-    .calloc_fn = NULL,
-    .realloc_fn = NULL,
-    .free_fn = NULL,
+    .malloc_fn = malloc,
+    .calloc_fn = calloc,
+    .realloc_fn = realloc,
+    .free_fn = free,
 };
 
 int tidesdb_initialized = 0;
@@ -56,10 +57,10 @@ int tidesdb_init(tidesdb_malloc_fn malloc_fn, tidesdb_calloc_fn calloc_fn,
 
 void tidesdb_finalize(void)
 {
-    tidesdb_allocator.malloc_fn = NULL;
-    tidesdb_allocator.calloc_fn = NULL;
-    tidesdb_allocator.realloc_fn = NULL;
-    tidesdb_allocator.free_fn = NULL;
+    tidesdb_allocator.malloc_fn = real_malloc;
+    tidesdb_allocator.calloc_fn = real_calloc;
+    tidesdb_allocator.realloc_fn = real_realloc;
+    tidesdb_allocator.free_fn = real_free;
     tidesdb_initialized = 0;
 }
 

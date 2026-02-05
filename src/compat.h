@@ -3017,6 +3017,59 @@ static inline int atomic_rename_file(const char *old_path, const char *new_path)
 }
 
 /**
+ * atomic_rename_dir
+ * renames a directory from old_path to new_path
+ * on POSIX systems, rename() works for directories
+ * on Windows, rename() fails if target exists, so we use MoveFileEx
+ * NOTE: This does NOT replace existing directories -- caller must ensure target doesn't exist
+ * @param old_path the current path of the directory
+ * @param new_path the new path for the directory
+ * @return 0 on success, -1 on failure
+ */
+static inline int atomic_rename_dir(const char *old_path, const char *new_path)
+{
+    if (!old_path || !new_path) return -1;
+
+#ifdef _WIN32
+    /* MoveFileEx works for directories on Windows
+     * Note -- MOVEFILE_REPLACE_EXISTING does NOT work for non-empty directories,
+     * so we don't use it here. Caller must ensure target doesn't exist. */
+    if (!MoveFileEx(old_path, new_path, MOVEFILE_WRITE_THROUGH))
+    {
+        errno = GetLastError();
+        return -1;
+    }
+
+    return 0;
+#else
+    /* POSIX rename() works for directories */
+    if (rename(old_path, new_path) != 0)
+    {
+        return -1;
+    }
+
+    /* sync parent directory for durability */
+    char dir_path[4096];
+    const char *last_sep = strrchr(new_path, '/');
+    if (last_sep && (size_t)(last_sep - new_path) < sizeof(dir_path) - 1)
+    {
+        size_t dir_len = last_sep - new_path;
+        memcpy(dir_path, new_path, dir_len);
+        dir_path[dir_len] = '\0';
+
+        const int dir_fd = open(dir_path, O_RDONLY);
+        if (dir_fd >= 0)
+        {
+            fsync(dir_fd);
+            close(dir_fd);
+        }
+    }
+
+    return 0;
+#endif
+}
+
+/**
  * tdb_get_cpu_count
  * gets the number of available CPU cores
  * @return number of CPU cores, or 4 as fallback

@@ -12467,7 +12467,7 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         wait_count++;
     }
 
-    /* invalidate all block cache entries for this column family before freeing */
+    /* we invalidate all block cache entries for this column family before freeing */
     tidesdb_invalidate_block_cache_for_cf(db, cf_to_drop->name);
 
     const int result = remove_directory(cf_to_drop->directory);
@@ -12561,6 +12561,16 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         return TDB_ERR_INVALID_ARGS;
     }
 
+    struct STAT_STRUCT st;
+    if (STAT_FUNC(new_directory, &st) == 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR,
+                      "Cannot rename CF '%s' to '%s': destination directory already exists",
+                      old_name, new_name);
+        pthread_rwlock_unlock(&db->cf_list_lock);
+        return TDB_ERR_EXISTS;
+    }
+
     /* on windows, we must close all file handles before renaming directory
      * close the active memtable's WAL */
     tidesdb_memtable_t *active_mt = atomic_load(&cf->active_memtable);
@@ -12613,8 +12623,8 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
         pthread_rwlock_unlock(&cf->manifest->lock);
     }
 
-    /* we rename directory on disk */
-    if (rename(cf->directory, new_directory) != 0)
+    /* we rename directory on disk (use atomic_rename_dir for Windows compatibility) */
+    if (atomic_rename_dir(cf->directory, new_directory) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to rename directory %s to %s: %s", cf->directory,
                       new_directory, strerror(errno));
@@ -12652,7 +12662,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
     if (!new_name_copy)
     {
         /* try to revert directory rename */
-        rename(new_directory, cf->directory);
+        atomic_rename_dir(new_directory, cf->directory);
         pthread_rwlock_unlock(&db->cf_list_lock);
         return TDB_ERR_MEMORY;
     }
@@ -12663,7 +12673,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
     {
         free(new_name_copy);
         /* we try to revert directory rename */
-        rename(new_directory, cf->directory);
+        atomic_rename_dir(new_directory, cf->directory);
         pthread_rwlock_unlock(&db->cf_list_lock);
         return TDB_ERR_MEMORY;
     }

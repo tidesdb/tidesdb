@@ -2381,6 +2381,175 @@ static void test_rename_column_family(void)
     cleanup_test_dir();
 }
 
+static void test_clone_column_family(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    /* test 1 -- NULL argument handling */
+    ASSERT_EQ(tidesdb_clone_column_family(NULL, "src", "dst"), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_clone_column_family(db, NULL, "dst"), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_clone_column_family(db, "src", NULL), TDB_ERR_INVALID_ARGS);
+
+    /* test 2 -- clone non-existent CF */
+    ASSERT_EQ(tidesdb_clone_column_family(db, "nonexistent", "new_clone"), TDB_ERR_NOT_FOUND);
+
+    /* test 3 -- same name should fail */
+    ASSERT_EQ(tidesdb_create_column_family(db, "source_cf", &cf_config), 0);
+    ASSERT_EQ(tidesdb_clone_column_family(db, "source_cf", "source_cf"), TDB_ERR_INVALID_ARGS);
+
+    /* test 4 -- add data to source CF */
+    tidesdb_column_family_t *src_cf = tidesdb_get_column_family(db, "source_cf");
+    ASSERT_TRUE(src_cf != NULL);
+
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "clone_key_%04d", i);
+        snprintf(value, sizeof(value), "clone_value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, src_cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* test 5 -- clone the CF */
+    ASSERT_EQ(tidesdb_clone_column_family(db, "source_cf", "cloned_cf"), TDB_SUCCESS);
+
+    /* source should still exist */
+    src_cf = tidesdb_get_column_family(db, "source_cf");
+    ASSERT_TRUE(src_cf != NULL);
+
+    /* clone should exist */
+    tidesdb_column_family_t *clone_cf = tidesdb_get_column_family(db, "cloned_cf");
+    ASSERT_TRUE(clone_cf != NULL);
+
+    /* test 6 -- verify data is accessible in clone */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read_txn), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "clone_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(read_txn, clone_cf, (uint8_t *)key, strlen(key) + 1, &value,
+                                  &value_size),
+                  TDB_SUCCESS);
+        ASSERT_TRUE(value != NULL);
+
+        char expected_value[64];
+        snprintf(expected_value, sizeof(expected_value), "clone_value_%04d", i);
+        ASSERT_EQ(value_size, strlen(expected_value) + 1);
+        ASSERT_TRUE(memcmp(value, expected_value, value_size) == 0);
+        free(value);
+    }
+    tidesdb_txn_free(read_txn);
+
+    /* test 7 -- verify source data is still accessible */
+    read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read_txn), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "clone_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(read_txn, src_cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+            TDB_SUCCESS);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+    }
+    tidesdb_txn_free(read_txn);
+
+    /* test 8 -- modifications to clone don't affect source */
+    tidesdb_txn_t *write_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &write_txn), 0);
+    uint8_t new_key[] = "clone_only_key";
+    uint8_t new_value[] = "clone_only_value";
+    ASSERT_EQ(tidesdb_txn_put(write_txn, clone_cf, new_key, sizeof(new_key), new_value,
+                              sizeof(new_value), -1),
+              0);
+    ASSERT_EQ(tidesdb_txn_commit(write_txn), 0);
+    tidesdb_txn_free(write_txn);
+
+    /* we verify new key exists in clone */
+    read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read_txn), 0);
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, clone_cf, new_key, sizeof(new_key), &retrieved_value,
+                              &retrieved_size),
+              TDB_SUCCESS);
+    ASSERT_TRUE(retrieved_value != NULL);
+    free(retrieved_value);
+
+    /* verify new key does NOT exist in source */
+    retrieved_value = NULL;
+    retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, src_cf, new_key, sizeof(new_key), &retrieved_value,
+                              &retrieved_size),
+              TDB_ERR_NOT_FOUND);
+    tidesdb_txn_free(read_txn);
+
+    /* test 9 -- clone to existing name should fail */
+    ASSERT_EQ(tidesdb_clone_column_family(db, "source_cf", "cloned_cf"), TDB_ERR_EXISTS);
+
+    /* test 10 -- we verify clone persists after reopen */
+    tidesdb_close(db);
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    /* both CFs should exist after reopen */
+    src_cf = tidesdb_get_column_family(db, "source_cf");
+    ASSERT_TRUE(src_cf != NULL);
+
+    clone_cf = tidesdb_get_column_family(db, "cloned_cf");
+    ASSERT_TRUE(clone_cf != NULL);
+
+    /* we verify data still accessible in clone after reopen */
+    read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read_txn), 0);
+
+    char key[32];
+    snprintf(key, sizeof(key), "clone_key_%04d", 0);
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    ASSERT_EQ(
+        tidesdb_txn_get(read_txn, clone_cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+        TDB_SUCCESS);
+    ASSERT_TRUE(value != NULL);
+    free(value);
+
+    /* verify clone-only key still exists after reopen */
+    retrieved_value = NULL;
+    retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, clone_cf, new_key, sizeof(new_key), &retrieved_value,
+                              &retrieved_size),
+              TDB_SUCCESS);
+    ASSERT_TRUE(retrieved_value != NULL);
+    free(retrieved_value);
+
+    tidesdb_txn_free(read_txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 typedef struct
 {
     tidesdb_t *db;
@@ -17927,6 +18096,7 @@ int main(void)
     RUN_TEST(test_cf_rename_during_pending_flush, tests_passed);
     RUN_TEST(test_cf_rename_during_active_compaction, tests_passed);
     RUN_TEST(test_multiple_cf_drop_with_concurrent_workers, tests_passed);
+    RUN_TEST(test_clone_column_family, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

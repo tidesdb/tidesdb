@@ -18380,6 +18380,258 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
 }
 
 /**
+ * tidesdb_clone_copy_cf_dir
+ * copy a column family directory to a new location, copying all files
+ * @param src_dir source directory
+ * @param dst_dir destination directory
+ * @return TDB_SUCCESS on success, error code on failure
+ */
+static int tidesdb_clone_copy_cf_dir(const char *src_dir, const char *dst_dir)
+{
+    struct STAT_STRUCT dst_st;
+    if (STAT_FUNC(dst_dir, &dst_st) != 0)
+    {
+        if (mkdir(dst_dir, TDB_DIR_PERMISSIONS) != 0)
+        {
+            return TDB_ERR_IO;
+        }
+    }
+    else if (!S_ISDIR(dst_st.st_mode))
+    {
+        return TDB_ERR_IO;
+    }
+
+    DIR *dir = opendir(src_dir);
+    if (!dir) return TDB_ERR_IO;
+
+    struct dirent *entry;
+    int result = TDB_SUCCESS;
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (strcmp(entry->d_name, TDB_LOCK_FILE) == 0) continue;
+
+        /* skip WAL files - we don't want to copy uncommitted data */
+        if (tidesdb_backup_is_wal_file(entry->d_name)) continue;
+
+        const size_t src_len = strlen(src_dir) + strlen(PATH_SEPARATOR) + strlen(entry->d_name) + 1;
+        const size_t dst_len = strlen(dst_dir) + strlen(PATH_SEPARATOR) + strlen(entry->d_name) + 1;
+        char *src_path = malloc(src_len);
+        char *dst_path = malloc(dst_len);
+        if (!src_path || !dst_path)
+        {
+            free(src_path);
+            free(dst_path);
+            result = TDB_ERR_MEMORY;
+            break;
+        }
+
+        snprintf(src_path, src_len, "%s%s%s", src_dir, PATH_SEPARATOR, entry->d_name);
+        snprintf(dst_path, dst_len, "%s%s%s", dst_dir, PATH_SEPARATOR, entry->d_name);
+
+        struct STAT_STRUCT src_st;
+        if (STAT_FUNC(src_path, &src_st) != 0)
+        {
+            if (errno != ENOENT) result = TDB_ERR_IO;
+            free(src_path);
+            free(dst_path);
+            if (result != TDB_SUCCESS) break;
+            continue;
+        }
+
+        if (S_ISDIR(src_st.st_mode))
+        {
+            result = tidesdb_clone_copy_cf_dir(src_path, dst_path);
+        }
+        else
+        {
+            result = tidesdb_backup_copy_file(src_path, dst_path);
+        }
+
+        free(src_path);
+        free(dst_path);
+
+        if (result != TDB_SUCCESS) break;
+    }
+
+    closedir(dir);
+    return result;
+}
+
+int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char *dst_name)
+{
+    if (!db || !src_name || !dst_name) return TDB_ERR_INVALID_ARGS;
+
+    const int wait_result = wait_for_open(db);
+    if (wait_result != TDB_SUCCESS) return wait_result;
+
+    /* we validate names are different */
+    if (strcmp(src_name, dst_name) == 0) return TDB_ERR_INVALID_ARGS;
+
+    /* we check destination doesn't already exist */
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    for (int i = 0; i < db->num_column_families; i++)
+    {
+        if (db->column_families[i] && strcmp(db->column_families[i]->name, dst_name) == 0)
+        {
+            pthread_rwlock_unlock(&db->cf_list_lock);
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "Clone destination CF '%s' already exists", dst_name);
+            return TDB_ERR_EXISTS;
+        }
+    }
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    tidesdb_column_family_t *src_cf = tidesdb_get_column_family(db, src_name);
+    if (!src_cf)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Clone source CF '%s' not found", src_name);
+        return TDB_ERR_NOT_FOUND;
+    }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Cloning column family '%s' to '%s'", src_name, dst_name);
+
+    /* wait for any in-progress flush to complete */
+    int wait_count = 0;
+    while (atomic_load_explicit(&src_cf->is_flushing, memory_order_acquire) != 0 &&
+           wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS)
+    {
+        usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
+        wait_count++;
+    }
+
+    /* we flush the source memtable to ensure all data is on disk */
+    int result = tidesdb_flush_memtable_internal(src_cf, 0, 1);
+    if (result != TDB_SUCCESS)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to flush source CF '%s' before clone", src_name);
+        return result;
+    }
+
+    /* we wait for flush to complete */
+    wait_count = 0;
+    while (atomic_load_explicit(&src_cf->is_flushing, memory_order_acquire) != 0 &&
+           wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS)
+    {
+        usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
+        wait_count++;
+    }
+
+    /* we wait for any in-progress compaction to complete */
+    wait_count = 0;
+    while (atomic_load_explicit(&src_cf->is_compacting, memory_order_acquire) != 0 &&
+           wait_count < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS)
+    {
+        usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
+        wait_count++;
+    }
+
+    char dst_dir[TDB_MAX_PATH_LEN];
+    snprintf(dst_dir, sizeof(dst_dir), "%s" PATH_SEPARATOR "%s", db->db_path, dst_name);
+
+    /* we check destination directory doesn't exist */
+    struct STAT_STRUCT st;
+    if (STAT_FUNC(dst_dir, &st) == 0)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Clone destination directory '%s' already exists", dst_dir);
+        return TDB_ERR_EXISTS;
+    }
+
+    /* we copy all files from source to destination */
+    result = tidesdb_clone_copy_cf_dir(src_cf->directory, dst_dir);
+    if (result != TDB_SUCCESS)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to copy CF directory from '%s' to '%s'",
+                      src_cf->directory, dst_dir);
+        /* we attempt cleanup */
+        remove_directory(dst_dir);
+        return result;
+    }
+
+    /* we update config.ini with new name */
+    char config_path[TDB_MAX_PATH_LEN];
+    snprintf(config_path, sizeof(config_path),
+             "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+             dst_dir);
+
+    result = tidesdb_cf_config_save_to_ini(config_path, dst_name, &src_cf->config);
+    if (result != TDB_SUCCESS)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_WARN, "Failed to save config for cloned CF '%s' (error: %d)",
+                      dst_name, result);
+        /* non-fatal, continue */
+    }
+
+    tdb_sync_directory(dst_dir);
+
+    /* we create the new column family structure by loading from disk */
+    tidesdb_column_family_config_t clone_config = src_cf->config;
+
+    /* we clear cached comparator pointers - they will be re-resolved */
+    clone_config.comparator_fn_cached = NULL;
+    clone_config.comparator_ctx_cached = NULL;
+
+    result = tidesdb_create_column_family(db, dst_name, &clone_config);
+    if (result != TDB_SUCCESS)
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to create cloned CF structure '%s' (error: %d)",
+                      dst_name, result);
+        remove_directory(dst_dir);
+        return result;
+    }
+
+    /* we get the newly created CF and recover its SSTables */
+    tidesdb_column_family_t *dst_cf = tidesdb_get_column_family(db, dst_name);
+    if (dst_cf)
+    {
+        /* we recover ssts from the copied files */
+        result = tidesdb_recover_sstables(dst_cf);
+        if (result != TDB_SUCCESS)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to recover SSTables for cloned CF '%s'", dst_name);
+            /* CF is created but may be incomplete - user should drop and retry */
+            return result;
+        }
+
+        /* we update next_sstable_id to prevent overwriting recovered sstables
+         * we scan all levels to find the maximum sstable ID */
+        uint64_t max_sst_id = 0;
+        const int num_levels =
+            atomic_load_explicit(&dst_cf->num_active_levels, memory_order_acquire);
+        for (int level_idx = 0; level_idx < num_levels; level_idx++)
+        {
+            tidesdb_level_t *level = dst_cf->levels[level_idx];
+            if (!level) continue;
+
+            tidesdb_sstable_t **sstables =
+                atomic_load_explicit(&level->sstables, memory_order_acquire);
+            const int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+
+            for (int sst_idx = 0; sst_idx < num_ssts; sst_idx++)
+            {
+                tidesdb_sstable_t *sst = sstables[sst_idx];
+                if (sst && sst->id >= max_sst_id)
+                {
+                    max_sst_id = sst->id + 1;
+                }
+            }
+        }
+
+        if (max_sst_id > atomic_load(&dst_cf->next_sstable_id))
+        {
+            atomic_store(&dst_cf->next_sstable_id, max_sst_id);
+            TDB_DEBUG_LOG(TDB_LOG_INFO,
+                          "CF '%s' updated next_sstable_id to %" PRIu64 " after clone", dst_name,
+                          max_sst_id);
+        }
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Successfully cloned CF '%s' to '%s'", src_name, dst_name);
+    }
+
+    return TDB_SUCCESS;
+}
+
+/**
  * ini_config_context_t
  * INI configuration handler context
  * @param config

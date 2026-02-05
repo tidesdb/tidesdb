@@ -351,6 +351,16 @@ int tidesdb_is_flushing(tidesdb_column_family_t *cf);
 int tidesdb_is_compacting(tidesdb_column_family_t *cf);
 int tidesdb_backup(tidesdb_t *db, char *dir);
 
+/**
+ * tidesdb_clone_column_family
+ * clones an existing column family to a new column family with a different name
+ * @param db database handle
+ * @param src_name name of the source column family to clone
+ * @param dst_name name for the new cloned column family
+ * @return TDB_SUCCESS, TDB_ERR_NOT_FOUND, TDB_ERR_EXISTS, or other error codes
+ */
+int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char *dst_name);
+
 /**** configuration operations */
 int tidesdb_cf_config_load_from_ini(const char *ini_file, const char *section_name,
                                     tidesdb_column_family_config_t *config);

@@ -10994,6 +10994,9 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, skip_list_comparator
 
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 {
+    /* auto-initialize with system allocator if not already initialized */
+    tidesdb_ensure_initialized();
+
     if (!config || !db) return TDB_ERR_INVALID_ARGS;
 
     *db = calloc(1, sizeof(tidesdb_t));

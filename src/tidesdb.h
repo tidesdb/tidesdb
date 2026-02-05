@@ -19,6 +19,7 @@
 #ifndef __TIDESDB_H__
 #define __TIDESDB_H__
 
+#include "alloc.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "btree.h"

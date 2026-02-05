@@ -257,6 +257,71 @@ typedef struct tidesdb_cache_stats_t
 tidesdb_column_family_config_t tidesdb_default_column_family_config(void);
 tidesdb_config_t tidesdb_default_config(void);
 
+/**** initialization and custom allocator support */
+
+/**
+ * tidesdb_malloc_fn
+ * function pointer type for malloc-like allocation
+ * @param size number of bytes to allocate
+ * @return pointer to allocated memory or NULL on failure
+ */
+typedef void *(*tidesdb_malloc_fn)(size_t size);
+
+/**
+ * tidesdb_calloc_fn
+ * function pointer type for calloc-like allocation
+ * @param count number of elements to allocate
+ * @param size size of each element in bytes
+ * @return pointer to zero-initialized memory or NULL on failure
+ */
+typedef void *(*tidesdb_calloc_fn)(size_t count, size_t size);
+
+/**
+ * tidesdb_realloc_fn
+ * function pointer type for realloc-like reallocation
+ * @param ptr pointer to previously allocated memory (or NULL)
+ * @param size new size in bytes
+ * @return pointer to reallocated memory or NULL on failure
+ */
+typedef void *(*tidesdb_realloc_fn)(void *ptr, size_t size);
+
+/**
+ * tidesdb_free_fn
+ * function pointer type for free-like deallocation
+ * @param ptr pointer to memory to free (may be NULL)
+ */
+typedef void (*tidesdb_free_fn)(void *ptr);
+
+/**
+ * tidesdb_init
+ * initializes TidesDB with optional custom memory allocation functions
+ * MUST be called exactly once before any other TidesDB function
+ * pass NULL for any function to use the default system allocator
+ *
+ * Example (Redis module):
+ *   tidesdb_init(RedisModule_Alloc, RedisModule_Calloc,
+ *                RedisModule_Realloc, RedisModule_Free);
+ *
+ * Example (system allocator):
+ *   tidesdb_init(NULL, NULL, NULL, NULL);
+ *
+ * @param malloc_fn custom malloc function (or NULL for system malloc)
+ * @param calloc_fn custom calloc function (or NULL for system calloc)
+ * @param realloc_fn custom realloc function (or NULL for system realloc)
+ * @param free_fn custom free function (or NULL for system free)
+ * @return 0 on success, -1 if already initialized
+ */
+int tidesdb_init(tidesdb_malloc_fn malloc_fn, tidesdb_calloc_fn calloc_fn,
+                 tidesdb_realloc_fn realloc_fn, tidesdb_free_fn free_fn);
+
+/**
+ * tidesdb_finalize
+ * finalizes TidesDB and resets the allocator
+ * should be called after all TidesDB operations are complete
+ * after calling this, tidesdb_init() can be called again
+ */
+void tidesdb_finalize(void);
+
 /**** database operations */
 int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db);
 int tidesdb_close(tidesdb_t *db);

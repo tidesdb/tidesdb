@@ -19,6 +19,7 @@
 #ifndef __TIDESDB_H__
 #define __TIDESDB_H__
 
+#include "alloc.h"
 #include "block_manager.h"
 #include "bloom_filter.h"
 #include "btree.h"
@@ -1255,6 +1256,19 @@ int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
  * @return 0 on success, -n on failure
  */
 int tidesdb_backup(tidesdb_t *db, char *dir);
+
+/**
+ * tidesdb_clone_column_family
+ * clones an existing column family to a new column family with a different name.
+ * flushes the source memtable, waits for background operations, copies all SSTable files,
+ * and creates a new column family structure with the copied data.
+ * @param db database handle
+ * @param src_name name of the source column family to clone
+ * @param dst_name name for the new cloned column family
+ * @return TDB_SUCCESS on success, TDB_ERR_NOT_FOUND if source doesn't exist,
+ *         TDB_ERR_EXISTS if destination already exists, or other error codes on failure
+ */
+int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char *dst_name);
 
 /**
  * tidesdb_free

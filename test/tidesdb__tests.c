@@ -49,6 +49,129 @@ static void test_basic_open_close(void)
     cleanup_test_dir();
 }
 
+/* custom allocator test tracking variables */
+static atomic_int custom_malloc_count;
+static atomic_int custom_calloc_count;
+static atomic_int custom_realloc_count;
+static atomic_int custom_free_count;
+
+/* we save the real stdlib functions before tidesdb.h redefines them
+ * this is done at file scope initialization before main() runs */
+static void *(*saved_malloc)(size_t) = NULL;
+static void *(*saved_calloc)(size_t, size_t) = NULL;
+static void *(*saved_realloc)(void *, size_t) = NULL;
+static void (*saved_free)(void *) = NULL;
+
+static void *test_custom_malloc(size_t size)
+{
+    atomic_fetch_add(&custom_malloc_count, 1);
+    return saved_malloc(size);
+}
+
+static void *test_custom_calloc(size_t count, size_t size)
+{
+    atomic_fetch_add(&custom_calloc_count, 1);
+    return saved_calloc(count, size);
+}
+
+static void *test_custom_realloc(void *ptr, size_t size)
+{
+    atomic_fetch_add(&custom_realloc_count, 1);
+    return saved_realloc(ptr, size);
+}
+
+static void test_custom_free(void *ptr)
+{
+    atomic_fetch_add(&custom_free_count, 1);
+    saved_free(ptr);
+}
+
+static void test_custom_allocator(void)
+{
+    cleanup_test_dir();
+
+    /* we ensure TidesDB is initialized with system allocator first
+     * so we can save the real stdlib function pointers */
+    tidesdb_ensure_initialized();
+    saved_malloc = tidesdb_allocator.malloc_fn;
+    saved_calloc = tidesdb_allocator.calloc_fn;
+    saved_realloc = tidesdb_allocator.realloc_fn;
+    saved_free = tidesdb_allocator.free_fn;
+
+    /* we reset counters */
+    atomic_init(&custom_malloc_count, 0);
+    atomic_init(&custom_calloc_count, 0);
+    atomic_init(&custom_realloc_count, 0);
+    atomic_init(&custom_free_count, 0);
+
+    /* we finalize any previous initialization */
+    tidesdb_finalize();
+
+    /* we test that double init fails */
+    ASSERT_EQ(
+        tidesdb_init(test_custom_malloc, test_custom_calloc, test_custom_realloc, test_custom_free),
+        0);
+    ASSERT_EQ(
+        tidesdb_init(test_custom_malloc, test_custom_calloc, test_custom_realloc, test_custom_free),
+        -1);
+
+    /* we open database with custom allocator */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    /* we create a column family */
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "alloc_test_cf", &cf_config), 0);
+
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "alloc_test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* we write some data */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    uint8_t key[] = "alloc_test_key";
+    uint8_t value[] = "alloc_test_value";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), -1), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* we read the data back */
+    txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved_value, &retrieved_size), 0);
+    ASSERT_TRUE(retrieved_value != NULL);
+    ASSERT_EQ(retrieved_size, sizeof(value));
+    free(retrieved_value);
+
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    /* we verify custom allocator was used */
+    int malloc_calls = atomic_load(&custom_malloc_count);
+    int calloc_calls = atomic_load(&custom_calloc_count);
+    int free_calls = atomic_load(&custom_free_count);
+
+    ASSERT_TRUE(malloc_calls > 0 || calloc_calls > 0);
+    ASSERT_TRUE(free_calls > 0);
+
+    /* we finalize and reset for other tests */
+    tidesdb_finalize();
+
+    /* we re-init with system allocator for remaining tests */
+    tidesdb_init(NULL, NULL, NULL, NULL);
+
+    cleanup_test_dir();
+}
+
 static void test_log_file(void)
 {
     cleanup_test_dir();
@@ -2375,6 +2498,396 @@ static void test_rename_column_family(void)
         TDB_SUCCESS);
     ASSERT_TRUE(value != NULL);
     free(value);
+    tidesdb_txn_free(read_txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_clone_column_family(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    /* test 1 -- NULL argument handling */
+    ASSERT_EQ(tidesdb_clone_column_family(NULL, "src", "dst"), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_clone_column_family(db, NULL, "dst"), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_clone_column_family(db, "src", NULL), TDB_ERR_INVALID_ARGS);
+
+    /* test 2 -- clone non-existent CF */
+    ASSERT_EQ(tidesdb_clone_column_family(db, "nonexistent", "new_clone"), TDB_ERR_NOT_FOUND);
+
+    /* test 3 -- same name should fail */
+    ASSERT_EQ(tidesdb_create_column_family(db, "source_cf", &cf_config), 0);
+    ASSERT_EQ(tidesdb_clone_column_family(db, "source_cf", "source_cf"), TDB_ERR_INVALID_ARGS);
+
+    /* test 4 -- add data to source CF */
+    tidesdb_column_family_t *src_cf = tidesdb_get_column_family(db, "source_cf");
+    ASSERT_TRUE(src_cf != NULL);
+
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[64];
+        snprintf(key, sizeof(key), "clone_key_%04d", i);
+        snprintf(value, sizeof(value), "clone_value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, src_cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* test 5 -- clone the CF */
+    ASSERT_EQ(tidesdb_clone_column_family(db, "source_cf", "cloned_cf"), TDB_SUCCESS);
+
+    /* source should still exist */
+    src_cf = tidesdb_get_column_family(db, "source_cf");
+    ASSERT_TRUE(src_cf != NULL);
+
+    /* clone should exist */
+    tidesdb_column_family_t *clone_cf = tidesdb_get_column_family(db, "cloned_cf");
+    ASSERT_TRUE(clone_cf != NULL);
+
+    /* test 6 -- verify data is accessible in clone */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read_txn), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "clone_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(read_txn, clone_cf, (uint8_t *)key, strlen(key) + 1, &value,
+                                  &value_size),
+                  TDB_SUCCESS);
+        ASSERT_TRUE(value != NULL);
+
+        char expected_value[64];
+        snprintf(expected_value, sizeof(expected_value), "clone_value_%04d", i);
+        ASSERT_EQ(value_size, strlen(expected_value) + 1);
+        ASSERT_TRUE(memcmp(value, expected_value, value_size) == 0);
+        free(value);
+    }
+    tidesdb_txn_free(read_txn);
+
+    /* test 7 -- verify source data is still accessible */
+    read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read_txn), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32];
+        snprintf(key, sizeof(key), "clone_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(read_txn, src_cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+            TDB_SUCCESS);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+    }
+    tidesdb_txn_free(read_txn);
+
+    /* test 8 -- modifications to clone don't affect source */
+    tidesdb_txn_t *write_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &write_txn), 0);
+    uint8_t new_key[] = "clone_only_key";
+    uint8_t new_value[] = "clone_only_value";
+    ASSERT_EQ(tidesdb_txn_put(write_txn, clone_cf, new_key, sizeof(new_key), new_value,
+                              sizeof(new_value), -1),
+              0);
+    ASSERT_EQ(tidesdb_txn_commit(write_txn), 0);
+    tidesdb_txn_free(write_txn);
+
+    /* we verify new key exists in clone */
+    read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read_txn), 0);
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, clone_cf, new_key, sizeof(new_key), &retrieved_value,
+                              &retrieved_size),
+              TDB_SUCCESS);
+    ASSERT_TRUE(retrieved_value != NULL);
+    free(retrieved_value);
+
+    /* verify new key does NOT exist in source */
+    retrieved_value = NULL;
+    retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, src_cf, new_key, sizeof(new_key), &retrieved_value,
+                              &retrieved_size),
+              TDB_ERR_NOT_FOUND);
+    tidesdb_txn_free(read_txn);
+
+    /* test 9 -- clone to existing name should fail */
+    ASSERT_EQ(tidesdb_clone_column_family(db, "source_cf", "cloned_cf"), TDB_ERR_EXISTS);
+
+    /* test 10 -- we verify clone persists after reopen */
+    tidesdb_close(db);
+
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+
+    /* both CFs should exist after reopen */
+    src_cf = tidesdb_get_column_family(db, "source_cf");
+    ASSERT_TRUE(src_cf != NULL);
+
+    clone_cf = tidesdb_get_column_family(db, "cloned_cf");
+    ASSERT_TRUE(clone_cf != NULL);
+
+    /* we verify data still accessible in clone after reopen */
+    read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read_txn), 0);
+
+    char key[32];
+    snprintf(key, sizeof(key), "clone_key_%04d", 0);
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    ASSERT_EQ(
+        tidesdb_txn_get(read_txn, clone_cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+        TDB_SUCCESS);
+    ASSERT_TRUE(value != NULL);
+    free(value);
+
+    /* verify clone-only key still exists after reopen */
+    retrieved_value = NULL;
+    retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, clone_cf, new_key, sizeof(new_key), &retrieved_value,
+                              &retrieved_size),
+              TDB_SUCCESS);
+    ASSERT_TRUE(retrieved_value != NULL);
+    free(retrieved_value);
+
+    tidesdb_txn_free(read_txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int thread_id;
+    int num_ops;
+    atomic_int *clone_done;
+    atomic_int *errors;
+} clone_concurrent_ctx_t;
+
+static void *clone_concurrent_writer(void *arg)
+{
+    clone_concurrent_ctx_t *ctx = (clone_concurrent_ctx_t *)arg;
+
+    for (int i = 0; i < ctx->num_ops; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(ctx->db, &txn) != 0)
+        {
+            atomic_fetch_add(ctx->errors, 1);
+            continue;
+        }
+
+        char key[64];
+        char value[128];
+        snprintf(key, sizeof(key), "clone_concurrent_key_t%d_%04d", ctx->thread_id, i);
+        snprintf(value, sizeof(value), "clone_concurrent_value_t%d_%04d", ctx->thread_id, i);
+
+        int put_result = tidesdb_txn_put(txn, ctx->cf, (uint8_t *)key, strlen(key) + 1,
+                                         (uint8_t *)value, strlen(value) + 1, -1);
+        if (put_result != 0)
+        {
+            tidesdb_txn_free(txn);
+            atomic_fetch_add(ctx->errors, 1);
+            continue;
+        }
+
+        if (tidesdb_txn_commit(txn) != 0)
+        {
+            atomic_fetch_add(ctx->errors, 1);
+        }
+        tidesdb_txn_free(txn);
+
+        usleep(100);
+    }
+
+    return NULL;
+}
+
+static void *clone_concurrent_reader(void *arg)
+{
+    clone_concurrent_ctx_t *ctx = (clone_concurrent_ctx_t *)arg;
+
+    for (int i = 0; i < ctx->num_ops; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(ctx->db, &txn) != 0)
+        {
+            continue;
+        }
+
+        char key[64];
+        snprintf(key, sizeof(key), "initial_clone_key_%04d", i % 50);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        tidesdb_txn_get(txn, ctx->cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+        if (value) free(value);
+
+        tidesdb_txn_free(txn);
+        usleep(50);
+    }
+
+    return NULL;
+}
+
+static void test_clone_column_family_concurrent(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 8192;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "source_concurrent_cf", &cf_config), 0);
+    tidesdb_column_family_t *src_cf = tidesdb_get_column_family(db, "source_concurrent_cf");
+    ASSERT_TRUE(src_cf != NULL);
+
+    /* add initial data */
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char value[128];
+        snprintf(key, sizeof(key), "initial_clone_key_%04d", i);
+        snprintf(value, sizeof(value), "initial_clone_value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, src_cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    atomic_int clone_done;
+    atomic_int errors;
+    atomic_init(&clone_done, 0);
+    atomic_init(&errors, 0);
+
+    /* start writer and reader threads on source CF */
+    const int num_threads = 4;
+    const int ops_per_thread = 100;
+    pthread_t writer_threads[4];
+    pthread_t reader_threads[4];
+    clone_concurrent_ctx_t writer_contexts[4];
+    clone_concurrent_ctx_t reader_contexts[4];
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        writer_contexts[i].db = db;
+        writer_contexts[i].cf = src_cf;
+        writer_contexts[i].thread_id = i;
+        writer_contexts[i].num_ops = ops_per_thread;
+        writer_contexts[i].clone_done = &clone_done;
+        writer_contexts[i].errors = &errors;
+        pthread_create(&writer_threads[i], NULL, clone_concurrent_writer, &writer_contexts[i]);
+
+        reader_contexts[i].db = db;
+        reader_contexts[i].cf = src_cf;
+        reader_contexts[i].thread_id = i;
+        reader_contexts[i].num_ops = ops_per_thread;
+        reader_contexts[i].clone_done = &clone_done;
+        reader_contexts[i].errors = &errors;
+        pthread_create(&reader_threads[i], NULL, clone_concurrent_reader, &reader_contexts[i]);
+    }
+
+    /*** we let threads run for a bit */
+    usleep(50000);
+
+    /* we perform clone while threads are active */
+    int clone_result =
+        tidesdb_clone_column_family(db, "source_concurrent_cf", "cloned_concurrent_cf");
+    ASSERT_EQ(clone_result, TDB_SUCCESS);
+
+    /* signal clone is done */
+    atomic_store(&clone_done, 1);
+
+    /* we wait for all threads */
+    for (int i = 0; i < num_threads; i++)
+    {
+        pthread_join(writer_threads[i], NULL);
+        pthread_join(reader_threads[i], NULL);
+    }
+
+    /* we verify source CF still exists and is accessible */
+    src_cf = tidesdb_get_column_family(db, "source_concurrent_cf");
+    ASSERT_TRUE(src_cf != NULL);
+
+    /* we verify cloned CF exists */
+    tidesdb_column_family_t *clone_cf = tidesdb_get_column_family(db, "cloned_concurrent_cf");
+    ASSERT_TRUE(clone_cf != NULL);
+
+    /* we verify initial data is accessible in clone */
+    tidesdb_txn_t *read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read_txn), 0);
+
+    int found_count = 0;
+    for (int i = 0; i < 50; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "initial_clone_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        if (tidesdb_txn_get(read_txn, clone_cf, (uint8_t *)key, strlen(key) + 1, &value,
+                            &value_size) == TDB_SUCCESS)
+        {
+            found_count++;
+            free(value);
+        }
+    }
+    tidesdb_txn_free(read_txn);
+
+    /* all initial data should be found in clone */
+    ASSERT_EQ(found_count, 50);
+
+    /* verify clone and source are independent - write to clone */
+    tidesdb_txn_t *write_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &write_txn), 0);
+    uint8_t clone_only_key[] = "clone_only_concurrent_key";
+    uint8_t clone_only_value[] = "clone_only_concurrent_value";
+    ASSERT_EQ(tidesdb_txn_put(write_txn, clone_cf, clone_only_key, sizeof(clone_only_key),
+                              clone_only_value, sizeof(clone_only_value), -1),
+              0);
+    ASSERT_EQ(tidesdb_txn_commit(write_txn), 0);
+    tidesdb_txn_free(write_txn);
+
+    /* we verify key exists in clone but not in source */
+    read_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &read_txn), 0);
+
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, clone_cf, clone_only_key, sizeof(clone_only_key),
+                              &retrieved_value, &retrieved_size),
+              TDB_SUCCESS);
+    ASSERT_TRUE(retrieved_value != NULL);
+    free(retrieved_value);
+
+    retrieved_value = NULL;
+    ASSERT_EQ(tidesdb_txn_get(read_txn, src_cf, clone_only_key, sizeof(clone_only_key),
+                              &retrieved_value, &retrieved_size),
+              TDB_ERR_NOT_FOUND);
+
     tidesdb_txn_free(read_txn);
 
     tidesdb_close(db);
@@ -17665,6 +18178,7 @@ static void test_compaction_partitioned_z_calculation(void)
 int main(void)
 {
     cleanup_test_dir();
+    RUN_TEST(test_custom_allocator, tests_passed);
     RUN_TEST(test_basic_open_close, tests_passed);
     RUN_TEST(test_tidesdb_free, tests_passed);
     RUN_TEST(test_column_family_creation, tests_passed);
@@ -17927,6 +18441,8 @@ int main(void)
     RUN_TEST(test_cf_rename_during_pending_flush, tests_passed);
     RUN_TEST(test_cf_rename_during_active_compaction, tests_passed);
     RUN_TEST(test_multiple_cf_drop_with_concurrent_workers, tests_passed);
+    RUN_TEST(test_clone_column_family, tests_passed);
+    RUN_TEST(test_clone_column_family_concurrent, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

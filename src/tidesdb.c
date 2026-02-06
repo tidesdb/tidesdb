@@ -112,13 +112,6 @@ void tidesdb_log_write(const int level, const char *file, const int line, const 
     pthread_mutex_unlock(&tidesdb_log_mutex);
 }
 
-typedef tidesdb_t tidesdb_t;
-typedef tidesdb_column_family_t tidesdb_column_family_t;
-typedef tidesdb_level_t tidesdb_level_t;
-typedef tidesdb_sstable_t tidesdb_sstable_t;
-typedef tidesdb_txn_t tidesdb_txn_t;
-typedef tidesdb_iter_t tidesdb_iter_t;
-typedef tidesdb_stats_t tidesdb_stats_t;
 typedef struct tidesdb_flush_work_t tidesdb_flush_work_t;
 typedef struct tidesdb_compaction_work_t tidesdb_compaction_work_t;
 typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
@@ -254,7 +247,6 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_MEMORY_PERCENTAGE                   0.6
 #define TDB_MIN_KEY_VALUE_SIZE                  (1024 * 1024)
 #define TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY 32
-#define TDB_MAX_LEVELS                          32
 #define TDB_DISK_SPACE_CHECK_INTERVAL_SECONDS   60
 #define TDB_NO_CF_SYNC_SLEEP_US                 100000
 
@@ -1701,7 +1693,7 @@ static int tidesdb_resolve_comparator(tidesdb_t *db, const tidesdb_column_family
         /* no comparator specified or explicitly requested memcmp, we use default */
         *fn = tidesdb_comparator_memcmp;
         if (ctx) *ctx = NULL;
-        return -1;
+        return 0;
     }
 
     return 0;
@@ -2748,6 +2740,12 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
     sst->vlog_bm = NULL;
     sst->use_btree = config->use_btree;
 
+    /* we cache resolved comparator on the sstable to avoid per-lookup resolution */
+    sst->cached_comparator_fn = NULL;
+    sst->cached_comparator_ctx = NULL;
+    sst->is_reverse = 0;
+    tidesdb_resolve_comparator(db, config, &sst->cached_comparator_fn, &sst->cached_comparator_ctx);
+
     const size_t path_len = strlen(base_path) + 32;
     sst->klog_path = malloc(path_len);
     sst->vlog_path = malloc(path_len);
@@ -2875,13 +2873,13 @@ static void tidesdb_sstable_free(tidesdb_sstable_t *sst)
 {
     if (!sst) return;
 
-    /* invalidate btree node cache entries for this SSTable before freeing */
+    /* we invalidate btree node cache entries for this sstable before freeing */
     if (sst->use_btree && sst->db && sst->db->btree_node_cache)
     {
         tidesdb_invalidate_btree_cache_for_sstable(sst->db, sst->id);
     }
 
-    /* invalidate block cache entries for this SSTable before freeing */
+    /* we invalidate block cache entries for this sstable before freeing */
     if (sst->db && sst->db->clock_cache && sst->cf_name[0] != '\0' && sst->klog_path)
     {
         tidesdb_invalidate_block_cache_for_sstable(sst->db, sst->cf_name, sst->klog_path);
@@ -3358,12 +3356,16 @@ static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm)
     }
 }
 
+#define TDB_IMM_SNAPSHOT_STACK_SIZE 8
+
 typedef struct
 {
     tidesdb_immutable_memtable_t **items;
+    tidesdb_immutable_memtable_t *stack_items[TDB_IMM_SNAPSHOT_STACK_SIZE];
     size_t count;
     size_t capacity;
     int failed;
+    int heap_allocated;
 } tidesdb_imm_snapshot_ctx_t;
 
 static void tidesdb_collect_imm_snapshot(void *data, void *context)
@@ -3373,13 +3375,29 @@ static void tidesdb_collect_imm_snapshot(void *data, void *context)
 
     if (ctx->count >= ctx->capacity)
     {
-        const size_t new_capacity = ctx->capacity == 0 ? 8 : ctx->capacity * 2;
-        void *new_items =
-            realloc(ctx->items, new_capacity * sizeof(tidesdb_immutable_memtable_t *));
-        if (!new_items)
+        const size_t new_capacity = ctx->capacity * 2;
+        tidesdb_immutable_memtable_t **new_items;
+        if (!ctx->heap_allocated)
         {
-            ctx->failed = 1;
-            return;
+            /* first overflow from stack to heap */
+            new_items = malloc(new_capacity * sizeof(tidesdb_immutable_memtable_t *));
+            if (!new_items)
+            {
+                ctx->failed = 1;
+                return;
+            }
+            memcpy(new_items, ctx->stack_items,
+                   ctx->count * sizeof(tidesdb_immutable_memtable_t *));
+            ctx->heap_allocated = 1;
+        }
+        else
+        {
+            new_items = realloc(ctx->items, new_capacity * sizeof(tidesdb_immutable_memtable_t *));
+            if (!new_items)
+            {
+                ctx->failed = 1;
+                return;
+            }
         }
         ctx->items = new_items;
         ctx->capacity = new_capacity;
@@ -3397,9 +3415,9 @@ static tidesdb_immutable_memtable_t **tidesdb_snapshot_immutable_memtables(queue
     if (!queue) return NULL;
 
     tidesdb_imm_snapshot_ctx_t ctx = {0};
-    ctx.capacity = 8;
-    ctx.items = malloc(ctx.capacity * sizeof(tidesdb_immutable_memtable_t *));
-    if (!ctx.items) return NULL;
+    ctx.capacity = TDB_IMM_SNAPSHOT_STACK_SIZE;
+    ctx.items = ctx.stack_items;
+    ctx.heap_allocated = 0;
 
     queue_foreach(queue, tidesdb_collect_imm_snapshot, &ctx);
 
@@ -3409,8 +3427,25 @@ static tidesdb_immutable_memtable_t **tidesdb_snapshot_immutable_memtables(queue
         {
             if (ctx.items[i]) tidesdb_immutable_memtable_unref(ctx.items[i]);
         }
-        free(ctx.items);
+        if (ctx.heap_allocated) free(ctx.items);
         return NULL;
+    }
+
+    /* if still on stack, copy to heap for caller ownership */
+    if (!ctx.heap_allocated)
+    {
+        tidesdb_immutable_memtable_t **heap_items =
+            malloc(ctx.count * sizeof(tidesdb_immutable_memtable_t *));
+        if (!heap_items)
+        {
+            for (size_t i = 0; i < ctx.count; i++)
+            {
+                if (ctx.items[i]) tidesdb_immutable_memtable_unref(ctx.items[i]);
+            }
+            return NULL;
+        }
+        memcpy(heap_items, ctx.stack_items, ctx.count * sizeof(tidesdb_immutable_memtable_t *));
+        ctx.items = heap_items;
     }
 
     if (out_count) *out_count = ctx.count;
@@ -4508,15 +4543,17 @@ static int tidesdb_kv_pair_load_value(const tidesdb_t *db, tidesdb_sstable_t *ss
     {
         /* inline value path -- data already in memory */
         kv->value = malloc(value_size);
-        if (kv->value)
-        {
-            memcpy(kv->value, block->inline_values[idx], value_size);
-        }
+        if (!kv->value) return TDB_ERR_MEMORY;
+
+        memcpy(kv->value, block->inline_values[idx], value_size);
     }
     else if (vlog_offset > 0)
     {
         /* vlog path -- requires disk I/O */
-        tidesdb_vlog_read_value(db, sst, vlog_offset, value_size, &kv->value);
+        if (tidesdb_vlog_read_value(db, sst, vlog_offset, value_size, &kv->value) != TDB_SUCCESS)
+        {
+            return TDB_ERR_IO;
+        }
     }
 
     return TDB_SUCCESS;
@@ -4623,10 +4660,13 @@ static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, cons
         return TDB_ERR_NOT_FOUND;
     }
 
-    /* resolve comparator and check key range */
-    skip_list_comparator_fn comparator_fn = NULL;
-    void *comparator_ctx = NULL;
-    tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+    /* we use cached comparator from sstable (resolved at load/create time) */
+    skip_list_comparator_fn comparator_fn = sst->cached_comparator_fn;
+    void *comparator_ctx = sst->cached_comparator_ctx;
+    if (TDB_UNLIKELY(!comparator_fn))
+    {
+        tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+    }
 
     const int min_cmp =
         comparator_fn(key, key_size, sst->min_key, sst->min_key_size, comparator_ctx);
@@ -4689,7 +4729,7 @@ static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, cons
     /* we check TTL */
     if (ttl > 0)
     {
-        const int64_t now = (int64_t)time(NULL);
+        const int64_t now = (int64_t)atomic_load(&db->cached_current_time);
         if (now > ttl)
         {
             free(value);
@@ -4791,20 +4831,20 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         return TDB_ERR_NOT_FOUND;
     }
 
-    /* we resolve comparator and check key range first (cheaper than bloom filter) */
-    skip_list_comparator_fn comparator_fn = NULL;
-    void *comparator_ctx = NULL;
-    tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+    /* we use cached comparator from sstable (resolved at load/create time) */
+    skip_list_comparator_fn comparator_fn = sst->cached_comparator_fn;
+    void *comparator_ctx = sst->cached_comparator_ctx;
+    if (TDB_UNLIKELY(!comparator_fn))
+    {
+        tidesdb_resolve_comparator(sst->db, sst->config, &comparator_fn, &comparator_ctx);
+    }
 
-    const int min_max_cmp = comparator_fn(sst->min_key, sst->min_key_size, sst->max_key,
-                                          sst->max_key_size, comparator_ctx);
-    const int is_reverse = (min_max_cmp > 0);
     const int min_cmp =
         comparator_fn(key, key_size, sst->min_key, sst->min_key_size, comparator_ctx);
     const int max_cmp =
         comparator_fn(key, key_size, sst->max_key, sst->max_key_size, comparator_ctx);
 
-    if (is_reverse)
+    if (sst->is_reverse)
     {
         if (min_cmp > 0 || max_cmp < 0) return TDB_ERR_NOT_FOUND;
     }
@@ -4961,7 +5001,18 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
                     const uint8_t arena_flag = (*kv)->entry.flags & TDB_KV_FLAG_ARENA;
                     (*kv)->entry = klog_block->entries[i];
                     (*kv)->entry.flags |= arena_flag;
-                    tidesdb_kv_pair_load_value(db, sst, klog_block, i, *kv);
+                    const int load_rc = tidesdb_kv_pair_load_value(db, sst, klog_block, i, *kv);
+                    if (load_rc != TDB_SUCCESS)
+                    {
+                        tidesdb_kv_pair_free(*kv);
+                        *kv = NULL;
+                        if (rc_block)
+                            tidesdb_block_release(rc_block);
+                        else
+                            tidesdb_klog_block_free(klog_block);
+                        if (raw_block) block_manager_block_release(raw_block);
+                        return load_rc;
+                    }
 
                     /* we release resources and return success */
                     if (rc_block)
@@ -5246,6 +5297,25 @@ load_bloom_and_index:; /* empty statement for C89/C90 compatibility */
      * they will be managed by the cache and closed when the sstable is evicted or freed */
     sst->klog_bm = klog_bm;
     sst->vlog_bm = vlog_bm;
+
+    /* we cache resolved comparator on the sstable to avoid per-lookup resolution */
+    sst->cached_comparator_fn = NULL;
+    sst->cached_comparator_ctx = NULL;
+    sst->is_reverse = 0;
+    if (db && sst->config)
+    {
+        tidesdb_resolve_comparator(db, sst->config, &sst->cached_comparator_fn,
+                                   &sst->cached_comparator_ctx);
+
+        /* we cache is_reverse to avoid recomputing on every klog get */
+        if (sst->cached_comparator_fn && sst->min_key && sst->max_key)
+        {
+            const int min_max_cmp =
+                sst->cached_comparator_fn(sst->min_key, sst->min_key_size, sst->max_key,
+                                          sst->max_key_size, sst->cached_comparator_ctx);
+            sst->is_reverse = (min_max_cmp > 0);
+        }
+    }
 
     /* we track that this file is now open */
     if (db)
@@ -13658,9 +13728,17 @@ static int tidesdb_txn_add_cf_internal(tidesdb_txn_t *txn, tidesdb_column_family
     if (!txn || !cf) return -1;
     if (txn->is_committed || txn->is_aborted) return -1;
 
+    /* fast path: check last-used CF (covers single-CF workloads in O(1)) */
+    if (txn->last_cf == cf) return txn->last_cf_index;
+
     for (int i = 0; i < txn->num_cfs; i++)
     {
-        if (txn->cfs[i] == cf) return i;
+        if (txn->cfs[i] == cf)
+        {
+            txn->last_cf = cf;
+            txn->last_cf_index = i;
+            return i;
+        }
     }
 
     if (txn->num_cfs >= txn->cf_capacity)
@@ -13693,6 +13771,9 @@ static int tidesdb_txn_add_cf_internal(tidesdb_txn_t *txn, tidesdb_column_family
     const int cf_index = txn->num_cfs;
     txn->cfs[cf_index] = cf;
     txn->num_cfs++;
+
+    txn->last_cf = cf;
+    txn->last_cf_index = cf_index;
 
     return cf_index;
 }
@@ -13966,9 +14047,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
             return TDB_SUCCESS;
         }
 
-        /* TTL expired */
+        /* TTL expired -- newest version is expired, do not fall through to older data */
         free(temp_value);
-        /* fall through to check immutables */
+        return TDB_ERR_NOT_FOUND;
     }
 
     tidesdb_immutable_memtable_t **immutable_refs = NULL;
@@ -17947,7 +18028,7 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
     }
 
     /* we calculate read amplification: worst case is 1 (memtable) + sum of sstables per level
-     * note -- levels[0] is L1 (first SSTable level), L0 is the immutable memtables queue */
+     * note -- levels[0] is L1 (first sstable level), L0 is the immutable memtables queue */
     double read_amp = 1.0; /* memtable lookup */
     for (int i = 0; i < (*stats)->num_levels; i++)
     {
@@ -18415,7 +18496,7 @@ static int tidesdb_clone_copy_cf_dir(const char *src_dir, const char *dst_dir)
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
         if (strcmp(entry->d_name, TDB_LOCK_FILE) == 0) continue;
 
-        /* skip WAL files - we don't want to copy uncommitted data */
+        /* we skip WAL files -- we don't want to copy uncommitted data */
         if (tidesdb_backup_is_wal_file(entry->d_name)) continue;
 
         const size_t src_len = strlen(src_dir) + strlen(PATH_SEPARATOR) + strlen(entry->d_name) + 1;
@@ -18553,9 +18634,16 @@ int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char 
 
     /* we update config.ini with new name */
     char config_path[TDB_MAX_PATH_LEN];
-    snprintf(config_path, sizeof(config_path),
-             "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
-             dst_dir);
+    const int config_written = snprintf(
+        config_path, sizeof(config_path),
+        "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT, dst_dir);
+
+    if (config_written < 0 || (size_t)config_written >= sizeof(config_path))
+    {
+        TDB_DEBUG_LOG(TDB_LOG_ERROR, "Config path too long for cloned CF '%s'", dst_name);
+        remove_directory(dst_dir);
+        return TDB_ERR_INVALID_ARGS;
+    }
 
     result = tidesdb_cf_config_save_to_ini(config_path, dst_name, &src_cf->config);
     if (result != TDB_SUCCESS)
@@ -18570,7 +18658,7 @@ int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char 
     /* we create the new column family structure by loading from disk */
     tidesdb_column_family_config_t clone_config = src_cf->config;
 
-    /* we clear cached comparator pointers - they will be re-resolved */
+    /* we clear cached comparator pointers -- they will be re-resolved */
     clone_config.comparator_fn_cached = NULL;
     clone_config.comparator_ctx_cached = NULL;
 
@@ -18583,7 +18671,7 @@ int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char 
         return result;
     }
 
-    /* we get the newly created CF and recover its SSTables */
+    /* we get the newly created CF and recover its sstables */
     tidesdb_column_family_t *dst_cf = tidesdb_get_column_family(db, dst_name);
     if (dst_cf)
     {
@@ -18592,7 +18680,7 @@ int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char 
         if (result != TDB_SUCCESS)
         {
             TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to recover SSTables for cloned CF '%s'", dst_name);
-            /* CF is created but may be incomplete - user should drop and retry */
+            /* CF is created but may be incomplete -- the user should drop and retry */
             return result;
         }
 
@@ -19363,28 +19451,28 @@ void tidesdb_print_read_stats(tidesdb_t *db)
     double avg_blocks_per_read =
         stats.total_reads > 0 ? ((double)stats.blocks_read / stats.total_reads) : 0.0;
     printf("\n*---------------------- TidesDB Read Profiling Stats ----------------------*\n");
-    printf("Total Reads:           " PRIu64 "\n", stats.total_reads);
+    printf("Total Reads:           %" PRIu64 "\n", stats.total_reads);
     printf("\nRead Hit Location:\n");
-    printf("  Memtable hits:       " PRIu64 " (%.1f%%)\n", stats.memtable_hits,
+    printf("  Memtable hits:       %" PRIu64 " (%.1f%%)\n", stats.memtable_hits,
            stats.total_reads > 0 ? 100.0 * stats.memtable_hits / stats.total_reads : 0.0);
-    printf("  Immutable hits:      " PRIu64 " (%.1f%%)\n", stats.immutable_hits,
+    printf("  Immutable hits:      %" PRIu64 " (%.1f%%)\n", stats.immutable_hits,
            stats.total_reads > 0 ? 100.0 * stats.immutable_hits / stats.total_reads : 0.0);
-    printf("  SSTable hits:        " PRIu64 " (%.1f%%)\n", stats.sstable_hits,
+    printf("  SSTable hits:        %" PRIu64 " (%.1f%%)\n", stats.sstable_hits,
            stats.total_reads > 0 ? 100.0 * stats.sstable_hits / stats.total_reads : 0.0);
     printf("\nSSTable Search:\n");
-    printf("  Levels searched:     " PRIu64 " (avg: %.2f per read)\n", stats.levels_searched,
+    printf("  Levels searched:     %" PRIu64 " (avg: %.2f per read)\n", stats.levels_searched,
            avg_levels_per_read);
-    printf("  SSTables checked:    " PRIu64 " (avg: %.2f per read)\n", stats.sstables_checked,
+    printf("  SSTables checked:    %" PRIu64 " (avg: %.2f per read)\n", stats.sstables_checked,
            avg_sstables_per_read);
-    printf("  Bloom checks:        " PRIu64 "\n", stats.bloom_checks);
-    printf("  Bloom hits:          " PRIu64 " (%.1f%%)\n", stats.bloom_hits, bloom_hit_rate);
+    printf("  Bloom checks:        %" PRIu64 "\n", stats.bloom_checks);
+    printf("  Bloom hits:          %" PRIu64 " (%.1f%%)\n", stats.bloom_hits, bloom_hit_rate);
     printf("\nBlock-Level Cache:\n");
-    printf("  Cache hits:          " PRIu64 "\n", stats.cache_block_hits);
-    printf("  Cache misses:        " PRIu64 "\n", stats.cache_block_misses);
+    printf("  Cache hits:          %" PRIu64 "\n", stats.cache_block_hits);
+    printf("  Cache misses:        %" PRIu64 "\n", stats.cache_block_misses);
     printf("  Cache hit rate:      %.1f%%\n", cache_hit_rate);
-    printf("  Blocks read:         " PRIu64 " (avg: %.2f per read)\n", stats.blocks_read,
+    printf("  Blocks read:         %" PRIu64 " (avg: %.2f per read)\n", stats.blocks_read,
            avg_blocks_per_read);
-    printf("  Disk reads:          " PRIu64 "\n", stats.disk_reads);
+    printf("  Disk reads:          %" PRIu64 "\n", stats.disk_reads);
 
     if (db->clock_cache)
     {
@@ -19393,8 +19481,8 @@ void tidesdb_print_read_stats(tidesdb_t *db)
         printf("\nClock Cache Stats:\n");
         printf("  Total entries:       %zu\n", cache_stats.total_entries);
         printf("  Total bytes:         %.2f MB\n", cache_stats.total_bytes / (1024.0 * 1024.0));
-        printf("  Global hits:         " PRIu64 "\n", cache_stats.hits);
-        printf("  Global misses:       " PRIu64 "\n", cache_stats.misses);
+        printf("  Global hits:         %" PRIu64 "\n", cache_stats.hits);
+        printf("  Global misses:       %" PRIu64 "\n", cache_stats.misses);
         printf("  Global hit rate:     %.1f%%\n", cache_stats.hit_rate * 100.0);
     }
     printf("*--------------------------------------------------------------------------*\n\n");

@@ -285,7 +285,7 @@ int block_manager_close(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    /* final sync on close -- really only needed if O_DSYNC wasnt used
+    /* final sync on close -- we really only needed if O_DSYNC wasnt used
      * with O_DSYNC, all writes are already durable */
     if (is_sync_full(bm) && !odsync_available())
     {
@@ -324,7 +324,7 @@ block_manager_block_t *block_manager_block_create(const uint64_t size, const voi
         return NULL;
     }
 
-    /* only copy if size > 0 and data is not NULL */
+    /* we only copy if size > 0 and data is not NULL */
     if (size > 0 && data != NULL)
     {
         memcpy(block->data, data, size);
@@ -643,7 +643,7 @@ int block_manager_cursor_init_stack(block_manager_cursor_t *cursor, block_manage
     cursor->block_size_valid = 0;
     set_file_sequential_hint(bm->fd);
 
-    /* position at first block so cursor_read works immediately */
+    /* we position at first block so cursor_read works immediately */
     block_manager_cursor_goto_first(cursor);
 
     return 0;
@@ -665,7 +665,7 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
 
     uint32_t block_size;
 
-    /* use cached block size if valid, otherwise read from disk */
+    /* we use cached block size if valid, otherwise read from disk */
     if (cursor->block_size_valid && cursor->current_block_size > 0)
     {
         block_size = (uint32_t)cursor->current_block_size;
@@ -688,7 +688,7 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
     cursor->current_pos +=
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + (uint64_t)block_size + BLOCK_MANAGER_FOOTER_SIZE;
     cursor->current_block_size = 0;
-    cursor->block_size_valid = 0; /* invalidate cache after moving */
+    cursor->block_size_valid = 0; /* we invalidate cache after moving */
     cursor->block_index++;
 
     return 0;
@@ -701,13 +701,13 @@ int block_manager_cursor_has_next(block_manager_cursor_t *cursor)
     const uint64_t file_size = atomic_load(&cursor->bm->current_file_size);
     if (cursor->current_pos >= file_size) return 0; /* at or past EOF */
 
-    /* use cached block size if valid */
+    /** we use cached block size if valid */
     if (cursor->block_size_valid && cursor->current_block_size > 0)
     {
         return 1;
     }
 
-    /* read current block size to check if current block is valid */
+    /* we read current block size to check if current block is valid */
     unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     const ssize_t nread =
         pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)cursor->current_pos);
@@ -832,12 +832,21 @@ block_manager_block_t *block_manager_cursor_read_partial(block_manager_cursor_t 
     block_manager_t *bm = cursor->bm;
     const uint64_t offset = cursor->current_pos;
 
-    unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
-    if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=
-        BLOCK_MANAGER_SIZE_FIELD_SIZE)
-        return NULL;
-    const uint32_t block_size = decode_uint32_le_compat(size_buf);
-    if (block_size == 0) return NULL;
+    /* we use cached block size to avoid redundant pread syscall */
+    uint32_t block_size;
+    if (cursor->block_size_valid && cursor->current_block_size > 0)
+    {
+        block_size = (uint32_t)cursor->current_block_size;
+    }
+    else
+    {
+        unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+        if (pread(bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)offset) !=
+            BLOCK_MANAGER_SIZE_FIELD_SIZE)
+            return NULL;
+        block_size = decode_uint32_le_compat(size_buf);
+        if (block_size == 0) return NULL;
+    }
 
     /* if block is smaller than max_bytes, read full block */
     if (block_size <= max_bytes)
@@ -987,7 +996,7 @@ int block_manager_cursor_goto_last(block_manager_cursor_t *cursor)
     const uint32_t block_size = decode_uint32_le_compat(footer_buf);
     const uint32_t footer_magic = decode_uint32_le_compat(footer_buf + 4);
 
-    /* verify footer magic */
+    /* we verify footer magic */
     if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC || block_size == 0)
     {
         return -1;
@@ -1055,7 +1064,7 @@ int block_manager_truncate(block_manager_t *bm)
         }
     }
 
-    /* reset cached file size to header size */
+    /* we reset cached file size to header size */
     atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
 
     return 0;
@@ -1094,19 +1103,32 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
 {
     if (!cursor) return -1;
 
-    unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
-    if (pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
-              (off_t)cursor->current_pos) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
-        return -1;
-    const uint32_t block_size = decode_uint32_le_compat(size_buf);
-    if (block_size == 0) return -1;
+    /* we use cached block size to avoid pread syscall when possible */
+    uint32_t block_size;
+    if (cursor->block_size_valid && cursor->current_block_size > 0)
+    {
+        block_size = (uint32_t)cursor->current_block_size;
+    }
+    else
+    {
+        unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
+        if (pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                  (off_t)cursor->current_pos) != BLOCK_MANAGER_SIZE_FIELD_SIZE)
+            return -1;
+        block_size = decode_uint32_le_compat(size_buf);
+        if (block_size == 0) return -1;
+    }
 
     /* we calculate position after current block, [size][checksum][data][footer] */
     const uint64_t total_block_size =
         BLOCK_MANAGER_BLOCK_HEADER_SIZE + block_size + BLOCK_MANAGER_FOOTER_SIZE;
     const uint64_t next_block_pos = cursor->current_pos + total_block_size;
 
-    /* try to read next block size -- if we can't, we're at last block */
+    /* we check against cached file size first to avoid syscall */
+    const uint64_t file_size = atomic_load(&cursor->bm->current_file_size);
+    if (next_block_pos >= file_size) return 1;
+
+     /*we try to read next block size -- if we can't, we're at last block */
     unsigned char next_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     const ssize_t read_result =
         pread(cursor->bm->fd, next_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)next_block_pos);
@@ -1126,7 +1148,7 @@ int block_manager_cursor_goto(block_manager_cursor_t *cursor, const uint64_t pos
     if (!cursor) return -1;
 
     cursor->current_pos = pos;
-    cursor->block_size_valid = 0; /* invalidate cache when jumping to arbitrary position */
+    cursor->block_size_valid = 0; /* we invalidate cache when jumping to arbitrary position */
     return 0;
 }
 
@@ -1149,34 +1171,33 @@ int block_manager_count_blocks(block_manager_t *bm)
 {
     if (!bm) return -1;
 
-    block_manager_cursor_t *cursor;
+    /* we use stack cursor to avoid heap allocation */
+    block_manager_cursor_t cursor;
     int count = 0;
 
-    if (block_manager_cursor_init(&cursor, bm) != 0) return -1;
+    if (block_manager_cursor_init_stack(&cursor, bm) != 0) return -1;
 
-    if (block_manager_cursor_goto_first(cursor) != 0)
+    if (block_manager_cursor_goto_first(&cursor) != 0)
     {
-        block_manager_cursor_free(cursor);
         return 0; /* empty file */
     }
 
-    if (cursor->block_index >= 0)
+    if (cursor.block_index >= 0)
     {
         count = 1;
-        while (block_manager_cursor_next(cursor) == 0)
+        while (block_manager_cursor_next(&cursor) == 0)
         {
             count++;
         }
     }
     else
     {
-        while (block_manager_cursor_next(cursor) == 0)
+        while (block_manager_cursor_next(&cursor) == 0)
         {
             count++;
         }
     }
 
-    block_manager_cursor_free(cursor);
     return count;
 }
 
@@ -1315,7 +1336,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
                 fdatasync(bm->fd);
             }
             close(bm->fd);
-            /* reopen with same flags as original open */
+            /* we reopen with same flags as original open */
             int flags = O_RDWR | O_CREAT;
             if (is_sync_full(bm) && odsync_available())
             {
@@ -1358,7 +1379,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
     if (pread(bm->fd, header_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)block_start) !=
         BLOCK_MANAGER_SIZE_FIELD_SIZE)
     {
-        /* cant read block header = I/O error (fail in both modes) */
+        /* we cant read block header = I/O error (fail in both modes) */
         return -1;
     }
 
@@ -1369,7 +1390,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
         return -1;
     }
 
-    /* last block is valid, no truncation needed */
+    /* the last block is valid, no truncation needed */
     return 0;
 }
 
@@ -1463,7 +1484,7 @@ int block_manager_read_block_data_at_offset(block_manager_t *bm, const uint64_t 
     }
     else
     {
-        /* large block -- need second read for remaining data */
+        /* large block -- we need second read for remaining data */
         const size_t already_have = (size_t)initial_read - BLOCK_MANAGER_BLOCK_HEADER_SIZE;
         if (already_have > 0)
         {

@@ -403,6 +403,9 @@ struct tidesdb_column_family_t
  * @param btree_last_leaf last leaf offset for btree backward iteration
  * @param btree_node_count total number of nodes in btree
  * @param btree_height height of btree
+ * @param cached_comparator_fn cached comparator function for fast iteration
+ * @param cached_comparator_ctx cached comparator context for fast iteration
+ * @param is_reverse flag indicating sstable is reverse sorted
  */
 struct tidesdb_sstable_t
 {
@@ -436,6 +439,9 @@ struct tidesdb_sstable_t
     int64_t btree_last_leaf;
     uint64_t btree_node_count;
     uint32_t btree_height;
+    skip_list_comparator_fn cached_comparator_fn;
+    void *cached_comparator_ctx;
+    int is_reverse;
 };
 
 /**
@@ -492,6 +498,7 @@ struct tidesdb_level_t
  * @param reaper_thread_mutex mutex for reaper thread
  * @param reaper_thread_cond condition variable for reaper thread
  * @param clock_cache clock cache for hot sstable blocks
+ * @param btree_node_cache clock cache for hot btree nodes
  * @param num_open_sstables global counter for open sstables
  * @param next_txn_id global transaction id counter
  * @param global_seq global sequence counter for snapshots and commits
@@ -508,6 +515,7 @@ struct tidesdb_level_t
  * @param cf_list_lock rwlock for cf list modifications
  * @param lock_fd file descriptor for lock file
  * @param log_file file descriptor for log file
+ * @param read_stats read profiling statistics (only when TDB_ENABLE_READ_PROFILING is defined)
  */
 struct tidesdb_t
 {
@@ -562,10 +570,10 @@ struct tidesdb_t
  *
  * supports multiple isolation levels:
  * -- read_uncommitted -- sees all versions including uncommitted (dirty reads allowed)
- * -- read_committed -- refreshes snapshot on each read (prevents dirty reads)
- * -- repeatable_read -- consistent snapshot, read-write conflict detection
- * -- snapshot -- consistent snapshot, read-write + write-write conflict detection
- * -- serializable -- full ssi with dangerous structure detection (prevents all anomalies)
+ * -- read_committed   -- refreshes snapshot on each read (prevents dirty reads)
+ * -- repeatable_read  -- consistent snapshot, read-write conflict detection
+ * -- snapshot         -- consistent snapshot, read-write + write-write conflict detection
+ * -- serializable     -- full ssi with dangerous structure detection (prevents all anomalies)
  *
  * snapshot isolation semantics:
  * -- snapshot captured at begin (all committed txns with seq <= snapshot_seq are visible)
@@ -595,6 +603,8 @@ struct tidesdb_t
  * @param cfs array of column families involved in transaction
  * @param num_cfs number of column families
  * @param cf_capacity capacity of column families array
+ * @param last_cf cached last-used column family for O(1) single-CF lookup
+ * @param last_cf_index cached index of last-used column family
  * @param savepoints array of savepoint transaction states
  * @param savepoint_names array of savepoint names
  * @param num_savepoints number of savepoints
@@ -628,6 +638,8 @@ struct tidesdb_txn_t
     tidesdb_column_family_t **cfs;
     int num_cfs;
     int cf_capacity;
+    tidesdb_column_family_t *last_cf;
+    int last_cf_index;
     tidesdb_txn_t **savepoints;
     char **savepoint_names;
     int num_savepoints;
@@ -1251,8 +1263,8 @@ int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
  * backup current database to a directory. this is a best effort backup that copies immutable files
  * first, then forces a sorted run, waits for the flush/compaction queues to drain, and performs a
  * final copy to pick up wal's and the manifest while skipping already copied sstable files.
- * @param db
- * @param dir
+ * @param db database handle
+ * @param dir destination directory for the backup
  * @return 0 on success, -n on failure
  */
 int tidesdb_backup(tidesdb_t *db, char *dir);

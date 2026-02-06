@@ -222,13 +222,24 @@ static clock_cache_entry_t *find_entry_with_hash(clock_cache_partition_t *partit
             return NULL;
         }
 
+        /* prefetch next probe's hash index entry to overlap with current try_match */
+        if (probe + 1 < max_probe)
+        {
+            const size_t next_pos = (idx + probe + 1) & partition->hash_mask;
+            PREFETCH_READ(&partition->hash_index[next_pos]);
+        }
+
         PREFETCH_READ(&partition->slots[slot_idx]);
         clock_cache_entry_t *entry = &partition->slots[slot_idx];
         clock_cache_entry_t *match = try_match_entry(entry, key, key_len, target_hash);
         if (match) return match;
     }
 
-    for (size_t i = 0; i < partition->num_slots; i++)
+    /* capped linear fallback -- scan limited slots instead of O(n) full scan
+     * entries that overflowed the hash index are rare; full scan is too expensive */
+    const size_t fallback_limit =
+        (partition->num_slots < max_probe) ? partition->num_slots : max_probe;
+    for (size_t i = 0; i < fallback_limit; i++)
     {
         PREFETCH_READ(&partition->slots[i]);
         clock_cache_entry_t *entry = &partition->slots[i];
@@ -286,8 +297,9 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
         return;
     }
 
-    /* mark hash entry as deleted (tombstone) -- but keep back-pointer for reuse */
-    const uint64_t hash = compute_hash(key, klen);
+    /* mark hash entry as deleted (tombstone) -- but keep back-pointer for reuse
+     * use cached hash to avoid redundant XXH3 recomputation */
+    const uint64_t hash = atomic_load_explicit(&entry->cached_hash, memory_order_relaxed);
     const size_t slot_idx = entry - partition->slots;
     hash_table_remove(partition, hash, slot_idx);
 
@@ -516,6 +528,8 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
         atomic_store_explicit(&partition->clock_hand, 0, memory_order_relaxed);
         atomic_store_explicit(&partition->occupied_count, 0, memory_order_relaxed);
         atomic_store_explicit(&partition->bytes_used, 0, memory_order_relaxed);
+        atomic_store_explicit(&partition->hits, 0, memory_order_relaxed);
+        atomic_store_explicit(&partition->misses, 0, memory_order_relaxed);
 
         /* we calculate hash index size (1.5x slots for low collision rate) */
         partition->hash_index_size =
@@ -555,13 +569,13 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
             return NULL;
         }
 
-        /* initialize hash index to -1 (which is empty) */
+        /* we initialize hash index to -1 (which is empty) */
         for (size_t j = 0; j < partition->hash_index_size; j++)
         {
             atomic_store_explicit(&partition->hash_index[j], -1, memory_order_relaxed);
         }
 
-        /* initialize all entry states to EMPTY */
+        /* we initialize all entry states to EMPTY */
         for (size_t j = 0; j < partition->num_slots; j++)
         {
             atomic_store_explicit(&partition->slots[j].state, ENTRY_EMPTY, memory_order_relaxed);
@@ -573,7 +587,7 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
             atomic_store_explicit(&partition->slots[j].cached_hash, 0, memory_order_relaxed);
         }
 
-        /* link partitions */
+        /* we link partitions */
         if (i > 0)
         {
             cache->partitions[i - 1].next = partition;
@@ -733,7 +747,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
 
     if (!entry)
     {
-        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&partition->misses, 1, memory_order_relaxed);
         return NULL;
     }
 
@@ -767,7 +781,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
     uint8_t *payload_recheck = atomic_load_explicit(&entry->payload, memory_order_acquire);
     if (payload_recheck != entry_payload)
     {
-        /* cleared or changed, abort */
+        /* *** cleared or changed, abort *** */
         free(result);
         atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
         return NULL;
@@ -780,7 +794,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
 
     if (payload_len) *payload_len = entry_payload_len;
 
-    atomic_fetch_add_explicit(&cache->hits, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&partition->hits, 1, memory_order_relaxed);
     return result;
 }
 
@@ -800,7 +814,7 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
 
     if (!entry)
     {
-        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&partition->misses, 1, memory_order_relaxed);
         return NULL;
     }
 
@@ -837,7 +851,7 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
 
     atomic_fetch_or_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_relaxed);
 
-    atomic_fetch_add_explicit(&cache->hits, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&partition->hits, 1, memory_order_relaxed);
     return entry_payload;
 }
 
@@ -916,8 +930,17 @@ void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats)
 
     stats->total_bytes = total_bytes;
     stats->total_entries = total_entries;
-    stats->hits = atomic_load_explicit(&cache->hits, memory_order_relaxed);
-    stats->misses = atomic_load_explicit(&cache->misses, memory_order_relaxed);
+
+    /* sum per-partition counters to avoid false sharing on hot path */
+    uint64_t total_hits = 0;
+    uint64_t total_misses = 0;
+    for (size_t i = 0; i < cache->num_partitions; i++)
+    {
+        total_hits += atomic_load_explicit(&cache->partitions[i].hits, memory_order_relaxed);
+        total_misses += atomic_load_explicit(&cache->partitions[i].misses, memory_order_relaxed);
+    }
+    stats->hits = total_hits;
+    stats->misses = total_misses;
     stats->num_partitions = cache->num_partitions;
 
     const uint64_t total_accesses = stats->hits + stats->misses;
@@ -947,7 +970,7 @@ size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size
             atomic_fetch_add_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC,
                                       memory_order_acq_rel);
 
-            /* re-verify state after incrementing ref_bit */
+            /* * we re-verify state after incrementing ref_bit */
             state = atomic_load_explicit(&entry->state, memory_order_acquire);
             if (state != ENTRY_VALID)
             {

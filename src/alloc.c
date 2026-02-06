@@ -16,24 +16,37 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-/* we need the real stdlib functions before alloc.h redefines them */
 #include <stdlib.h>
 
-/* we save references to real stdlib functions before they get redefined */
-static void *(*real_malloc)(size_t) = malloc;
-static void *(*real_calloc)(size_t, size_t) = calloc;
-static void *(*real_realloc)(void *, size_t) = realloc;
-static void (*real_free)(void *) = free;
+/* we use thin wrappers instead of taking addresses of stdlib functions directly
+ * on MSVC, malloc/calloc/realloc/free are __declspec(dllimport) and their
+ * address is not guaranteed to be static (warning C4232) */
+static void *real_malloc(size_t size)
+{
+    return malloc(size);
+}
+static void *real_calloc(size_t count, size_t size)
+{
+    return calloc(count, size);
+}
+static void *real_realloc(void *ptr, size_t size)
+{
+    return realloc(ptr, size);
+}
+static void real_free(void *ptr)
+{
+    free(ptr);
+}
 
 #include "alloc.h"
 
 /* global allocator instance initialized with system defaults
  * we initialize with real stdlib functions so malloc/free work before tidesdb_init is called */
 tidesdb_allocator_t tidesdb_allocator = {
-    .malloc_fn = malloc,
-    .calloc_fn = calloc,
-    .realloc_fn = realloc,
-    .free_fn = free,
+    .malloc_fn = real_malloc,
+    .calloc_fn = real_calloc,
+    .realloc_fn = real_realloc,
+    .free_fn = real_free,
 };
 
 int tidesdb_initialized = 0;

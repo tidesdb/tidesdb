@@ -581,8 +581,8 @@ int skip_list_random_level(const skip_list_t *list)
 
     /* geometric distribution via trailing zeros
      * for p=0.25, we need ~2 bits per level on average
-     * TDB_CTZ64 counts trailing zeros, giving geometric distribution
-     * we divide by 2 to approximate p=0.25 (each level requires ~2 zero bits) */
+     ** TDB_CTZ64 counts trailing zeros, giving geometric distribution
+     *** we divide by 2 to approximate p=0.25 (each level requires ~2 zero bits) */
     const int level = TDB_CTZ64(rnd | (1ULL << 62)) >> 1;
 
     return level < list->max_level ? level : list->max_level;
@@ -622,23 +622,21 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, const size_t key_size, 
     skip_list_node_t *candidate = NULL;
 
     /* we search from top level down with prefetching
-     * use relaxed loads during traversal, acquire only at level 0 for final target */
+     * use relaxed loads during traversal, acquire only at level 0 for final target
+     * prefetch fires BEFORE sentinel check so cache line is warming during condition eval */
     for (int i = max_level; i >= 0; i--)
     {
         const int mem_order = (i == 0) ? memory_order_acquire : memory_order_relaxed;
         skip_list_node_t *next = atomic_load_explicit(&current->forward[i], mem_order);
 
-        /** we prefetch next node to reduce cache miss latency */
-        if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
+        /* we prefetch before touching any fields -- this gives memory subsystem head start */
+        if (SKIP_LIST_LIKELY(next != NULL))
         {
-            PREFETCH_READ(next); /* prefetch for read, high temporal locality */
-            if (next->key != NULL)
-            {
-                PREFETCH_READ(next->key);
-            }
+            PREFETCH_READ(next);
         }
 
-        while (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next) && next->key != NULL))
+        /* non-sentinel nodes always have key != NULL, so sentinel check is sufficient */
+        while (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
         {
             const int cmp =
                 skip_list_compare_keys_inline(list, next->key, next->key_size, key, key_size);
@@ -656,14 +654,10 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, const size_t key_size, 
             current = next;
             next = atomic_load_explicit(&current->forward[i], mem_order);
 
-            /** we prefetch next iteration */
-            if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
+            /* prefetch immediately after loading pointer, before next iteration's sentinel check */
+            if (SKIP_LIST_LIKELY(next != NULL))
             {
                 PREFETCH_READ(next);
-                if (next->key != NULL)
-                {
-                    PREFETCH_READ(next->key);
-                }
             }
         }
     }
@@ -739,40 +733,32 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, const size_t key_siz
     skip_list_node_t *current = header;
     const int max_level = atomic_load_explicit(&list->level, memory_order_acquire);
 
-    /* we traverse with prefetching */
+    /* we traverse with prefetching -- prefetch before sentinel check */
     for (int i = max_level; i >= 0; i--)
     {
         skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
 
-        if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
+        if (SKIP_LIST_LIKELY(next != NULL))
         {
             PREFETCH_READ(next);
-            if (next->key != NULL)
-            {
-                PREFETCH_READ(next->key);
-            }
         }
 
-        while (next != NULL && !NODE_IS_SENTINEL(next) && next->key != NULL)
+        while (next != NULL && !NODE_IS_SENTINEL(next))
         {
             int cmp = skip_list_compare_keys_inline(list, next->key, next->key_size, key, key_size);
             if (cmp >= 0) break;
             current = next;
             next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
 
-            if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
+            if (SKIP_LIST_LIKELY(next != NULL))
             {
                 PREFETCH_READ(next);
-                if (next->key != NULL)
-                {
-                    PREFETCH_READ(next->key);
-                }
             }
         }
     }
 
     skip_list_node_t *target = atomic_load_explicit(&current->forward[0], memory_order_acquire);
-    if (target == NULL || NODE_IS_SENTINEL(target) || target->key == NULL) return 0;
+    if (target == NULL || NODE_IS_SENTINEL(target)) return 0;
 
     int cmp = skip_list_compare_keys_inline(list, target->key, target->key_size, key, key_size);
     if (cmp != 0) return 0;
@@ -1132,13 +1118,16 @@ int skip_list_cursor_seek(skip_list_cursor_t *cursor, const uint8_t *key, size_t
     for (int i = max_level; i >= 0; i--)
     {
         skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
-        while (next != NULL && !NODE_IS_SENTINEL(next) && next->key != NULL)
+        if (SKIP_LIST_LIKELY(next != NULL)) PREFETCH_READ(next);
+
+        while (next != NULL && !NODE_IS_SENTINEL(next))
         {
             int cmp = skip_list_compare_keys_inline(cursor->list, next->key, next->key_size, key,
                                                     key_size);
             if (cmp >= 0) break; /* stop before target or equal */
             current = next;
             next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+            if (SKIP_LIST_LIKELY(next != NULL)) PREFETCH_READ(next);
         }
     }
 
@@ -1162,13 +1151,16 @@ int skip_list_cursor_seek_for_prev(skip_list_cursor_t *cursor, const uint8_t *ke
     for (int i = max_level; i >= 0; i--)
     {
         skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
-        while (next != NULL && !NODE_IS_SENTINEL(next) && next->key != NULL)
+        if (SKIP_LIST_LIKELY(next != NULL)) PREFETCH_READ(next);
+
+        while (next != NULL && !NODE_IS_SENTINEL(next))
         {
             int cmp = skip_list_compare_keys_inline(cursor->list, next->key, next->key_size, key,
                                                     key_size);
             if (cmp > 0) break; /* stop when key > target */
             current = next;
             next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+            if (SKIP_LIST_LIKELY(next != NULL)) PREFETCH_READ(next);
         }
     }
 
@@ -1216,41 +1208,33 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
 
     skip_list_node_t *current = header;
 
-    /* we traverse with prefetching */
+    /* we traverse with prefetching -- prefetch before sentinel check */
     for (int i = max_level; i >= 0; i--)
     {
         skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
 
-        if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
+        if (SKIP_LIST_LIKELY(next != NULL))
         {
             PREFETCH_READ(next);
-            if (next->key != NULL)
-            {
-                PREFETCH_READ(next->key);
-            }
         }
 
-        while (next != NULL && !NODE_IS_SENTINEL(next) && next->key != NULL)
+        while (next != NULL && !NODE_IS_SENTINEL(next))
         {
             int cmp = skip_list_compare_keys_inline(list, next->key, next->key_size, key, key_size);
             if (cmp >= 0) break;
             current = next;
             next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
 
-            if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
+            if (SKIP_LIST_LIKELY(next != NULL))
             {
                 PREFETCH_READ(next);
-                if (next->key != NULL)
-                {
-                    PREFETCH_READ(next->key);
-                }
             }
         }
         update[i] = current;
     }
 
     skip_list_node_t *existing = atomic_load_explicit(&current->forward[0], memory_order_acquire);
-    if (existing != NULL && !NODE_IS_SENTINEL(existing) && existing->key != NULL)
+    if (existing != NULL && !NODE_IS_SENTINEL(existing))
     {
         int cmp =
             skip_list_compare_keys_inline(list, existing->key, existing->key_size, key, key_size);
@@ -1380,7 +1364,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
     {
         next_at_0 = atomic_load_explicit(&pred->forward[0], memory_order_acquire);
 
-        if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0) && next_at_0->key != NULL)
+        if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0))
         {
             int cmp = skip_list_compare_keys_inline(list, next_at_0->key, next_at_0->key_size, key,
                                                     key_size);
@@ -1432,7 +1416,7 @@ int skip_list_put_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
             break;
         }
 
-        if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0) && next_at_0->key != NULL)
+        if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0))
         {
             int cmp = skip_list_compare_keys_inline(list, next_at_0->key, next_at_0->key_size, key,
                                                     key_size);
@@ -1570,22 +1554,18 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
          * forward pointers beyond node's level */
         skip_list_node_t *current = header;
 
-        /* we traverse with prefetching */
+        /* we traverse with prefetching -- prefetch before sentinel check */
         for (int i = max_level; i >= 0; i--)
         {
             skip_list_node_t *next =
                 atomic_load_explicit(&current->forward[i], memory_order_acquire);
 
-            if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
+            if (SKIP_LIST_LIKELY(next != NULL))
             {
                 PREFETCH_READ(next);
-                if (next->key != NULL)
-                {
-                    PREFETCH_READ(next->key);
-                }
             }
 
-            while (next != NULL && !NODE_IS_SENTINEL(next) && next->key != NULL)
+            while (next != NULL && !NODE_IS_SENTINEL(next))
             {
                 int cmp = skip_list_compare_keys_inline(list, next->key, next->key_size, entry->key,
                                                         entry->key_size);
@@ -1593,13 +1573,9 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
                 current = next;
                 next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
 
-                if (SKIP_LIST_LIKELY(next != NULL && !NODE_IS_SENTINEL(next)))
+                if (SKIP_LIST_LIKELY(next != NULL))
                 {
                     PREFETCH_READ(next);
-                    if (next->key != NULL)
-                    {
-                        PREFETCH_READ(next->key);
-                    }
                 }
             }
             update[i] = current;
@@ -1608,7 +1584,7 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
         /* we check if key exists */
         skip_list_node_t *existing =
             atomic_load_explicit(&current->forward[0], memory_order_acquire);
-        if (existing != NULL && !NODE_IS_SENTINEL(existing) && existing->key != NULL)
+        if (existing != NULL && !NODE_IS_SENTINEL(existing))
         {
             int cmp = skip_list_compare_keys_inline(list, existing->key, existing->key_size,
                                                     entry->key, entry->key_size);
@@ -1697,13 +1673,13 @@ int skip_list_put_batch(skip_list_t *list, const skip_list_batch_entry_t *entrie
         {
             next_at_0 = atomic_load_explicit(&pred->forward[0], memory_order_acquire);
 
-            if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0) && next_at_0->key != NULL)
+            if (next_at_0 != NULL && !NODE_IS_SENTINEL(next_at_0))
             {
                 int cmp = skip_list_compare_keys_inline(list, next_at_0->key, next_at_0->key_size,
                                                         entry->key, entry->key_size);
                 if (cmp == 0)
                 {
-                    /* concurrent insert, add version instead */
+                    /* concurrent insert, we add version instead */
                     skip_list_version_t *latest =
                         atomic_load_explicit(&next_at_0->versions, memory_order_acquire);
                     if (skip_list_validate_sequence(latest, entry->seq) == 0)
@@ -1820,17 +1796,20 @@ int skip_list_get_max_seq(skip_list_t *list, const uint8_t *key, const size_t ke
     for (int i = max_level; i >= 0; i--)
     {
         skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
-        while (next != NULL && !NODE_IS_SENTINEL(next) && next->key != NULL)
+        if (SKIP_LIST_LIKELY(next != NULL)) PREFETCH_READ(next);
+
+        while (next != NULL && !NODE_IS_SENTINEL(next))
         {
             int cmp = skip_list_compare_keys_inline(list, next->key, next->key_size, key, key_size);
             if (cmp >= 0) break;
             current = next;
             next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+            if (SKIP_LIST_LIKELY(next != NULL)) PREFETCH_READ(next);
         }
     }
 
     skip_list_node_t *target = atomic_load_explicit(&current->forward[0], memory_order_acquire);
-    if (target == NULL || NODE_IS_SENTINEL(target) || target->key == NULL) return -1;
+    if (target == NULL || NODE_IS_SENTINEL(target)) return -1;
 
     int cmp = skip_list_compare_keys_inline(list, target->key, target->key_size, key, key_size);
     if (cmp != 0) return -1;
@@ -1855,21 +1834,24 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
     const int max_level =
         atomic_load_explicit(&list->level, memory_order_acquire); /* cache level */
 
-    /* attempt to find the node */
+    /* we attempt to find the node */
     for (int i = max_level; i >= 0; i--)
     {
         skip_list_node_t *next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
-        while (next != NULL && !NODE_IS_SENTINEL(next) && next->key != NULL)
+        if (SKIP_LIST_LIKELY(next != NULL)) PREFETCH_READ(next);
+
+        while (next != NULL && !NODE_IS_SENTINEL(next))
         {
             int cmp = skip_list_compare_keys_inline(list, next->key, next->key_size, key, key_size);
             if (cmp >= 0) break;
             current = next;
             next = atomic_load_explicit(&current->forward[i], memory_order_acquire);
+            if (SKIP_LIST_LIKELY(next != NULL)) PREFETCH_READ(next);
         }
     }
 
     skip_list_node_t *target = atomic_load_explicit(&current->forward[0], memory_order_acquire);
-    if (target == NULL || NODE_IS_SENTINEL(target) || target->key == NULL) return -1;
+    if (target == NULL || NODE_IS_SENTINEL(target)) return -1;
 
     int cmp = skip_list_compare_keys_inline(list, target->key, target->key_size, key, key_size);
     if (cmp != 0) return -1;
@@ -1899,7 +1881,7 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
                 {
                     if (visibility_check(visibility_ctx, version_seq))
                     {
-                        /* found the newest committed version within snapshot -- use it */
+                        /* we found the newest committed version within snapshot -- we use it */
                         break;
                     }
                     /* this version is not committed yet -- check older versions */
@@ -1917,7 +1899,7 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, const size_t k
         if (version == NULL) return -1; /* no visible version */
     }
 
-    /* always set ttl if provided */
+    /* we always set ttl if provided */
     if (ttl != NULL) *ttl = version->ttl;
 
     if (version->ttl > 0)

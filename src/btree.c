@@ -28,7 +28,7 @@
 
 /**
  * varint encoding utilities
- * uses LEB128-style encoding: 7 bits per byte, high bit = continuation
+ * uses LEB128-style encoding -- 7 bits per byte, high bit = continuation
  */
 
 /**
@@ -448,10 +448,10 @@ struct btree_builder_t
 /**
  * btree_leaf_serialize
  * serializes a leaf node with optimized format:
- * - varint encoding for sizes and metadata
- * - prefix compression for keys
- * - key indirection table for O(1) access
- * - delta encoding for sequence numbers
+ * -- varint encoding for sizes and metadata
+ * -- prefix compression for keys
+ * -- key indirection table for O(1) access
+ * -- delta encoding for sequence numbers
  *
  * format:
  * [type:1][num_entries:varint][prev_offset:8][next_offset:8]
@@ -582,7 +582,7 @@ static int btree_leaf_serialize(const btree_pending_leaf_t *leaf, const int64_t 
         buffer[off++] = leaf->entries[i].flags;
     }
 
-    /* keys (prefix-compressed: only suffix stored) */
+    /* keys (prefix-compressed -- only suffix stored) */
     size_t keys_start = off;
     for (uint32_t i = 0; i < leaf->num_entries; i++)
     {
@@ -615,9 +615,9 @@ static int btree_leaf_serialize(const btree_pending_leaf_t *leaf, const int64_t 
 /**
  * btree_internal_serialize
  * serializes an internal node with optimized format:
- * - varint encoding for counts and key sizes
- * - delta encoding for child offsets
- * - prefix compression for separator keys
+ * -- varint encoding for counts and key sizes
+ * -- delta encoding for child offsets
+ * -- prefix compression for separator keys
  *
  * format:
  * [type:1][num_keys:varint][base_offset:8][child_offset_deltas:signed_varint*N]
@@ -659,7 +659,7 @@ static int btree_internal_serialize(const btree_level_entry_t *entries, const ui
     buffer[off++] = BTREE_NODE_INTERNAL;
     off += btree_varint_encode(buffer + off, num_keys);
 
-    /* base offset is the first child offset */
+    /* we base offset is the first child offset */
     const int64_t base_offset = entries[0].child_offset;
     encode_int64_le_compat(buffer + off, base_offset);
     off += 8;
@@ -804,7 +804,7 @@ static int btree_node_deserialize(const uint8_t *data, const size_t data_size, b
                     memcpy(n->keys[i], n->keys[i - 1], prefix_lens[i]);
                 }
 
-                /* copy suffix from serialized data */
+                /* we copy suffix from serialized data */
                 size_t suffix_pos = keys_start + key_offsets[i];
                 memcpy(n->keys[i] + prefix_lens[i], data + suffix_pos, suffix_lens[i]);
             }
@@ -1067,7 +1067,15 @@ static int btree_node_deserialize_arena(const uint8_t *data, const size_t data_s
 void btree_node_free(btree_node_t *node)
 {
     if (!node) return;
-    if (node->arena) return;
+
+    /* for arena-allocated nodes we destroy arena for O(1) bulk deallocation
+     * btree_node_free is only called for uncached nodes (!using_cache guard at every call site)
+     * cached nodes have their arenas freed by the eviction callback */
+    if (node->arena)
+    {
+        btree_arena_destroy(node->arena);
+        return;
+    }
 
     if (node->keys)
     {
@@ -1138,7 +1146,7 @@ int btree_node_read_with_compression(block_manager_t *bm, const int64_t offset, 
                 size_t pos = 1;
                 uint64_t num_entries;
                 pos += btree_varint_decode(decompressed + pos, &num_entries);
-                /* now pos points to prev_offset - write in little-endian format */
+                /* now pos points to prev_offset -- we write in little-endian format */
                 encode_int64_le_compat(decompressed + pos, header_prev_offset);
                 encode_int64_le_compat(decompressed + pos + 8, header_next_offset);
             }
@@ -1153,10 +1161,24 @@ int btree_node_read_with_compression(block_manager_t *bm, const int64_t offset, 
         }
     }
 
-    const int result = btree_node_deserialize(data, data_size, node);
+    /* we use arena allocation to eliminate N+7 individual malloc/free per node read
+     * btree_node_free will destroy the arena via O(1) bulk deallocation */
+    btree_arena_t *arena = btree_arena_create();
+    if (!arena)
+    {
+        free(decompressed);
+        block_manager_block_free(block);
+        return -1;
+    }
+
+    const int result = btree_node_deserialize_arena(data, data_size, node, arena);
     if (result == 0)
     {
         (*node)->block_offset = offset;
+    }
+    else
+    {
+        btree_arena_destroy(arena);
     }
 
     free(decompressed);
@@ -1208,14 +1230,13 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
 {
     if (!tree || !tree->bm || offset < 0 || !node) return -1;
 
-    /* if no cache, fall back to direct read with compression */
+    /* if no cache, we fall back to direct read with compression */
     if (!tree->node_cache)
     {
         return btree_node_read_with_compression(tree->bm, offset, node,
                                                 tree->config.compression_algo);
     }
 
-    /* fast cache key generation using hex conversion instead of snprintf */
     char cache_key[BTREE_CACHE_KEY_SIZE];
     int key_len = btree_u64_to_hex(tree->cache_key_prefix, cache_key);
     cache_key[key_len++] = ':';
@@ -1542,9 +1563,10 @@ static int btree_builder_flush_leaf(btree_builder_t *builder)
 
     /* leaf nodes are written without compression during build phase
      * because we need to backpatch next_offset links after all leaves are written.
-     * compression is applied during the backpatch phase after patching. */
-    block_manager_block_t *block = block_manager_block_create(serialized_size, serialized);
-    free(serialized);
+     * compression is applied during the backpatch phase after patching.
+     * use from_buffer to transfer ownership and avoid redundant malloc+memcpy */
+    block_manager_block_t *block =
+        block_manager_block_create_from_buffer(serialized_size, serialized);
 
     if (!block) return -1;
 
@@ -1951,7 +1973,8 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
         for (uint32_t i = 0; i < builder->num_leaf_offsets; i++)
         {
             /* header format -- [original_size:4][prev_offset:8][next_offset:8][compressed_data] */
-            /* block format -- [block_size:4][checksum:4][data...] where data starts with our header
+            /* block format  -- [block_size:4][checksum:4][data...] where data starts with our
+             * header
              */
             const int64_t prev_patch_offset = new_offsets[i] + BLOCK_MANAGER_BLOCK_HEADER_SIZE + 4;
             const int64_t next_patch_offset = new_offsets[i] + BLOCK_MANAGER_BLOCK_HEADER_SIZE + 12;

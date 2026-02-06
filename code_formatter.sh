@@ -1,7 +1,13 @@
 #!/bin/bash
+set -euo pipefail
 
 # Before submitting a PR, run this script to format the source code.
 
-EXCLUDE_DIRS="external\|cmake-build-debug\|.idea|build|cmake"
-
-find . -type f -name "*.c" -o -name "*.h" | grep -v "$EXCLUDE_DIRS" | xargs clang-format -i
+find . \
+  \( -path "./external" \
+     -o -path "./cmake-build-debug" \
+     -o -path "./.idea" \
+     -o -path "./build" \
+     -o -path "./cmake" \) -prune \
+  -o -type f \( -name "*.c" -o -name "*.h" \) -print0 \
+| xargs -0 clang-format -i

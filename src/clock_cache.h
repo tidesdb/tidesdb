@@ -102,6 +102,8 @@ typedef struct
  * @param clock_hand atomic CLOCK hand position
  * @param occupied_count atomic count of occupied slots
  * @param bytes_used atomic bytes used in this partition
+ * @param hits per-partition hit counter (avoids false sharing on global counter)
+ * @param misses per-partition miss counter (avoids false sharing on global counter)
  * @param next atomic next pointer for lock-free chain
  */
 struct clock_cache_partition_t
@@ -114,6 +116,8 @@ struct clock_cache_partition_t
     atomic_size_t clock_hand;
     atomic_size_t occupied_count;
     atomic_size_t bytes_used;
+    atomic_uint64_t hits;
+    atomic_uint64_t misses;
     _Atomic(clock_cache_partition_t *) next;
 };
 
@@ -136,6 +140,7 @@ struct clock_cache_partition_t
  * @param hits cache hits
  * @param misses cache misses
  * @param shutdown shutdown flag -- prevents new operations
+ * @param evict_callback optional callback for custom cleanup on eviction (can be NULL)
  */
 struct clock_cache_t
 {

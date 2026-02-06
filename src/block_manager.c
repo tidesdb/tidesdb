@@ -1128,7 +1128,7 @@ int block_manager_cursor_at_last(block_manager_cursor_t *cursor)
     const uint64_t file_size = atomic_load(&cursor->bm->current_file_size);
     if (next_block_pos >= file_size) return 1;
 
-     /*we try to read next block size -- if we can't, we're at last block */
+    /*we try to read next block size -- if we can't, we're at last block */
     unsigned char next_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
     const ssize_t read_result =
         pread(cursor->bm->fd, next_size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE, (off_t)next_block_pos);

@@ -579,7 +579,7 @@ int skip_list_random_level(const skip_list_t *list)
 
     const uint64_t rnd = skip_list_xorshift64star(&rng_state);
 
-    /* geometric distribution via trailing zeros 
+    /* geometric distribution via trailing zeros
      * for p=0.25, we need ~2 bits per level on average
      ** TDB_CTZ64 counts trailing zeros, giving geometric distribution
      *** we divide by 2 to approximate p=0.25 (each level requires ~2 zero bits) */

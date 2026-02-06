@@ -1565,7 +1565,8 @@ static int btree_builder_flush_leaf(btree_builder_t *builder)
      * because we need to backpatch next_offset links after all leaves are written.
      * compression is applied during the backpatch phase after patching.
      * use from_buffer to transfer ownership and avoid redundant malloc+memcpy */
-    block_manager_block_t *block = block_manager_block_create_from_buffer(serialized_size, serialized);
+    block_manager_block_t *block =
+        block_manager_block_create_from_buffer(serialized_size, serialized);
 
     if (!block) return -1;
 
@@ -1972,7 +1973,8 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
         for (uint32_t i = 0; i < builder->num_leaf_offsets; i++)
         {
             /* header format -- [original_size:4][prev_offset:8][next_offset:8][compressed_data] */
-            /* block format  -- [block_size:4][checksum:4][data...] where data starts with our header
+            /* block format  -- [block_size:4][checksum:4][data...] where data starts with our
+             * header
              */
             const int64_t prev_patch_offset = new_offsets[i] + BLOCK_MANAGER_BLOCK_HEADER_SIZE + 4;
             const int64_t next_patch_offset = new_offsets[i] + BLOCK_MANAGER_BLOCK_HEADER_SIZE + 12;

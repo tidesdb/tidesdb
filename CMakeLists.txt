@@ -61,8 +61,11 @@ if(TIDESDB_WITH_SANITIZER)
     elseif(MINGW)
         # MinGW/GCC flags
         add_compile_options(-Wextra -Wall -std=c11)
-    elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|SunOS|DragonFly")
-        # BSD/Illumos sanitizer support
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD" OR CMAKE_SYSTEM_NAME STREQUAL "DragonFly")
+        # ASan is not supported on OpenBSD and DragonFlyBSD
+        add_compile_options(-Wextra -Wall)
+    elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|SunOS")
+        # FreeBSD, NetBSD, OmniOS/Illumos support sanitizers
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
         add_link_options(-fsanitize=address,undefined)
     else()

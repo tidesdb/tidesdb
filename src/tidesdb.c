@@ -488,9 +488,9 @@ typedef struct tidesdb_ref_counted_block_t tidesdb_ref_counted_block_t;
 
 /**
  * tidesdb_merge_source_t
- * is a source for merging (memtable or sstable)
- * @param type type of source (memtable or sstable)
- * @param source union of memtable or sstable source
+ * is a source for merging (memtable, sstable, or transaction write buffer)
+ * @param type type of source (memtable, sstable, btree, or txn_ops)
+ * @param source union of source-specific state
  * @param current_kv current key-value pair
  * @param config column family configuration
  * @param is_cached if 1, dont free when popped from heap (for iterators)
@@ -501,7 +501,8 @@ typedef struct
     {
         MERGE_SOURCE_MEMTABLE,
         MERGE_SOURCE_SSTABLE,
-        MERGE_SOURCE_BTREE
+        MERGE_SOURCE_BTREE,
+        MERGE_SOURCE_TXN_OPS
     } type;
 
     union
@@ -532,6 +533,18 @@ typedef struct
             btree_cursor_t *cursor;
             block_manager_cursor_t *vlog_cursor;
         } btree;
+
+        /* transaction write buffer source for read-your-own-writes
+         * sorted_indices is an array of indices into txn->ops, sorted by key
+         * and deduplicated (last write per key wins) */
+        struct
+        {
+            tidesdb_txn_t *txn;
+            tidesdb_column_family_t *cf;
+            int *sorted_indices;
+            int count;
+            int pos;
+        } txn_ops;
     } source;
 
     tidesdb_kv_pair_t *current_kv;
@@ -6021,6 +6034,149 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_memtable(
 }
 
 /**
+ * tidesdb_txn_ops_sort_ctx_t
+ * context for qsort_r comparator when sorting transaction ops indices
+ * @param ops pointer to the transaction ops array
+ * @param comparator key comparator function
+ * @param comparator_ctx comparator context
+ */
+typedef struct
+{
+    tidesdb_txn_op_t *ops;
+    skip_list_comparator_fn comparator;
+    void *comparator_ctx;
+} tidesdb_txn_ops_sort_ctx_t;
+
+/* thread-local context for qsort comparator (cross-platform alternative to qsort_r) */
+static _Thread_local const tidesdb_txn_ops_sort_ctx_t *tidesdb_txn_ops_sort_ctx_tls = NULL;
+
+/**
+ * tidesdb_txn_ops_index_cmp
+ * qsort comparator that orders two indices into the txn ops array by key
+ * uses thread-local context for cross-platform compatibility
+ * @param a pointer to first index
+ * @param b pointer to second index
+ * @return <0 if a < b, 0 if equal, >0 if a > b
+ */
+static int tidesdb_txn_ops_index_cmp(const void *a, const void *b)
+{
+    const int ia = *(const int *)a;
+    const int ib = *(const int *)b;
+    const tidesdb_txn_ops_sort_ctx_t *c = tidesdb_txn_ops_sort_ctx_tls;
+
+    return c->comparator(c->ops[ia].key, c->ops[ia].key_size, c->ops[ib].key, c->ops[ib].key_size,
+                         c->comparator_ctx);
+}
+
+/**
+ * tidesdb_merge_source_from_txn_ops
+ * create a merge source from transaction pending writes for read-your-own-writes
+ *
+ * filters txn->ops for the target column family, deduplicates (last write per
+ * key wins by scanning in reverse), sorts by key using the cf comparator, and
+ * positions at the first entry.
+ *
+ * entries use seq=UINT64_MAX so they always win over committed data with the
+ * same key in the merge heap.
+ *
+ * @param txn transaction handle
+ * @param cf column family to filter for
+ * @param config column family configuration
+ * @return merge source or NULL if no ops for this cf (or on error)
+ */
+static tidesdb_merge_source_t *tidesdb_merge_source_from_txn_ops(
+    tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_column_family_config_t *config)
+{
+    if (!txn || !cf || txn->num_ops == 0) return NULL;
+
+    /* we resolve the comparator for this column family */
+    skip_list_comparator_fn comparator_fn = NULL;
+    void *comparator_ctx = NULL;
+    tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
+    if (!comparator_fn) comparator_fn = tidesdb_comparator_memcmp;
+
+    /* first pass: collect indices of ops belonging to this CF
+     * we scan in reverse so the first occurrence of each key is the newest write */
+    int *candidate_indices = malloc(txn->num_ops * sizeof(int));
+    if (!candidate_indices) return NULL;
+
+    int candidate_count = 0;
+
+    /* we use a simple seen-set to deduplicate
+     * for each key we only keep the latest (highest index) op */
+    for (int i = txn->num_ops - 1; i >= 0; i--)
+    {
+        const tidesdb_txn_op_t *op = &txn->ops[i];
+
+        /* quick CF check (pointer comparison) */
+        if (op->cf != cf) continue;
+
+        /* we check if we already have a newer op for this key */
+        int already_seen = 0;
+        for (int j = 0; j < candidate_count; j++)
+        {
+            const tidesdb_txn_op_t *existing = &txn->ops[candidate_indices[j]];
+            if (existing->key_size == op->key_size &&
+                comparator_fn(existing->key, existing->key_size, op->key, op->key_size,
+                              comparator_ctx) == 0)
+            {
+                already_seen = 1;
+                break;
+            }
+        }
+
+        if (!already_seen)
+        {
+            candidate_indices[candidate_count++] = i;
+        }
+    }
+
+    if (candidate_count == 0)
+    {
+        free(candidate_indices);
+        return NULL;
+    }
+
+    /* we shrink to actual size */
+    int *sorted_indices = realloc(candidate_indices, candidate_count * sizeof(int));
+    if (!sorted_indices)
+        sorted_indices = candidate_indices; /* realloc shrink cant fail, but safe */
+
+    /* we sort by key using the column family comparator */
+    tidesdb_txn_ops_sort_ctx_t sort_ctx = {
+        .ops = txn->ops, .comparator = comparator_fn, .comparator_ctx = comparator_ctx};
+
+    tidesdb_txn_ops_sort_ctx_tls = &sort_ctx;
+    qsort(sorted_indices, candidate_count, sizeof(int), tidesdb_txn_ops_index_cmp);
+    tidesdb_txn_ops_sort_ctx_tls = NULL;
+
+    /* we create the merge source */
+    tidesdb_merge_source_t *source = calloc(1, sizeof(tidesdb_merge_source_t));
+    if (!source)
+    {
+        free(sorted_indices);
+        return NULL;
+    }
+
+    source->type = MERGE_SOURCE_TXN_OPS;
+    source->config = config;
+    source->is_cached = 0;
+    source->source.txn_ops.txn = txn;
+    source->source.txn_ops.cf = cf;
+    source->source.txn_ops.sorted_indices = sorted_indices;
+    source->source.txn_ops.count = candidate_count;
+    source->source.txn_ops.pos = 0;
+
+    /* we set current_kv from the first sorted entry */
+    const tidesdb_txn_op_t *first_op = &txn->ops[sorted_indices[0]];
+    source->current_kv = tidesdb_kv_pair_create(first_op->key, first_op->key_size, first_op->value,
+                                                first_op->value_size, first_op->ttl, UINT64_MAX,
+                                                first_op->is_delete);
+
+    return source;
+}
+
+/**
  * tidesdb_merge_source_from_sstable_klog
  * create a merge source from a klog-based sstable
  * @param db database instance
@@ -6392,6 +6548,12 @@ static void tidesdb_merge_source_free(tidesdb_merge_source_t *source)
         block_manager_cursor_free(source->source.btree.vlog_cursor);
         tidesdb_sstable_unref(NULL, source->source.btree.sst);
     }
+    else if (source->type == MERGE_SOURCE_TXN_OPS)
+    {
+        /* we only free the sorted index array
+         * txn and cf are borrowed pointers, not owned */
+        free(source->source.txn_ops.sorted_indices);
+    }
     else
     {
         if (source->source.sstable.current_rc_block)
@@ -6489,6 +6651,22 @@ static int tidesdb_merge_source_advance(tidesdb_merge_source_t *source)
                 return TDB_SUCCESS;
             }
         }
+    }
+    else if (source->type == MERGE_SOURCE_TXN_OPS)
+    {
+        /* advance to next entry in sorted txn ops index */
+        source->source.txn_ops.pos++;
+        if (source->source.txn_ops.pos < source->source.txn_ops.count)
+        {
+            const int op_idx = source->source.txn_ops.sorted_indices[source->source.txn_ops.pos];
+            const tidesdb_txn_op_t *op = &source->source.txn_ops.txn->ops[op_idx];
+
+            source->current_kv =
+                tidesdb_kv_pair_create(op->key, op->key_size, op->value, op->value_size, op->ttl,
+                                       UINT64_MAX, op->is_delete);
+            return TDB_SUCCESS;
+        }
+        return TDB_ERR_NOT_FOUND;
     }
     else
     {
@@ -6715,6 +6893,22 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                 return TDB_SUCCESS;
             }
         }
+    }
+    else if (source->type == MERGE_SOURCE_TXN_OPS)
+    {
+        /* retreat to previous entry in sorted txn ops index */
+        source->source.txn_ops.pos--;
+        if (source->source.txn_ops.pos >= 0)
+        {
+            const int op_idx = source->source.txn_ops.sorted_indices[source->source.txn_ops.pos];
+            const tidesdb_txn_op_t *op = &source->source.txn_ops.txn->ops[op_idx];
+
+            source->current_kv =
+                tidesdb_kv_pair_create(op->key, op->key_size, op->value, op->value_size, op->ttl,
+                                       UINT64_MAX, op->is_delete);
+            return TDB_SUCCESS;
+        }
+        return TDB_ERR_NOT_FOUND;
     }
     else
     {
@@ -15446,6 +15640,10 @@ static int tidesdb_iter_kv_visible(tidesdb_iter_t *iter, tidesdb_kv_pair_t *kv)
         return 0;
     }
 
+    /* entries from our own transaction write buffer use seq=UINT64_MAX
+     * these are always visible to the owning transaction (read-your-own-writes) */
+    if (kv->entry.seq == UINT64_MAX) return 1;
+
     /* snapshot isolation we only accept versions <= snapshot sequence */
     return (kv->entry.seq <= iter->cf_snapshot);
 }
@@ -15517,6 +15715,25 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
     else if (memtable_source)
     {
         tidesdb_merge_source_free(memtable_source);
+    }
+
+    /* we add transaction write buffer as a merge source for read-your-own-writes
+     * this allows iterators to see uncommitted puts/deletes from the owning txn */
+    if (txn->num_ops > 0)
+    {
+        tidesdb_merge_source_t *txn_ops_source =
+            tidesdb_merge_source_from_txn_ops(txn, cf, &cf->config);
+        if (txn_ops_source && txn_ops_source->current_kv != NULL)
+        {
+            if (tidesdb_merge_heap_add_source((*iter)->heap, txn_ops_source) != TDB_SUCCESS)
+            {
+                tidesdb_merge_source_free(txn_ops_source);
+            }
+        }
+        else if (txn_ops_source)
+        {
+            tidesdb_merge_source_free(txn_ops_source);
+        }
     }
 
     /* we add immutables from our snapshot to merge heap */
@@ -15906,6 +16123,39 @@ static int tidesdb_iter_collect_memtable_sources(const tidesdb_iter_t *iter,
         tidesdb_immutable_memtable_unref(imm);
     }
     free(imm_snapshot);
+
+    /* we add transaction write buffer source for read-your-own-writes on re-seek */
+    if (iter->txn && iter->txn->num_ops > 0)
+    {
+        tidesdb_merge_source_t *txn_ops_source =
+            tidesdb_merge_source_from_txn_ops(iter->txn, cf, &cf->config);
+        if (txn_ops_source)
+        {
+            if (*count >= *capacity)
+            {
+                *capacity *= 2;
+                tidesdb_merge_source_t **new_sources =
+                    realloc(*sources, *capacity * sizeof(tidesdb_merge_source_t *));
+                if (!new_sources)
+                {
+                    tidesdb_merge_source_free(txn_ops_source);
+                    /* dont fail the whole collect -- memtable sources are still valid */
+                }
+                else
+                {
+                    *sources = new_sources;
+                }
+            }
+            if (*count < *capacity)
+            {
+                (*sources)[(*count)++] = txn_ops_source;
+            }
+            else
+            {
+                tidesdb_merge_source_free(txn_ops_source);
+            }
+        }
+    }
 
     return TDB_SUCCESS;
 }
@@ -16407,6 +16657,82 @@ static void tidesdb_iter_seek_sstable_source_forward(const tidesdb_iter_t *iter,
 }
 
 /**
+ * tidesdb_iter_seek_txn_ops_source
+ * seek a txn ops source to the target key
+ * uses binary search on the sorted index array
+ * @param source the txn ops source
+ * @param key the target key
+ * @param key_size the size of the key
+ * @param direction 1 for forward (first entry >= key), -1 for backward (last entry <= key)
+ */
+static void tidesdb_iter_seek_txn_ops_source(tidesdb_merge_source_t *source, const uint8_t *key,
+                                             const size_t key_size, const int direction)
+{
+    tidesdb_txn_t *txn = source->source.txn_ops.txn;
+    tidesdb_column_family_t *cf = source->source.txn_ops.cf;
+    const int count = source->source.txn_ops.count;
+    const int *indices = source->source.txn_ops.sorted_indices;
+
+    /* we resolve the comparator */
+    skip_list_comparator_fn comparator_fn = NULL;
+    void *comparator_ctx = NULL;
+    tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
+    if (!comparator_fn) comparator_fn = tidesdb_comparator_memcmp;
+
+    /* binary search for the target position */
+    int lo = 0, hi = count;
+    while (lo < hi)
+    {
+        const int mid = lo + (hi - lo) / 2;
+        const tidesdb_txn_op_t *op = &txn->ops[indices[mid]];
+        const int cmp = comparator_fn(op->key, op->key_size, key, key_size, comparator_ctx);
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    /* lo is now the index of the first entry >= key */
+
+    if (direction > 0)
+    {
+        /* forward: first entry >= key */
+        if (lo < count)
+        {
+            source->source.txn_ops.pos = lo;
+            const tidesdb_txn_op_t *op = &txn->ops[indices[lo]];
+            source->current_kv =
+                tidesdb_kv_pair_create(op->key, op->key_size, op->value, op->value_size, op->ttl,
+                                       UINT64_MAX, op->is_delete);
+        }
+    }
+    else
+    {
+        /* backward: last entry <= key
+         * if lo points to an exact match, use it; otherwise use lo-1 */
+        int pos = lo;
+        if (pos < count)
+        {
+            const tidesdb_txn_op_t *op = &txn->ops[indices[pos]];
+            const int cmp = comparator_fn(op->key, op->key_size, key, key_size, comparator_ctx);
+            if (cmp > 0) pos--;
+        }
+        else
+        {
+            pos = count - 1;
+        }
+
+        if (pos >= 0)
+        {
+            source->source.txn_ops.pos = pos;
+            const tidesdb_txn_op_t *op = &txn->ops[indices[pos]];
+            source->current_kv =
+                tidesdb_kv_pair_create(op->key, op->key_size, op->value, op->value_size, op->ttl,
+                                       UINT64_MAX, op->is_delete);
+        }
+    }
+}
+
+/**
  * tidesdb_iter_seek_sstable_source_backward
  * seek an sstable source backward to find last entry <= key
  * @param iter the iterator
@@ -16664,6 +16990,10 @@ int tidesdb_iter_seek(tidesdb_iter_t *iter, const uint8_t *key, const size_t key
         {
             tidesdb_iter_seek_btree_source_forward(source, key, key_size);
         }
+        else if (source->type == MERGE_SOURCE_TXN_OPS)
+        {
+            tidesdb_iter_seek_txn_ops_source(source, key, key_size, 1);
+        }
         else
         {
             tidesdb_iter_seek_sstable_source_forward(iter, source, key, key_size);
@@ -16753,6 +17083,10 @@ int tidesdb_iter_seek_for_prev(tidesdb_iter_t *iter, const uint8_t *key, const s
         else if (source->type == MERGE_SOURCE_BTREE)
         {
             tidesdb_iter_seek_btree_source_backward(source, key, key_size);
+        }
+        else if (source->type == MERGE_SOURCE_TXN_OPS)
+        {
+            tidesdb_iter_seek_txn_ops_source(source, key, key_size, -1);
         }
         else
         {
@@ -16885,6 +17219,21 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
                         key, key_size, actual_value, actual_value_size, ttl, seq, deleted);
                     free(vlog_value);
                 }
+            }
+        }
+        else if (source->type == MERGE_SOURCE_TXN_OPS)
+        {
+            /* position at the last entry in the sorted txn ops index */
+            if (source->source.txn_ops.count > 0)
+            {
+                source->source.txn_ops.pos = source->source.txn_ops.count - 1;
+                const int op_idx =
+                    source->source.txn_ops.sorted_indices[source->source.txn_ops.pos];
+                const tidesdb_txn_op_t *op = &source->source.txn_ops.txn->ops[op_idx];
+
+                source->current_kv =
+                    tidesdb_kv_pair_create(op->key, op->key_size, op->value, op->value_size,
+                                           op->ttl, UINT64_MAX, op->is_delete);
             }
         }
         else

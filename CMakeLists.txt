@@ -62,8 +62,9 @@ if(TIDESDB_WITH_SANITIZER)
         # MinGW/GCC flags
         add_compile_options(-Wextra -Wall -std=c11)
     elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|SunOS|DragonFly")
-        # ASan support varies on BSD variants, just enable warnings
-        add_compile_options(-Wextra -Wall)
+        # BSD/Illumos sanitizer support
+        add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
+        add_link_options(-fsanitize=address,undefined)
     else()
         # Unix/Linux/macOS flags
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)

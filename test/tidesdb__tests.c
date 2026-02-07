@@ -8078,6 +8078,134 @@ static void test_txn_get_multiple_puts_same_key(void)
     cleanup_test_dir();
 }
 
+static void test_iter_seek_preserves_txn_ops(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "seek_txn_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "seek_txn_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* we commit keys A, B, C, D, E */
+    const char *committed_keys[] = {"key_A", "key_B", "key_C", "key_D", "key_E"};
+    const char *committed_vals[] = {"val_A", "val_B", "val_C", "val_D", "val_E"};
+    for (int i = 0; i < 5; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        ASSERT_EQ(
+            tidesdb_txn_put(txn, cf, (uint8_t *)committed_keys[i], strlen(committed_keys[i]) + 1,
+                            (uint8_t *)committed_vals[i], strlen(committed_vals[i]) + 1, 0),
+            0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* we begin a txn with uncommitted ops:
+     * overwrite B with new value, delete C, add F */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)"key_B", 6, (uint8_t *)"val_B_new", 10, 0), 0);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)"key_C", 6), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)"key_F", 6, (uint8_t *)"val_F", 6, 0), 0);
+
+    /* expected visible: A, B(new), D, E, F  (C deleted) */
+
+    /* we create iterator and seek_to_first */
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    /* we verify first entry is key_A */
+    uint8_t *key = NULL;
+    size_t key_size = 0;
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_A") == 0);
+
+    /* we advance to key_B and verify overwritten value */
+    ASSERT_EQ(tidesdb_iter_next(iter), 0);
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_B") == 0);
+
+    uint8_t *val = NULL;
+    size_t val_size = 0;
+    ASSERT_EQ(tidesdb_iter_value(iter, &val, &val_size), 0);
+    ASSERT_TRUE(strcmp((char *)val, "val_B_new") == 0);
+
+    tidesdb_iter_free(iter);
+
+    /* now we test iter_seek re-adds TXN_OPS after source rebuild */
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    /* we advance past a few entries to consume from heap */
+    ASSERT_EQ(tidesdb_iter_next(iter), 0); /* now at B */
+    ASSERT_EQ(tidesdb_iter_next(iter), 0); /* now at D (C deleted) */
+
+    /* we call iter_seek to trigger source rebuild -- TXN_OPS must be re-added */
+    ASSERT_EQ(tidesdb_iter_seek(iter, (uint8_t *)"key_A", 6), 0);
+
+    /* we verify key_A is found */
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_A") == 0);
+
+    /* we advance and verify uncommitted overwrite of B is still visible */
+    ASSERT_EQ(tidesdb_iter_next(iter), 0);
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_B") == 0);
+    ASSERT_EQ(tidesdb_iter_value(iter, &val, &val_size), 0);
+    ASSERT_TRUE(strcmp((char *)val, "val_B_new") == 0);
+
+    /* we verify C is still deleted (skipped) -- next should be D */
+    ASSERT_EQ(tidesdb_iter_next(iter), 0);
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_D") == 0);
+
+    /* we continue to E */
+    ASSERT_EQ(tidesdb_iter_next(iter), 0);
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_E") == 0);
+
+    /* we verify uncommitted put F is visible */
+    ASSERT_EQ(tidesdb_iter_next(iter), 0);
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_F") == 0);
+    ASSERT_EQ(tidesdb_iter_value(iter, &val, &val_size), 0);
+    ASSERT_TRUE(strcmp((char *)val, "val_F") == 0);
+
+    /* we verify no more entries */
+    ASSERT_TRUE(tidesdb_iter_next(iter) != 0);
+
+    /* we test seek_for_prev also preserves TXN_OPS */
+    ASSERT_EQ(tidesdb_iter_seek_for_prev(iter, (uint8_t *)"key_F", 6), 0);
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_F") == 0);
+
+    /* we go backward and verify D is visible, C is skipped */
+    ASSERT_EQ(tidesdb_iter_prev(iter), 0);
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_E") == 0);
+
+    ASSERT_EQ(tidesdb_iter_prev(iter), 0);
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_D") == 0);
+
+    /* C should be skipped -- prev should give B */
+    ASSERT_EQ(tidesdb_iter_prev(iter), 0);
+    ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+    ASSERT_TRUE(strcmp((char *)key, "key_B") == 0);
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_rollback(txn);
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_multi_cf_transaction_conflict(void)
 {
     cleanup_test_dir();
@@ -18747,6 +18875,7 @@ int main(void)
     RUN_TEST(test_txn_get_uncommitted_delete_masks_uncommitted_put, tests_passed);
     RUN_TEST(test_txn_get_put_after_delete, tests_passed);
     RUN_TEST(test_txn_get_multiple_puts_same_key, tests_passed);
+    RUN_TEST(test_iter_seek_preserves_txn_ops, tests_passed);
     RUN_TEST(test_multi_cf_transaction_conflict, tests_passed);
     RUN_TEST(test_many_sstables_with_bloom_filter, tests_passed);
     RUN_TEST(test_many_sstables_without_bloom_filter, tests_passed);

@@ -13,7 +13,7 @@ endif()
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 8.2.2)
+set(PROJECT_VERSION 8.2.3)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -21,7 +21,7 @@ configure_file(
 )
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
-option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
+option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
 # BUILD_SHARED_LIBS controls static vs shared library
@@ -61,9 +61,13 @@ if(TIDESDB_WITH_SANITIZER)
     elseif(MINGW)
         # MinGW/GCC flags
         add_compile_options(-Wextra -Wall -std=c11)
-    elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|SunOS|DragonFly")
-        # ASan support varies on BSD variants, just enable warnings
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD" OR CMAKE_SYSTEM_NAME STREQUAL "DragonFly" OR CMAKE_SYSTEM_NAME STREQUAL "SunOS")
+        # ASan is not supported on OpenBSD, DragonFlyBSD, and OmniOS/Illumos
         add_compile_options(-Wextra -Wall)
+    elseif(CMAKE_SYSTEM_NAME MATCHES "BSD")
+        # FreeBSD, NetBSD support sanitizers
+        add_compile_options(-Wextra -Wall -fsanitize=address,undefined)
+        add_link_options(-fsanitize=address,undefined)
     else()
         # Unix/Linux/macOS flags
         add_compile_options(-Wextra -Wall -fsanitize=address,undefined)

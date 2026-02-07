@@ -16172,9 +16172,9 @@ static int tidesdb_iter_collect_memtable_sources(const tidesdb_iter_t *iter,
         {
             if (*count >= *capacity)
             {
-                *capacity *= 2;
+                const int new_capacity = *capacity * 2;
                 tidesdb_merge_source_t **new_sources =
-                    realloc(*sources, *capacity * sizeof(tidesdb_merge_source_t *));
+                    realloc(*sources, new_capacity * sizeof(tidesdb_merge_source_t *));
                 if (!new_sources)
                 {
                     tidesdb_merge_source_free(txn_ops_source);
@@ -16183,15 +16183,13 @@ static int tidesdb_iter_collect_memtable_sources(const tidesdb_iter_t *iter,
                 else
                 {
                     *sources = new_sources;
+                    *capacity = new_capacity;
+                    (*sources)[(*count)++] = txn_ops_source;
                 }
-            }
-            if (*count < *capacity)
-            {
-                (*sources)[(*count)++] = txn_ops_source;
             }
             else
             {
-                tidesdb_merge_source_free(txn_ops_source);
+                (*sources)[(*count)++] = txn_ops_source;
             }
         }
     }

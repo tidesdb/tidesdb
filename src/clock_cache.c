@@ -277,7 +277,6 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
 
     char *key = atomic_load_explicit(&entry->key, memory_order_acquire);
     void *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
-    const size_t klen = atomic_load_explicit(&entry->key_len, memory_order_acquire);
     const size_t plen = atomic_load_explicit(&entry->payload_len, memory_order_acquire);
 
     if (!key || !payload)

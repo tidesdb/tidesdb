@@ -698,10 +698,10 @@ struct tidesdb_iter_t
  * @param level_key_counts number of keys per level
  * @param read_amp read amplification (point lookup cost multiplier)
  * @param hit_rate cache hit rate (0.0 if cache disabled)
- * @param use_btree whether column family uses B+tree format
- * @param btree_total_nodes total B+tree nodes across all SSTables
- * @param btree_max_height maximum tree height across all SSTables
- * @param btree_avg_height average tree height across all SSTables
+ * @param use_btree whether column family uses b+tree klog format
+ * @param btree_total_nodes total b+tree nodes across all sstables
+ * @param btree_max_height maximum tree height across all sstables
+ * @param btree_avg_height average tree height across all sstables
  */
 struct tidesdb_stats_t
 {
@@ -1272,7 +1272,7 @@ int tidesdb_backup(tidesdb_t *db, char *dir);
 /**
  * tidesdb_clone_column_family
  * clones an existing column family to a new column family with a different name.
- * flushes the source memtable, waits for background operations, copies all SSTable files,
+ * flushes the source memtable, waits for background operations, copies all sstable files,
  * and creates a new column family structure with the copied data.
  * @param db database handle
  * @param src_name name of the source column family to clone

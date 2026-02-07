@@ -2860,7 +2860,7 @@ static void test_clone_column_family_concurrent(void)
     /* all initial data should be found in clone */
     ASSERT_EQ(found_count, 50);
 
-    /* verify clone and source are independent - write to clone */
+    /* we verify clone and source are independent -- write to clone */
     tidesdb_txn_t *write_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &write_txn), 0);
     uint8_t clone_only_key[] = "clone_only_concurrent_key";
@@ -7790,6 +7790,294 @@ static void test_iterator_read_own_uncommitted_writes(void)
     cleanup_test_dir();
 }
 
+static void test_iterator_uncommitted_deletes(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "iter_del_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "iter_del_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* commit keys 00, 10, 20, 30, 40 to sstable */
+    for (int i = 0; i < 50; i += 10)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%02d", i);
+        snprintf(value, sizeof(value), "committed_value_%02d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    tidesdb_flush_memtable(cf);
+    usleep(100000);
+
+    /* commit keys 05, 15, 25, 35, 45 to memtable */
+    for (int i = 5; i < 50; i += 10)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key_%02d", i);
+        snprintf(value, sizeof(value), "memtable_value_%02d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* start a transaction with uncommitted DELETES for keys 10, 20, 30 (from sstable) */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)"key_10", 7), 0);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)"key_20", 7), 0);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)"key_30", 7), 0);
+
+    /* also delete a memtable key */
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, (uint8_t *)"key_15", 7), 0);
+
+    /* we create iterator -- uncommitted deletes should mask committed values
+     * sstable: 00, 10, 20, 30, 40
+     * memtable: 05, 15, 25, 35, 45
+     * uncommitted deletes: 10, 15, 20, 30
+     * expected visible: 00, 05, 25, 35, 40, 45 */
+    tidesdb_iter_t *iter = NULL;
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_first(iter), 0);
+
+    int expected_keys[] = {0, 5, 25, 35, 40, 45};
+    int expected_count = sizeof(expected_keys) / sizeof(expected_keys[0]);
+    int count = 0;
+
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+
+        char expected_key[32];
+        snprintf(expected_key, sizeof(expected_key), "key_%02d", expected_keys[count]);
+        ASSERT_TRUE(strcmp((char *)key, expected_key) == 0);
+
+        count++;
+        tidesdb_iter_next(iter);
+    }
+
+    ASSERT_EQ(count, expected_count);
+
+    tidesdb_iter_free(iter);
+
+    /* we test reverse iteration with fresh iterator */
+    ASSERT_EQ(tidesdb_iter_new(txn, cf, &iter), 0);
+    ASSERT_EQ(tidesdb_iter_seek_to_last(iter), 0);
+    count = expected_count - 1;
+
+    while (tidesdb_iter_valid(iter) && count >= 0)
+    {
+        uint8_t *key = NULL;
+        size_t key_size = 0;
+
+        ASSERT_EQ(tidesdb_iter_key(iter, &key, &key_size), 0);
+
+        char expected_key[32];
+        snprintf(expected_key, sizeof(expected_key), "key_%02d", expected_keys[count]);
+        ASSERT_TRUE(strcmp((char *)key, expected_key) == 0);
+
+        count--;
+        tidesdb_iter_prev(iter);
+    }
+
+    ASSERT_EQ(count, -1);
+
+    tidesdb_iter_free(iter);
+
+    /* rollback -- deleted keys should reappear */
+    tidesdb_txn_rollback(txn);
+    tidesdb_txn_free(txn);
+
+    /* we verify deleted keys are visible again after rollback */
+    tidesdb_txn_t *verify_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &verify_txn), 0);
+
+    uint8_t *retrieved = NULL;
+    size_t retrieved_size = 0;
+
+    /* key_10 should exist again */
+    int result =
+        tidesdb_txn_get(verify_txn, cf, (uint8_t *)"key_10", 7, &retrieved, &retrieved_size);
+    ASSERT_EQ(result, 0);
+    ASSERT_TRUE(strcmp((char *)retrieved, "committed_value_10") == 0);
+    free(retrieved);
+
+    /* key_15 should exist again */
+    result = tidesdb_txn_get(verify_txn, cf, (uint8_t *)"key_15", 7, &retrieved, &retrieved_size);
+    ASSERT_EQ(result, 0);
+    ASSERT_TRUE(strcmp((char *)retrieved, "memtable_value_15") == 0);
+    free(retrieved);
+
+    tidesdb_txn_free(verify_txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_txn_get_uncommitted_delete_masks_committed(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* commit a key */
+    tidesdb_txn_t *txn1 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
+    uint8_t key[] = "mask_key";
+    uint8_t value[] = "committed_value";
+    ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
+    tidesdb_txn_free(txn1);
+
+    /* in new txn, delete the key (uncommitted) then try to get it */
+    tidesdb_txn_t *txn2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+    ASSERT_EQ(tidesdb_txn_delete(txn2, cf, key, sizeof(key)), 0);
+
+    uint8_t *retrieved = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn2, cf, key, sizeof(key), &retrieved, &retrieved_size),
+              TDB_ERR_NOT_FOUND);
+
+    tidesdb_txn_free(txn2);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_txn_get_uncommitted_delete_masks_uncommitted_put(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* in same txn: put then delete then get */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    uint8_t key[] = "put_del_key";
+    uint8_t value[] = "some_value";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+    ASSERT_EQ(tidesdb_txn_delete(txn, cf, key, sizeof(key)), 0);
+
+    uint8_t *retrieved = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved, &retrieved_size),
+              TDB_ERR_NOT_FOUND);
+
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_txn_get_put_after_delete(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* commit a key */
+    tidesdb_txn_t *txn1 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
+    uint8_t key[] = "rewrite_key";
+    uint8_t value1[] = "original_value";
+    ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
+    tidesdb_txn_free(txn1);
+
+    /* in same txn: delete then put with new value then get */
+    tidesdb_txn_t *txn2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+    ASSERT_EQ(tidesdb_txn_delete(txn2, cf, key, sizeof(key)), 0);
+
+    uint8_t value2[] = "new_value";
+    ASSERT_EQ(tidesdb_txn_put(txn2, cf, key, sizeof(key), value2, sizeof(value2), 0), 0);
+
+    uint8_t *retrieved = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn2, cf, key, sizeof(key), &retrieved, &retrieved_size), 0);
+    ASSERT_TRUE(retrieved != NULL);
+    ASSERT_EQ(retrieved_size, sizeof(value2));
+    ASSERT_TRUE(memcmp(retrieved, value2, sizeof(value2)) == 0);
+    free(retrieved);
+
+    tidesdb_txn_free(txn2);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_txn_get_multiple_puts_same_key(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "test_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "test_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* in same txn: put key three times, get should return last value */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    uint8_t key[] = "multi_put_key";
+    uint8_t value1[] = "first_value";
+    uint8_t value2[] = "second_value";
+    uint8_t value3[] = "third_value";
+
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value2, sizeof(value2), 0), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value3, sizeof(value3), 0), 0);
+
+    uint8_t *retrieved = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved, &retrieved_size), 0);
+    ASSERT_TRUE(retrieved != NULL);
+    ASSERT_EQ(retrieved_size, sizeof(value3));
+    ASSERT_TRUE(memcmp(retrieved, value3, sizeof(value3)) == 0);
+    free(retrieved);
+
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_multi_cf_transaction_conflict(void)
 {
     cleanup_test_dir();
@@ -9736,7 +10024,7 @@ static void test_cf_rename_during_active_compaction(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "rename_compact_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* write multiple batches to create SSTables */
+    /* write multiple batches to create sstables */
     for (int batch = 0; batch < 5; batch++)
     {
         for (int i = 0; i < 30; i++)
@@ -11216,7 +11504,7 @@ static void test_concurrent_batched_transactions(void)
     /* iterate and count all keys */
     printf("  starting iteration to verify all keys...\n");
 
-    /* create a transaction for iteration */
+    /** we create a transaction for iteration */
     tidesdb_txn_t *iter_txn = NULL;
     ASSERT_EQ(tidesdb_txn_begin(db, &iter_txn), 0);
 
@@ -11754,7 +12042,7 @@ static void test_crash_during_flush(void)
         tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "crash_cf");
         ASSERT_TRUE(cf != NULL);
 
-        /* verify all data recovered (either from sst or wal) */
+        /* we verify all data recovered (either from sst or wal) */
         tidesdb_txn_t *txn = NULL;
         ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
 
@@ -12736,7 +13024,6 @@ static void test_multiple_databases_concurrent_operations(void)
         snprintf(db_paths[i], sizeof(db_paths[i]), "./test_tidesdb_multi_%d", i);
         remove_directory(db_paths[i]);
 
-        /* create database with unique path */
         tidesdb_config_t config = tidesdb_default_config();
         config.db_path = db_paths[i];
         config.num_flush_threads = 1;
@@ -12745,7 +13032,6 @@ static void test_multiple_databases_concurrent_operations(void)
         ASSERT_EQ(tidesdb_open(&config, &databases[i]), 0);
         ASSERT_TRUE(databases[i] != NULL);
 
-        /* create column family for this database */
         tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
         cf_config.write_buffer_size = 4 * 1024 * 1024; /* 4MB */
 
@@ -12805,7 +13091,7 @@ static void test_multiple_databases_concurrent_operations(void)
     printf("  operations complete: %d successful, %d errors, %d cross-db errors\n", final_ops,
            final_errors, final_cross_db_errors);
 
-    /* verify no cross-database contamination */
+    /* we verify no cross-database contamination */
     ASSERT_EQ(final_cross_db_errors, 0);
     ASSERT_EQ(final_ops, TOTAL_EXPECTED_OPS);
 
@@ -12813,7 +13099,7 @@ static void test_multiple_databases_concurrent_operations(void)
     printf("  waiting for background operations to settle...\n");
     usleep(100000);
 
-    /* check database state before verification */
+    /* we check database state before verification */
     printf("  checking database states...\n");
     for (int i = 0; i < NUM_DATABASES; i++)
     {
@@ -18456,6 +18742,11 @@ int main(void)
     RUN_TEST(test_transaction_isolation_snapshot_with_updates, tests_passed);
     RUN_TEST(test_read_own_uncommitted_writes, tests_passed);
     RUN_TEST(test_iterator_read_own_uncommitted_writes, tests_passed);
+    RUN_TEST(test_iterator_uncommitted_deletes, tests_passed);
+    RUN_TEST(test_txn_get_uncommitted_delete_masks_committed, tests_passed);
+    RUN_TEST(test_txn_get_uncommitted_delete_masks_uncommitted_put, tests_passed);
+    RUN_TEST(test_txn_get_put_after_delete, tests_passed);
+    RUN_TEST(test_txn_get_multiple_puts_same_key, tests_passed);
     RUN_TEST(test_multi_cf_transaction_conflict, tests_passed);
     RUN_TEST(test_many_sstables_with_bloom_filter, tests_passed);
     RUN_TEST(test_many_sstables_without_bloom_filter, tests_passed);

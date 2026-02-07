@@ -2002,7 +2002,7 @@ static void tidesdb_klog_block_free(tidesdb_klog_block_t *block)
 
     if (block->is_arena_allocated)
     {
-        /* arena allocation everything is in one contiguous block
+        /* with arena allocation everything is in one contiguous block
          * except max_key which is allocated separately during deserialization */
         free(block->max_key);
         free(block);
@@ -3766,7 +3766,7 @@ static int tidesdb_sstable_write_from_memtable_btree(tidesdb_t *db, tidesdb_ssta
         return TDB_ERR_MEMORY;
     }
 
-    /* create bloom filter if enabled */
+    /* we create bloom filter if enabled */
     bloom_filter_t *bloom = NULL;
     if (sst->config->enable_bloom_filter)
     {
@@ -4820,7 +4820,7 @@ static int tidesdb_sstable_get_btree(tidesdb_t *db, tidesdb_sstable_t *sst, cons
 static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint8_t *key,
                                const size_t key_size, tidesdb_kv_pair_t **kv)
 {
-    /* branch based on sstable type */
+    /* we branch based on sstable type */
     if (sst->use_btree)
     {
         return tidesdb_sstable_get_btree(db, sst, key, key_size, kv);
@@ -4943,7 +4943,7 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         const int read_result =
             tidesdb_read_klog_block_cached(db, sst, klog_cursor, block_position, cf_name,
                                            has_cf_name, 1, &klog_block, &rc_block, &raw_block);
-        /* track if cursor was advanced (only on disk read, not cache hit) */
+        /*** we track if cursor was advanced (only on disk read, not cache hit) */
         const int cursor_advanced = (rc_block == NULL && raw_block != NULL);
         if (read_result != TDB_SUCCESS)
         {
@@ -5401,7 +5401,7 @@ static void tidesdb_level_free(const tidesdb_t *db, tidesdb_level_t *level)
 
     free(ssts);
 
-    /* free any retired array that was deferred */
+    /* we free any retired array that was deferred */
     tidesdb_sstable_t **retired =
         atomic_load_explicit(&level->retired_sstables_arr, memory_order_acquire);
     free(retired);
@@ -5721,6 +5721,38 @@ static int heap_compare(const tidesdb_merge_heap_t *heap, const int i, const int
 }
 
 /**
+ * heap_compare_max
+ * compare two elements in a max-heap
+ * for equal keys, prefer higher sequence number (newer) on top
+ * this ensures tombstones (seq=UINT64_MAX) are popped before committed values
+ * @param heap heap containing elements
+ * @param i index of first element
+ * @param j index of second element
+ * @return comparison result
+ */
+static int heap_compare_max(const tidesdb_merge_heap_t *heap, const int i, const int j)
+{
+    tidesdb_kv_pair_t *a = heap->sources[i]->current_kv;
+    tidesdb_kv_pair_t *b = heap->sources[j]->current_kv;
+
+    if (!a && !b) return 0;
+    if (!a) return -1; /* a is smaller, push to end in max-heap */
+    if (!b) return 1;  /* b is smaller, push to end in max-heap */
+
+    const int cmp = heap->comparator(a->key, a->entry.key_size, b->key, b->entry.key_size,
+                                     heap->comparator_ctx);
+
+    if (cmp == 0)
+    {
+        /* same key, prefer higher sequence number (newer) on top of max-heap */
+        if (a->entry.seq > b->entry.seq) return 1;
+        if (a->entry.seq < b->entry.seq) return -1;
+    }
+
+    return cmp;
+}
+
+/**
  * heap_sift_down
  * sift down an element in a heap
  * @param heap heap to sift down
@@ -5783,11 +5815,11 @@ static void heap_sift_down_max(const tidesdb_merge_heap_t *heap, int idx)
         int largest = idx;
 
         /* for max-heap, we want largest element on top */
-        if (left < heap->num_sources && heap_compare(heap, left, largest) > 0)
+        if (left < heap->num_sources && heap_compare_max(heap, left, largest) > 0)
         {
             largest = left;
         }
-        if (right < heap->num_sources && heap_compare(heap, right, largest) > 0)
+        if (right < heap->num_sources && heap_compare_max(heap, right, largest) > 0)
         {
             largest = right;
         }
@@ -5823,8 +5855,7 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop_max(tidesdb_merge_heap_t *heap)
         return NULL;
     }
 
-    tidesdb_kv_pair_t *result = top->current_kv;
-    top->current_kv = NULL;
+    tidesdb_kv_pair_t *result = tidesdb_kv_pair_clone(top->current_kv);
 
     /* the source to get its previous entry */
     if (tidesdb_merge_source_retreat(top) != TDB_SUCCESS)
@@ -5941,7 +5972,7 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
     const int advance_result = tidesdb_merge_source_advance(top);
     if (advance_result != 0)
     {
-        /* source exhausted or corrupted */
+        /* the source is exhausted or corrupted */
         if (advance_result == TDB_ERR_CORRUPTION && top->type == MERGE_SOURCE_SSTABLE &&
             corrupted_sst)
         {
@@ -5954,7 +5985,7 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
         heap->sources[0] = heap->sources[heap->num_sources - 1];
         heap->num_sources--;
 
-        /* only free if not cached for reuse */
+        /* we only free if not cached for reuse */
         if (!top->is_cached)
         {
             tidesdb_merge_source_free(top);
@@ -6095,7 +6126,7 @@ static tidesdb_merge_source_t *tidesdb_merge_source_from_txn_ops(
     tidesdb_resolve_comparator(cf->db, &cf->config, &comparator_fn, &comparator_ctx);
     if (!comparator_fn) comparator_fn = tidesdb_comparator_memcmp;
 
-    /* first pass: collect indices of ops belonging to this CF
+    /* first pass is to collect indices of ops belonging to this CF
      * we scan in reverse so the first occurrence of each key is the newest write */
     int *candidate_indices = malloc(txn->num_ops * sizeof(int));
     if (!candidate_indices) return NULL;
@@ -6988,7 +7019,7 @@ static int tidesdb_merge_source_retreat(tidesdb_merge_source_t *source)
                 continue;
             }
 
-            /* block is owned by us, decompress if needed */
+            /* block is owned by us, we decompress if needed */
             const uint8_t *data = block->data;
             size_t data_size = block->size;
             uint8_t *decompressed = NULL;
@@ -7737,7 +7768,7 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Block indexes disabled");
     }
 
-    /* branch to btree output if use_btree is enabled */
+    /* we branch to btree output if use_btree is enabled */
     if (cf->config.use_btree)
     {
         int btree_result = tidesdb_sstable_write_from_heap_btree(
@@ -8821,7 +8852,8 @@ static int tidesdb_dividing_merge(tidesdb_column_family_t *cf, int target_level)
         new_sst->max_key = last_key;
         new_sst->max_key_size = last_key_size;
 
-        /* wecapture klog file offset where data blocks end (before writing index/bloom/metadata) */
+        /* we capture klog file offset where data blocks end (before writing index/bloom/metadata)
+         */
         block_manager_get_size(klog_bm, &new_sst->klog_data_end_offset);
 
         /* we write auxiliary structures (always write, even if empty, to maintain consistent file
@@ -11572,7 +11604,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Block clock cache disabled (block_cache_size=0)");
     }
 
-    /* create btree node cache (uses same size as block cache for now) */
+    /* we create btree node cache (uses same size as block cache for now) */
     if (config->block_cache_size > 0)
     {
         (*db)->btree_node_cache = btree_create_node_cache(config->block_cache_size);
@@ -13922,7 +13954,7 @@ static int tidesdb_txn_add_cf_internal(tidesdb_txn_t *txn, tidesdb_column_family
     if (!txn || !cf) return -1;
     if (txn->is_committed || txn->is_aborted) return -1;
 
-    /* fast path: check last-used CF (covers single-CF workloads in O(1)) */
+    /* fast path -- we check last-used CF (covers single-CF workloads in O(1)) */
     if (txn->last_cf == cf) return txn->last_cf_index;
 
     for (int i = 0; i < txn->num_cfs; i++)
@@ -14086,9 +14118,9 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     /* we check write set first (read your own writes)
      * transaction must see its own uncommitted changes before checking cache/memtable
      * use search strategy based on transaction size:
-     * -- small txns -- linear scan from end (cache-friendly, low overhead)
+     * -- small txns  -- linear scan from end (cache-friendly, low overhead)
      * -- medium txns -- linear scan with early termination per CF
-     * -- large txns -- O(1) hash table lookup
+     * -- large txns  -- O(1) hash table lookup
      *
      * we search in reverse order (newest first) to find most recent write */
 
@@ -15155,8 +15187,8 @@ static uint8_t *tidesdb_txn_serialize_wal(const tidesdb_txn_t *txn,
                                           const tidesdb_column_family_t *cf, size_t *out_size)
 {
     /*** single-pass serialization with pre-sized buffer
-     ** estimate size based on average entry overhead + actual key/value sizes
-     * overhead per entry -- flags(1) + varints(~15 max) + ttl(8 optional) = ~24 bytes max */
+     ** we estimate size based on average entry overhead + actual key/value sizes
+     ** overhead per entry -- flags(1) + varints(~15 max) + ttl(8 optional) = ~24 bytes max */
     size_t estimated_size = 0;
     int cf_op_count = 0;
 
@@ -15601,11 +15633,11 @@ int tidesdb_txn_release_savepoint(tidesdb_txn_t *txn, const char *name)
 
     if (savepoint_idx == -1) return TDB_ERR_NOT_FOUND;
 
-    /* free the savepoint without rolling back */
+    /* we free the savepoint without rolling back */
     tidesdb_txn_free(txn->savepoints[savepoint_idx]);
     free(txn->savepoint_names[savepoint_idx]);
 
-    /* shift remaining savepoints down */
+    /* we shift remaining savepoints down */
     for (int i = savepoint_idx; i < txn->num_savepoints - 1; i++)
     {
         txn->savepoints[i] = txn->savepoints[i + 1];
@@ -15624,15 +15656,27 @@ int tidesdb_txn_release_savepoint(tidesdb_txn_t *txn, const char *name)
  *  tombstone flag
  * @param iter iterator
  * @param kv KV pair
- * @return 1 if visible, 0 if should be skipped
+ * @return 1 if visible, 0 if should be skipped, -1 if tombstone (skip all versions of this key)
  */
 static int tidesdb_iter_kv_visible(tidesdb_iter_t *iter, tidesdb_kv_pair_t *kv)
 {
     if (!iter || !kv) return 0;
 
+    /* we check sequence visibility first (before tombstone check)
+     * entries from our own transaction write buffer use seq=UINT64_MAX
+     * these are always visible to the owning transaction (read-your-own-writes) */
+    const int seq_visible = (kv->entry.seq == UINT64_MAX) || (kv->entry.seq <= iter->cf_snapshot);
+
+    if (!seq_visible)
+    {
+        return 0; /* not visible due to isolation level */
+    }
+
+    /* we now check if it's a tombstone -- if visible tombstone, return -1 to signal
+     * that all versions of this key should be skipped */
     if (kv->entry.flags & TDB_KV_FLAG_TOMBSTONE)
     {
-        return 0;
+        return -1; /* tombstone -- we skip all versions of this key */
     }
 
     if (kv->entry.ttl > 0 && kv->entry.ttl < iter->snapshot_time)
@@ -15640,12 +15684,7 @@ static int tidesdb_iter_kv_visible(tidesdb_iter_t *iter, tidesdb_kv_pair_t *kv)
         return 0;
     }
 
-    /* entries from our own transaction write buffer use seq=UINT64_MAX
-     * these are always visible to the owning transaction (read-your-own-writes) */
-    if (kv->entry.seq == UINT64_MAX) return 1;
-
-    /* snapshot isolation we only accept versions <= snapshot sequence */
-    return (kv->entry.seq <= iter->cf_snapshot);
+    return 1;
 }
 
 int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_iter_t **iter)
@@ -15717,7 +15756,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         tidesdb_merge_source_free(memtable_source);
     }
 
-    /* we add transaction write buffer as a merge source for read-your-own-writes
+    /* we add transaction write buffer as a merge source for read-your-own-ops
      * this allows iterators to see uncommitted puts/deletes from the owning txn */
     if (txn->num_ops > 0)
     {
@@ -15833,7 +15872,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                         realloc(ssts_array, new_capacity * sizeof(tidesdb_sstable_t *));
                     if (!new_array)
                     {
-                        /* cleanup refs taken so far */
+                        /* we cleanup refs taken so far */
                         for (int k = 0; k < sst_count; k++)
                         {
                             tidesdb_sstable_unref(cf->db, ssts_array[k]);
@@ -16695,7 +16734,7 @@ static void tidesdb_iter_seek_txn_ops_source(tidesdb_merge_source_t *source, con
 
     if (direction > 0)
     {
-        /* forward: first entry >= key */
+        /* forward -- first entry >= key */
         if (lo < count)
         {
             source->source.txn_ops.pos = lo;
@@ -16707,7 +16746,7 @@ static void tidesdb_iter_seek_txn_ops_source(tidesdb_merge_source_t *source, con
     }
     else
     {
-        /* backward: last entry <= key
+        /* backward -- last entry <= key
          * if lo points to an exact match, use it; otherwise use lo-1 */
         int pos = lo;
         if (pos < count)
@@ -16913,7 +16952,36 @@ static int tidesdb_iter_find_visible_entry(tidesdb_iter_t *iter, const int direc
                                                 : tidesdb_merge_heap_pop_max(iter->heap);
         if (!kv) break;
 
-        if (!tidesdb_iter_kv_visible(iter, kv))
+        const int visible = tidesdb_iter_kv_visible(iter, kv);
+        if (visible == -1)
+        {
+            /*** tombstone -- we skip all versions of this key */
+            const uint8_t *tombstone_key = kv->key;
+            const size_t tombstone_key_size = kv->entry.key_size;
+
+            /* we pop and discard all entries with the same key */
+            while (!tidesdb_merge_heap_empty(iter->heap))
+            {
+                tidesdb_kv_pair_t *peek =
+                    iter->heap->sources[0]->current_kv; /* peek at top without popping */
+                if (!peek) break;
+
+                const int cmp =
+                    iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
+                                           tombstone_key_size, iter->heap->comparator_ctx);
+                if (cmp != 0) break; /* different key, stop skipping */
+
+                /* same key, we pop and discard */
+                tidesdb_kv_pair_t *dup = (direction > 0) ? tidesdb_merge_heap_pop(iter->heap, NULL)
+                                                         : tidesdb_merge_heap_pop_max(iter->heap);
+                tidesdb_kv_pair_free(dup);
+            }
+
+            tidesdb_kv_pair_free(kv);
+            continue;
+        }
+
+        if (visible == 0)
         {
             tidesdb_kv_pair_free(kv);
             continue;
@@ -17130,7 +17198,33 @@ int tidesdb_iter_seek_to_first(tidesdb_iter_t *iter)
         if (!kv) break;
 
         /* we check visibility (isolation, TTL, tombstones) */
-        if (!tidesdb_iter_kv_visible(iter, kv))
+        const int visible = tidesdb_iter_kv_visible(iter, kv);
+        if (visible == -1)
+        {
+            /* tombstone -- we skip all versions of this key */
+            const uint8_t *tombstone_key = kv->key;
+            const size_t tombstone_key_size = kv->entry.key_size;
+
+            /* we pop and discard all entries with the same key */
+            while (!tidesdb_merge_heap_empty(iter->heap))
+            {
+                tidesdb_kv_pair_t *peek = iter->heap->sources[0]->current_kv;
+                if (!peek) break;
+
+                const int cmp =
+                    iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
+                                           tombstone_key_size, iter->heap->comparator_ctx);
+                if (cmp != 0) break;
+
+                tidesdb_kv_pair_t *dup = tidesdb_merge_heap_pop(iter->heap, NULL);
+                tidesdb_kv_pair_free(dup);
+            }
+
+            tidesdb_kv_pair_free(kv);
+            continue;
+        }
+
+        if (visible == 0)
         {
             tidesdb_kv_pair_free(kv);
             continue;
@@ -17154,7 +17248,7 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
     iter->valid = 0;
     iter->direction = -1; /* set to backward */
 
-    /* position all sources at their last entries */
+    /* we position all sources at their last entries */
     for (int i = 0; i < iter->heap->num_sources; i++)
     {
         tidesdb_merge_source_t *source = iter->heap->sources[i];
@@ -17351,76 +17445,50 @@ int tidesdb_iter_seek_to_last(tidesdb_iter_t *iter)
     /* we build max-heap (for backward iteration) and find largest key */
     for (int i = (iter->heap->num_sources / 2) - 1; i >= 0; i--)
     {
-        int current = i;
-        while (current < iter->heap->num_sources)
-        {
-            int largest = current;
-            const int left = 2 * current + 1;
-            const int right = 2 * current + 2;
-
-            if (left < iter->heap->num_sources && iter->heap->sources[left]->current_kv)
-            {
-                if (!iter->heap->sources[largest]->current_kv)
-                {
-                    largest = left;
-                }
-                else
-                {
-                    int cmp = iter->heap->comparator(
-                        iter->heap->sources[left]->current_kv->key,
-                        iter->heap->sources[left]->current_kv->entry.key_size,
-                        iter->heap->sources[largest]->current_kv->key,
-                        iter->heap->sources[largest]->current_kv->entry.key_size,
-                        iter->heap->comparator_ctx);
-                    if (cmp > 0) largest = left;
-                }
-            }
-
-            if (right < iter->heap->num_sources && iter->heap->sources[right]->current_kv)
-            {
-                if (!iter->heap->sources[largest]->current_kv)
-                {
-                    largest = right;
-                }
-                else
-                {
-                    const int cmp = iter->heap->comparator(
-                        iter->heap->sources[right]->current_kv->key,
-                        iter->heap->sources[right]->current_kv->entry.key_size,
-                        iter->heap->sources[largest]->current_kv->key,
-                        iter->heap->sources[largest]->current_kv->entry.key_size,
-                        iter->heap->comparator_ctx);
-                    if (cmp > 0) largest = right;
-                }
-            }
-
-            if (largest != current)
-            {
-                tidesdb_merge_source_t *temp = iter->heap->sources[current];
-                iter->heap->sources[current] = iter->heap->sources[largest];
-                iter->heap->sources[largest] = temp;
-                current = largest;
-            }
-            else
-            {
-                break;
-            }
-        }
+        heap_sift_down_max(iter->heap, i);
     }
 
-    /* we get the largest (last) key */
-    if (iter->heap->num_sources > 0 && iter->heap->sources[0]->current_kv)
+    /* we get the largest (last) key, handling tombstones */
+    while (iter->heap->num_sources > 0 && iter->heap->sources[0]->current_kv)
     {
-        tidesdb_kv_pair_t *kv = iter->heap->sources[0]->current_kv;
+        tidesdb_kv_pair_t *kv = tidesdb_merge_heap_pop_max(iter->heap);
+        if (!kv) break;
 
-        if (tidesdb_iter_kv_visible(iter, kv))
+        const int visible = tidesdb_iter_kv_visible(iter, kv);
+        if (visible == -1)
         {
-            iter->current = tidesdb_kv_pair_create(
-                kv->key, kv->entry.key_size, kv->value, kv->entry.value_size, kv->entry.ttl,
-                kv->entry.seq, kv->entry.flags & TDB_KV_FLAG_TOMBSTONE);
-            iter->valid = 1;
-            return TDB_SUCCESS;
+            /* tombstone -- we skip all versions of this key */
+            const uint8_t *tombstone_key = kv->key;
+            const size_t tombstone_key_size = kv->entry.key_size;
+
+            /* we pop and discard all entries with the same key */
+            while (!tidesdb_merge_heap_empty(iter->heap))
+            {
+                tidesdb_kv_pair_t *peek = iter->heap->sources[0]->current_kv;
+                if (!peek) break;
+
+                const int cmp =
+                    iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
+                                           tombstone_key_size, iter->heap->comparator_ctx);
+                if (cmp != 0) break;
+
+                tidesdb_kv_pair_t *dup = tidesdb_merge_heap_pop_max(iter->heap);
+                tidesdb_kv_pair_free(dup);
+            }
+
+            tidesdb_kv_pair_free(kv);
+            continue;
         }
+
+        if (visible == 0)
+        {
+            tidesdb_kv_pair_free(kv);
+            continue;
+        }
+
+        iter->current = kv;
+        iter->valid = 1;
+        return TDB_SUCCESS;
     }
 
     return TDB_ERR_NOT_FOUND;
@@ -17499,13 +17567,39 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
             continue;
         }
 
-        if (!tidesdb_iter_kv_visible(iter, kv))
+        const int visible = tidesdb_iter_kv_visible(iter, kv);
+        if (visible == -1)
+        {
+            /* tombstone -- we skip all versions of this key */
+            const uint8_t *tombstone_key = kv->key;
+            const size_t tombstone_key_size = kv->entry.key_size;
+
+            /* we pop and discard all entries with the same key */
+            while (!tidesdb_merge_heap_empty(iter->heap))
+            {
+                tidesdb_kv_pair_t *peek = iter->heap->sources[0]->current_kv;
+                if (!peek) break;
+
+                const int cmp =
+                    iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
+                                           tombstone_key_size, iter->heap->comparator_ctx);
+                if (cmp != 0) break;
+
+                tidesdb_kv_pair_t *dup = tidesdb_merge_heap_pop(iter->heap, NULL);
+                tidesdb_kv_pair_free(dup);
+            }
+
+            tidesdb_kv_pair_free(kv);
+            continue;
+        }
+
+        if (visible == 0)
         {
             tidesdb_kv_pair_free(kv);
             continue;
         }
 
-        /* snapshot isolation -- track read for conflict detection */
+        /* snapshot isolation -- we track read for conflict detection */
         tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
                                     kv->entry.seq);
 
@@ -17592,7 +17686,33 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         }
 
         /* we skip invisible entries */
-        if (!tidesdb_iter_kv_visible(iter, kv))
+        const int visible = tidesdb_iter_kv_visible(iter, kv);
+        if (visible == -1)
+        {
+            /* tombstone - skip all versions of this key */
+            const uint8_t *tombstone_key = kv->key;
+            const size_t tombstone_key_size = kv->entry.key_size;
+
+            /* pop and discard all entries with the same key */
+            while (!tidesdb_merge_heap_empty(iter->heap))
+            {
+                tidesdb_kv_pair_t *peek = iter->heap->sources[0]->current_kv;
+                if (!peek) break;
+
+                const int cmp =
+                    iter->heap->comparator(peek->key, peek->entry.key_size, tombstone_key,
+                                           tombstone_key_size, iter->heap->comparator_ctx);
+                if (cmp != 0) break;
+
+                tidesdb_kv_pair_t *dup = tidesdb_merge_heap_pop_max(iter->heap);
+                tidesdb_kv_pair_free(dup);
+            }
+
+            tidesdb_kv_pair_free(kv);
+            continue;
+        }
+
+        if (visible == 0)
         {
             tidesdb_kv_pair_free(kv);
             continue;
@@ -18332,7 +18452,7 @@ int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats)
                 total_data_size += sstables[j]->klog_size + sstables[j]->vlog_size;
                 total_klog_size += sstables[j]->klog_size;
 
-                /* aggregate btree stats if this sstable uses btree */
+                /* we aggregate btree stats if this sstable uses btree */
                 if (sstables[j]->use_btree && sstables[j]->btree_root_offset >= 0)
                 {
                     btree_sstable_count++;
@@ -19701,19 +19821,20 @@ static int compact_block_index_find_predecessor(const tidesdb_block_index_t *ind
 
             if (cmp_max <= 0)
             {
-                /* key lies inside this block; remember and search right for the rightmost match */
+                /* key lies inside this block; we must remember and search right for the rightmost
+                 * match */
                 exact_match = mid;
                 left = mid + 1;
             }
             else
             {
-                /* search_key > max_key: need to search right for a tighter block */
+                /* search_key > max_key -- we need to search right for a tighter block */
                 left = mid + 1;
             }
         }
         else
         {
-            /* search_key < min_key, search left */
+            /* search_key < min_key -- we need to search left */
             right = mid - 1;
         }
     }

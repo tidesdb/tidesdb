@@ -5855,7 +5855,9 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop_max(tidesdb_merge_heap_t *heap)
         return NULL;
     }
 
-    tidesdb_kv_pair_t *result = tidesdb_kv_pair_clone(top->current_kv);
+    /* we transfer ownership instead of cloning (same as pop) */
+    tidesdb_kv_pair_t *result = top->current_kv;
+    top->current_kv = NULL;
 
     /* the source to get its previous entry */
     if (tidesdb_merge_source_retreat(top) != TDB_SUCCESS)
@@ -5967,7 +5969,11 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
     tidesdb_merge_source_t *top = heap->sources[0];
     if (!top->current_kv) return NULL;
 
-    tidesdb_kv_pair_t *result = tidesdb_kv_pair_clone(top->current_kv);
+    /* we transfer ownership of current_kv instead of cloning.
+     ** advance() starts with kv_pair_free(current_kv) which is a no-op on NULL.
+     *** eliminates 1 malloc + 1 free + 2 memcpy per pop. */
+    tidesdb_kv_pair_t *result = top->current_kv;
+    top->current_kv = NULL;
 
     const int advance_result = tidesdb_merge_source_advance(top);
     if (advance_result != 0)
@@ -17503,32 +17509,11 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
     /* we set direction to forward */
     iter->direction = 1;
 
-    /* we save current key to skip duplicates */
-    uint8_t stack_key[TDB_ITER_STACK_KEY_SIZE];
-    uint8_t *current_key = NULL;
-    size_t current_key_size = 0;
-    int key_on_heap = 0;
-
-    if (iter->current)
-    {
-        current_key_size = iter->current->entry.key_size;
-        if (current_key_size <= TDB_ITER_STACK_KEY_SIZE)
-        {
-            current_key = stack_key;
-            memcpy(current_key, iter->current->key, current_key_size);
-        }
-        else
-        {
-            current_key = malloc(current_key_size);
-            if (current_key)
-            {
-                memcpy(current_key, iter->current->key, current_key_size);
-                key_on_heap = 1;
-            }
-        }
-    }
-
-    tidesdb_kv_pair_free(iter->current);
+    /* we keep previous entry alive for duplicate detection instead
+     * of copying its key into a separate buffer.  This avoids a memcpy (and
+     * potential malloc for keys > TDB_ITER_STACK_KEY_SIZE) per iter_next call.
+     * prev is freed once we find the next visible entry or at end-of-scan. */
+    tidesdb_kv_pair_t *prev = iter->current;
     iter->current = NULL;
     iter->valid = 0;
 
@@ -17558,8 +17543,8 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         if (!kv) break;
 
         /* we skip duplicates (same key as previous) */
-        if (current_key && current_key_size == kv->entry.key_size &&
-            memcmp(current_key, kv->key, current_key_size) == 0)
+        if (prev && prev->entry.key_size == kv->entry.key_size &&
+            memcmp(prev->key, kv->key, prev->entry.key_size) == 0)
         {
             tidesdb_kv_pair_free(kv);
             continue;
@@ -17601,13 +17586,13 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
                                     kv->entry.seq);
 
-        if (key_on_heap) free(current_key);
+        tidesdb_kv_pair_free(prev);
         iter->current = kv;
         iter->valid = 1;
         return TDB_SUCCESS;
     }
 
-    if (key_on_heap) free(current_key);
+    tidesdb_kv_pair_free(prev);
     return TDB_ERR_NOT_FOUND;
 }
 
@@ -17622,31 +17607,8 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
     /* we set direction to backward */
     iter->direction = -1;
 
-    uint8_t stack_key[TDB_ITER_STACK_KEY_SIZE];
-    uint8_t *current_key = NULL;
-    size_t current_key_size = 0;
-    int key_on_heap = 0;
-
-    if (iter->current)
-    {
-        current_key_size = iter->current->entry.key_size;
-        if (current_key_size <= TDB_ITER_STACK_KEY_SIZE)
-        {
-            current_key = stack_key;
-            memcpy(current_key, iter->current->key, current_key_size);
-        }
-        else
-        {
-            current_key = malloc(current_key_size);
-            if (current_key)
-            {
-                memcpy(current_key, iter->current->key, current_key_size);
-                key_on_heap = 1;
-            }
-        }
-    }
-
-    tidesdb_kv_pair_free(iter->current);
+    /* we keep previous entry alive for duplicate detection (same as iter_next) */
+    tidesdb_kv_pair_t *prev = iter->current;
     iter->current = NULL;
     iter->valid = 0;
 
@@ -17676,8 +17638,8 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         if (!kv) break;
 
         /* we skip duplicates (same key as previous) */
-        if (current_key && current_key_size == kv->entry.key_size &&
-            memcmp(current_key, kv->key, current_key_size) == 0)
+        if (prev && prev->entry.key_size == kv->entry.key_size &&
+            memcmp(prev->key, kv->key, prev->entry.key_size) == 0)
         {
             tidesdb_kv_pair_free(kv);
             continue;
@@ -17720,13 +17682,13 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
                                     kv->entry.seq);
 
-        if (key_on_heap) free(current_key);
+        tidesdb_kv_pair_free(prev);
         iter->current = kv;
         iter->valid = 1;
         return TDB_SUCCESS;
     }
 
-    if (key_on_heap) free(current_key);
+    tidesdb_kv_pair_free(prev);
     return TDB_ERR_NOT_FOUND;
 }
 

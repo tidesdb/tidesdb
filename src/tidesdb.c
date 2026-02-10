@@ -5855,7 +5855,9 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop_max(tidesdb_merge_heap_t *heap)
         return NULL;
     }
 
-    tidesdb_kv_pair_t *result = tidesdb_kv_pair_clone(top->current_kv);
+    /* we transfer ownership instead of cloning (same as pop) */
+    tidesdb_kv_pair_t *result = top->current_kv;
+    top->current_kv = NULL;
 
     /* the source to get its previous entry */
     if (tidesdb_merge_source_retreat(top) != TDB_SUCCESS)
@@ -5967,7 +5969,11 @@ static tidesdb_kv_pair_t *tidesdb_merge_heap_pop(tidesdb_merge_heap_t *heap,
     tidesdb_merge_source_t *top = heap->sources[0];
     if (!top->current_kv) return NULL;
 
-    tidesdb_kv_pair_t *result = tidesdb_kv_pair_clone(top->current_kv);
+    /* we transfer ownership of current_kv instead of cloning.
+     ** advance() starts with kv_pair_free(current_kv) which is a no-op on NULL.
+     *** eliminates 1 malloc + 1 free + 2 memcpy per pop. */
+    tidesdb_kv_pair_t *result = top->current_kv;
+    top->current_kv = NULL;
 
     const int advance_result = tidesdb_merge_source_advance(top);
     if (advance_result != 0)
@@ -13703,7 +13709,7 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
         if (!new_arena) return -1;
 
         /* we grow arena array if needed */
-        if (!txn->read_key_arenas || txn->read_key_arena_count == 0)
+        if (!txn->read_key_arenas)
         {
             txn->read_key_arenas =
                 malloc(TDB_TXN_READ_KEY_ARENA_INITIAL_CAPACITY * sizeof(uint8_t *));
@@ -14574,6 +14580,136 @@ void tidesdb_txn_free(tidesdb_txn_t *txn) /* NOLINT(misc-no-recursion) */
 
     free(txn->cfs);
     free(txn);
+}
+
+int tidesdb_txn_reset(tidesdb_txn_t *txn, const tidesdb_isolation_level_t isolation)
+{
+    if (!txn || !txn->db) return TDB_ERR_INVALID_ARGS;
+    if (!txn->is_committed && !txn->is_aborted) return TDB_ERR_INVALID_ARGS;
+
+    if (isolation < TDB_ISOLATION_READ_UNCOMMITTED || isolation > TDB_ISOLATION_SERIALIZABLE)
+    {
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    const int wait_result = wait_for_open(txn->db);
+    if (wait_result != TDB_SUCCESS)
+    {
+        return wait_result;
+    }
+
+    /* we remove from SERIALIZABLE active list if the old isolation was SERIALIZABLE */
+    if (txn->isolation_level == TDB_ISOLATION_SERIALIZABLE)
+    {
+        tidesdb_txn_remove_from_active_list(txn);
+    }
+
+    /* we free op key/value data but keep the ops array itself */
+    for (int i = 0; i < txn->num_ops; i++)
+    {
+        free(txn->ops[i].key);
+        txn->ops[i].key = NULL;
+        free(txn->ops[i].value);
+        txn->ops[i].value = NULL;
+    }
+    txn->num_ops = 0;
+
+    /* we reset read set -- keep arrays allocated, free arena buffers to avoid leaks */
+    txn->read_set_count = 0;
+
+    /* we free individual arena buffers but keep the pointer array for reuse */
+    for (int i = 0; i < txn->read_key_arena_count; i++)
+    {
+        free(txn->read_key_arenas[i]);
+        txn->read_key_arenas[i] = NULL;
+    }
+    txn->read_key_arena_count = 0;
+    txn->read_key_arena_used = 0;
+
+    /* we allocate read set arrays if switching to higher isolation that needs them */
+    if (isolation >= TDB_ISOLATION_REPEATABLE_READ && !txn->read_keys)
+    {
+        txn->read_set_capacity = TDB_INITIAL_TXN_READ_SET_CAPACITY;
+        txn->read_keys = calloc(txn->read_set_capacity, sizeof(uint8_t *));
+        txn->read_key_sizes = calloc(txn->read_set_capacity, sizeof(size_t));
+        txn->read_seqs = calloc(txn->read_set_capacity, sizeof(uint64_t));
+        txn->read_cfs = calloc(txn->read_set_capacity, sizeof(tidesdb_column_family_t *));
+
+        if (!txn->read_keys || !txn->read_key_sizes || !txn->read_seqs || !txn->read_cfs)
+        {
+            return TDB_ERR_MEMORY;
+        }
+    }
+
+    /* we free hash tables -- they contain stale indices.  will be rebuilt lazily */
+    if (txn->write_set_hash)
+    {
+        tidesdb_write_set_hash_free((tidesdb_write_set_hash_t *)txn->write_set_hash);
+        txn->write_set_hash = NULL;
+    }
+    if (txn->read_set_hash)
+    {
+        tidesdb_read_set_hash_free((tidesdb_read_set_hash_t *)txn->read_set_hash);
+        txn->read_set_hash = NULL;
+    }
+
+    /* we free any savepoints */
+    for (int i = 0; i < txn->num_savepoints; i++)
+    {
+        free(txn->savepoint_names[i]);
+        tidesdb_txn_free(txn->savepoints[i]);
+    }
+    txn->num_savepoints = 0;
+
+    /* we reset cf tracking */
+    txn->num_cfs = 0;
+    txn->last_cf = NULL;
+    txn->last_cf_index = 0;
+
+    /* we assign fresh transaction identity */
+    txn->isolation_level = isolation;
+    txn->txn_id = atomic_fetch_add_explicit(&txn->db->next_txn_id, 1, memory_order_relaxed);
+
+    if (isolation == TDB_ISOLATION_READ_UNCOMMITTED)
+    {
+        txn->snapshot_seq = UINT64_MAX;
+    }
+    else if (isolation == TDB_ISOLATION_READ_COMMITTED)
+    {
+        txn->snapshot_seq = 0;
+    }
+    else
+    {
+        uint64_t current_seq = atomic_load_explicit(&txn->db->global_seq, memory_order_acquire);
+        txn->snapshot_seq = (current_seq > 0) ? current_seq - 1 : 0;
+    }
+
+    txn->commit_seq = 0;
+    txn->is_committed = 0;
+    txn->is_aborted = 0;
+    txn->has_rw_conflict_in = 0;
+    txn->has_rw_conflict_out = 0;
+
+    /* we register in active list if new isolation is SERIALIZABLE */
+    if (isolation == TDB_ISOLATION_SERIALIZABLE)
+    {
+        pthread_rwlock_wrlock(&txn->db->active_txns_lock);
+
+        if (txn->db->num_active_txns < txn->db->active_txns_capacity)
+        {
+            txn->db->active_txns[txn->db->num_active_txns++] = txn;
+        }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "Active transaction list full (%d), SSI may be less effective",
+                          txn->db->active_txns_capacity);
+        }
+
+        pthread_rwlock_unlock(&txn->db->active_txns_lock);
+    }
+
+    return TDB_SUCCESS;
 }
 
 /**
@@ -17503,32 +17639,11 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
     /* we set direction to forward */
     iter->direction = 1;
 
-    /* we save current key to skip duplicates */
-    uint8_t stack_key[TDB_ITER_STACK_KEY_SIZE];
-    uint8_t *current_key = NULL;
-    size_t current_key_size = 0;
-    int key_on_heap = 0;
-
-    if (iter->current)
-    {
-        current_key_size = iter->current->entry.key_size;
-        if (current_key_size <= TDB_ITER_STACK_KEY_SIZE)
-        {
-            current_key = stack_key;
-            memcpy(current_key, iter->current->key, current_key_size);
-        }
-        else
-        {
-            current_key = malloc(current_key_size);
-            if (current_key)
-            {
-                memcpy(current_key, iter->current->key, current_key_size);
-                key_on_heap = 1;
-            }
-        }
-    }
-
-    tidesdb_kv_pair_free(iter->current);
+    /* we keep previous entry alive for duplicate detection instead
+     * of copying its key into a separate buffer.  This avoids a memcpy (and
+     * potential malloc for keys > TDB_ITER_STACK_KEY_SIZE) per iter_next call.
+     * prev is freed once we find the next visible entry or at end-of-scan. */
+    tidesdb_kv_pair_t *prev = iter->current;
     iter->current = NULL;
     iter->valid = 0;
 
@@ -17558,8 +17673,8 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         if (!kv) break;
 
         /* we skip duplicates (same key as previous) */
-        if (current_key && current_key_size == kv->entry.key_size &&
-            memcmp(current_key, kv->key, current_key_size) == 0)
+        if (prev && prev->entry.key_size == kv->entry.key_size &&
+            memcmp(prev->key, kv->key, prev->entry.key_size) == 0)
         {
             tidesdb_kv_pair_free(kv);
             continue;
@@ -17601,13 +17716,13 @@ int tidesdb_iter_next(tidesdb_iter_t *iter)
         tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
                                     kv->entry.seq);
 
-        if (key_on_heap) free(current_key);
+        tidesdb_kv_pair_free(prev);
         iter->current = kv;
         iter->valid = 1;
         return TDB_SUCCESS;
     }
 
-    if (key_on_heap) free(current_key);
+    tidesdb_kv_pair_free(prev);
     return TDB_ERR_NOT_FOUND;
 }
 
@@ -17622,31 +17737,8 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
     /* we set direction to backward */
     iter->direction = -1;
 
-    uint8_t stack_key[TDB_ITER_STACK_KEY_SIZE];
-    uint8_t *current_key = NULL;
-    size_t current_key_size = 0;
-    int key_on_heap = 0;
-
-    if (iter->current)
-    {
-        current_key_size = iter->current->entry.key_size;
-        if (current_key_size <= TDB_ITER_STACK_KEY_SIZE)
-        {
-            current_key = stack_key;
-            memcpy(current_key, iter->current->key, current_key_size);
-        }
-        else
-        {
-            current_key = malloc(current_key_size);
-            if (current_key)
-            {
-                memcpy(current_key, iter->current->key, current_key_size);
-                key_on_heap = 1;
-            }
-        }
-    }
-
-    tidesdb_kv_pair_free(iter->current);
+    /* we keep previous entry alive for duplicate detection (same as iter_next) */
+    tidesdb_kv_pair_t *prev = iter->current;
     iter->current = NULL;
     iter->valid = 0;
 
@@ -17676,8 +17768,8 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         if (!kv) break;
 
         /* we skip duplicates (same key as previous) */
-        if (current_key && current_key_size == kv->entry.key_size &&
-            memcmp(current_key, kv->key, current_key_size) == 0)
+        if (prev && prev->entry.key_size == kv->entry.key_size &&
+            memcmp(prev->key, kv->key, prev->entry.key_size) == 0)
         {
             tidesdb_kv_pair_free(kv);
             continue;
@@ -17720,13 +17812,13 @@ int tidesdb_iter_prev(tidesdb_iter_t *iter)
         tidesdb_txn_add_to_read_set(iter->txn, iter->cf, kv->key, kv->entry.key_size,
                                     kv->entry.seq);
 
-        if (key_on_heap) free(current_key);
+        tidesdb_kv_pair_free(prev);
         iter->current = kv;
         iter->valid = 1;
         return TDB_SUCCESS;
     }
 
-    if (key_on_heap) free(current_key);
+    tidesdb_kv_pair_free(prev);
     return TDB_ERR_NOT_FOUND;
 }
 

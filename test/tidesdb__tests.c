@@ -18750,6 +18750,286 @@ static void test_compaction_partitioned_z_calculation(void)
     cleanup_test_dir();
 }
 
+static void test_txn_reset_basic(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "reset_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "reset_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* first transaction -- we put a key and commit */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    uint8_t key1[] = "key1";
+    uint8_t value1[] = "value1";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key1, sizeof(key1), value1, sizeof(value1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+
+    /* we reset the same transaction instead of free + begin */
+    ASSERT_EQ(tidesdb_txn_reset(txn, TDB_ISOLATION_READ_COMMITTED), 0);
+
+    /* we verify the reset txn can read the previously committed data */
+    uint8_t *retrieved = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key1, sizeof(key1), &retrieved, &retrieved_size), 0);
+    ASSERT_TRUE(memcmp(retrieved, value1, sizeof(value1)) == 0);
+    free(retrieved);
+
+    /* put new data with the reset txn and commit */
+    uint8_t key2[] = "key2";
+    uint8_t value2[] = "value2";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key2, sizeof(key2), value2, sizeof(value2), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+
+    /* we reset again and verify both keys exist */
+    ASSERT_EQ(tidesdb_txn_reset(txn, TDB_ISOLATION_READ_COMMITTED), 0);
+
+    retrieved = NULL;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key1, sizeof(key1), &retrieved, &retrieved_size), 0);
+    ASSERT_TRUE(memcmp(retrieved, value1, sizeof(value1)) == 0);
+    free(retrieved);
+
+    retrieved = NULL;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key2, sizeof(key2), &retrieved, &retrieved_size), 0);
+    ASSERT_TRUE(memcmp(retrieved, value2, sizeof(value2)) == 0);
+    free(retrieved);
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_txn_reset_after_rollback(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "reset_rb_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "reset_rb_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *setup = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &setup), 0);
+    uint8_t key[] = "rkey";
+    uint8_t value1[] = "original";
+    ASSERT_EQ(tidesdb_txn_put(setup, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(setup), 0);
+    tidesdb_txn_free(setup);
+
+    /* start txn, write, rollback */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    uint8_t value2[] = "rolled_back";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value2, sizeof(value2), 0), 0);
+    ASSERT_EQ(tidesdb_txn_rollback(txn), 0);
+
+    /* we reset after rollback should work */
+    ASSERT_EQ(tidesdb_txn_reset(txn, TDB_ISOLATION_READ_COMMITTED), 0);
+
+    /* we should still see original value (rollback was not applied) */
+    uint8_t *retrieved = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved, &retrieved_size), 0);
+    ASSERT_TRUE(memcmp(retrieved, value1, sizeof(value1)) == 0);
+    free(retrieved);
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_txn_reset_isolation_change(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "reset_iso_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "reset_iso_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *setup = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &setup), 0);
+    uint8_t key[] = "isokey";
+    uint8_t value1[] = "v1";
+    ASSERT_EQ(tidesdb_txn_put(setup, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(setup), 0);
+    tidesdb_txn_free(setup);
+
+    /* we start with READ_COMMITTED, commit, then reset to REPEATABLE_READ */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_READ_COMMITTED, &txn), 0);
+
+    uint8_t *retrieved = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved, &retrieved_size), 0);
+    free(retrieved);
+
+    uint8_t key2[] = "isokey2";
+    uint8_t value2[] = "v2";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key2, sizeof(key2), value2, sizeof(value2), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+
+    /* we reset to REPEATABLE_READ -- should allocate read set arrays */
+    ASSERT_EQ(tidesdb_txn_reset(txn, TDB_ISOLATION_REPEATABLE_READ), 0);
+
+    /* we verify we can read with the new isolation level */
+    retrieved = NULL;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved, &retrieved_size), 0);
+    ASSERT_TRUE(memcmp(retrieved, value1, sizeof(value1)) == 0);
+    free(retrieved);
+
+    retrieved = NULL;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key2, sizeof(key2), &retrieved, &retrieved_size), 0);
+    ASSERT_TRUE(memcmp(retrieved, value2, sizeof(value2)) == 0);
+    free(retrieved);
+
+    /* commit and verify read set was tracked (no crash) */
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_txn_reset_reuse_loop(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "reset_loop_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "reset_loop_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    /* we reuse the same transaction 50 times */
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "loop_key_%d", i);
+        snprintf(value, sizeof(value), "loop_value_%d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        ASSERT_EQ(tidesdb_txn_reset(txn, TDB_ISOLATION_READ_COMMITTED), 0);
+    }
+
+    /* we verify all 50 keys exist */
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], expected[64];
+        snprintf(key, sizeof(key), "loop_key_%d", i);
+        snprintf(expected, sizeof(expected), "loop_value_%d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size),
+                  0);
+        ASSERT_TRUE(strcmp((char *)value, expected) == 0);
+        free(value);
+    }
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_txn_reset_invalid_args(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "reset_err_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "reset_err_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* reset on NULL should fail */
+    ASSERT_EQ(tidesdb_txn_reset(NULL, TDB_ISOLATION_READ_COMMITTED), TDB_ERR_INVALID_ARGS);
+
+    /* reset on a live (not committed/aborted) txn should fail */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    uint8_t key[] = "k";
+    uint8_t val[] = "v";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), val, sizeof(val), 0), 0);
+    ASSERT_EQ(tidesdb_txn_reset(txn, TDB_ISOLATION_READ_COMMITTED), TDB_ERR_INVALID_ARGS);
+
+    /* commit, then reset should succeed */
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    ASSERT_EQ(tidesdb_txn_reset(txn, TDB_ISOLATION_READ_COMMITTED), 0);
+
+    /* invalid isolation level should fail */
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    ASSERT_EQ(tidesdb_txn_reset(txn, (tidesdb_isolation_level_t)99), TDB_ERR_INVALID_ARGS);
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_txn_reset_with_repeatable_read(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "reset_rr_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "reset_rr_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *setup = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &setup), 0);
+    uint8_t key[] = "rrkey";
+    uint8_t value1[] = "v1";
+    ASSERT_EQ(tidesdb_txn_put(setup, cf, key, sizeof(key), value1, sizeof(value1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(setup), 0);
+    tidesdb_txn_free(setup);
+
+    /* we use REPEATABLE_READ txn, read, commit, reset, read again */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin_with_isolation(db, TDB_ISOLATION_REPEATABLE_READ, &txn), 0);
+
+    uint8_t *retrieved = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved, &retrieved_size), 0);
+    ASSERT_TRUE(memcmp(retrieved, value1, sizeof(value1)) == 0);
+    free(retrieved);
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+
+    /* another txn updates the value between resets */
+    tidesdb_txn_t *updater = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &updater), 0);
+    uint8_t value2[] = "v2";
+    ASSERT_EQ(tidesdb_txn_put(updater, cf, key, sizeof(key), value2, sizeof(value2), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(updater), 0);
+    tidesdb_txn_free(updater);
+
+    /* reset gets a fresh snapshot -- we should see the updated value */
+    ASSERT_EQ(tidesdb_txn_reset(txn, TDB_ISOLATION_REPEATABLE_READ), 0);
+
+    retrieved = NULL;
+    ASSERT_EQ(tidesdb_txn_get(txn, cf, key, sizeof(key), &retrieved, &retrieved_size), 0);
+    ASSERT_TRUE(memcmp(retrieved, value2, sizeof(value2)) == 0);
+    free(retrieved);
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -19025,6 +19305,12 @@ int main(void)
     RUN_TEST(test_multiple_cf_drop_with_concurrent_workers, tests_passed);
     RUN_TEST(test_clone_column_family, tests_passed);
     RUN_TEST(test_clone_column_family_concurrent, tests_passed);
+    RUN_TEST(test_txn_reset_basic, tests_passed);
+    RUN_TEST(test_txn_reset_after_rollback, tests_passed);
+    RUN_TEST(test_txn_reset_isolation_change, tests_passed);
+    RUN_TEST(test_txn_reset_reuse_loop, tests_passed);
+    RUN_TEST(test_txn_reset_invalid_args, tests_passed);
+    RUN_TEST(test_txn_reset_with_repeatable_read, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

@@ -14582,6 +14582,130 @@ void tidesdb_txn_free(tidesdb_txn_t *txn) /* NOLINT(misc-no-recursion) */
     free(txn);
 }
 
+int tidesdb_txn_reset(tidesdb_txn_t *txn, const tidesdb_isolation_level_t isolation)
+{
+    if (!txn || !txn->db) return TDB_ERR_INVALID_ARGS;
+    if (!txn->is_committed && !txn->is_aborted) return TDB_ERR_INVALID_ARGS;
+
+    if (isolation < TDB_ISOLATION_READ_UNCOMMITTED || isolation > TDB_ISOLATION_SERIALIZABLE)
+    {
+        return TDB_ERR_INVALID_ARGS;
+    }
+
+    const int wait_result = wait_for_open(txn->db);
+    if (wait_result != TDB_SUCCESS)
+    {
+        return wait_result;
+    }
+
+    /* we remove from SERIALIZABLE active list if the old isolation was SERIALIZABLE */
+    if (txn->isolation_level == TDB_ISOLATION_SERIALIZABLE)
+    {
+        tidesdb_txn_remove_from_active_list(txn);
+    }
+
+    /* we free op key/value data but keep the ops array itself */
+    for (int i = 0; i < txn->num_ops; i++)
+    {
+        free(txn->ops[i].key);
+        txn->ops[i].key = NULL;
+        free(txn->ops[i].value);
+        txn->ops[i].value = NULL;
+    }
+    txn->num_ops = 0;
+
+    /* we reset read set -- keep arrays and arenas allocated, just reset counts
+     * arena memory is reused by resetting arena_count and arena_used to 0 */
+    txn->read_set_count = 0;
+    txn->read_key_arena_count = 0;
+    txn->read_key_arena_used = 0;
+
+    /* we allocate read set arrays if switching to higher isolation that needs them */
+    if (isolation >= TDB_ISOLATION_REPEATABLE_READ && !txn->read_keys)
+    {
+        txn->read_set_capacity = TDB_INITIAL_TXN_READ_SET_CAPACITY;
+        txn->read_keys = calloc(txn->read_set_capacity, sizeof(uint8_t *));
+        txn->read_key_sizes = calloc(txn->read_set_capacity, sizeof(size_t));
+        txn->read_seqs = calloc(txn->read_set_capacity, sizeof(uint64_t));
+        txn->read_cfs = calloc(txn->read_set_capacity, sizeof(tidesdb_column_family_t *));
+
+        if (!txn->read_keys || !txn->read_key_sizes || !txn->read_seqs || !txn->read_cfs)
+        {
+            return TDB_ERR_MEMORY;
+        }
+    }
+
+    /* we free hash tables -- they contain stale indices.  will be rebuilt lazily */
+    if (txn->write_set_hash)
+    {
+        tidesdb_write_set_hash_free((tidesdb_write_set_hash_t *)txn->write_set_hash);
+        txn->write_set_hash = NULL;
+    }
+    if (txn->read_set_hash)
+    {
+        tidesdb_read_set_hash_free((tidesdb_read_set_hash_t *)txn->read_set_hash);
+        txn->read_set_hash = NULL;
+    }
+
+    /* we free any savepoints */
+    for (int i = 0; i < txn->num_savepoints; i++)
+    {
+        free(txn->savepoint_names[i]);
+        tidesdb_txn_free(txn->savepoints[i]);
+    }
+    txn->num_savepoints = 0;
+
+    /* we reset cf tracking */
+    txn->num_cfs = 0;
+    txn->last_cf = NULL;
+    txn->last_cf_index = 0;
+
+    /* we assign fresh transaction identity */
+    txn->isolation_level = isolation;
+    txn->txn_id = atomic_fetch_add_explicit(&txn->db->next_txn_id, 1, memory_order_relaxed);
+
+    if (isolation == TDB_ISOLATION_READ_UNCOMMITTED)
+    {
+        txn->snapshot_seq = UINT64_MAX;
+    }
+    else if (isolation == TDB_ISOLATION_READ_COMMITTED)
+    {
+        txn->snapshot_seq = 0;
+    }
+    else
+    {
+        uint64_t current_seq = atomic_load_explicit(&txn->db->global_seq, memory_order_acquire);
+        txn->snapshot_seq = (current_seq > 0) ? current_seq - 1 : 0;
+    }
+
+    txn->commit_seq = 0;
+    txn->is_committed = 0;
+    txn->is_aborted = 0;
+    txn->has_rw_conflict_in = 0;
+    txn->has_rw_conflict_out = 0;
+
+    /* we register in active list if new isolation is SERIALIZABLE */
+    if (isolation == TDB_ISOLATION_SERIALIZABLE)
+    {
+        pthread_rwlock_wrlock(&txn->db->active_txns_lock);
+
+        if (txn->db->num_active_txns < txn->db->active_txns_capacity)
+        {
+            txn->db->active_txns[txn->db->num_active_txns++] = txn;
+        }
+        else
+        {
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "Active transaction list full (%d), SSI may be less effective",
+                          txn->db->active_txns_capacity);
+        }
+
+        pthread_rwlock_unlock(&txn->db->active_txns_lock);
+    }
+
+    return TDB_SUCCESS;
+}
+
 /**
  * tidesdb_txn_check_seq_conflict
  * check sequence conflicts in memtable/immutable

@@ -959,6 +959,18 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn);
 void tidesdb_txn_free(tidesdb_txn_t *txn);
 
 /**
+ * tidesdb_txn_reset
+ * resets a committed or aborted transaction for reuse without freeing/reallocating buffers
+ * keeps the ops array, read set arrays, arenas, cfs array, and savepoints array allocated
+ * frees op key/value data, resets read set counts, clears hash tables, frees savepoint children
+ * assigns a fresh txn_id and snapshot_seq based on the new isolation level
+ * @param txn transaction handle (must be committed or aborted)
+ * @param isolation new isolation level for the reset transaction
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_txn_reset(tidesdb_txn_t *txn, tidesdb_isolation_level_t isolation);
+
+/**
  * tidesdb_txn_savepoint
  * creates a savepoint in the transaction
  * @param txn transaction handle

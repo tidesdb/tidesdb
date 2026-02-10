@@ -13709,7 +13709,7 @@ static int tidesdb_txn_add_to_read_set(tidesdb_txn_t *txn, tidesdb_column_family
         if (!new_arena) return -1;
 
         /* we grow arena array if needed */
-        if (!txn->read_key_arenas || txn->read_key_arena_count == 0)
+        if (!txn->read_key_arenas)
         {
             txn->read_key_arenas =
                 malloc(TDB_TXN_READ_KEY_ARENA_INITIAL_CAPACITY * sizeof(uint8_t *));
@@ -14614,9 +14614,15 @@ int tidesdb_txn_reset(tidesdb_txn_t *txn, const tidesdb_isolation_level_t isolat
     }
     txn->num_ops = 0;
 
-    /* we reset read set -- keep arrays and arenas allocated, just reset counts
-     * arena memory is reused by resetting arena_count and arena_used to 0 */
+    /* we reset read set -- keep arrays allocated, free arena buffers to avoid leaks */
     txn->read_set_count = 0;
+
+    /* we free individual arena buffers but keep the pointer array for reuse */
+    for (int i = 0; i < txn->read_key_arena_count; i++)
+    {
+        free(txn->read_key_arenas[i]);
+        txn->read_key_arenas[i] = NULL;
+    }
     txn->read_key_arena_count = 0;
     txn->read_key_arena_used = 0;
 

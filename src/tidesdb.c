@@ -19111,7 +19111,6 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
         }
 
         /* we halt compactions for this CF */
-        int compaction_was_running = 0;
         for (int i = 0; i < TDB_CHECKPOINT_COMPACTION_WAIT_MAX_ATTEMPTS; i++)
         {
             int expected = 0;
@@ -19121,7 +19120,6 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
                 break;
             }
             /* compaction is running, wait for it to finish */
-            compaction_was_running = 1;
             usleep(TDB_CHECKPOINT_COMPACTION_WAIT_SLEEP_US);
         }
 
@@ -19208,11 +19206,25 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
         {
             char src_manifest[TDB_MAX_PATH_LEN];
             char dst_manifest[TDB_MAX_PATH_LEN];
-            snprintf(src_manifest, sizeof(src_manifest), "%s" PATH_SEPARATOR "%s", cf->directory,
-                     TDB_COLUMN_FAMILY_MANIFEST_NAME);
-            snprintf(dst_manifest, sizeof(dst_manifest), "%s" PATH_SEPARATOR "%s",
-                     cf_checkpoint_dir, TDB_COLUMN_FAMILY_MANIFEST_NAME);
-            result = tidesdb_backup_copy_file(src_manifest, dst_manifest);
+            int n = snprintf(src_manifest, sizeof(src_manifest), "%s" PATH_SEPARATOR "%s",
+                             cf->directory, TDB_COLUMN_FAMILY_MANIFEST_NAME);
+            if (n < 0 || (size_t)n >= sizeof(src_manifest))
+            {
+                result = TDB_ERR_IO;
+            }
+            else
+            {
+                n = snprintf(dst_manifest, sizeof(dst_manifest), "%s" PATH_SEPARATOR "%s",
+                             cf_checkpoint_dir, TDB_COLUMN_FAMILY_MANIFEST_NAME);
+                if (n < 0 || (size_t)n >= sizeof(dst_manifest))
+                {
+                    result = TDB_ERR_IO;
+                }
+                else
+                {
+                    result = tidesdb_backup_copy_file(src_manifest, dst_manifest);
+                }
+            }
             if (result != TDB_SUCCESS)
             {
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to copy manifest for CF '%s'",
@@ -19225,13 +19237,29 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
         {
             char src_config[TDB_MAX_PATH_LEN];
             char dst_config[TDB_MAX_PATH_LEN];
-            snprintf(src_config, sizeof(src_config),
-                     "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
-                     cf->directory);
-            snprintf(dst_config, sizeof(dst_config),
-                     "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
-                     cf_checkpoint_dir);
-            result = tidesdb_backup_copy_file(src_config, dst_config);
+            int n = snprintf(
+                src_config, sizeof(src_config),
+                "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+                cf->directory);
+            if (n < 0 || (size_t)n >= sizeof(src_config))
+            {
+                result = TDB_ERR_IO;
+            }
+            else
+            {
+                n = snprintf(
+                    dst_config, sizeof(dst_config),
+                    "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+                    cf_checkpoint_dir);
+                if (n < 0 || (size_t)n >= sizeof(dst_config))
+                {
+                    result = TDB_ERR_IO;
+                }
+                else
+                {
+                    result = tidesdb_backup_copy_file(src_config, dst_config);
+                }
+            }
             if (result != TDB_SUCCESS)
             {
                 TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to copy config for CF '%s'",

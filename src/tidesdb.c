@@ -3288,16 +3288,6 @@ static void tidesdb_immutable_memtable_ref(tidesdb_immutable_memtable_t *imm)
 }
 
 /**
- * tidesdb_skip_list_free_wrapper
- * pthread-compatible wrapper for skip_list_free
- */
-static void *tidesdb_skip_list_free_wrapper(void *arg)
-{
-    skip_list_free((skip_list_t *)arg);
-    return NULL;
-}
-
-/**
  * tidesdb_immutable_memtable_unref
  * decrement reference count of an immutable memtable
  * @param imm immutable memtable to unreference
@@ -3313,17 +3303,7 @@ static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm)
 
         if (memtable_to_free)
         {
-            pthread_t cleanup_thread;
-            pthread_attr_t attr;
-            pthread_attr_init(&attr);
-            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
-            if (pthread_create(&cleanup_thread, &attr, tidesdb_skip_list_free_wrapper,
-                               memtable_to_free) != 0)
-            {
-                skip_list_free(memtable_to_free);
-            }
-            pthread_attr_destroy(&attr);
+            skip_list_free(memtable_to_free);
         }
     }
 }
@@ -5331,6 +5311,7 @@ static tidesdb_level_t *tidesdb_level_create(const int level_num, size_t capacit
     atomic_init(&level->sstables_capacity, TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY);
     atomic_init(&level->num_boundaries, 0);
     atomic_init(&level->retired_sstables_arr, NULL);
+    atomic_init(&level->array_readers, 0);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Level %d created with capacity %zu", level_num, capacity);
 
@@ -5427,7 +5408,13 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
 
                 tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
                     &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
-                free(prev_retired);
+                if (prev_retired)
+                {
+                    while (atomic_load_explicit(&level->array_readers, memory_order_acquire) > 0)
+                    {
+                    }
+                    free(prev_retired);
+                }
 
                 return TDB_SUCCESS;
             }
@@ -5469,7 +5456,13 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
 
                 tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
                     &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
-                free(prev_retired);
+                if (prev_retired)
+                {
+                    while (atomic_load_explicit(&level->array_readers, memory_order_acquire) > 0)
+                    {
+                    }
+                    free(prev_retired);
+                }
 
                 return TDB_SUCCESS;
             }
@@ -5552,7 +5545,13 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
 
             tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
                 &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
-            free(prev_retired);
+            if (prev_retired)
+            {
+                while (atomic_load_explicit(&level->array_readers, memory_order_acquire) > 0)
+                {
+                }
+                free(prev_retired);
+            }
 
             return TDB_SUCCESS;
         }
@@ -11048,6 +11047,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 /* we load array pointer and count with careful ordering to handle concurrent
                  * modifications re-load count to detect concurrent remove, use minimum to avoid OOB
                  */
+                atomic_fetch_add_explicit(&lvl->array_readers, 1, memory_order_seq_cst);
+
                 tidesdb_sstable_t **ssts =
                     atomic_load_explicit(&lvl->sstables, memory_order_acquire);
                 int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
@@ -11097,6 +11098,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                         }
                     }
                 }
+
+                atomic_fetch_sub_explicit(&lvl->array_readers, 1, memory_order_release);
             }
         }
         pthread_rwlock_unlock(&db->cf_list_lock);
@@ -14314,6 +14317,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         PROFILE_INC(txn->db, levels_searched);
         tidesdb_level_t *level = cf->levels[level_num];
 
+        atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_seq_cst);
+
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
@@ -14355,6 +14360,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
              * containing the merged sstable, so we must retry the entire level */
             if (!tidesdb_sstable_try_ref(sst))
             {
+                atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
                 goto retry_level;
             }
 
@@ -14383,6 +14389,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                         {
                             tidesdb_kv_pair_free(candidate_kv);
                             tidesdb_sstable_unref(cf->db, sst);
+                            atomic_fetch_sub_explicit(&level->array_readers, 1,
+                                                      memory_order_release);
                             return TDB_ERR_MEMORY;
                         }
                         memcpy(*value, candidate_kv->value, candidate_kv->entry.value_size);
@@ -14392,11 +14400,13 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
                         tidesdb_kv_pair_free(candidate_kv);
                         tidesdb_sstable_unref(cf->db, sst);
+                        atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
                         return TDB_SUCCESS;
                     }
 
                     tidesdb_kv_pair_free(candidate_kv);
                     tidesdb_sstable_unref(cf->db, sst);
+                    atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
                     return TDB_ERR_NOT_FOUND;
                 }
 
@@ -14405,6 +14415,8 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
 
             tidesdb_sstable_unref(cf->db, sst);
         }
+
+        atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
     }
 
     return TDB_ERR_NOT_FOUND;
@@ -14753,6 +14765,8 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
 
         /* we load array pointer and count with careful ordering to handle concurrent modifications
          * re-load count to detect concurrent remove, use minimum to avoid OOB */
+        atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_seq_cst);
+
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_sstables = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
@@ -14797,12 +14811,15 @@ static int tidesdb_txn_check_sstable_conflict(tidesdb_t *db, tidesdb_column_fami
                 if (found_seq > threshold_seq)
                 {
                     tidesdb_sstable_unref(db, sst);
+                    atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
                     return 1;
                 }
             }
 
             tidesdb_sstable_unref(db, sst);
         }
+
+        atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
     }
 
     /** conflict if we found any version with seq > threshold */
@@ -15915,6 +15932,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
         retry_level:;
             /* we load array pointer and count with careful ordering to handle concurrent
              * modifications re-load count to detect concurrent remove, use minimum to avoid OOB */
+            atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_seq_cst);
+
             tidesdb_sstable_t **sstables =
                 atomic_load_explicit(&level->sstables, memory_order_acquire);
             int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
@@ -15997,6 +16016,8 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                 }
                 ssts_array[sst_count++] = sst;
             }
+
+            atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
 
             if (!ssts_array) break; /* allocation failed */
             if (need_retry) goto retry_level;
@@ -16092,6 +16113,8 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
         if (!level) continue;
 
     retry_level:;
+        atomic_fetch_add_explicit(&level->array_readers, 1, memory_order_seq_cst);
+
         tidesdb_sstable_t **sstables = atomic_load_explicit(&level->sstables, memory_order_acquire);
         int num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
@@ -16106,7 +16129,11 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
             sstables = sstables_check;
             num_ssts = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         }
-        if (num_ssts == 0) continue;
+        if (num_ssts == 0)
+        {
+            atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
+            continue;
+        }
 
         const int sst_count_before_level = sst_count;
         int need_retry = 0;
@@ -16144,12 +16171,15 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
                     for (int k = 0; k < sst_count; k++)
                         tidesdb_sstable_unref(cf->db, ssts_array[k]);
                     free(ssts_array);
+                    atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
                     return TDB_ERR_MEMORY;
                 }
                 ssts_array = new_array;
                 ssts_array[sst_count++] = sst;
             }
         }
+
+        atomic_fetch_sub_explicit(&level->array_readers, 1, memory_order_release);
 
         if (need_retry) goto retry_level;
     }

@@ -19030,6 +19030,600 @@ static void test_txn_reset_with_repeatable_read(void)
     cleanup_test_dir();
 }
 
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int thread_id;
+    int num_keys;       /* total shared key space */
+    int num_ops;        /* ops per thread */
+    int use_large_vals; /* 1 = large values (vlog), 0 = small (inline) */
+    _Atomic(int) *commit_ok;
+    _Atomic(int) *commit_fail;
+    _Atomic(int) *started;
+    _Atomic(int) *go;
+} mt_mixed_rw_thread_data_t;
+
+static void *mt_mixed_rw_writer_thread(void *arg)
+{
+    mt_mixed_rw_thread_data_t *data = (mt_mixed_rw_thread_data_t *)arg;
+
+    /* signal ready and wait for go */
+    atomic_fetch_add(data->started, 1);
+    while (!atomic_load(data->go))
+    {
+        /* spin */
+    }
+
+    for (int op = 0; op < data->num_ops; op++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(data->db, &txn) != 0)
+        {
+            atomic_fetch_add(data->commit_fail, 1);
+            continue;
+        }
+
+        int key_idx = (data->thread_id + op) % data->num_keys;
+        char key[64];
+        snprintf(key, sizeof(key), "shared_key_%06d", key_idx);
+
+        uint8_t *old_val = NULL;
+        size_t old_size = 0;
+        tidesdb_txn_get(txn, data->cf, (uint8_t *)key, strlen(key) + 1, &old_val, &old_size);
+        if (old_val) free(old_val);
+
+        int is_large = data->use_large_vals || ((op % 3) == 0);
+        size_t val_size = is_large ? 1024 : 64;
+        uint8_t *val = malloc(val_size);
+        memset(val, 'A' + (data->thread_id % 26), val_size);
+        snprintf((char *)val, val_size, "t%d_op%d_v%zu", data->thread_id, op, val_size);
+
+        int put_rc =
+            tidesdb_txn_put(txn, data->cf, (uint8_t *)key, strlen(key) + 1, val, val_size, 0);
+        free(val);
+
+        if (put_rc != 0)
+        {
+            atomic_fetch_add(data->commit_fail, 1);
+            tidesdb_txn_free(txn);
+            continue;
+        }
+
+        char unique_key[64];
+        snprintf(unique_key, sizeof(unique_key), "uniq_t%d_op%d", data->thread_id, op);
+        size_t uval_size = is_large ? 2048 : 128;
+        uint8_t *uval = malloc(uval_size);
+        memset(uval, 'B' + (data->thread_id % 26), uval_size);
+        snprintf((char *)uval, uval_size, "unique_t%d_op%d", data->thread_id, op);
+
+        tidesdb_txn_put(txn, data->cf, (uint8_t *)unique_key, strlen(unique_key) + 1, uval,
+                        uval_size, 0);
+        free(uval);
+
+        int commit_rc = tidesdb_txn_commit(txn);
+        if (commit_rc == 0)
+        {
+            atomic_fetch_add(data->commit_ok, 1);
+        }
+        else
+        {
+            atomic_fetch_add(data->commit_fail, 1);
+        }
+
+        tidesdb_txn_free(txn);
+    }
+
+    return NULL;
+}
+
+static void *mt_mixed_rw_reader_thread(void *arg)
+{
+    mt_mixed_rw_thread_data_t *data = (mt_mixed_rw_thread_data_t *)arg;
+
+    /* signal ready and wait for go */
+    atomic_fetch_add(data->started, 1);
+    while (!atomic_load(data->go))
+    {
+        /* spin */
+    }
+
+    for (int op = 0; op < data->num_ops; op++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(data->db, &txn) != 0)
+        {
+            continue;
+        }
+
+        int key_idx = (data->thread_id + op) % data->num_keys;
+        char key[64];
+        snprintf(key, sizeof(key), "shared_key_%06d", key_idx);
+
+        uint8_t *val = NULL;
+        size_t val_size = 0;
+        tidesdb_txn_get(txn, data->cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size);
+        if (val) free(val);
+
+        tidesdb_txn_free(txn);
+    }
+
+    return NULL;
+}
+
+static void test_concurrent_txn_commit_sequence_race(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    cf_config.write_buffer_size = 4 * 1024; /* 4KB */
+    cf_config.compression_algorithm = TDB_COMPRESS_LZ4;
+    cf_config.enable_bloom_filter = 1;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "race_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "race_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int NUM_WRITERS = 8;
+    const int NUM_READERS = 8;
+    const int NUM_SHARED_KEYS = 50;
+    const int OPS_PER_WRITER = 100;
+    const int OPS_PER_READER = 200;
+
+    printf("  concurrent txn commit race test\n");
+    printf("  writers: %d, readers: %d, shared keys: %d, ops/writer: %d\n", NUM_WRITERS,
+           NUM_READERS, NUM_SHARED_KEYS, OPS_PER_WRITER);
+
+    _Atomic(int) commit_ok = 0;
+    _Atomic(int) commit_fail = 0;
+    _Atomic(int) started = 0;
+    _Atomic(int) go = 0;
+
+    pthread_t writers[8];
+    pthread_t readers[8];
+    mt_mixed_rw_thread_data_t writer_data[8];
+    mt_mixed_rw_thread_data_t reader_data[8];
+
+    /* launch all writers */
+    for (int i = 0; i < NUM_WRITERS; i++)
+    {
+        writer_data[i].db = db;
+        writer_data[i].cf = cf;
+        writer_data[i].thread_id = i;
+        writer_data[i].num_keys = NUM_SHARED_KEYS;
+        writer_data[i].num_ops = OPS_PER_WRITER;
+        writer_data[i].use_large_vals = (i % 2); /* half use large vals (vlog) */
+        writer_data[i].commit_ok = &commit_ok;
+        writer_data[i].commit_fail = &commit_fail;
+        writer_data[i].started = &started;
+        writer_data[i].go = &go;
+        pthread_create(&writers[i], NULL, mt_mixed_rw_writer_thread, &writer_data[i]);
+    }
+
+    /* launch all readers */
+    for (int i = 0; i < NUM_READERS; i++)
+    {
+        reader_data[i].db = db;
+        reader_data[i].cf = cf;
+        reader_data[i].thread_id = NUM_WRITERS + i;
+        reader_data[i].num_keys = NUM_SHARED_KEYS;
+        reader_data[i].num_ops = OPS_PER_READER;
+        reader_data[i].use_large_vals = 0;
+        reader_data[i].commit_ok = &commit_ok;
+        reader_data[i].commit_fail = &commit_fail;
+        reader_data[i].started = &started;
+        reader_data[i].go = &go;
+        pthread_create(&readers[i], NULL, mt_mixed_rw_reader_thread, &reader_data[i]);
+    }
+
+    while (atomic_load(&started) < NUM_WRITERS + NUM_READERS)
+    {
+        usleep(1000);
+    }
+    atomic_store(&go, 1);
+
+    for (int i = 0; i < NUM_WRITERS; i++)
+    {
+        pthread_join(writers[i], NULL);
+    }
+    for (int i = 0; i < NUM_READERS; i++)
+    {
+        pthread_join(readers[i], NULL);
+    }
+
+    int final_ok = atomic_load(&commit_ok);
+    int final_fail = atomic_load(&commit_fail);
+    int total_attempted = NUM_WRITERS * OPS_PER_WRITER;
+
+    printf("  results: %d/%d commits succeeded, %d failed\n", final_ok, total_attempted,
+           final_fail);
+
+    if (final_fail > 0)
+    {
+        printf(BOLDRED "  BUG: %d commits failed (likely sequence validation race)\n" RESET,
+               final_fail);
+    }
+    ASSERT_EQ(final_fail, 0);
+    ASSERT_EQ(final_ok, total_attempted);
+
+    printf("  verifying data integrity post-test...\n");
+    tidesdb_txn_t *verify_txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &verify_txn), 0);
+
+    int found = 0;
+    for (int k = 0; k < NUM_SHARED_KEYS; k++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "shared_key_%06d", k);
+        uint8_t *val = NULL;
+        size_t val_size = 0;
+        if (tidesdb_txn_get(verify_txn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0)
+        {
+            found++;
+            free(val);
+        }
+    }
+    printf("  found %d/%d shared keys\n", found, NUM_SHARED_KEYS);
+    ASSERT_TRUE(found > 0);
+
+    tidesdb_txn_free(verify_txn);
+
+    int num_levels = atomic_load(&cf->num_active_levels);
+    printf("  active levels: %d\n", num_levels);
+    for (int i = 0; i < num_levels && i < 10; i++)
+    {
+        if (cf->levels[i])
+        {
+            printf("  level %d: %d sstables, size=%zu\n", i,
+                   atomic_load(&cf->levels[i]->num_sstables),
+                   (size_t)atomic_load(&cf->levels[i]->current_size));
+        }
+    }
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+typedef struct
+{
+    tidesdb_t *db;
+    tidesdb_column_family_t *cf;
+    int thread_id;
+    int num_ops;
+    _Atomic(int) *commit_errors;
+    _Atomic(int) *commits_ok;
+    _Atomic(int) *reads_ok;
+    _Atomic(int) *reads_miss;
+    _Atomic(int) *go;
+    _Atomic(int) *stop;
+} unified_stress_data_t;
+
+static void *unified_writer_thread(void *arg)
+{
+    unified_stress_data_t *d = (unified_stress_data_t *)arg;
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
+
+    for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        if (tidesdb_txn_begin(d->db, &txn) != 0)
+        {
+            atomic_fetch_add(d->commit_errors, 1);
+            continue;
+        }
+
+        char key[64];
+        if (i % 4 == 0)
+        {
+            snprintf(key, sizeof(key), "shared_%06d", i % 40);
+        }
+        else
+        {
+            snprintf(key, sizeof(key), "uniq_t%d_%06d", d->thread_id, i);
+        }
+
+        /* alternate vlog-sized (>=512) and inline values to stress both paths
+         * vlog values also force value-log reads during compaction merge */
+        size_t val_size;
+        switch (i % 4)
+        {
+            case 0:
+                val_size = 1024;
+                break; /* 1KB vlog */
+            case 1:
+                val_size = 48;
+                break; /* inline */
+            case 2:
+                val_size = 768;
+                break; /* vlog */
+            case 3:
+                val_size = 96;
+                break; /* inline */
+        }
+        uint8_t *val = malloc(val_size);
+        memset(val, 'A' + (d->thread_id % 26), val_size);
+        snprintf((char *)val, val_size, "t%d_i%d_v%zu", d->thread_id, i, val_size);
+
+        tidesdb_txn_put(txn, d->cf, (uint8_t *)key, strlen(key) + 1, val, val_size, 0);
+        free(val);
+
+        /* interleave deletes on shared keys to create tombstones across levels */
+        if (i % 15 == 14)
+        {
+            char del_key[64];
+            snprintf(del_key, sizeof(del_key), "shared_%06d", (i + 7) % 40);
+            tidesdb_txn_delete(txn, d->cf, (uint8_t *)del_key, strlen(del_key) + 1);
+        }
+
+        if (tidesdb_txn_commit(txn) != 0)
+        {
+            atomic_fetch_add(d->commit_errors, 1);
+        }
+        else
+        {
+            atomic_fetch_add(d->commits_ok, 1);
+        }
+        tidesdb_txn_free(txn);
+    }
+    return NULL;
+}
+
+static void *unified_reader_thread(void *arg)
+{
+    unified_stress_data_t *d = (unified_stress_data_t *)arg;
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
+
+    for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        tidesdb_isolation_level_t iso;
+        switch (i % 4)
+        {
+            case 0:
+                iso = TDB_ISOLATION_REPEATABLE_READ;
+                break;
+            case 1:
+                iso = TDB_ISOLATION_READ_COMMITTED;
+                break;
+            case 2:
+                iso = TDB_ISOLATION_SNAPSHOT;
+                break;
+            default:
+                iso = TDB_ISOLATION_READ_UNCOMMITTED;
+                break;
+        }
+        if (tidesdb_txn_begin_with_isolation(d->db, iso, &txn) != 0) continue;
+
+        for (int k = 0; k < 8; k++)
+        {
+            char key[64];
+            if (k < 3)
+            {
+                /* shared keys: likely in active memtable or recently rotated immutable */
+                snprintf(key, sizeof(key), "shared_%06d", (i * 3 + k) % 40);
+            }
+            else
+            {
+                int t = (i + k) % 6;
+                snprintf(key, sizeof(key), "uniq_t%d_%06d", t, (i * 5 + k) % 200);
+            }
+
+            uint8_t *val = NULL;
+            size_t val_size = 0;
+            if (tidesdb_txn_get(txn, d->cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0)
+            {
+                atomic_fetch_add(d->reads_ok, 1);
+                free(val);
+            }
+            else
+            {
+                atomic_fetch_add(d->reads_miss, 1);
+            }
+        }
+        tidesdb_txn_free(txn);
+    }
+    return NULL;
+}
+
+static void *unified_compactor_thread(void *arg)
+{
+    unified_stress_data_t *d = (unified_stress_data_t *)arg;
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
+
+    for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
+    {
+        tidesdb_compact(d->cf);
+        usleep(15000);
+    }
+    return NULL;
+}
+
+static void *unified_flusher_thread(void *arg)
+{
+    unified_stress_data_t *d = (unified_stress_data_t *)arg;
+    while (!atomic_load(d->go))
+    { /* spin */
+    }
+
+    for (int i = 0; i < d->num_ops && !atomic_load(d->stop); i++)
+    {
+        tidesdb_flush_memtable(d->cf);
+        usleep(10000); /* 10ms */
+    }
+    return NULL;
+}
+
+static void test_stress_unified_read_races(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    cf_config.write_buffer_size = 1024;
+    cf_config.level_size_ratio = 4;
+    cf_config.min_levels = 4;
+    cf_config.compression_algorithm = TDB_COMPRESS_LZ4;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.klog_value_threshold = 512;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "stress_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "stress_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    const int NUM_WRITERS = 6;
+    const int NUM_READERS = 6;
+    const int NUM_COMPACTORS = 2;
+    const int NUM_FLUSHERS = 2;
+    const int OPS_PER_WRITER = 2000;
+    const int OPS_PER_READER = 1050;
+    const int OPS_PER_COMPACTOR = 20;
+    const int OPS_PER_FLUSHER = 30;
+
+    _Atomic(int) commit_errors = 0, commits_ok = 0;
+    _Atomic(int) reads_ok = 0, reads_miss = 0;
+    _Atomic(int) go = 0, stop = 0;
+
+    pthread_t writers[6], readers[6], compactors[2], flushers[2];
+    unified_stress_data_t w_data[6], r_data[6], c_data[2], f_data[2];
+
+    for (int i = 0; i < NUM_WRITERS; i++)
+    {
+        w_data[i] = (unified_stress_data_t){
+            db,        cf,          i,   OPS_PER_WRITER, &commit_errors, &commits_ok,
+            &reads_ok, &reads_miss, &go, &stop};
+        pthread_create(&writers[i], NULL, unified_writer_thread, &w_data[i]);
+    }
+    for (int i = 0; i < NUM_READERS; i++)
+    {
+        r_data[i] = (unified_stress_data_t){db,
+                                            cf,
+                                            NUM_WRITERS + i,
+                                            OPS_PER_READER,
+                                            &commit_errors,
+                                            &commits_ok,
+                                            &reads_ok,
+                                            &reads_miss,
+                                            &go,
+                                            &stop};
+        pthread_create(&readers[i], NULL, unified_reader_thread, &r_data[i]);
+    }
+    for (int i = 0; i < NUM_COMPACTORS; i++)
+    {
+        c_data[i] = (unified_stress_data_t){
+            db,          cf,  90 + i, OPS_PER_COMPACTOR, &commit_errors, &commits_ok, &reads_ok,
+            &reads_miss, &go, &stop};
+        pthread_create(&compactors[i], NULL, unified_compactor_thread, &c_data[i]);
+    }
+    for (int i = 0; i < NUM_FLUSHERS; i++)
+    {
+        f_data[i] = (unified_stress_data_t){
+            db,          cf,  95 + i, OPS_PER_FLUSHER, &commit_errors, &commits_ok, &reads_ok,
+            &reads_miss, &go, &stop};
+        pthread_create(&flushers[i], NULL, unified_flusher_thread, &f_data[i]);
+    }
+
+    /* we release all threads simultaneously */
+    atomic_store(&go, 1);
+
+    for (int i = 0; i < NUM_WRITERS; i++) pthread_join(writers[i], NULL);
+    /* writers done -- we signal stop so readers/compactors/flushers wind down */
+    atomic_store(&stop, 1);
+    for (int i = 0; i < NUM_READERS; i++) pthread_join(readers[i], NULL);
+    for (int i = 0; i < NUM_COMPACTORS; i++) pthread_join(compactors[i], NULL);
+    for (int i = 0; i < NUM_FLUSHERS; i++) pthread_join(flushers[i], NULL);
+
+    int final_commit_errors = atomic_load(&commit_errors);
+    int final_commits = atomic_load(&commits_ok);
+    int final_reads = atomic_load(&reads_ok);
+    int final_misses = atomic_load(&reads_miss);
+
+    printf("  unified stress results:\n");
+    printf("    commits: %d ok, %d errors\n", final_commits, final_commit_errors);
+    printf("    reads: %d found, %d miss\n", final_reads, final_misses);
+
+    /* we drain flush queue before inspecting levels */
+    for (int i = 0; i < 200; i++)
+    {
+        int flushing = atomic_load(&cf->is_flushing);
+        int compacting = atomic_load(&cf->is_compacting);
+        size_t fq = queue_size(db->flush_queue);
+        if (!flushing && !compacting && fq == 0) break;
+        usleep(50000);
+    }
+
+    /* final compaction pass to push data deep and exercise DCA */
+    tidesdb_compact(cf);
+    for (int i = 0; i < 100; i++)
+    {
+        if (!atomic_load(&cf->is_compacting)) break;
+        usleep(50000);
+    }
+
+    int num_levels = atomic_load(&cf->num_active_levels);
+    printf("    active levels: %d\n", num_levels);
+    int total_ssts = 0;
+    for (int i = 0; i < num_levels && i < TDB_MAX_LEVELS; i++)
+    {
+        if (cf->levels[i])
+        {
+            int n = atomic_load(&cf->levels[i]->num_sstables);
+            total_ssts += n;
+            printf("    L%d: %d ssts, cap=%zu, size=%zu\n", i, n,
+                   (size_t)atomic_load(&cf->levels[i]->capacity),
+                   (size_t)atomic_load(&cf->levels[i]->current_size));
+        }
+    }
+    printf("    total sstables: %d\n", total_ssts);
+
+    ASSERT_EQ(final_commit_errors, 0);
+
+    tidesdb_txn_t *vtxn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &vtxn), 0);
+    int found_shared = 0, found_unique = 0;
+
+    for (int k = 0; k < 40; k++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "shared_%06d", k);
+        uint8_t *val = NULL;
+        size_t val_size = 0;
+        if (tidesdb_txn_get(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0)
+        {
+            found_shared++;
+            free(val);
+        }
+    }
+    for (int t = 0; t < NUM_WRITERS; t++)
+    {
+        for (int k = 1; k < OPS_PER_WRITER; k += 20)
+        {
+            char key[64];
+            snprintf(key, sizeof(key), "uniq_t%d_%06d", t, k);
+            uint8_t *val = NULL;
+            size_t val_size = 0;
+            if (tidesdb_txn_get(vtxn, cf, (uint8_t *)key, strlen(key) + 1, &val, &val_size) == 0)
+            {
+                found_unique++;
+                free(val);
+            }
+        }
+    }
+    tidesdb_txn_free(vtxn);
+    printf("    verified: %d/40 shared keys, %d unique keys\n", found_shared, found_unique);
+    ASSERT_TRUE(found_shared > 0);
+    ASSERT_TRUE(found_unique > 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -19311,6 +19905,8 @@ int main(void)
     RUN_TEST(test_txn_reset_reuse_loop, tests_passed);
     RUN_TEST(test_txn_reset_invalid_args, tests_passed);
     RUN_TEST(test_txn_reset_with_repeatable_read, tests_passed);
+    RUN_TEST(test_concurrent_txn_commit_sequence_race, tests_passed);
+    RUN_TEST(test_stress_unified_read_races, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

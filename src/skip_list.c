@@ -227,10 +227,10 @@ static inline int skip_list_version_is_invalid_with_time(skip_list_version_t *ve
 
 /**
  * skip_list_validate_sequence
- * validates that new sequence number is greater than existing version
+ * validates that new sequence number does not duplicate an existing version
  * @param existing_version existing version to check against
  * @param new_seq new sequence number
- * @return 0 if valid (new_seq > existing), -1 if invalid
+ * @return 0 if valid (new_seq != existing), -1 if duplicate
  */
 static inline int skip_list_validate_sequence(skip_list_version_t *existing_version,
                                               uint64_t new_seq)
@@ -238,47 +238,99 @@ static inline int skip_list_validate_sequence(skip_list_version_t *existing_vers
     if (existing_version != NULL)
     {
         uint64_t existing_seq = atomic_load_explicit(&existing_version->seq, memory_order_acquire);
-        if (new_seq <= existing_seq) return -1;
+        if (new_seq == existing_seq) return -1;
     }
     return 0;
 }
 
 /**
  * skip_list_insert_version_cas
- * inserts a new version at the head of a version chain using CAS loop
+ * inserts a new version into a version chain maintaining descending seq order
+ * handles out-of-order arrivals from concurrent transaction commits by inserting
+ * at the correct position in the chain rather than only at the head
  * @param versions_ptr pointer to atomic version list head
  * @param new_version version to insert
  * @param seq sequence number (for validation)
  * @param list skip list (for total_size update)
  * @param value_size size of new value
- * @return 0 on success, -1 on failure
+ * @return 0 on success, -1 on failure (duplicate seq)
  */
 static int skip_list_insert_version_cas(_Atomic(skip_list_version_t *) *versions_ptr,
                                         skip_list_version_t *new_version, const uint64_t seq,
                                         skip_list_t *list, size_t value_size)
 {
     skip_list_version_t *old_head;
-    do
+    while (1)
     {
         old_head = atomic_load_explicit(versions_ptr, memory_order_acquire);
 
-        if (skip_list_validate_sequence(old_head, seq) != 0)
+        if (old_head == NULL || seq > atomic_load_explicit(&old_head->seq, memory_order_acquire))
         {
+            /* normal case -- new version is newest, prepend at head */
+            atomic_store_explicit(&new_version->next, old_head, memory_order_relaxed);
+            if (atomic_compare_exchange_weak_explicit(versions_ptr, &old_head, new_version,
+                                                      memory_order_release, memory_order_acquire))
+            {
+                /* head prepend succeeded -- update total_size, subtract old head, add new */
+                if (old_head && old_head->value_size > 0)
+                {
+                    atomic_fetch_sub_explicit(&list->total_size, old_head->value_size,
+                                              memory_order_relaxed);
+                }
+                atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
+                return 0;
+            }
+            /* CAS failed, retry from top */
+            continue;
+        }
+
+        uint64_t head_seq = atomic_load_explicit(&old_head->seq, memory_order_acquire);
+        if (seq == head_seq)
+        {
+            /* duplicate sequence -- reject */
             skip_list_free_version(new_version);
             return -1;
         }
 
-        atomic_store_explicit(&new_version->next, old_head, memory_order_relaxed);
-    } while (!atomic_compare_exchange_weak_explicit(versions_ptr, &old_head, new_version,
-                                                    memory_order_release, memory_order_acquire));
+        /* out-of-order arrival -- walk chain to find correct insertion point
+         * chain is descending by seq, so find first node where next->seq < seq
+         * then insert between current and next.
+         * for out-of-order inserts we cannot use head CAS, so we retry from the top
+         * if the head changed. we insert by splicing into the chain. */
+        skip_list_version_t *prev = old_head;
+        skip_list_version_t *curr = atomic_load_explicit(&prev->next, memory_order_acquire);
 
-    /* we update total_size, subtract old, add new */
-    if (old_head && old_head->value_size > 0)
-    {
-        atomic_fetch_sub_explicit(&list->total_size, old_head->value_size, memory_order_relaxed);
+        while (curr != NULL)
+        {
+            uint64_t curr_seq = atomic_load_explicit(&curr->seq, memory_order_acquire);
+            if (seq == curr_seq)
+            {
+                /* duplicate in chain */
+                skip_list_free_version(new_version);
+                return -1;
+            }
+            if (seq > curr_seq)
+            {
+                break; /* insert between prev and curr */
+            }
+            prev = curr;
+            curr = atomic_load_explicit(&prev->next, memory_order_acquire);
+        }
+
+        /* splice new_version between prev and curr */
+        atomic_store_explicit(&new_version->next, curr, memory_order_relaxed);
+        skip_list_version_t *expected_curr = curr;
+        if (!atomic_compare_exchange_strong_explicit(&prev->next, &expected_curr, new_version,
+                                                     memory_order_release, memory_order_acquire))
+        {
+            /* chain was modified concurrently, retry from top */
+            continue;
+        }
+
+        /* successfully inserted in middle/tail -- update total_size */
+        atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
+        return 0;
     }
-    atomic_fetch_add_explicit(&list->total_size, value_size, memory_order_relaxed);
-    return 0;
 }
 
 int skip_list_comparator_memcmp(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
@@ -764,24 +816,13 @@ int skip_list_delete(skip_list_t *list, const uint8_t *key, const size_t key_siz
     int cmp = skip_list_compare_keys_inline(list, target->key, target->key_size, key, key_size);
     if (cmp != 0) return 0;
 
-    skip_list_version_t *latest = atomic_load_explicit(&target->versions, memory_order_acquire);
-    if (skip_list_validate_sequence(latest, seq) != 0) return -1;
-
     skip_list_version_t *tombstone = skip_list_create_version(NULL, 0, -1, 1, seq);
     if (tombstone == NULL) return -1;
 
-    skip_list_version_t *old_head;
-    do
+    if (skip_list_insert_version_cas(&target->versions, tombstone, seq, list, 0) != 0)
     {
-        old_head = atomic_load_explicit(&target->versions, memory_order_acquire);
-        if (skip_list_validate_sequence(old_head, seq) != 0)
-        {
-            skip_list_free_version(tombstone);
-            return -1;
-        }
-        atomic_store_explicit(&tombstone->next, old_head, memory_order_relaxed);
-    } while (!atomic_compare_exchange_weak_explicit(&target->versions, &old_head, tombstone,
-                                                    memory_order_release, memory_order_acquire));
+        return -1;
+    }
     return 0;
 }
 

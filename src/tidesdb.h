@@ -457,6 +457,7 @@ struct tidesdb_sstable_t
  * @param boundary_sizes sizes of boundary keys
  * @param num_boundaries number of boundaries
  * @param retired_sstables_arr array of retired sstables (mainly TOCTOU protection)
+ * @param array_readers count of concurrent readers accessing sstable array
  */
 struct tidesdb_level_t
 {
@@ -470,6 +471,7 @@ struct tidesdb_level_t
     _Atomic(size_t *) boundary_sizes;
     _Atomic(int) num_boundaries;
     _Atomic(tidesdb_sstable_t **) retired_sstables_arr;
+    _Atomic(int) array_readers;
 };
 
 /**
@@ -493,8 +495,8 @@ struct tidesdb_level_t
  * @param sync_thread_active atomic flag indicating if sync thread is active
  * @param sync_thread_mutex mutex for sync thread
  * @param sync_thread_cond condition variable for sync thread
- * @param reaper_thread background thread for evicting most un-accessed sstables
- * @param reaper_thread_active atomic flag indicating if reaper thread is active
+ * @param sstable_reaper_thread background thread for evicting most un-accessed sstables
+ * @param sstable_reaper_active atomic flag indicating if reaper thread is active
  * @param reaper_thread_mutex mutex for reaper thread
  * @param reaper_thread_cond condition variable for reaper thread
  * @param clock_cache clock cache for hot sstable blocks

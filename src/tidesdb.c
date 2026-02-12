@@ -953,7 +953,6 @@ static tidesdb_kv_pair_t *tidesdb_kv_pair_create(const uint8_t *key, size_t key_
                                                  const uint8_t *value, size_t value_size,
                                                  time_t ttl, uint64_t seq, int is_tombstone);
 static void tidesdb_kv_pair_free(tidesdb_kv_pair_t *kv);
-static tidesdb_kv_pair_t *tidesdb_kv_pair_clone(const tidesdb_kv_pair_t *kv);
 static int tidesdb_iter_kv_visible(tidesdb_iter_t *iter, tidesdb_kv_pair_t *kv);
 static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst);
 static int wait_for_open(tidesdb_t *db);
@@ -18678,7 +18677,10 @@ static int tidesdb_backup_copy_file(const char *src_path, const char *dst_path)
     FILE *src = tdb_fopen(src_path, "rb");
     if (!src)
     {
-        if (errno == ENOENT) return TDB_SUCCESS;
+        /* ENOENT: file was deleted between readdir/stat and fopen
+         * EACCES: on Windows, file may be in NTFS "delete pending" state
+         *         from concurrent compaction -- treat as transient */
+        if (errno == ENOENT || errno == EACCES) return TDB_SUCCESS;
         return TDB_ERR_IO;
     }
 
@@ -18758,7 +18760,7 @@ static int tidesdb_backup_copy_dir(const char *src_dir, const char *dst_dir,
         struct STAT_STRUCT src_st;
         if (STAT_FUNC(src_path, &src_st) != 0)
         {
-            if (errno != ENOENT) result = TDB_ERR_IO;
+            if (errno != ENOENT && errno != EACCES) result = TDB_ERR_IO;
             free(src_path);
             free(dst_path);
             if (result != TDB_SUCCESS) break;
@@ -19047,7 +19049,7 @@ static int tidesdb_clone_copy_cf_dir(const char *src_dir, const char *dst_dir)
         struct STAT_STRUCT src_st;
         if (STAT_FUNC(src_path, &src_st) != 0)
         {
-            if (errno != ENOENT) result = TDB_ERR_IO;
+            if (errno != ENOENT && errno != EACCES) result = TDB_ERR_IO;
             free(src_path);
             free(dst_path);
             if (result != TDB_SUCCESS) break;

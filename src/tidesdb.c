@@ -1017,7 +1017,8 @@ static void tidesdb_cache_evict_block(void *payload, const size_t payload_len)
 {
     if (!payload || payload_len != sizeof(tidesdb_ref_counted_block_t *)) return;
 
-    tidesdb_ref_counted_block_t *rc_block = *(tidesdb_ref_counted_block_t **)payload;
+    tidesdb_ref_counted_block_t *rc_block;
+    memcpy(&rc_block, payload, sizeof(rc_block));
     if (rc_block)
     {
         /* release cache's reference */
@@ -1143,7 +1144,8 @@ static tidesdb_klog_block_t *tidesdb_cache_block_get(tidesdb_t *db, const char *
     }
 
     /* we extract ref-counted block pointer */
-    tidesdb_ref_counted_block_t *rc_block = *(tidesdb_ref_counted_block_t *const *)payload;
+    tidesdb_ref_counted_block_t *rc_block;
+    memcpy(&rc_block, payload, sizeof(rc_block));
 
     /* we release cache entry ref_bit now that we've read the pointer */
     clock_cache_release(cache_entry);
@@ -1940,26 +1942,6 @@ static void tidesdb_kv_pair_free(tidesdb_kv_pair_t *kv)
     free(kv->key);
     free(kv->value);
     free(kv);
-}
-
-/**
- * tidesdb_kv_pair_clone
- * clone a KV pair
- * @param kv KV pair to clone
- * @return cloned KV pair
- */
-static tidesdb_kv_pair_t *tidesdb_kv_pair_clone(const tidesdb_kv_pair_t *kv)
-{
-    if (!kv) return NULL;
-
-    tidesdb_kv_pair_t *clone = tidesdb_kv_pair_create(
-        kv->key, kv->entry.key_size, kv->value, kv->entry.value_size, kv->entry.ttl, kv->entry.seq,
-        kv->entry.flags & TDB_KV_FLAG_TOMBSTONE);
-    if (clone)
-    {
-        clone->entry.vlog_offset = kv->entry.vlog_offset;
-    }
-    return clone;
 }
 
 /**

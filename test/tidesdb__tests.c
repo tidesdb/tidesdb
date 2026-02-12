@@ -19327,7 +19327,7 @@ static void *unified_writer_thread(void *arg)
 
         /* alternate vlog-sized (>=512) and inline values to stress both paths
          * vlog values also force value-log reads during compaction merge */
-        size_t val_size;
+        size_t val_size = 0;
         switch (i % 4)
         {
             case 0:

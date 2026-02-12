@@ -1284,6 +1284,28 @@ int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
 int tidesdb_backup(tidesdb_t *db, char *dir);
 
 /**
+ * tidesdb_checkpoint
+ * creates a lightweight checkpoint of the database using hard links for SSTable files.
+ * this is much faster than a full backup since SSTable files (which are immutable) are
+ * hard-linked rather than copied. only small metadata files (manifest, config) are copied.
+ *
+ * the checkpoint is a fully openable tidesdb database directory.
+ *
+ * algorithm:
+ *   1. for each column family: flush memtable, halt compactions
+ *   2. hard link all live SSTable files into the checkpoint directory
+ *   3. copy manifest and config files
+ *   4. resume compactions
+ *
+ * if hard linking fails (e.g., cross-filesystem), falls back to file copy.
+ *
+ * @param db database handle
+ * @param checkpoint_dir destination directory for the checkpoint (must not exist or be empty)
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir);
+
+/**
  * tidesdb_clone_column_family
  * clones an existing column family to a new column family with a different name.
  * flushes the source memtable, waits for background operations, copies all sstable files,

@@ -186,19 +186,21 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_MAX_TXN_OPS_BEFORE_BATCH  10   /* use batch methods when ops exceed this threshold */
 
 /* flush and close retry configuration */
-#define TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS         100
-#define TDB_FLUSH_ENQUEUE_BACKOFF_US           10000
-#define TDB_FLUSH_RETRY_DELAY_US               100000
-#define TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS      100
-#define TDB_CLOSE_FLUSH_WAIT_SLEEP_US          10000
-#define TDB_CLOSE_TXN_WAIT_SLEEP_US            1000
-#define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US     10000
-#define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS 100
-#define TDB_OPENING_WAIT_MAX_MS                100
-#define TDB_MAX_FFLUSH_RETRY_ATTEMPTS          5
-#define TDB_FLUSH_RETRY_BACKOFF_US             100000
-#define TDB_SHUTDOWN_BROADCAST_ATTEMPTS        10
-#define TDB_SHUTDOWN_BROADCAST_INTERVAL_US     5000
+#define TDB_FLUSH_ENQUEUE_MAX_ATTEMPTS              100
+#define TDB_FLUSH_ENQUEUE_BACKOFF_US                10000
+#define TDB_FLUSH_RETRY_DELAY_US                    100000
+#define TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS           100
+#define TDB_CLOSE_FLUSH_WAIT_SLEEP_US               10000
+#define TDB_CLOSE_TXN_WAIT_SLEEP_US                 1000
+#define TDB_COMPACTION_FLUSH_WAIT_SLEEP_US          10000
+#define TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS      100
+#define TDB_CHECKPOINT_COMPACTION_WAIT_MAX_ATTEMPTS 200
+#define TDB_CHECKPOINT_COMPACTION_WAIT_SLEEP_US     50000
+#define TDB_OPENING_WAIT_MAX_MS                     100
+#define TDB_MAX_FFLUSH_RETRY_ATTEMPTS               5
+#define TDB_FLUSH_RETRY_BACKOFF_US                  100000
+#define TDB_SHUTDOWN_BROADCAST_ATTEMPTS             10
+#define TDB_SHUTDOWN_BROADCAST_INTERVAL_US          5000
 
 /* sstable reaper thread configuration */
 #define TDB_SSTABLE_REAPER_SLEEP_US    100000
@@ -10605,102 +10607,89 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
         /* we cleanup flushed immutables from queue if they have no active readers
          * we need to keep them in queue until all reads complete to maintain MVCC correctness
-         * when force_cleanup is set, we block waiting for readers to finish */
-        queue_t *temp_queue = (should_cleanup || force_cleanup) ? queue_new() : NULL;
-        if (temp_queue)
+         * when force_cleanup is set, we block waiting for readers to finish
+         *
+         * we process items by dequeuing one at a time and immediately re-enqueuing
+         * items we want to keep. this ensures the queue is never fully drained, preventing
+         * a visibility gap where concurrent readers (tidesdb_txn_get) could see an empty
+         * immutable queue and skip searching immutable memtables entirely, losing data that
+         * hasn't been flushed to sstables yet. */
+        if (should_cleanup || force_cleanup)
         {
             int cleaned = 0;
             int force_cleaned = 0;
-            while (!queue_is_empty(cf->immutable_memtables))
+            size_t items_to_process = queue_size(cf->immutable_memtables);
+
+            for (size_t qi = 0; qi < items_to_process; qi++)
             {
                 tidesdb_immutable_memtable_t *queued_imm =
                     (tidesdb_immutable_memtable_t *)queue_dequeue(cf->immutable_memtables);
-                if (queued_imm)
+                if (!queued_imm) break;
+
+                int is_flushed = atomic_load_explicit(&queued_imm->flushed, memory_order_acquire);
+
+                /* we use atomic CAS to try claiming the last reference
+                 * if refcount is 1, try to CAS it to 0 to claim ownership for cleanup
+                 * if CAS succeeds, we own it and can free; if it fails, someone else ref'd it
+                 */
+                int expected_refcount = 1;
+                int can_cleanup = 0;
+
+                if (is_flushed)
                 {
-                    int is_flushed =
-                        atomic_load_explicit(&queued_imm->flushed, memory_order_acquire);
-
-                    /* we use atomic CAS to try claiming the last reference
-                     * if refcount is 1, try to CAS it to 0 to claim ownership for cleanup
-                     * if CAS succeeds, we own it and can free; if it fails, someone else ref'd it
-                     */
-                    int expected_refcount = 1;
-                    int can_cleanup = 0;
-
-                    if (is_flushed)
+                    /* we try to claim the last reference atomically */
+                    if (atomic_compare_exchange_strong_explicit(
+                            &queued_imm->refcount, &expected_refcount, 0, memory_order_acquire,
+                            memory_order_relaxed))
                     {
-                        /* we try to claim the last reference atomically */
-                        if (atomic_compare_exchange_strong_explicit(
-                                &queued_imm->refcount, &expected_refcount, 0, memory_order_acquire,
-                                memory_order_relaxed))
-                        {
-                            can_cleanup = 1;
-                        }
-                        else if (force_cleanup)
-                        {
-                            /* force cleanup, spin waiting for readers to finish */
-                            int64_t waited_us = 0;
-                            while (waited_us < TDB_IMMUTABLE_FORCE_CLEANUP_MAX_WAIT)
-                            {
-                                expected_refcount = 1;
-                                if (atomic_compare_exchange_strong_explicit(
-                                        &queued_imm->refcount, &expected_refcount, 0,
-                                        memory_order_acquire, memory_order_relaxed))
-                                {
-                                    can_cleanup = 1;
-                                    force_cleaned++;
-                                    break;
-                                }
-                                usleep(TDB_IMMUTABLE_FORCE_CLEANUP_SPIN_US);
-                                waited_us += TDB_IMMUTABLE_FORCE_CLEANUP_SPIN_US;
-                            }
-                            if (!can_cleanup)
-                            {
-                                TDB_DEBUG_LOG(TDB_LOG_WARN,
-                                              "CF '%s' force cleanup timed out waiting for "
-                                              "immutable refcount "
-                                              "(refcount=%d)",
-                                              cf->name,
-                                              atomic_load_explicit(&queued_imm->refcount,
-                                                                   memory_order_acquire));
-                            }
-                        }
+                        can_cleanup = 1;
                     }
-
-                    if (can_cleanup)
+                    else if (force_cleanup)
                     {
-                        /* we successfully claimed it -- safe to free
-                         * manually free since we set refcount to 0 */
-                        if (queued_imm->skip_list) skip_list_free(queued_imm->skip_list);
-                        if (queued_imm->wal) block_manager_close(queued_imm->wal);
-                        free(queued_imm);
-                        cleaned++;
-                    }
-                    else
-                    {
-                        /* keep in queue -- either not flushed or has active readers
-                         * restore refcount if we decremented it */
-                        if (is_flushed && expected_refcount == 0)
+                        /* force cleanup, spin waiting for readers to finish */
+                        int64_t waited_us = 0;
+                        while (waited_us < TDB_IMMUTABLE_FORCE_CLEANUP_MAX_WAIT)
                         {
-                            /* CAS failed after we saw refcount=1, someone else took a ref
-                             * refcount is already correct, just re-enqueue */
+                            expected_refcount = 1;
+                            if (atomic_compare_exchange_strong_explicit(
+                                    &queued_imm->refcount, &expected_refcount, 0,
+                                    memory_order_acquire, memory_order_relaxed))
+                            {
+                                can_cleanup = 1;
+                                force_cleaned++;
+                                break;
+                            }
+                            usleep(TDB_IMMUTABLE_FORCE_CLEANUP_SPIN_US);
+                            waited_us += TDB_IMMUTABLE_FORCE_CLEANUP_SPIN_US;
                         }
-                        queue_enqueue(temp_queue, queued_imm);
+                        if (!can_cleanup)
+                        {
+                            TDB_DEBUG_LOG(
+                                TDB_LOG_WARN,
+                                "CF '%s' force cleanup timed out waiting for "
+                                "immutable refcount "
+                                "(refcount=%d)",
+                                cf->name,
+                                atomic_load_explicit(&queued_imm->refcount, memory_order_acquire));
+                        }
                     }
                 }
-            }
 
-            /* we restore kept immutables back to original queue */
-            while (!queue_is_empty(temp_queue))
-            {
-                tidesdb_immutable_memtable_t *queued_imm =
-                    (tidesdb_immutable_memtable_t *)queue_dequeue(temp_queue);
-                if (queued_imm)
+                if (can_cleanup)
                 {
+                    /* we successfully claimed it -- safe to free
+                     * manually free since we set refcount to 0 */
+                    if (queued_imm->skip_list) skip_list_free(queued_imm->skip_list);
+                    if (queued_imm->wal) block_manager_close(queued_imm->wal);
+                    free(queued_imm);
+                    cleaned++;
+                }
+                else
+                {
+                    /* keep in queue -- immediately re-enqueue to avoid visibility gap */
                     queue_enqueue(cf->immutable_memtables, queued_imm);
                 }
             }
-            queue_free(temp_queue);
 
             if (cleaned > 0)
             {
@@ -18992,6 +18981,274 @@ int tidesdb_backup(tidesdb_t *db, char *dir)
     if (result != TDB_SUCCESS) return result;
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Backup completed successfully: %s", dir);
+    return TDB_SUCCESS;
+}
+
+/**
+ * tidesdb_checkpoint_link_or_copy
+ * try to hard link a file, falling back to copy if hard linking fails
+ * (e.g., cross-filesystem)
+ * @param src source file path
+ * @param dst destination file path
+ * @return TDB_SUCCESS on success, error code on failure
+ */
+static int tidesdb_checkpoint_link_or_copy(const char *src, const char *dst)
+{
+    if (tdb_hardlink(src, dst) == 0)
+    {
+        return TDB_SUCCESS;
+    }
+
+    return tidesdb_backup_copy_file(src, dst);
+}
+
+/**
+ * tidesdb_checkpoint_ensure_parent_dir
+ * ensure the parent directory of a file path exists, creating it recursively if needed
+ * @param file_path the file path whose parent directory should exist
+ * @return TDB_SUCCESS on success, TDB_ERR_IO on failure
+ */
+static int tidesdb_checkpoint_ensure_parent_dir(const char *file_path)
+{
+    if (!file_path) return TDB_ERR_INVALID_ARGS;
+
+    char *path_copy = tdb_strdup(file_path);
+    if (!path_copy) return TDB_ERR_MEMORY;
+
+    /* we walk from the end to find each directory component and create it */
+    for (char *p = path_copy + 1; *p; p++)
+    {
+        if (*p == PATH_SEPARATOR[0])
+        {
+            *p = '\0';
+            struct STAT_STRUCT st;
+            if (STAT_FUNC(path_copy, &st) != 0)
+            {
+                if (mkdir(path_copy, TDB_DIR_PERMISSIONS) != 0 && errno != EEXIST)
+                {
+                    free(path_copy);
+                    return TDB_ERR_IO;
+                }
+            }
+            *p = PATH_SEPARATOR[0];
+        }
+    }
+
+    free(path_copy);
+    return TDB_SUCCESS;
+}
+
+int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir)
+{
+    if (!db || !checkpoint_dir) return TDB_ERR_INVALID_ARGS;
+
+    const int wait_result = wait_for_open(db);
+    if (wait_result != TDB_SUCCESS) return wait_result;
+
+    if (strcmp(db->db_path, checkpoint_dir) == 0) return TDB_ERR_INVALID_ARGS;
+
+    /* we create the checkpoint directory */
+    struct STAT_STRUCT st;
+    if (STAT_FUNC(checkpoint_dir, &st) == 0)
+    {
+        if (!S_ISDIR(st.st_mode)) return TDB_ERR_INVALID_ARGS;
+        if (!is_directory_empty(checkpoint_dir)) return TDB_ERR_EXISTS;
+    }
+    else
+    {
+        if (mkdir(checkpoint_dir, TDB_DIR_PERMISSIONS) != 0) return TDB_ERR_IO;
+    }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Starting checkpoint to directory: %s", checkpoint_dir);
+
+    int result = TDB_SUCCESS;
+
+    pthread_rwlock_rdlock(&db->cf_list_lock);
+    const int num_cfs = db->num_column_families;
+    pthread_rwlock_unlock(&db->cf_list_lock);
+
+    for (int cf_idx = 0; cf_idx < num_cfs; cf_idx++)
+    {
+        pthread_rwlock_rdlock(&db->cf_list_lock);
+        if (cf_idx >= db->num_column_families)
+        {
+            pthread_rwlock_unlock(&db->cf_list_lock);
+            break;
+        }
+        tidesdb_column_family_t *cf = db->column_families[cf_idx];
+        pthread_rwlock_unlock(&db->cf_list_lock);
+
+        if (!cf) continue;
+        if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire)) continue;
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Checkpoint: processing CF '%s'", cf->name);
+
+        /* we wait for any in-flight flush to finish */
+        for (int i = 0; i < TDB_CLOSE_FLUSH_WAIT_MAX_ATTEMPTS; i++)
+        {
+            if (!atomic_load_explicit(&cf->is_flushing, memory_order_acquire)) break;
+            usleep(TDB_CLOSE_FLUSH_WAIT_SLEEP_US);
+        }
+
+        /* we force flush memtable so all data is in sstables */
+        result = tidesdb_flush_memtable_internal(cf, 0, 1);
+        if (result != TDB_SUCCESS && result != TDB_ERR_MEMORY)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: flush failed for CF '%s' (err=%d)", cf->name,
+                          result);
+            return result;
+        }
+
+        /* we wait for flush to complete */
+        for (int i = 0; i < TDB_COMPACTION_FLUSH_WAIT_MAX_ATTEMPTS * 2; i++)
+        {
+            if (queue_size(db->flush_queue) == 0 &&
+                !atomic_load_explicit(&cf->is_flushing, memory_order_acquire))
+            {
+                break;
+            }
+            usleep(TDB_COMPACTION_FLUSH_WAIT_SLEEP_US);
+        }
+
+        /* we halt compactions for this CF */
+        int compaction_was_running = 0;
+        for (int i = 0; i < TDB_CHECKPOINT_COMPACTION_WAIT_MAX_ATTEMPTS; i++)
+        {
+            int expected = 0;
+            if (atomic_compare_exchange_strong_explicit(&cf->is_compacting, &expected, 1,
+                                                        memory_order_acquire, memory_order_relaxed))
+            {
+                break;
+            }
+            /* compaction is running, wait for it to finish */
+            compaction_was_running = 1;
+            usleep(TDB_CHECKPOINT_COMPACTION_WAIT_SLEEP_US);
+        }
+
+        /* we commit manifest to ensure it reflects current state */
+        if (cf->manifest)
+        {
+            tidesdb_manifest_commit(cf->manifest, cf->manifest->path);
+        }
+
+        /* we create CF directory in checkpoint */
+        char cf_checkpoint_dir[TDB_MAX_PATH_LEN];
+        snprintf(cf_checkpoint_dir, sizeof(cf_checkpoint_dir), "%s" PATH_SEPARATOR "%s",
+                 checkpoint_dir, cf->name);
+        if (mkdir(cf_checkpoint_dir, TDB_DIR_PERMISSIONS) != 0 && errno != EEXIST)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to create CF dir %s",
+                          cf_checkpoint_dir);
+            atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
+            return TDB_ERR_IO;
+        }
+
+        /* we hard link all live sstable files */
+        const int num_levels = atomic_load_explicit(&cf->num_active_levels, memory_order_acquire);
+        const size_t cf_dir_len = strlen(cf->directory);
+
+        for (int level = 0; level < num_levels && result == TDB_SUCCESS; level++)
+        {
+            tidesdb_level_t *lvl = cf->levels[level];
+            if (!lvl) continue;
+
+            tidesdb_sstable_t **sstables =
+                atomic_load_explicit(&lvl->sstables, memory_order_acquire);
+            const int num_ssts = atomic_load_explicit(&lvl->num_sstables, memory_order_acquire);
+
+            for (int s = 0; s < num_ssts && result == TDB_SUCCESS; s++)
+            {
+                tidesdb_sstable_t *sst = sstables[s];
+                if (!sst) continue;
+
+                /* we compute destination paths by replacing cf->directory prefix
+                 * with cf_checkpoint_dir */
+                const char *klog_rel = sst->klog_path + cf_dir_len;
+                const char *vlog_rel = sst->vlog_path + cf_dir_len;
+
+                char dst_klog[TDB_MAX_PATH_LEN];
+                char dst_vlog[TDB_MAX_PATH_LEN];
+                snprintf(dst_klog, sizeof(dst_klog), "%s%s", cf_checkpoint_dir, klog_rel);
+                snprintf(dst_vlog, sizeof(dst_vlog), "%s%s", cf_checkpoint_dir, vlog_rel);
+
+                /* we ensure level subdirectory exists in checkpoint */
+                result = tidesdb_checkpoint_ensure_parent_dir(dst_klog);
+                if (result != TDB_SUCCESS)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to create parent dir for %s",
+                                  dst_klog);
+                    break;
+                }
+
+                /* we hard link klog */
+                result = tidesdb_checkpoint_link_or_copy(sst->klog_path, dst_klog);
+                if (result != TDB_SUCCESS)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to link/copy klog %s",
+                                  sst->klog_path);
+                    break;
+                }
+
+                /* we hard link vlog */
+                result = tidesdb_checkpoint_link_or_copy(sst->vlog_path, dst_vlog);
+                if (result != TDB_SUCCESS)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to link/copy vlog %s",
+                                  sst->vlog_path);
+                    break;
+                }
+
+                TDB_DEBUG_LOG(TDB_LOG_DEBUG, "Checkpoint: linked SSTable %" PRIu64 " on L%d",
+                              sst->id, level + 1);
+            }
+        }
+
+        /* we copy manifest file (small) */
+        if (result == TDB_SUCCESS && cf->manifest)
+        {
+            char src_manifest[TDB_MAX_PATH_LEN];
+            char dst_manifest[TDB_MAX_PATH_LEN];
+            snprintf(src_manifest, sizeof(src_manifest), "%s" PATH_SEPARATOR "%s", cf->directory,
+                     TDB_COLUMN_FAMILY_MANIFEST_NAME);
+            snprintf(dst_manifest, sizeof(dst_manifest), "%s" PATH_SEPARATOR "%s",
+                     cf_checkpoint_dir, TDB_COLUMN_FAMILY_MANIFEST_NAME);
+            result = tidesdb_backup_copy_file(src_manifest, dst_manifest);
+            if (result != TDB_SUCCESS)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to copy manifest for CF '%s'",
+                              cf->name);
+            }
+        }
+
+        /* we copy config file (small) */
+        if (result == TDB_SUCCESS)
+        {
+            char src_config[TDB_MAX_PATH_LEN];
+            char dst_config[TDB_MAX_PATH_LEN];
+            snprintf(src_config, sizeof(src_config),
+                     "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+                     cf->directory);
+            snprintf(dst_config, sizeof(dst_config),
+                     "%s" PATH_SEPARATOR TDB_COLUMN_FAMILY_CONFIG_NAME TDB_COLUMN_FAMILY_CONFIG_EXT,
+                     cf_checkpoint_dir);
+            result = tidesdb_backup_copy_file(src_config, dst_config);
+            if (result != TDB_SUCCESS)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_ERROR, "Checkpoint: failed to copy config for CF '%s'",
+                              cf->name);
+            }
+        }
+
+        /* we resume compactions */
+        atomic_store_explicit(&cf->is_compacting, 0, memory_order_release);
+
+        TDB_DEBUG_LOG(TDB_LOG_INFO, "Checkpoint: CF '%s' done (levels=%d, result=%d)", cf->name,
+                      num_levels, result);
+
+        if (result != TDB_SUCCESS) return result;
+    }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Checkpoint completed successfully: %s", checkpoint_dir);
     return TDB_SUCCESS;
 }
 

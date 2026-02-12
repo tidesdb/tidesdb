@@ -23,6 +23,7 @@
 /* test configuration constants */
 #define TEST_FLUSH_DRAIN_WAIT_INTERVAL_US 100000
 #define TEST_DB_BACKUP_PATH               "./test_tidesdb_backup"
+#define TEST_DB_CHECKPOINT_PATH           "./test_tidesdb_checkpoint"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -946,6 +947,418 @@ static void test_backup_concurrent_writes(void)
     ASSERT_EQ(tidesdb_close(backup_db), 0);
     cleanup_test_dir();
     remove_directory(TEST_DB_BACKUP_PATH);
+}
+
+static void test_checkpoint_basic(void)
+{
+    cleanup_test_dir();
+    remove_directory(TEST_DB_CHECKPOINT_PATH);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "ckpt_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ckpt_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write some data and flush to SSTables */
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char value[128];
+        snprintf(key, sizeof(key), "ckpt_key_%04d", i);
+        snprintf(value, sizeof(value), "ckpt_value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    for (int i = 0; i < 50; i++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+    usleep(50000);
+
+    /* write more data (will be in memtable, checkpoint should flush it) */
+    for (int i = 50; i < 80; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char value[128];
+        snprintf(key, sizeof(key), "ckpt_key_%04d", i);
+        snprintf(value, sizeof(value), "ckpt_value_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    /* create checkpoint */
+    ASSERT_EQ(tidesdb_checkpoint(db, TEST_DB_CHECKPOINT_PATH), 0);
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    /* open the checkpoint as a database and verify all data */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_CHECKPOINT_PATH;
+
+    tidesdb_t *ckpt_db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &ckpt_db), 0);
+    ASSERT_TRUE(ckpt_db != NULL);
+
+    tidesdb_column_family_t *ckpt_cf = tidesdb_get_column_family(ckpt_db, "ckpt_cf");
+    ASSERT_TRUE(ckpt_cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(ckpt_db, &txn), 0);
+    for (int i = 0; i < 80; i++)
+    {
+        char key[64];
+        char expected[128];
+        snprintf(key, sizeof(key), "ckpt_key_%04d", i);
+        snprintf(expected, sizeof(expected), "ckpt_value_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(txn, ckpt_cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size), 0);
+        ASSERT_TRUE(value != NULL);
+        ASSERT_TRUE(strcmp((char *)value, expected) == 0);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(ckpt_db), 0);
+    cleanup_test_dir();
+    remove_directory(TEST_DB_CHECKPOINT_PATH);
+}
+
+static void test_checkpoint_data_integrity_after_compaction(void)
+{
+    cleanup_test_dir();
+    remove_directory(TEST_DB_CHECKPOINT_PATH);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 512;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "ckpt_compact_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ckpt_compact_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write enough data across multiple flushes to create multiple SSTables */
+    for (int batch = 0; batch < 3; batch++)
+    {
+        for (int i = 0; i < 40; i++)
+        {
+            int key_idx = batch * 40 + i;
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+            char key[64];
+            char value[256];
+            snprintf(key, sizeof(key), "ckpt_c_key_%04d", key_idx);
+            snprintf(value, sizeof(value), "ckpt_c_value_%04d_batch_%d", key_idx, batch);
+
+            ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                      strlen(value) + 1, 0),
+                      0);
+            ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+            tidesdb_txn_free(txn);
+        }
+
+        ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+        for (int w = 0; w < 50; w++)
+        {
+            usleep(10000);
+            if (queue_size(db->flush_queue) == 0) break;
+        }
+    }
+
+    /* trigger compaction and wait */
+    tidesdb_compact(cf);
+    for (int i = 0, stable = 0; i < 300 && stable < 3; i++)
+    {
+        usleep(50000);
+        int is_compacting = atomic_load_explicit(&cf->is_compacting, memory_order_acquire);
+        int is_flushing = atomic_load_explicit(&cf->is_flushing, memory_order_acquire);
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !is_compacting && !is_flushing)
+        {
+            stable++;
+        }
+        else
+        {
+            stable = 0;
+        }
+    }
+
+    /* create checkpoint after compaction */
+    ASSERT_EQ(tidesdb_checkpoint(db, TEST_DB_CHECKPOINT_PATH), 0);
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    /* open checkpoint and verify all 120 keys */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_CHECKPOINT_PATH;
+
+    tidesdb_t *ckpt_db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &ckpt_db), 0);
+    ASSERT_TRUE(ckpt_db != NULL);
+
+    tidesdb_column_family_t *ckpt_cf = tidesdb_get_column_family(ckpt_db, "ckpt_compact_cf");
+    ASSERT_TRUE(ckpt_cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(ckpt_db, &txn), 0);
+    for (int i = 0; i < 120; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "ckpt_c_key_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(txn, ckpt_cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size), 0);
+        ASSERT_TRUE(value != NULL);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(ckpt_db), 0);
+    cleanup_test_dir();
+    remove_directory(TEST_DB_CHECKPOINT_PATH);
+}
+
+static void test_checkpoint_concurrent_writes(void)
+{
+    cleanup_test_dir();
+    remove_directory(TEST_DB_CHECKPOINT_PATH);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "ckpt_conc_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "ckpt_conc_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* pre-populate some data and flush */
+    for (int i = 0; i < 50; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char value[128];
+        snprintf(key, sizeof(key), "ckpt_pre_%04d", i);
+        snprintf(value, sizeof(value), "ckpt_pre_val_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), 0);
+    for (int w = 0; w < 50; w++)
+    {
+        usleep(10000);
+        if (queue_size(db->flush_queue) == 0) break;
+    }
+    usleep(50000);
+
+    /* start a writer thread that writes concurrently */
+    _Atomic(int) stop_flag;
+    atomic_init(&stop_flag, 0);
+    _Atomic(int) errors;
+    atomic_init(&errors, 0);
+
+    backup_concurrent_writer_t writer_data = {
+        .db = db, .cf = cf, .start_key = 0, .end_key = 500, .stop = &stop_flag, .errors = &errors};
+    atomic_init(&writer_data.last_written, -1);
+
+    pthread_t writer_thread;
+    pthread_create(&writer_thread, NULL, backup_concurrent_writer_thread, &writer_data);
+
+    /* let writer make some progress */
+    usleep(50000);
+
+    /* checkpoint while writes are happening */
+    ASSERT_EQ(tidesdb_checkpoint(db, TEST_DB_CHECKPOINT_PATH), 0);
+
+    /* stop writer */
+    atomic_store(&stop_flag, 1);
+    pthread_join(writer_thread, NULL);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    /* open checkpoint and verify pre-populated data is accessible */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_CHECKPOINT_PATH;
+
+    tidesdb_t *ckpt_db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &ckpt_db), 0);
+    ASSERT_TRUE(ckpt_db != NULL);
+
+    tidesdb_column_family_t *ckpt_cf = tidesdb_get_column_family(ckpt_db, "ckpt_conc_cf");
+    ASSERT_TRUE(ckpt_cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(ckpt_db, &txn), 0);
+
+    /* pre-populated keys must be present */
+    for (int i = 0; i < 50; i++)
+    {
+        char key[64];
+        char expected[128];
+        snprintf(key, sizeof(key), "ckpt_pre_%04d", i);
+        snprintf(expected, sizeof(expected), "ckpt_pre_val_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        ASSERT_EQ(
+            tidesdb_txn_get(txn, ckpt_cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size), 0);
+        ASSERT_TRUE(value != NULL);
+        ASSERT_TRUE(strcmp((char *)value, expected) == 0);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(ckpt_db), 0);
+    cleanup_test_dir();
+    remove_directory(TEST_DB_CHECKPOINT_PATH);
+}
+
+static void test_checkpoint_invalid_args(void)
+{
+    cleanup_test_dir();
+    remove_directory(TEST_DB_CHECKPOINT_PATH);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    ASSERT_EQ(tidesdb_create_column_family(db, "ckpt_args_cf", &cf_config), 0);
+
+    /* NULL args */
+    ASSERT_TRUE(tidesdb_checkpoint(NULL, TEST_DB_CHECKPOINT_PATH) != 0);
+    ASSERT_TRUE(tidesdb_checkpoint(db, NULL) != 0);
+
+    /* checkpoint to same path as DB */
+    ASSERT_TRUE(tidesdb_checkpoint(db, db->db_path) != 0);
+
+    /* valid checkpoint -- creates directory with CF content */
+    ASSERT_EQ(tidesdb_checkpoint(db, TEST_DB_CHECKPOINT_PATH), 0);
+
+    /* checkpoint to non-empty directory should fail */
+    ASSERT_TRUE(tidesdb_checkpoint(db, TEST_DB_CHECKPOINT_PATH) != 0);
+
+    ASSERT_EQ(tidesdb_close(db), 0);
+    cleanup_test_dir();
+    remove_directory(TEST_DB_CHECKPOINT_PATH);
+}
+
+static void test_checkpoint_multi_cf(void)
+{
+    cleanup_test_dir();
+    remove_directory(TEST_DB_CHECKPOINT_PATH);
+
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 1024;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+
+    /* create multiple column families */
+    ASSERT_EQ(tidesdb_create_column_family(db, "ckpt_cf_a", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "ckpt_cf_b", &cf_config), 0);
+    tidesdb_column_family_t *cf_a = tidesdb_get_column_family(db, "ckpt_cf_a");
+    tidesdb_column_family_t *cf_b = tidesdb_get_column_family(db, "ckpt_cf_b");
+    ASSERT_TRUE(cf_a != NULL);
+    ASSERT_TRUE(cf_b != NULL);
+
+    /* write data to both CFs */
+    for (int i = 0; i < 30; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[64];
+        char val_a[128], val_b[128];
+        snprintf(key, sizeof(key), "multi_key_%04d", i);
+        snprintf(val_a, sizeof(val_a), "value_a_%04d", i);
+        snprintf(val_b, sizeof(val_b), "value_b_%04d", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf_a, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val_a,
+                                  strlen(val_a) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf_b, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val_b,
+                                  strlen(val_b) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_checkpoint(db, TEST_DB_CHECKPOINT_PATH), 0);
+    ASSERT_EQ(tidesdb_close(db), 0);
+
+    /* open checkpoint and verify both CFs */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_CHECKPOINT_PATH;
+
+    tidesdb_t *ckpt_db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &ckpt_db), 0);
+    ASSERT_TRUE(ckpt_db != NULL);
+
+    tidesdb_column_family_t *ckpt_a = tidesdb_get_column_family(ckpt_db, "ckpt_cf_a");
+    tidesdb_column_family_t *ckpt_b = tidesdb_get_column_family(ckpt_db, "ckpt_cf_b");
+    ASSERT_TRUE(ckpt_a != NULL);
+    ASSERT_TRUE(ckpt_b != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(ckpt_db, &txn), 0);
+    for (int i = 0; i < 30; i++)
+    {
+        char key[64];
+        char expected_a[128], expected_b[128];
+        snprintf(key, sizeof(key), "multi_key_%04d", i);
+        snprintf(expected_a, sizeof(expected_a), "value_a_%04d", i);
+        snprintf(expected_b, sizeof(expected_b), "value_b_%04d", i);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+
+        ASSERT_EQ(
+            tidesdb_txn_get(txn, ckpt_a, (uint8_t *)key, strlen(key) + 1, &value, &value_size), 0);
+        ASSERT_TRUE(value != NULL);
+        ASSERT_TRUE(strcmp((char *)value, expected_a) == 0);
+        free(value);
+
+        value = NULL;
+        ASSERT_EQ(
+            tidesdb_txn_get(txn, ckpt_b, (uint8_t *)key, strlen(key) + 1, &value, &value_size), 0);
+        ASSERT_TRUE(value != NULL);
+        ASSERT_TRUE(strcmp((char *)value, expected_b) == 0);
+        free(value);
+    }
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(tidesdb_close(ckpt_db), 0);
+    cleanup_test_dir();
+    remove_directory(TEST_DB_CHECKPOINT_PATH);
 }
 
 static void test_iterator_basic(void)
@@ -19641,6 +20054,11 @@ int main(void)
     RUN_TEST(test_persistence_and_recovery, tests_passed);
     RUN_TEST(test_backup_basic, tests_passed);
     RUN_TEST(test_backup_concurrent_writes, tests_passed);
+    RUN_TEST(test_checkpoint_basic, tests_passed);
+    RUN_TEST(test_checkpoint_data_integrity_after_compaction, tests_passed);
+    RUN_TEST(test_checkpoint_concurrent_writes, tests_passed);
+    RUN_TEST(test_checkpoint_invalid_args, tests_passed);
+    RUN_TEST(test_checkpoint_multi_cf, tests_passed);
     RUN_TEST(test_multi_cf_wal_recovery, tests_passed);
     RUN_TEST(test_multi_cf_many_sstables_recovery, tests_passed);
     RUN_TEST(test_multi_cf_transaction_atomicity_recovery, tests_passed);

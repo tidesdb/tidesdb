@@ -457,6 +457,7 @@ struct tidesdb_sstable_t
  * @param boundary_sizes sizes of boundary keys
  * @param num_boundaries number of boundaries
  * @param retired_sstables_arr array of retired sstables (mainly TOCTOU protection)
+ * @param array_readers count of concurrent readers accessing sstable array
  */
 struct tidesdb_level_t
 {
@@ -470,6 +471,7 @@ struct tidesdb_level_t
     _Atomic(size_t *) boundary_sizes;
     _Atomic(int) num_boundaries;
     _Atomic(tidesdb_sstable_t **) retired_sstables_arr;
+    _Atomic(int) array_readers;
 };
 
 /**
@@ -493,8 +495,8 @@ struct tidesdb_level_t
  * @param sync_thread_active atomic flag indicating if sync thread is active
  * @param sync_thread_mutex mutex for sync thread
  * @param sync_thread_cond condition variable for sync thread
- * @param reaper_thread background thread for evicting most un-accessed sstables
- * @param reaper_thread_active atomic flag indicating if reaper thread is active
+ * @param sstable_reaper_thread background thread for evicting most un-accessed sstables
+ * @param sstable_reaper_active atomic flag indicating if reaper thread is active
  * @param reaper_thread_mutex mutex for reaper thread
  * @param reaper_thread_cond condition variable for reaper thread
  * @param clock_cache clock cache for hot sstable blocks
@@ -1280,6 +1282,28 @@ int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
  * @return 0 on success, -n on failure
  */
 int tidesdb_backup(tidesdb_t *db, char *dir);
+
+/**
+ * tidesdb_checkpoint
+ * creates a lightweight checkpoint of the database using hard links for SSTable files.
+ * this is much faster than a full backup since SSTable files (which are immutable) are
+ * hard-linked rather than copied. only small metadata files (manifest, config) are copied.
+ *
+ * the checkpoint is a fully openable tidesdb database directory.
+ *
+ * algorithm:
+ *   1. for each column family: flush memtable, halt compactions
+ *   2. hard link all live SSTable files into the checkpoint directory
+ *   3. copy manifest and config files
+ *   4. resume compactions
+ *
+ * if hard linking fails (e.g., cross-filesystem), falls back to file copy.
+ *
+ * @param db database handle
+ * @param checkpoint_dir destination directory for the checkpoint (must not exist or be empty)
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir);
 
 /**
  * tidesdb_clone_column_family

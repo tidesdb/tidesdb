@@ -2747,6 +2747,23 @@ static inline int tdb_get_available_disk_space(const char *path, uint64_t *avail
 #endif
 
 /*
+ * tdb_hardlink
+ * portable hard link creation
+ * @param src existing file path
+ * @param dst new hard link path
+ * @return 0 on success, -1 on failure
+ */
+static inline int tdb_hardlink(const char *src, const char *dst)
+{
+    if (!src || !dst) return -1;
+#ifdef _WIN32
+    return CreateHardLinkA(dst, src, NULL) ? 0 : -1;
+#else
+    return link(src, dst);
+#endif
+}
+
+/*
  * tdb_unlink
  * portable file deletion
  * @param path the file path to delete

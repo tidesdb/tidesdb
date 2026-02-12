@@ -13,7 +13,7 @@ endif()
 project(tidesdb C)
 
 set(CMAKE_C_STANDARD 11)
-set(PROJECT_VERSION 8.3.0)
+set(PROJECT_VERSION 8.3.1)
 
 configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/tidesdb_version.h.in"
@@ -21,7 +21,7 @@ configure_file(
 )
 
 # when building for production releases, you/we want to disable all warnings and sanitizers
-option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" OFF)
+option(TIDESDB_WITH_SANITIZER "build with sanitizer in tidesdb" ON)
 option(TIDESDB_BUILD_TESTS "enable building tests in tidesdb" ON)
 option(ENABLE_READ_PROFILING "Enable read profiling instrumentation" OFF)
 # BUILD_SHARED_LIBS controls static vs shared library

@@ -416,6 +416,7 @@ int tidesdb_is_flushing(tidesdb_column_family_t *cf);
  */
 int tidesdb_is_compacting(tidesdb_column_family_t *cf);
 int tidesdb_backup(tidesdb_t *db, char *dir);
+int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir);
 
 /**
  * tidesdb_clone_column_family

@@ -248,6 +248,8 @@ jobs:
         if: matrix.compiler == 'mingw'
         shell: pwsh
         run: |
+          # Remove pre-installed MinGW from PATH to avoid shadowing choco-installed version
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
           if ("${{ matrix.arch }}" -eq "x86") {
               choco install mingw --version=8.1.0 --forcex86 -y
               $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
@@ -256,7 +258,10 @@ jobs:
               $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
           }
           echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          $env:PATH = "$mingwPath;$env:PATH"
+          # Also persist the PATH cleanup for subsequent steps
+          $cleanPath = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
+          echo "PATH=$mingwPath;$cleanPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $env:PATH = "$mingwPath;$cleanPath"
           gcc --version
 
       - name: Configure CMake (Linux/macOS x64)
@@ -613,6 +618,8 @@ jobs:
         if: matrix.compiler == 'mingw'
         shell: pwsh
         run: |
+          # Remove pre-installed MinGW from PATH to avoid shadowing choco-installed version
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
           if ("${{ matrix.arch }}" -eq "x86") {
               choco install mingw --version=8.1.0 --forcex86 -y
               $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
@@ -625,6 +632,8 @@ jobs:
               .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
           }
           echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $cleanPath = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
+          echo "PATH=$mingwPath;$cleanPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       
       - name: Build TidesDB
         shell: bash
@@ -1057,6 +1066,8 @@ jobs:
         if: matrix.compiler == 'mingw'
         shell: pwsh
         run: |
+          # Remove pre-installed MinGW from PATH to avoid shadowing choco-installed version
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
           if ("${{ matrix.arch }}" -eq "x86") {
               choco install mingw --version=8.1.0 --forcex86 -y
               $mingwPath = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw32\bin"
@@ -1069,6 +1080,8 @@ jobs:
               .\vcpkg.exe install zstd:x64-windows snappy:x64-windows lz4:x64-windows pthreads:x64-windows
           }
           echo "$mingwPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $cleanPath = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'mingw' }) -join ';'
+          echo "PATH=$mingwPath;$cleanPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       
       - name: Build TidesDB
         shell: bash

@@ -77,9 +77,10 @@ static void hash_table_insert(clock_cache_partition_t *partition, uint64_t hash,
         const size_t pos = (idx + probe) & partition->hash_mask;
         int32_t expected = -1;
 
-        /* we try to claim this hash index slot */
-        if (atomic_compare_exchange_strong(&partition->hash_index[pos], &expected,
-                                           (int32_t)slot_idx))
+        /* we try to claim this hash index slot
+         * weak CAS is sufficient since we're in a probe loop -- spurious failure
+         * just advances to the next probe position */
+        if (atomic_compare_exchange_weak(&partition->hash_index[pos], &expected, (int32_t)slot_idx))
         {
             return;
         }
@@ -211,6 +212,9 @@ static clock_cache_entry_t *find_entry_with_hash(clock_cache_partition_t *partit
     const size_t max_probe = (partition->hash_index_size < CLOCK_CACHE_MAX_HASH_PROBE)
                                  ? partition->hash_index_size
                                  : CLOCK_CACHE_MAX_HASH_PROBE;
+    /* we prefetch the first hash index entry before the loop to warm the cache line */
+    PREFETCH_READ(&partition->hash_index[idx & partition->hash_mask]);
+
     for (size_t probe = 0; probe < max_probe; probe++)
     {
         const size_t pos = (idx + probe) & partition->hash_mask;
@@ -222,14 +226,16 @@ static clock_cache_entry_t *find_entry_with_hash(clock_cache_partition_t *partit
             return NULL;
         }
 
-        /* prefetch next probe's hash index entry to overlap with current try_match */
+        /* we prefetch slot data + next hash index entry simultaneously
+         * this gives memory subsystem time to warm both cache lines
+         * before the next iteration's hash_index load and this iteration's try_match */
+        PREFETCH_READ(&partition->slots[slot_idx]);
         if (probe + 1 < max_probe)
         {
             const size_t next_pos = (idx + probe + 1) & partition->hash_mask;
             PREFETCH_READ(&partition->hash_index[next_pos]);
         }
 
-        PREFETCH_READ(&partition->slots[slot_idx]);
         clock_cache_entry_t *entry = &partition->slots[slot_idx];
         clock_cache_entry_t *match = try_match_entry(entry, key, key_len, target_hash);
         if (match) return match;
@@ -241,7 +247,11 @@ static clock_cache_entry_t *find_entry_with_hash(clock_cache_partition_t *partit
         (partition->num_slots < max_probe) ? partition->num_slots : max_probe;
     for (size_t i = 0; i < fallback_limit; i++)
     {
-        PREFETCH_READ(&partition->slots[i]);
+        /* we prefetch one slot ahead to overlap memory latency with try_match */
+        if (i + 1 < fallback_limit)
+        {
+            PREFETCH_READ(&partition->slots[i + 1]);
+        }
         clock_cache_entry_t *entry = &partition->slots[i];
         clock_cache_entry_t *match = try_match_entry(entry, key, key_len, target_hash);
         if (match) return match;
@@ -268,12 +278,9 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
         return;
     }
 
-    atomic_thread_fence(memory_order_seq_cst);
-
-    for (int i = 0; i < CLOCK_CACHE_YIELD_COUNT; i++)
-    {
-        sched_yield();
-    }
+    /* acq_rel fence sufficient here -- CAS above provides acquire/release semantics
+     * and we just need to ensure subsequent loads see up-to-date values */
+    atomic_thread_fence(memory_order_acq_rel);
 
     char *key = atomic_load_explicit(&entry->key, memory_order_acquire);
     void *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
@@ -308,8 +315,8 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
     atomic_store_explicit(&entry->key, NULL, memory_order_release);
     atomic_store_explicit(&entry->payload, NULL, memory_order_release);
 
-    /* fence to ensure pointer clears are visible before we free */
-    atomic_thread_fence(memory_order_seq_cst);
+    /* fence to ensure pointer clears are visible before we re-check readers */
+    atomic_thread_fence(memory_order_acq_rel);
 
     /* we must re-check ref_bit after clearing pointers, a reader may have snuck in
      * between our first check and clearing pointers */
@@ -330,8 +337,8 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
         cache->evict_callback(payload, plen);
     }
 
+    /* payload is embedded in same allocation as key -- single free */
     free(key);
-    free(payload);
     atomic_store_explicit(&entry->key_len, 0, memory_order_release);
     atomic_store_explicit(&entry->payload_len, 0, memory_order_release);
     atomic_store_explicit(&entry->ref_bit, 0, memory_order_release);
@@ -637,8 +644,8 @@ void clock_cache_destroy(clock_cache_t *cache)
                 cache->evict_callback(payload, payload_len);
             }
 
+            /* payload is embedded in same allocation as key -- single free */
             if (key) free(key);
-            if (payload) free(payload);
         }
 
         free((void *)partition->hash_index);
@@ -700,18 +707,17 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
         return -1;
     }
 
-    /* we own the slot now, allocate and fill */
-    char *new_key = (char *)malloc(key_len);
-    void *new_payload = malloc(payload_len);
-
-    if (!new_key || !new_payload)
+    /* we own the slot now, allocate key + payload in single allocation
+     * this halves malloc calls and improves data locality */
+    char *new_buf = (char *)malloc(key_len + payload_len);
+    if (!new_buf)
     {
-        free(new_key);
-        free(new_payload);
         atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
         return -1;
     }
 
+    char *new_key = new_buf;
+    void *new_payload = new_buf + key_len;
     memcpy(new_key, key, key_len);
     memcpy(new_payload, payload, payload_len);
 

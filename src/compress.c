@@ -57,51 +57,44 @@ uint8_t *compress_data(const uint8_t *data, const size_t data_size, size_t *comp
 
         case TDB_COMPRESS_LZ4:
         case TDB_COMPRESS_LZ4_FAST:
-        case TDB_COMPRESS_ZSTD:
         {
-            *compressed_size = (type == TDB_COMPRESS_LZ4 || type == TDB_COMPRESS_LZ4_FAST)
-                                   ? (size_t)LZ4_compressBound((int)data_size)
-                                   : ZSTD_compressBound(data_size);
+            *compressed_size = (size_t)LZ4_compressBound((int)data_size);
             const size_t total_size = *compressed_size + sizeof(uint64_t);
             compressed_data = malloc(total_size);
             if (TDB_UNLIKELY(!compressed_data)) return NULL;
 
             encode_uint64_le_compat(compressed_data, data_size);
 
-            size_t actual_size;
-            if (type == TDB_COMPRESS_LZ4)
+            /* unified LZ4 path: acceleration=1 for default, acceleration=2 for fast */
+            const int acceleration = (type == TDB_COMPRESS_LZ4_FAST) ? 2 : 1;
+            const int lz4_result =
+                LZ4_compress_fast((const char *)data, (char *)(compressed_data + sizeof(uint64_t)),
+                                  (int)data_size, (int)*compressed_size, acceleration);
+            if (TDB_UNLIKELY(lz4_result <= 0))
             {
-                const int lz4_result = LZ4_compress_default(
-                    (const char *)data, (char *)(compressed_data + sizeof(uint64_t)),
-                    (int)data_size, (int)*compressed_size);
-                if (TDB_UNLIKELY(lz4_result <= 0))
-                {
-                    free(compressed_data);
-                    return NULL;
-                }
-                actual_size = (size_t)lz4_result;
+                free(compressed_data);
+                return NULL;
             }
-            else if (type == TDB_COMPRESS_LZ4_FAST)
+
+            *compressed_size = (size_t)lz4_result + sizeof(uint64_t);
+            break;
+        }
+
+        case TDB_COMPRESS_ZSTD:
+        {
+            *compressed_size = ZSTD_compressBound(data_size);
+            const size_t total_size = *compressed_size + sizeof(uint64_t);
+            compressed_data = malloc(total_size);
+            if (TDB_UNLIKELY(!compressed_data)) return NULL;
+
+            encode_uint64_le_compat(compressed_data, data_size);
+
+            const size_t actual_size = ZSTD_compress(compressed_data + sizeof(uint64_t),
+                                                     *compressed_size, data, data_size, 1);
+            if (TDB_UNLIKELY(ZSTD_isError(actual_size)))
             {
-                const int lz4_result = LZ4_compress_fast(
-                    (const char *)data, (char *)(compressed_data + sizeof(uint64_t)),
-                    (int)data_size, (int)*compressed_size, 2);
-                if (TDB_UNLIKELY(lz4_result <= 0))
-                {
-                    free(compressed_data);
-                    return NULL;
-                }
-                actual_size = (size_t)lz4_result;
-            }
-            else
-            {
-                actual_size = ZSTD_compress(compressed_data + sizeof(uint64_t), *compressed_size,
-                                            data, data_size, 1);
-                if (TDB_UNLIKELY(ZSTD_isError(actual_size)))
-                {
-                    free(compressed_data);
-                    return NULL;
-                }
+                free(compressed_data);
+                return NULL;
             }
 
             *compressed_size = actual_size + sizeof(uint64_t);
@@ -110,6 +103,17 @@ uint8_t *compress_data(const uint8_t *data, const size_t data_size, size_t *comp
 
         default:
             return NULL;
+    }
+
+    /* shrink buffer to actual compressed size to save memory and improve cache
+     * when the compressed data is stored or transmitted */
+    if (TDB_LIKELY(compressed_data != NULL))
+    {
+        uint8_t *shrunk = realloc(compressed_data, *compressed_size);
+        if (TDB_LIKELY(shrunk != NULL))
+        {
+            compressed_data = shrunk;
+        }
     }
 
     return compressed_data;
@@ -158,6 +162,35 @@ uint8_t *decompress_data(const uint8_t *data, const size_t data_size, size_t *de
 
         case TDB_COMPRESS_LZ4:
         case TDB_COMPRESS_LZ4_FAST:
+        {
+            if (TDB_UNLIKELY(data_size < sizeof(uint64_t)))
+            {
+                return NULL;
+            }
+
+            const uint64_t original_size = decode_uint64_le_compat(data);
+
+            if (TDB_UNLIKELY(original_size > UINT32_MAX))
+            {
+                return NULL;
+            }
+
+            *decompressed_size = (size_t)original_size;
+
+            decompressed_data = malloc(*decompressed_size);
+            if (TDB_UNLIKELY(!decompressed_data)) return NULL;
+
+            const int lz4_result = LZ4_decompress_safe(
+                (const char *)(data + sizeof(uint64_t)), (char *)decompressed_data,
+                (int)(data_size - sizeof(uint64_t)), (int)*decompressed_size);
+            if (TDB_UNLIKELY(lz4_result < 0 || lz4_result != (int)*decompressed_size))
+            {
+                free(decompressed_data);
+                return NULL;
+            }
+            break;
+        }
+
         case TDB_COMPRESS_ZSTD:
         {
             if (TDB_UNLIKELY(data_size < sizeof(uint64_t)))
@@ -177,37 +210,13 @@ uint8_t *decompress_data(const uint8_t *data, const size_t data_size, size_t *de
             decompressed_data = malloc(*decompressed_size);
             if (TDB_UNLIKELY(!decompressed_data)) return NULL;
 
-            if (type == TDB_COMPRESS_LZ4 || type == TDB_COMPRESS_LZ4_FAST)
+            const size_t zstd_result =
+                ZSTD_decompress(decompressed_data, *decompressed_size, data + sizeof(uint64_t),
+                                data_size - sizeof(uint64_t));
+            if (TDB_UNLIKELY(ZSTD_isError(zstd_result) || zstd_result != *decompressed_size))
             {
-                const int lz4_result = LZ4_decompress_safe(
-                    (const char *)(data + sizeof(uint64_t)), (char *)decompressed_data,
-                    (int)(data_size - sizeof(uint64_t)), (int)*decompressed_size);
-                if (TDB_UNLIKELY(lz4_result < 0))
-                {
-                    free(decompressed_data);
-                    return NULL;
-                }
-                if (TDB_UNLIKELY(lz4_result != (int)*decompressed_size))
-                {
-                    free(decompressed_data);
-                    return NULL;
-                }
-            }
-            else
-            {
-                const size_t zstd_result =
-                    ZSTD_decompress(decompressed_data, *decompressed_size, data + sizeof(uint64_t),
-                                    data_size - sizeof(uint64_t));
-                if (TDB_UNLIKELY(ZSTD_isError(zstd_result)))
-                {
-                    free(decompressed_data);
-                    return NULL;
-                }
-                if (TDB_UNLIKELY(zstd_result != *decompressed_size))
-                {
-                    free(decompressed_data);
-                    return NULL;
-                }
+                free(decompressed_data);
+                return NULL;
             }
             break;
         }

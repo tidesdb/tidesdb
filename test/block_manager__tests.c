@@ -1214,10 +1214,11 @@ void benchmark_block_manager_iteration(void)
 
     /* we test with different block counts to show cache scaling */
     const int test_configs[][2] = {
-        {1000, 1024},  /* 1K blocks (1KB each) */
-        {5000, 1024},  /* 5K blocks (1KB each) */
-        {10000, 1024}, /* 10K blocks (1KB each) */
-        {20000, 1024}, /* 20K blocks (1KB each) */
+        {1000, 1024},   /* 1K blocks (1KB each) */
+        {5000, 1024},   /* 5K blocks (1KB each) */
+        {10000, 1024},  /* 10K blocks (1KB each) */
+        {20000, 1024},  /* 20K blocks (1KB each) */
+        {10000, 65536}, /* 10K blocks (64KB each) */
     };
 
     for (size_t config = 0; config < sizeof(test_configs) / sizeof(test_configs[0]); config++)
@@ -1232,6 +1233,9 @@ void benchmark_block_manager_iteration(void)
         uint8_t *data = malloc(block_size);
         memset(data, 'X', block_size);
 
+        struct timespec write_start;
+        clock_gettime(CLOCK_MONOTONIC, &write_start);
+
         for (int i = 0; i < num_blocks; i++)
         {
             block_manager_block_t *block = block_manager_block_create(block_size, data);
@@ -1240,35 +1244,75 @@ void benchmark_block_manager_iteration(void)
         }
         free(data);
 
+        struct timespec write_end;
+        clock_gettime(CLOCK_MONOTONIC, &write_end);
+        double write_elapsed = (write_end.tv_sec - write_start.tv_sec) +
+                               (write_end.tv_nsec - write_start.tv_nsec) / 1e9;
+        double write_throughput = num_blocks / write_elapsed;
+        double write_mb = (write_throughput * block_size) / (1024.0 * 1024.0);
+
+        printf("  Write phase:\n");
+        printf("    Time: %.3f seconds\n", write_elapsed);
+        printf("    Throughput: %.2f blocks/sec (%.2f MB/sec)\n", write_throughput, write_mb);
+
         block_manager_close(bm);
         ASSERT_TRUE(block_manager_open(&bm, "iteration_bench.db", BLOCK_MANAGER_SYNC_NONE) == 0);
 
+        /* Phase 2: cursor_next iteration only (no data read) */
         block_manager_cursor_t *cursor;
         ASSERT_TRUE(block_manager_cursor_init(&cursor, bm) == 0);
 
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
 
-        int blocks_read = 0;
+        int blocks_iterated = 0;
         ASSERT_TRUE(block_manager_cursor_goto_first(cursor) == 0);
         do
         {
-            blocks_read++;
+            blocks_iterated++;
         } while (block_manager_cursor_next(cursor) == 0);
 
         clock_gettime(CLOCK_MONOTONIC, &end);
-        double elapsed_no_cache = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        double iter_elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        double iter_throughput = blocks_iterated / iter_elapsed;
+        double iter_mb = (iter_throughput * block_size) / (1024.0 * 1024.0);
 
-        double throughput_no_cache = blocks_read / elapsed_no_cache;
-        double mb_per_sec_no_cache = (throughput_no_cache * block_size) / (1024.0 * 1024.0);
-
-        printf("    Blocks iterated: %d\n", blocks_read);
-        printf("    Time: %.3f seconds\n", elapsed_no_cache);
-        printf("    Throughput: %.2f blocks/sec\n", throughput_no_cache);
-        printf("    Throughput: %.2f MB/sec\n", mb_per_sec_no_cache);
-        printf("    Avg latency: %.2f μs/block\n", (elapsed_no_cache / blocks_read) * 1e6);
+        printf("  Iterate-only (cursor_next, no read):\n");
+        printf("    Blocks: %d | Time: %.3f s\n", blocks_iterated, iter_elapsed);
+        printf("    Throughput: %.2f blocks/sec (%.2f MB/sec)\n", iter_throughput, iter_mb);
+        printf("    Avg latency: %.2f μs/block\n", (iter_elapsed / blocks_iterated) * 1e6);
 
         block_manager_cursor_free(cursor);
+
+        /* Phase 3: full read + verify (cursor_read every block) */
+        block_manager_cursor_t *read_cursor;
+        ASSERT_TRUE(block_manager_cursor_init(&read_cursor, bm) == 0);
+
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        int blocks_read = 0;
+        ASSERT_TRUE(block_manager_cursor_goto_first(read_cursor) == 0);
+        do
+        {
+            block_manager_block_t *blk = block_manager_cursor_read(read_cursor);
+            if (blk)
+            {
+                blocks_read++;
+                block_manager_block_free(blk);
+            }
+        } while (block_manager_cursor_next(read_cursor) == 0);
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double read_elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        double read_throughput = blocks_read / read_elapsed;
+        double read_mb = (read_throughput * block_size) / (1024.0 * 1024.0);
+
+        printf("  Read+verify (cursor_read every block):\n");
+        printf("    Blocks: %d | Time: %.3f s\n", blocks_read, read_elapsed);
+        printf("    Throughput: %.2f blocks/sec (%.2f MB/sec)\n", read_throughput, read_mb);
+        printf("    Avg latency: %.2f μs/block\n", (read_elapsed / blocks_read) * 1e6);
+
+        block_manager_cursor_free(read_cursor);
     }
 
     block_manager_close(bm);

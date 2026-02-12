@@ -987,8 +987,8 @@ void benchmark_queue_scaling()
 }
 
 #define BENCH_FOREACH_PEEK_NUM_THREADS 4
-#define BENCH_FOREACH_PEEK_QUEUE_SIZE  100
-#define BENCH_FOREACH_PEEK_ITERATIONS  1000
+#define BENCH_FOREACH_PEEK_QUEUE_SIZE  10000
+#define BENCH_FOREACH_PEEK_ITERATIONS  500
 
 typedef struct
 {
@@ -1173,6 +1173,161 @@ void benchmark_queue_foreach_peek_at_concurrent()
     queue_free(queue);
 }
 
+void benchmark_queue_foreach_large()
+{
+    printf("\n");
+    queue_t *queue = queue_new();
+    const int queue_sizes[] = {1000, 10000, 100000};
+    const int num_sizes = 3;
+
+    for (int s = 0; s < num_sizes; s++)
+    {
+        int sz = queue_sizes[s];
+
+        /* populate queue */
+        int *values = malloc(sz * sizeof(int));
+        for (int i = 0; i < sz; i++)
+        {
+            values[i] = i;
+            queue_enqueue(queue, &values[i]);
+        }
+
+        /* benchmark foreach */
+        int iterations = (sz <= 1000) ? 10000 : (sz <= 10000) ? 1000 : 100;
+        _Atomic int visit_count = 0;
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        for (int i = 0; i < iterations; i++)
+        {
+            queue_foreach(queue, foreach_noop_callback, (void *)&visit_count);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        double total_visits_d = (double)iterations * sz;
+        double visits_per_sec = total_visits_d / elapsed;
+
+        printf("  foreach (queue_size=%d, iters=%d): %.2f M visits/sec (%.3f s)\n", sz, iterations,
+               visits_per_sec / 1e6, elapsed);
+
+        queue_clear(queue);
+        free(values);
+    }
+
+    queue_free(queue);
+}
+
+void benchmark_queue_roundtrip()
+{
+    printf("\n");
+    queue_t *queue = queue_new();
+    const int num_ops = 1000000;
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        int *data = malloc(sizeof(int));
+        *data = i;
+        queue_enqueue(queue, data);
+        int *out = (int *)queue_dequeue(queue);
+        if (out) free(out);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double ops_per_sec = num_ops / elapsed;
+
+    printf("  Enqueue+Dequeue round-trip %d ops: %.2f M ops/sec (%.3f s)\n", num_ops,
+           ops_per_sec / 1e6, elapsed);
+    printf("  Final queue size: %zu\n", queue_size(queue));
+
+    queue_free(queue);
+}
+
+void benchmark_queue_clear()
+{
+    printf("\n");
+    queue_t *queue = queue_new();
+    const int fill_sizes[] = {1000, 10000, 100000};
+    const int num_sizes = 3;
+
+    for (int s = 0; s < num_sizes; s++)
+    {
+        int sz = fill_sizes[s];
+        int iterations = (sz <= 1000) ? 1000 : (sz <= 10000) ? 100 : 10;
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        for (int iter = 0; iter < iterations; iter++)
+        {
+            for (int i = 0; i < sz; i++)
+            {
+                int *data = malloc(sizeof(int));
+                *data = i;
+                queue_enqueue(queue, data);
+            }
+            /* clear frees nodes but not data -- we already lost the pointers
+             * so just use free_with_data pattern instead */
+            queue_node_t *dummy_check = NULL;
+            (void)dummy_check;
+            /* we need to dequeue and free data to avoid leaks */
+            while (queue_size(queue) > 0)
+            {
+                int *d = (int *)queue_dequeue(queue);
+                if (d) free(d);
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        double total_ops = (double)iterations * sz * 2; /* enqueue + dequeue */
+        double ops_per_sec = total_ops / elapsed;
+
+        printf("  Fill+Drain (size=%d, iters=%d): %.2f M ops/sec (%.3f s)\n", sz, iterations,
+               ops_per_sec / 1e6, elapsed);
+    }
+
+    queue_free(queue);
+}
+
+void benchmark_queue_peek()
+{
+    printf("\n");
+    queue_t *queue = queue_new();
+    const int queue_size_val = 10000;
+    const int num_peeks = 1000000;
+
+    int *values = malloc(queue_size_val * sizeof(int));
+    for (int i = 0; i < queue_size_val; i++)
+    {
+        values[i] = i;
+        queue_enqueue(queue, &values[i]);
+    }
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < num_peeks; i++)
+    {
+        void *data = queue_peek(queue);
+        (void)data;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double ops_per_sec = num_peeks / elapsed;
+
+    printf("  queue_peek %d ops: %.2f M ops/sec (%.3f s)\n", num_peeks, ops_per_sec / 1e6, elapsed);
+
+    free(values);
+    queue_free(queue);
+}
+
 int main(void)
 {
     RUN_TEST(test_queue_new, tests_passed);
@@ -1200,6 +1355,10 @@ int main(void)
     RUN_TEST(benchmark_queue_mixed_operations, tests_passed);
     RUN_TEST(benchmark_queue_scaling, tests_passed);
     RUN_TEST(benchmark_queue_foreach_peek_at_concurrent, tests_passed);
+    RUN_TEST(benchmark_queue_foreach_large, tests_passed);
+    RUN_TEST(benchmark_queue_roundtrip, tests_passed);
+    RUN_TEST(benchmark_queue_clear, tests_passed);
+    RUN_TEST(benchmark_queue_peek, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

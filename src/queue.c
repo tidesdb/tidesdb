@@ -36,16 +36,23 @@
  */
 static inline queue_node_t *queue_alloc_node(queue_t *queue)
 {
-    queue_node_t *node = NULL;
+    /* speculative lock-free check: skip mutex when pool is empty
+     * racy read is safe -- worst case we malloc when pool had a node */
+    if (QUEUE_UNLIKELY(atomic_load_explicit(&queue->pool_size, memory_order_relaxed) == 0))
+    {
+        return (queue_node_t *)malloc(sizeof(queue_node_t));
+    }
 
     pthread_mutex_lock(&queue->pool_lock);
 
     /* we check pool first (common case) */
     if (QUEUE_LIKELY(queue->node_pool != NULL))
     {
-        node = queue->node_pool;
+        queue_node_t *node = queue->node_pool;
         queue->node_pool = node->next;
-        atomic_fetch_sub_explicit(&queue->pool_size, 1, memory_order_relaxed);
+        /* load+store avoids lock-prefixed instruction; mutex provides ordering */
+        const size_t ps = atomic_load_explicit(&queue->pool_size, memory_order_relaxed);
+        atomic_store_explicit(&queue->pool_size, ps - 1, memory_order_relaxed);
         pthread_mutex_unlock(&queue->pool_lock);
         return node;
     }
@@ -53,8 +60,7 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
     pthread_mutex_unlock(&queue->pool_lock);
 
     /* pool empty, allocate from heap */
-    node = (queue_node_t *)malloc(sizeof(queue_node_t));
-    return node;
+    return (queue_node_t *)malloc(sizeof(queue_node_t));
 }
 
 /**
@@ -66,15 +72,25 @@ static inline queue_node_t *queue_alloc_node(queue_t *queue)
  */
 static inline void queue_free_node(queue_t *queue, queue_node_t *node)
 {
+    /* speculative lock-free check: skip mutex when pool is full
+     * racy read is safe -- worst case we free when pool had room */
+    if (QUEUE_UNLIKELY(atomic_load_explicit(&queue->pool_size, memory_order_relaxed) >=
+                       queue->max_pool_size))
+    {
+        free(node);
+        return;
+    }
+
     pthread_mutex_lock(&queue->pool_lock);
 
-    if (QUEUE_LIKELY(atomic_load_explicit(&queue->pool_size, memory_order_relaxed) <
-                     queue->max_pool_size))
+    const size_t ps = atomic_load_explicit(&queue->pool_size, memory_order_relaxed);
+    if (QUEUE_LIKELY(ps < queue->max_pool_size))
     {
         /* return to pool */
         node->next = queue->node_pool;
         queue->node_pool = node;
-        atomic_fetch_add_explicit(&queue->pool_size, 1, memory_order_relaxed);
+        /* load+store avoids lock-prefixed instruction; mutex provides ordering */
+        atomic_store_explicit(&queue->pool_size, ps + 1, memory_order_relaxed);
         pthread_mutex_unlock(&queue->pool_lock);
         return;
     }
@@ -428,6 +444,11 @@ int queue_foreach(queue_t *queue, void (*fn)(void *data, void *context), void *c
     const queue_node_t *current = queue->head->next;
     while (QUEUE_LIKELY(current != NULL))
     {
+        /* prefetch next node to overlap memory latency with callback execution */
+        if (QUEUE_LIKELY(current->next != NULL))
+        {
+            PREFETCH_READ(current->next);
+        }
         fn(current->data, context);
         count++;
         current = current->next;
@@ -453,6 +474,11 @@ void *queue_peek_at(queue_t *queue, const size_t index)
     const queue_node_t *current = queue->head->next;
     for (size_t i = 0; i < index && QUEUE_LIKELY(current != NULL); i++)
     {
+        /* prefetch next node to overlap memory latency with loop iteration */
+        if (QUEUE_LIKELY(current->next != NULL))
+        {
+            PREFETCH_READ(current->next);
+        }
         current = current->next;
     }
 

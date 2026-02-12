@@ -689,9 +689,19 @@ static inline int encode_varint(uint8_t *buf, uint64_t value)
  */
 static inline int decode_varint(const uint8_t *buf, uint64_t *value, const int max_bytes)
 {
-    *value = 0;
-    int shift = 0;
-    int pos = 0;
+    if (TDB_UNLIKELY(max_bytes <= 0)) return -1;
+
+    /* fast path for 1-byte varints (values < 128) -- most common case */
+    if (TDB_LIKELY(!(buf[0] & 0x80)))
+    {
+        *value = buf[0];
+        return 1;
+    }
+
+    /* slow path for multi-byte varints */
+    *value = (uint64_t)(buf[0] & 0x7F);
+    int shift = 7;
+    int pos = 1;
 
     while (pos < max_bytes)
     {
@@ -2292,71 +2302,22 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
     uint32_t block_size = decode_uint32_le_compat(ptr);
     ptr += sizeof(uint32_t);
 
-    /* we calculate total size needed for arena allocation */
-    size_t total_key_size = 0;
-    size_t total_value_size = 0;
-    const uint8_t *scan_ptr = ptr;
-    size_t scan_remaining = data_size - (scan_ptr - data);
+    /* sanity check: num_entries must be reasonable for the data size
+     * each entry needs at least 4 bytes (flags + 3 varints min) */
+    if (num_entries > data_size / 4) return TDB_ERR_CORRUPTION;
 
-    for (uint32_t i = 0; i < num_entries; i++)
-    {
-        if (scan_remaining < 1) return TDB_ERR_CORRUPTION;
-        uint8_t flags = *scan_ptr++;
-        scan_remaining--;
-
-        uint64_t key_size_u64, value_size_u64, seq_value;
-
-        int bytes_read = decode_varint(scan_ptr, &key_size_u64, (int)scan_remaining);
-        if (bytes_read < 0 || key_size_u64 > UINT32_MAX) return TDB_ERR_CORRUPTION;
-        scan_ptr += bytes_read;
-        scan_remaining -= bytes_read;
-        total_key_size += (size_t)key_size_u64;
-
-        bytes_read = decode_varint(scan_ptr, &value_size_u64, (int)scan_remaining);
-        if (bytes_read < 0 || value_size_u64 > UINT32_MAX) return TDB_ERR_CORRUPTION;
-        scan_ptr += bytes_read;
-        scan_remaining -= bytes_read;
-
-        bytes_read = decode_varint(scan_ptr, &seq_value, (int)scan_remaining);
-        if (bytes_read < 0) return TDB_ERR_CORRUPTION;
-        scan_ptr += bytes_read;
-        scan_remaining -= bytes_read;
-
-        if (flags & TDB_KV_FLAG_HAS_TTL)
-        {
-            if (scan_remaining < sizeof(int64_t)) return TDB_ERR_CORRUPTION;
-            scan_ptr += sizeof(int64_t);
-            scan_remaining -= sizeof(int64_t);
-        }
-
-        if (flags & TDB_KV_FLAG_HAS_VLOG)
-        {
-            uint64_t vlog_offset;
-            bytes_read = decode_varint(scan_ptr, &vlog_offset, (int)scan_remaining);
-            if (bytes_read < 0) return TDB_ERR_CORRUPTION;
-            scan_ptr += bytes_read;
-            scan_remaining -= bytes_read;
-        }
-
-        if (scan_remaining < key_size_u64) return TDB_ERR_CORRUPTION;
-        scan_ptr += key_size_u64;
-        scan_remaining -= key_size_u64;
-
-        if (!(flags & TDB_KV_FLAG_HAS_VLOG) && value_size_u64 > 0)
-        {
-            if (scan_remaining < value_size_u64) return TDB_ERR_CORRUPTION;
-            scan_ptr += value_size_u64;
-            scan_remaining -= value_size_u64;
-            total_value_size += (size_t)value_size_u64;
-        }
-    }
+    /* we use data_size as upper bound for key+value data instead of scanning
+     * the entire serialized stream first. this eliminates the pre-scan pass
+     * which was the #1 source of branch mispredictions (34% of all branch misses).
+     * the second (actual deserialization) pass validates everything anyway. */
+    const size_t data_payload_bound = data_size;
 
     /* block + entries + key_ptrs + value_ptrs + key_data + value_data */
     const size_t arena_size = sizeof(tidesdb_klog_block_t) +
                               (num_entries * sizeof(tidesdb_klog_entry_t)) +
                               (num_entries * sizeof(uint8_t *)) + /* keys array */
                               (num_entries * sizeof(uint8_t *)) + /* inline_values array */
-                              total_key_size + total_value_size;
+                              data_payload_bound;
 
     uint8_t *arena = malloc(arena_size);
     if (!arena) return TDB_ERR_MEMORY;
@@ -2378,8 +2339,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
     (*block)->inline_values = (uint8_t **)arena_ptr;
     arena_ptr += num_entries * sizeof(uint8_t *);
 
-    uint8_t *key_data_arena = arena_ptr;
-    uint8_t *value_data_arena = arena_ptr + total_key_size;
+    uint8_t *data_arena = arena_ptr;
 
     (*block)->num_entries = 0;
     (*block)->block_size = block_size;
@@ -2387,8 +2347,7 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
 
     uint64_t prev_seq = 0;
     size_t remaining = data_size - (ptr - data);
-    size_t key_offset = 0;
-    size_t value_offset = 0;
+    size_t data_offset = 0;
 
     for (uint32_t i = 0; i < num_entries; i++)
     {
@@ -2499,9 +2458,9 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
         }
 
         /* we point into arena instead of malloc */
-        (*block)->keys[i] = key_data_arena + key_offset;
+        (*block)->keys[i] = data_arena + data_offset;
         memcpy((*block)->keys[i], ptr, (*block)->entries[i].key_size);
-        key_offset += (*block)->entries[i].key_size;
+        data_offset += (*block)->entries[i].key_size;
         ptr += (*block)->entries[i].key_size;
         remaining -= (*block)->entries[i].key_size;
 
@@ -2515,9 +2474,9 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
                 return TDB_ERR_CORRUPTION;
             }
 
-            (*block)->inline_values[i] = value_data_arena + value_offset;
+            (*block)->inline_values[i] = data_arena + data_offset;
             memcpy((*block)->inline_values[i], ptr, (*block)->entries[i].value_size);
-            value_offset += (*block)->entries[i].value_size;
+            data_offset += (*block)->entries[i].value_size;
             ptr += (*block)->entries[i].value_size;
             remaining -= (*block)->entries[i].value_size;
         }

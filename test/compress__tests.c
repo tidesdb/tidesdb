@@ -644,7 +644,7 @@ void benchmark_compress_small_payloads(void)
     const size_t small_sizes[] = {32, 128, 512};
     const char *size_names[] = {"32B", "128B", "512B"};
     const int num_sizes = 3;
-    const int iterations = 100000;
+    const int iterations = 10000;
 
     printf("  Small payload compress+decompress (%d iterations)\n", iterations);
     printf("  %-10s %-8s %-15s %-12s\n", "Algorithm", "Size", "Ops/sec", "MB/s");

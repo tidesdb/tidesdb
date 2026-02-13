@@ -1144,16 +1144,22 @@ static tidesdb_klog_block_t *tidesdb_cache_block_get(tidesdb_t *db, const char *
         return NULL;
     }
 
-    /* we extract ref-counted block pointer */
+    /* we extract ref-counted block pointer while cache reader count protects entry */
     tidesdb_ref_counted_block_t *rc_block;
     memcpy(&rc_block, payload, sizeof(rc_block));
 
-    /* we release cache entry ref_bit now that we've read the pointer */
+    if (!rc_block || !rc_block->block)
+    {
+        clock_cache_release(cache_entry);
+        return NULL;
+    }
+
+    /* we acquire rc_block ref BEFORE releasing cache entry to prevent use-after-free
+     * if we release cache entry first, another thread's cache_put for the same key
+     * could evict this entry and free rc_block before we increment ref_count */
+    tidesdb_block_acquire(rc_block);
     clock_cache_release(cache_entry);
 
-    if (!rc_block || !rc_block->block) return NULL;
-
-    tidesdb_block_acquire(rc_block);
     *rc_block_out = rc_block;
 
     return rc_block->block;

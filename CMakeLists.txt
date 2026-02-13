@@ -303,10 +303,12 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
     endif()
 else()
     # for linux and other unix systems
+    # we use -l flags to avoid collision with CMake MODULE targets that some distros
+    # (e.g. Oracle Linux 8, RHEL 8) ship in their zstd-devel CMake configs
     target_link_libraries(tidesdb PUBLIC
-            zstd
-            snappy
-            lz4
+            -lzstd
+            -lsnappy
+            -llz4
             pthread
             m           # math library
             stdc++      # C++ standard library (required by Snappy)

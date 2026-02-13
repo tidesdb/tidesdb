@@ -868,6 +868,34 @@ jobs:
           cd build
           ctest -V --output-on-failure --timeout 1800 --build-config Release
 
+  build-and-test-oracle-linux:
+    runs-on: ubuntu-latest
+    name: Oracle Linux 8 x64
+    container:
+      image: oraclelinux:8
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y oracle-epel-release-el8
+          dnf install -y gcc gcc-c++ make cmake git \
+            libzstd-devel lz4-devel snappy-devel \
+            diffutils
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run tests
+        run: |
+          cd build
+          ctest -V --output-on-failure --timeout 1800 --build-config Release
+
   create-portable-db-lsmb:
     runs-on: ubuntu-latest
     needs: build-and-test

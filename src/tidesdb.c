@@ -1154,7 +1154,7 @@ static tidesdb_klog_block_t *tidesdb_cache_block_get(tidesdb_t *db, const char *
         return NULL;
     }
 
-    /* we acquire rc_block ref BEFORE releasing cache entry to prevent use-after-free
+    /* we acquire rc_block ref before releasing cache entry to prevent use-after-free
      * if we release cache entry first, another thread's cache_put for the same key
      * could evict this entry and free rc_block before we increment ref_count */
     tidesdb_block_acquire(rc_block);

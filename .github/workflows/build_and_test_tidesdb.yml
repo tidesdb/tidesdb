@@ -882,7 +882,7 @@ jobs:
         run: |
           dnf install -y oracle-epel-release-el8
           dnf install -y gcc gcc-c++ make cmake git \
-            libzstd-devel lz4-devel \
+            libzstd-devel lz4-devel libatomic \
             diffutils wget
 
           # snappy-devel is not available in OL8 repos, build from source

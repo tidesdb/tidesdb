@@ -532,9 +532,9 @@ static int btree_leaf_serialize(const btree_pending_leaf_t *leaf, const int64_t 
         est_size += btree_varint_size(leaf->entries[i].value_size);
         est_size += btree_varint_size(leaf->entries[i].vlog_offset);
         const int64_t seq_delta = (int64_t)(leaf->entries[i].seq - base_seq);
-        est_size += btree_varint_size((uint64_t)((seq_delta << 1) ^ (seq_delta >> 63)));
-        est_size += btree_varint_size(
-            (uint64_t)((leaf->entries[i].ttl << 1) ^ (leaf->entries[i].ttl >> 63)));
+        est_size += btree_varint_size(((uint64_t)seq_delta << 1) ^ (uint64_t)(seq_delta >> 63));
+        est_size += btree_varint_size(((uint64_t)leaf->entries[i].ttl << 1) ^
+                                      (uint64_t)(leaf->entries[i].ttl >> 63));
         est_size += 1; /* flags */
         keys_total += suffix_lens[i];
         if (leaf->entries[i].vlog_offset == 0 && leaf->values[i])

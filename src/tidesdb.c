@@ -15522,6 +15522,10 @@ int tidesdb_txn_savepoint(tidesdb_txn_t *txn, const char *name)
                         memcpy(savepoint->ops[j].value, txn->ops[j].value, txn->ops[j].value_size);
                     }
                 }
+                else
+                {
+                    savepoint->ops[j].value = NULL;
+                }
                 savepoint->ops[j].value_size = txn->ops[j].value_size;
                 savepoint->ops[j].ttl = txn->ops[j].ttl;
                 savepoint->ops[j].is_delete = txn->ops[j].is_delete;
@@ -15605,6 +15609,10 @@ int tidesdb_txn_savepoint(tidesdb_txn_t *txn, const char *name)
             {
                 memcpy(savepoint->ops[i].value, txn->ops[i].value, txn->ops[i].value_size);
             }
+        }
+        else
+        {
+            savepoint->ops[i].value = NULL;
         }
         savepoint->ops[i].value_size = txn->ops[i].value_size;
         savepoint->ops[i].ttl = txn->ops[i].ttl;

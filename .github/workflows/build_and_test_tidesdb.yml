@@ -882,8 +882,20 @@ jobs:
         run: |
           dnf install -y oracle-epel-release-el8
           dnf install -y gcc gcc-c++ make cmake git \
-            libzstd-devel lz4-devel snappy-devel \
-            diffutils
+            libzstd-devel lz4-devel \
+            diffutils wget
+
+          # snappy-devel is not available in OL8 repos, build from source
+          cd /tmp
+          wget https://github.com/google/snappy/archive/refs/tags/1.1.10.tar.gz -O snappy.tar.gz
+          tar xzf snappy.tar.gz
+          cd snappy-1.1.10
+          cmake -S . -B build \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DSNAPPY_BUILD_TESTS=OFF \
+            -DSNAPPY_BUILD_BENCHMARKS=OFF
+          cmake --build build
+          cmake --install build
 
       - name: Configure CMake
         run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF

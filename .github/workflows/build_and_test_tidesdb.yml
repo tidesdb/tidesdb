@@ -892,6 +892,7 @@ jobs:
           cd snappy-1.1.10
           cmake -S . -B build \
             -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DSNAPPY_BUILD_TESTS=OFF \
             -DSNAPPY_BUILD_BENCHMARKS=OFF
           cmake --build build

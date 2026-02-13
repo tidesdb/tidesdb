@@ -868,6 +868,47 @@ jobs:
           cd build
           ctest -V --output-on-failure --timeout 1800 --build-config Release
 
+  build-and-test-oracle-linux:
+    runs-on: ubuntu-latest
+    name: Oracle Linux 8 x64
+    container:
+      image: oraclelinux:8
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y oracle-epel-release-el8
+          dnf install -y gcc gcc-c++ make cmake git \
+            libzstd-devel lz4-devel libatomic \
+            diffutils wget
+
+          # snappy-devel is not available in OL8 repos, build from source
+          cd /tmp
+          wget https://github.com/google/snappy/archive/refs/tags/1.1.10.tar.gz -O snappy.tar.gz
+          tar xzf snappy.tar.gz
+          cd snappy-1.1.10
+          cmake -S . -B build \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DSNAPPY_BUILD_TESTS=OFF \
+            -DSNAPPY_BUILD_BENCHMARKS=OFF
+          cmake --build build
+          cmake --install build
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DTIDESDB_BUILD_TESTS=ON -DTIDESDB_WITH_SANITIZER=OFF
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run tests
+        run: |
+          cd build
+          ctest -V --output-on-failure --timeout 1800 --build-config Release
+
   create-portable-db-lsmb:
     runs-on: ubuntu-latest
     needs: build-and-test

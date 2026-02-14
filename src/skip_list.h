@@ -33,6 +33,41 @@
 typedef struct skip_list_node_t skip_list_node_t;
 typedef struct skip_list_t skip_list_t;
 typedef struct skip_list_version_t skip_list_version_t;
+typedef struct skip_list_arena_block_t skip_list_arena_block_t;
+typedef struct skip_list_arena_t skip_list_arena_t;
+
+/* arena alignment for all allocations */
+#define SKIP_LIST_ARENA_ALIGNMENT 8
+
+/**
+ * skip_list_arena_block_t
+ * a single contiguous memory block in the arena's linked list
+ * @param data pointer to the raw memory
+ * @param used atomic bump pointer (bytes consumed so far)
+ * @param capacity total bytes available in this block
+ * @param prev previous block in the chain (for destruction)
+ */
+struct skip_list_arena_block_t
+{
+    uint8_t *data;
+    _Atomic(size_t) used;
+    size_t capacity;
+    skip_list_arena_block_t *prev;
+};
+
+/**
+ * skip_list_arena_t
+ * lock-free bump allocator for skip list nodes and versions
+ * allocations are wait-free (single atomic_fetch_add per alloc)
+ * individual frees are no-ops; all memory is reclaimed when the arena is destroyed
+ * @param current_block atomic pointer to the active allocation block
+ * @param block_size default capacity for new blocks
+ */
+struct skip_list_arena_t
+{
+    _Atomic(skip_list_arena_block_t *) current_block;
+    size_t block_size;
+};
 
 /* skip_list_version_t flag bits */
 #define SKIP_LIST_FLAG_DELETED 0x01 /* version is tombstone */
@@ -151,6 +186,7 @@ typedef struct skip_list_t
     skip_list_comparator_fn comparator;
     void *comparator_ctx;
     _Atomic(time_t) *cached_time;
+    skip_list_arena_t *arena;
 } skip_list_t;
 
 /**
@@ -163,6 +199,8 @@ typedef struct
 {
     skip_list_t *list;
     skip_list_node_t *current;
+    skip_list_node_t *cached_header;
+    skip_list_node_t *cached_tail;
 } skip_list_cursor_t;
 
 /**
@@ -269,6 +307,25 @@ int skip_list_new_with_comparator_and_cached_time(skip_list_t **list, int max_le
                                                   _Atomic(time_t) *cached_time);
 
 /**
+ * skip_list_new_with_arena
+ * creates a new skip list backed by a bump arena for cache-friendly node allocation
+ * all node and version memory is allocated from contiguous blocks, improving spatial
+ * locality during traversal. individual frees are no-ops; memory is reclaimed when
+ * the skip list is freed. ideal for memtable skip lists that are filled then freed whole.
+ * @param list pointer to skip list pointer
+ * @param max_level maximum level
+ * @param probability probability for level generation
+ * @param comparator custom key comparison function
+ * @param comparator_ctx context for comparator
+ * @param cached_time pointer to external cached time (avoids time() syscalls)
+ * @param arena_initial_capacity initial arena block size in bytes (0 = no arena)
+ * @return 0 on success, -1 on failure
+ */
+int skip_list_new_with_arena(skip_list_t **list, int max_level, float probability,
+                             skip_list_comparator_fn comparator, void *comparator_ctx,
+                             _Atomic(time_t) *cached_time, size_t arena_initial_capacity);
+
+/**
  * skip_list_random_level
  * generates a random level for a new node
  * @param list skip list
@@ -359,6 +416,23 @@ int skip_list_get(skip_list_t *list, const uint8_t *key, size_t key_size, uint8_
                   size_t *value_size, int64_t *ttl, uint8_t *deleted);
 
 /**
+ * skip_list_get_ref
+ * zero-copy get that returns a direct pointer into the version data
+ * the returned pointers are only valid while the caller holds a reference
+ * to the skip list (e.g. memtable refcount). caller must NOT free the value.
+ * @param list skip list
+ * @param key key data
+ * @param key_size size of key
+ * @param value pointer to value pointer (do NOT free)
+ * @param value_size pointer to value size
+ * @param ttl pointer to ttl
+ * @param deleted pointer to deleted flag
+ * @return 0 on success, -1 on failure
+ */
+int skip_list_get_ref(skip_list_t *list, const uint8_t *key, size_t key_size, const uint8_t **value,
+                      size_t *value_size, int64_t *ttl, uint8_t *deleted);
+
+/**
  * skip_list_visibility_check_fn
  * Callback function to check if a sequence is visible
  * @param opaque_ctx opaque context pointer (e.g., commit_status)
@@ -387,6 +461,30 @@ int skip_list_get_with_seq(skip_list_t *list, const uint8_t *key, size_t key_siz
                            size_t *value_size, int64_t *ttl, uint8_t *deleted, uint64_t *seq,
                            uint64_t snapshot_seq, skip_list_visibility_check_fn visibility_check,
                            void *visibility_ctx);
+
+/**
+ * skip_list_get_with_seq_ref
+ * zero-copy MVCC get that returns a direct pointer into the version data
+ * the returned pointer is only valid while the caller holds a reference
+ * to the skip list (e.g. memtable refcount). caller must not free the value.
+ * @param list skip list
+ * @param key key data
+ * @param key_size size of key
+ * @param value pointer to const value pointer (do NOT free)
+ * @param value_size pointer to value size
+ * @param ttl pointer to ttl
+ * @param deleted pointer to deleted flag
+ * @param seq pointer to sequence number (output)
+ * @param snapshot_seq snapshot sequence number
+ * @param visibility_check callback to check if a sequence is committed
+ * @param visibility_ctx context for visibility check callback
+ * @return 0 on success, -1 on failure
+ */
+int skip_list_get_with_seq_ref(skip_list_t *list, const uint8_t *key, size_t key_size,
+                               const uint8_t **value, size_t *value_size, int64_t *ttl,
+                               uint8_t *deleted, uint64_t *seq, uint64_t snapshot_seq,
+                               skip_list_visibility_check_fn visibility_check,
+                               void *visibility_ctx);
 
 /**
  * skip_list_get_max_seq
@@ -440,6 +538,22 @@ int skip_list_cursor_prev(skip_list_cursor_t *cursor);
  */
 int skip_list_cursor_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_size,
                          uint8_t **value, size_t *value_size, int64_t *ttl, uint8_t *deleted);
+
+/**
+ * skip_list_cursor_next_get
+ * fused next + get in a single call, avoiding redundant sentinel checks
+ * and enabling better prefetching. returns zero-copy pointers.
+ * @param cursor cursor
+ * @param key pointer to key pointer (do NOT free)
+ * @param key_size pointer to key size
+ * @param value pointer to value pointer (do NOT free)
+ * @param value_size pointer to value size
+ * @param ttl pointer to ttl
+ * @param deleted pointer to deleted flag
+ * @return 0 on success, -1 on failure (end of list)
+ */
+int skip_list_cursor_next_get(skip_list_cursor_t *cursor, uint8_t **key, size_t *key_size,
+                              uint8_t **value, size_t *value_size, int64_t *ttl, uint8_t *deleted);
 
 /**
  * skip_list_cursor_get_with_seq

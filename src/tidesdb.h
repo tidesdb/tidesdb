@@ -204,6 +204,7 @@ typedef struct tidesdb_level_t tidesdb_level_t;
 typedef struct tidesdb_sstable_t tidesdb_sstable_t;
 typedef struct tidesdb_block_index_t tidesdb_block_index_t;
 typedef struct tidesdb_memtable_t tidesdb_memtable_t;
+typedef struct tidesdb_deferred_free_node_t tidesdb_deferred_free_node_t;
 typedef struct tidesdb_t tidesdb_t;
 typedef struct tidesdb_column_family_t tidesdb_column_family_t;
 typedef struct tidesdb_txn_t tidesdb_txn_t;
@@ -559,6 +560,7 @@ struct tidesdb_t
     uint64_t available_memory;
     uint64_t total_memory;
     pthread_rwlock_t cf_list_lock;
+    _Atomic(tidesdb_deferred_free_node_t *) deferred_free_list;
     int lock_fd;
     FILE *log_file;
 #ifdef TDB_ENABLE_READ_PROFILING

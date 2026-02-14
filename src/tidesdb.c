@@ -5649,11 +5649,10 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
             new_arr[old_num] = sst;
 
             /* we update count before the CAS so readers never see the new array
-             * with a stale (smaller) count.  If the CAS fails the count is harmlessly
-             * ahead -- the old array position old_num is uninitialised but readers
-             * NULL-check every entry (`if (!sst) continue`).  On retry the count is
-             * re-loaded from the atomic anyway. */
-            atomic_store_explicit(&level->num_sstables, old_num + 1, memory_order_release);
+             * with a stale (smaller) count.  We use fetch_add/fetch_sub instead of
+             * plain store so that concurrent adds to the same level don't clobber
+             * each other's count updates. */
+            atomic_fetch_add_explicit(&level->num_sstables, 1, memory_order_release);
             atomic_thread_fence(memory_order_seq_cst);
 
             /* CAS to swap in new array */
@@ -5674,7 +5673,7 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
                 return TDB_SUCCESS;
             }
             /* CAS failed -- restore count and retry */
-            atomic_store_explicit(&level->num_sstables, old_num, memory_order_release);
+            atomic_fetch_sub_explicit(&level->num_sstables, 1, memory_order_release);
             free(new_arr);
         }
         else
@@ -5699,8 +5698,8 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
             memcpy(new_arr, old_arr, old_num * sizeof(tidesdb_sstable_t *));
             new_arr[old_num] = sst;
 
-            /* we update count BEFORE the CAS -- see comment in resize path above */
-            atomic_store_explicit(&level->num_sstables, old_num + 1, memory_order_release);
+            /* we update count before the CAS -- see comment in resize path above */
+            atomic_fetch_add_explicit(&level->num_sstables, 1, memory_order_release);
             atomic_thread_fence(memory_order_seq_cst);
 
             if (atomic_compare_exchange_strong_explicit(&level->sstables, &old_arr, new_arr,
@@ -5716,7 +5715,7 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
                 return TDB_SUCCESS;
             }
             /* CAS failed -- restore count and retry */
-            atomic_store_explicit(&level->num_sstables, old_num, memory_order_release);
+            atomic_fetch_sub_explicit(&level->num_sstables, 1, memory_order_release);
             free(new_arr);
         }
     }

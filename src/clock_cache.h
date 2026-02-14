@@ -69,6 +69,7 @@ typedef struct
     _Atomic(uint8_t) ref_bit;
     _Atomic(uint8_t) state;
     atomic_uint64_t cached_hash;
+    char _pad[16]; /* pad to 64 bytes (one cache line) to prevent false sharing */
 } clock_cache_entry_t;
 
 /** entry states */
@@ -108,17 +109,22 @@ typedef struct
  */
 struct clock_cache_partition_t
 {
+    /* --- cache line 0: cold, read-only after init --- */
     clock_cache_entry_t *slots;
     _Atomic(int32_t) *hash_index;
     size_t num_slots;
     size_t hash_index_size;
     size_t hash_mask;
+    _Atomic(clock_cache_partition_t *) next;
+    char _pad_cold[16]; /* pad to 64 bytes */
+
+    /* --- cache line 1: hot, written by multiple threads --- */
     atomic_size_t clock_hand;
     atomic_size_t occupied_count;
     atomic_size_t bytes_used;
     atomic_uint64_t hits;
     atomic_uint64_t misses;
-    _Atomic(clock_cache_partition_t *) next;
+    char _pad_hot[24]; /* pad to 64 bytes */
 };
 
 /**

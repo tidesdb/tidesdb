@@ -143,65 +143,34 @@ static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const ch
     size_t entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_relaxed);
     if (entry_key_len != key_len) return NULL;
 
+    /* acquire reader ref -- prevents free_entry from freeing key/payload while we memcmp */
     atomic_fetch_add_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
 
-    uint8_t state_before = atomic_load_explicit(&entry->state, memory_order_acquire);
-    if (state_before != ENTRY_VALID)
+    /* re-validate state after acquiring ref (entry may have been evicted between
+     * our pre-checks and the ref acquisition) */
+    state = atomic_load_explicit(&entry->state, memory_order_acquire);
+    if (state != ENTRY_VALID)
     {
         atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
         return NULL;
     }
 
-    char *entry_key_ptr = atomic_load_explicit(&entry->key, memory_order_acquire);
-    if (!entry_key_ptr)
+    char *entry_key = atomic_load_explicit(&entry->key, memory_order_acquire);
+    if (!entry_key)
     {
         atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
         return NULL;
     }
 
-    entry_hash = atomic_load_explicit(&entry->cached_hash, memory_order_acquire);
-    if (entry_hash != target_hash)
+    if (memcmp(entry_key, key, key_len) != 0)
     {
         atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
         return NULL;
     }
 
-    entry_key_len = atomic_load_explicit(&entry->key_len, memory_order_acquire);
-    if (entry_key_len != key_len)
-    {
-        atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
-        return NULL;
-    }
-
-    uint8_t state_check = atomic_load_explicit(&entry->state, memory_order_acquire);
-    if (state_check != ENTRY_VALID)
-    {
-        atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
-        return NULL;
-    }
-
-    char *key_final = atomic_load_explicit(&entry->key, memory_order_acquire);
-    if (!key_final || key_final != entry_key_ptr)
-    {
-        atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
-        return NULL;
-    }
-
-    const int match = (memcmp(key_final, key, key_len) == 0);
-
-    atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
-
-    if (!match) return NULL;
-
-    uint8_t state_after = atomic_load_explicit(&entry->state, memory_order_acquire);
-    char *key_after = atomic_load_explicit(&entry->key, memory_order_acquire);
-
-    if (state_after == ENTRY_VALID && key_after == key_final)
-    {
-        return entry;
-    }
-
-    return NULL;
+    /* match! return with reader ref HELD -- caller must release via
+     * atomic_fetch_sub(ref_bit, CLOCK_CACHE_READER_INC) when done */
+    return entry;
 }
 
 static clock_cache_entry_t *find_entry_with_hash(clock_cache_partition_t *partition,
@@ -672,7 +641,9 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     clock_cache_entry_t *old_entry = find_entry_with_hash(partition, key, key_len, hash);
     if (old_entry)
     {
-        /* we mark old entry as deleted to avoid duplicates */
+        /* release reader ref before free_entry (which checks for active readers) */
+        atomic_fetch_sub_explicit(&old_entry->ref_bit, CLOCK_CACHE_READER_INC,
+                                  memory_order_acq_rel);
         free_entry(cache, partition, old_entry);
     }
 
@@ -748,6 +719,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
     const size_t partition_idx = (size_t)(hash & cache->partition_mask);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
+    /* find_entry_with_hash returns entry with reader ref HELD (from try_match_entry) */
     clock_cache_entry_t *entry = find_entry_with_hash(partition, key, key_len, hash);
 
     if (!entry)
@@ -756,17 +728,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
         return NULL;
     }
 
-    /* we increment ref_bit to protect entry from eviction during read */
-    atomic_fetch_add_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
-
-    /* we verify entry is still valid after incrementing ref_bit */
-    uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
-    if (state != ENTRY_VALID)
-    {
-        atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
-        return NULL;
-    }
-
+    /* reader ref is held -- entry is protected from eviction */
     uint8_t *entry_payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
     size_t entry_payload_len = atomic_load_explicit(&entry->payload_len, memory_order_acquire);
 
@@ -783,17 +745,9 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
         return NULL;
     }
 
-    uint8_t *payload_recheck = atomic_load_explicit(&entry->payload, memory_order_acquire);
-    if (payload_recheck != entry_payload)
-    {
-        /* *** cleared or changed, abort *** */
-        free(result);
-        atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
-        return NULL;
-    }
-
     memcpy(result, entry_payload, entry_payload_len);
 
+    /* mark as recently used and release reader ref */
     atomic_fetch_or_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_relaxed);
     atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
 
@@ -815,6 +769,7 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
     const size_t partition_idx = (size_t)(hash & cache->partition_mask);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
+    /* find_entry_with_hash returns entry with reader ref HELD (from try_match_entry) */
     clock_cache_entry_t *entry = find_entry_with_hash(partition, key, key_len, hash);
 
     if (!entry)
@@ -823,17 +778,7 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
         return NULL;
     }
 
-    /* we increment ref_bit to protect entry from eviction during use */
-    atomic_fetch_add_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
-
-    /* we verify entry is still valid after incrementing ref_bit */
-    uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
-    if (state != ENTRY_VALID)
-    {
-        atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
-        return NULL;
-    }
-
+    /* reader ref is held -- entry is protected from eviction */
     uint8_t *entry_payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
     size_t entry_payload_len = atomic_load_explicit(&entry->payload_len, memory_order_acquire);
 
@@ -843,17 +788,10 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
         return NULL;
     }
 
-    /* we need to re-verify payload pointer hasnt been cleared by free_entry */
-    uint8_t *payload_recheck = atomic_load_explicit(&entry->payload, memory_order_acquire);
-    if (payload_recheck != entry_payload)
-    {
-        atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
-        return NULL;
-    }
-
     if (payload_len) *payload_len = entry_payload_len;
     if (entry_out) *entry_out = entry;
 
+    /* mark as recently used; caller releases ref via clock_cache_release() */
     atomic_fetch_or_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_relaxed);
 
     atomic_fetch_add_explicit(&partition->hits, 1, memory_order_relaxed);
@@ -883,6 +821,8 @@ int clock_cache_delete(clock_cache_t *cache, const char *key, const size_t key_l
         return -1;
     }
 
+    /* release reader ref before free_entry (which checks for active readers) */
+    atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
     free_entry(cache, partition, entry);
 
     return 0;

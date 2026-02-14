@@ -5538,6 +5538,58 @@ static void tidesdb_retire_array(tidesdb_t *db, void *prev_retired, tidesdb_leve
 }
 
 /**
+ * tidesdb_defer_removed_sst_unref
+ * defer the unref of a removed sstable until array_readers drains to 0
+ * prevents use-after-free when readers hold raw pointers from the old array
+ * @param db the database
+ * @param level the level whose array_readers guards reader access
+ * @param sst the removed sstable to defer unreffing
+ */
+static void tidesdb_defer_removed_sst_unref(tidesdb_t *db, tidesdb_level_t *level,
+                                            tidesdb_sstable_t *sst)
+{
+    /* brief spin -- handles common case where readers finish quickly */
+    for (int i = 0; i < TDB_DEFERRED_FREE_SPIN_ATTEMPTS; i++)
+    {
+        if (atomic_load_explicit(&level->array_readers, memory_order_acquire) == 0)
+        {
+            tidesdb_sstable_unref(db, sst);
+            return;
+        }
+        cpu_pause();
+    }
+
+    /* readers still active, defer to reaper thread */
+    tidesdb_deferred_free_node_t *node = malloc(sizeof(tidesdb_deferred_free_node_t));
+    tidesdb_sstable_t **unrefs = node ? malloc(sizeof(tidesdb_sstable_t *)) : NULL;
+
+    if (!node || !unrefs)
+    {
+        /* allocation failed, must spin-wait */
+        while (atomic_load_explicit(&level->array_readers, memory_order_acquire) > 0) cpu_yield();
+        tidesdb_sstable_unref(db, sst);
+        free(node);
+        free(unrefs);
+        return;
+    }
+
+    unrefs[0] = sst;
+    node->ptr = NULL;
+    node->level = level;
+    node->sst_unrefs = unrefs;
+    node->sst_unrefs_count = 1;
+    node->db = db;
+
+    tidesdb_deferred_free_node_t *old_head =
+        atomic_load_explicit(&db->deferred_free_list, memory_order_acquire);
+    do
+    {
+        node->next = old_head;
+    } while (!atomic_compare_exchange_weak_explicit(&db->deferred_free_list, &old_head, node,
+                                                    memory_order_release, memory_order_acquire));
+}
+
+/**
  * tidesdb_level_add_sstable
  * add an sstable to a level
  * @param level level to add sstable to
@@ -5702,15 +5754,21 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
             atomic_fetch_sub_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                       memory_order_relaxed);
 
-            /* we unref old array's sstables */
+            /* we unref old array's surviving sstables immediately (safe: new array holds refs)
+             * but skip the removed sstable -- readers may still hold raw pointers from old array
+             * and would hit use-after-free if we unref it to 0 before they call try_ref */
             for (int i = 0; i < old_num; i++)
             {
+                if (i == found_idx) continue;
                 tidesdb_sstable_unref(db, old_arr[i]);
             }
 
             tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(
                 &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
             tidesdb_retire_array((tidesdb_t *)db, prev_retired, level);
+
+            /* defer the removed SSTable's unref until array_readers drains to 0 */
+            tidesdb_defer_removed_sst_unref((tidesdb_t *)db, level, sst);
 
             return TDB_SUCCESS;
         }

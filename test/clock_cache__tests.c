@@ -17,12 +17,22 @@
  * limitations under the License.
  */
 #include <math.h>
+#include <time.h>
 
 #include "../src/clock_cache.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
+
+/* wall-clock timing helper -- clock() measures CPU time across all threads
+ * which makes multi-threaded scaling look ~Nx worse than reality */
+static inline double wall_time_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
 void test_cache_create_destroy(void)
 {
@@ -672,7 +682,7 @@ void benchmark_cache_insertions(void)
     clock_cache_t *cache = clock_cache_create(&config);
     ASSERT_TRUE(cache != NULL);
 
-    clock_t start = clock();
+    double start = wall_time_sec();
     for (int i = 0; i < 100000; i++)
     {
         char key[64];
@@ -681,9 +691,9 @@ void benchmark_cache_insertions(void)
         snprintf((char *)payload, sizeof(payload), "bench_value_%d", i);
         clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1);
     }
-    clock_t end = clock();
+    double end = wall_time_sec();
 
-    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    double time_spent = end - start;
     printf(CYAN "Inserting 100,000 entries took %f seconds\n" RESET, time_spent);
 
     clock_cache_stats_t stats;
@@ -711,7 +721,7 @@ void benchmark_cache_lookups(void)
         clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1);
     }
 
-    clock_t start = clock();
+    double start = wall_time_sec();
     int hits = 0;
     for (int i = 0; i < 100000; i++)
     {
@@ -725,9 +735,9 @@ void benchmark_cache_lookups(void)
             free(data);
         }
     }
-    clock_t end = clock();
+    double end = wall_time_sec();
 
-    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    double time_spent = end - start;
     printf(CYAN "100,000 lookups took %f seconds\n" RESET, time_spent);
     printf(BOLDWHITE "Hit rate: %.2f%%\n" RESET, (double)hits / 100000.0 * 100.0);
 
@@ -748,7 +758,7 @@ void benchmark_concurrent_puts(void)
     thread_args_t *args = malloc(num_threads * sizeof(thread_args_t));
     ASSERT_TRUE(threads != NULL && args != NULL);
 
-    clock_t start = clock();
+    double start = wall_time_sec();
     for (int i = 0; i < num_threads; i++)
     {
         args[i].cache = cache;
@@ -760,9 +770,9 @@ void benchmark_concurrent_puts(void)
     for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
     free(threads);
     free(args);
-    clock_t end = clock();
+    double end = wall_time_sec();
 
-    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    double time_spent = end - start;
     printf(CYAN "%d threads inserting %d entries each took %f seconds\n" RESET, num_threads,
            ops_per_thread, time_spent);
 
@@ -797,7 +807,7 @@ void benchmark_concurrent_gets(void)
     thread_args_t *args = malloc(num_threads * sizeof(thread_args_t));
     ASSERT_TRUE(threads != NULL && args != NULL);
 
-    clock_t start = clock();
+    double start = wall_time_sec();
     for (int i = 0; i < num_threads; i++)
     {
         args[i].cache = cache;
@@ -809,9 +819,9 @@ void benchmark_concurrent_gets(void)
     for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
     free(threads);
     free(args);
-    clock_t end = clock();
+    double end = wall_time_sec();
 
-    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    double time_spent = end - start;
     printf(CYAN "%d threads performing %d gets each took %f seconds\n" RESET, num_threads,
            ops_per_thread, time_spent);
 
@@ -832,7 +842,7 @@ void benchmark_concurrent_mixed(void)
     thread_args_t *args = malloc(num_threads * sizeof(thread_args_t));
     ASSERT_TRUE(threads != NULL && args != NULL);
 
-    clock_t start = clock();
+    double start = wall_time_sec();
     for (int i = 0; i < num_threads; i++)
     {
         args[i].cache = cache;
@@ -844,9 +854,9 @@ void benchmark_concurrent_mixed(void)
     for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
     free(threads);
     free(args);
-    clock_t end = clock();
+    double end = wall_time_sec();
 
-    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    double time_spent = end - start;
     printf(CYAN "%d threads performing %d mixed ops each took %f seconds\n" RESET, num_threads,
            ops_per_thread, time_spent);
 
@@ -882,7 +892,7 @@ void benchmark_scaling_puts(void)
         pthread_t threads[16];
         thread_args_t args[16];
 
-        clock_t start = clock();
+        double start = wall_time_sec();
 
         for (int t = 0; t < num_threads; t++)
         {
@@ -894,8 +904,7 @@ void benchmark_scaling_puts(void)
 
         for (int t = 0; t < num_threads; t++) pthread_join(threads[t], NULL);
 
-        clock_t end = clock();
-        double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+        double time_spent = wall_time_sec() - start;
 
         if (i == 0) baseline_time = time_spent;
 
@@ -943,7 +952,7 @@ void benchmark_scaling_gets(void)
         pthread_t threads[16];
         thread_args_t args[16];
 
-        clock_t start = clock();
+        double start = wall_time_sec();
 
         for (int t = 0; t < num_threads; t++)
         {
@@ -955,8 +964,7 @@ void benchmark_scaling_gets(void)
 
         for (int t = 0; t < num_threads; t++) pthread_join(threads[t], NULL);
 
-        clock_t end = clock();
-        double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+        double time_spent = wall_time_sec() - start;
 
         if (i == 0) baseline_time = time_spent;
 
@@ -995,7 +1003,7 @@ void benchmark_scaling_mixed(void)
         pthread_t threads[16];
         thread_args_t args[16];
 
-        clock_t start = clock();
+        double start = wall_time_sec();
 
         for (int t = 0; t < num_threads; t++)
         {
@@ -1007,8 +1015,7 @@ void benchmark_scaling_mixed(void)
 
         for (int t = 0; t < num_threads; t++) pthread_join(threads[t], NULL);
 
-        clock_t end = clock();
-        double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+        double time_spent = wall_time_sec() - start;
 
         if (i == 0) baseline_time = time_spent;
 

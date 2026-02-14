@@ -285,12 +285,18 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
  * pushed by flush/compaction workers, swept by reaper thread
  * @param ptr pointer to the retired array to free
  * @param level level whose array_readers must reach 0 before freeing
+ * @param sst_unrefs optional array of sstable pointers to unref when freed
+ * @param sst_unrefs_count number of entries in sst_unrefs
+ * @param db database handle needed for sstable_unref (only when sst_unrefs_count > 0)
  * @param next pointer to next node in the deferred free list
  */
 struct tidesdb_deferred_free_node_t
 {
     void *ptr;
     tidesdb_level_t *level;
+    tidesdb_sstable_t **sst_unrefs;
+    int sst_unrefs_count;
+    const tidesdb_t *db;
     struct tidesdb_deferred_free_node_t *next;
 };
 
@@ -5394,6 +5400,9 @@ static void tidesdb_deferred_free_enqueue(tidesdb_t *db, void *ptr, tidesdb_leve
 
     node->ptr = ptr;
     node->level = level;
+    node->sst_unrefs = NULL;
+    node->sst_unrefs_count = 0;
+    node->db = NULL;
 
     /* lock-free push onto head of singly-linked list */
     tidesdb_deferred_free_node_t *old_head =
@@ -5427,7 +5436,15 @@ static void tidesdb_deferred_free_sweep(tidesdb_t *db)
 
         if (atomic_load_explicit(&current->level->array_readers, memory_order_acquire) == 0)
         {
-            /* safe to free */
+            /* safe to free -- also unref any deferred sstables */
+            if (current->sst_unrefs_count > 0 && current->sst_unrefs)
+            {
+                for (int i = 0; i < current->sst_unrefs_count; i++)
+                {
+                    tidesdb_sstable_unref(current->db, current->sst_unrefs[i]);
+                }
+                free(current->sst_unrefs);
+            }
             free(current->ptr);
             free(current);
         }
@@ -5468,6 +5485,14 @@ static void tidesdb_deferred_free_drain(tidesdb_t *db)
             cpu_yield();
         }
 
+        if (list->sst_unrefs_count > 0 && list->sst_unrefs)
+        {
+            for (int i = 0; i < list->sst_unrefs_count; i++)
+            {
+                tidesdb_sstable_unref(list->db, list->sst_unrefs[i]);
+            }
+            free(list->sst_unrefs);
+        }
         free(list->ptr);
         free(list);
         list = next;
@@ -5513,6 +5538,83 @@ static void tidesdb_retire_array(tidesdb_t *db, void *prev_retired, tidesdb_leve
 }
 
 /**
+ * tidesdb_retire_sstable_unrefs
+ * defer sstable unrefs until no readers are accessing the level's array
+ * this prevents use-after-free when a reader still holds a pointer from the old array
+ * @param db the database
+ * @param unrefs array of sstable pointers to unref (ownership transferred)
+ * @param count number of entries in unrefs
+ * @param level the level whose array_readers must reach 0 before unreffing
+ */
+static void tidesdb_retire_sstable_unrefs(tidesdb_t *db, tidesdb_sstable_t **unrefs, int count,
+                                          tidesdb_level_t *level)
+{
+    if (!unrefs || count <= 0) return;
+
+    /* brief spin -- handles the common case where readers finish quickly */
+    for (int i = 0; i < TDB_DEFERRED_FREE_SPIN_ATTEMPTS; i++)
+    {
+        if (atomic_load_explicit(&level->array_readers, memory_order_acquire) == 0)
+        {
+            for (int j = 0; j < count; j++)
+            {
+                tidesdb_sstable_unref(db, unrefs[j]);
+            }
+            free(unrefs);
+            return;
+        }
+        cpu_pause();
+    }
+
+    /* readers still active -- enqueue for deferred processing by reaper thread */
+    if (db)
+    {
+        tidesdb_deferred_free_node_t *node = malloc(sizeof(tidesdb_deferred_free_node_t));
+        if (!node)
+        {
+            /* last resort spin-wait */
+            while (atomic_load_explicit(&level->array_readers, memory_order_acquire) > 0)
+            {
+                cpu_yield();
+            }
+            for (int j = 0; j < count; j++)
+            {
+                tidesdb_sstable_unref(db, unrefs[j]);
+            }
+            free(unrefs);
+            return;
+        }
+
+        node->ptr = NULL;
+        node->level = level;
+        node->sst_unrefs = unrefs;
+        node->sst_unrefs_count = count;
+        node->db = db;
+
+        tidesdb_deferred_free_node_t *old_head =
+            atomic_load_explicit(&db->deferred_free_list, memory_order_acquire);
+        do
+        {
+            node->next = old_head;
+        } while (!atomic_compare_exchange_weak_explicit(
+            &db->deferred_free_list, &old_head, node, memory_order_release, memory_order_acquire));
+    }
+    else
+    {
+        /* no db handle, must spin */
+        while (atomic_load_explicit(&level->array_readers, memory_order_acquire) > 0)
+        {
+            cpu_yield();
+        }
+        for (int j = 0; j < count; j++)
+        {
+            tidesdb_sstable_unref(db, unrefs[j]);
+        }
+        free(unrefs);
+    }
+}
+
+/**
  * tidesdb_level_add_sstable
  * add an sstable to a level
  * @param level level to add sstable to
@@ -5546,14 +5648,21 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
 
             new_arr[old_num] = sst;
 
+            /* we update count before the CAS so readers never see the new array
+             * with a stale (smaller) count.  If the CAS fails the count is harmlessly
+             * ahead -- the old array position old_num is uninitialised but readers
+             * NULL-check every entry (`if (!sst) continue`).  On retry the count is
+             * re-loaded from the atomic anyway. */
+            atomic_store_explicit(&level->num_sstables, old_num + 1, memory_order_release);
+            atomic_thread_fence(memory_order_seq_cst);
+
             /* CAS to swap in new array */
             if (atomic_compare_exchange_strong_explicit(&level->sstables, &old_arr, new_arr,
                                                         memory_order_release, memory_order_acquire))
             {
-                /* success! update capacity and count */
+                /* success! update capacity */
                 atomic_store_explicit(&level->sstables_capacity, new_capacity,
                                       memory_order_release);
-                atomic_store_explicit(&level->num_sstables, old_num + 1, memory_order_release);
 
                 atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                           memory_order_relaxed);
@@ -5564,7 +5673,8 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
 
                 return TDB_SUCCESS;
             }
-            /* CAS failed, retry with new state */
+            /* CAS failed -- restore count and retry */
+            atomic_store_explicit(&level->num_sstables, old_num, memory_order_release);
             free(new_arr);
         }
         else
@@ -5589,14 +5699,13 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
             memcpy(new_arr, old_arr, old_num * sizeof(tidesdb_sstable_t *));
             new_arr[old_num] = sst;
 
+            /* we update count BEFORE the CAS -- see comment in resize path above */
+            atomic_store_explicit(&level->num_sstables, old_num + 1, memory_order_release);
+            atomic_thread_fence(memory_order_seq_cst);
+
             if (atomic_compare_exchange_strong_explicit(&level->sstables, &old_arr, new_arr,
                                                         memory_order_release, memory_order_acquire))
             {
-                /* array swapped successfully, now update count
-                 * readers will see new array with sst already in place before count increases */
-                atomic_thread_fence(memory_order_seq_cst);
-                atomic_store_explicit(&level->num_sstables, old_num + 1, memory_order_release);
-
                 atomic_fetch_add_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                           memory_order_relaxed);
 
@@ -5606,7 +5715,8 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
 
                 return TDB_SUCCESS;
             }
-            /* CAS failed, another thread modified the array first, retry */
+            /* CAS failed -- restore count and retry */
+            atomic_store_explicit(&level->num_sstables, old_num, memory_order_release);
             free(new_arr);
         }
     }
@@ -5677,10 +5787,27 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
             atomic_fetch_sub_explicit(&level->current_size, sst->klog_size + sst->vlog_size,
                                       memory_order_relaxed);
 
-            /* we unref old array's sstables */
-            for (int i = 0; i < old_num; i++)
+            /* defer unrefs of old array's sstables until no readers hold the old array
+             * readers that loaded old_arr before the CAS may still be iterating it
+             * and calling try_ref on its entries -- immediate unref could free an sstable
+             * while a reader still holds a raw pointer to it */
+            tidesdb_sstable_t **unrefs_copy = malloc(old_num * sizeof(tidesdb_sstable_t *));
+            if (unrefs_copy)
             {
-                tidesdb_sstable_unref(db, old_arr[i]);
+                memcpy(unrefs_copy, old_arr, old_num * sizeof(tidesdb_sstable_t *));
+                tidesdb_retire_sstable_unrefs((tidesdb_t *)db, unrefs_copy, old_num, level);
+            }
+            else
+            {
+                /* allocation failed -- fallback to spinning until safe to unref */
+                while (atomic_load_explicit(&level->array_readers, memory_order_acquire) > 0)
+                {
+                    cpu_yield();
+                }
+                for (int i = 0; i < old_num; i++)
+                {
+                    tidesdb_sstable_unref(db, old_arr[i]);
+                }
             }
 
             tidesdb_sstable_t **prev_retired = atomic_exchange_explicit(

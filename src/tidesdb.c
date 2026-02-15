@@ -1187,7 +1187,6 @@ static tidesdb_klog_block_t *tidesdb_cache_block_get(tidesdb_t *db, const char *
 
     if (!rc_block || !rc_block->block)
     {
-        clock_cache_release(cache_entry);
         return NULL;
     }
 
@@ -2768,21 +2767,6 @@ static tidesdb_sstable_t *tidesdb_sstable_create(tidesdb_t *db, const char *base
 }
 
 /**
- * tidesdb_btree_cache_delete_callback
- * callback for clock_cache_foreach_prefix to delete matching entries
- */
-static int tidesdb_btree_cache_delete_callback(const char *key, size_t key_len,
-                                               const uint8_t *payload, size_t payload_len,
-                                               void *user_data)
-{
-    (void)payload;
-    (void)payload_len;
-    clock_cache_t *cache = (clock_cache_t *)user_data;
-    clock_cache_delete(cache, key, key_len);
-    return 0; /* continue iteration */
-}
-
-/**
  * tidesdb_invalidate_btree_cache_for_sstable
  * invalidate all btree node cache entries for a specific sstable
  * @param db the database
@@ -2794,23 +2778,7 @@ static void tidesdb_invalidate_btree_cache_for_sstable(tidesdb_t *db, uint64_t s
 
     char prefix[32];
     const int prefix_len = snprintf(prefix, sizeof(prefix), "%" PRIu64 ":", sst_id);
-    clock_cache_foreach_prefix(db->btree_node_cache, prefix, (size_t)prefix_len,
-                               tidesdb_btree_cache_delete_callback, db->btree_node_cache);
-}
-
-/**
- * tidesdb_block_cache_delete_callback
- * callback for clock_cache_foreach_prefix to delete matching block cache entries
- */
-static int tidesdb_block_cache_delete_callback(const char *key, size_t key_len,
-                                               const uint8_t *payload, size_t payload_len,
-                                               void *user_data)
-{
-    (void)payload;
-    (void)payload_len;
-    clock_cache_t *cache = (clock_cache_t *)user_data;
-    clock_cache_delete(cache, key, key_len);
-    return 0; /* continue iteration */
+    clock_cache_delete_by_prefix(db->btree_node_cache, prefix, (size_t)prefix_len);
 }
 
 /**
@@ -2836,8 +2804,7 @@ static void tidesdb_invalidate_block_cache_for_sstable(tidesdb_t *db, const char
     const int prefix_len = snprintf(prefix, sizeof(prefix), "%s:%s:", cf_name, filename);
     if (prefix_len <= 0 || (size_t)prefix_len >= sizeof(prefix)) return;
 
-    clock_cache_foreach_prefix(db->clock_cache, prefix, (size_t)prefix_len,
-                               tidesdb_block_cache_delete_callback, db->clock_cache);
+    clock_cache_delete_by_prefix(db->clock_cache, prefix, (size_t)prefix_len);
 }
 
 /**
@@ -2854,8 +2821,7 @@ static void tidesdb_invalidate_block_cache_for_cf(tidesdb_t *db, const char *cf_
     const int prefix_len = snprintf(prefix, sizeof(prefix), "%s:", cf_name);
     if (prefix_len <= 0 || (size_t)prefix_len >= sizeof(prefix)) return;
 
-    clock_cache_foreach_prefix(db->clock_cache, prefix, (size_t)prefix_len,
-                               tidesdb_block_cache_delete_callback, db->clock_cache);
+    clock_cache_delete_by_prefix(db->clock_cache, prefix, (size_t)prefix_len);
 }
 
 /**
@@ -5891,7 +5857,7 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
                 &level->retired_sstables_arr, old_arr, memory_order_acq_rel);
             tidesdb_retire_array((tidesdb_t *)db, prev_retired, level);
 
-            /* defer the removed SSTable's unref until array_readers drains to 0 */
+            /* we defer the removed sstables unref until array_readers drains to 0 */
             tidesdb_defer_removed_sst_unref((tidesdb_t *)db, level, sst);
 
             return TDB_SUCCESS;
@@ -14773,7 +14739,7 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
                     goto retry_level;
                 }
 
-                /* array unchanged or retries exhausted -- skip dead SSTable
+                /* array unchanged or retries exhausted -- skip dead we sstable
                  * this prevents livelock under heavy compaction
                  * the merged result is accessible at this or deeper levels */
                 continue;
@@ -16444,7 +16410,7 @@ int tidesdb_iter_new(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, tidesdb_it
                         break;
                     }
 
-                    /* array unchanged or retries exhausted -- skip dead SSTable */
+                    /* array unchanged or retries exhausted -- we skip dead sstable */
                     continue;
                 }
                 ssts_array[sst_count++] = sst;
@@ -16609,7 +16575,7 @@ static int tidesdb_iter_rebuild_sst_cache(tidesdb_iter_t *iter)
                         break;
                     }
 
-                    /* array unchanged or retries exhausted -- skip dead SSTable */
+                    /* array unchanged or retries exhausted -- we skip dead sstable */
                     continue;
                 }
 

@@ -6,6 +6,7 @@ set -euo pipefail
 find . \
   \( -path "./external" \
      -o -path "./cmake-build-debug" \
+     -o -path "./cmake-build-release" \
      -o -path "./.idea" \
      -o -path "./build" \
      -o -path "./cmake" \) -prune \

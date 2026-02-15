@@ -874,8 +874,7 @@ void btree_node_free(btree_node_t *node)
     if (!node) return;
 
     /* for arena-allocated nodes we destroy arena for O(1) bulk deallocation
-     * btree_node_free is only called for uncached nodes (!using_cache guard at every call site)
-     * cached nodes have their arenas freed by the eviction callback */
+     * for uncached nodes only -- cached nodes use btree_cached_node_release */
     if (node->arena)
     {
         btree_arena_destroy(node->arena);
@@ -904,6 +903,54 @@ void btree_node_free(btree_node_t *node)
     free(node->key_sizes);
     free(node->child_offsets);
     free(node);
+}
+
+/**
+ * btree_cached_node_release
+ * release a reference to a cached btree node
+ * frees the node when the last reference is released
+ * @param node the cached node to release
+ */
+static void btree_cached_node_release(btree_node_t *node)
+{
+    if (!node) return;
+    if (atomic_fetch_sub_explicit(&node->rc_count, 1, memory_order_acq_rel) == 1)
+    {
+        if (node->arena)
+        {
+            btree_arena_destroy(node->arena);
+        }
+        else
+        {
+            btree_node_free(node);
+        }
+    }
+}
+
+/**
+ * btree_node_done
+ * release a node returned by btree_node_read_cached
+ * handles both cached (ref-counted) and non-cached (direct free) nodes
+ * @param node the node to release
+ * @param cached 1 if node came from cache, 0 if direct read
+ */
+static inline void btree_node_done(btree_node_t *node, const int cached)
+{
+    if (!node) return;
+    if (cached)
+        btree_cached_node_release(node);
+    else
+        btree_node_free(node);
+}
+
+static void btree_node_cache_evict_callback(void *payload, size_t payload_len)
+{
+    if (payload && payload_len == sizeof(btree_node_t *))
+    {
+        btree_node_t *node;
+        memcpy(&node, payload, sizeof(btree_node_t *));
+        if (node) btree_cached_node_release(node);
+    }
 }
 
 int btree_node_read(block_manager_t *bm, const int64_t offset, btree_node_t **node)
@@ -1054,9 +1101,11 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
 
     if (cached_ptr && cached_size == sizeof(btree_node_t *))
     {
-        /* cache hit -- we return pointer to cached deserialized node */
+        /* cache hit -- acquire caller ref BEFORE releasing cache entry
+         * this prevents eviction from freeing the node while we use it */
         btree_node_t *cached_node;
         memcpy(&cached_node, cached_ptr, sizeof(btree_node_t *));
+        atomic_fetch_add_explicit(&cached_node->rc_count, 1, memory_order_relaxed);
         clock_cache_release(entry);
         *node = cached_node;
         return 0;
@@ -1135,6 +1184,9 @@ static int btree_node_read_cached(btree_t *tree, const int64_t offset, btree_nod
     }
 
     new_node->block_offset = offset;
+
+    /* rc_count = 2, 1 for cache ownership + 1 for caller */
+    atomic_store_explicit(&new_node->rc_count, 2, memory_order_relaxed);
 
     clock_cache_put(tree->node_cache, cache_key, (size_t)key_len, &new_node,
                     sizeof(btree_node_t *));
@@ -1667,7 +1719,7 @@ static int btree_builder_backpatch_leaf_links(btree_builder_t *builder)
         block_manager_block_t *block = block_manager_cursor_read(&cursor);
         if (!block) return -1;
 
-        /* we calculate next_offset position: type(1) + num_entries(varint) + prev_offset(8) */
+        /* we calculate next_offset position type(1) + num_entries(varint) + prev_offset(8) */
         uint8_t *block_data = (uint8_t *)block->data;
         size_t off = 1; /* skip type byte */
         uint64_t num_entries;
@@ -1976,10 +2028,7 @@ int btree_get(btree_t *tree, const uint8_t *key, const size_t key_size, uint8_t 
 
         const int64_t child_offset = node->child_offsets[child_idx];
 
-        if (!using_cache)
-        {
-            btree_node_free(node);
-        }
+        btree_node_done(node, using_cache);
 
         if (btree_node_read_cached(tree, child_offset, &node) != 0)
         {
@@ -2013,7 +2062,7 @@ int btree_get(btree_t *tree, const uint8_t *key, const size_t key_size, uint8_t 
 
     if (found_idx < 0)
     {
-        if (!using_cache) btree_node_free(node);
+        btree_node_done(node, using_cache);
         return -1;
     }
 
@@ -2042,7 +2091,7 @@ int btree_get(btree_t *tree, const uint8_t *key, const size_t key_size, uint8_t 
     if (ttl) *ttl = entry->ttl;
     if (deleted) *deleted = (entry->flags & BTREE_ENTRY_FLAG_TOMBSTONE) ? 1 : 0;
 
-    if (!using_cache) btree_node_free(node);
+    btree_node_done(node, using_cache);
     return 0;
 }
 
@@ -2112,30 +2161,6 @@ void btree_free(btree_t *tree)
         btree_arena_destroy(tree->node_arena);
     }
     free(tree);
-}
-
-/**
- * btree_node_cache_evict_callback
- * called when a node is evicted from the cache
- * frees the deserialized node and its arena
- * @param payload pointer to the cached node pointer
- * @param payload_len size of the payload (should be sizeof(btree_node_t *))
- */
-static void btree_node_cache_evict_callback(void *payload, size_t payload_len)
-{
-    if (payload && payload_len == sizeof(btree_node_t *))
-    {
-        btree_node_t *node;
-        memcpy(&node, payload, sizeof(btree_node_t *));
-        if (node && node->arena)
-        {
-            btree_arena_destroy(node->arena);
-        }
-        else
-        {
-            btree_node_free(node);
-        }
-    }
 }
 
 void btree_set_node_cache(btree_t *tree, clock_cache_t *cache)
@@ -2273,12 +2298,11 @@ int btree_cursor_goto_first(btree_cursor_t *cursor)
 {
     if (!cursor || !cursor->tree) return -1;
 
-    if (cursor->current_node && !cursor->using_cache)
+    if (cursor->current_node)
     {
-        btree_node_free(cursor->current_node);
+        btree_node_done(cursor->current_node, cursor->using_cache);
         cursor->current_node = NULL;
     }
-    cursor->current_node = NULL;
 
     if (cursor->tree->first_leaf_offset < 0)
     {
@@ -2303,12 +2327,11 @@ int btree_cursor_goto_last(btree_cursor_t *cursor)
 {
     if (!cursor || !cursor->tree) return -1;
 
-    if (cursor->current_node && !cursor->using_cache)
+    if (cursor->current_node)
     {
-        btree_node_free(cursor->current_node);
+        btree_node_done(cursor->current_node, cursor->using_cache);
         cursor->current_node = NULL;
     }
-    cursor->current_node = NULL;
 
     if (cursor->tree->last_leaf_offset < 0)
     {
@@ -2350,7 +2373,7 @@ int btree_cursor_next(btree_cursor_t *cursor)
             return -1;
         }
 
-        if (!cursor->using_cache) btree_node_free(cursor->current_node);
+        btree_node_done(cursor->current_node, cursor->using_cache);
         cursor->current_node = NULL;
 
         cursor->current_leaf_offset = next_leaf_offset;
@@ -2396,7 +2419,7 @@ int btree_cursor_prev(btree_cursor_t *cursor)
             return -1;
         }
 
-        if (!cursor->using_cache) btree_node_free(cursor->current_node);
+        btree_node_done(cursor->current_node, cursor->using_cache);
         cursor->current_node = NULL;
 
         cursor->current_leaf_offset = prev_leaf_offset;
@@ -2423,9 +2446,9 @@ int btree_cursor_seek(btree_cursor_t *cursor, const uint8_t *key, const size_t k
 {
     if (!cursor || !cursor->tree || !key || key_size == 0) return -1;
 
-    if (cursor->current_node && !cursor->using_cache)
+    if (cursor->current_node)
     {
-        btree_node_free(cursor->current_node);
+        btree_node_done(cursor->current_node, cursor->using_cache);
     }
     cursor->current_node = NULL;
 
@@ -2467,7 +2490,7 @@ int btree_cursor_seek(btree_cursor_t *cursor, const uint8_t *key, const size_t k
         }
 
         const int64_t child_offset = node->child_offsets[child_idx];
-        if (!cursor->using_cache) btree_node_free(node);
+        btree_node_done(node, cursor->using_cache);
 
         if (btree_node_read_cached(cursor->tree, child_offset, &node) != 0)
         {
@@ -2509,7 +2532,7 @@ int btree_cursor_seek(btree_cursor_t *cursor, const uint8_t *key, const size_t k
         if (node->next_offset >= 0)
         {
             const int64_t next_off = node->next_offset;
-            if (!cursor->using_cache) btree_node_free(node);
+            btree_node_done(node, cursor->using_cache);
             if (btree_node_read_cached(cursor->tree, next_off, &node) != 0)
             {
                 cursor->at_end = 1;
@@ -2519,7 +2542,7 @@ int btree_cursor_seek(btree_cursor_t *cursor, const uint8_t *key, const size_t k
         }
         else
         {
-            if (!cursor->using_cache) btree_node_free(node);
+            btree_node_done(node, cursor->using_cache);
             cursor->at_end = 1;
             return -1;
         }
@@ -2620,6 +2643,6 @@ int btree_cursor_has_prev(btree_cursor_t *cursor)
 void btree_cursor_free(btree_cursor_t *cursor)
 {
     if (!cursor) return;
-    if (!cursor->using_cache) btree_node_free(cursor->current_node);
+    btree_node_done(cursor->current_node, cursor->using_cache);
     free(cursor);
 }

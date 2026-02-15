@@ -29,6 +29,95 @@
 #define CLOCK_CACHE_HAS_READERS(ref)         (((ref)&CLOCK_CACHE_REF_MASK) != 0)
 #define CLOCK_CACHE_PAYLOAD_ALIGN            8 /* align payload for safe typed access */
 #define CLOCK_CACHE_ALIGN_UP(x, a)           (((x) + ((a)-1)) & ~((size_t)(a)-1))
+#define CLOCK_CACHE_MAX_CPUS                 1024
+
+/**
+ * detect_l3_groups
+ * detect L3 cache topology by reading sysfs on Linux
+ * groups CPUs by shared L3 cache (CCX on AMD, monolithic on Intel)
+ * @param num_cpus number of CPUs to probe
+ * @param cpu_to_group output array mapping CPU ID -> group ID
+ * @return number of L3 groups (power of 2), or 1 if detection fails
+ */
+static int detect_l3_groups(int num_cpus, uint8_t *cpu_to_group)
+{
+    memset(cpu_to_group, 0, (size_t)num_cpus);
+
+#if defined(__linux__)
+    int seen_ids[64];
+    int num_groups = 0;
+
+    for (int cpu = 0; cpu < num_cpus; cpu++)
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index3/id", cpu);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+
+        int id = -1;
+        if (fscanf(f, "%d", &id) != 1) id = -1;
+        fclose(f);
+        if (id < 0) continue;
+
+        int g;
+        for (g = 0; g < num_groups; g++)
+        {
+            if (seen_ids[g] == id) break;
+        }
+        if (g == num_groups && num_groups < 64)
+        {
+            seen_ids[num_groups++] = id;
+        }
+        if (cpu < num_cpus) cpu_to_group[cpu] = (uint8_t)g;
+    }
+
+    if (num_groups > 1)
+    {
+        /* round down to power of 2 for masking */
+        int p = 1;
+        while (p * 2 <= num_groups) p <<= 1;
+        if (p < num_groups)
+        {
+            for (int cpu = 0; cpu < num_cpus; cpu++)
+                cpu_to_group[cpu] = cpu_to_group[cpu] % (uint8_t)p;
+            return p;
+        }
+        return num_groups;
+    }
+#else
+    (void)num_cpus;
+    (void)cpu_to_group;
+#endif
+    return 1;
+}
+
+/**
+ * get_local_partition
+ * NUMA-aware partition selection -- routes threads to CCX-local partitions
+ * on monolithic dies (num_groups=1), this is identical to hash & partition_mask
+ * @param cache the cache
+ * @param hash the key hash
+ * @return partition index local to the calling thread's L3 group
+ */
+static inline size_t get_local_partition(const clock_cache_t *cache, uint64_t hash)
+{
+    if (cache->num_groups <= 1)
+    {
+        return (size_t)(hash & cache->partition_mask);
+    }
+
+    static THREAD_LOCAL int cached_group = -1;
+    int group = cached_group;
+    if (__builtin_expect(group < 0, 0))
+    {
+        int cpu = tdb_get_cpu_id();
+        group = (cpu >= 0 && cpu < cache->max_cpus) ? (int)cache->cpu_to_group[cpu] : 0;
+        cached_group = group;
+    }
+
+    const size_t local_idx = (size_t)(hash & cache->local_partition_mask);
+    return (size_t)group * cache->partitions_per_group + local_idx;
+}
 
 /**
  * entry_size
@@ -108,7 +197,10 @@ static void hash_table_remove(clock_cache_partition_t *partition, const uint64_t
                               const size_t slot_idx)
 {
     const size_t idx = hash & partition->hash_mask;
-    for (size_t probe = 0; probe < partition->hash_index_size; probe++)
+    const size_t max_probe = (partition->hash_index_size < CLOCK_CACHE_MAX_HASH_PROBE)
+                                 ? partition->hash_index_size
+                                 : CLOCK_CACHE_MAX_HASH_PROBE;
+    for (size_t probe = 0; probe < max_probe; probe++)
     {
         const size_t pos = (idx + probe) & partition->hash_mask;
         int32_t current = atomic_load_explicit(&partition->hash_index[pos], memory_order_acquire);
@@ -149,7 +241,7 @@ static clock_cache_entry_t *try_match_entry(clock_cache_entry_t *entry, const ch
     /* acquire reader ref -- prevents free_entry from freeing key/payload while we memcmp */
     atomic_fetch_add_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
 
-    /* re-validate state after acquiring ref (entry may have been evicted between
+    /* we re-validate state after acquiring ref (entry may have been evicted between
      * our pre-checks and the ref acquisition) */
     state = atomic_load_explicit(&entry->state, memory_order_acquire);
     if (state != ENTRY_VALID)
@@ -250,10 +342,6 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
         return;
     }
 
-    /* acq_rel fence sufficient here -- CAS above provides acquire/release semantics
-     * and we just need to ensure subsequent loads see up-to-date values */
-    atomic_thread_fence(memory_order_acq_rel);
-
     char *key = atomic_load_explicit(&entry->key, memory_order_acquire);
     void *payload = atomic_load_explicit(&entry->payload, memory_order_acquire);
     const size_t plen = atomic_load_explicit(&entry->payload_len, memory_order_acquire);
@@ -266,7 +354,6 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
     }
 
     /* we check if entry is being read (upper bits indicate active readers) */
-    atomic_thread_fence(memory_order_acq_rel);
     uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
     if (CLOCK_CACHE_HAS_READERS(ref))
     {
@@ -275,23 +362,18 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
         return;
     }
 
-    /* mark hash entry as deleted (tombstone) -- but keep back-pointer for reuse
-     * use cached hash to avoid redundant XXH3 recomputation */
+    /* we mark hash entry as deleted (tombstone) -- but keep back-pointer for reuse
+     * we use cached hash to avoid redundant XXH3 recomputation */
     const uint64_t hash = atomic_load_explicit(&entry->cached_hash, memory_order_relaxed);
     const size_t slot_idx = entry - partition->slots;
     hash_table_remove(partition, hash, slot_idx);
 
-    /* mem fence -- ensure all readers see deleted before we free (acq_rel sufficient) */
-    atomic_thread_fence(memory_order_acq_rel);
-
     atomic_store_explicit(&entry->key, NULL, memory_order_release);
     atomic_store_explicit(&entry->payload, NULL, memory_order_release);
 
-    /* fence to ensure pointer clears are visible before we re-check readers */
-    atomic_thread_fence(memory_order_acq_rel);
-
     /* we must re-check ref_bit after clearing pointers, a reader may have snuck in
-     * between our first check and clearing pointers */
+     * between our first check and clearing pointers
+     * the release stores above + this acquire load form a release-acquire pair */
     ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
     if (CLOCK_CACHE_HAS_READERS(ref))
     {
@@ -317,16 +399,16 @@ static void free_entry(const clock_cache_t *cache, clock_cache_partition_t *part
 
     atomic_fetch_sub_explicit(&partition->occupied_count, 1, memory_order_relaxed);
 
-    /* transition to empty state */
+    /* we transition to empty state */
     atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
 }
 
 /**
  * clock_evict
- * clock eviction
+ * CLOCK second-chance eviction -- finds or frees a slot
  * @param cache the cache
  * @param partition the partition
- * @return the slot index of the evicted entry
+ * @return slot index of an available (empty or just-evicted) entry
  */
 static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *partition)
 {
@@ -340,17 +422,18 @@ static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *p
         thread_hand = (size_t)TDB_THREAD_ID();
         if (thread_hand == 0) thread_hand = 1; /* ensure non-zero */
     }
-    const size_t start_pos = thread_hand % partition->num_slots;
+    const size_t slots_mask = partition->slots_mask;
+    const size_t start_pos = thread_hand & slots_mask;
 
     while (iterations < max_iterations)
     {
         /* we use local counter with occasional sync to global clock_hand */
-        const size_t hand = (start_pos + iterations) % partition->num_slots;
+        const size_t hand = (start_pos + iterations) & slots_mask;
         clock_cache_entry_t *entry = &partition->slots[hand];
 
-        /* prefetch 2 entries ahead to overlap memory latency with eviction logic */
-        const size_t pf1 = (hand + 1) % partition->num_slots;
-        const size_t pf2 = (hand + 2) % partition->num_slots;
+        /* we prefetch 2 entries ahead to overlap memory latency with eviction logic */
+        const size_t pf1 = (hand + 1) & slots_mask;
+        const size_t pf2 = (hand + 2) & slots_mask;
         PREFETCH_READ(&partition->slots[pf1]);
         PREFETCH_READ(&partition->slots[pf2]);
 
@@ -402,8 +485,7 @@ static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *p
     }
 
     /* we try to evict at current position as a fallback*/
-    size_t hand =
-        atomic_load_explicit(&partition->clock_hand, memory_order_acquire) % partition->num_slots;
+    size_t hand = atomic_load_explicit(&partition->clock_hand, memory_order_acquire) & slots_mask;
     clock_cache_entry_t *entry = &partition->slots[hand];
     PREFETCH_WRITE(entry);
     uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
@@ -432,9 +514,8 @@ static int ensure_space(const clock_cache_t *cache, clock_cache_partition_t *par
     /* we use cached occupied count instead of scanning all slots */
     size_t occupied = atomic_load_explicit(&partition->occupied_count, memory_order_relaxed);
 
-    /* if partition is getting full (>CLOCK_CACHE_PARTITION_FULL_THRESHOLD%), evict one entry  */
-    size_t threshold = (partition->num_slots * CLOCK_CACHE_PARTITION_FULL_THRESHOLD) / 100;
-    if (occupied >= threshold)
+    /* if partition is getting full (>85%), evict one entry */
+    if (occupied >= partition->evict_threshold)
     {
         clock_evict(cache, partition);
     }
@@ -464,7 +545,7 @@ void clock_cache_compute_config(const size_t max_bytes, cache_config_t *config)
     /* we distribute entries across partitions */
     size_t slots_per_partition = total_entries / num_partitions;
 
-    /* we clamp to reasonable range: 64-2048 slots per partition */
+    /* we clamp to reasonable range -- 64-8192 slots per partition */
     if (slots_per_partition < CLOCK_CACHE_MIN_SLOTS_PER_PARTITION)
         slots_per_partition = CLOCK_CACHE_MIN_SLOTS_PER_PARTITION;
     if (slots_per_partition > CLOCK_CACHE_MAX_SLOTS_PER_PARTITION)
@@ -500,10 +581,26 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
     atomic_store_explicit(&cache->misses, 0, memory_order_relaxed);
     atomic_store_explicit(&cache->shutdown, 0, memory_order_relaxed);
 
+    /** we detect L3/CCX topology for NUMA-aware partition routing */
+    cache->max_cpus = tdb_get_cpu_count();
+    if (cache->max_cpus > CLOCK_CACHE_MAX_CPUS) cache->max_cpus = CLOCK_CACHE_MAX_CPUS;
+    cache->cpu_to_group = (uint8_t *)calloc((size_t)cache->max_cpus, sizeof(uint8_t));
+    if (!cache->cpu_to_group)
+    {
+        free(cache);
+        return NULL;
+    }
+
+    cache->num_groups = (size_t)detect_l3_groups(cache->max_cpus, cache->cpu_to_group);
+    if (cache->num_groups > config->num_partitions) cache->num_groups = 1;
+    cache->partitions_per_group = config->num_partitions / cache->num_groups;
+    cache->local_partition_mask = cache->partitions_per_group - 1;
+
     cache->partitions =
         (clock_cache_partition_t *)calloc(config->num_partitions, sizeof(clock_cache_partition_t));
     if (!cache->partitions)
     {
+        free(cache->cpu_to_group);
         free(cache);
         return NULL;
     }
@@ -512,13 +609,16 @@ clock_cache_t *clock_cache_create(const cache_config_t *config)
     {
         clock_cache_partition_t *partition = &cache->partitions[i];
         partition->num_slots = config->slots_per_partition;
+        partition->slots_mask = config->slots_per_partition - 1;
+        partition->evict_threshold =
+            (config->slots_per_partition * CLOCK_CACHE_PARTITION_FULL_THRESHOLD) / 100;
         atomic_store_explicit(&partition->clock_hand, 0, memory_order_relaxed);
         atomic_store_explicit(&partition->occupied_count, 0, memory_order_relaxed);
         atomic_store_explicit(&partition->bytes_used, 0, memory_order_relaxed);
         atomic_store_explicit(&partition->hits, 0, memory_order_relaxed);
         atomic_store_explicit(&partition->misses, 0, memory_order_relaxed);
 
-        /* we calculate hash index size (1.5x slots for low collision rate) */
+        /* we calculate hash index size (2x slots for low collision rate) */
         partition->hash_index_size =
             (config->slots_per_partition * CLOCK_CACHE_HASH_INDEX_MULTIPLIER_NUM) /
             CLOCK_CACHE_HASH_INDEX_MULTIPLIER_DEN;
@@ -634,6 +734,7 @@ void clock_cache_destroy(clock_cache_t *cache)
     }
 
     free(cache->partitions);
+    free(cache->cpu_to_group);
     free(cache);
 }
 
@@ -645,7 +746,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return -1;
 
     const uint64_t hash = compute_hash(key, key_len);
-    const size_t partition_idx = (size_t)(hash & cache->partition_mask);
+    const size_t partition_idx = get_local_partition(cache, hash);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
     const size_t entry_bytes = entry_size(key_len, payload_len);
 
@@ -653,7 +754,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     clock_cache_entry_t *old_entry = find_entry_with_hash(partition, key, key_len, hash);
     if (old_entry)
     {
-        /* release reader ref before free_entry (which checks for active readers) */
+        /* we release reader ref before free_entry (which checks for active readers) */
         atomic_fetch_sub_explicit(&old_entry->ref_bit, CLOCK_CACHE_READER_INC,
                                   memory_order_acq_rel);
         free_entry(cache, partition, old_entry);
@@ -730,7 +831,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return NULL;
 
     const uint64_t hash = compute_hash(key, key_len);
-    const size_t partition_idx = (size_t)(hash & cache->partition_mask);
+    const size_t partition_idx = get_local_partition(cache, hash);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
     /* find_entry_with_hash returns entry with reader ref HELD (from try_match_entry) */
@@ -761,7 +862,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
 
     memcpy(result, entry_payload, entry_payload_len);
 
-    /* mark as recently used and release reader ref */
+    /* we mark as recently used and release reader ref */
     atomic_fetch_or_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_relaxed);
     atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
 
@@ -780,7 +881,7 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return NULL;
 
     const uint64_t hash = compute_hash(key, key_len);
-    const size_t partition_idx = (size_t)(hash & cache->partition_mask);
+    const size_t partition_idx = get_local_partition(cache, hash);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
     /* find_entry_with_hash returns entry with reader ref HELD (from try_match_entry) */
@@ -805,7 +906,7 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
     if (payload_len) *payload_len = entry_payload_len;
     if (entry_out) *entry_out = entry;
 
-    /* mark as recently used; caller releases ref via clock_cache_release() */
+    /* we mark as recently used; caller releases ref via clock_cache_release() */
     atomic_fetch_or_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_relaxed);
 
     atomic_fetch_add_explicit(&partition->hits, 1, memory_order_relaxed);
@@ -825,7 +926,7 @@ int clock_cache_delete(clock_cache_t *cache, const char *key, const size_t key_l
     if (atomic_load_explicit(&cache->shutdown, memory_order_acquire)) return -1;
 
     const uint64_t hash = compute_hash(key, key_len);
-    const size_t partition_idx = (size_t)(hash & cache->partition_mask);
+    const size_t partition_idx = get_local_partition(cache, hash);
     clock_cache_partition_t *partition = &cache->partitions[partition_idx];
 
     clock_cache_entry_t *entry = find_entry_with_hash(partition, key, key_len, hash);
@@ -835,7 +936,7 @@ int clock_cache_delete(clock_cache_t *cache, const char *key, const size_t key_l
         return -1;
     }
 
-    /* release reader ref before free_entry (which checks for active readers) */
+    /* we release reader ref before free_entry (which checks for active readers) */
     atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
     free_entry(cache, partition, entry);
 
@@ -890,7 +991,7 @@ void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats)
     stats->total_bytes = total_bytes;
     stats->total_entries = total_entries;
 
-    /* sum per-partition counters to avoid false sharing on hot path */
+    /* we sum per-partition counters to avoid false sharing on hot path */
     uint64_t total_hits = 0;
     uint64_t total_misses = 0;
     for (size_t i = 0; i < cache->num_partitions; i++)
@@ -904,6 +1005,58 @@ void clock_cache_get_stats(clock_cache_t *cache, clock_cache_stats_t *stats)
 
     const uint64_t total_accesses = stats->hits + stats->misses;
     stats->hit_rate = (total_accesses > 0) ? ((double)stats->hits / (double)total_accesses) : 0.0;
+}
+
+size_t clock_cache_delete_by_prefix(clock_cache_t *cache, const char *prefix,
+                                    const size_t prefix_len)
+{
+    if (!cache || !prefix || prefix_len == 0) return 0;
+
+    size_t count = 0;
+
+    for (size_t p = 0; p < cache->num_partitions; p++)
+    {
+        clock_cache_partition_t *partition = &cache->partitions[p];
+
+        for (size_t i = 0; i < partition->num_slots; i++)
+        {
+            clock_cache_entry_t *entry = &partition->slots[i];
+
+            uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
+            if (state != ENTRY_VALID) continue;
+
+            /* we acquire reader ref to safely read key */
+            atomic_fetch_add_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC,
+                                      memory_order_acq_rel);
+
+            state = atomic_load_explicit(&entry->state, memory_order_acquire);
+            if (state != ENTRY_VALID)
+            {
+                atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC,
+                                          memory_order_release);
+                continue;
+            }
+
+            char *key = atomic_load_explicit(&entry->key, memory_order_acquire);
+            size_t key_len = atomic_load_explicit(&entry->key_len, memory_order_acquire);
+
+            const int match =
+                (key && key_len >= prefix_len && memcmp(key, prefix, prefix_len) == 0);
+
+            /** we release reader ref before calling free_entry
+             * free_entry checks for active readers and aborts if any are held */
+            atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC,
+                                      memory_order_acq_rel);
+
+            if (match)
+            {
+                free_entry(cache, partition, entry);
+                count++;
+            }
+        }
+    }
+
+    return count;
 }
 
 size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size_t prefix_len,

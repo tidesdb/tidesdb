@@ -17,12 +17,22 @@
  * limitations under the License.
  */
 #include <math.h>
+#include <time.h>
 
 #include "../src/clock_cache.h"
 #include "test_utils.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
+
+/* wall-clock timing helper -- clock() measures CPU time across all threads
+ * which makes multi-threaded scaling look ~Nx worse than reality */
+static inline double wall_time_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
 void test_cache_create_destroy(void)
 {
@@ -183,7 +193,8 @@ static void test_eviction_callback(void *payload, size_t payload_len)
 {
     if (!payload || payload_len != sizeof(test_evict_data_t *)) return;
 
-    test_evict_data_t *data = *(test_evict_data_t **)payload;
+    test_evict_data_t *data;
+    memcpy(&data, payload, sizeof(data));
     if (data)
     {
         free(data->data);
@@ -672,7 +683,7 @@ void benchmark_cache_insertions(void)
     clock_cache_t *cache = clock_cache_create(&config);
     ASSERT_TRUE(cache != NULL);
 
-    clock_t start = clock();
+    double start = wall_time_sec();
     for (int i = 0; i < 100000; i++)
     {
         char key[64];
@@ -681,9 +692,9 @@ void benchmark_cache_insertions(void)
         snprintf((char *)payload, sizeof(payload), "bench_value_%d", i);
         clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1);
     }
-    clock_t end = clock();
+    double end = wall_time_sec();
 
-    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    double time_spent = end - start;
     printf(CYAN "Inserting 100,000 entries took %f seconds\n" RESET, time_spent);
 
     clock_cache_stats_t stats;
@@ -711,7 +722,7 @@ void benchmark_cache_lookups(void)
         clock_cache_put(cache, key, strlen(key), payload, strlen((char *)payload) + 1);
     }
 
-    clock_t start = clock();
+    double start = wall_time_sec();
     int hits = 0;
     for (int i = 0; i < 100000; i++)
     {
@@ -725,9 +736,9 @@ void benchmark_cache_lookups(void)
             free(data);
         }
     }
-    clock_t end = clock();
+    double end = wall_time_sec();
 
-    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    double time_spent = end - start;
     printf(CYAN "100,000 lookups took %f seconds\n" RESET, time_spent);
     printf(BOLDWHITE "Hit rate: %.2f%%\n" RESET, (double)hits / 100000.0 * 100.0);
 
@@ -748,7 +759,7 @@ void benchmark_concurrent_puts(void)
     thread_args_t *args = malloc(num_threads * sizeof(thread_args_t));
     ASSERT_TRUE(threads != NULL && args != NULL);
 
-    clock_t start = clock();
+    double start = wall_time_sec();
     for (int i = 0; i < num_threads; i++)
     {
         args[i].cache = cache;
@@ -760,9 +771,9 @@ void benchmark_concurrent_puts(void)
     for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
     free(threads);
     free(args);
-    clock_t end = clock();
+    double end = wall_time_sec();
 
-    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    double time_spent = end - start;
     printf(CYAN "%d threads inserting %d entries each took %f seconds\n" RESET, num_threads,
            ops_per_thread, time_spent);
 
@@ -797,7 +808,7 @@ void benchmark_concurrent_gets(void)
     thread_args_t *args = malloc(num_threads * sizeof(thread_args_t));
     ASSERT_TRUE(threads != NULL && args != NULL);
 
-    clock_t start = clock();
+    double start = wall_time_sec();
     for (int i = 0; i < num_threads; i++)
     {
         args[i].cache = cache;
@@ -809,9 +820,9 @@ void benchmark_concurrent_gets(void)
     for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
     free(threads);
     free(args);
-    clock_t end = clock();
+    double end = wall_time_sec();
 
-    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    double time_spent = end - start;
     printf(CYAN "%d threads performing %d gets each took %f seconds\n" RESET, num_threads,
            ops_per_thread, time_spent);
 
@@ -832,7 +843,7 @@ void benchmark_concurrent_mixed(void)
     thread_args_t *args = malloc(num_threads * sizeof(thread_args_t));
     ASSERT_TRUE(threads != NULL && args != NULL);
 
-    clock_t start = clock();
+    double start = wall_time_sec();
     for (int i = 0; i < num_threads; i++)
     {
         args[i].cache = cache;
@@ -844,9 +855,9 @@ void benchmark_concurrent_mixed(void)
     for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
     free(threads);
     free(args);
-    clock_t end = clock();
+    double end = wall_time_sec();
 
-    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+    double time_spent = end - start;
     printf(CYAN "%d threads performing %d mixed ops each took %f seconds\n" RESET, num_threads,
            ops_per_thread, time_spent);
 
@@ -882,7 +893,7 @@ void benchmark_scaling_puts(void)
         pthread_t threads[16];
         thread_args_t args[16];
 
-        clock_t start = clock();
+        double start = wall_time_sec();
 
         for (int t = 0; t < num_threads; t++)
         {
@@ -894,8 +905,7 @@ void benchmark_scaling_puts(void)
 
         for (int t = 0; t < num_threads; t++) pthread_join(threads[t], NULL);
 
-        clock_t end = clock();
-        double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+        double time_spent = wall_time_sec() - start;
 
         if (i == 0) baseline_time = time_spent;
 
@@ -943,7 +953,7 @@ void benchmark_scaling_gets(void)
         pthread_t threads[16];
         thread_args_t args[16];
 
-        clock_t start = clock();
+        double start = wall_time_sec();
 
         for (int t = 0; t < num_threads; t++)
         {
@@ -955,8 +965,7 @@ void benchmark_scaling_gets(void)
 
         for (int t = 0; t < num_threads; t++) pthread_join(threads[t], NULL);
 
-        clock_t end = clock();
-        double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+        double time_spent = wall_time_sec() - start;
 
         if (i == 0) baseline_time = time_spent;
 
@@ -995,7 +1004,7 @@ void benchmark_scaling_mixed(void)
         pthread_t threads[16];
         thread_args_t args[16];
 
-        clock_t start = clock();
+        double start = wall_time_sec();
 
         for (int t = 0; t < num_threads; t++)
         {
@@ -1007,8 +1016,7 @@ void benchmark_scaling_mixed(void)
 
         for (int t = 0; t < num_threads; t++) pthread_join(threads[t], NULL);
 
-        clock_t end = clock();
-        double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+        double time_spent = wall_time_sec() - start;
 
         if (i == 0) baseline_time = time_spent;
 
@@ -1717,6 +1725,159 @@ void test_put_after_shutdown(void)
     printf("  ✓ Put after shutdown test passed\n");
 }
 
+typedef struct
+{
+    clock_cache_t *cache;
+    int thread_id;
+    int num_ops;
+    int num_unique_keys;
+    _Atomic(int) *reads_done;
+    _Atomic(int) *writes_done;
+} rw_cache_bench_ctx_t;
+
+void *rw_cache_bench_reader(void *arg)
+{
+    rw_cache_bench_ctx_t *ctx = (rw_cache_bench_ctx_t *)arg;
+    int completed = 0;
+
+    for (int i = 0; i < ctx->num_ops; i++)
+    {
+        char key_buf[32];
+        snprintf(key_buf, sizeof(key_buf), "rwcache_%06d", i % ctx->num_unique_keys);
+
+        size_t len;
+        uint8_t *data = clock_cache_get(ctx->cache, key_buf, strlen(key_buf), &len);
+        if (data) free(data);
+        completed++;
+    }
+
+    atomic_fetch_add_explicit(ctx->reads_done, completed, memory_order_relaxed);
+    return NULL;
+}
+
+void *rw_cache_bench_writer(void *arg)
+{
+    rw_cache_bench_ctx_t *ctx = (rw_cache_bench_ctx_t *)arg;
+    int completed = 0;
+
+    for (int i = 0; i < ctx->num_ops; i++)
+    {
+        char key_buf[32];
+        char value_buf[64];
+        snprintf(key_buf, sizeof(key_buf), "rwcache_%06d", i % ctx->num_unique_keys);
+        snprintf(value_buf, sizeof(value_buf), "t%d_v%d", ctx->thread_id, i);
+
+        if (clock_cache_put(ctx->cache, key_buf, strlen(key_buf), (uint8_t *)value_buf,
+                            strlen(value_buf) + 1) == 0)
+        {
+            completed++;
+        }
+    }
+
+    atomic_fetch_add_explicit(ctx->writes_done, completed, memory_order_relaxed);
+    return NULL;
+}
+
+static void run_cache_rw_contention_ratio(int num_readers, int num_writers, int ops_per_thread,
+                                          int num_unique_keys)
+{
+    cache_config_t config = {
+        .max_bytes = 50 * 1024 * 1024, .num_partitions = 32, .slots_per_partition = 2048};
+
+    clock_cache_t *cache = clock_cache_create(&config);
+    ASSERT_TRUE(cache != NULL);
+
+    _Atomic(int) reads_done = 0;
+    _Atomic(int) writes_done = 0;
+
+    /* pre-populate so readers always have data */
+    for (int i = 0; i < num_unique_keys; i++)
+    {
+        char key_buf[32];
+        char value_buf[64];
+        snprintf(key_buf, sizeof(key_buf), "rwcache_%06d", i);
+        snprintf(value_buf, sizeof(value_buf), "init_%d", i);
+        clock_cache_put(cache, key_buf, strlen(key_buf), (uint8_t *)value_buf,
+                        strlen(value_buf) + 1);
+    }
+
+    int total_threads = num_readers + num_writers;
+    pthread_t *threads = malloc(total_threads * sizeof(pthread_t));
+    rw_cache_bench_ctx_t *ctxs = malloc(total_threads * sizeof(rw_cache_bench_ctx_t));
+
+    for (int i = 0; i < total_threads; i++)
+    {
+        ctxs[i].cache = cache;
+        ctxs[i].thread_id = i;
+        ctxs[i].num_ops = ops_per_thread;
+        ctxs[i].num_unique_keys = num_unique_keys;
+        ctxs[i].reads_done = &reads_done;
+        ctxs[i].writes_done = &writes_done;
+    }
+
+    double start = wall_time_sec();
+
+    for (int i = 0; i < num_readers; i++)
+    {
+        pthread_create(&threads[i], NULL, rw_cache_bench_reader, &ctxs[i]);
+    }
+    for (int i = 0; i < num_writers; i++)
+    {
+        pthread_create(&threads[num_readers + i], NULL, rw_cache_bench_writer,
+                       &ctxs[num_readers + i]);
+    }
+
+    for (int i = 0; i < total_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    double elapsed = wall_time_sec() - start;
+
+    int tr = atomic_load(&reads_done);
+    int tw = atomic_load(&writes_done);
+    int total_ops = tr + tw;
+
+    int read_pct = (total_threads > 0) ? (num_readers * 100 / total_threads) : 0;
+    int write_pct = 100 - read_pct;
+
+    printf(CYAN "  %3d/%3d R/W  | %2dR + %2dW threads | %.3f sec | %7.2f M total ops/sec", read_pct,
+           write_pct, num_readers, num_writers, elapsed, total_ops / elapsed / 1000000.0);
+    if (tr > 0) printf(" | R: %.2f M/s", tr / elapsed / 1000000.0);
+    if (tw > 0) printf(" | W: %.2f M/s", tw / elapsed / 1000000.0);
+    printf("\n" RESET);
+
+    free(threads);
+    free(ctxs);
+    clock_cache_destroy(cache);
+}
+
+void benchmark_cache_rw_contention(void)
+{
+    printf(BOLDWHITE
+           "\n----------------- Cache Read-Write Contention Benchmark -----------------\n" RESET);
+
+    const int ops_per_thread = 100000;
+    const int num_unique_keys = 10000;
+    const int total_threads = 8;
+
+    printf(YELLOW "  %d threads total, %d ops/thread, %d unique keys\n" RESET, total_threads,
+           ops_per_thread, num_unique_keys);
+
+    /* pure read baseline */
+    run_cache_rw_contention_ratio(total_threads, 0, ops_per_thread, num_unique_keys);
+    /* read-heavy */
+    run_cache_rw_contention_ratio(7, 1, ops_per_thread, num_unique_keys);
+    /* 75/25 */
+    run_cache_rw_contention_ratio(6, 2, ops_per_thread, num_unique_keys);
+    /* balanced */
+    run_cache_rw_contention_ratio(4, 4, ops_per_thread, num_unique_keys);
+    /* write-heavy */
+    run_cache_rw_contention_ratio(2, 6, ops_per_thread, num_unique_keys);
+    /* pure write baseline */
+    run_cache_rw_contention_ratio(0, total_threads, ops_per_thread, num_unique_keys);
+}
+
 int main(void)
 {
     srand((unsigned int)time(NULL));
@@ -1749,6 +1910,7 @@ int main(void)
     RUN_TEST(benchmark_scaling_puts, tests_passed);
     RUN_TEST(benchmark_scaling_gets, tests_passed);
     RUN_TEST(benchmark_scaling_mixed, tests_passed);
+    RUN_TEST(benchmark_cache_rw_contention, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

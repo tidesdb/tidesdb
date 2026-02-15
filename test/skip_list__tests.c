@@ -2264,6 +2264,642 @@ void benchmark_skip_list_batch_vs_single()
     skip_list_free(list_batch);
 }
 
+void test_skip_list_arena_put_get()
+{
+    /* test basic put/get with arena-backed skip list */
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
+                                       1024 * 1024),
+              0);
+    ASSERT_TRUE(list != NULL);
+    ASSERT_TRUE(list->arena != NULL);
+
+    uint8_t key[] = "arena_key";
+    uint8_t value[] = "arena_value";
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0), 0);
+
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_value_size = 0;
+    int64_t ttl;
+    uint8_t deleted;
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &retrieved_value, &retrieved_value_size, &ttl,
+                            &deleted),
+              0);
+    ASSERT_EQ(memcmp(retrieved_value, value, sizeof(value)), 0);
+    free(retrieved_value);
+
+    ASSERT_EQ(skip_list_count_entries(list), 1);
+    skip_list_free(list);
+}
+
+void test_skip_list_arena_batch()
+{
+    /* test batch put with arena-backed skip list */
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
+                                       4 * 1024 * 1024),
+              0);
+
+    const int batch_size = 1000;
+    skip_list_batch_entry_t *entries = malloc(batch_size * sizeof(skip_list_batch_entry_t));
+    char **keys = malloc(batch_size * sizeof(char *));
+    char **values = malloc(batch_size * sizeof(char *));
+
+    for (int i = 0; i < batch_size; i++)
+    {
+        keys[i] = malloc(32);
+        values[i] = malloc(64);
+        snprintf(keys[i], 32, "arena_batch_%06d", i);
+        snprintf(values[i], 64, "arena_val_%06d", i);
+        entries[i].key = (const uint8_t *)keys[i];
+        entries[i].key_size = strlen(keys[i]) + 1;
+        entries[i].value = (const uint8_t *)values[i];
+        entries[i].value_size = strlen(values[i]) + 1;
+        entries[i].ttl = -1;
+        entries[i].seq = (uint64_t)(i + 1);
+        entries[i].deleted = 0;
+    }
+
+    ASSERT_EQ(skip_list_put_batch(list, entries, batch_size), batch_size);
+    ASSERT_EQ(skip_list_count_entries(list), batch_size);
+
+    /* verify first, middle, last */
+    uint8_t *rv = NULL;
+    size_t rvs = 0;
+    int64_t ttl;
+    uint8_t del;
+    ASSERT_EQ(
+        skip_list_get(list, (const uint8_t *)keys[0], strlen(keys[0]) + 1, &rv, &rvs, &ttl, &del),
+        0);
+    ASSERT_EQ(strcmp((char *)rv, values[0]), 0);
+    free(rv);
+
+    ASSERT_EQ(skip_list_get(list, (const uint8_t *)keys[500], strlen(keys[500]) + 1, &rv, &rvs,
+                            &ttl, &del),
+              0);
+    ASSERT_EQ(strcmp((char *)rv, values[500]), 0);
+    free(rv);
+
+    ASSERT_EQ(skip_list_get(list, (const uint8_t *)keys[999], strlen(keys[999]) + 1, &rv, &rvs,
+                            &ttl, &del),
+              0);
+    ASSERT_EQ(strcmp((char *)rv, values[999]), 0);
+    free(rv);
+
+    for (int i = 0; i < batch_size; i++)
+    {
+        free(keys[i]);
+        free(values[i]);
+    }
+    free(keys);
+    free(values);
+    free(entries);
+    skip_list_free(list);
+}
+
+void test_skip_list_arena_cursor()
+{
+    /* test cursor iteration with arena-backed skip list */
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
+                                       1024 * 1024),
+              0);
+
+    for (int i = 0; i < 100; i++)
+    {
+        char key[32], val[32];
+        snprintf(key, sizeof(key), "cursor_%04d", i);
+        snprintf(val, sizeof(val), "val_%04d", i);
+        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                         strlen(val) + 1, -1, (uint64_t)(i + 1), 0),
+                  0);
+    }
+
+    ASSERT_EQ(skip_list_count_entries(list), 100);
+
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+    ASSERT_EQ(skip_list_cursor_next(cursor), 0);
+
+    int count = 0;
+    do
+    {
+        count++;
+    } while (skip_list_cursor_next(cursor) == 0);
+    ASSERT_EQ(count, 99); /* 99 more after the first next */
+
+    skip_list_cursor_free(cursor);
+    skip_list_free(list);
+}
+
+void test_skip_list_arena_delete()
+{
+    /* test tombstone creation with arena-backed skip list */
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
+                                       1024 * 1024),
+              0);
+
+    uint8_t key[] = "delete_me";
+    uint8_t value[] = "some_value";
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0), 0);
+
+    /* delete the key */
+    ASSERT_EQ(skip_list_delete(list, key, sizeof(key), 2), 0);
+
+    /* get should return deleted flag */
+    uint8_t *rv = NULL;
+    size_t rvs = 0;
+    int64_t ttl;
+    uint8_t del = 0;
+    ASSERT_EQ(skip_list_get(list, key, sizeof(key), &rv, &rvs, &ttl, &del), 0);
+    ASSERT_EQ(del, 1);
+
+    skip_list_free(list);
+}
+
+void test_skip_list_arena_zero_capacity()
+{
+    /* arena_initial_capacity=0 should create a normal (non-arena) skip list */
+    skip_list_t *list = NULL;
+    ASSERT_EQ(
+        skip_list_new_with_arena(&list, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL, 0), 0);
+    ASSERT_TRUE(list != NULL);
+    ASSERT_TRUE(list->arena == NULL);
+
+    uint8_t key[] = "no_arena";
+    uint8_t value[] = "fallback";
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0), 0);
+    ASSERT_EQ(skip_list_count_entries(list), 1);
+
+    skip_list_free(list);
+}
+
+void benchmark_skip_list_arena_vs_malloc()
+{
+    printf(BOLDWHITE "\n----------------- Arena vs Malloc Benchmark -----------------\n" RESET);
+
+    const int num_entries = BENCH_N;
+    const size_t key_size = 16;
+    const size_t value_size = 64;
+
+    uint8_t **keys = malloc(num_entries * sizeof(uint8_t *));
+    uint8_t **values = malloc(num_entries * sizeof(uint8_t *));
+    for (int i = 0; i < num_entries; i++)
+    {
+        keys[i] = malloc(key_size);
+        values[i] = malloc(value_size);
+        snprintf((char *)keys[i], key_size, "k%014d", i);
+        snprintf((char *)values[i], value_size, "v%062d", i);
+    }
+
+    /* benchmark malloc-backed skip list (write) */
+    skip_list_t *list_malloc = NULL;
+    skip_list_new(&list_malloc, 12, 0.24f);
+
+    clock_t start = clock();
+    for (int i = 0; i < num_entries; i++)
+    {
+        skip_list_put_with_seq(list_malloc, keys[i], key_size, values[i], value_size, -1,
+                               (uint64_t)(i + 1), 0);
+    }
+    clock_t end = clock();
+    double write_malloc = (double)(end - start) / CLOCKS_PER_SEC;
+
+    /* benchmark malloc-backed skip list (read) */
+    start = clock();
+    for (int i = 0; i < num_entries; i++)
+    {
+        uint8_t *rv;
+        size_t rvs;
+        int64_t ttl;
+        uint8_t del;
+        skip_list_get(list_malloc, keys[i], key_size, &rv, &rvs, &ttl, &del);
+        free(rv);
+    }
+    end = clock();
+    double read_malloc = (double)(end - start) / CLOCKS_PER_SEC;
+
+    /* benchmark arena-backed skip list (write) */
+    skip_list_t *list_arena = NULL;
+    size_t arena_size = (size_t)num_entries * (key_size + value_size + 128);
+    skip_list_new_with_arena(&list_arena, 12, 0.24f, skip_list_comparator_memcmp, NULL, NULL,
+                             arena_size);
+
+    start = clock();
+    for (int i = 0; i < num_entries; i++)
+    {
+        skip_list_put_with_seq(list_arena, keys[i], key_size, values[i], value_size, -1,
+                               (uint64_t)(i + 1), 0);
+    }
+    end = clock();
+    double write_arena = (double)(end - start) / CLOCKS_PER_SEC;
+
+    /* benchmark arena-backed skip list (read) */
+    start = clock();
+    for (int i = 0; i < num_entries; i++)
+    {
+        uint8_t *rv;
+        size_t rvs;
+        int64_t ttl;
+        uint8_t del;
+        skip_list_get(list_arena, keys[i], key_size, &rv, &rvs, &ttl, &del);
+        free(rv);
+    }
+    end = clock();
+    double read_arena = (double)(end - start) / CLOCKS_PER_SEC;
+
+    ASSERT_EQ(skip_list_count_entries(list_malloc), num_entries);
+    ASSERT_EQ(skip_list_count_entries(list_arena), num_entries);
+
+    printf(CYAN "WRITE malloc: %.4f sec (%.0f ops/sec)\n" RESET, write_malloc,
+           num_entries / write_malloc);
+    printf(CYAN "WRITE arena:  %.4f sec (%.0f ops/sec)\n" RESET, write_arena,
+           num_entries / write_arena);
+    printf(BOLDWHITE "Write speedup: %.2fx\n" RESET, write_malloc / write_arena);
+
+    printf(CYAN "READ  malloc: %.4f sec (%.0f ops/sec)\n" RESET, read_malloc,
+           num_entries / read_malloc);
+    printf(CYAN "READ  arena:  %.4f sec (%.0f ops/sec)\n" RESET, read_arena,
+           num_entries / read_arena);
+    printf(BOLDWHITE "Read speedup:  %.2fx\n" RESET, read_malloc / read_arena);
+
+    /* benchmark free time */
+    start = clock();
+    skip_list_free(list_malloc);
+    end = clock();
+    double free_malloc = (double)(end - start) / CLOCKS_PER_SEC;
+
+    start = clock();
+    skip_list_free(list_arena);
+    end = clock();
+    double free_arena = (double)(end - start) / CLOCKS_PER_SEC;
+
+    printf(CYAN "FREE  malloc: %.4f sec\n" RESET, free_malloc);
+    printf(CYAN "FREE  arena:  %.4f sec\n" RESET, free_arena);
+    printf(BOLDWHITE "Free speedup:  %.2fx\n" RESET, free_malloc / free_arena);
+
+    for (int i = 0; i < num_entries; i++)
+    {
+        free(keys[i]);
+        free(values[i]);
+    }
+    free(keys);
+    free(values);
+}
+
+void test_skip_list_get_ref()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    uint8_t key[] = "ref_key";
+    uint8_t value[] = "ref_value_data";
+    ASSERT_EQ(skip_list_put_with_seq(list, key, sizeof(key), value, sizeof(value), -1, 1, 0), 0);
+
+    const uint8_t *rv = NULL;
+    size_t rvs = 0;
+    int64_t ttl;
+    uint8_t del;
+    ASSERT_EQ(skip_list_get_ref(list, key, sizeof(key), &rv, &rvs, &ttl, &del), 0);
+    ASSERT_EQ(del, 0);
+    ASSERT_EQ(rvs, sizeof(value));
+    ASSERT_EQ(memcmp(rv, value, sizeof(value)), 0);
+    /* do not free rv -- it points into version data */
+
+    /* test nonexistent key */
+    uint8_t bad[] = "no_such_key";
+    ASSERT_EQ(skip_list_get_ref(list, bad, sizeof(bad), &rv, &rvs, &ttl, &del), -1);
+
+    skip_list_free(list);
+}
+
+void test_skip_list_cursor_next_get()
+{
+    skip_list_t *list = NULL;
+    ASSERT_EQ(skip_list_new(&list, 12, 0.24f), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[32], val[32];
+        snprintf(key, sizeof(key), "fused_%04d", i);
+        snprintf(val, sizeof(val), "val_%04d", i);
+        ASSERT_EQ(skip_list_put_with_seq(list, (uint8_t *)key, strlen(key) + 1, (uint8_t *)val,
+                                         strlen(val) + 1, -1, (uint64_t)(i + 1), 0),
+                  0);
+    }
+
+    skip_list_cursor_t *cursor = NULL;
+    ASSERT_EQ(skip_list_cursor_init(&cursor, list), 0);
+
+    /* cursor starts at first node -- get it via cursor_get */
+    int count = 0;
+    uint8_t *key, *value;
+    size_t key_size, value_size;
+    int64_t ttl;
+    uint8_t deleted;
+    ASSERT_EQ(skip_list_cursor_get(cursor, &key, &key_size, &value, &value_size, &ttl, &deleted),
+              0);
+    ASSERT_TRUE(key != NULL);
+    count++;
+
+    /* remaining 49 via fused next_get */
+    while (skip_list_cursor_next_get(cursor, &key, &key_size, &value, &value_size, &ttl,
+                                     &deleted) == 0)
+    {
+        ASSERT_TRUE(key != NULL);
+        ASSERT_TRUE(key_size > 0);
+        count++;
+    }
+    ASSERT_EQ(count, 50);
+
+    skip_list_cursor_free(cursor);
+    skip_list_free(list);
+}
+
+void benchmark_skip_list_read_path()
+{
+    printf(BOLDWHITE "\n----------------- Read Path Benchmark -----------------\n" RESET);
+
+    const int num_entries = BENCH_N;
+    const size_t key_size = 16;
+    const size_t value_size = 64;
+
+    skip_list_t *list = NULL;
+    skip_list_new(&list, 12, 0.24f);
+
+    uint8_t **keys = malloc(num_entries * sizeof(uint8_t *));
+    for (int i = 0; i < num_entries; i++)
+    {
+        keys[i] = malloc(key_size);
+        snprintf((char *)keys[i], key_size, "k%014d", i);
+        uint8_t val[64];
+        snprintf((char *)val, value_size, "v%062d", i);
+        skip_list_put_with_seq(list, keys[i], key_size, val, value_size, -1, (uint64_t)(i + 1), 0);
+    }
+
+    /* benchmark skip_list_get (malloc+memcpy) */
+    clock_t start = clock();
+    for (int i = 0; i < num_entries; i++)
+    {
+        uint8_t *rv;
+        size_t rvs;
+        int64_t ttl;
+        uint8_t del;
+        skip_list_get(list, keys[i], key_size, &rv, &rvs, &ttl, &del);
+        free(rv);
+    }
+    clock_t end = clock();
+    double time_get = (double)(end - start) / CLOCKS_PER_SEC;
+
+    /* benchmark skip_list_get_ref (zero-copy) */
+    start = clock();
+    for (int i = 0; i < num_entries; i++)
+    {
+        const uint8_t *rv;
+        size_t rvs;
+        int64_t ttl;
+        uint8_t del;
+        skip_list_get_ref(list, keys[i], key_size, &rv, &rvs, &ttl, &del);
+    }
+    end = clock();
+    double time_ref = (double)(end - start) / CLOCKS_PER_SEC;
+
+    printf(CYAN "get (malloc+copy): %.4f sec (%.0f ops/sec)\n" RESET, time_get,
+           num_entries / time_get);
+    printf(CYAN "get_ref (zero-copy): %.4f sec (%.0f ops/sec)\n" RESET, time_ref,
+           num_entries / time_ref);
+    printf(BOLDWHITE "Point read speedup: %.2fx\n" RESET, time_get / time_ref);
+
+    /* benchmark cursor iteration -- next+get vs next_get */
+    skip_list_cursor_t *cursor = NULL;
+    skip_list_cursor_init(&cursor, list);
+
+    start = clock();
+    {
+        uint8_t *k, *v;
+        size_t ks, vs;
+        int64_t t;
+        uint8_t d;
+        while (skip_list_cursor_next(cursor) == 0)
+        {
+            skip_list_cursor_get(cursor, &k, &ks, &v, &vs, &t, &d);
+        }
+    }
+    end = clock();
+    double time_sep = (double)(end - start) / CLOCKS_PER_SEC;
+    skip_list_cursor_free(cursor);
+
+    skip_list_cursor_init(&cursor, list);
+    start = clock();
+    {
+        uint8_t *k, *v;
+        size_t ks, vs;
+        int64_t t;
+        uint8_t d;
+        while (skip_list_cursor_next_get(cursor, &k, &ks, &v, &vs, &t, &d) == 0)
+        {
+        }
+    }
+    end = clock();
+    double time_fused = (double)(end - start) / CLOCKS_PER_SEC;
+    skip_list_cursor_free(cursor);
+
+    printf(CYAN "cursor next+get:   %.4f sec (%.0f ops/sec)\n" RESET, time_sep,
+           num_entries / time_sep);
+    printf(CYAN "cursor next_get:   %.4f sec (%.0f ops/sec)\n" RESET, time_fused,
+           num_entries / time_fused);
+    printf(BOLDWHITE "Scan speedup: %.2fx\n" RESET, time_sep / time_fused);
+
+    for (int i = 0; i < num_entries; i++)
+    {
+        free(keys[i]);
+    }
+    free(keys);
+    skip_list_free(list);
+}
+
+typedef struct
+{
+    skip_list_t *list;
+    int thread_id;
+    int num_ops;
+    int num_unique_keys;
+    _Atomic(uint64_t) *shared_seq;
+    _Atomic(int) *reads_done;
+    _Atomic(int) *writes_done;
+} rw_bench_ctx_t;
+
+void *rw_bench_reader(void *arg)
+{
+    rw_bench_ctx_t *ctx = (rw_bench_ctx_t *)arg;
+    int completed = 0;
+
+    for (int i = 0; i < ctx->num_ops; i++)
+    {
+        char key_buf[32];
+        snprintf(key_buf, sizeof(key_buf), "rwkey_%06d", i % ctx->num_unique_keys);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+        int64_t ttl;
+        int result = skip_list_get(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1, &value,
+                                   &value_size, &ttl, &deleted);
+        if (result == 0 && value != NULL)
+        {
+            free(value);
+        }
+        completed++;
+    }
+
+    atomic_fetch_add_explicit(ctx->reads_done, completed, memory_order_relaxed);
+    return NULL;
+}
+
+void *rw_bench_writer(void *arg)
+{
+    rw_bench_ctx_t *ctx = (rw_bench_ctx_t *)arg;
+    int completed = 0;
+
+    for (int i = 0; i < ctx->num_ops; i++)
+    {
+        char key_buf[32];
+        char value_buf[64];
+        snprintf(key_buf, sizeof(key_buf), "rwkey_%06d", i % ctx->num_unique_keys);
+        snprintf(value_buf, sizeof(value_buf), "t%d_v%d", ctx->thread_id, i);
+
+        int result = -1;
+        int retry_count = 0;
+        while (result != 0 && retry_count < 100)
+        {
+            uint64_t seq = atomic_fetch_add_explicit(ctx->shared_seq, 1, memory_order_relaxed) + 1;
+            result =
+                skip_list_put_with_seq(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1,
+                                       (uint8_t *)value_buf, strlen(value_buf) + 1, -1, seq, 0);
+            retry_count++;
+        }
+        if (result == 0) completed++;
+    }
+
+    atomic_fetch_add_explicit(ctx->writes_done, completed, memory_order_relaxed);
+    return NULL;
+}
+
+static void run_rw_contention_ratio(int num_readers, int num_writers, int ops_per_thread,
+                                    int num_unique_keys, int use_arena)
+{
+    skip_list_t *list = NULL;
+    if (use_arena)
+    {
+        ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.25f, skip_list_comparator_memcmp, NULL,
+                                           NULL, 128 * 1024 * 1024),
+                  0);
+    }
+    else
+    {
+        ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+    }
+
+    _Atomic(uint64_t) shared_seq = 0;
+    _Atomic(int) reads_done = 0;
+    _Atomic(int) writes_done = 0;
+
+    /* pre-populate so readers always have data */
+    for (int i = 0; i < num_unique_keys; i++)
+    {
+        char key_buf[32];
+        char value_buf[64];
+        snprintf(key_buf, sizeof(key_buf), "rwkey_%06d", i);
+        snprintf(value_buf, sizeof(value_buf), "init_%d", i);
+        uint64_t seq = atomic_fetch_add_explicit(&shared_seq, 1, memory_order_relaxed) + 1;
+        skip_list_put_with_seq(list, (uint8_t *)key_buf, strlen(key_buf) + 1, (uint8_t *)value_buf,
+                               strlen(value_buf) + 1, -1, seq, 0);
+    }
+
+    int total_threads = num_readers + num_writers;
+    pthread_t *threads = malloc(total_threads * sizeof(pthread_t));
+    rw_bench_ctx_t *ctxs = malloc(total_threads * sizeof(rw_bench_ctx_t));
+
+    for (int i = 0; i < total_threads; i++)
+    {
+        ctxs[i].list = list;
+        ctxs[i].thread_id = i;
+        ctxs[i].num_ops = ops_per_thread;
+        ctxs[i].num_unique_keys = num_unique_keys;
+        ctxs[i].shared_seq = &shared_seq;
+        ctxs[i].reads_done = &reads_done;
+        ctxs[i].writes_done = &writes_done;
+    }
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < num_readers; i++)
+    {
+        pthread_create(&threads[i], NULL, rw_bench_reader, &ctxs[i]);
+    }
+    for (int i = 0; i < num_writers; i++)
+    {
+        pthread_create(&threads[num_readers + i], NULL, rw_bench_writer, &ctxs[num_readers + i]);
+    }
+
+    for (int i = 0; i < total_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    int tr = atomic_load(&reads_done);
+    int tw = atomic_load(&writes_done);
+    int total_ops = tr + tw;
+
+    int read_pct = (total_threads > 0) ? (num_readers * 100 / total_threads) : 0;
+    int write_pct = 100 - read_pct;
+
+    printf(CYAN "  %3d/%3d R/W  | %2dR + %2dW threads | %.3f sec | %7.2f M total ops/sec", read_pct,
+           write_pct, num_readers, num_writers, elapsed, total_ops / elapsed / 1000000.0);
+    if (tr > 0) printf(" | R: %.2f M/s", tr / elapsed / 1000000.0);
+    if (tw > 0) printf(" | W: %.2f M/s", tw / elapsed / 1000000.0);
+    printf("\n" RESET);
+
+    free(threads);
+    free(ctxs);
+    skip_list_free(list);
+}
+
+static void run_rw_contention_suite(int total_threads, int ops_per_thread, int num_unique_keys,
+                                    int use_arena)
+{
+    run_rw_contention_ratio(total_threads, 0, ops_per_thread, num_unique_keys, use_arena);
+    run_rw_contention_ratio(7, 1, ops_per_thread, num_unique_keys, use_arena);
+    run_rw_contention_ratio(6, 2, ops_per_thread, num_unique_keys, use_arena);
+    run_rw_contention_ratio(4, 4, ops_per_thread, num_unique_keys, use_arena);
+    run_rw_contention_ratio(2, 6, ops_per_thread, num_unique_keys, use_arena);
+    run_rw_contention_ratio(0, total_threads, ops_per_thread, num_unique_keys, use_arena);
+}
+
+void benchmark_skip_list_rw_contention()
+{
+    printf(BOLDWHITE
+           "\n----------------- Read-Write Contention Benchmark -----------------\n" RESET);
+
+    const int ops_per_thread = 100000;
+    const int num_unique_keys = 10000;
+    const int total_threads = 8;
+
+    printf(YELLOW "  %d threads total, %d ops/thread, %d unique keys\n" RESET, total_threads,
+           ops_per_thread, num_unique_keys);
+
+    printf(BOLDWHITE "  [malloc]\n" RESET);
+    run_rw_contention_suite(total_threads, ops_per_thread, num_unique_keys, 0);
+
+    printf(BOLDWHITE "  [arena]\n" RESET);
+    run_rw_contention_suite(total_threads, ops_per_thread, num_unique_keys, 1);
+}
+
 int main(void)
 {
     RUN_TEST(test_skip_list_create_node, tests_passed);
@@ -2299,12 +2935,22 @@ int main(void)
     RUN_TEST(test_skip_list_prefix_seek_behavior, tests_passed);
     RUN_TEST(test_skip_list_put_batch, tests_passed);
     RUN_TEST(test_skip_list_put_batch_sorted, tests_passed);
+    RUN_TEST(test_skip_list_arena_put_get, tests_passed);
+    RUN_TEST(test_skip_list_arena_batch, tests_passed);
+    RUN_TEST(test_skip_list_arena_cursor, tests_passed);
+    RUN_TEST(test_skip_list_arena_delete, tests_passed);
+    RUN_TEST(test_skip_list_arena_zero_capacity, tests_passed);
+    RUN_TEST(test_skip_list_get_ref, tests_passed);
+    RUN_TEST(test_skip_list_cursor_next_get, tests_passed);
 
     RUN_TEST(benchmark_skip_list, tests_passed);
     RUN_TEST(benchmark_skip_list_sequential, tests_passed);
     RUN_TEST(benchmark_skip_list_zipfian, tests_passed);
     RUN_TEST(benchmark_skip_list_deletions, tests_passed);
     RUN_TEST(benchmark_skip_list_batch_vs_single, tests_passed);
+    RUN_TEST(benchmark_skip_list_arena_vs_malloc, tests_passed);
+    RUN_TEST(benchmark_skip_list_read_path, tests_passed);
+    RUN_TEST(benchmark_skip_list_rw_contention, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

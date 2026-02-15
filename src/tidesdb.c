@@ -18567,12 +18567,15 @@ static void tidesdb_recover_single_sstable(tidesdb_column_family_t *cf, const st
     tidesdb_sstable_unref(cf->db, sst);
 }
 
-/**
- * tidesdb_recover_sstables
- * discover and recover all sstables for a column family
- * @param cf column family
- * @return TDB_SUCCESS on success, error code on failure
- */
+static int sstable_cmp_by_id(const void *a, const void *b)
+{
+    const tidesdb_sstable_t *sa = *(const tidesdb_sstable_t *const *)a;
+    const tidesdb_sstable_t *sb = *(const tidesdb_sstable_t *const *)b;
+    if (sa->id < sb->id) return -1;
+    if (sa->id > sb->id) return 1;
+    return 0;
+}
+
 static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
 {
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Recovering SSTables from directory: %s", cf->directory);
@@ -18589,6 +18592,21 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
         }
     }
     closedir(dir);
+
+    /* sort level 0 SSTables by ID so newer sstables (higher ID) are at higher
+     * array indices -- tidesdb_txn_get searches level 0 in reverse order
+     * and returns on the first match, so the ordering is critical for
+     * correctness after recovery where readdir() order is non-deterministic */
+    tidesdb_level_t *l0 = cf->levels[0];
+    if (l0)
+    {
+        tidesdb_sstable_t **arr = atomic_load_explicit(&l0->sstables, memory_order_acquire);
+        int n = atomic_load_explicit(&l0->num_sstables, memory_order_acquire);
+        if (arr && n > 1)
+        {
+            qsort(arr, n, sizeof(tidesdb_sstable_t *), sstable_cmp_by_id);
+        }
+    }
 
     return TDB_SUCCESS;
 }

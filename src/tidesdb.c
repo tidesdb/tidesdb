@@ -2981,6 +2981,14 @@ static void tidesdb_sstable_unref(const tidesdb_t *db, tidesdb_sstable_t *sst)
     }
 }
 
+/**
+ * tidesdb_flush_memtable_internal
+ * rotates the active memtable and enqueues the old one for flush to disk
+ * @param cf column family
+ * @param already_holds_lock 1 if caller already holds is_flushing lock
+ * @param force 1 to flush regardless of size threshold
+ * @return TDB_SUCCESS or error code
+ */
 static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf, int already_holds_lock,
                                            int force);
 
@@ -5402,7 +5410,7 @@ static tidesdb_level_t *tidesdb_level_create(const int level_num, size_t capacit
     atomic_init(&level->current_size, 0);
 
     tidesdb_sstable_t **sstables =
-        calloc(TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY, sizeof(tidesdb_sstable_t *));
+        calloc(TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY + 1, sizeof(tidesdb_sstable_t *));
     if (!sstables)
     {
         free(level);
@@ -5694,12 +5702,27 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
         int old_capacity = atomic_load_explicit(&level->sstables_capacity, memory_order_acquire);
         int old_num = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
 
+        /* spin until (old_arr, old_num) are consistent
+         * another writer may have CAS'd a new array but not yet updated num_sstables
+         * arrays are calloc'd with a +1 sentinel slot so old_arr[old_num] is always safe */
+        if (old_arr[old_num] != NULL)
+        {
+            cpu_pause();
+            continue; /* stale-low  -- concurrent add completed CAS but count not yet bumped */
+        }
+        if (old_num > 0 && old_arr[old_num - 1] == NULL)
+        {
+            cpu_pause();
+            continue; /* stale-high  -- concurrent remove completed CAS but count not yet
+                         decremented */
+        }
+
         /* we check if we need to grow the array */
         if (old_num >= old_capacity)
         {
             int new_capacity =
                 old_capacity == 0 ? TDB_MIN_LEVEL_SSTABLES_INITIAL_CAPACITY : old_capacity * 2;
-            tidesdb_sstable_t **new_arr = malloc(new_capacity * sizeof(tidesdb_sstable_t *));
+            tidesdb_sstable_t **new_arr = calloc(new_capacity + 1, sizeof(tidesdb_sstable_t *));
             if (!new_arr)
             {
                 tidesdb_sstable_unref(sst->db, sst); /* release ref on failure */
@@ -5743,7 +5766,7 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
             }
 
             /* we create new array with the additional sstable already in place */
-            tidesdb_sstable_t **new_arr = malloc(old_capacity * sizeof(tidesdb_sstable_t *));
+            tidesdb_sstable_t **new_arr = calloc(old_capacity + 1, sizeof(tidesdb_sstable_t *));
             if (!new_arr)
             {
                 tidesdb_sstable_unref(sst->db, sst);
@@ -5794,6 +5817,20 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
         const int old_capacity =
             atomic_load_explicit(&level->sstables_capacity, memory_order_acquire);
 
+        /* spin until (old_arr, old_num) are consistent
+         * another writer may have CAS'd a new array but not yet updated num_sstables */
+        if (old_arr[old_num] != NULL)
+        {
+            cpu_pause();
+            continue; /* stale-low:  -- concurrent add completed CAS but count not yet bumped */
+        }
+        if (old_num > 0 && old_arr[old_num - 1] == NULL)
+        {
+            cpu_pause();
+            continue; /* stale-high  -- concurrent remove completed CAS but count not yet
+                         decremented */
+        }
+
         int found_idx = -1;
         for (int i = 0; i < old_num; i++)
         {
@@ -5809,7 +5846,7 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
             return TDB_ERR_NOT_FOUND;
         }
 
-        tidesdb_sstable_t **new_arr = calloc(old_capacity, sizeof(tidesdb_sstable_t *));
+        tidesdb_sstable_t **new_arr = calloc(old_capacity + 1, sizeof(tidesdb_sstable_t *));
         if (!new_arr)
         {
             return TDB_ERR_MEMORY;
@@ -5868,6 +5905,11 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
     }
 }
 
+/**
+ * tidesdb_bump_sstable_layout_version
+ * atomically increments the sstable layout version to signal iterators to rebuild caches
+ * @param cf column family
+ */
 static void tidesdb_bump_sstable_layout_version(tidesdb_column_family_t *cf)
 {
     atomic_fetch_add_explicit(&cf->sstable_layout_version, 1, memory_order_release);
@@ -13377,6 +13419,13 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
     return TDB_SUCCESS;
 }
 
+/**
+ * tidesdb_get_column_family_internal
+ * looks up a column family by name without locking or open-check
+ * @param db database handle
+ * @param name column family name
+ * @return pointer to column family, or NULL if not found
+ */
 static tidesdb_column_family_t *tidesdb_get_column_family_internal(tidesdb_t *db, const char *name)
 {
     if (!db || !name) return NULL;
@@ -13415,6 +13464,12 @@ tidesdb_column_family_t *tidesdb_get_column_family(tidesdb_t *db, const char *na
     return result;
 }
 
+/**
+ * wait_for_open
+ * blocks until the database is fully open and recovery is complete
+ * @param db database handle
+ * @return TDB_SUCCESS when open, TDB_ERR_INVALID_DB on timeout or close
+ */
 static int wait_for_open(tidesdb_t *db)
 {
     /* we wait for database to open and finish recovery, but timeout if it's closing
@@ -13507,6 +13562,15 @@ int tidesdb_is_compacting(tidesdb_column_family_t *cf)
     return atomic_load_explicit(&cf->is_compacting, memory_order_acquire) != 0 ? 1 : 0;
 }
 
+/**
+ * tidesdb_flush_memtable_internal
+ * rotates the active memtable and enqueues the old one for flush to disk
+ * creates a new memtable + WAL, swaps the active pointer, publishes immutable snapshot
+ * @param cf column family
+ * @param already_holds_lock 1 if caller already holds is_flushing lock
+ * @param force 1 to flush regardless of size threshold
+ * @return TDB_SUCCESS or error code
+ */
 static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
                                            const int already_holds_lock, int force)
 {
@@ -18567,6 +18631,13 @@ static void tidesdb_recover_single_sstable(tidesdb_column_family_t *cf, const st
     tidesdb_sstable_unref(cf->db, sst);
 }
 
+/**
+ * sstable_cmp_by_id
+ * qsort comparator for sorting sstables by id ascending
+ * @param a pointer to first sstable pointer
+ * @param b pointer to second sstable pointer
+ * @return negative if a < b, 0 if equal, positive if a > b
+ */
 static int sstable_cmp_by_id(const void *a, const void *b)
 {
     const tidesdb_sstable_t *sa = *(const tidesdb_sstable_t *const *)a;
@@ -18576,6 +18647,13 @@ static int sstable_cmp_by_id(const void *a, const void *b)
     return 0;
 }
 
+/**
+ * tidesdb_recover_sstables
+ * discovers and recovers all sstables for a column family from disk
+ * sorts level 0 by id after recovery to restore newest-at-highest-index invariant
+ * @param cf column family
+ * @return TDB_SUCCESS or error code
+ */
 static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
 {
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Recovering SSTables from directory: %s", cf->directory);
@@ -19060,6 +19138,12 @@ typedef enum
     TDB_BACKUP_COPY_FINAL = 2
 } tidesdb_backup_copy_mode_t;
 
+/**
+ * tidesdb_backup_is_sstable_file
+ * checks if a filename is an sstable file (.klog or .vlog)
+ * @param name filename to check
+ * @return 1 if sstable file, 0 otherwise
+ */
 static int tidesdb_backup_is_sstable_file(const char *name)
 {
     if (!name) return 0;
@@ -19068,6 +19152,12 @@ static int tidesdb_backup_is_sstable_file(const char *name)
     return (strcmp(ext, TDB_SSTABLE_KLOG_EXT) == 0 || strcmp(ext, TDB_SSTABLE_VLOG_EXT) == 0);
 }
 
+/**
+ * tidesdb_backup_is_wal_file
+ * checks if a filename is a WAL file (wal_*.log)
+ * @param name filename to check
+ * @return 1 if WAL file, 0 otherwise
+ */
 static int tidesdb_backup_is_wal_file(const char *name)
 {
     if (!name) return 0;
@@ -19080,6 +19170,13 @@ static int tidesdb_backup_is_wal_file(const char *name)
     return 1;
 }
 
+/**
+ * tidesdb_backup_sstable_in_manifest
+ * checks if an sstable file is tracked in the column family manifest
+ * @param cf column family
+ * @param name sstable filename
+ * @return 1 if in manifest, 0 otherwise
+ */
 static int tidesdb_backup_sstable_in_manifest(const tidesdb_column_family_t *cf, const char *name)
 {
     if (!cf || !cf->manifest || !name) return 0;
@@ -19101,6 +19198,13 @@ static int tidesdb_backup_sstable_in_manifest(const tidesdb_column_family_t *cf,
     return 0;
 }
 
+/**
+ * tidesdb_backup_copy_file
+ * copies a single file from source to destination
+ * @param src_path source file path
+ * @param dst_path destination file path
+ * @return TDB_SUCCESS or TDB_ERR_IO
+ */
 static int tidesdb_backup_copy_file(const char *src_path, const char *dst_path)
 {
     FILE *src = tdb_fopen(src_path, "rb");
@@ -19143,6 +19247,15 @@ static int tidesdb_backup_copy_file(const char *src_path, const char *dst_path)
     return result;
 }
 
+/**
+ * tidesdb_backup_copy_dir
+ * copies a column family directory to backup destination
+ * @param src_dir source directory path
+ * @param dst_dir destination directory path
+ * @param mode copy mode (immutable or final)
+ * @param cf column family for manifest checks
+ * @return TDB_SUCCESS or error code
+ */
 static int tidesdb_backup_copy_dir(const char *src_dir, const char *dst_dir,
                                    const tidesdb_backup_copy_mode_t mode,
                                    const tidesdb_column_family_t *cf)
@@ -19250,6 +19363,14 @@ static int tidesdb_backup_copy_dir(const char *src_dir, const char *dst_dir,
     return result;
 }
 
+/**
+ * tidesdb_backup_copy_all_cfs
+ * copies all column family directories to backup destination
+ * @param db database handle
+ * @param dir backup destination directory
+ * @param mode copy mode (immutable or final)
+ * @return TDB_SUCCESS or error code
+ */
 static int tidesdb_backup_copy_all_cfs(tidesdb_t *db, const char *dir,
                                        const tidesdb_backup_copy_mode_t mode)
 {
@@ -20277,6 +20398,15 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
     return TDB_SUCCESS;
 }
 
+/**
+ * compact_block_index_create
+ * creates a new block index for fast key-to-block lookups in sstables
+ * @param initial_capacity initial number of index entries
+ * @param prefix_len length of key prefixes to store
+ * @param comparator comparator function for key ordering
+ * @param comparator_ctx context for comparator
+ * @return new block index, or NULL on failure
+ */
 static tidesdb_block_index_t *compact_block_index_create(uint32_t initial_capacity,
                                                          uint8_t prefix_len,
                                                          const tidesdb_comparator_fn comparator,
@@ -20307,6 +20437,13 @@ static tidesdb_block_index_t *compact_block_index_create(uint32_t initial_capaci
     return index;
 }
 
+/**
+ * compact_block_index_serialize
+ * serializes a block index to a byte buffer for writing to disk
+ * @param index block index to serialize
+ * @param out_size output parameter for serialized size
+ * @return serialized data (caller must free), or NULL on failure
+ */
 static uint8_t *compact_block_index_serialize(const tidesdb_block_index_t *index, size_t *out_size)
 {
     if (!index || !out_size) return NULL;
@@ -20362,6 +20499,13 @@ static uint8_t *compact_block_index_serialize(const tidesdb_block_index_t *index
     return final_data;
 }
 
+/**
+ * compact_block_index_deserialize
+ * deserializes a block index from a byte buffer read from disk
+ * @param data serialized data
+ * @param data_size size of serialized data
+ * @return deserialized block index, or NULL on failure
+ */
 static tidesdb_block_index_t *compact_block_index_deserialize(const uint8_t *data,
                                                               const size_t data_size)
 {

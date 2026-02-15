@@ -232,6 +232,9 @@ static inline int skip_list_compare_keys_32_inline(const uint8_t *key1, const ui
 /**
  * skip_list_get_latest_valid_version
  * fast path for accessing the latest valid version
+ * @param node node to get version from
+ * @param current_time current time for TTL validation
+ * @return latest valid version, or NULL if none
  */
 static inline int skip_list_version_is_invalid_with_time(skip_list_version_t *version,
                                                          int64_t current_time);
@@ -267,7 +270,7 @@ static inline skip_list_version_t *skip_list_get_latest_valid_version(skip_list_
 /**
  * skip_list_free_version
  * frees a single version
- * @param list
+ * @param list skip list (used to check for arena)
  * @param version version to free
  */
 static void skip_list_free_version(const skip_list_t *list, skip_list_version_t *version);
@@ -784,8 +787,12 @@ int skip_list_new_with_arena(skip_list_t **list, const int max_level, const floa
     return 0;
 }
 
-/* fast thread-local RNG for skip list level selection
- * uses xorshift64* algorithm */
+/**
+ * skip_list_xorshift64star
+ * fast thread-local RNG for skip list level selection using xorshift64* algorithm
+ * @param state pointer to thread-local RNG state
+ * @return pseudo-random 64-bit value
+ */
 static inline uint64_t skip_list_xorshift64star(uint64_t *state)
 {
     uint64_t x = *state;

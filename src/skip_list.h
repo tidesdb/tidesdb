@@ -172,6 +172,7 @@ struct skip_list_node_t
  * @param comparator key comparison function
  * @param comparator_ctx context for comparator
  * @param cached_time pointer to external cached time (NULL = use time(NULL))
+ * @param arena bump allocator for cache-friendly node allocation (NULL = use malloc/free)
  */
 typedef struct skip_list_t
 {
@@ -194,6 +195,8 @@ typedef struct skip_list_t
  * cursor structure for iterating through the skip list
  * @param list pointer to the skip list
  * @param current current node position
+ * @param cached_header cached header sentinel for fast boundary checks
+ * @param cached_tail cached tail sentinel for fast boundary checks
  */
 typedef struct
 {

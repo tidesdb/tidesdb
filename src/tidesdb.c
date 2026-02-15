@@ -10399,7 +10399,8 @@ static int tidesdb_wal_recover(tidesdb_column_family_t *cf, const char *wal_path
 
     if (skip_list_new_with_arena(memtable, cf->config.skip_list_max_level,
                                  cf->config.skip_list_probability, comparator_fn, comparator_ctx,
-                                 &cf->db->cached_current_time, cf->config.write_buffer_size) != 0)
+                                 &cf->db->cached_current_time,
+                                 cf->config.write_buffer_size * 2) != 0)
     {
         block_manager_close(wal);
         return TDB_ERR_MEMORY;
@@ -10651,6 +10652,17 @@ static void *tidesdb_flush_worker_thread(void *arg)
 
         tidesdb_column_family_t *cf = work->cf;
         tidesdb_immutable_memtable_t *imm = work->imm;
+
+        /* rotation request from commit path -- imm==NULL is the sentinel
+         * commit path already set is_flushing=1, so pass already_holds_lock=1
+         * this performs memtable rotation + WAL creation in the background thread
+         * instead of blocking the commit hot path on file I/O */
+        if (!imm)
+        {
+            tidesdb_flush_memtable_internal(cf, 1, 0);
+            free(work);
+            continue;
+        }
 
         /* we check if CF is marked for deletion -- if so, skip processing and cleanup */
         if (atomic_load_explicit(&cf->marked_for_deletion, memory_order_acquire))
@@ -12421,8 +12433,9 @@ int tidesdb_close(tidesdb_t *db)
             tidesdb_flush_work_t *work = (tidesdb_flush_work_t *)queue_dequeue(db->flush_queue);
             if (work)
             {
-                /* we each flush work holds a reference to the immutable memtable */
-                tidesdb_immutable_memtable_unref(work->imm);
+                /* we each flush work holds a reference to the immutable memtable
+                 * rotation requests (imm == NULL) have no ref to release */
+                if (work->imm) tidesdb_immutable_memtable_unref(work->imm);
                 free(work);
             }
         }
@@ -12711,7 +12724,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
     if (skip_list_new_with_arena(&new_memtable, config->skip_list_max_level,
                                  config->skip_list_probability, comparator_fn, comparator_ctx,
-                                 &db->cached_current_time, config->write_buffer_size) != 0)
+                                 &db->cached_current_time, config->write_buffer_size * 2) != 0)
     {
         free(cf->directory);
         free(cf->name);
@@ -13601,7 +13614,8 @@ static int tidesdb_flush_memtable_internal(tidesdb_column_family_t *cf,
     skip_list_t *new_memtable;
     if (skip_list_new_with_arena(&new_memtable, cf->config.skip_list_max_level,
                                  cf->config.skip_list_probability, comparator_fn, comparator_ctx,
-                                 &cf->db->cached_current_time, cf->config.write_buffer_size) != 0)
+                                 &cf->db->cached_current_time,
+                                 cf->config.write_buffer_size * 2) != 0)
     {
         TDB_DEBUG_LOG(TDB_LOG_WARN, "CF '%s' failed to create new memtable", cf->name);
         atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
@@ -15796,8 +15810,7 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
 
         const size_t memtable_size = (size_t)skip_list_get_size(memtable);
-        const size_t flush_threshold =
-            cf->config.write_buffer_size + (cf->config.write_buffer_size / 4);
+        const size_t flush_threshold = cf->config.write_buffer_size;
         const int needs_flush = (memtable_size >= flush_threshold);
 
         atomic_fetch_sub_explicit(&mt->refcount, 1, memory_order_release);
@@ -15805,7 +15818,30 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
 
         if (needs_flush)
         {
-            tidesdb_flush_memtable(cf);
+            /* async rotation -- signal flush worker instead of blocking on I/O
+             * we claim is_flushing ownership here and let the flush worker
+             * perform the actual memtable rotation + WAL creation in background */
+            int expected_flushing = 0;
+            if (atomic_compare_exchange_strong_explicit(&cf->is_flushing, &expected_flushing, 1,
+                                                        memory_order_acquire, memory_order_relaxed))
+            {
+                tidesdb_flush_work_t *rotation_work = malloc(sizeof(tidesdb_flush_work_t));
+                if (rotation_work)
+                {
+                    rotation_work->cf = cf;
+                    rotation_work->imm = NULL; /* sentinel -- rotation request, not flush */
+                    rotation_work->sst_id = 0;
+                    if (queue_enqueue(cf->db->flush_queue, rotation_work) != 0)
+                    {
+                        free(rotation_work);
+                        atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+                    }
+                }
+                else
+                {
+                    atomic_store_explicit(&cf->is_flushing, 0, memory_order_release);
+                }
+            }
         }
     }
 

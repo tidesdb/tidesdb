@@ -157,8 +157,9 @@ static void *skip_list_arena_alloc(skip_list_arena_t *arena, size_t size)
             }
         }
 
-        /* thread-local block is NULL or full -- allocate a new one */
-        size_t new_cap = arena->block_size;
+        /* thread-local block is NULL or full -- allocate a new one
+         * use smaller blocks for thread-local slots to save memory on multi-threaded systems */
+        size_t new_cap = SKIP_LIST_ARENA_TL_BLOCK_SIZE;
         if (size > new_cap) new_cap = size;
 
         skip_list_arena_block_t *new_block = skip_list_arena_create_block(new_cap);

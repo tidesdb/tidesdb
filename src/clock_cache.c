@@ -27,6 +27,8 @@
 #define CLOCK_CACHE_READER_INC               2u
 #define CLOCK_CACHE_REF_MASK                 ((uint8_t)(~1u & 0xFFu))
 #define CLOCK_CACHE_HAS_READERS(ref)         (((ref)&CLOCK_CACHE_REF_MASK) != 0)
+#define CLOCK_CACHE_PAYLOAD_ALIGN            8 /* align payload for safe typed access */
+#define CLOCK_CACHE_ALIGN_UP(x, a)           (((x) + ((a)-1)) & ~((size_t)(a)-1))
 
 /**
  * entry_size
@@ -37,7 +39,8 @@
  */
 static inline size_t entry_size(const size_t key_len, const size_t payload_len)
 {
-    return key_len + payload_len + sizeof(clock_cache_entry_t);
+    return CLOCK_CACHE_ALIGN_UP(key_len, CLOCK_CACHE_PAYLOAD_ALIGN) + payload_len +
+           sizeof(clock_cache_entry_t);
 }
 
 /**
@@ -344,8 +347,12 @@ static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *p
         /* we use local counter with occasional sync to global clock_hand */
         const size_t hand = (start_pos + iterations) % partition->num_slots;
         clock_cache_entry_t *entry = &partition->slots[hand];
-        const size_t next_hand = (hand + 1) % partition->num_slots;
-        PREFETCH_READ(&partition->slots[next_hand]);
+
+        /* prefetch 2 entries ahead to overlap memory latency with eviction logic */
+        const size_t pf1 = (hand + 1) % partition->num_slots;
+        const size_t pf2 = (hand + 2) % partition->num_slots;
+        PREFETCH_READ(&partition->slots[pf1]);
+        PREFETCH_READ(&partition->slots[pf2]);
 
         /* we check state atomically */
         uint8_t state = atomic_load_explicit(&entry->state, memory_order_acquire);
@@ -357,34 +364,39 @@ static size_t clock_evict(const clock_cache_t *cache, clock_cache_partition_t *p
             return hand;
         }
 
-        if (state == ENTRY_VALID)
+        if (state != ENTRY_VALID)
         {
-            /* we check reference bit and active readers */
-            uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
-            if (CLOCK_CACHE_HAS_READERS(ref))
-            {
-                if (ref & CLOCK_CACHE_REF_BIT)
-                {
-                    atomic_fetch_and_explicit(&entry->ref_bit, CLOCK_CACHE_REF_MASK,
-                                              memory_order_relaxed);
-                }
-                iterations++;
-                continue;
-            }
-
-            if ((ref & CLOCK_CACHE_REF_BIT) == 0)
-            {
-                /* found victim -- try to evict */
-                PREFETCH_WRITE(entry);
-                free_entry(cache, partition, entry);
-
-                /* we update thread position for next time */
-                thread_hand = hand + 1;
-                return hand;
-            }
-
-            atomic_fetch_and_explicit(&entry->ref_bit, CLOCK_CACHE_REF_MASK, memory_order_relaxed);
+            /* fast-skip transient states (WRITING/DELETING) without counting
+             * toward max_iterations -- these are momentary and will resolve */
+            iterations++;
+            continue;
         }
+
+        /* we check reference bit and active readers */
+        uint8_t ref = atomic_load_explicit(&entry->ref_bit, memory_order_acquire);
+        if (CLOCK_CACHE_HAS_READERS(ref))
+        {
+            if (ref & CLOCK_CACHE_REF_BIT)
+            {
+                atomic_fetch_and_explicit(&entry->ref_bit, CLOCK_CACHE_REF_MASK,
+                                          memory_order_relaxed);
+            }
+            iterations++;
+            continue;
+        }
+
+        if ((ref & CLOCK_CACHE_REF_BIT) == 0)
+        {
+            /* found victim -- try to evict */
+            PREFETCH_WRITE(entry);
+            free_entry(cache, partition, entry);
+
+            /* we update thread position for next time */
+            thread_hand = hand + 1;
+            return hand;
+        }
+
+        atomic_fetch_and_explicit(&entry->ref_bit, CLOCK_CACHE_REF_MASK, memory_order_relaxed);
 
         iterations++;
     }
@@ -679,8 +691,10 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     }
 
     /* we own the slot now, allocate key + payload in single allocation
+     * payload is aligned to CLOCK_CACHE_PAYLOAD_ALIGN for safe typed access
      * this halves malloc calls and improves data locality */
-    char *new_buf = (char *)malloc(key_len + payload_len);
+    const size_t aligned_key_len = CLOCK_CACHE_ALIGN_UP(key_len, CLOCK_CACHE_PAYLOAD_ALIGN);
+    char *new_buf = (char *)malloc(aligned_key_len + payload_len);
     if (!new_buf)
     {
         atomic_store_explicit(&entry->state, ENTRY_EMPTY, memory_order_release);
@@ -688,7 +702,7 @@ int clock_cache_put(clock_cache_t *cache, const char *key, size_t key_len, const
     }
 
     char *new_key = new_buf;
-    void *new_payload = new_buf + key_len;
+    void *new_payload = new_buf + aligned_key_len;
     memcpy(new_key, key, key_len);
     memcpy(new_payload, payload, payload_len);
 

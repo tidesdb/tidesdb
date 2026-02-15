@@ -380,7 +380,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # tidesdb config variables for benchmark
     if(NOT DEFINED BENCH_DB_LOG_LEVEL)
-        set(BENCH_DB_LOG_LEVEL TDB_LOG_NONE)
+        set(BENCH_DB_LOG_LEVEL TDB_LOG_DEBUG)
     endif()
     if(NOT DEFINED BENCH_DB_PATH)
         set(BENCH_DB_PATH "benchmark_db")

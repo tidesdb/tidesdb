@@ -81,15 +81,15 @@ typedef struct
 /** cache configuration constants */
 #define CLOCK_CACHE_MAX_PUT_RETRIES         100  /* max retries for claiming a slot */
 #define CLOCK_CACHE_MIN_PARTITIONS          4    /* minimum number of partitions */
-#define CLOCK_CACHE_MAX_PARTITIONS          128  /* maximum number of partitions */
-#define CLOCK_CACHE_PARTITIONS_PER_CPU      2    /* partitions per CPU core */
+#define CLOCK_CACHE_MAX_PARTITIONS          512  /* maximum number of partitions */
+#define CLOCK_CACHE_PARTITIONS_PER_CPU      4    /* partitions per CPU core */
 #define CLOCK_CACHE_MIN_SLOTS_PER_PARTITION 64   /* minimum slots per partition */
-#define CLOCK_CACHE_MAX_SLOTS_PER_PARTITION 2048 /* maximum slots per partition */
+#define CLOCK_CACHE_MAX_SLOTS_PER_PARTITION 8192 /* maximum slots per partition */
 #define CLOCK_CACHE_AVG_ENTRY_SIZE          100  /* estimated average entry size in bytes */
-/* hash index size = slots * 3 / 2 (1.5x, using integer arithmetic) */
-#define CLOCK_CACHE_HASH_INDEX_MULTIPLIER_NUM 3
-#define CLOCK_CACHE_HASH_INDEX_MULTIPLIER_DEN 2
-#define CLOCK_CACHE_MAX_HASH_PROBE            64 /* max linear probing distance */
+/* hash index size = slots * 2 (2x, low load factor for fast probing) */
+#define CLOCK_CACHE_HASH_INDEX_MULTIPLIER_NUM 2
+#define CLOCK_CACHE_HASH_INDEX_MULTIPLIER_DEN 1
+#define CLOCK_CACHE_MAX_HASH_PROBE            128 /* max linear probing distance */
 
 /**
  * clock_cache_partition_t
@@ -136,7 +136,7 @@ struct clock_cache_partition_t
  * -- hash table provides O(1) average-case lookups (with chaining for collisions)
  * -- CLOCK array enables efficient second-chance eviction without reordering
  * -- for high-performance workloads
- *    -- use 64-128 partitions for 16+ threads to minimize lock contention
+ *    -- use 128-512 partitions for 16+ threads to minimize lock contention
  *    -- hash table size auto-scales to next power-of-2 >= slots_per_partition
  * @param partitions array of partitions
  * @param num_partitions number of partitions

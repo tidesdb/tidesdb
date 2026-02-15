@@ -2719,6 +2719,187 @@ void benchmark_skip_list_read_path()
     skip_list_free(list);
 }
 
+typedef struct
+{
+    skip_list_t *list;
+    int thread_id;
+    int num_ops;
+    int num_unique_keys;
+    _Atomic(uint64_t) *shared_seq;
+    _Atomic(int) *reads_done;
+    _Atomic(int) *writes_done;
+} rw_bench_ctx_t;
+
+void *rw_bench_reader(void *arg)
+{
+    rw_bench_ctx_t *ctx = (rw_bench_ctx_t *)arg;
+    int completed = 0;
+
+    for (int i = 0; i < ctx->num_ops; i++)
+    {
+        char key_buf[32];
+        snprintf(key_buf, sizeof(key_buf), "rwkey_%06d", i % ctx->num_unique_keys);
+
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        uint8_t deleted = 0;
+        int64_t ttl;
+        int result = skip_list_get(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1, &value,
+                                   &value_size, &ttl, &deleted);
+        if (result == 0 && value != NULL)
+        {
+            free(value);
+        }
+        completed++;
+    }
+
+    atomic_fetch_add_explicit(ctx->reads_done, completed, memory_order_relaxed);
+    return NULL;
+}
+
+void *rw_bench_writer(void *arg)
+{
+    rw_bench_ctx_t *ctx = (rw_bench_ctx_t *)arg;
+    int completed = 0;
+
+    for (int i = 0; i < ctx->num_ops; i++)
+    {
+        char key_buf[32];
+        char value_buf[64];
+        snprintf(key_buf, sizeof(key_buf), "rwkey_%06d", i % ctx->num_unique_keys);
+        snprintf(value_buf, sizeof(value_buf), "t%d_v%d", ctx->thread_id, i);
+
+        int result = -1;
+        int retry_count = 0;
+        while (result != 0 && retry_count < 100)
+        {
+            uint64_t seq = atomic_fetch_add_explicit(ctx->shared_seq, 1, memory_order_relaxed) + 1;
+            result =
+                skip_list_put_with_seq(ctx->list, (uint8_t *)key_buf, strlen(key_buf) + 1,
+                                       (uint8_t *)value_buf, strlen(value_buf) + 1, -1, seq, 0);
+            retry_count++;
+        }
+        if (result == 0) completed++;
+    }
+
+    atomic_fetch_add_explicit(ctx->writes_done, completed, memory_order_relaxed);
+    return NULL;
+}
+
+static void run_rw_contention_ratio(int num_readers, int num_writers, int ops_per_thread,
+                                    int num_unique_keys, int use_arena)
+{
+    skip_list_t *list = NULL;
+    if (use_arena)
+    {
+        ASSERT_EQ(skip_list_new_with_arena(&list, 12, 0.25f, skip_list_comparator_memcmp, NULL,
+                                           NULL, 128 * 1024 * 1024),
+                  0);
+    }
+    else
+    {
+        ASSERT_EQ(skip_list_new(&list, 12, 0.25f), 0);
+    }
+
+    _Atomic(uint64_t) shared_seq = 0;
+    _Atomic(int) reads_done = 0;
+    _Atomic(int) writes_done = 0;
+
+    /* pre-populate so readers always have data */
+    for (int i = 0; i < num_unique_keys; i++)
+    {
+        char key_buf[32];
+        char value_buf[64];
+        snprintf(key_buf, sizeof(key_buf), "rwkey_%06d", i);
+        snprintf(value_buf, sizeof(value_buf), "init_%d", i);
+        uint64_t seq = atomic_fetch_add_explicit(&shared_seq, 1, memory_order_relaxed) + 1;
+        skip_list_put_with_seq(list, (uint8_t *)key_buf, strlen(key_buf) + 1, (uint8_t *)value_buf,
+                               strlen(value_buf) + 1, -1, seq, 0);
+    }
+
+    int total_threads = num_readers + num_writers;
+    pthread_t *threads = malloc(total_threads * sizeof(pthread_t));
+    rw_bench_ctx_t *ctxs = malloc(total_threads * sizeof(rw_bench_ctx_t));
+
+    for (int i = 0; i < total_threads; i++)
+    {
+        ctxs[i].list = list;
+        ctxs[i].thread_id = i;
+        ctxs[i].num_ops = ops_per_thread;
+        ctxs[i].num_unique_keys = num_unique_keys;
+        ctxs[i].shared_seq = &shared_seq;
+        ctxs[i].reads_done = &reads_done;
+        ctxs[i].writes_done = &writes_done;
+    }
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < num_readers; i++)
+    {
+        pthread_create(&threads[i], NULL, rw_bench_reader, &ctxs[i]);
+    }
+    for (int i = 0; i < num_writers; i++)
+    {
+        pthread_create(&threads[num_readers + i], NULL, rw_bench_writer, &ctxs[num_readers + i]);
+    }
+
+    for (int i = 0; i < total_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    int tr = atomic_load(&reads_done);
+    int tw = atomic_load(&writes_done);
+    int total_ops = tr + tw;
+
+    int read_pct = (total_threads > 0) ? (num_readers * 100 / total_threads) : 0;
+    int write_pct = 100 - read_pct;
+
+    printf(CYAN "  %3d/%3d R/W  | %2dR + %2dW threads | %.3f sec | %7.2f M total ops/sec", read_pct,
+           write_pct, num_readers, num_writers, elapsed, total_ops / elapsed / 1000000.0);
+    if (tr > 0) printf(" | R: %.2f M/s", tr / elapsed / 1000000.0);
+    if (tw > 0) printf(" | W: %.2f M/s", tw / elapsed / 1000000.0);
+    printf("\n" RESET);
+
+    free(threads);
+    free(ctxs);
+    skip_list_free(list);
+}
+
+static void run_rw_contention_suite(int total_threads, int ops_per_thread, int num_unique_keys,
+                                    int use_arena)
+{
+    run_rw_contention_ratio(total_threads, 0, ops_per_thread, num_unique_keys, use_arena);
+    run_rw_contention_ratio(7, 1, ops_per_thread, num_unique_keys, use_arena);
+    run_rw_contention_ratio(6, 2, ops_per_thread, num_unique_keys, use_arena);
+    run_rw_contention_ratio(4, 4, ops_per_thread, num_unique_keys, use_arena);
+    run_rw_contention_ratio(2, 6, ops_per_thread, num_unique_keys, use_arena);
+    run_rw_contention_ratio(0, total_threads, ops_per_thread, num_unique_keys, use_arena);
+}
+
+void benchmark_skip_list_rw_contention()
+{
+    printf(BOLDWHITE
+           "\n----------------- Read-Write Contention Benchmark -----------------\n" RESET);
+
+    const int ops_per_thread = 100000;
+    const int num_unique_keys = 10000;
+    const int total_threads = 8;
+
+    printf(YELLOW "  %d threads total, %d ops/thread, %d unique keys\n" RESET, total_threads,
+           ops_per_thread, num_unique_keys);
+
+    printf(BOLDWHITE "  [malloc]\n" RESET);
+    run_rw_contention_suite(total_threads, ops_per_thread, num_unique_keys, 0);
+
+    printf(BOLDWHITE "  [arena]\n" RESET);
+    run_rw_contention_suite(total_threads, ops_per_thread, num_unique_keys, 1);
+}
+
 int main(void)
 {
     RUN_TEST(test_skip_list_create_node, tests_passed);
@@ -2769,6 +2950,7 @@ int main(void)
     RUN_TEST(benchmark_skip_list_batch_vs_single, tests_passed);
     RUN_TEST(benchmark_skip_list_arena_vs_malloc, tests_passed);
     RUN_TEST(benchmark_skip_list_read_path, tests_passed);
+    RUN_TEST(benchmark_skip_list_rw_contention, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

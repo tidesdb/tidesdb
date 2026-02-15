@@ -267,6 +267,7 @@ static inline skip_list_version_t *skip_list_get_latest_valid_version(skip_list_
 /**
  * skip_list_free_version
  * frees a single version
+ * @param list
  * @param version version to free
  */
 static void skip_list_free_version(const skip_list_t *list, skip_list_version_t *version);

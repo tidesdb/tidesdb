@@ -195,7 +195,10 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
                                      size_t key2_size, void *ctx);
 
 /* forward declarations for internal types */
-#define TDB_MAX_LEVELS 32
+#define TDB_MAX_LEVELS         32
+#define TDB_IMM_SNAP_MAX_ITEMS 16 /* max immutables in lock-free snapshot array */
+#define TDB_IMM_SNAP_SLOTS     2  /* double-buffered snapshot slots */
+
 typedef struct tidesdb_txn_op_t tidesdb_txn_op_t;
 typedef struct tidesdb_merge_heap_t tidesdb_merge_heap_t;
 typedef struct tidesdb_kv_pair_t tidesdb_kv_pair_t;
@@ -207,6 +210,16 @@ typedef struct tidesdb_memtable_t tidesdb_memtable_t;
 typedef struct tidesdb_deferred_free_node_t tidesdb_deferred_free_node_t;
 typedef struct tidesdb_t tidesdb_t;
 typedef struct tidesdb_column_family_t tidesdb_column_family_t;
+
+/* lock-free immutable memtable snapshot slot
+ * part of a double-buffered RCU scheme: writers build in inactive slot,
+ * swap the active index, then wait for old-slot readers to drain */
+typedef struct
+{
+    tidesdb_memtable_t *items[TDB_IMM_SNAP_MAX_ITEMS];
+    _Atomic(size_t) count;
+    _Atomic(int32_t) readers; /* active reader count on this slot */
+} tidesdb_imm_snap_t;
 typedef struct tidesdb_txn_t tidesdb_txn_t;
 typedef struct tidesdb_iter_t tidesdb_iter_t;
 typedef struct tidesdb_stats_t tidesdb_stats_t;
@@ -368,6 +381,12 @@ struct tidesdb_column_family_t
     _Atomic(int) marked_for_deletion;
     tidesdb_manifest_t *manifest;
     tidesdb_t *db;
+
+    /* lock-free immutable memtable snapshot (double-buffered RCU)
+     * readers acquire active slot, use items, release when done
+     * writers rebuild in inactive slot, swap active, wait for old readers */
+    tidesdb_imm_snap_t imm_snaps[TDB_IMM_SNAP_SLOTS];
+    _Atomic(int) imm_snap_active; /* 0 or 1, index of current snapshot */
 };
 
 /**

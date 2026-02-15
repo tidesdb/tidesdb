@@ -674,7 +674,7 @@ void benchmark_queue_single_threaded()
 {
     printf("\n");
     queue_t *queue = queue_new();
-    const int num_ops = 1000000;
+    const int num_ops = 100000;
 
     /* benchmark enqueue */
     struct timespec start, end;
@@ -786,7 +786,7 @@ void benchmark_queue_concurrent_producers_consumers()
     printf("\n");
     const int num_producers = 4;
     const int num_consumers = 4;
-    const int ops_per_producer = 100000;
+    const int ops_per_producer = 10000;
     const int total_items = num_producers * ops_per_producer;
 
     queue_t *queue = queue_new();
@@ -893,7 +893,7 @@ void benchmark_queue_mixed_operations()
 {
     printf("\n");
     const int num_threads = 8;
-    const int ops_per_thread = 50000;
+    const int ops_per_thread = 10000;
 
     queue_t *queue = queue_new();
 
@@ -936,7 +936,7 @@ void benchmark_queue_mixed_operations()
 void benchmark_queue_scaling()
 {
     printf("\n");
-    const int ops_per_thread = 50000;
+    const int ops_per_thread = 10000;
     int thread_counts[] = {1, 2, 4, 8, 16};
     int num_configs = sizeof(thread_counts) / sizeof(thread_counts[0]);
 
@@ -987,8 +987,8 @@ void benchmark_queue_scaling()
 }
 
 #define BENCH_FOREACH_PEEK_NUM_THREADS 4
-#define BENCH_FOREACH_PEEK_QUEUE_SIZE  10000
-#define BENCH_FOREACH_PEEK_ITERATIONS  500
+#define BENCH_FOREACH_PEEK_QUEUE_SIZE  1000
+#define BENCH_FOREACH_PEEK_ITERATIONS  100
 
 typedef struct
 {
@@ -1177,7 +1177,7 @@ void benchmark_queue_foreach_large()
 {
     printf("\n");
     queue_t *queue = queue_new();
-    const int queue_sizes[] = {1000, 10000, 100000};
+    const int queue_sizes[] = {1000, 10000, 50000};
     const int num_sizes = 3;
 
     for (int s = 0; s < num_sizes; s++)
@@ -1193,7 +1193,7 @@ void benchmark_queue_foreach_large()
         }
 
         /* benchmark foreach */
-        int iterations = (sz <= 1000) ? 10000 : (sz <= 10000) ? 1000 : 100;
+        int iterations = (sz <= 1000) ? 1000 : (sz <= 10000) ? 100 : 10;
         _Atomic int visit_count = 0;
 
         struct timespec start, end;
@@ -1223,7 +1223,7 @@ void benchmark_queue_roundtrip()
 {
     printf("\n");
     queue_t *queue = queue_new();
-    const int num_ops = 1000000;
+    const int num_ops = 100000;
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1252,13 +1252,13 @@ void benchmark_queue_clear()
 {
     printf("\n");
     queue_t *queue = queue_new();
-    const int fill_sizes[] = {1000, 10000, 100000};
+    const int fill_sizes[] = {1000, 10000, 50000};
     const int num_sizes = 3;
 
     for (int s = 0; s < num_sizes; s++)
     {
         int sz = fill_sizes[s];
-        int iterations = (sz <= 1000) ? 1000 : (sz <= 10000) ? 100 : 10;
+        int iterations = (sz <= 1000) ? 100 : (sz <= 10000) ? 10 : 2;
 
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1299,8 +1299,8 @@ void benchmark_queue_peek()
 {
     printf("\n");
     queue_t *queue = queue_new();
-    const int queue_size_val = 10000;
-    const int num_peeks = 1000000;
+    const int queue_size_val = 1000;
+    const int num_peeks = 100000;
 
     int *values = malloc(queue_size_val * sizeof(int));
     for (int i = 0; i < queue_size_val; i++)

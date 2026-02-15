@@ -108,9 +108,9 @@ static inline size_t get_local_partition(const clock_cache_t *cache, uint64_t ha
 
     static THREAD_LOCAL int cached_group = -1;
     int group = cached_group;
-    if (__builtin_expect(group < 0, 0))
+    if (TDB_UNLIKELY(group < 0))
     {
-        int cpu = tdb_get_cpu_id();
+        const int cpu = tdb_get_cpu_id();
         group = (cpu >= 0 && cpu < cache->max_cpus) ? (int)cache->cpu_to_group[cpu] : 0;
         cached_group = group;
     }

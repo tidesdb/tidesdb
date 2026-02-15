@@ -19,7 +19,10 @@
 
 #include "skip_list.h"
 
-/* thread-local slot for arena allocation -- assigned once per thread */
+/* thread-local cache for arena slot assignment
+ * each thread caches its slot for ONE arena at a time
+ * if the arena changes, we must get a new slot from that arena */
+static _Thread_local skip_list_arena_t *tl_cached_arena = NULL;
 static _Thread_local int tl_arena_slot = -1;
 
 /**
@@ -28,7 +31,7 @@ static _Thread_local int tl_arena_slot = -1;
  * @param capacity size in bytes for the block
  * @return pointer to block, or NULL on failure
  */
-static skip_list_arena_block_t *skip_list_arena_create_block(size_t capacity)
+static skip_list_arena_block_t *skip_list_arena_create_block(const size_t capacity)
 {
     skip_list_arena_block_t *block = malloc(sizeof(skip_list_arena_block_t));
     if (block == NULL) return NULL;
@@ -70,7 +73,7 @@ static void skip_list_arena_register_block(skip_list_arena_t *arena, skip_list_a
  * @param initial_capacity size in bytes for the first block
  * @return pointer to arena, or NULL on failure
  */
-static skip_list_arena_t *skip_list_arena_create(size_t initial_capacity)
+static skip_list_arena_t *skip_list_arena_create(const size_t initial_capacity)
 {
     skip_list_arena_t *arena = malloc(sizeof(skip_list_arena_t));
     if (arena == NULL) return NULL;
@@ -97,23 +100,27 @@ static skip_list_arena_t *skip_list_arena_create(size_t initial_capacity)
 
 /**
  * skip_list_arena_get_slot
- * gets or assigns a thread-local slot for this thread
+ * gets or assigns a thread-local slot for this thread and arena
+ * the slot is cached per-thread but invalidated when switching arenas
  * @param arena the arena
  * @return slot index (0 to SKIP_LIST_ARENA_MAX_THREADS-1), or -1 if slots exhausted
  */
 static inline int skip_list_arena_get_slot(skip_list_arena_t *arena)
 {
-    if (SKIP_LIST_LIKELY(tl_arena_slot >= 0))
+    /* fast path: cached slot for this arena */
+    if (SKIP_LIST_LIKELY(tl_cached_arena == arena && tl_arena_slot >= 0))
     {
         return tl_arena_slot;
     }
 
+    /* different arena or first allocation -- get a new slot */
     int slot = atomic_fetch_add_explicit(&arena->tl_slot_counter, 1, memory_order_relaxed);
     if (slot >= SKIP_LIST_ARENA_MAX_THREADS)
     {
         return -1;
     }
 
+    tl_cached_arena = arena;
     tl_arena_slot = slot;
     return slot;
 }

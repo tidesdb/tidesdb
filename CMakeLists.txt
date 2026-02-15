@@ -383,7 +383,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_DB_LOG_LEVEL TDB_LOG_DEBUG)
     endif()
     if(NOT DEFINED BENCH_DB_PATH)
-        set(BENCH_DB_PATH "/media/agpmastersystem/c794105c-0cd9-4be9-8369-ee6d6e707d68/home/benchmark_db")
+        set(BENCH_DB_PATH "benchmark_db")
     endif()
     if(NOT DEFINED BENCH_DB_FLUSH_POOL_THREADS)
         set(BENCH_DB_FLUSH_POOL_THREADS 2)

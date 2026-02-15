@@ -357,7 +357,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # benchmark configuration variables (can be overridden at build time with -D flags)
     if(NOT DEFINED BENCH_NUM_OPERATIONS)
-        set(BENCH_NUM_OPERATIONS 10000000)
+        set(BENCH_NUM_OPERATIONS 1000000)
     endif()
     if(NOT DEFINED BENCH_NUM_SEEK_OPS)
         set(BENCH_NUM_SEEK_OPS 100)
@@ -394,7 +394,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
 
     # column family configuration variables for benchmark
     if(NOT DEFINED BENCH_WRITE_BUFFER_SIZE)
-        math(EXPR BENCH_WRITE_BUFFER_SIZE 67108864)
+        math(EXPR BENCH_WRITE_BUFFER_SIZE 6764)
     endif()
     if(NOT DEFINED BENCH_LEVEL_RATIO)
         set(BENCH_LEVEL_RATIO 10)
@@ -442,7 +442,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         set(BENCH_COMPARATOR_NAME "memcmp")
     endif()
     if (NOT DEFINED BENCH_BLOCK_CACHE_SIZE)
-        math(EXPR BENCH_BLOCK_CACHE_SIZE 67108864)
+        math(EXPR BENCH_BLOCK_CACHE_SIZE 6764)
     endif()
     if(NOT DEFINED BENCH_ISOLATION_LEVEL)
         set(BENCH_ISOLATION_LEVEL TDB_ISOLATION_READ_COMMITTED)

@@ -19,6 +19,51 @@
 
 #include "skip_list.h"
 
+/* thread-local slot for arena allocation -- assigned once per thread */
+static _Thread_local int tl_arena_slot = -1;
+
+/**
+ * skip_list_arena_create_block
+ * creates a new arena block with the given capacity
+ * @param capacity size in bytes for the block
+ * @return pointer to block, or NULL on failure
+ */
+static skip_list_arena_block_t *skip_list_arena_create_block(size_t capacity)
+{
+    skip_list_arena_block_t *block = malloc(sizeof(skip_list_arena_block_t));
+    if (block == NULL) return NULL;
+
+    block->data = malloc(capacity);
+    if (block->data == NULL)
+    {
+        free(block);
+        return NULL;
+    }
+
+    atomic_init(&block->used, 0);
+    block->capacity = capacity;
+    block->prev = NULL;
+
+    return block;
+}
+
+/**
+ * skip_list_arena_register_block
+ * adds a block to the arena's all_blocks_head list for later destruction
+ * @param arena the arena
+ * @param block the block to register
+ */
+static void skip_list_arena_register_block(skip_list_arena_t *arena, skip_list_arena_block_t *block)
+{
+    skip_list_arena_block_t *head;
+    do
+    {
+        head = atomic_load_explicit(&arena->all_blocks_head, memory_order_acquire);
+        block->prev = head;
+    } while (!atomic_compare_exchange_weak_explicit(&arena->all_blocks_head, &head, block,
+                                                    memory_order_release, memory_order_acquire));
+}
+
 /**
  * skip_list_arena_create
  * creates a new arena with an initial block of the given capacity
@@ -30,36 +75,54 @@ static skip_list_arena_t *skip_list_arena_create(size_t initial_capacity)
     skip_list_arena_t *arena = malloc(sizeof(skip_list_arena_t));
     if (arena == NULL) return NULL;
 
-    skip_list_arena_block_t *block = malloc(sizeof(skip_list_arena_block_t));
+    skip_list_arena_block_t *block = skip_list_arena_create_block(initial_capacity);
     if (block == NULL)
     {
         free(arena);
         return NULL;
     }
 
-    block->data = malloc(initial_capacity);
-    if (block->data == NULL)
-    {
-        free(block);
-        free(arena);
-        return NULL;
-    }
-
-    atomic_init(&block->used, 0);
-    block->capacity = initial_capacity;
-    block->prev = NULL;
-
     atomic_init(&arena->current_block, block);
     arena->block_size = initial_capacity;
+    atomic_init(&arena->tl_slot_counter, 0);
+    atomic_init(&arena->all_blocks_head, block);
+
+    for (int i = 0; i < SKIP_LIST_ARENA_MAX_THREADS; i++)
+    {
+        atomic_init(&arena->tl_blocks[i], NULL);
+    }
 
     return arena;
 }
 
 /**
+ * skip_list_arena_get_slot
+ * gets or assigns a thread-local slot for this thread
+ * @param arena the arena
+ * @return slot index (0 to SKIP_LIST_ARENA_MAX_THREADS-1), or -1 if slots exhausted
+ */
+static inline int skip_list_arena_get_slot(skip_list_arena_t *arena)
+{
+    if (SKIP_LIST_LIKELY(tl_arena_slot >= 0))
+    {
+        return tl_arena_slot;
+    }
+
+    int slot = atomic_fetch_add_explicit(&arena->tl_slot_counter, 1, memory_order_relaxed);
+    if (slot >= SKIP_LIST_ARENA_MAX_THREADS)
+    {
+        return -1;
+    }
+
+    tl_arena_slot = slot;
+    return slot;
+}
+
+/**
  * skip_list_arena_alloc
- * wait-free bump allocation from the arena
- * uses atomic_fetch_add for the bump pointer (single instruction, no CAS loop)
- * if the current block is full, allocates a new block via CAS
+ * thread-local bump allocation from the arena
+ * each thread gets its own block -- no atomic contention on the fast path
+ * only block allocation requires synchronization (rare)
  * @param arena the arena
  * @param size number of bytes to allocate
  * @return pointer to aligned memory, or NULL on failure
@@ -69,6 +132,39 @@ static void *skip_list_arena_alloc(skip_list_arena_t *arena, size_t size)
     /* align up to SKIP_LIST_ARENA_ALIGNMENT */
     size = (size + (SKIP_LIST_ARENA_ALIGNMENT - 1)) & ~(size_t)(SKIP_LIST_ARENA_ALIGNMENT - 1);
 
+    int slot = skip_list_arena_get_slot(arena);
+
+    if (SKIP_LIST_LIKELY(slot >= 0))
+    {
+        /* fast path: thread-local block with no atomic contention */
+        skip_list_arena_block_t *block =
+            atomic_load_explicit(&arena->tl_blocks[slot], memory_order_relaxed);
+
+        if (SKIP_LIST_LIKELY(block != NULL))
+        {
+            size_t used = block->used;
+            if (SKIP_LIST_LIKELY(used + size <= block->capacity))
+            {
+                block->used = used + size;
+                return block->data + used;
+            }
+        }
+
+        /* thread-local block is NULL or full -- allocate a new one */
+        size_t new_cap = arena->block_size;
+        if (size > new_cap) new_cap = size;
+
+        skip_list_arena_block_t *new_block = skip_list_arena_create_block(new_cap);
+        if (new_block == NULL) return NULL;
+
+        new_block->used = size;
+        atomic_store_explicit(&arena->tl_blocks[slot], new_block, memory_order_relaxed);
+        skip_list_arena_register_block(arena, new_block);
+
+        return new_block->data;
+    }
+
+    /* fallback: too many threads, use shared block with atomic contention */
     while (1)
     {
         skip_list_arena_block_t *block =
@@ -80,32 +176,23 @@ static void *skip_list_arena_alloc(skip_list_arena_t *arena, size_t size)
             return block->data + offset;
         }
 
-        /* block full -- we try to install a new block */
+        /* block full -- allocate a new shared block */
         size_t new_cap = arena->block_size;
-        if (size > new_cap) new_cap = size; /* oversized allocation */
+        if (size > new_cap) new_cap = size;
 
-        skip_list_arena_block_t *new_block = malloc(sizeof(skip_list_arena_block_t));
+        skip_list_arena_block_t *new_block = skip_list_arena_create_block(new_cap);
         if (new_block == NULL) return NULL;
-
-        new_block->data = malloc(new_cap);
-        if (new_block->data == NULL)
-        {
-            free(new_block);
-            return NULL;
-        }
-
-        atomic_init(&new_block->used, 0);
-        new_block->capacity = new_cap;
-        new_block->prev = block;
 
         if (!atomic_compare_exchange_strong_explicit(&arena->current_block, &block, new_block,
                                                      memory_order_release, memory_order_acquire))
         {
-            /* another thread installed a new block first -- we discard ours and retry */
             free(new_block->data);
             free(new_block);
         }
-        /* retry allocation in the (possibly new) current block */
+        else
+        {
+            skip_list_arena_register_block(arena, new_block);
+        }
     }
 }
 
@@ -118,8 +205,9 @@ static void skip_list_arena_destroy(skip_list_arena_t *arena)
 {
     if (arena == NULL) return;
 
+    /* free all blocks from the all_blocks_head list */
     skip_list_arena_block_t *block =
-        atomic_load_explicit(&arena->current_block, memory_order_relaxed);
+        atomic_load_explicit(&arena->all_blocks_head, memory_order_relaxed);
     while (block != NULL)
     {
         skip_list_arena_block_t *prev = block->prev;

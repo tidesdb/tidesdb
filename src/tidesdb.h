@@ -227,6 +227,7 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
 /**
  * tidesdb_column_family_config_t
  * configuration for a column family
+ * @param name column family name (set automatically when CF is created/loaded)
  * @param write_buffer_size size of write buffer
  * @param level_size_ratio ratio of level sizes
  * @param min_levels minimum number of levels
@@ -254,6 +255,7 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  */
 typedef struct tidesdb_column_family_config_t
 {
+    char name[TDB_MAX_CF_NAME_LEN];
     size_t write_buffer_size;
     size_t level_size_ratio;
     int min_levels;

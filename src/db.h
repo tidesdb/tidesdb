@@ -105,6 +105,7 @@ typedef enum
 /** configuration limits */
 #define TDB_MAX_COMPARATOR_NAME 64
 #define TDB_MAX_COMPARATOR_CTX  256
+#define TDB_MAX_CF_NAME_LEN     128
 
 /** comparator function type */
 typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
@@ -113,6 +114,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
 /**
  * tidesdb_column_family_config_t
  * configuration for a column family
+ * @param name name of column family
  * @param write_buffer_size size of write buffer
  * @param level_size_ratio ratio of level sizes
  * @param min_levels minimum number of levels
@@ -140,6 +142,7 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  */
 typedef struct tidesdb_column_family_config_t
 {
+    char name[TDB_MAX_CF_NAME_LEN];
     size_t write_buffer_size;
     size_t level_size_ratio;
     int min_levels;

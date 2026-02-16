@@ -15449,7 +15449,7 @@ static int tidesdb_txn_apply_ops_to_memtable(const tidesdb_txn_t *txn,
                                              const tidesdb_column_family_t *cf,
                                              skip_list_t *memtable)
 {
-    /* count ops for this CF */
+    /* we count ops for this CF */
     int cf_op_count = 0;
     for (int i = 0; i < txn->num_ops; i++)
     {
@@ -15458,8 +15458,31 @@ static int tidesdb_txn_apply_ops_to_memtable(const tidesdb_txn_t *txn,
 
     if (cf_op_count == 0) return TDB_SUCCESS;
 
+    if (cf_op_count == 1)
+    {
+        /* single-op fast path -- we skip dedup and batch overhead entirely */
+        for (int i = txn->num_ops - 1; i >= 0; i--)
+        {
+            if (txn->ops[i].cf == cf)
+            {
+                const tidesdb_txn_op_t *op = &txn->ops[i];
+                return skip_list_put_with_seq(memtable, op->key, op->key_size, op->value,
+                                              op->value_size, op->ttl, txn->commit_seq,
+                                              op->is_delete) == 0
+                           ? TDB_SUCCESS
+                           : TDB_ERR_MEMORY;
+            }
+        }
+        return TDB_SUCCESS;
+    }
+
     if (cf_op_count < TDB_TXN_DEDUP_SKIP_THRESHOLD)
     {
+        /* we build a small batch on the stack after dedup filtering
+         * skip_list_put_batch benefits from sorted-key hints and batched atomic updates */
+        skip_list_batch_entry_t stack_batch[TDB_TXN_DEDUP_SKIP_THRESHOLD];
+        int batch_idx = 0;
+
         for (int i = txn->num_ops - 1; i >= 0; i--)
         {
             const tidesdb_txn_op_t *op = &txn->ops[i];
@@ -15479,8 +15502,19 @@ static int tidesdb_txn_apply_ops_to_memtable(const tidesdb_txn_t *txn,
             }
             if (is_superseded) continue;
 
-            if (skip_list_put_with_seq(memtable, op->key, op->key_size, op->value, op->value_size,
-                                       op->ttl, txn->commit_seq, op->is_delete) != 0)
+            stack_batch[batch_idx].key = op->key;
+            stack_batch[batch_idx].key_size = op->key_size;
+            stack_batch[batch_idx].value = op->value;
+            stack_batch[batch_idx].value_size = op->value_size;
+            stack_batch[batch_idx].ttl = op->ttl;
+            stack_batch[batch_idx].seq = txn->commit_seq;
+            stack_batch[batch_idx].deleted = op->is_delete;
+            batch_idx++;
+        }
+
+        if (batch_idx > 0)
+        {
+            if (skip_list_put_batch(memtable, stack_batch, batch_idx) < 0)
             {
                 return TDB_ERR_MEMORY;
             }
@@ -15674,10 +15708,13 @@ static int tidesdb_txn_apply_ops_to_memtable(const tidesdb_txn_t *txn,
  * @param txn transaction to serialize
  * @param cf column family to serialize for
  * @param out_size output parameter for serialized size
- * @return serialized WAL batch
+ * @param stack_buf caller-provided stack buffer for small payloads (may be NULL)
+ * @param stack_buf_size size of the caller-provided stack buffer
+ * @return serialized WAL batch (may point to stack_buf or heap-allocated memory)
  */
 static uint8_t *tidesdb_txn_serialize_wal(const tidesdb_txn_t *txn,
-                                          const tidesdb_column_family_t *cf, size_t *out_size)
+                                          const tidesdb_column_family_t *cf, size_t *out_size,
+                                          uint8_t *stack_buf, size_t stack_buf_size)
 {
     /*** single-pass serialization with pre-sized buffer
      ** we estimate size based on average entry overhead + actual key/value sizes
@@ -15702,11 +15739,20 @@ static uint8_t *tidesdb_txn_serialize_wal(const tidesdb_txn_t *txn,
         return NULL;
     }
 
-    uint8_t *wal_batch = malloc(estimated_size);
-    if (!wal_batch)
+    /* use caller-provided stack buffer for small payloads to avoid malloc/free per txn */
+    uint8_t *wal_batch;
+    if (stack_buf != NULL && estimated_size <= stack_buf_size)
     {
-        *out_size = estimated_size; /* signal alloc failure */
-        return NULL;
+        wal_batch = stack_buf;
+    }
+    else
+    {
+        wal_batch = malloc(estimated_size);
+        if (!wal_batch)
+        {
+            *out_size = estimated_size; /* signal alloc failure */
+            return NULL;
+        }
     }
 
     uint8_t *wal_ptr = wal_batch;
@@ -15762,27 +15808,52 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         return TDB_SUCCESS;
     }
 
-    int result = tidesdb_txn_check_read_conflicts(txn);
-    if (result != TDB_SUCCESS) return result;
+    /* fast path -- skip all conflict checks for READ_UNCOMMITTED and READ_COMMITTED
+     * read conflicts require REPEATABLE_READ+, write conflicts require SNAPSHOT+,
+     * SSI conflicts require SERIALIZABLE -- none apply at lower isolation levels */
+    int result;
+    if (txn->isolation_level > TDB_ISOLATION_READ_COMMITTED)
+    {
+        result = tidesdb_txn_check_read_conflicts(txn);
+        if (result != TDB_SUCCESS) return result;
 
-    result = tidesdb_txn_check_write_conflicts(txn);
-    if (result != TDB_SUCCESS) return result;
+        result = tidesdb_txn_check_write_conflicts(txn);
+        if (result != TDB_SUCCESS) return result;
 
-    result = tidesdb_txn_check_ssi_conflicts(txn);
-    if (result != TDB_SUCCESS) return result;
+        result = tidesdb_txn_check_ssi_conflicts(txn);
+        if (result != TDB_SUCCESS) return result;
+    }
 
     txn->commit_seq = atomic_fetch_add_explicit(&txn->db->global_seq, 1, memory_order_relaxed);
     tidesdb_commit_status_mark(txn->db->commit_status, txn->commit_seq,
                                TDB_COMMIT_STATUS_IN_PROGRESS);
 
+    /* stack-allocate for common case (≤4 CFs) to avoid malloc/free per transaction */
+#define TDB_TXN_COMMIT_STACK_CFS 4
+    tidesdb_memtable_t *stack_memtables[TDB_TXN_COMMIT_STACK_CFS];
+    skip_list_t *stack_skiplists[TDB_TXN_COMMIT_STACK_CFS];
     const size_t alloc_size = txn->num_cfs > 0 ? txn->num_cfs : 1;
-    tidesdb_memtable_t **cf_memtables = calloc(alloc_size, sizeof(tidesdb_memtable_t *));
-    skip_list_t **cf_skiplists = calloc(alloc_size, sizeof(skip_list_t *));
-    if (!cf_memtables || !cf_skiplists)
+    const int use_stack_cf = ((int)alloc_size <= TDB_TXN_COMMIT_STACK_CFS);
+    tidesdb_memtable_t **cf_memtables;
+    skip_list_t **cf_skiplists;
+
+    if (use_stack_cf)
     {
-        free(cf_memtables);
-        free(cf_skiplists);
-        return TDB_ERR_MEMORY;
+        cf_memtables = stack_memtables;
+        cf_skiplists = stack_skiplists;
+        memset(cf_memtables, 0, alloc_size * sizeof(tidesdb_memtable_t *));
+        memset(cf_skiplists, 0, alloc_size * sizeof(skip_list_t *));
+    }
+    else
+    {
+        cf_memtables = calloc(alloc_size, sizeof(tidesdb_memtable_t *));
+        cf_skiplists = calloc(alloc_size, sizeof(skip_list_t *));
+        if (!cf_memtables || !cf_skiplists)
+        {
+            free(cf_memtables);
+            free(cf_skiplists);
+            return TDB_ERR_MEMORY;
+        }
     }
 
     for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
@@ -15794,8 +15865,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         cf_memtables[cf_idx] = mt;
         cf_skiplists[cf_idx] = mt ? mt->skip_list : NULL;
 
+        /* stack buffer for small WAL payloads -- avoids malloc/free per txn */
+        uint8_t wal_stack_buf[512];
         size_t wal_size = 0;
-        uint8_t *wal_batch = tidesdb_txn_serialize_wal(txn, cf, &wal_size);
+        uint8_t *wal_batch =
+            tidesdb_txn_serialize_wal(txn, cf, &wal_size, wal_stack_buf, sizeof(wal_stack_buf));
 
         if (!wal_batch)
         {
@@ -15807,13 +15881,15 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             continue;
         }
 
+        const int wal_is_heap = (wal_batch != wal_stack_buf);
+
         block_manager_t *wal = mt ? mt->wal : NULL;
         if (wal)
         {
             block_manager_block_t *wal_block = block_manager_block_create(wal_size, wal_batch);
             if (!wal_block)
             {
-                free(wal_batch);
+                if (wal_is_heap) free(wal_batch);
                 goto cleanup_error_memory;
             }
 
@@ -15821,12 +15897,12 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
             block_manager_block_release(wal_block);
             if (wal_result < 0)
             {
-                free(wal_batch);
+                if (wal_is_heap) free(wal_batch);
                 goto cleanup_error_io;
             }
         }
 
-        free(wal_batch);
+        if (wal_is_heap) free(wal_batch);
     }
 
     for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
@@ -15875,8 +15951,11 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         }
     }
 
-    free(cf_memtables);
-    free(cf_skiplists);
+    if (!use_stack_cf)
+    {
+        free(cf_memtables);
+        free(cf_skiplists);
+    }
 
     txn->is_committed = 1;
     atomic_thread_fence(memory_order_seq_cst);
@@ -15906,8 +15985,11 @@ cleanup:
             atomic_fetch_sub_explicit(&cf_memtables[i]->refcount, 1, memory_order_release);
         }
     }
-    free(cf_memtables);
-    free(cf_skiplists);
+    if (!use_stack_cf)
+    {
+        free(cf_memtables);
+        free(cf_skiplists);
+    }
     return result;
 }
 

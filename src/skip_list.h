@@ -43,7 +43,7 @@ typedef struct skip_list_arena_t skip_list_arena_t;
 #define SKIP_LIST_ARENA_MAX_THREADS 64
 
 /* default size for thread-local blocks (smaller than shared block to save memory) */
-#define SKIP_LIST_ARENA_TL_BLOCK_SIZE (64 * 1024) /* 64 KB */
+#define SKIP_LIST_ARENA_TL_BLOCK_SIZE (64 * 1024)
 
 /**
  * skip_list_arena_block_t

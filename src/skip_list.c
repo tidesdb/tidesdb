@@ -20,7 +20,7 @@
 #include "skip_list.h"
 
 /* thread-local cache for arena slot assignment
- * each thread caches its slot for ONE arena at a time
+ * each thread caches its slot for one arena at a time
  * if the arena changes, we must get a new slot from that arena */
 static _Thread_local skip_list_arena_t *tl_cached_arena = NULL;
 static _Thread_local int tl_arena_slot = -1;
@@ -107,7 +107,7 @@ static skip_list_arena_t *skip_list_arena_create(const size_t initial_capacity)
  */
 static inline int skip_list_arena_get_slot(skip_list_arena_t *arena)
 {
-    /* fast path: cached slot for this arena */
+    /* fast path -- cached slot for this arena */
     if (SKIP_LIST_LIKELY(tl_cached_arena == arena && tl_arena_slot >= 0))
     {
         return tl_arena_slot;
@@ -143,7 +143,7 @@ static void *skip_list_arena_alloc(skip_list_arena_t *arena, size_t size)
 
     if (SKIP_LIST_LIKELY(slot >= 0))
     {
-        /* fast path: thread-local block with no atomic contention */
+        /* fast path -- thread-local block with no atomic contention */
         skip_list_arena_block_t *block =
             atomic_load_explicit(&arena->tl_blocks[slot], memory_order_relaxed);
 
@@ -172,7 +172,7 @@ static void *skip_list_arena_alloc(skip_list_arena_t *arena, size_t size)
         return new_block->data;
     }
 
-    /* fallback: too many threads, use shared block with atomic contention */
+    /* fallback -- too many threads, use shared block with atomic contention */
     while (1)
     {
         skip_list_arena_block_t *block =

@@ -57,8 +57,9 @@ typedef struct
  * @param key_len atomic key length
  * @param payload_len atomic payload length
  * @param ref_bit atomic ref bit (LSB) plus reader count in upper bits
- * @param state atomic state: 0=empty, 1=writing, 2=valid, 3=deleting
+ * @param state atomic state -- 0=empty, 1=writing, 2=valid, 3=deleting
  * @param cached_hash cached hash value for this entry
+ * @param _pad padding to align struct to cache line size
  */
 typedef struct
 {
@@ -69,7 +70,7 @@ typedef struct
     _Atomic(uint8_t) ref_bit;
     _Atomic(uint8_t) state;
     atomic_uint64_t cached_hash;
-    char _pad[16]; /* pad to 64 bytes (one cache line) to prevent false sharing */
+    char _pad[16];
 } clock_cache_entry_t;
 
 /** entry states */
@@ -96,35 +97,41 @@ typedef struct
  * single partition
  * uses hybrid design -- hash table for O(1) lookup + circular array for CLOCK eviction
  * @param slots circular array of slots for CLOCK
- * @param hash_index fixed-size hash index: hash --> slot_idx (-1 = empty)
+ * @param hash_index fixed-size hash index, hash --> slot_idx (-1 = empty)
  * @param num_slots current number of slots (immutable after init)
  * @param hash_index_size hash index size (2x num_slots for low collisions)
  * @param hash_mask mask for fast modulo (immutable)
+ * @param next atomic next pointer for lock-free chain
+ * @param slots_mask mask for fast modulo (num_slots - 1, power of 2)
+ * @param evict_threshold precomputed -- num_slots * 85 / 100
  * @param clock_hand atomic CLOCK hand position
  * @param occupied_count atomic count of occupied slots
  * @param bytes_used atomic bytes used in this partition
  * @param hits per-partition hit counter (avoids false sharing on global counter)
  * @param misses per-partition miss counter (avoids false sharing on global counter)
- * @param next atomic next pointer for lock-free chain
  */
 struct clock_cache_partition_t
 {
-    /* --- cache line 0: cold, read-only after init --- */
+    /* --- cache line 0 -- cold, read-only after init --- */
     clock_cache_entry_t *slots;
     _Atomic(int32_t) *hash_index;
     size_t num_slots;
     size_t hash_index_size;
     size_t hash_mask;
     _Atomic(clock_cache_partition_t *) next;
-    char _pad_cold[16]; /* pad to 64 bytes */
+    size_t slots_mask;
+    size_t evict_threshold;
 
-    /* --- cache line 1: hot, written by multiple threads --- */
+    /* --- cache line 1 -- eviction path (writers/evictors only) --- */
     atomic_size_t clock_hand;
     atomic_size_t occupied_count;
     atomic_size_t bytes_used;
+    char _pad_evict[40]; /* pad to 64 bytes */
+
+    /* --- cache line 2 -- read-path stats (readers only) --- */
     atomic_uint64_t hits;
     atomic_uint64_t misses;
-    char _pad_hot[24]; /* pad to 64 bytes */
+    char _pad_stats[48]; /* pad to 64 bytes */
 };
 
 /**
@@ -147,6 +154,11 @@ struct clock_cache_partition_t
  * @param misses cache misses
  * @param shutdown shutdown flag -- prevents new operations
  * @param evict_callback optional callback for custom cleanup on eviction (can be NULL)
+ * @param num_groups number of L3/CCX groups (1 on monolithic dies, 4 on Threadripper)
+ * @param partitions_per_group partitions per L3 group
+ * @param local_partition_mask partitions_per_group - 1 for fast modulo
+ * @param cpu_to_group CPU ID to L3 group mapping table
+ * @param max_cpus size of cpu_to_group table
  */
 struct clock_cache_t
 {
@@ -159,6 +171,11 @@ struct clock_cache_t
     atomic_uint64_t misses;
     _Atomic(uint8_t) shutdown;
     clock_cache_evict_fn evict_callback;
+    size_t num_groups;
+    size_t partitions_per_group;
+    size_t local_partition_mask;
+    uint8_t *cpu_to_group;
+    int max_cpus;
 };
 
 /**
@@ -239,7 +256,7 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, size_t key_len,
  * @param key_len the key length
  * @param payload_len output parameter for payload length
  * @param entry_out output parameter for entry pointer (needed for release)
- * @return pointer to cached payload (*DO NOT FREE*) or NULL if not found
+ * @return pointer to cached payload (**DO NOT FREE**) or NULL if not found
  */
 const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key, size_t key_len,
                                          size_t *payload_len, clock_cache_entry_t **entry_out);
@@ -302,5 +319,16 @@ typedef int (*clock_cache_foreach_callback_t)(const char *key, size_t key_len,
  */
 size_t clock_cache_foreach_prefix(clock_cache_t *cache, const char *prefix, size_t prefix_len,
                                   clock_cache_foreach_callback_t callback, void *user_data);
+
+/**
+ * clock_cache_delete_by_prefix
+ * delete all entries matching a key prefix
+ * unlike foreach_prefix + delete, this correctly releases reader refs before deletion
+ * @param cache the cache
+ * @param prefix the key prefix to match
+ * @param prefix_len the prefix length
+ * @return number of entries deleted
+ */
+size_t clock_cache_delete_by_prefix(clock_cache_t *cache, const char *prefix, size_t prefix_len);
 
 #endif /* __CLOCK_CACHE_H__ */

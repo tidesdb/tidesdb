@@ -24,8 +24,6 @@
 #define BM_UNLIKELY(x) TDB_UNLIKELY(x)
 #define BM_LIKELY(x)   TDB_LIKELY(x)
 
-#define BLOCK_MANAGER_STACK_BUFFER_SIZE 65536
-
 /**
  *
  *  * * * * * * * * * *

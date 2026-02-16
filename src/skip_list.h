@@ -39,6 +39,12 @@ typedef struct skip_list_arena_t skip_list_arena_t;
 /* arena alignment for all allocations */
 #define SKIP_LIST_ARENA_ALIGNMENT 8
 
+/* maximum number of thread-local blocks for contention-free allocation */
+#define SKIP_LIST_ARENA_MAX_THREADS 64
+
+/* default size for thread-local blocks (smaller than shared block to save memory) */
+#define SKIP_LIST_ARENA_TL_BLOCK_SIZE (64 * 1024)
+
 /**
  * skip_list_arena_block_t
  * a single contiguous memory block in the arena's linked list
@@ -58,15 +64,22 @@ struct skip_list_arena_block_t
 /**
  * skip_list_arena_t
  * lock-free bump allocator for skip list nodes and versions
- * allocations are wait-free (single atomic_fetch_add per alloc)
+ * uses thread-local blocks to eliminate atomic contention on the fast path
+ * each thread gets its own block; only block allocation requires synchronization
  * individual frees are no-ops; all memory is reclaimed when the arena is destroyed
- * @param current_block atomic pointer to the active allocation block
+ * @param current_block atomic pointer to the shared fallback block (rarely used)
  * @param block_size default capacity for new blocks
+ * @param tl_blocks thread-local block pointers indexed by thread slot
+ * @param tl_slot_counter atomic counter for assigning thread slots
+ * @param all_blocks_head atomic linked list of all blocks for destruction
  */
 struct skip_list_arena_t
 {
     _Atomic(skip_list_arena_block_t *) current_block;
     size_t block_size;
+    _Atomic(skip_list_arena_block_t *) tl_blocks[SKIP_LIST_ARENA_MAX_THREADS];
+    _Atomic(int) tl_slot_counter;
+    _Atomic(skip_list_arena_block_t *) all_blocks_head;
 };
 
 /* skip_list_version_t flag bits */

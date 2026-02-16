@@ -3116,6 +3116,26 @@ static inline int tdb_get_cpu_count(void)
 #endif
 }
 
+/**
+ * tdb_get_cpu_id
+ * gets the current CPU core ID the calling thread is running on
+ * used for NUMA-aware partition routing
+ * @return current CPU ID, or 0 as fallback
+ */
+static inline int tdb_get_cpu_id(void)
+{
+#if defined(__linux__) && (defined(__GLIBC__) || defined(__GNU_LIBRARY__))
+    /* sched_getcpu() is a fast vDSO call (~5ns) on modern Linux */
+    extern int sched_getcpu(void);
+    int cpu = sched_getcpu();
+    return cpu >= 0 ? cpu : 0;
+#elif defined(_WIN32)
+    return (int)GetCurrentProcessorNumber();
+#else
+    return 0; /* fallback -- no CPU detection */
+#endif
+}
+
 /*
  * tdb_get_current_time
  * cross-platform function to get current Unix timestamp in seconds

@@ -182,6 +182,7 @@ struct btree_entry_t
  * @param next_offset offset of next sibling (leaf nodes, for forward scan)
  * @param block_offset this node's offset in the file
  * @param arena arena for cached node allocations (owned by btree, created with cache)
+ * @param rc_count reference count for cached nodes (0 = not ref-counted)
  */
 struct btree_node_t
 {
@@ -196,6 +197,7 @@ struct btree_node_t
     int64_t next_offset;
     int64_t block_offset;
     btree_arena_t *arena;
+    atomic_int rc_count;
 };
 
 /**

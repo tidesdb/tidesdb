@@ -1751,6 +1751,39 @@ typedef pthread_mutex_t crit_section_t;
 typedef pthread_rwlock_t rwlock_t;
 #endif
 
+/* cross-platform thread naming
+ * Linux                -- prctl(PR_SET_NAME)               -- 16 char limit including null
+ * macOS                -- pthread_setname_np(name)         -- only current thread, 1 arg
+ * FreeBSD/DragonFly    -- pthread_setname_np(thread, name) -- 2 args
+ * OpenBSD/NetBSD       -- pthread_set_name_np(thread, name)
+ * Windows MSVC         -- SetThreadDescription (Win10 1607+)
+ * Windows MinGW        -- no-op fallback */
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+static inline void tdb_set_thread_name(const char *name)
+{
+    if (!name) return;
+#if defined(__linux__)
+    prctl(PR_SET_NAME, (unsigned long)name, 0, 0, 0);
+#elif defined(__APPLE__)
+    pthread_setname_np(name);
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
+    pthread_setname_np(pthread_self(), name);
+#elif defined(__OpenBSD__) || defined(__NetBSD__)
+    pthread_set_name_np(pthread_self(), name);
+#elif defined(_MSC_VER)
+    /* SetThreadDescription requires wide string */
+    wchar_t wname[64];
+    size_t i;
+    for (i = 0; i < 63 && name[i]; i++) wname[i] = (wchar_t)name[i];
+    wname[i] = L'\0';
+    SetThreadDescription(GetCurrentThread(), wname);
+#else
+    (void)name; /* no-op fallback */
+#endif
+}
+
 /* O_DSYNC/O_SYNC for synchronous writes (must be after all platform includes)
  * POSIX -- O_DSYNC syncs data only, O_SYNC syncs data + metadata
  * windows -- no direct equivalent at open() time, use fdatasync() per-write

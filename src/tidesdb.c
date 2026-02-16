@@ -202,6 +202,9 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_SHUTDOWN_BROADCAST_ATTEMPTS             10
 #define TDB_SHUTDOWN_BROADCAST_INTERVAL_US          5000
 
+/* thread name prefix for all tidesdb background threads (15 char limit on Linux) */
+#define TDB_THREAD_PREFIX "tdb."
+
 /* sstable reaper thread configuration */
 #define TDB_SSTABLE_REAPER_SLEEP_US    100000
 #define TDB_SSTABLE_REAPER_EVICT_RATIO 0.25
@@ -251,6 +254,11 @@ typedef tidesdb_memtable_t tidesdb_immutable_memtable_t;
 #define TDB_SST_RETRY_INITIAL_SPINS     1  /* initial cpu_pause count on first retry */
 #define TDB_SST_RETRY_MAX_SPINS         16 /* maximum cpu_pause count per retry */
 #define TDB_SST_RETRY_MAX_LEVEL_RETRIES 4  /* max full level restarts before skipping dead ssts */
+
+/* sstable reaper eviction sentinel -- set on refcount during block manager close
+ * to prevent concurrent try_ref from acquiring a reference on an evicting sstable */
+#define TDB_REFCOUNT_EVICTING (-1)
+#define TDB_EVICT_SPIN_MAX    1024 /* max cpu_pause spins waiting for eviction to finish */
 
 /* time conversion constants for pthread_cond_timedwait */
 #define TDB_MICROSECONDS_PER_SECOND     1000000
@@ -982,6 +990,14 @@ static int tidesdb_apply_dca(tidesdb_column_family_t *cf);
 static int tidesdb_recover_database(tidesdb_t *db);
 static int tidesdb_recover_column_family(tidesdb_column_family_t *cf);
 static void tidesdb_column_family_free(tidesdb_column_family_t *cf);
+
+/* thread argument for pooled workers (flush/compaction) to pass index */
+typedef struct
+{
+    tidesdb_t *db;
+    int index;
+} tidesdb_worker_thread_arg_t;
+
 static void *tidesdb_flush_worker_thread(void *arg);
 static void *tidesdb_compaction_worker_thread(void *arg);
 static void *tidesdb_sync_worker_thread(void *arg);
@@ -2501,6 +2517,10 @@ static int tidesdb_klog_block_deserialize(const uint8_t *data, size_t data_size,
             ptr += (*block)->entries[i].value_size;
             remaining -= (*block)->entries[i].value_size;
         }
+        else
+        {
+            (*block)->inline_values[i] = NULL;
+        }
     }
 
     (*block)->num_entries = num_entries;
@@ -2916,18 +2936,36 @@ static int tidesdb_sstable_try_ref(tidesdb_sstable_t *sst)
     if (!sst) return 0;
 
     /* we use CAS loop to only increment if refcount > 0
-     * if refcount is 0, the sstable is being freed and we must not touch it */
+     * if refcount is 0, the sstable is being freed and we must not touch it
+     * if refcount < 0 (TDB_REFCOUNT_EVICTING), the reaper is closing block
+     * managers -- we spin briefly until it finishes and restores refcount */
     int old_refcount = atomic_load_explicit(&sst->refcount, memory_order_acquire);
-    while (old_refcount > 0)
+    int evict_spins = 0;
+    for (;;)
     {
-        if (atomic_compare_exchange_weak_explicit(&sst->refcount, &old_refcount, old_refcount + 1,
-                                                  memory_order_acq_rel, memory_order_acquire))
+        if (old_refcount > 0)
         {
-            return 1; /* successfully acquired reference */
+            if (atomic_compare_exchange_weak_explicit(&sst->refcount, &old_refcount,
+                                                      old_refcount + 1, memory_order_acq_rel,
+                                                      memory_order_acquire))
+            {
+                return 1; /* successfully acquired reference */
+            }
+            /* CAS failed, old_refcount was updated, continue loop */
         }
-        /* CAS failed, old_refcount was updated, retry if still > 0 */
+        else if (old_refcount == 0)
+        {
+            return 0; /* refcount was 0, sstable is being freed */
+        }
+        else
+        {
+            /* negative refcount means reaper is evicting block managers
+             * spin briefly -- the reaper will restore refcount after close */
+            if (++evict_spins > TDB_EVICT_SPIN_MAX) return 0;
+            cpu_pause();
+            old_refcount = atomic_load_explicit(&sst->refcount, memory_order_acquire);
+        }
     }
-    return 0; /* refcount was 0, sstable is being freed */
 }
 
 /**
@@ -3356,9 +3394,9 @@ static void tidesdb_imm_snap_publish(tidesdb_column_family_t *cf)
     /* ensure the new slot contents are visible before swapping active index */
     atomic_thread_fence(memory_order_release);
 
-    /* swap active index -- readers will now acquire the new slot
-     * NON-BLOCKING: old slot readers drain on their own, no spin-wait here
-     * this avoids the flush worker stalling on slow readers (SSTable I/O) */
+    /*** we swap active index -- readers will now acquire the new slot
+     ** NON-BLOCKING**** old slot readers drain on their own, no spin-wait here
+     * this avoids the flush worker stalling on slow readers (sstable I/O) */
     atomic_store_explicit(&cf->imm_snap_active, next_idx, memory_order_release);
 }
 
@@ -10638,7 +10676,12 @@ static void tidesdb_column_family_free(tidesdb_column_family_t *cf)
  */
 static void *tidesdb_flush_worker_thread(void *arg)
 {
-    tidesdb_t *db = (tidesdb_t *)arg;
+    tidesdb_worker_thread_arg_t *targ = (tidesdb_worker_thread_arg_t *)arg;
+    tidesdb_t *db = targ->db;
+    char tname[16]; /* Linux limit is 15 chars + null */
+    snprintf(tname, sizeof(tname), TDB_THREAD_PREFIX "flush.%d", targ->index);
+    tdb_set_thread_name(tname);
+    free(targ);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Flush worker thread started");
 
@@ -11080,7 +11123,12 @@ static void *tidesdb_flush_worker_thread(void *arg)
  */
 static void *tidesdb_compaction_worker_thread(void *arg)
 {
-    tidesdb_t *db = (tidesdb_t *)arg;
+    tidesdb_worker_thread_arg_t *targ = (tidesdb_worker_thread_arg_t *)arg;
+    tidesdb_t *db = targ->db;
+    char tname[16];
+    snprintf(tname, sizeof(tname), TDB_THREAD_PREFIX "compact.%d", targ->index);
+    tdb_set_thread_name(tname);
+    free(targ);
 
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Compaction worker thread started");
 
@@ -11154,6 +11202,7 @@ static void *tidesdb_compaction_worker_thread(void *arg)
 static void *tidesdb_sync_worker_thread(void *arg)
 {
     tidesdb_t *db = (tidesdb_t *)arg;
+    tdb_set_thread_name(TDB_THREAD_PREFIX "sync");
     TDB_DEBUG_LOG(TDB_LOG_INFO, "Sync worker thread started");
 
     while (atomic_load(&db->sync_thread_active))
@@ -11282,6 +11331,7 @@ static int compare_sstable_candidates(const void *a, const void *b)
 static void *tidesdb_sstable_reaper_thread(void *arg)
 {
     tidesdb_t *db = (tidesdb_t *)arg;
+    tdb_set_thread_name(TDB_THREAD_PREFIX "reaper");
     TDB_DEBUG_LOG(TDB_LOG_INFO, "SSTable reaper thread started");
 
     while (atomic_load(&db->sstable_reaper_active))
@@ -11471,8 +11521,12 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
         {
             tidesdb_sstable_t *sst = candidates[i].sst;
 
-            /* we double-check refcount before closing (should be 2b -- our ref + base ref) */
-            if (atomic_load(&sst->refcount) == 2 && sst->klog_bm && sst->vlog_bm)
+            /* we atomically CAS refcount from 2 to TDB_REFCOUNT_EVICTING (-1)
+             * this prevents concurrent try_ref from succeeding during the close
+             * window, fixing the TOCTOU race between refcount check and close */
+            int expected = 2;
+            if (sst->klog_bm && sst->vlog_bm &&
+                atomic_compare_exchange_strong(&sst->refcount, &expected, TDB_REFCOUNT_EVICTING))
             {
                 block_manager_close(sst->klog_bm);
                 block_manager_close(sst->vlog_bm);
@@ -11480,6 +11534,10 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 sst->vlog_bm = NULL;
                 atomic_fetch_sub(&db->num_open_sstables, 1);
                 closed_count++;
+
+                /* restore refcount to 2 (base ref + reaper ref still held)
+                 * reaper will unref in the cleanup loop below */
+                atomic_store(&sst->refcount, 2);
             }
         }
 
@@ -11966,8 +12024,32 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     for (int i = 0; i < config->num_flush_threads; i++)
     {
-        if (pthread_create(&(*db)->flush_threads[i], NULL, tidesdb_flush_worker_thread, *db) != 0)
+        tidesdb_worker_thread_arg_t *flush_arg = malloc(sizeof(tidesdb_worker_thread_arg_t));
+        if (!flush_arg)
         {
+            for (int j = 0; j < i; j++) pthread_join((*db)->flush_threads[j], NULL);
+            free((*db)->flush_threads);
+            clock_cache_destroy((*db)->clock_cache);
+            free((*db)->active_txns);
+            pthread_rwlock_destroy(&(*db)->active_txns_lock);
+            tidesdb_commit_status_destroy((*db)->commit_status);
+            queue_free((*db)->flush_queue);
+            queue_free((*db)->compaction_queue);
+            free(atomic_load(&(*db)->comparators));
+            pthread_rwlock_destroy(&(*db)->cf_list_lock);
+            free((*db)->column_families);
+            tdb_file_unlock((*db)->lock_fd);
+            close((*db)->lock_fd);
+            free((*db)->db_path);
+            free(*db);
+            return TDB_ERR_MEMORY;
+        }
+        flush_arg->db = *db;
+        flush_arg->index = i;
+        if (pthread_create(&(*db)->flush_threads[i], NULL, tidesdb_flush_worker_thread,
+                           flush_arg) != 0)
+        {
+            free(flush_arg);
             for (int j = 0; j < i; j++)
             {
                 pthread_join((*db)->flush_threads[j], NULL);
@@ -12016,9 +12098,35 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
 
     for (int i = 0; i < config->num_compaction_threads; i++)
     {
-        if (pthread_create(&(*db)->compaction_threads[i], NULL, tidesdb_compaction_worker_thread,
-                           *db) != 0)
+        tidesdb_worker_thread_arg_t *compact_arg = malloc(sizeof(tidesdb_worker_thread_arg_t));
+        if (!compact_arg)
         {
+            for (int j = 0; j < i; j++) pthread_join((*db)->compaction_threads[j], NULL);
+            free((*db)->compaction_threads);
+            for (int k = 0; k < config->num_flush_threads; k++)
+                pthread_join((*db)->flush_threads[k], NULL);
+            free((*db)->flush_threads);
+            clock_cache_destroy((*db)->clock_cache);
+            free((*db)->active_txns);
+            pthread_rwlock_destroy(&(*db)->active_txns_lock);
+            tidesdb_commit_status_destroy((*db)->commit_status);
+            queue_free((*db)->flush_queue);
+            queue_free((*db)->compaction_queue);
+            free(atomic_load(&(*db)->comparators));
+            pthread_rwlock_destroy(&(*db)->cf_list_lock);
+            free((*db)->column_families);
+            tdb_file_unlock((*db)->lock_fd);
+            close((*db)->lock_fd);
+            free((*db)->db_path);
+            free(*db);
+            return TDB_ERR_MEMORY;
+        }
+        compact_arg->db = *db;
+        compact_arg->index = i;
+        if (pthread_create(&(*db)->compaction_threads[i], NULL, tidesdb_compaction_worker_thread,
+                           compact_arg) != 0)
+        {
+            free(compact_arg);
             for (int j = 0; j < i; j++)
             {
                 pthread_join((*db)->compaction_threads[j], NULL);
@@ -12669,6 +12777,7 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     }
 
     cf->config = *config;
+    snprintf(cf->config.name, sizeof(cf->config.name), "%s", name);
     cf->db = db;
 
     /* we validate and fix index_sample_ratio (must be at least 1 to avoid division by zero) */
@@ -18738,7 +18847,7 @@ static int tidesdb_recover_sstables(tidesdb_column_family_t *cf)
     }
     closedir(dir);
 
-    /* sort level 0 SSTables by ID so newer sstables (higher ID) are at higher
+    /* we sort level 0 sstables by ID so newer sstables (higher ID) are at higher
      * array indices -- tidesdb_txn_get searches level 0 in reverse order
      * and returns on the first match, so the ordering is critical for
      * correctness after recovery where readdir() order is non-deterministic */
@@ -19643,8 +19752,19 @@ static int tidesdb_checkpoint_ensure_parent_dir(const char *file_path)
     char *path_copy = tdb_strdup(file_path);
     if (!path_copy) return TDB_ERR_MEMORY;
 
+    char *start = path_copy + 1;
+#ifdef _WIN32
+    /* we skip drive letter prefix (e.g., "C:\") */
+    if (((path_copy[0] >= 'A' && path_copy[0] <= 'Z') ||
+         (path_copy[0] >= 'a' && path_copy[0] <= 'z')) &&
+        path_copy[1] == ':' && path_copy[2] == PATH_SEPARATOR[0])
+    {
+        start = path_copy + 3;
+    }
+#endif
+
     /* we walk from the end to find each directory component and create it */
-    for (char *p = path_copy + 1; *p; p++)
+    for (char *p = start; *p; p++)
     {
         if (*p == PATH_SEPARATOR[0])
         {

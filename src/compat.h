@@ -1755,7 +1755,8 @@ typedef pthread_rwlock_t rwlock_t;
  * Linux                -- prctl(PR_SET_NAME)               -- 16 char limit including null
  * macOS                -- pthread_setname_np(name)         -- only current thread, 1 arg
  * FreeBSD/DragonFly    -- pthread_setname_np(thread, name) -- 2 args
- * OpenBSD/NetBSD       -- pthread_set_name_np(thread, name)
+ * NetBSD               -- pthread_setname_np(thread, fmt, arg) -- 3 args, printf-style
+ * OpenBSD              -- pthread_set_name_np(thread, name)
  * Windows MSVC         -- SetThreadDescription (Win10 1607+)
  * Windows MinGW        -- no-op fallback */
 #if defined(__linux__)
@@ -1770,7 +1771,9 @@ static inline void tdb_set_thread_name(const char *name)
     pthread_setname_np(name);
 #elif defined(__FreeBSD__) || defined(__DragonFly__)
     pthread_setname_np(pthread_self(), name);
-#elif defined(__OpenBSD__) || defined(__NetBSD__)
+#elif defined(__NetBSD__)
+    pthread_setname_np(pthread_self(), "%s", (void *)name);
+#elif defined(__OpenBSD__)
     pthread_set_name_np(pthread_self(), name);
 #elif defined(_MSC_VER)
     /* SetThreadDescription requires wide string */

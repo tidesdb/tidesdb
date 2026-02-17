@@ -871,6 +871,15 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
 
 /**
+ * tidesdb_delete_column_family
+ * drops a column family passing pointer instead of string
+ * @param db database handle
+ * @param cf column family to drop
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_delete_column_family(tidesdb_t *db, tidesdb_column_family_t *cf);
+
+/**
  * tidesdb_rename_column_family
  * renames a column family safely (flushes pending data first)
  * @param db database handle

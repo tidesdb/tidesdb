@@ -338,6 +338,7 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, tidesdb_comparator_f
 int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config);
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
+int tidesdb_delete_column_family(tidesdb_t *db, tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_rename_column_family

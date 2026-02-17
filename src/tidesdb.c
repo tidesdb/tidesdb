@@ -13228,11 +13228,19 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
     return TDB_SUCCESS;
 }
 
-int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
+/**
+ * tidesdb_drop_column_family_internal
+ * shared implementation for dropping a column family by name or pointer
+ * exactly one of name or cf must be non-NULL
+ * @param db database handle
+ * @param name column family name (NULL when dropping by pointer)
+ * @param cf column family pointer (NULL when dropping by name)
+ * @return 0 on success, -n on failure
+ */
+static int tidesdb_drop_column_family_internal(tidesdb_t *db, const char *name,
+                                               const tidesdb_column_family_t *cf)
 {
-    if (!db || !name) return TDB_ERR_INVALID_ARGS;
-
-    TDB_DEBUG_LOG(TDB_LOG_INFO, "Dropping column family: %s", name);
+    if (!db) return TDB_ERR_INVALID_ARGS;
 
     tidesdb_column_family_t *cf_to_drop = NULL;
 
@@ -13242,7 +13250,12 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     int found_idx = -1;
     for (int i = 0; i < db->num_column_families; i++)
     {
-        if (db->column_families[i] && strcmp(db->column_families[i]->name, name) == 0)
+        if (!db->column_families[i]) continue;
+
+        /* when cf pointer is provided we match by pointer (skip name search)
+         * otherwise we match by name string */
+        if ((cf && db->column_families[i] == cf) ||
+            (name && strcmp(db->column_families[i]->name, name) == 0))
         {
             found_idx = i;
             cf_to_drop = db->column_families[i];
@@ -13255,6 +13268,8 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
         pthread_rwlock_unlock(&db->cf_list_lock);
         return TDB_ERR_NOT_FOUND;
     }
+
+    TDB_DEBUG_LOG(TDB_LOG_INFO, "Dropping column family: %s", cf_to_drop->name);
 
     /* we mark CF for deletion first -- workers will check this flag and skip processing */
     atomic_store_explicit(&cf_to_drop->marked_for_deletion, 1, memory_order_release);
@@ -13299,6 +13314,20 @@ int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
     tidesdb_column_family_free(cf_to_drop);
 
     return TDB_SUCCESS;
+}
+
+int tidesdb_drop_column_family(tidesdb_t *db, const char *name)
+{
+    if (!name) return TDB_ERR_INVALID_ARGS;
+
+    return tidesdb_drop_column_family_internal(db, name, NULL);
+}
+
+int tidesdb_delete_column_family(tidesdb_t *db, tidesdb_column_family_t *cf)
+{
+    if (!cf) return TDB_ERR_INVALID_ARGS;
+
+    return tidesdb_drop_column_family_internal(db, NULL, cf);
 }
 
 int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char *new_name)

@@ -2807,6 +2807,39 @@ static void test_drop_column_family(void)
     cleanup_test_dir();
 }
 
+static void test_delete_column_family(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "delete_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "delete_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write some data */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    uint8_t key[] = "key";
+    uint8_t value[] = "value";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), -1), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    /* drop by pointer -- skips name lookup */
+    ASSERT_EQ(tidesdb_delete_column_family(db, cf), 0);
+
+    /* should not be able to get it anymore */
+    cf = tidesdb_get_column_family(db, "delete_cf");
+    ASSERT_TRUE(cf == NULL);
+
+    /* NULL cf should return error */
+    ASSERT_TRUE(tidesdb_delete_column_family(db, NULL) != 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 static void test_rename_column_family(void)
 {
     cleanup_test_dir();
@@ -20129,12 +20162,13 @@ static void test_range_cost(void)
     ASSERT_TRUE(total_sstables > 0);
     tidesdb_free_stats(stats);
 
-    /* test 4 -- cost with sstables should be positive */
+    /* test 4 -- cost with sstables should be positive and greater than empty CF cost */
     double wide_cost = 0.0;
     ASSERT_EQ(tidesdb_range_cost(cf, (uint8_t *)"rc_key_000000", 14, (uint8_t *)"rc_key_000399", 14,
                                  &wide_cost),
               TDB_SUCCESS);
     ASSERT_TRUE(wide_cost > 0.0);
+    ASSERT_TRUE(wide_cost > empty_cost);
 
     /* test 5 -- narrower range should have cost <= wider range */
     double narrow_cost = 0.0;
@@ -20300,6 +20334,7 @@ int main(void)
     RUN_TEST(test_runtime_config_update, tests_passed);
     RUN_TEST(test_error_invalid_args, tests_passed);
     RUN_TEST(test_drop_column_family, tests_passed);
+    RUN_TEST(test_delete_column_family, tests_passed);
     RUN_TEST(test_rename_column_family, tests_passed);
     RUN_TEST(test_rename_column_family_concurrent, tests_passed);
     RUN_TEST(test_empty_iterator, tests_passed);

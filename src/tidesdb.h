@@ -871,6 +871,15 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
 
 /**
+ * tidesdb_delete_column_family
+ * drops a column family passing pointer instead of string
+ * @param db database handle
+ * @param cf column family to drop
+ * @return 0 on success, -n on failure
+ */
+int tidesdb_delete_column_family(tidesdb_t *db, tidesdb_column_family_t *cf);
+
+/**
  * tidesdb_rename_column_family
  * renames a column family safely (flushes pending data first)
  * @param db database handle
@@ -1340,6 +1349,28 @@ int tidesdb_checkpoint(tidesdb_t *db, const char *checkpoint_dir);
  *         TDB_ERR_EXISTS if destination already exists, or other error codes on failure
  */
 int tidesdb_clone_column_family(tidesdb_t *db, const char *src_name, const char *dst_name);
+
+/**
+ * tidesdb_range_cost
+ * estimate the computational cost of iterating between two keys in a column family.
+ * the returned cost is an opaque double -- meaningful only for comparison with other
+ * values from the same function. uses only in-memory metadata (block indexes, sstable
+ * min/max keys, entry counts); performs no disk I/O and no iteration.
+ *
+ * when block indexes are enabled, cost is estimated via O(log B) binary search per
+ * overlapping sstable. when block indexes are disabled, a byte-level key interpolation
+ * fallback is used instead.
+ *
+ * @param cf column family
+ * @param key_a first key (bound of range)
+ * @param key_a_size size of first key
+ * @param key_b second key (bound of range)
+ * @param key_b_size size of second key
+ * @param cost output -- estimated traversal cost (higher = more expensive)
+ * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS on bad input
+ */
+int tidesdb_range_cost(tidesdb_column_family_t *cf, const uint8_t *key_a, size_t key_a_size,
+                       const uint8_t *key_b, size_t key_b_size, double *cost);
 
 /**
  * tidesdb_free

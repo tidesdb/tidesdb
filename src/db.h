@@ -338,6 +338,7 @@ int tidesdb_get_comparator(tidesdb_t *db, const char *name, tidesdb_comparator_f
 int tidesdb_create_column_family(tidesdb_t *db, const char *name,
                                  const tidesdb_column_family_config_t *config);
 int tidesdb_drop_column_family(tidesdb_t *db, const char *name);
+int tidesdb_delete_column_family(tidesdb_t *db, tidesdb_column_family_t *cf);
 
 /**
  * tidesdb_rename_column_family
@@ -444,6 +445,9 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
 int tidesdb_get_stats(tidesdb_column_family_t *cf, tidesdb_stats_t **stats);
 void tidesdb_free_stats(tidesdb_stats_t *stats);
 int tidesdb_get_cache_stats(tidesdb_t *db, tidesdb_cache_stats_t *stats);
+
+int tidesdb_range_cost(tidesdb_column_family_t *cf, const uint8_t *key_a, size_t key_a_size,
+                       const uint8_t *key_b, size_t key_b_size, double *cost);
 
 void tidesdb_free(void *ptr);
 

@@ -623,7 +623,6 @@ int block_manager_cursor_init_stack(block_manager_cursor_t *cursor, block_manage
     cursor->current_block_size = 0;
     cursor->block_index = -1; /* -1 means before first block */
     cursor->block_size_valid = 0;
-    set_file_sequential_hint(bm->fd);
 
     /* we position at first block so cursor_read works immediately */
     block_manager_cursor_goto_first(cursor);
@@ -638,7 +637,14 @@ int block_manager_cursor_init(block_manager_cursor_t **cursor, block_manager_t *
     (*cursor) = malloc(sizeof(block_manager_cursor_t));
     if (!(*cursor)) return -1;
 
-    return block_manager_cursor_init_stack(*cursor, bm);
+    const int rc = block_manager_cursor_init_stack(*cursor, bm);
+    if (rc == 0)
+    {
+        /* heap-allocated cursors are used for sequential iteration
+         * hint to OS for read-ahead optimization */
+        set_file_sequential_hint(bm->fd);
+    }
+    return rc;
 }
 
 int block_manager_cursor_next(block_manager_cursor_t *cursor)
@@ -1135,6 +1141,9 @@ int block_manager_count_blocks(block_manager_t *bm)
     int count = 0;
 
     if (block_manager_cursor_init_stack(&cursor, bm) != 0) return -1;
+
+    /* sequential scan -- hint for read-ahead */
+    set_file_sequential_hint(bm->fd);
 
     if (block_manager_cursor_goto_first(&cursor) != 0)
     {

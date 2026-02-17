@@ -1100,10 +1100,11 @@ static size_t tidesdb_block_cache_key(const char *cf_name, const char *klog_path
 {
     if (!cf_name || !klog_path || !key_buffer || buffer_size == 0) return 0;
 
-    /* we extract filename from path (cross-platform) */
-    const char *filename = strrchr(klog_path, '/');
-    if (!filename) filename = strrchr(klog_path, '\\');
-    filename = filename ? filename + 1 : klog_path;
+    /* we extract filename from path (cross-platform, handles mixed separators) */
+    const char *last_fwd = strrchr(klog_path, '/');
+    const char *last_back = strrchr(klog_path, '\\');
+    const char *last_sep = (last_fwd > last_back) ? last_fwd : last_back;
+    const char *filename = last_sep ? last_sep + 1 : klog_path;
 
     /* fast path -- memcpy + hex encode instead of snprintf
      * format: "cf_name:filename:XXXXXXXXXXXXXXXX" (16 hex chars for uint64) */
@@ -2884,10 +2885,11 @@ static void tidesdb_invalidate_block_cache_for_sstable(tidesdb_t *db, const char
 {
     if (!db || !db->clock_cache || !cf_name || !klog_path) return;
 
-    /* we extract filename from path (cross-platform) */
-    const char *filename = strrchr(klog_path, '/');
-    if (!filename) filename = strrchr(klog_path, '\\');
-    filename = filename ? filename + 1 : klog_path;
+    /* we extract filename from path (cross-platform, handles mixed separators) */
+    const char *last_fwd = strrchr(klog_path, '/');
+    const char *last_back = strrchr(klog_path, '\\');
+    const char *last_sep = (last_fwd > last_back) ? last_fwd : last_back;
+    const char *filename = last_sep ? last_sep + 1 : klog_path;
 
     char prefix[TDB_CACHE_KEY_SIZE];
     const int prefix_len = snprintf(prefix, sizeof(prefix), "%s:%s:", cf_name, filename);
@@ -5076,8 +5078,9 @@ static int tidesdb_sstable_get(tidesdb_t *db, tidesdb_sstable_t *sst, const uint
         const int read_result =
             tidesdb_read_klog_block_cached(db, sst, klog_cursor, block_position, cf_name,
                                            has_cf_name, 1, &klog_block, &rc_block, &raw_block);
-        /*** we track if cursor was advanced (only on disk read, not cache hit) */
-        const int cursor_advanced = (rc_block == NULL && raw_block != NULL);
+        /*** we track if cursor was advanced (only on disk read, not cache hit)
+         * raw_block is non-NULL only when we read from disk (never on cache hit) */
+        const int cursor_advanced = (raw_block != NULL);
         if (read_result != TDB_SUCCESS)
         {
             if (read_result == TDB_ERR_CORRUPTION)

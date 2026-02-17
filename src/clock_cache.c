@@ -305,22 +305,6 @@ static clock_cache_entry_t *find_entry_with_hash(clock_cache_partition_t *partit
         if (match) return match;
     }
 
-    /* capped linear fallback -- scan limited slots instead of O(n) full scan
-     * entries that overflowed the hash index are rare; full scan is too expensive */
-    const size_t fallback_limit =
-        (partition->num_slots < max_probe) ? partition->num_slots : max_probe;
-    for (size_t i = 0; i < fallback_limit; i++)
-    {
-        /* we prefetch one slot ahead to overlap memory latency with try_match */
-        if (i + 1 < fallback_limit)
-        {
-            PREFETCH_READ(&partition->slots[i + 1]);
-        }
-        clock_cache_entry_t *entry = &partition->slots[i];
-        clock_cache_entry_t *match = try_match_entry(entry, key, key_len, target_hash);
-        if (match) return match;
-    }
-
     return NULL;
 }
 
@@ -862,9 +846,14 @@ uint8_t *clock_cache_get(clock_cache_t *cache, const char *key, const size_t key
 
     memcpy(result, entry_payload, entry_payload_len);
 
-    /* we mark as recently used and release reader ref */
-    atomic_fetch_or_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_relaxed);
-    atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
+    /* we release reader ref and conditionally mark as recently used
+     * combining two atomic RMWs into one when ref bit is already set (hot entries) */
+    uint8_t old_ref =
+        atomic_fetch_sub_explicit(&entry->ref_bit, CLOCK_CACHE_READER_INC, memory_order_acq_rel);
+    if (!(old_ref & CLOCK_CACHE_REF_BIT))
+    {
+        atomic_fetch_or_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_relaxed);
+    }
 
     if (payload_len) *payload_len = entry_payload_len;
 
@@ -906,8 +895,13 @@ const uint8_t *clock_cache_get_zero_copy(clock_cache_t *cache, const char *key,
     if (payload_len) *payload_len = entry_payload_len;
     if (entry_out) *entry_out = entry;
 
-    /* we mark as recently used; caller releases ref via clock_cache_release() */
-    atomic_fetch_or_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_relaxed);
+    /* we conditionally mark as recently used -- skip atomic RMW when ref bit is already set
+     * (hot entries); caller releases ref via clock_cache_release() */
+    uint8_t cur_ref = atomic_load_explicit(&entry->ref_bit, memory_order_relaxed);
+    if (!(cur_ref & CLOCK_CACHE_REF_BIT))
+    {
+        atomic_fetch_or_explicit(&entry->ref_bit, CLOCK_CACHE_REF_BIT, memory_order_relaxed);
+    }
 
     atomic_fetch_add_explicit(&partition->hits, 1, memory_order_relaxed);
     return entry_payload;

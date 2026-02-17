@@ -20037,6 +20037,201 @@ static void test_stress_unified_read_races(void)
     cleanup_test_dir();
 }
 
+static void test_range_cost(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "range_cost_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "range_cost_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* test 1 -- invalid arguments */
+    double cost = 0.0;
+    uint8_t dummy_key[] = "key";
+    ASSERT_EQ(tidesdb_range_cost(NULL, dummy_key, 3, dummy_key, 3, &cost), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_range_cost(cf, NULL, 3, dummy_key, 3, &cost), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_range_cost(cf, dummy_key, 3, NULL, 3, &cost), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_range_cost(cf, dummy_key, 0, dummy_key, 3, &cost), TDB_ERR_INVALID_ARGS);
+    ASSERT_EQ(tidesdb_range_cost(cf, dummy_key, 3, dummy_key, 3, NULL), TDB_ERR_INVALID_ARGS);
+
+    /* test 2 -- empty CF should return zero or near-zero cost */
+    cost = -1.0;
+    ASSERT_EQ(tidesdb_range_cost(cf, (uint8_t *)"aaa", 4, (uint8_t *)"zzz", 4, &cost), TDB_SUCCESS);
+    ASSERT_TRUE(cost >= 0.0);
+    double empty_cost = cost;
+
+    /* test 3 -- write data and flush to create sstables */
+    for (int i = 0; i < 200; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[128];
+        snprintf(key, sizeof(key), "rc_key_%06d", i);
+        snprintf(value, sizeof(value), "rc_value_%06d_with_padding_data_here", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), TDB_SUCCESS);
+
+    int wait_count = 0;
+    while (tidesdb_is_flushing(cf) && wait_count < 100)
+    {
+        usleep(10000);
+        wait_count++;
+    }
+
+    /* add more data and flush again to get multiple sstables */
+    for (int i = 200; i < 400; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[128];
+        snprintf(key, sizeof(key), "rc_key_%06d", i);
+        snprintf(value, sizeof(value), "rc_value_%06d_with_padding_data_here", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), TDB_SUCCESS);
+
+    wait_count = 0;
+    while (tidesdb_is_flushing(cf) && wait_count < 100)
+    {
+        usleep(10000);
+        wait_count++;
+    }
+
+    /* verify we have sstables */
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
+    int total_sstables = 0;
+    for (int i = 0; i < stats->num_levels; i++)
+    {
+        total_sstables += stats->level_num_sstables[i];
+    }
+    ASSERT_TRUE(total_sstables > 0);
+    tidesdb_free_stats(stats);
+
+    /* test 4 -- cost with sstables should be positive */
+    double wide_cost = 0.0;
+    ASSERT_EQ(tidesdb_range_cost(cf, (uint8_t *)"rc_key_000000", 14, (uint8_t *)"rc_key_000399", 14,
+                                 &wide_cost),
+              TDB_SUCCESS);
+    ASSERT_TRUE(wide_cost > 0.0);
+
+    /* test 5 -- narrower range should have cost <= wider range */
+    double narrow_cost = 0.0;
+    ASSERT_EQ(tidesdb_range_cost(cf, (uint8_t *)"rc_key_000100", 14, (uint8_t *)"rc_key_000200", 14,
+                                 &narrow_cost),
+              TDB_SUCCESS);
+    ASSERT_TRUE(narrow_cost > 0.0);
+    ASSERT_TRUE(narrow_cost <= wide_cost);
+
+    /* test 6 -- range outside sstable data should have minimal cost */
+    double outside_cost = 0.0;
+    ASSERT_EQ(tidesdb_range_cost(cf, (uint8_t *)"zzz_000000", 11, (uint8_t *)"zzz_999999", 11,
+                                 &outside_cost),
+              TDB_SUCCESS);
+    ASSERT_TRUE(outside_cost < wide_cost);
+
+    /* test 7 -- reversed key order should produce same result (function normalizes) */
+    double reversed_cost = 0.0;
+    ASSERT_EQ(tidesdb_range_cost(cf, (uint8_t *)"rc_key_000399", 14, (uint8_t *)"rc_key_000000", 14,
+                                 &reversed_cost),
+              TDB_SUCCESS);
+    ASSERT_TRUE(reversed_cost == wide_cost);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_range_cost_no_block_indexes(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 4096;
+    cf_config.compression_algorithm = TDB_COMPRESS_NONE;
+    cf_config.enable_block_indexes = 0;
+    cf_config.enable_bloom_filter = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "range_cost_nobi_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "range_cost_nobi_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write data and flush to create sstables without block indexes */
+    for (int i = 0; i < 200; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32];
+        char value[128];
+        snprintf(key, sizeof(key), "nb_key_%06d", i);
+        snprintf(value, sizeof(value), "nb_value_%06d_with_padding_data_here", i);
+
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, -1),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+    }
+
+    ASSERT_EQ(tidesdb_flush_memtable(cf), TDB_SUCCESS);
+
+    int wait_count = 0;
+    while (tidesdb_is_flushing(cf) && wait_count < 100)
+    {
+        usleep(10000);
+        wait_count++;
+    }
+
+    /* verify sstables exist */
+    tidesdb_stats_t *stats = NULL;
+    ASSERT_EQ(tidesdb_get_stats(cf, &stats), TDB_SUCCESS);
+    int total_sstables = 0;
+    for (int i = 0; i < stats->num_levels; i++)
+    {
+        total_sstables += stats->level_num_sstables[i];
+    }
+    ASSERT_TRUE(total_sstables > 0);
+    tidesdb_free_stats(stats);
+
+    /* test -- cost should still work via key-fraction interpolation fallback */
+    double wide_cost = 0.0;
+    ASSERT_EQ(tidesdb_range_cost(cf, (uint8_t *)"nb_key_000000", 14, (uint8_t *)"nb_key_000199", 14,
+                                 &wide_cost),
+              TDB_SUCCESS);
+    ASSERT_TRUE(wide_cost > 0.0);
+
+    double narrow_cost = 0.0;
+    ASSERT_EQ(tidesdb_range_cost(cf, (uint8_t *)"nb_key_000050", 14, (uint8_t *)"nb_key_000100", 14,
+                                 &narrow_cost),
+              TDB_SUCCESS);
+    ASSERT_TRUE(narrow_cost > 0.0);
+    ASSERT_TRUE(narrow_cost <= wide_cost);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -20069,6 +20264,8 @@ int main(void)
     RUN_TEST(test_cache_stats, tests_passed);
     RUN_TEST(test_cache_stats_disabled, tests_passed);
     RUN_TEST(test_cache_stats_invalid_args, tests_passed);
+    RUN_TEST(test_range_cost, tests_passed);
+    RUN_TEST(test_range_cost_no_block_indexes, tests_passed);
     RUN_TEST(test_iterator_seek, tests_passed);
     RUN_TEST(test_iterator_seek_for_prev, tests_passed);
     RUN_TEST(test_tidesdb_block_index_seek, tests_passed);

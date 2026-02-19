@@ -13509,7 +13509,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
     }
 
     /* we update CF name */
-    char *new_name_copy = strdup(new_name);
+    char *new_name_copy = tdb_strdup(new_name);
     if (!new_name_copy)
     {
         /* try to revert directory rename */
@@ -13519,7 +13519,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
     }
 
     /* we update CF directory */
-    char *new_dir_copy = strdup(new_directory);
+    char *new_dir_copy = tdb_strdup(new_directory);
     if (!new_dir_copy)
     {
         free(new_name_copy);
@@ -13557,7 +13557,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
                                         lvl + 1, sst->id);
             if (path_written > 0 && (size_t)path_written < sizeof(new_klog_path))
             {
-                char *new_klog = strdup(new_klog_path);
+                char *new_klog = tdb_strdup(new_klog_path);
                 if (new_klog)
                 {
                     free(sst->klog_path);
@@ -13572,7 +13572,7 @@ int tidesdb_rename_column_family(tidesdb_t *db, const char *old_name, const char
                                     lvl + 1, sst->id);
             if (path_written > 0 && (size_t)path_written < sizeof(new_vlog_path))
             {
-                char *new_vlog = strdup(new_vlog_path);
+                char *new_vlog = tdb_strdup(new_vlog_path);
                 if (new_vlog)
                 {
                     free(sst->vlog_path);
@@ -13724,7 +13724,7 @@ int tidesdb_list_column_families(tidesdb_t *db, char ***names, int *count)
     {
         if (db->column_families[i] && db->column_families[i]->name)
         {
-            (*names)[i] = strdup(db->column_families[i]->name);
+            (*names)[i] = tdb_strdup(db->column_families[i]->name);
             if (!(*names)[i])
             {
                 for (int j = 0; j < i; j++)

@@ -11765,6 +11765,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     if (!(*db)->db_path)
     {
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
 
@@ -11879,6 +11880,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
     (*db)->column_families = cfs;
@@ -11894,6 +11896,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
 
@@ -11907,6 +11910,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
     atomic_init(&(*db)->comparators, initial_comparators);
@@ -11935,6 +11939,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
 
@@ -11954,6 +11959,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
 
@@ -11969,6 +11975,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
     /* we start with larger capacity to avoid realloc under lock */
@@ -11987,6 +11994,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
     (*db)->num_active_txns = 0;
@@ -12029,6 +12037,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
 
@@ -12053,6 +12062,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             close((*db)->lock_fd);
             free((*db)->db_path);
             free(*db);
+            *db = NULL;
             return TDB_ERR_MEMORY;
         }
         TDB_DEBUG_LOG(TDB_LOG_INFO, "Block clock cache created with max_bytes=%.2f MB",
@@ -12100,7 +12110,9 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         if ((*db)->clock_cache) clock_cache_destroy((*db)->clock_cache);
+        if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
         free(*db);
+        *db = NULL;
         return rc;
     }
 
@@ -12108,6 +12120,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     if (!(*db)->flush_threads)
     {
         clock_cache_destroy((*db)->clock_cache);
+        if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
         free((*db)->active_txns);
         pthread_rwlock_destroy(&(*db)->active_txns_lock);
         tidesdb_commit_status_destroy((*db)->commit_status);
@@ -12120,6 +12133,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
 
@@ -12128,9 +12142,11 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tidesdb_worker_thread_arg_t *flush_arg = malloc(sizeof(tidesdb_worker_thread_arg_t));
         if (!flush_arg)
         {
+            queue_shutdown((*db)->flush_queue);
             for (int j = 0; j < i; j++) pthread_join((*db)->flush_threads[j], NULL);
             free((*db)->flush_threads);
             clock_cache_destroy((*db)->clock_cache);
+            if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
             free((*db)->active_txns);
             pthread_rwlock_destroy(&(*db)->active_txns_lock);
             tidesdb_commit_status_destroy((*db)->commit_status);
@@ -12143,6 +12159,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             close((*db)->lock_fd);
             free((*db)->db_path);
             free(*db);
+            *db = NULL;
             return TDB_ERR_MEMORY;
         }
         flush_arg->db = *db;
@@ -12151,12 +12168,14 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                            flush_arg) != 0)
         {
             free(flush_arg);
+            queue_shutdown((*db)->flush_queue);
             for (int j = 0; j < i; j++)
             {
                 pthread_join((*db)->flush_threads[j], NULL);
             }
             free((*db)->flush_threads);
             clock_cache_destroy((*db)->clock_cache);
+            if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
             free((*db)->active_txns);
             pthread_rwlock_destroy(&(*db)->active_txns_lock);
             tidesdb_commit_status_destroy((*db)->commit_status);
@@ -12169,6 +12188,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             close((*db)->lock_fd);
             free((*db)->db_path);
             free(*db);
+            *db = NULL;
             return TDB_ERR_MEMORY;
         }
     }
@@ -12176,12 +12196,14 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
     (*db)->compaction_threads = malloc(config->num_compaction_threads * sizeof(pthread_t));
     if (!(*db)->compaction_threads)
     {
+        queue_shutdown((*db)->flush_queue);
         for (int i = 0; i < config->num_flush_threads; i++)
         {
             pthread_join((*db)->flush_threads[i], NULL);
         }
         free((*db)->flush_threads);
         clock_cache_destroy((*db)->clock_cache);
+        if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
         free((*db)->active_txns);
         pthread_rwlock_destroy(&(*db)->active_txns_lock);
         tidesdb_commit_status_destroy((*db)->commit_status);
@@ -12194,6 +12216,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         close((*db)->lock_fd);
         free((*db)->db_path);
         free(*db);
+        *db = NULL;
         return TDB_ERR_MEMORY;
     }
 
@@ -12202,12 +12225,15 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
         tidesdb_worker_thread_arg_t *compact_arg = malloc(sizeof(tidesdb_worker_thread_arg_t));
         if (!compact_arg)
         {
+            queue_shutdown((*db)->compaction_queue);
             for (int j = 0; j < i; j++) pthread_join((*db)->compaction_threads[j], NULL);
             free((*db)->compaction_threads);
+            queue_shutdown((*db)->flush_queue);
             for (int k = 0; k < config->num_flush_threads; k++)
                 pthread_join((*db)->flush_threads[k], NULL);
             free((*db)->flush_threads);
             clock_cache_destroy((*db)->clock_cache);
+            if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
             free((*db)->active_txns);
             pthread_rwlock_destroy(&(*db)->active_txns_lock);
             tidesdb_commit_status_destroy((*db)->commit_status);
@@ -12220,6 +12246,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             close((*db)->lock_fd);
             free((*db)->db_path);
             free(*db);
+            *db = NULL;
             return TDB_ERR_MEMORY;
         }
         compact_arg->db = *db;
@@ -12228,18 +12255,21 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
                            compact_arg) != 0)
         {
             free(compact_arg);
+            queue_shutdown((*db)->compaction_queue);
             for (int j = 0; j < i; j++)
             {
                 pthread_join((*db)->compaction_threads[j], NULL);
             }
             free((*db)->compaction_threads);
 
+            queue_shutdown((*db)->flush_queue);
             for (int k = 0; k < config->num_flush_threads; k++)
             {
                 pthread_join((*db)->flush_threads[k], NULL);
             }
             free((*db)->flush_threads);
             clock_cache_destroy((*db)->clock_cache);
+            if ((*db)->btree_node_cache) clock_cache_destroy((*db)->btree_node_cache);
             free((*db)->active_txns);
             pthread_rwlock_destroy(&(*db)->active_txns_lock);
             tidesdb_commit_status_destroy((*db)->commit_status);
@@ -12252,6 +12282,7 @@ int tidesdb_open(const tidesdb_config_t *config, tidesdb_t **db)
             close((*db)->lock_fd);
             free((*db)->db_path);
             free(*db);
+            *db = NULL;
             return TDB_ERR_MEMORY;
         }
     }

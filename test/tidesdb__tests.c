@@ -20719,6 +20719,194 @@ static void test_commit_hook_sequence_monotonic(void)
     cleanup_test_dir();
 }
 
+/* OOM exhaustion test infrastructure
+ * tests that every allocation failure path is handled gracefully
+ * no crashes, no leaks (ASAN), no undefined behavior (UBSAN)
+ *
+ * algorithm -- for i = 0, 1, 2, ... run the full workload with the allocator
+ * returning NULL on the (i+1)-th allocation. if the workload completes
+ * successfully, we're done. otherwise increment i and retry. */
+static _Atomic(int64_t) oom_alloc_count;
+static _Atomic(int64_t) oom_fail_after; /* -1 = never fail */
+
+static void *oom_malloc(size_t size)
+{
+    int64_t limit = atomic_load_explicit(&oom_fail_after, memory_order_relaxed);
+    if (limit >= 0)
+    {
+        int64_t count = atomic_fetch_add_explicit(&oom_alloc_count, 1, memory_order_relaxed);
+        if (count >= limit) return NULL;
+    }
+    return saved_malloc(size);
+}
+
+static void *oom_calloc(size_t nmemb, size_t size)
+{
+    int64_t limit = atomic_load_explicit(&oom_fail_after, memory_order_relaxed);
+    if (limit >= 0)
+    {
+        int64_t count = atomic_fetch_add_explicit(&oom_alloc_count, 1, memory_order_relaxed);
+        if (count >= limit) return NULL;
+    }
+    return saved_calloc(nmemb, size);
+}
+
+static void *oom_realloc(void *ptr, size_t size)
+{
+    int64_t limit = atomic_load_explicit(&oom_fail_after, memory_order_relaxed);
+    if (limit >= 0)
+    {
+        int64_t count = atomic_fetch_add_explicit(&oom_alloc_count, 1, memory_order_relaxed);
+        if (count >= limit) return NULL;
+    }
+    return saved_realloc(ptr, size);
+}
+
+static void oom_free(void *ptr)
+{
+    saved_free(ptr);
+}
+
+static void test_oom_exhaustion(void)
+{
+    /* we ensure saved_* are populated */
+    tidesdb_ensure_initialized();
+    if (!saved_malloc)
+    {
+        saved_malloc = tidesdb_allocator.malloc_fn;
+        saved_calloc = tidesdb_allocator.calloc_fn;
+        saved_realloc = tidesdb_allocator.realloc_fn;
+        saved_free = tidesdb_allocator.free_fn;
+    }
+
+    atomic_init(&oom_alloc_count, 0);
+    atomic_init(&oom_fail_after, (int64_t)-1);
+
+    int completed_at = -1;
+    const int max_iterations = 10000;
+
+    for (int i = 0; i < max_iterations; i++)
+    {
+        /* all declarations at top to avoid goto-past-declaration issues */
+        int ok = 1;
+        tidesdb_t *db = NULL;
+        tidesdb_txn_t *txn = NULL;
+        tidesdb_column_family_t *cf = NULL;
+        uint8_t *got_value = NULL;
+        size_t got_size = 0;
+        uint8_t key[] = "oom_test_key";
+        uint8_t value[] = "oom_test_value";
+        tidesdb_config_t config;
+        tidesdb_column_family_config_t cf_config;
+
+        /* we clean up with system allocator (from previous iteration) */
+        cleanup_test_dir();
+
+        /* we install the OOM allocator for this iteration */
+        tidesdb_finalize();
+        atomic_store(&oom_alloc_count, 0);
+        atomic_store(&oom_fail_after, (int64_t)i);
+
+        if (tidesdb_init(oom_malloc, oom_calloc, oom_realloc, oom_free) != 0)
+        {
+            atomic_store(&oom_fail_after, (int64_t)-1);
+            tidesdb_init(NULL, NULL, NULL, NULL);
+            continue;
+        }
+
+        config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+
+        if (tidesdb_open(&config, &db) != 0 || !db)
+        {
+            ok = 0;
+            goto oom_done;
+        }
+
+        cf_config = tidesdb_default_column_family_config();
+        if (tidesdb_create_column_family(db, "oom_cf", &cf_config) != 0)
+        {
+            ok = 0;
+            goto oom_done;
+        }
+
+        cf = tidesdb_get_column_family(db, "oom_cf");
+        if (!cf)
+        {
+            ok = 0;
+            goto oom_done;
+        }
+
+        if (tidesdb_txn_begin(db, &txn) != 0 || !txn)
+        {
+            ok = 0;
+            goto oom_done;
+        }
+
+        if (tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), -1) != 0)
+        {
+            tidesdb_txn_free(txn);
+            txn = NULL;
+            ok = 0;
+            goto oom_done;
+        }
+
+        if (tidesdb_txn_commit(txn) != 0)
+        {
+            tidesdb_txn_free(txn);
+            txn = NULL;
+            ok = 0;
+            goto oom_done;
+        }
+        tidesdb_txn_free(txn);
+        txn = NULL;
+
+        if (tidesdb_txn_begin(db, &txn) != 0 || !txn)
+        {
+            ok = 0;
+            goto oom_done;
+        }
+
+        if (tidesdb_txn_get(txn, cf, key, sizeof(key), &got_value, &got_size) != 0)
+        {
+            tidesdb_txn_free(txn);
+            txn = NULL;
+            ok = 0;
+            goto oom_done;
+        }
+
+        if (!got_value || got_size != sizeof(value) || memcmp(got_value, value, sizeof(value)) != 0)
+        {
+            ok = 0;
+        }
+
+        free(got_value);
+        got_value = NULL;
+        tidesdb_txn_free(txn);
+        txn = NULL;
+
+    oom_done:
+        /* we disable allocation failures before cleanup to allow proper shutdown */
+        atomic_store(&oom_fail_after, (int64_t)-1);
+        if (got_value) saved_free(got_value);
+        if (db) tidesdb_close(db);
+        tidesdb_finalize();
+        tidesdb_init(NULL, NULL, NULL, NULL);
+
+        if (ok)
+        {
+            completed_at = i;
+            break;
+        }
+    }
+
+    printf("  OOM exhaustion: workload completed at fail_after=%d (%d failure points tested)\n",
+           completed_at, completed_at >= 0 ? completed_at + 1 : max_iterations);
+    ASSERT_TRUE(completed_at >= 0);
+
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -21018,6 +21206,7 @@ int main(void)
     RUN_TEST(test_commit_hook_multi_cf_isolation, tests_passed);
     RUN_TEST(test_commit_hook_via_config, tests_passed);
     RUN_TEST(test_commit_hook_sequence_monotonic, tests_passed);
+    RUN_TEST(test_oom_exhaustion, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

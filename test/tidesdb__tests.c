@@ -20266,6 +20266,647 @@ static void test_range_cost_no_block_indexes(void)
     cleanup_test_dir();
 }
 
+/* commit hook test infrastructure */
+typedef struct
+{
+    _Atomic(int) call_count;
+    _Atomic(int) total_ops;
+    _Atomic(uint64_t) last_commit_seq;
+    _Atomic(int) last_num_ops;
+    _Atomic(int) saw_delete;
+    _Atomic(int) last_return_code;
+    /* snapshot of first call's ops for verification */
+    uint8_t captured_key[128];
+    size_t captured_key_size;
+    uint8_t captured_value[128];
+    size_t captured_value_size;
+} commit_hook_state_t;
+
+static commit_hook_state_t g_hook_state;
+
+static void commit_hook_state_reset(void)
+{
+    atomic_store(&g_hook_state.call_count, 0);
+    atomic_store(&g_hook_state.total_ops, 0);
+    atomic_store(&g_hook_state.last_commit_seq, 0);
+    atomic_store(&g_hook_state.last_num_ops, 0);
+    atomic_store(&g_hook_state.saw_delete, 0);
+    atomic_store(&g_hook_state.last_return_code, 0);
+    memset(g_hook_state.captured_key, 0, sizeof(g_hook_state.captured_key));
+    g_hook_state.captured_key_size = 0;
+    memset(g_hook_state.captured_value, 0, sizeof(g_hook_state.captured_value));
+    g_hook_state.captured_value_size = 0;
+}
+
+static int test_commit_hook_callback(const tidesdb_commit_op_t *ops, int num_ops,
+                                     uint64_t commit_seq, void *ctx)
+{
+    commit_hook_state_t *state = (commit_hook_state_t *)ctx;
+    atomic_fetch_add(&state->call_count, 1);
+    atomic_fetch_add(&state->total_ops, num_ops);
+    atomic_store(&state->last_commit_seq, commit_seq);
+    atomic_store(&state->last_num_ops, num_ops);
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        if (ops[i].is_delete) atomic_store(&state->saw_delete, 1);
+    }
+
+    /* capture first op on first call */
+    if (atomic_load(&state->call_count) == 1 && num_ops > 0)
+    {
+        size_t ks = ops[0].key_size < sizeof(state->captured_key) ? ops[0].key_size
+                                                                  : sizeof(state->captured_key) - 1;
+        memcpy(state->captured_key, ops[0].key, ks);
+        state->captured_key_size = ks;
+
+        if (ops[0].value && ops[0].value_size > 0)
+        {
+            size_t vs = ops[0].value_size < sizeof(state->captured_value)
+                            ? ops[0].value_size
+                            : sizeof(state->captured_value) - 1;
+            memcpy(state->captured_value, ops[0].value, vs);
+            state->captured_value_size = vs;
+        }
+    }
+
+    return atomic_load(&state->last_return_code);
+}
+
+static void test_commit_hook_basic(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "hook_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "hook_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    commit_hook_state_reset();
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(cf, test_commit_hook_callback, &g_hook_state), 0);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    uint8_t key[] = "hook_key";
+    uint8_t value[] = "hook_value";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(atomic_load(&g_hook_state.call_count), 1);
+    ASSERT_EQ(atomic_load(&g_hook_state.last_num_ops), 1);
+    ASSERT_TRUE(atomic_load(&g_hook_state.last_commit_seq) > 0);
+    ASSERT_EQ(g_hook_state.captured_key_size, sizeof(key));
+    ASSERT_TRUE(memcmp(g_hook_state.captured_key, key, sizeof(key)) == 0);
+    ASSERT_EQ(g_hook_state.captured_value_size, sizeof(value));
+    ASSERT_TRUE(memcmp(g_hook_state.captured_value, value, sizeof(value)) == 0);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_commit_hook_with_delete(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "hook_del_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "hook_del_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    commit_hook_state_reset();
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(cf, test_commit_hook_callback, &g_hook_state), 0);
+
+    /* put a key first */
+    tidesdb_txn_t *txn1 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
+    uint8_t key[] = "del_hook_key";
+    uint8_t value[] = "del_hook_value";
+    ASSERT_EQ(tidesdb_txn_put(txn1, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
+    tidesdb_txn_free(txn1);
+
+    ASSERT_EQ(atomic_load(&g_hook_state.call_count), 1);
+    ASSERT_FALSE(atomic_load(&g_hook_state.saw_delete));
+
+    /* now delete it */
+    tidesdb_txn_t *txn2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+    ASSERT_EQ(tidesdb_txn_delete(txn2, cf, key, sizeof(key)), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn2), 0);
+    tidesdb_txn_free(txn2);
+
+    ASSERT_EQ(atomic_load(&g_hook_state.call_count), 2);
+    ASSERT_TRUE(atomic_load(&g_hook_state.saw_delete));
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_commit_hook_multi_op(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "hook_multi_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "hook_multi_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    commit_hook_state_reset();
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(cf, test_commit_hook_callback, &g_hook_state), 0);
+
+    /* single txn with multiple ops */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    for (int i = 0; i < 5; i++)
+    {
+        char key[32], value[32];
+        snprintf(key, sizeof(key), "multi_key_%d", i);
+        snprintf(value, sizeof(value), "multi_val_%d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+    }
+
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(atomic_load(&g_hook_state.call_count), 1);
+    ASSERT_EQ(atomic_load(&g_hook_state.last_num_ops), 5);
+    ASSERT_EQ(atomic_load(&g_hook_state.total_ops), 5);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static int test_commit_hook_error_callback(const tidesdb_commit_op_t *ops, int num_ops,
+                                           uint64_t commit_seq, void *ctx)
+{
+    (void)ops;
+    (void)num_ops;
+    (void)commit_seq;
+    int *call_count = (int *)ctx;
+    (*call_count)++;
+    return -1; /* simulate error */
+}
+
+static void test_commit_hook_error_does_not_rollback(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "hook_err_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "hook_err_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    int error_hook_calls = 0;
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(cf, test_commit_hook_error_callback, &error_hook_calls),
+              0);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    uint8_t key[] = "err_hook_key";
+    uint8_t value[] = "err_hook_value";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+
+    /* commit should still succeed even though hook returns error */
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(error_hook_calls, 1);
+
+    /* verify data is still accessible */
+    tidesdb_txn_t *txn2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+    uint8_t *retrieved_value = NULL;
+    size_t retrieved_size = 0;
+    ASSERT_EQ(tidesdb_txn_get(txn2, cf, key, sizeof(key), &retrieved_value, &retrieved_size), 0);
+    ASSERT_TRUE(retrieved_value != NULL);
+    ASSERT_EQ(retrieved_size, sizeof(value));
+    ASSERT_TRUE(memcmp(retrieved_value, value, sizeof(value)) == 0);
+    free(retrieved_value);
+    tidesdb_txn_free(txn2);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_commit_hook_runtime_set_clear(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "hook_setclr_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "hook_setclr_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    commit_hook_state_reset();
+
+    /* commit without hook -- should work fine */
+    tidesdb_txn_t *txn1 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
+    uint8_t key1[] = "no_hook_key";
+    uint8_t val1[] = "no_hook_val";
+    ASSERT_EQ(tidesdb_txn_put(txn1, cf, key1, sizeof(key1), val1, sizeof(val1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
+    tidesdb_txn_free(txn1);
+    ASSERT_EQ(atomic_load(&g_hook_state.call_count), 0);
+
+    /* set hook at runtime */
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(cf, test_commit_hook_callback, &g_hook_state), 0);
+
+    tidesdb_txn_t *txn2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+    uint8_t key2[] = "with_hook_key";
+    uint8_t val2[] = "with_hook_val";
+    ASSERT_EQ(tidesdb_txn_put(txn2, cf, key2, sizeof(key2), val2, sizeof(val2), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn2), 0);
+    tidesdb_txn_free(txn2);
+    ASSERT_EQ(atomic_load(&g_hook_state.call_count), 1);
+
+    /* clear hook at runtime */
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(cf, NULL, NULL), 0);
+
+    tidesdb_txn_t *txn3 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn3), 0);
+    uint8_t key3[] = "cleared_hook_key";
+    uint8_t val3[] = "cleared_hook_val";
+    ASSERT_EQ(tidesdb_txn_put(txn3, cf, key3, sizeof(key3), val3, sizeof(val3), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn3), 0);
+    tidesdb_txn_free(txn3);
+
+    /* call count should not have increased */
+    ASSERT_EQ(atomic_load(&g_hook_state.call_count), 1);
+
+    /* invalid args */
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(NULL, test_commit_hook_callback, &g_hook_state),
+              TDB_ERR_INVALID_ARGS);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static commit_hook_state_t g_hook_state_cf1;
+static commit_hook_state_t g_hook_state_cf2;
+
+static int test_commit_hook_cf1(const tidesdb_commit_op_t *ops, int num_ops, uint64_t commit_seq,
+                                void *ctx)
+{
+    return test_commit_hook_callback(ops, num_ops, commit_seq, ctx);
+}
+
+static int test_commit_hook_cf2(const tidesdb_commit_op_t *ops, int num_ops, uint64_t commit_seq,
+                                void *ctx)
+{
+    return test_commit_hook_callback(ops, num_ops, commit_seq, ctx);
+}
+
+static void test_commit_hook_multi_cf_isolation(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "hook_cf1", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "hook_cf2", &cf_config), 0);
+    ASSERT_EQ(tidesdb_create_column_family(db, "hook_cf3_nohook", &cf_config), 0);
+
+    tidesdb_column_family_t *cf1 = tidesdb_get_column_family(db, "hook_cf1");
+    tidesdb_column_family_t *cf2 = tidesdb_get_column_family(db, "hook_cf2");
+    tidesdb_column_family_t *cf3 = tidesdb_get_column_family(db, "hook_cf3_nohook");
+    ASSERT_TRUE(cf1 != NULL);
+    ASSERT_TRUE(cf2 != NULL);
+    ASSERT_TRUE(cf3 != NULL);
+
+    memset(&g_hook_state_cf1, 0, sizeof(g_hook_state_cf1));
+    memset(&g_hook_state_cf2, 0, sizeof(g_hook_state_cf2));
+
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(cf1, test_commit_hook_cf1, &g_hook_state_cf1), 0);
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(cf2, test_commit_hook_cf2, &g_hook_state_cf2), 0);
+    /* cf3 has no hook */
+
+    /* write to cf1 */
+    tidesdb_txn_t *txn1 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn1), 0);
+    uint8_t k1[] = "cf1_key";
+    uint8_t v1[] = "cf1_val";
+    ASSERT_EQ(tidesdb_txn_put(txn1, cf1, k1, sizeof(k1), v1, sizeof(v1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn1), 0);
+    tidesdb_txn_free(txn1);
+
+    ASSERT_EQ(atomic_load(&g_hook_state_cf1.call_count), 1);
+    ASSERT_EQ(atomic_load(&g_hook_state_cf2.call_count), 0);
+
+    /* write to cf2 */
+    tidesdb_txn_t *txn2 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn2), 0);
+    uint8_t k2[] = "cf2_key";
+    uint8_t v2[] = "cf2_val";
+    ASSERT_EQ(tidesdb_txn_put(txn2, cf2, k2, sizeof(k2), v2, sizeof(v2), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn2), 0);
+    tidesdb_txn_free(txn2);
+
+    ASSERT_EQ(atomic_load(&g_hook_state_cf1.call_count), 1);
+    ASSERT_EQ(atomic_load(&g_hook_state_cf2.call_count), 1);
+
+    /* write to cf3 (no hook) -- no crash */
+    tidesdb_txn_t *txn3 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn3), 0);
+    uint8_t k3[] = "cf3_key";
+    uint8_t v3[] = "cf3_val";
+    ASSERT_EQ(tidesdb_txn_put(txn3, cf3, k3, sizeof(k3), v3, sizeof(v3), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn3), 0);
+    tidesdb_txn_free(txn3);
+
+    /* hook counts unchanged */
+    ASSERT_EQ(atomic_load(&g_hook_state_cf1.call_count), 1);
+    ASSERT_EQ(atomic_load(&g_hook_state_cf2.call_count), 1);
+
+    /* multi-CF txn fires hook on each CF that has one */
+    tidesdb_txn_t *txn4 = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn4), 0);
+    uint8_t mk1[] = "multi_cf1";
+    uint8_t mv1[] = "multi_v1";
+    uint8_t mk2[] = "multi_cf2";
+    uint8_t mv2[] = "multi_v2";
+    uint8_t mk3[] = "multi_cf3";
+    uint8_t mv3[] = "multi_v3";
+    ASSERT_EQ(tidesdb_txn_put(txn4, cf1, mk1, sizeof(mk1), mv1, sizeof(mv1), 0), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn4, cf2, mk2, sizeof(mk2), mv2, sizeof(mv2), 0), 0);
+    ASSERT_EQ(tidesdb_txn_put(txn4, cf3, mk3, sizeof(mk3), mv3, sizeof(mv3), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn4), 0);
+    tidesdb_txn_free(txn4);
+
+    ASSERT_EQ(atomic_load(&g_hook_state_cf1.call_count), 2);
+    ASSERT_EQ(atomic_load(&g_hook_state_cf2.call_count), 2);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_commit_hook_via_config(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    commit_hook_state_reset();
+    cf_config.commit_hook_fn = test_commit_hook_callback;
+    cf_config.commit_hook_ctx = &g_hook_state;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "hook_cfg_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "hook_cfg_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    uint8_t key[] = "cfg_hook_key";
+    uint8_t value[] = "cfg_hook_val";
+    ASSERT_EQ(tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), 0), 0);
+    ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+    tidesdb_txn_free(txn);
+
+    ASSERT_EQ(atomic_load(&g_hook_state.call_count), 1);
+    ASSERT_EQ(atomic_load(&g_hook_state.last_num_ops), 1);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_commit_hook_sequence_monotonic(void)
+{
+    cleanup_test_dir();
+    tidesdb_t *db = create_test_db();
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "hook_seq_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "hook_seq_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    commit_hook_state_reset();
+    ASSERT_EQ(tidesdb_cf_set_commit_hook(cf, test_commit_hook_callback, &g_hook_state), 0);
+
+    uint64_t prev_seq = 0;
+    for (int i = 0; i < 10; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+        char key[32], value[32];
+        snprintf(key, sizeof(key), "seq_key_%d", i);
+        snprintf(value, sizeof(value), "seq_val_%d", i);
+        ASSERT_EQ(tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                  strlen(value) + 1, 0),
+                  0);
+        ASSERT_EQ(tidesdb_txn_commit(txn), 0);
+        tidesdb_txn_free(txn);
+
+        uint64_t cur_seq = atomic_load(&g_hook_state.last_commit_seq);
+        ASSERT_TRUE(cur_seq > prev_seq);
+        prev_seq = cur_seq;
+    }
+
+    ASSERT_EQ(atomic_load(&g_hook_state.call_count), 10);
+    ASSERT_EQ(atomic_load(&g_hook_state.total_ops), 10);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+/* OOM exhaustion test infrastructure
+ * tests that every allocation failure path is handled gracefully
+ * no crashes, no leaks (ASAN), no undefined behavior (UBSAN)
+ *
+ * algorithm -- for i = 0, 1, 2, ... run the full workload with the allocator
+ * returning NULL on the (i+1)-th allocation. if the workload completes
+ * successfully, we're done. otherwise increment i and retry. */
+static _Atomic(int64_t) oom_alloc_count;
+static _Atomic(int64_t) oom_fail_after; /* -1 = never fail */
+
+static void *oom_malloc(size_t size)
+{
+    int64_t limit = atomic_load_explicit(&oom_fail_after, memory_order_relaxed);
+    if (limit >= 0)
+    {
+        int64_t count = atomic_fetch_add_explicit(&oom_alloc_count, 1, memory_order_relaxed);
+        if (count >= limit) return NULL;
+    }
+    return saved_malloc(size);
+}
+
+static void *oom_calloc(size_t nmemb, size_t size)
+{
+    int64_t limit = atomic_load_explicit(&oom_fail_after, memory_order_relaxed);
+    if (limit >= 0)
+    {
+        int64_t count = atomic_fetch_add_explicit(&oom_alloc_count, 1, memory_order_relaxed);
+        if (count >= limit) return NULL;
+    }
+    return saved_calloc(nmemb, size);
+}
+
+static void *oom_realloc(void *ptr, size_t size)
+{
+    int64_t limit = atomic_load_explicit(&oom_fail_after, memory_order_relaxed);
+    if (limit >= 0)
+    {
+        int64_t count = atomic_fetch_add_explicit(&oom_alloc_count, 1, memory_order_relaxed);
+        if (count >= limit) return NULL;
+    }
+    return saved_realloc(ptr, size);
+}
+
+static void oom_free(void *ptr)
+{
+    saved_free(ptr);
+}
+
+static void test_oom_exhaustion(void)
+{
+    /* we ensure saved_* are populated */
+    tidesdb_ensure_initialized();
+    if (!saved_malloc)
+    {
+        saved_malloc = tidesdb_allocator.malloc_fn;
+        saved_calloc = tidesdb_allocator.calloc_fn;
+        saved_realloc = tidesdb_allocator.realloc_fn;
+        saved_free = tidesdb_allocator.free_fn;
+    }
+
+    atomic_init(&oom_alloc_count, 0);
+    atomic_init(&oom_fail_after, (int64_t)-1);
+
+    int completed_at = -1;
+    const int max_iterations = 10000;
+
+    for (int i = 0; i < max_iterations; i++)
+    {
+        /* all declarations at top to avoid goto-past-declaration issues */
+        int ok = 1;
+        tidesdb_t *db = NULL;
+        tidesdb_txn_t *txn = NULL;
+        tidesdb_column_family_t *cf = NULL;
+        uint8_t *got_value = NULL;
+        size_t got_size = 0;
+        uint8_t key[] = "oom_test_key";
+        uint8_t value[] = "oom_test_value";
+        tidesdb_config_t config;
+        tidesdb_column_family_config_t cf_config;
+
+        /* we clean up with system allocator (from previous iteration) */
+        cleanup_test_dir();
+
+        /* we install the OOM allocator for this iteration */
+        tidesdb_finalize();
+        atomic_store(&oom_alloc_count, 0);
+        atomic_store(&oom_fail_after, (int64_t)i);
+
+        if (tidesdb_init(oom_malloc, oom_calloc, oom_realloc, oom_free) != 0)
+        {
+            atomic_store(&oom_fail_after, (int64_t)-1);
+            tidesdb_init(NULL, NULL, NULL, NULL);
+            continue;
+        }
+
+        config = tidesdb_default_config();
+        config.db_path = TEST_DB_PATH;
+
+        if (tidesdb_open(&config, &db) != 0 || !db)
+        {
+            ok = 0;
+            goto oom_done;
+        }
+
+        cf_config = tidesdb_default_column_family_config();
+        if (tidesdb_create_column_family(db, "oom_cf", &cf_config) != 0)
+        {
+            ok = 0;
+            goto oom_done;
+        }
+
+        cf = tidesdb_get_column_family(db, "oom_cf");
+        if (!cf)
+        {
+            ok = 0;
+            goto oom_done;
+        }
+
+        if (tidesdb_txn_begin(db, &txn) != 0 || !txn)
+        {
+            ok = 0;
+            goto oom_done;
+        }
+
+        if (tidesdb_txn_put(txn, cf, key, sizeof(key), value, sizeof(value), -1) != 0)
+        {
+            tidesdb_txn_free(txn);
+            txn = NULL;
+            ok = 0;
+            goto oom_done;
+        }
+
+        if (tidesdb_txn_commit(txn) != 0)
+        {
+            tidesdb_txn_free(txn);
+            txn = NULL;
+            ok = 0;
+            goto oom_done;
+        }
+        tidesdb_txn_free(txn);
+        txn = NULL;
+
+        if (tidesdb_txn_begin(db, &txn) != 0 || !txn)
+        {
+            ok = 0;
+            goto oom_done;
+        }
+
+        if (tidesdb_txn_get(txn, cf, key, sizeof(key), &got_value, &got_size) != 0)
+        {
+            tidesdb_txn_free(txn);
+            txn = NULL;
+            ok = 0;
+            goto oom_done;
+        }
+
+        if (!got_value || got_size != sizeof(value) || memcmp(got_value, value, sizeof(value)) != 0)
+        {
+            ok = 0;
+        }
+
+        free(got_value);
+        got_value = NULL;
+        tidesdb_txn_free(txn);
+        txn = NULL;
+
+    oom_done:
+        /* we disable allocation failures before cleanup to allow proper shutdown */
+        atomic_store(&oom_fail_after, (int64_t)-1);
+        if (got_value) saved_free(got_value);
+        if (db) tidesdb_close(db);
+        tidesdb_finalize();
+        tidesdb_init(NULL, NULL, NULL, NULL);
+
+        if (ok)
+        {
+            completed_at = i;
+            break;
+        }
+    }
+
+    printf("  OOM exhaustion: workload completed at fail_after=%d (%d failure points tested)\n",
+           completed_at, completed_at >= 0 ? completed_at + 1 : max_iterations);
+    ASSERT_TRUE(completed_at >= 0);
+
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -20557,6 +21198,15 @@ int main(void)
     RUN_TEST(test_txn_reset_with_repeatable_read, tests_passed);
     RUN_TEST(test_concurrent_txn_commit_sequence_race, tests_passed);
     RUN_TEST(test_stress_unified_read_races, tests_passed);
+    RUN_TEST(test_commit_hook_basic, tests_passed);
+    RUN_TEST(test_commit_hook_with_delete, tests_passed);
+    RUN_TEST(test_commit_hook_multi_op, tests_passed);
+    RUN_TEST(test_commit_hook_error_does_not_rollback, tests_passed);
+    RUN_TEST(test_commit_hook_runtime_set_clear, tests_passed);
+    RUN_TEST(test_commit_hook_multi_cf_isolation, tests_passed);
+    RUN_TEST(test_commit_hook_via_config, tests_passed);
+    RUN_TEST(test_commit_hook_sequence_monotonic, tests_passed);
+    RUN_TEST(test_oom_exhaustion, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

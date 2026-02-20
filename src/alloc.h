@@ -21,6 +21,7 @@
 
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 
 /**
  * tidesdb_malloc_fn
@@ -122,5 +123,22 @@ void tidesdb_ensure_initialized(void);
 #define calloc(count, size) tdb_calloc((count), (size))
 #define realloc(ptr, size)  tdb_realloc((ptr), (size))
 #define free(ptr)           tdb_free(ptr)
+
+/**
+ * tdb_strdup
+ * custom allocator-aware string duplication
+ * uses malloc (which is redirected to tdb_malloc above) so that the
+ * returned pointer can safely be freed via the custom allocator's free
+ * @param s the string to duplicate
+ * @return newly allocated copy of s, or NULL on failure
+ */
+static inline char *tdb_strdup(const char *s)
+{
+    if (!s) return NULL;
+    size_t len = strlen(s) + 1;
+    char *dup = (char *)malloc(len);
+    if (dup) memcpy(dup, s, len);
+    return dup;
+}
 
 #endif /* __TIDESDB_ALLOC_H__ */

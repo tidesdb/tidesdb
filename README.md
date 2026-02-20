@@ -34,6 +34,7 @@ It is not a full-featured database, but rather a library that can be used to bui
 - Optional hybrid B-tree + LSM-tree which can be configured per column family
 - Ability to clone column families
 - Easy pluggable custom allocator support
+- Column family commit hooks 
 
 ## Getting Started
 To learn more about TidesDB, check out [What is TidesDB?](https://tidesdb.com/getting-started/what-is-tidesdb/)

@@ -112,6 +112,43 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
                                      size_t key2_size, void *ctx);
 
 /**
+ * tidesdb_commit_op_t
+ * represents a single operation in a committed transaction batch
+ * passed to the commit hook callback
+ * @param key pointer to key data (valid only during callback invocation)
+ * @param key_size size of key in bytes
+ * @param value pointer to value data (NULL for deletes, valid only during callback invocation)
+ * @param value_size size of value in bytes (0 for deletes)
+ * @param ttl time-to-live for the key-value pair (0 = no expiry)
+ * @param is_delete 1 if this is a delete operation, 0 for put
+ */
+typedef struct tidesdb_commit_op_t
+{
+    const uint8_t *key;
+    size_t key_size;
+    const uint8_t *value;
+    size_t value_size;
+    time_t ttl;
+    int is_delete;
+} tidesdb_commit_op_t;
+
+/**
+ * tidesdb_commit_hook_fn
+ * callback function invoked synchronously after a transaction commits to a column family
+ * the callback receives the full batch of operations for that CF atomically
+ * the hook fires after WAL write, memtable apply, and commit status marking are complete
+ * hook failure is logged but does not roll back the commit (data is already durable)
+ *
+ * @param ops array of committed operations (valid only during callback invocation)
+ * @param num_ops number of operations in the array
+ * @param commit_seq monotonic commit sequence number
+ * @param ctx user-provided context pointer
+ * @return 0 on success, non-zero on failure (logged as warning)
+ */
+typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_ops,
+                                      uint64_t commit_seq, void *ctx);
+
+/**
  * tidesdb_column_family_config_t
  * configuration for a column family
  * @param name name of column family
@@ -139,6 +176,8 @@ typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, cons
  * @param l1_file_count_trigger trigger for L1 file count, utilized for compaction triggering
  * @param l0_queue_stall_threshold threshold for L0 queue stall, utilized for backpressure
  * @param use_btree whether btree is used
+ * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
+ * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
  */
 typedef struct tidesdb_column_family_config_t
 {
@@ -167,6 +206,8 @@ typedef struct tidesdb_column_family_config_t
     int l1_file_count_trigger;
     int l0_queue_stall_threshold;
     int use_btree;
+    tidesdb_commit_hook_fn commit_hook_fn;
+    void *commit_hook_ctx;
 } tidesdb_column_family_config_t;
 
 /**
@@ -399,6 +440,19 @@ int tidesdb_comparator_reverse_memcmp(const uint8_t *key1, size_t key1_size, con
                                       size_t key2_size, void *ctx);
 int tidesdb_comparator_case_insensitive(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                         size_t key2_size, void *ctx);
+
+/**** commit hook operations */
+
+/**
+ * tidesdb_cf_set_commit_hook
+ * sets or clears the commit hook for a column family at runtime
+ * pass NULL for fn to disable the hook
+ * @param cf column family handle
+ * @param fn commit hook callback (or NULL to disable)
+ * @param ctx user-provided context passed to the callback
+ * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS if cf is NULL
+ */
+int tidesdb_cf_set_commit_hook(tidesdb_column_family_t *cf, tidesdb_commit_hook_fn fn, void *ctx);
 
 /**** maintenance operations */
 int tidesdb_compact(tidesdb_column_family_t *cf);

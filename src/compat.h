@@ -40,13 +40,6 @@
 #define PATH_SEPARATOR "/"
 #endif
 
-/* cross-platform strdup abstraction */
-#if defined(_MSC_VER)
-#define tdb_strdup(s) _strdup(s)
-#else
-#define tdb_strdup(s) strdup(s)
-#endif
-
 /* cross-platform line buffering -- Windows doesn't support _IOLBF properly with NULL buffer */
 #if defined(_MSC_VER)
 #define tdb_setlinebuf(stream) setvbuf((stream), NULL, _IONBF, 0)

@@ -1969,7 +1969,9 @@ tidesdb_column_family_config_t tidesdb_default_column_family_config(void)
         .min_disk_space = TDB_DEFAULT_MIN_DISK_SPACE,
         .l1_file_count_trigger = TDB_DEFAULT_L1_FILE_COUNT_TRIGGER,
         .l0_queue_stall_threshold = TDB_DEFAULT_L0_QUEUE_STALL_THRESHOLD,
-        .use_btree = 0};
+        .use_btree = 0,
+        .commit_hook_fn = NULL,
+        .commit_hook_ctx = NULL};
 }
 
 tidesdb_config_t tidesdb_default_config(void)
@@ -16200,6 +16202,71 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
                                TDB_COMMIT_STATUS_COMMITTED);
     tidesdb_txn_remove_from_active_list(txn);
 
+    /* we invoke commit hooks for each CF that has one registered
+     * hooks fire after commit is fully durable (WAL + memtable + commit status)
+     * hook failure is logged but does not affect the commit result */
+    for (int cf_idx = 0; cf_idx < txn->num_cfs; cf_idx++)
+    {
+        tidesdb_column_family_t *cf = txn->cfs[cf_idx];
+        if (!cf || !cf->config.commit_hook_fn) continue;
+
+        /* we count ops for this CF */
+        int hook_op_count = 0;
+        for (int i = 0; i < txn->num_ops; i++)
+        {
+            if (txn->ops[i].cf == cf) hook_op_count++;
+        }
+        if (hook_op_count == 0) continue;
+
+            /* we use stack allocation for common case (small txns) */
+#define TDB_COMMIT_HOOK_STACK_OPS 16
+        tidesdb_commit_op_t stack_hook_ops[TDB_COMMIT_HOOK_STACK_OPS];
+        tidesdb_commit_op_t *hook_ops;
+        const int hook_use_stack = (hook_op_count <= TDB_COMMIT_HOOK_STACK_OPS);
+
+        if (hook_use_stack)
+        {
+            hook_ops = stack_hook_ops;
+        }
+        else
+        {
+            hook_ops = malloc(hook_op_count * sizeof(tidesdb_commit_op_t));
+            if (!hook_ops)
+            {
+                TDB_DEBUG_LOG(TDB_LOG_WARN,
+                              "Failed to allocate commit hook ops for CF '%s' (count=%d)", cf->name,
+                              hook_op_count);
+                continue;
+            }
+        }
+
+        int idx = 0;
+        for (int i = 0; i < txn->num_ops; i++)
+        {
+            const tidesdb_txn_op_t *op = &txn->ops[i];
+            if (op->cf != cf) continue;
+
+            hook_ops[idx].key = op->key;
+            hook_ops[idx].key_size = op->key_size;
+            hook_ops[idx].value = op->value;
+            hook_ops[idx].value_size = op->value_size;
+            hook_ops[idx].ttl = op->ttl;
+            hook_ops[idx].is_delete = op->is_delete;
+            idx++;
+        }
+
+        const int hook_result = cf->config.commit_hook_fn(hook_ops, hook_op_count, txn->commit_seq,
+                                                          cf->config.commit_hook_ctx);
+        if (hook_result != 0)
+        {
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "Commit hook for CF '%s' returned error %d (seq=%" PRIu64 ")", cf->name,
+                          hook_result, txn->commit_seq);
+        }
+
+        if (!hook_use_stack) free(hook_ops);
+    }
+
     return TDB_SUCCESS;
 
 cleanup_error_memory:
@@ -20890,6 +20957,8 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
     cf->config.l1_file_count_trigger = new_config->l1_file_count_trigger;
     cf->config.l0_queue_stall_threshold = new_config->l0_queue_stall_threshold;
     cf->config.min_disk_space = new_config->min_disk_space;
+    cf->config.commit_hook_fn = new_config->commit_hook_fn;
+    cf->config.commit_hook_ctx = new_config->commit_hook_ctx;
 
     tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
     if (mt && mt->wal)
@@ -20911,6 +20980,16 @@ int tidesdb_cf_update_runtime_config(tidesdb_column_family_t *cf,
             return result;
         }
     }
+
+    return TDB_SUCCESS;
+}
+
+int tidesdb_cf_set_commit_hook(tidesdb_column_family_t *cf, tidesdb_commit_hook_fn fn, void *ctx)
+{
+    if (!cf) return TDB_ERR_INVALID_ARGS;
+
+    cf->config.commit_hook_fn = fn;
+    cf->config.commit_hook_ctx = ctx;
 
     return TDB_SUCCESS;
 }

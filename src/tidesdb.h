@@ -194,6 +194,27 @@ typedef enum
 typedef int (*tidesdb_comparator_fn)(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                      size_t key2_size, void *ctx);
 
+/**
+ * tidesdb_commit_op_t
+ * represents a single operation in a committed transaction batch
+ */
+typedef struct tidesdb_commit_op_t
+{
+    const uint8_t *key;
+    size_t key_size;
+    const uint8_t *value;
+    size_t value_size;
+    time_t ttl;
+    int is_delete;
+} tidesdb_commit_op_t;
+
+/**
+ * tidesdb_commit_hook_fn
+ * callback invoked synchronously after a transaction commits to a column family
+ */
+typedef int (*tidesdb_commit_hook_fn)(const tidesdb_commit_op_t *ops, int num_ops,
+                                      uint64_t commit_seq, void *ctx);
+
 /* forward declarations for internal types */
 #define TDB_MAX_LEVELS         32
 #define TDB_IMM_SNAP_MAX_ITEMS 16 /* max immutables in lock-free snapshot array */
@@ -252,6 +273,8 @@ typedef struct tidesdb_stats_t tidesdb_stats_t;
  * @param l1_file_count_trigger trigger for L1 file count, utilized for compaction triggering
  * @param l0_queue_stall_threshold threshold for L0 queue stall, utilized for backpressure
  * @param use_btree use btree for klog, faster reads depending on workload
+ * @param commit_hook_fn optional commit hook callback (NULL = disabled, runtime-only)
+ * @param commit_hook_ctx optional user context passed to commit hook (runtime-only)
  */
 typedef struct tidesdb_column_family_config_t
 {
@@ -280,6 +303,8 @@ typedef struct tidesdb_column_family_config_t
     int l1_file_count_trigger;
     int l0_queue_stall_threshold;
     int use_btree;
+    tidesdb_commit_hook_fn commit_hook_fn;
+    void *commit_hook_ctx;
 } tidesdb_column_family_config_t;
 
 /**
@@ -1211,6 +1236,17 @@ int tidesdb_comparator_reverse_memcmp(const uint8_t *key1, size_t key1_size, con
  */
 int tidesdb_comparator_case_insensitive(const uint8_t *key1, size_t key1_size, const uint8_t *key2,
                                         size_t key2_size, void *ctx);
+
+/**
+ * tidesdb_cf_set_commit_hook
+ * sets or clears the commit hook for a column family at runtime
+ * pass NULL for fn to disable the hook
+ * @param cf column family handle
+ * @param fn commit hook callback (or NULL to disable)
+ * @param ctx user-provided context passed to the callback
+ * @return TDB_SUCCESS on success, TDB_ERR_INVALID_ARGS if cf is NULL
+ */
+int tidesdb_cf_set_commit_hook(tidesdb_column_family_t *cf, tidesdb_commit_hook_fn fn, void *ctx);
 
 /**
  * tidesdb_compact

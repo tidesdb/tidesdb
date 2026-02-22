@@ -20923,7 +20923,7 @@ static void test_memory_pressure_level_computation(void)
     ASSERT_TRUE(db != NULL);
 
     /***** override resolved_memory_limit to 4KB for testing (bypasses 50% floor) */
-    db->resolved_memory_limit = 4096;
+    atomic_store_explicit(&db->resolved_memory_limit, (size_t)4096, memory_order_seq_cst);
 
     /* we create CF with large write_buffer_size so auto-flush doesnt drain memtable
      * before the reaper can detect pressure */
@@ -21013,7 +21013,7 @@ static void test_memory_pressure_force_flush_and_compaction(void)
     ASSERT_TRUE(db != NULL);
 
     /* we override resolved_memory_limit to 8KB for testing (bypasses 50% floor) */
-    db->resolved_memory_limit = 8192;
+    atomic_store_explicit(&db->resolved_memory_limit, (size_t)8192, memory_order_seq_cst);
 
     tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
     cf_config.write_buffer_size = 512;

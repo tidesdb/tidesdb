@@ -11626,8 +11626,10 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
             int prev_level =
                 atomic_exchange_explicit(&db->memory_pressure_level, level, memory_order_release);
 
-            /* at high or critical pressure--force-flush + aggressive compaction */
-            if (level >= TDB_MEMORY_PRESSURE_HIGH)
+            /* at high or critical pressure--force-flush + aggressive compaction
+             * but NOT during shutdown -- close has already drained work and is
+             * joining worker threads; enqueueing new work would race with shutdown */
+            if (level >= TDB_MEMORY_PRESSURE_HIGH && atomic_load(&db->is_open))
             {
                 if (level >= TDB_MEMORY_PRESSURE_CRITICAL)
                 {

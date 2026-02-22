@@ -20975,6 +20975,17 @@ static void test_memory_pressure_level_computation(void)
         }
 
         usleep(10000); /* 10ms per poll -- 10x faster than reaper cycle */
+
+        /* nudge the reaper awake every ~100ms. on MinGW x86, pthread_cond_timedwait
+         * with CLOCK_REALTIME may not timeout reliably, so the reaper can get stuck.
+         * pthread_cond_signal is known to work (shutdown uses it successfully). */
+        if (i % 10 == 0)
+        {
+            pthread_mutex_lock(&db->reaper_thread_mutex);
+            pthread_cond_signal(&db->reaper_thread_cond);
+            pthread_mutex_unlock(&db->reaper_thread_mutex);
+        }
+
         int p = atomic_load_explicit(&db->memory_pressure_level, memory_order_acquire);
         int64_t c = atomic_load_explicit(&db->cached_memtable_bytes, memory_order_acquire);
         if (p > max_pressure) max_pressure = p;
@@ -21064,11 +21075,16 @@ static void test_memory_pressure_force_flush_and_compaction(void)
 writes_done:
     printf("  wrote %d keys across flush rounds\n", total_keys);
 
-    /* we poll for pressure detection (track max observed, since pressure cycles) */
+    /* we poll for pressure detection (track max observed, since pressure cycles).
+     * nudge the reaper awake each iteration -- on MinGW x86, pthread_cond_timedwait
+     * with CLOCK_REALTIME may not timeout reliably. */
     int max_pressure = 0;
     for (int i = 0; i < 30; i++)
     {
         usleep(100000);
+        pthread_mutex_lock(&db->reaper_thread_mutex);
+        pthread_cond_signal(&db->reaper_thread_cond);
+        pthread_mutex_unlock(&db->reaper_thread_mutex);
         int p = atomic_load_explicit(&db->memory_pressure_level, memory_order_relaxed);
         if (p > max_pressure) max_pressure = p;
         if (max_pressure >= 1) break;

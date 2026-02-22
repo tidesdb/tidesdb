@@ -20936,36 +20936,39 @@ static void test_memory_pressure_level_computation(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "pressure_cf");
     ASSERT_TRUE(cf != NULL);
 
-    /* we write ~3KB of data to push past 60% of 4KB limit
-     * each KV pair is ~100 bytes, so ~30 writes should suffice */
-    for (int i = 0; i < 40; i++)
-    {
-        tidesdb_txn_t *txn = NULL;
-        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
-        char key[32], value[64];
-        snprintf(key, sizeof(key), "pressure_key_%04d", i);
-        snprintf(value, sizeof(value), "pressure_value_%04d_padding_data", i);
-        int put_result = tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
-                                         strlen(value) + 1, 0);
-        if (put_result != 0)
-        {
-            /* write may fail under critical pressure (TDB_ERR_MEMORY_LIMIT) -- thats A-----OK */
-            tidesdb_txn_free(txn);
-            break;
-        }
-        int commit_result = tidesdb_txn_commit(txn);
-        tidesdb_txn_free(txn);
-        if (commit_result != 0) break;
-    }
-
-    /* we poll for pressure level (reaper runs every 100ms, but force-flush + flush worker
-     * can drain the memtable and cycle pressure back to normal within a few hundred ms
-     * so we track the max pressure observed during the polling window) */
+    /* we poll for pressure level while continuously writing data.
+     * the reaper runs every 100ms, detects pressure, and triggers nuclear flush which
+     * drains the memtable almost instantly. we must keep writing to replenish the
+     * memtable so the reaper sees pressure on every cycle. we poll at 10ms intervals
+     * (10x faster than the reaper) to catch the brief CRITICAL spike between reaper
+     * cycles, since the pressure level is only updated once per reaper cycle. */
     int max_pressure = 0;
     int64_t max_cached = 0;
-    for (int i = 0; i < 50; i++)
+    int write_idx = 0;
+    for (int i = 0; i < 500; i++)
     {
-        usleep(100000); /* 100ms per poll */
+        /* keep writing to maintain memtable pressure across reaper cycles */
+        for (int w = 0; w < 5; w++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            if (tidesdb_txn_begin(db, &txn) != 0) break;
+            char key[32], value[64];
+            snprintf(key, sizeof(key), "pressure_key_%04d", write_idx);
+            snprintf(value, sizeof(value), "pressure_value_%04d_padding_data", write_idx);
+            write_idx++;
+            int put_result = tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1,
+                                             (uint8_t *)value, strlen(value) + 1, 0);
+            if (put_result != 0)
+            {
+                tidesdb_txn_free(txn);
+                break;
+            }
+            int commit_result = tidesdb_txn_commit(txn);
+            tidesdb_txn_free(txn);
+            if (commit_result != 0) break;
+        }
+
+        usleep(10000); /* 10ms per poll -- 10x faster than reaper cycle */
         int p = atomic_load_explicit(&db->memory_pressure_level, memory_order_relaxed);
         int64_t c = atomic_load_explicit(&db->cached_memtable_bytes, memory_order_relaxed);
         if (p > max_pressure) max_pressure = p;

@@ -20907,6 +20907,260 @@ static void test_oom_exhaustion(void)
     cleanup_test_dir();
 }
 
+static void test_memory_pressure_level_computation(void)
+{
+    cleanup_test_dir();
+
+    /* we open DB with no block cache, then override resolved_memory_limit directly
+     * to a tiny value so memtable data alone triggers pressure thresholds.
+     * we bypass max_memory_usage config because the 50% floor would clamp it. */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.block_cache_size = 0;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    /***** override resolved_memory_limit to 4KB for testing (bypasses 50% floor) */
+    db->resolved_memory_limit = 4096;
+
+    /* we create CF with large write_buffer_size so auto-flush doesnt drain memtable
+     * before the reaper can detect pressure */
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 65536; /* 64KB -- much larger than 4KB limit */
+    cf_config.enable_bloom_filter = 0;
+    cf_config.enable_block_indexes = 0;
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "pressure_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "pressure_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* we write ~3KB of data to push past 60% of 4KB limit
+     * each KV pair is ~100 bytes, so ~30 writes should suffice */
+    for (int i = 0; i < 40; i++)
+    {
+        tidesdb_txn_t *txn = NULL;
+        ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "pressure_key_%04d", i);
+        snprintf(value, sizeof(value), "pressure_value_%04d_padding_data", i);
+        int put_result = tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1, (uint8_t *)value,
+                                         strlen(value) + 1, 0);
+        if (put_result != 0)
+        {
+            /* write may fail under critical pressure (TDB_ERR_MEMORY_LIMIT) -- thats A-----OK */
+            tidesdb_txn_free(txn);
+            break;
+        }
+        int commit_result = tidesdb_txn_commit(txn);
+        tidesdb_txn_free(txn);
+        if (commit_result != 0) break;
+    }
+
+    /* we poll for pressure level (reaper runs every 100ms, but force-flush + flush worker
+     * can drain the memtable and cycle pressure back to normal within a few hundred ms
+     * so we track the max pressure observed during the polling window) */
+    int max_pressure = 0;
+    int64_t max_cached = 0;
+    for (int i = 0; i < 50; i++)
+    {
+        usleep(100000); /* 100ms per poll */
+        int p = atomic_load_explicit(&db->memory_pressure_level, memory_order_relaxed);
+        int64_t c = atomic_load_explicit(&db->cached_memtable_bytes, memory_order_relaxed);
+        if (p > max_pressure) max_pressure = p;
+        if (c > max_cached) max_cached = c;
+        if (max_pressure >= 1) break;
+    }
+
+    printf("  max memory_pressure_level observed = %d (expected >= 1)\n", max_pressure);
+    ASSERT_TRUE(max_pressure >= 1); /* at least ELEVATED was seen */
+
+    printf("  max cached_memtable_bytes observed = %" PRId64 "\n", max_cached);
+    ASSERT_TRUE(max_cached > 0);
+
+    /* we verify data is still readable */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    int result = tidesdb_txn_get(txn, cf, (uint8_t *)"pressure_key_0000", 18, &value, &value_size);
+    ASSERT_EQ(result, 0);
+    ASSERT_TRUE(value != NULL);
+    free(value);
+    tidesdb_txn_free(txn);
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_memory_pressure_force_flush_and_compaction(void)
+{
+    cleanup_test_dir();
+
+    /* we open DB with no block cache, then override resolved_memory_limit directly
+     * to a tiny value to trigger HIGH/CRITICAL pressure quickly.
+     * we bypass max_memory_usage config because the 50% floor would clamp it. */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.block_cache_size = 0;
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    /* we override resolved_memory_limit to 8KB for testing (bypasses 50% floor) */
+    db->resolved_memory_limit = 8192;
+
+    tidesdb_column_family_config_t cf_config = tidesdb_default_column_family_config();
+    cf_config.write_buffer_size = 512;
+    cf_config.enable_bloom_filter = 1;
+    cf_config.enable_block_indexes = 1;
+    cf_config.l0_queue_stall_threshold = 30; /* high threshold so per-CF stall doesnt interfere */
+
+    ASSERT_EQ(tidesdb_create_column_family(db, "compact_pressure_cf", &cf_config), 0);
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "compact_pressure_cf");
+    ASSERT_TRUE(cf != NULL);
+
+    /* write data in rounds, flushing to create multiple sstables
+     * each round writes ~500 bytes then flushes --> creates an SSTable with bloom + index */
+    int total_keys = 0;
+    for (int round = 0; round < 8; round++)
+    {
+        for (int i = 0; i < 5; i++)
+        {
+            tidesdb_txn_t *txn = NULL;
+            ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+            char key[32], value[64];
+            snprintf(key, sizeof(key), "cpk_%02d_%02d", round, i);
+            snprintf(value, sizeof(value), "cpv_%02d_%02d_data", round, i);
+            int put_result = tidesdb_txn_put(txn, cf, (uint8_t *)key, strlen(key) + 1,
+                                             (uint8_t *)value, strlen(value) + 1, 0);
+            if (put_result != 0)
+            {
+                tidesdb_txn_free(txn);
+                goto writes_done;
+            }
+            int commit_result = tidesdb_txn_commit(txn);
+            tidesdb_txn_free(txn);
+            if (commit_result != 0) goto writes_done;
+            total_keys++;
+        }
+        tidesdb_flush_memtable(cf);
+        /* we wait for flush to process */
+        usleep(100000);
+    }
+
+writes_done:
+    printf("  wrote %d keys across flush rounds\n", total_keys);
+
+    /* we poll for pressure detection (track max observed, since pressure cycles) */
+    int max_pressure = 0;
+    for (int i = 0; i < 30; i++)
+    {
+        usleep(100000);
+        int p = atomic_load_explicit(&db->memory_pressure_level, memory_order_relaxed);
+        if (p > max_pressure) max_pressure = p;
+        if (max_pressure >= 1) break;
+    }
+    printf("  max memory_pressure_level observed = %d\n", max_pressure);
+
+    for (int i = 0; i < 100; i++)
+    {
+        usleep(50000);
+        if (queue_size(db->flush_queue) == 0 && queue_size(db->compaction_queue) == 0 &&
+            !atomic_load_explicit(&cf->is_compacting, memory_order_acquire))
+        {
+            usleep(100000);
+            break;
+        }
+    }
+
+    /* we verify all written data is still readable */
+    tidesdb_txn_t *txn = NULL;
+    ASSERT_EQ(tidesdb_txn_begin(db, &txn), 0);
+
+    int found = 0;
+    for (int round = 0; round < 8; round++)
+    {
+        for (int i = 0; i < 5; i++)
+        {
+            if (found >= total_keys) break;
+            char key[32];
+            snprintf(key, sizeof(key), "cpk_%02d_%02d", round, i);
+            uint8_t *value = NULL;
+            size_t value_size = 0;
+            int result =
+                tidesdb_txn_get(txn, cf, (uint8_t *)key, strlen(key) + 1, &value, &value_size);
+            ASSERT_EQ(result, 0);
+            ASSERT_TRUE(value != NULL);
+            free(value);
+            found++;
+        }
+    }
+    printf("  verified %d/%d keys readable after pressure + compaction\n", found, total_keys);
+    ASSERT_EQ(found, total_keys);
+
+    tidesdb_txn_free(txn);
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
+static void test_memory_pressure_auto_limit(void)
+{
+    cleanup_test_dir();
+
+    /* we verify max_memory_usage = 0 auto-resolves to 80% of total memory */
+    tidesdb_config_t config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.max_memory_usage = 0; /* auto */
+
+    tidesdb_t *db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    /* resolved_memory_limit should be ~80% of total_memory */
+    ASSERT_TRUE(db->resolved_memory_limit > 0);
+    ASSERT_TRUE(db->total_memory > 0);
+
+    size_t expected = (size_t)((double)db->total_memory * 0.80);
+    /* allow 1% tolerance for floating point */
+    size_t diff = db->resolved_memory_limit > expected ? db->resolved_memory_limit - expected
+                                                       : expected - db->resolved_memory_limit;
+    ASSERT_TRUE(diff <= expected / 100);
+
+    printf("  total_memory = %" PRIu64 ", resolved_memory_limit = %zu (expected ~%zu)\n",
+           db->total_memory, db->resolved_memory_limit, expected);
+
+    /* pressure should be normal under auto limit with no data */
+    usleep(200000); /* wait for reaper */
+    int pressure = atomic_load_explicit(&db->memory_pressure_level, memory_order_relaxed);
+    ASSERT_EQ(pressure, 0); /* NORMAL */
+
+    size_t total_mem = db->total_memory;
+    tidesdb_close(db);
+    cleanup_test_dir();
+
+    /* we verify absurdly low max_memory_usage gets clamped to 50% floor */
+    cleanup_test_dir();
+    config = tidesdb_default_config();
+    config.db_path = TEST_DB_PATH;
+    config.max_memory_usage = 1024; /* 1KB -- way below floor */
+
+    db = NULL;
+    ASSERT_EQ(tidesdb_open(&config, &db), 0);
+    ASSERT_TRUE(db != NULL);
+
+    size_t floor = (size_t)((double)total_mem * 0.50);
+    printf("  floor clamp test: requested=1024, resolved=%zu, expected_floor~=%zu\n",
+           db->resolved_memory_limit, floor);
+    ASSERT_TRUE(db->resolved_memory_limit >= floor);
+    ASSERT_TRUE(db->resolved_memory_limit > 1024); /* definitely not the raw value */
+
+    tidesdb_close(db);
+    cleanup_test_dir();
+}
+
 int main(void)
 {
     cleanup_test_dir();
@@ -21207,6 +21461,9 @@ int main(void)
     RUN_TEST(test_commit_hook_via_config, tests_passed);
     RUN_TEST(test_commit_hook_sequence_monotonic, tests_passed);
     RUN_TEST(test_oom_exhaustion, tests_passed);
+    RUN_TEST(test_memory_pressure_auto_limit, tests_passed);
+    RUN_TEST(test_memory_pressure_level_computation, tests_passed);
+    RUN_TEST(test_memory_pressure_force_flush_and_compaction, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

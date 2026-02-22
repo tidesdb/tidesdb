@@ -335,6 +335,7 @@ typedef struct tidesdb_comparator_entry_t
  * @param max_open_sstables maximum number of open sstables
  * @param log_to_file flag to determine if debug logging should be written to a file
  * @param log_truncation_at size in bytes at which to truncate the log file, 0 = no truncation
+ * @param max_memory_usage maximum memory usage for the database
  */
 typedef struct tidesdb_config_t
 {
@@ -346,6 +347,7 @@ typedef struct tidesdb_config_t
     size_t max_open_sstables;
     int log_to_file;
     size_t log_truncation_at;
+    size_t max_memory_usage;
 } tidesdb_config_t;
 
 /**
@@ -561,6 +563,9 @@ struct tidesdb_level_t
  * @param cached_current_time cached current time updated by reaper thread to avoid syscalls
  * @param available_memory available system memory in bytes
  * @param total_memory total system memory in bytes
+ * @param resolved_memory_limit resolved global memory limit in bytes
+ * @param cached_memtable_bytes cached total memtable + cache memory (updated by reaper)
+ * @param memory_pressure_level cached pressure level 0=normal 1=elevated 2=high 3=critical
  * @param cf_list_lock rwlock for cf list modifications
  * @param lock_fd file descriptor for lock file
  * @param log_file file descriptor for log file
@@ -605,6 +610,9 @@ struct tidesdb_t
     _Atomic(time_t) cached_current_time;
     uint64_t available_memory;
     uint64_t total_memory;
+    size_t resolved_memory_limit;
+    _Atomic(int64_t) cached_memtable_bytes;
+    _Atomic(int) memory_pressure_level;
     pthread_rwlock_t cf_list_lock;
     _Atomic(tidesdb_deferred_free_node_t *) deferred_free_list;
     int lock_fd;

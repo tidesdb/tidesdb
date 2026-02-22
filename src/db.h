@@ -222,6 +222,7 @@ typedef struct tidesdb_column_family_config_t
  * @param max_open_sstables maximum number of open sstables
  * @param log_to_file flag to determine if debug logging should be written to a file\
  * @param log_truncation_at log file truncation threshold (0 = no truncation)
+ * @param max_memory_usage global memory limit in bytes (0 = auto, 80%% of total system memory)
  */
 typedef struct tidesdb_config_t
 {
@@ -233,6 +234,7 @@ typedef struct tidesdb_config_t
     size_t max_open_sstables;
     int log_to_file;
     size_t log_truncation_at;
+    size_t max_memory_usage;
 } tidesdb_config_t;
 
 /**

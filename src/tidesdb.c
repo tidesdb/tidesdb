@@ -3432,6 +3432,31 @@ static void tidesdb_immutable_memtable_unref(tidesdb_immutable_memtable_t *imm)
 }
 
 /**
+ * tidesdb_memtable_try_ref
+ * try to increment reference count of a memtable using CAS
+ * this is safe to call on a memtable that might be concurrently freed
+ * (e.g. the active memtable which can rotate to immutable and get cleaned up)
+ * @param mt memtable to reference
+ * @return 1 if reference was acquired, 0 if memtable is being freed (refcount was 0)
+ */
+static int tidesdb_memtable_try_ref(tidesdb_memtable_t *mt)
+{
+    if (!mt) return 0;
+
+    int old = atomic_load_explicit(&mt->refcount, memory_order_acquire);
+    for (;;)
+    {
+        if (old <= 0) return 0; /* being freed or already freed */
+        if (atomic_compare_exchange_weak_explicit(&mt->refcount, &old, old + 1,
+                                                  memory_order_acq_rel, memory_order_acquire))
+        {
+            return 1;
+        }
+        /* CAS failed, old was updated by the CAS, retry */
+    }
+}
+
+/**
  * tidesdb_imm_snap_publish
  * rebuild the lock-free immutable snapshot from the current queue contents
  * uses double-buffered RCU, building in inactive slot, swap active index,
@@ -11486,8 +11511,12 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
 
         /*** -----global memory pressure computations-----
          ** we scan all CFs to compute total memtable + cache + bloom/index memory
-         * we store pressure level atomically for write path to consume */
-        if (db->resolved_memory_limit > 0)
+         * we store pressure level atomically for write path to consume
+         * we use explicit atomic_load to guarantee cross-thread visibility
+         * of test overrides and runtime changes on all compilers (MSVC, MinGW) */
+        const size_t mem_limit =
+            atomic_load_explicit(&db->resolved_memory_limit, memory_order_acquire);
+        if (mem_limit > 0)
         {
             int64_t total_mem_bytes = 0;
 
@@ -11590,7 +11619,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                                   memory_order_relaxed);
 
             /* we compute pressure level from ratio */
-            double ratio = (double)total_mem_bytes / (double)db->resolved_memory_limit;
+            double ratio = (double)total_mem_bytes / (double)mem_limit;
             int level = TDB_MEMORY_PRESSURE_NORMAL;
             if (ratio >= TDB_MEMORY_PRESSURE_CRITICAL_RATIO)
                 level = TDB_MEMORY_PRESSURE_CRITICAL;
@@ -11627,7 +11656,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 atomic_exchange_explicit(&db->memory_pressure_level, level, memory_order_release);
 
             /* at high or critical pressure--force-flush + aggressive compaction
-             * but NOT during shutdown -- close has already drained work and is
+             * but not during shutdown -- close has already drained work and is
              * joining worker threads; enqueueing new work would race with shutdown */
             if (level >= TDB_MEMORY_PRESSURE_HIGH && atomic_load(&db->is_open))
             {
@@ -11646,8 +11675,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                         TDB_DEBUG_LOG(TDB_LOG_WARN,
                                       "Memory pressure CRITICAL: nuclear flush CF '%s' "
                                       "(global %" PRId64 "/%zu bytes, %.1f%%)",
-                                      victim->name, total_mem_bytes, db->resolved_memory_limit,
-                                      ratio * 100.0);
+                                      victim->name, total_mem_bytes, mem_limit, ratio * 100.0);
                         tidesdb_flush_memtable_internal(victim, 0, 1);
                     }
                     pthread_rwlock_unlock(&db->cf_list_lock);
@@ -11658,8 +11686,8 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                     TDB_DEBUG_LOG(TDB_LOG_WARN,
                                   "Memory pressure HIGH: force-flushing CF '%s' "
                                   "(memtable %zu bytes, global %" PRId64 "/%zu bytes, %.1f%%)",
-                                  flush_victim->name, flush_victim_size, total_mem_bytes,
-                                  db->resolved_memory_limit, ratio * 100.0);
+                                  flush_victim->name, flush_victim_size, total_mem_bytes, mem_limit,
+                                  ratio * 100.0);
                     tidesdb_flush_memtable_internal(flush_victim, 0, 1);
                 }
 
@@ -11682,8 +11710,7 @@ static void *tidesdb_sstable_reaper_thread(void *arg)
                 TDB_DEBUG_LOG(level >= TDB_MEMORY_PRESSURE_HIGH ? TDB_LOG_WARN : TDB_LOG_INFO,
                               "Memory pressure level changed: %d -> %d "
                               "(%.1f%% of limit, %" PRId64 " / %zu bytes)",
-                              prev_level, level, ratio * 100.0, total_mem_bytes,
-                              db->resolved_memory_limit);
+                              prev_level, level, ratio * 100.0, total_mem_bytes, mem_limit);
             }
         }
 
@@ -15143,10 +15170,15 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
         visibility_check = tidesdb_visibility_check_callback;
     }
 
-    /* we now load active memtable -- any keys that rotated are already in our immutable snapshot */
+    /* we now load active memtable with refcount protection
+     * skip_list_get_with_seq_ref returns a zero-copy pointer into the arena,
+     * so the memtable must stay alive through the memcpy.
+     * use CAS-based try_ref to safely handle concurrent rotation+cleanup.
+     * if try_ref fails the memtable is being freed -- fall through to immutables */
     tidesdb_memtable_t *active_mt_struct =
         atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
-    skip_list_t *active_mt = active_mt_struct ? active_mt_struct->skip_list : NULL;
+    int active_mt_refed = tidesdb_memtable_try_ref(active_mt_struct);
+    skip_list_t *active_mt = active_mt_refed ? active_mt_struct->skip_list : NULL;
 
     atomic_thread_fence(memory_order_acquire);
 
@@ -15167,23 +15199,34 @@ int tidesdb_txn_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf, const uint8
     {
         if (deleted)
         {
+            if (active_mt_refed) tidesdb_immutable_memtable_unref(active_mt_struct);
             return TDB_ERR_NOT_FOUND;
         }
 
         if (ttl <= 0 || ttl > now)
         {
             *value = malloc(temp_value_size);
-            if (*value == NULL) return TDB_ERR_MEMORY;
+            if (*value == NULL)
+            {
+                if (active_mt_refed) tidesdb_immutable_memtable_unref(active_mt_struct);
+                return TDB_ERR_MEMORY;
+            }
             memcpy(*value, temp_value, temp_value_size);
             *value_size = temp_value_size;
+
+            if (active_mt_refed) tidesdb_immutable_memtable_unref(active_mt_struct);
 
             PROFILE_INC(txn->db, memtable_hits);
             tidesdb_txn_add_to_read_set(txn, cf, key, key_size, found_seq);
             return TDB_SUCCESS;
         }
 
+        if (active_mt_refed) tidesdb_immutable_memtable_unref(active_mt_struct);
         return TDB_ERR_NOT_FOUND;
     }
+
+    /* active memtable ref no longer needed -- value was not found there */
+    if (active_mt_refed) tidesdb_immutable_memtable_unref(active_mt_struct);
 
     /* we use lock-free snapshot to search immutable memtables
      * acquire holds a reader count on the snapshot slot -- no malloc, no per-item refs
@@ -15804,11 +15847,14 @@ static int tidesdb_txn_check_key_conflict(const tidesdb_txn_t *txn, tidesdb_colu
     }
 
     tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+    int mt_refed = tidesdb_memtable_try_ref(mt);
 
-    if (tidesdb_txn_check_seq_conflict(mt ? mt->skip_list : NULL, key, key_size, threshold_seq))
+    if (mt_refed && tidesdb_txn_check_seq_conflict(mt->skip_list, key, key_size, threshold_seq))
     {
+        tidesdb_immutable_memtable_unref(mt);
         return TDB_ERR_CONFLICT;
     }
+    if (mt_refed) tidesdb_immutable_memtable_unref(mt);
 
     for (size_t i = 0; i < *imm_count; i++)
     {
@@ -16430,7 +16476,14 @@ int tidesdb_txn_commit(tidesdb_txn_t *txn)
         tidesdb_column_family_t *cf = txn->cfs[cf_idx];
         tidesdb_memtable_t *mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
 
-        if (mt) atomic_fetch_add_explicit(&mt->refcount, 1, memory_order_acq_rel);
+        /* we use CAS-based try_ref to safely handle the case where the loaded
+         * memtable was rotated to immutable and freed between our load and ref.
+         * if try_ref fails, reload -- the new active memtable will be current */
+        if (!tidesdb_memtable_try_ref(mt))
+        {
+            mt = atomic_load_explicit(&cf->active_memtable, memory_order_acquire);
+            (void)tidesdb_memtable_try_ref(mt); /* new active should always succeed */
+        }
         cf_memtables[cf_idx] = mt;
         cf_skiplists[cf_idx] = mt ? mt->skip_list : NULL;
 

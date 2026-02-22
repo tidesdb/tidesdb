@@ -20936,16 +20936,22 @@ static void test_memory_pressure_level_computation(void)
     tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "pressure_cf");
     ASSERT_TRUE(cf != NULL);
 
+    /* we verify the override was stored (sanity check for atomic visibility) */
+    size_t stored_limit = atomic_load_explicit(&db->resolved_memory_limit, memory_order_seq_cst);
+    printf("  resolved_memory_limit after override = %zu (expected 4096)\n", stored_limit);
+    ASSERT_EQ((int)stored_limit, 4096);
+
     /* we poll for pressure level while continuously writing data.
      * the reaper runs every 100ms, detects pressure, and triggers nuclear flush which
      * drains the memtable almost instantly. we must keep writing to replenish the
      * memtable so the reaper sees pressure on every cycle. we poll at 10ms intervals
      * (10x faster than the reaper) to catch the brief CRITICAL spike between reaper
-     * cycles, since the pressure level is only updated once per reaper cycle. */
+     * cycles, since the pressure level is only updated once per reaper cycle.
+     * we use 800 iterations (8 seconds) to accommodate slow windows CI!!! */
     int max_pressure = 0;
     int64_t max_cached = 0;
     int write_idx = 0;
-    for (int i = 0; i < 500; i++)
+    for (int i = 0; i < 800; i++)
     {
         /* keep writing to maintain memtable pressure across reaper cycles */
         for (int w = 0; w < 5; w++)
@@ -20969,18 +20975,19 @@ static void test_memory_pressure_level_computation(void)
         }
 
         usleep(10000); /* 10ms per poll -- 10x faster than reaper cycle */
-        int p = atomic_load_explicit(&db->memory_pressure_level, memory_order_relaxed);
-        int64_t c = atomic_load_explicit(&db->cached_memtable_bytes, memory_order_relaxed);
+        int p = atomic_load_explicit(&db->memory_pressure_level, memory_order_acquire);
+        int64_t c = atomic_load_explicit(&db->cached_memtable_bytes, memory_order_acquire);
         if (p > max_pressure) max_pressure = p;
         if (c > max_cached) max_cached = c;
         if (max_pressure >= 1) break;
     }
 
-    printf("  max memory_pressure_level observed = %d (expected >= 1)\n", max_pressure);
-    ASSERT_TRUE(max_pressure >= 1); /* at least ELEVATED was seen */
-
+    /* print diagnostics before assertions so they appear in CI logs on failure */
     printf("  max cached_memtable_bytes observed = %" PRId64 "\n", max_cached);
+    printf("  max memory_pressure_level observed = %d (expected >= 1)\n", max_pressure);
+    printf("  total writes = %d\n", write_idx);
     ASSERT_TRUE(max_cached > 0);
+    ASSERT_TRUE(max_pressure >= 1); /* at least ELEVATED was seen */
 
     /* we verify data is still readable */
     tidesdb_txn_t *txn = NULL;

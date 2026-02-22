@@ -1210,7 +1210,7 @@ static int tidesdb_cache_block_put(tidesdb_t *db, const char *cf_name, const cha
  * @param block_position position of block in file
  * @param block already-deserialized klog block (ownership transferred to rc_block)
  * @param rc_block_out output ref-counted block with ref_count=2 (cache + caller)
- * @return 0 on success, -1 on failure (block ownership NOT transferred on failure)
+ * @return 0 on success, -1 on failure (block ownership not transferred on failure)
  */
 static int tidesdb_cache_block_put_deserialized(tidesdb_t *db, const char *cf_name,
                                                 const char *klog_path,
@@ -2752,6 +2752,10 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
         return 0; /* already open */
     }
 
+    /* we track whether the sstable was fully closed (evicted by reaper) so we can
+     * update num_open_sstables after reopening */
+    const int was_fully_closed = (!sst->klog_bm && !sst->vlog_bm);
+
     /* we open block managers if needed, using CAS to prevent race conditions
      * where two threads both try to open the same sstable simultaneously */
     if (!sst->klog_bm)
@@ -2799,6 +2803,13 @@ static int tidesdb_sstable_ensure_open(tidesdb_t *db, tidesdb_sstable_t *sst)
     }
 
     atomic_store(&sst->last_access_time, atomic_load(&db->cached_current_time));
+
+    /* if we transitioned from fully-closed to fully-open, track it
+     * this balances the reaper's decrement when it evicts the sstable */
+    if (was_fully_closed && sst->klog_bm && sst->vlog_bm)
+    {
+        atomic_fetch_add(&db->num_open_sstables, 1);
+    }
 
     return 0;
 }
@@ -2968,15 +2979,22 @@ static void tidesdb_sstable_free(tidesdb_sstable_t *sst)
         }
     }
 
-    if (sst->klog_bm)
     {
-        block_manager_close(sst->klog_bm);
-        sst->klog_bm = NULL;
-    }
-    if (sst->vlog_bm)
-    {
-        block_manager_close(sst->vlog_bm);
-        sst->vlog_bm = NULL;
+        const int had_open_bms = (sst->klog_bm != NULL || sst->vlog_bm != NULL);
+        if (sst->klog_bm)
+        {
+            block_manager_close(sst->klog_bm);
+            sst->klog_bm = NULL;
+        }
+        if (sst->vlog_bm)
+        {
+            block_manager_close(sst->vlog_bm);
+            sst->vlog_bm = NULL;
+        }
+        if (had_open_bms && sst->db)
+        {
+            atomic_fetch_sub(&sst->db->num_open_sstables, 1);
+        }
     }
 
     /* we delete files only when refcount reaches 0
@@ -8628,15 +8646,16 @@ static int tidesdb_full_preemptive_merge(tidesdb_column_family_t *cf, int start_
     new_sst->vlog_bm = vlog_bm;
     atomic_store(&new_sst->last_access_time,
                  atomic_load_explicit(&cf->db->cached_current_time, memory_order_relaxed));
-    atomic_fetch_add(&cf->db->num_open_sstables, 1);
 
     /* we ensure all writes are visible before making sstable discoverable */
     atomic_thread_fence(memory_order_seq_cst);
 
-    /* we close write handles before adding to level
-     * readers will reopen files on-demand through tidesdb_sstable_ensure_open
-     * this prevents file locking issues where readers try to open files
-     * that are still open for writing */
+    /******     we close write handles before adding to level
+     *****      readers will reopen files on-demand through tidesdb_sstable_ensure_open
+     ****       this prevents file locking issues where readers try to open files
+     ***        that are still open for writing
+     **         note -- we do not increment num_open_sstables here because we close
+     *          immediately -- ensure_open will increment when a reader reopens */
     if (klog_bm)
     {
         block_manager_close(klog_bm);
@@ -10981,15 +11000,22 @@ static void *tidesdb_flush_worker_thread(void *arg)
          * readers will reopen files on-demand through tidesdb_sstable_ensure_open
          * this prevents file locking issues where readers cannot open files
          * that are still held open by the flush worker */
-        if (sst->klog_bm)
         {
-            block_manager_close(sst->klog_bm);
-            sst->klog_bm = NULL;
-        }
-        if (sst->vlog_bm)
-        {
-            block_manager_close(sst->vlog_bm);
-            sst->vlog_bm = NULL;
+            const int had_open_bms = (sst->klog_bm != NULL || sst->vlog_bm != NULL);
+            if (sst->klog_bm)
+            {
+                block_manager_close(sst->klog_bm);
+                sst->klog_bm = NULL;
+            }
+            if (sst->vlog_bm)
+            {
+                block_manager_close(sst->vlog_bm);
+                sst->vlog_bm = NULL;
+            }
+            if (had_open_bms)
+            {
+                atomic_fetch_sub(&db->num_open_sstables, 1);
+            }
         }
 
         /* we validate flush ordering -- new sst should have higher sequence than existing ones

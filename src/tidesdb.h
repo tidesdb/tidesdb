@@ -610,7 +610,7 @@ struct tidesdb_t
     _Atomic(time_t) cached_current_time;
     uint64_t available_memory;
     uint64_t total_memory;
-    size_t resolved_memory_limit;
+    _Atomic(size_t) resolved_memory_limit;
     _Atomic(int64_t) cached_memtable_bytes;
     _Atomic(int) memory_pressure_level;
     pthread_rwlock_t cf_list_lock;

@@ -5861,14 +5861,16 @@ static int tidesdb_level_add_sstable(tidesdb_level_t *level, tidesdb_sstable_t *
 
     while (1)
     {
-        /* we load current array state atomically */
-        tidesdb_sstable_t **old_arr = atomic_load_explicit(&level->sstables, memory_order_acquire);
-        int old_capacity = atomic_load_explicit(&level->sstables_capacity, memory_order_acquire);
+        /* we load count and capacity before the array pointer
+         * count-after-CAS guarantees the array is always large enough for the count
+         * loading num first ensures old_arr[old_num] is always within bounds
+         * (the array is at least as new as the count, so it has room for the sentinel) */
         int old_num = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
+        int old_capacity = atomic_load_explicit(&level->sstables_capacity, memory_order_acquire);
+        tidesdb_sstable_t **old_arr = atomic_load_explicit(&level->sstables, memory_order_acquire);
 
         /* spin until (old_arr, old_num) are consistent
-         * another writer may have CAS'd a new array but not yet updated num_sstables
-         * arrays are calloc'd with a +1 sentinel slot so old_arr[old_num] is always safe */
+         * another writer may have CAS'd a new array but not yet updated num_sstables */
         if (old_arr[old_num] != NULL)
         {
             cpu_pause();
@@ -5976,10 +5978,13 @@ static int tidesdb_level_remove_sstable(const tidesdb_t *db, tidesdb_level_t *le
 {
     while (1)
     {
-        tidesdb_sstable_t **old_arr = atomic_load_explicit(&level->sstables, memory_order_acquire);
+        /* we load count and capacity before the array pointer
+         * count-after-CAS guarantees the array is always large enough for the count
+         * loading num first ensures old_arr[old_num] is always within bounds */
         int old_num = atomic_load_explicit(&level->num_sstables, memory_order_acquire);
         const int old_capacity =
             atomic_load_explicit(&level->sstables_capacity, memory_order_acquire);
+        tidesdb_sstable_t **old_arr = atomic_load_explicit(&level->sstables, memory_order_acquire);
 
         /* spin until (old_arr, old_num) are consistent
          * another writer may have CAS'd a new array but not yet updated num_sstables */

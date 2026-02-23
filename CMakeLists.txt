@@ -391,6 +391,9 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     if(NOT DEFINED BENCH_DB_COMPACTION_POOL_THREADS)
         set(BENCH_DB_COMPACTION_POOL_THREADS 2)
     endif()
+    if(NOT DEFINED BENCH_DB_MAX_MEMORY)
+        math(EXPR BENCH_DB_MAX_MEMORY 0) # 0 defaults to 80% of system memory
+    endif()
 
     # column family configuration variables for benchmark
     if(NOT DEFINED BENCH_WRITE_BUFFER_SIZE)
@@ -488,6 +491,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
             BENCH_NUM_THREADS=${BENCH_NUM_THREADS}
             BENCH_DB_LOG_LEVEL=${BENCH_DB_LOG_LEVEL}
             BENCH_DB_PATH=\"${BENCH_DB_PATH}\"
+            BENCH_DB_MAX_MEMORY=${BENCH_DB_MAX_MEMORY}
             BENCH_KEY_PATTERN=\"${BENCH_KEY_PATTERN}\"
             BENCH_WRITE_BUFFER_SIZE=${BENCH_WRITE_BUFFER_SIZE}
             BENCH_LEVEL_RATIO=${BENCH_LEVEL_RATIO}

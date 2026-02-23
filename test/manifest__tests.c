@@ -775,6 +775,170 @@ void test_manifest_duplicate_id_handling()
     remove(test_path);
 }
 
+void test_manifest_null_safety(void)
+{
+    /* tidesdb_manifest_open with NULL path */
+    ASSERT_TRUE(tidesdb_manifest_open(NULL) == NULL);
+
+    /* tidesdb_manifest_add_sstable with NULL manifest */
+    ASSERT_EQ(tidesdb_manifest_add_sstable(NULL, 1, 100, 1000, 65536), -1);
+
+    /* tidesdb_manifest_remove_sstable with NULL manifest */
+    ASSERT_EQ(tidesdb_manifest_remove_sstable(NULL, 1, 100), -1);
+
+    /* tidesdb_manifest_has_sstable with NULL manifest */
+    ASSERT_EQ(tidesdb_manifest_has_sstable(NULL, 1, 100), 0);
+
+    /* tidesdb_manifest_update_sequence with NULL should not crash */
+    tidesdb_manifest_update_sequence(NULL, 12345);
+
+    /* tidesdb_manifest_commit with NULL manifest */
+    ASSERT_EQ(tidesdb_manifest_commit(NULL, "some_path"), -1);
+
+    /* tidesdb_manifest_commit with NULL path */
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
+    ASSERT_TRUE(manifest != NULL);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, NULL), -1);
+    tidesdb_manifest_close(manifest);
+    remove(TEST_MANIFEST_PATH);
+
+    /* tidesdb_manifest_close with NULL should not crash */
+    tidesdb_manifest_close(NULL);
+}
+
+void test_manifest_commit_different_path(void)
+{
+    const char *path1 = "." PATH_SEPARATOR "test_manifest_path1";
+    const char *path2 = "." PATH_SEPARATOR "test_manifest_path2";
+
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(path1);
+    ASSERT_TRUE(manifest != NULL);
+
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    tidesdb_manifest_update_sequence(manifest, 5000);
+
+    /* we commit to path1 first */
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, path1), 0);
+
+    /* we add more data and commit to a different path */
+    tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072);
+    tidesdb_manifest_update_sequence(manifest, 6000);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, path2), 0);
+
+    tidesdb_manifest_close(manifest);
+
+    /* we verify path2 has all entries */
+    tidesdb_manifest_t *m2 = tidesdb_manifest_open(path2);
+    ASSERT_TRUE(m2 != NULL);
+    ASSERT_EQ(m2->num_entries, 2);
+    ASSERT_EQ(m2->sequence, 6000);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 1, 100));
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 2, 200));
+    tidesdb_manifest_close(m2);
+
+    /* we verify path1 still has original data */
+    tidesdb_manifest_t *m1 = tidesdb_manifest_open(path1);
+    ASSERT_TRUE(m1 != NULL);
+    ASSERT_EQ(m1->num_entries, 1);
+    ASSERT_EQ(m1->sequence, 5000);
+    tidesdb_manifest_close(m1);
+
+    remove(path1);
+    remove(path2);
+}
+
+void test_manifest_corrupted_version_nonnumeric(void)
+{
+    const char *test_path = "." PATH_SEPARATOR "test_nonnumeric_manifest";
+
+    FILE *f = tdb_fopen(test_path, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f, "abc\n1000\n1,100,1000,65536\n");
+    fclose(f);
+
+    /* non-numeric version should fail to parse (endptr == line) */
+    tidesdb_manifest_t *m = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(m == NULL);
+
+    remove(test_path);
+}
+
+void test_manifest_remove_to_zero(void)
+{
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(TEST_MANIFEST_PATH);
+    ASSERT_TRUE(manifest != NULL);
+
+    tidesdb_manifest_add_sstable(manifest, 1, 100, 1000, 65536);
+    ASSERT_EQ(manifest->num_entries, 1);
+
+    /* we remove the sole entry */
+    ASSERT_EQ(tidesdb_manifest_remove_sstable(manifest, 1, 100), 0);
+    ASSERT_EQ(manifest->num_entries, 0);
+    ASSERT_FALSE(tidesdb_manifest_has_sstable(manifest, 1, 100));
+
+    /* we verify we can still add after emptying */
+    ASSERT_EQ(tidesdb_manifest_add_sstable(manifest, 2, 200, 2000, 131072), 0);
+    ASSERT_EQ(manifest->num_entries, 1);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(manifest, 2, 200));
+
+    tidesdb_manifest_close(manifest);
+    remove(TEST_MANIFEST_PATH);
+}
+
+void test_manifest_commit_empty(void)
+{
+    const char *test_path = "." PATH_SEPARATOR "test_empty_commit_manifest";
+
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(manifest != NULL);
+    ASSERT_EQ(manifest->num_entries, 0);
+
+    /* we commit with zero entries */
+    tidesdb_manifest_update_sequence(manifest, 42);
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path), 0);
+    tidesdb_manifest_close(manifest);
+
+    /* we reload and verify */
+    tidesdb_manifest_t *m2 = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(m2 != NULL);
+    ASSERT_EQ(m2->num_entries, 0);
+    ASSERT_EQ(m2->sequence, 42);
+    tidesdb_manifest_close(m2);
+
+    remove(test_path);
+}
+
+void test_manifest_large_uint64_roundtrip(void)
+{
+    const char *test_path = "." PATH_SEPARATOR "test_large_uint64_manifest";
+
+    tidesdb_manifest_t *manifest = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(manifest != NULL);
+
+    const uint64_t large_id = UINT64_MAX - 1;
+    const uint64_t large_entries = UINT64_MAX / 2;
+    const uint64_t large_size = UINT64_MAX;
+
+    tidesdb_manifest_add_sstable(manifest, 1, large_id, large_entries, large_size);
+    tidesdb_manifest_update_sequence(manifest, UINT64_MAX);
+
+    ASSERT_EQ(tidesdb_manifest_commit(manifest, test_path), 0);
+    tidesdb_manifest_close(manifest);
+
+    /* we reload and verify large values survived round-trip */
+    tidesdb_manifest_t *m2 = tidesdb_manifest_open(test_path);
+    ASSERT_TRUE(m2 != NULL);
+    ASSERT_EQ(m2->num_entries, 1);
+    ASSERT_EQ(m2->sequence, UINT64_MAX);
+    ASSERT_TRUE(tidesdb_manifest_has_sstable(m2, 1, large_id));
+    ASSERT_EQ(m2->entries[0].id, large_id);
+    ASSERT_EQ(m2->entries[0].num_entries, large_entries);
+    ASSERT_EQ(m2->entries[0].size_bytes, large_size);
+
+    tidesdb_manifest_close(m2);
+    remove(test_path);
+}
+
 int main()
 {
     RUN_TEST(test_manifest_create, tests_passed);
@@ -796,6 +960,12 @@ int main()
     RUN_TEST(test_manifest_corrupted_recovery, tests_passed);
     RUN_TEST(test_manifest_large_stress, tests_passed);
     RUN_TEST(test_manifest_duplicate_id_handling, tests_passed);
+    RUN_TEST(test_manifest_null_safety, tests_passed);
+    RUN_TEST(test_manifest_commit_different_path, tests_passed);
+    RUN_TEST(test_manifest_corrupted_version_nonnumeric, tests_passed);
+    RUN_TEST(test_manifest_remove_to_zero, tests_passed);
+    RUN_TEST(test_manifest_commit_empty, tests_passed);
+    RUN_TEST(test_manifest_large_uint64_roundtrip, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);
 

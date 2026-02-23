@@ -328,11 +328,9 @@ int tidesdb_manifest_commit(tidesdb_manifest_t *manifest, const char *path)
     atomic_fetch_add(&manifest->active_ops, 1);
     pthread_rwlock_wrlock(&manifest->lock);
 
-    /* we close existing file pointer if path changed */
-    if (manifest->fp && strcmp(manifest->path, path) != 0)
+    /* we update stored path if it changed */
+    if (strcmp(manifest->path, path) != 0)
     {
-        fclose(manifest->fp);
-        manifest->fp = NULL;
         strncpy(manifest->path, path, MANIFEST_PATH_LEN - 1);
         manifest->path[MANIFEST_PATH_LEN - 1] = '\0';
     }

@@ -110,9 +110,9 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
         return -1;
     }
 
-    /* we calculate the size of the bitset (m) using the formula
-     * m = -n * ln(p) / (ln(2)^2)
-     *
+    /**** we calculate the size of the bitset (m) using the formula
+     ***  m = -n * ln(p) / (ln(2)^2)
+     **
      */
     const double m_double = ceil(-((double)n) * log(p) / (M_LN2 * M_LN2));
 
@@ -264,71 +264,7 @@ unsigned int bloom_filter_hash(const uint8_t *entry, const size_t size, const in
 {
     if (BLOOM_UNLIKELY(entry == NULL || size == 0)) return 0;
 
-    const uint32_t prime = 0xc6a4a793;
-    const uint8_t *limit = entry + size;
-    uint32_t h = (uint32_t)seed ^ ((uint32_t)size * prime);
-
-/* on 64-bit platforms, we process 8 bytes at a time for better throughput */
-#if UINTPTR_MAX == UINT64_MAX
-    /*** we process 8 bytes at a time (two 4-byte words per iteration) */
-    while (entry + 8 <= limit)
-    {
-        uint32_t w1, w2;
-        memcpy(&w1, entry, sizeof(w1));
-        memcpy(&w2, entry + 4, sizeof(w2));
-        entry += 8;
-
-        h += w1;
-        h *= prime;
-        h ^= (h >> 16);
-
-        h += w2;
-        h *= prime;
-        h ^= (h >> 16);
-    }
-
-    /*** we process remaining 4-byte chunk if present */
-    if (entry + 4 <= limit)
-    {
-        uint32_t w;
-        memcpy(&w, entry, sizeof(w));
-        entry += 4;
-        h += w;
-        h *= prime;
-        h ^= (h >> 16);
-    }
-#else
-    /* 32-bit path -- we process 4 bytes at a time */
-    while (entry + 4 <= limit)
-    {
-        uint32_t w;
-        memcpy(&w, entry, sizeof(w));
-        entry += 4;
-        h += w;
-        h *= prime;
-        h ^= (h >> 16);
-    }
-#endif
-
-    /* we process remaining bytes (0-3) */
-    switch (limit - entry)
-    {
-        case 3:
-            h += (uint32_t)entry[2] << 16;
-            /* fall through */
-        case 2:
-            h += (uint32_t)entry[1] << 8;
-            /* fall through */
-        case 1:
-            h += entry[0];
-            h *= prime;
-            h ^= (h >> 24);
-            break;
-        default:
-            break;
-    }
-
-    return h;
+    return bf_hash_inline(entry, size, (uint32_t)seed);
 }
 
 uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
@@ -346,8 +282,8 @@ uint8_t *bloom_filter_serialize(const bloom_filter_t *bf, size_t *out_size)
     }
 
     /* we allocate worst-case size
-     * -- header -- 3 varint32s (m, h, non_zero_count) = 15 bytes max
-     * -- sparse data -- each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
+     * -- header        -- 3 varint32s (m, h, non_zero_count) = 15 bytes max
+     * -- sparse data   -- each non-zero word = 5 bytes (index) + 10 bytes (value) = 15 bytes max
      */
     const size_t max_size = 15 + non_zero_count * 15;
     uint8_t *buffer = malloc(max_size);
@@ -399,7 +335,7 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
     const unsigned int m = m_u32;
     const unsigned int h = h_u32;
 
-    /* validate deserialized values */
+    /* we validate deserialized values */
     if (m == 0 || h == 0)
     {
         return NULL;
@@ -412,11 +348,6 @@ bloom_filter_t *bloom_filter_deserialize(const uint8_t *data)
     }
 
     const unsigned int size_in_words = (m + BF_BITS_PER_WORD - 1) / BF_BITS_PER_WORD;
-
-    if (size_in_words == 0)
-    {
-        return NULL;
-    }
 
     /* we allocate and zero-initialize bitset */
     uint64_t *bitset = calloc((size_t)size_in_words, sizeof(uint64_t));
@@ -467,5 +398,4 @@ void bloom_filter_free(bloom_filter_t *bf)
 
     free(bf->bitset);
     free(bf);
-    bf = NULL;
 }

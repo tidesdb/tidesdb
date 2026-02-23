@@ -1,5 +1,5 @@
 <div>
-    <h1 align="left"><img width="128" src="artwork/tidesdb-logo-v0.1.png"></h1>
+    <h1 align="left"><img width="108" src="artwork/tidesdb-logo-v8.png"></h1>
 </div>
 
 TidesDB is a fast and efficient key value storage engine library written in C. The underlying data structure is based on a log-structured merge-tree (LSM-tree).

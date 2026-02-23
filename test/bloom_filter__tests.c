@@ -586,6 +586,162 @@ void test_bloom_filter_batch_vs_single()
     (void)bloom_filter_free(bf_batch);
 }
 
+void test_bloom_filter_hash_direct(void)
+{
+    /* we test the public bloom_filter_hash function directly */
+    unsigned int h1 = bloom_filter_hash((const uint8_t *)"hello", 5, 0);
+    unsigned int h2 = bloom_filter_hash((const uint8_t *)"hello", 5, 0);
+    ASSERT_EQ(h1, h2); /* deterministic */
+
+    /* different seeds produce different hashes */
+    unsigned int h3 = bloom_filter_hash((const uint8_t *)"hello", 5, 1);
+    ASSERT_TRUE(h1 != h3);
+
+    /* different keys produce different hashes */
+    unsigned int h4 = bloom_filter_hash((const uint8_t *)"world", 5, 0);
+    ASSERT_TRUE(h1 != h4);
+
+    /* NULL entry returns 0 */
+    ASSERT_EQ(bloom_filter_hash(NULL, 5, 0), 0);
+
+    /* size 0 returns 0 */
+    ASSERT_EQ(bloom_filter_hash((const uint8_t *)"hello", 0, 0), 0);
+}
+
+void test_bloom_filter_is_full_true(void)
+{
+    /* we create a tiny bloom filter and force all bits set */
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.5, 1), 0);
+
+    /* we force all words to all-ones */
+    for (unsigned int i = 0; i < bf->size_in_words; i++)
+    {
+        bf->bitset[i] = UINT64_MAX;
+    }
+
+    ASSERT_EQ(bloom_filter_is_full(bf), 1);
+
+    bloom_filter_free(bf);
+}
+
+void test_bloom_filter_null_safety(void)
+{
+    /* bloom_filter_is_full with NULL */
+    ASSERT_EQ(bloom_filter_is_full(NULL), -1);
+
+    /* bloom_filter_contains with NULL bf */
+    ASSERT_EQ(bloom_filter_contains(NULL, (const uint8_t *)"key", 3), -1);
+
+    /* bloom_filter_add with NULL bf should not crash */
+    bloom_filter_add(NULL, (const uint8_t *)"key", 3);
+
+    /* bloom_filter_add_batch with NULL bf should not crash */
+    const uint8_t *entries[] = {(const uint8_t *)"key"};
+    size_t sizes[] = {3};
+    bloom_filter_add_batch(NULL, entries, sizes, 1);
+
+    /* bloom_filter_add_batch with NULL entries should not crash */
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
+    bloom_filter_add_batch(bf, NULL, sizes, 1);
+    bloom_filter_add_batch(bf, entries, NULL, 1);
+    bloom_filter_add_batch(bf, entries, sizes, 0);
+    bloom_filter_free(bf);
+
+    /* bloom_filter_serialize with NULL */
+    size_t out_size;
+    ASSERT_TRUE(bloom_filter_serialize(NULL, &out_size) == NULL);
+
+    /* bloom_filter_deserialize with NULL */
+    ASSERT_TRUE(bloom_filter_deserialize(NULL) == NULL);
+}
+
+void test_bloom_filter_deserialize_oob_index(void)
+{
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 100), 0);
+    bloom_filter_add(bf, (const uint8_t *)"test", 4);
+
+    size_t size;
+    uint8_t *data = bloom_filter_serialize(bf, &size);
+    ASSERT_TRUE(data != NULL);
+
+    /* we craft a malicious payload: valid header but OOB word index
+     * first we deserialize to get baseline, then we'll manually build one */
+    bloom_filter_free(bf);
+
+    /* we build a minimal serialized payload with an OOB index
+     * header    m=64 (1 word), h=1, non_zero_count=1
+     * then      index=9999 (way out of bounds), value=0xFF */
+    uint8_t crafted[32];
+    uint8_t *ptr = crafted;
+    ptr = encode_varint32(ptr, 64);   /* m = 64 bits = 1 word */
+    ptr = encode_varint32(ptr, 1);    /* h = 1 */
+    ptr = encode_varint32(ptr, 1);    /* non_zero_count = 1 */
+    ptr = encode_varint32(ptr, 9999); /* index = 9999 (OOB) */
+    ptr = encode_varint64(ptr, 0xFF); /* value */
+
+    bloom_filter_t *bad_bf = bloom_filter_deserialize(crafted);
+    ASSERT_TRUE(bad_bf == NULL); /* should fail due to OOB index */
+
+    free(data);
+}
+
+void test_bloom_filter_serialize_roundtrip_size_in_words(void)
+{
+    bloom_filter_t *bf;
+    ASSERT_EQ(bloom_filter_new(&bf, 0.01, 500), 0);
+
+    for (int i = 0; i < 50; i++)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "roundtrip_%d", i);
+        bloom_filter_add(bf, (const uint8_t *)key, strlen(key));
+    }
+
+    size_t size;
+    uint8_t *data = bloom_filter_serialize(bf, &size);
+    ASSERT_TRUE(data != NULL);
+
+    bloom_filter_t *bf2 = bloom_filter_deserialize(data);
+    ASSERT_TRUE(bf2 != NULL);
+
+    /* we verify all fields match, including size_in_words */
+    ASSERT_EQ(bf2->m, bf->m);
+    ASSERT_EQ(bf2->h, bf->h);
+    ASSERT_EQ(bf2->size_in_words, bf->size_in_words);
+
+    /* we verify bitsets are identical */
+    for (unsigned int i = 0; i < bf->size_in_words; i++)
+    {
+        ASSERT_EQ(bf2->bitset[i], bf->bitset[i]);
+    }
+
+    free(data);
+    bloom_filter_free(bf);
+    bloom_filter_free(bf2);
+}
+
+void test_bloom_filter_deserialize_corrupted_assertions(void)
+{
+    /* we test that m=0 in header causes deserialize to return NULL */
+    uint8_t crafted_m0[16];
+    uint8_t *ptr = crafted_m0;
+    ptr = encode_varint32(ptr, 0); /* m = 0 */
+    ptr = encode_varint32(ptr, 1); /* h = 1 */
+    ptr = encode_varint32(ptr, 0); /* non_zero_count = 0 */
+    ASSERT_TRUE(bloom_filter_deserialize(crafted_m0) == NULL);
+
+    /* we test that h=0 in header causes deserialize to return NULL */
+    uint8_t crafted_h0[16];
+    ptr = crafted_h0;
+    ptr = encode_varint32(ptr, 64); /* m = 64 */
+    ptr = encode_varint32(ptr, 0);  /* h = 0 */
+    ptr = encode_varint32(ptr, 0);  /* non_zero_count = 0 */
+    ASSERT_TRUE(bloom_filter_deserialize(crafted_h0) == NULL);
+}
+
 int main(void)
 {
     RUN_TEST(test_bloom_filter_new, tests_passed);
@@ -605,6 +761,12 @@ int main(void)
     RUN_TEST(test_bloom_filter_large_capacity_random_keys, tests_passed);
     RUN_TEST(test_bloom_filter_add_batch, tests_passed);
     RUN_TEST(test_bloom_filter_batch_vs_single, tests_passed);
+    RUN_TEST(test_bloom_filter_hash_direct, tests_passed);
+    RUN_TEST(test_bloom_filter_is_full_true, tests_passed);
+    RUN_TEST(test_bloom_filter_null_safety, tests_passed);
+    RUN_TEST(test_bloom_filter_deserialize_oob_index, tests_passed);
+    RUN_TEST(test_bloom_filter_serialize_roundtrip_size_in_words, tests_passed);
+    RUN_TEST(test_bloom_filter_deserialize_corrupted_assertions, tests_passed);
     RUN_TEST(benchmark_bloom_filter, tests_passed);
 
     PRINT_TEST_RESULTS(tests_passed, tests_failed);

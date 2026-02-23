@@ -643,6 +643,7 @@ int main()
     printf("  DB Flush Pool Threads: %d\n", BENCH_DB_FLUSH_POOL_THREADS);
     printf("  DB Compaction Pool Threads: %d\n", BENCH_DB_COMPACTION_POOL_THREADS);
     printf("  DB Block Cache Size: %d\n", BENCH_BLOCK_CACHE_SIZE);
+    printf("  DB Max Memory: %d\n", BENCH_DB_MAX_MEMORY);
 
     printf("\n" BOLDWHITE "Column Family Configuration:\n" RESET);
     printf("  Write Buffer Size: %zu bytes (%.2f MB)\n", (size_t)BENCH_WRITE_BUFFER_SIZE,
@@ -767,7 +768,9 @@ int main()
                                .num_flush_threads = BENCH_DB_FLUSH_POOL_THREADS,
                                .num_compaction_threads = BENCH_DB_COMPACTION_POOL_THREADS,
                                .block_cache_size = BENCH_BLOCK_CACHE_SIZE,
+                               .max_memory_usage = BENCH_DB_MAX_MEMORY,
                                .max_open_sstables = BENCH_MAX_OPEN_SSTABLES};
+
     int open_result = tidesdb_open(&config, &tdb);
     if (open_result != 0)
     {

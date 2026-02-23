@@ -176,6 +176,48 @@ static int get_file_size(const int fd, uint64_t *size)
 }
 
 /**
+ * reopen_fd
+ * closes and reopens the block manager file descriptor with the same flags
+ * @param bm the block manager
+ * @return 0 if successful, -1 if not
+ */
+static int reopen_fd(block_manager_t *bm)
+{
+    close(bm->fd);
+
+    int flags = O_RDWR | O_CREAT;
+    if (is_sync_full(bm) && odsync_available())
+    {
+        flags |= O_DSYNC;
+    }
+
+    bm->fd = open(bm->file_path, flags, BLOCK_MANAGER_FILE_MODE);
+    if (bm->fd == -1) return -1;
+
+    return 0;
+}
+
+/**
+ * truncate_to_header
+ * truncates a block manager file to just the header and syncs
+ * @param bm the block manager
+ * @return 0 if successful, -1 if not
+ */
+static int truncate_to_header(block_manager_t *bm)
+{
+    if (ftruncate(bm->fd, (off_t)BLOCK_MANAGER_HEADER_SIZE) == -1) return -1;
+
+    /* ftruncate is not covered by O_DSYNC, always sync truncation */
+    if (is_sync_full(bm))
+    {
+        fdatasync(bm->fd);
+    }
+
+    atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
+    return 0;
+}
+
+/**
  * block_manager_open_internal
  * opens a block manager (no cache)
  * @param bm the block manager to open
@@ -661,8 +703,8 @@ int block_manager_cursor_next(block_manager_cursor_t *cursor)
     else
     {
         unsigned char size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
-        ssize_t nread = pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
-                              (off_t)cursor->current_pos);
+        const ssize_t nread = pread(cursor->bm->fd, size_buf, BLOCK_MANAGER_SIZE_FIELD_SIZE,
+                                    (off_t)cursor->current_pos);
         if (nread != BLOCK_MANAGER_SIZE_FIELD_SIZE)
         {
             if (nread == 0) return 1; /* EOF */
@@ -998,23 +1040,7 @@ int block_manager_truncate(block_manager_t *bm)
         fdatasync(bm->fd);
     }
 
-    if (close(bm->fd) != 0)
-    {
-        return -1;
-    }
-
-    /* we reopen with same flags as original open, including O_DSYNC if in SYNC_FULL mode */
-    int flags = O_RDWR | O_CREAT;
-    if (is_sync_full(bm) && odsync_available())
-    {
-        flags |= O_DSYNC;
-    }
-
-    bm->fd = open(bm->file_path, flags, 0644);
-    if (bm->fd == -1)
-    {
-        return -1;
-    }
+    if (reopen_fd(bm) != 0) return -1;
 
     if (write_header(bm->fd) != 0)
     {
@@ -1140,30 +1166,14 @@ int block_manager_count_blocks(block_manager_t *bm)
     block_manager_cursor_t cursor;
     int count = 0;
 
-    if (block_manager_cursor_init_stack(&cursor, bm) != 0) return -1;
+    (void)block_manager_cursor_init_stack(&cursor, bm);
 
     /* sequential scan -- hint for read-ahead */
     set_file_sequential_hint(bm->fd);
 
-    if (block_manager_cursor_goto_first(&cursor) != 0)
+    while (block_manager_cursor_next(&cursor) == 0)
     {
-        return 0; /* empty file */
-    }
-
-    if (cursor.block_index >= 0)
-    {
-        count = 1;
-        while (block_manager_cursor_next(&cursor) == 0)
-        {
-            count++;
-        }
-    }
-    else
-    {
-        while (block_manager_cursor_next(&cursor) == 0)
-        {
-            count++;
-        }
+        count++;
     }
 
     return count;
@@ -1206,18 +1216,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
         {
             return -1;
         }
-        if (ftruncate(bm->fd, (off_t)BLOCK_MANAGER_HEADER_SIZE) == -1)
-        {
-            return -1;
-        }
-        /* ftruncate is not covered by O_DSYNC, always sync truncation */
-        if (is_sync_full(bm))
-        {
-            fdatasync(bm->fd);
-        }
-        lseek(bm->fd, 0, SEEK_SET);
-        atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
-        return 0;
+        return truncate_to_header(bm);
     }
 
     /* fast O(1) validation, read footer of last block */
@@ -1233,14 +1232,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
             return -1;
         }
         /* permissive mode -- truncate to header */
-        if (ftruncate(bm->fd, (off_t)BLOCK_MANAGER_HEADER_SIZE) == -1) return -1;
-        /* ftruncate is not covered by O_DSYNC, always sync truncation */
-        if (is_sync_full(bm))
-        {
-            fdatasync(bm->fd);
-        }
-        atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
-        return 0;
+        return truncate_to_header(bm);
     }
 
     const uint32_t footer_size = decode_uint32_le_compat(footer_buf);
@@ -1249,16 +1241,11 @@ int block_manager_validate_last_block(block_manager_t *bm,
     /* we check if footer is valid */
     if (footer_magic != BLOCK_MANAGER_FOOTER_MAGIC)
     {
-        fprintf(stderr,
-                "[block_manager] File %s: invalid footer magic 0x%08x (expected 0x%08x), "
-                "file_size=%" PRIu64 "\n",
-                bm->file_path, footer_magic, BLOCK_MANAGER_FOOTER_MAGIC, file_size);
         if (validation == BLOCK_MANAGER_STRICT_BLOCK_VALIDATION)
         {
             return -1;
         }
 
-        fprintf(stderr, "[block_manager] Permissive mode: scanning for last valid block\n");
         uint64_t scan_pos = BLOCK_MANAGER_HEADER_SIZE;
         uint64_t valid_size = BLOCK_MANAGER_HEADER_SIZE;
 
@@ -1295,30 +1282,17 @@ int block_manager_validate_last_block(block_manager_t *bm,
 
         if (valid_size != file_size)
         {
-            fprintf(stderr, "[block_manager] Truncating %s from %" PRIu64 " to %" PRIu64 " bytes\n",
-                    bm->file_path, file_size, valid_size);
             if (ftruncate(bm->fd, (off_t)valid_size) != 0) return -1;
 
             if (is_sync_full(bm))
             {
                 fdatasync(bm->fd);
             }
-            close(bm->fd);
-            /* we reopen with same flags as original open */
-            int flags = O_RDWR | O_CREAT;
-            if (is_sync_full(bm) && odsync_available())
-            {
-                flags |= O_DSYNC;
-            }
-            bm->fd = open(bm->file_path, flags, 0644);
-            if (bm->fd == -1) return -1;
+
+            if (reopen_fd(bm) != 0) return -1;
             atomic_store(&bm->current_file_size, valid_size);
-            fprintf(stderr, "[block_manager] Truncation complete, file reopened\n");
         }
-        else
-        {
-            fprintf(stderr, "[block_manager] No truncation needed, valid_size matches file_size\n");
-        }
+
         return 0;
     }
 
@@ -1333,14 +1307,7 @@ int block_manager_validate_last_block(block_manager_t *bm,
             return -1;
         }
         /*** permissive mode -- truncate to header */
-        if (ftruncate(bm->fd, (off_t)BLOCK_MANAGER_HEADER_SIZE) == -1) return -1;
-        /* ftruncate is not covered by O_DSYNC, always sync truncation */
-        if (is_sync_full(bm))
-        {
-            fdatasync(bm->fd);
-        }
-        atomic_store(&bm->current_file_size, BLOCK_MANAGER_HEADER_SIZE);
-        return 0;
+        return truncate_to_header(bm);
     }
 
     unsigned char header_size_buf[BLOCK_MANAGER_SIZE_FIELD_SIZE];
@@ -1372,9 +1339,9 @@ block_manager_sync_mode_t convert_sync_mode(const int tdb_sync_mode)
 {
     switch (tdb_sync_mode)
     {
-        case 0: /* TDB_SYNC_NONE */
+        case 0:
             return BLOCK_MANAGER_SYNC_NONE;
-        case 1: /* TDB_SYNC_FULL */
+        case 1:
             return BLOCK_MANAGER_SYNC_FULL;
         default:
             return BLOCK_MANAGER_SYNC_NONE;

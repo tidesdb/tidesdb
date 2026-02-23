@@ -770,6 +770,7 @@ int main()
                                .block_cache_size = BENCH_BLOCK_CACHE_SIZE,
                                .max_memory_usage = BENCH_DB_MAX_MEMORY,
                                .max_open_sstables = BENCH_MAX_OPEN_SSTABLES};
+
     int open_result = tidesdb_open(&config, &tdb);
     if (open_result != 0)
     {

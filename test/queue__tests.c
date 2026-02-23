@@ -670,6 +670,84 @@ void test_queue_foreach_empty()
     queue_free(queue);
 }
 
+void test_queue_null_safety_extended(void)
+{
+    int val = 42;
+
+    /* queue_enqueue with NULL queue */
+    ASSERT_EQ(queue_enqueue(NULL, &val), -1);
+
+    /* queue_dequeue_wait with NULL queue */
+    ASSERT_TRUE(queue_dequeue_wait(NULL) == NULL);
+
+    /* queue_shutdown with NULL should not crash */
+    queue_shutdown(NULL);
+
+    /* queue_free_with_data with NULL queue should not crash */
+    queue_free_with_data(NULL, free);
+
+    /* queue_clear with NULL queue should return -1 */
+    ASSERT_EQ(queue_clear(NULL), -1);
+}
+
+void test_queue_free_with_data_null_fn(void)
+{
+    queue_t *queue = queue_new();
+    ASSERT_TRUE(queue != NULL);
+
+    int *d1 = malloc(sizeof(int));
+    int *d2 = malloc(sizeof(int));
+    *d1 = 10;
+    *d2 = 20;
+
+    queue_enqueue(queue, d1);
+    queue_enqueue(queue, d2);
+    ASSERT_EQ(queue_size(queue), 2);
+
+    /* free_fn is NULL so data pointers are not freed, only nodes */
+    queue_free_with_data(queue, NULL);
+
+    /* we must manually free the data to avoid leaks */
+    free(d1);
+    free(d2);
+}
+
+void test_queue_clear_then_reuse(void)
+{
+    queue_t *queue = queue_new();
+    ASSERT_TRUE(queue != NULL);
+
+    int v1 = 1, v2 = 2, v3 = 3;
+    queue_enqueue(queue, &v1);
+    queue_enqueue(queue, &v2);
+    queue_enqueue(queue, &v3);
+    ASSERT_EQ(queue_size(queue), 3);
+
+    ASSERT_EQ(queue_clear(queue), 0);
+    ASSERT_EQ(queue_size(queue), 0);
+    ASSERT_EQ(queue_is_empty(queue), 1);
+    ASSERT_TRUE(queue_peek(queue) == NULL);
+    ASSERT_TRUE(queue_dequeue(queue) == NULL);
+
+    /* we verify queue works normally after clear */
+    int v4 = 40, v5 = 50;
+    ASSERT_EQ(queue_enqueue(queue, &v4), 0);
+    ASSERT_EQ(queue_enqueue(queue, &v5), 0);
+    ASSERT_EQ(queue_size(queue), 2);
+
+    int *r1 = (int *)queue_dequeue(queue);
+    ASSERT_TRUE(r1 != NULL);
+    ASSERT_EQ(*r1, 40);
+
+    int *r2 = (int *)queue_dequeue(queue);
+    ASSERT_TRUE(r2 != NULL);
+    ASSERT_EQ(*r2, 50);
+
+    ASSERT_EQ(queue_is_empty(queue), 1);
+
+    queue_free(queue);
+}
+
 void benchmark_queue_single_threaded()
 {
     printf("\n");
@@ -1350,6 +1428,9 @@ int main(void)
     RUN_TEST(test_queue_is_empty, tests_passed);
     RUN_TEST(test_queue_peek_at_boundary, tests_passed);
     RUN_TEST(test_queue_foreach_empty, tests_passed);
+    RUN_TEST(test_queue_null_safety_extended, tests_passed);
+    RUN_TEST(test_queue_free_with_data_null_fn, tests_passed);
+    RUN_TEST(test_queue_clear_then_reuse, tests_passed);
     RUN_TEST(benchmark_queue_single_threaded, tests_passed);
     RUN_TEST(benchmark_queue_concurrent_producers_consumers, tests_passed);
     RUN_TEST(benchmark_queue_mixed_operations, tests_passed);

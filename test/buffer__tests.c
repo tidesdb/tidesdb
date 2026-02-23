@@ -1070,6 +1070,109 @@ static void test_buffer_struct_eviction(void)
     buffer_free(buffer);
 }
 
+void test_buffer_null_safety_extended(void)
+{
+    buffer_t *buffer = NULL;
+    ASSERT_EQ(buffer_new(&buffer, 5), 0);
+
+    uint32_t id;
+    void *data;
+    uint64_t gen;
+
+    /* buffer_try_acquire with NULL buffer */
+    ASSERT_EQ(buffer_try_acquire(NULL, (void *)1, &id), -1);
+
+    /* buffer_try_acquire with NULL id */
+    ASSERT_EQ(buffer_try_acquire(buffer, (void *)1, NULL), -1);
+
+    /* buffer_release_silent with NULL buffer */
+    ASSERT_EQ(buffer_release_silent(NULL, 0), -1);
+
+    /* buffer_set_retry_params with NULL buffer */
+    ASSERT_EQ(buffer_set_retry_params(NULL, 10, 1), -1);
+
+    /* buffer_clear with NULL buffer */
+    ASSERT_EQ(buffer_clear(NULL), -1);
+
+    /* buffer_free with NULL should not crash */
+    buffer_free(NULL);
+
+    /* buffer_get_generation with NULL buffer */
+    ASSERT_EQ(buffer_get_generation(NULL, 0, &gen), -1);
+
+    /* buffer_get_generation with NULL generation pointer */
+    ASSERT_EQ(buffer_get_generation(buffer, 0, NULL), -1);
+
+    /* buffer_validate with NULL buffer */
+    ASSERT_EQ(buffer_validate(NULL, 0, 0), -1);
+
+    /* buffer_foreach with NULL buffer */
+    ASSERT_EQ(buffer_foreach(NULL, foreach_callback, NULL), -1);
+
+    /* buffer_get with NULL data pointer */
+    ASSERT_EQ(buffer_get(buffer, 0, NULL), -1);
+
+    /* buffer_acquire with NULL id */
+    ASSERT_EQ(buffer_acquire(buffer, (void *)1, NULL), -1);
+
+    buffer_free(buffer);
+}
+
+void test_buffer_double_release(void)
+{
+    buffer_t *buffer = NULL;
+    ASSERT_EQ(buffer_new(&buffer, 5), 0);
+
+    int value = 42;
+    uint32_t id;
+    ASSERT_EQ(buffer_acquire(buffer, &value, &id), 0);
+    ASSERT_EQ(buffer_is_occupied(buffer, id), 1);
+
+    /* first release should succeed */
+    ASSERT_EQ(buffer_release(buffer, id), 0);
+    ASSERT_EQ(buffer_is_occupied(buffer, id), 0);
+
+    /* second release should fail (slot already free) */
+    ASSERT_EQ(buffer_release(buffer, id), -1);
+
+    buffer_free(buffer);
+}
+
+void test_buffer_foreach_empty(void)
+{
+    buffer_t *buffer = NULL;
+    ASSERT_EQ(buffer_new(&buffer, 10), 0);
+
+    foreach_ctx_t ctx = {0, 0};
+    int visited = buffer_foreach(buffer, foreach_callback, &ctx);
+
+    ASSERT_EQ(visited, 0);
+    ASSERT_EQ(ctx.count, 0);
+
+    buffer_free(buffer);
+}
+
+void test_buffer_validate_edge_cases(void)
+{
+    buffer_t *buffer = NULL;
+    ASSERT_EQ(buffer_new(&buffer, 5), 0);
+
+    /* validate with out-of-bounds id */
+    ASSERT_EQ(buffer_validate(buffer, 100, 0), 0);
+
+    /* validate on free slot */
+    ASSERT_EQ(buffer_validate(buffer, 0, 0), 0);
+
+    /* is_occupied with out-of-bounds id */
+    ASSERT_EQ(buffer_is_occupied(buffer, 100), -1);
+
+    /* release with out-of-bounds id */
+    ASSERT_EQ(buffer_release(buffer, 100), -1);
+    ASSERT_EQ(buffer_release_silent(buffer, 100), -1);
+
+    buffer_free(buffer);
+}
+
 int main(void)
 {
     RUN_TEST(test_buffer_create, tests_passed);
@@ -1085,6 +1188,10 @@ int main(void)
     RUN_TEST(test_buffer_concurrent_mixed, tests_passed);
     RUN_TEST(test_buffer_eviction_with_malloc, tests_passed);
     RUN_TEST(test_buffer_struct_eviction, tests_passed);
+    RUN_TEST(test_buffer_null_safety_extended, tests_passed);
+    RUN_TEST(test_buffer_double_release, tests_passed);
+    RUN_TEST(test_buffer_foreach_empty, tests_passed);
+    RUN_TEST(test_buffer_validate_edge_cases, tests_passed);
     RUN_TEST(test_buffer_stress, tests_passed);
     RUN_TEST(benchmark_buffer_single_threaded, tests_passed);
     RUN_TEST(benchmark_buffer_concurrent_throughput, tests_passed);

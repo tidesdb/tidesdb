@@ -97,13 +97,13 @@ static int try_acquire_slot(buffer_t *buffer, const uint32_t index, void *data, 
     /* we own the slot now, set data and transition to OCCUPIED */
     atomic_store_explicit(&slot->data, data, memory_order_relaxed);
 
-    /* increment generation for ABA prevention */
+    /* we increment generation for ABA prevention */
     atomic_fetch_add_explicit(&slot->generation, 1, memory_order_relaxed);
 
-    /* transition ACQUIRED -> OCCUPIED */
+    /* we transition ACQUIRED -> OCCUPIED */
     atomic_store_explicit(&slot->state, BUFFER_SLOT_OCCUPIED, memory_order_release);
 
-    /* update active count */
+    /* we update active count */
     atomic_fetch_add_explicit(&buffer->active_count, 1, memory_order_relaxed);
 
     *id = index;
@@ -216,7 +216,7 @@ static inline int buffer_release_internal(buffer_t *buffer, const uint32_t id, i
 {
     buffer_slot_t *slot = &buffer->slots[id];
 
-    /* try to transition OCCUPIED -> RELEASING */
+    /* we try to transition OCCUPIED -> RELEASING */
     uint32_t expected = BUFFER_SLOT_OCCUPIED;
     if (BUFFER_UNLIKELY(
             !atomic_compare_exchange_strong_explicit(&slot->state, &expected, BUFFER_SLOT_RELEASING,
@@ -225,10 +225,10 @@ static inline int buffer_release_internal(buffer_t *buffer, const uint32_t id, i
         return -1; /* slot not occupied or already being released */
     }
 
-    /* get data for eviction callback */
+    /* we get data for eviction callback */
     void *data = atomic_load_explicit(&slot->data, memory_order_relaxed);
 
-    /* call eviction callback if requested and set */
+    /* we call eviction callback if requested and set */
     if (call_eviction && BUFFER_UNLIKELY(buffer->eviction_fn != NULL && data != NULL))
     {
         buffer->eviction_fn(data, buffer->eviction_ctx);
@@ -239,7 +239,7 @@ static inline int buffer_release_internal(buffer_t *buffer, const uint32_t id, i
     /* transition RELEASING -> FREE */
     atomic_store_explicit(&slot->state, BUFFER_SLOT_FREE, memory_order_release);
 
-    /* update active count */
+    /* we update active count */
     atomic_fetch_sub_explicit(&buffer->active_count, 1, memory_order_relaxed);
 
     return 0;
@@ -304,7 +304,6 @@ void buffer_free(buffer_t *buffer)
 
     free(buffer->slots);
     free(buffer);
-    buffer = NULL;
 }
 
 int buffer_foreach(const buffer_t *buffer, void (*callback)(uint32_t id, void *data, void *ctx),

@@ -16,8 +16,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef __TIDESDB_ALLOC_H__
-#define __TIDESDB_ALLOC_H__
+#ifndef __ALLOC_H__
+#define __ALLOC_H__
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -135,10 +135,10 @@ void tidesdb_ensure_initialized(void);
 static inline char *tdb_strdup(const char *s)
 {
     if (!s) return NULL;
-    size_t len = strlen(s) + 1;
+    const size_t len = strlen(s) + 1;
     char *dup = (char *)malloc(len);
     if (dup) memcpy(dup, s, len);
     return dup;
 }
 
-#endif /* __TIDESDB_ALLOC_H__ */
+#endif /* __ALLOC_H__ */
